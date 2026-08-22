@@ -879,6 +879,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       assertInputValues(row.version.inputsSchema, inputs);
       const updated = await store.setInputs(row.id, inputs);
       if (!updated) throw new ConnectError("automation not found", Code.NotFound);
+      // The Slack route's per-channel window reads this row through a cache.
       return { automation: toProtoAutomation(updated) };
     },
 

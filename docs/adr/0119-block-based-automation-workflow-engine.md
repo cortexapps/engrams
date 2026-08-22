@@ -136,6 +136,21 @@ Two rules make this safe:
     `automation_session.relay` flag is set) is what the Slack thread relay
     (`system.slack_thread_relay`) consumes. Any run in flight across the
     2→3 deploy strands and is failed by the sweep, by design.
+  - **4** (phase 4.6): **conversation loops.** Three changes that let a
+    built-in loop `wait_event → send_prompt` until a thread goes quiet.
+    (1) A loop's `maxIterations` may be a `$ref` (e.g. `inputs.max_turns`);
+    the bound is resolved and clamped in its own checkpointed step
+    `step:<loopFramePath>.__bound__:0`, emitted before the first
+    iteration of EVERY loop (a literal bound gets the step too — one
+    shape). (2) The wait half of a wait-capable block reads the execute
+    half's RESOLVED config (`BlockOutcome.resolvedConfig`, which rides the
+    checkpointed step output), so a `$ref` deadline such as
+    `inputs.idle_timeout` is honoured on replay. (3) `wait_event` gains
+    `onDeadline: "continue"`: the deadline records `outcome: "deadline"`
+    on a SUCCEEDED step and the graph goes on (a loop's `until` reads
+    it), instead of ending the run `deadline`. Every other wait keeps the
+    phase-1 semantics. Any run in flight across the 3→4 deploy strands
+    and is failed by the sweep, by design.
 - **The golden test.** A step-sequence test asserts the exact ordered step
   names for linear, branch, loop, retry, deadline, stop, and supersede
   graphs. Accidental contract drift is a red diff at review time.
@@ -236,7 +251,7 @@ seed-profile pattern (idempotent, unique-violation tolerant, content-hash
 version bumps; user input values are merged with new-key defaults, never
 overwritten). Review-specific product logic that is not a generic primitive
 stays in code-registered **system blocks** (`open_review_pass`,
-`review_policy_gate`, `slack_thread_relay`) that only built-in definitions
+`review_policy_gate`, `slack_thread_relay`, `slack_thread_recap`) that only built-in definitions
 may reference. If a system block proves generic, it graduates to the catalog.
 
 The old graphs stay live during a parallel window: per-repository

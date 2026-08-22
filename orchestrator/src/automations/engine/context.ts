@@ -63,6 +63,10 @@ export interface RunContext {
    * and each must reach its own external resource. */
   currentPath?: string;
   currentAttempt?: number;
+  /** The installed handler's state as of its previous invocation (contract
+   * 3, see BlockExecutor.onMessage): a checkpointed step output, so it
+   * survives recovery. Seeded from the install step's `outputs.handler_state`. */
+  handlerState?: Record<string, unknown>;
   /** Set once the run has a terminal status, before finalize hooks run, so
    * a hook's templates can read `run.status` / `run.error`. */
   terminal?: { status: string; error?: string };

@@ -67,6 +67,9 @@ export interface EngineSessionOps {
     title: string | null;
     role: string;
     keep: boolean;
+    /** Run the session as this engrams user (their credentials + task
+     * ownership). Unset = the harness's programmatic org credential. */
+    ownerUserId?: string;
     harnessMode?: string;
     harness?: string;
     model?: string;

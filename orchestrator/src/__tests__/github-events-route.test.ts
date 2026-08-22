@@ -137,6 +137,7 @@ export function fakeIngress() {
       connectionIdFor: async (provider: string) => `conn-${provider}`,
       dispatch: async (input: IntegrationEventDispatchInput) => {
         dispatched.push(input);
+        return undefined;
       },
     },
   };
@@ -646,6 +647,9 @@ describe("ingress → integration-trigger dispatch (2.C)", () => {
         },
         async claimConcurrency() {
           return { claimed: true } as const;
+        },
+        async getConcurrencyHolder() {
+          return null;
         },
         async casConcurrency() {
           return true;

@@ -21,6 +21,8 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import { isValidSlackRequest } from "@slack/bolt";
 
 import { log as rootLog } from "../log.ts";
+import { SLACK_BRAIN_BUILTIN_KEY } from "../automations/builtins/slack-brain.ts";
+import { builtinTookDelivery } from "../automations/dispatch.ts";
 import { getSlackSigningSecret } from "../integrations/slack.ts";
 import { classifySlackEvent } from "../integrations/slack-webhook.ts";
 import {
@@ -31,7 +33,7 @@ import {
 import { ownPath } from "../automations/paths.ts";
 import { threadHash, selectThreadWorkflowId } from "../workflows/thread-workflow-id.ts";
 import { slackThreadWorkflow } from "../workflows/slack-thread.ts";
-import { THREAD_TOPIC, type ThreadInbox } from "../workflows/thread-inbox.ts";
+import { THREAD_TOPIC, type SourceMention, type ThreadInbox } from "../workflows/thread-inbox.ts";
 
 /** DBOS statuses a workflow can't re-run from → the thread is done (Invariant 4). */
 const TERMINAL_WF = new Set(["SUCCESS", "ERROR", "MAX_RECOVERY_ATTEMPTS_EXCEEDED", "CANCELLED"]);
@@ -44,6 +46,8 @@ export interface SlackEventsDeps {
   signingSecret?: () => Promise<string>;
   /** Ingress-spine seams (ledger store, new-trigger dispatch, connection). */
   ingress?: HandleDeliveryDeps;
+  /** The legacy per-thread DBOS workflow start + send (default = DBOS). */
+  startLegacyThread?: (mention: SourceMention) => Promise<void>;
 }
 
 const log = rootLog.child({ component: "slack" });
@@ -51,6 +55,7 @@ const log = rootLog.child({ component: "slack" });
 export function makeSlackEventsRoute(deps: SlackEventsDeps = {}): Hono {
   const signingSecret = deps.signingSecret ?? getSlackSigningSecret;
   const ingressDeps: HandleDeliveryDeps = deps.ingress ?? {};
+  const startLegacyThread = deps.startLegacyThread ?? startLegacyThreadWorkflow;
 
   const ingressRoute: IntegrationEventRoute = {
     provider: "slack",
@@ -124,7 +129,7 @@ export function makeSlackEventsRoute(deps: SlackEventsDeps = {}): Hono {
     }
     const rawBody = new TextDecoder().decode(delivery.rawBody);
 
-    // Legacy thread-brain path (retires with the Slack built-in): unchanged.
+    // Legacy thread-brain classification: unchanged.
     const evt = classifySlackEvent(rawBody);
     if (evt.kind === "challenge") return c.text(evt.challenge);
     if (evt.kind === "ignore") {
@@ -133,26 +138,48 @@ export function makeSlackEventsRoute(deps: SlackEventsDeps = {}): Hono {
     }
 
     const m = evt.mention;
-    const workflowId = await selectThreadWorkflowId(
-      threadHash(m.team, m.channel, m.threadRoot),
-      async (id) => {
-        const status = await DBOS.getWorkflowStatus(id);
-        return status != null && TERMINAL_WF.has(status.status);
-      },
-    );
-    log.info(
-      { channel: m.channel, user: m.user, thread: m.threadRoot, workflowId },
-      "slack: app_mention → thread workflow",
-    );
-    // 1st mention creates the thread workflow; later ones are a no-op start and
-    // the send delivers. Ack only after both commit (Invariant 3); the event_id
-    // idempotency key makes a Slack retry a no-op.
-    await DBOS.startWorkflow(slackThreadWorkflow, { workflowID: workflowId })();
-    await DBOS.send<ThreadInbox>(workflowId, { kind: "trigger_mention", mention: m }, THREAD_TOPIC, m.eventId);
+    // The per-channel window (ADR 0119 phase 4.6): one brain per thread. The
+    // spine above already dispatched the delivery; if the dispatcher handed
+    // it to the Slack thread-brain built-in (a run started or joined), the
+    // legacy workflow must not answer it too. The decision is the
+    // dispatcher's own admission result — the same fresh read of the
+    // built-in's `enabled` + `channels` — never a separate cached lookup
+    // that another replica's RPC could have left stale (dropped or doubled
+    // answers). The kill switch needs no handling here: the dispatcher
+    // refuses a disabled built-in, so the delivery falls through to legacy.
+    const dispatched = delivery.kind === "recorded" ? delivery.dispatch : undefined;
+    if (builtinTookDelivery(dispatched, SLACK_BRAIN_BUILTIN_KEY)) {
+      log.info(
+        { channel: m.channel, user: m.user, thread: m.threadRoot },
+        "slack: app_mention → thread-brain built-in (legacy workflow skipped)",
+      );
+      return c.body(null, 200);
+    }
+    await startLegacyThread(m);
     return c.body(null, 200);
   });
 
   return app;
+}
+
+/** Legacy thread-brain path (retires with the Slack built-in): unchanged. */
+async function startLegacyThreadWorkflow(m: SourceMention): Promise<void> {
+  const workflowId = await selectThreadWorkflowId(
+    threadHash(m.team, m.channel, m.threadRoot),
+    async (id) => {
+      const status = await DBOS.getWorkflowStatus(id);
+      return status != null && TERMINAL_WF.has(status.status);
+    },
+  );
+  log.info(
+    { channel: m.channel, user: m.user, thread: m.threadRoot, workflowId },
+    "slack: app_mention → thread workflow",
+  );
+  // 1st mention creates the thread workflow; later ones are a no-op start and
+  // the send delivers. Ack only after both commit (Invariant 3); the event_id
+  // idempotency key makes a Slack retry a no-op.
+  await DBOS.startWorkflow(slackThreadWorkflow, { workflowID: workflowId })();
+  await DBOS.send<ThreadInbox>(workflowId, { kind: "trigger_mention", mention: m }, THREAD_TOPIC, m.eventId);
 }
 
 export default makeSlackEventsRoute();

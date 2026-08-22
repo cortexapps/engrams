@@ -49,6 +49,11 @@ export const createSessionConfigSchema = z.object({
   role: z.string().min(1).max(64).optional(),
   /** Default: keep (D8). finalize ends only keep=false sessions. */
   keepOnFinish: z.boolean().optional(),
+  /** The engrams user the session runs AS (templated, e.g. from an identity
+   * block): their credentials, OAuth subject and git attribution instead of
+   * the harness's programmatic org credential, and the task is theirs.
+   * Empty/unset = programmatic (the review workers). */
+  ownerUserId: z.string().optional(),
   ...overrideFields,
   ...sessionPolicyFields,
 });
@@ -111,6 +116,8 @@ async function executeCreateSession(
     config.capabilityOverride !== undefined
       ? await Promise.all(config.capabilityOverride.map((c) => renderIfTemplated(ctx, c)))
       : undefined;
+  const ownerUserId =
+    config.ownerUserId !== undefined ? await renderIfTemplated(ctx, config.ownerUserId) : "";
   const created = await ctx.deps.sessions.createSession({
     runId: ctx.runId,
     blockId: currentBlockId(ctx),
@@ -118,6 +125,7 @@ async function executeCreateSession(
     profileId,
     prompt,
     title,
+    ...(ownerUserId !== "" ? { ownerUserId } : {}),
     role: config.role ?? "primary",
     // D8: keep by default; end_sessions_on_finish flips the default, and the
     // block's keepOnFinish overrides either way.

@@ -228,6 +228,38 @@ export async function admitAutomationRun(
 
   const key = await renderConcurrencyKey(concurrency.keyTemplate, target, trigger);
 
+  const joinHolder = async (holderRunId: string): Promise<"joined"> => {
+    // No run row: the delivery joins the holder's mailbox.
+    await deps.sender.send(
+      holderRunId,
+      {
+        kind: "event",
+        eventKey: trigger.eventKey ?? trigger.source,
+        deliveryKey,
+        payload: trigger.payload ?? {},
+        receivedAt: trigger.receivedAt ?? deps.now().toISOString(),
+      },
+      inboxKeys.joinedEvent(deliveryKey, holderRunId),
+    );
+    return "joined";
+  };
+
+  // A continue-only event (trigger.continueOnly) belongs to an ACTIVE run or
+  // to nobody: it never claims the key, so it can never open a run. This is
+  // the one place that invariant lives — a Slack thread reply in a flagged
+  // channel continues the thread the bot was mentioned in, and a reply in
+  // any other thread is dropped here without a run row (validation pins
+  // continueOnly to policy join).
+  const triggerSpec = target.definition.trigger;
+  if (
+    triggerSpec.kind === "integration" &&
+    trigger.eventKey !== undefined &&
+    triggerSpec.continueOnly?.includes(trigger.eventKey)
+  ) {
+    const holder = await deps.store.getConcurrencyHolder(automationId, key);
+    return holder === null ? "skipped" : joinHolder(holder);
+  }
+
   const claim = await deps.store.claimConcurrency(automationId, key, runId);
   if (claim.claimed) {
     await startRun(key);
@@ -235,21 +267,8 @@ export async function admitAutomationRun(
   }
 
   switch (concurrency.policy) {
-    case "join": {
-      // No run row: the delivery joins the holder's mailbox.
-      await deps.sender.send(
-        claim.holderRunId,
-        {
-          kind: "event",
-          eventKey: trigger.eventKey ?? trigger.source,
-          deliveryKey,
-          payload: trigger.payload ?? {},
-          receivedAt: trigger.receivedAt ?? deps.now().toISOString(),
-        },
-        inboxKeys.joinedEvent(deliveryKey, claim.holderRunId),
-      );
-      return "joined";
-    }
+    case "join":
+      return joinHolder(claim.holderRunId);
     case "queue": {
       await deps.store.insertRun({
         id: runId,
@@ -387,6 +406,8 @@ export interface IntegrationDispatchStore extends AutomationDispatchStore {
 export function disabledBuiltinsFromConfig(): ReadonlySet<string> {
   const keys: string[] = [];
   if (config.reviewAutomationDisabled) keys.push("pr_review");
+  // "slack_brain" ← ORCHESTRATOR_SLACK_AUTOMATION_DISABLED (4.6).
+  if (config.slackAutomationDisabled) keys.push("slack_brain");
   return new Set(keys);
 }
 
@@ -407,6 +428,22 @@ export interface DispatchIntegrationResult {
   skipped: number;
   /** Targets whose admission threw; the dispatcher rethrows after the loop. */
   failed: number;
+  /** Admission outcome per matched BUILT-IN (keyed by builtin key). This is
+   * what a legacy route consults to decide whether the engine took the
+   * delivery: a built-in absent here (not enabled, kill-switched, scope did
+   * not match) or `skipped` leaves the legacy path in charge. The same
+   * read the dispatcher made — never a second, possibly stale, lookup. */
+  builtins: Record<string, AdmitOutcome>;
+}
+
+/** Did the dispatcher hand this delivery to the built-in — a run started,
+ * joined, or queued for it? */
+export function builtinTookDelivery(
+  result: DispatchIntegrationResult | undefined,
+  builtinKey: string,
+): boolean {
+  const outcome = result?.builtins[builtinKey];
+  return outcome !== undefined && outcome !== "skipped";
 }
 
 /** Providers whose scope noun compares case-insensitively (GitHub owner/repo).
@@ -502,6 +539,7 @@ export async function dispatchIntegrationEvent(
     queued: 0,
     skipped: 0,
     failed: 0,
+    builtins: {},
   };
 
   // Each target is admitted in isolation: one transient fault must never drop
@@ -531,6 +569,9 @@ export async function dispatchIntegrationEvent(
         { store, starter, sender, now },
       );
       result[outcome] += 1;
+      if (target.automation.builtinKey !== null) {
+        result.builtins[target.automation.builtinKey] = outcome;
+      }
     } catch (error) {
       result.failed += 1;
       failures.push({ automationId: target.automation.id, error });

@@ -113,6 +113,9 @@ function fixture(input?: {
       }
       return { claimed: false, holderRunId: holder };
     },
+    async getConcurrencyHolder(automationId, key) {
+      return claims.get(`${automationId}:${key}`) ?? null;
+    },
     async casConcurrency(automationId, key, fromRunId, toRunId) {
       const mapKey = `${automationId}:${key}`;
       const holder = input?.claimHolder ?? claims.get(mapKey);

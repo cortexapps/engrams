@@ -10,6 +10,8 @@ import { registerCodeBlock } from "./code.ts";
 import { registerIntegrationActionBlock } from "./integration-action.ts";
 import { registerReviewSystemBlocks } from "./system/review.ts";
 import { registerSlackRelayBlock } from "./system/slack-relay.ts";
+import { registerSlackRecapBlock } from "./system/slack-recap.ts";
+import { registerSlackIdentityBlock } from "./system/slack-identity.ts";
 import { getBlock, listBlockTypes } from "./registry.ts";
 
 let registered = false;
@@ -26,6 +28,8 @@ export function registerEngineBlocks(): void {
   // Built-in-only (ADR 0119 D7): the validator rejects these on user graphs.
   registerReviewSystemBlocks();
   registerSlackRelayBlock();
+  registerSlackRecapBlock();
+  registerSlackIdentityBlock();
 }
 
 export const V1_BLOCK_TYPES = [

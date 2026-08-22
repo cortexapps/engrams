@@ -76,6 +76,7 @@ function harness(run: AutomationRunRow | null) {
       return { id: input.id } as never;
     },
     claimConcurrency: async () => ({ claimed: true as const }),
+    getConcurrencyHolder: async () => null,
     casConcurrency: async () => true,
   };
   const deps = {

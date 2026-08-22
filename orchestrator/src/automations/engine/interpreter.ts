@@ -37,7 +37,14 @@ import { evaluateFilter, parseFilterGroup } from "./conditions.ts";
 import { isSafePath, ownPath } from "../paths.ts";
 import { buildRunContext, recordStepOutputs, type RunContext, type RunSnapshot } from "./context.ts";
 import type { EngineDeps } from "./deps.ts";
-import type { BlockDef, RetryPolicy } from "./definition.ts";
+import { log as rootLog } from "../../log.ts";
+import {
+  isValueRef,
+  MAX_LOOP_ITERATIONS,
+  MAX_WAIT_DEADLINE_S,
+  type BlockDef,
+  type RetryPolicy,
+} from "./definition.ts";
 import { AUTOMATION_TOPIC, type AutomationInbox } from "./inbox.ts";
 import { getBlock, type BlockExecutor, type BlockOutcome } from "./blocks/registry.ts";
 import { registerEngineBlocks } from "./blocks/index.ts";
@@ -45,6 +52,7 @@ import {
   clockStepName,
   conditionStepName,
   framePath,
+  loopBoundStepName,
   relayStepName,
   stepName,
   untilStepName,
@@ -52,6 +60,8 @@ import {
   SNAPSHOT_STEP,
   type Frame,
 } from "./step-name.ts";
+
+const log = rootLog.child({ component: "automation-interpreter" });
 
 /** Single source of truth for terminal run statuses. Everything that gates
  * on terminality (e.g. claimCronOccurrence) derives from this array, so a
@@ -212,31 +222,93 @@ export async function interpretAutomation(
   const ledger: TurnLedger = { started: new Map(), idleSeen: new Map() };
   /** Sessions an end_session block already ended (see finalize). */
   const endedByBlock = new Set<string>();
-  /** The one installed message handler (contract 3), once its block ran. */
+  /** The one installed message handler (contract 3), once its block ran.
+   * `state` is the handler's threaded state — ALWAYS a value that came out of
+   * a checkpointed step (the install step's `outputs.handler_state`, then
+   * each handler step's recorded `state`), so recovery rebuilds it from the
+   * replayed outputs. Never module memory. */
   let installed:
-    | { path: string; executor: BlockExecutor<never>; config: never; count: number }
+    | {
+        blockId: string;
+        path: string;
+        executor: BlockExecutor<never>;
+        config: never;
+        count: number;
+        state: Record<string, unknown> | undefined;
+      }
     | null = null;
 
   /** Offer a fresh message to the installed handler (if any) inside its own
-   * checkpointed step. Returns true when the handler consumed it. */
+   * checkpointed step. The step's recorded output is `{verdict, state}`; on
+   * recovery DBOS replays that output without running the closure, which is
+   * exactly why the state must ride the output and not a closure-local. */
+  const recordRelayLedgerBestEffort = async (
+    stepPath: string,
+    count: number,
+    state: Record<string, unknown> | undefined,
+  ): Promise<void> => {
+    const record = {
+      status: "succeeded" as const,
+      ...(state !== undefined ? { outputs: { handler_state: state } } : {}),
+    };
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await deps.store.recordStep(input.runId, stepPath, count, record);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    log.warn(
+      { runId: input.runId, path: stepPath, attempt: count, err: lastError },
+      "relay step ledger write failed; the checkpointed step result stands",
+    );
+  };
+
   const offerToInstalled = async (msg: AutomationInbox): Promise<boolean> => {
     if (installed === null) return false;
     const relay = installed;
     relay.count += 1;
-    const verdict = await deps.step(async () => {
+    const stepPath = `${relay.path}.__relay__`;
+    const result = await deps.step(async (): Promise<{
+      verdict: "consumed" | "pass";
+      state?: Record<string, unknown>;
+    }> => {
+      ctx.handlerState = relay.state;
+      let r: { verdict: "consumed" | "pass"; state?: Record<string, unknown> };
       try {
-        return await relay.executor.onMessage!(msg, relay.config, ctx);
+        r = await relay.executor.onMessage!(msg, relay.config, ctx);
       } catch (error) {
         // A relay's delivery failure is recorded on its step and never fails
         // the run (the legacy thread loop's "drop it, keep the thread alive").
-        await deps.store.recordStep(input.runId, `${relay.path}.__relay__`, relay.count, {
+        // State is unchanged: the next call sees what this one saw.
+        await deps.store.recordStep(input.runId, stepPath, relay.count, {
           status: "failed",
           error: errorMessage(error),
         });
-        return "pass" as const;
+        return { verdict: "pass" as const };
       }
+      // The step's RETURN VALUE ({verdict, state}) is the checkpointed,
+      // durable truth of this step; the `automation_step_run` row is
+      // observability only. `deps.step` is DBOS.runStep with no retries and
+      // the run's catch turns a throw into a failed run, so the ledger write
+      // is best-effort (one bounded retry): on persistent failure it is
+      // logged and the REAL result is still returned. The state is never
+      // discarded and the run never dies because of the ledger.
+      await recordRelayLedgerBestEffort(stepPath, relay.count, r.state);
+      return r;
     }, relayStepName(relay.path, relay.count));
-    return verdict === "consumed";
+    if (result.state !== undefined) {
+      relay.state = result.state;
+      // Mirror the latest state onto the relay block's own outputs so a
+      // later block (the closing recap) reads checkpointed data, not memory.
+      recordStepOutputs(ctx, relay.blockId, relay.path, {
+        ...(ctx.steps[relay.blockId] ?? {}),
+        handler_state: result.state,
+      });
+    }
+    return result.verdict === "consumed";
   };
 
   /** Stamp a freshly received message with its turn bookkeeping. */
@@ -384,6 +456,19 @@ export async function interpretAutomation(
     let resolved: Record<string, unknown>;
     try {
       resolved = await resolveBlockConfig(block.config, ctx);
+      // A wait deadline bound through a `$ref` (e.g. `inputs.idle_timeout`)
+      // is clamped into the schema's range the way a loop's `$ref` bound is,
+      // never refused: an org input outside the ceiling must shorten the
+      // wait, not fail every thread after its first turn. An unusable value
+      // falls back to the block's default.
+      if (executor.wait !== undefined && isValueRef(block.config["deadlineSeconds"])) {
+        const raw = resolved["deadlineSeconds"];
+        if (typeof raw === "number" && Number.isFinite(raw)) {
+          resolved["deadlineSeconds"] = Math.max(1, Math.min(Math.floor(raw), MAX_WAIT_DEADLINE_S));
+        } else {
+          delete resolved["deadlineSeconds"];
+        }
+      }
       // Save-time validation skipped `$ref` fields; check the resolved
       // shape against the block's schema before the executor sees it.
       const checked = executor.configSchema.safeParse(resolved);
@@ -430,7 +515,9 @@ export async function interpretAutomation(
       ...(result.kind === "ok" ? { outputs: result.outputs } : {}),
       ...(result.kind === "error" ? { error: `${result.code}: ${result.message}` } : {}),
     });
-    return result;
+    // The wait half (below, outside this step) must see the RESOLVED config;
+    // it rides the step's checkpointed return value.
+    return result.kind === "ok" ? { ...result, resolvedConfig: resolved } : result;
   };
 
   const runBlock = async (block: BlockDef, frames: Frame[]): Promise<void> => {
@@ -466,10 +553,21 @@ export async function interpretAutomation(
       return;
     }
     if (block.type === "loop") {
-      const config = block.config as { until?: unknown; maxIterations: number };
+      const config = block.config as { until?: unknown; maxIterations: unknown };
+      // Contract 4: the bound is a checkpointed decision. A `$ref` (e.g.
+      // `inputs.max_turns`) resolves from scope here; a literal passes
+      // through. Clamped to the schema's ceiling; anything unusable → 0
+      // iterations (recorded on the step), never NaN-driven silence.
+      const bound = await deps.step(async () => {
+        const raw = isValueRef(config.maxIterations)
+          ? ownPath(ctx.scope(), config.maxIterations.$ref)
+          : config.maxIterations;
+        const n = typeof raw === "number" && Number.isFinite(raw) ? Math.floor(raw) : 0;
+        return Math.max(0, Math.min(n, MAX_LOOP_ITERATIONS));
+      }, loopBoundStepName(frames));
       let iterations = 0;
       let exhausted = true;
-      for (let i = 0; i < config.maxIterations; i += 1) {
+      for (let i = 0; i < bound; i += 1) {
         const iterationFrames: Frame[] = [...frames.slice(0, -1), { blockId: block.id, iteration: i }];
         for (const child of block.body ?? []) {
           await runBlock(child, [...iterationFrames, { blockId: child.id }]);
@@ -494,6 +592,10 @@ export async function interpretAutomation(
     let lastError: Extract<BlockOutcome, { kind: "error" }> | null = null;
     for (let attempt = 0; attempt < policy.attempts; attempt += 1) {
       ctx.currentAttempt = attempt;
+      // A re-executed installed block (re-point) must see the threaded
+      // state so it can carry it forward into its new handler_state output.
+      ctx.handlerState =
+        installed !== null && installed.executor === executor ? installed.state : undefined;
       const name = stepName(frames, attempt);
       const outcome: BlockOutcome = await deps.step(
         () => executeDataBlock(block, executor, path, attempt),
@@ -519,12 +621,27 @@ export async function interpretAutomation(
         if (installed !== null && installed.executor !== executor) {
           throw new RunEnd("failed", `block "${block.id}": a message handler is already installed`);
         }
+        // The install/re-point execute step's output carries the handler's
+        // state (`handler_state`) — checkpointed, so recovery seeds it too.
+        const seeded = outcome.outputs["handler_state"];
+        const seededState =
+          typeof seeded === "object" && seeded !== null && !Array.isArray(seeded)
+            ? (seeded as Record<string, unknown>)
+            : undefined;
         if (installed === null) {
-          installed = { path, executor, config: block.config as never, count: 0 };
+          installed = {
+            blockId: block.id,
+            path,
+            executor,
+            config: block.config as never,
+            count: 0,
+            state: seededState,
+          };
         } else {
           // The same block re-executed (e.g. a loop body re-pointing a relay
-          // at a new turn): refresh its config, keep the counter.
+          // at a new turn): refresh its config and state, keep the counter.
           installed.config = block.config as never;
+          if (seededState !== undefined) installed.state = seededState;
         }
       }
 
@@ -543,26 +660,34 @@ export async function interpretAutomation(
         }
       }
 
-      // Wait half, when the block has one and its config asks for it.
+      // Wait half, when the block has one and its config asks for it. It
+      // reads the config the execute step RESOLVED (refs + templates), which
+      // rides that step's checkpointed outcome — never the raw definition.
       if (executor.wait) {
-        const deadlineS = executor.wait.deadlineSeconds(block.config as never, ctx);
+        const waitConfig = (outcome.resolvedConfig ?? block.config) as never;
+        const deadlineS = executor.wait.deadlineSeconds(waitConfig, ctx);
         if (deadlineS !== 0) {
-          const matched = await waitForMessage(frames, executor, block.config as never, deadlineS);
+          const matched = await waitForMessage(frames, executor, waitConfig, deadlineS);
           const waited =
             matched ??
             (executor.wait.onDeadline
-              ? executor.wait.onDeadline(block.config as never, ctx)
+              ? executor.wait.onDeadline(waitConfig, ctx)
               : { outcome: "deadline" });
           const merged = { ...ctx.steps[block.id], ...waited };
           recordStepOutputs(ctx, block.id, path, merged);
+          // A block may declare a deadline as a normal outcome (`onDeadline:
+          // "continue"`, e.g. wait_event in a conversation loop); otherwise a
+          // deadline is terminal, as in phase 1.
+          const continueOnDeadline =
+            (waitConfig as { onDeadline?: string }).onDeadline === "continue";
           await deps.step(async () => {
             await deps.store.recordStep(input.runId, path, attempt, {
-              status: matched === null ? "failed" : "succeeded",
+              status: matched === null && !continueOnDeadline ? "failed" : "succeeded",
               outputs: merged,
-              ...(matched === null ? { error: "deadline" } : {}),
+              ...(matched === null && !continueOnDeadline ? { error: "deadline" } : {}),
             });
           }, `${name}:wait`);
-          if (matched === null) {
+          if (matched === null && !continueOnDeadline) {
             throw new RunEnd("deadline", `block "${block.id}" wait deadline expired`);
           }
           if (merged["outcome"] === "failed") {
