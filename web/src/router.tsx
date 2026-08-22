@@ -65,7 +65,7 @@ import { GoogleCloudSetupPage } from "./components/integrations/GoogleCloudSetup
 import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
-import { Automations } from "./pages/settings/Automations";
+import { AutomationsList } from "./pages/settings/automations/AutomationsList";
 import { AutomationEditor } from "./pages/settings/AutomationEditor";
 
 export interface RouterContext {
@@ -460,11 +460,15 @@ const profileEditRoute = createRoute({
   beforeLoad: requireAdmin,
   component: () => <SessionProfileEditor mode="edit" />,
 });
+export type AutomationEditorTab = "build" | "inputs" | "runs" | "settings";
+export interface AutomationEditorSearch {
+  tab?: AutomationEditorTab;
+}
 const automationsRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "automations",
   beforeLoad: requireAdmin,
-  component: Automations,
+  component: AutomationsList,
 });
 const automationsNewRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
@@ -476,6 +480,14 @@ const automationEditRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "automations/$id",
   beforeLoad: requireAdmin,
+  // ADR 0119 phase 3: the editor's tabs ride a search param so every tab is
+  // deep-linkable (list rows link to build/runs; reviewed-repos → inputs).
+  validateSearch: (search: Record<string, unknown>): AutomationEditorSearch => {
+    const tab = search["tab"];
+    return tab === "build" || tab === "inputs" || tab === "runs" || tab === "settings"
+      ? { tab }
+      : {};
+  },
   component: () => <AutomationEditor mode="edit" />,
 });
 
