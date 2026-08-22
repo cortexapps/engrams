@@ -31,6 +31,7 @@ import {
   routeSessionEvent,
   summarizeAsset,
   type AssetSummary,
+  type ClosingSummary,
   type CommunicationPolicy,
   type QuestionProtocol,
   type StartedSession,
@@ -283,6 +284,28 @@ export function slackRelayClosingSummary(
 ): { lastMessage: string | null; assets: AssetSummary[] } | null {
   const st = states.get(runId);
   return st ? { lastMessage: st.lastAssistantText, assets: [...st.assets] } : null;
+}
+
+/** Everything the recap block needs to render a terminal message the way the
+ * legacy loop did: the thread route, the session, and the summary. Null when
+ * no relay was installed on this run (the run ended before the relay block). */
+export function slackRelayFinalFacts(runId: string): {
+  mention: SourceMention;
+  session: StartedSession;
+  summary: ClosingSummary;
+} | null {
+  const st = states.get(runId);
+  if (!st) return null;
+  return {
+    mention: st.mention,
+    session: { id: st.sessionId, webUrl: deps().sessionWebUrl(st.sessionId) },
+    summary: { lastMessage: st.lastAssistantText, assets: [...st.assets] },
+  };
+}
+
+/** Production policy access for sibling system blocks (the recap). */
+export function slackRelayPolicy(runId: string): CommunicationPolicy {
+  return deps().policy(runId);
 }
 
 export function registerSlackRelayBlock(): void {
