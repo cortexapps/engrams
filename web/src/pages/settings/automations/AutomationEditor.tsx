@@ -46,6 +46,7 @@ import { useAutomationTest } from "@/hooks/useAutomationTest";
 import { BuildTab } from "./build/BuildTab";
 import { TestPanel } from "./build/test/TestPanel";
 import { InputsTab } from "./inputs/InputsTab";
+import { DryRunButton } from "./build/DryRunButton";
 
 export const EDITOR_TABS = ["build", "inputs", "runs", "settings"] as const;
 export type EditorTab = (typeof EDITOR_TABS)[number];
@@ -278,6 +279,12 @@ export function AutomationEditor({
                 <Copy className="size-4" aria-hidden /> Duplicate
               </Button>
             )}
+            {mode === "edit" &&
+              automation && (
+                // A dry run executes the SAVED definition; unsaved edits would
+                // mislead, so it waits for a clean editor.
+                <DryRunButton automationId={automation.id} disabled={dirty} />
+              )}
             <Button
               type="button"
               onClick={save}
