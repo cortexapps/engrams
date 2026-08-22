@@ -40,6 +40,7 @@ import {
 } from "@/pages/sessions/SessionHarnessControls";
 
 import { asFilterGroup, ConditionEditor } from "./fields/ConditionEditor";
+import { CodeInspector } from "./inspectors/CodeInspector";
 import { GenericField } from "./fields/GenericField";
 import { VariablePicker } from "./fields/VariablePicker";
 
@@ -326,68 +327,6 @@ function ConditionInspector(props: BlockInspectorProps & { kind: "filter" | "bra
               : kind === "loop"
                 ? "Optional. Without it the loop runs to the iteration cap."
                 : "Paths resolve against inputs, trigger, event, and steps."}
-          </FieldDescription>
-        )}
-      </Field>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// code — textarea now; 3.5 swaps in CodeMirror + Run
-// ---------------------------------------------------------------------------
-
-function CodeInspector(props: BlockInspectorProps) {
-  const { block, onChange, builtin, errors } = props;
-  const sourcePinned = !editable(block, builtin, "source");
-  return (
-    <div className="flex flex-col gap-3">
-      <GenericField
-        spec={{
-          type: "select",
-          key: "mode",
-          label: "Mode",
-          options: ["value", "boolean"],
-          help: "boolean: returning false ends the run as filtered.",
-        }}
-        value={block.config["mode"]}
-        onChange={(value) => onChange({ ...block, config: setPath(block.config, "mode", value) })}
-        pinned={!editable(block, builtin, "mode")}
-        error={errorFor(errors, "mode")}
-        sessionSources={props.sessionSources}
-        variablePaths={props.variablePaths}
-      />
-      <Field
-        data-invalid={errorFor(errors, "source") ? true : undefined}
-        data-testid="field-source"
-      >
-        <FieldLabel className="flex items-center gap-1.5">
-          Source
-          {sourcePinned && (
-            <span className="text-muted-foreground inline-flex items-center gap-1 text-xs font-normal">
-              <Lock className="size-3" aria-hidden /> Set by the built-in
-            </span>
-          )}
-        </FieldLabel>
-        {/* 3.5: CodeMirror editor + Run button (EvalCode) replace this textarea. */}
-        <Textarea
-          value={typeof block.config["source"] === "string" ? block.config["source"] : ""}
-          onChange={(e) =>
-            onChange({ ...block, config: setPath(block.config, "source", e.target.value) })
-          }
-          rows={12}
-          className="font-mono text-xs"
-          disabled={sourcePinned}
-          spellCheck={false}
-        />
-        {errorFor(errors, "source") ? (
-          <FieldError>{errorFor(errors, "source")}</FieldError>
-        ) : (
-          <FieldDescription>
-            <code>
-              export default ({"{"} event, inputs, steps, trigger {"}"}) =&gt; value
-            </code>{" "}
-            — no network, no timers; 250 ms CPU, 32 MiB.
           </FieldDescription>
         )}
       </Field>
