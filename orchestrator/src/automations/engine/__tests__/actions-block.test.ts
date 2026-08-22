@@ -60,6 +60,7 @@ function harness(blocks: BlockDef[], responses: IntegrationOpResult[]) {
   };
   const unusedSessions: EngineSessionOps = {
     createSession: () => Promise.reject(new Error("unused")),
+    setSessionRelay: async () => {},
     sendPrompt: () => Promise.reject(new Error("unused")),
     endSession: () => Promise.reject(new Error("unused")),
     exec: () => Promise.reject(new Error("unused")),

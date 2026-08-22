@@ -192,6 +192,7 @@ function enrollment(repo: string, profileId: string | null): EnrollmentRow {
     repo,
     profileId,
     triggerMode: "auto",
+    engine: "legacy" as const,
     autofix: "off",
     createdAt: new Date(0),
     updatedAt: new Date(0),

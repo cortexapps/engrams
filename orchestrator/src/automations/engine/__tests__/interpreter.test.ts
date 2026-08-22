@@ -28,6 +28,7 @@ interface Harness {
   execs: Array<{ sessionId: string; command: string; execId: string }>;
   released: string[];
   promoted: string[];
+  actions: Array<{ actionId: string; stepPath: string; params: Record<string, unknown> }>;
 }
 
 function makeDefinition(
@@ -52,6 +53,10 @@ function makeHarness(
     sessions?: Array<{ sessionId: string; keep: boolean }>;
     promote?: string | null;
     failExec?: boolean;
+    /** Fake integration-action runtime: records calls; throws when asked. */
+    failActions?: boolean;
+    /** Make recordStep throw for these frame paths (a ledger blip). */
+    failRecordStepFor?: string[];
   } = {},
 ): Harness {
   const names: string[] = [];
@@ -64,6 +69,7 @@ function makeHarness(
   const execs: Harness["execs"] = [];
   const released: string[] = [];
   const promoted: string[] = [];
+  const actions: Array<{ actionId: string; stepPath: string; params: Record<string, unknown> }> = [];
   const recvQueue = [...(options.recv ?? [])];
   const runSessions = options.sessions ?? [];
   let clock = 1_000_000_000;
@@ -89,6 +95,7 @@ function makeHarness(
     },
     async markRunning() {},
     async recordStep(_runId, framePath, attempt, record) {
+      if (options.failRecordStepFor?.includes(framePath)) throw new Error("ledger down");
       stepRecords.push({ framePath, attempt, record });
     },
     async finalizeRun(_runId, status, error) {
@@ -111,6 +118,7 @@ function makeHarness(
       runSessions.push({ sessionId, keep: input.keep });
       return { sessionId, taskId: `t-${input.blockId}` };
     },
+    async setSessionRelay() {},
     async sendPrompt(sessionId, promptId, text) {
       prompts.push({ sessionId, promptId, text });
     },
@@ -144,16 +152,23 @@ function makeHarness(
     startQueuedRun: async (runId) => {
       promoted.push(runId);
     },
+    integrationActions: {
+      async execute(input) {
+        if (options.failActions) throw new Error("provider down");
+        actions.push({ actionId: input.actionId, stepPath: input.stepPath, params: input.params });
+        return { comment_id: 7 };
+      },
+    },
   };
 
-  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted };
+  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, actions };
 }
 
 const RUN = { runId: "autorun:auto-1:manual:x", automationId: "auto-1" };
 
 // ---------------------------------------------------------------------------
 
-describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 1)", () => {
+describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 4)", () => {
   test("linear graph: filter → create_session → send_prompt(wait) → end_session", async () => {
     const definition = makeDefinition([
       {
@@ -280,11 +295,100 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 1)
     expect(h.names).toEqual([
       "step:__snapshot__:0",
       "step:launch:0",
+      // Contract 4: the loop's bound is a checkpointed decision step.
+      "step:poll.__bound__:0",
       "step:poll[0].tick:0",
       "step:poll[0].__until__:0",
       "step:__finalize__:0",
     ]);
-    expect(h.execs[0]!.execId).toBe(`exec:auto:${RUN.runId}:tick:a0`);
+    expect(h.execs[0]!.execId).toBe(`exec:auto:${RUN.runId}:poll[0].tick:a0`);
+  });
+
+  test("every loop iteration mints its own idempotency identity (exec, prompt, action)", async () => {
+    // Regression: keys derived from the static block id collapsed a loop's
+    // iterations onto one external resource — the coordinator outbox dedupes
+    // prompt_id (ON CONFLICT DO NOTHING), durable exec attaches to an
+    // existing execId, and action client ids / markers dedupe on the provider.
+    const definition = makeDefinition([
+      { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+      {
+        id: "turns",
+        type: "loop",
+        config: { maxIterations: 2 },
+        body: [
+          {
+            id: "ask",
+            type: "send_prompt",
+            config: { session: { blockId: "launch" }, promptTemplate: "again", waitFor: { kind: "none" } },
+          },
+          { id: "tick", type: "run_command", config: { session: { blockId: "launch" }, commandTemplate: "true" } },
+          {
+            id: "post",
+            type: "integration_action",
+            config: { provider: "github", actionId: "create_issue_comment", params: { body: "hi" } },
+          },
+        ],
+      },
+    ]);
+    const h = makeHarness(definition);
+    const result = await interpretAutomation(RUN, h.deps);
+
+    expect(result.status).toBe("completed");
+    expect(h.prompts.map((p) => p.promptId)).toEqual([
+      `autorun:${RUN.runId}:turns[0].ask:s-launch`,
+      `autorun:${RUN.runId}:turns[1].ask:s-launch`,
+    ]);
+    expect(h.execs.map((e) => e.execId)).toEqual([
+      `exec:auto:${RUN.runId}:turns[0].tick:a0`,
+      `exec:auto:${RUN.runId}:turns[1].tick:a0`,
+    ]);
+    expect(h.actions.map((a) => a.stepPath)).toEqual(["turns[0].post", "turns[1].post"]);
+  });
+
+  test("a snapshot failure still finalizes: failed status, claim released, successor promoted", async () => {
+    const definition = makeDefinition([]);
+    const h = makeHarness(definition, { promote: "autorun:auto-1:manual:next" });
+    const failing: EngineDeps = {
+      ...h.deps,
+      store: {
+        ...h.deps.store,
+        loadSnapshot: () => Promise.reject(new Error("inputs.limit: must be a number")),
+      },
+    };
+    const result = await interpretAutomation(RUN, failing);
+
+    expect(result).toEqual({ status: "failed", error: "inputs.limit: must be a number" });
+    expect(h.names).toEqual(["step:__snapshot__:0", "step:__finalize__:0"]);
+    expect(h.finalized).toEqual([{ status: "failed", error: "inputs.limit: must be a number" }]);
+    expect(h.released).toEqual([RUN.runId]);
+    expect(h.promoted).toEqual(["autorun:auto-1:manual:next"]);
+  });
+
+  test("a loop bound may be a $ref into inputs, resolved in the bound step and clamped", async () => {
+    const definition = makeDefinition([
+      { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+      {
+        id: "poll",
+        type: "loop",
+        config: { maxIterations: { $ref: "inputs.max_turns" } },
+        body: [
+          {
+            id: "tick",
+            type: "run_command",
+            config: { session: { blockId: "launch" }, commandTemplate: "true" },
+          },
+        ],
+      },
+    ]);
+    const two = makeHarness(definition, { inputs: { max_turns: 2 } });
+    expect((await interpretAutomation(RUN, two.deps)).status).toBe("completed");
+    expect(two.names.filter((n) => n.startsWith("step:poll[")).length).toBe(2);
+    expect(two.names).toContain("step:poll.__bound__:0");
+
+    // Unusable bound (missing input) → zero iterations, never NaN silence.
+    const none = makeHarness(definition, { inputs: {} });
+    expect((await interpretAutomation(RUN, none.deps)).status).toBe("completed");
+    expect(none.names.filter((n) => n.startsWith("step:poll[")).length).toBe(0);
   });
 
   test("engine-level retries mint attempt-scoped steps then fail the run", async () => {
@@ -430,6 +534,50 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     expect(result.status).toBe("completed");
     const next = h.stepRecords.filter((r) => r.framePath === "next").at(-1)!;
     expect(next.record.outputs).toMatchObject({ event_key: "app_mention" });
+  });
+
+  test("a $ref-bound wait deadline is clamped into the schema's range, never refused", async () => {
+    // inputs.idle_timeout = 200000 (> 24 h) must shorten the wait to the
+    // ceiling instead of failing the block with config_render_failed —
+    // the loop-bound rule (contract 4) applied to deadlines.
+    const definition: AutomationDefinition = {
+      ...makeDefinition([
+        {
+          id: "next",
+          type: "wait_event",
+          config: { eventKeys: ["app_mention"], deadlineSeconds: { $ref: "inputs.idle_timeout" } },
+        },
+      ]),
+      inputsSchema: [{ key: "idle_timeout", label: "Idle", type: "number" }],
+    };
+    const h = makeHarness(definition, {
+      inputs: { idle_timeout: 200_000 },
+      recv: [
+        {
+          kind: "event",
+          eventKey: "app_mention",
+          deliveryKey: "slack:E1",
+          payload: { text: "hi" },
+          receivedAt: "2026-08-21T00:01:00Z",
+        },
+      ],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    const running = h.stepRecords.find((r) => r.framePath === "next" && r.record.status === "running")!;
+    expect(running.record.inputs).toMatchObject({ deadlineSeconds: 86_400 });
+
+    // Below the floor → 1; unusable (a string) → the block's default applies.
+    const low = makeHarness(definition, { inputs: { idle_timeout: 0 }, recv: [null] });
+    await interpretAutomation(RUN, low.deps);
+    expect(
+      low.stepRecords.find((r) => r.framePath === "next" && r.record.status === "running")!.record.inputs,
+    ).toMatchObject({ deadlineSeconds: 1 });
+    const bad = makeHarness(definition, { inputs: { idle_timeout: "soon" }, recv: [null] });
+    const badResult = await interpretAutomation(RUN, bad.deps);
+    expect(badResult.status).not.toBe("failed");
+    const badRunning = bad.stepRecords.find((r) => r.framePath === "next" && r.record.status === "running")!;
+    expect(badRunning.record.inputs).not.toHaveProperty("deadlineSeconds");
   });
 
   test("finalize keeps sessions by default and ends them under end_sessions_on_finish", async () => {
@@ -582,6 +730,104 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     expect(phaseB.record.outputs).toMatchObject({ signal: { phase: "b" } });
   });
 
+  test("finalize hooks run as their own steps before finalize, only for matching statuses (contract 2)", async () => {
+    const hooks: Pick<AutomationDefinition["settings"], "onFinalize"> = {
+      onFinalize: [
+        {
+          when: ["failed", "deadline"],
+          block: {
+            id: "report_failure",
+            type: "integration_action",
+            config: {
+              provider: "github",
+              actionId: "update_issue_comment",
+              params: { body: "❌ ${{ run.status }}: ${{ run.error }}" },
+            },
+          },
+        },
+        {
+          when: ["completed"],
+          block: {
+            id: "celebrate",
+            type: "integration_action",
+            config: { provider: "github", actionId: "create_issue_comment", params: { body: "✅" } },
+          },
+        },
+      ],
+    };
+    // A failing run: the failure hook fires, the completion hook does not.
+    const failing = makeDefinition(
+      [
+        { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+        {
+          id: "boom",
+          type: "run_command",
+          config: { session: { blockId: "launch" }, commandTemplate: "false" },
+        },
+      ],
+      { onFinalize: hooks.onFinalize },
+    );
+    const h = makeHarness(failing, { failExec: true });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("failed");
+    expect(h.names).toEqual([
+      "step:__snapshot__:0",
+      "step:launch:0",
+      "step:boom:0",
+      "step:__finalize__.report_failure:0",
+      "step:__finalize__:0",
+    ]);
+    expect(h.actions).toHaveLength(1);
+    expect(h.actions[0]!.actionId).toBe("update_issue_comment");
+    // The hook's template read the terminal status and reason.
+    expect(String(h.actions[0]!.params["body"])).toMatch(/^❌ failed: block "boom"/);
+    // The hook's outputs land in the ledger under the finalize path.
+    const hookStep = h.stepRecords.filter((r) => r.framePath === "__finalize__.report_failure").at(-1)!;
+    expect(hookStep.record.status).toBe("succeeded");
+
+    // A completing run: only the completion hook fires.
+    const completing = makeDefinition(
+      [{ id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } }],
+      { onFinalize: hooks.onFinalize },
+    );
+    const c = makeHarness(completing);
+    expect((await interpretAutomation(RUN, c.deps)).status).toBe("completed");
+    expect(c.names).toEqual([
+      "step:__snapshot__:0",
+      "step:launch:0",
+      "step:__finalize__.celebrate:0",
+      "step:__finalize__:0",
+    ]);
+    expect(c.actions.map((a) => a.actionId)).toEqual(["create_issue_comment"]);
+  });
+
+  test("a throwing finalize hook is recorded on its step and never changes the terminal status", async () => {
+    const definition = makeDefinition(
+      [{ id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } }],
+      {
+        onFinalize: [
+          {
+            when: ["completed"],
+            block: {
+              id: "flaky_hook",
+              type: "integration_action",
+              config: { provider: "github", actionId: "create_issue_comment", params: {} },
+            },
+          },
+        ],
+      },
+    );
+    const h = makeHarness(definition, { failActions: true });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.finalized).toEqual([{ status: "completed" }]);
+    const hookStep = h.stepRecords.filter((r) => r.framePath === "__finalize__.flaky_hook").at(-1)!;
+    expect(hookStep.record.status).toBe("failed");
+    expect(hookStep.record.error).toContain("provider down");
+    // Finalize still ran after the hook.
+    expect(h.names.at(-1)).toBe("step:__finalize__:0");
+  });
+
   test("phase-2 stubs return typed unavailable failures", async () => {
     const definition = makeDefinition([
       { id: "transform", type: "code", config: { source: "export default () => 1", mode: "value" } },
@@ -590,5 +836,166 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("failed");
     expect(result.error).toContain("code_runtime_unavailable");
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Contract 3: installed message handlers
+// ---------------------------------------------------------------------------
+
+import { z } from "zod";
+import { registerBlock, unregisterBlockForTest } from "../blocks/registry.ts";
+
+describe("interpretAutomation — installed message handlers (contract 3)", () => {
+  const TYPE = "system.test_relay";
+
+  const relayDefinition = (config: Record<string, unknown>): AutomationDefinition => ({
+    engine: 1,
+    trigger: { kind: "manual" },
+    blocks: [
+      { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+      { id: "relay", type: TYPE, config },
+      {
+        id: "turn",
+        type: "send_prompt",
+        config: {
+          session: { blockId: "launch" },
+          promptTemplate: "ping",
+          waitFor: { kind: "run_end" },
+          deadlineSeconds: 600,
+        },
+      },
+    ],
+    inputsSchema: [],
+    settings: { endSessionsOnFinish: false },
+  });
+
+  test("every message after install is offered to the handler first, in its own step; consumed ones never reach the wait", async () => {
+    const seen: AutomationInbox[] = [];
+    registerBlock<{ consume: string[] }>({
+      type: TYPE,
+      system: true,
+      configSchema: z.object({ consume: z.array(z.string()) }),
+      async execute() {
+        return { kind: "ok", outputs: { installed: true } };
+      },
+      async onMessage(msg, config) {
+        seen.push(msg);
+        return { verdict: config.consume.includes(msg.kind) ? "consumed" : "pass" };
+      },
+    });
+    try {
+      // Two curated events (consumed by the relay) interleave with the two
+      // idles the wait needs (create turn = stale, prompt turn = match).
+      const curated = (n: number): AutomationInbox => ({
+        kind: "session_event",
+        sessionId: "s-launch",
+        event: { idx: BigInt(n), kind: "agent_message", payloadJson: "{}" },
+      });
+      const h = makeHarness(relayDefinition({ consume: ["session_event"] }), {
+        recv: [
+          curated(1),
+          { kind: "session_idle", sessionId: "s-launch" },
+          curated(2),
+          { kind: "session_idle", sessionId: "s-launch" },
+        ],
+      });
+      const result = await interpretAutomation(RUN, h.deps);
+      expect(result.status).toBe("completed");
+      expect(h.names).toEqual([
+        "step:__snapshot__:0",
+        "step:launch:0",
+        "step:relay:0",
+        "step:turn:0",
+        "step:relay.__relay__:1",
+        "step:turn:clock:1",
+        "step:relay.__relay__:2",
+        "step:turn:clock:2",
+        "step:relay.__relay__:3",
+        "step:turn:clock:3",
+        "step:relay.__relay__:4",
+        "step:turn:0:wait",
+        "step:__finalize__:0",
+      ]);
+      // The handler saw all four; it consumed the curated two and passed the
+      // idles through to the wait (stale first, then the match).
+      expect(seen.map((m) => m.kind)).toEqual([
+        "session_event",
+        "session_idle",
+        "session_event",
+        "session_idle",
+      ]);
+    } finally {
+      unregisterBlockForTest(TYPE);
+    }
+  });
+
+  test("a ledger blip AFTER a successful handler call never loses the result: state carries, the run continues", async () => {
+    // `deps.step` is DBOS.runStep with no retries, and the run's catch turns
+    // a throw into a failed run — so the ledger row is best-effort
+    // observability; the step's return value is the durable truth.
+    let calls = 0;
+    const seenStates: unknown[] = [];
+    registerBlock<Record<string, never>>({
+      type: TYPE,
+      system: true,
+      configSchema: z.object({}),
+      async execute() {
+        return { kind: "ok", outputs: { handler_state: { n: 0 } } };
+      },
+      async onMessage(_msg, _config, ctx) {
+        calls += 1;
+        seenStates.push(ctx.handlerState);
+        return { verdict: "pass", state: { n: calls } };
+      },
+    });
+    try {
+      const h = makeHarness(relayDefinition({}), {
+        recv: [
+          { kind: "session_idle", sessionId: "s-launch" },
+          { kind: "session_idle", sessionId: "s-launch" },
+        ],
+        failRecordStepFor: ["relay.__relay__"],
+      });
+      const result = await interpretAutomation(RUN, h.deps);
+      expect(result.status).toBe("completed");
+      expect(calls).toBe(2);
+      // The second call saw the state the first one returned: nothing was
+      // discarded by the ledger failure.
+      expect(seenStates).toEqual([{ n: 0 }, { n: 1 }]);
+      expect(h.stepRecords.filter((r) => r.framePath === "relay.__relay__")).toEqual([]);
+    } finally {
+      unregisterBlockForTest(TYPE);
+    }
+  });
+
+  test("a throwing handler is recorded on its relay step and never fails the run", async () => {
+    registerBlock<Record<string, never>>({
+      type: TYPE,
+      system: true,
+      configSchema: z.object({}),
+      async execute() {
+        return { kind: "ok", outputs: {} };
+      },
+      async onMessage() {
+        throw new Error("slack exploded");
+      },
+    });
+    try {
+      const h = makeHarness(relayDefinition({}), {
+        recv: [
+          { kind: "session_idle", sessionId: "s-launch" },
+          { kind: "session_idle", sessionId: "s-launch" },
+        ],
+      });
+      const result = await interpretAutomation(RUN, h.deps);
+      expect(result.status).toBe("completed");
+      const relayRows = h.stepRecords.filter((r) => r.framePath === "relay.__relay__");
+      expect(relayRows.length).toBe(2);
+      expect(relayRows.every((r) => r.record.status === "failed")).toBe(true);
+    } finally {
+      unregisterBlockForTest(TYPE);
+    }
   });
 });

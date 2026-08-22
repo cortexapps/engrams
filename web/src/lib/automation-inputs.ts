@@ -5,12 +5,13 @@
  * The schema is the `inputsSchema` array of the automation's current
  * version; the values are `inputs_json` on the automation row.
  *
- * Validation here is load-bearing, not a courtesy: today SetInputs rejects
- * only UNDECLARED keys server-side and stores values verbatim, and nothing
- * in the engine re-validates values at run time. Until server-side value
- * validation lands (tracked for the phase-4.3b orchestrator change), these
- * checks are the only guard on what a running automation receives. Do not
- * weaken them on the assumption the server backstops them. */
+ * Validation here is a courtesy for the form: the orchestrator re-validates
+ * VALUES on SetInputs/CreateAutomation/RunNow with the same rules
+ * (orchestrator/src/automations/inputs.ts — the two are pinned to each
+ * other by a shared-fixture test) and answers in `inputs.<key>[.path]:
+ * message` lines that inputErrorFromServer routes back to the field. The
+ * seeder and the run snapshot apply the same rules, so nothing reaches a
+ * running automation that this form would have refused. */
 
 export const INPUT_TYPES = [
   "string",
@@ -47,6 +48,9 @@ export interface InputFieldSpec {
   default?: unknown;
   /** enum: allowed values. */
   values?: string[];
+  /** number: inclusive bounds (mirrors the orchestrator's rule). */
+  min?: number;
+  max?: number;
   /** string: render a textarea. */
   multiline?: boolean;
   /** map: the integration noun that populates the key picker. */
@@ -66,6 +70,16 @@ export interface InputFieldError {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Identical wording to the orchestrator's inputs.ts rangeMessage. */
+export function rangeMessage(value: number, min?: number, max?: number): string | null {
+  if (min !== undefined && max !== undefined && (value < min || value > max)) {
+    return `must be between ${min} and ${max}`;
+  }
+  if (min !== undefined && value < min) return `must be at least ${min}`;
+  if (max !== undefined && value > max) return `must be at most ${max}`;
+  return null;
 }
 
 function isInputType(value: unknown): value is InputType {
@@ -97,6 +111,8 @@ export function parseInputsSchema(raw: unknown): InputFieldSpec[] {
     if (Array.isArray(entry["values"])) {
       spec.values = entry["values"].filter((v): v is string => typeof v === "string");
     }
+    if (typeof entry["min"] === "number") spec.min = entry["min"];
+    if (typeof entry["max"] === "number") spec.max = entry["max"];
     if (entry["multiline"] === true) spec.multiline = true;
     if (isKeyNoun(entry["keyNoun"])) spec.keyNoun = entry["keyNoun"];
     if (isRecord(entry["valueShape"])) spec.valueShape = entry["valueShape"];
@@ -308,6 +324,9 @@ export function validateInputs(schema: InputFieldSpec[], values: InputValues): I
       case "number":
         if (typeof value !== "number" || !Number.isFinite(value)) {
           errors.push({ key: spec.key, message: "must be a number" });
+        } else {
+          const range = rangeMessage(value, spec.min, spec.max);
+          if (range !== null) errors.push({ key: spec.key, message: range });
         }
         break;
       case "boolean":

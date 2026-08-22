@@ -20,7 +20,7 @@ export function makeIntegrationActionRuntime(
           ...(input.connectionId !== undefined ? { connectionId: input.connectionId } : {}),
           params: input.params,
         },
-        { runId: input.runId, blockId: input.blockId },
+        { runId: input.runId, stepPath: input.stepPath },
         deps,
       );
     },

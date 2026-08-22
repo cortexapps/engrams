@@ -29,6 +29,7 @@ import {
 import type { EngineRunStore, EngineStepRecord } from "../automations/engine/deps.ts";
 import type { RunSnapshot } from "../automations/engine/context.ts";
 import { RUN_TERMINAL_STATUSES } from "../automations/engine/interpreter.ts";
+import { InputValidationError, validateInputValues } from "../automations/inputs.ts";
 import { cronDeliveryKey } from "../automations/ids.ts";
 import type { WebhookAliasMapping } from "../automations/template.ts";
 
@@ -279,6 +280,9 @@ export interface AutomationCronStore {
     concurrencyKey: string,
     runId: string,
   ): Promise<ConcurrencyClaimResult>;
+  /** The run holding the key, or null — a read, never a claim (a
+   * continue-only delivery must not leave a phantom claim behind). */
+  getConcurrencyHolder(automationId: string, concurrencyKey: string): Promise<string | null>;
   casConcurrency(
     automationId: string,
     concurrencyKey: string,
@@ -316,6 +320,9 @@ export interface AutomationDispatchStore {
     concurrencyKey: string,
     runId: string,
   ): Promise<ConcurrencyClaimResult>;
+  /** The run holding the key, or null — a read, never a claim (a
+   * continue-only delivery must not leave a phantom claim behind). */
+  getConcurrencyHolder(automationId: string, concurrencyKey: string): Promise<string | null>;
   casConcurrency(
     automationId: string,
     concurrencyKey: string,
@@ -333,6 +340,8 @@ export interface AutomationEngineStore extends EngineRunStore {
     automationId: string;
     title: string | null;
     source: Record<string, unknown>;
+    /** The task's owner (CASL subject); null = the automation itself. */
+    createdByUserId?: string | null;
   }): Promise<string>;
   getAutomationTaskSession(runId: string): Promise<string | null>;
   recordSessionBinding(input: {
@@ -350,7 +359,11 @@ export interface AutomationEngineStore extends EngineRunStore {
     prompt: string;
     title: string | null;
   }): Promise<void>;
-  findSessionBinding(sessionId: string): Promise<{ runId: string; blockId: string; role: string } | null>;
+  findSessionBinding(
+    sessionId: string,
+  ): Promise<{ runId: string; blockId: string; role: string; relay: boolean } | null>;
+  /** Flip curated-event forwarding for a bound session (the relay block). */
+  setSessionRelay(sessionId: string, relay: boolean): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1051,20 @@ export function makeAutomationStore(
       return { claimed: false, holderRunId: holder.runId };
     },
 
+    async getConcurrencyHolder(automationId, concurrencyKey) {
+      const [holder] = await db
+        .select({ runId: claimTable.runId })
+        .from(claimTable)
+        .where(
+          and(
+            eq(claimTable.automationId, automationId),
+            eq(claimTable.concurrencyKey, concurrencyKey),
+          ),
+        )
+        .limit(1);
+      return holder?.runId ?? null;
+    },
+
     async casConcurrency(automationId, concurrencyKey, fromRunId, toRunId) {
       const rows = await db
         .update(claimTable)
@@ -1264,9 +1291,18 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         aliases = await aliasResolver(definition.trigger.registrationId);
       }
 
+      // ADR 0119 phase 4.3b: a run must never start on inputs the pinned
+      // schema rejects (e.g. a built-in version bump tightened a rule after
+      // the org saved its values). Throw: the interpreter turns a snapshot
+      // failure into the normal finalize (terminal `failed` row + concurrency
+      // release), so the row is visible AND the key is free.
+      const resolvedInputs = resolveAutomationInputs(version.inputsSchema, meta.inputs);
+      const inputErrors = validateInputValues(version.inputsSchema, resolvedInputs);
+      if (inputErrors.length > 0) throw new InputValidationError(inputErrors);
+
       return {
         definition,
-        inputs: resolveAutomationInputs(version.inputsSchema, meta.inputs),
+        inputs: resolvedInputs,
         automationId: meta.id,
         automationName: meta.name,
         version: version.version,
@@ -1403,7 +1439,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
             type: "automation",
             title: input.title,
             status: "working",
-            createdByUserId: null,
+            createdByUserId: input.createdByUserId ?? null,
             source: input.source,
           })
           .onConflictDoNothing();
@@ -1466,11 +1502,19 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
           runId: automationSessionTable.runId,
           blockId: automationSessionTable.blockId,
           role: automationSessionTable.role,
+          relay: automationSessionTable.relay,
         })
         .from(automationSessionTable)
         .where(eq(automationSessionTable.sessionId, sessionId))
         .limit(1);
       return row ?? null;
+    },
+
+    async setSessionRelay(sessionId, relay) {
+      await db
+        .update(automationSessionTable)
+        .set({ relay })
+        .where(eq(automationSessionTable.sessionId, sessionId));
     },
   };
 }

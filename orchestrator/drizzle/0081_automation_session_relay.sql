@@ -1,0 +1,1 @@
+ALTER TABLE "automation_session" ADD COLUMN "relay" boolean DEFAULT false NOT NULL;

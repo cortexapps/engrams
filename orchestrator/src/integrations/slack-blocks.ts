@@ -53,6 +53,10 @@ export interface ThreadRoute {
   team: string;
   channel: string;
   threadRoot: string;
+  /** ADR 0119 phase 4.5: present when the question was posted by an
+   * automation run's relay. The interactivity route then delivers the answer
+   * to `autorun:<runId>` instead of the legacy thread workflow. */
+  runId?: string;
 }
 
 /** A question, compacted for carriage in a Slack value/private_metadata (option

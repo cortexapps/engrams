@@ -141,6 +141,24 @@ describe("InputsTab", () => {
     await waitFor(() => expect(screen.getByText("mention must start with @")).toBeTruthy());
   });
 
+  it("routes the server's multi-line value errors to the map row and its field (phase 4.3b)", async () => {
+    // The orchestrator now validates VALUES and answers in the same
+    // `inputs.<key>[.path]: message` lines the tab already parses, joined
+    // by "; ". A bad row key lands on the row; a bad field lands on the
+    // field inside its row.
+    setInputs.mockRejectedValueOnce(
+      new Error(
+        "inputs.repos.engrams/engrams.mode: must be one of auto, on_request; inputs.mention: must be text",
+      ),
+    );
+    render(<InputsTab automationId="b1" />);
+    fireEvent.change(screen.getByLabelText("Mention"), { target: { value: "@changed" } });
+    fireEvent.click(screen.getByRole("button", { name: /save inputs/i }));
+    await waitFor(() => expect(screen.getByText("must be text")).toBeTruthy());
+    const row = screen.getByTestId("map-row-engrams/engrams");
+    expect(row.textContent).toContain("must be one of auto, on_request");
+  });
+
   it("discard restores the stored values", () => {
     render(<InputsTab automationId="b1" />);
     fireEvent.change(screen.getByLabelText("Mention"), { target: { value: "@x" } });

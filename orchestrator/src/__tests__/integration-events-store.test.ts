@@ -58,7 +58,7 @@ describe("integration-event store (live PG)", () => {
     expect(again.recorded).toBe(false);
   });
 
-  test.skipIf(!dbReachable)("write-time retention keeps the newest 20 per (connection, key)", async () => {
+  test.skipIf(!dbReachable)("the sweep keeps the newest 20 per (connection, key)", async () => {
     const store = makeIntegrationEventStore();
     const key = `retention-${Date.now()}`;
     for (let i = 0; i < INTEGRATION_EVENT_RETENTION_PER_KEY + 3; i += 1) {
@@ -67,6 +67,9 @@ describe("integration-event store (live PG)", () => {
         receivedAt: new Date(Date.now() + i * 1000),
       });
     }
+    // The write path never prunes (it is one insert on the ack path).
+    expect(await store.list(CONNECTION_ID, key, 100)).toHaveLength(INTEGRATION_EVENT_RETENTION_PER_KEY + 3);
+    expect(await store.sweep(new Date())).toBeGreaterThanOrEqual(3);
     const rows = await store.list(CONNECTION_ID, key, 100);
     expect(rows).toHaveLength(INTEGRATION_EVENT_RETENTION_PER_KEY);
     // Newest first; the pruned rows are the oldest three.
@@ -75,12 +78,12 @@ describe("integration-event store (live PG)", () => {
     expect(latest?.deliveryId).toBe(rows[0]!.deliveryId);
   });
 
-  test.skipIf(!dbReachable)("sweepExpired removes only rows past the 7-day window", async () => {
+  test.skipIf(!dbReachable)("the sweep removes rows past the 7-day window", async () => {
     const store = makeIntegrationEventStore();
     const key = `sweep-${Date.now()}`;
     await store.record({ ...input(`old-${key}`, key), receivedAt: new Date(Date.now() - 8 * 24 * 3600 * 1000) });
     await store.record({ ...input(`new-${key}`, key), receivedAt: new Date() });
-    const swept = await store.sweepExpired(new Date());
+    const swept = await store.sweep(new Date());
     expect(swept).toBeGreaterThanOrEqual(1);
     const rows = await store.list(CONNECTION_ID, key, 10);
     expect(rows.map((r) => r.deliveryId)).toEqual([`new-${key}`]);

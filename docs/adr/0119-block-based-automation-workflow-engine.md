@@ -98,12 +98,59 @@ the ADR 0104 sweep policy carries over). Its body is deliberately thin:
 Two rules make this safe:
 
 - **The step contract.** The registered body contains a literal
-  `const ENGINE_STEP_CONTRACT = 1`. Any change to step naming, step order,
+  `const ENGINE_STEP_CONTRACT = <n>`. Any change to step naming, step order,
   recv semantics, or the finalize position MUST bump the literal. The bump
   rotates the DBOS application version, so in-flight executions from the
   previous deploy strand loudly and the sweep (adopt, 48 h) fails them —
   they are never silently replayed through changed semantics. Additive
   changes (new block types, new outcome fields) keep the contract.
+
+  Contract history:
+  - **1** (phase 1): snapshot step, `step:<framePath>:<attempt>`, condition
+    and clock micro-steps, one trailing `step:__finalize__:0`.
+  - **2** (phase 4.3b): **finalize hooks.** `settings.onFinalize` lists
+    `{when: [terminal statuses], block}` entries. For a run ending in a
+    hook's `when`, the hook block runs as its own step,
+    `step:__finalize__.<blockId>:0`, in definition order, BEFORE the
+    finalize step — so finalize is no longer the single step after the
+    walk. Hooks observe `run.status`/`run.error` in scope; a hook's outcome
+    never changes the terminal status (a throwing hook is recorded on its
+    own step row), and hooks may not wait (validation refuses wait-capable
+    and control blocks). This is what lets the PR-review built-in reach the
+    legacy graph's failure, halt, and supersede behaviour (the sticky ❌
+    status comment, the activity-log reason, worker teardown) through
+    `system.review_finalize`. Any automation run in flight across the
+    1→2 deploy strands and is failed by the sweep, by design.
+  - **3** (phase 4.5): **installed message handlers.** A block executor
+    may implement `onMessage(msg, config, ctx) → "consumed" | "pass"`.
+    A successful `execute` of such a block INSTALLS it for the rest of the
+    run (one installer per definition, refused in finalize hooks;
+    re-executing the same block repoints its config). From then on every
+    received mailbox message is offered to the handler FIRST, inside its
+    own checkpointed step `step:<relayFramePath>.__relay__:<n>` (`n`
+    counts from 1 per run), before the stop/supersede checks and before
+    the active wait's matcher. A `consumed` message never reaches the
+    wait; a throwing handler is recorded as a failed relay step and the
+    message passes through. The new `session_event` inbox arm (curated
+    session events, forwarded by the consumer only for sessions whose
+    `automation_session.relay` flag is set) is what the Slack thread relay
+    (`system.slack_thread_relay`) consumes. Any run in flight across the
+    2→3 deploy strands and is failed by the sweep, by design.
+  - **4** (phase 4.6): **conversation loops.** Three changes that let a
+    built-in loop `wait_event → send_prompt` until a thread goes quiet.
+    (1) A loop's `maxIterations` may be a `$ref` (e.g. `inputs.max_turns`);
+    the bound is resolved and clamped in its own checkpointed step
+    `step:<loopFramePath>.__bound__:0`, emitted before the first
+    iteration of EVERY loop (a literal bound gets the step too — one
+    shape). (2) The wait half of a wait-capable block reads the execute
+    half's RESOLVED config (`BlockOutcome.resolvedConfig`, which rides the
+    checkpointed step output), so a `$ref` deadline such as
+    `inputs.idle_timeout` is honoured on replay. (3) `wait_event` gains
+    `onDeadline: "continue"`: the deadline records `outcome: "deadline"`
+    on a SUCCEEDED step and the graph goes on (a loop's `until` reads
+    it), instead of ending the run `deadline`. Every other wait keeps the
+    phase-1 semantics. Any run in flight across the 3→4 deploy strands
+    and is failed by the sweep, by design.
 - **The golden test.** A step-sequence test asserts the exact ordered step
   names for linear, branch, loop, retry, deadline, stop, and supersede
   graphs. Accidental contract drift is a red diff at review time.
@@ -204,7 +251,7 @@ seed-profile pattern (idempotent, unique-violation tolerant, content-hash
 version bumps; user input values are merged with new-key defaults, never
 overwritten). Review-specific product logic that is not a generic primitive
 stays in code-registered **system blocks** (`open_review_pass`,
-`review_policy_gate`, `slack_thread_relay`) that only built-in definitions
+`review_policy_gate`, `slack_thread_relay`, `slack_thread_recap`) that only built-in definitions
 may reference. If a system block proves generic, it graduates to the catalog.
 
 The old graphs stay live during a parallel window: per-repository

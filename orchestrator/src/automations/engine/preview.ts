@@ -65,6 +65,7 @@ function inertDeps(): EngineDeps {
     },
     sessions: {
       createSession: unavailable,
+      setSessionRelay: unavailable,
       sendPrompt: unavailable,
       endSession: unavailable,
       exec: unavailable,

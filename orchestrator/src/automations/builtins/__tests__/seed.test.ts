@@ -129,6 +129,31 @@ describe("seedBuiltinAutomations", () => {
     expect(v1.trigger).toMatchObject({ kind: "integration", provider: "github", connectionId: "conn-github" });
   });
 
+  test("a legacy enrollment row the schema rejects drops just that row and never blocks the seed (phase 4.3b)", async () => {
+    // review_enrollment.repo is a free text PK; a malformed legacy value
+    // must not stop the built-in from seeding for every healthy repo.
+    const warnings: Array<Record<string, unknown>> = [];
+    const h = harness({
+      enrollments: [
+        { repo: "acme/app", triggerMode: "auto", autofix: "off" },
+        { repo: "not a repo", triggerMode: "auto", autofix: "off" },
+      ],
+    });
+    const result = await seedBuiltinAutomations({
+      ...h.deps,
+      log: { info() {}, warn: (b: Record<string, unknown>) => void warnings.push(b) },
+      builtins: [PR_REVIEW_BUILTIN],
+    });
+    expect(result.created).toEqual([PR_REVIEW_BUILTIN_KEY]);
+    const row = h.rows.get("auto-pr-review")!;
+    expect(row.inputs["repos"]).toEqual({ "acme/app": { mode: "auto", autofix: false } });
+    expect(warnings).toEqual([
+      expect.objectContaining({ key: "repos", path: "not a repo", builtinKey: PR_REVIEW_BUILTIN_KEY }),
+    ]);
+    // The shipped schema's own defaults are valid: no other key fell back.
+    expect(warnings).toHaveLength(1);
+  });
+
   test("re-run with an unchanged shipped definition is a no-op", async () => {
     const h = harness();
     await seedBuiltinAutomations({ ...h.deps, builtins: [PR_REVIEW_BUILTIN] });
@@ -147,6 +172,13 @@ describe("seedBuiltinAutomations", () => {
     // Stored: the current shipped definition with org edits layered on.
     const stored = structuredClone(PR_REVIEW_BUILTIN.definition);
     if (stored.trigger.kind === "integration") stored.trigger.connectionId = "conn-github";
+    // A tunable field on a finalize-hook block: its override must survive a
+    // bump like a graph block's (the seeder walks the same target set).
+    const markHookTunable = (d: typeof stored) => {
+      const hook = d.settings.onFinalize!.find((h) => h.block.id === "report_failure")!;
+      hook.block.tunable = ["reason"];
+    };
+    markHookTunable(stored);
     const h = harness({
       existing: {
         definition: stored,
@@ -156,6 +188,8 @@ describe("seedBuiltinAutomations", () => {
           find: { deadlineSeconds: 900 },
           // Equal to the OLD shipped default — not an edit; follows the new default.
           verify: { deadlineSeconds: 7200 },
+          // A real edit on a finalize-hook block — kept.
+          report_failure: { reason: "custom: ${{ run.error }}" },
         },
       },
     });
@@ -166,6 +200,7 @@ describe("seedBuiltinAutomations", () => {
       ...PR_REVIEW_BUILTIN,
       definition: (() => {
         const d = structuredClone(PR_REVIEW_BUILTIN.definition);
+        markHookTunable(d);
         const then = d.blocks.find((b) => b.id === "has_candidates")!.then!;
         const verify = then.find((b) => b.id === "verify")!;
         verify.config = { ...verify.config, deadlineSeconds: 3600 };
@@ -187,7 +222,10 @@ describe("seedBuiltinAutomations", () => {
     expect(row.inputs["repos"]).toEqual({ "acme/app": { mode: "auto", autofix: false } });
     expect(row.inputs["new_knob"]).toBe("x");
     // Overrides: the real edit survives; the un-edited one follows the new default.
-    expect(row.blockOverrides).toEqual({ find: { deadlineSeconds: 900 } });
+    expect(row.blockOverrides).toEqual({
+      find: { deadlineSeconds: 900 },
+      report_failure: { reason: "custom: ${{ run.error }}" },
+    });
   });
 
   test("content hash ignores key order and is stable", () => {

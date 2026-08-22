@@ -348,6 +348,9 @@ function fakeStore(seed?: {
       }
       return { claimed: false, holderRunId: holder };
     },
+    async getConcurrencyHolder(automationId, key) {
+      return claims.get(`${automationId}:${key}`) ?? null;
+    },
     async casConcurrency(automationId, key, from, to) {
       const k = `${automationId}:${key}`;
       if (claims.get(k) !== from) return false;
@@ -616,6 +619,95 @@ describe("AutomationService v2", () => {
       Code.InvalidArgument,
     );
     expect(err.message).toContain("inputs.nope");
+  });
+
+  test("SetInputs rejects VALUES the schema refuses, one routed line per error (phase 4.3b)", async () => {
+    // The schema declares `mention` as a string. A number is declared-but-wrong:
+    // the undeclared-key check passes and the value check must catch it, in
+    // the `inputs.<key>: message` form the web routes back to the field.
+    const deps = adminDeps();
+    deps.fake.automations.set("builtin-1", builtinStored());
+    const { automations } = clients(deps);
+    const err = await expectCode(
+      automations.setInputs({ automationId: "builtin-1", inputsJson: JSON.stringify({ mention: 42 }) }),
+      Code.InvalidArgument,
+    );
+    expect(err.rawMessage).toBe("inputs.mention: must be text");
+    // Nothing was stored.
+    expect(deps.fake.automations.get("builtin-1")!.meta.inputs).not.toHaveProperty("mention", 42);
+  });
+
+  test("SetInputs routes map-row errors by path (review-shaped schema)", async () => {
+    const deps = adminDeps();
+    const b = builtinStored();
+    b.versions.get(1)!.inputsSchema = [
+      {
+        key: "repos",
+        label: "Repositories",
+        type: "map",
+        keyNoun: "repository",
+        required: true,
+        valueShape: {
+          mode: { type: "enum", values: ["auto", "on_request"] },
+          autofix: { type: "boolean" },
+        },
+      },
+    ];
+    deps.fake.automations.set("builtin-1", b);
+    const { automations } = clients(deps);
+    const err = await expectCode(
+      automations.setInputs({
+        automationId: "builtin-1",
+        inputsJson: JSON.stringify({ repos: { "acme/x": { mode: "never", autofix: true }, bad: { mode: "auto", autofix: false } } }),
+      }),
+      Code.InvalidArgument,
+    );
+    expect(err.rawMessage).toBe(
+      "inputs.repos.acme/x.mode: must be one of auto, on_request; inputs.repos.bad: not a valid owner/repo",
+    );
+  });
+
+  test("CreateAutomation and RunNow validate input values too", async () => {
+    const deps = adminDeps();
+    const { automations } = clients(deps);
+    const schema = cronDefinition({
+      trigger: { kind: "manual" },
+      inputsSchema: [{ key: "limit", label: "Limit", type: "number", required: true }],
+    });
+    const err = await expectCode(
+      automations.createAutomation({
+        name: "x",
+        description: "",
+        enabled: false,
+        definitionJson: JSON.stringify(schema),
+        inputsJson: JSON.stringify({ limit: "ten" }),
+      }),
+      Code.InvalidArgument,
+    );
+    expect(err.rawMessage).toBe("inputs.limit: must be a number");
+
+    const created = await automations.createAutomation({
+      name: "x",
+      description: "",
+      enabled: false,
+      definitionJson: JSON.stringify(schema),
+      inputsJson: JSON.stringify({ limit: 10 }),
+    });
+    const id = created.automation!.id;
+    // RunNow validates the MERGED values (its override persists), so a bad
+    // override is refused before anything is stored or started.
+    const runErr = await expectCode(
+      automations.runNow({ automationId: id, inputsJson: JSON.stringify({ limit: false }) }),
+      Code.InvalidArgument,
+    );
+    expect(runErr.rawMessage).toBe("inputs.limit: must be a number");
+    expect(deps.fake.automations.get(id)!.meta.inputs).toEqual({ limit: 10 });
+    // And an undeclared override key is refused like SetInputs.
+    const strayErr = await expectCode(
+      automations.runNow({ automationId: id, inputsJson: JSON.stringify({ stray: 1 }) }),
+      Code.InvalidArgument,
+    );
+    expect(strayErr.rawMessage).toContain("inputs.stray");
   });
 
   test("Duplicate folds overrides into an editable user copy", async () => {

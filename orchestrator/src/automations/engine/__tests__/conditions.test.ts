@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   ConditionParseError,
+  type FilterGroup,
   evaluateFilter,
   parseFilterGroup,
   CONDITION_MAX_LEAVES,
@@ -46,6 +47,17 @@ describe("parseFilterGroup", () => {
       ConditionParseError,
     );
   });
+
+  test("rejects patterns that backtrack super-linearly", () => {
+    for (const value of ["(a+)+$", "(.*)*x", "(\\w+\\s?)*$", "(a|aa)+$", "((a|aa))+$", "((foo|foobar)x?)+", "(?:(?:a|b)c)*", "a*a*a*a*b", "\\d+\\s+\\w+\\s+x{2,}", "(a)\\1", "(?<n>a)\\k<n>", "a{1,500}", "(a{2,}){2}"]) {
+      expect(() => parseFilterGroup(group([{ path: "a", op: "matches", value }]))).toThrow(
+        ConditionParseError,
+      );
+    }
+    for (const value of ["^fix:", "a+b*", "(ab)+", "[a-z]+\\d{1,3}", "(?:x|y)?z", "(?<=a)b", "(a+)?", "a{3}", "\\d+\\.\\d+", "a*a*a*b"]) {
+      expect(() => parseFilterGroup(group([{ path: "a", op: "matches", value }]))).not.toThrow();
+    }
+  });
 });
 
 describe("evaluateFilter", () => {
@@ -64,6 +76,28 @@ describe("evaluateFilter", () => {
     expect(evaluate([{ path: "event.empty", op: "is_empty" }])).toBe(true);
     expect(evaluate([{ path: "event.pr.draft", op: "is_false" }])).toBe(true);
     expect(evaluate([{ path: "event.pr.draft", op: "is_true" }])).toBe(false);
+  });
+
+  test("gt/lt read numeric strings as numbers, not dates", () => {
+    const s = { event: { n: "41", year: "2026", when: "2026-08-21T00:00:00Z" } };
+    const run = (conditions: unknown[]) => evaluateFilter(parseFilterGroup({ mode: "all", conditions }), s);
+    expect(run([{ path: "event.n", op: "gt", value: 40 }])).toBe(true);
+    expect(run([{ path: "event.n", op: "lt", value: 40 }])).toBe(false);
+    expect(run([{ path: "event.year", op: "gt", value: 100 }])).toBe(true);
+    expect(run([{ path: "event.year", op: "gt", value: 3000 }])).toBe(false);
+    expect(run([{ path: "event.year", op: "lt", value: "2027" }])).toBe(true);
+    expect(run([{ path: "event.when", op: "gt", value: "2026-08-20" }])).toBe(true);
+  });
+
+  test("an unsafe pattern stored before the guard fails closed, fast", () => {
+    // Bypass parse-time validation the way a pre-guard row would.
+    const stored: FilterGroup = {
+      mode: "all",
+      conditions: [{ path: "event.text", op: "matches", value: "(a+)+$" }],
+    };
+    const startedAt = performance.now();
+    expect(evaluateFilter(stored, { event: { text: `${"a".repeat(4096)}!` } })).toBe(false);
+    expect(performance.now() - startedAt).toBeLessThan(200);
   });
 
   test("missing paths: false for everything except is_empty/not_equals", () => {

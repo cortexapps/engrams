@@ -2,11 +2,14 @@
  *
  * One evaluator serves the filter block, branch conditions, loop-until, and
  * trigger scope narrowing. The Code block is the escape hatch for anything
- * these rows cannot say. Regex work is bounded (pattern and subject caps), so
- * the worst case is small without an RE2 dependency.
+ * these rows cannot say. Regex work is bounded by the pattern and subject
+ * caps AND by `safe-regex.ts`, which refuses the super-linear backtracking
+ * shapes (nested quantifiers, backreferences) — length caps alone do not
+ * bound backtracking, and there is no RE2 under Bun.
  */
 
 import { isSafePath, jsonEqual, ownPath } from "../paths.ts";
+import { assertSafeRegex, isSafeRegex, UnsafeRegexError } from "./safe-regex.ts";
 
 export const CONDITION_MAX_DEPTH = 3;
 export const CONDITION_MAX_LEAVES = 50;
@@ -69,6 +72,12 @@ function parseCondition(raw: unknown, where: string): FilterCondition {
     } catch {
       throw new ConditionParseError(`${where}: invalid regular expression`);
     }
+    try {
+      assertSafeRegex(pattern);
+    } catch (error) {
+      if (!(error instanceof UnsafeRegexError)) throw error;
+      throw new ConditionParseError(`${where}: ${error.message}`);
+    }
   }
   if (op === "in" && !Array.isArray(raw["value"])) {
     throw new ConditionParseError(`${where}: "in" needs an array value`);
@@ -113,9 +122,19 @@ function isEmptyValue(value: unknown): boolean {
   return false;
 }
 
+const NUMERIC_STRING = /^\s*[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?\s*$/;
+
+/** `gt`/`lt` compare numbers, numeric strings as numbers, and everything
+ * else that `Date.parse` accepts as epoch milliseconds. A numeric string
+ * must be tried as a number FIRST: `Date.parse("2026")` is a year, and
+ * `Date.parse("41")` is NaN — both wrong for a string-encoded count. */
 function asComparable(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string") {
+    if (NUMERIC_STRING.test(value)) {
+      const num = Number(value);
+      return Number.isFinite(num) ? num : undefined;
+    }
     const parsed = Date.parse(value);
     if (!Number.isNaN(parsed)) return parsed;
   }
@@ -137,6 +156,8 @@ function evaluateCondition(condition: FilterCondition, scope: Record<string, unk
       return false;
     case "matches": {
       if (typeof resolved !== "string" || typeof condition.value !== "string") return false;
+      // Fail closed on a pattern stored before the guard existed.
+      if (!isSafeRegex(condition.value)) return false;
       const subject = resolved.slice(0, CONDITION_SUBJECT_MAX_CHARS);
       return new RegExp(condition.value, "u").test(subject);
     }

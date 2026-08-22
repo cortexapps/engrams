@@ -54,6 +54,7 @@ function fakeEngineStore(overrides: Partial<AutomationEngineStore> = {}): Automa
     },
     async recordSessionBinding() {},
     async recordRunLaunch() {},
+    async setSessionRelay() {},
     async findSessionBinding() {
       return null;
     },
@@ -79,6 +80,7 @@ describe("automationRunWorkflowImpl", () => {
       store,
       sessions: {
         createSession: async () => ({ sessionId: "s", taskId: "t" }),
+        setSessionRelay: async () => {},
         sendPrompt: async () => {},
         endSession: async () => {},
         exec: async () => ({ exitStatus: 0, stdout: "", stderr: "" }),
@@ -105,9 +107,11 @@ describe("makeProductionSessionOps.createSession", () => {
     const bindings: Array<Record<string, unknown>> = [];
     const launches: Array<Record<string, unknown>> = [];
     let existingPrimary: string | null = null;
+    const taskOwners: Array<string | null | undefined> = [];
     const store = fakeEngineStore({
       async ensureAutomationTask(input) {
         calls.push("task");
+        taskOwners.push(input.createdByUserId);
         return `automation:${input.runId}`;
       },
       async getAutomationTaskSession() {
@@ -140,6 +144,7 @@ describe("makeProductionSessionOps.createSession", () => {
       createdParams,
       bindings,
       launches,
+      taskOwners,
       setExistingPrimary(id: string) {
         existingPrimary = id;
       },
@@ -171,6 +176,19 @@ describe("makeProductionSessionOps.createSession", () => {
     expect(params.integrationPrincipalId).toBe("automation:auto-1");
     expect(params.registerListener).toBe(false);
     expect(params.role).toBe("primary");
+  });
+
+  test("an owner (the Slack brain's identity gate) rides through to the session and the task", async () => {
+    const h = harness();
+    await h.ops.createSession({ ...input, ownerUserId: "user-1" });
+    const params = h.createdParams[0]!;
+    expect(params.ownerUserId).toBe("user-1");
+    expect(h.taskOwners).toEqual(["user-1"]);
+    // Without an owner nothing is stamped: the programmatic path is unchanged.
+    const h2 = harness();
+    await h2.ops.createSession(input);
+    expect(h2.createdParams[0]!.ownerUserId).toBeUndefined();
+    expect(h2.taskOwners).toEqual([undefined]);
   });
 
   test("a primary launch reuses the task's existing primary session", async () => {

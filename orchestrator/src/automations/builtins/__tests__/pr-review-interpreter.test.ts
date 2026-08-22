@@ -160,6 +160,12 @@ function harness(options: {
     async cleanupSupersededReview() {
       cpCalls.push("cleanupSupersededReview");
     },
+    async failReview(_reviewId, opts) {
+      cpCalls.push(`failReview:${opts?.reason ?? ""}`);
+    },
+    async haltReview() {
+      cpCalls.push("haltReview");
+    },
   };
   setReviewBlockDeps({
     controlPlane: () => cp,
@@ -200,6 +206,7 @@ function harness(options: {
       runSessions.push({ sessionId: id, keep: input.keep });
       return { sessionId: id, taskId: `t-${input.role}` };
     },
+    async setSessionRelay() {},
     async sendPrompt(sessionId, _promptId, text) {
       prompts.push({ sessionId, text });
     },
@@ -363,5 +370,33 @@ describe("PR-review built-in on the interpreter", () => {
     // the finder because the built-in creates workers with keep=false.
     expect(h.ended).toEqual(["s-finder"]);
     expect(h.finalized[0]!.status).toBe("superseded");
+    // The supersede hook (contract 2) tore the pass down through the legacy
+    // cleanup path — and only that: no failure comment on a superseded pass.
+    expect(h.cpCalls).toContain("cleanupSupersededReview");
+    expect(h.cpCalls.some((c) => c.startsWith("failReview"))).toBe(false);
+    expect(h.names).toContain("step:__finalize__.cleanup_superseded:0");
+    expect(h.names.at(-1)).toBe("step:__finalize__:0");
+  });
+
+  test("(f) a finder-phase deadline fails the run and the hook marks the pass failed with the legacy status comment", async () => {
+    // No messages ever arrive: the finder's signal wait deadlines.
+    const h = harness({ eventKey: "pull_request.opened", payload: prPayload() });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("deadline");
+    expect(h.prompts).toHaveLength(1);
+    expect(h.cpCalls).not.toContain("decideReviewResults");
+    // The failure hook ran through failReview with the run's error as the
+    // activity-log reason; failReview owns the sticky ❌ comment (legacy
+    // parity), so no extra comment action fires.
+    const fail = h.cpCalls.find((c) => c.startsWith("failReview:"));
+    expect(fail).toBeDefined();
+    expect(fail).toMatch(/deadline/);
+    expect(h.actions.map((a) => a.actionId)).toEqual(["create_issue_comment"]);
+    expect(h.names).toContain("step:__finalize__.report_failure:0");
+    expect(h.names.at(-1)).toBe("step:__finalize__:0");
+    // The hook is a step with its own ledger row, succeeded.
+    const hook = h.records.filter((r) => r.path === "__finalize__.report_failure").at(-1)!;
+    expect(hook.record.status).toBe("succeeded");
+    expect(h.finalized[0]!.status).toBe("deadline");
   });
 });

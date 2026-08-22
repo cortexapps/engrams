@@ -220,6 +220,23 @@ export function AutomationEditor({
     }
   };
 
+  // 3.4: "Test with sample" renders the DRAFT (unsaved edits included) and
+  // routes server BlockErrors into the inspector; its latest scope feeds the
+  // picker's live previews. Only an existing automation can be rendered
+  // server-side (TestRender needs a saved row for samples).
+  //
+  // HOOK ORDER: this must sit ABOVE the early returns below. While the
+  // automation loads, the shell returns early with fewer hooks; a hook placed
+  // after that return made the hook count grow once data arrived — React
+  // #310 ("rendered more hooks than during the previous render"), which
+  // crashed the edit page in production.
+  const test = useAutomationTest({
+    automationId: automation?.id,
+    definition: draft,
+    inputsJson: automation?.inputsJson || "{}",
+    onErrors: setErrors,
+  });
+
   if (mode === "edit" && existing.isPending) {
     return <p className="text-muted-foreground text-sm">Loading…</p>;
   }
@@ -237,16 +254,6 @@ export function AutomationEditor({
   const nameError = errors.find((e) => e.blockId === "" && e.field === "name")?.message;
   const triggerSummary = existingSummary(automation?.id, draft);
 
-  // 3.4: "Test with sample" renders the DRAFT (unsaved edits included) and
-  // routes server BlockErrors into the inspector; its latest scope feeds the
-  // picker's live previews. Only an existing automation can be rendered
-  // server-side (TestRender needs a saved row for samples).
-  const test = useAutomationTest({
-    automationId: automation?.id,
-    definition: draft,
-    inputsJson: automation?.inputsJson || "{}",
-    onErrors: setErrors,
-  });
   const panel = testPanel ?? (automation ? <TestPanel test={test} /> : null);
   const liveValues = variableValues ?? test.variableValues;
 

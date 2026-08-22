@@ -49,6 +49,11 @@ export const createSessionConfigSchema = z.object({
   role: z.string().min(1).max(64).optional(),
   /** Default: keep (D8). finalize ends only keep=false sessions. */
   keepOnFinish: z.boolean().optional(),
+  /** The engrams user the session runs AS (templated, e.g. from an identity
+   * block): their credentials, OAuth subject and git attribution instead of
+   * the harness's programmatic org credential, and the task is theirs.
+   * Empty/unset = programmatic (the review workers). */
+  ownerUserId: z.string().optional(),
   ...overrideFields,
   ...sessionPolicyFields,
 });
@@ -111,6 +116,8 @@ async function executeCreateSession(
     config.capabilityOverride !== undefined
       ? await Promise.all(config.capabilityOverride.map((c) => renderIfTemplated(ctx, c)))
       : undefined;
+  const ownerUserId =
+    config.ownerUserId !== undefined ? await renderIfTemplated(ctx, config.ownerUserId) : "";
   const created = await ctx.deps.sessions.createSession({
     runId: ctx.runId,
     blockId: currentBlockId(ctx),
@@ -118,6 +125,7 @@ async function executeCreateSession(
     profileId,
     prompt,
     title,
+    ...(ownerUserId !== "" ? { ownerUserId } : {}),
     role: config.role ?? "primary",
     // D8: keep by default; end_sessions_on_finish flips the default, and the
     // block's keepOnFinish overrides either way.
@@ -161,6 +169,11 @@ function currentBlockId(ctx: RunContext): string {
   return ctx.currentBlockId;
 }
 
+function currentPath(ctx: RunContext): string {
+  if (ctx.currentPath === undefined) throw new Error("engine bug: currentPath missing");
+  return ctx.currentPath;
+}
+
 function matchesSessionMessage(
   msg: AutomationInbox,
   sessionId: string,
@@ -199,11 +212,13 @@ export function registerSessionBlocks(): void {
     type: "send_prompt",
     outputs: ["outcome", "signal"],
     configSchema: sendPromptConfigSchema,
-    requiresSession: true,
     async execute(config, ctx) {
       const sessionId = await ctx.resolveSession(config.session);
       const text = await ctx.render(config.promptTemplate);
-      const promptId = `autorun:${ctx.runId}:${currentBlockId(ctx)}:${sessionId}`;
+      // Keyed by frame path: the coordinator outbox dedupes on prompt_id
+      // (ON CONFLICT DO NOTHING), so a send_prompt inside a loop must mint
+      // a new id per iteration or every prompt after the first is dropped.
+      const promptId = `autorun:${ctx.runId}:${currentPath(ctx)}:${sessionId}`;
       await ctx.deps.sessions.sendPrompt(sessionId, promptId, text, config.harnessMode);
       return { kind: "ok", outputs: { session_id: sessionId, sent: true } };
     },
@@ -227,7 +242,6 @@ export function registerSessionBlocks(): void {
     type: "wait_session",
     outputs: ["outcome"],
     configSchema: waitSessionConfigSchema,
-    requiresSession: true,
     async execute(config, ctx) {
       const sessionId = await ctx.resolveSession(config.session);
       return { kind: "ok", outputs: { session_id: sessionId } };
@@ -250,7 +264,6 @@ export function registerSessionBlocks(): void {
   registerBlock<EndSessionConfig>({
     type: "end_session",
     configSchema: endSessionConfigSchema,
-    requiresSession: true,
     async execute(config, ctx) {
       const sessionId = await ctx.resolveSession(config.session);
       await ctx.deps.sessions.endSession(sessionId);

@@ -12,9 +12,22 @@ import type { AutomationInbox } from "../inbox.ts";
 import type { RunContext } from "../context.ts";
 
 export type BlockOutcome<O extends Record<string, unknown> = Record<string, unknown>> =
-  | { kind: "ok"; outputs: O }
+  /** `resolvedConfig` is the config after `$ref`/template resolution, set by
+   * the interpreter so the block's WAIT half reads the same values its
+   * execute half did (a `{ $ref: "inputs.idle_timeout" }` deadline must not
+   * fall back to the default because the wait saw the unresolved object).
+   * It rides the checkpointed step output, so replay sees it too. */
+  | { kind: "ok"; outputs: O; resolvedConfig?: Record<string, unknown> }
   | { kind: "end_run"; status: "filtered" | "completed"; reason?: string }
   | { kind: "error"; code: string; message: string; retryable: boolean };
+
+/** What an installed handler returns: the verdict for this message and the
+ * state the NEXT invocation must see. `state` must be JSON-serializable — it
+ * is a checkpointed step output. */
+export interface HandlerResult {
+  verdict: "consumed" | "pass";
+  state?: Record<string, unknown>;
+}
 
 export interface BlockWaitSpec<C> {
   /** null = no per-block deadline (the run deadline still applies). */
@@ -41,9 +54,27 @@ export interface BlockExecutor<C = unknown> {
   execute?(config: C, ctx: RunContext): Promise<BlockOutcome>;
   /** Wait half: the interpreter parks on recv and routes messages here. */
   wait?: BlockWaitSpec<C>;
-  /** When true the interpreter refuses to run the block without a resolvable
-   * session (config carries a SessionRef). */
-  requiresSession?: boolean;
+  /** Installed message handler (contract 3). After this block's execute step
+   * succeeds, the interpreter calls `onMessage` for EVERY mailbox message it
+   * receives until the run ends — BEFORE the active wait's `matches` — each
+   * call inside its own checkpointed step. "consumed" swallows the message;
+   * "pass" hands it on. Exactly one installable block per run (validation).
+   * This is how a long-lived relay (Slack thread ↔ session) rides the run's
+   * single recv loop without becoming a wait block.
+   *
+   * STATE THREADS THROUGH STEP OUTPUTS, never through module memory. A
+   * checkpointed step's closure does NOT re-run on DBOS recovery — only its
+   * recorded output is replayed — so any state a handler keeps in a
+   * process-local map is gone after a pod restart. The handler therefore
+   * receives `ctx.handlerState` (the previous handler step's recorded
+   * `state`, seeded from the install step's `outputs.handler_state`) and
+   * returns the next one; the interpreter records it as the step output.
+   * On recovery the chain of recorded outputs rebuilds the state exactly. */
+  onMessage?(
+    msg: AutomationInbox,
+    config: C,
+    ctx: RunContext,
+  ): Promise<HandlerResult>;
 }
 
 const registry = new Map<string, BlockExecutor<never>>();

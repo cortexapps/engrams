@@ -32,6 +32,12 @@ import {
   type SourceAnswer,
   type SourceProfileChoice,
 } from "../workflows/thread-inbox.ts";
+import {
+  AUTOMATION_TOPIC,
+  assertIdempotencyKey,
+  type AutomationInbox,
+} from "../automations/engine/inbox.ts";
+import { SLACK_ANSWER_SIGNAL } from "../automations/engine/blocks/system/slack-relay.ts";
 
 /** DBOS statuses a workflow can't re-run from → that epoch is done (Invariant 4). */
 const TERMINAL_WF = new Set(["SUCCESS", "ERROR", "MAX_RECOVERY_ATTEMPTS_EXCEEDED", "CANCELLED"]);
@@ -52,9 +58,46 @@ export interface SlackInteractivityDeps {
   openModal?: (triggerId: string, view: ModalView) => Promise<void>;
 }
 
-/** Default delivery: route the answer to the thread's live (non-terminal) epoch
- *  and send it once (idempotency key = the tool_call_id). */
+/** ADR 0119 phase 4.5: which mailbox an answer belongs to. A question posted
+ *  by an automation run's relay carries `runId` in its Block Kit route; its
+ *  answer is a `slack_answer` signal on that run. Otherwise it is the legacy
+ *  thread workflow's (deleted in phase 4.8). Pure, so the split is testable
+ *  without DBOS. */
+export function answerDelivery(
+  route: ThreadRoute,
+  answer: SourceAnswer,
+):
+  | { kind: "automation"; runId: string; message: AutomationInbox; idempotencyKey: string }
+  | { kind: "legacy" } {
+  if (route.runId) {
+    return {
+      kind: "automation",
+      runId: route.runId,
+      message: {
+        kind: "signal",
+        name: SLACK_ANSWER_SIGNAL,
+        payload: { toolCallId: answer.toolCallId, answers: answer.answers },
+      },
+      idempotencyKey: `slack-answer:${answer.toolCallId}`,
+    };
+  }
+  return { kind: "legacy" };
+}
+
+/** Default delivery (see `answerDelivery`). */
 async function defaultDeliverAnswer(route: ThreadRoute, answer: SourceAnswer): Promise<void> {
+  const delivery = answerDelivery(route, answer);
+  if (delivery.kind === "automation") {
+    assertIdempotencyKey(delivery.idempotencyKey);
+    await DBOS.send<AutomationInbox>(
+      delivery.runId,
+      delivery.message,
+      AUTOMATION_TOPIC,
+      delivery.idempotencyKey,
+    );
+    return;
+  }
+  // Legacy path — deleted in phase 4.8 with the SlackThreadWorkflow.
   const workflowId = await selectThreadWorkflowId(
     threadHash(route.team, route.channel, route.threadRoot),
     async (id) => {
@@ -126,6 +169,11 @@ export function makeSlackInteractivityRoute(deps: SlackInteractivityDeps = {}): 
         await deliverAnswer(action.route, action.answer);
         return c.body(null, 200);
       case "profile_choice":
+        // ADR 0119 phase 4.5: the automation path has no profile picker (the
+        // built-in reads `inputs.channels`); a pick that carries a runId is a
+        // stale card from nothing and is ignored. Legacy path below — deleted
+        // in phase 4.8.
+        if (action.route.runId) return c.body(null, 200);
         // Only the mentioning user decides which profile serves their request.
         if (action.clicker !== action.expectedUser) {
           log.info(

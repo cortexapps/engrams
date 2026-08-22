@@ -113,6 +113,12 @@ function fake(options: { deduplicate?: boolean; payload?: ReviewPostPayload } = 
     async cleanupSupersededReview(reviewId) {
       calls.push(`cleanupSupersededReview:${reviewId}`);
     },
+    async failReview(reviewId, opts) {
+      calls.push(`failReview:${reviewId}:${opts?.reason ?? ""}`);
+    },
+    async haltReview(reviewId) {
+      calls.push(`haltReview:${reviewId}`);
+    },
   };
   setReviewBlockDeps({
     controlPlane: () => cp,

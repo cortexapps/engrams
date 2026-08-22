@@ -9,7 +9,7 @@
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
-import type { TerminalOutcome } from "../../control-plane/session-events.ts";
+import type { CuratedEvent, TerminalOutcome } from "../../control-plane/session-events.ts";
 
 export const AUTOMATION_TOPIC = "automation";
 
@@ -25,7 +25,10 @@ export type AutomationInbox =
       receivedAt: string;
     }
   | { kind: "stop"; reason?: string }
-  | { kind: "supersede"; byRunId: string };
+  | { kind: "supersede"; byRunId: string }
+  /** A curated session event, forwarded only for sessions bound with
+   * `relay: true` (an installed handler consumes them; nothing else does). */
+  | { kind: "session_event"; sessionId: string; event: CuratedEvent };
 
 export interface AutomationSender {
   send(runId: string, message: AutomationInbox, idempotencyKey: string): Promise<void>;
@@ -51,6 +54,8 @@ export const inboxKeys = {
   sessionIdle: (sessionId: string, eventIdx: bigint | number): string =>
     `autorun:${sessionId}:idle:${eventIdx}`,
   sessionEnded: (sessionId: string): string => `autorun:${sessionId}:terminal`,
+  sessionEvent: (sessionId: string, eventIdx: bigint | number): string =>
+    `autorun:${sessionId}:event:${eventIdx}`,
   signal: (sessionId: string, name: string, toolCallId: string): string =>
     `autorun:${sessionId}:signal:${name}:${toolCallId}`,
   joinedEvent: (deliveryKey: string, runId: string): string =>

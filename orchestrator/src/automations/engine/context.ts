@@ -56,7 +56,20 @@ export interface RunContext {
   loop?: { index: number };
   /** Set by the interpreter for the duration of one block's execute/wait. */
   currentBlockId?: string;
+  /** The block's frame path (`loop[2].post`, `__finalize__.recap`): the
+   * run-durable identity of THIS execution. Every idempotency key a block
+   * mints (prompt ids, action client ids, markers) derives from it, never
+   * from `currentBlockId` — a block inside a loop runs once per iteration
+   * and each must reach its own external resource. */
+  currentPath?: string;
   currentAttempt?: number;
+  /** The installed handler's state as of its previous invocation (contract
+   * 3, see BlockExecutor.onMessage): a checkpointed step output, so it
+   * survives recovery. Seeded from the install step's `outputs.handler_state`. */
+  handlerState?: Record<string, unknown>;
+  /** Set once the run has a terminal status, before finalize hooks run, so
+   * a hook's templates can read `run.status` / `run.error`. */
+  terminal?: { status: string; error?: string };
   /** True for an editor DryRun (see RunSnapshot.dryRun). */
   dryRun: boolean;
   deps: EngineDeps;
@@ -108,7 +121,13 @@ export function buildRunContext(
         trigger: ctx.trigger,
         event: ctx.event,
         steps: ctx.steps,
-        run: { id: runId, automation: { id: ctx.automationId, name: ctx.automationName } },
+        run: {
+          id: runId,
+          automation: { id: ctx.automationId, name: ctx.automationName },
+          ...(ctx.terminal
+            ? { status: ctx.terminal.status, error: ctx.terminal.error ?? "" }
+            : {}),
+        },
       };
     },
     async render(template: string): Promise<string> {

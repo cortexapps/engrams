@@ -8,40 +8,6 @@ export function isActiveRunStatus(status: string): boolean {
   return ACTIVE_RUN_STATUSES.has(status);
 }
 
-/** Status → instrument tone. Lime is the accent, never a status colour
- * (web/DESIGN.md); filtered/superseded/halted are muted, not alarming. */
-export type RunTone = "caution" | "nominal" | "critical" | "muted";
-
-export function runTone(status: string): RunTone {
-  switch (status) {
-    case "pending":
-    case "running":
-    case "waiting":
-      return "caution";
-    case "completed":
-    case "succeeded":
-      return "nominal";
-    case "failed":
-    case "deadline":
-      return "critical";
-    default:
-      return "muted";
-  }
-}
-
-export function toneDotClass(tone: RunTone): string {
-  switch (tone) {
-    case "caution":
-      return "bg-instrument-caution";
-    case "nominal":
-      return "bg-instrument-nominal";
-    case "critical":
-      return "bg-instrument-critical";
-    case "muted":
-      return "bg-muted-foreground/50";
-  }
-}
-
 export function runStatusLabel(status: string): string {
   return status.replaceAll("_", " ");
 }

@@ -1037,6 +1037,10 @@ export const reviewEnrollment = pgTable("review_enrollment", {
   triggerMode: text("trigger_mode").notNull().default("manual"), // auto|manual
   autofix: text("autofix").notNull().default("off"), // auto|manual|off
   profileId: text("profile_id").references(() => profile.id),
+  // ADR 0119 phase 4.4: which engine reviews this repo during the parallel
+  // window. legacy = the hand-written PrReviewWorkflow; automation = the
+  // seeded PR-review built-in. Dropped with this table in phase 4.7.
+  engine: text("engine").notNull().default("legacy"), // legacy|automation
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true })
     .notNull()
@@ -1528,6 +1532,10 @@ export const automationSession = pgTable(
     role: text("role").notNull().default("primary"),
     /** ADR 0119 D8: finalize ends only keep=false sessions. */
     keep: boolean("keep").notNull().default(true),
+    /** Contract 3: an installed relay wants this session's CURATED events
+     * forwarded to the run mailbox (not just idle/terminal). Set by the relay
+     * block when it installs; the automation consumer gates on it. */
+    relay: boolean("relay").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index("automation_session_run_idx").on(t.runId)],

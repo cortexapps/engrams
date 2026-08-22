@@ -18,6 +18,7 @@ const PATH = "/api/v1/integrations/github/events";
 const enrollment: EnrollmentRow = {
   repo: "openai/engrams",
   triggerMode: "auto",
+  engine: "legacy" as const,
   autofix: "off",
   profileId: null,
   createdAt: new Date("2026-07-17T00:00:00Z"),
@@ -109,7 +110,7 @@ export function fakeIngress() {
       if (!duplicate) recorded.push(input);
       return { recorded: !duplicate };
     },
-    async sweepExpired() {
+    async sweep() {
       return 0;
     },
     async list() {
@@ -136,12 +137,13 @@ export function fakeIngress() {
       connectionIdFor: async (provider: string) => `conn-${provider}`,
       dispatch: async (input: IntegrationEventDispatchInput) => {
         dispatched.push(input);
+        return undefined;
       },
     },
   };
 }
 
-function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
+function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment, reviewAutomationDisabled = false) {
   const dispatches: DispatchReviewInput[] = [];
   const ingresses: ReviewIngressStart[] = [];
   const refreshes: UpsertReviewTargetInput[] = [];
@@ -156,6 +158,7 @@ function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
       ingress: ingress.deps,
       webhookSecret: async () => SECRET,
       mentionHandle: "acme-reviewer",
+      reviewAutomationDisabled,
       enrollments: { get: async () => enrolled ? enrollmentRow : null },
       dispatch: async (input) => {
         dispatches.push(input);
@@ -177,6 +180,73 @@ function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
     }),
   };
 }
+
+const autoAutomationEnrollment: EnrollmentRow = { ...enrollment, engine: "automation" };
+
+describe("the automation-engine route branch (ADR 0119 phase 4.4)", () => {
+  test("an automation-engine repo skips legacy ingress, still refreshes the target, and the spine dispatched", async () => {
+    const body = pullRequestBody("opened", false);
+    const fixture = app(true, autoAutomationEnrollment);
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.ingresses).toEqual([]); // no legacy ingress
+    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.refreshes).toHaveLength(1); // dossier target kept fresh
+    expect(fixture.integrationDispatches).toHaveLength(1); // spine → built-in
+  });
+
+  test("the kill switch forces an automation repo back onto legacy ingress", async () => {
+    const body = pullRequestBody("opened", false);
+    const fixture = app(true, autoAutomationEnrollment, /* reviewAutomationDisabled */ true);
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.ingresses).toHaveLength(1); // legacy ingress ran
+    expect(fixture.integrationDispatches).toHaveLength(1); // spine always ledgers+dispatches
+  });
+
+  test("a legacy repo is unchanged: legacy ingress starts", async () => {
+    const body = pullRequestBody("opened", false);
+    const fixture = app(true, enrollment); // engine "legacy"
+    await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+    expect(fixture.ingresses).toHaveLength(1);
+  });
+
+  test("an @mention review on an automation repo skips legacy ingress", async () => {
+    const body = commentBody("@acme-reviewer review", "MEMBER", "User");
+    const fixture = app(true, autoAutomationEnrollment);
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "issue_comment"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.ingresses).toEqual([]);
+    expect(fixture.integrationDispatches).toHaveLength(1);
+  });
+
+  test("an @mention review on a legacy repo still starts legacy ingress", async () => {
+    const body = commentBody("@acme-reviewer review", "MEMBER", "User");
+    const fixture = app(true, enrollment);
+    await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "issue_comment"),
+    });
+    expect(fixture.ingresses).toHaveLength(1);
+  });
+});
 
 const manualEnrollment: EnrollmentRow = { ...enrollment, triggerMode: "manual" };
 
@@ -577,6 +647,9 @@ describe("ingress → integration-trigger dispatch (2.C)", () => {
         },
         async claimConcurrency() {
           return { claimed: true } as const;
+        },
+        async getConcurrencyHolder() {
+          return null;
         },
         async casConcurrency() {
           return true;

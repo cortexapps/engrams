@@ -9,6 +9,7 @@
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
+import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
 
 import {
@@ -227,6 +228,38 @@ export async function admitAutomationRun(
 
   const key = await renderConcurrencyKey(concurrency.keyTemplate, target, trigger);
 
+  const joinHolder = async (holderRunId: string): Promise<"joined"> => {
+    // No run row: the delivery joins the holder's mailbox.
+    await deps.sender.send(
+      holderRunId,
+      {
+        kind: "event",
+        eventKey: trigger.eventKey ?? trigger.source,
+        deliveryKey,
+        payload: trigger.payload ?? {},
+        receivedAt: trigger.receivedAt ?? deps.now().toISOString(),
+      },
+      inboxKeys.joinedEvent(deliveryKey, holderRunId),
+    );
+    return "joined";
+  };
+
+  // A continue-only event (trigger.continueOnly) belongs to an ACTIVE run or
+  // to nobody: it never claims the key, so it can never open a run. This is
+  // the one place that invariant lives — a Slack thread reply in a flagged
+  // channel continues the thread the bot was mentioned in, and a reply in
+  // any other thread is dropped here without a run row (validation pins
+  // continueOnly to policy join).
+  const triggerSpec = target.definition.trigger;
+  if (
+    triggerSpec.kind === "integration" &&
+    trigger.eventKey !== undefined &&
+    triggerSpec.continueOnly?.includes(trigger.eventKey)
+  ) {
+    const holder = await deps.store.getConcurrencyHolder(automationId, key);
+    return holder === null ? "skipped" : joinHolder(holder);
+  }
+
   const claim = await deps.store.claimConcurrency(automationId, key, runId);
   if (claim.claimed) {
     await startRun(key);
@@ -234,21 +267,8 @@ export async function admitAutomationRun(
   }
 
   switch (concurrency.policy) {
-    case "join": {
-      // No run row: the delivery joins the holder's mailbox.
-      await deps.sender.send(
-        claim.holderRunId,
-        {
-          kind: "event",
-          eventKey: trigger.eventKey ?? trigger.source,
-          deliveryKey,
-          payload: trigger.payload ?? {},
-          receivedAt: trigger.receivedAt ?? deps.now().toISOString(),
-        },
-        inboxKeys.joinedEvent(deliveryKey, claim.holderRunId),
-      );
-      return "joined";
-    }
+    case "join":
+      return joinHolder(claim.holderRunId);
     case "queue": {
       await deps.store.insertRun({
         id: runId,
@@ -379,7 +399,21 @@ export interface IntegrationDispatchStore extends AutomationDispatchStore {
   ): Promise<DispatchTarget[]>;
 }
 
+/** Built-in keys whose kill switch is ON. Resolved from config by default;
+ * tests inject. Each built-in's switch registers its key here — one line per
+ * switch, so the dispatcher gate and the route fallback can never disagree.
+ * "pr_review" ← ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED (4.4). */
+export function disabledBuiltinsFromConfig(): ReadonlySet<string> {
+  const keys: string[] = [];
+  if (config.reviewAutomationDisabled) keys.push("pr_review");
+  // "slack_brain" ← ORCHESTRATOR_SLACK_AUTOMATION_DISABLED (4.6).
+  if (config.slackAutomationDisabled) keys.push("slack_brain");
+  return new Set(keys);
+}
+
 export interface DispatchIntegrationDeps {
+  /** Kill-switched built-in keys; their triggers never admit a run. */
+  disabledBuiltins?: ReadonlySet<string>;
   store?: IntegrationDispatchStore;
   workflowStarter?: AutomationWebhookStarter;
   sender?: AutomationSender;
@@ -394,6 +428,22 @@ export interface DispatchIntegrationResult {
   skipped: number;
   /** Targets whose admission threw; the dispatcher rethrows after the loop. */
   failed: number;
+  /** Admission outcome per matched BUILT-IN (keyed by builtin key). This is
+   * what a legacy route consults to decide whether the engine took the
+   * delivery: a built-in absent here (not enabled, kill-switched, scope did
+   * not match) or `skipped` leaves the legacy path in charge. The same
+   * read the dispatcher made — never a second, possibly stale, lookup. */
+  builtins: Record<string, AdmitOutcome>;
+}
+
+/** Did the dispatcher hand this delivery to the built-in — a run started,
+ * joined, or queued for it? */
+export function builtinTookDelivery(
+  result: DispatchIntegrationResult | undefined,
+  builtinKey: string,
+): boolean {
+  const outcome = result?.builtins[builtinKey];
+  return outcome !== undefined && outcome !== "skipped";
 }
 
 /** Providers whose scope noun compares case-insensitively (GitHub owner/repo).
@@ -452,10 +502,22 @@ export async function dispatchIntegrationEvent(
   const starter = deps.workflowStarter ?? defaultWorkflowStarter();
   const sender = deps.sender ?? defaultAutomationSender;
   const now = deps.now ?? (() => new Date());
+  const disabledBuiltins = deps.disabledBuiltins ?? disabledBuiltinsFromConfig();
 
   const targets = (
     await store.listEnabledForIntegrationTrigger(input.provider, input.connectionId)
   ).filter((target) => {
+    // A built-in's kill switch must stop its TRIGGER path too, not only the
+    // legacy route's fallback: otherwise a flagged repo/channel is served by
+    // both brains at once (the legacy graph via the route, the built-in via
+    // this dispatcher). The switch is the fleet-wide brake; the built-in's
+    // own `enabled` toggle is the independent second one.
+    if (
+      target.automation.builtinKey !== null &&
+      disabledBuiltins.has(target.automation.builtinKey)
+    ) {
+      return false;
+    }
     const trigger = target.definition.trigger;
     if (trigger.kind !== "integration") return false;
     return matchesIntegrationTrigger(
@@ -477,6 +539,7 @@ export async function dispatchIntegrationEvent(
     queued: 0,
     skipped: 0,
     failed: 0,
+    builtins: {},
   };
 
   // Each target is admitted in isolation: one transient fault must never drop
@@ -506,6 +569,9 @@ export async function dispatchIntegrationEvent(
         { store, starter, sender, now },
       );
       result[outcome] += 1;
+      if (target.automation.builtinKey !== null) {
+        result.builtins[target.automation.builtinKey] = outcome;
+      }
     } catch (error) {
       result.failed += 1;
       failures.push({ automationId: target.automation.id, error });
