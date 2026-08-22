@@ -41,6 +41,9 @@ export interface BlockWaitSpec<C> {
   ): Record<string, unknown> | "ignore" | null;
   /** Step outputs when the deadline expires (typed outcome, not an error). */
   onDeadline?(config: C, ctx: RunContext): Record<string, unknown>;
+  /** Step outputs a dry run substitutes for the wait (nothing can arrive).
+   * Default: `{ outcome: "completed" }` — the happy path. */
+  dryRunOutcome?(config: C, ctx: RunContext): Record<string, unknown>;
 }
 
 export interface BlockExecutor<C = unknown> {

@@ -66,6 +66,11 @@ export function registerWaitEventBlock(): void {
       onDeadline() {
         return { outcome: "deadline" };
       },
+      // A dry run routes no events, so the wait "expires" at once; a loop's
+      // `until` on outcome=deadline then exits the way a quiet thread does.
+      dryRunOutcome() {
+        return { outcome: "deadline" };
+      },
     },
   });
 }

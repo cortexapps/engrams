@@ -118,6 +118,22 @@ async function executeCreateSession(
       : undefined;
   const ownerUserId =
     config.ownerUserId !== undefined ? await renderIfTemplated(ctx, config.ownerUserId) : "";
+  if (ctx.dryRun) {
+    // A dry run boots nothing. The fake session id keeps `{blockId}` session
+    // refs resolvable so the rest of the graph renders; no binding row is
+    // written, so finalize has nothing to end and nothing ever signals it.
+    return {
+      kind: "ok",
+      outputs: {
+        session_id: dryRunSessionId(ctx),
+        task_id: "",
+        initial_prompt: prompt.length > 0,
+        prompt,
+        dry_run: true,
+        would_execute: { profile_id: profileId, title, owner_user_id: ownerUserId || null },
+      },
+    };
+  }
   const created = await ctx.deps.sessions.createSession({
     runId: ctx.runId,
     blockId: currentBlockId(ctx),
@@ -167,6 +183,12 @@ async function renderIfTemplated(ctx: RunContext, value: string): Promise<string
 function currentBlockId(ctx: RunContext): string {
   if (ctx.currentBlockId === undefined) throw new Error("engine bug: currentBlockId missing");
   return ctx.currentBlockId;
+}
+
+/** Deterministic per-block fake id for dry runs (`dry-run:<runId>:<path>`):
+ * recognisable in the timeline and never a real session. */
+function dryRunSessionId(ctx: RunContext): string {
+  return `dry-run:${ctx.runId}:${currentPath(ctx)}`;
 }
 
 function currentPath(ctx: RunContext): string {
@@ -219,6 +241,12 @@ export function registerSessionBlocks(): void {
       // (ON CONFLICT DO NOTHING), so a send_prompt inside a loop must mint
       // a new id per iteration or every prompt after the first is dropped.
       const promptId = `autorun:${ctx.runId}:${currentPath(ctx)}:${sessionId}`;
+      if (ctx.dryRun) {
+        return {
+          kind: "ok",
+          outputs: { session_id: sessionId, sent: false, dry_run: true, would_execute: { prompt: text } },
+        };
+      }
       await ctx.deps.sessions.sendPrompt(sessionId, promptId, text, config.harnessMode);
       return { kind: "ok", outputs: { session_id: sessionId, sent: true } };
     },
@@ -266,6 +294,7 @@ export function registerSessionBlocks(): void {
     configSchema: endSessionConfigSchema,
     async execute(config, ctx) {
       const sessionId = await ctx.resolveSession(config.session);
+      if (ctx.dryRun) return { kind: "ok", outputs: { session_id: sessionId, ended: false, dry_run: true } };
       await ctx.deps.sessions.endSession(sessionId);
       return { kind: "ok", outputs: { session_id: sessionId, ended: true } };
     },
