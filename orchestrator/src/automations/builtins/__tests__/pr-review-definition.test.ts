@@ -3,7 +3,12 @@ import { describe, expect, test } from "bun:test";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import { validateDefinition, applyBlockOverrides } from "../../engine/definition.ts";
 import { evaluateCode } from "../../code/sandbox.ts";
-import { PR_REVIEW_BUILTIN, PR_REVIEW_DEFINITION, REVIEW_FACTS_SOURCE } from "../pr-review.ts";
+import {
+  PR_REVIEW_BUILTIN,
+  PR_REVIEW_DEFINITION,
+  REVIEW_FACTS_SOURCE,
+  defaultMentionHandle,
+} from "../pr-review.ts";
 
 registerEngineBlocks();
 
@@ -135,5 +140,14 @@ describe("review facts predicate (QuickJS)", () => {
     if (outsider.ok) expect(outsider.value).toBeNull();
     const chatter = await run(commentEvent("nice work @engrams"), { event: "issue_comment.created" });
     if (chatter.ok) expect(chatter.value).toBeNull();
+  });
+});
+
+describe("defaultMentionHandle", () => {
+  test("derives from the App login, tolerating @ and [bot]; blank keeps the placeholder", () => {
+    expect(defaultMentionHandle("engrams-agent")).toBe("@engrams-agent");
+    expect(defaultMentionHandle("@engrams-agent[bot]")).toBe("@engrams-agent");
+    expect(defaultMentionHandle("  ")).toBe("@engrams");
+    expect(defaultMentionHandle("")).toBe("@engrams");
   });
 });
