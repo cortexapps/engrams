@@ -38,6 +38,7 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     statusCommentId: null,
     finderSessionId: null,
     verifierSessionId: null,
+    automationRunId: null,
     summaryMd: null,
     providerId: null,
     prUrl: null,
@@ -154,6 +155,7 @@ function fakeReviewStore(options: {
     },
     async setStatusCommentId() {},
     async setReviewSessionId() {},
+    async setAutomationRunId() {},
     async recordEvent() {},
     async listEvents() {
       return [];

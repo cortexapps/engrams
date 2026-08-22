@@ -191,6 +191,16 @@ export interface ReviewControlPlane {
     repo: string;
     prNumber: number;
   }): Promise<void>;
+  /** ADR 0119 phase 4: the decision + persistence half of `postReviewResults`
+   *  without the GitHub post. Settles every finding into its decided state,
+   *  finalizes the review, and returns the payload the generic
+   *  `github.post_pr_review` action posts. Retires the verifier worker first
+   *  (best-effort) when a session id is given. The legacy workflow keeps
+   *  calling `postReviewResults` end to end. */
+  decideReviewResults(
+    reviewId: string,
+    opts?: { sessionId?: string },
+  ): Promise<ReviewPostPayload>;
   /** Post the review results. Retires the verifier worker first (best-effort)
    *  when a session id is given, so a stray worker never blocks the post. */
   postReviewResults(
@@ -242,8 +252,19 @@ type CreateExistingTaskSession = (
   params: CreateSessionForExistingTaskParams,
 ) => Promise<{ sessionId: string }>;
 
+/** Where a worker session's reverse binding (session → its driver) lives.
+ * The legacy DBOS graph records `review_session` (→ review workflow id);
+ * the ADR 0119 built-in records `automation_session` (→ run id) through the
+ * engine's store. Injected so this library stays driver-agnostic. */
+export interface ReviewSessionBinding {
+  record(sessionId: string, role: "finder" | "verifier", legacyWorkflowId: string): Promise<void>;
+  remove(sessionId: string): Promise<void>;
+}
+
 export interface ReviewControlPlaneDeps {
   reviews?: ReviewControlPlaneStore;
+  /** Defaults to the legacy `review_session` store. */
+  sessionBinding?: ReviewSessionBinding;
   db?: ReturnType<typeof getDb>;
   sessions?: ReviewSessionsClient;
   profiles?: Pick<ProfileStore, "getActive" | "getByDesignation">;
@@ -270,10 +291,62 @@ export interface ReviewControlPlaneDeps {
   ) => Promise<void>;
 }
 
+/** What the built-in's GitHub action posts (ADR 0119 phase 4). The summary
+ * carries the `<!-- engrams-review:<id> -->` marker so the action's
+ * already-posted scan is crash-safe, exactly like the legacy poster. */
+export interface ReviewPostPayload {
+  review_id: string;
+  repo: string;
+  pr_number: number;
+  commit_id: string;
+  summary_md: string;
+  comments: Array<{
+    finding_id: string;
+    path: string;
+    line: number;
+    side: string;
+    start_line?: number;
+    body: string;
+  }>;
+  to_post_count: number;
+  ui_only_count: number;
+}
+
 /** Human detail for a `posted` activity-log entry. */
 function postedSummary(count: number): string {
   if (count === 0) return "No findings";
   return `${count} finding${count === 1 ? "" : "s"} posted`;
+}
+
+/** Settle every finding into its decided terminal state. Idempotent, so it
+ * is safe on a replayed engine step. A module-level twin of the closure
+ * inside the legacy `postReviewResults` (left untouched on purpose). */
+async function settleFindingStates(
+  store: Pick<ReviewControlPlaneStore, "updateFindingState">,
+  settled: PolicyDecision,
+  inlinePosted: boolean,
+): Promise<void> {
+  for (const item of settled.toPost) {
+    await store.updateFindingState(
+      item.finding.id,
+      inlinePosted ? "posted" : "ui_only",
+      item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
+    );
+  }
+  for (const item of settled.uiOnly) {
+    await store.updateFindingState(
+      item.finding.id,
+      "ui_only",
+      item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
+    );
+  }
+  for (const item of settled.suppressed) {
+    await store.updateFindingState(
+      item.finding.id,
+      item.state,
+      item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
+    );
+  }
 }
 
 export class ReviewSetupError extends Error {
@@ -283,12 +356,12 @@ export class ReviewSetupError extends Error {
   }
 }
 
-const FINDER_SYSTEM_PROMPT = [
+export const FINDER_SYSTEM_PROMPT = [
   "You are the finder for an automated pull-request review.",
   "Read /workspace/.review/finder.md and follow it. Never edit files, never push, and report findings only through the provided tools.",
 ].join("\n");
 
-const VERIFIER_SYSTEM_PROMPT = [
+export const VERIFIER_SYSTEM_PROMPT = [
   "You are the verifier for an automated pull-request review.",
   "Read /workspace/.review/verifier.md and follow it. Refute each finding; confirm only what you can reproduce from code you read, and report every judgment through submit_verdict.",
 ].join("\n");
@@ -315,11 +388,11 @@ function clipPriorText(text: string): string {
 // Security clamp: reviewer workers may read only the reviewed repo, while the
 // orchestrator remains the sole GitHub writer. Direct clone/codeload hosts are
 // explicit because the GitHub connector itself declares only api.github.com.
-const REVIEW_CAPABILITIES = (repo: string): readonly string[] => [
+export const REVIEW_CAPABILITIES = (repo: string): readonly string[] => [
   "engram:pr_review",
   `github:contents:read@${repo}`,
 ];
-const REVIEW_NETWORK: ProfileNetwork = {
+export const REVIEW_NETWORK: ProfileNetwork = {
   default: "deny",
   allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
   allowHostPatterns: [],
@@ -464,6 +537,11 @@ export function makeReviewControlPlane(
   const reviewSessions = () => (
     reviewSessionStore ??= makeReviewSessionStore(db())
   );
+  const binding: ReviewSessionBinding = deps.sessionBinding ?? {
+    record: (sessionId, role, legacyWorkflowId) =>
+      reviewSessions().record(sessionId, legacyWorkflowId, role),
+    remove: (sessionId) => reviewSessions().remove(sessionId),
+  };
   const renderReviewer = deps.renderReviewer ?? defaultRenderReviewer;
   const githubPoster = deps.githubPoster ?? makeGithubReviewPoster();
 
@@ -538,7 +616,7 @@ export function makeReviewControlPlane(
         "review worker session was already absent during cleanup",
       );
     }
-    await reviewSessions().remove(sessionId);
+    await binding.remove(sessionId);
   };
   // Best-effort cleanup for the terminal paths: a worker that will not tear down
   // must never block the review from settling into failed/halted.
@@ -827,11 +905,7 @@ export function makeReviewControlPlane(
           prNumber: input.prNumber,
         },
       });
-      await reviewSessions().record(
-        created.sessionId,
-        input.workflowId,
-        "finder",
-      );
+      await binding.record(created.sessionId, "finder", input.workflowId);
       // Stamp the session on the review at kickoff so the UI can offer a live
       // "watch" link the moment the finding phase starts.
       await reviews().setReviewSessionId(input.reviewId, "finder", created.sessionId);
@@ -1006,11 +1080,7 @@ export function makeReviewControlPlane(
           prNumber: input.prNumber,
         },
       });
-      await reviewSessions().record(
-        created.sessionId,
-        input.workflowId,
-        "verifier",
-      );
+      await binding.record(created.sessionId, "verifier", input.workflowId);
       await reviews().setReviewSessionId(input.reviewId, "verifier", created.sessionId);
       await recordEvent(input.reviewId, "verifier_started");
       await registerSessionListener(created.sessionId);
@@ -1106,6 +1176,67 @@ export function makeReviewControlPlane(
         `${candidateCount} candidate finding${candidateCount === 1 ? "" : "s"}`,
       );
       await ackStatus(input.reviewId, "verifying", candidateCount);
+    },
+
+    async decideReviewResults(reviewId, opts = {}) {
+      await cleanupWorkerSession(opts.sessionId);
+      const detail = await reviews().getReview(reviewId);
+      if (!detail) throw new Error(`review not found: ${reviewId}`);
+      const { repo, prNumber } = detail.review;
+      let { headSha, baseSha } = detail.review;
+      if (headSha === "" || baseSha === "") {
+        const live = await githubPoster.fetchPrContext(repo, prNumber);
+        if (headSha === "") headSha = live.headSha;
+        if (baseSha === "") baseSha = live.baseSha;
+        await reviews().finalizeReview(reviewId, {
+          status: detail.review.status,
+          summaryMd: detail.review.summaryMd ?? "",
+          headSha,
+          baseSha,
+        });
+      }
+      const decision = buildDecision(detail);
+      const comments = decision.toPost.map((item) => {
+        const line = item.finding.endLine ?? item.finding.startLine;
+        if (line == null) {
+          throw new Error(`finding ${item.finding.id} has no inline anchor`);
+        }
+        const startLine = item.finding.startLine;
+        return {
+          finding_id: item.finding.id,
+          path: item.finding.path,
+          line,
+          side: item.finding.side ?? "RIGHT",
+          ...(startLine != null && startLine !== line ? { start_line: startLine } : {}),
+          body: buildInlineCommentBody(item.finding),
+        };
+      });
+      // Findings settle as if the inline comments land; the action reports
+      // a 422 summary-only fallback on its own outputs for the dossier.
+      await settleFindingStates(reviews(), decision, true);
+      const summaryMd = buildReviewSummary({
+        reviewId,
+        reviewUrl: reviewsPageUrl,
+        decision,
+        inlinePosted: true,
+      });
+      const finalized = await reviews().finalizeReview(reviewId, {
+        status: "posted",
+        summaryMd,
+      });
+      if (!finalized) logRefusedTransition(reviewId, "posted");
+      const surfaced = decision.toPost.length + decision.uiOnly.length;
+      await recordEvent(reviewId, "posted", postedSummary(surfaced));
+      return {
+        review_id: reviewId,
+        repo,
+        pr_number: prNumber,
+        commit_id: headSha,
+        summary_md: summaryMd,
+        comments,
+        to_post_count: decision.toPost.length,
+        ui_only_count: decision.uiOnly.length,
+      };
     },
 
     async postReviewResults(reviewId, opts = {}) {

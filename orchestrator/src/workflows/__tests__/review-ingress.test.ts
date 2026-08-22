@@ -58,6 +58,9 @@ function controlPlane(
     failReview: async () => {},
     haltReview: async () => {},
     cleanupSupersededReview: async () => {},
+    decideReviewResults: async () => {
+      throw new Error("not used");
+    },
     ...overrides,
   };
 }

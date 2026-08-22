@@ -70,6 +70,9 @@ function recordingControlPlane(
     cleanupSupersededReview: async () => {
       rec("cleanupSupersededReview", undefined);
     },
+    decideReviewResults: async () => {
+      throw new Error("not used by the legacy workflow");
+    },
   };
 }
 
