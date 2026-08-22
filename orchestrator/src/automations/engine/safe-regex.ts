@@ -41,7 +41,9 @@ export function assertSafeRegex(pattern: string): void {
   // `heightOfLast` is the star height of the atom a quantifier would apply
   // to (0 for a plain atom, n+1 for a group whose content has height n).
   const stack: number[] = [];
-  /** Per open group: whether a top-level `|` was seen inside it. */
+  /** Per open group: whether a `|` was seen inside it AT ANY DEPTH. Like
+   * star height, the signal propagates up on `)`: `((a|aa))+` is the same
+   * machine as `(a|aa)+`. */
   const altStack: boolean[] = [];
   let current = 0;
   let currentHasAlt = false;
@@ -109,7 +111,7 @@ export function assertSafeRegex(pattern: string): void {
         current = Math.max(stack.pop() ?? 0, inner);
         heightOfLast = inner;
         lastIsAltGroup = currentHasAlt;
-        currentHasAlt = altStack.pop() ?? false;
+        currentHasAlt = (altStack.pop() ?? false) || currentHasAlt;
         i += 1;
         break;
       }

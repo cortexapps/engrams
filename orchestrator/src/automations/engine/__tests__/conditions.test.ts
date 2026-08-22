@@ -49,7 +49,7 @@ describe("parseFilterGroup", () => {
   });
 
   test("rejects patterns that backtrack super-linearly", () => {
-    for (const value of ["(a+)+$", "(.*)*x", "(\\w+\\s?)*$", "(a|aa)+$", "(a)\\1", "(?<n>a)\\k<n>", "a{1,500}", "(a{2,}){2}"]) {
+    for (const value of ["(a+)+$", "(.*)*x", "(\\w+\\s?)*$", "(a|aa)+$", "((a|aa))+$", "((foo|foobar)x?)+", "(?:(?:a|b)c)*", "(a)\\1", "(?<n>a)\\k<n>", "a{1,500}", "(a{2,}){2}"]) {
       expect(() => parseFilterGroup(group([{ path: "a", op: "matches", value }]))).toThrow(
         ConditionParseError,
       );
