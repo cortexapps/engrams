@@ -52,6 +52,9 @@ export interface SpecTicketTreeProps {
 export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps) {
   const [selected, setSelected] = useState<string[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
+  // Only a row this session just created takes focus; expanding an existing
+  // row to read it must not move the cursor.
+  const [focusTitleId, setFocusTitleId] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   // The row being dragged also lives in a ref. The drop must know it whether
   // or not a re-render landed between `dragstart` and `drop`; state alone
@@ -70,19 +73,47 @@ export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps)
   }, [tree]);
 
   /** Show `optimistic` at once, then keep whatever the server stored. */
-  async function run(command: SpecTicketCommand, optimistic?: SpecTicketTree): Promise<void> {
+  async function run(
+    command: SpecTicketCommand,
+    optimistic?: SpecTicketTree,
+  ): Promise<SpecTicketTree | null> {
     const before = live.current;
     if (optimistic) onTree(optimistic);
     setError(null);
     setPending(true);
     try {
-      onTree(await onCommand(command));
+      const stored = await onCommand(command);
+      onTree(stored);
+      return stored;
     } catch (failure) {
       onTree(before);
       setError(failure instanceof Error ? failure.message : "The change did not land.");
+      return null;
     } finally {
       setPending(false);
     }
+  }
+
+  /**
+   * Add a ticket and open it on its title.
+   *
+   * A new row is called "New ticket" and its title only becomes editable once
+   * the row is expanded, so adding one used to leave the reader looking at a
+   * placeholder with no visible way into it.
+   */
+  async function addTicket() {
+    const before = new Set(live.current.tickets.map((ticket) => ticket.id));
+    const stored = await run({
+      kind: "add",
+      parentId: null,
+      title: "New ticket",
+      body: "",
+      sectionId: live.current.sections[0]?.id ?? "",
+    });
+    const added = stored?.tickets.find((ticket) => !before.has(ticket.id));
+    if (!added) return;
+    setEditingId(added.id);
+    setFocusTitleId(added.id);
   }
 
   /**
@@ -144,20 +175,7 @@ export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps)
           >
             <Merge aria-hidden /> Merge {selected.length > 1 ? selected.length : ""}
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={pending}
-            onClick={() =>
-              void run({
-                kind: "add",
-                parentId: null,
-                title: "New ticket",
-                body: "",
-                sectionId: tree.sections[0]?.id ?? "",
-              })
-            }
-          >
+          <Button variant="outline" size="sm" disabled={pending} onClick={() => void addTicket()}>
             <Plus aria-hidden /> Add ticket
           </Button>
         </div>
@@ -176,6 +194,7 @@ export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps)
             ticket={ticket}
             selected={selected.includes(ticket.id)}
             editing={editingId === ticket.id}
+            focusTitle={focusTitleId === ticket.id}
             dragging={draggingId === ticket.id}
             dropTarget={dropTarget === ticket.id}
             disabled={pending}
@@ -264,6 +283,7 @@ interface TicketRowProps {
   ticket: SpecTicket;
   selected: boolean;
   editing: boolean;
+  focusTitle: boolean;
   dragging: boolean;
   dropTarget: boolean;
   disabled: boolean;
@@ -373,7 +393,12 @@ function TicketRow(props: TicketRowProps) {
         </div>
       </div>
       {props.editing && (
-        <TicketEditor ticket={ticket} sections={props.sections} onSave={props.onSave} />
+        <TicketEditor
+          ticket={ticket}
+          sections={props.sections}
+          onSave={props.onSave}
+          focusTitle={props.focusTitle}
+        />
       )}
     </li>
   );
@@ -383,10 +408,12 @@ function TicketEditor({
   ticket,
   sections,
   onSave,
+  focusTitle,
 }: {
   ticket: SpecTicket;
   sections: Array<{ id: string; title: string }>;
   onSave: (changes: { title: string; body: string; sectionId: string }) => void;
+  focusTitle: boolean;
 }) {
   const [title, setTitle] = useState(ticket.title);
   const [body, setBody] = useState(ticket.body);
@@ -401,7 +428,11 @@ function TicketEditor({
     >
       <label>
         Title
-        <Input value={title} onChange={(event) => setTitle(event.target.value)} />
+        <Input
+          autoFocus={focusTitle}
+          value={title}
+          onChange={(event) => setTitle(event.target.value)}
+        />
       </label>
       <label>
         Description
