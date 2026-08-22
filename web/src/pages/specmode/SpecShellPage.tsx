@@ -277,6 +277,24 @@ const LINK_VISIBLE_AFTER_FAILURES = 3;
 const LINK_STOP_AFTER_FAILURES = 10;
 
 /**
+ * A transient verdict must never overwrite a known refusal.
+ *
+ * The classifier's answer arrives asynchronously, but the socket keeps failing
+ * while it is in flight — so the next `connection-close` would re-set
+ * "unreachable" and wipe the specific reason a moment after it appeared.
+ * Caught driving prod: the 401 was fetched correctly and the banner still read
+ * "Cannot reach the document", because a later failure had clobbered it. The
+ * unit tests missed it by emitting exactly the threshold number of failures
+ * and stopping.
+ *
+ * A refusal is terminal — retrying cannot change it — so it wins.
+ */
+const keepRefusal =
+  (next: SpecLinkState) =>
+  (current: SpecLinkState): SpecLinkState =>
+    current.kind === "refused" ? current : next;
+
+/**
  * Why did the socket really fail?
  *
  * The server refuses an upgrade by completing the handshake and closing with
@@ -365,14 +383,14 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
         failures += 1;
         if (failures >= LINK_STOP_AFTER_FAILURES) {
           stopped = true;
-          setLink({ kind: "unreachable", stopped: true });
+          setLink(keepRefusal({ kind: "unreachable", stopped: true }));
           // Deferred for the same reason: break the synchronous re-entry.
           queueMicrotask(() => provider.disconnect());
           void explain();
           return;
         }
         if (failures >= LINK_VISIBLE_AFTER_FAILURES) {
-          setLink({ kind: "unreachable", stopped: false });
+          setLink(keepRefusal({ kind: "unreachable", stopped: false }));
           // Exactly ON the threshold, not past it: one classification when the
           // failure first becomes visible, and one more from the give-up branch
           // above. `failures` resets on sync, so a LATER episode in the same
