@@ -21,6 +21,8 @@ import type { SessionConsumer } from "./consumer.ts";
 
 export interface AutomationSessionBindingRef {
   runId: string;
+  /** The session's run has an installed relay wanting curated events. */
+  relay?: boolean;
 }
 
 export type AutomationMailboxSend = (
@@ -63,6 +65,21 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
       return binding !== null;
     },
     async handle(event, ctx) {
+      // Contract 3: a relay-bound session forwards EVERY curated event so an
+      // installed handler can render the conversation (idle still rides the
+      // dedicated arm below, so wait matchers keep working unchanged). The
+      // relay flag flips AFTER the session exists (when the relay block
+      // installs), so it is re-read per event rather than taken from the
+      // memoized applies-to binding.
+      const live = await deps.findSessionBinding(ctx.sessionId);
+      if (live?.relay === true) {
+        await deps.send(
+          destination().runId,
+          { kind: "session_event", sessionId: ctx.sessionId, event },
+          AUTOMATION_TOPIC,
+          inboxKeys.sessionEvent(ctx.sessionId, event.idx),
+        );
+      }
       // Unlike a review worker, an automation session can go idle once per
       // prompt turn (a kept session takes follow-ups), so the idempotency key
       // carries the event idx — each turn's idle is its own message.
@@ -95,7 +112,7 @@ export function makeProductionAutomationConsumer(): SessionConsumer {
   return makeAutomationConsumer({
     findSessionBinding: async (sessionId) => {
       const binding = await store.findSessionBinding(sessionId);
-      return binding === null ? null : { runId: binding.runId };
+      return binding === null ? null : { runId: binding.runId, relay: binding.relay };
     },
     send: async (destinationId, message, topic, idempotencyKey) => {
       assertIdempotencyKey(idempotencyKey);

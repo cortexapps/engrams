@@ -82,6 +82,8 @@ export interface EngineSessionOps {
     appendSystemPrompt?: string;
   }): Promise<EngineCreateSessionResult>;
   sendPrompt(sessionId: string, promptId: string, text: string, harnessMode?: string): Promise<void>;
+  /** Contract 3: a relay block asks for this session's curated events. */
+  setSessionRelay(sessionId: string, relay: boolean): Promise<void>;
   endSession(sessionId: string): Promise<void>;
   exec(
     sessionId: string,

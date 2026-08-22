@@ -417,8 +417,12 @@ describe("automation engine store (live PG)", () => {
       runId,
       blockId: "launch",
       role: "primary",
+      relay: false,
     });
     expect(await engine.listRunSessions(runId)).toEqual([{ sessionId, keep: false }]);
+    // Contract 3: the relay block flips curated-event forwarding on.
+    await engine.setSessionRelay(sessionId, true);
+    expect((await engine.findSessionBinding(sessionId))?.relay).toBe(true);
   });
 
   test.skipIf(!dbReachable)("delivery-key uniqueness dedupes a redelivery", async () => {

@@ -106,3 +106,72 @@ describe("Automation consumer", () => {
     ]);
   });
 });
+
+
+describe("Automation consumer — relay gate (ADR 0119 phase 4.5)", () => {
+  test("a relay-bound session forwards every curated event with an idx-scoped key; a plain one forwards none", async () => {
+    const sent = sender();
+    const relayBound = makeAutomationConsumer({
+      findSessionBinding: async () => ({ runId: RUN_ID, relay: true }),
+      send: sent.send,
+    });
+    expect(await relayBound.appliesTo("session-1")).toBe(true);
+    await relayBound.handle(
+      { idx: 5n, kind: "agent_message", payloadJson: `{"role":"assistant","text":"hi"}` },
+      { sessionId: "session-1" },
+    );
+    expect(sent.calls).toEqual([
+      {
+        destinationId: RUN_ID,
+        message: {
+          kind: "session_event",
+          sessionId: "session-1",
+          event: { idx: 5n, kind: "agent_message", payloadJson: `{"role":"assistant","text":"hi"}` },
+        },
+        topic: AUTOMATION_TOPIC,
+        idempotencyKey: "autorun:session-1:event:5",
+      },
+    ]);
+
+    const plain = sender();
+    const unbound = makeAutomationConsumer({
+      findSessionBinding: async () => ({ runId: RUN_ID, relay: false }),
+      send: plain.send,
+    });
+    await unbound.appliesTo("session-1");
+    await unbound.handle(
+      { idx: 6n, kind: "agent_message", payloadJson: "{}" },
+      { sessionId: "session-1" },
+    );
+    expect(plain.calls).toEqual([]);
+  });
+
+  test("run_completed on a relay-bound session emits BOTH the curated event and the idle", async () => {
+    const sent = sender();
+    const consumer = makeAutomationConsumer({
+      findSessionBinding: async () => ({ runId: RUN_ID, relay: true }),
+      send: sent.send,
+    });
+    await consumer.appliesTo("session-1");
+    await consumer.handle(
+      { idx: 7n, kind: "run_completed", payloadJson: `{"ok":true}` },
+      { sessionId: "session-1" },
+    );
+    expect(sent.calls.map((c) => c.message.kind)).toEqual(["session_event", "session_idle"]);
+  });
+
+  test("the relay flag is re-read per event, so a flip after install takes effect", async () => {
+    let relay = false;
+    const sent = sender();
+    const consumer = makeAutomationConsumer({
+      findSessionBinding: async () => ({ runId: RUN_ID, relay }),
+      send: sent.send,
+    });
+    await consumer.appliesTo("session-1");
+    await consumer.handle({ idx: 1n, kind: "agent_message", payloadJson: "{}" }, { sessionId: "session-1" });
+    expect(sent.calls).toEqual([]);
+    relay = true; // the relay block installed
+    await consumer.handle({ idx: 2n, kind: "agent_message", payloadJson: "{}" }, { sessionId: "session-1" });
+    expect(sent.calls.map((c) => c.message.kind)).toEqual(["session_event"]);
+  });
+});
