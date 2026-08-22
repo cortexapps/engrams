@@ -4,11 +4,15 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   archiveAutomation,
   createAutomation,
+  duplicateAutomation,
   getAutomation,
   listAutomations,
   listEventSamples,
+  runNow,
   saveVersion,
   setAutomationEnabled,
+  setBlockOverrides,
+  setInputs,
   testRender,
   updateAutomationMeta,
 } from "@/gen/engram/app/v1/automation-AutomationService_connectquery";
@@ -26,6 +30,16 @@ export function useAutomations(includeArchived = false) {
 
 export function useAutomation(id: string | undefined) {
   return useQuery(getAutomation, { lookup: { case: "id", value: id ?? "" } }, { enabled: !!id });
+}
+
+/** A built-in by its stable key (e.g. "pr_review") — resolves to null rather
+ * than erroring when the built-in has not been seeded yet. */
+export function useBuiltinAutomation(builtinKey: string) {
+  return useQuery(
+    getAutomation,
+    { lookup: { case: "builtinKey", value: builtinKey } },
+    { staleTime: 30_000, retry: false },
+  );
 }
 
 export function useAutomationRuns(id: string | undefined, limit = 25) {
@@ -115,6 +129,26 @@ export function useArchiveAutomation() {
 export function useSetAutomationEnabled() {
   const invalidate = useInvalidateAutomations();
   return useMutation(setAutomationEnabled, { onSuccess: invalidate });
+}
+
+export function useDuplicateAutomation() {
+  const invalidate = useInvalidateAutomations();
+  return useMutation(duplicateAutomation, { onSuccess: invalidate });
+}
+
+export function useSetInputs() {
+  const invalidate = useInvalidateAutomations();
+  return useMutation(setInputs, { onSuccess: invalidate });
+}
+
+export function useSetBlockOverrides() {
+  const invalidate = useInvalidateAutomations();
+  return useMutation(setBlockOverrides, { onSuccess: invalidate });
+}
+
+export function useRunNow() {
+  const invalidate = useInvalidateAutomations();
+  return useMutation(runNow, { onSuccess: invalidate });
 }
 
 export function useTestAutomationRender() {
