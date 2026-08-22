@@ -4,7 +4,7 @@ import { fireEvent, screen } from "@testing-library/react";
 import { renderWithProviders } from "@/test-utils";
 import type { AutomationTestState, TestRenderResult } from "@/hooks/useAutomationTest";
 
-import { SamplePicker } from "./SamplePicker";
+import { SamplePicker, toLocalDateTimeInput } from "./SamplePicker";
 import { TestPanel } from "./TestPanel";
 
 const NOW = new Date("2026-08-22T12:00:00Z");
@@ -124,6 +124,29 @@ describe("SamplePicker", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: /now/i }));
     expect(onChange).toHaveBeenCalledWith({ kind: "scheduled", scheduledFor: NOW.toISOString() });
+  });
+
+  it("the scheduled-for input shows the instant it stored — no UTC-offset drift on round-trip", async () => {
+    // onChange interprets the widget as local wall-clock and stores UTC; the
+    // displayed value must convert back, or every edit shifts by the offset.
+    // Timezone-independent: whatever TZ the host runs in, local → UTC → local
+    // is the identity.
+    const local = "2026-08-22T14:00";
+    const storedUtc = new Date(local).toISOString();
+    expect(toLocalDateTimeInput(storedUtc)).toBe(local);
+    expect(toLocalDateTimeInput("not a date")).toBe("");
+
+    renderWithProviders(
+      <SamplePicker
+        timed
+        samples={[]}
+        value={{ kind: "scheduled", scheduledFor: storedUtc }}
+        onChange={vi.fn()}
+        now={NOW}
+      />,
+    );
+    const input = (await screen.findByLabelText("Scheduled for")) as HTMLInputElement;
+    expect(input.value).toBe(local);
   });
 
   it("lists stored samples for event triggers", async () => {

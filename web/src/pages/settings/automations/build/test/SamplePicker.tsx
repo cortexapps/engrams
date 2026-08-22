@@ -46,6 +46,16 @@ export interface SamplePickerProps {
 
 const PASTE = "__paste__";
 
+/** A `datetime-local` input speaks the browser's wall clock; the stored
+ * `scheduledFor` is a UTC instant. Display must convert back to local, or
+ * every round-trip shifts the shown time by the UTC offset. Exported for the
+ * test. */
+export function toLocalDateTimeInput(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+}
+
 export function SamplePicker({ timed, samples, loading, value, onChange, now }: SamplePickerProps) {
   const [pasting, setPasting] = useState(value.kind === "payload");
   const [payloadText, setPayloadText] = useState(value.kind === "payload" ? value.payloadJson : "");
@@ -61,7 +71,7 @@ export function SamplePicker({ timed, samples, loading, value, onChange, now }: 
           id="test-scheduled-for"
           type="datetime-local"
           className="h-8 w-56"
-          value={scheduled ? scheduled.slice(0, 16) : ""}
+          value={scheduled ? toLocalDateTimeInput(scheduled) : ""}
           onChange={(e) => {
             const local = e.target.value;
             if (!local) {
