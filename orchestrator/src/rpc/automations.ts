@@ -78,6 +78,7 @@ import {
   type InputFieldSpec,
 } from "../automations/engine/definition.ts";
 import { previewDefinition } from "../automations/engine/preview.ts";
+import { makeCodeBlockRuntime } from "../automations/code/runtime.ts";
 import { makeWebhookAliasResolver } from "../automations/aliases.ts";
 import {
   admitAutomationRun,
@@ -967,6 +968,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           payload: sample.payload,
         },
         aliases: sample.aliases,
+        code: makeCodeBlockRuntime(),
       });
       return {
         blocks: result.blocks.map((b) => ({
