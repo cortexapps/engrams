@@ -200,20 +200,15 @@ describe("section state service", () => {
     ]);
   });
 
-  test("publishes one chip for a human edit and one chip for its undo", async () => {
+  test("publishes one chip for a proposal and one chip for its undo", async () => {
     const store = new MemorySectionStateStore();
     const transcript = new MemoryTranscriptPublisher();
     const service = serviceWith(store, transcript);
 
-    const edit = await service.recordHumanEdit({
+    const edit = await service.transition({
       actionId: "edit-action",
       context,
-      actorUserId: "user-1",
-    });
-    if (!edit) throw new Error("The empty section edit must change its state.");
-    const unchanged = await service.recordHumanEdit({
-      actionId: "second-edit-action",
-      context,
+      target: "proposed",
       actorUserId: "user-1",
     });
     const undo = await service.undo({
@@ -223,7 +218,6 @@ describe("section state service", () => {
       actorUserId: "user-1",
     });
 
-    expect(unchanged).toBeNull();
     expect(transcript.publications.map(({ actionId }) => actionId)).toEqual([
       "edit-action",
       "undo-action",

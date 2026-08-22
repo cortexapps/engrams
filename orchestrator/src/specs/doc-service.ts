@@ -16,8 +16,8 @@ import * as Y from "yjs";
 import type { Pool, PoolClient } from "pg";
 import { listenForSpecChannel, type SpecChannelListenerOptions } from "./channel-listener.ts";
 
-import { applyHumanSectionEdit, type SectionStateValue } from "./section-state.ts";
-import { humanEditRequestFingerprint } from "./section-state-service.ts";
+import { applySectionEdit, type SectionStateValue } from "./section-state.ts";
+import { sectionEditRequestFingerprint } from "./section-state-service.ts";
 
 export const SPEC_UPDATE_CHANNEL = "spec_update";
 export const SPEC_CHANNEL_PAYLOAD_MAX_BYTES = 7_900;
@@ -170,6 +170,8 @@ export interface SpecDocumentSectionEffect {
   id: string;
   title: string;
   changed: boolean;
+  /** Whether the section holds anything past its heading: prose or a question. */
+  hasBody: boolean;
 }
 
 export interface SpecUpdateEffects {
@@ -1004,7 +1006,31 @@ function compareSections(
     id: section.id,
     title: section.title,
     changed: prior[index] == null || !specNodesSemanticallyEqual(prior[index].node, section.node),
+    hasBody: sectionHasBody(section.node),
   }));
+}
+
+/**
+ * Whether a section shows the reader anything past its heading. This is the
+ * same judgement the document pane makes when it offers "Nothing here yet."
+ */
+function sectionHasBody(section: ProseMirrorNode): boolean {
+  let hasBody = false;
+  section.forEach((child, _offset, index) => {
+    if (index === 0 || hasBody) return; // index 0 is the section heading
+    // An open question counts even when it carries no text, so it is tested
+    // before the text check and on the child itself — `descendants` starts
+    // below the node it is called on.
+    if (child.type.name === "openQuestion" || child.textContent.trim().length > 0) {
+      hasBody = true;
+      return;
+    }
+    child.descendants((node) => {
+      if (node.type.name === "openQuestion") hasBody = true;
+      return !hasBody;
+    });
+  });
+  return hasBody;
 }
 
 interface DocumentSection {
@@ -1221,7 +1247,11 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     transcriptAction?: SpecTrackedEditActionInput & { createdAt: Date },
   ): Promise<SpecUpdateInsertResult | null> {
     const changesDocument = effects.sections.some((section) => section.changed);
-    if (clientId !== null && changesDocument && !effects.at) {
+    // A visible edit must carry an injected timestamp: it stamps both the
+    // section proposal and the transcript row written below. Binding it here
+    // is what lets those writes take it as a `Date` without a second check.
+    const visibleAt = clientId !== null && changesDocument ? effects.at : undefined;
+    if (clientId !== null && changesDocument && !visibleAt) {
       throw new Error("A visible spec update requires an injected timestamp.");
     }
     const client = await this.pool.connect();
@@ -1361,17 +1391,19 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
           );
           actorUserId = participant.rows[0]?.user_id;
         }
-        if (actorUserId) {
-          if (!effects.at) throw new Error("A human spec update requires an injected timestamp.");
-          await proposeHumanEditedSections(
+        // Every edit proposes the sections it changed, whoever made it. The
+        // agent drafts most sections and its writes resolve no participant
+        // row, so gating this on a human actor left a fully drafted section
+        // `open` — which shows the reader no Keep control and can never be
+        // settled.
+        if (visibleAt) {
+          await proposeEditedSections(
             client,
             specId,
             BigInt(next.current_semantic_doc_seq),
-            actorUserId,
-            {
-              ...effects,
-              at: effects.at,
-            },
+            actorUserId ?? null,
+            { ...effects, at: visibleAt },
+            transcriptAction?.sectionId ?? null,
           );
         }
       }
@@ -1490,20 +1522,22 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
   }
 }
 
-interface HumanSectionStateRow {
+interface SectionStateRow {
   section_id: string;
   state: "open" | "proposed" | "settled" | "n/a";
   na_reason: string | null;
 }
 
-async function proposeHumanEditedSections(
+async function proposeEditedSections(
   client: PoolClient,
   specId: string,
   seq: bigint,
-  actorUserId: string,
+  actorUserId: string | null,
   effects: SpecUpdateEffects & { at: Date },
+  /** A section already publishing its own chip in this commit. */
+  chippedSectionId: string | null,
 ): Promise<void> {
-  const rows = await client.query<HumanSectionStateRow>(
+  const rows = await client.query<SectionStateRow>(
     `SELECT section_id, state, na_reason
        FROM spec_section_state
       WHERE spec_id = $1`,
@@ -1517,7 +1551,12 @@ async function proposeHumanEditedSections(
   for (const section of effects.sections) {
     if (!section.changed) continue;
     const current = states.get(section.id) ?? { state: "open", naReason: null };
-    const change = applyHumanSectionEdit(current, {
+    // An empty section that is still open has nothing to review: creating a
+    // spec writes every template section at once, and that must not arrive as
+    // a proposal per section. An empty section that was settled or marked n/a
+    // still moves, because the decision no longer describes the content.
+    if (!section.hasBody && current.state === "open") continue;
+    const change = applySectionEdit(current, {
       specId,
       sectionId: section.id,
       sectionTitle: section.title,
@@ -1536,7 +1575,13 @@ async function proposeHumanEditedSections(
            updated_at = excluded.updated_at`,
       [specId, section.id, effects.at],
     );
-    const actionId = `human-edit:${specId}:${seq}:${section.id}`;
+    // A tracked edit already tells the reader what it changed. The state still
+    // moves; a second chip for the same edit would just say it twice.
+    if (section.id === chippedSectionId) {
+      states.set(section.id, change.value);
+      continue;
+    }
+    const actionId = `section-edit:${specId}:${seq}:${section.id}`;
     await client.query(
       `INSERT INTO spec_transcript_action
          (id, spec_id, section_id, request_fingerprint, chip, actor_user_id, created_at, delivered_at)
@@ -1545,7 +1590,7 @@ async function proposeHumanEditedSections(
         actionId,
         specId,
         section.id,
-        humanEditRequestFingerprint(actorUserId, priorSeq),
+        sectionEditRequestFingerprint(actorUserId, priorSeq),
         change.transcriptChip,
         actorUserId,
         effects.at,

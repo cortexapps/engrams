@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  applyHumanSectionEdit,
+  applySectionEdit,
   applySectionStateUndo,
   SectionStateTransitionError,
   transitionSectionState,
@@ -89,9 +89,9 @@ describe("section state machine", () => {
 
   test("a human edit proposes open, settled, and n/a sections", () => {
     for (const state of ["open", "settled", "n/a"] as const) {
-      expect(applyHumanSectionEdit(values[state], context)?.value).toEqual(values.proposed);
+      expect(applySectionEdit(values[state], context)?.value).toEqual(values.proposed);
     }
-    expect(applyHumanSectionEdit(values.proposed, context)).toBeNull();
+    expect(applySectionEdit(values.proposed, context)).toBeNull();
   });
 
   test("keeps the direct open-to-settled transition illegal", () => {
