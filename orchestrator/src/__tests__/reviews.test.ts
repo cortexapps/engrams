@@ -193,7 +193,26 @@ function spawn(
   enrollments?: EnrollmentStore,
   profileExists = true,
   startIngress?: (input: ReviewIngressStart) => Promise<void>,
+  overrides?: {
+    builtins?: import("../reviews/engine-flag.ts").EngineFlagStore;
+    retryAutomation?: (automationRunId: string) => Promise<string>;
+  },
 ) {
+  // A default built-in store so the engine-flag path (UpsertEnrollment with
+  // an engine field) resolves offline. Its repos input starts empty.
+  const builtinRow = {
+    id: "b1",
+    name: "PR review",
+    kind: "builtin",
+    builtinKey: "pr_review",
+    enabled: false,
+    inputs: { repos: {} },
+  } as unknown as import("../db/automations.ts").AutomationRow;
+  const defaultBuiltins: import("../reviews/engine-flag.ts").EngineFlagStore = {
+    getByBuiltinKey: async () => builtinRow,
+    setInputs: async () => builtinRow,
+    setEnabled: async () => builtinRow,
+  };
   const transport = createRouterTransport((router) =>
     registerReviews(router, {
       getSession: async () =>
@@ -203,6 +222,8 @@ function spawn(
       profiles: {
         get: async (id) => profileExists ? { id } : null,
       },
+      builtins: overrides?.builtins ?? defaultBuiltins,
+      ...(overrides?.retryAutomation != null ? { retryAutomation: overrides.retryAutomation } : {}),
       ...(startIngress != null
         ? { startIngress, randomUUID: () => "idem-1" }
         : {}),
@@ -387,6 +408,88 @@ describe("ReviewService", () => {
       trigger: "retry",
       idempotencyKey: "idem-1",
     }]);
+  });
+
+  test("RetryReview on an automation-engine repo retries the built-in, not legacy ingress", async () => {
+    const legacyCalls: ReviewIngressStart[] = [];
+    const store = makeStore({
+      ...detail,
+      review: reviewRow({ status: "failed", automationRunId: "autorun:b1:github:d1" }),
+    });
+    const enrollments = makeEnrollmentStore([{
+      repo: "openai/engrams",
+      triggerMode: "auto",
+      engine: "automation",
+      autofix: "off",
+      profileId: null,
+      createdAt: CREATED_AT,
+      updatedAt: UPDATED_AT,
+    }]);
+    const retried: string[] = [];
+    const response = await spawn(store, true, "user", enrollments, true, async (i) => {
+      legacyCalls.push(i);
+    }, {
+      retryAutomation: async (runId) => {
+        retried.push(runId);
+        return "autorun:b1:retry:x";
+      },
+    }).retryReview({ id: REVIEW_ID });
+
+    expect(retried).toEqual(["autorun:b1:github:d1"]);
+    expect(legacyCalls).toEqual([]); // no legacy ingress
+    expect(response.workflowId).toBe("autorun:b1:retry:x");
+  });
+
+  test("RetryReview on an automation repo with no automation run is a FailedPrecondition", async () => {
+    const store = makeStore({
+      ...detail,
+      review: reviewRow({ status: "failed", automationRunId: null }),
+    });
+    const enrollments = makeEnrollmentStore([{
+      repo: "openai/engrams",
+      triggerMode: "auto",
+      engine: "automation",
+      autofix: "off",
+      profileId: null,
+      createdAt: CREATED_AT,
+      updatedAt: UPDATED_AT,
+    }]);
+    await expectConnectError(
+      spawn(store, true, "user", enrollments, true, async () => {}).retryReview({ id: REVIEW_ID }),
+      Code.FailedPrecondition,
+    );
+  });
+
+  test("UpsertEnrollment with engine=automation reconciles the built-in", async () => {
+    const setInputsCalls: Array<Record<string, unknown>> = [];
+    const setEnabledCalls: boolean[] = [];
+    const builtinRow = {
+      id: "b1", name: "PR review", kind: "builtin", builtinKey: "pr_review",
+      enabled: false, inputs: { repos: {} },
+    } as unknown as import("../db/automations.ts").AutomationRow;
+    const builtins = {
+      getByBuiltinKey: async () => builtinRow,
+      setInputs: async (_id: string, inputs: Record<string, unknown>) => {
+        setInputsCalls.push(inputs);
+        return builtinRow;
+      },
+      setEnabled: async (_id: string, enabled: boolean) => {
+        setEnabledCalls.push(enabled);
+        return builtinRow;
+      },
+    };
+    const admin = spawn(makeStore(null), true, "admin", makeEnrollmentStore([]), true, undefined, { builtins });
+    const response = await admin.upsertEnrollment({
+      repo: "openai/engrams",
+      triggerMode: "auto",
+      autofix: "manual",
+      engine: "automation",
+    });
+    expect(response.enrollment?.engine).toBe("automation");
+    expect(setInputsCalls.at(-1)!["repos"]).toEqual({
+      "openai/engrams": { mode: "auto", autofix: true },
+    });
+    expect(setEnabledCalls).toEqual([true]);
   });
 
   test("RetryReview requires authentication", async () => {
