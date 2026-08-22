@@ -8,9 +8,10 @@
  * a session never emits a signal.
  */
 
-import { DBOS } from "@dbos-inc/dbos-sdk";
+import { DBOS, Error as DBOSErrors } from "@dbos-inc/dbos-sdk";
 
 import { makeAutomationEngineStore } from "../db/automations.ts";
+import { log as rootLog } from "../log.ts";
 import {
   AUTOMATION_TOPIC,
   assertIdempotencyKey,
@@ -47,12 +48,32 @@ function runCompletedFailed(payloadJson: string): boolean {
   }
 }
 
+const log = rootLog.child({ component: "automation-consumer" });
+
 export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionConsumer {
   let binding: AutomationSessionBindingRef | null | undefined;
 
   const destination = (): AutomationSessionBindingRef => {
     if (!binding) throw new Error("Automation consumer has no run binding");
     return binding;
+  };
+
+  // A session is KEPT by default (D8), so it outlives its run. Every later
+  // session event (a follow-up the user types, the idle after it, the
+  // eventual end) still maps to the finished run's mailbox, and DBOS rejects
+  // a send to a workflow that no longer exists. That is not an error to
+  // retry — the run is over and nobody is waiting — so it is a no-op;
+  // retrying would pin the listener's cursor on this event forever.
+  const deliver: AutomationMailboxSend = async (destinationId, message, topic, idempotencyKey) => {
+    try {
+      await deps.send(destinationId, message, topic, idempotencyKey);
+    } catch (error) {
+      if (error instanceof DBOSErrors.DBOSNonExistentWorkflowError) {
+        log.debug({ runId: destinationId, kind: message.kind }, "automation run finished; session event dropped");
+        return;
+      }
+      throw error;
+    }
   };
 
   return {
@@ -73,7 +94,7 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
       // memoized applies-to binding.
       const live = await deps.findSessionBinding(ctx.sessionId);
       if (live?.relay === true) {
-        await deps.send(
+        await deliver(
           destination().runId,
           { kind: "session_event", sessionId: ctx.sessionId, event },
           AUTOMATION_TOPIC,
@@ -85,7 +106,7 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
       // carries the event idx — each turn's idle is its own message.
       if (event.kind !== "run_completed") return;
       const runFailed = runCompletedFailed(event.payloadJson);
-      await deps.send(
+      await deliver(
         destination().runId,
         {
           kind: "session_idle",
@@ -97,7 +118,7 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
       );
     },
     async onTerminal(outcome, ctx) {
-      await deps.send(
+      await deliver(
         destination().runId,
         { kind: "session_ended", sessionId: ctx.sessionId, outcome },
         AUTOMATION_TOPIC,
