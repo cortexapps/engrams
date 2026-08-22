@@ -15,6 +15,9 @@ import { getBlock, isSystemBlockType } from "./blocks/registry.ts";
 export const ENGINE_VERSION = 1;
 export const MAX_BLOCKS = 64;
 export const MAX_LOOP_ITERATIONS = 100;
+/** The ceiling every wait block's `deadlineSeconds` schema enforces, and
+ * the clamp the interpreter applies to a `$ref`-resolved deadline. */
+export const MAX_WAIT_DEADLINE_S = 24 * 3600;
 
 // ---------------------------------------------------------------------------
 // Triggers
@@ -71,6 +74,12 @@ export const inputFieldSchema = z.object({
   default: z.unknown().optional(),
   /** enum: allowed values. */
   values: z.array(z.string()).optional(),
+  /** number: inclusive bounds, enforced on every value write (SetInputs,
+   * the seeder, the run snapshot) and mirrored by the web Inputs tab. A
+   * block that consumes the input through a `$ref` has its own schema
+   * ceiling; bounding the input is what makes a saved value always run. */
+  min: z.number().optional(),
+  max: z.number().optional(),
   /** string: render a textarea (the web Inputs tab honors it). */
   multiline: z.boolean().optional(),
   /** map: the integration noun that populates the key picker. */

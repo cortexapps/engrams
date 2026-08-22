@@ -144,3 +144,24 @@ describe("payload + errors + equality", () => {
     expect(inputsEqual({ a: 1 }, { a: 2 })).toBe(false);
   });
 });
+
+describe("number bounds (mirrors the orchestrator's rule + wording)", () => {
+  const schema = parseInputsSchema([
+    { key: "idle_timeout", label: "Idle", type: "number", min: 60, max: 86400 },
+    { key: "floor_only", label: "Floor", type: "number", min: 1 },
+    { key: "cap_only", label: "Cap", type: "number", max: 10 },
+  ]);
+  it("parses min/max and enforces them", () => {
+    expect(schema[0]).toMatchObject({ min: 60, max: 86400 });
+    expect(validateInputs(schema, { idle_timeout: 3600, floor_only: 1, cap_only: 10 })).toEqual([]);
+    expect(validateInputs(schema, { idle_timeout: 90000 })).toEqual([
+      { key: "idle_timeout", message: "must be between 60 and 86400" },
+    ]);
+    expect(validateInputs(schema, { floor_only: 0 })).toEqual([
+      { key: "floor_only", message: "must be at least 1" },
+    ]);
+    expect(validateInputs(schema, { cap_only: 11 })).toEqual([
+      { key: "cap_only", message: "must be at most 10" },
+    ]);
+  });
+});

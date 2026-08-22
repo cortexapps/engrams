@@ -29,7 +29,12 @@
  *     fallback.
  */
 
-import type { AutomationDefinition, BlockDef } from "../engine/definition.ts";
+import {
+  MAX_LOOP_ITERATIONS,
+  MAX_WAIT_DEADLINE_S,
+  type AutomationDefinition,
+  type BlockDef,
+} from "../engine/definition.ts";
 import type { BuiltinAutomation } from "../engine/builtins.ts";
 import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 
@@ -314,8 +319,13 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       key: "idle_timeout",
       label: "Idle timeout (seconds)",
       type: "number",
-      help: "How long a thread may go quiet before the run ends (the session is kept).",
+      help: "How long a thread may go quiet before the run ends (the session is kept). 60 s to 24 h.",
       default: SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S,
+      // The wait_event that consumes this through `$ref` has a 24 h schema
+      // ceiling; the bound here keeps a saved value always runnable (the
+      // interpreter also clamps, as a second line).
+      min: 60,
+      max: MAX_WAIT_DEADLINE_S,
     },
     {
       key: "max_turns",
@@ -323,6 +333,8 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       type: "number",
       help: "Upper bound on follow-up messages one run answers.",
       default: SLACK_BRAIN_DEFAULT_MAX_TURNS,
+      min: 1,
+      max: MAX_LOOP_ITERATIONS,
     },
   ],
   settings: {

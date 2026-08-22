@@ -21,7 +21,7 @@ export interface InputValueError {
   key: string;
   /** Dotted path under the field for map/list errors ("engrams/engrams.mode", "0"). */
   path?: string;
-  code: "required" | "type" | "enum" | "map_key" | "shape";
+  code: "required" | "type" | "enum" | "map_key" | "shape" | "range";
   message: string;
 }
 
@@ -35,6 +35,16 @@ interface ValueFieldSpec {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Identical wording to the web's automation-inputs.ts rangeMessage. */
+export function rangeMessage(value: number, min?: number, max?: number): string | null {
+  if (min !== undefined && max !== undefined && (value < min || value > max)) {
+    return `must be between ${min} and ${max}`;
+  }
+  if (min !== undefined && value < min) return `must be at least ${min}`;
+  if (max !== undefined && value > max) return `must be at most ${max}`;
+  return null;
 }
 
 /** The object fields of a map value (from `valueShape`) — same projection as
@@ -166,6 +176,9 @@ export function validateInputValues(
       case "number":
         if (typeof value !== "number" || !Number.isFinite(value)) {
           errors.push({ key: spec.key, code: "type", message: "must be a number" });
+        } else {
+          const range = rangeMessage(value, spec.min, spec.max);
+          if (range !== null) errors.push({ key: spec.key, code: "range", message: range });
         }
         break;
       case "boolean":

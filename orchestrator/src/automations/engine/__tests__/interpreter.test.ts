@@ -536,6 +536,50 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     expect(next.record.outputs).toMatchObject({ event_key: "app_mention" });
   });
 
+  test("a $ref-bound wait deadline is clamped into the schema's range, never refused", async () => {
+    // inputs.idle_timeout = 200000 (> 24 h) must shorten the wait to the
+    // ceiling instead of failing the block with config_render_failed —
+    // the loop-bound rule (contract 4) applied to deadlines.
+    const definition: AutomationDefinition = {
+      ...makeDefinition([
+        {
+          id: "next",
+          type: "wait_event",
+          config: { eventKeys: ["app_mention"], deadlineSeconds: { $ref: "inputs.idle_timeout" } },
+        },
+      ]),
+      inputsSchema: [{ key: "idle_timeout", label: "Idle", type: "number" }],
+    };
+    const h = makeHarness(definition, {
+      inputs: { idle_timeout: 200_000 },
+      recv: [
+        {
+          kind: "event",
+          eventKey: "app_mention",
+          deliveryKey: "slack:E1",
+          payload: { text: "hi" },
+          receivedAt: "2026-08-21T00:01:00Z",
+        },
+      ],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    const running = h.stepRecords.find((r) => r.framePath === "next" && r.record.status === "running")!;
+    expect(running.record.inputs).toMatchObject({ deadlineSeconds: 86_400 });
+
+    // Below the floor → 1; unusable (a string) → the block's default applies.
+    const low = makeHarness(definition, { inputs: { idle_timeout: 0 }, recv: [null] });
+    await interpretAutomation(RUN, low.deps);
+    expect(
+      low.stepRecords.find((r) => r.framePath === "next" && r.record.status === "running")!.record.inputs,
+    ).toMatchObject({ deadlineSeconds: 1 });
+    const bad = makeHarness(definition, { inputs: { idle_timeout: "soon" }, recv: [null] });
+    const badResult = await interpretAutomation(RUN, bad.deps);
+    expect(badResult.status).not.toBe("failed");
+    const badRunning = bad.stepRecords.find((r) => r.framePath === "next" && r.record.status === "running")!;
+    expect(badRunning.record.inputs).not.toHaveProperty("deadlineSeconds");
+  });
+
   test("finalize keeps sessions by default and ends them under end_sessions_on_finish", async () => {
     const keepDef = makeDefinition([
       { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },

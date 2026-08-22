@@ -37,7 +37,13 @@ import { evaluateFilter, parseFilterGroup } from "./conditions.ts";
 import { isSafePath, ownPath } from "../paths.ts";
 import { buildRunContext, recordStepOutputs, type RunContext, type RunSnapshot } from "./context.ts";
 import type { EngineDeps } from "./deps.ts";
-import { isValueRef, MAX_LOOP_ITERATIONS, type BlockDef, type RetryPolicy } from "./definition.ts";
+import {
+  isValueRef,
+  MAX_LOOP_ITERATIONS,
+  MAX_WAIT_DEADLINE_S,
+  type BlockDef,
+  type RetryPolicy,
+} from "./definition.ts";
 import { AUTOMATION_TOPIC, type AutomationInbox } from "./inbox.ts";
 import { getBlock, type BlockExecutor, type BlockOutcome } from "./blocks/registry.ts";
 import { registerEngineBlocks } from "./blocks/index.ts";
@@ -424,6 +430,19 @@ export async function interpretAutomation(
     let resolved: Record<string, unknown>;
     try {
       resolved = await resolveBlockConfig(block.config, ctx);
+      // A wait deadline bound through a `$ref` (e.g. `inputs.idle_timeout`)
+      // is clamped into the schema's range the way a loop's `$ref` bound is,
+      // never refused: an org input outside the ceiling must shorten the
+      // wait, not fail every thread after its first turn. An unusable value
+      // falls back to the block's default.
+      if (executor.wait !== undefined && isValueRef(block.config["deadlineSeconds"])) {
+        const raw = resolved["deadlineSeconds"];
+        if (typeof raw === "number" && Number.isFinite(raw)) {
+          resolved["deadlineSeconds"] = Math.max(1, Math.min(Math.floor(raw), MAX_WAIT_DEADLINE_S));
+        } else {
+          delete resolved["deadlineSeconds"];
+        }
+      }
       // Save-time validation skipped `$ref` fields; check the resolved
       // shape against the block's schema before the executor sees it.
       const checked = executor.configSchema.safeParse(resolved);
