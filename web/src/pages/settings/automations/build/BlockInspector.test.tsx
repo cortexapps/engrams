@@ -141,4 +141,40 @@ describe("BlockInspector", () => {
     expect(screen.getByTestId("field-params.number")).toBeTruthy();
     expect(screen.getByTestId("field-params.body").querySelector("textarea")).not.toBeNull();
   });
+
+  it("integration_action numeric params are written as numbers, never strings", async () => {
+    // The action validates params at RUN time and rejects a numeric string.
+    const block: BlockDef = {
+      id: "ack",
+      type: "integration_action",
+      config: { provider: "github", actionId: "create_issue_comment", params: {} },
+    };
+    const { onChange } = mount(block, false);
+    const field = await screen.findByTestId("field-params.number");
+    const input = field.querySelector("input")!;
+
+    fireEvent.change(input, { target: { value: "42" } });
+    const written = onChange.mock.calls.at(-1)![0] as BlockDef;
+    expect((written.config["params"] as Record<string, unknown>)["number"]).toBe(42);
+
+    // A half-typed / non-numeric value stays local with an inline error and
+    // never reaches the config as NaN.
+    onChange.mockClear();
+    fireEvent.change(input, { target: { value: "4x" } });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(field.getAttribute("data-invalid")).toBe("true");
+    expect(screen.getByText("Enter a whole number")).toBeTruthy();
+
+    // A template is accepted verbatim (it renders to a number before validation).
+    fireEvent.change(input, { target: { value: "${{ event.pr.number }}" } });
+    const templated = onChange.mock.calls.at(-1)![0] as BlockDef;
+    expect((templated.config["params"] as Record<string, unknown>)["number"]).toBe(
+      "${{ event.pr.number }}",
+    );
+
+    // Clearing removes the key (required-ness is the schema's call).
+    fireEvent.change(input, { target: { value: "" } });
+    const cleared = onChange.mock.calls.at(-1)![0] as BlockDef;
+    expect("number" in (cleared.config["params"] as Record<string, unknown>)).toBe(false);
+  });
 });

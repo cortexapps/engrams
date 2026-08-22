@@ -8,7 +8,7 @@
  * key is in the block's `tunable` list; everything else is pinned. */
 
 import { Lock } from "lucide-react";
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field";
@@ -428,6 +428,12 @@ function IntegrationActionInspector(props: BlockInspectorProps) {
 
   const setParam = (key: string, value: unknown) =>
     onChange({ ...block, config: { ...block.config, params: { ...params, [key]: value } } });
+  // Clearing a param removes the key so the action's `required` check (not an
+  // empty string / NaN) decides whether it is missing.
+  const clearParam = (key: string) => {
+    const { [key]: _dropped, ...rest } = params;
+    onChange({ ...block, config: { ...block.config, params: rest } });
+  };
 
   return (
     <div className="flex flex-col gap-3">
@@ -527,9 +533,27 @@ function IntegrationActionInspector(props: BlockInspectorProps) {
               </Field>
             );
           }
-          if (prop.type === "string" || prop.type === "number" || prop.type === "integer") {
-            const text =
-              typeof value === "string" ? value : typeof value === "number" ? String(value) : "";
+          if (prop.type === "number" || prop.type === "integer") {
+            // The action validates params against its schema at RUN time
+            // (validateFieldValue rejects a numeric string), so the inspector
+            // must write a real number. A Liquid template is also accepted —
+            // it renders to a number before validation.
+            return (
+              <NumericParamField
+                key={key}
+                label={label}
+                integer={prop.type === "integer"}
+                value={value}
+                pinned={paramsPinned}
+                error={error}
+                variablePaths={variablePaths}
+                testId={`field-params.${key}`}
+                onChange={(next) => (next === undefined ? clearParam(key) : setParam(key, next))}
+              />
+            );
+          }
+          if (prop.type === "string") {
+            const text = typeof value === "string" ? value : "";
             return (
               <Field
                 key={key}
@@ -589,6 +613,79 @@ function IntegrationActionInspector(props: BlockInspectorProps) {
       ) : null}
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Numeric action param — writes a number (or a template), never a string
+// ---------------------------------------------------------------------------
+
+const TEMPLATE_RE = /\$\{\{/;
+
+function NumericParamField({
+  label,
+  integer,
+  value,
+  pinned,
+  error,
+  variablePaths,
+  testId,
+  onChange,
+}: {
+  label: string;
+  integer: boolean;
+  value: unknown;
+  pinned: boolean;
+  error: string | undefined;
+  variablePaths: string[];
+  testId: string;
+  onChange: (next: number | string | undefined) => void;
+}) {
+  // Local text so a half-typed value ("-", "1e") never reaches the config as
+  // NaN; the committed value is a number, a template string, or absent.
+  const committed =
+    typeof value === "number" ? String(value) : typeof value === "string" ? value : "";
+  const [text, setText] = useState(committed);
+  const lastCommitted = useRef(committed);
+  useEffect(() => {
+    if (lastCommitted.current === committed) return;
+    lastCommitted.current = committed;
+    setText(committed);
+  }, [committed]);
+  const invalid = text !== "" && !TEMPLATE_RE.test(text) && !isFiniteNumeric(text, integer);
+  const apply = (raw: string) => {
+    setText(raw);
+    if (raw === "") {
+      onChange(undefined);
+      return;
+    }
+    if (TEMPLATE_RE.test(raw)) {
+      onChange(raw);
+      return;
+    }
+    if (isFiniteNumeric(raw, integer)) onChange(Number(raw));
+    // Otherwise keep the keystroke locally and leave the config untouched.
+  };
+  return (
+    <Field data-invalid={error || invalid ? true : undefined} data-testid={testId}>
+      <FieldLabel>{label}</FieldLabel>
+      <Input
+        inputMode={integer ? "numeric" : "decimal"}
+        value={text}
+        onChange={(e) => apply(e.target.value)}
+        disabled={pinned}
+        aria-invalid={invalid || undefined}
+      />
+      {!pinned && <VariablePicker paths={variablePaths} onInsert={(p) => apply(`\${{ ${p} }}`)} />}
+      {invalid && <FieldError>{integer ? "Enter a whole number" : "Enter a number"}</FieldError>}
+      {error && <FieldError>{error}</FieldError>}
+    </Field>
+  );
+}
+
+function isFiniteNumeric(raw: string, integer: boolean): boolean {
+  if (!/^-?\d+(\.\d+)?$/.test(raw.trim())) return false;
+  const n = Number(raw);
+  return Number.isFinite(n) && (!integer || Number.isInteger(n));
 }
 
 // ---------------------------------------------------------------------------
