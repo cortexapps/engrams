@@ -40,6 +40,9 @@ message RepoEnrollment {
   optional string profile_id = 4;
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
+  // ADR 0119 phase 4.4: legacy | automation — which engine reviews this repo
+  // during the parallel window. Retires with the enrollment surface (4.7).
+  string engine = 7;
 }
 
 message ListEnrollmentsRequest {}
@@ -53,6 +56,8 @@ message UpsertEnrollmentRequest {
   string trigger_mode = 2;
   string autofix = 3;
   optional string profile_id = 4;
+  // ADR 0119 phase 4.4: legacy | automation. Omitted = keep the stored value.
+  optional string engine = 5;
 }
 
 message UpsertEnrollmentResponse {

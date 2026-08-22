@@ -18,6 +18,7 @@ const PATH = "/api/v1/integrations/github/events";
 const enrollment: EnrollmentRow = {
   repo: "openai/engrams",
   triggerMode: "auto",
+  engine: "legacy" as const,
   autofix: "off",
   profileId: null,
   createdAt: new Date("2026-07-17T00:00:00Z"),
