@@ -58,6 +58,9 @@ function controlPlane(
     failReview: async () => {},
     haltReview: async () => {},
     cleanupSupersededReview: async () => {},
+    composeFinderPrompt: async () => ({ prompt: "finder prompt", mergeBase: "" }),
+    composeVerifierPrompt: () => ({ prompt: "verifier prompt" }),
+    markPhasePrompted: async () => {},
     decideReviewResults: async () => {
       throw new Error("not used");
     },

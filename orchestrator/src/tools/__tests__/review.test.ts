@@ -446,7 +446,9 @@ describe("review tools", () => {
   });
 
   test("finder_done on an automation-owned session signals the run, not the legacy workflow", async () => {
-    const fake = fakeReviewStore();
+    // Three findings recorded so far: the signal carries them as
+    // candidate_count for the built-in's "any candidates?" branch.
+    const fake = fakeReviewStore({ findingCount: 3 });
     const legacy = notifier();
     const automation = automationNotifier();
     const done = reviewRegistry(fake.store, {
@@ -467,7 +469,12 @@ describe("review tools", () => {
 
     expect(automation.calls).toEqual([{
       runId: "autorun:auto-1:github:d1",
-      message: { kind: "signal", name: "finder_done", sessionId: "session-1" },
+      message: {
+        kind: "signal",
+        name: "finder_done",
+        sessionId: "session-1",
+        payload: { candidate_count: 3 },
+      },
       idempotencyKey: "autorun:session-1:signal:finder_done:call-1",
     }]);
     expect(legacy.calls).toEqual([]);
@@ -505,7 +512,7 @@ describe("review tools", () => {
     }));
 
     expect(automation.calls.map((call) => call.message)).toEqual([
-      { kind: "signal", name: "verifier_done", sessionId: "session-1" },
+      { kind: "signal", name: "verifier_done", sessionId: "session-1", payload: {} },
     ]);
     expect(legacy.calls).toEqual([]);
   });

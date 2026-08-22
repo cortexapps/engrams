@@ -25,6 +25,22 @@ const overrideFields = {
   effort: z.string().min(1).optional(),
 };
 
+/** Session-policy clamps a block may impose on top of the profile (phase 4.3:
+ * the built-in review workers). Strings inside may carry Liquid templates. */
+const sessionPolicyFields = {
+  /** Replaces the profile's integration grants outright. */
+  capabilityOverride: z.array(z.string().min(1)).optional(),
+  networkOverride: z
+    .object({
+      default: z.enum(["deny", "allow"]),
+      allowHosts: z.array(z.string().min(1)),
+      allowHostPatterns: z.array(z.string().min(1)),
+    })
+    .optional(),
+  dropProfileSecretsAndEnv: z.boolean().optional(),
+  appendSystemPrompt: z.string().optional(),
+};
+
 export const createSessionConfigSchema = z.object({
   profileId: z.string().min(1),
   promptTemplate: z.string(),
@@ -34,6 +50,7 @@ export const createSessionConfigSchema = z.object({
   /** Default: keep (D8). finalize ends only keep=false sessions. */
   keepOnFinish: z.boolean().optional(),
   ...overrideFields,
+  ...sessionPolicyFields,
 });
 export type CreateSessionConfig = z.infer<typeof createSessionConfigSchema>;
 
@@ -87,11 +104,18 @@ async function executeCreateSession(
     }
   }
   const title = config.titleTemplate !== undefined ? await ctx.render(config.titleTemplate) : null;
+  // Profile and capability strings may be templated (`${{ inputs.profile }}`,
+  // `github:contents:read@${{ event.repository.full_name }}`).
+  const profileId = await renderIfTemplated(ctx, config.profileId);
+  const capabilityOverride =
+    config.capabilityOverride !== undefined
+      ? await Promise.all(config.capabilityOverride.map((c) => renderIfTemplated(ctx, c)))
+      : undefined;
   const created = await ctx.deps.sessions.createSession({
     runId: ctx.runId,
     blockId: currentBlockId(ctx),
     automationId: ctx.automationId,
-    profileId: config.profileId,
+    profileId,
     prompt,
     title,
     role: config.role ?? "primary",
@@ -103,6 +127,14 @@ async function executeCreateSession(
     ...(config.model !== undefined ? { model: config.model } : {}),
     ...(config.modelRouter !== undefined ? { modelRouter: config.modelRouter } : {}),
     ...(config.effort !== undefined ? { effort: config.effort } : {}),
+    ...(capabilityOverride !== undefined ? { capabilityOverride } : {}),
+    ...(config.networkOverride !== undefined ? { networkOverride: config.networkOverride } : {}),
+    ...(config.dropProfileSecretsAndEnv !== undefined
+      ? { dropProfileSecretsAndEnv: config.dropProfileSecretsAndEnv }
+      : {}),
+    ...(config.appendSystemPrompt !== undefined
+      ? { appendSystemPrompt: config.appendSystemPrompt }
+      : {}),
   });
   return {
     kind: "ok",
@@ -114,6 +146,10 @@ async function executeCreateSession(
       initial_prompt: prompt.length > 0,
     },
   };
+}
+
+async function renderIfTemplated(ctx: RunContext, value: string): Promise<string> {
+  return value.includes("${{") ? ctx.render(value) : value;
 }
 
 function currentBlockId(ctx: RunContext): string {

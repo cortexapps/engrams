@@ -149,6 +149,16 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
         ...(input.model !== undefined ? { model: input.model } : {}),
         ...(input.modelRouter !== undefined ? { modelRouter: input.modelRouter } : {}),
         ...(input.effort !== undefined ? { effort: input.effort } : {}),
+        ...(input.capabilityOverride !== undefined
+          ? { capabilityOverride: input.capabilityOverride }
+          : {}),
+        ...(input.networkOverride !== undefined ? { networkOverride: input.networkOverride } : {}),
+        ...(input.dropProfileSecretsAndEnv !== undefined
+          ? { dropProfileSecretsAndEnv: input.dropProfileSecretsAndEnv }
+          : {}),
+        ...(input.appendSystemPrompt !== undefined
+          ? { appendSystemPrompt: input.appendSystemPrompt }
+          : {}),
         registerListener: false,
       });
       await store().recordSessionBinding({

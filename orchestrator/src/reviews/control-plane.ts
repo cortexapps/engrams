@@ -157,6 +157,8 @@ export interface ReviewControlPlane {
     headSha: string;
     enabledCategories?: readonly ReviewCategory[];
     orgInstructions?: string;
+    /** Stage files only; the caller already cloned (phase 4.3). */
+    skipClone?: boolean;
   }): Promise<void>;
   sendFinderPrompt(sessionId: string, input: {
     reviewId: string;
@@ -166,6 +168,18 @@ export interface ReviewControlPlane {
     baseSha: string;
     focus?: string;
   }): Promise<void>;
+  /** ADR 0119 phase 4.3: the prompt-composition half of sendFinderPrompt
+   *  (merge-base resolution in the clone + re-review scoping + prior-pass
+   *  context), returned as text for a generic send_prompt block. Byte-identical
+   *  to what the legacy path sends. */
+  composeFinderPrompt(sessionId: string, input: {
+    reviewId: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    baseSha: string;
+    focus?: string;
+  }): Promise<{ prompt: string; mergeBase: string }>;
   /** Retire the finder worker (best-effort) and report how many candidate
    *  findings it left, as one durable step. */
   concludeFinderPhase(
@@ -185,12 +199,20 @@ export interface ReviewControlPlane {
     reviewId: string;
     enabledCategories?: readonly ReviewCategory[];
     orgInstructions?: string;
+    skipClone?: boolean;
   }): Promise<void>;
   sendVerifierPrompt(sessionId: string, input: {
     reviewId: string;
     repo: string;
     prNumber: number;
   }): Promise<void>;
+  /** ADR 0119 phase 4.3: the verifier prompt text, for a generic send_prompt. */
+  composeVerifierPrompt(input: { repo: string; prNumber: number }): { prompt: string };
+  /** The status bookkeeping that follows a phase prompt (status transition,
+   *  activity event, sticky status comment). send*Prompt call it; the
+   *  built-in's system.review_stage block calls it after the generic
+   *  send_prompt delivers the composed text. */
+  markPhasePrompted(reviewId: string, role: "finder" | "verifier"): Promise<void>;
   /** ADR 0119 phase 4: the decision + persistence half of `postReviewResults`
    *  without the GitHub post. Settles every finding into its decided state,
    *  finalizes the review, and returns the payload the generic
@@ -763,7 +785,7 @@ export function makeReviewControlPlane(
     await ackStatus(reviewId, "failed");
   };
 
-  return {
+  const plane: ReviewControlPlane = {
     async resolvePrHeads(repo, prNumber) {
       return githubPoster.fetchPrContext(repo, prNumber);
     },
@@ -915,15 +937,19 @@ export function makeReviewControlPlane(
     },
 
     async bootstrapFinderSession(sessionId, input) {
-      await recordEvent(input.reviewId, "cloning", "finder");
-      await cloneRepo(
-        sessions,
-        sessionId,
-        input.repo,
-        input.headSha,
-        "finder",
-        execRuntime,
-      );
+      // ADR 0119 phase 4.3: the built-in clones through a visible, property-
+      // editable run_command block and asks only for the staging half.
+      if (!input.skipClone) {
+        await recordEvent(input.reviewId, "cloning", "finder");
+        await cloneRepo(
+          sessions,
+          sessionId,
+          input.repo,
+          input.headSha,
+          "finder",
+          execRuntime,
+        );
+      }
 
       const encoder = new TextEncoder();
       const priorFindings = await buildPriorFindingsFile(input.reviewId);
@@ -950,7 +976,7 @@ export function makeReviewControlPlane(
       }
     },
 
-    async sendFinderPrompt(sessionId, input) {
+    async composeFinderPrompt(sessionId, input) {
       const name = repoName(input.repo);
       // Resolve the TRUE merge base here and hand it to the finder as the diff
       // anchor. input.baseSha is GitHub's `pull.base.sha` — the base BRANCH's
@@ -1025,6 +1051,11 @@ export function makeReviewControlPlane(
         ...(input.focus?.trim() ? [`Focus directive: ${input.focus.trim()}`] : []),
         "Report findings only through the provided review tools; do not edit files or push changes.",
       ].join("\n");
+      return { prompt, mergeBase };
+    },
+
+    async sendFinderPrompt(sessionId, input) {
+      const { prompt } = await plane.composeFinderPrompt(sessionId, input);
 
       // The prompt id MUST be scoped to the session: the coordinator's
       // outbox is keyed globally by prompt_id (ON CONFLICT DO NOTHING), so
@@ -1037,12 +1068,33 @@ export function makeReviewControlPlane(
         promptId: `review:${input.reviewId}:finder:${sessionId}`,
         text: prompt,
       });
-      if (!(await reviews().updateReviewStatus(input.reviewId, "finding"))) {
-        logRefusedTransition(input.reviewId, "finding");
+      await plane.markPhasePrompted(input.reviewId, "finder");
+    },
+
+    async markPhasePrompted(reviewId, role) {
+      if (role === "finder") {
+        if (!(await reviews().updateReviewStatus(reviewId, "finding"))) {
+          logRefusedTransition(reviewId, "finding");
+          return;
+        }
+        await recordEvent(reviewId, "reviewing");
+        await ackStatus(reviewId, "finding");
         return;
       }
-      await recordEvent(input.reviewId, "reviewing");
-      await ackStatus(input.reviewId, "finding");
+      if (!(await reviews().updateReviewStatus(reviewId, "verifying"))) {
+        logRefusedTransition(reviewId, "verifying");
+        return;
+      }
+      const detail = await reviews().getReview(reviewId);
+      const candidateCount = detail?.findings.filter(
+        (finding) => finding.state === "candidate",
+      ).length ?? 0;
+      await recordEvent(
+        reviewId,
+        "verifying",
+        `${candidateCount} candidate finding${candidateCount === 1 ? "" : "s"}`,
+      );
+      await ackStatus(reviewId, "verifying", candidateCount);
     },
 
     async concludeFinderPhase(reviewId, opts = {}) {
@@ -1088,15 +1140,17 @@ export function makeReviewControlPlane(
     },
 
     async bootstrapVerifierSession(sessionId, input) {
-      await recordEvent(input.reviewId, "cloning", "verifier");
-      await cloneRepo(
-        sessions,
-        sessionId,
-        input.repo,
-        input.headSha,
-        "verifier",
-        execRuntime,
-      );
+      if (!input.skipClone) {
+        await recordEvent(input.reviewId, "cloning", "verifier");
+        await cloneRepo(
+          sessions,
+          sessionId,
+          input.repo,
+          input.headSha,
+          "verifier",
+          execRuntime,
+        );
+      }
 
       const review = await reviews().getReview(input.reviewId);
       if (!review) {
@@ -1147,13 +1201,18 @@ export function makeReviewControlPlane(
       }
     },
 
-    async sendVerifierPrompt(sessionId, input) {
+    composeVerifierPrompt(input) {
       repoName(input.repo);
       const prompt = [
         `Judge the candidate findings for ${input.repo} pull request #${input.prNumber}.`,
         "Judge each candidate in /workspace/.review/candidates.json per /workspace/.review/verifier.md.",
         "Submit submit_verdict for every candidate; confirm only findings you can reproduce from code you read.",
       ].join("\n");
+      return { prompt };
+    },
+
+    async sendVerifierPrompt(sessionId, input) {
+      const { prompt } = plane.composeVerifierPrompt(input);
 
       // Session-scoped for the same reason as the finder prompt id: a
       // verifier retry must not dedupe against a dead attempt's row.
@@ -1162,20 +1221,7 @@ export function makeReviewControlPlane(
         promptId: `review:${input.reviewId}:verifier:${sessionId}`,
         text: prompt,
       });
-      if (!(await reviews().updateReviewStatus(input.reviewId, "verifying"))) {
-        logRefusedTransition(input.reviewId, "verifying");
-        return;
-      }
-      const detail = await reviews().getReview(input.reviewId);
-      const candidateCount = detail?.findings.filter(
-        (finding) => finding.state === "candidate",
-      ).length ?? 0;
-      await recordEvent(
-        input.reviewId,
-        "verifying",
-        `${candidateCount} candidate finding${candidateCount === 1 ? "" : "s"}`,
-      );
-      await ackStatus(input.reviewId, "verifying", candidateCount);
+      await plane.markPhasePrompted(input.reviewId, "verifier");
     },
 
     async decideReviewResults(reviewId, opts = {}) {
@@ -1381,4 +1427,5 @@ export function makeReviewControlPlane(
       await cleanupWorkerSession(opts.sessionId);
     },
   };
+  return plane;
 }

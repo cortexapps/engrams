@@ -29,11 +29,13 @@ import {
   type ReviewPostPayload,
 } from "../../../../reviews/control-plane.ts";
 import { isCompletePrContext, type PrContext } from "../../../../reviews/pr-context.ts";
+import { REVIEW_CATEGORIES, type ReviewCategory } from "../../../../reviewers/render.ts";
 import { isHumanReviewTrigger } from "../../../../reviews/review-trigger.ts";
 import { makeReviewStore } from "../../../../db/reviews.ts";
 import { registerBlock, type BlockOutcome } from "../registry.ts";
 
 export const OPEN_REVIEW_PASS_TYPE = "system.open_review_pass";
+export const REVIEW_STAGE_TYPE = "system.review_stage";
 export const REVIEW_POLICY_GATE_TYPE = "system.review_policy_gate";
 export const REVIEW_CLEANUP_TYPE = "system.review_cleanup";
 
@@ -43,6 +45,11 @@ export type ReviewBlockControlPlane = Pick<
   | "resolvePrHeads"
   | "resolveReviewTarget"
   | "createReviewPass"
+  | "bootstrapFinderSession"
+  | "bootstrapVerifierSession"
+  | "composeFinderPrompt"
+  | "composeVerifierPrompt"
+  | "markPhasePrompted"
   | "decideReviewResults"
   | "cleanupSupersededReview"
 >;
@@ -202,6 +209,77 @@ async function executeOpenReviewPass(
 }
 
 // ---------------------------------------------------------------------------
+// system.review_stage
+// ---------------------------------------------------------------------------
+//
+// Why a system block and not write_files + Liquid: the staged files are
+// product logic, not templates — reviewer markdown rendered from the lens
+// catalog, prior-findings.json assembled from the review record AND the
+// author's GitHub replies, candidates.json from the findings table — and the
+// finder prompt depends on review-record reads (re-review scoping after a
+// push, prior-pass context). Pushing that through Liquid would re-implement
+// the control plane in a template. The block stages (the clone is the
+// visible run_command block before it), composes the phase prompt, and
+// returns it as an output for the generic send_prompt block, so the prompt
+// delivery itself stays a property-editable block. The org-facing knobs
+// (categories, instructions, focus) are block config and tunable.
+
+export const reviewStageConfigSchema = z.object({
+  phase: z.enum(["finder", "verifier"]),
+  reviewId: z.string().min(1),
+  sessionId: z.string().min(1),
+  repo: z.string().regex(/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/),
+  prNumber: z.coerce.number().int().positive(),
+  headSha: z.string().regex(/^[0-9a-fA-F]{7,40}$/),
+  baseSha: z.string().regex(/^[0-9a-fA-F]{7,40}$/).optional(),
+  /** Tunable: the lenses the reviewer applies (default: all six). */
+  enabledCategories: z.array(z.string().min(1)).optional(),
+  /** Tunable: org guidance rendered into the reviewer brief. */
+  orgInstructions: z.string().optional(),
+  /** Tunable (finder only): a focus directive appended to the prompt. */
+  focus: z.string().optional(),
+});
+export type ReviewStageConfig = z.infer<typeof reviewStageConfigSchema>;
+
+function isReviewCategory(value: string): value is ReviewCategory {
+  return (REVIEW_CATEGORIES as readonly string[]).includes(value);
+}
+
+async function executeReviewStage(config: ReviewStageConfig): Promise<BlockOutcome> {
+  const cp = deps().controlPlane();
+  const categories = config.enabledCategories?.filter(isReviewCategory);
+  const common = {
+    reviewId: config.reviewId,
+    repo: config.repo,
+    headSha: config.headSha,
+    ...(categories && categories.length > 0 ? { enabledCategories: categories } : {}),
+    ...(config.orgInstructions !== undefined && config.orgInstructions !== ""
+      ? { orgInstructions: config.orgInstructions }
+      : {}),
+    skipClone: true,
+  };
+
+  if (config.phase === "finder") {
+    await cp.bootstrapFinderSession(config.sessionId, common);
+    const { prompt, mergeBase } = await cp.composeFinderPrompt(config.sessionId, {
+      reviewId: config.reviewId,
+      repo: config.repo,
+      prNumber: config.prNumber,
+      headSha: config.headSha,
+      baseSha: config.baseSha ?? "",
+      ...(config.focus !== undefined && config.focus !== "" ? { focus: config.focus } : {}),
+    });
+    await cp.markPhasePrompted(config.reviewId, "finder");
+    return { kind: "ok", outputs: { phase: "finder", prompt, merge_base: mergeBase } };
+  }
+
+  await cp.bootstrapVerifierSession(config.sessionId, common);
+  const { prompt } = cp.composeVerifierPrompt({ repo: config.repo, prNumber: config.prNumber });
+  await cp.markPhasePrompted(config.reviewId, "verifier");
+  return { kind: "ok", outputs: { phase: "verifier", prompt, merge_base: "" } };
+}
+
+// ---------------------------------------------------------------------------
 // system.review_policy_gate
 // ---------------------------------------------------------------------------
 
@@ -247,6 +325,16 @@ export function registerReviewSystemBlocks(): void {
     configSchema: openReviewPassConfigSchema,
     async execute(config, ctx) {
       return executeOpenReviewPass(config, ctx.runId);
+    },
+  });
+
+  registerBlock<ReviewStageConfig>({
+    type: REVIEW_STAGE_TYPE,
+    system: true,
+    outputs: ["phase", "prompt", "merge_base"],
+    configSchema: reviewStageConfigSchema,
+    async execute(config) {
+      return executeReviewStage(config);
     },
   });
 
