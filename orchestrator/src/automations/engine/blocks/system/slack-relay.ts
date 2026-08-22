@@ -113,6 +113,10 @@ export const RELAY_STATE_KIND = "slack_relay";
  * find it among the run's step outputs without knowing the relay's block id. */
 export interface RelayState extends Record<string, unknown> {
   kind: typeof RELAY_STATE_KIND;
+  /** Monotonic per change. Install and re-point blocks each record a state
+   * on their own outputs, so "the latest" is the highest seq among the
+   * run's step outputs, not a position in the graph. */
+  seq: number;
   sessionId: string;
   mention: SourceMention;
   questionTs: Record<string, string>;
@@ -141,11 +145,12 @@ function stateFrom(ctx: RunContext): RelayState | null {
  * interpreter mirrors onto the relay block's `handler_state` after every
  * handler step. Null when no relay was installed on this run. */
 function stateFromSteps(ctx: RunContext): RelayState | null {
+  let latest: RelayState | null = null;
   for (const outputs of Object.values(ctx.steps)) {
     const st = outputs["handler_state"];
-    if (isRelayState(st)) return st;
+    if (isRelayState(st) && (latest === null || st.seq > latest.seq)) latest = st;
   }
-  return null;
+  return latest;
 }
 
 function mentionFrom(config: SlackRelayConfig): SourceMention {
@@ -168,6 +173,7 @@ async function install(config: SlackRelayConfig, ctx: RunContext): Promise<Block
   await ctx.deps.sessions.setSessionRelay(sessionId, true);
   const state: RelayState = {
     kind: RELAY_STATE_KIND,
+    seq: 0,
     sessionId,
     mention: mentionFrom(config),
     questionTs: {},
@@ -182,15 +188,17 @@ async function install(config: SlackRelayConfig, ctx: RunContext): Promise<Block
   };
 }
 
-/** A later `send_prompt` for a new mention re-points the turn: the built-in
- * graph calls this block again with the new mention ts (structure-locked,
- * but `mentionTs`/`eventId` are tunable at runtime via `$ref`). Re-executing
- * an installed relay is a re-point, not a second install: the carried state
+/** A later turn re-points the relay: the built-in graph carries a second
+ * relay block inside its loop body, templated on the accepted follow-up's
+ * ts/user/event, so ⏳/✅ land on the message that started THAT turn and
+ * its responses open a fresh bubble. Executing the relay's type while one
+ * is installed is a re-point, not a second install: the carried state
  * (questions, assets, last message) continues; only the mention and the
  * bubble change. */
 function repoint(config: SlackRelayConfig, prev: RelayState): BlockOutcome {
   const state: RelayState = {
     ...prev,
+    seq: prev.seq + 1,
     mention: mentionFrom(config),
     bubble: null, // a new turn — the next response opens a fresh message
   };
@@ -211,6 +219,7 @@ async function onMessage(
   // stay what that step recorded.
   const st: RelayState = {
     ...prev,
+    seq: prev.seq + 1,
     questionTs: { ...prev.questionTs },
     questionProtocols: { ...prev.questionProtocols },
     assets: [...prev.assets],

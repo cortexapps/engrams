@@ -419,7 +419,11 @@ export function validateDefinition(
 
   const seen = new Set<string>();
   let count = 0;
-  const installers: string[] = [];
+  /** Contract 3: one message handler per run. Several blocks may carry it
+   * as long as they are the SAME type — a later one (a loop body re-pointing
+   * the Slack relay at a new turn) is a re-point of the installed handler,
+   * never a second install (the interpreter enforces the same executor). */
+  const installers: Array<{ id: string; type: string }> = [];
   const checkBlock = (block: BlockDef, hook: boolean): void => {
     count += 1;
     if (count > MAX_BLOCKS) {
@@ -479,14 +483,15 @@ export function validateDefinition(
           `block type "${block.type}" installs a message handler; not allowed in a finalize hook`,
         );
       }
-      installers.push(block.id);
-      if (installers.length > 1) {
+      const first = installers[0];
+      if (first !== undefined && first.type !== block.type) {
         throw new DefinitionError(
           block.id,
           "type",
-          `only one message-handler block per automation (already: "${installers[0]}")`,
+          `only one message-handler type per automation (already: "${first.id}" of type "${first.type}")`,
         );
       }
+      installers.push({ id: block.id, type: block.type });
     }
     if (hook) {
       // A finalize hook runs inside the finalize step: nothing may park on

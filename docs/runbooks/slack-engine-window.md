@@ -84,7 +84,9 @@ to use the switch; the flags survive, so lifting it re-opens the same window.
 - **Runs**: Settings → Automations → Slack thread brain → Runs. One run per
   thread (concurrency key `team:channel:thread_ts`, policy `join`). A
   healthy thread: `facts` → `admit` → `identity` → `session` → `relay` →
-  `first_turn` → `thread[n].next` … and ends `completed` when the idle
+  `first_turn` → `thread[n].next` → `thread[n].has_turn.repoint` (the
+  relay re-pointed at the follow-up, so ⏳/✅ land on it) →
+  `thread[n].has_turn.turn` … and ends `completed` when the idle
   timeout expires (the `until` exits the loop). `filtered` = the admission
   code rejected the event (bot message, top-level message, no profile for
   the channel) or the identity gate did (the author has no engrams user —

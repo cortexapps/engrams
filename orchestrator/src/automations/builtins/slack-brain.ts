@@ -247,6 +247,22 @@ const conversation: BlockDef = {
         },
       },
       then: [
+        // Re-point the relay at the accepted follow-up BEFORE its prompt is
+        // sent: ⏳ lands on the reply, its responses open a fresh bubble and
+        // ✅ seals on the reply — the legacy per-turn mention ownership.
+        {
+          id: "repoint",
+          type: "system.slack_thread_relay",
+          config: {
+            session: { blockId: "session" },
+            team: `\${{ ${F}.team }}`,
+            channel: `\${{ ${F}.channel }}`,
+            threadTs: `\${{ ${F}.thread_ts }}`,
+            mentionTs: "${{ steps.turn_text.value.mention_ts }}",
+            userId: "${{ steps.turn_text.value.user_id }}",
+            eventId: "${{ steps.next.delivery_key }}",
+          },
+        },
         {
           id: "turn",
           type: "send_prompt",

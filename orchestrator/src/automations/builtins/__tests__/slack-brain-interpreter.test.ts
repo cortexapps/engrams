@@ -112,8 +112,8 @@ function harness(options: {
     async onProfileChoice() { return "p1"; },
     async onProfileChosen() {},
     async onStarted() { policyCalls.push("started"); },
-    async onWorking() { policyCalls.push("working"); },
-    async onIdle() { policyCalls.push("idle"); },
+    async onWorking(m) { policyCalls.push(`working:${m.ts}`); },
+    async onIdle(m) { policyCalls.push(`idle:${m.ts}`); },
     async onAssistantMessage(_m, text) { policyCalls.push(`msg:${text}`); return "b1"; },
     async onUserQuestion() { policyCalls.push("question"); return "q1"; },
     async onAnswered() { policyCalls.push("answered"); },
@@ -277,7 +277,7 @@ describe("Slack thread brain through the interpreter", () => {
     for (let i = 0; i < 50 && !h.policyCalls.includes("msg:one\n\ntwo"); i += 1) {
       await new Promise((r) => setTimeout(r, 1));
     }
-    expect(h.policyCalls).toEqual(["working", "msg:one", "msg:one\n\ntwo"]);
+    expect(h.policyCalls).toEqual(["working:100.1", "msg:one", "msg:one\n\ntwo"]);
     const liveBeforeCrash = runner.executed.length;
     expect(liveBeforeCrash).toBeGreaterThan(0);
 
@@ -288,13 +288,13 @@ describe("Slack thread brain through the interpreter", () => {
     // Recovery replayed the recorded relay steps (their closures did not
     // run again: no duplicate "msg:one"/"working" through the policy) …
     expect(h.policyCalls.filter((c) => c === "msg:one")).toHaveLength(1);
-    expect(h.policyCalls.filter((c) => c === "working")).toHaveLength(1);
+    expect(h.policyCalls.filter((c) => c === "working:100.1")).toHaveLength(1);
     expect(new Set(runner.executed).size).toBe(runner.executed.length);
     expect(runner.executed.length).toBeGreaterThan(liveBeforeCrash);
     // … then message 4 appended to the bubble the dead pod opened (the
     // relay's state came back through the checkpointed outputs) …
     expect(h.policyCalls).toContain("msg:one\n\ntwo\n\nthree");
-    expect(h.policyCalls).toContain("idle");
+    expect(h.policyCalls).toContain("idle:100.1");
     // … and the recap read the last message from the recorded step outputs.
     expect(h.policyCalls.at(-1)).toBe("complete:three");
     // The relay's step names are unchanged across passes (contract stays 4).
@@ -317,6 +317,46 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.names).toContain("step:identity:0");
     expect(h.names).not.toContain("step:session:0");
     expect(h.finalized).toEqual([{ status: "filtered", error: expect.stringContaining("not linked") }]);
+  });
+
+  test("(a4) each accepted turn re-points the relay: ⏳/✅ land on the reply that started it", async () => {
+    const h = harness({
+      recv: [
+        curated(1, "run_started", {}),
+        curated(2, "agent_message", { role: "assistant", text: "first answer" }),
+        curated(3, "run_completed", { ok: true }),
+        { kind: "session_idle", sessionId: "s-1" },
+        joined("<@UBOT> and then?", "100.2"),
+        curated(4, "run_started", {}),
+        curated(5, "agent_message", { role: "assistant", text: "second answer" }),
+        curated(6, "run_completed", { ok: true }),
+        { kind: "session_idle", sessionId: "s-1" },
+        null,
+        null,
+      ],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    // Turn 1 reacts on the opening mention; turn 2 on the follow-up's ts.
+    expect(h.policyCalls.filter((c) => c.startsWith("working:"))).toEqual(["working:100.1", "working:100.2"]);
+    expect(h.policyCalls.filter((c) => c.startsWith("idle:"))).toEqual(["idle:100.1", "idle:100.2"]);
+    // The second answer opened a fresh bubble (no append onto the first).
+    expect(h.policyCalls.filter((c) => c.startsWith("msg:"))).toEqual(["msg:first answer", "msg:second answer"]);
+    // The re-point ran inside the loop body, before the turn's prompt, and
+    // was NOT a second install.
+    const body = h.names.filter((n) => n.startsWith("step:thread[0].has_turn."));
+    expect(body.indexOf("step:thread[0].has_turn.repoint:0")).toBeLessThan(
+      body.indexOf("step:thread[0].has_turn.turn:0"),
+    );
+    expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
+    // Relay step names keep the FIRST install's path and a single counter
+    // across the re-point (every mailbox message is offered: 6 curated
+    // events, 2 idles, 1 joined event).
+    expect(h.names.filter((n) => n.includes(".__relay__:"))).toEqual(
+      [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `step:relay.__relay__:${n}`),
+    );
+    // The recap carries the last message across the re-point.
+    expect(h.policyCalls.at(-1)).toBe("complete:second answer");
   });
 
   test("(b) a top-level channel message (no thread_ts) is filtered, never a session", async () => {
