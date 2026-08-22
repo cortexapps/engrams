@@ -43,7 +43,7 @@ export interface IntegrationActionConfigInput {
 
 export interface IntegrationActionCallContext {
   runId: string;
-  blockId: string;
+  stepPath: string;
 }
 
 export interface ExecuteIntegrationActionDeps {
@@ -211,9 +211,9 @@ export async function executeIntegrationAction(
 
   const marker =
     action.idempotency.kind === "marker_comment"
-      ? (action.idempotency.markerTemplate ?? "<!-- engrams-automation:{runId}:{blockId} -->")
+      ? (action.idempotency.markerTemplate ?? "<!-- engrams-automation:{runId}:{stepPath} -->")
           .replaceAll("{runId}", ctx.runId)
-          .replaceAll("{blockId}", ctx.blockId)
+          .replaceAll("{stepPath}", ctx.stepPath)
       : null;
 
   switch (action.execute.kind) {
@@ -257,7 +257,7 @@ export async function executeIntegrationAction(
       // caller did not supply one; the document must thread it into the input.
       const variables =
         action.idempotency.kind === "client_id" && config.params["id"] === undefined
-          ? { ...config.params, id: actionClientId(ctx.runId, ctx.blockId) }
+          ? { ...config.params, id: actionClientId(ctx.runId, ctx.stepPath) }
           : config.params;
       const result = await runOp(config.provider, {
         method: "POST",
@@ -293,7 +293,7 @@ export async function executeIntegrationAction(
         deps.builtinDeps ?? defaultBuiltinActionDeps(deps.connectors ? { connectors: deps.connectors } : undefined);
       let result: Record<string, unknown>;
       try {
-        result = await fn(config.params, { runId: ctx.runId, blockId: ctx.blockId, marker }, builtinDeps);
+        result = await fn(config.params, { runId: ctx.runId, stepPath: ctx.stepPath, marker }, builtinDeps);
       } catch (error) {
         if (error instanceof IntegrationActionError) throw error;
         if (error instanceof LinearError) {

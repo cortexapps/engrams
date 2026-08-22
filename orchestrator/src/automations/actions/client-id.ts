@@ -1,6 +1,6 @@
 /** Deterministic client ids for client_id-idempotent actions (ADR 0119 D5).
  *
- * RFC 4122 name-based UUID (version 5, SHA-1) over `<runId>:<blockId>` in a
+ * RFC 4122 name-based UUID (version 5, SHA-1) over `<runId>:<stepPath>` in a
  * fixed engrams namespace: the same block in the same run always mints the
  * same id, so a replayed or retried create adopts instead of duplicating.
  */
@@ -19,10 +19,10 @@ function uuidBytes(uuid: string): Uint8Array {
   return bytes;
 }
 
-export function actionClientId(runId: string, blockId: string): string {
+export function actionClientId(runId: string, stepPath: string): string {
   const hash = createHash("sha1");
   hash.update(uuidBytes(NAMESPACE));
-  hash.update(`${runId}:${blockId}`);
+  hash.update(`${runId}:${stepPath}`);
   const digest = hash.digest().subarray(0, 16);
   digest[6] = (digest[6]! & 0x0f) | 0x50; // version 5
   digest[8] = (digest[8]! & 0x3f) | 0x80; // RFC 4122 variant
