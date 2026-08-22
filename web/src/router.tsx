@@ -59,7 +59,6 @@ import { ApiKeysPanel } from "./components/settings/ApiKeysPanel";
 import { HarnessesPanel } from "./components/settings/HarnessesPanel";
 import { ModelRoutersPanel } from "./components/settings/ModelRoutersPanel";
 import { IntegrationsPanel } from "./components/settings/IntegrationsPanel";
-import { ReviewedReposPanel } from "./components/settings/ReviewedReposPanel";
 import { IntegrationDetail } from "./components/integrations/IntegrationDetail";
 import { GoogleCloudSetupPage } from "./components/integrations/GoogleCloudSetupPage";
 import { TokensPanel } from "./components/settings/TokensPanel";
@@ -72,6 +71,9 @@ import {
   type EditorTab,
 } from "./pages/settings/automations/AutomationEditor";
 import { RunPage } from "./pages/settings/automations/runs/RunPage";
+import { RunsTab } from "./pages/settings/automations/runs/RunsTab";
+import { SettingsTab } from "./pages/settings/automations/settings/SettingsTab";
+import { RedirectToBuiltin } from "./pages/settings/automations/settings/RedirectToBuiltin";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -426,11 +428,14 @@ const integrationsRoute = createRoute({
   beforeLoad: requireAdmin,
   component: IntegrationsPanel,
 });
+// Kept for bookmarks: reviewed repos became the PR-review built-in's `repos`
+// input (ADR 0119 phase 3.8). The panel itself retires with the enrollment
+// RPCs in phase 4.7.
 const reviewedReposRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "reviewed-repos",
   beforeLoad: requireAdmin,
-  component: ReviewedReposPanel,
+  component: RedirectToBuiltin,
 });
 const integrationDetailRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
@@ -481,6 +486,18 @@ const automationsNewRoute = createRoute({
   beforeLoad: requireAdmin,
   component: () => <AutomationEditor mode="create" />,
 });
+/** The editor with the sibling tabs mounted (3.7 runs, 3.8 settings; 3.4/3.5/3.6
+ * plug their slots in the same way). Tab components read `$id` themselves. */
+function AutomationEditorPage() {
+  const { id } = automationEditRoute.useParams();
+  return (
+    <AutomationEditor
+      mode="edit"
+      runsTab={<RunsTab automationId={id} />}
+      settingsTab={<SettingsTab automationId={id} />}
+    />
+  );
+}
 const automationEditRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "automations/$id",
@@ -488,7 +505,7 @@ const automationEditRoute = createRoute({
   // ?tab=build|inputs|runs|settings (ADR 0119 phase 3.3); anything else → build.
   validateSearch: (search: Record<string, unknown>): { tab?: EditorTab } =>
     isEditorTab(search["tab"]) ? { tab: search["tab"] } : {},
-  component: () => <AutomationEditor mode="edit" />,
+  component: AutomationEditorPage,
 });
 const automationRunRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
