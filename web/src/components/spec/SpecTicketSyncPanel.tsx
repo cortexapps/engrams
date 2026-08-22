@@ -38,6 +38,10 @@ export function SpecTicketSyncPanel({ specId, onBack }: SpecTicketSyncPanelProps
   );
   const connected = ledger.data?.connector.connected ?? false;
   const pending = tickets.filter((ticket) => ticket.syncState !== "synced").length;
+  // Syncing without a team fails server-side with `no_target`. Nothing here can
+  // choose one — the target comes from the Linear connection — so say that up
+  // front rather than sending the reader into an error they cannot act on.
+  const noTeam = connected && ledger.data !== undefined && !ledger.data.target.teamId;
 
   const runSync = (ticketIds?: string[]) => {
     setError(null);
@@ -61,7 +65,7 @@ export function SpecTicketSyncPanel({ specId, onBack }: SpecTicketSyncPanelProps
         <span className="spec-ticket-head-actions">
           <Button
             size="sm"
-            disabled={!connected || pending === 0 || sync.isPending}
+            disabled={!connected || noTeam || pending === 0 || sync.isPending}
             onClick={() => runSync()}
           >
             {sync.isPending && pendingTicketId === null ? "Syncing…" : "Sync all to Linear"}
@@ -91,6 +95,12 @@ export function SpecTicketSyncPanel({ specId, onBack }: SpecTicketSyncPanelProps
         ) : null}
       </div>
 
+      {noTeam ? (
+        <p className="spec-ticket-empty">
+          Choose a Linear team on the Linear connection under Settings › Integrations before
+          syncing.
+        </p>
+      ) : null}
       {error ? <p className="spec-action-error">{error}</p> : null}
     </section>
   );
