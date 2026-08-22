@@ -4,6 +4,7 @@ import { buildMessages } from "@/components/session-thread/buildMessages";
 import type { IndexedEvent, SessionEvent } from "@/lib/types";
 import type { SpecMessage } from "@/hooks/useSpecMessages";
 import { buildSpecThread } from "./buildSpecThread";
+import { selectionActionPrompt } from "./selection-prompt";
 
 const AT = "2026-08-13T10:00:00.000Z";
 
@@ -245,6 +246,63 @@ describe("phase changes and attribution", () => {
       { kind: "human", author: owner },
       { kind: "human", author: null },
     ]);
+  });
+
+  // A selection action reaches the agent as a prompt full of Yjs anchors and a
+  // fingerprint. That prompt is the person's turn, so it is also what the
+  // transcript renders - and it used to render the plumbing verbatim.
+  test("renders a selection turn as the passage and the request", () => {
+    const prompt = selectionActionPrompt({
+      specId: "spec-1",
+      action: "ask",
+      instruction: "Answer in chat about this passage.",
+      span: {
+        specId: "spec-1",
+        sectionId: "section-1",
+        revision: "56",
+        startAnchor: "yjs-section://section-1/00a1bedfb2010100",
+        endAnchor: "yjs-section://section-1/02a1bedfb2010000",
+        selectedText: "Rendering is repeated on every read.",
+        sliceFingerprint: "b115155dd60c95af34e990ae4f06fc846b4c518d0177fab94306dc69cc3067da",
+      },
+    });
+    const messages = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "sel",
+          role: "user",
+          prompt_id: "prompt-sel",
+          text: prompt,
+          at: AT,
+        },
+      ]),
+      "session-1",
+    ).messages;
+    const stored = new Map<string, SpecMessage>([
+      [
+        "prompt-sel",
+        {
+          promptId: "prompt-sel",
+          text: prompt,
+          author: { id: "u1", name: "Nikhil" },
+          createdAt: AT,
+        },
+      ],
+    ]);
+
+    const entries = buildSpecThread(messages, stored, new Map([["section-1", "Problem"]]));
+
+    expect(entries).toMatchObject([
+      {
+        kind: "human",
+        text: "Asked about a passage in \u00a7Problem\n\n> Rendering is repeated on every read.",
+      },
+    ]);
+    const rendered = JSON.stringify(entries);
+    expect(rendered).not.toContain("yjs-section");
+    expect(rendered).not.toContain("selection_fingerprint");
   });
 });
 

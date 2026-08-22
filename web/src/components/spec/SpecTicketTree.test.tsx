@@ -358,6 +358,58 @@ describe("the ticket tree", () => {
     expect(survivor?.openQuestions.map((question) => question.id)).toEqual(["q6"]);
     expect(merged.unattachedQuestions).toEqual([]);
   });
+
+  // "Add ticket" appends a row called "New ticket" whose title only becomes
+  // editable once the row is expanded, and the control that expands it is the
+  // title text. Opening it on its title is the only way in. That focus is a
+  // one-shot: leaving it armed moved the cursor again every time the reader
+  // reopened that same row.
+  test("opens a new ticket on its title, once", async () => {
+    const added = {
+      ...tree(),
+      tickets: [
+        ...tree().tickets,
+        {
+          id: "ticket-new",
+          parentId: null,
+          ordinal: 99,
+          depth: 0,
+          title: "New ticket",
+          body: "",
+          description: "",
+          backlink: {
+            sectionId: tree().sections[0]!.id,
+            sectionTitle: tree().sections[0]!.title,
+            href: "#",
+          },
+          dependsOn: [],
+          syncState: "draft" as const,
+          linearId: null,
+          syncError: null,
+          openQuestions: [],
+        },
+      ],
+    };
+    renderTree(() => Promise.resolve(added));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Add ticket/ }));
+    });
+
+    const title = () => screen.getByLabelText("Title") as HTMLInputElement;
+    expect(document.activeElement).toBe(title());
+
+    // Collapse, then reopen the same row to read it.
+    const toggle = screen.getByRole("button", { name: "New ticket" });
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+
+    expect(document.activeElement).not.toBe(title());
+  });
 });
 
 function childTitles(current: Tree, parentId: string | null): string[] {
