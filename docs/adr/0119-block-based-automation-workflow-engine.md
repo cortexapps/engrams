@@ -98,12 +98,29 @@ the ADR 0104 sweep policy carries over). Its body is deliberately thin:
 Two rules make this safe:
 
 - **The step contract.** The registered body contains a literal
-  `const ENGINE_STEP_CONTRACT = 1`. Any change to step naming, step order,
+  `const ENGINE_STEP_CONTRACT = <n>`. Any change to step naming, step order,
   recv semantics, or the finalize position MUST bump the literal. The bump
   rotates the DBOS application version, so in-flight executions from the
   previous deploy strand loudly and the sweep (adopt, 48 h) fails them —
   they are never silently replayed through changed semantics. Additive
   changes (new block types, new outcome fields) keep the contract.
+
+  Contract history:
+  - **1** (phase 1): snapshot step, `step:<framePath>:<attempt>`, condition
+    and clock micro-steps, one trailing `step:__finalize__:0`.
+  - **2** (phase 4.3b): **finalize hooks.** `settings.onFinalize` lists
+    `{when: [terminal statuses], block}` entries. For a run ending in a
+    hook's `when`, the hook block runs as its own step,
+    `step:__finalize__.<blockId>:0`, in definition order, BEFORE the
+    finalize step — so finalize is no longer the single step after the
+    walk. Hooks observe `run.status`/`run.error` in scope; a hook's outcome
+    never changes the terminal status (a throwing hook is recorded on its
+    own step row), and hooks may not wait (validation refuses wait-capable
+    and control blocks). This is what lets the PR-review built-in reach the
+    legacy graph's failure, halt, and supersede behaviour (the sticky ❌
+    status comment, the activity-log reason, worker teardown) through
+    `system.review_finalize`. Any automation run in flight across the
+    1→2 deploy strands and is failed by the sweep, by design.
 - **The golden test.** A step-sequence test asserts the exact ordered step
   names for linear, branch, loop, retry, deadline, stop, and supersede
   graphs. Accidental contract drift is a red diff at review time.
