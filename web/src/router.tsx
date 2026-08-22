@@ -66,7 +66,11 @@ import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
 import { Automations } from "./pages/settings/Automations";
-import { AutomationEditor } from "./pages/settings/AutomationEditor";
+import {
+  AutomationEditor,
+  isEditorTab,
+  type EditorTab,
+} from "./pages/settings/automations/AutomationEditor";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -476,6 +480,9 @@ const automationEditRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "automations/$id",
   beforeLoad: requireAdmin,
+  // ?tab=build|inputs|runs|settings (ADR 0119 phase 3.3); anything else → build.
+  validateSearch: (search: Record<string, unknown>): { tab?: EditorTab } =>
+    isEditorTab(search["tab"]) ? { tab: search["tab"] } : {},
   component: () => <AutomationEditor mode="edit" />,
 });
 

@@ -1,0 +1,159 @@
+// Contract test for the editor shell's save semantics under the built-in
+// editing model (ADR 0119 phase 3.3): a built-in saves only the changed
+// tunable fields as overrides (SetBlockOverrides); a user automation saves
+// the full definition as a new version (SaveVersion).
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+
+import { AutomationEditor } from "./AutomationEditor";
+
+const automationHolder = vi.hoisted(() => ({
+  value: undefined as undefined | { automation: unknown },
+}));
+const searchHolder = vi.hoisted(() => ({ value: {} as { tab?: string } }));
+const navigate = vi.hoisted(() => vi.fn());
+const saveVersion = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "a1" } }));
+const setOverrides = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "b1" } }));
+const updateMeta = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "a1" } }));
+const duplicate = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "copy" } }));
+
+vi.mock("@/hooks/useAutomationEditor", () => ({
+  useEditorAutomation: () => ({ data: automationHolder.value, isPending: false, error: null }),
+  useCreateAutomationV2: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useSaveVersionV2: () => ({ mutateAsync: saveVersion, isPending: false }),
+  useSetBlockOverrides: () => ({ mutateAsync: setOverrides, isPending: false }),
+  useUpdateAutomationMetaV2: () => ({ mutateAsync: updateMeta, isPending: false }),
+  useSetAutomationEnabledV2: () => ({ mutate: vi.fn(), isPending: false }),
+  useDuplicateAutomation: () => ({ mutateAsync: duplicate, isPending: false }),
+  useEventCatalog: () => ({ data: undefined }),
+  useActionCatalog: () => ({ data: undefined }),
+  useEditorWebhookRegistrations: () => ({ data: { registrations: [] } }),
+}));
+vi.mock("@/hooks/useProfiles", () => ({
+  useProfiles: () => ({
+    data: { profiles: [{ id: "pr_reviewer", name: "PR reviewer", harness: "claude" }] },
+  }),
+}));
+vi.mock("@/hooks/useHarnessCatalog", () => ({ useHarnessCatalog: () => ({ data: [] }) }));
+vi.mock("@/hooks/useModelRouters", () => ({
+  useModelRouters: () => ({ data: { routers: [] } }),
+  useRouterModels: () => ({ data: { models: [] } }),
+}));
+vi.mock("@tanstack/react-router", async (orig) => ({
+  ...(await orig()),
+  useNavigate: () => navigate,
+  useParams: () => ({ id: "a1" }),
+  useSearch: () => searchHolder.value,
+  Link: ({ children }: { children: React.ReactNode }) => <a>{children}</a>,
+}));
+// Panels measure layout; jsdom has none.
+vi.mock("@/components/ui/resizable", () => ({
+  ResizablePanelGroup: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  ResizablePanel: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  ResizableHandle: () => null,
+}));
+
+const definition = {
+  engine: 1,
+  trigger: { kind: "manual" },
+  blocks: [
+    {
+      id: "finder",
+      type: "create_session",
+      tunable: ["promptTemplate"],
+      config: { profileId: "pr_reviewer", promptTemplate: "Review it.", role: "finder" },
+    },
+  ],
+  inputsSchema: [],
+  settings: { endSessionsOnFinish: false },
+};
+
+function automation(kind: "user" | "builtin") {
+  return {
+    id: kind === "builtin" ? "b1" : "a1",
+    name: kind === "builtin" ? "PR review" : "My automation",
+    description: "",
+    kind,
+    builtinKey: kind === "builtin" ? "pr_review" : undefined,
+    enabled: true,
+    currentVersion: 1,
+    inputsJson: "{}",
+    blockOverridesJson: "{}",
+    archived: false,
+    createdAt: "",
+    updatedAt: "",
+    version: {
+      automationId: "x",
+      number: 1,
+      definitionJson: JSON.stringify(definition),
+      createdAt: "",
+    },
+  };
+}
+
+describe("AutomationEditor", () => {
+  beforeEach(() => {
+    saveVersion.mockClear();
+    setOverrides.mockClear();
+    updateMeta.mockClear();
+    navigate.mockClear();
+    searchHolder.value = {};
+  });
+
+  it("selects the tab from the search param and navigates on tab change", async () => {
+    automationHolder.value = { automation: automation("user") };
+    searchHolder.value = { tab: "runs" };
+    render(<AutomationEditor mode="edit" />);
+    expect(screen.getByRole("tab", { name: "Runs" }).getAttribute("aria-selected")).toBe("true");
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Build" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Build" }));
+    await waitFor(() => expect(navigate).toHaveBeenCalled());
+    const call = navigate.mock.calls.at(-1)![0] as {
+      search: (prev: Record<string, unknown>) => Record<string, unknown>;
+    };
+    expect(call.search({})).toEqual({ tab: "build" });
+  });
+
+  it("built-in: shows the banner + Duplicate, locks the structure, and saves only changed tunable fields as overrides", async () => {
+    automationHolder.value = { automation: automation("builtin") };
+    render(<AutomationEditor mode="edit" />);
+    expect(screen.getByTestId("builtin-banner")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /duplicate/i })).toBeTruthy();
+    expect(screen.queryByLabelText("Insert block here")).toBeNull();
+
+    // Edit the tunable prompt; the pinned role stays disabled.
+    fireEvent.click(screen.getByTestId("block-row-finder"));
+    const prompt = screen.getByTestId("field-promptTemplate").querySelector("textarea")!;
+    fireEvent.change(prompt, { target: { value: "Be strict." } });
+    expect(screen.getByTestId("field-role").querySelector("input")!.disabled).toBe(true);
+
+    fireEvent.click(screen.getByTestId("save-button"));
+    await waitFor(() => expect(setOverrides).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(setOverrides.mock.calls[0]![0].overridesJson)).toEqual({
+      finder: { promptTemplate: "Be strict." },
+    });
+    expect(saveVersion).not.toHaveBeenCalled();
+    // Name is pinned on a built-in, so no meta update either.
+    expect(updateMeta).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: /duplicate/i }));
+    await waitFor(() => expect(duplicate).toHaveBeenCalledWith({ automationId: "b1" }));
+    expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ params: { id: "copy" } }));
+  });
+
+  it("user automation: saves the full definition as a new version", async () => {
+    automationHolder.value = { automation: automation("user") };
+    render(<AutomationEditor mode="edit" />);
+    expect(screen.queryByTestId("builtin-banner")).toBeNull();
+    fireEvent.click(screen.getByTestId("block-row-finder"));
+    const prompt = screen.getByTestId("field-promptTemplate").querySelector("textarea")!;
+    fireEvent.change(prompt, { target: { value: "Changed." } });
+    fireEvent.click(screen.getByTestId("save-button"));
+    await waitFor(() => expect(saveVersion).toHaveBeenCalledTimes(1));
+    const sent = JSON.parse(saveVersion.mock.calls[0]![0].definitionJson);
+    expect(sent.blocks[0].config.promptTemplate).toBe("Changed.");
+    expect(sent.blocks[0].id).toBe("finder");
+    expect(setOverrides).not.toHaveBeenCalled();
+  });
+});
