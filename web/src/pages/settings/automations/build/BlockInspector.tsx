@@ -263,7 +263,9 @@ function CreateSessionInspector(props: BlockInspectorProps) {
           audience="programmatic"
         />
         <FieldDescription>
-          Leave unset to inherit the profile's harness, model, and effort.
+          {builtin && !harnessPinned
+            ? "Clearing a field reverts it to the built-in's shipped default (an override only tunes a value; it cannot unset one)."
+            : "Leave unset to inherit the profile's harness, model, and effort."}
         </FieldDescription>
       </Field>
       <GenericForm {...props} fields={CREATE_SESSION_FIELDS} />
@@ -636,7 +638,7 @@ function NumericParamField({
   value: unknown;
   pinned: boolean;
   error: string | undefined;
-  variablePaths: string[];
+  variablePaths: readonly string[];
   testId: string;
   onChange: (next: number | string | undefined) => void;
 }) {
