@@ -413,6 +413,7 @@ export function validateDefinition(
 
   const seen = new Set<string>();
   let count = 0;
+  const installers: string[] = [];
   const checkBlock = (block: BlockDef, hook: boolean): void => {
     count += 1;
     if (count > MAX_BLOCKS) {
@@ -460,6 +461,26 @@ export function validateDefinition(
     }
     if (block.type !== "loop" && block.body) {
       throw new DefinitionError(block.id, "body", `only loop blocks nest a body`);
+    }
+    if (executor.onMessage !== undefined) {
+      // Contract 3: an installed message handler rides the run's single recv
+      // loop, so exactly one may exist, and a finalize hook (which runs after
+      // the loop is over) can never install one.
+      if (hook) {
+        throw new DefinitionError(
+          block.id,
+          "type",
+          `block type "${block.type}" installs a message handler; not allowed in a finalize hook`,
+        );
+      }
+      installers.push(block.id);
+      if (installers.length > 1) {
+        throw new DefinitionError(
+          block.id,
+          "type",
+          `only one message-handler block per automation (already: "${installers[0]}")`,
+        );
+      }
     }
     if (hook) {
       // A finalize hook runs inside the finalize step: nothing may park on

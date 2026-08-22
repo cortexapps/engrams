@@ -183,6 +183,10 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
       return { sessionId, taskId };
     },
 
+    async setSessionRelay(sessionId, relay) {
+      await store().setSessionRelay(sessionId, relay);
+    },
+
     async sendPrompt(sessionId, promptId, text, harnessMode) {
       // ADR 0107: a mid-run prompt may select a harness mode (e.g. "plan");
       // SendPromptRequest carries it as an optional field.
@@ -260,7 +264,7 @@ export async function automationRunWorkflowImpl(
   // ADR 0119 D2: bump on ANY change to step naming, step order, recv
   // semantics, or finalize position anywhere in the engine. The literal lives
   // in this registered body so the bump rotates the DBOS application version.
-  const ENGINE_STEP_CONTRACT = 2;
+  const ENGINE_STEP_CONTRACT = 3;
   const engine = deps.engine ?? productionEngineDeps();
   return interpretAutomation(
     { runId: input.runId, automationId: input.automationId, contract: ENGINE_STEP_CONTRACT },

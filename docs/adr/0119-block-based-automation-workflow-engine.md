@@ -121,6 +121,21 @@ Two rules make this safe:
     status comment, the activity-log reason, worker teardown) through
     `system.review_finalize`. Any automation run in flight across the
     1→2 deploy strands and is failed by the sweep, by design.
+  - **3** (phase 4.5): **installed message handlers.** A block executor
+    may implement `onMessage(msg, config, ctx) → "consumed" | "pass"`.
+    A successful `execute` of such a block INSTALLS it for the rest of the
+    run (one installer per definition, refused in finalize hooks;
+    re-executing the same block repoints its config). From then on every
+    received mailbox message is offered to the handler FIRST, inside its
+    own checkpointed step `step:<relayFramePath>.__relay__:<n>` (`n`
+    counts from 1 per run), before the stop/supersede checks and before
+    the active wait's matcher. A `consumed` message never reaches the
+    wait; a throwing handler is recorded as a failed relay step and the
+    message passes through. The new `session_event` inbox arm (curated
+    session events, forwarded by the consumer only for sessions whose
+    `automation_session.relay` flag is set) is what the Slack thread relay
+    (`system.slack_thread_relay`) consumes. Any run in flight across the
+    2→3 deploy strands and is failed by the sweep, by design.
 - **The golden test.** A step-sequence test asserts the exact ordered step
   names for linear, branch, loop, retry, deadline, stop, and supersede
   graphs. Accidental contract drift is a red diff at review time.
