@@ -41,7 +41,12 @@ import {
   type BlockErrorRef,
 } from "@/lib/automation-blocks";
 
+import { useAutomationTest } from "@/hooks/useAutomationTest";
+
 import { BuildTab } from "./build/BuildTab";
+import { TestPanel } from "./build/test/TestPanel";
+import { InputsTab } from "./inputs/InputsTab";
+import { DryRunButton } from "./build/DryRunButton";
 
 export const EDITOR_TABS = ["build", "inputs", "runs", "settings"] as const;
 export type EditorTab = (typeof EDITOR_TABS)[number];
@@ -56,7 +61,7 @@ interface Props {
   inputsTab?: ReactNode;
   runsTab?: ReactNode;
   settingsTab?: ReactNode;
-  /** 3.4: TestPanel mounted under the Build inspector. */
+  /** 3.4 mounts TestPanel by default; these override it (tests, siblings). */
   testPanel?: ReactNode;
   variableValues?: Readonly<Record<string, string>>;
 }
@@ -232,6 +237,19 @@ export function AutomationEditor({
   const nameError = errors.find((e) => e.blockId === "" && e.field === "name")?.message;
   const triggerSummary = existingSummary(automation?.id, draft);
 
+  // 3.4: "Test with sample" renders the DRAFT (unsaved edits included) and
+  // routes server BlockErrors into the inspector; its latest scope feeds the
+  // picker's live previews. Only an existing automation can be rendered
+  // server-side (TestRender needs a saved row for samples).
+  const test = useAutomationTest({
+    automationId: automation?.id,
+    definition: draft,
+    inputsJson: automation?.inputsJson || "{}",
+    onErrors: setErrors,
+  });
+  const panel = testPanel ?? (automation ? <TestPanel test={test} /> : null);
+  const liveValues = variableValues ?? test.variableValues;
+
   return (
     <div className="space-y-6" data-testid="automation-editor">
       <PageHeading
@@ -261,6 +279,12 @@ export function AutomationEditor({
                 <Copy className="size-4" aria-hidden /> Duplicate
               </Button>
             )}
+            {mode === "edit" &&
+              automation && (
+                // A dry run executes the SAVED definition; unsaved edits would
+                // mislead, so it waits for a clean editor.
+                <DryRunButton automationId={automation.id} disabled={dirty} />
+              )}
             <Button
               type="button"
               onClick={save}
@@ -334,12 +358,12 @@ export function AutomationEditor({
             builtin={builtin}
             errors={errors}
             triggerSummary={triggerSummary}
-            testPanel={testPanel}
-            variableValues={variableValues}
+            testPanel={panel}
+            variableValues={liveValues}
           />
         </TabsContent>
         <TabsContent value="inputs" className="pt-4">
-          {inputsTab ?? <Placeholder item="3.6 (Inputs)" />}
+          {inputsTab ?? <InputsTab automationId={id} />}
         </TabsContent>
         <TabsContent value="runs" className="pt-4">
           {runsTab ?? <Placeholder item="3.7 (Runs)" />}

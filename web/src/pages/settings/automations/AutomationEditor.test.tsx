@@ -18,6 +18,11 @@ const setOverrides = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { 
 const updateMeta = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "a1" } }));
 const duplicate = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "copy" } }));
 
+// 3.5: the header's DryRun button uses a connect-query mutation; this suite
+// renders without a QueryClient, so stub it like every other hook here.
+vi.mock("@/hooks/useAutomationCode", () => ({
+  useDryRun: () => ({ mutate: vi.fn(), isPending: false }),
+}));
 vi.mock("@/hooks/useAutomationEditor", () => ({
   useEditorAutomation: () => ({ data: automationHolder.value, isPending: false, error: null }),
   useCreateAutomationV2: () => ({ mutateAsync: vi.fn(), isPending: false }),
@@ -29,6 +34,23 @@ vi.mock("@/hooks/useAutomationEditor", () => ({
   useEventCatalog: () => ({ data: undefined }),
   useActionCatalog: () => ({ data: undefined }),
   useEditorWebhookRegistrations: () => ({ data: { registrations: [] } }),
+}));
+// 3.4: the shell instantiates the test-with-sample state; the shell tests
+// exercise save paths, not rendering, so the hook is inert here.
+vi.mock("@/hooks/useAutomationTest", () => ({
+  useAutomationTest: () => ({
+    isTimed: false,
+    samples: [],
+    samplesLoading: false,
+    sample: { kind: "none" },
+    setSample: vi.fn(),
+    latest: null,
+    tally: null,
+    running: false,
+    runOnce: vi.fn(),
+    runAcrossSamples: vi.fn(),
+    variableValues: {},
+  }),
 }));
 vi.mock("@/hooks/useProfiles", () => ({
   useProfiles: () => ({
