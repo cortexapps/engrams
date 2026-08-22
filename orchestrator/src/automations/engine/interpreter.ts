@@ -37,7 +37,7 @@ import { evaluateFilter, parseFilterGroup } from "./conditions.ts";
 import { isSafePath, ownPath } from "../paths.ts";
 import { buildRunContext, recordStepOutputs, type RunContext, type RunSnapshot } from "./context.ts";
 import type { EngineDeps } from "./deps.ts";
-import type { BlockDef, RetryPolicy } from "./definition.ts";
+import { isValueRef, MAX_LOOP_ITERATIONS, type BlockDef, type RetryPolicy } from "./definition.ts";
 import { AUTOMATION_TOPIC, type AutomationInbox } from "./inbox.ts";
 import { getBlock, type BlockExecutor, type BlockOutcome } from "./blocks/registry.ts";
 import { registerEngineBlocks } from "./blocks/index.ts";
@@ -45,6 +45,7 @@ import {
   clockStepName,
   conditionStepName,
   framePath,
+  loopBoundStepName,
   relayStepName,
   stepName,
   untilStepName,
@@ -430,7 +431,9 @@ export async function interpretAutomation(
       ...(result.kind === "ok" ? { outputs: result.outputs } : {}),
       ...(result.kind === "error" ? { error: `${result.code}: ${result.message}` } : {}),
     });
-    return result;
+    // The wait half (below, outside this step) must see the RESOLVED config;
+    // it rides the step's checkpointed return value.
+    return result.kind === "ok" ? { ...result, resolvedConfig: resolved } : result;
   };
 
   const runBlock = async (block: BlockDef, frames: Frame[]): Promise<void> => {
@@ -466,10 +469,21 @@ export async function interpretAutomation(
       return;
     }
     if (block.type === "loop") {
-      const config = block.config as { until?: unknown; maxIterations: number };
+      const config = block.config as { until?: unknown; maxIterations: unknown };
+      // Contract 4: the bound is a checkpointed decision. A `$ref` (e.g.
+      // `inputs.max_turns`) resolves from scope here; a literal passes
+      // through. Clamped to the schema's ceiling; anything unusable → 0
+      // iterations (recorded on the step), never NaN-driven silence.
+      const bound = await deps.step(async () => {
+        const raw = isValueRef(config.maxIterations)
+          ? ownPath(ctx.scope(), config.maxIterations.$ref)
+          : config.maxIterations;
+        const n = typeof raw === "number" && Number.isFinite(raw) ? Math.floor(raw) : 0;
+        return Math.max(0, Math.min(n, MAX_LOOP_ITERATIONS));
+      }, loopBoundStepName(frames));
       let iterations = 0;
       let exhausted = true;
-      for (let i = 0; i < config.maxIterations; i += 1) {
+      for (let i = 0; i < bound; i += 1) {
         const iterationFrames: Frame[] = [...frames.slice(0, -1), { blockId: block.id, iteration: i }];
         for (const child of block.body ?? []) {
           await runBlock(child, [...iterationFrames, { blockId: child.id }]);
@@ -543,26 +557,34 @@ export async function interpretAutomation(
         }
       }
 
-      // Wait half, when the block has one and its config asks for it.
+      // Wait half, when the block has one and its config asks for it. It
+      // reads the config the execute step RESOLVED (refs + templates), which
+      // rides that step's checkpointed outcome — never the raw definition.
       if (executor.wait) {
-        const deadlineS = executor.wait.deadlineSeconds(block.config as never, ctx);
+        const waitConfig = (outcome.resolvedConfig ?? block.config) as never;
+        const deadlineS = executor.wait.deadlineSeconds(waitConfig, ctx);
         if (deadlineS !== 0) {
-          const matched = await waitForMessage(frames, executor, block.config as never, deadlineS);
+          const matched = await waitForMessage(frames, executor, waitConfig, deadlineS);
           const waited =
             matched ??
             (executor.wait.onDeadline
-              ? executor.wait.onDeadline(block.config as never, ctx)
+              ? executor.wait.onDeadline(waitConfig, ctx)
               : { outcome: "deadline" });
           const merged = { ...ctx.steps[block.id], ...waited };
           recordStepOutputs(ctx, block.id, path, merged);
+          // A block may declare a deadline as a normal outcome (`onDeadline:
+          // "continue"`, e.g. wait_event in a conversation loop); otherwise a
+          // deadline is terminal, as in phase 1.
+          const continueOnDeadline =
+            (waitConfig as { onDeadline?: string }).onDeadline === "continue";
           await deps.step(async () => {
             await deps.store.recordStep(input.runId, path, attempt, {
-              status: matched === null ? "failed" : "succeeded",
+              status: matched === null && !continueOnDeadline ? "failed" : "succeeded",
               outputs: merged,
-              ...(matched === null ? { error: "deadline" } : {}),
+              ...(matched === null && !continueOnDeadline ? { error: "deadline" } : {}),
             });
           }, `${name}:wait`);
-          if (matched === null) {
+          if (matched === null && !continueOnDeadline) {
             throw new RunEnd("deadline", `block "${block.id}" wait deadline expired`);
           }
           if (merged["outcome"] === "failed") {

@@ -165,7 +165,7 @@ const RUN = { runId: "autorun:auto-1:manual:x", automationId: "auto-1" };
 
 // ---------------------------------------------------------------------------
 
-describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 3)", () => {
+describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 4)", () => {
   test("linear graph: filter → create_session → send_prompt(wait) → end_session", async () => {
     const definition = makeDefinition([
       {
@@ -292,6 +292,8 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 3)
     expect(h.names).toEqual([
       "step:__snapshot__:0",
       "step:launch:0",
+      // Contract 4: the loop's bound is a checkpointed decision step.
+      "step:poll.__bound__:0",
       "step:poll[0].tick:0",
       "step:poll[0].__until__:0",
       "step:__finalize__:0",
@@ -357,6 +359,33 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 3)
     expect(h.finalized).toEqual([{ status: "failed", error: "inputs.limit: must be a number" }]);
     expect(h.released).toEqual([RUN.runId]);
     expect(h.promoted).toEqual(["autorun:auto-1:manual:next"]);
+  });
+
+  test("a loop bound may be a $ref into inputs, resolved in the bound step and clamped", async () => {
+    const definition = makeDefinition([
+      { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+      {
+        id: "poll",
+        type: "loop",
+        config: { maxIterations: { $ref: "inputs.max_turns" } },
+        body: [
+          {
+            id: "tick",
+            type: "run_command",
+            config: { session: { blockId: "launch" }, commandTemplate: "true" },
+          },
+        ],
+      },
+    ]);
+    const two = makeHarness(definition, { inputs: { max_turns: 2 } });
+    expect((await interpretAutomation(RUN, two.deps)).status).toBe("completed");
+    expect(two.names.filter((n) => n.startsWith("step:poll[")).length).toBe(2);
+    expect(two.names).toContain("step:poll.__bound__:0");
+
+    // Unusable bound (missing input) → zero iterations, never NaN silence.
+    const none = makeHarness(definition, { inputs: {} });
+    expect((await interpretAutomation(RUN, none.deps)).status).toBe("completed");
+    expect(none.names.filter((n) => n.startsWith("step:poll[")).length).toBe(0);
   });
 
   test("engine-level retries mint attempt-scoped steps then fail the run", async () => {

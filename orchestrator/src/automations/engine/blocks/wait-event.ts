@@ -27,6 +27,11 @@ export const waitEventConfigSchema = z.object({
   eventKeys: z.array(z.string().min(1)).optional(),
   conditions: conditionGroup.optional(),
   deadlineSeconds: z.number().int().min(1).max(24 * 3600).optional(),
+  /** What a deadline means. `fail_run` (default) ends the run `deadline`, as
+   * every wait did in phase 1. `continue` records `outcome: "deadline"` on
+   * the step and lets the graph go on — a loop's `until` can read it, which
+   * is how a conversation ends when its thread goes quiet. */
+  onDeadline: z.enum(["fail_run", "continue"]).optional(),
 });
 export type WaitEventConfig = z.infer<typeof waitEventConfigSchema>;
 

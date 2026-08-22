@@ -30,6 +30,13 @@ export function conditionStepName(frames: readonly Frame[]): string {
   return `step:${framePath(frames)}.__cond__:0`;
 }
 
+/** A loop's iteration bound, resolved once per loop entry (contract 4): the
+ * bound may be a `$ref` into scope (`inputs.max_turns`), so it is read inside
+ * a checkpointed step like every other decision. */
+export function loopBoundStepName(frames: readonly Frame[]): string {
+  return `step:${framePath(frames)}.__bound__:0`;
+}
+
 export function untilStepName(frames: readonly Frame[], iteration: number): string {
   return `step:${framePath(frames)}[${iteration}].__until__:0`;
 }

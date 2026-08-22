@@ -12,7 +12,12 @@ import type { AutomationInbox } from "../inbox.ts";
 import type { RunContext } from "../context.ts";
 
 export type BlockOutcome<O extends Record<string, unknown> = Record<string, unknown>> =
-  | { kind: "ok"; outputs: O }
+  /** `resolvedConfig` is the config after `$ref`/template resolution, set by
+   * the interpreter so the block's WAIT half reads the same values its
+   * execute half did (a `{ $ref: "inputs.idle_timeout" }` deadline must not
+   * fall back to the default because the wait saw the unresolved object).
+   * It rides the checkpointed step output, so replay sees it too. */
+  | { kind: "ok"; outputs: O; resolvedConfig?: Record<string, unknown> }
   | { kind: "end_run"; status: "filtered" | "completed"; reason?: string }
   | { kind: "error"; code: string; message: string; retryable: boolean };
 
