@@ -71,6 +71,7 @@ import {
   isEditorTab,
   type EditorTab,
 } from "./pages/settings/automations/AutomationEditor";
+import { RunPage } from "./pages/settings/automations/runs/RunPage";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -485,6 +486,12 @@ const automationEditRoute = createRoute({
     isEditorTab(search["tab"]) ? { tab: search["tab"] } : {},
   component: () => <AutomationEditor mode="edit" />,
 });
+const automationRunRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "automations/$id/runs/$runId",
+  beforeLoad: requireAdmin,
+  component: RunPage,
+});
 
 export const routeTree = rootRoute.addChildren([
   // /login — bare page, no app chrome
@@ -538,6 +545,7 @@ export const routeTree = rootRoute.addChildren([
       automationsRoute,
       automationsNewRoute,
       automationEditRoute,
+      automationRunRoute,
     ]),
   ]),
 ]);
