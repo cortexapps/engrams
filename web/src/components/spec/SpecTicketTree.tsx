@@ -52,8 +52,9 @@ export interface SpecTicketTreeProps {
 export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps) {
   const [selected, setSelected] = useState<string[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
-  // Only a row this session just created takes focus; expanding an existing
-  // row to read it must not move the cursor.
+  // A one-shot: the row "Add ticket" just created opens with the cursor in its
+  // title. Cleared as soon as the reader touches any row, so reopening that
+  // same row later — or expanding another to read it — leaves the cursor be.
   const [focusTitleId, setFocusTitleId] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   // The row being dragged also lives in a ref. The drop must know it whether
@@ -204,8 +205,15 @@ export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps)
                 checked ? [...current, ticket.id] : current.filter((id) => id !== ticket.id),
               )
             }
-            onEdit={() => setEditingId(editingId === ticket.id ? null : ticket.id)}
+            onEdit={() => {
+              // The auto-focus is a one-shot for the row this session created.
+              // `TicketEditor` mounts on every expand, so leaving the flag set
+              // would move the cursor again each time that row is reopened.
+              setFocusTitleId(null);
+              setEditingId(editingId === ticket.id ? null : ticket.id);
+            }}
             onSave={(changes) => {
+              setFocusTitleId(null);
               setEditingId(null);
               void run({ kind: "update", id: ticket.id, ...changes });
             }}
