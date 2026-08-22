@@ -67,6 +67,7 @@ import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
 import { Automations } from "./pages/settings/Automations";
 import { AutomationEditor } from "./pages/settings/AutomationEditor";
+import { RunPage } from "./pages/settings/automations/runs/RunPage";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -478,6 +479,12 @@ const automationEditRoute = createRoute({
   beforeLoad: requireAdmin,
   component: () => <AutomationEditor mode="edit" />,
 });
+const automationRunRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "automations/$id/runs/$runId",
+  beforeLoad: requireAdmin,
+  component: RunPage,
+});
 
 export const routeTree = rootRoute.addChildren([
   // /login — bare page, no app chrome
@@ -531,6 +538,7 @@ export const routeTree = rootRoute.addChildren([
       automationsRoute,
       automationsNewRoute,
       automationEditRoute,
+      automationRunRoute,
     ]),
   ]),
 ]);
