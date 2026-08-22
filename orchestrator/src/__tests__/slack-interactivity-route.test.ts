@@ -10,7 +10,7 @@
 
 import { expect, test, describe } from "bun:test";
 import { createHmac } from "node:crypto";
-import { makeSlackInteractivityRoute } from "../routes/slack-interactivity.ts";
+import { answerDelivery, makeSlackInteractivityRoute } from "../routes/slack-interactivity.ts";
 import { ACTION_ANSWER, ACTION_OPEN, ACTION_PROFILE } from "../integrations/slack-blocks.ts";
 
 const SECRET = "test-signing-secret";
@@ -157,5 +157,64 @@ describe("POST /api/v1/integrations/slack/interactivity", () => {
     expect(res.status).toBe(200);
     expect(calls.answers).toHaveLength(0);
     expect(calls.modals).toHaveLength(0);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// ADR 0119 phase 4.5: the automation dual-path
+// ---------------------------------------------------------------------------
+
+describe("automation relay answers (ADR 0119 phase 4.5)", () => {
+  const RUN_ROUTE = { ...ROUTE, runId: "autorun:auto-1:slack:E1" };
+
+  test("a route carrying runId delivers a slack_answer signal to that run; a legacy route does not", () => {
+    const answer = { toolCallId: "tc1", answers: { Pick: ["A"] } };
+    expect(answerDelivery(RUN_ROUTE, answer)).toEqual({
+      kind: "automation",
+      runId: "autorun:auto-1:slack:E1",
+      message: {
+        kind: "signal",
+        name: "slack_answer",
+        payload: { toolCallId: "tc1", answers: { Pick: ["A"] } },
+      },
+      idempotencyKey: "slack-answer:tc1",
+    });
+    expect(answerDelivery(ROUTE, answer)).toEqual({ kind: "legacy" });
+  });
+
+  test("the runId rides the Block Kit value end to end through the route", async () => {
+    const { app, calls } = makeApp();
+    const res = await postSigned(app, {
+      type: "block_actions",
+      trigger_id: "trig",
+      actions: [
+        {
+          action_id: ACTION_ANSWER,
+          value: JSON.stringify({ t: "tc9", q: "Pick", a: "B", r: RUN_ROUTE }),
+        },
+      ],
+    });
+    expect(res.status).toBe(200);
+    expect(calls.answers).toEqual([
+      { route: RUN_ROUTE, answer: { toolCallId: "tc9", answers: { Pick: ["B"] } } },
+    ]);
+  });
+
+  test("a profile pick whose route carries a runId is acked and dropped (no picker on the automation path)", async () => {
+    const { app, calls } = makeApp();
+    const res = await postSigned(app, {
+      type: "block_actions",
+      user: { id: "U1" },
+      actions: [
+        {
+          action_id: ACTION_PROFILE,
+          block_id: JSON.stringify({ r: RUN_ROUTE, u: "U1", n: "Ev0" }),
+          selected_option: { value: "profile-2", text: { type: "plain_text", text: "Infra" } },
+        },
+      ],
+    });
+    expect(res.status).toBe(200);
+    expect(calls.profileChoices).toEqual([]);
   });
 });
