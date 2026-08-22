@@ -4,12 +4,13 @@
  * automation's `inputs_json`. Editable on EVERY automation, built-ins
  * included: inputs are the per-org knobs a locked graph exposes (the review
  * built-in's repos map, mention, categories, instructions…). Save posts the
- * whole value object through SetInputs; the server re-validates and its
- * errors route back by field key. */
+ * whole value object through SetInputs. Value validation is CLIENT-side
+ * (lib/automation-inputs.ts — see its header): the server currently rejects
+ * only undeclared keys, and its errors route back by field key. */
 
 import { ConnectError } from "@connectrpc/connect";
 import { Lock, RotateCcw } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -310,8 +311,28 @@ function JsonInput({
   disabled: boolean;
   ariaLabel: string;
 }) {
-  const [text, setText] = useState(() => JSON.stringify(value ?? {}, null, 2));
+  const committed = JSON.stringify(value ?? {}, null, 2);
+  const [text, setText] = useState(committed);
   const [bad, setBad] = useState(false);
+  // Re-sync to the committed value when the PARENT changes it (Discard, a
+  // post-save reload). A keystroke also round-trips through the parent, but
+  // comes back SEMANTICALLY equal to what the user typed — so compare parsed
+  // values, not text, to leave their formatting and cursor alone; invalid
+  // typing never reaches the parent and is never clobbered.
+  const lastCommitted = useRef(committed);
+  const textRef = useRef(text);
+  textRef.current = text;
+  useEffect(() => {
+    if (lastCommitted.current === committed) return;
+    lastCommitted.current = committed;
+    try {
+      if (JSON.stringify(JSON.parse(textRef.current), null, 2) === committed) return;
+    } catch {
+      // invalid text is replaced below
+    }
+    setText(committed);
+    setBad(false);
+  }, [committed]);
   return (
     <div className="flex flex-col gap-1">
       <Textarea

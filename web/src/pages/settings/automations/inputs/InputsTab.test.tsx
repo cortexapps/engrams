@@ -150,6 +150,32 @@ describe("InputsTab", () => {
     expect(screen.queryByText("Unsaved changes")).toBeNull();
   });
 
+  it("a json input's textarea follows Discard and keeps mid-edit formatting otherwise", () => {
+    automationHolder.value = reviewBuiltin({ extra: { a: 1 } }, [
+      { key: "extra", label: "Extra", type: "json" },
+    ]);
+    render(<InputsTab automationId="b1" />);
+    const area = screen.getByLabelText("Extra") as HTMLTextAreaElement;
+    const stored = JSON.stringify({ a: 1 }, null, 2);
+    expect(area.value).toBe(stored);
+
+    // A valid edit round-trips through the parent and must NOT be reformatted
+    // under the user's cursor (the text stays exactly as typed).
+    fireEvent.change(area, { target: { value: '{"a":2}' } });
+    expect(area.value).toBe('{"a":2}');
+    expect(screen.getByText("Unsaved changes")).toBeTruthy();
+
+    // Discard resets the parent; the textarea must follow, not freeze.
+    fireEvent.click(screen.getByRole("button", { name: /discard/i }));
+    expect(area.value).toBe(stored);
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+
+    // Invalid typing is never clobbered and is flagged.
+    fireEvent.change(area, { target: { value: "{not json" } });
+    expect(area.value).toBe("{not json");
+    expect(screen.getByRole("alert").textContent).toContain("Not valid JSON");
+  });
+
   it("explains when the automation declares no inputs", () => {
     automationHolder.value = reviewBuiltin({}, []);
     render(<InputsTab automationId="b1" />);
