@@ -66,7 +66,11 @@ import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
 import { AutomationsList } from "./pages/settings/automations/AutomationsList";
-import { AutomationEditor } from "./pages/settings/AutomationEditor";
+import {
+  AutomationEditor,
+  isEditorTab,
+  type EditorTab,
+} from "./pages/settings/automations/AutomationEditor";
 import { RunPage } from "./pages/settings/automations/runs/RunPage";
 
 export interface RouterContext {
@@ -461,9 +465,11 @@ const profileEditRoute = createRoute({
   beforeLoad: requireAdmin,
   component: () => <SessionProfileEditor mode="edit" />,
 });
-export type AutomationEditorTab = "build" | "inputs" | "runs" | "settings";
+/** The editor shell owns the tab vocabulary (`isEditorTab`); these names are
+ * kept as aliases so either spelling resolves to the one definition. */
+export type AutomationEditorTab = EditorTab;
 export interface AutomationEditorSearch {
-  tab?: AutomationEditorTab;
+  tab?: EditorTab;
 }
 const automationsRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
@@ -481,14 +487,10 @@ const automationEditRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "automations/$id",
   beforeLoad: requireAdmin,
-  // ADR 0119 phase 3: the editor's tabs ride a search param so every tab is
-  // deep-linkable (list rows link to build/runs; reviewed-repos → inputs).
-  validateSearch: (search: Record<string, unknown>): AutomationEditorSearch => {
-    const tab = search["tab"];
-    return tab === "build" || tab === "inputs" || tab === "runs" || tab === "settings"
-      ? { tab }
-      : {};
-  },
+  // ?tab=build|inputs|runs|settings (ADR 0119 phase 3.3); anything else → build.
+  // Deep-linkable: list rows link to build/runs, reviewed-repos → inputs.
+  validateSearch: (search: Record<string, unknown>): { tab?: EditorTab } =>
+    isEditorTab(search["tab"]) ? { tab: search["tab"] } : {},
   component: () => <AutomationEditor mode="edit" />,
 });
 const automationRunRoute = createRoute({
