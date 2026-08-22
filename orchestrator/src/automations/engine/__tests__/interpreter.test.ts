@@ -28,6 +28,7 @@ interface Harness {
   execs: Array<{ sessionId: string; command: string; execId: string }>;
   released: string[];
   promoted: string[];
+  actions: Array<{ actionId: string; params: Record<string, unknown> }>;
 }
 
 function makeDefinition(
@@ -52,6 +53,8 @@ function makeHarness(
     sessions?: Array<{ sessionId: string; keep: boolean }>;
     promote?: string | null;
     failExec?: boolean;
+    /** Fake integration-action runtime: records calls; throws when asked. */
+    failActions?: boolean;
   } = {},
 ): Harness {
   const names: string[] = [];
@@ -64,6 +67,7 @@ function makeHarness(
   const execs: Harness["execs"] = [];
   const released: string[] = [];
   const promoted: string[] = [];
+  const actions: Array<{ actionId: string; params: Record<string, unknown> }> = [];
   const recvQueue = [...(options.recv ?? [])];
   const runSessions = options.sessions ?? [];
   let clock = 1_000_000_000;
@@ -144,16 +148,23 @@ function makeHarness(
     startQueuedRun: async (runId) => {
       promoted.push(runId);
     },
+    integrationActions: {
+      async execute(input) {
+        if (options.failActions) throw new Error("provider down");
+        actions.push({ actionId: input.actionId, params: input.params });
+        return { comment_id: 7 };
+      },
+    },
   };
 
-  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted };
+  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, actions };
 }
 
 const RUN = { runId: "autorun:auto-1:manual:x", automationId: "auto-1" };
 
 // ---------------------------------------------------------------------------
 
-describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 1)", () => {
+describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 2)", () => {
   test("linear graph: filter → create_session → send_prompt(wait) → end_session", async () => {
     const definition = makeDefinition([
       {
@@ -580,6 +591,104 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     expect(result.status).toBe("completed");
     const phaseB = h.stepRecords.filter((r) => r.framePath === "phase_b").at(-1)!;
     expect(phaseB.record.outputs).toMatchObject({ signal: { phase: "b" } });
+  });
+
+  test("finalize hooks run as their own steps before finalize, only for matching statuses (contract 2)", async () => {
+    const hooks: Pick<AutomationDefinition["settings"], "onFinalize"> = {
+      onFinalize: [
+        {
+          when: ["failed", "deadline"],
+          block: {
+            id: "report_failure",
+            type: "integration_action",
+            config: {
+              provider: "github",
+              actionId: "update_issue_comment",
+              params: { body: "❌ ${{ run.status }}: ${{ run.error }}" },
+            },
+          },
+        },
+        {
+          when: ["completed"],
+          block: {
+            id: "celebrate",
+            type: "integration_action",
+            config: { provider: "github", actionId: "create_issue_comment", params: { body: "✅" } },
+          },
+        },
+      ],
+    };
+    // A failing run: the failure hook fires, the completion hook does not.
+    const failing = makeDefinition(
+      [
+        { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+        {
+          id: "boom",
+          type: "run_command",
+          config: { session: { blockId: "launch" }, commandTemplate: "false" },
+        },
+      ],
+      { onFinalize: hooks.onFinalize },
+    );
+    const h = makeHarness(failing, { failExec: true });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("failed");
+    expect(h.names).toEqual([
+      "step:__snapshot__:0",
+      "step:launch:0",
+      "step:boom:0",
+      "step:__finalize__.report_failure:0",
+      "step:__finalize__:0",
+    ]);
+    expect(h.actions).toHaveLength(1);
+    expect(h.actions[0]!.actionId).toBe("update_issue_comment");
+    // The hook's template read the terminal status and reason.
+    expect(String(h.actions[0]!.params["body"])).toMatch(/^❌ failed: block "boom"/);
+    // The hook's outputs land in the ledger under the finalize path.
+    const hookStep = h.stepRecords.filter((r) => r.framePath === "__finalize__.report_failure").at(-1)!;
+    expect(hookStep.record.status).toBe("succeeded");
+
+    // A completing run: only the completion hook fires.
+    const completing = makeDefinition(
+      [{ id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } }],
+      { onFinalize: hooks.onFinalize },
+    );
+    const c = makeHarness(completing);
+    expect((await interpretAutomation(RUN, c.deps)).status).toBe("completed");
+    expect(c.names).toEqual([
+      "step:__snapshot__:0",
+      "step:launch:0",
+      "step:__finalize__.celebrate:0",
+      "step:__finalize__:0",
+    ]);
+    expect(c.actions.map((a) => a.actionId)).toEqual(["create_issue_comment"]);
+  });
+
+  test("a throwing finalize hook is recorded on its step and never changes the terminal status", async () => {
+    const definition = makeDefinition(
+      [{ id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } }],
+      {
+        onFinalize: [
+          {
+            when: ["completed"],
+            block: {
+              id: "flaky_hook",
+              type: "integration_action",
+              config: { provider: "github", actionId: "create_issue_comment", params: {} },
+            },
+          },
+        ],
+      },
+    );
+    const h = makeHarness(definition, { failActions: true });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.finalized).toEqual([{ status: "completed" }]);
+    const hookStep = h.stepRecords.filter((r) => r.framePath === "__finalize__.flaky_hook").at(-1)!;
+    expect(hookStep.record.status).toBe("failed");
+    expect(hookStep.record.error).toContain("provider down");
+    // Finalize still ran after the hook.
+    expect(h.names.at(-1)).toBe("step:__finalize__:0");
   });
 
   test("phase-2 stubs return typed unavailable failures", async () => {

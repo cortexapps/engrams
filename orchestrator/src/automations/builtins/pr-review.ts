@@ -22,16 +22,19 @@
  * the hardened Liquid sandbox has no conditional tags, so deriving
  * "command vs opened" or "repo short name" belongs in code, once.
  *
- * Two known gaps wait on one engine feature (a finalize-time hook):
- *   - on failure, the legacy graph edits the sticky status comment to
- *     "failed"; the engine has no on-failure hook, so a failed run leaves the
- *     👀 comment as-is (the Reviews dossier shows the failure);
- *   - on supersede, the legacy graph tears the old pass down explicitly; the
- *     engine's supersede policy ends the run and finalize
- *     (endSessionsOnFinish) ends the workers, while the review row's
- *     `superseded` status is written by the NEW pass's open_review_pass
- *     (beginReviewPass marks the predecessor). system.review_cleanup exists
- *     for the hook to call when it lands.
+ * Terminal parity with the legacy graph rides `settings.onFinalize`
+ * (ENGINE_STEP_CONTRACT 2) through system.review_finalize:
+ *   - failed | deadline → the pass is marked failed, the activity log gets
+ *     the run's error as the reason, and the sticky status comment flips to
+ *     the legacy "failed" text (failReview);
+ *   - halted → the same via haltReview;
+ *   - superseded → worker teardown only (cleanupSupersededReview); the review
+ *     row's `superseded` status is written by the NEW pass's open_review_pass
+ *     (beginReviewPass marks the predecessor), which also posts its own ack.
+ * Worker sessions are ended by the engine's finalize (endSessionsOnFinish),
+ * so the hooks pass no sessionId. A run that fails BEFORE open_review_pass
+ * has no review id: the hook's `$ref` cannot resolve, it fails on its own
+ * step row, and the run's status stands — there is no pass to report on.
  */
 
 import { PR_REVIEWER_DESIGNATION } from "../../reviewers/seed-profile.ts";
@@ -54,7 +57,7 @@ export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 /** Bump on any graph or inputs-schema change (the seeder inserts a new
  * version when the stored content hash differs). */
-export const PR_REVIEW_DEFINITION_VERSION = 1;
+export const PR_REVIEW_DEFINITION_VERSION = 2;
 
 /** Placeholder the seeder replaces with the org's default GitHub connection. */
 export const DEFAULT_CONNECTION_PLACEHOLDER = "__default__";
@@ -401,6 +404,36 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
     },
     runDeadlineSeconds: 4 * PHASE_DEADLINE_S,
     endSessionsOnFinish: true,
+    onFinalize: [
+      {
+        when: ["failed", "deadline"],
+        block: {
+          id: "report_failure",
+          type: "system.review_finalize",
+          config: {
+            reviewId: { $ref: "steps.open.review_id" },
+            outcome: "failed",
+            reason: "${{ run.error }}",
+          },
+        },
+      },
+      {
+        when: ["halted"],
+        block: {
+          id: "report_halt",
+          type: "system.review_finalize",
+          config: { reviewId: { $ref: "steps.open.review_id" }, outcome: "halted" },
+        },
+      },
+      {
+        when: ["superseded"],
+        block: {
+          id: "cleanup_superseded",
+          type: "system.review_finalize",
+          config: { reviewId: { $ref: "steps.open.review_id" }, outcome: "superseded" },
+        },
+      },
+    ],
   },
 };
 

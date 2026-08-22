@@ -14,11 +14,15 @@
  *                                 payload for the generic github.post_pr_review
  *                                 action
  *   - system.review_cleanup     — worker teardown for a superseded pass
+ *   - system.review_finalize    — the finalize-hook arm (contract 2): mark the
+ *                                 pass failed/halted with the legacy sticky
+ *                                 status comment + activity event, or tear a
+ *                                 superseded pass down — byte-for-byte the
+ *                                 legacy failReview/haltReview/cleanup path
  *
  * Supersession itself is the ENGINE's concurrency policy (supersede keyed on
- * the PR url); the engine has no finalize-time hook yet through which a run
- * could invoke review_cleanup on its own supersession, so the built-in (4.3)
- * wires it explicitly and the hook is recorded as a follow-up.
+ * the PR url). The built-in reaches the legacy graph's failure/halt/supersede
+ * behaviour through `settings.onFinalize` hooks that run review_finalize.
  */
 
 import { z } from "zod";
@@ -38,6 +42,7 @@ export const OPEN_REVIEW_PASS_TYPE = "system.open_review_pass";
 export const REVIEW_STAGE_TYPE = "system.review_stage";
 export const REVIEW_POLICY_GATE_TYPE = "system.review_policy_gate";
 export const REVIEW_CLEANUP_TYPE = "system.review_cleanup";
+export const REVIEW_FINALIZE_TYPE = "system.review_finalize";
 
 /** The slice of the control plane the blocks use; injected for tests. */
 export type ReviewBlockControlPlane = Pick<
@@ -52,6 +57,8 @@ export type ReviewBlockControlPlane = Pick<
   | "markPhasePrompted"
   | "decideReviewResults"
   | "cleanupSupersededReview"
+  | "failReview"
+  | "haltReview"
 >;
 
 export interface ReviewBlockDeps {
@@ -317,7 +324,53 @@ export const reviewCleanupConfigSchema = z.object({
 });
 export type ReviewCleanupConfig = z.infer<typeof reviewCleanupConfigSchema>;
 
+// ---------------------------------------------------------------------------
+// system.review_finalize — the finalize-hook arm
+// ---------------------------------------------------------------------------
+
+export const reviewFinalizeConfigSchema = z.object({
+  reviewId: z.string().min(1),
+  /** Which legacy terminal path to take. Maps from the run's terminal status
+   * in the built-in's hooks: failed|deadline → "failed", halted → "halted",
+   * superseded → "superseded". */
+  outcome: z.enum(["failed", "halted", "superseded"]),
+  /** Recorded on the review's activity log (failed only); the built-in passes
+   * `${{ run.error }}`. */
+  reason: z.string().max(2000).optional(),
+});
+export type ReviewFinalizeConfig = z.infer<typeof reviewFinalizeConfigSchema>;
+
+/** Worker sessions are ended by the engine's own finalize (the built-in runs
+ * with endSessionsOnFinish), so no sessionId is passed: the legacy helpers'
+ * teardown is a no-op without one and the rest — status transition, activity
+ * event, sticky ❌/halted comment — is exactly what the legacy graph did. */
+export async function executeReviewFinalize(config: ReviewFinalizeConfig): Promise<BlockOutcome> {
+  const plane = deps().controlPlane();
+  switch (config.outcome) {
+    case "failed":
+      await plane.failReview(config.reviewId, config.reason ? { reason: config.reason } : {});
+      break;
+    case "halted":
+      await plane.haltReview(config.reviewId, {});
+      break;
+    case "superseded":
+      await plane.cleanupSupersededReview(config.reviewId, {});
+      break;
+  }
+  return { kind: "ok", outputs: { review_id: config.reviewId, outcome: config.outcome } };
+}
+
 export function registerReviewSystemBlocks(): void {
+  registerBlock<ReviewFinalizeConfig>({
+    type: REVIEW_FINALIZE_TYPE,
+    system: true,
+    outputs: ["review_id", "outcome"],
+    configSchema: reviewFinalizeConfigSchema,
+    async execute(config) {
+      return executeReviewFinalize(config);
+    },
+  });
+
   registerBlock<OpenReviewPassConfig>({
     type: OPEN_REVIEW_PASS_TYPE,
     system: true,

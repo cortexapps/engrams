@@ -88,7 +88,7 @@ export const retryPolicySchema = z.object({
 });
 export type RetryPolicy = z.infer<typeof retryPolicySchema>;
 
-export const settingsSchema = z.object({
+const settingsBaseSchema = z.object({
   concurrency: z
     .object({
       keyTemplate: z.string().min(1),
@@ -98,7 +98,20 @@ export const settingsSchema = z.object({
   runDeadlineSeconds: z.number().int().min(60).max(48 * 3600).optional(),
   endSessionsOnFinish: z.boolean(),
 });
-export type AutomationSettings = z.infer<typeof settingsSchema>;
+
+/** Terminal statuses a finalize hook can fire on. Mirrors RunTerminalStatus
+ * (interpreter.ts); kept literal here so the definition module stays
+ * import-free of the interpreter. */
+export const FINALIZE_HOOK_STATUSES = [
+  "completed",
+  "filtered",
+  "failed",
+  "superseded",
+  "halted",
+  "deadline",
+] as const;
+export type FinalizeHookStatus = (typeof FINALIZE_HOOK_STATUSES)[number];
+export const MAX_FINALIZE_HOOKS = 8;
 
 // ---------------------------------------------------------------------------
 // Blocks
@@ -219,6 +232,9 @@ export function applyBlockOverrides(
 ): AutomationDefinition {
   const byId = new Map<string, BlockDef>();
   for (const block of walkBlockTree(definition.blocks)) byId.set(block.id, block);
+  // Finalize hooks are tunable too (e.g. the review built-in's failure
+  // comment body).
+  for (const hook of definition.settings.onFinalize ?? []) byId.set(hook.block.id, hook.block);
 
   for (const [blockId, fields] of Object.entries(overrides)) {
     const block = byId.get(blockId);
@@ -266,8 +282,35 @@ export function applyBlockOverrides(
       return merged;
     });
 
-  return { ...definition, blocks: merge(definition.blocks) };
+  const onFinalize = definition.settings.onFinalize?.map((hook) => ({
+    ...hook,
+    block: merge([hook.block])[0]!,
+  }));
+  return {
+    ...definition,
+    blocks: merge(definition.blocks),
+    settings: onFinalize ? { ...definition.settings, onFinalize } : definition.settings,
+  };
 }
+
+/** A finalize-time hook (ADR 0119, contract 2): a block that runs inside the
+ * finalize step when the run ends in one of `when`. Hooks observe the
+ * terminal status (`run.status`, `run.error` in scope) and may post, clean up,
+ * or record — they can never change the outcome, and they never wait. */
+export interface FinalizeHook {
+  when: FinalizeHookStatus[];
+  block: BlockDef;
+}
+
+const finalizeHookSchema: z.ZodType<FinalizeHook> = z.object({
+  when: z.array(z.enum(FINALIZE_HOOK_STATUSES)).min(1),
+  block: blockDefSchema,
+});
+
+export const settingsSchema = settingsBaseSchema.extend({
+  onFinalize: z.array(finalizeHookSchema).max(MAX_FINALIZE_HOOKS).optional(),
+});
+export type AutomationSettings = z.infer<typeof settingsSchema>;
 
 export const definitionSchema = z.object({
   engine: z.literal(ENGINE_VERSION),
@@ -368,7 +411,7 @@ export function validateDefinition(
 
   const seen = new Set<string>();
   let count = 0;
-  for (const block of walkBlocks(definition.blocks)) {
+  const checkBlock = (block: BlockDef, hook: boolean): void => {
     count += 1;
     if (count > MAX_BLOCKS) {
       throw new DefinitionError(null, "blocks", `more than ${MAX_BLOCKS} blocks`);
@@ -416,8 +459,29 @@ export function validateDefinition(
     if (block.type !== "loop" && block.body) {
       throw new DefinitionError(block.id, "body", `only loop blocks nest a body`);
     }
+    if (hook) {
+      // A finalize hook runs inside the finalize step: nothing may park on
+      // the mailbox there, and control flow has no graph to branch into.
+      if (executor.wait !== undefined || block.type === "wait_event") {
+        throw new DefinitionError(
+          block.id,
+          "type",
+          `block type "${block.type}" waits; a finalize hook cannot wait`,
+        );
+      }
+      if (block.type === "branch" || block.type === "loop" || block.type === "filter") {
+        throw new DefinitionError(
+          block.id,
+          "type",
+          `control block "${block.type}" is not allowed in a finalize hook`,
+        );
+      }
+    }
     validateTemplatesIn(block.id, block.config, "");
-  }
+  };
+
+  for (const block of walkBlocks(definition.blocks)) checkBlock(block, false);
+  for (const hook of definition.settings.onFinalize ?? []) checkBlock(hook.block, true);
 
   if (definition.settings.concurrency) {
     validateTemplatesIn("__settings__", definition.settings.concurrency.keyTemplate, "concurrency.keyTemplate");
