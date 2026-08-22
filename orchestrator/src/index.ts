@@ -85,6 +85,7 @@ import {
 import { setIntegrationEventDispatch } from "./automations/integration-ingress.ts";
 import { dispatchIntegrationEvent } from "./automations/dispatch.ts";
 import { assertSweepPoliciesExhaustive } from "./sweep/policy.ts";
+import { assertBlockRegistryComplete } from "./automations/engine/blocks/index.ts";
 import { makeSweepRuntime } from "./sweep/production.ts";
 import { getDb, getPool } from "./db/client.ts";
 import { resolveDraftingSpec, resolveSpecMembership } from "./authz/resolve.ts";
@@ -660,6 +661,12 @@ void retireProviderWebhookSchemes({
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 assertSweepPoliciesExhaustive();
+// ADR 0119 D1: the block registry is static and must be populated before the
+// first RPC validates a definition — registration was lazy (first interpreter
+// run) and the e2e suite caught a cold CreateAutomation rejecting
+// create_session as unknown. Registers every v1 + system block and fails boot
+// if any v1 type is missing, mirroring the sweep-policy assertion above.
+assertBlockRegistryComplete();
 const { heartbeat, sweeper } = makeSweepRuntime({
   config: {
     sweepDisabled: config.sweepDisabled,
