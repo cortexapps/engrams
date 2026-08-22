@@ -1,6 +1,7 @@
 import type { ThreadMessageLike } from "@assistant-ui/react";
 
 import type { SpecMessage } from "@/hooks/useSpecMessages";
+import { parseSelectionActionPrompt, selectionTurnMarkdown } from "./selection-prompt";
 
 export interface SpecHumanThreadEntry {
   kind: "human";
@@ -106,12 +107,17 @@ export function buildSpecThread(
       // stay unattributed rather than guessed.
       const author = stored?.author ?? (sawHumanTurn ? null : owner);
       sawHumanTurn = true;
+      // A selection action is a human turn whose prompt carries the anchors the
+      // agent edits by. Show the passage and the request, not the anchors.
+      const selection = parseSelectionActionPrompt(text);
       result.push({
         kind: "human",
         id: `human:${promptId}`,
         promptId,
         author,
-        text,
+        text: selection
+          ? selectionTurnMarkdown(selection, sectionTitles.get(selection.sectionId))
+          : text,
         createdAt: stored?.createdAt ?? toIso(message.createdAt),
       });
       continue;
