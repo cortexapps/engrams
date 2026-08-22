@@ -7,14 +7,9 @@ import { useRunList } from "@/hooks/useAutomationRuns";
 import { relativeTime } from "@/pages/sessions/session-format";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { runStatusTone, toneDotClass } from "@/lib/automations";
 import { cn } from "@/lib/utils";
-import {
-  formatDuration,
-  runStatusLabel,
-  runTone,
-  toneDotClass,
-  triggerSourceLabel,
-} from "./run-format";
+import { formatDuration, runStatusLabel, triggerSourceLabel } from "./run-format";
 
 export interface RunsTabProps {
   automationId: string;
@@ -28,10 +23,10 @@ export function RunStatusDot({ status, className }: { status: string; className?
     <span
       role="img"
       aria-label={`status ${runStatusLabel(status)}`}
-      data-tone={runTone(status)}
+      data-tone={runStatusTone(status)}
       className={cn(
         "inline-block size-2 shrink-0 rounded-full",
-        toneDotClass(runTone(status)),
+        toneDotClass(runStatusTone(status)),
         className,
       )}
     />

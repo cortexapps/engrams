@@ -43,12 +43,17 @@ export function automationStatusLabel(status: string): string {
 
 export type RunTone = "nominal" | "caution" | "critical" | "muted" | "active";
 
-/** Status → instrument tone for the list's status dot. `filtered`,
- * `superseded`, and `halted` are neutral outcomes (the run ended on purpose),
- * not failures; `active` covers everything still moving. */
+/** THE status → instrument tone mapping, shared by every surface that shows a
+ * run or step status (list rows, runs tab, run page, step drawer) so they
+ * cannot drift. Covers both vocabularies: run statuses (`completed`,
+ * `filtered`, …) and step statuses (`succeeded`, `skipped`). `filtered`,
+ * `superseded`, `halted`, and a skipped step are neutral outcomes (ended on
+ * purpose), not failures; `active` covers everything still moving. Lime is
+ * the accent, never a status (web/DESIGN.md). */
 export function runStatusTone(status: string): RunTone {
   switch (status) {
     case "completed":
+    case "succeeded":
       return "nominal";
     case "failed":
     case "deadline":
@@ -56,6 +61,7 @@ export function runStatusTone(status: string): RunTone {
     case "filtered":
     case "superseded":
     case "halted":
+    case "skipped":
       return "caution";
     case "pending":
     case "running":
@@ -63,6 +69,22 @@ export function runStatusTone(status: string): RunTone {
       return "active";
     default:
       return "muted";
+  }
+}
+
+/** Dot fill per tone; `active` pulses. */
+export function toneDotClass(tone: RunTone): string {
+  switch (tone) {
+    case "nominal":
+      return "bg-instrument-nominal";
+    case "caution":
+      return "bg-instrument-caution";
+    case "critical":
+      return "bg-instrument-critical";
+    case "active":
+      return "bg-instrument-nominal animate-pulse";
+    case "muted":
+      return "bg-muted-foreground/30";
   }
 }
 

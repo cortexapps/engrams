@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRouterTransport } from "@connectrpc/connect";
+import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
 
 import {
   AutomationService,
@@ -16,6 +16,11 @@ vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
   useNavigate: () => navigate,
 }));
+const toastError = vi.hoisted(() => vi.fn());
+vi.mock("sonner", async (orig) => {
+  const real = await orig<typeof import("sonner")>();
+  return { ...real, toast: { ...real.toast, error: toastError } };
+});
 
 const T0 = "2026-08-21T12:00:00Z";
 
@@ -82,7 +87,10 @@ function transportFor(
   });
 }
 
-beforeEach(() => navigate.mockReset());
+beforeEach(() => {
+  navigate.mockReset();
+  toastError.mockReset();
+});
 
 describe("settingsFromDraft", () => {
   it("builds settings and validates the key + deadline", () => {
@@ -184,6 +192,27 @@ describe("SettingsTab", () => {
         expect.objectContaining({ to: "/settings/automations" }),
       ),
     );
+  });
+
+  it("a failed archive surfaces the error and never navigates away", async () => {
+    // The confirm dialog closes on click regardless of outcome, so a swallowed
+    // rejection would leave the operator believing the automation is gone
+    // while it keeps firing.
+    const archiveAutomation = vi.fn<ArchiveImpl>(() => {
+      throw new ConnectError("another admin is archiving this automation", Code.Aborted);
+    });
+    renderWithProviders(<SettingsTab automationId="auto-1" />, {
+      transport: transportFor("user", { archiveAutomation }),
+    });
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: /^archive$/i }));
+    const dialog = await screen.findByRole("alertdialog");
+    await user.click(within(dialog).getByRole("button", { name: /^archive$/i }));
+    await waitFor(() => expect(archiveAutomation).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(expect.stringMatching(/another admin is archiving/)),
+    );
+    expect(navigate).not.toHaveBeenCalled();
   });
 
   it("duplicates and opens the copy in the editor", async () => {

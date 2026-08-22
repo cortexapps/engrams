@@ -11,6 +11,8 @@ import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { toast } from "sonner";
 
+import { errorMessage } from "@/lib/errors";
+
 import {
   AlertDialog,
   AlertDialogAction,
@@ -154,15 +156,28 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
     }
   };
 
+  // Both mutations surface failures: the confirm dialog closes on click
+  // regardless of outcome, so a swallowed rejection would leave the operator
+  // believing an archive happened while the automation keeps firing.
   const onArchive = async () => {
-    await archive.mutateAsync({ id });
+    try {
+      await archive.mutateAsync({ id });
+    } catch (err) {
+      toast.error(errorMessage(err));
+      return;
+    }
     toast.success("Automation archived");
     void navigate({ to: "/settings/automations" });
   };
 
   const onDuplicate = async () => {
-    const response = await duplicate.mutateAsync({ automationId: id });
-    const copy = response.automation;
+    let copy;
+    try {
+      copy = (await duplicate.mutateAsync({ automationId: id })).automation;
+    } catch (err) {
+      toast.error(errorMessage(err));
+      return;
+    }
     if (copy) {
       toast.success("Duplicated");
       void navigate({
