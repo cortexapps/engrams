@@ -280,6 +280,9 @@ export interface AutomationCronStore {
     concurrencyKey: string,
     runId: string,
   ): Promise<ConcurrencyClaimResult>;
+  /** The run holding the key, or null — a read, never a claim (a
+   * continue-only delivery must not leave a phantom claim behind). */
+  getConcurrencyHolder(automationId: string, concurrencyKey: string): Promise<string | null>;
   casConcurrency(
     automationId: string,
     concurrencyKey: string,
@@ -317,6 +320,9 @@ export interface AutomationDispatchStore {
     concurrencyKey: string,
     runId: string,
   ): Promise<ConcurrencyClaimResult>;
+  /** The run holding the key, or null — a read, never a claim (a
+   * continue-only delivery must not leave a phantom claim behind). */
+  getConcurrencyHolder(automationId: string, concurrencyKey: string): Promise<string | null>;
   casConcurrency(
     automationId: string,
     concurrencyKey: string,
@@ -1043,6 +1049,20 @@ export function makeAutomationStore(
       if (!holder) return this.claimConcurrency(automationId, concurrencyKey, runId);
       if (holder.runId === runId) return { claimed: true };
       return { claimed: false, holderRunId: holder.runId };
+    },
+
+    async getConcurrencyHolder(automationId, concurrencyKey) {
+      const [holder] = await db
+        .select({ runId: claimTable.runId })
+        .from(claimTable)
+        .where(
+          and(
+            eq(claimTable.automationId, automationId),
+            eq(claimTable.concurrencyKey, concurrencyKey),
+          ),
+        )
+        .limit(1);
+      return holder?.runId ?? null;
     },
 
     async casConcurrency(automationId, concurrencyKey, fromRunId, toRunId) {

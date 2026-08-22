@@ -338,8 +338,12 @@ describe("automation engine store (live PG)", () => {
     }
     // CAS moves the claim only from the current holder.
     const holder = winners[0] === a ? "run-a" : "run-b";
+    // The peek reads the holder without claiming (a continue-only delivery).
+    expect(await store.getConcurrencyHolder(id, "pr-7")).toBe(holder);
+    expect(await store.getConcurrencyHolder(id, "pr-8")).toBeNull();
     expect(await store.casConcurrency(id, "pr-7", "run-neither", "run-c")).toBe(false);
     expect(await store.casConcurrency(id, "pr-7", holder, "run-c")).toBe(true);
+    expect(await store.getConcurrencyHolder(id, "pr-7")).toBe("run-c");
   });
 
   test.skipIf(!dbReachable)(

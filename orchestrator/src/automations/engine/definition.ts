@@ -49,6 +49,13 @@ const integrationTrigger = z.object({
       z.object({ fromInput: z.string().min(1) }),
     ])
     .optional(),
+  /** Event keys that only CONTINUE an active run (delivered into the
+   * concurrency holder's mailbox under policy `join`) and never open one:
+   * with no active run for the key, the delivery is dropped at admission.
+   * The conversation-shaped built-ins use it — a Slack thread reply belongs
+   * to a thread the bot was mentioned in, or to nobody. Must be a subset of
+   * `eventKeys`, and requires `settings.concurrency.policy: "join"`. */
+  continueOnly: z.array(z.string().min(1)).optional(),
 });
 
 const manualTrigger = z.object({ kind: z.literal("manual") });
@@ -528,6 +535,25 @@ export function validateDefinition(
 
   if (definition.settings.concurrency) {
     validateTemplatesIn("__settings__", definition.settings.concurrency.keyTemplate, "concurrency.keyTemplate");
+  }
+  if (definition.trigger.kind === "integration" && definition.trigger.continueOnly !== undefined) {
+    const trigger = definition.trigger;
+    for (const key of definition.trigger.continueOnly) {
+      if (!trigger.eventKeys.includes(key)) {
+        throw new DefinitionError(
+          "__trigger__",
+          "continueOnly",
+          `continueOnly event "${key}" is not one of the trigger's eventKeys`,
+        );
+      }
+    }
+    if (definition.settings.concurrency?.policy !== "join") {
+      throw new DefinitionError(
+        "__trigger__",
+        "continueOnly",
+        "continueOnly needs settings.concurrency.policy \"join\" (a continue-only event joins the active run's mailbox)",
+      );
+    }
   }
 
   return definition;

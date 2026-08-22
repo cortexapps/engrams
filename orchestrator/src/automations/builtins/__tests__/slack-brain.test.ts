@@ -25,6 +25,9 @@ describe("Slack thread brain built-in — definition", () => {
       "thread",
     ]);
     expect(parsed.settings.concurrency?.policy).toBe("join");
+    // A thread reply continues a mention-opened thread or is dropped at
+    // admission; it never opens a run of its own.
+    expect(parsed.trigger).toMatchObject({ continueOnly: ["message"] });
     expect(parsed.settings.endSessionsOnFinish).toBe(false);
     expect(parsed.settings.onFinalize?.[0]?.block.type).toBe("system.slack_thread_recap");
   });

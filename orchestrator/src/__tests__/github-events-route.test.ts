@@ -648,6 +648,9 @@ describe("ingress → integration-trigger dispatch (2.C)", () => {
         async claimConcurrency() {
           return { claimed: true } as const;
         },
+        async getConcurrencyHolder() {
+          return null;
+        },
         async casConcurrency() {
           return true;
         },

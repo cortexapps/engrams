@@ -207,6 +207,9 @@ function makeHarness(targets: DispatchTarget[]): Harness {
       }
       return { claimed: false, holderRunId: holder };
     },
+    async getConcurrencyHolder(automationId, key) {
+      return claims.get(`${automationId}:${key}`) ?? null;
+    },
     async casConcurrency(automationId, key, fromRunId, toRunId) {
       const mapKey = `${automationId}:${key}`;
       if (claims.get(mapKey) !== fromRunId) return false;
@@ -331,6 +334,70 @@ describe("dispatchIntegrationEvent", () => {
     expect(second).toMatchObject({ queued: 1, started: 0 });
     const pending = h.runs.get("autorun:automation-1:github:gh-delivery-2")!;
     expect(pending.status).toBe("pending");
+  });
+
+  test("a continue-only event joins an active run or is dropped — it never opens one", async () => {
+    // The Slack thread brain's shape: app_mention opens a thread run (join
+    // policy, one run per thread); a `message` reply only continues it. A
+    // reply in a thread the bot was never mentioned in must not become a
+    // fresh run (the legacy brain only engaged app_mention-opened threads).
+    const threadKey = "${{ event.raw.event.thread_ts | default: event.raw.event.ts }}";
+    const brain = {
+      automation: meta({ id: "slack-brain", kind: "builtin", builtinKey: "slack_brain" }),
+      definition: {
+        ...definition(
+          trigger({
+            provider: "slack",
+            eventKeys: ["app_mention", "message"],
+            continueOnly: ["message"],
+          }),
+        ),
+        settings: {
+          endSessionsOnFinish: false,
+          concurrency: { keyTemplate: threadKey, policy: "join" as const },
+        },
+      },
+    };
+    const h = makeHarness([brain]);
+    const sent: Array<{ runId: string; deliveryKey: string }> = [];
+    const d = {
+      ...deps(h),
+      sender: {
+        async send(runId: string, msg: { kind: string; deliveryKey?: string }) {
+          sent.push({ runId, deliveryKey: msg.deliveryKey ?? "" });
+        },
+      },
+    };
+    const slack = (eventKey: string, deliveryId: string, event: Record<string, unknown>) =>
+      input({ provider: "slack", eventKey, deliveryId, payload: { event } });
+
+    // A reply in a thread nobody opened: dropped — no run row, no claim, no send.
+    const stray = await dispatchIntegrationEvent(
+      slack("message", "d-stray", { ts: "5.2", thread_ts: "5.0", text: "hi" }),
+      d,
+    );
+    expect(stray).toMatchObject({ matched: 1, skipped: 1, started: 0, joined: 0 });
+    expect(h.runs.size).toBe(0);
+    expect(h.starts).toEqual([]);
+    expect(sent).toEqual([]);
+    expect(await h.store.getConcurrencyHolder("slack-brain", "5.0")).toBeNull();
+
+    // The mention opens the thread run …
+    const opened = await dispatchIntegrationEvent(
+      slack("app_mention", "d-open", { ts: "7.0", text: "<@bot> hello" }),
+      d,
+    );
+    expect(opened).toMatchObject({ started: 1, builtins: { slack_brain: "started" } });
+    const runId = h.starts[0]!.runId;
+
+    // … and a reply in THAT thread joins it (delivered into its mailbox).
+    const reply = await dispatchIntegrationEvent(
+      slack("message", "d-reply", { ts: "7.1", thread_ts: "7.0", text: "and?" }),
+      d,
+    );
+    expect(reply).toMatchObject({ joined: 1, builtins: { slack_brain: "joined" } });
+    expect(sent).toEqual([{ runId, deliveryKey: "slack:d-reply" }]);
+    expect(h.runs.size).toBe(1);
   });
 
   test("a kill-switched built-in never admits a run, so a flagged repo is not served by both brains", async () => {

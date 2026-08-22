@@ -292,6 +292,11 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     provider: "slack",
     connectionId: DEFAULT_CONNECTION_PLACEHOLDER,
     eventKeys: ["app_mention", "message"],
+    // A thread reply continues the thread the bot was mentioned in — it is
+    // delivered into that run's mailbox — and never opens a thread of its
+    // own (legacy parity: only an app_mention engaged the brain). Admission
+    // enforces it; the facts block's message checks are about shape only.
+    continueOnly: ["message"],
     // The channels map's keys ARE the scope: a channel not in the map never
     // matches, so nothing reaches the run for channels an org never flagged.
     scope: { fromInput: "channels" },

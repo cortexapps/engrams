@@ -122,6 +122,11 @@ channel before any real one:
 - [ ] A failed turn → ❌ recap with the error; the session is kept.
 - [ ] A bot message / an edited message / a top-level channel message →
       `filtered`, no session.
+- [ ] A reply in a thread the bot was never mentioned in (flagged channel) →
+      NO run at all: admission drops a `message` with no active run for its
+      thread key (`trigger.continueOnly`), the Runs list stays empty, and
+      the legacy path ignores it as before. Only an `app_mention` opens a
+      thread.
 - [ ] A mention from a Slack user with no engrams account → the "log in
       first" ❌ on the mention, `filtered`, no session (legacy parity).
 - [ ] The session of a linked user is owned by that user (Sessions list:

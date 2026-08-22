@@ -228,6 +228,38 @@ export async function admitAutomationRun(
 
   const key = await renderConcurrencyKey(concurrency.keyTemplate, target, trigger);
 
+  const joinHolder = async (holderRunId: string): Promise<"joined"> => {
+    // No run row: the delivery joins the holder's mailbox.
+    await deps.sender.send(
+      holderRunId,
+      {
+        kind: "event",
+        eventKey: trigger.eventKey ?? trigger.source,
+        deliveryKey,
+        payload: trigger.payload ?? {},
+        receivedAt: trigger.receivedAt ?? deps.now().toISOString(),
+      },
+      inboxKeys.joinedEvent(deliveryKey, holderRunId),
+    );
+    return "joined";
+  };
+
+  // A continue-only event (trigger.continueOnly) belongs to an ACTIVE run or
+  // to nobody: it never claims the key, so it can never open a run. This is
+  // the one place that invariant lives — a Slack thread reply in a flagged
+  // channel continues the thread the bot was mentioned in, and a reply in
+  // any other thread is dropped here without a run row (validation pins
+  // continueOnly to policy join).
+  const triggerSpec = target.definition.trigger;
+  if (
+    triggerSpec.kind === "integration" &&
+    trigger.eventKey !== undefined &&
+    triggerSpec.continueOnly?.includes(trigger.eventKey)
+  ) {
+    const holder = await deps.store.getConcurrencyHolder(automationId, key);
+    return holder === null ? "skipped" : joinHolder(holder);
+  }
+
   const claim = await deps.store.claimConcurrency(automationId, key, runId);
   if (claim.claimed) {
     await startRun(key);
@@ -235,21 +267,8 @@ export async function admitAutomationRun(
   }
 
   switch (concurrency.policy) {
-    case "join": {
-      // No run row: the delivery joins the holder's mailbox.
-      await deps.sender.send(
-        claim.holderRunId,
-        {
-          kind: "event",
-          eventKey: trigger.eventKey ?? trigger.source,
-          deliveryKey,
-          payload: trigger.payload ?? {},
-          receivedAt: trigger.receivedAt ?? deps.now().toISOString(),
-        },
-        inboxKeys.joinedEvent(deliveryKey, claim.holderRunId),
-      );
-      return "joined";
-    }
+    case "join":
+      return joinHolder(claim.holderRunId);
     case "queue": {
       await deps.store.insertRun({
         id: runId,
