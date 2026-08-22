@@ -137,6 +137,7 @@ export function fakeIngress() {
       connectionIdFor: async (provider: string) => `conn-${provider}`,
       dispatch: async (input: IntegrationEventDispatchInput) => {
         dispatched.push(input);
+        return undefined;
       },
     },
   };

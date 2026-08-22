@@ -19,6 +19,7 @@ import {
   type IntegrationEventStore,
 } from "../db/integration-events.ts";
 import { BodyTooLargeError, readBoundedBody } from "../http/bounded-body.ts";
+import type { DispatchIntegrationResult } from "./dispatch.ts";
 import { log as rootLog } from "../log.ts";
 import { parseWebhookPayload, redactWebhookPayload, WebhookEventError } from "./webhook.ts";
 
@@ -62,7 +63,7 @@ export interface IntegrationEventDispatchInput {
 
 export type IntegrationEventDispatch = (
   input: IntegrationEventDispatchInput,
-) => Promise<unknown>;
+) => Promise<DispatchIntegrationResult | undefined>;
 
 /** The 2.C seam: trigger matching installs itself here at boot. Until then a
  * verified delivery is ledgered and goes nowhere else. */
@@ -99,6 +100,11 @@ export type DeliveryResult =
       payload: Record<string, unknown>;
       event: ExtractedIntegrationEvent;
       connectionId: string;
+      /** What the trigger dispatcher did with the delivery (undefined until
+       * the dispatcher is installed at boot). A legacy route decides its
+       * own fallback from THIS — the dispatcher's fresh read — so the two
+       * brains can never disagree on who owns the delivery. */
+      dispatch: DispatchIntegrationResult | undefined;
     };
 
 function jsonResponse(status: number, error: string): Response {
@@ -172,8 +178,9 @@ export async function handleIntegrationDelivery(
   });
 
   const dispatch = deps.dispatch ?? integrationEventDispatch;
+  let dispatched: DispatchIntegrationResult | undefined;
   try {
-    await dispatch({
+    dispatched = await dispatch({
       provider: route.provider,
       connectionId,
       eventKey: outcome.event.eventKey,
@@ -205,5 +212,6 @@ export async function handleIntegrationDelivery(
     payload,
     event: outcome.event,
     connectionId,
+    dispatch: dispatched,
   };
 }

@@ -263,7 +263,15 @@ describe("dispatchIntegrationEvent", () => {
       deps(h),
     );
 
-    expect(result).toEqual({ matched: 1, started: 1, joined: 0, queued: 0, skipped: 0, failed: 0 });
+    expect(result).toEqual({
+      matched: 1,
+      started: 1,
+      joined: 0,
+      queued: 0,
+      skipped: 0,
+      failed: 0,
+      builtins: {},
+    });
     expect(h.starts).toEqual([
       {
         runId: "autorun:automation-1:github:gh-delivery-1",
@@ -343,13 +351,16 @@ describe("dispatchIntegrationEvent", () => {
       disabledBuiltins: new Set<string>(),
     });
     expect(off.started).toBe(2);
+    // The per-built-in tally is what a legacy route consults (the Slack
+    // window): the built-in's own admission outcome, user automations absent.
+    expect(off.builtins).toEqual({ pr_review: "started" });
 
     const h2 = makeHarness([builtin, user]);
     const on = await dispatchIntegrationEvent(input(), {
       ...deps(h2),
       disabledBuiltins: new Set(["pr_review"]),
     });
-    expect(on).toMatchObject({ matched: 1, started: 1 });
+    expect(on).toMatchObject({ matched: 1, started: 1, builtins: {} });
     expect(h2.starts.map((s) => s.automationId)).toEqual(["user-auto"]);
 
     // The Slack switch registers its key the same way (4.6).
@@ -362,8 +373,19 @@ describe("dispatchIntegrationEvent", () => {
       ...deps(h3),
       disabledBuiltins: new Set(["slack_brain"]),
     });
-    expect(slackOff).toMatchObject({ matched: 1, started: 1 });
+    expect(slackOff).toMatchObject({ matched: 1, started: 1, builtins: {} });
     expect(h3.starts.map((s) => s.automationId)).toEqual(["user-auto"]);
+  });
+
+  test("builtinTookDelivery: started/joined/queued = the engine owns it; absent or skipped = legacy", async () => {
+    const { builtinTookDelivery } = await import("../dispatch.ts");
+    const base = { matched: 1, started: 0, joined: 0, queued: 0, skipped: 0, failed: 0 };
+    expect(builtinTookDelivery(undefined, "slack_brain")).toBe(false);
+    expect(builtinTookDelivery({ ...base, builtins: {} }, "slack_brain")).toBe(false);
+    expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "skipped" } }, "slack_brain")).toBe(false);
+    expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "started" } }, "slack_brain")).toBe(true);
+    expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "joined" } }, "slack_brain")).toBe(true);
+    expect(builtinTookDelivery({ ...base, builtins: { pr_review: "started" } }, "slack_brain")).toBe(false);
   });
 
   test("disabledBuiltinsFromConfig maps each switch to its built-in key", async () => {

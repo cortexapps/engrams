@@ -7,20 +7,23 @@ The Slack thread brain exists twice during the parity window:
   block engine with two system blocks (`system.slack_thread_relay`,
   `system.slack_thread_recap`).
 
-One channel is served by exactly one of them. The Slack events route decides
-per delivery (`orchestrator/src/routes/slack-events.ts`):
+One channel is served by exactly one of them. The integration dispatcher
+decides per delivery, and the Slack events route
+(`orchestrator/src/routes/slack-events.ts`) follows that decision:
 
 ```
-kill switch ON                      → legacy (every channel)
-kill switch off, channel flagged    → engine  (legacy workflow skipped)
-kill switch off, channel not flagged → legacy (byte-identical to before 4.6)
+dispatcher admitted a run for slack_brain (started / joined) → engine (legacy skipped)
+anything else (not flagged, built-in disabled, kill switch)  → legacy (byte-identical to before 4.6)
 ```
 
 "Flagged" means: the `slack_brain` built-in is **enabled** AND the channel id
-is a key of its `channels` input. The route reads this through a 30 s
-in-memory cache (`automations/builtins/slack-flag.ts`); `SetInputs` and
-`SetAutomationEnabled` on the built-in drop the cache, so a flag lands on
-the next delivery.
+is a key of its `channels` input — the dispatcher's trigger match
+(`scope: { fromInput: "channels" }`). The route does NOT do a second
+lookup: it reads the dispatcher's own admission result for the delivery
+(`DispatchIntegrationResult.builtins`), so there is no cache, no replica
+skew, and a flag lands on the very next delivery on every pod. The two
+brains cannot disagree on who owns a delivery because only one read is
+made.
 
 The ingress spine ledgers and dispatches every Slack event regardless of
 the window. The engine's trigger scope (`scope: { fromInput: "channels" }`)
@@ -60,8 +63,8 @@ session is kept — and the next mention in that thread goes to legacy.
 ## The two brakes
 
 - **Per-channel**: remove the channel from `channels`, or disable the
-  built-in. Takes effect on the next delivery (the cache is invalidated by
-  the RPC).
+  built-in. Takes effect on the next delivery on every replica (the
+  dispatcher reads the row per delivery; there is no cache).
 - **Kill switch**: `ORCHESTRATOR_SLACK_AUTOMATION_DISABLED=1` (or `true`;
   any other spelling is off). Every channel takes legacy, flags untouched,
   and the flag is never consulted. This is an orchestrator env var: add it

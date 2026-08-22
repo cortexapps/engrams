@@ -79,8 +79,6 @@ import {
 } from "../automations/engine/definition.ts";
 import { previewDefinition } from "../automations/engine/preview.ts";
 import { makeWebhookAliasResolver } from "../automations/aliases.ts";
-import { invalidateSlackFlagCache } from "../automations/builtins/slack-flag.ts";
-import { SLACK_BRAIN_BUILTIN_KEY } from "../automations/builtins/slack-brain.ts";
 import {
   admitAutomationRun,
   automationRunId,
@@ -833,7 +831,6 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
             : null;
       const row = await store.setEnabled(id, req.enabled, nextFireAt);
       if (!row) throw new ConnectError("automation not found", Code.NotFound);
-      if (row.builtinKey === SLACK_BRAIN_BUILTIN_KEY) invalidateSlackFlagCache();
       return { automation: toProtoAutomation(row) };
     },
 
@@ -883,7 +880,6 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const updated = await store.setInputs(row.id, inputs);
       if (!updated) throw new ConnectError("automation not found", Code.NotFound);
       // The Slack route's per-channel window reads this row through a cache.
-      if (updated.builtinKey === SLACK_BRAIN_BUILTIN_KEY) invalidateSlackFlagCache();
       return { automation: toProtoAutomation(updated) };
     },
 

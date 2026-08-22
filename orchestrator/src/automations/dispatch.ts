@@ -409,6 +409,22 @@ export interface DispatchIntegrationResult {
   skipped: number;
   /** Targets whose admission threw; the dispatcher rethrows after the loop. */
   failed: number;
+  /** Admission outcome per matched BUILT-IN (keyed by builtin key). This is
+   * what a legacy route consults to decide whether the engine took the
+   * delivery: a built-in absent here (not enabled, kill-switched, scope did
+   * not match) or `skipped` leaves the legacy path in charge. The same
+   * read the dispatcher made — never a second, possibly stale, lookup. */
+  builtins: Record<string, AdmitOutcome>;
+}
+
+/** Did the dispatcher hand this delivery to the built-in — a run started,
+ * joined, or queued for it? */
+export function builtinTookDelivery(
+  result: DispatchIntegrationResult | undefined,
+  builtinKey: string,
+): boolean {
+  const outcome = result?.builtins[builtinKey];
+  return outcome !== undefined && outcome !== "skipped";
 }
 
 /** Providers whose scope noun compares case-insensitively (GitHub owner/repo).
@@ -504,6 +520,7 @@ export async function dispatchIntegrationEvent(
     queued: 0,
     skipped: 0,
     failed: 0,
+    builtins: {},
   };
 
   // Each target is admitted in isolation: one transient fault must never drop
@@ -533,6 +550,9 @@ export async function dispatchIntegrationEvent(
         { store, starter, sender, now },
       );
       result[outcome] += 1;
+      if (target.automation.builtinKey !== null) {
+        result.builtins[target.automation.builtinKey] = outcome;
+      }
     } catch (error) {
       result.failed += 1;
       failures.push({ automationId: target.automation.id, error });

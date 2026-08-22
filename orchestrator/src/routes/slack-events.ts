@@ -20,9 +20,9 @@ import { Hono } from "hono";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import { isValidSlackRequest } from "@slack/bolt";
 
-import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
-import { isChannelOnAutomation } from "../automations/builtins/slack-flag.ts";
+import { SLACK_BRAIN_BUILTIN_KEY } from "../automations/builtins/slack-brain.ts";
+import { builtinTookDelivery } from "../automations/dispatch.ts";
 import { getSlackSigningSecret } from "../integrations/slack.ts";
 import { classifySlackEvent } from "../integrations/slack-webhook.ts";
 import {
@@ -46,12 +46,6 @@ export interface SlackEventsDeps {
   signingSecret?: () => Promise<string>;
   /** Ingress-spine seams (ledger store, new-trigger dispatch, connection). */
   ingress?: HandleDeliveryDeps;
-  /** The per-channel window (ADR 0119 phase 4.6): is this channel served by
-   * the Slack thread-brain built-in? Default = the cached store lookup. */
-  channelOnAutomation?: (channelId: string) => Promise<boolean>;
-  /** ORCHESTRATOR_SLACK_AUTOMATION_DISABLED: when true every channel takes
-   * the legacy path. Default = the process config. */
-  automationKillSwitch?: () => boolean;
   /** The legacy per-thread DBOS workflow start + send (default = DBOS). */
   startLegacyThread?: (mention: SourceMention) => Promise<void>;
 }
@@ -61,8 +55,6 @@ const log = rootLog.child({ component: "slack" });
 export function makeSlackEventsRoute(deps: SlackEventsDeps = {}): Hono {
   const signingSecret = deps.signingSecret ?? getSlackSigningSecret;
   const ingressDeps: HandleDeliveryDeps = deps.ingress ?? {};
-  const channelOnAutomation = deps.channelOnAutomation ?? isChannelOnAutomation;
-  const automationKillSwitch = deps.automationKillSwitch ?? (() => config.slackAutomationDisabled);
   const startLegacyThread = deps.startLegacyThread ?? startLegacyThreadWorkflow;
 
   const ingressRoute: IntegrationEventRoute = {
@@ -146,12 +138,17 @@ export function makeSlackEventsRoute(deps: SlackEventsDeps = {}): Hono {
     }
 
     const m = evt.mention;
-    // The per-channel window (ADR 0119 phase 4.6): a channel flagged on the
-    // enabled Slack thread-brain built-in is served by the engine — the spine
-    // above already ledgered + dispatched the delivery — so the legacy
-    // workflow must NOT also answer it (one brain per thread). The kill
-    // switch sends every channel back to legacy without a redeploy of data.
-    if (!automationKillSwitch() && (await channelOnAutomation(m.channel))) {
+    // The per-channel window (ADR 0119 phase 4.6): one brain per thread. The
+    // spine above already dispatched the delivery; if the dispatcher handed
+    // it to the Slack thread-brain built-in (a run started or joined), the
+    // legacy workflow must not answer it too. The decision is the
+    // dispatcher's own admission result — the same fresh read of the
+    // built-in's `enabled` + `channels` — never a separate cached lookup
+    // that another replica's RPC could have left stale (dropped or doubled
+    // answers). The kill switch needs no handling here: the dispatcher
+    // refuses a disabled built-in, so the delivery falls through to legacy.
+    const dispatched = delivery.kind === "recorded" ? delivery.dispatch : undefined;
+    if (builtinTookDelivery(dispatched, SLACK_BRAIN_BUILTIN_KEY)) {
       log.info(
         { channel: m.channel, user: m.user, thread: m.threadRoot },
         "slack: app_mention → thread-brain built-in (legacy workflow skipped)",
