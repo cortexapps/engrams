@@ -16,16 +16,21 @@
  * - **backreferences** (`\1`, `\k<n>`): matching with them is NP-hard;
  * - **large counted repetition** (`{n,m}` with a bound above
  *   `REGEX_MAX_REPEAT`), whose expansion multiplies any remaining
- *   polynomial cost.
+ *   polynomial cost;
+ * - **more than `REGEX_MAX_UNBOUNDED` unbounded quantifiers** (`*`, `+`,
+ *   `{n,}`) in one pattern: k adjacent stars over an overlapping atom
+ *   (`a*a*a*b`) backtrack in O(n^(k-1)), a degree that grows with the
+ *   pattern, so the count is capped where the 4096-char subject keeps the
+ *   worst case at a few million steps (k = 3 → n² ≈ 16 M).
  *
- * Polynomial shapes (`a*a*b`) survive; with the 4096-char subject cap their
- * worst case is a few million steps. The check is applied when a condition
+ * Polynomial shapes (`a*a*b`) survive under that cap. The check is applied when a condition
  * is saved AND when it is evaluated, so a pattern stored before the guard
  * existed fails closed (no match) instead of running.
  */
 
 export const REGEX_MAX_REPEAT = 100;
 export const REGEX_MAX_STAR_HEIGHT = 1;
+export const REGEX_MAX_UNBOUNDED = 3;
 
 export class UnsafeRegexError extends Error {
   constructor(message: string) {
@@ -51,6 +56,13 @@ export function assertSafeRegex(pattern: string): void {
   /** Whether the atom a quantifier would apply to is a group with `|`. */
   let lastIsAltGroup = false;
   let inClass = false;
+  let unbounded = 0;
+  const countUnbounded = () => {
+    unbounded += 1;
+    if (unbounded > REGEX_MAX_UNBOUNDED) {
+      throw new UnsafeRegexError(`more than ${REGEX_MAX_UNBOUNDED} unbounded quantifiers (\`*\`, \`+\`, \`{n,}\`) are not allowed`);
+    }
+  };
   let i = 0;
   const n = pattern.length;
 
@@ -127,6 +139,7 @@ export function assertSafeRegex(pattern: string): void {
         if (ch !== "?" && lastIsAltGroup) {
           throw new UnsafeRegexError("a repeated group with alternation (e.g. `(a|aa)+`) is not allowed");
         }
+        if (ch !== "?") countUnbounded();
         current = Math.max(current, height);
         heightOfLast = height;
         lastIsAltGroup = false;
@@ -163,6 +176,7 @@ export function assertSafeRegex(pattern: string): void {
         if (repeats && lastIsAltGroup) {
           throw new UnsafeRegexError("a repeated group with alternation (e.g. `(a|aa){2,}`) is not allowed");
         }
+        if (hi === Number.POSITIVE_INFINITY) countUnbounded();
         current = Math.max(current, height);
         heightOfLast = height;
         lastIsAltGroup = false;

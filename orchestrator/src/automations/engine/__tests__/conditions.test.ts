@@ -49,12 +49,12 @@ describe("parseFilterGroup", () => {
   });
 
   test("rejects patterns that backtrack super-linearly", () => {
-    for (const value of ["(a+)+$", "(.*)*x", "(\\w+\\s?)*$", "(a|aa)+$", "((a|aa))+$", "((foo|foobar)x?)+", "(?:(?:a|b)c)*", "(a)\\1", "(?<n>a)\\k<n>", "a{1,500}", "(a{2,}){2}"]) {
+    for (const value of ["(a+)+$", "(.*)*x", "(\\w+\\s?)*$", "(a|aa)+$", "((a|aa))+$", "((foo|foobar)x?)+", "(?:(?:a|b)c)*", "a*a*a*a*b", "\\d+\\s+\\w+\\s+x{2,}", "(a)\\1", "(?<n>a)\\k<n>", "a{1,500}", "(a{2,}){2}"]) {
       expect(() => parseFilterGroup(group([{ path: "a", op: "matches", value }]))).toThrow(
         ConditionParseError,
       );
     }
-    for (const value of ["^fix:", "a+b*", "(ab)+", "[a-z]+\\d{1,3}", "(?:x|y)?z", "(?<=a)b", "(a+)?", "a{3}", "\\d+\\.\\d+"]) {
+    for (const value of ["^fix:", "a+b*", "(ab)+", "[a-z]+\\d{1,3}", "(?:x|y)?z", "(?<=a)b", "(a+)?", "a{3}", "\\d+\\.\\d+", "a*a*a*b"]) {
       expect(() => parseFilterGroup(group([{ path: "a", op: "matches", value }]))).not.toThrow();
     }
   });
