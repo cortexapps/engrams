@@ -299,6 +299,25 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 3)
     expect(h.execs[0]!.execId).toBe(`exec:auto:${RUN.runId}:tick:a0`);
   });
 
+  test("a snapshot failure still finalizes: failed status, claim released, successor promoted", async () => {
+    const definition = makeDefinition([]);
+    const h = makeHarness(definition, { promote: "autorun:auto-1:manual:next" });
+    const failing: EngineDeps = {
+      ...h.deps,
+      store: {
+        ...h.deps.store,
+        loadSnapshot: () => Promise.reject(new Error("inputs.limit: must be a number")),
+      },
+    };
+    const result = await interpretAutomation(RUN, failing);
+
+    expect(result).toEqual({ status: "failed", error: "inputs.limit: must be a number" });
+    expect(h.names).toEqual(["step:__snapshot__:0", "step:__finalize__:0"]);
+    expect(h.finalized).toEqual([{ status: "failed", error: "inputs.limit: must be a number" }]);
+    expect(h.released).toEqual([RUN.runId]);
+    expect(h.promoted).toEqual(["autorun:auto-1:manual:next"]);
+  });
+
   test("engine-level retries mint attempt-scoped steps then fail the run", async () => {
     const definition = makeDefinition([
       { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },

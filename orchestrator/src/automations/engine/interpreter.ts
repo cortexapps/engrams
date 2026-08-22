@@ -183,11 +183,29 @@ export async function interpretAutomation(
 
   // step:__snapshot__:0 — pin the definition + inputs and mark the run
   // running. Replay walks exactly this object.
-  const snapshot: RunSnapshot = await deps.step(async () => {
-    const loaded = await deps.store.loadSnapshot(input.runId);
-    await deps.store.markRunning(input.runId, loaded.startedAtMs);
-    return loaded;
-  }, SNAPSHOT_STEP);
+  let snapshot: RunSnapshot;
+  try {
+    snapshot = await deps.step(async () => {
+      const loaded = await deps.store.loadSnapshot(input.runId);
+      await deps.store.markRunning(input.runId, loaded.startedAtMs);
+      return loaded;
+    }, SNAPSHOT_STEP);
+  } catch (error) {
+    // The run never had a definition to walk (stored inputs the pinned
+    // schema rejects, a missing version, ...). It still holds the
+    // concurrency claim admission took for it, so it must reach the same
+    // finalize every other exit does: terminal status, then release (which
+    // promotes a queued successor). Without this a queue|join|skip key
+    // stays held by a dead run forever. No sessions and no finalize hooks
+    // exist yet, so finalize is only the status + the release.
+    const message = error instanceof Error ? error.message : String(error);
+    await deps.step(async () => {
+      await deps.store.finalizeRun(input.runId, "failed", message);
+      const promoted = await deps.store.releaseConcurrency(input.runId);
+      if (promoted !== null && deps.startQueuedRun) await deps.startQueuedRun(promoted);
+    }, FINALIZE_STEP);
+    return { status: "failed", error: message };
+  }
 
   const ctx = buildRunContext(input.runId, snapshot, deps);
   const wait: WaitState = { buffer: [], clockSteps: 0 };
