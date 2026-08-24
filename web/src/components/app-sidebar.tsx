@@ -21,6 +21,12 @@ import {
 
 interface Dest extends NavItem {
   adminOnly: boolean;
+  /**
+   * Kept out of the rail for everyone, whatever their role. This is not
+   * authorization — `adminOnly` is — it is "this is not ready to be met yet".
+   * Deleting the line restores the destination as it was.
+   */
+  unreleased?: boolean;
   match: (p: string) => boolean;
 }
 
@@ -61,12 +67,13 @@ const DESTS: Dest[] = [
     to: "/specs",
     label: "Tech Specs",
     icon: FilePenLine,
-    // Admin-only while Tech Specs is finished, so the org does not meet it
-    // mid-polish. This hides the entry point, not the feature: /specs still
-    // answers on a direct link, and the orchestrator still serves every spec
-    // RPC. Anyone holding a spec URL keeps their spec. Put this back to false
-    // when the feature is ready to be met.
-    adminOnly: true,
+    adminOnly: false,
+    // Tech Specs is still being finished, so nobody meets it from the rail —
+    // admins included. This hides the entry point, not the feature: /specs
+    // still answers on a direct link and the orchestrator still serves every
+    // spec RPC, so anyone holding a spec URL keeps their spec. Delete the line
+    // below when the feature is ready.
+    unreleased: true,
     match: (p) => p.startsWith("/specs"),
   },
   {
@@ -88,7 +95,7 @@ const DESTS: Dest[] = [
 export function MainSidebar() {
   const isAdmin = useIsAdmin();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const dests = DESTS.filter((d) => !d.adminOnly || isAdmin);
+  const dests = DESTS.filter((d) => !d.unreleased && (!d.adminOnly || isAdmin));
 
   // border-r-sidebar is load-bearing: it recolours the Sidebar's default right
   // border to the spine's own fill, suppressing the divider line that would
