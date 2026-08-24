@@ -538,7 +538,21 @@ export function proxyHttp(
           headers.delete("content-length");
           // A guest must not be able to overwrite the visitor's session cookie
           // or write one on the shared parent domain.
-          const cookies = sanitizeGuestSetCookie(upstream.headers.getSetCookie());
+          const rawCookies = upstream.headers.getSetCookie();
+          const cookies = sanitizeGuestSetCookie(rawCookies);
+          // Dropping a guest's own auth cookie is correct (above) and also
+          // completely silent from the guest's side: its login succeeds, the
+          // browser never stores anything, and the next navigation shows the
+          // form again. That cost a day of debugging on an engrams-in-engrams
+          // session, so say it happened. The fix is on the guest: rename the
+          // cookie (`ORCHESTRATOR_COOKIE_PREFIX` for a nested engrams).
+          if (cookies.length !== rawCookies.length) {
+            console.warn(
+              { sessionId, port, dropped: rawCookies.length - cookies.length },
+              `preview: dropped a guest Set-Cookie named like the orchestrator's own ` +
+                `(contains "${ORCHESTRATOR_COOKIE_MARKER}") — the app must rename its cookie`,
+            );
+          }
           headers.delete("set-cookie");
           for (const cookie of cookies) headers.append("set-cookie", cookie);
           resolve(
