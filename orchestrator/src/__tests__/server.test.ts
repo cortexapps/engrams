@@ -217,3 +217,61 @@ describe("SSE streaming regression (proves no full-response buffering)", () => {
 // `sessions` client from control-plane/client.ts instead of an ad-hoc
 // inline transport. Run with: ENGRAM_SMOKE_GRPC=1 bun test
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ADR 0118 — a preview host NEVER reaches the orchestrator's own RPC surface.
+//
+// This dispatch is path-keyed and runs before Hono, where the preview wall
+// lives, so without a host check `<app>.preview.<domain>/rpc/...` was answered
+// by the orchestrator's OWN Connect services. The visitor's cookie is scoped to
+// the parent domain, so the browser attaches it on a preview host and the call
+// succeeded as that user — letting an agent-authored page drive the control
+// plane as whoever opened it. Observed in prod: a nested engrams' SPA calls
+// same-origin `/rpc` and was served the visitor's real prod task list.
+// ---------------------------------------------------------------------------
+
+describe("preview hosts terminate before /rpc", () => {
+  const BASE_DOMAIN = "preview.example.test";
+  let previewUrl: string;
+  let previewServer: ReturnType<typeof buildServer>;
+
+  beforeAll(async () => {
+    const app = new Hono();
+    // Stands in for the preview middleware: proves the request reached Hono.
+    app.all("*", (c) => c.text("HONO", 200));
+    previewServer = buildServer(app, () => {}, undefined, [], BASE_DOMAIN);
+    await new Promise<void>((resolve) => {
+      previewServer.listen(0, "127.0.0.1", () => {
+        previewUrl = `http://127.0.0.1:${(previewServer.address() as AddressInfo).port}`;
+        resolve();
+      });
+    });
+  });
+
+  afterAll(() => previewServer.close());
+
+  const post = (host: string) =>
+    fetch(`${previewUrl}/rpc/engram.app.v1.TaskService/ListTasks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Connect-Protocol-Version": "1", host },
+      body: "{}",
+    });
+
+  test("an app host under the preview domain goes to Hono, not Connect", async () => {
+    const res = await post(`web-jumping-fat-kittens.${BASE_DOMAIN}`);
+    expect(await res.text()).toBe("HONO");
+  });
+
+  test("the preview apex itself is covered too", async () => {
+    const res = await post(BASE_DOMAIN);
+    expect(await res.text()).toBe("HONO");
+  });
+
+  test("a normal host still reaches the Connect adapter", async () => {
+    const res = await post("app.example.com");
+    // The Hono app here answers EVERY path with "HONO", so "not HONO" is the
+    // discriminator: the Connect adapter took the request. (An empty router
+    // answers an unknown procedure with an empty body, hence no shape check.)
+    expect(await res.text()).not.toBe("HONO");
+  });
+});

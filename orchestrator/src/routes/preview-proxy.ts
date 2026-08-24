@@ -40,7 +40,7 @@ import {
 } from "../gen/engram/app/v1/session_pb.ts";
 import { portRelay as defaultPortRelay } from "../control-plane/client.ts";
 import { config } from "../config.ts";
-import { isValidHostLabel, schemeFor } from "../apps/hostname.ts";
+import { isUnderPreviewDomain, isValidHostLabel, schemeFor } from "../apps/hostname.ts";
 import {
   makeSessionAppStore,
   type SessionAppRow,
@@ -48,6 +48,8 @@ import {
 } from "../db/session-apps.ts";
 import { pushableQueue } from "./shell.ts";
 import type { GetSession } from "./guard.ts";
+
+export { isUnderPreviewDomain };
 
 // ---------------------------------------------------------------------------
 // PortRelay client — minimal interface (bidi: AsyncIterable in/out)
@@ -100,24 +102,6 @@ export function previewHostLabel(
 export type PreviewAuth =
   | { ok: true; row: SessionAppRow }
   | { ok: false; status: 401 | 403 | 404 };
-
-/**
- * True if `host` is under the preview base domain at all — apex, nested label,
- * junk label, or a real app. This is the TERMINATION test: everything it
- * matches must be answered by the preview handler, never passed to the app.
- *
- * `previewHostLabel` is the narrower question ("does it name a routable app?")
- * and returns null for the cases this still matches.
- */
-export function isUnderPreviewDomain(
-  hostHeader: string | undefined,
-  baseDomain: string,
-): boolean {
-  if (!hostHeader || !baseDomain) return false;
-  const host = hostHeader.toLowerCase();
-  const base = baseDomain.toLowerCase();
-  return host === base || host.endsWith("." + base);
-}
 
 /**
  * Authorize a resolved app.
