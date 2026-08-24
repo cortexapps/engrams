@@ -307,8 +307,8 @@ same correlation key and the lifetime is hours — D9 does not replace it.
 ### D10 — Automation state: a shared KV, one writer per entity
 
 `automation_state (automation_id, key) PK → value jsonb, version bigint,
-writer text, updated_at`. Three blocks: `state.get`, `state.set`, and
-`state.list` (bounded prefix scan). Reads and writes are checkpointed steps,
+writer text, updated_at`. Four blocks: `state_get`, `state_set`,
+`state_delete`, and `state_list` (bounded prefix scan). Reads and writes are checkpointed steps,
 so a replayed run sees the values it recorded — a read is a snapshot at that
 step, never a subscription.
 
@@ -322,13 +322,13 @@ Concurrency is layered; the bottom layer is free:
    never comes up because an entity's facts live in one document.
 2. **Versioned CAS for the actors that cannot hold the entity claim.** A
    cron sweep touches many entities in one run; a session tool writes with
-   no run live. For them `state.set` takes an optional `expectVersion`; a
+   no run live. For them `state_set` takes an optional `expectVersion`; a
    miss is a typed outcome (`{ok: false, current}`), never an error. Every
    write stamps `writer = <runId>:<framePath>`; a CAS retry that finds
    `version == expect + 1` and `writer == me` reports success, so a crash
    between a successful write and its checkpoint replays clean (the same
    idempotency identity as the prompt outbox).
-3. **What the engine refuses.** No `state.lock` block and no transactions
+3. **What the engine refuses.** No lock block and no transactions
    across blocks. A graph that "needs" a lock across a wait must hold the
    entity claim instead — a lock parked across `wait_session` for hours is
    the disease the PG leasing pattern exists to avoid. Sweeps are written
@@ -353,7 +353,7 @@ resolving step. Waits and relays then route to the adopting run's mailbox.
 A session bound to a different automation — or to no automation — is
 refused: the binding row is the ownership boundary. The adopted session
 keeps its `keep` flag; the adopting run's finalize applies the usual D8
-rules. Alongside adoption, a read-only `session.status` block (status,
+rules. Alongside adoption, a read-only `session_status` block (status,
 last_active_at, pending question) gives sweep entrypoints a probe cheaper
 than prompting.
 
@@ -413,7 +413,7 @@ retry). `IntegrationService` gains `ListEventCatalog` and `ListActionCatalog`.
    (window opens), then the two deletion PRs and the ADR bookends
    (this ADR → Accepted; ADR 0060/0100/0102 amended).
 5. **Stateful automations** (D9–D11, amended 2026-08-24) — `automation_state`
-   + state blocks, multiple entrypoints, session adoption + `session.status`.
+   + state blocks, multiple entrypoints, session adoption + `session_status`.
    Ships after the phase-4 windows open; no dependency on the deletions.
 
 ## Correctness and security invariants
