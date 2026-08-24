@@ -129,6 +129,51 @@ export interface EngineClock {
   nowMs(): number;
 }
 
+/** Automation state (ADR 0119 D10): the per-automation KV. Reads and
+ * writes run inside checkpointed steps; CAS misses are typed outcomes the
+ * graph branches on, never errors. Implemented in db/automation-state.ts. */
+export interface EngineStateEntry {
+  key: string;
+  value: unknown;
+  version: number;
+  writer: string;
+}
+
+/** A caller-fixable limit violation (key too long, value too big,
+ * automation full). Thrown by the store; blocks map it to a non-retryable
+ * typed error. */
+export class StateLimitError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "StateLimitError";
+    this.code = code;
+  }
+}
+
+export type EngineStateSetResult =
+  | { ok: true; version: number }
+  | { ok: false; current: EngineStateEntry | null };
+
+export interface EngineStateStore {
+  get(automationId: string, key: string): Promise<EngineStateEntry | null>;
+  set(
+    automationId: string,
+    key: string,
+    value: unknown,
+    opts: { writer: string; expectVersion?: number },
+  ): Promise<EngineStateSetResult>;
+  delete(
+    automationId: string,
+    key: string,
+    opts: { expectVersion?: number },
+  ): Promise<{ ok: true; deleted: boolean } | { ok: false; current: EngineStateEntry }>;
+  list(
+    automationId: string,
+    opts?: { prefix?: string; limit?: number },
+  ): Promise<{ entries: EngineStateEntry[]; truncated: boolean }>;
+}
+
 export interface EngineDeps {
   step: EngineStepRunner;
   recv: EngineReceiver;
@@ -139,6 +184,7 @@ export interface EngineDeps {
    * successor's id is fixed before the call, so a replayed finalize cannot
    * double-start it (DBOS start on an existing id is a no-op). */
   startQueuedRun?(runId: string): Promise<void>;
+  state?: EngineStateStore;
   code?: CodeBlockRuntime;
   integrationActions?: IntegrationActionRuntime;
 }
