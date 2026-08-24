@@ -94,6 +94,50 @@ function fakeRelayServing(responseText: string | Uint8Array): PortRelayClient {
   };
 }
 
+/** A PortRelay that records what the edge sent to the guest, then replies with
+ * a canned response. `guestRequest()` resolves once a complete request head has
+ * arrived, so a test never races the background drain. */
+function fakeRelayCapturing(responseText: string = CANNED_200): {
+  relay: PortRelayClient;
+  guestRequest: () => Promise<string>;
+} {
+  const chunks: Buffer[] = [];
+  const bytes = new TextEncoder().encode(responseText);
+  const head = () => Buffer.concat(chunks).toString("utf8");
+  return {
+    relay: {
+      relay(inbound: AsyncIterable<RelayPortRequest>) {
+        // READ THEN ANSWER, like a real origin. Answering first (as
+        // fakeRelayServing does, which is fine when only the response matters)
+        // lets fetch finish and tear the socket down before the request head
+        // is ever flushed into the tunnel — the frames a test asserts on would
+        // never arrive.
+        return (async function* () {
+          for await (const msg of inbound) {
+            if (msg.frame.case === "data") chunks.push(Buffer.from(msg.frame.value));
+            if (msg.frame.case === "close" || head().includes("\r\n\r\n")) break;
+          }
+          yield create(RelayPortResponseSchema, { frame: { case: "data", value: bytes } });
+        })();
+      },
+    },
+    async guestRequest() {
+      for (let i = 0; i < 200 && !head().includes("\r\n\r\n"); i++) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      return head();
+    },
+  };
+}
+
+/** Header value as the guest saw it, from a raw HTTP/1.1 request head. */
+function guestHeader(request: string, name: string): string | null {
+  const line = request
+    .split("\r\n")
+    .find((l) => l.toLowerCase().startsWith(name.toLowerCase() + ":"));
+  return line ? line.slice(line.indexOf(":") + 1).trim() : null;
+}
+
 const CANNED_200 =
   "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nhello world";
 
@@ -278,6 +322,45 @@ describe("preview proxy middleware (HTTP)", () => {
     expect(res.headers.get("content-encoding")).toBeNull();
     expect(res.headers.get("content-length")).not.toBe(String(body.length));
     expect(await res.text()).toBe("hello gzipped world");
+  });
+
+  // ADR 0118: the Host rewrite takes the app's real address away, so
+  // X-Forwarded-Host is the only channel left for it. Without this pair an app
+  // that builds an absolute URL from the request redirects the browser to
+  // `localhost` — the user's own machine — which is how the brain stack's
+  // login broke (`Location: https://localhost/dev-login`).
+  test("the guest learns its real public address from X-Forwarded-Host", async () => {
+    const guest = fakeRelayCapturing();
+    const app = appWith(guest.relay);
+    const res = await app.request(...previewReq("/index.html"));
+    expect(res.status).toBe(200);
+
+    const req = await guest.guestRequest();
+    // Host still says localhost — dev servers reject an unknown one outright.
+    expect(guestHeader(req, "host")).toBe("localhost:3000");
+    expect(guestHeader(req, "x-forwarded-host")).toBe("web-jumping-fat-kittens.lvh.me:8787");
+    // `lvh.me` is a local base domain, so the public scheme is http — the same
+    // answer appUrl() gives when it mints <APP>_INGRESS_URL.
+    expect(guestHeader(req, "x-forwarded-proto")).toBe("http");
+  });
+
+  test("an inbound X-Forwarded-Host is overwritten, never passed to the guest", async () => {
+    // A client controls its own headers. A guest that trusted this one would
+    // build absolute URLs — password-reset links, redirects — at an address the
+    // caller chose, so the edge always states the address itself.
+    const guest = fakeRelayCapturing();
+    const app = appWith(guest.relay);
+    const res = await app.request(
+      ...previewReq("/", {
+        headers: { "x-forwarded-host": "evil.example.com", "x-forwarded-proto": "gopher" },
+      }),
+    );
+    expect(res.status).toBe(200);
+
+    const req = await guest.guestRequest();
+    expect(req).not.toContain("evil.example.com");
+    expect(guestHeader(req, "x-forwarded-host")).toBe("web-jumping-fat-kittens.lvh.me:8787");
+    expect(guestHeader(req, "x-forwarded-proto")).toBe("http");
   });
 
   test("non-preview host falls through to the app", async () => {

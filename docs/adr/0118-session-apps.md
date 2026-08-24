@@ -189,8 +189,15 @@ The cost is that an app deriving absolute URLs from `Host` still emits `localhos
 the peer-address variables above are the answer to that, and they are a better answer,
 because they also configure services that never see the request at all.
 
-`Origin`, however, is passed through verbatim, and `X-Forwarded-Host` /
-`X-Forwarded-Proto` carry the real address. Codespaces rewrites `Origin` to
+`Origin`, however, is passed through verbatim, and the edge **sets**
+`X-Forwarded-Host` / `X-Forwarded-Proto` to the real address. Setting, not
+forwarding: an inbound value is client-controlled, so a guest that trusted it
+would build absolute URLs at an address the caller chose. The value is rebuilt
+from the label the platform minted, and the scheme comes from the base domain —
+the same pair `appUrl()` uses for `<APP>_INGRESS_URL`, so an app's own address
+and its siblings' agree. This half of the pair went unimplemented at first and
+the ambiguity here is why: the `Host` rewrite shipped alone, so a server-rendered
+login redirected the browser to `https://localhost/dev-login`. Codespaces rewrites `Origin` to
 `http://localhost:8000`, which destroys an app's ability to build its own allowlist
 and breaks framework CSRF checks; they declined to fix it. We do not repeat it.
 
