@@ -438,8 +438,15 @@ export function proxyHttp(
   targetPath?: string,
   /** ADR 0118: `dropBody` is used by the preflight path, which is the one
    *  request shape that reaches the guest WITHOUT a session — forwarding a body
-   *  there would turn it into a general-purpose unauthenticated request path. */
-  opts?: { dropBody?: boolean },
+   *  there would turn it into a general-purpose unauthenticated request path.
+   *
+   *  `forwarded` is the app's real public address. The guest cannot read it off
+   *  `Host` any more (see the rewrite below), so this is the only channel for
+   *  it. Set it only for a mount rooted at the app's OWN hostname — the IDE
+   *  mount deliberately leaves it unset, because it serves code-server under a
+   *  stripped route prefix and a public host without the matching
+   *  `X-Forwarded-Prefix` would produce absolute URLs missing that prefix. */
+  opts?: { dropBody?: boolean; forwarded?: { host: string; proto: string } },
 ): Promise<Response> {
   const signal = c.req.raw.signal;
 
@@ -480,6 +487,32 @@ export function proxyHttp(
       // straight to it.
       const headers = stripOrchestratorCredentials(c.req.raw.headers);
       headers.set("host", `localhost:${port}`);
+
+      // ADR 0118 pairs that Host rewrite with `X-Forwarded-Host`, and the pair
+      // is the whole contract: the rewrite takes the app's real address away,
+      // so this header is the only place the guest can read it back. Missing
+      // it, an app that derives an absolute URL from the request emits
+      // `localhost` and the browser follows it to the user's own machine. The
+      // brain stack's login did exactly that — Spring answered
+      // `Location: https://localhost/dev-login`, with the port dropped too,
+      // because `X-Forwarded-Proto` present and `X-Forwarded-Port` absent makes
+      // Spring reset the port to the new scheme's default.
+      //
+      // Always SET, never forwarded from the inbound request: a client controls
+      // its own headers, and a guest that trusts a spoofed one builds URLs the
+      // attacker chose. So the value is the canonical address the platform
+      // itself minted, and the scheme comes from the base domain — the same
+      // pair `appUrl()` uses for the `<APP>_INGRESS_URL` handed to the guest at
+      // boot, so an app's own address and its siblings' agree.
+      //
+      // No `X-Forwarded-Port`: the host carries its own port where it has a
+      // non-default one, and naming it twice is how frameworks emit `:443`.
+      if (opts?.forwarded) {
+        headers.set("x-forwarded-host", opts.forwarded.host);
+        headers.set("x-forwarded-proto", opts.forwarded.proto);
+      } else {
+        headers.delete("x-forwarded-host");
+      }
 
       const body = opts?.dropBody ? null : c.req.raw.body;
       const init: FetchInit = {
@@ -580,6 +613,11 @@ export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareH
     const row = await getStore().getByHostLabel(label);
     if (!row) return c.text("not found", 404);
 
+    // The app's real public address, for the guest's absolute URLs. Rebuilt
+    // from the label the platform minted rather than echoed from the inbound
+    // `Host`, so it is canonical and carries nothing the caller chose.
+    const forwarded = { host: `${label}.${baseDomain}`, proto: schemeFor(baseDomain) };
+
     // INVARIANT — a genuine CORS preflight skips the wall (ADR 0118). A browser
     // NEVER sends cookies on a preflight, so authenticating it would reject
     // every cross-app call and no CORS config in the app could repair it.
@@ -603,7 +641,10 @@ export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareH
       }
       // No body reaches the guest: a preflight has none, and forwarding one
       // would make this a general-purpose unauthenticated request path.
-      return proxyHttp(relay, row.sessionId, row.port, c, undefined, { dropBody: true });
+      return proxyHttp(relay, row.sessionId, row.port, c, undefined, {
+        dropBody: true,
+        forwarded,
+      });
     }
 
     // INVARIANT — a credentialed cross-origin request must come from a sibling
@@ -626,6 +667,6 @@ export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareH
       return c.text(authz.status === 403 ? "forbidden" : "not found", authz.status);
     }
 
-    return proxyHttp(relay, row.sessionId, row.port, c);
+    return proxyHttp(relay, row.sessionId, row.port, c, undefined, { forwarded });
   };
 }
