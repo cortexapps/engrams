@@ -217,6 +217,7 @@ function harness(options: {
       execs.push({ sessionId, command });
       return { exitStatus: 0, stdout: "", stderr: "" };
     },
+    async getSession() { return { found: false as const }; },
     async writeFiles(_s, files) {
       return files.map((f) => ({ path: f.path, ok: true }));
     },
@@ -235,6 +236,8 @@ function harness(options: {
       async finalizeRun(_r, status, error) { finalized.push({ status, ...(error !== undefined ? { error } : {}) }); },
       async listRunSessions() { return runSessions; },
       async releaseConcurrency() { return null; },
+      async adoptSession() { return "foreign" as const; },
+      async getSessionBinding() { return null; },
     },
     sessions: sessionOps,
     clock: { nowMs: () => (clock += 1000) },

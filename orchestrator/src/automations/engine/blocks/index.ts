@@ -47,6 +47,7 @@ export const V1_BLOCK_TYPES = [
   "run_command",
   "write_files",
   "integration_action",
+  "session_status",
   "state_get",
   "state_set",
   "state_delete",

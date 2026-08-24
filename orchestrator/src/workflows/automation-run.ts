@@ -189,6 +189,23 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
       return { sessionId, taskId };
     },
 
+    async getSession(sessionId) {
+      try {
+        const resp = await defaultSessions.getSession({ sessionId });
+        const session = resp.session;
+        if (!session) return { found: false };
+        return {
+          found: true,
+          status: session.status,
+          lastActiveAt: session.lastActiveAt,
+          lastEventAt: session.lastEventAt && session.lastEventAt !== "" ? session.lastEventAt : null,
+        };
+      } catch (error) {
+        if (error instanceof ConnectError && error.code === Code.NotFound) return { found: false };
+        throw error;
+      }
+    },
+
     async setSessionRelay(sessionId, relay) {
       await store().setSessionRelay(sessionId, relay);
     },

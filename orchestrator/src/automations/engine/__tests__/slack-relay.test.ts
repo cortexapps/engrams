@@ -102,6 +102,7 @@ function harness() {
     endSession: async () => {},
     exec: async () => ({ exitStatus: 0, stdout: "", stderr: "" }),
     writeFiles: async () => [],
+    getSession: async () => ({ found: false }),
   };
   const store: EngineRunStore = {
     loadSnapshot: () => Promise.reject(new Error("unused")),
@@ -110,6 +111,8 @@ function harness() {
     finalizeRun: async () => {},
     listRunSessions: async () => [],
     releaseConcurrency: async () => null,
+    adoptSession: async () => "foreign",
+    getSessionBinding: async () => null,
   };
   const deps: EngineDeps = {
     step: async (fn) => fn(),

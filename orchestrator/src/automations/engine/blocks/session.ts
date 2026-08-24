@@ -80,6 +80,7 @@ export const waitSessionConfigSchema = z.object({
 export type WaitSessionConfig = z.infer<typeof waitSessionConfigSchema>;
 
 export const endSessionConfigSchema = z.object({ session: sessionRefSchema });
+export const sessionStatusConfigSchema = z.object({ session: sessionRefSchema });
 export type EndSessionConfig = z.infer<typeof endSessionConfigSchema>;
 
 const DEFAULT_WAIT_DEADLINE_S = 7200;
@@ -289,6 +290,60 @@ export function registerSessionBlocks(): void {
     },
   });
 
+  registerBlock<z.infer<typeof sessionStatusConfigSchema>>({
+    type: "session_status",
+    outputs: [
+      "found",
+      "session_id",
+      "status",
+      "last_active_at",
+      "last_event_at",
+      "idle_seconds",
+      "owner_run_live",
+    ],
+    configSchema: sessionStatusConfigSchema,
+    async execute(config, ctx) {
+      // Read-only probe (D11): the sweep entrypoint's cheap look before it
+      // prompts. Unlike resolveSession's adopt path, "unbound" and "gone"
+      // are VALUES here — a sweep iterating stale state entries needs to
+      // branch on them, not fail. It never re-binds, so probing 50 sessions
+      // steals no routing. Runs live in dry runs too (side-effect free; a
+      // dry-run fake id simply reports found: false).
+      let sessionId: string;
+      if ("blockId" in config.session) {
+        sessionId = await ctx.resolveSession(config.session);
+      } else {
+        sessionId = await ctx.render(config.session.template);
+        if (sessionId === "") throw new Error("session reference rendered empty");
+        const binding = await ctx.deps.store.getSessionBinding(sessionId);
+        if (binding === null || binding.automationId !== ctx.automationId) {
+          return {
+            kind: "ok",
+            outputs: { found: false, session_id: sessionId, reason: "unbound" },
+          };
+        }
+        const probe = await ctx.deps.sessions.getSession(sessionId);
+        if (!probe.found) {
+          return { kind: "ok", outputs: { found: false, session_id: sessionId, reason: "gone" } };
+        }
+        return {
+          kind: "ok",
+          outputs: sessionStatusOutputs(ctx, sessionId, probe, {
+            ownerRunLive: !binding.ownerTerminal && binding.runId !== ctx.runId,
+          }),
+        };
+      }
+      const probe = await ctx.deps.sessions.getSession(sessionId);
+      if (!probe.found) {
+        return { kind: "ok", outputs: { found: false, session_id: sessionId, reason: "gone" } };
+      }
+      return {
+        kind: "ok",
+        outputs: sessionStatusOutputs(ctx, sessionId, probe, { ownerRunLive: false }),
+      };
+    },
+  });
+
   registerBlock<EndSessionConfig>({
     type: "end_session",
     configSchema: endSessionConfigSchema,
@@ -299,6 +354,28 @@ export function registerSessionBlocks(): void {
       return { kind: "ok", outputs: { session_id: sessionId, ended: true } };
     },
   });
+}
+
+function sessionStatusOutputs(
+  ctx: RunContext,
+  sessionId: string,
+  probe: { found: true; status: string; lastActiveAt: string; lastEventAt: string | null },
+  extra: { ownerRunLive: boolean },
+): Record<string, unknown> {
+  const reference = probe.lastEventAt ?? probe.lastActiveAt;
+  const referenceMs = Date.parse(reference);
+  const idleSeconds = Number.isFinite(referenceMs)
+    ? Math.max(0, Math.round((ctx.deps.clock.nowMs() - referenceMs) / 1000))
+    : null;
+  return {
+    found: true,
+    session_id: sessionId,
+    status: probe.status,
+    last_active_at: probe.lastActiveAt,
+    last_event_at: probe.lastEventAt,
+    idle_seconds: idleSeconds,
+    owner_run_live: extra.ownerRunLive,
+  };
 }
 
 /** A wait's matcher runs after its own execute step recorded outputs; the

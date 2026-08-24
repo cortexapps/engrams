@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, isNull, lte, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lte, ne, sql } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 import {
@@ -1247,6 +1247,27 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
   const now = deps.now ?? (() => new Date());
   let aliasResolver = deps.aliases;
 
+  async function getSessionBinding(
+    sessionId: string,
+  ): Promise<{ automationId: string; runId: string; ownerTerminal: boolean } | null> {
+    const [row] = await db
+      .select({
+        runId: automationSessionTable.runId,
+        automationId: automationRunTable.automationId,
+        status: automationRunTable.status,
+      })
+      .from(automationSessionTable)
+      .innerJoin(automationRunTable, eq(automationRunTable.id, automationSessionTable.runId))
+      .where(eq(automationSessionTable.sessionId, sessionId))
+      .limit(1);
+    if (!row) return null;
+    return {
+      automationId: row.automationId,
+      runId: row.runId,
+      ownerTerminal: TERMINAL_RUN_STATUSES.has(row.status),
+    };
+  }
+
   async function getRun(id: string): Promise<AutomationRunRow | null> {
     const [row] = await db
       .select()
@@ -1384,6 +1405,41 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         .from(automationSessionTable)
         .where(eq(automationSessionTable.runId, runId));
       return rows;
+    },
+
+    getSessionBinding,
+
+    async adoptSession({ runId, automationId, sessionId }) {
+      // One statement classifies AND transfers: the UPDATE only fires when
+      // the binding row belongs to this automation and its owning run is
+      // terminal. A re-executed step (crash before checkpoint) matches the
+      // already_ours arm below and stays idempotent.
+      const adopted = await db
+        .update(automationSessionTable)
+        .set({ runId })
+        .where(
+          and(
+            eq(automationSessionTable.sessionId, sessionId),
+            inArray(
+              automationSessionTable.runId,
+              db
+                .select({ id: automationRunTable.id })
+                .from(automationRunTable)
+                .where(
+                  and(
+                    eq(automationRunTable.automationId, automationId),
+                    inArray(automationRunTable.status, [...TERMINAL_RUN_STATUSES]),
+                  ),
+                ),
+            ),
+          ),
+        )
+        .returning({ sessionId: automationSessionTable.sessionId });
+      if (adopted.length > 0) return "adopted";
+      const binding = await getSessionBinding(sessionId);
+      if (binding === null || binding.automationId !== automationId) return "foreign";
+      if (binding.runId === runId) return "already_ours";
+      return "owner_live";
     },
 
     async releaseConcurrency(runId) {
