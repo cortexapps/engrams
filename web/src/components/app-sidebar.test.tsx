@@ -43,6 +43,8 @@ test("member sees shared destinations but not admin destinations in the rail", a
   );
   expect(await screen.findByRole("link", { name: "Tasks" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Artifacts" })).toBeTruthy();
-  expect(screen.getByRole("link", { name: "Tech Specs" })).toBeTruthy();
   expect(screen.queryByRole("link", { name: "Operator" })).toBeNull();
+  // Tech Specs is admin-only until it is finished. The route still answers on
+  // a direct link — this hides where people would find it, nothing more.
+  expect(screen.queryByRole("link", { name: "Tech Specs" })).toBeNull();
 });

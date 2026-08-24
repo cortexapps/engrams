@@ -61,7 +61,12 @@ const DESTS: Dest[] = [
     to: "/specs",
     label: "Tech Specs",
     icon: FilePenLine,
-    adminOnly: false,
+    // Admin-only while Tech Specs is finished, so the org does not meet it
+    // mid-polish. This hides the entry point, not the feature: /specs still
+    // answers on a direct link, and the orchestrator still serves every spec
+    // RPC. Anyone holding a spec URL keeps their spec. Put this back to false
+    // when the feature is ready to be met.
+    adminOnly: true,
     match: (p) => p.startsWith("/specs"),
   },
   {
