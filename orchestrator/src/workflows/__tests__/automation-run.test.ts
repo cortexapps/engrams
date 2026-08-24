@@ -37,6 +37,12 @@ function fakeEngineStore(overrides: Partial<AutomationEngineStore> = {}): Automa
     async markRunning() {},
     async recordStep() {},
     async finalizeRun() {},
+    async adoptSession() {
+      return "foreign" as const;
+    },
+    async getSessionBinding() {
+      return null;
+    },
     async listRunSessions() {
       return [];
     },
@@ -85,6 +91,7 @@ describe("automationRunWorkflowImpl", () => {
         endSession: async () => {},
         exec: async () => ({ exitStatus: 0, stdout: "", stderr: "" }),
         writeFiles: async () => [],
+        getSession: async () => ({ found: false }),
       },
       clock: { nowMs: () => 1_000 },
     };

@@ -18,6 +18,7 @@ import {
 import {
   automation as automationTable,
   automationRun as automationRunTable,
+  automationSession as automationSessionTable,
 } from "../db/schema.ts";
 import type { AutomationRunTrigger } from "../db/schema.ts";
 import { interpretAutomation } from "../automations/engine/interpreter.ts";
@@ -227,6 +228,7 @@ describe("automation engine store (live PG)", () => {
           endSession: () => Promise.reject(new Error("unused")),
           exec: () => Promise.reject(new Error("unused")),
           writeFiles: () => Promise.reject(new Error("unused")),
+      getSession: () => Promise.resolve({ found: false as const }),
         },
         clock: { nowMs: () => 0 },
         startQueuedRun: async (rid) => {
@@ -507,4 +509,67 @@ describe("resolveAutomationInputs", () => {
     );
     expect(resolved).toEqual({ mention: "@engrams", max: 9 });
   });
+});
+
+describe("session adoption (live PG, ADR 0119 D11)", () => {
+  test.skipIf(!dbReachable)(
+    "adoptSession transfers only terminal-run bindings in the same automation",
+    async () => {
+      const db = getDb();
+      const autoId = `${AUTO_ID}-adopt`;
+      const otherAutoId = `${AUTO_ID}-adopt-other`;
+      await seedAutomation(autoId);
+      await seedAutomation(otherAutoId);
+      const store = makeAutomationEngineStore();
+
+      const doneRun = `autorun:${autoId}:done`;
+      const liveRun = `autorun:${autoId}:live`;
+      const meRun = `autorun:${autoId}:me`;
+      const foreignRun = `autorun:${otherAutoId}:done`;
+      await db.insert(automationRunTable).values([
+        { id: doneRun, automationId: autoId, trigger: TRIGGER, status: "completed" },
+        { id: liveRun, automationId: autoId, trigger: TRIGGER, status: "waiting" },
+        { id: meRun, automationId: autoId, trigger: TRIGGER, status: "running" },
+        { id: foreignRun, automationId: otherAutoId, trigger: TRIGGER, status: "completed" },
+      ]);
+      const kept = `sess-${UNIQ}-kept`;
+      const busy = `sess-${UNIQ}-busy`;
+      const foreign = `sess-${UNIQ}-foreign`;
+      await db.insert(automationSessionTable).values([
+        { sessionId: kept, runId: doneRun, blockId: "launch", keep: true },
+        { sessionId: busy, runId: liveRun, blockId: "launch", keep: true },
+        { sessionId: foreign, runId: foreignRun, blockId: "launch", keep: true },
+      ]);
+
+      // Terminal owner in the same automation: transfers.
+      expect(await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: kept })).toBe(
+        "adopted",
+      );
+      expect(await store.getSessionBinding(kept)).toMatchObject({
+        automationId: autoId,
+        runId: meRun,
+        ownerTerminal: false,
+      });
+      // A replayed step (crash before checkpoint) is already_ours, not a
+      // refusal.
+      expect(await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: kept })).toBe(
+        "already_ours",
+      );
+
+      // A live owner keeps exclusive routing.
+      expect(await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: busy })).toBe(
+        "owner_live",
+      );
+      expect((await store.getSessionBinding(busy))?.runId).toBe(liveRun);
+
+      // Another automation's binding, and no binding at all, are foreign.
+      expect(
+        await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: foreign }),
+      ).toBe("foreign");
+      expect(
+        await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: "no-such" }),
+      ).toBe("foreign");
+      expect(await store.getSessionBinding("no-such")).toBeNull();
+    },
+  );
 });

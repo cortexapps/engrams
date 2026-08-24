@@ -70,6 +70,8 @@ function inertDeps(): EngineDeps {
       finalizeRun: unavailable,
       listRunSessions: unavailable,
       releaseConcurrency: unavailable,
+      adoptSession: unavailable,
+      getSessionBinding: unavailable,
     },
     sessions: {
       createSession: unavailable,
@@ -78,6 +80,7 @@ function inertDeps(): EngineDeps {
       endSession: unavailable,
       exec: unavailable,
       writeFiles: unavailable,
+      getSession: unavailable,
     },
     clock: { nowMs: () => 0 },
   };

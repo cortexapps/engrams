@@ -48,6 +48,21 @@ export interface EngineRunStore {
    * id when the policy is queue and a pending run waits, else null. The whole
    * release+promote is one transaction. */
   releaseConcurrency(runId: string): Promise<string | null>;
+  /** D11 adoption: re-bind a kept session's `automation_session` row to
+   * this run so waits and relays route to its mailbox. Only a row in the
+   * SAME automation whose owning run is TERMINAL transfers — adoption must
+   * never steal event routing from a live run ("owner_live"). "foreign"
+   * covers a row in another automation and no row at all: the binding row
+   * is the ownership boundary. */
+  adoptSession(input: {
+    runId: string;
+    automationId: string;
+    sessionId: string;
+  }): Promise<"adopted" | "already_ours" | "owner_live" | "foreign">;
+  /** Read-only counterpart for the `session_status` probe. */
+  getSessionBinding(
+    sessionId: string,
+  ): Promise<{ automationId: string; runId: string; ownerTerminal: boolean } | null>;
 }
 
 export interface EngineCreateSessionResult {
@@ -87,6 +102,12 @@ export interface EngineSessionOps {
   sendPrompt(sessionId: string, promptId: string, text: string, harnessMode?: string): Promise<void>;
   /** Contract 3: a relay block asks for this session's curated events. */
   setSessionRelay(sessionId: string, relay: boolean): Promise<void>;
+  /** Read-only probe (`session_status`). Not-found is a value, never an
+   * error — a swept-away session is a normal answer for a sweep. */
+  getSession(sessionId: string): Promise<
+    | { found: false }
+    | { found: true; status: string; lastActiveAt: string; lastEventAt: string | null }
+  >;
   endSession(sessionId: string): Promise<void>;
   exec(
     sessionId: string,

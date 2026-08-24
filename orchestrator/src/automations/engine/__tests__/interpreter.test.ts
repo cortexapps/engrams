@@ -30,6 +30,7 @@ interface Harness {
   execs: Array<{ sessionId: string; command: string; execId: string }>;
   released: string[];
   promoted: string[];
+  adopted: Array<{ runId: string; sessionId: string }>;
   actions: Array<{ actionId: string; stepPath: string; params: Record<string, unknown> }>;
   state: Map<string, { value: unknown; version: number; writer: string }>;
 }
@@ -63,6 +64,14 @@ function makeHarness(
     stateEntries?: Record<string, { value: unknown; version: number; writer: string }>;
     /** Leave deps.state undefined (the unavailable path). */
     noStateStore?: boolean;
+    /** Session bindings visible to adoptSession/getSessionBinding:
+     * sessionId -> {automationId, runId, ownerTerminal}. */
+    bindings?: Record<string, { automationId: string; runId: string; ownerTerminal: boolean }>;
+    /** getSession probe results by session id (absent = found: false). */
+    probes?: Record<
+      string,
+      { status: string; lastActiveAt: string; lastEventAt: string | null }
+    >;
     /** Make recordStep throw for these frame paths (a ledger blip). */
     failRecordStepFor?: string[];
   } = {},
@@ -117,9 +126,27 @@ function makeHarness(
       released.push(runId);
       return options.promote ?? null;
     },
+    async adoptSession({ runId, automationId, sessionId }) {
+      const binding = bindings[sessionId];
+      if (!binding || binding.automationId !== automationId) return "foreign";
+      if (binding.runId === runId) return "already_ours";
+      if (!binding.ownerTerminal) return "owner_live";
+      binding.runId = runId;
+      binding.ownerTerminal = false;
+      adopted.push({ runId, sessionId });
+      return "adopted";
+    },
+    async getSessionBinding(sessionId) {
+      const binding = bindings[sessionId];
+      return binding ? { ...binding } : null;
+    },
   };
 
   const sessions: EngineSessionOps = {
+    async getSession(sessionId) {
+      const probe = options.probes?.[sessionId];
+      return probe ? { found: true, ...probe } : { found: false };
+    },
     async createSession(input) {
       const sessionId = `s-${input.blockId}`;
       createdInputs.push(input);
@@ -143,6 +170,10 @@ function makeHarness(
       return files.map((f) => ({ path: f.path, ok: true }));
     },
   };
+
+  const bindings: Record<string, { automationId: string; runId: string; ownerTerminal: boolean }> =
+    structuredClone(options.bindings ?? {});
+  const adopted: Array<{ runId: string; sessionId: string }> = [];
 
   const state = new Map<string, { value: unknown; version: number; writer: string }>(
     Object.entries(options.stateEntries ?? {}),
@@ -207,7 +238,7 @@ function makeHarness(
   };
 
   if (!options.noStateStore) deps.state = fakeState;
-  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, actions, state };
+  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, actions, state, adopted };
 }
 
 const RUN = { runId: "autorun:auto-1:manual:x", automationId: "auto-1" };
@@ -1239,5 +1270,130 @@ describe("state blocks (ADR 0119 D10)", () => {
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("failed");
     expect(result.error).toContain("state_store_unavailable");
+  });
+});
+
+describe("session adoption + session_status (ADR 0119 D11)", () => {
+  const BINDING_TERMINAL = {
+    "s-kept": { automationId: "auto-1", runId: "autorun:auto-1:old", ownerTerminal: true },
+  };
+
+  test("a template session ref adopts a terminal-run session, then prompts and waits route here", async () => {
+    const definition = makeDefinition([
+      {
+        id: "nudge",
+        type: "send_prompt",
+        config: {
+          session: { template: "${{ event.raw.session_id }}" },
+          promptTemplate: "review feedback arrived",
+          waitFor: { kind: "none" },
+        },
+      },
+    ]);
+    const h = makeHarness(definition, {
+      payload: { session_id: "s-kept" },
+      bindings: structuredClone(BINDING_TERMINAL),
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+
+    expect(result.status).toBe("completed");
+    expect(h.adopted).toEqual([{ runId: RUN.runId, sessionId: "s-kept" }]);
+    expect(h.prompts.map((prompt) => prompt.sessionId)).toEqual(["s-kept"]);
+  });
+
+  test("adoption never steals from a live run: the block fails, typed and loud", async () => {
+    const definition = makeDefinition([
+      {
+        id: "nudge",
+        type: "send_prompt",
+        config: {
+          session: { template: "s-kept" },
+          promptTemplate: "hi",
+          waitFor: { kind: "none" },
+        },
+      },
+    ]);
+    const h = makeHarness(definition, {
+      bindings: {
+        "s-kept": { automationId: "auto-1", runId: "autorun:auto-1:live", ownerTerminal: false },
+      },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("never steals");
+    expect(h.prompts).toEqual([]);
+  });
+
+  test("the binding row is the ownership boundary: an unbound id is refused", async () => {
+    const definition = makeDefinition([
+      {
+        id: "bye",
+        type: "end_session",
+        config: { session: { template: "s-someone-elses" } },
+      },
+    ]);
+    const h = makeHarness(definition, {});
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("not bound to this automation");
+    expect(h.ended).toEqual([]);
+  });
+
+  test("session_status probes without adopting; unbound and gone are values", async () => {
+    const definition = makeDefinition([
+      { id: "probe", type: "session_status", config: { session: { template: "s-kept" } } },
+      { id: "stale", type: "session_status", config: { session: { template: "s-unknown" } } },
+      { id: "swept", type: "session_status", config: { session: { template: "s-gone" } } },
+    ]);
+    const h = makeHarness(definition, {
+      bindings: {
+        "s-kept": { automationId: "auto-1", runId: "autorun:auto-1:live", ownerTerminal: false },
+        "s-gone": { automationId: "auto-1", runId: "autorun:auto-1:old", ownerTerminal: true },
+      },
+      probes: {
+        "s-kept": {
+          status: "idle",
+          lastActiveAt: "2001-09-09T01:40:00Z",
+          lastEventAt: "2001-09-09T01:45:40Z",
+        },
+      },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+
+    expect(result.status).toBe("completed");
+    const outputs = Object.fromEntries(h.stepRecords.map((r) => [r.framePath, r.record.outputs ?? {}]));
+    // Harness clock starts at 1_000_000_000 ms and ticks 60s per step; the
+    // probe only asserts shape + owner_run_live, and that idle_seconds is a
+    // number derived from last_event_at.
+    expect(outputs["probe"]).toMatchObject({
+      found: true,
+      session_id: "s-kept",
+      status: "idle",
+      owner_run_live: true,
+    });
+    expect(typeof (outputs["probe"] as { idle_seconds: unknown }).idle_seconds).toBe("number");
+    expect(outputs["stale"]).toMatchObject({ found: false, reason: "unbound" });
+    expect(outputs["swept"]).toMatchObject({ found: false, session_id: "s-gone", reason: "gone" });
+    // No probe ever re-binds.
+    expect(h.adopted).toEqual([]);
+  });
+
+  test("a dry run resolves template refs without touching bindings", async () => {
+    const definition = makeDefinition([
+      {
+        id: "nudge",
+        type: "send_prompt",
+        config: {
+          session: { template: "s-kept" },
+          promptTemplate: "hi",
+          waitFor: { kind: "none" },
+        },
+      },
+    ]);
+    const h = makeHarness(definition, { dryRun: true, bindings: structuredClone(BINDING_TERMINAL) });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.adopted).toEqual([]);
+    expect(h.prompts).toEqual([]);
   });
 });

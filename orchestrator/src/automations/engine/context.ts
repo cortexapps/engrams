@@ -74,6 +74,14 @@ export interface RunContext {
   dryRun: boolean;
   deps: EngineDeps;
   render(template: string): Promise<string>;
+  /** Resolve a session ref to a session id. A `{blockId}` ref reads the
+   * block's recorded `session_id`. A `{template}` ref renders the id and —
+   * outside dry runs — ADOPTS it (D11): the session must be bound to THIS
+   * automation (the binding row is the ownership boundary), and the row
+   * re-binds to this run so waits and relays route here. Re-binding only
+   * succeeds when the owning run is terminal — adoption never steals
+   * routing from a live run. The read-only `session_status` block does its
+   * own binding read instead, where "unbound" is a value, not an error. */
   resolveSession(ref: SessionRef): Promise<string>;
   /** The flat object condition paths resolve against. */
   scope(): Record<string, unknown>;
@@ -143,6 +151,24 @@ export function buildRunContext(
       }
       const rendered = await ctx.render(ref.template);
       if (rendered === "") throw new Error("session reference rendered empty");
+      // Dry runs skip the binding checks: no dry block ever acts on the id,
+      // and a dry-run:<...> fake could never pass them.
+      if (ctx.dryRun) return rendered;
+      const outcome = await deps.store.adoptSession({
+        runId,
+        automationId: ctx.automationId,
+        sessionId: rendered,
+      });
+      if (outcome === "foreign") {
+        throw new Error(
+          `session "${rendered}" is not bound to this automation (the binding row is the ownership boundary)`,
+        );
+      }
+      if (outcome === "owner_live") {
+        throw new Error(
+          `session "${rendered}" belongs to a live run of this automation; adoption never steals routing (probe with session_status, or serialize through the entity's concurrency key)`,
+        );
+      }
       return rendered;
     },
   };
