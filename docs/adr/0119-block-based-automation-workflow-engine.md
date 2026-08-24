@@ -274,6 +274,89 @@ automation, honored by the single trailing `step:__finalize__:0` that every
 exit path reaches (terminal status, claim release/promotion, session
 teardown). The review built-in ends its worker sessions explicitly.
 
+### D9 — Multiple entrypoints; runs stay short
+
+One automation can own several ways in. The definition grows
+**entrypoints**: `entrypoints: [{id, trigger, blocks}]`, all sharing the
+automation's inputs, settings, and state (D10). A definition with the
+singular `trigger` + `blocks` shape is one entrypoint named `main`; the
+schema normalizes it, so every stored version has the array form.
+
+- The run id grows the entrypoint:
+  `autorun:<automationId>:<entrypointId>:<deliveryKey>`. Dispatch matches a
+  delivery against every entrypoint's trigger; cron, integration, and manual
+  triggers can coexist in one automation.
+- `step:__snapshot__:0` records the entrypoint id with the pinned version,
+  and the interpreter walks that entrypoint's blocks. This changes what the
+  registered body does with the snapshot, so it bumps
+  `ENGINE_STEP_CONTRACT`.
+- Concurrency claims stay **automation-scoped**: two entrypoints whose runs
+  compute the same `concurrencyKey` (for example `ticket:<id>`) serialize
+  through one claim row, whatever entrypoint opened them.
+
+The model this enables is the house state-machine pattern applied to
+automations: each entrypoint fires a **short** run that reads and writes
+shared state (D10) and exits. The automation is stateful; no run is. An
+entity lifecycle that spans days (a ticket becomes a PR, the PR gathers
+review rounds, a cron pass nudges stuck work) must NOT be one long-lived
+run: long runs collide with `MAX_WAIT_DEADLINE_S`, the 48h sweep, and every
+`ENGINE_STEP_CONTRACT` bump. The `join` policy with `continueOnly` (D4)
+remains the right shape for conversations, where every event carries the
+same correlation key and the lifetime is hours — D9 does not replace it.
+
+### D10 — Automation state: a shared KV, one writer per entity
+
+`automation_state (automation_id, key) PK → value jsonb, version bigint,
+writer text, updated_at`. Three blocks: `state.get`, `state.set`, and
+`state.list` (bounded prefix scan). Reads and writes are checkpointed steps,
+so a replayed run sees the values it recorded — a read is a snapshot at that
+step, never a subscription.
+
+Concurrency is layered; the bottom layer is free:
+
+1. **One writer per entity (the default).** The design rule is: state key =
+   entity, concurrency key = entity, one JSON document per entity. Every
+   entrypoint that mutates an entity derives the same `concurrencyKey` with
+   policy `queue`, so the existing claim row serializes its runs. Inside a
+   held claim, get → decide → set needs no lock, and multi-key atomicity
+   never comes up because an entity's facts live in one document.
+2. **Versioned CAS for the actors that cannot hold the entity claim.** A
+   cron sweep touches many entities in one run; a session tool writes with
+   no run live. For them `state.set` takes an optional `expectVersion`; a
+   miss is a typed outcome (`{ok: false, current}`), never an error. Every
+   write stamps `writer = <runId>:<framePath>`; a CAS retry that finds
+   `version == expect + 1` and `writer == me` reports success, so a crash
+   between a successful write and its checkpoint replays clean (the same
+   idempotency identity as the prompt outbox).
+3. **What the engine refuses.** No `state.lock` block and no transactions
+   across blocks. A graph that "needs" a lock across a wait must hold the
+   entity claim instead — a lock parked across `wait_session` for hours is
+   the disease the PG leasing pattern exists to avoid. Sweeps are written
+   read-mostly: probe, prompt (idempotent per frame path), and record
+   bookkeeping via CAS where losing the race is the correct outcome.
+
+Caps, enforced at the store: key ≤ 512 chars, serialized value ≤ 64 KiB,
+≤ 5,000 keys per automation, `state.list` returns ≤ 500 entries.
+
+### D11 — Cross-run session adoption
+
+Kept sessions outlive their runs, and a later entrypoint must be able to do
+more than fire-and-forget at them. Resolving a session by rendered id today
+lets `send_prompt` reach it, but the automation consumer routes idle and
+terminal events by the `automation_session` binding row — whose `run_id`
+points at the finished run, so `wait_session` never resolves.
+
+**Adoption** fixes the routing: when a run resolves a `{template}` session
+ref to a session whose binding row belongs to the **same automation**, the
+engine re-binds the row (`run_id` CASes to the current run) inside the
+resolving step. Waits and relays then route to the adopting run's mailbox.
+A session bound to a different automation — or to no automation — is
+refused: the binding row is the ownership boundary. The adopted session
+keeps its `keep` flag; the adopting run's finalize applies the usual D8
+rules. Alongside adoption, a read-only `session.status` block (status,
+last_active_at, pending question) gives sweep entrypoints a probe cheaper
+than prompting.
+
 ## Statuses
 
 Run: `pending → running ⇄ waiting → completed | filtered | failed |
@@ -300,6 +383,10 @@ Phase 2 adds `integration_event`. Phase 4 adds `review.automation_run_id`
 and the window flag, then drops `review_session`, `review_enrollment`,
 `webhook_sample`, and `review.workflow_id`.
 
+Phase 5 (D9–D11) adds `automation_state` (migration 0083). Entrypoints
+need no migration — definitions are jsonb — and adoption re-uses
+`automation_session.run_id`.
+
 ## API surface
 
 Phase 1 keeps `automation.proto` byte-identical: the RPC layer maps the
@@ -325,6 +412,9 @@ retry). `IntegrationService` gains `ListEventCatalog` and `ListActionCatalog`.
    per-repo flag (window opens), Slack relay + built-in + per-channel flag
    (window opens), then the two deletion PRs and the ADR bookends
    (this ADR → Accepted; ADR 0060/0100/0102 amended).
+5. **Stateful automations** (D9–D11, amended 2026-08-24) — `automation_state`
+   + state blocks, multiple entrypoints, session adoption + `session.status`.
+   Ships after the phase-4 windows open; no dependency on the deletions.
 
 ## Correctness and security invariants
 
