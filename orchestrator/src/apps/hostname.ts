@@ -100,3 +100,26 @@ export function schemeFor(domain: string): "http" | "https" {
 export function appUrl(hostLabel: string, baseDomain: string): string {
   return `${schemeFor(baseDomain)}://${hostLabel}.${baseDomain}`;
 }
+
+/**
+ * True if `host` is under the preview base domain at all — apex, nested label,
+ * junk label, or a real app. This is the TERMINATION test: everything it
+ * matches must be answered by the preview handler, never passed to the app.
+ *
+ * `previewHostLabel` (routes/preview-proxy.ts) is the narrower question ("does
+ * it name a routable app?") and returns null for cases this still matches.
+ *
+ * Lives HERE, in a module with no DB or control-plane imports, because
+ * `server.ts` needs it to keep the `/rpc` seam away from preview hosts and must
+ * not drag the preview proxy's dependencies into every consumer of
+ * `buildServer`.
+ */
+export function isUnderPreviewDomain(
+  hostHeader: string | undefined,
+  baseDomain: string,
+): boolean {
+  if (!hostHeader || !baseDomain) return false;
+  const host = hostHeader.toLowerCase();
+  const base = baseDomain.toLowerCase();
+  return host === base || host.endsWith("." + base);
+}

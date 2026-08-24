@@ -4,7 +4,7 @@
  * Shape:
  *   - /rpc/* → connectNodeAdapter (Connect/gRPC/gRPC-Web); prefix="/rpc" must
  *     match the startsWith("/rpc/") seam so handlers registered at prefix+path
- *     resolve correctly.
+ *     resolve correctly. NOT for a preview host — see the dispatch below.
  *   - everything else → Hono via getRequestListener(app.fetch), which is pure
  *     node:http code: streams SSE correctly, preserves multiple Set-Cookie
  *     headers, and wires client-disconnect→request abort.
@@ -46,6 +46,8 @@ import { connectNodeAdapter } from "@connectrpc/connect-node";
 import type { ConnectRouter } from "@connectrpc/connect";
 import type { NodeWebSocket } from "@hono/node-ws";
 import { iapBridge } from "./auth/iap-bridge.ts";
+import { isUnderPreviewDomain } from "./apps/hostname.ts";
+import { config } from "./config.ts";
 import { log } from "./log.ts";
 
 export type RouteRegistrar = (router: ConnectRouter) => void;
@@ -79,6 +81,9 @@ export function buildServer(
   routes: RouteRegistrar = () => {},
   nodeWs?: NodeWebSocket,
   upgradeHooks: UpgradeHook[] = [],
+  /** Preview base domain, for the termination check below. Defaults to config;
+   *  a test that passes "" opts out, since no host is under an empty domain. */
+  previewBaseDomain: string = config.previewBaseDomain,
 ) {
   // requestPathPrefix must match the "/rpc/" seam — handlers register at
   // prefix+requestPath, so a missing prefix causes every real RPC to 404.
@@ -96,7 +101,26 @@ export function buildServer(
     iapBridge(req, res, () => {
       const url = req.url ?? "/";
 
-      if (url.startsWith("/rpc/") || url === "/rpc") {
+      // INVARIANT — preview hosts terminate (ADR 0118). This dispatch is the
+      // one place that can break it, because it is PATH-keyed and runs BEFORE
+      // Hono, where the preview wall lives. Without the host check a request to
+      // `<app>.preview.<domain>/rpc/...` is answered by the ORCHESTRATOR'S OWN
+      // Connect services — and the visitor's cookie is scoped to the parent
+      // domain, so the browser attaches it and the call succeeds as that user.
+      //
+      // That is a real escalation, not a routing curiosity: a session app's
+      // page is written by the agent, and this seam let it drive the control
+      // plane as whoever opened it. It also walked straight around the
+      // credential-stripping boundary in the preview proxy, whose entire job is
+      // to keep the visitor's session token away from guest code. Found in
+      // prod: a nested engrams' SPA calls same-origin `/rpc`, and the outer
+      // orchestrator answered it with the visitor's real task list.
+      //
+      // A preview host therefore goes to Hono, where the wall answers it and
+      // the proxy forwards it to the guest — which is also what the nested app
+      // wanted: its own `/rpc`, served by its own orchestrator.
+      const isPreviewHost = isUnderPreviewDomain(req.headers.host, previewBaseDomain);
+      if (!isPreviewHost && (url.startsWith("/rpc/") || url === "/rpc")) {
         // Connect adapter takes over: handles Connect/gRPC/gRPC-Web protocols.
         connectHandler(req, res);
         return;
