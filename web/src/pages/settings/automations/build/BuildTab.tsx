@@ -24,7 +24,7 @@ import {
 } from "@/lib/automation-blocks";
 
 import { BlockInspector } from "./BlockInspector";
-import { BlockList, TRIGGER_ROW_ID } from "./BlockList";
+import { Canvas, TRIGGER_ROW_ID } from "./canvas/Canvas";
 import { TriggerInspector } from "./TriggerInspector";
 
 export interface BuildTabProps {
@@ -153,20 +153,18 @@ export function BuildTab({
   return (
     <ResizablePanelGroup orientation="horizontal" className="min-h-[480px] rounded-lg border">
       <ResizablePanel defaultSize={42} minSize={28}>
-        <div className="h-full overflow-y-auto p-3">
-          <BlockList
-            trigger={definition.trigger}
-            triggerSummary={triggerSummary}
-            blocks={definition.blocks}
-            selectedId={effectiveId}
-            onSelect={setSelectedId}
-            erroredIds={erroredIds}
-            locked={builtin}
-            onInsert={onInsert}
-            onMove={onMove}
-            onRemove={onRemove}
-          />
-        </div>
+        <Canvas
+          trigger={definition.trigger}
+          triggerSummary={triggerSummary}
+          blocks={definition.blocks}
+          selectedId={effectiveId}
+          onSelect={setSelectedId}
+          erroredIds={erroredIds}
+          locked={builtin}
+          onInsert={onInsert}
+          onMove={onMove}
+          onRemove={onRemove}
+        />
       </ResizablePanel>
       <ResizableHandle />
       <ResizablePanel defaultSize={58} minSize={32}>
