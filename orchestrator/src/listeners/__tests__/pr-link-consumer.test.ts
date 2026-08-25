@@ -40,6 +40,9 @@ function prRefRecorder() {
   const upserts: PrRefInput[] = [];
   const rows = new Map<string, PrRefRow>();
   const store: PrRefStore = {
+    async getByPr() {
+      return null;
+    },
     async upsert(input) {
       upserts.push(input);
       const key = `${input.repo}#${input.prNumber}`;

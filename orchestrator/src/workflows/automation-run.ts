@@ -45,6 +45,7 @@ import { interpretAutomation, type EngineRunResult } from "../automations/engine
 import type { EngineDeps, EngineSessionOps } from "../automations/engine/deps.ts";
 import { makeCodeBlockRuntime } from "../automations/code/runtime.ts";
 import { makeAutomationStateStore } from "../db/automation-state.ts";
+import { makePrRefStore } from "../db/pr-refs.ts";
 import { makeIntegrationActionRuntime } from "../automations/actions/runtime.ts";
 
 export interface AutomationRunWorkflowInput {
@@ -265,6 +266,20 @@ function productionEngineDeps(): EngineDeps {
     clock: { nowMs: () => Date.now() },
     code: makeCodeBlockRuntime(),
     state: makeAutomationStateStore(),
+    prRefs: {
+      getByPr: async (repo, prNumber) => {
+        const row = await makePrRefStore().getByPr(repo, prNumber);
+        return row
+          ? {
+              sessionId: row.sessionId,
+              taskId: row.authoringTaskId,
+              headBranch: row.headBranch,
+              url: row.url,
+              title: row.title,
+            }
+          : null;
+      },
+    },
     integrationActions: makeIntegrationActionRuntime(),
     async startQueuedRun(runId) {
       const run = await store.getRun(runId);
