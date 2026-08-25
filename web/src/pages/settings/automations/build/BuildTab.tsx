@@ -37,6 +37,8 @@ export interface BuildTabProps {
   testPanel?: ReactNode;
   /** 3.4: live variable values keyed by path for the selected sample. */
   variableValues?: Readonly<Record<string, string>>;
+  /** D9: block ids in OTHER entrypoints — ids stay unique automation-wide. */
+  reservedBlockIds?: readonly string[];
 }
 
 /** Static variable paths available to a block: trigger/inputs/event roots
@@ -101,6 +103,7 @@ export function BuildTab({
   triggerSummary,
   testPanel,
   variableValues,
+  reservedBlockIds,
 }: BuildTabProps) {
   const firstId = definition.blocks[0]?.id ?? TRIGGER_ROW_ID;
   const [selectedId, setSelectedId] = useState<string>(firstId);
@@ -121,7 +124,7 @@ export function BuildTab({
   const updateTrigger = (trigger: TriggerSpec) => onChange({ ...definition, trigger });
   const onInsert = (at: ListPath, index: number, kind: string) => {
     const spec = blockKind(kind);
-    const id = nextBlockId(definition.blocks, kind);
+    const id = nextBlockId(definition.blocks, kind, reservedBlockIds ?? []);
     const block: BlockDef = { id, type: kind, config: spec.defaults() };
     if (spec.nests === "branch") {
       block.then = [];

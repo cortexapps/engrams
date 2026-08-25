@@ -3,6 +3,13 @@ import { describe, expect, it } from "vitest";
 import {
   blockKind,
   insertableBlockKinds,
+  removeEntrypoint,
+  projectEntrypoint,
+  mergeEntrypoint,
+  entrypointIds,
+  entrypointIdError,
+  blockIdsOutsideEntrypoint,
+  addEntrypoint,
   applyOverrides,
   diffOverrides,
   findBlock,
@@ -171,5 +178,70 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
     for (const spec of insertableBlockKinds()) {
       expect(() => spec.summary(spec.defaults())).not.toThrow();
     }
+  });
+});
+
+describe("entrypoint projection (ADR 0119 D9)", () => {
+  const def = (): AutomationDefinition => ({
+    engine: 1,
+    trigger: { kind: "manual" },
+    blocks: [{ id: "launch", type: "create_session", config: {} }],
+    entrypoints: [
+      {
+        id: "sweep",
+        trigger: { kind: "cron", schedule: "* * * * *", timezone: "UTC" } as never,
+        blocks: [{ id: "probe", type: "session_status", config: {} }],
+      },
+    ],
+    inputsSchema: [],
+    settings: { endSessionsOnFinish: false },
+  });
+
+  it("projects an entrypoint's trigger + blocks to the top level; main is the definition itself", () => {
+    const d = def();
+    expect(projectEntrypoint(d, "main")).toBe(d);
+    const sweep = projectEntrypoint(d, "sweep");
+    expect(sweep.trigger.kind).toBe("cron");
+    expect(sweep.blocks.map((b) => b.id)).toEqual(["probe"]);
+  });
+
+  it("merge folds an edited projection back and restores main's own trigger + blocks", () => {
+    const d = def();
+    const edited = {
+      ...projectEntrypoint(d, "sweep"),
+      blocks: [{ id: "probe", type: "session_status", config: { x: 1 } }],
+    };
+    const merged = mergeEntrypoint(d, "sweep", edited);
+    expect(merged.trigger.kind).toBe("manual");
+    expect(merged.blocks.map((b) => b.id)).toEqual(["launch"]);
+    expect(merged.entrypoints?.[0]?.blocks[0]?.config).toEqual({ x: 1 });
+  });
+
+  it("add/remove round-trip; removing the last extra drops the field entirely", () => {
+    let d = addEntrypoint(def(), "feedback");
+    expect(entrypointIds(d)).toEqual(["main", "sweep", "feedback"]);
+    d = removeEntrypoint(removeEntrypoint(d, "feedback"), "sweep");
+    expect(entrypointIds(d)).toEqual(["main"]);
+    expect("entrypoints" in d).toBe(false);
+  });
+
+  it("id validation: shape, the reserved main, and duplicates", () => {
+    const d = def();
+    expect(entrypointIdError(d, "feedback")).toBeNull();
+    expect(entrypointIdError(d, "main")).toContain("implicit");
+    expect(entrypointIdError(d, "sweep")).toContain("exists");
+    expect(entrypointIdError(d, "Bad-Id")).toContain("Lowercase");
+  });
+
+  it("reserved ids keep nextBlockId unique across entrypoints", () => {
+    const d = def();
+    const reserved = blockIdsOutsideEntrypoint(d, "sweep");
+    expect(reserved).toEqual(["launch"]);
+    // Inserting a create_session inside "sweep" must not mint "launch"
+    // again — the server holds block ids unique automation-wide.
+    expect(nextBlockId(projectEntrypoint(d, "sweep").blocks, "create_session", reserved)).toBe(
+      "create_session",
+    );
+    expect(nextBlockId([], "create_session", ["create_session"])).toBe("create_session_2");
   });
 });

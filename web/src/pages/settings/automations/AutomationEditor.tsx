@@ -31,6 +31,13 @@ import {
   useUpdateAutomationMetaV2,
 } from "@/hooks/useAutomationEditor";
 import {
+  removeEntrypoint,
+  projectEntrypoint,
+  mergeEntrypoint,
+  MAIN_ENTRYPOINT_ID,
+  entrypointIds,
+  blockIdsOutsideEntrypoint,
+  addEntrypoint,
   applyOverrides,
   diffOverrides,
   EMPTY_DEFINITION,
@@ -44,6 +51,7 @@ import {
 import { useAutomationTest } from "@/hooks/useAutomationTest";
 
 import { BuildTab } from "./build/BuildTab";
+import { EntrypointBar } from "./build/EntrypointBar";
 import { TestPanel } from "./build/test/TestPanel";
 import { InputsTab } from "./inputs/InputsTab";
 import { DryRunButton } from "./build/DryRunButton";
@@ -230,9 +238,17 @@ export function AutomationEditor({
   // after that return made the hook count grow once data arrived — React
   // #310 ("rendered more hooks than during the previous render"), which
   // crashed the edit page in production.
+  // D9: which entrypoint the Build tab edits. Falls back to main when the
+  // selected one disappears (removed, or a different automation loaded).
+  const [entrypointId, setEntrypointId] = useState<string>(MAIN_ENTRYPOINT_ID);
+  const effectiveEntrypointId = entrypointIds(draft).includes(entrypointId)
+    ? entrypointId
+    : MAIN_ENTRYPOINT_ID;
+
   const test = useAutomationTest({
     automationId: automation?.id,
     definition: draft,
+    entrypointId: effectiveEntrypointId,
     inputsJson: automation?.inputsJson || "{}",
     onErrors: setErrors,
   });
@@ -252,7 +268,10 @@ export function AutomationEditor({
   }
 
   const nameError = errors.find((e) => e.blockId === "" && e.field === "name")?.message;
-  const triggerSummary = existingSummary(automation?.id, draft);
+  const triggerSummary = existingSummary(
+    automation?.id,
+    projectEntrypoint(draft, effectiveEntrypointId),
+  );
 
   const panel = testPanel ?? (automation ? <TestPanel test={test} /> : null);
   const liveValues = variableValues ?? test.variableValues;
@@ -290,7 +309,11 @@ export function AutomationEditor({
               automation && (
                 // A dry run executes the SAVED definition; unsaved edits would
                 // mislead, so it waits for a clean editor.
-                <DryRunButton automationId={automation.id} disabled={dirty} />
+                <DryRunButton
+                  automationId={automation.id}
+                  entrypointId={effectiveEntrypointId}
+                  disabled={dirty}
+                />
               )}
             <Button
               type="button"
@@ -358,15 +381,25 @@ export function AutomationEditor({
             Settings
           </TabsTrigger>
         </TabsList>
-        <TabsContent value="build" className="pt-4">
-          <BuildTab
+        <TabsContent value="build" className="space-y-3 pt-4">
+          <EntrypointBar
             definition={draft}
-            onChange={setDraft}
+            selected={effectiveEntrypointId}
+            onSelect={setEntrypointId}
+            onAdd={(epId) => setDraft(addEntrypoint(draft, epId))}
+            onRemove={(epId) => setDraft(removeEntrypoint(draft, epId))}
+            locked={builtin}
+          />
+          <BuildTab
+            key={effectiveEntrypointId}
+            definition={projectEntrypoint(draft, effectiveEntrypointId)}
+            onChange={(next) => setDraft(mergeEntrypoint(draft, effectiveEntrypointId, next))}
             builtin={builtin}
             errors={errors}
             triggerSummary={triggerSummary}
             testPanel={panel}
             variableValues={liveValues}
+            reservedBlockIds={blockIdsOutsideEntrypoint(draft, effectiveEntrypointId)}
           />
         </TabsContent>
         <TabsContent value="inputs" className="pt-4">

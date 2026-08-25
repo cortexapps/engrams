@@ -15,10 +15,17 @@ export interface DryRunButtonProps {
   automationId: string;
   /** Selected sample to drive the run (3.4); absent → the server picks the latest. */
   sampleId?: string;
+  /** D9: which entrypoint to dry-run (default "main"). */
+  entrypointId?: string;
   disabled?: boolean;
 }
 
-export function DryRunButton({ automationId, sampleId, disabled }: DryRunButtonProps) {
+export function DryRunButton({
+  automationId,
+  sampleId,
+  entrypointId,
+  disabled,
+}: DryRunButtonProps) {
   const navigate = useNavigate();
   const dryRun = useDryRun();
   return (
@@ -32,6 +39,7 @@ export function DryRunButton({ automationId, sampleId, disabled }: DryRunButtonP
           {
             automationId,
             ...(sampleId !== undefined ? { sample: { case: "sampleId", value: sampleId } } : {}),
+            ...(entrypointId !== undefined && entrypointId !== "main" ? { entrypointId } : {}),
           },
           {
             onSuccess: ({ runId }) => {
