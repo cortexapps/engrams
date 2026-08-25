@@ -271,6 +271,7 @@ function bootstrapInput() {
   return {
     reviewId: review.id,
     repo: review.repo,
+    prNumber: review.prNumber,
     headSha: review.headSha,
   };
 }

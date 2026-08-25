@@ -154,6 +154,7 @@ export interface ReviewControlPlane {
   bootstrapFinderSession(sessionId: string, input: {
     reviewId: string;
     repo: string;
+    prNumber: number;
     headSha: string;
     enabledCategories?: readonly ReviewCategory[];
     orgInstructions?: string;
@@ -195,6 +196,7 @@ export interface ReviewControlPlane {
   }): Promise<{ sessionId: string }>;
   bootstrapVerifierSession(sessionId: string, input: {
     repo: string;
+    prNumber: number;
     headSha: string;
     reviewId: string;
     enabledCategories?: readonly ReviewCategory[];
@@ -432,13 +434,19 @@ function repoName(repo: string): string {
 }
 
 /** The one coarse clone step both phases share: `rm -rf` the target (so a
- *  retried step is safe) then clone (+ checkout when a head SHA is known). repo
- *  and headSha are validated before reaching the `sh -c` — injection defense in
- *  depth. Throws ReviewSetupError on a non-zero/absent exit, carrying stderr. */
+ *  retried step is safe) then clone (+ checkout when a head SHA is known).
+ *  The checkout falls back to fetching the PR's immutable ref: a merged PR's
+ *  branch is deleted, so the head SHA is unreachable in a fresh clone, but
+ *  GitHub keeps `refs/pull/<n>/head` forever — a review must survive its PR
+ *  being merged mid-flight (live: engrams#1353, #1364, #1376). repo, headSha,
+ *  and prNumber are validated before reaching the `sh -c` — injection defense
+ *  in depth. Throws ReviewSetupError on a non-zero/absent exit, carrying
+ *  stderr. */
 async function cloneRepo(
   sessions: ReviewSessionsClient,
   sessionId: string,
   repo: string,
+  prNumber: number,
   headSha: string,
   phase: string,
   execRuntime: RunExecRuntime,
@@ -447,10 +455,16 @@ async function cloneRepo(
   if (headSha !== "" && !SHA_RE.test(headSha)) {
     throw new ReviewSetupError(`invalid head SHA: ${headSha}`);
   }
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new ReviewSetupError(`invalid PR number: ${prNumber}`);
+  }
   const workspace = `/workspace/${name}`;
   let command = `rm -rf ${workspace} && git clone https://github.com/${repo}.git ${workspace}`;
   if (headSha !== "") {
-    command += ` && git -C ${workspace} checkout ${headSha}`;
+    command +=
+      ` && (git -C ${workspace} checkout ${headSha}` +
+      ` || (git -C ${workspace} fetch origin +refs/pull/${prNumber}/head` +
+      ` && git -C ${workspace} checkout ${headSha}))`;
   }
 
   let result: RunExecResult;
@@ -945,6 +959,7 @@ export function makeReviewControlPlane(
           sessions,
           sessionId,
           input.repo,
+          input.prNumber,
           input.headSha,
           "finder",
           execRuntime,
@@ -1146,6 +1161,7 @@ export function makeReviewControlPlane(
           sessions,
           sessionId,
           input.repo,
+          input.prNumber,
           input.headSha,
           "verifier",
           execRuntime,

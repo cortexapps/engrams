@@ -267,6 +267,7 @@ async function executeReviewStage(config: ReviewStageConfig): Promise<BlockOutco
   const common = {
     reviewId: config.reviewId,
     repo: config.repo,
+    prNumber: config.prNumber,
     headSha: config.headSha,
     ...(categories && categories.length > 0 ? { enabledCategories: categories } : {}),
     ...(config.orgInstructions !== undefined && config.orgInstructions !== ""

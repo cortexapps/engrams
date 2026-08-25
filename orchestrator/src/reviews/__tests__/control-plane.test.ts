@@ -747,13 +747,14 @@ describe("ReviewControlPlane", () => {
     await cp.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
       repo: active.repo,
+      prNumber: 41,
       headSha: active.headSha,
       enabledCategories: ["functional-correctness"],
     });
 
     expect(sessions.execCalls).toEqual([{
       sessionId: "finder-session",
-      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && git -C /workspace/engrams checkout ${active.headSha}`,
+      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && (git -C /workspace/engrams checkout ${active.headSha} || (git -C /workspace/engrams fetch origin +refs/pull/41/head && git -C /workspace/engrams checkout ${active.headSha}))`,
       execId: "exec:finder-session:bootstrap-clone",
       stdoutOffset: 0n,
       stderrOffset: 0n,
@@ -775,10 +776,20 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({ sessions });
 
     await expect(
-      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: "openai/engrams; rm -rf /", headSha: "" }),
+      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: "openai/engrams; rm -rf /", prNumber: 41, headSha: "" }),
     ).rejects.toBeInstanceOf(ReviewSetupError);
     await expect(
-      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: active.repo, headSha: "$(touch pwned)" }),
+      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: active.repo, prNumber: 41, headSha: "$(touch pwned)" }),
+    ).rejects.toBeInstanceOf(ReviewSetupError);
+    // The PR number lands in the fallback fetch ref; a non-integer must
+    // never reach the shell.
+    await expect(
+      cp.bootstrapFinderSession("finder-session", {
+        reviewId: active.id,
+        repo: active.repo,
+        prNumber: 41.5,
+        headSha: active.headSha,
+      }),
     ).rejects.toBeInstanceOf(ReviewSetupError);
     // Nothing was executed for the rejected inputs.
     expect(sessions.execCalls).toEqual([]);
@@ -791,6 +802,7 @@ describe("ReviewControlPlane", () => {
     await expect(cloneFailure.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
       repo: active.repo,
+      prNumber: 41,
       headSha: "",
     })).rejects.toThrow(/clone denied/);
 
@@ -800,6 +812,7 @@ describe("ReviewControlPlane", () => {
     await expect(writeFailure.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
       repo: active.repo,
+      prNumber: 41,
       headSha: "",
     })).rejects.toThrow(/disk full/);
   });
@@ -821,12 +834,13 @@ describe("ReviewControlPlane", () => {
     await cp.bootstrapVerifierSession("verifier-session", {
       reviewId: active.id,
       repo: active.repo,
+      prNumber: 41,
       headSha: active.headSha,
     });
 
     expect(sessions.execCalls[0]).toEqual({
       sessionId: "verifier-session",
-      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && git -C /workspace/engrams checkout ${active.headSha}`,
+      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && (git -C /workspace/engrams checkout ${active.headSha} || (git -C /workspace/engrams fetch origin +refs/pull/41/head && git -C /workspace/engrams checkout ${active.headSha}))`,
       execId: "exec:verifier-session:bootstrap-clone",
       stdoutOffset: 0n,
       stderrOffset: 0n,
@@ -916,6 +930,7 @@ describe("ReviewControlPlane", () => {
     await cp.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
       repo: active.repo,
+      prNumber: 41,
       headSha: active.headSha,
       enabledCategories: ["functional-correctness"],
     });
@@ -980,6 +995,7 @@ describe("ReviewControlPlane", () => {
     await cp.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
       repo: active.repo,
+      prNumber: 41,
       headSha: active.headSha,
       enabledCategories: ["functional-correctness"],
     });
@@ -997,6 +1013,7 @@ describe("ReviewControlPlane", () => {
     await cp.bootstrapFinderSession("finder-session", {
       reviewId: active.id,
       repo: active.repo,
+      prNumber: 41,
       headSha: active.headSha,
       enabledCategories: ["functional-correctness"],
     });
