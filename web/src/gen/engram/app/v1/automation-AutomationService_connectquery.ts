@@ -24,6 +24,14 @@ export const getAutomation = AutomationService.method.getAutomation;
 export const createAutomation = AutomationService.method.createAutomation;
 
 /**
+ * Builder v2: create a disabled automation plus the sandboxed drafting
+ * session that assembles it from a plain-English prompt.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.DraftAutomation
+ */
+export const draftAutomation = AutomationService.method.draftAutomation;
+
+/**
  * Save = a new immutable version; in-flight runs finish on theirs.
  * PermissionDenied on a built-in (structure is locked — use
  * SetBlockOverrides / SetInputs).

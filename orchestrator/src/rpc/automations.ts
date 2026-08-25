@@ -57,6 +57,8 @@ import {
   loadRegistry,
 } from "../connectors/registry.ts";
 import { loadEventSample } from "../connectors/samples.ts";
+import { draftAutomation, type DraftSessionInput } from "../automations/draft.ts";
+import { config as appConfig } from "../config.ts";
 import {
   makeIntegrationEventStore,
   type IntegrationEventStore,
@@ -135,6 +137,11 @@ export interface AutomationDeps {
   randomSecret?: () => string;
   /** Test seam for the QuickJS sandbox behind EvalCode. */
   evalCode?: typeof evaluateCode;
+  /** Builder v2: boots the drafting session (createTaskWithSession with
+   * fixed ids and task type "automation_draft"); wired in index.ts. */
+  startDraftSession?: (input: DraftSessionInput) => Promise<void>;
+  /** The org every draft's derived ids scope to (config.deploymentId). */
+  orgId?: string;
 }
 
 export const EVAL_CODE_LIMIT_PER_MINUTE = 30;
@@ -346,6 +353,7 @@ function toProtoAutomation(row: AutomationRow): ProtoAutomation {
     ...(row.createdByUserId ? { createdByUserId: row.createdByUserId } : {}),
     ...(row.nextFireAt ? { nextFireAt: row.nextFireAt.toISOString() } : {}),
     ...(row.lastFiredAt ? { lastFiredAt: row.lastFiredAt.toISOString() } : {}),
+    ...(row.draftSessionId ? { draftSessionId: row.draftSessionId } : {}),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     version: toProtoVersion(row.version),
@@ -810,6 +818,34 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         userId,
       );
       return { automation: toProtoAutomation(row) };
+    },
+
+    async draftAutomation(req, ctx) {
+      const principal = await requireAdmin(ctx, getSession);
+      const startSession = deps?.startDraftSession;
+      if (!startSession) {
+        throw new ConnectError("drafting is not wired on this deployment", Code.Unimplemented);
+      }
+      const result = await draftAutomation(
+        { store, startSession },
+        {
+          orgId: deps?.orgId ?? appConfig.deploymentId,
+          ownerUserId: principal.id,
+          idempotencyKey: requiredText(req.idempotencyKey, "idempotency_key"),
+          prompt: requiredText(req.prompt, "prompt"),
+          profileId: requiredText(req.profileId, "profile_id"),
+          ...(req.harness !== undefined ? { harness: req.harness } : {}),
+          ...(req.model !== undefined ? { model: req.model } : {}),
+          ...(req.modelRouter !== undefined ? { modelRouter: req.modelRouter } : {}),
+          ...(req.effort !== undefined ? { effort: req.effort } : {}),
+          ...(req.harnessMode !== undefined ? { harnessMode: req.harnessMode } : {}),
+        },
+      );
+      return {
+        automationId: result.automationId,
+        sessionId: result.sessionId,
+        created: result.created,
+      };
     },
 
     async saveVersion(req, ctx) {

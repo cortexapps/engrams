@@ -54,6 +54,8 @@ export interface AutomationMetaRow {
   createdByUserId: string | null;
   nextFireAt: Date | null;
   lastFiredAt: Date | null;
+  /** The AI drafting session bound to this automation (Builder v2). */
+  draftSessionId: string | null;
   createdAt: Date;
   updatedAt: Date;
   archivedAt: Date | null;
@@ -92,6 +94,9 @@ export interface CreateAutomationInput {
   kind?: "user" | "builtin";
   builtinKey?: string | null;
   inputs?: Record<string, unknown>;
+  /** Fixed id for idempotent creates (DraftAutomation derives it from the
+   * caller's idempotency key). Default: a random uuid. */
+  id?: string;
 }
 
 export interface AutomationMetaPatch {
@@ -185,6 +190,11 @@ export interface AutomationStore {
     connectionId: string,
   ): Promise<DispatchTarget[]>;
   create(input: CreateAutomationInput, createdByUserId: string | null): Promise<AutomationRow>;
+  /** Bind (or clear) the AI drafting session (Builder v2). */
+  setDraftSession(automationId: string, sessionId: string | null): Promise<void>;
+  /** The automation a drafting session is bound to — the draft tools'
+   * authz lookup. Excludes archived rows. */
+  getByDraftSession(sessionId: string): Promise<AutomationRow | null>;
   /** Insert version current+1 and repoint the automation at it, in one
    * transaction. Returns null for a missing/archived automation. */
   saveVersion(
@@ -396,6 +406,7 @@ function metaRow(row: typeof automationTable.$inferSelect): AutomationMetaRow {
     createdByUserId: row.createdByUserId ?? null,
     nextFireAt: row.nextFireAt ?? null,
     lastFiredAt: row.lastFiredAt ?? null,
+    draftSessionId: row.draftSessionId ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     archivedAt: row.archivedAt ?? null,
@@ -582,6 +593,27 @@ export function makeAutomationStore(
       return row ? fullView(metaRow(row)) : null;
     },
 
+    async setDraftSession(automationId, sessionId) {
+      await db
+        .update(automationTable)
+        .set({ draftSessionId: sessionId, updatedAt: new Date() })
+        .where(eq(automationTable.id, automationId));
+    },
+
+    async getByDraftSession(sessionId) {
+      const [row] = await db
+        .select()
+        .from(automationTable)
+        .where(
+          and(
+            eq(automationTable.draftSessionId, sessionId),
+            isNull(automationTable.archivedAt),
+          ),
+        )
+        .limit(1);
+      return row ? fullView(metaRow(row)) : null;
+    },
+
     async getActive(id) {
       const [row] = await db
         .select()
@@ -645,7 +677,7 @@ export function makeAutomationStore(
     },
 
     async create(input, createdByUserId) {
-      const id = crypto.randomUUID();
+      const id = input.id ?? crypto.randomUUID();
       const definition = input.definition;
       await db.transaction(async (tx) => {
         await tx.insert(automationTable).values({

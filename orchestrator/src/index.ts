@@ -113,6 +113,8 @@ import { makeProfileStore } from "./db/profiles.ts";
 import { makeModelRouterStore } from "./db/model-routers.ts";
 import { ModelRouterCatalogRefresher } from "./model-routers/catalog.ts";
 import { makeIntegrationConnectionStore } from "./db/integration-connections.ts";
+import { makeIntegrationEventStore } from "./db/integration-events.ts";
+import { registerAutomationDraftTools } from "./tools/automation-draft.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
 import { loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
@@ -545,7 +547,44 @@ const server = buildServer(
     // Native AutomationService + WebhookRegistrationService (ADR 0102):
     // admin-authored triggers, render preview, run/sample history, and sealed
     // per-registration webhook secrets.
-    registerAutomations(router);
+    registerAutomations(router, {
+      // Builder v2: the drafting session rides the one create primitive with
+      // fixed ids, exactly like a spec session (task type selects the tool
+      // manifest + system prompt).
+      startDraftSession: async (input) => {
+        await createTaskWithSession(
+          {
+            profiles: makeProfileStore(getDb()),
+            images: controlPlaneImages,
+            connectors: { list: () => makeConnectorStore(getDb()).list() },
+            harnessCatalog: controlPlaneHarnessCatalog,
+            sessions: controlPlaneSessions,
+            secrets: makeUserSecretStore(getDb()),
+            db: getDb(),
+            newTaskId: () => input.taskId,
+            newSessionId: () => input.sessionId,
+          },
+          {
+            type: "automation_draft",
+            ownerUserId: input.ownerUserId,
+            ...(input.ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
+            profileId: input.profileId,
+            ...(input.harness !== undefined ? { harness: input.harness } : {}),
+            ...(input.model !== undefined ? { model: input.model } : {}),
+            ...(input.modelRouter !== undefined ? { modelRouter: input.modelRouter } : {}),
+            ...(input.effort !== undefined ? { effort: input.effort } : {}),
+            ...(input.harnessMode !== undefined ? { harnessMode: input.harnessMode } : {}),
+            title: input.title,
+            prompt: input.prompt,
+            source: {
+              automationId: input.automationId,
+              draftCreateRequestHash: input.requestHash,
+            },
+          },
+        );
+      },
+      orgId: config.deploymentId,
+    });
 
     // Native ArtifactService: the cross-session artifact registry (owner /
     // org-shared / admin via the shared service layer). Before passthrough.
@@ -620,6 +659,15 @@ setReviewIngressControlPlane(reviewControlPlane);
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
 registerReviewTools(tools, { reviews: makeReviewStore(getDb()) });
 registerAutomationTools(tools);
+registerAutomationDraftTools(tools, {
+  store: makeAutomationStore(getDb()),
+  profiles: makeProfileStore(getDb()),
+  events: {
+    connectors: { list: () => makeConnectorStore(getDb()).list() },
+    connections: makeIntegrationConnectionStore(getDb()),
+    integrationEvents: makeIntegrationEventStore(getDb()),
+  },
+});
 registerSpecTools(tools, {
   resolveSpecForSession: async (sessionId) => {
     const id = await productionSpecProjection.storeSpecForSession(sessionId);

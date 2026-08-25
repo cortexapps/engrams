@@ -619,6 +619,7 @@ describe("ingress → integration-trigger dispatch (2.C)", () => {
         createdByUserId: null,
         nextFireAt: null,
         lastFiredAt: null,
+        draftSessionId: null,
         createdAt: new Date(0),
         updatedAt: new Date(0),
         archivedAt: null,

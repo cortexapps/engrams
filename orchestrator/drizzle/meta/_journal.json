@@ -596,6 +596,13 @@
       "when": 1788300000000,
       "tag": "0084_entrypoints",
       "breakpoints": true
+    },
+    {
+      "idx": 85,
+      "version": "7",
+      "when": 1788400000000,
+      "tag": "0085_automation_draft_session",
+      "breakpoints": true
     }
   ]
 }

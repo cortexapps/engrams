@@ -46,6 +46,7 @@ function harness(
       endSessionsOnFinish: true,
       nextFireAt: null,
       lastFiredAt: null,
+      draftSessionId: null,
       createdByUserId: null,
       createdAt: NOW,
       updatedAt: NOW,

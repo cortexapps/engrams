@@ -32,6 +32,7 @@ function meta(scheduledFor = NOW): AutomationMetaRow {
     createdByUserId: "admin-1",
     nextFireAt: scheduledFor,
     lastFiredAt: null,
+    draftSessionId: null,
     createdAt: NOW,
     updatedAt: NOW,
     archivedAt: null,

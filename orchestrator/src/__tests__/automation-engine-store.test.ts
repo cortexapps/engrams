@@ -662,3 +662,23 @@ describe("entrypoint-borne triggers (live PG, ADR 0119 D9)", () => {
     },
   );
 });
+
+describe("draft-session binding (live PG, Builder v2)", () => {
+  test.skipIf(!dbReachable)("setDraftSession binds; getByDraftSession resolves and respects archive", async () => {
+    const autoId = `${AUTO_ID}-draft`;
+    await seedAutomation(autoId);
+    const store = makeAutomationStore(getDb());
+    const sessionId = `draft-sess-${UNIQ}`;
+
+    expect(await store.getByDraftSession(sessionId)).toBeNull();
+    await store.setDraftSession(autoId, sessionId);
+    expect((await store.getByDraftSession(sessionId))?.id).toBe(autoId);
+    expect((await store.get(autoId))?.draftSessionId).toBe(sessionId);
+
+    await store.archive(autoId);
+    expect(await store.getByDraftSession(sessionId)).toBeNull();
+
+    await store.setDraftSession(autoId, null);
+    expect((await store.get(autoId))?.draftSessionId).toBeNull();
+  });
+});

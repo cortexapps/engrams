@@ -17,6 +17,9 @@ service AutomationService {
   rpc GetAutomation(GetAutomationRequest) returns (GetAutomationResponse);
   // definition_json → version 1.
   rpc CreateAutomation(CreateAutomationRequest) returns (CreateAutomationResponse);
+  // Builder v2: create a disabled automation plus the sandboxed drafting
+  // session that assembles it from a plain-English prompt.
+  rpc DraftAutomation(DraftAutomationRequest) returns (DraftAutomationResponse);
   // Save = a new immutable version; in-flight runs finish on theirs.
   // PermissionDenied on a built-in (structure is locked — use
   // SetBlockOverrides / SetInputs).
@@ -94,6 +97,9 @@ message Automation {
   optional string created_by_user_id = 11;
   optional string next_fire_at = 12;
   optional string last_fired_at = 13;
+  // Builder v2: the AI drafting session bound to this automation, when a
+  // draft is in progress.
+  optional string draft_session_id = 17;
   string created_at = 14;
   string updated_at = 15;
   // The current version's definition, for the editor.
@@ -172,6 +178,28 @@ message GetAutomationRequest {
 
 message GetAutomationResponse {
   Automation automation = 1;
+}
+
+message DraftAutomationRequest {
+  // The plain-English description the drafting agent starts from.
+  string prompt = 1;
+  // The profile the drafting session runs on (this is what gives the agent
+  // its repos).
+  string profile_id = 2;
+  // Client-stable key: a retried create reaches the same automation/session.
+  string idempotency_key = 3;
+  optional string harness = 4;
+  optional string model = 5;
+  optional string model_router = 6;
+  optional string effort = 7;
+  optional string harness_mode = 8;
+}
+
+message DraftAutomationResponse {
+  string automation_id = 1;
+  string session_id = 2;
+  // False when the call replayed a create the same key already made.
+  bool created = 3;
 }
 
 message CreateAutomationRequest {
