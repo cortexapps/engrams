@@ -43,6 +43,12 @@ function makeDeps(blocks: BlockDef[], payload?: Record<string, unknown>) {
     async listRunSessions() {
       return [];
     },
+    async adoptSession() {
+      return "foreign" as const;
+    },
+    async getSessionBinding() {
+      return null;
+    },
     async releaseConcurrency() {
       return null;
     },
@@ -56,6 +62,9 @@ function makeDeps(blocks: BlockDef[], payload?: Record<string, unknown>) {
     async endSession() {},
     async exec() {
       throw new Error("unused");
+    },
+    async getSession() {
+      return { found: false as const };
     },
     async writeFiles() {
       return [];

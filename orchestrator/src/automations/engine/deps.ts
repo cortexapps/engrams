@@ -48,6 +48,21 @@ export interface EngineRunStore {
    * id when the policy is queue and a pending run waits, else null. The whole
    * release+promote is one transaction. */
   releaseConcurrency(runId: string): Promise<string | null>;
+  /** D11 adoption: re-bind a kept session's `automation_session` row to
+   * this run so waits and relays route to its mailbox. Only a row in the
+   * SAME automation whose owning run is TERMINAL transfers — adoption must
+   * never steal event routing from a live run ("owner_live"). "foreign"
+   * covers a row in another automation and no row at all: the binding row
+   * is the ownership boundary. */
+  adoptSession(input: {
+    runId: string;
+    automationId: string;
+    sessionId: string;
+  }): Promise<"adopted" | "already_ours" | "owner_live" | "foreign">;
+  /** Read-only counterpart for the `session_status` probe. */
+  getSessionBinding(
+    sessionId: string,
+  ): Promise<{ automationId: string; runId: string; ownerTerminal: boolean } | null>;
 }
 
 export interface EngineCreateSessionResult {
@@ -87,6 +102,12 @@ export interface EngineSessionOps {
   sendPrompt(sessionId: string, promptId: string, text: string, harnessMode?: string): Promise<void>;
   /** Contract 3: a relay block asks for this session's curated events. */
   setSessionRelay(sessionId: string, relay: boolean): Promise<void>;
+  /** Read-only probe (`session_status`). Not-found is a value, never an
+   * error — a swept-away session is a normal answer for a sweep. */
+  getSession(sessionId: string): Promise<
+    | { found: false }
+    | { found: true; status: string; lastActiveAt: string; lastEventAt: string | null }
+  >;
   endSession(sessionId: string): Promise<void>;
   exec(
     sessionId: string,
@@ -129,6 +150,51 @@ export interface EngineClock {
   nowMs(): number;
 }
 
+/** Automation state (ADR 0119 D10): the per-automation KV. Reads and
+ * writes run inside checkpointed steps; CAS misses are typed outcomes the
+ * graph branches on, never errors. Implemented in db/automation-state.ts. */
+export interface EngineStateEntry {
+  key: string;
+  value: unknown;
+  version: number;
+  writer: string;
+}
+
+/** A caller-fixable limit violation (key too long, value too big,
+ * automation full). Thrown by the store; blocks map it to a non-retryable
+ * typed error. */
+export class StateLimitError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "StateLimitError";
+    this.code = code;
+  }
+}
+
+export type EngineStateSetResult =
+  | { ok: true; version: number }
+  | { ok: false; current: EngineStateEntry | null };
+
+export interface EngineStateStore {
+  get(automationId: string, key: string): Promise<EngineStateEntry | null>;
+  set(
+    automationId: string,
+    key: string,
+    value: unknown,
+    opts: { writer: string; expectVersion?: number },
+  ): Promise<EngineStateSetResult>;
+  delete(
+    automationId: string,
+    key: string,
+    opts: { expectVersion?: number },
+  ): Promise<{ ok: true; deleted: boolean } | { ok: false; current: EngineStateEntry }>;
+  list(
+    automationId: string,
+    opts?: { prefix?: string; limit?: number },
+  ): Promise<{ entries: EngineStateEntry[]; truncated: boolean }>;
+}
+
 export interface EngineDeps {
   step: EngineStepRunner;
   recv: EngineReceiver;
@@ -139,6 +205,7 @@ export interface EngineDeps {
    * successor's id is fixed before the call, so a replayed finalize cannot
    * double-start it (DBOS start on an existing id is a no-op). */
   startQueuedRun?(runId: string): Promise<void>;
+  state?: EngineStateStore;
   code?: CodeBlockRuntime;
   integrationActions?: IntegrationActionRuntime;
 }

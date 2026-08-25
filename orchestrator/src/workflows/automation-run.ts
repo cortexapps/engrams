@@ -44,6 +44,7 @@ import { AUTOMATION_TOPIC, type AutomationInbox } from "../automations/engine/in
 import { interpretAutomation, type EngineRunResult } from "../automations/engine/interpreter.ts";
 import type { EngineDeps, EngineSessionOps } from "../automations/engine/deps.ts";
 import { makeCodeBlockRuntime } from "../automations/code/runtime.ts";
+import { makeAutomationStateStore } from "../db/automation-state.ts";
 import { makeIntegrationActionRuntime } from "../automations/actions/runtime.ts";
 
 export interface AutomationRunWorkflowInput {
@@ -188,6 +189,23 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
       return { sessionId, taskId };
     },
 
+    async getSession(sessionId) {
+      try {
+        const resp = await defaultSessions.getSession({ sessionId });
+        const session = resp.session;
+        if (!session) return { found: false };
+        return {
+          found: true,
+          status: session.status,
+          lastActiveAt: session.lastActiveAt,
+          lastEventAt: session.lastEventAt && session.lastEventAt !== "" ? session.lastEventAt : null,
+        };
+      } catch (error) {
+        if (error instanceof ConnectError && error.code === Code.NotFound) return { found: false };
+        throw error;
+      }
+    },
+
     async setSessionRelay(sessionId, relay) {
       await store().setSessionRelay(sessionId, relay);
     },
@@ -246,6 +264,7 @@ function productionEngineDeps(): EngineDeps {
     sessions: makeProductionSessionOps({ store }),
     clock: { nowMs: () => Date.now() },
     code: makeCodeBlockRuntime(),
+    state: makeAutomationStateStore(),
     integrationActions: makeIntegrationActionRuntime(),
     async startQueuedRun(runId) {
       const run = await store.getRun(runId);

@@ -7,6 +7,7 @@ import { registerSessionBlocks } from "./session.ts";
 import { registerWaitEventBlock } from "./wait-event.ts";
 import { registerExecBlocks } from "./exec.ts";
 import { registerCodeBlock } from "./code.ts";
+import { registerStateBlocks } from "./state.ts";
 import { registerIntegrationActionBlock } from "./integration-action.ts";
 import { registerReviewSystemBlocks } from "./system/review.ts";
 import { registerSlackRelayBlock } from "./system/slack-relay.ts";
@@ -24,6 +25,7 @@ export function registerEngineBlocks(): void {
   registerWaitEventBlock();
   registerExecBlocks();
   registerCodeBlock();
+  registerStateBlocks();
   registerIntegrationActionBlock();
   // Built-in-only (ADR 0119 D7): the validator rejects these on user graphs.
   registerReviewSystemBlocks();
@@ -45,6 +47,11 @@ export const V1_BLOCK_TYPES = [
   "run_command",
   "write_files",
   "integration_action",
+  "session_status",
+  "state_get",
+  "state_set",
+  "state_delete",
+  "state_list",
 ] as const;
 
 /** Boot assertion (next to assertSweepPoliciesExhaustive): every v1 type is

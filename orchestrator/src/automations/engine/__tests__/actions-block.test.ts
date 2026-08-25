@@ -54,6 +54,12 @@ function harness(blocks: BlockDef[], responses: IntegrationOpResult[]) {
     async listRunSessions() {
       return [];
     },
+    async adoptSession() {
+      return "foreign" as const;
+    },
+    async getSessionBinding() {
+      return null;
+    },
     async releaseConcurrency() {
       return null;
     },
@@ -65,6 +71,7 @@ function harness(blocks: BlockDef[], responses: IntegrationOpResult[]) {
     endSession: () => Promise.reject(new Error("unused")),
     exec: () => Promise.reject(new Error("unused")),
     writeFiles: () => Promise.reject(new Error("unused")),
+    getSession: () => Promise.resolve({ found: false as const }),
   };
   const deps: EngineDeps = {
     step: async (fn) => fn(),

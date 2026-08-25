@@ -1556,6 +1556,25 @@ export const automationConcurrencyClaim = pgTable(
   (t) => [primaryKey({ columns: [t.automationId, t.concurrencyKey] })],
 );
 
+/** Automation state (ADR 0119 D10): a per-automation KV, one JSON document
+ * per entity. `version` backs the optional CAS on writes; `writer`
+ * (`<runId>:<framePath>`) makes a CAS retry after a crash-before-checkpoint
+ * report success instead of a false conflict. */
+export const automationState = pgTable(
+  "automation_state",
+  {
+    automationId: text("automation_id")
+      .notNull()
+      .references(() => automation.id, { onDelete: "cascade" }),
+    key: text("key").notNull(),
+    value: jsonb("value").notNull(),
+    version: bigint("version", { mode: "number" }).notNull().default(1),
+    writer: text("writer").notNull().default(""),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.automationId, t.key] })],
+);
+
 export const webhookSample = pgTable(
   "webhook_sample",
   {
