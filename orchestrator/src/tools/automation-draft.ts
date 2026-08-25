@@ -13,7 +13,7 @@
 
 import { z } from "zod";
 
-import { definitionOf, SaveVersionConflictError } from "../db/automations.ts";
+import { definitionOf, effectiveDefinition, SaveVersionConflictError } from "../db/automations.ts";
 import type { AutomationRow, AutomationStore } from "../db/automations.ts";
 import type { ProfileStore } from "../db/profiles.ts";
 import {
@@ -161,8 +161,9 @@ export function registerAutomationDraftTools(
       "'events' = trigger events with real sample payloads per provider; 'actions' = " +
       "integration actions; 'profiles' = the profiles a create_session block can run; " +
       "'draft' = the automation you are drafting (current definition + version); " +
-      "'org_automations' = what already exists. Recon with catalog/events/org_automations " +
-      "before your first propose.",
+      "'org_automations' = what already exists, each with its FULL effective definition — " +
+      "read these to avoid duplicating one and to learn the house patterns. Recon with " +
+      "catalog/events/org_automations before your first propose.",
     input: ReadInput,
     output: ReadOutput,
     handling: "handled",
@@ -214,7 +215,9 @@ export function registerAutomationDraftTools(
                 name: row.name,
                 description: row.description,
                 enabled: row.enabled,
-                trigger: definitionOf(row.version).trigger,
+                // The EFFECTIVE definition (block overrides applied) — what
+                // actually runs, so the agent learns real house patterns.
+                definition: effectiveDefinition(row.version, row.blockOverrides),
               })),
           };
         }
