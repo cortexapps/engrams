@@ -322,6 +322,7 @@ export async function admitAutomationRun(
           id: runId,
           automationId,
           version: target.automation.currentVersion,
+          entrypointId: entrypoint.id,
           trigger,
           deliveryKey,
           concurrencyKey: key,
