@@ -170,10 +170,15 @@ function clone(id: string, sessionBlock: string): BlockDef {
       session: { blockId: sessionBlock },
       // head_sha is always present for PR events; a comment command on a PR
       // whose head open_review_pass resolved lands in steps.open.head_sha.
+      // The checkout falls back to the PR's immutable ref: a merged PR's
+      // branch is deleted, but refs/pull/<n>/head survives — the review must
+      // not fail because its PR merged mid-flight.
       commandTemplate:
         `rm -rf /workspace/\${{ ${F}.repo_name }} && ` +
         `git clone https://github.com/${REPO}.git /workspace/\${{ ${F}.repo_name }} && ` +
-        `git -C /workspace/\${{ ${F}.repo_name }} checkout \${{ steps.open.head_sha }}`,
+        `(git -C /workspace/\${{ ${F}.repo_name }} checkout \${{ steps.open.head_sha }} || ` +
+        `(git -C /workspace/\${{ ${F}.repo_name }} fetch origin +refs/pull/${PR_NUMBER}/head && ` +
+        `git -C /workspace/\${{ ${F}.repo_name }} checkout \${{ steps.open.head_sha }}))`,
       deadlineMs: CLONE_DEADLINE_MS,
     },
   };

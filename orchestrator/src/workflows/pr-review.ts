@@ -93,7 +93,7 @@ export async function prReviewWorkflowImpl(
       );
       finderSessionId = sessionId;
       await step(
-        () => cp.bootstrapFinderSession(sessionId, { reviewId, repo: first.repo, headSha }),
+        () => cp.bootstrapFinderSession(sessionId, { reviewId, repo: first.repo, prNumber: first.prNumber, headSha }),
         "bootstrapFinderSession",
       );
       await step(
@@ -110,7 +110,7 @@ export async function prReviewWorkflowImpl(
       );
       verifierSessionId = sessionId;
       await step(
-        () => cp.bootstrapVerifierSession(sessionId, { reviewId, repo: first.repo, headSha }),
+        () => cp.bootstrapVerifierSession(sessionId, { reviewId, repo: first.repo, prNumber: first.prNumber, headSha }),
         "bootstrapVerifierSession",
       );
       await step(

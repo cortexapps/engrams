@@ -289,6 +289,9 @@ describe("PR-review built-in on the interpreter", () => {
     expect(h.sessions[0]!.appendSystemPrompt).toContain("finder");
     // Visible clone at the PR head, then the staged prompt delivered.
     expect(h.execs[0]!.command).toContain(`git clone https://github.com/acme/repo.git /workspace/repo`);
+    // A merged PR's branch is gone; the checkout falls back to the immutable
+    // PR ref so the review survives (engrams#1376).
+    expect(h.execs[0]!.command).toContain("fetch origin +refs/pull/");
     expect(h.execs[0]!.command).toContain(`checkout ${HEAD}`);
     expect(h.prompts).toEqual([{ sessionId: "s-finder", text: "FINDER PROMPT" }]);
     // Ack → post (structured comments passed by $ref) → status update.
