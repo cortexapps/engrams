@@ -18,7 +18,7 @@
  */
 
 import { ConnectError, Code } from "@connectrpc/connect";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { log as rootLog } from "../log.ts";
@@ -843,6 +843,35 @@ export async function registerSessionListener(db: Db, sessionId: string): Promis
  * before any worker session exists. Callers opt into listener registration
  * when their workflow needs terminal session state.
  */
+/** The frozen launch snapshot a task's children spawn from (ADR 0115).
+ * Built from the COMPILED session input, so it records what the session
+ * actually runs with, not the live profile. */
+export function buildLaunchPolicy(
+  profile: ProfileRow,
+  sessionInput: SessionCreateInput,
+): schema.TaskLaunchPolicy {
+  return {
+    version: 1,
+    profileId: profile.id,
+    imageUri: sessionInput.imageUri,
+    harness: sessionInput.harness ?? profile.harness,
+    ...(sessionInput.modelRouter != null ? { modelRouter: sessionInput.modelRouter } : {}),
+    ...(sessionInput.model != null ? { model: sessionInput.model } : {}),
+    ...(sessionInput.effort != null ? { effort: sessionInput.effort } : {}),
+    includeUserTokens: profile.includeUserTokens,
+    envVars: { ...profile.envVars },
+    skills: [...(sessionInput.selectedSkills ?? [])],
+    capabilities: [...(sessionInput.capabilities ?? [])],
+    integrationPolicyJson: sessionInput.integrationPolicyJson ?? "",
+    integrationGrants: [...(sessionInput.integrationGrants ?? [])],
+    integrationConnections: [...(sessionInput.integrationConnections ?? [])],
+    network: profile.network,
+    secrets: [...profile.secrets],
+    repos: [...profile.repos],
+    apps: profile.apps.map((a) => ({ ...a })),
+  };
+}
+
 export async function createSessionForExistingTask(
   deps: CreateSessionForExistingTaskDeps,
   params: CreateSessionForExistingTaskParams,
@@ -939,6 +968,14 @@ export async function createSessionForExistingTask(
   const sessionId = deps.newSessionId?.() ?? crypto.randomUUID();
   sessionInput.requestedSessionId = sessionId;
   await deps.db.transaction(async (tx) => {
+    // The task pre-exists here (automation/review paths), so it never got a
+    // launch-policy snapshot at task create. Stamp one from THIS session's
+    // compile if none exists yet — that is what lets an automation-owned
+    // session spawn children (the child inherits the frozen policy).
+    await tx
+      .update(taskTable)
+      .set({ launchPolicy: buildLaunchPolicy(profile, sessionInput) })
+      .where(and(eq(taskTable.id, params.taskId), isNull(taskTable.launchPolicy)));
     await tx.insert(taskSessionTable).values({
       taskId: params.taskId,
       sessionId,
@@ -1094,26 +1131,7 @@ export async function createTaskWithSession(
   const taskId = deps.newTaskId?.() ?? crypto.randomUUID();
   const sessionId = deps.newSessionId?.() ?? crypto.randomUUID();
   sessionInput.requestedSessionId = sessionId;
-  const launchPolicy: schema.TaskLaunchPolicy = {
-    version: 1,
-    profileId: profile.id,
-    imageUri: sessionInput.imageUri,
-    harness: sessionInput.harness ?? profile.harness,
-    ...(sessionInput.modelRouter != null ? { modelRouter: sessionInput.modelRouter } : {}),
-    ...(sessionInput.model != null ? { model: sessionInput.model } : {}),
-    ...(sessionInput.effort != null ? { effort: sessionInput.effort } : {}),
-    includeUserTokens: profile.includeUserTokens,
-    envVars: { ...profile.envVars },
-    skills: [...(sessionInput.selectedSkills ?? [])],
-    capabilities: [...(sessionInput.capabilities ?? [])],
-    integrationPolicyJson: sessionInput.integrationPolicyJson ?? "",
-    integrationGrants: [...(sessionInput.integrationGrants ?? [])],
-    integrationConnections: [...(sessionInput.integrationConnections ?? [])],
-    network: profile.network,
-    secrets: [...profile.secrets],
-    repos: [...profile.repos],
-    apps: profile.apps.map((a) => ({ ...a })),
-  };
+  const launchPolicy = buildLaunchPolicy(profile, sessionInput);
 
   // ADR 0118: the apps this session hosts. A malformed declaration is DROPPED,
   // not fatal — one bad app must never stop a session booting — and logged so
