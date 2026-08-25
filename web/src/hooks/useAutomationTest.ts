@@ -11,6 +11,7 @@ import { useMutation } from "@connectrpc/connect-query";
 import { testRender } from "@/gen/engram/app/v1/automation-AutomationService_connectquery";
 import type { EventSample, TestRenderResponse } from "@/gen/engram/app/v1/automation_pb";
 import { useEventSamples } from "@/hooks/useAutomations";
+import { MAIN_ENTRYPOINT_ID, projectEntrypoint } from "@/lib/automation-blocks";
 import type { AutomationDefinition, BlockErrorRef } from "@/lib/automation-blocks";
 
 /** What the current trigger can be tested against. */
@@ -127,6 +128,8 @@ export function variableValuesFrom(result: TestRenderResult | null): Record<stri
 export interface UseAutomationTestOptions {
   automationId: string | undefined;
   definition: AutomationDefinition;
+  /** D9: which entrypoint TestRender walks (default "main"). */
+  entrypointId?: string;
   inputsJson?: string;
   /** Server errors from a render route into the inspector via the shell. */
   onErrors?: (errors: BlockErrorRef[]) => void;
@@ -135,10 +138,12 @@ export interface UseAutomationTestOptions {
 export function useAutomationTest({
   automationId,
   definition,
+  entrypointId = MAIN_ENTRYPOINT_ID,
   inputsJson = "{}",
   onErrors,
 }: UseAutomationTestOptions) {
-  const isTimed = definition.trigger.kind === "cron" || definition.trigger.kind === "manual";
+  const trigger = projectEntrypoint(definition, entrypointId).trigger;
+  const isTimed = trigger.kind === "cron" || trigger.kind === "manual";
   const samples = useEventSamples(isTimed ? undefined : automationId, 20);
   const sampleList: EventSample[] = samples.data?.samples ?? [];
 
@@ -152,6 +157,7 @@ export function useAutomationTest({
       automationId: automationId ?? "",
       draftDefinitionJson: JSON.stringify(definition),
       inputsJson,
+      ...(entrypointId !== MAIN_ENTRYPOINT_ID ? { entrypointId } : {}),
       ...(target.kind === "sample"
         ? { sample: { case: "sampleId" as const, value: target.sampleId } }
         : target.kind === "payload"
@@ -159,7 +165,7 @@ export function useAutomationTest({
           : {}),
       ...(target.kind === "scheduled" ? { scheduledFor: target.scheduledFor } : {}),
     }),
-    [automationId, definition, inputsJson],
+    [automationId, definition, entrypointId, inputsJson],
   );
 
   /** Render the draft against the selected sample. */

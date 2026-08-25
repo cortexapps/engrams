@@ -123,6 +123,60 @@ describe("AutomationEditor", () => {
     searchHolder.value = {};
   });
 
+  it("entrypoint bar (D9): switching edits the extra entrypoint; save keeps main untouched", async () => {
+    const withEp = {
+      ...definition,
+      entrypoints: [
+        {
+          id: "sweep",
+          trigger: { kind: "manual" },
+          blocks: [
+            {
+              id: "nudge",
+              type: "send_prompt",
+              config: {
+                session: { template: "s" },
+                promptTemplate: "wake up",
+                waitFor: { kind: "none" },
+              },
+            },
+          ],
+        },
+      ],
+    };
+    automationHolder.value = {
+      automation: {
+        ...automation("user"),
+        version: {
+          automationId: "x",
+          number: 1,
+          definitionJson: JSON.stringify(withEp),
+          createdAt: "",
+        },
+      },
+    };
+    render(<AutomationEditor mode="edit" />);
+    expect(screen.getByTestId("entrypoint-bar")).toBeTruthy();
+    // Main shows its own blocks.
+    expect(screen.getByTestId("block-row-finder")).toBeTruthy();
+    expect(screen.queryByTestId("block-row-nudge")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("entrypoint-sweep"));
+    expect(screen.getByTestId("block-row-nudge")).toBeTruthy();
+    expect(screen.queryByTestId("block-row-finder")).toBeNull();
+
+    // Edit the extra entrypoint's prompt and save: the payload carries the
+    // edit inside entrypoints[0] while main's blocks stay untouched.
+    fireEvent.click(screen.getByTestId("block-row-nudge"));
+    const prompt = screen.getByTestId("field-promptTemplate").querySelector("textarea")!;
+    fireEvent.change(prompt, { target: { value: "review feedback arrived" } });
+    fireEvent.click(screen.getByTestId("save-button"));
+    await waitFor(() => expect(saveVersion).toHaveBeenCalledTimes(1));
+    const sent = JSON.parse(saveVersion.mock.calls[0]![0].definitionJson);
+    expect(sent.blocks[0].config.promptTemplate).toBe("Review it.");
+    expect(sent.entrypoints[0].blocks[0].config.promptTemplate).toBe("review feedback arrived");
+  });
+
   it("selects the tab from the search param and navigates on tab change", async () => {
     automationHolder.value = { automation: automation("user") };
     searchHolder.value = { tab: "runs" };

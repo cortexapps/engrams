@@ -47,16 +47,115 @@ export interface TriggerSpec {
   [key: string]: unknown;
 }
 
+export interface AutomationEntrypoint {
+  id: string;
+  trigger: TriggerSpec;
+  blocks: BlockDef[];
+}
+
 export interface AutomationDefinition {
   engine: number;
   trigger: TriggerSpec;
   blocks: BlockDef[];
+  /** ADR 0119 D9: additional named ways in. The top-level trigger + blocks
+   * are the implicit "main" entrypoint. */
+  entrypoints?: AutomationEntrypoint[];
   inputsSchema: unknown[];
   settings: {
     concurrency?: { keyTemplate: string; policy: "queue" | "supersede" | "skip" | "join" };
     runDeadlineSeconds?: number;
     endSessionsOnFinish: boolean;
   };
+}
+
+// ---------------------------------------------------------------------------
+// Entrypoints (ADR 0119 D9): the Build tab edits ONE entrypoint at a time
+// through a projection — the projected definition carries the selected
+// entrypoint's trigger + blocks at the top level, so BuildTab and every tree
+// helper stay entrypoint-blind.
+// ---------------------------------------------------------------------------
+
+export const MAIN_ENTRYPOINT_ID = "main";
+export const ENTRYPOINT_ID_RE = /^[a-z][a-z0-9_]*$/;
+
+export function entrypointIds(definition: AutomationDefinition): string[] {
+  return [MAIN_ENTRYPOINT_ID, ...(definition.entrypoints ?? []).map((ep) => ep.id)];
+}
+
+/** The definition as seen from one entrypoint: its trigger + blocks at the
+ * top level. `main` is the definition itself. */
+export function projectEntrypoint(
+  definition: AutomationDefinition,
+  entrypointId: string,
+): AutomationDefinition {
+  if (entrypointId === MAIN_ENTRYPOINT_ID) return definition;
+  const ep = definition.entrypoints?.find((e) => e.id === entrypointId);
+  if (!ep) return definition;
+  return { ...definition, trigger: ep.trigger, blocks: ep.blocks };
+}
+
+/** Fold an edited projection back: the projected trigger + blocks land in
+ * the entrypoint, everything else (settings, inputsSchema, …) lands on the
+ * definition, and main's own trigger + blocks are restored. */
+export function mergeEntrypoint(
+  definition: AutomationDefinition,
+  entrypointId: string,
+  next: AutomationDefinition,
+): AutomationDefinition {
+  if (entrypointId === MAIN_ENTRYPOINT_ID) return next;
+  return {
+    ...next,
+    trigger: definition.trigger,
+    blocks: definition.blocks,
+    entrypoints: (definition.entrypoints ?? []).map((ep) =>
+      ep.id === entrypointId ? { ...ep, trigger: next.trigger, blocks: next.blocks } : ep,
+    ),
+  };
+}
+
+/** null = ok; otherwise the reason the id is unusable. */
+export function entrypointIdError(definition: AutomationDefinition, id: string): string | null {
+  if (!ENTRYPOINT_ID_RE.test(id))
+    return "Lowercase letters, digits, underscores; starts with a letter.";
+  if (id === MAIN_ENTRYPOINT_ID) return '"main" names the implicit top-level entrypoint.';
+  if (entrypointIds(definition).includes(id)) return `"${id}" already exists.`;
+  return null;
+}
+
+export function addEntrypoint(definition: AutomationDefinition, id: string): AutomationDefinition {
+  return {
+    ...definition,
+    entrypoints: [
+      ...(definition.entrypoints ?? []),
+      { id, trigger: { kind: "manual" }, blocks: [] },
+    ],
+  };
+}
+
+export function removeEntrypoint(
+  definition: AutomationDefinition,
+  id: string,
+): AutomationDefinition {
+  const rest = (definition.entrypoints ?? []).filter((ep) => ep.id !== id);
+  const { entrypoints: _dropped, ...base } = definition;
+  return rest.length > 0 ? { ...base, entrypoints: rest } : base;
+}
+
+/** Block ids OUTSIDE one entrypoint — the reserved set for nextBlockId
+ * (server validation holds ids unique across ALL entrypoints). */
+export function blockIdsOutsideEntrypoint(
+  definition: AutomationDefinition,
+  entrypointId: string,
+): string[] {
+  const ids: string[] = [];
+  const collect = (blocks: readonly BlockDef[]) => {
+    for (const block of walkBlocks(blocks)) ids.push(block.id);
+  };
+  if (entrypointId !== MAIN_ENTRYPOINT_ID) collect(definition.blocks);
+  for (const ep of definition.entrypoints ?? []) {
+    if (ep.id !== entrypointId) collect(ep.blocks);
+  }
+  return ids;
 }
 
 export type FieldSpec =
@@ -566,9 +665,13 @@ export function moveBlock(
 }
 
 /** A unique, id-safe block id for a new block of `kind`. */
-export function nextBlockId(blocks: readonly BlockDef[], kind: string): string {
+export function nextBlockId(
+  blocks: readonly BlockDef[],
+  kind: string,
+  reserved: readonly string[] = [],
+): string {
   const base = kind.replace(/^system\./, "").replace(/[^a-z0-9_]/g, "_");
-  const taken = new Set([...walkBlocks(blocks)].map((b) => b.id));
+  const taken = new Set([...[...walkBlocks(blocks)].map((b) => b.id), ...reserved]);
   if (!taken.has(base)) return base;
   let n = 2;
   while (taken.has(`${base}_${n}`)) n += 1;
