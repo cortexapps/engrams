@@ -311,6 +311,26 @@ describe("automation draft tools", () => {
   });
 });
 
+describe("automation_read patterns", () => {
+  test("the patterns part teaches the multi-entrypoint idioms", async () => {
+    const h = harness(null);
+    const result = (await call(h.deps, "automation_read", { part: "patterns" })) as {
+      content: Record<string, unknown>;
+    };
+    for (const key of [
+      "core_model",
+      "state",
+      "kept_sessions",
+      "slack_clarification_thread",
+      "pr_feedback_loop",
+      "delegation",
+      "cron_heartbeat",
+    ]) {
+      expect(Array.isArray(result.content[key]), key).toBe(true);
+    }
+  });
+});
+
 describe("draftBlockCatalog", () => {
   test("golden: every user block type projects with a real JSON schema", () => {
     registerEngineBlocks();

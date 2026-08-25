@@ -84,6 +84,7 @@ const KNOWN_OUTPUTS: Record<string, readonly string[]> = {
   state_set: ["ok", "version", "current_version", "current_value"],
   state_delete: ["ok", "deleted"],
   state_list: ["entries", "count", "truncated"],
+  lookup_pr_session: ["found", "session_id", "task_id", "head_branch", "url", "title"],
 };
 
 function sessionSourcesFor(definition: AutomationDefinition, selectedId: string | null): string[] {

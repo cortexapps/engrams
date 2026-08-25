@@ -166,7 +166,14 @@ describe("parseBlockErrors", () => {
 
 describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
   it("every engine block the orchestrator registers has a typed catalog entry", () => {
-    for (const kind of ["state_get", "state_set", "state_delete", "state_list", "session_status"]) {
+    for (const kind of [
+      "state_get",
+      "state_set",
+      "state_delete",
+      "state_list",
+      "session_status",
+      "lookup_pr_session",
+    ]) {
       const spec = blockKind(kind);
       expect(spec.description).not.toBe("Unknown block kind.");
       expect(spec.system).not.toBe(true);

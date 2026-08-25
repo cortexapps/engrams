@@ -31,6 +31,7 @@ import {
   draftActionCatalog,
   draftBlockCatalog,
   draftEventCatalog,
+  draftPatterns,
   type DraftEventCatalogDeps,
 } from "../automations/draft-catalog.ts";
 import { AUTOMATION_DRAFT_TASK_TYPE } from "../automations/draft.ts";
@@ -51,7 +52,7 @@ export interface AutomationDraftToolDeps {
 const DRAFT_TASK_TYPES = [AUTOMATION_DRAFT_TASK_TYPE] as const;
 
 const ReadInput = z.object({
-  part: z.enum(["catalog", "events", "actions", "profiles", "draft", "org_automations"]),
+  part: z.enum(["catalog", "events", "actions", "profiles", "draft", "org_automations", "patterns"]),
 });
 const ReadOutput = z.object({ part: z.string(), content: z.unknown() });
 
@@ -162,7 +163,10 @@ export function registerAutomationDraftTools(
       "integration actions; 'profiles' = the profiles a create_session block can run; " +
       "'draft' = the automation you are drafting (current definition + version); " +
       "'org_automations' = what already exists, each with its FULL effective definition — " +
-      "read these to avoid duplicating one and to learn the house patterns. Recon with " +
+      "read these to avoid duplicating one and to learn the house patterns; 'patterns' = " +
+      "the design idioms for workflows that span multiple events or days (entrypoints + " +
+      "state + kept sessions + adoption) — READ IT whenever the request involves more " +
+      "than one trigger, a long-lived process, or humans in the loop. Recon with " +
       "catalog/events/org_automations before your first propose.",
     input: ReadInput,
     output: ReadOutput,
@@ -172,6 +176,8 @@ export function registerAutomationDraftTools(
       switch (args.part) {
         case "catalog":
           return { part: args.part, content: draftBlockCatalog() };
+        case "patterns":
+          return { part: args.part, content: draftPatterns() };
         case "events":
           return { part: args.part, content: await draftEventCatalog(deps.events) };
         case "actions":

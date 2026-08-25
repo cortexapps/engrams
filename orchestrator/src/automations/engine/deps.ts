@@ -195,6 +195,18 @@ export interface EngineStateStore {
   ): Promise<{ entries: EngineStateEntry[]; truncated: boolean }>;
 }
 
+/** PR → authoring-session lookup (the pr_ref ledger the link consumer
+ * maintains). Read-only; the `lookup_pr_session` block's seam. */
+export interface EnginePrRefLookup {
+  getByPr(repo: string, prNumber: number): Promise<{
+    sessionId: string;
+    taskId: string | null;
+    headBranch: string;
+    url: string;
+    title: string;
+  } | null>;
+}
+
 export interface EngineDeps {
   step: EngineStepRunner;
   recv: EngineReceiver;
@@ -206,6 +218,7 @@ export interface EngineDeps {
    * double-start it (DBOS start on an existing id is a no-op). */
   startQueuedRun?(runId: string): Promise<void>;
   state?: EngineStateStore;
+  prRefs?: EnginePrRefLookup;
   code?: CodeBlockRuntime;
   integrationActions?: IntegrationActionRuntime;
 }

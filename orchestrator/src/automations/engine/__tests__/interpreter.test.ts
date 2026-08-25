@@ -74,6 +74,11 @@ function makeHarness(
       string,
       { status: string; lastActiveAt: string; lastEventAt: string | null }
     >;
+    /** pr_ref lookups: "repo#number" -> the authoring session. */
+    prRefs?: Record<
+      string,
+      { sessionId: string; taskId: string | null; headBranch: string; url: string; title: string }
+    >;
     /** Make recordStep throw for these frame paths (a ledger blip). */
     failRecordStepFor?: string[];
   } = {},
@@ -241,6 +246,14 @@ function makeHarness(
   };
 
   if (!options.noStateStore) deps.state = fakeState;
+  if (options.prRefs) {
+    const refs = options.prRefs;
+    deps.prRefs = {
+      async getByPr(repo, prNumber) {
+        return refs[`${repo}#${prNumber}`] ?? null;
+      },
+    };
+  }
   return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, actions, state, adopted };
 }
 
@@ -1439,5 +1452,79 @@ describe("entrypoint walks (ADR 0119 D9)", () => {
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("failed");
     expect(result.error).toContain("renamed_away");
+  });
+});
+
+describe("lookup_pr_session (pr_ref ledger)", () => {
+  test("maps a PR to its authoring session; not-found is a value; feedback routes via adoption", async () => {
+    const definition = makeDefinition([
+      {
+        id: "who",
+        type: "lookup_pr_session",
+        config: {
+          repo: "${{ event.raw.repo }}",
+          prNumber: { $ref: "event.raw.pr" },
+        },
+      },
+      {
+        id: "known",
+        type: "filter",
+        config: { conditions: { mode: "all", conditions: [{ path: "steps.who.found", op: "is_true" }] } },
+      },
+      {
+        id: "nudge",
+        type: "send_prompt",
+        config: {
+          session: { template: "${{ steps.who.session_id }}" },
+          promptTemplate: "review feedback arrived",
+          waitFor: { kind: "none" },
+        },
+      },
+    ]);
+    const h = makeHarness(definition, {
+      payload: { repo: "acme/repo", pr: 42 },
+      prRefs: {
+        "acme/repo#42": {
+          sessionId: "s-impl",
+          taskId: "t-1",
+          headBranch: "ticket-eng-1",
+          url: "https://github.com/acme/repo/pull/42",
+          title: "Implement ENG-1",
+        },
+      },
+      bindings: {
+        "s-impl": { automationId: "auto-1", runId: "autorun:auto-1:old", ownerTerminal: true },
+      },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    const outputs = Object.fromEntries(h.stepRecords.map((r) => [r.framePath, r.record.outputs ?? {}]));
+    expect(outputs["who"]).toMatchObject({ found: true, session_id: "s-impl", head_branch: "ticket-eng-1" });
+    expect(h.adopted).toEqual([{ runId: RUN.runId, sessionId: "s-impl" }]);
+    expect(h.prompts.map((prompt) => prompt.sessionId)).toEqual(["s-impl"]);
+  });
+
+  test("an unmapped PR filters the run instead of failing", async () => {
+    const definition = makeDefinition([
+      { id: "who", type: "lookup_pr_session", config: { repo: "acme/repo", prNumber: 7 } },
+      {
+        id: "known",
+        type: "filter",
+        config: { conditions: { mode: "all", conditions: [{ path: "steps.who.found", op: "is_true" }] } },
+      },
+    ]);
+    const h = makeHarness(definition, { prRefs: {} });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("filtered");
+  });
+
+  test("a missing lookup seam is a typed non-retryable failure", async () => {
+    const definition = makeDefinition([
+      { id: "who", type: "lookup_pr_session", config: { repo: "acme/repo", prNumber: 7 } },
+    ]);
+    const h = makeHarness(definition);
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("pr_ref_lookup_unavailable");
   });
 });

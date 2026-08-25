@@ -16,6 +16,7 @@ import {
   Filter,
   FilePlus2,
   GitBranch,
+  GitPullRequest,
   HeartPulse,
   Hourglass,
   List,
@@ -482,6 +483,32 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       return prefix ? `prefix ${truncate(prefix, 40)}` : "every entry";
     },
     defaults: () => ({ prefix: "" }),
+  },
+  {
+    kind: "lookup_pr_session",
+    label: "Look up PR session",
+    description: "Map a pull request to the session that authored it (the pr_ref ledger).",
+    icon: GitPullRequest,
+    fields: [
+      {
+        type: "template",
+        key: "repo",
+        label: "Repository",
+        help: "owner/name, e.g. ${{ event.raw.repository.full_name }}",
+      },
+      {
+        type: "number",
+        key: "prNumber",
+        label: "PR number",
+        min: 1,
+        help: 'Usually a run-time reference: {"$ref": "event.raw.pull_request.number"}.',
+      },
+    ],
+    summary: (c) => {
+      const repo = str(c["repo"]);
+      return repo ? `PR in ${truncate(repo, 40)}` : "No repository";
+    },
+    defaults: () => ({ repo: "", prNumber: 1 }),
   },
   {
     kind: "integration_action",

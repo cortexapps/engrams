@@ -74,6 +74,50 @@ export function draftBlockCatalog(): Record<string, unknown> {
   };
 }
 
+
+/** The design idioms for workflows that span multiple events or days. The
+ * block catalog teaches WHAT exists; this teaches HOW the engine is meant
+ * to be composed. Static by design — review it when the engine's rules
+ * change (a stale idiom here misleads every draft). */
+export function draftPatterns(): Record<string, unknown> {
+  return {
+    core_model: [
+      "Runs are SHORT and stateless. Waits inside a run cap at 24h and stuck runs are swept at 48h - never design a run to live for a day.",
+      "A workflow that spans days = multiple ENTRYPOINTS (one per way in: an integration event, a cron tick, a manual kick) sharing the automation's inputs, settings, and state. Each run enters through one entrypoint, does one step of the lifecycle, and exits.",
+      "Conversations (hours, every event carries the same key) are the ONE long-lived-run shape: concurrency policy join + trigger.continueOnly, like the Slack brain built-in.",
+      "At most one cron trigger per automation.",
+    ],
+    state: [
+      "automation_state is the shared memory across entrypoints and runs: state key = entity (one JSON document per entity, e.g. ticket:ENG-123), and make the automation's concurrency keyTemplate render the SAME entity key with policy queue - then runs touching one entity serialize and get-then-set needs no locks.",
+      "Actors that cannot hold the entity claim (a cron sweep over many entities) write with expectVersion (CAS); an ok:false result is a branchable output, and losing a race to a real per-entity run is usually the correct outcome.",
+      "There is no lock block and no cross-block transaction on purpose; put facts that must change together in one document.",
+    ],
+    kept_sessions: [
+      'Sessions are kept by default and outlive their runs. Record a long-lived session id in state (e.g. state["pm"].session_id).',
+      "A later run reaches a kept session with a {template} session ref: resolving it ADOPTS the session (re-binds its event routing to this run) - allowed only within the same automation and only when the owning run finished, so adoption never steals from a live waiting run.",
+      "Probe before you prompt: session_status is read-only, never re-binds, and reports found/status/idle_seconds/owner_run_live as VALUES a filter can branch on - the cheap look for a sweep entrypoint.",
+      'For an agent inside a session to talk back to the run waiting on it, the session uses its signal_automation tool and the run waits with send_prompt waitFor {kind: "signal", name} or wait_session.',
+    ],
+    slack_clarification_thread: [
+      "Post with integration_action slack.post_message (it accepts thread_ts and RETURNS the posted ts). In the same run, state_set key thread:<ts> value {session_id, ticket, ...}. Exit.",
+      "A second entrypoint triggers on slack message in that channel; a filter keeps only events whose thread_ts has a state entry; the run reads the entry, adopts the bound session by id, send_prompts the human reply into it, and exits.",
+      "The Slack app must be a member of the channel for message events to arrive.",
+    ],
+    pr_feedback_loop: [
+      "Every session that opens a PR is auto-recorded in the pr_ref ledger. The lookup_pr_session block maps {repo, prNumber} to the authoring session - found:false is a value, so unrelated PRs just filter out.",
+      'So: an entrypoint on pull_request_review.submitted / pull_request_review_comment.created / issue_comment.created -> lookup_pr_session -> filter on found -> send_prompt with session {template: "${{ steps.<lookup>.session_id }}"} delivers the feedback to the implementer. Adoption handles the routing.',
+    ],
+    delegation: [
+      "A coordinator session can spawn and manage its own sub-sessions with the session-side coordination tools (spawn_session, send_session_message, read_session, wait_sessions) - good for a manager/worker shape.",
+      "Those tools require the session to have an OWNING USER: set ownerUserId on the coordinator's create_session block (automation sessions default to the org principal, which cannot spawn).",
+      "The engine-side alternative - the run creates sessions with create_session blocks - is more auditable in the run ledger; prefer it when the set of workers is decided by the workflow, and spawn_session when the coordinating agent decides dynamically.",
+    ],
+    cron_heartbeat: [
+      "A multi-day lifecycle stays alive through a cron entrypoint: each tick reads state, probes sessions (session_status), adopts + prompts whatever is stuck or due, updates state, exits. The coordinator session learns of progress on the next tick - like a coworker checking their board.",
+    ],
+  };
+}
+
 export interface DraftEventCatalogDeps {
   connectors: CustomConnectorSource;
   connections: Pick<IntegrationConnectionStore, "getDefault">;

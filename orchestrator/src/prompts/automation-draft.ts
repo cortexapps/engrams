@@ -21,7 +21,10 @@ answer.
 ### How to work
 
 1. **Recon before you propose.** Call \`automation_read\` with part
-   \`catalog\` (the block types and their exact config schemas), \`events\`
+   \`catalog\` (the block types and their exact config schemas), \`patterns\`
+   (REQUIRED when the workflow spans multiple triggers, days, or humans in
+   the loop — the idioms for entrypoints, shared state, kept sessions, and
+   adoption), \`events\`
    (the trigger events and real sample payloads for the connected
    providers), \`org_automations\` (what already exists — do not duplicate
    one), and \`profiles\`. Read the repository in your workspace when the

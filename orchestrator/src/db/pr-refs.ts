@@ -25,6 +25,8 @@ export interface PrRefStore {
   upsert(row: PrRefInput): Promise<string>;
   listByTaskId(taskId: string): Promise<PrRefRow[]>;
   listBySessionId(sessionId: string): Promise<PrRefRow[]>;
+  /** The authoring session for one PR — the (repo, pr_number) unique. */
+  getByPr(repo: string, prNumber: number): Promise<PrRefRow | null>;
 }
 
 function toRow(row: typeof prRefTable.$inferSelect): PrRefRow {
@@ -58,6 +60,15 @@ export function makePrRefStore(
   };
 
   return {
+    async getByPr(repo, prNumber) {
+      const rows = await db
+        .select()
+        .from(prRefTable)
+        .where(sql`${prRefTable.repo} = ${repo} and ${prRefTable.prNumber} = ${prNumber}`)
+        .limit(1);
+      return rows[0] ? toRow(rows[0]) : null;
+    },
+
     async upsert(row) {
       const id = crypto.randomUUID();
       const rows = await db

@@ -44,6 +44,9 @@ function makeStore(rows: PrRefRow[]): FakePrRefStore {
   return {
     taskCalls,
     sessionCalls,
+    async getByPr() {
+      return null;
+    },
     async upsert(_input: PrRefInput) {
       throw new Error("unused");
     },
