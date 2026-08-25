@@ -144,6 +144,14 @@ describe("draftAutomation", () => {
     const h = harness({ failSession: true });
     await expect(draftAutomation(h.deps, request())).rejects.toThrow("session boot failed");
     expect(h.archived).toHaveLength(1);
+    // The binding is cleared BEFORE the archive, so no replay can adopt it.
+    expect(h.bound.at(-1)).toMatchObject({ sessionId: null });
+  });
+
+  test("a retry after a failed boot is refused, never a created:false dead draft", async () => {
+    const h = harness({ failSession: true });
+    await expect(draftAutomation(h.deps, request())).rejects.toThrow("session boot failed");
+    await expect(draftAutomation(h.deps, request())).rejects.toThrow(/retry with a new key/);
   });
 
   test("an empty prompt is refused before any write", async () => {

@@ -139,13 +139,16 @@ export async function draftAutomation(
       automationId,
     });
   } catch (error) {
-    // Release the reservation so a retry with the same key starts clean. A
-    // failed release is logged by archive's own error path and never masks
-    // the original error.
+    // Release the reservation: clear the binding FIRST (so a replay can
+    // never report created:false against a draft whose session never
+    // booted), then archive. A failed release never masks the original
+    // error.
     try {
+      await deps.store.setDraftSession(automationId, null);
       await deps.store.archive(automationId);
     } catch {
-      // The row stays as a disabled, session-less draft — harmless.
+      // The row stays as a disabled draft; the archived/binding guards in
+      // replayed() still refuse it.
     }
     throw error;
   }
@@ -162,10 +165,11 @@ async function replayed(
   if (!existing) {
     throw new ConnectError("the reserved automation disappeared during creation", Code.Aborted);
   }
-  if (existing.draftSessionId !== sessionId) {
-    // The row exists but its session never bound (a crash between create and
-    // setDraftSession, or the release after a failed session boot archived
-    // it). Refuse rather than guess; the caller retries with a fresh key.
+  if (existing.archivedAt !== null || existing.draftSessionId !== sessionId) {
+    // The row exists but is unusable: its session never bound (a crash
+    // between create and setDraftSession) or a failed session boot released
+    // it (binding cleared + archived). Refuse rather than hand back a dead
+    // draft; the caller retries with a fresh key.
     throw new ConnectError("the draft's session is not bound; retry with a new key", Code.Aborted);
   }
   return { automationId, sessionId, created: false };
