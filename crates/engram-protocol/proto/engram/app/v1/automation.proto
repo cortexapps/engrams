@@ -271,6 +271,8 @@ message TestRenderRequest {
   }
   // Cron/manual previews carry no payload; this names the occurrence.
   optional string scheduled_for = 6;
+  // ADR 0119 D9: which entrypoint to render (default "main").
+  optional string entrypoint_id = 7;
 }
 
 message BlockRender {
@@ -295,6 +297,8 @@ message DryRunRequest {
     string sample_id = 2;
     string payload_json = 3;
   }
+  // ADR 0119 D9: which entrypoint to run (default "main").
+  optional string entrypoint_id = 4;
 }
 
 message DryRunResponse {
@@ -325,6 +329,8 @@ message RunNowRequest {
   optional string inputs_json = 2;
   // Optional event payload for integration/webhook-shaped automations.
   optional string payload_json = 3;
+  // ADR 0119 D9: which entrypoint to run (default "main").
+  optional string entrypoint_id = 4;
 }
 
 message RunNowResponse {

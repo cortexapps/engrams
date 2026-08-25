@@ -573,3 +573,92 @@ describe("session adoption (live PG, ADR 0119 D11)", () => {
     },
   );
 });
+
+describe("entrypoint-borne triggers (live PG, ADR 0119 D9)", () => {
+  test.skipIf(!dbReachable)(
+    "the integration and cron candidate queries see triggers on extra entrypoints",
+    async () => {
+      const db = getDb();
+      const store = makeAutomationStore(getDb());
+      const autoId = `${AUTO_ID}-ep`;
+      const connectionId = `conn-ep-${UNIQ}`;
+      await db.insert(automationTable).values({
+        id: autoId,
+        name: `Entrypoint test ${autoId}`,
+        description: "",
+        enabled: true,
+        currentVersion: 1,
+        nextFireAt: new Date(Date.now() - 60_000),
+      });
+      createdAutomationIds.push(autoId);
+      // Main is manual; the integration trigger and the cron trigger both
+      // live on EXTRA entrypoints.
+      await db.execute(sql`
+        insert into automation_version (automation_id, version, trigger, blocks, entrypoints, inputs_schema, settings)
+        values (${autoId}, 1, ${JSON.stringify({ kind: "manual" })}::jsonb, '[]'::jsonb,
+                ${JSON.stringify([
+                  {
+                    id: "feedback",
+                    trigger: {
+                      kind: "integration",
+                      provider: "github",
+                      connectionId,
+                      eventKeys: ["pull_request_review.submitted"],
+                    },
+                    blocks: [],
+                  },
+                  {
+                    id: "tick",
+                    trigger: { kind: "cron", schedule: "* * * * *", timezone: "UTC" },
+                    blocks: [],
+                  },
+                ])}::jsonb,
+                '[]'::jsonb, ${JSON.stringify({ endSessionsOnFinish: false })}::jsonb)
+      `);
+
+      const candidates = await store.listEnabledForIntegrationTrigger("github", connectionId);
+      expect(candidates.map((c) => c.automation.id)).toEqual([autoId]);
+
+      const due = await store.listDueCron(new Date());
+      const mine = due.find((d) => d.automation.id === autoId);
+      expect(mine).toBeDefined();
+      expect(mine!.entrypointId).toBe("tick");
+      expect(mine!.trigger.schedule).toBe("* * * * *");
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "one delivery key admits one run PER entrypoint (the rebuilt unique index)",
+    async () => {
+      const db = getDb();
+      const autoId = `${AUTO_ID}-ep-uniq`;
+      await seedAutomation(autoId);
+      const deliveryKey = `github:d-${UNIQ}`;
+      await db.insert(automationRunTable).values([
+        { id: `autorun:${autoId}:${deliveryKey}`, automationId: autoId, trigger: TRIGGER, deliveryKey },
+        {
+          id: `autorun:${autoId}:feedback:${deliveryKey}`,
+          automationId: autoId,
+          entrypointId: "feedback",
+          trigger: TRIGGER,
+          deliveryKey,
+        },
+      ]);
+      // A THIRD row for an existing (automation, entrypoint, delivery) must
+      // hit the unique index.
+      let refused = false;
+      try {
+        await db.insert(automationRunTable).values({
+          id: `autorun:${autoId}:dup`,
+          automationId: autoId,
+          entrypointId: "feedback",
+          trigger: TRIGGER,
+          deliveryKey,
+        });
+      } catch {
+        refused = true;
+      }
+      expect(refused).toBe(true);
+    },
+  );
+});

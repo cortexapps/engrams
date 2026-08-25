@@ -45,6 +45,7 @@ function dueAutomation(
   const trigger = { kind: "cron", schedule: "* * * * *", timezone: "UTC" } as const;
   return {
     automation: meta(scheduledFor),
+    entrypointId: "main",
     trigger,
     definition: { engine: 1, trigger, blocks: [], inputsSchema: [], settings },
     nextFireAt: scheduledFor,
@@ -59,6 +60,7 @@ function pendingRun(
     id: automationCronWorkflowId("automation-1", scheduledFor),
     automationId: "automation-1",
     version: 3,
+    entrypointId: "main",
     trigger: { source: "cron", receivedAt: scheduledFor.toISOString() },
     deliveryKey: `cron:${Math.floor(scheduledFor.getTime() / 1_000)}`,
     dryRun: false,

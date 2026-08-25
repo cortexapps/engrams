@@ -1272,6 +1272,7 @@ export const profile = pgTable(
 // import is type-only, so no runtime cycle exists.
 import type {
   AutomationSettings,
+  AutomationEntrypoint,
   BlockDef,
   InputFieldSpec,
   TriggerSpec,
@@ -1444,6 +1445,9 @@ export const automationVersion = pgTable(
     version: integer("version").notNull(),
     trigger: jsonb("trigger").$type<AutomationTrigger>().notNull(),
     blocks: jsonb("blocks").$type<BlockDef[]>().notNull(),
+    /** ADR 0119 D9: additional named entrypoints ({id, trigger, blocks});
+     * `[]` = the classic single-entrypoint automation. */
+    entrypoints: jsonb("entrypoints").$type<AutomationEntrypoint[]>().notNull().default([]),
     inputsSchema: jsonb("inputs_schema").$type<InputFieldSpec[]>().notNull().default([]),
     settings: jsonb("settings").$type<AutomationSettings>().notNull(),
     createdByUserId: text("created_by_user_id"),
@@ -1472,6 +1476,10 @@ export const automationRun = pgTable(
     taskId: text("task_id").references(() => task.id, { onDelete: "set null" }),
     sessionId: text("session_id"), // logical ref to the control-plane session
     status: text("status").notNull().default("pending"),
+    /** ADR 0119 D9: which entrypoint this run entered through. Part of both
+     * dedupe identities below — the same delivery (or cron occurrence) may
+     * legitimately open one run per matching entrypoint. */
+    entrypointId: text("entrypoint_id").notNull().default("main"),
     error: text("error"),
     // A cron claim is the run row. The partial unique key gives one durable row
     // per occurrence; an expired lease can be reacquired and the same DBOS id
@@ -1488,10 +1496,10 @@ export const automationRun = pgTable(
   },
   (t) => [
     uniqueIndex("automation_run_occurrence_unique")
-      .on(t.automationId, t.scheduledFor)
+      .on(t.automationId, t.entrypointId, t.scheduledFor)
       .where(sql`scheduled_for is not null`),
     uniqueIndex("automation_run_delivery_unique")
-      .on(t.automationId, t.deliveryKey)
+      .on(t.automationId, t.entrypointId, t.deliveryKey)
       .where(sql`delivery_key is not null`),
     index("automation_run_automation_created_idx").on(t.automationId, t.createdAt),
     index("automation_run_lease_idx").on(t.leaseExpiresAt),

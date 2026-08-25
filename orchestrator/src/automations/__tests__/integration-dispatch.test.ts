@@ -161,6 +161,7 @@ interface Harness {
   store: IntegrationDispatchStore;
   starts: Array<{ runId: string; automationId: string; workflowId: string }>;
   runs: Map<string, AutomationRunRow>;
+  claims: Map<string, string>;
 }
 
 function makeHarness(targets: DispatchTarget[]): Harness {
@@ -178,6 +179,7 @@ function makeHarness(targets: DispatchTarget[]): Harness {
           id: input.id,
           automationId: input.automationId,
           version: input.version,
+          entrypointId: input.entrypointId ?? "main",
           trigger: input.trigger,
           deliveryKey: input.deliveryKey,
           concurrencyKey: input.concurrencyKey,
@@ -218,7 +220,7 @@ function makeHarness(targets: DispatchTarget[]): Harness {
     },
   };
 
-  return { store, starts, runs };
+  return { store, starts, runs , claims };
 }
 
 function input(
@@ -290,6 +292,82 @@ describe("dispatchIntegrationEvent", () => {
       scopeValue: "engrams/engrams",
     });
     expect(run.deliveryKey).toBe("github:gh-delivery-1");
+  });
+
+  test("a matching EXTRA entrypoint opens its own run with an entrypoint-scoped id (D9)", async () => {
+    // Main listens for PR-opened; the "feedback" entrypoint listens for
+    // review events on the SAME connection. A review delivery must open a
+    // run through feedback only; a PR delivery through main only; and one
+    // delivery matching BOTH entrypoints opens two runs with distinct ids.
+    const both: AutomationDefinition = {
+      ...definition(trigger()),
+      entrypoints: [
+        {
+          id: "feedback",
+          trigger: trigger({ eventKeys: ["pull_request_review.submitted", "pull_request.opened"] }),
+          blocks: [
+            {
+              id: "nudge",
+              type: "send_prompt",
+              config: {
+                session: { template: "s-kept" },
+                promptTemplate: "review arrived",
+                waitFor: { kind: "none" },
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const h = makeHarness([{ automation: meta(), definition: both }]);
+
+    const review = await dispatchIntegrationEvent(
+      input({ eventKey: "pull_request_review.submitted", deliveryId: "gh-rev-1" }),
+      deps(h),
+    );
+    expect(review).toMatchObject({ matched: 1, started: 1 });
+    const run = h.runs.get("autorun:automation-1:feedback:github:gh-rev-1")!;
+    expect(run.entrypointId).toBe("feedback");
+    expect(run.deliveryKey).toBe("github:gh-rev-1");
+
+    // One delivery, two matching entrypoints: two runs, two ids, one
+    // delivery key — the (automation, entrypoint, delivery) unique holds.
+    const openedBoth = await dispatchIntegrationEvent(
+      input({ eventKey: "pull_request.opened", deliveryId: "gh-pr-9" }),
+      deps(h),
+    );
+    expect(openedBoth).toMatchObject({ matched: 2, started: 2 });
+    expect(h.runs.get("autorun:automation-1:github:gh-pr-9")?.entrypointId).toBe("main");
+    expect(h.runs.get("autorun:automation-1:feedback:github:gh-pr-9")?.entrypointId).toBe(
+      "feedback",
+    );
+  });
+
+  test("a supersede-lost row keeps its entrypoint (never the 'main' default)", async () => {
+    // The CAS-race loser records a filtered run row; that row's
+    // entrypoint_id is part of the delivery dedupe identity and must match
+    // the 3-part run id, not fall back to the column default.
+    const withEp: AutomationDefinition = {
+      ...definition(trigger({ eventKeys: ["x"] })),
+      settings: {
+        endSessionsOnFinish: false,
+        concurrency: { keyTemplate: "k", policy: "supersede" },
+      },
+      entrypoints: [
+        { id: "feedback", trigger: trigger({ eventKeys: ["pull_request.opened"] }), blocks: [] },
+      ],
+    };
+    const h = makeHarness([{ automation: meta(), definition: withEp }]);
+    h.claims.set("automation-1:k", "autorun:automation-1:github:earlier");
+    const d = deps(h);
+    // Lose every CAS: a concurrent superseder always got there first.
+    d.store = { ...d.store, casConcurrency: async () => false };
+
+    const result = await dispatchIntegrationEvent(input({ deliveryId: "gh-lost-1" }), d);
+    expect(result).toMatchObject({ matched: 1, skipped: 1 });
+    const row = h.runs.get("autorun:automation-1:feedback:github:gh-lost-1")!;
+    expect(row.status).toBe("filtered");
+    expect(row.entrypointId).toBe("feedback");
   });
 
   test("a redelivery mints the same run id, so DBOS start and the delivery unique dedupe", async () => {

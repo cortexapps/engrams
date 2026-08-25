@@ -22,8 +22,10 @@ import {
 import { makeWebhookAliasResolver } from "../automations/aliases.ts";
 import {
   applyBlockOverrides,
+  cronEntrypointOf,
   ENGINE_VERSION,
   type AutomationDefinition,
+  type AutomationEntrypoint,
   type BlockOverrides,
 } from "../automations/engine/definition.ts";
 import type { EngineRunStore, EngineStepRecord } from "../automations/engine/deps.ts";
@@ -67,6 +69,7 @@ export interface AutomationVersionRow {
   version: number;
   trigger: AutomationTrigger;
   blocks: BlockDef[];
+  entrypoints: AutomationEntrypoint[];
   inputsSchema: InputFieldSpec[];
   settings: AutomationSettings;
   createdByUserId: string | null;
@@ -123,6 +126,7 @@ export interface AutomationRunRow {
   id: string;
   automationId: string;
   version: number;
+  entrypointId: string;
   trigger: AutomationRunTrigger;
   deliveryKey: string | null;
   concurrencyKey: string | null;
@@ -242,6 +246,9 @@ export interface AutomationStore {
 
 export interface DueCronAutomation {
   automation: AutomationMetaRow;
+  /** D9: the entrypoint carrying the cron trigger (validation caps cron at
+   * one per automation). */
+  entrypointId: string;
   trigger: Extract<AutomationTrigger, { kind: "cron" }>;
   /** The effective definition (overrides applied) — carries the concurrency
    * settings the scheduler admits against. */
@@ -262,6 +269,8 @@ export interface AutomationCronStore {
     runId: string;
     automationId: string;
     version: number;
+    /** D9: the cron entrypoint's id (default "main"). */
+    entrypointId?: string;
     scheduledFor: Date;
     leaseOwner: string;
     leaseExpiresAt: Date;
@@ -306,6 +315,8 @@ export interface AutomationDispatchStore {
     id: string;
     automationId: string;
     version: number;
+    /** D9: which entrypoint the run enters through (default "main"). */
+    entrypointId?: string;
     trigger: AutomationRunTrigger;
     deliveryKey: string | null;
     concurrencyKey: string | null;
@@ -397,6 +408,7 @@ function versionRow(row: typeof versionTable.$inferSelect): AutomationVersionRow
     version: row.version,
     trigger: row.trigger,
     blocks: row.blocks,
+    entrypoints: row.entrypoints,
     inputsSchema: row.inputsSchema,
     settings: row.settings,
     createdByUserId: row.createdByUserId ?? null,
@@ -409,6 +421,7 @@ export function definitionOf(version: AutomationVersionRow): AutomationDefinitio
     engine: ENGINE_VERSION,
     trigger: version.trigger,
     blocks: version.blocks,
+    ...(version.entrypoints.length > 0 ? { entrypoints: version.entrypoints } : {}),
     inputsSchema: version.inputsSchema,
     settings: version.settings,
   };
@@ -419,6 +432,7 @@ function runRow(row: typeof automationRunTable.$inferSelect): AutomationRunRow {
     id: row.id,
     automationId: row.automationId,
     version: row.version,
+    entrypointId: row.entrypointId,
     trigger: row.trigger,
     deliveryKey: row.deliveryKey ?? null,
     concurrencyKey: row.concurrencyKey ?? null,
@@ -614,9 +628,17 @@ export function makeAutomationStore(
         and(
           eq(automationTable.enabled, true),
           isNull(automationTable.archivedAt),
-          sql`${versionTable.trigger}->>'kind' = 'integration'`,
-          sql`${versionTable.trigger}->>'provider' = ${provider}`,
-          sql`${versionTable.trigger}->>'connectionId' = ${connectionId}`,
+          // D9: the trigger may live on the main entrypoint or any extra
+          // one. The dispatcher re-matches per entrypoint; this predicate
+          // only prunes the candidate set.
+          sql`((${versionTable.trigger}->>'kind' = 'integration'
+                and ${versionTable.trigger}->>'provider' = ${provider}
+                and ${versionTable.trigger}->>'connectionId' = ${connectionId})
+            or exists (
+                select 1 from jsonb_array_elements(${versionTable.entrypoints}) e
+                where e->'trigger'->>'kind' = 'integration'
+                  and e->'trigger'->>'provider' = ${provider}
+                  and e->'trigger'->>'connectionId' = ${connectionId}))`,
         ),
       );
       return rows.map(({ meta, version }) => target(meta, version));
@@ -644,6 +666,7 @@ export function makeAutomationStore(
           version: 1,
           trigger: definition.trigger,
           blocks: definition.blocks,
+          entrypoints: definition.entrypoints ?? [],
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId,
@@ -669,6 +692,7 @@ export function makeAutomationStore(
           version: nextVersion,
           trigger: definition.trigger,
           blocks: definition.blocks,
+          entrypoints: definition.entrypoints ?? [],
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId,
@@ -868,7 +892,9 @@ export function makeAutomationStore(
           and(
             eq(automationTable.enabled, true),
             isNull(automationTable.archivedAt),
-            sql`${versionTable.trigger}->>'kind' = 'cron'`,
+            sql`(${versionTable.trigger}->>'kind' = 'cron' or exists (
+              select 1 from jsonb_array_elements(${versionTable.entrypoints}) e
+              where e->'trigger'->>'kind' = 'cron'))`,
             lte(automationTable.nextFireAt, now),
           ),
         )
@@ -877,13 +903,16 @@ export function makeAutomationStore(
       return rows.map((raw) => {
         const meta = metaRow(raw.automation);
         const version = versionRow(raw.version);
-        if (version.trigger.kind !== "cron" || meta.nextFireAt === null) {
+        const definition = effectiveDefinition(version, meta.blockOverrides);
+        const cron = cronEntrypointOf(definition);
+        if (cron === null || cron.trigger.kind !== "cron" || meta.nextFireAt === null) {
           throw new Error(`due automation ${meta.id} did not contain a cron occurrence`);
         }
         return {
           automation: meta,
-          trigger: version.trigger,
-          definition: effectiveDefinition(version, meta.blockOverrides),
+          entrypointId: cron.id,
+          trigger: cron.trigger,
+          definition,
           nextFireAt: meta.nextFireAt,
         };
       });
@@ -900,6 +929,7 @@ export function makeAutomationStore(
           id: input.runId,
           automationId: input.automationId,
           version: input.version,
+          ...(input.entrypointId !== undefined ? { entrypointId: input.entrypointId } : {}),
           trigger,
           deliveryKey: cronDeliveryKey(input.scheduledFor),
           scheduledFor: input.scheduledFor,
@@ -1006,6 +1036,7 @@ export function makeAutomationStore(
           id: input.id,
           automationId: input.automationId,
           version: input.version,
+          ...(input.entrypointId !== undefined ? { entrypointId: input.entrypointId } : {}),
           trigger: input.trigger,
           deliveryKey: input.deliveryKey,
           concurrencyKey: input.concurrencyKey,
@@ -1139,6 +1170,7 @@ export function makeAutomationStore(
           version,
           trigger: definition.trigger,
           blocks: definition.blocks,
+          entrypoints: definition.entrypoints ?? [],
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId: null,
@@ -1327,6 +1359,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         automationId: meta.id,
         automationName: meta.name,
         version: version.version,
+        entrypointId: run.entrypointId,
         trigger: {
           kind: run.trigger.source,
           receivedAt: run.trigger.receivedAt ?? run.createdAt.toISOString(),

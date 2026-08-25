@@ -246,6 +246,7 @@ function* walkBlockTree(blocks: BlockDef[]): Generator<BlockDef> {
  * `tunable` field is editable exactly like a graph block. */
 export function* overrideTargets(definition: AutomationDefinition): Generator<BlockDef> {
   yield* walkBlockTree(definition.blocks);
+  for (const entrypoint of definition.entrypoints ?? []) yield* walkBlockTree(entrypoint.blocks);
   for (const hook of definition.settings.onFinalize ?? []) yield hook.block;
 }
 
@@ -313,6 +314,14 @@ export function applyBlockOverrides(
   return {
     ...definition,
     blocks: merge(definition.blocks),
+    ...(definition.entrypoints
+      ? {
+          entrypoints: definition.entrypoints.map((entrypoint) => ({
+            ...entrypoint,
+            blocks: merge(entrypoint.blocks),
+          })),
+        }
+      : {}),
     settings: onFinalize ? { ...definition.settings, onFinalize } : definition.settings,
   };
 }
@@ -336,10 +345,49 @@ export const settingsSchema = settingsBaseSchema.extend({
 });
 export type AutomationSettings = z.infer<typeof settingsSchema>;
 
+// ---------------------------------------------------------------------------
+// Entrypoints (ADR 0119 D9)
+// ---------------------------------------------------------------------------
+
+/** The implicit entrypoint every automation has: the top-level
+ * `trigger` + `blocks`. Extra entrypoints are named and never "main". */
+export const MAIN_ENTRYPOINT_ID = "main";
+export const MAX_ENTRYPOINTS = 8;
+
+/** Extra entrypoints take integration, cron, or manual triggers. The legacy
+ * `webhook` trigger stays main-only: its alias-resolution path is
+ * registration-scoped and retires with ADR 0119 phase 2. */
+const entrypointTriggerSchema = z.discriminatedUnion("kind", [
+  cronTrigger,
+  integrationTrigger,
+  manualTrigger,
+]);
+
+export const entrypointSchema = z.object({
+  id: z
+    .string()
+    .regex(/^[a-z][a-z0-9_]*$/)
+    .max(64)
+    .refine((id) => id !== MAIN_ENTRYPOINT_ID, `"${MAIN_ENTRYPOINT_ID}" names the implicit top-level entrypoint`),
+  trigger: entrypointTriggerSchema,
+  blocks: z.array(blockDefSchema),
+});
+
+export interface AutomationEntrypoint {
+  id: string;
+  trigger: TriggerSpec;
+  blocks: BlockDef[];
+}
+
 export const definitionSchema = z.object({
   engine: z.literal(ENGINE_VERSION),
   trigger: triggerSpecSchema,
   blocks: z.array(blockDefSchema),
+  /** Additional named ways into the SAME automation (shared inputs,
+   * settings, and automation_state). Each run enters through exactly one
+   * entrypoint and walks only its blocks. Absent = the classic
+   * single-entrypoint automation, byte-identical to the pre-D9 shape. */
+  entrypoints: z.array(entrypointSchema).max(MAX_ENTRYPOINTS).optional(),
   inputsSchema: z.array(inputFieldSchema),
   settings: settingsSchema,
 });
@@ -348,8 +396,32 @@ export interface AutomationDefinition {
   engine: typeof ENGINE_VERSION;
   trigger: TriggerSpec;
   blocks: BlockDef[];
+  entrypoints?: AutomationEntrypoint[];
   inputsSchema: InputFieldSpec[];
   settings: AutomationSettings;
+}
+
+/** Every way in, main first. The one view dispatch, validation, and the
+ * interpreter share. */
+export function entrypointsOf(definition: AutomationDefinition): AutomationEntrypoint[] {
+  return [
+    { id: MAIN_ENTRYPOINT_ID, trigger: definition.trigger, blocks: definition.blocks },
+    ...(definition.entrypoints ?? []),
+  ];
+}
+
+export function entrypointOf(
+  definition: AutomationDefinition,
+  id: string,
+): AutomationEntrypoint | null {
+  return entrypointsOf(definition).find((entrypoint) => entrypoint.id === id) ?? null;
+}
+
+/** The automation's single cron entrypoint, if any. Validation caps cron
+ * triggers at one per automation because the scheduler tracks ONE
+ * `next_fire_at` per automation row. */
+export function cronEntrypointOf(definition: AutomationDefinition): AutomationEntrypoint | null {
+  return entrypointsOf(definition).find((entrypoint) => entrypoint.trigger.kind === "cron") ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -435,11 +507,12 @@ export function validateDefinition(
 
   const seen = new Set<string>();
   let count = 0;
-  /** Contract 3: one message handler per run. Several blocks may carry it
+  /** Contract 3: one message handler per RUN — a run walks one entrypoint,
+   * so the installer list resets per entrypoint. Several blocks may carry it
    * as long as they are the SAME type — a later one (a loop body re-pointing
    * the Slack relay at a new turn) is a re-point of the installed handler,
    * never a second install (the interpreter enforces the same executor). */
-  const installers: Array<{ id: string; type: string }> = [];
+  let installers: Array<{ id: string; type: string }> = [];
   const checkBlock = (block: BlockDef, hook: boolean): void => {
     count += 1;
     if (count > MAX_BLOCKS) {
@@ -530,15 +603,39 @@ export function validateDefinition(
     validateTemplatesIn(block.id, block.config, "");
   };
 
-  for (const block of walkBlocks(definition.blocks)) checkBlock(block, false);
+  const entrypoints = entrypointsOf(definition);
+  const entrypointIds = new Set<string>();
+  for (const entrypoint of entrypoints) {
+    if (entrypointIds.has(entrypoint.id)) {
+      throw new DefinitionError(
+        "__entrypoints__",
+        "id",
+        `duplicate entrypoint id "${entrypoint.id}"`,
+      );
+    }
+    entrypointIds.add(entrypoint.id);
+    // Block ids stay unique across ALL entrypoints (`seen` is shared): a
+    // step path addresses one automation-wide namespace.
+    installers = [];
+    for (const block of walkBlocks(entrypoint.blocks)) checkBlock(block, false);
+  }
+  if (entrypoints.filter((entrypoint) => entrypoint.trigger.kind === "cron").length > 1) {
+    throw new DefinitionError(
+      "__entrypoints__",
+      "trigger",
+      "at most one cron trigger per automation (the scheduler tracks one next_fire_at per row)",
+    );
+  }
+  installers = [];
   for (const hook of definition.settings.onFinalize ?? []) checkBlock(hook.block, true);
 
   if (definition.settings.concurrency) {
     validateTemplatesIn("__settings__", definition.settings.concurrency.keyTemplate, "concurrency.keyTemplate");
   }
-  if (definition.trigger.kind === "integration" && definition.trigger.continueOnly !== undefined) {
-    const trigger = definition.trigger;
-    for (const key of definition.trigger.continueOnly) {
+  for (const entrypoint of entrypoints) {
+    const trigger = entrypoint.trigger;
+    if (trigger.kind !== "integration" || trigger.continueOnly === undefined) continue;
+    for (const key of trigger.continueOnly) {
       if (!trigger.eventKeys.includes(key)) {
         throw new DefinitionError(
           "__trigger__",

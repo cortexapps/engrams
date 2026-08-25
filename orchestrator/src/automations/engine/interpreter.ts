@@ -39,6 +39,8 @@ import { buildRunContext, recordStepOutputs, type RunContext, type RunSnapshot }
 import type { EngineDeps } from "./deps.ts";
 import { log as rootLog } from "../../log.ts";
 import {
+  MAIN_ENTRYPOINT_ID,
+  entrypointOf,
   isValueRef,
   MAX_LOOP_ITERATIONS,
   MAX_WAIT_DEADLINE_S,
@@ -735,7 +737,16 @@ export async function interpretAutomation(
 
   let terminal: EngineRunResult;
   try {
-    for (const block of snapshot.definition.blocks) {
+    // D9: the run walks exactly one entrypoint's blocks. An old checkpointed
+    // snapshot has no entrypointId — that is the main entrypoint, whose
+    // blocks are the top-level list, so replay walks what it always walked.
+    const entrypoint = entrypointOf(snapshot.definition, snapshot.entrypointId ?? MAIN_ENTRYPOINT_ID);
+    if (entrypoint === null) {
+      throw new Error(
+        `run entrypoint "${snapshot.entrypointId}" is not in the pinned version`,
+      );
+    }
+    for (const block of entrypoint.blocks) {
       await runBlock(block, [{ blockId: block.id }]);
     }
     terminal = { status: "completed" };

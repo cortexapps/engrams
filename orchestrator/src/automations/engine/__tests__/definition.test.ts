@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
 import { registerEngineBlocks } from "../blocks/index.ts";
-import { DefinitionError, validateDefinition, type AutomationDefinition } from "../definition.ts";
+import {
+  cronEntrypointOf,
+  DefinitionError,
+  entrypointOf,
+  entrypointsOf,
+  validateDefinition,
+  type AutomationDefinition,
+} from "../definition.ts";
 
 registerEngineBlocks();
 
@@ -205,5 +212,89 @@ describe("validateDefinition", () => {
         { kind: "user" },
       ),
     ).toThrow(/only loop blocks/);
+  });
+});
+
+describe("entrypoints (ADR 0119 D9)", () => {
+  const withEntrypoints = (entrypoints: unknown) => def({ entrypoints } as Partial<AutomationDefinition>);
+  const sweep = (id = "sweep") => ({
+    id,
+    trigger: { kind: "manual" },
+    blocks: [{ id: `${id}_probe`, type: "session_status", config: { session: { template: "s" } } }],
+  });
+
+  test("extra entrypoints validate and round-trip", () => {
+    const parsed = validateDefinition(withEntrypoints([sweep()]), { kind: "user" });
+    expect(parsed.entrypoints).toHaveLength(1);
+    expect(entrypointsOf(parsed).map((e) => e.id)).toEqual(["main", "sweep"]);
+    expect(entrypointOf(parsed, "sweep")?.blocks[0]?.id).toBe("sweep_probe");
+  });
+
+  test('"main" is the implicit top-level entrypoint and cannot be redeclared', () => {
+    expect(() => validateDefinition(withEntrypoints([sweep("main")]), { kind: "user" })).toThrow(
+      DefinitionError,
+    );
+  });
+
+  test("entrypoint ids are unique", () => {
+    expect(() =>
+      validateDefinition(withEntrypoints([sweep("a"), sweep("a")]), { kind: "user" }),
+    ).toThrow(/duplicate entrypoint id/);
+  });
+
+  test("block ids stay unique across ALL entrypoints (one steps.* namespace)", () => {
+    const clash = {
+      id: "other",
+      trigger: { kind: "manual" },
+      blocks: [{ id: "launch", type: "session_status", config: { session: { template: "s" } } }],
+    };
+    expect(() => validateDefinition(withEntrypoints([clash]), { kind: "user" })).toThrow(
+      /duplicate block id "launch"/,
+    );
+  });
+
+  test("at most one cron trigger per automation (single next_fire_at)", () => {
+    const cronEp = {
+      id: "tick",
+      trigger: { kind: "cron", schedule: "*/5 * * * *", timezone: "UTC" },
+      blocks: [],
+    };
+    // The main trigger in def() is already cron.
+    expect(() => validateDefinition(withEntrypoints([cronEp]), { kind: "user" })).toThrow(
+      /at most one cron trigger/,
+    );
+    // Cron on the extra entrypoint with a non-cron main is fine.
+    const manualMain = def({
+      trigger: { kind: "manual" },
+      entrypoints: [cronEp],
+    } as Partial<AutomationDefinition>);
+    const parsed = validateDefinition(manualMain, { kind: "user" });
+    expect(cronEntrypointOf(parsed)?.id).toBe("tick");
+  });
+
+  test("the legacy webhook trigger stays main-only", () => {
+    const webhookEp = {
+      id: "hook",
+      trigger: { kind: "webhook", registrationId: "r", events: ["push"] },
+      blocks: [],
+    };
+    expect(() => validateDefinition(withEntrypoints([webhookEp]), { kind: "user" })).toThrow(
+      DefinitionError,
+    );
+  });
+
+  test("a message-handler cap is per entrypoint, not per definition", () => {
+    // Two entrypoints may EACH carry a handler type; a run walks only one.
+    // (User graphs cannot register handlers, so assert via the reserved
+    // system gate instead: the validator rejects the system type first,
+    // proving the walk covers entrypoint blocks.)
+    const sysEp = {
+      id: "relay",
+      trigger: { kind: "manual" },
+      blocks: [{ id: "fx", type: "system.slack_thread_relay", config: {} }],
+    };
+    expect(() => validateDefinition(withEntrypoints([sysEp]), { kind: "user" })).toThrow(
+      /reserved for built-in automations/,
+    );
   });
 });

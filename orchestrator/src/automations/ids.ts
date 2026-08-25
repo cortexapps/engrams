@@ -3,11 +3,21 @@
  * here imports back into them.
  */
 
-export function automationRunId(automationId: string, deliveryKey: string): string {
+import { MAIN_ENTRYPOINT_ID } from "./engine/definition.ts";
+
+export function automationRunId(
+  automationId: string,
+  deliveryKey: string,
+  entrypointId: string = MAIN_ENTRYPOINT_ID,
+): string {
   // The run id IS the DBOS workflow id. DBOS treats workflowID as the durable
   // execution identity: starting an existing running or terminal id returns
-  // its handle and never re-executes the body.
-  return `autorun:${automationId}:${deliveryKey}`;
+  // its handle and never re-executes the body. The main entrypoint keeps the
+  // historical two-part shape so pre-D9 ids never churn; an extra entrypoint
+  // adds its id, because the same delivery may open one run per entrypoint.
+  return entrypointId === MAIN_ENTRYPOINT_ID
+    ? `autorun:${automationId}:${deliveryKey}`
+    : `autorun:${automationId}:${entrypointId}:${deliveryKey}`;
 }
 
 /** The one place the cron delivery-key format lives. The scheduler's workflow

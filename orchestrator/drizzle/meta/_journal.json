@@ -589,6 +589,13 @@
       "when": 1788200000000,
       "tag": "0083_automation_state",
       "breakpoints": true
+    },
+    {
+      "idx": 84,
+      "version": "7",
+      "when": 1788300000000,
+      "tag": "0084_entrypoints",
+      "breakpoints": true
     }
   ]
 }

@@ -28,6 +28,7 @@ function builtin() {
       version: 2,
       trigger: { kind: "integration", provider: "github", connectionId: "c", eventKeys: ["pull_request.opened"] },
       blocks: [],
+      entrypoints: [],
       inputsSchema: [],
       settings: { concurrency: { keyTemplate: "${{ event.raw.pull_request.html_url }}", policy: "supersede" }, endSessionsOnFinish: true },
       createdByUserId: null,
@@ -40,6 +41,7 @@ function originalRun(): AutomationRunRow {
   return {
     id: "autorun:b1:github:d1",
     automationId: "b1",
+    entrypointId: "main",
     version: 2,
     trigger: {
       source: "integration",

@@ -64,6 +64,8 @@ function makeHarness(
     stateEntries?: Record<string, { value: unknown; version: number; writer: string }>;
     /** Leave deps.state undefined (the unavailable path). */
     noStateStore?: boolean;
+    /** D9: the entrypoint recorded in the snapshot. */
+    entrypointId?: string;
     /** Session bindings visible to adoptSession/getSessionBinding:
      * sessionId -> {automationId, runId, ownerTerminal}. */
     bindings?: Record<string, { automationId: string; runId: string; ownerTerminal: boolean }>;
@@ -105,6 +107,7 @@ function makeHarness(
     aliases: [],
     startedAtMs: clock,
     ...(options.dryRun ? { dryRun: true } : {}),
+    ...(options.entrypointId !== undefined ? { entrypointId: options.entrypointId } : {}),
   };
 
   const store: EngineRunStore = {
@@ -1395,5 +1398,46 @@ describe("session adoption + session_status (ADR 0119 D11)", () => {
     expect(result.status).toBe("completed");
     expect(h.adopted).toEqual([]);
     expect(h.prompts).toEqual([]);
+  });
+});
+
+describe("entrypoint walks (ADR 0119 D9)", () => {
+  const twoWays = (): AutomationDefinition => ({
+    ...makeDefinition([
+      { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+    ]),
+    entrypoints: [
+      {
+        id: "sweep",
+        trigger: { kind: "manual" },
+        blocks: [{ id: "note", type: "state_set", config: { key: "swept", value: true } }],
+      },
+    ],
+  });
+
+  test("a run with an entrypointId walks ONLY that entrypoint's blocks", async () => {
+    const h = makeHarness(twoWays(), { entrypointId: "sweep" });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.created).toEqual([]); // main's create_session never ran
+    expect(h.state.get("swept")?.value).toBe(true);
+    expect(
+      h.stepRecords.filter((r) => r.record.status === "succeeded").map((r) => r.framePath),
+    ).toEqual(["note"]);
+  });
+
+  test("no entrypointId (an old checkpointed snapshot) walks main", async () => {
+    const h = makeHarness(twoWays());
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.created).toEqual(["s-launch"]);
+    expect(h.state.size).toBe(0);
+  });
+
+  test("an entrypoint missing from the pinned version fails loudly", async () => {
+    const h = makeHarness(twoWays(), { entrypointId: "renamed_away" });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("renamed_away");
   });
 });

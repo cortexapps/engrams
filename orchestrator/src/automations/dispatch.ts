@@ -26,6 +26,12 @@ import {
   inboxKeys,
   type AutomationSender,
 } from "./engine/inbox.ts";
+import {
+  entrypointsOf,
+  MAIN_ENTRYPOINT_ID,
+  type AutomationEntrypoint,
+  type TriggerSpec,
+} from "./engine/definition.ts";
 import { automationRunWorkflow, type AutomationRunWorkflowInput } from "../workflows/automation-run.ts";
 import { matchesWebhookFilter } from "./webhook.ts";
 
@@ -88,6 +94,10 @@ export interface AdmitRunInput {
   target: DispatchTarget;
   runId: string;
   deliveryKey: string;
+  /** D9: the matched entrypoint. Default: the main entrypoint. Admission
+   * reads the TRIGGER from here (continueOnly lives per entrypoint) and
+   * stamps the id on the run row. */
+  entrypoint?: { id: string; trigger: TriggerSpec };
   trigger: AutomationRunTrigger;
   scheduledFor: Date | null;
   /** Editor DryRun: the run row is flagged and integration actions stub. */
@@ -206,12 +216,17 @@ export async function admitAutomationRun(
   const { target, runId, deliveryKey, trigger } = input;
   const automationId = target.automation.id;
   const concurrency = target.definition.settings.concurrency;
+  const entrypoint = input.entrypoint ?? {
+    id: MAIN_ENTRYPOINT_ID,
+    trigger: target.definition.trigger,
+  };
 
   const startRun = async (concurrencyKey: string | null): Promise<void> => {
     await deps.store.insertRun({
       id: runId,
       automationId,
       version: target.automation.currentVersion,
+      entrypointId: entrypoint.id,
       trigger,
       deliveryKey,
       concurrencyKey,
@@ -250,7 +265,7 @@ export async function admitAutomationRun(
   // channel continues the thread the bot was mentioned in, and a reply in
   // any other thread is dropped here without a run row (validation pins
   // continueOnly to policy join).
-  const triggerSpec = target.definition.trigger;
+  const triggerSpec = entrypoint.trigger;
   if (
     triggerSpec.kind === "integration" &&
     trigger.eventKey !== undefined &&
@@ -274,6 +289,7 @@ export async function admitAutomationRun(
         id: runId,
         automationId,
         version: target.automation.currentVersion,
+        entrypointId: entrypoint.id,
         trigger,
         deliveryKey,
         concurrencyKey: key,
@@ -287,6 +303,7 @@ export async function admitAutomationRun(
         id: runId,
         automationId,
         version: target.automation.currentVersion,
+        entrypointId: entrypoint.id,
         trigger,
         deliveryKey,
         concurrencyKey: key,
@@ -305,6 +322,7 @@ export async function admitAutomationRun(
           id: runId,
           automationId,
           version: target.automation.currentVersion,
+          entrypointId: entrypoint.id,
           trigger,
           deliveryKey,
           concurrencyKey: key,
@@ -506,7 +524,7 @@ export async function dispatchIntegrationEvent(
 
   const targets = (
     await store.listEnabledForIntegrationTrigger(input.provider, input.connectionId)
-  ).filter((target) => {
+  ).flatMap((target) => {
     // A built-in's kill switch must stop its TRIGGER path too, not only the
     // legacy route's fallback: otherwise a flagged repo/channel is served by
     // both brains at once (the legacy graph via the route, the built-in via
@@ -516,20 +534,25 @@ export async function dispatchIntegrationEvent(
       target.automation.builtinKey !== null &&
       disabledBuiltins.has(target.automation.builtinKey)
     ) {
-      return false;
+      return [];
     }
-    const trigger = target.definition.trigger;
-    if (trigger.kind !== "integration") return false;
-    return matchesIntegrationTrigger(
-      trigger,
-      {
-        provider: input.provider,
-        connectionId: input.connectionId,
-        eventKey: input.eventKey,
-        ...(input.scopeValue !== undefined ? { scopeValue: input.scopeValue } : {}),
-      },
-      (key) => scopeValuesFromInput(target.automation.inputs, key),
-    );
+    // D9: a delivery matches per ENTRYPOINT — the same event may open (or
+    // join) one run for each entrypoint whose trigger matches it.
+    return entrypointsOf(target.definition).flatMap((entrypoint) => {
+      const trigger = entrypoint.trigger;
+      if (trigger.kind !== "integration") return [];
+      const matched = matchesIntegrationTrigger(
+        trigger,
+        {
+          provider: input.provider,
+          connectionId: input.connectionId,
+          eventKey: input.eventKey,
+          ...(input.scopeValue !== undefined ? { scopeValue: input.scopeValue } : {}),
+        },
+        (key) => scopeValuesFromInput(target.automation.inputs, key),
+      );
+      return matched ? [{ target, entrypoint }] : [];
+    });
   });
 
   const result: DispatchIntegrationResult = {
@@ -548,13 +571,14 @@ export async function dispatchIntegrationEvent(
   // the provider's delivery (it retries; the ledger and the run id dedupe the
   // targets that already succeeded).
   const failures: Array<{ automationId: string; error: unknown }> = [];
-  for (const target of targets) {
+  for (const { target, entrypoint } of targets) {
     const deliveryKey = `${input.provider}:${input.deliveryId}`;
     try {
       const outcome = await admitAutomationRun(
         {
           target,
-          runId: automationRunId(target.automation.id, deliveryKey),
+          runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id),
+          entrypoint: { id: entrypoint.id, trigger: entrypoint.trigger },
           deliveryKey,
           trigger: {
             source: "integration",

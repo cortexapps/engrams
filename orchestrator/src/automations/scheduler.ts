@@ -45,8 +45,9 @@ export interface AutomationSchedulerTickResult {
 export function automationCronWorkflowId(
   automationId: string,
   scheduledFor: Date,
+  entrypointId?: string,
 ): string {
-  return automationRunId(automationId, cronDeliveryKey(scheduledFor));
+  return automationRunId(automationId, cronDeliveryKey(scheduledFor), entrypointId);
 }
 
 export function nextCronOccurrence(
@@ -89,11 +90,16 @@ export async function runSchedulerTick(
     const automation = dueAutomation.automation;
     try {
       const scheduledFor = dueAutomation.nextFireAt;
-      const workflowId = automationCronWorkflowId(automation.id, scheduledFor);
+      const workflowId = automationCronWorkflowId(
+        automation.id,
+        scheduledFor,
+        dueAutomation.entrypointId,
+      );
       const claim = await deps.store.claimCronOccurrence({
         runId: workflowId,
         automationId: automation.id,
         version: automation.currentVersion,
+        entrypointId: dueAutomation.entrypointId,
         scheduledFor,
         leaseOwner: deps.owner,
         leaseExpiresAt: new Date(now.getTime() + AUTOMATION_LEASE_TTL_MS),
