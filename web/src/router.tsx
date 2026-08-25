@@ -65,6 +65,7 @@ import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
 import { AutomationsList } from "./pages/settings/automations/AutomationsList";
+import { ComposePage } from "./pages/settings/automations/ComposePage";
 import {
   AutomationEditor,
   isEditorTab,
@@ -482,9 +483,17 @@ const automationsRoute = createRoute({
   beforeLoad: requireAdmin,
   component: AutomationsList,
 });
+/** Builder v2: "New automation" lands on the plain-English composer; the
+ * blank editor lives at /new/manual (the "build by hand" escape hatch). */
 const automationsNewRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "automations/new",
+  beforeLoad: requireAdmin,
+  component: ComposePage,
+});
+const automationsNewManualRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "automations/new/manual",
   beforeLoad: requireAdmin,
   component: () => <AutomationEditor mode="create" />,
 });
@@ -567,6 +576,7 @@ export const routeTree = rootRoute.addChildren([
       profileEditRoute,
       automationsRoute,
       automationsNewRoute,
+      automationsNewManualRoute,
       automationEditRoute,
       automationRunRoute,
     ]),

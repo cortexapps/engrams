@@ -24,7 +24,17 @@ import {
 } from "@/gen/engram/app/v1/automation-WebhookRegistrationService_connectquery";
 
 export function useEditorAutomation(id: string | undefined) {
-  return useQuery(getAutomation, { lookup: { case: "id", value: id ?? "" } }, { enabled: !!id });
+  return useQuery(
+    getAutomation,
+    { lookup: { case: "id", value: id ?? "" } },
+    {
+      enabled: !!id,
+      // Builder v2: while a drafting agent is bound, poll so its saved
+      // versions land in the editor live (SSE is a later upgrade).
+      refetchInterval: (query) => (query.state.data?.automation?.draftSessionId ? 2_500 : false),
+      refetchIntervalInBackground: false,
+    },
+  );
 }
 
 export function useEventCatalog(provider: string | undefined) {

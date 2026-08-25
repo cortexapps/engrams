@@ -105,6 +105,8 @@ export interface TaskComposerProps {
   submitTestId?: string;
   ariaLabel?: string;
   placeholder?: string;
+  /** Seed the (uncontrolled) prompt; remount with a new `key` to re-seed. */
+  initialPrompt?: string;
   uploads?: TaskComposerUploads;
   /**
    * Fold the session plumbing (harness, route, model, effort, the reachable-
@@ -129,6 +131,7 @@ export function TaskComposer({
   submitTestId,
   ariaLabel = "Task",
   placeholder = "Fix the flaky billing-gateway integration test and open a PR.",
+  initialPrompt,
   uploads,
   quiet = false,
 }: TaskComposerProps) {
@@ -153,7 +156,7 @@ export function TaskComposer({
   const profiles = profilesData?.profiles ?? [];
   const views = useMemo(() => catalogToViews(catalog?.providers ?? []), [catalog]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState("");
+  const [prompt, setPrompt] = useState(initialPrompt ?? "");
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [harnessOverride, setHarnessOverride] = useState<HarnessOverride>(EMPTY_OVERRIDE);
 
