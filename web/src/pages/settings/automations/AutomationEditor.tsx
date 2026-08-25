@@ -188,8 +188,18 @@ export function AutomationEditor({
     const key = `${automation.id}:${automation.currentVersion}:${automation.blockOverridesJson}`;
     if (key === loadedVersion) return;
     if (loadedVersion !== null && userDirty && loadedVersion.startsWith(`${automation.id}:`)) {
-      setStaleVersion(key);
-      return;
+      // The arriving row may BE the user's own just-committed save (the
+      // refetch after SaveVersion/SetBlockOverrides/UpdateMeta): when it
+      // matches what is on screen, adopting is visually a no-op and resets
+      // the baseline. Only a version that DIFFERS from the screen banners.
+      const matchesScreen =
+        automation.name === name &&
+        automation.description === description &&
+        JSON.stringify(comparable(effective)) === JSON.stringify(comparable(draft));
+      if (!matchesScreen) {
+        setStaleVersion(key);
+        return;
+      }
     }
     setLoadedVersion(key);
     setName(automation.name);

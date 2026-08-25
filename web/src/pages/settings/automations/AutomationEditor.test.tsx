@@ -204,6 +204,70 @@ describe("AutomationEditor", () => {
     );
   });
 
+  it("drafting (Builder v2): the user's own save never banners — the matching version adopts", async () => {
+    const base = { ...automation("user"), draftSessionId: "draft-sess-1" };
+    automationHolder.value = { automation: base };
+    const view = render(<AutomationEditor mode="edit" />);
+
+    // The user edits...
+    fireEvent.click(screen.getByTestId("block-row-finder"));
+    const prompt = screen.getByTestId("field-promptTemplate").querySelector("textarea")!;
+    fireEvent.change(prompt, { target: { value: "My saved edit." } });
+
+    // ...saves, and the refetch brings back v2 EQUAL to the screen state.
+    const savedDef = {
+      ...definition,
+      blocks: [
+        {
+          ...definition.blocks[0]!,
+          config: { ...definition.blocks[0]!.config, promptTemplate: "My saved edit." },
+        },
+      ],
+    };
+    automationHolder.value = {
+      automation: {
+        ...base,
+        currentVersion: 2,
+        version: {
+          automationId: "x",
+          number: 2,
+          definitionJson: JSON.stringify(savedDef),
+          createdAt: "",
+        },
+      },
+    };
+    view.rerender(<AutomationEditor mode="edit" />);
+    expect(screen.queryByTestId("draft-stale-banner")).toBeNull();
+
+    // The baseline advanced: a LATER agent version now adopts silently.
+    const agentDef = {
+      ...savedDef,
+      blocks: [
+        {
+          ...savedDef.blocks[0]!,
+          config: { ...savedDef.blocks[0]!.config, promptTemplate: "Agent v3." },
+        },
+      ],
+    };
+    automationHolder.value = {
+      automation: {
+        ...base,
+        currentVersion: 3,
+        version: {
+          automationId: "x",
+          number: 3,
+          definitionJson: JSON.stringify(agentDef),
+          createdAt: "",
+        },
+      },
+    };
+    view.rerender(<AutomationEditor mode="edit" />);
+    expect(screen.queryByTestId("draft-stale-banner")).toBeNull();
+    expect(screen.getByTestId("field-promptTemplate").querySelector("textarea")!.value).toBe(
+      "Agent v3.",
+    );
+  });
+
   it("entrypoint bar (D9): switching edits the extra entrypoint; save keeps main untouched", async () => {
     const withEp = {
       ...definition,
