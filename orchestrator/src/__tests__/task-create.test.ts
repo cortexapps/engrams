@@ -1337,7 +1337,7 @@ function recordingDb(
   records: Record<string, unknown>[],
   throwOnTx = false,
   failInsertAt?: number,
-  opts: { deletes?: string[]; failOnDelete?: boolean } = {},
+  opts: { deletes?: string[]; failOnDelete?: boolean; updates?: Record<string, unknown>[] } = {},
 ): Db {
   let insertCount = 0;
   return {
@@ -1350,6 +1350,13 @@ function recordingDb(
             if (insertCount === failInsertAt) throw new Error("insert boom");
             records.push(v);
           },
+        }),
+        update: () => ({
+          set: (v: Record<string, unknown>) => ({
+            where: async () => {
+              opts.updates?.push(v);
+            },
+          }),
         }),
         delete: (table: { _?: unknown }) => ({
           where: async () => {
@@ -1765,6 +1772,29 @@ describe("createTaskWithSession", () => {
 });
 
 describe("createSessionForExistingTask", () => {
+  test("stamps a launch-policy snapshot on the pre-existing task (spawn precondition)", async () => {
+    const sessions = fakeSessions();
+    const records: Record<string, unknown>[] = [];
+    const updates: Record<string, unknown>[] = [];
+    await createSessionForExistingTask(
+      createDeps(sessions, recordingDb(records, false, undefined, { updates })),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "primary",
+        integrationPrincipalId: "automation:nightly",
+      },
+    );
+    // The task pre-exists (never went through createTaskWithSession), so the
+    // session compile stamps the frozen launch policy — this is what lets an
+    // automation-owned session spawn children.
+    const policy = updates[0]?.["launchPolicy"] as
+      | { version: number; profileId: string; imageUri: string }
+      | undefined;
+    expect(policy).toBeDefined();
+    expect(policy).toMatchObject({ version: 1, profileId: "p1" });
+  });
+
   test("stamps an explicit automation principal into the integration snapshot", async () => {
     const sessions = fakeSessions();
     const records: Record<string, unknown>[] = [];

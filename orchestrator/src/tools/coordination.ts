@@ -212,10 +212,15 @@ async function compileChildInput(
   const policy = parent.launchPolicy;
   if (!policy)
     throw new Error("tasks created before launch-policy snapshots cannot spawn children");
-  if (!parent.createdByUserId) throw new Error("sub-session spawning requires an owning user");
+  // An automation-owned parent has no human owner; its children compile the
+  // programmatic (org-credential) path — ADR 0119's invariant that
+  // unattended sessions never carry human credentials extends to spawns.
+  // The frozen policy already stamped org authority for such a parent (no
+  // oauth_user mint sources), so no user seam below would fire anyway.
+  const ownerId = parent.createdByUserId;
   const db = getDb();
   const secrets = makeUserSecretStore(db);
-  const identity = await makeUserIdentityStore(db).getIdentity(parent.createdByUserId);
+  const identity = ownerId ? await makeUserIdentityStore(db).getIdentity(ownerId) : null;
   // ADR 0115: the child ships the parent's FROZEN policy, so the user-scoped
   // gate must follow what that policy actually stamped — not the profile
   // toggle. A service-account parent compiled org authority (no `oauth_user`
@@ -273,26 +278,30 @@ async function compileChildInput(
       connectors: { list: () => makeConnectorStore(db).list() },
       harnessCatalog: harnessCatalog as unknown as HarnessCatalogClient,
       toolRegistry: productionTools,
-      resolveUserToken: (envVar) => secrets.get(parent.createdByUserId!, envVar),
-      resolveAllUserTokens: () => secrets.getAll(parent.createdByUserId!),
-      oauthSubject: { kind: OauthSubjectKind.USER, id: parent.createdByUserId },
-      hasOAuthCredential: async (provider) => {
-        const response = await oauthCredential.listCredentials({
-          subject: { kind: OauthSubjectKind.USER, id: parent.createdByUserId! },
-        });
-        return response.credentials.some(
-          (credential) => credential.provider === provider && credential.connected,
-        );
-      },
-      listUserConnectorCredentials: async () => {
-        const response = await oauthCredential.listCredentials({
-          subject: { kind: OauthSubjectKind.USER_CONNECTOR, id: parent.createdByUserId! },
-        });
-        return response.credentials.map((credential) => ({
-          provider: credential.provider,
-          status: credential.status,
-        }));
-      },
+      resolveUserToken: (envVar) => (ownerId ? secrets.get(ownerId, envVar) : Promise.resolve(null)),
+      resolveAllUserTokens: () => (ownerId ? secrets.getAll(ownerId) : Promise.resolve({})),
+      ...(ownerId
+        ? {
+            oauthSubject: { kind: OauthSubjectKind.USER, id: ownerId },
+            hasOAuthCredential: async (provider: string) => {
+              const response = await oauthCredential.listCredentials({
+                subject: { kind: OauthSubjectKind.USER, id: ownerId },
+              });
+              return response.credentials.some(
+                (credential) => credential.provider === provider && credential.connected,
+              );
+            },
+            listUserConnectorCredentials: async () => {
+              const response = await oauthCredential.listCredentials({
+                subject: { kind: OauthSubjectKind.USER_CONNECTOR, id: ownerId },
+              });
+              return response.credentials.map((credential) => ({
+                provider: credential.provider,
+                status: credential.status,
+              }));
+            },
+          }
+        : {}),
       orgSecret,
       connections: snapshotConnectionStore(policy),
     },
@@ -301,6 +310,7 @@ async function compileChildInput(
       ...(args.model_override ? { model: args.model_override } : {}),
       ...(args.effort_override ? { effort: args.effort_override } : {}),
       ...(identity ? { owner: identity } : {}),
+      ...(ownerId ? {} : { programmatic: true }),
       excludeHumanInteractionTools: true,
     },
   );

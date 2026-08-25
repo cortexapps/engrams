@@ -109,7 +109,7 @@ export function draftPatterns(): Record<string, unknown> {
     ],
     delegation: [
       "A coordinator session can spawn and manage its own sub-sessions with the session-side coordination tools (spawn_session, send_session_message, read_session, wait_sessions) - good for a manager/worker shape.",
-      "Those tools require the session to have an OWNING USER: set ownerUserId on the coordinator's create_session block (automation sessions default to the org principal, which cannot spawn).",
+      "Automation-owned coordinators spawn on ORG authority: children inherit the parent's frozen launch policy and programmatic credentials — no human owner or ownerUserId needed.",
       "The engine-side alternative - the run creates sessions with create_session blocks - is more auditable in the run ledger; prefer it when the set of workers is decided by the workflow, and spawn_session when the coordinating agent decides dynamically.",
     ],
     cron_heartbeat: [
