@@ -344,6 +344,10 @@ pub async fn host_lost_straggler_sweep(
 /// long to bind).
 pub const UNBOUND_ENTOMB_GRACE_SECS: u64 = 30;
 
+/// engrams#1378: `running` is the host's PRESENCE set — running VMs ∪ the
+/// attributed NBD-residue sandboxes from the heartbeat — so a tombstone is
+/// acked by absence only when the VM AND its kernel binding are gone, and
+/// the A5 entomb arm mints the destroy order for residue no session binds.
 pub async fn process_sandbox_tombstones(
     meta: &Arc<dyn MetadataStore>,
     host_id: HostId,

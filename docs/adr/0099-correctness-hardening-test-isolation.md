@@ -321,6 +321,17 @@ the `soft_invariant` field). Per-site dispositions:
    sever; THIS is the reconcile finding a device it cannot account for at all.
    Should stay at zero — a firing means a survivor's records were lost upstream
    and an operator/runbook must reconcile the device.
+   **Amended 2026-08-25 (engrams#1378):** the site narrows to UNATTRIBUTED
+   devices. The 2026-08-25 firing was a destroy that raced a pod roll (FC
+   killed, NBD disconnect never ran, tombstone acked by VM-only absence) — a
+   terminal leftover indistinguishable, at one scan instant, from the gap-A
+   survivor the site was built for. Durable owner records now attribute such
+   devices, they classify `ResidueAwaitingTombstone`, and the coordinator's
+   residue-aware tombstone flow (ADR 0116 A-D5 amendment) completes the
+   teardown — no alert, no operator. A firing therefore again means what the
+   site always intended: a connected device NOTHING accounts for — owner
+   record, coord list, chain heads, or live FC — which after the one-roll
+   owner-record migration window is corruption-class by construction.
 
 ### H7 / H8 — Dispositions for the known flaky tests
 

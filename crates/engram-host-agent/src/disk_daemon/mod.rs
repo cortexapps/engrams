@@ -39,6 +39,7 @@ pub mod backend;
 pub mod flush_scheduler;
 pub mod live_manifest_publisher;
 pub mod nbd;
+pub mod owners;
 pub mod slot;
 pub mod spool;
 
@@ -72,5 +73,6 @@ pub use nbd_kernel::HostNbdKernel;
 pub use runtime::{
     attach_manifest, classify_startup_inventory, device_has_live_holder,
     enter_shutdown_abandon_mode, flush_block_device_cache, reattach, reattach_manifest,
-    recover_stuck_nbd_devices, spawn, NbdHandle, NbdRuntimeError, NbdSandboxState, NBD_BLOCK_SIZE,
+    recover_stuck_nbd_devices, spawn, NbdHandle, NbdRuntimeError, NbdSandboxState, StartupRecords,
+    NBD_BLOCK_SIZE,
 };
