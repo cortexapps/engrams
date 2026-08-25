@@ -271,9 +271,15 @@ describe("automation draft tools", () => {
     expect(profiles.content[0]?.id).toBe("prof-1");
 
     const org = (await call(h.deps, "automation_read", { part: "org_automations" })) as {
-      content: Array<{ name: string; trigger: { kind: string } }>;
+      content: Array<{ name: string; definition: AutomationDefinition }>;
     };
-    expect(org.content[0]).toMatchObject({ name: "Existing", trigger: { kind: "cron" } });
+    expect(org.content[0]).toMatchObject({
+      name: "Existing",
+      definition: { engine: 1, trigger: { kind: "cron" } },
+    });
+    // The FULL graph rides along, not just the trigger.
+    expect(Array.isArray(org.content[0]?.definition.blocks)).toBe(true);
+    expect(org.content[0]?.definition.settings).toBeDefined();
   });
 
   test("automation_test renders the draft against a payload, side-effect free", async () => {
