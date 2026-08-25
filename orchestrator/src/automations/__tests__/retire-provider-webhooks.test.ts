@@ -49,6 +49,7 @@ function meta(id: string, kind: "user" | "builtin" = "user"): AutomationMetaRow 
     createdByUserId: "admin",
     nextFireAt: null,
     lastFiredAt: null,
+    draftSessionId: null,
     createdAt: NOW,
     updatedAt: NOW,
     archivedAt: null,

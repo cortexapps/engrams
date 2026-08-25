@@ -1419,6 +1419,11 @@ export const automation = pgTable(
     // query and advance a claimed cron occurrence without rewriting config.
     nextFireAt: timestamp("next_fire_at", { withTimezone: true }),
     lastFiredAt: timestamp("last_fired_at", { withTimezone: true }),
+    /** The AI drafting session bound to this automation (Builder v2). A
+     * logical session reference, no FK; null = no draft in progress. The
+     * binding is the draft tools' authz: a tool call may only write to the
+     * automation whose draft_session_id equals its own session. */
+    draftSessionId: text("draft_session_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
@@ -1428,6 +1433,7 @@ export const automation = pgTable(
   },
   (t) => [
     index("automation_due_idx").on(t.enabled, t.nextFireAt),
+    index("automation_draft_session_idx").on(t.draftSessionId),
     uniqueIndex("automation_builtin_key_unique")
       .on(t.builtinKey)
       .where(sql`builtin_key is not null`),

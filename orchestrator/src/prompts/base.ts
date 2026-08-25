@@ -1,5 +1,6 @@
 import { PAPERCUT_SYSTEM_PROMPT } from "../tools/papercut-prompt.ts";
 import { specModeSystemPrompt, type SpecPromptContext } from "./spec-mode.ts";
+import { AUTOMATION_DRAFT_SYSTEM_PROMPT } from "./automation-draft.ts";
 
 /** The agent's words are a product surface: they land in Slack threads, PR
  *  descriptions, and commit messages, read by non-native speakers, by
@@ -27,5 +28,6 @@ export function systemPromptForTaskType(taskType?: string, spec?: SpecPromptCont
   return [
     BASE_SYSTEM_PROMPT,
     ...(taskType === "spec" ? [specModeSystemPrompt(spec)] : []),
+    ...(taskType === "automation_draft" ? [AUTOMATION_DRAFT_SYSTEM_PROMPT] : []),
   ].join("\n\n");
 }

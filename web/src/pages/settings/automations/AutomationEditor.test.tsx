@@ -20,6 +20,11 @@ const duplicate = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id:
 
 // 3.5: the header's DryRun button uses a connect-query mutation; this suite
 // renders without a QueryClient, so stub it like every other hook here.
+vi.mock("./DraftRail", () => ({
+  DraftRail: ({ sessionId }: { sessionId: string }) => (
+    <div data-testid="draft-rail">{sessionId}</div>
+  ),
+}));
 vi.mock("@/hooks/useAutomationCode", () => ({
   useDryRun: () => ({ mutate: vi.fn(), isPending: false }),
 }));
@@ -121,6 +126,146 @@ describe("AutomationEditor", () => {
     updateMeta.mockClear();
     navigate.mockClear();
     searchHolder.value = {};
+  });
+
+  it("drafting (Builder v2): rail when bound; agent versions adopt when clean, banner when dirty", async () => {
+    const v2 = {
+      ...definition,
+      blocks: [
+        {
+          id: "finder",
+          type: "create_session",
+          tunable: ["promptTemplate"],
+          config: { profileId: "pr_reviewer", promptTemplate: "Agent v2.", role: "finder" },
+        },
+      ],
+    };
+    const base = {
+      ...automation("user"),
+      draftSessionId: "draft-sess-1",
+    };
+    automationHolder.value = { automation: base };
+    const view = render(<AutomationEditor mode="edit" />);
+    expect(screen.getByTestId("draft-rail").textContent).toBe("draft-sess-1");
+    expect(screen.queryByTestId("draft-stale-banner")).toBeNull();
+
+    // CLEAN editor: the agent saves v2 → the editor adopts silently.
+    automationHolder.value = {
+      automation: {
+        ...base,
+        currentVersion: 2,
+        version: {
+          automationId: "x",
+          number: 2,
+          definitionJson: JSON.stringify(v2),
+          createdAt: "",
+        },
+      },
+    };
+    view.rerender(<AutomationEditor mode="edit" />);
+    fireEvent.click(screen.getByTestId("block-row-finder"));
+    expect(screen.getByTestId("field-promptTemplate").querySelector("textarea")!.value).toBe(
+      "Agent v2.",
+    );
+    expect(screen.queryByTestId("draft-stale-banner")).toBeNull();
+
+    // DIRTY editor: a local edit, then the agent saves v3 → banner, no clobber.
+    const prompt = screen.getByTestId("field-promptTemplate").querySelector("textarea")!;
+    fireEvent.change(prompt, { target: { value: "My local edit." } });
+    const v3 = {
+      ...v2,
+      blocks: [
+        { ...v2.blocks[0]!, config: { ...v2.blocks[0]!.config, promptTemplate: "Agent v3." } },
+      ],
+    };
+    automationHolder.value = {
+      automation: {
+        ...base,
+        currentVersion: 3,
+        version: {
+          automationId: "x",
+          number: 3,
+          definitionJson: JSON.stringify(v3),
+          createdAt: "",
+        },
+      },
+    };
+    view.rerender(<AutomationEditor mode="edit" />);
+    expect(screen.getByTestId("draft-stale-banner")).toBeTruthy();
+    expect(screen.getByTestId("field-promptTemplate").querySelector("textarea")!.value).toBe(
+      "My local edit.",
+    );
+
+    // Reload adopts the agent's version and clears the banner.
+    fireEvent.click(screen.getByRole("button", { name: /reload/i }));
+    expect(screen.queryByTestId("draft-stale-banner")).toBeNull();
+    expect(screen.getByTestId("field-promptTemplate").querySelector("textarea")!.value).toBe(
+      "Agent v3.",
+    );
+  });
+
+  it("drafting (Builder v2): the user's own save never banners — the matching version adopts", async () => {
+    const base = { ...automation("user"), draftSessionId: "draft-sess-1" };
+    automationHolder.value = { automation: base };
+    const view = render(<AutomationEditor mode="edit" />);
+
+    // The user edits...
+    fireEvent.click(screen.getByTestId("block-row-finder"));
+    const prompt = screen.getByTestId("field-promptTemplate").querySelector("textarea")!;
+    fireEvent.change(prompt, { target: { value: "My saved edit." } });
+
+    // ...saves, and the refetch brings back v2 EQUAL to the screen state.
+    const savedDef = {
+      ...definition,
+      blocks: [
+        {
+          ...definition.blocks[0]!,
+          config: { ...definition.blocks[0]!.config, promptTemplate: "My saved edit." },
+        },
+      ],
+    };
+    automationHolder.value = {
+      automation: {
+        ...base,
+        currentVersion: 2,
+        version: {
+          automationId: "x",
+          number: 2,
+          definitionJson: JSON.stringify(savedDef),
+          createdAt: "",
+        },
+      },
+    };
+    view.rerender(<AutomationEditor mode="edit" />);
+    expect(screen.queryByTestId("draft-stale-banner")).toBeNull();
+
+    // The baseline advanced: a LATER agent version now adopts silently.
+    const agentDef = {
+      ...savedDef,
+      blocks: [
+        {
+          ...savedDef.blocks[0]!,
+          config: { ...savedDef.blocks[0]!.config, promptTemplate: "Agent v3." },
+        },
+      ],
+    };
+    automationHolder.value = {
+      automation: {
+        ...base,
+        currentVersion: 3,
+        version: {
+          automationId: "x",
+          number: 3,
+          definitionJson: JSON.stringify(agentDef),
+          createdAt: "",
+        },
+      },
+    };
+    view.rerender(<AutomationEditor mode="edit" />);
+    expect(screen.queryByTestId("draft-stale-banner")).toBeNull();
+    expect(screen.getByTestId("field-promptTemplate").querySelector("textarea")!.value).toBe(
+      "Agent v3.",
+    );
   });
 
   it("entrypoint bar (D9): switching edits the extra entrypoint; save keeps main untouched", async () => {

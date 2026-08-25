@@ -54,6 +54,8 @@ export interface AutomationMetaRow {
   createdByUserId: string | null;
   nextFireAt: Date | null;
   lastFiredAt: Date | null;
+  /** The AI drafting session bound to this automation (Builder v2). */
+  draftSessionId: string | null;
   createdAt: Date;
   updatedAt: Date;
   archivedAt: Date | null;
@@ -92,6 +94,18 @@ export interface CreateAutomationInput {
   kind?: "user" | "builtin";
   builtinKey?: string | null;
   inputs?: Record<string, unknown>;
+  /** Fixed id for idempotent creates (DraftAutomation derives it from the
+   * caller's idempotency key). Default: a random uuid. */
+  id?: string;
+}
+
+/** saveVersion's in-transaction fence tripped: the row advanced past the
+ * expected version between the caller's read and the FOR UPDATE. */
+export class SaveVersionConflictError extends Error {
+  constructor(readonly currentVersion: number) {
+    super(`automation is at version ${currentVersion}`);
+    this.name = "SaveVersionConflictError";
+  }
 }
 
 export interface AutomationMetaPatch {
@@ -185,13 +199,23 @@ export interface AutomationStore {
     connectionId: string,
   ): Promise<DispatchTarget[]>;
   create(input: CreateAutomationInput, createdByUserId: string | null): Promise<AutomationRow>;
+  /** Bind (or clear) the AI drafting session (Builder v2). */
+  setDraftSession(automationId: string, sessionId: string | null): Promise<void>;
+  /** The automation a drafting session is bound to — the draft tools'
+   * authz lookup. Excludes archived rows. */
+  getByDraftSession(sessionId: string): Promise<AutomationRow | null>;
   /** Insert version current+1 and repoint the automation at it, in one
    * transaction. Returns null for a missing/archived automation. */
+  /** `opts.expectedVersion` makes the write conditional INSIDE the FOR
+   * UPDATE transaction (throws SaveVersionConflictError on mismatch) — the
+   * drafting agent's fence; a check outside the transaction is a
+   * check-then-act race against a concurrent human save. */
   saveVersion(
     automationId: string,
     definition: AutomationDefinition,
     createdByUserId: string | null,
     meta?: AutomationMetaPatch,
+    opts?: { expectedVersion?: number },
   ): Promise<AutomationRow | null>;
   updateMeta(id: string, patch: AutomationMetaPatch): Promise<AutomationRow | null>;
   setInputs(id: string, inputs: Record<string, unknown>): Promise<AutomationRow | null>;
@@ -396,6 +420,7 @@ function metaRow(row: typeof automationTable.$inferSelect): AutomationMetaRow {
     createdByUserId: row.createdByUserId ?? null,
     nextFireAt: row.nextFireAt ?? null,
     lastFiredAt: row.lastFiredAt ?? null,
+    draftSessionId: row.draftSessionId ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     archivedAt: row.archivedAt ?? null,
@@ -582,6 +607,27 @@ export function makeAutomationStore(
       return row ? fullView(metaRow(row)) : null;
     },
 
+    async setDraftSession(automationId, sessionId) {
+      await db
+        .update(automationTable)
+        .set({ draftSessionId: sessionId, updatedAt: new Date() })
+        .where(eq(automationTable.id, automationId));
+    },
+
+    async getByDraftSession(sessionId) {
+      const [row] = await db
+        .select()
+        .from(automationTable)
+        .where(
+          and(
+            eq(automationTable.draftSessionId, sessionId),
+            isNull(automationTable.archivedAt),
+          ),
+        )
+        .limit(1);
+      return row ? fullView(metaRow(row)) : null;
+    },
+
     async getActive(id) {
       const [row] = await db
         .select()
@@ -645,7 +691,7 @@ export function makeAutomationStore(
     },
 
     async create(input, createdByUserId) {
-      const id = crypto.randomUUID();
+      const id = input.id ?? crypto.randomUUID();
       const definition = input.definition;
       await db.transaction(async (tx) => {
         await tx.insert(automationTable).values({
@@ -677,7 +723,7 @@ export function makeAutomationStore(
       return row;
     },
 
-    async saveVersion(automationId, definition, createdByUserId, meta) {
+    async saveVersion(automationId, definition, createdByUserId, meta, opts) {
       const saved = await db.transaction(async (tx) => {
         const [existing] = await tx
           .select()
@@ -686,6 +732,12 @@ export function makeAutomationStore(
           .for("update")
           .limit(1);
         if (!existing) return false;
+        if (
+          opts?.expectedVersion !== undefined &&
+          existing.currentVersion !== opts.expectedVersion
+        ) {
+          throw new SaveVersionConflictError(existing.currentVersion);
+        }
         const nextVersion = existing.currentVersion + 1;
         await tx.insert(versionTable).values({
           automationId,

@@ -52,6 +52,7 @@ import { useAutomationTest } from "@/hooks/useAutomationTest";
 
 import { BuildTab } from "./build/BuildTab";
 import { EntrypointBar } from "./build/EntrypointBar";
+import { DraftRail } from "./DraftRail";
 import { TestPanel } from "./build/test/TestPanel";
 import { InputsTab } from "./inputs/InputsTab";
 import { DryRunButton } from "./build/DryRunButton";
@@ -121,17 +122,20 @@ export function AutomationEditor({
   const [errors, setErrors] = useState<BlockErrorRef[]>([]);
   const [loadedVersion, setLoadedVersion] = useState<string | null>(null);
 
-  // (Re)load the draft when the automation (or its version) changes.
-  useEffect(() => {
-    if (!automation) return;
-    const key = `${automation.id}:${automation.currentVersion}:${automation.blockOverridesJson}`;
-    if (key === loadedVersion) return;
-    setLoadedVersion(key);
-    setName(automation.name);
-    setDescription(automation.description);
-    setDraft(effective);
-    setErrors([]);
-  }, [automation, effective, loadedVersion]);
+  // Builder v2: the drafting agent saves versions while this editor is
+  // open. A clean editor adopts them silently (the canvas re-renders — the
+  // "assembling live" effect); a dirty one gets a banner instead of a
+  // clobber. `staleVersion` holds the not-yet-adopted key.
+  const [staleVersion, setStaleVersion] = useState<string | null>(null);
+  // What the editor LOADED (not the live row): the user-intent baseline.
+  // `dirty` below compares against the live effective definition (it drives
+  // Save), which flips the moment the agent lands a version — useless as an
+  // "has the user edited?" signal. This baseline only moves on load/adopt.
+  const [baseline, setBaseline] = useState<{
+    name: string;
+    description: string;
+    draftJson: string;
+  } | null>(null);
 
   const create = useCreateAutomationV2();
   const saveVersion = useSaveVersionV2();
@@ -152,6 +156,65 @@ export function AutomationEditor({
       (name !== automation.name ||
         description !== automation.description ||
         JSON.stringify(comparable(draft)) !== JSON.stringify(comparable(effective))));
+
+  const userDirty =
+    baseline !== null &&
+    (name !== baseline.name ||
+      description !== baseline.description ||
+      JSON.stringify(comparable(draft)) !== baseline.draftJson);
+
+  const adoptCurrent = () => {
+    if (!automation) return;
+    setLoadedVersion(
+      `${automation.id}:${automation.currentVersion}:${automation.blockOverridesJson}`,
+    );
+    setName(automation.name);
+    setDescription(automation.description);
+    setDraft(effective);
+    setBaseline({
+      name: automation.name,
+      description: automation.description,
+      draftJson: JSON.stringify(comparable(effective)),
+    });
+    setErrors([]);
+    setStaleVersion(null);
+  };
+
+  // (Re)load the draft when the automation (or its version) changes. A
+  // dirty editor is never clobbered: the change parks in `staleVersion`
+  // and the banner offers the reload.
+  useEffect(() => {
+    if (!automation) return;
+    const key = `${automation.id}:${automation.currentVersion}:${automation.blockOverridesJson}`;
+    if (key === loadedVersion) return;
+    if (loadedVersion !== null && userDirty && loadedVersion.startsWith(`${automation.id}:`)) {
+      // The arriving row may BE the user's own just-committed save (the
+      // refetch after SaveVersion/SetBlockOverrides/UpdateMeta): when it
+      // matches what is on screen, adopting is visually a no-op and resets
+      // the baseline. Only a version that DIFFERS from the screen banners.
+      const matchesScreen =
+        automation.name === name &&
+        automation.description === description &&
+        JSON.stringify(comparable(effective)) === JSON.stringify(comparable(draft));
+      if (!matchesScreen) {
+        setStaleVersion(key);
+        return;
+      }
+    }
+    setLoadedVersion(key);
+    setName(automation.name);
+    setDescription(automation.description);
+    setDraft(effective);
+    setBaseline({
+      name: automation.name,
+      description: automation.description,
+      draftJson: JSON.stringify(comparable(effective)),
+    });
+    setErrors([]);
+    setStaleVersion(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- userDirty is
+    // deliberately read, not depended on: only a KEY change re-evaluates.
+  }, [automation, effective, loadedVersion]);
 
   const setTab = (next: EditorTab) => {
     void navigate({
@@ -276,142 +339,160 @@ export function AutomationEditor({
   const panel = testPanel ?? (automation ? <TestPanel test={test} /> : null);
   const liveValues = variableValues ?? test.variableValues;
 
+  const draftSessionId = automation?.draftSessionId;
   return (
-    <div className="space-y-6" data-testid="automation-editor">
-      <PageHeading
-        title={mode === "create" ? "New automation" : name || "Automation"}
-        actions={
-          <div className="flex items-center gap-2">
-            {automation && (
-              <label className="flex items-center gap-2 text-sm">
-                <Switch
-                  checked={automation.enabled}
-                  disabled={setEnabled.isPending}
-                  onCheckedChange={(enabled) =>
-                    setEnabled.mutate({ id: automation.id, enabled }, { onError: fail })
-                  }
-                  aria-label="Enabled"
-                />
-                Enabled
-              </label>
-            )}
-            {builtin && (
+    <div className={draftSessionId ? "flex items-start gap-6" : undefined}>
+      {draftSessionId && <DraftRail sessionId={draftSessionId} />}
+      <div className="min-w-0 flex-1 space-y-6" data-testid="automation-editor">
+        <PageHeading
+          title={mode === "create" ? "New automation" : name || "Automation"}
+          actions={
+            <div className="flex items-center gap-2">
+              {automation && (
+                <label className="flex items-center gap-2 text-sm">
+                  <Switch
+                    checked={automation.enabled}
+                    disabled={setEnabled.isPending}
+                    onCheckedChange={(enabled) =>
+                      setEnabled.mutate({ id: automation.id, enabled }, { onError: fail })
+                    }
+                    aria-label="Enabled"
+                  />
+                  Enabled
+                </label>
+              )}
+              {builtin && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={onDuplicate}
+                  disabled={duplicate.isPending}
+                >
+                  <Copy className="size-4" aria-hidden /> Duplicate
+                </Button>
+              )}
+              {mode === "edit" &&
+                automation && (
+                  // A dry run executes the SAVED definition; unsaved edits would
+                  // mislead, so it waits for a clean editor.
+                  <DryRunButton
+                    automationId={automation.id}
+                    entrypointId={effectiveEntrypointId}
+                    disabled={dirty}
+                  />
+                )}
               <Button
                 type="button"
-                variant="outline"
-                onClick={onDuplicate}
-                disabled={duplicate.isPending}
+                onClick={save}
+                disabled={saving || !dirty}
+                data-testid="save-button"
               >
-                <Copy className="size-4" aria-hidden /> Duplicate
+                {mode === "create" ? "Create" : builtin ? "Save overrides" : "Save version"}
               </Button>
-            )}
-            {mode === "edit" &&
-              automation && (
-                // A dry run executes the SAVED definition; unsaved edits would
-                // mislead, so it waits for a clean editor.
-                <DryRunButton
-                  automationId={automation.id}
-                  entrypointId={effectiveEntrypointId}
-                  disabled={dirty}
-                />
-              )}
-            <Button
-              type="button"
-              onClick={save}
-              disabled={saving || !dirty}
-              data-testid="save-button"
-            >
-              {mode === "create" ? "Create" : builtin ? "Save overrides" : "Save version"}
+            </div>
+          }
+        />
+
+        {builtin && (
+          <div
+            className="bg-muted flex items-start gap-2 rounded-lg border p-3 text-sm"
+            data-testid="builtin-banner"
+          >
+            <Lock className="mt-0.5 size-4 shrink-0" aria-hidden />
+            <div>
+              <span className="font-medium">Built-in automation</span>
+              <Badge variant="secondary" className="ml-2">
+                {automation?.builtinKey}
+              </Badge>
+              <p className="text-muted-foreground mt-0.5">
+                Its blocks and wiring are fixed. Properties marked as editable, and the Inputs tab,
+                are yours to change; Duplicate makes a fully editable copy.
+              </p>
+            </div>
+          </div>
+        )}
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <Field data-invalid={nameError ? true : undefined}>
+            <FieldLabel htmlFor="automation-name">Name</FieldLabel>
+            <Input
+              id="automation-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              disabled={builtin}
+            />
+            {nameError && <FieldError>{nameError}</FieldError>}
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="automation-description">Description</FieldLabel>
+            <Input
+              id="automation-description"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              disabled={builtin}
+            />
+          </Field>
+        </div>
+
+        {staleVersion !== null && (
+          <div
+            className="border-instrument-caution/50 bg-instrument-caution/10 flex items-center gap-3 rounded-md border px-3 py-2 text-sm"
+            data-testid="draft-stale-banner"
+          >
+            <span className="min-w-0 flex-1">
+              The drafting agent saved a new version while you were editing. Reloading discards your
+              unsaved edits.
+            </span>
+            <Button type="button" size="sm" variant="outline" onClick={adoptCurrent}>
+              Reload
             </Button>
           </div>
-        }
-      />
-
-      {builtin && (
-        <div
-          className="bg-muted flex items-start gap-2 rounded-lg border p-3 text-sm"
-          data-testid="builtin-banner"
-        >
-          <Lock className="mt-0.5 size-4 shrink-0" aria-hidden />
-          <div>
-            <span className="font-medium">Built-in automation</span>
-            <Badge variant="secondary" className="ml-2">
-              {automation?.builtinKey}
-            </Badge>
-            <p className="text-muted-foreground mt-0.5">
-              Its blocks and wiring are fixed. Properties marked as editable, and the Inputs tab,
-              are yours to change; Duplicate makes a fully editable copy.
-            </p>
-          </div>
-        </div>
-      )}
-
-      <div className="grid gap-4 md:grid-cols-2">
-        <Field data-invalid={nameError ? true : undefined}>
-          <FieldLabel htmlFor="automation-name">Name</FieldLabel>
-          <Input
-            id="automation-name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            disabled={builtin}
-          />
-          {nameError && <FieldError>{nameError}</FieldError>}
-        </Field>
-        <Field>
-          <FieldLabel htmlFor="automation-description">Description</FieldLabel>
-          <Input
-            id="automation-description"
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            disabled={builtin}
-          />
-        </Field>
+        )}
+        <Tabs value={tab} onValueChange={(v) => setTab(v as EditorTab)}>
+          <TabsList>
+            <TabsTrigger value="build">Build</TabsTrigger>
+            <TabsTrigger value="inputs" disabled={mode === "create"}>
+              Inputs
+            </TabsTrigger>
+            <TabsTrigger value="runs" disabled={mode === "create"}>
+              Runs
+            </TabsTrigger>
+            <TabsTrigger value="settings" disabled={mode === "create"}>
+              Settings
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="build" className="space-y-3 pt-4">
+            <EntrypointBar
+              definition={draft}
+              selected={effectiveEntrypointId}
+              onSelect={setEntrypointId}
+              onAdd={(epId) => setDraft(addEntrypoint(draft, epId))}
+              onRemove={(epId) => setDraft(removeEntrypoint(draft, epId))}
+              locked={builtin}
+            />
+            <BuildTab
+              key={effectiveEntrypointId}
+              definition={projectEntrypoint(draft, effectiveEntrypointId)}
+              onChange={(next) => setDraft(mergeEntrypoint(draft, effectiveEntrypointId, next))}
+              builtin={builtin}
+              errors={errors}
+              triggerSummary={triggerSummary}
+              testPanel={panel}
+              variableValues={liveValues}
+              reservedBlockIds={blockIdsOutsideEntrypoint(draft, effectiveEntrypointId)}
+            />
+          </TabsContent>
+          <TabsContent value="inputs" className="pt-4">
+            {inputsTab ?? <InputsTab automationId={id} />}
+          </TabsContent>
+          <TabsContent value="runs" className="pt-4">
+            {runsTab ?? <Placeholder item="3.7 (Runs)" />}
+          </TabsContent>
+          <TabsContent value="settings" className="pt-4">
+            {settingsTab ?? <Placeholder item="3.8 (Settings)" />}
+          </TabsContent>
+        </Tabs>
       </div>
-
-      <Tabs value={tab} onValueChange={(v) => setTab(v as EditorTab)}>
-        <TabsList>
-          <TabsTrigger value="build">Build</TabsTrigger>
-          <TabsTrigger value="inputs" disabled={mode === "create"}>
-            Inputs
-          </TabsTrigger>
-          <TabsTrigger value="runs" disabled={mode === "create"}>
-            Runs
-          </TabsTrigger>
-          <TabsTrigger value="settings" disabled={mode === "create"}>
-            Settings
-          </TabsTrigger>
-        </TabsList>
-        <TabsContent value="build" className="space-y-3 pt-4">
-          <EntrypointBar
-            definition={draft}
-            selected={effectiveEntrypointId}
-            onSelect={setEntrypointId}
-            onAdd={(epId) => setDraft(addEntrypoint(draft, epId))}
-            onRemove={(epId) => setDraft(removeEntrypoint(draft, epId))}
-            locked={builtin}
-          />
-          <BuildTab
-            key={effectiveEntrypointId}
-            definition={projectEntrypoint(draft, effectiveEntrypointId)}
-            onChange={(next) => setDraft(mergeEntrypoint(draft, effectiveEntrypointId, next))}
-            builtin={builtin}
-            errors={errors}
-            triggerSummary={triggerSummary}
-            testPanel={panel}
-            variableValues={liveValues}
-            reservedBlockIds={blockIdsOutsideEntrypoint(draft, effectiveEntrypointId)}
-          />
-        </TabsContent>
-        <TabsContent value="inputs" className="pt-4">
-          {inputsTab ?? <InputsTab automationId={id} />}
-        </TabsContent>
-        <TabsContent value="runs" className="pt-4">
-          {runsTab ?? <Placeholder item="3.7 (Runs)" />}
-        </TabsContent>
-        <TabsContent value="settings" className="pt-4">
-          {settingsTab ?? <Placeholder item="3.8 (Settings)" />}
-        </TabsContent>
-      </Tabs>
     </div>
   );
 }

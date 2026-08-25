@@ -31,6 +31,7 @@ function meta(overrides: Partial<AutomationMetaRow> = {}): AutomationMetaRow {
     createdByUserId: "admin-1",
     nextFireAt: null,
     lastFiredAt: null,
+    draftSessionId: null,
     createdAt: RECEIVED_AT,
     updatedAt: RECEIVED_AT,
     archivedAt: null,

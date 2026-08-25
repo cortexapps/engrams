@@ -134,6 +134,16 @@ function fakeStore(seed?: {
       const a = automations.get(id);
       return a && !a.meta.archivedAt ? row(a) : null;
     },
+    async setDraftSession(automationId, sessionId) {
+      const a = automations.get(automationId);
+      if (a) a.meta.draftSessionId = sessionId;
+    },
+    async getByDraftSession(sessionId) {
+      const a = [...automations.values()].find(
+        (x) => x.meta.draftSessionId === sessionId && !x.meta.archivedAt,
+      );
+      return a ? row(a) : null;
+    },
     async getByBuiltinKey(key) {
       const a = [...automations.values()].find((x) => x.meta.builtinKey === key);
       return a ? row(a) : null;
@@ -153,7 +163,12 @@ function fakeStore(seed?: {
       return [];
     },
     async create(input: CreateAutomationInput, createdByUserId) {
-      const id = `automation-${++sequence}`;
+      const id = input.id ?? `automation-${++sequence}`;
+      if (automations.has(id)) {
+        const dup = new Error("duplicate key") as Error & { code: string };
+        dup.code = "23505";
+        throw dup;
+      }
       const meta: AutomationMetaRow = {
         id,
         name: input.name,
@@ -168,6 +183,7 @@ function fakeStore(seed?: {
         createdByUserId,
         nextFireAt: input.nextFireAt,
         lastFiredAt: null,
+        draftSessionId: null,
         createdAt: NOW,
         updatedAt: NOW,
         archivedAt: null,
@@ -435,6 +451,7 @@ function builtinStored(id = "builtin-1"): Stored {
       createdByUserId: null,
       nextFireAt: null,
       lastFiredAt: null,
+      draftSessionId: null,
       createdAt: NOW,
       updatedAt: NOW,
       archivedAt: null,
@@ -816,6 +833,43 @@ describe("AutomationService v2", () => {
     });
     const m = await automations.runNow({ automationId: manual.automation!.id });
     expect(deps.fake.runs.get(m.runId)?.scheduledFor).toBeNull();
+  });
+
+  test("DraftAutomation boots a drafting session bound to a fresh disabled automation", async () => {
+    const sessions: Array<{ sessionId: string; automationId: string; prompt: string }> = [];
+    const deps = adminDeps({
+      orgId: "org-test",
+      startDraftSession: async (input) => {
+        sessions.push({
+          sessionId: input.sessionId,
+          automationId: input.automationId,
+          prompt: input.prompt,
+        });
+      },
+    });
+    const { automations } = clients(deps);
+    const req = {
+      prompt: "When a PR opens, run the tests",
+      profileId: "profile-1",
+      idempotencyKey: "draft-key-1",
+    };
+    const first = await automations.draftAutomation(req);
+    expect(first.created).toBe(true);
+    expect(sessions[0]).toMatchObject({
+      sessionId: first.sessionId,
+      automationId: first.automationId,
+    });
+    const row = await automations.getAutomation({
+      lookup: { case: "id", value: first.automationId },
+    });
+    expect(row.automation?.enabled).toBe(false);
+    expect(row.automation?.draftSessionId).toBe(first.sessionId);
+
+    // A byte-identical retry replays without a second session.
+    const second = await automations.draftAutomation(req);
+    expect(second.created).toBe(false);
+    expect(second.automationId).toBe(first.automationId);
+    expect(sessions).toHaveLength(1);
   });
 
   test("RunNow and DryRun target the named entrypoint; an unknown one is refused (D9)", async () => {
