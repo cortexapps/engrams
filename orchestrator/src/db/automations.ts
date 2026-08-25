@@ -99,6 +99,15 @@ export interface CreateAutomationInput {
   id?: string;
 }
 
+/** saveVersion's in-transaction fence tripped: the row advanced past the
+ * expected version between the caller's read and the FOR UPDATE. */
+export class SaveVersionConflictError extends Error {
+  constructor(readonly currentVersion: number) {
+    super(`automation is at version ${currentVersion}`);
+    this.name = "SaveVersionConflictError";
+  }
+}
+
 export interface AutomationMetaPatch {
   name?: string;
   description?: string;
@@ -197,11 +206,16 @@ export interface AutomationStore {
   getByDraftSession(sessionId: string): Promise<AutomationRow | null>;
   /** Insert version current+1 and repoint the automation at it, in one
    * transaction. Returns null for a missing/archived automation. */
+  /** `opts.expectedVersion` makes the write conditional INSIDE the FOR
+   * UPDATE transaction (throws SaveVersionConflictError on mismatch) — the
+   * drafting agent's fence; a check outside the transaction is a
+   * check-then-act race against a concurrent human save. */
   saveVersion(
     automationId: string,
     definition: AutomationDefinition,
     createdByUserId: string | null,
     meta?: AutomationMetaPatch,
+    opts?: { expectedVersion?: number },
   ): Promise<AutomationRow | null>;
   updateMeta(id: string, patch: AutomationMetaPatch): Promise<AutomationRow | null>;
   setInputs(id: string, inputs: Record<string, unknown>): Promise<AutomationRow | null>;
@@ -709,7 +723,7 @@ export function makeAutomationStore(
       return row;
     },
 
-    async saveVersion(automationId, definition, createdByUserId, meta) {
+    async saveVersion(automationId, definition, createdByUserId, meta, opts) {
       const saved = await db.transaction(async (tx) => {
         const [existing] = await tx
           .select()
@@ -718,6 +732,12 @@ export function makeAutomationStore(
           .for("update")
           .limit(1);
         if (!existing) return false;
+        if (
+          opts?.expectedVersion !== undefined &&
+          existing.currentVersion !== opts.expectedVersion
+        ) {
+          throw new SaveVersionConflictError(existing.currentVersion);
+        }
         const nextVersion = existing.currentVersion + 1;
         await tx.insert(versionTable).values({
           automationId,

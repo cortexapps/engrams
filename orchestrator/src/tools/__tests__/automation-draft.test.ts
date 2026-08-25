@@ -10,6 +10,7 @@ import {
 import { draftBlockCatalog } from "../../automations/draft-catalog.ts";
 import { AUTOMATION_DRAFT_TASK_TYPE } from "../../automations/draft.ts";
 import { registerEngineBlocks, V1_BLOCK_TYPES } from "../../automations/engine/blocks/index.ts";
+import { SaveVersionConflictError } from "../../db/automations.ts";
 import type { AutomationRow } from "../../db/automations.ts";
 import type { AutomationDefinition } from "../../automations/engine/definition.ts";
 
@@ -76,7 +77,7 @@ interface Harness {
   meta: Array<Record<string, unknown>>;
 }
 
-function harness(current: AutomationRow | null): Harness {
+function harness(current: AutomationRow | null, options: { raceToVersion?: number } = {}): Harness {
   const saved: Harness["saved"] = [];
   const meta: Harness["meta"] = [];
   const deps: AutomationDraftToolDeps = {
@@ -84,7 +85,13 @@ function harness(current: AutomationRow | null): Harness {
       async getByDraftSession(sessionId) {
         return current && current.draftSessionId === sessionId ? current : null;
       },
-      async saveVersion(automationId, def) {
+      async saveVersion(automationId, def, _user, _meta, opts) {
+        // The in-transaction fence: the row may have advanced past the
+        // handler's read (a concurrent human save).
+        const liveVersion = options.raceToVersion ?? current?.currentVersion ?? 1;
+        if (opts?.expectedVersion !== undefined && opts.expectedVersion !== liveVersion) {
+          throw new SaveVersionConflictError(liveVersion);
+        }
         saved.push({ automationId, definition: def });
         return current;
       },
@@ -233,6 +240,20 @@ describe("automation draft tools", () => {
     expect(result.applied).toBe(false);
     expect(result.current_version).toBe(4);
     expect(JSON.parse(result.definition_json!)).toMatchObject({ engine: 1 });
+    expect(h.saved).toHaveLength(0);
+  });
+
+  test("a human save landing DURING the propose trips the in-transaction fence", async () => {
+    // The pre-check passes (the handler read version 1), but the store's
+    // FOR UPDATE sees version 2 — the race the fence exists for.
+    const h = harness(row(definition(), 1), { raceToVersion: 2 });
+    const result = (await call(h.deps, "automation_propose", {
+      definition_json: JSON.stringify(definition()),
+      expected_version: 1,
+    })) as { applied: boolean; current_version?: number; definition_json?: string };
+    expect(result.applied).toBe(false);
+    expect(result.current_version).toBe(2);
+    expect(result.definition_json).toBeDefined();
     expect(h.saved).toHaveLength(0);
   });
 

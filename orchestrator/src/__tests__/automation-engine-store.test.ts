@@ -11,6 +11,8 @@ import { eq, inArray, sql } from "drizzle-orm";
 
 import { checkDb, getDb } from "../db/client.ts";
 import {
+  definitionOf,
+  SaveVersionConflictError,
   makeAutomationEngineStore,
   makeAutomationStore,
   resolveAutomationInputs,
@@ -680,5 +682,28 @@ describe("draft-session binding (live PG, Builder v2)", () => {
 
     await store.setDraftSession(autoId, null);
     expect((await store.get(autoId))?.draftSessionId).toBeNull();
+  });
+});
+
+describe("saveVersion fence (live PG, Builder v2)", () => {
+  test.skipIf(!dbReachable)("the in-transaction save fence refuses a stale expected version", async () => {
+    const autoId = `${AUTO_ID}-fence`;
+    await seedAutomation(autoId);
+    const store = makeAutomationStore(getDb());
+    const definition = definitionOf((await store.get(autoId))!.version);
+
+    const saved = await store.saveVersion(autoId, definition, null, undefined, {
+      expectedVersion: 1,
+    });
+    expect(saved?.currentVersion).toBe(2);
+
+    await expect(
+      store.saveVersion(autoId, definition, null, undefined, { expectedVersion: 1 }),
+    ).rejects.toBeInstanceOf(SaveVersionConflictError);
+    expect((await store.get(autoId))?.currentVersion).toBe(2);
+
+    // Without the option the write is unconditional (the human path).
+    const unfenced = await store.saveVersion(autoId, definition, null);
+    expect(unfenced?.currentVersion).toBe(3);
   });
 });

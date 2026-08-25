@@ -13,7 +13,7 @@
 
 import { z } from "zod";
 
-import { definitionOf } from "../db/automations.ts";
+import { definitionOf, SaveVersionConflictError } from "../db/automations.ts";
 import type { AutomationRow, AutomationStore } from "../db/automations.ts";
 import type { ProfileStore } from "../db/profiles.ts";
 import {
@@ -287,7 +287,34 @@ export function registerAutomationDraftTools(
       if (profileErrors.length > 0) {
         return { applied: false, errors: profileErrors };
       }
-      const saved = await deps.store.saveVersion(row.id, definition, ctx.userId ?? null);
+      // The fence rides INSIDE saveVersion's FOR UPDATE transaction — the
+      // pre-check above is only a fast path; a human save landing between
+      // the read and the write throws here instead of being clobbered.
+      let saved: AutomationRow | null;
+      try {
+        saved = await deps.store.saveVersion(row.id, definition, ctx.userId ?? null, undefined, {
+          expectedVersion: args.expected_version,
+        });
+      } catch (error) {
+        if (error instanceof SaveVersionConflictError) {
+          const fresh = await deps.store.getByDraftSession(ctx.sessionId);
+          return {
+            applied: false,
+            current_version: error.currentVersion,
+            ...(fresh
+              ? { definition_json: JSON.stringify(definitionOf(fresh.version)) }
+              : {}),
+            errors: [
+              {
+                block_id: "",
+                field: "expected_version",
+                message: `the automation advanced to version ${error.currentVersion} while you were proposing (the person saved an edit); re-read and merge`,
+              },
+            ],
+          };
+        }
+        throw error;
+      }
       if (!saved) {
         throw new DraftBindingError("the draft automation disappeared while saving");
       }
