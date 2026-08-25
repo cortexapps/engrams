@@ -321,6 +321,17 @@ the `soft_invariant` field). Per-site dispositions:
    sever; THIS is the reconcile finding a device it cannot account for at all.
    Should stay at zero — a firing means a survivor's records were lost upstream
    and an operator/runbook must reconcile the device.
+   **Amended 2026-08-25 (engrams#1378):** the site now fires at the END of the
+   bounded rescan ladder (`settle_startup_quarantine` — three barrier re-runs
+   over ~2 minutes), not at the first scan. The 2026-08-25 firing showed the
+   one-shot scan's false-positive class: a session-delete destroy that raced a
+   pod roll died between the FC kill and the NBD disconnect, and the TERMINAL
+   leftover device drew a transient live/unprovable holder verdict (udevd
+   re-probe after the dead FC's fds closed) at the single scan instant — parked
+   forever, operator paged, for a device the host proved dead seconds later.
+   The counter still increments at first quarantine; the invariant fires only
+   for devices whose holder never releases across the ladder — the genuine
+   gap-A survivor class the site was built for.
 
 ### H7 / H8 — Dispositions for the known flaky tests
 

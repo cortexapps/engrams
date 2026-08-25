@@ -52,8 +52,9 @@ pub enum SlotClass {
     /// dead-owner device whose node a live (or unprovable) process still holds
     /// open, but which NO tracked record references — the #769 gap-A survivor,
     /// invisible to the records. Parked (left kernel-bound, RECONNECTABLE) and
-    /// ALERTED (`rehydrate-unknown-device`); never severed, never silently
-    /// skipped.
+    /// handed to the [`QuarantineWatch`] rescan ladder (engrams#1378); the
+    /// `rehydrate-unknown-device` alert fires only for devices that persist
+    /// past the ladder's budget. Never severed, never silently skipped.
     QuarantinedUnknown,
 }
 
@@ -203,10 +204,128 @@ pub fn classify_startup_slots<D>(slots: Vec<StartupSlot<D>>) -> StartupClassific
     }
 }
 
+/// The quarantine RETRY OWNER (engrams#1378): pure state for the bounded
+/// rescan ladder over [`SlotClass::QuarantinedUnknown`] devices.
+///
+/// The 2026-08-25 firing showed the one-shot barrier's gap: a destroy that
+/// races a pod roll can die between the FC kill and the NBD disconnect,
+/// leaving a TERMINAL device (dead guest, deleted session) kernel-connected
+/// with every record erased. At the single startup scan the holder probe can
+/// return a transient `LiveHolder` (udevd re-probing after the dead FC's fds
+/// close) or an inconclusive `Unknown` — and the resulting quarantine had no
+/// retry owner, so a device the host could prove dead seconds later stayed
+/// parked (and alerted an operator) until the node itself was replaced. The
+/// `device_has_live_holder` docs always assumed a later pass would settle the
+/// transient; this watch is that pass, inside the same generation.
+///
+/// The driver re-runs the full classification per pass and feeds each pass's
+/// fresh [`ReapList`] to the destructive sweep (the ordering contract is
+/// untouched — reaping still requires a classification proving `Dead +
+/// NoHolder + no record`). [`QuarantineWatch::step`] then reconciles the watch
+/// set against the pass's quarantined set: a watched device no longer
+/// quarantined (reaped, adopted, or gone from the kernel inventory) settles
+/// and leaves the watch; a device quarantined anew joins it. The caller fires
+/// the `rehydrate-unknown-device` soft-invariant only for the devices still
+/// watched when the ladder's budget is exhausted — the genuine gap-A survivor
+/// class, whose holder never releases.
+#[derive(Debug)]
+pub struct QuarantineWatch<D> {
+    watched: Vec<D>,
+}
+
+/// The outcome of one [`QuarantineWatch::step`]: the devices that settled
+/// (left quarantine) and the devices newly quarantined this pass.
+#[derive(Debug)]
+pub struct QuarantineStep<D> {
+    /// Watched devices no longer quarantined — reaped by the sweep, adopted by
+    /// a record, or vanished from the kernel inventory. They leave the watch.
+    pub settled: Vec<D>,
+    /// Devices quarantined this pass that were not watched before. They join
+    /// the watch (with whatever ladder budget remains).
+    pub arrived: Vec<D>,
+}
+
+impl<D: PartialEq + Clone> QuarantineWatch<D> {
+    pub fn new(watched: Vec<D>) -> Self {
+        Self { watched }
+    }
+
+    /// The devices currently under watch — still quarantined as of the last
+    /// step (or the initial classification, before any step ran).
+    pub fn watched(&self) -> &[D] {
+        &self.watched
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.watched.is_empty()
+    }
+
+    /// Consume the watch, yielding the devices that never settled.
+    pub fn into_watched(self) -> Vec<D> {
+        self.watched
+    }
+
+    /// Reconcile one fresh classification's quarantined set against the watch.
+    /// After the call, the watch holds exactly `quarantined_now` (order taken
+    /// from the fresh classification — deterministic because the inventory
+    /// enumeration is).
+    pub fn step(&mut self, quarantined_now: Vec<D>) -> QuarantineStep<D> {
+        let settled = self
+            .watched
+            .iter()
+            .filter(|d| !quarantined_now.contains(d))
+            .cloned()
+            .collect();
+        let arrived = quarantined_now
+            .iter()
+            .filter(|d| !self.watched.contains(d))
+            .cloned()
+            .collect();
+        self.watched = quarantined_now;
+        QuarantineStep { settled, arrived }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{sweep_verdict, SweepAction};
+
+    /// The retry-owner reconcile: a watched device absent from the fresh
+    /// quarantined set settles; a new quarantined device joins; the watch ends
+    /// holding exactly the fresh set.
+    #[test]
+    fn quarantine_watch_settles_and_absorbs() {
+        let mut watch = QuarantineWatch::new(vec!["nbd4", "nbd7"]);
+        assert!(!watch.is_empty());
+
+        // Pass 1: nbd4 settles (the sweep reaped it), nbd7 persists, nbd9
+        // arrives.
+        let step = watch.step(vec!["nbd7", "nbd9"]);
+        assert_eq!(step.settled, vec!["nbd4"]);
+        assert_eq!(step.arrived, vec!["nbd9"]);
+        assert_eq!(watch.watched(), ["nbd7", "nbd9"]);
+
+        // Pass 2: everything settles; the watch is empty and fires nothing.
+        let step = watch.step(Vec::new());
+        assert_eq!(step.settled, vec!["nbd7", "nbd9"]);
+        assert!(step.arrived.is_empty());
+        assert!(watch.is_empty());
+        assert!(watch.into_watched().is_empty());
+    }
+
+    /// A persisting device survives every step unchanged — the set the caller
+    /// fires `rehydrate-unknown-device` for at budget exhaustion.
+    #[test]
+    fn quarantine_watch_persisting_device_reaches_exhaustion() {
+        let mut watch = QuarantineWatch::new(vec!["nbd4"]);
+        for _ in 0..3 {
+            let step = watch.step(vec!["nbd4"]);
+            assert!(step.settled.is_empty());
+            assert!(step.arrived.is_empty());
+        }
+        assert_eq!(watch.into_watched(), vec!["nbd4"]);
+    }
 
     /// The full `(liveness × holder × has_record)` truth table, and the
     /// REFINEMENT property: a slot is `TerminalSafeToReap` iff `sweep_verdict`

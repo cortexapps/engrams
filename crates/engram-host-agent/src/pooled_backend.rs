@@ -144,6 +144,19 @@ fn sweep_dirty_root_at(root: &Path, live: &HashSet<SandboxId>) {
 /// save and load paths use the same fleet-tuned fan-out.
 const MEMORY_PREFETCH_CONCURRENCY: usize = 32;
 
+/// engrams#1378: the prod rescan ladder for `settle_startup_quarantine` —
+/// three passes at 10 s / 30 s / 80 s after the startup barrier (~2 minutes
+/// total). Sized to outlive every observed transient holder (udevd re-probes
+/// a released device within milliseconds; an inconclusive `/proc` scan clears
+/// on the next pass) while keeping the operator page for a genuine invisible
+/// survivor within a couple of minutes of register.
+#[cfg(target_os = "linux")]
+pub const STARTUP_QUARANTINE_RESCAN_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(80),
+];
+
 #[cfg(target_os = "linux")]
 static PENDING_DIRTY_FILE_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -4506,8 +4519,11 @@ impl PooledBackend {
     /// `ChainHeadRecord`, or a now-served sandbox maps to — so a re-served
     /// survivor shows self-owned (`Serving`) and a device NO record accounts for
     /// (its live guest invisible to both passes) surfaces as
-    /// `QuarantinedUnknown`, fires the `rehydrate-unknown-device` soft-invariant
-    /// + counter (parked, RECONNECTABLE), and is NEVER handed to the sweep.
+    /// `QuarantinedUnknown` (parked, RECONNECTABLE) and is NEVER handed to the
+    /// sweep. The caller hands the quarantined set to
+    /// [`Self::settle_startup_quarantine`] (engrams#1378) — the rescan ladder
+    /// that re-runs this barrier and fires the `rehydrate-unknown-device`
+    /// soft-invariant only for devices persisting past its budget.
     ///
     /// Returns the classification; the caller feeds `.reap` (the sole
     /// `TerminalSafeToReap` subset) to [`recover_stuck_nbd_devices`] — the
@@ -4561,24 +4577,12 @@ impl PooledBackend {
         let classification =
             crate::disk_daemon::classify_startup_inventory(kernel, &record_devices);
 
-        // Quarantine: a CONNECTED device the reconcile could not account for. Fire
-        // the alertable soft-invariant + counter per device and leave it
-        // kernel-bound (RECONNECTABLE) — never sever, never silently skip.
-        for device in &classification.quarantined {
-            engram_core::soft_invariant!(
-                "rehydrate-unknown-device",
-                false,
-                "startup classification barrier: kernel-CONNECTED NBD device {} has a \
-                 live (or unprovable) holder but NO tracked record accounts for it — a \
-                 survivor invisible to both the coordinator rehydrate list AND the #739 \
-                 local ChainHeadRecord pass (#769 gap A). Quarantined: left RECONNECTABLE \
-                 (kernel binding intact, kept out of new-claim circulation by the \
-                 nbd_kernel_busy probe), NEVER handed to the stale-binding sweep. An \
-                 operator/runbook must reconcile this device's session",
-                device.display(),
-            );
-            ::metrics::counter!(crate::metrics::REHYDRATE_UNKNOWN_DEVICE_TOTAL).increment(1);
-        }
+        // Quarantined devices are parked (kernel-bound, RECONNECTABLE, kept
+        // out of new-claim circulation by the `nbd_kernel_busy` probe) and
+        // NEVER handed to the sweep. The alert/counter policy lives in
+        // `settle_startup_quarantine` (engrams#1378): the rescan ladder owns
+        // the quarantined set, and the `rehydrate-unknown-device`
+        // soft-invariant fires only for devices that persist past its budget.
         if !classification.reconnect.is_empty() {
             tracing::warn!(
                 count = classification.reconnect.len(),
@@ -4597,6 +4601,96 @@ impl PooledBackend {
              reconciled against tracked records)",
         );
         classification
+    }
+
+    /// The quarantine RETRY OWNER (engrams#1378): a bounded rescan ladder over
+    /// the devices the startup barrier classified `QuarantinedUnknown`.
+    ///
+    /// The 2026-08-25 `rehydrate-unknown-device` firing showed the one-shot
+    /// barrier's gap: a session-delete destroy that races a pod roll can die
+    /// between the FC kill and the NBD disconnect, leaving a TERMINAL device
+    /// (dead guest, deleted session, tombstone acked by absence)
+    /// kernel-connected with every record erased. At the single startup scan
+    /// the holder probe returned a transient live/unprovable verdict, so the
+    /// device stayed parked — and paged an operator — until the node itself
+    /// was replaced, even though a scan seconds later would have proven death.
+    /// The `device_has_live_holder` docs always assumed "a subsequent sweep
+    /// pass" settles such transients; this ladder is that pass, inside the
+    /// same generation.
+    ///
+    /// Each pass re-runs the FULL classification barrier and hands the fresh
+    /// `TerminalSafeToReap` subset to the destructive sweep via its fresh
+    /// [`ReapList`](engram_host_core::ReapList) — the ordering contract is
+    /// untouched: a DISCONNECT still requires a classification proving
+    /// `Dead + NoHolder + no record`. A watched device that leaves quarantine
+    /// (reaped, adopted by a record, or gone from the kernel inventory)
+    /// settles silently. The `rehydrate-unknown-device` soft-invariant fires
+    /// only for devices still quarantined when the ladder's budget is
+    /// exhausted — the genuine #769 gap-A survivor class, whose holder never
+    /// releases. Returns that persisting set (empty = fully settled).
+    ///
+    /// `rescan_delays` is injected so tests drive the ladder without wall
+    /// time; prod passes [`STARTUP_QUARANTINE_RESCAN_DELAYS`].
+    #[cfg(target_os = "linux")]
+    pub async fn settle_startup_quarantine(
+        &self,
+        kernel: &dyn engram_host_core::NbdKernel,
+        coord_survivors: &[crate::coord_client::RehydrateSandboxRef],
+        initial_quarantined: Vec<std::path::PathBuf>,
+        rescan_delays: &[std::time::Duration],
+    ) -> Vec<std::path::PathBuf> {
+        for device in &initial_quarantined {
+            ::metrics::counter!(crate::metrics::REHYDRATE_UNKNOWN_DEVICE_TOTAL).increment(1);
+            tracing::warn!(
+                device = %device.display(),
+                "startup classification quarantined an unaccounted kernel-CONNECTED \
+                 device; the rescan ladder owns settlement (engrams#1378)",
+            );
+        }
+        let mut watch = engram_host_core::QuarantineWatch::new(initial_quarantined);
+        for delay in rescan_delays {
+            if watch.is_empty() {
+                break;
+            }
+            tokio::time::sleep(*delay).await;
+            let classification = self.classify_startup_slots(kernel, coord_survivors).await;
+            if let Some(pool) = self.nbd_pool() {
+                crate::disk_daemon::recover_stuck_nbd_devices(&pool, classification.reap).await;
+            }
+            // Reconcile AFTER the sweep: a device the pass proved reapable is
+            // no longer quarantined and settles here.
+            let step = watch.step(classification.quarantined);
+            for device in &step.settled {
+                tracing::info!(
+                    device = %device.display(),
+                    "quarantined device settled on rescan (reaped with proof of death, \
+                     adopted by a record, or gone from the kernel inventory)",
+                );
+            }
+            for device in &step.arrived {
+                ::metrics::counter!(crate::metrics::REHYDRATE_UNKNOWN_DEVICE_TOTAL).increment(1);
+                tracing::warn!(
+                    device = %device.display(),
+                    "device quarantined during the rescan ladder; joining the watch",
+                );
+            }
+        }
+        for device in watch.watched() {
+            engram_core::soft_invariant!(
+                "rehydrate-unknown-device",
+                false,
+                "startup classification barrier: kernel-CONNECTED NBD device {} still has \
+                 a live (or unprovable) holder and NO tracked record after the full rescan \
+                 ladder — a survivor invisible to both the coordinator rehydrate list AND \
+                 the #739 local ChainHeadRecord pass (#769 gap A), and its holder never \
+                 released. Quarantined: left RECONNECTABLE (kernel binding intact, kept \
+                 out of new-claim circulation by the nbd_kernel_busy probe), NEVER handed \
+                 to the stale-binding sweep. An operator/runbook must reconcile this \
+                 device's session",
+                device.display(),
+            );
+        }
+        watch.into_watched()
     }
 
     /// ADR 0028 Fix A: post-capture chain bookkeeping + the durable

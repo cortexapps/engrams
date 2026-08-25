@@ -524,13 +524,15 @@ enum NbdRecoveryOutcome {
 /// whose guest is actually gone. The cost is bounded and self-healing: the
 /// verdict PARKs (leaves the device kernel-bound, RECONNECTABLE — the
 /// `nbd_kernel_busy` probe keeps it out of new-claim circulation) instead of
-/// disconnecting. udev closes its probe fd within milliseconds, so a subsequent
-/// sweep pass (the next host-agent register/roll — the sweep is per-register,
-/// not a periodic loop) sees `NoHolder` and disconnects legally; the interim
-/// cost is one reconnectable-but-parked slot, never a wrongful disconnect of a
-/// live device. This is the intended fail-safe asymmetry: deferring a
-/// disconnect is cheap and reversible, severing a device a guest is reading is
-/// not.
+/// disconnecting. udev closes its probe fd within milliseconds, so a later
+/// pass sees `NoHolder` and disconnects legally — the retry now exists INSIDE
+/// a generation: the quarantine rescan ladder (`settle_startup_quarantine`,
+/// engrams#1378) re-runs the barrier a few times over ~2 minutes, so a
+/// transient verdict no longer parks a terminal leftover until the next roll.
+/// The interim cost is one reconnectable-but-parked slot, never a wrongful
+/// disconnect of a live device. This is the intended fail-safe asymmetry:
+/// deferring a disconnect is cheap and reversible, severing a device a guest
+/// is reading is not.
 ///
 /// `pub` so the FC-lane test (`nbd_proc_holder`) can pin the kernel assumption
 /// this guard leans on: an open fd on a real `/dev/nbdN` with a dead netlink

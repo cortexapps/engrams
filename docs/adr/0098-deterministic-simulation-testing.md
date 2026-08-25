@@ -1233,10 +1233,14 @@ constructible SOLELY by `classify_startup_slots`, so a device reaches a
 can touch no other class. `ReconnectMe` (a dead-owner device a record accounts
 for) and `QuarantinedUnknown` (a dead-owner device a live/unprovable holder holds
 that NO record accounts for — the gap-A survivor) are BOTH left kernel-bound
-(RECONNECTABLE); the quarantine additionally fires the `rehydrate-unknown-device`
-soft-invariant (ADR 0099 H6 site) + `engram_nbd_rehydrate_unknown_device_total`
-counter so an operator/runbook reconciles the device — never a silent skip, never
-a sever.
+(RECONNECTABLE); the quarantine additionally increments the
+`engram_nbd_rehydrate_unknown_device_total` counter and hands the set to the
+bounded rescan ladder (`settle_startup_quarantine`, engrams#1378), which re-runs
+the barrier a few times over ~2 minutes so a transient holder verdict on a
+terminal leftover settles to a proven-dead reap; the `rehydrate-unknown-device`
+soft-invariant (ADR 0099 H6 site) fires only for devices persisting past the
+ladder, so an operator/runbook reconciles them — never a silent skip, never a
+sever.
 
 *Prod.* `HostNbdKernel::connected_devices` (Linux sysfs); `PooledBackend::classify_startup_slots`
 builds the record set from `rootfs_device` over the coord-list survivors ∪ the

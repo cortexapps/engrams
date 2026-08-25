@@ -1128,17 +1128,47 @@ impl HostAgent {
                                         // register returns promptly; the
                                         // per-device claim inside the sweep is
                                         // still the TOCTOU correctness gate.
-                                        let reap = pooled_for_rehydrate
+                                        let classification = pooled_for_rehydrate
                                             .classify_startup_slots(
                                                 &disk_daemon::HostNbdKernel,
                                                 &resp.rehydrate_sandboxes,
                                             )
-                                            .await
-                                            .reap;
+                                            .await;
+                                        let quarantined = classification.quarantined;
+                                        let reap = classification.reap;
                                         tokio::spawn(async move {
                                             disk_daemon::recover_stuck_nbd_devices(&nbd_pool, reap)
                                                 .await;
                                         });
+                                        // engrams#1378: the quarantine retry
+                                        // owner. A `QuarantinedUnknown` device
+                                        // is parked, never reaped — but a
+                                        // TERMINAL leftover (a destroy that
+                                        // died mid-teardown across a roll) is
+                                        // provably dead a few seconds later,
+                                        // once the transient holder (udevd
+                                        // re-probe / inconclusive /proc scan)
+                                        // clears. The ladder re-runs the
+                                        // barrier and fires the
+                                        // `rehydrate-unknown-device` alert
+                                        // only for devices that persist past
+                                        // its budget.
+                                        if !quarantined.is_empty() {
+                                            let pooled_for_settle = pooled_for_rehydrate.clone();
+                                            let survivors_for_settle =
+                                                resp.rehydrate_sandboxes.clone();
+                                            tokio::spawn(async move {
+                                                pooled_for_settle
+                                                    .settle_startup_quarantine(
+                                                        &disk_daemon::HostNbdKernel,
+                                                        &survivors_for_settle,
+                                                        quarantined,
+                                                        &pooled_backend
+                                                            ::STARTUP_QUARANTINE_RESCAN_DELAYS,
+                                                    )
+                                                    .await;
+                                            });
+                                        }
                                     }
                                 }
                                 #[cfg(not(target_os = "linux"))]

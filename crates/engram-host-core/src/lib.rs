@@ -62,8 +62,8 @@ pub use reattach::{
     SweepAction,
 };
 pub use startup::{
-    classify_startup_slot, classify_startup_slots, ReapList, SlotClass, StartupClassification,
-    StartupSlot,
+    classify_startup_slot, classify_startup_slots, QuarantineStep, QuarantineWatch, ReapList,
+    SlotClass, StartupClassification, StartupSlot,
 };
 pub use survivor::{
     plan_capture_disk_drain, plan_resume_attach, CaptureDrainPlan, ResumeAttachPlan,
