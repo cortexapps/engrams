@@ -25,6 +25,7 @@ function harness() {
         version: 1,
         trigger: input.definition.trigger,
         blocks: input.definition.blocks,
+        entrypoints: input.definition.entrypoints ?? [],
         inputsSchema: input.definition.inputsSchema,
         settings: input.definition.settings,
         createdByUserId: null,

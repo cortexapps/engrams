@@ -114,6 +114,7 @@ function fakeStore(seed?: {
     automationId,
     version,
     trigger: d.trigger,
+    entrypoints: d.entrypoints ?? [],
     blocks: d.blocks,
     inputsSchema: d.inputsSchema,
     settings: d.settings,
@@ -318,6 +319,7 @@ function fakeStore(seed?: {
         runs.set(input.id, {
           id: input.id,
           automationId: input.automationId,
+          entrypointId: input.entrypointId ?? "main",
           version: input.version,
           trigger: input.trigger,
           deliveryKey: input.deliveryKey,
@@ -437,7 +439,7 @@ function builtinStored(id = "builtin-1"): Stored {
       updatedAt: NOW,
       archivedAt: null,
     },
-    versions: new Map([[1, { automationId: id, version: 1, trigger: d.trigger, blocks: d.blocks, inputsSchema: d.inputsSchema, settings: d.settings, createdByUserId: null, createdAt: NOW }]]),
+    versions: new Map([[1, { automationId: id, version: 1, trigger: d.trigger, blocks: d.blocks, entrypoints: d.entrypoints ?? [], inputsSchema: d.inputsSchema, settings: d.settings, createdByUserId: null, createdAt: NOW }]]),
   };
 }
 
@@ -816,6 +818,46 @@ describe("AutomationService v2", () => {
     expect(deps.fake.runs.get(m.runId)?.scheduledFor).toBeNull();
   });
 
+  test("RunNow and DryRun target the named entrypoint; an unknown one is refused (D9)", async () => {
+    const deps = adminDeps({ workflowStarter: { async start() {} } });
+    const { automations } = clients(deps);
+    const created = await automations.createAutomation({
+      name: "TwoWays",
+      description: "",
+      enabled: true,
+      definitionJson: JSON.stringify(
+        cronDefinition({
+          trigger: { kind: "manual" },
+          entrypoints: [
+            {
+              id: "sweep",
+              trigger: { kind: "cron", schedule: "*/5 * * * *", timezone: "UTC" },
+              blocks: [],
+            },
+          ],
+        }),
+      ),
+      inputsJson: "{}",
+    });
+    const id = created.automation!.id;
+
+    const swept = await automations.runNow({ automationId: id, entrypointId: "sweep" });
+    const sweptRow = deps.fake.runs.get(swept.runId)!;
+    expect(sweptRow.entrypointId).toBe("sweep");
+    expect(swept.runId).toContain(":sweep:");
+    // The targeted entrypoint is cron, so the ad-hoc run synthesizes its
+    // would-be scheduled_for even though MAIN is manual.
+    expect(sweptRow.scheduledFor).toBeInstanceOf(Date);
+
+    const main = await automations.runNow({ automationId: id });
+    expect(deps.fake.runs.get(main.runId)?.entrypointId).toBe("main");
+    expect(deps.fake.runs.get(main.runId)?.scheduledFor).toBeNull();
+
+    await expect(
+      automations.dryRun({ automationId: id, sample: { case: undefined }, entrypointId: "gone" }),
+    ).rejects.toThrow(/entrypoint "gone"/);
+  });
+
   test("ListInputKeyOptions goes through the injected source", async () => {
     const { automations } = clients(
       adminDeps({ inputKeyOptions: { async list(noun) { return [{ key: `${noun}-1`, label: "One" }]; } } }),
@@ -832,6 +874,7 @@ describe("AutomationRunService", () => {
     return {
       id,
       automationId: "automation-1",
+      entrypointId: "main",
       version: 1,
       trigger: { source: "manual", receivedAt: createdAt.toISOString() },
       deliveryKey: `manual:${id}`,

@@ -84,6 +84,7 @@ function makeHarness(targets: DispatchTarget[]): Harness {
           id: input.id,
           automationId: input.automationId,
           version: input.version,
+          entrypointId: input.entrypointId ?? "main",
           trigger: input.trigger,
           deliveryKey: input.deliveryKey,
           concurrencyKey: input.concurrencyKey,

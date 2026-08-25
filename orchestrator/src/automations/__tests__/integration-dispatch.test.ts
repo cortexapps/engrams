@@ -178,6 +178,7 @@ function makeHarness(targets: DispatchTarget[]): Harness {
           id: input.id,
           automationId: input.automationId,
           version: input.version,
+          entrypointId: input.entrypointId ?? "main",
           trigger: input.trigger,
           deliveryKey: input.deliveryKey,
           concurrencyKey: input.concurrencyKey,
@@ -290,6 +291,55 @@ describe("dispatchIntegrationEvent", () => {
       scopeValue: "engrams/engrams",
     });
     expect(run.deliveryKey).toBe("github:gh-delivery-1");
+  });
+
+  test("a matching EXTRA entrypoint opens its own run with an entrypoint-scoped id (D9)", async () => {
+    // Main listens for PR-opened; the "feedback" entrypoint listens for
+    // review events on the SAME connection. A review delivery must open a
+    // run through feedback only; a PR delivery through main only; and one
+    // delivery matching BOTH entrypoints opens two runs with distinct ids.
+    const both: AutomationDefinition = {
+      ...definition(trigger()),
+      entrypoints: [
+        {
+          id: "feedback",
+          trigger: trigger({ eventKeys: ["pull_request_review.submitted", "pull_request.opened"] }),
+          blocks: [
+            {
+              id: "nudge",
+              type: "send_prompt",
+              config: {
+                session: { template: "s-kept" },
+                promptTemplate: "review arrived",
+                waitFor: { kind: "none" },
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const h = makeHarness([{ automation: meta(), definition: both }]);
+
+    const review = await dispatchIntegrationEvent(
+      input({ eventKey: "pull_request_review.submitted", deliveryId: "gh-rev-1" }),
+      deps(h),
+    );
+    expect(review).toMatchObject({ matched: 1, started: 1 });
+    const run = h.runs.get("autorun:automation-1:feedback:github:gh-rev-1")!;
+    expect(run.entrypointId).toBe("feedback");
+    expect(run.deliveryKey).toBe("github:gh-rev-1");
+
+    // One delivery, two matching entrypoints: two runs, two ids, one
+    // delivery key — the (automation, entrypoint, delivery) unique holds.
+    const openedBoth = await dispatchIntegrationEvent(
+      input({ eventKey: "pull_request.opened", deliveryId: "gh-pr-9" }),
+      deps(h),
+    );
+    expect(openedBoth).toMatchObject({ matched: 2, started: 2 });
+    expect(h.runs.get("autorun:automation-1:github:gh-pr-9")?.entrypointId).toBe("main");
+    expect(h.runs.get("autorun:automation-1:feedback:github:gh-pr-9")?.entrypointId).toBe(
+      "feedback",
+    );
   });
 
   test("a redelivery mints the same run id, so DBOS start and the delivery unique dedupe", async () => {

@@ -33,6 +33,9 @@ export interface RunSnapshot {
   automationId: string;
   automationName: string;
   version: number;
+  /** ADR 0119 D9: which entrypoint's blocks this run walks. Absent (an
+   * old checkpointed snapshot) = the main entrypoint. */
+  entrypointId?: string;
   trigger: RunTriggerFacts;
   aliases: WebhookAliasMapping[];
   concurrencyKey?: string;

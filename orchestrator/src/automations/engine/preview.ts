@@ -20,6 +20,7 @@
 import { evaluateFilter, parseFilterGroup, ConditionParseError } from "./conditions.ts";
 import { buildRunContext, type RunContext, type RunSnapshot } from "./context.ts";
 import type { AutomationDefinition, BlockDef } from "./definition.ts";
+import { entrypointOf, MAIN_ENTRYPOINT_ID } from "./definition.ts";
 import type { CodeBlockRuntime, EngineDeps } from "./deps.ts";
 import { AutomationTemplateError } from "../template.ts";
 
@@ -50,6 +51,8 @@ export interface PreviewInput {
   automationName: string;
   trigger: RunSnapshot["trigger"];
   aliases: RunSnapshot["aliases"];
+  /** D9: which entrypoint to render (default "main"). */
+  entrypointId?: string;
   /** When present, `code` blocks are evaluated (see the module comment). */
   code?: CodeBlockRuntime;
 }
@@ -245,7 +248,17 @@ export async function previewDefinition(input: PreviewInput): Promise<PreviewRes
     return true;
   };
 
-  await walk(input.definition.blocks);
+  const entrypoint = entrypointOf(input.definition, input.entrypointId ?? MAIN_ENTRYPOINT_ID);
+  if (entrypoint === null) {
+    errors.push({
+      blockId: "",
+      field: "entrypoint",
+      code: "unknown_entrypoint",
+      message: `entrypoint "${input.entrypointId}" is not in this definition`,
+    });
+  } else {
+    await walk(entrypoint.blocks);
+  }
   ctx.currentBlockId = undefined;
   return { blocks, errors };
 }

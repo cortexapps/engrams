@@ -67,6 +67,9 @@ import {
 } from "../db/integration-connections.ts";
 import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
 import {
+  entrypointsOf,
+  entrypointOf,
+  MAIN_ENTRYPOINT_ID,
   applyBlockOverrides,
   BlockOverrideError,
   DefinitionError,
@@ -501,29 +504,33 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       throw error;
     }
     await validateSessionBlocks(definition);
+    // D9: every entrypoint's trigger validates; the (single, validated)
+    // cron entrypoint yields the automation's next_fire_at.
     let nextFireAt: Date | null = null;
-    const trigger = definition.trigger;
-    if (trigger.kind === "cron") {
-      nextFireAt = nextCronFire(trigger.schedule, trigger.timezone, now());
-    } else if (trigger.kind === "webhook") {
-      if (!(await store.getRegistration(trigger.registrationId))) {
-        throw new BlockValidationError([
-          blockError("", "trigger.registrationId", "unknown_registration", "webhook registration not found"),
-        ]);
-      }
-    } else if (trigger.kind === "integration") {
-      const { webhook } = await connectorWithWebhookFacet(trigger.provider);
-      const declared = new Set(webhook.events.map((event) => event.key));
-      const unknown = trigger.eventKeys.filter((key) => !declared.has(key));
-      if (unknown.length > 0) {
-        throw new BlockValidationError([
-          blockError(
-            "",
-            "trigger.eventKeys",
-            "unknown_event",
-            `provider "${trigger.provider}" does not declare event keys: ${unknown.join(", ")}`,
-          ),
-        ]);
+    for (const entrypoint of entrypointsOf(definition)) {
+      const trigger = entrypoint.trigger;
+      if (trigger.kind === "cron") {
+        nextFireAt = nextCronFire(trigger.schedule, trigger.timezone, now());
+      } else if (trigger.kind === "webhook") {
+        if (!(await store.getRegistration(trigger.registrationId))) {
+          throw new BlockValidationError([
+            blockError("", "trigger.registrationId", "unknown_registration", "webhook registration not found"),
+          ]);
+        }
+      } else if (trigger.kind === "integration") {
+        const { webhook } = await connectorWithWebhookFacet(trigger.provider);
+        const declared = new Set(webhook.events.map((event) => event.key));
+        const unknown = trigger.eventKeys.filter((key) => !declared.has(key));
+        if (unknown.length > 0) {
+          throw new BlockValidationError([
+            blockError(
+              "",
+              "trigger.eventKeys",
+              "unknown_event",
+              `provider "${trigger.provider}" does not declare event keys: ${unknown.join(", ")}`,
+            ),
+          ]);
+        }
       }
     }
     return { definition, nextFireAt };
@@ -616,6 +623,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       }
     };
     await walk(definition.blocks);
+    for (const entrypoint of definition.entrypoints ?? []) await walk(entrypoint.blocks);
   }
 
   async function requireAutomation(id: string): Promise<AutomationRow> {
@@ -714,15 +722,26 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       eventKey?: string;
       dryRun: boolean;
       deliveryKey: string;
+      /** D9: which entrypoint to run (default "main"). */
+      entrypointId?: string;
     },
   ): Promise<string> {
     const definition = effectiveDefinition(row.version, row.blockOverrides);
-    const runId = automationRunId(row.id, input.deliveryKey);
+    const entrypointId = input.entrypointId ?? MAIN_ENTRYPOINT_ID;
+    const entrypoint = entrypointOf(definition, entrypointId);
+    if (entrypoint === null) {
+      throw new ConnectError(
+        `entrypoint "${entrypointId}" is not in the current version`,
+        Code.InvalidArgument,
+      );
+    }
+    const runId = automationRunId(row.id, input.deliveryKey, entrypoint.id);
     const receivedAt = now().toISOString();
     const outcome = await admitAutomationRun(
       {
         target: { automation: row, definition },
         runId,
+        entrypoint: { id: entrypoint.id, trigger: entrypoint.trigger },
         deliveryKey: input.deliveryKey,
         trigger: {
           source: input.source,
@@ -730,10 +749,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           payload: input.payload,
           ...(input.eventKey !== undefined ? { eventKey: input.eventKey } : {}),
         },
-        // A cron automation's templates read `trigger.scheduled_for`
+        // A cron entrypoint's templates read `trigger.scheduled_for`
         // (strict Liquid: an absent variable fails the render). An ad-hoc
         // run has no tick, so the would-be fire time is "now".
-        scheduledFor: definition.trigger.kind === "cron" ? new Date(receivedAt) : null,
+        scheduledFor: entrypoint.trigger.kind === "cron" ? new Date(receivedAt) : null,
         ...(input.dryRun ? { dryRun: true } : {}),
       },
       { store, starter: starter(), sender: sender(), now },
@@ -958,13 +977,24 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const inputValues =
         req.inputsJson !== undefined ? parseObjectJson(req.inputsJson, "inputs_json") : row.inputs;
       const sample = await resolveSample(row, req.sample);
+      const previewEntrypoint =
+        req.entrypointId !== undefined && req.entrypointId !== ""
+          ? entrypointOf(definition, req.entrypointId)
+          : entrypointOf(definition, MAIN_ENTRYPOINT_ID);
+      if (previewEntrypoint === null) {
+        throw new ConnectError(
+          `entrypoint "${req.entrypointId}" is not in this definition`,
+          Code.InvalidArgument,
+        );
+      }
       const result = await previewDefinition({
         definition,
         inputs: resolveAutomationInputs(definition.inputsSchema, inputValues),
         automationId: row.id,
         automationName: row.name,
+        entrypointId: previewEntrypoint.id,
         trigger: {
-          kind: definition.trigger.kind,
+          kind: previewEntrypoint.trigger.kind,
           receivedAt: sample.receivedAt.toISOString(),
           ...(sample.eventKey !== undefined ? { eventKey: sample.eventKey } : {}),
           ...(req.scheduledFor !== undefined ? { scheduledFor: req.scheduledFor } : {}),
@@ -996,6 +1026,9 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         ...(sample.eventKey !== undefined ? { eventKey: sample.eventKey } : {}),
         dryRun: true,
         deliveryKey: `dryrun:${randomId()}`,
+        ...(req.entrypointId !== undefined && req.entrypointId !== ""
+          ? { entrypointId: req.entrypointId }
+          : {}),
       });
       return { runId };
     },
@@ -1033,6 +1066,9 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         ...(sample.eventKey !== undefined ? { eventKey: sample.eventKey } : {}),
         dryRun: false,
         deliveryKey: `manual:${randomId()}`,
+        ...(req.entrypointId !== undefined && req.entrypointId !== ""
+          ? { entrypointId: req.entrypointId }
+          : {}),
       });
       return { runId };
     },
@@ -1264,6 +1300,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         ...(run.trigger.eventKey !== undefined ? { eventKey: run.trigger.eventKey } : {}),
         dryRun: run.dryRun,
         deliveryKey: `retry:${randomId()}`,
+        entrypointId: run.entrypointId,
       });
       return { runId };
     },
