@@ -6,7 +6,7 @@
  * token is obtained + stored server-side on the callback.
  */
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowUpRightIcon, CheckIcon, CopyIcon, InfoIcon, LockIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -36,6 +36,16 @@ export function OAuthConnectSheet({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<"url" | "manifest" | null>(null);
+  // The copied badge resets on a 2s timer; an unmounted sheet must not fire
+  // it (in tests the stray timer outlives the file and dispatches into a
+  // torn-down environment — the OAuthConnectSheet flake of 2026-08-22).
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (copyTimer.current !== null) clearTimeout(copyTimer.current);
+    },
+    [],
+  );
 
   const redirectUri = `${window.location.origin}/api/v1/integrations/${view.provider}/oauth/callback`;
   const filled = clientId.trim().length > 0 && clientSecret.trim().length > 0;
@@ -45,7 +55,8 @@ export function OAuthConnectSheet({
     if (typeof navigator === "undefined" || !navigator.clipboard) return;
     void navigator.clipboard.writeText(text).then(() => {
       setCopied(what);
-      setTimeout(() => setCopied((c) => (c === what ? null : c)), 2000);
+      if (copyTimer.current !== null) clearTimeout(copyTimer.current);
+      copyTimer.current = setTimeout(() => setCopied((c) => (c === what ? null : c)), 2000);
     });
   };
 
