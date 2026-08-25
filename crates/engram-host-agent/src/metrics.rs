@@ -597,6 +597,19 @@ pub const SWEEP_BLOCKED_LIVE_HOLDER_TOTAL: &str = "engram_nbd_sweep_blocked_live
 /// THIS is the reconcile finding a device it cannot account for at all.
 pub const REHYDRATE_UNKNOWN_DEVICE_TOTAL: &str = "engram_nbd_rehydrate_unknown_device_total";
 
+/// Gauge: kernel-connected devices classified
+/// [`engram_host_core::SlotClass::ResidueAwaitingTombstone`] (engrams#1378) —
+/// attributed leftovers of an interrupted teardown, parked and reported on the
+/// heartbeat (`device_residue_sandboxes`) until the coordinator's tombstone
+/// orders the disconnect. Should return to zero within a heartbeat cycle or
+/// two of a roll; a persistently non-zero value means the tombstone flow is
+/// not settling the residue (check the coordinator's A5 entomb arm).
+pub const NBD_RESIDUE_DEVICES: &str = "engram_nbd_residue_devices";
+
+/// Counter: interrupted-predecessor NBD teardowns this generation completed
+/// under a coordinator tombstone (`destroy`'s residue arm, engrams#1378).
+pub const NBD_RESIDUE_TEARDOWN_TOTAL: &str = "engram_nbd_residue_teardown_total";
+
 /// Gauge, label `state` = `capacity` | `free` | `warm` | `in_use` |
 /// `parked`. This makes the NBD ceiling and its real high-water pressure
 /// visible before a deployment changes `nbds_max` again.

@@ -1143,6 +1143,11 @@ impl SimHost {
                     liveness,
                     holder,
                     has_record,
+                    // engrams#1378: the sim models the pre-owner-record
+                    // (record-reconcile) classification; the attributed/
+                    // residue flow is the follow-up co-sim extension tracked
+                    // on #1378.
+                    attributed: false,
                 }
             })
             .collect();

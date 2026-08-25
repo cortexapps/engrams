@@ -773,6 +773,29 @@ pub struct PooledBackend {
     /// removed mid-op) is handled identically to "entry missing".
     #[cfg(target_os = "linux")]
     nbd_sandboxes: Arc<DashMap<SandboxId, crate::disk_daemon::NbdSandboxState>>,
+    /// engrams#1378: the durable device→sandbox OWNER RECORDS
+    /// (`<work_dir>/nbd-owners`). Written at every attach's id-known point
+    /// and every rehydrate; read by the startup classification barrier to
+    /// attribute kernel-connected devices no live process accounts for.
+    /// `None` when the record dir could not be opened (attribution degrades
+    /// to the legacy record-reconcile path).
+    #[cfg(target_os = "linux")]
+    nbd_owners: Option<Arc<crate::disk_daemon::owners::NbdOwnerDir>>,
+    /// engrams#1378: attributed residue — kernel-connected devices whose
+    /// sandbox is known (owner record) but which no rehydrate record serves
+    /// and whose owner process is dead. Populated by the startup
+    /// classification barrier; reported on every heartbeat
+    /// (`device_residue_sandboxes`); drained by `destroy` when the
+    /// coordinator's tombstone orders the teardown.
+    #[cfg(target_os = "linux")]
+    nbd_residue: Arc<DashMap<SandboxId, std::path::PathBuf>>,
+    /// engrams#1378: `false` until the startup classification barrier has
+    /// run once (or this host has no NBD pool, so there is nothing to
+    /// classify). Rides the heartbeat as `device_residue_known` — the
+    /// issue-#215 asymmetry: an unclassified generation's empty residue set
+    /// is "no information", and the coordinator withholds tombstone
+    /// ack-by-absence against it.
+    nbd_residue_known: Arc<std::sync::atomic::AtomicBool>,
     /// ADR 0014 issue #1/#2: per-sandbox in-flight snapshot tracking.
     /// `snapshot(sandbox_id)` records the produced snapshot_id here so
     /// (a) a retry from the same sandbox first aborts the prior attempt
@@ -2209,6 +2232,7 @@ impl PooledBackend {
             let publisher = self.live_manifest_publisher.clone();
             let health = self.data_plane_health.clone();
             let flush_config = self.flush_config.clone();
+            let owners = self.nbd_owners.clone();
             let abandoning = self.abandoning.clone();
             let dirty_root = self
                 .resolved_dirty_root()
@@ -2235,7 +2259,7 @@ impl PooledBackend {
                 // in the continuous-flush pipeline. Field-ordered Drop
                 // ensures scheduler-cancel → NBD-disconnect → slot-release
                 // on subsequent destroy.
-                state.install_flush_scheduler(new_id, publisher, health, flush_config);
+                state.install_flush_scheduler(new_id, publisher, health, flush_config, owners);
                 // ADR 0019: open the resume operation window — restore-time disk
                 // reads (load_snapshot + the resumed guest's working set) attach
                 // `chunk.fetch` spans to this trace. Covers idle→resume AND
@@ -2320,6 +2344,14 @@ impl PooledBackend {
             nbd_pool: None,
             #[cfg(target_os = "linux")]
             nbd_sandboxes: Arc::new(DashMap::new()),
+            #[cfg(target_os = "linux")]
+            nbd_owners: None,
+            #[cfg(target_os = "linux")]
+            nbd_residue: Arc::new(DashMap::new()),
+            // engrams#1378: flips false when an NBD pool is wired
+            // (`with_nbd_pool`) — a pool-less host has nothing to classify,
+            // so its residue report is vacuously known-empty.
+            nbd_residue_known: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             inflight_snapshots: Arc::new(DashMap::new()),
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
             checkpoint_pacing: Arc::new(DashMap::new()),
@@ -4501,13 +4533,20 @@ impl PooledBackend {
     /// (coord-list + #739 local) and BEFORE the destructive stale-binding sweep:
     /// enumerate the kernel's CONNECTED devices as ground truth and RECONCILE the
     /// tracked records against them, classifying every connected slot into
-    /// exactly one [`SlotClass`](engram_host_core::SlotClass). The tracked-record
-    /// device set is every device a coord-list survivor, a durable
-    /// `ChainHeadRecord`, or a now-served sandbox maps to — so a re-served
-    /// survivor shows self-owned (`Serving`) and a device NO record accounts for
-    /// (its live guest invisible to both passes) surfaces as
-    /// `QuarantinedUnknown`, fires the `rehydrate-unknown-device` soft-invariant
-    /// + counter (parked, RECONNECTABLE), and is NEVER handed to the sweep.
+    /// exactly one [`SlotClass`](engram_host_core::SlotClass).
+    ///
+    /// engrams#1378: attribution comes first from the durable owner records
+    /// (`nbd-owners/<dev>` — no live process needed), reconciled against the
+    /// SANDBOX-ID record view (coord-list ∪ `ChainHeadRecord`s ∪ served ∪ the
+    /// reattached FC list); the legacy device-path view (resolved through the
+    /// live FC entry, plus the allocator's parked set) covers unattributed
+    /// devices. An ATTRIBUTED dead-owner device no record accounts for is
+    /// `ResidueAwaitingTombstone`: parked, registered in `nbd_residue` for the
+    /// heartbeat report, and torn down when the coordinator's tombstone comes
+    /// back (`destroy`) — never severed on the host's own verdict, never
+    /// operator-paged. Only an UNATTRIBUTED unaccounted device still fires the
+    /// `rehydrate-unknown-device` soft-invariant + counter (pre-owner-record
+    /// leftovers for one fleet roll, then genuine corruption).
     ///
     /// Returns the classification; the caller feeds `.reap` (the sole
     /// `TerminalSafeToReap` subset) to [`recover_stuck_nbd_devices`] — the
@@ -4519,62 +4558,115 @@ impl PooledBackend {
         kernel: &dyn engram_host_core::NbdKernel,
         coord_survivors: &[crate::coord_client::RehydrateSandboxRef],
     ) -> engram_host_core::StartupClassification<std::path::PathBuf> {
-        // The tracked-record device set — the Layer-2 reconcile key. A device is
-        // "accounted for" if a coord-list survivor, a durable ChainHeadRecord, or
-        // an already-served sandbox maps to it (`rootfs_device` resolves the
-        // sandbox's `/dev/nbdN`). Anything CONNECTED but absent from this set is
-        // a survivor invisible to the records.
-        let mut record_devices: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
+        // The tracked-record views — the Layer-2 reconcile keys. The
+        // DEVICE-PATH view: a device is "accounted for" if a coord-list
+        // survivor, a durable ChainHeadRecord, or an already-served sandbox
+        // maps to it (`rootfs_device` resolves the sandbox's `/dev/nbdN`).
+        // The SANDBOX-ID view (engrams#1378): the same sources by id, plus
+        // the reattached FC list — needs no live-entry resolution, so an
+        // orphaned sandbox's records still count.
+        let mut records = crate::disk_daemon::StartupRecords::default();
         for entry in coord_survivors {
+            records.sandboxes.insert(entry.sandbox_id);
             if let Some(dev) = self.inner.rootfs_device(entry.sandbox_id) {
-                record_devices.insert(dev);
+                records.devices.insert(dev);
             }
         }
         if let Some(store) = self.chain_heads.clone() {
             for record in crate::checkpoint::ChainHeadRecord::load_all(store.dir()).await {
+                records.sandboxes.insert(record.sandbox_id);
                 if let Some(dev) = self.inner.rootfs_device(record.sandbox_id) {
-                    record_devices.insert(dev);
+                    records.devices.insert(dev);
                 }
             }
         }
         for entry in self.nbd_sandboxes.iter() {
+            records.sandboxes.insert(*entry.key());
             if let Some(dev) = self.inner.rootfs_device(*entry.key()) {
-                record_devices.insert(dev);
+                records.devices.insert(dev);
             }
         }
+        // Every reattached (live) FC counts as a record: an attributed device
+        // whose guest survived the roll must classify ReconnectMe (the
+        // rehydrate passes own re-serving it), never residue — a live guest's
+        // disk is not a leftover, whatever the other records say.
+        match self.inner.list().await {
+            Ok(live) => records.sandboxes.extend(live),
+            Err(error) => tracing::warn!(
+                %error,
+                "startup classification: backend list failed; live sandboxes \
+                 counted only via their other records this pass",
+            ),
+        }
         // Devices this process itself PARKED (a failed rehydrate's
-        // `slot.quarantine()`) are tracked records too. The three sources
-        // above all resolve through the live FC entry (`rootfs_device`),
-        // which a concurrent sandbox destroy can vacate between the park and
-        // this barrier — 2026-07-21: a rehydrate-failed survivor whose
-        // session completed two seconds later was reported as an UNKNOWN
-        // device demanding an operator, when this very process had parked it
-        // on purpose moments earlier. The allocator's parked set is
+        // `slot.quarantine()`) are tracked records too. The device-path
+        // sources above all resolve through the live FC entry
+        // (`rootfs_device`), which a concurrent sandbox destroy can vacate
+        // between the park and this barrier — 2026-07-21: a rehydrate-failed
+        // survivor whose session completed two seconds later was reported as
+        // an UNKNOWN device demanding an operator, when this very process had
+        // parked it on purpose moments earlier. The allocator's parked set is
         // device-keyed, so it survives the FC entry vanishing.
         if let Some(pool) = self.nbd_pool.as_ref() {
             for dev in pool.parked_devices() {
-                record_devices.insert(dev);
+                records.devices.insert(dev);
             }
         }
 
-        let classification =
-            crate::disk_daemon::classify_startup_inventory(kernel, &record_devices);
+        // engrams#1378: the durable owner records — device→sandbox
+        // attribution that survives every process death. Lazily clean the
+        // inert ones (devices no longer kernel-connected) first.
+        let owners = match self.nbd_owners.as_ref() {
+            Some(dir) => {
+                let connected: std::collections::HashSet<std::path::PathBuf> = kernel
+                    .connected_devices()
+                    .into_iter()
+                    .map(|d| d.device)
+                    .collect();
+                dir.remove_stale(&connected);
+                dir.load()
+            }
+            None => std::collections::HashMap::new(),
+        };
 
-        // Quarantine: a CONNECTED device the reconcile could not account for. Fire
-        // the alertable soft-invariant + counter per device and leave it
-        // kernel-bound (RECONNECTABLE) — never sever, never silently skip.
+        let (classification, residue_pairs) =
+            crate::disk_daemon::classify_startup_inventory(kernel, &records, &owners);
+
+        // Attributed residue: report + await the coordinator's tombstone
+        // (existing from the interrupted destroy, or minted by the ADR 0116
+        // A5 unbound-entomb arm). `destroy` completes the teardown when it
+        // arrives.
+        for (sandbox_id, device) in residue_pairs {
+            tracing::warn!(
+                %sandbox_id,
+                device = %device.display(),
+                "startup classification: kernel-connected device attributed to a \
+                 dead sandbox with no rehydrate record — residue of an interrupted \
+                 teardown; reported to the coordinator, settled by its tombstone \
+                 (engrams#1378)",
+            );
+            self.nbd_residue.insert(sandbox_id, device);
+        }
+        ::metrics::gauge!(crate::metrics::NBD_RESIDUE_DEVICES).set(self.nbd_residue.len() as f64);
+        self.nbd_residue_known
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Quarantine: an UNATTRIBUTED connected device the reconcile could not
+        // account for. Fire the alertable soft-invariant + counter per device
+        // and leave it kernel-bound (RECONNECTABLE) — never sever, never
+        // silently skip.
         for device in &classification.quarantined {
             engram_core::soft_invariant!(
                 "rehydrate-unknown-device",
                 false,
                 "startup classification barrier: kernel-CONNECTED NBD device {} has a \
-                 live (or unprovable) holder but NO tracked record accounts for it — a \
-                 survivor invisible to both the coordinator rehydrate list AND the #739 \
-                 local ChainHeadRecord pass (#769 gap A). Quarantined: left RECONNECTABLE \
-                 (kernel binding intact, kept out of new-claim circulation by the \
-                 nbd_kernel_busy probe), NEVER handed to the stale-binding sweep. An \
-                 operator/runbook must reconcile this device's session",
+                 live (or unprovable) holder but NO owner record and NO tracked record \
+                 accounts for it — a survivor invisible to the coordinator rehydrate \
+                 list, the #739 local ChainHeadRecord pass, AND the #1378 owner records \
+                 (#769 gap A). Quarantined: left RECONNECTABLE (kernel binding intact, \
+                 kept out of new-claim circulation by the nbd_kernel_busy probe), NEVER \
+                 handed to the stale-binding sweep. An operator/runbook must reconcile \
+                 this device's session",
                 device.display(),
             );
             ::metrics::counter!(crate::metrics::REHYDRATE_UNKNOWN_DEVICE_TOTAL).increment(1);
@@ -4592,9 +4684,10 @@ impl PooledBackend {
             serving = classification.serving.len(),
             reconnect = classification.reconnect.len(),
             quarantined = classification.quarantined.len(),
+            residue = classification.residue.len(),
             reap = classification.reap.len(),
             "startup NBD classification barrier complete (kernel-derived inventory \
-             reconciled against tracked records)",
+             reconciled against owner records + tracked records)",
         );
         classification
     }
@@ -4763,7 +4856,51 @@ impl PooledBackend {
     /// gated so dev workflows fall back to materialize-to-file.
     pub fn with_nbd_pool(mut self, pool: Arc<crate::disk_daemon::NbdSlotAllocator>) -> Self {
         self.nbd_pool = Some(pool);
+        // engrams#1378: a pooled Linux host classifies its kernel inventory
+        // at register; until that barrier runs, the residue report is "no
+        // information" and the heartbeat says so. macOS accepts a pool but
+        // never runs the (Linux-only) barrier, so its report stays
+        // vacuously known-empty.
+        #[cfg(target_os = "linux")]
+        self.nbd_residue_known
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self
+    }
+
+    /// engrams#1378: wire the durable NBD owner-record directory
+    /// (`<work_dir>/nbd-owners`). Written at every attach's id-known point
+    /// and every rehydrate; read by the startup classification barrier.
+    #[cfg(target_os = "linux")]
+    pub fn with_nbd_owner_dir(mut self, dir: std::path::PathBuf) -> Self {
+        match crate::disk_daemon::owners::NbdOwnerDir::open(dir) {
+            Ok(owners) => self.nbd_owners = Some(Arc::new(owners)),
+            Err(error) => tracing::warn!(
+                %error,
+                "NBD owner-record dir open failed; device attribution degrades \
+                 to the record-reconcile path",
+            ),
+        }
+        self
+    }
+
+    /// engrams#1378: the heartbeat's residue report — the attributed
+    /// kernel-connected leftovers awaiting a coordinator tombstone, plus
+    /// whether this generation has classified its inventory yet (the
+    /// issue-#215 "no information ≠ empty" asymmetry).
+    pub fn nbd_residue_report(&self) -> (Vec<SandboxId>, bool) {
+        let known = self
+            .nbd_residue_known
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(target_os = "linux")]
+        {
+            let mut ids: Vec<SandboxId> = self.nbd_residue.iter().map(|e| *e.key()).collect();
+            ids.sort();
+            (ids, known)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            (Vec::new(), known)
+        }
     }
 
     /// The NBD slot pool, when this host serves chunked rootfs via
@@ -7538,6 +7675,7 @@ impl SandboxBackend for PooledBackend {
                 let publisher = self.live_manifest_publisher.clone();
                 let health = self.data_plane_health.clone();
                 let flush_config = self.flush_config.clone();
+                let owners = self.nbd_owners.clone();
                 let abandoning = self.abandoning.clone();
                 let dirty_root = self
                     .resolved_dirty_root()
@@ -7554,7 +7692,13 @@ impl SandboxBackend for PooledBackend {
                                     .into(),
                             )
                         })?;
-                    state.install_flush_scheduler(sandbox_id, publisher, health, flush_config);
+                    state.install_flush_scheduler(
+                        sandbox_id,
+                        publisher,
+                        health,
+                        flush_config,
+                        owners,
+                    );
                     // ADR 0019: open the cold-boot operation window. The guest's
                     // rootfs/substrate ext4-mount page-ins (served by this NBD
                     // backend) now attach `chunk.fetch` spans to the cold-boot
@@ -9346,6 +9490,43 @@ impl SandboxBackend for PooledBackend {
                 let _ = crate::disk_daemon::spool::discard_spool(self.host_fs.as_ref(), &root, id)
                     .await;
             }
+            // engrams#1378: complete an INTERRUPTED PREDECESSOR teardown. A
+            // destroy that died between the FC kill and the NBD disconnect
+            // left this sandbox's device kernel-connected with no in-memory
+            // entry; the startup classification barrier attributed it via
+            // its durable owner record and parked it as residue, and the
+            // coordinator's tombstone (advertised on the heartbeat) re-drives
+            // destroy on THIS generation — this arm is where that teardown
+            // finally lands. On a disconnect error the residue entry is
+            // restored, so the next tombstone advertise retries; the inert
+            // owner record is lazily cleaned at the next startup.
+            if let Some((_, device)) = self.nbd_residue.remove(&id) {
+                use engram_host_core::NbdKernel as _;
+                match crate::disk_daemon::HostNbdKernel.disconnect(&device).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            sandbox_id = %id,
+                            device = %device.display(),
+                            "destroy completed a predecessor's interrupted NBD \
+                             teardown (tombstone-ordered residue disconnect)",
+                        );
+                        ::metrics::counter!(crate::metrics::NBD_RESIDUE_TEARDOWN_TOTAL)
+                            .increment(1);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            sandbox_id = %id,
+                            device = %device.display(),
+                            %error,
+                            "residue NBD disconnect failed; kept for the next \
+                             tombstone advertise to retry",
+                        );
+                        self.nbd_residue.insert(id, device);
+                    }
+                }
+                ::metrics::gauge!(crate::metrics::NBD_RESIDUE_DEVICES)
+                    .set(self.nbd_residue.len() as f64);
+            }
         }
         // ADR 0016 Phase A: drop the COW diagnostic timestamp so
         // the entry doesn't outlive its sandbox. A subsequent
@@ -10624,6 +10805,7 @@ impl PooledBackend {
             self.live_manifest_publisher.clone(),
             self.data_plane_health.clone(),
             self.flush_config.clone(),
+            self.nbd_owners.clone(),
         );
 
         // Issue #224: terminal-mode check. The await window above

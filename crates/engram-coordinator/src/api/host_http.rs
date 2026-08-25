@@ -425,6 +425,20 @@ pub struct HeartbeatRequest {
     /// the handler flips each owning session Active → Unreachable.
     #[serde(default)]
     pub unreachable_guests: Vec<(SandboxId, SessionId)>,
+    /// engrams#1378: sandboxes whose kernel NBD binding survives on the host
+    /// as attributed residue of an interrupted teardown. Counted as PRESENT
+    /// for tombstone ack-by-absence and the ADR 0116 A5 unbound-entomb arm —
+    /// a tombstone is only settled when the host affirms the VM AND its
+    /// kernel binding are gone. `#[serde(default)]` → empty from a pre-#1378
+    /// host-agent mid-roll.
+    #[serde(default)]
+    pub device_residue_sandboxes: Vec<SandboxId>,
+    /// engrams#1378: `false` while the host's startup classification barrier
+    /// has not yet run (residue unknown — the issue-#215 asymmetry). The
+    /// default is `true` so a pre-#1378 host-agent mid-roll keeps today's
+    /// ack behavior.
+    #[serde(default = "default_running_sandboxes_known")]
+    pub device_residue_known: bool,
 }
 
 #[derive(Serialize)]
@@ -1110,13 +1124,21 @@ pub async fn heartbeat(
         }
     };
 
-    // ADR 0116 A-D5: ack tombstones the host's running set no longer
-    // contains, then advertise what is still outstanding.
+    // ADR 0116 A-D5: ack tombstones the host's PRESENCE set no longer
+    // contains, then advertise what is still outstanding. engrams#1378:
+    // presence = running VMs ∪ attributed NBD residue — a sandbox whose
+    // kernel binding survives an interrupted teardown keeps its tombstone
+    // alive (and advertised, so the host's destroy completes the
+    // disconnect) instead of being acked by a VM-only absence check, the
+    // exact mis-ack of the 2026-08-25 firing. Both `known` flags gate the
+    // ack/entomb arms (the issue-#215 "no information ≠ empty" asymmetry).
+    let mut present_sandboxes = hb.running_sandboxes.clone();
+    present_sandboxes.extend(hb.device_residue_sandboxes.iter().copied());
     let tombstoned_sandboxes = crate::dead_host::process_sandbox_tombstones(
         &state.services.meta,
         host_id,
-        &hb.running_sandboxes,
-        hb.running_sandboxes_known,
+        &present_sandboxes,
+        hb.running_sandboxes_known && hb.device_residue_known,
     )
     .await;
 
@@ -1963,6 +1985,36 @@ mod tests {
         let minimal = r#"{"declared_at_unix_ms": 1, "ttl_secs": 2}"#;
         let m: HandoffMarker = serde_json::from_str(minimal).expect("decode minimal");
         assert_eq!(m.resident_sandboxes, 0);
+    }
+
+    /// engrams#1378 mixed-fleet pin: a heartbeat from a pre-#1378 host-agent
+    /// (no residue fields) must decode as known-empty residue — today's ack
+    /// behavior — while an unclassified new host's explicit `false` withholds
+    /// the ack (the issue-#215 asymmetry, applied to residue).
+    #[test]
+    fn heartbeat_residue_fields_default_for_pre_1378_hosts() {
+        let legacy = r#"{
+            "capacity": {
+                "total_mib": 1, "used_mib": 1, "running_sandboxes": 0
+            }
+        }"#;
+        let hb: HeartbeatRequest = serde_json::from_str(legacy).expect("decode legacy heartbeat");
+        assert!(hb.device_residue_sandboxes.is_empty());
+        assert!(hb.device_residue_known);
+        let sb = engram_core::SandboxId::new();
+        let unclassified = format!(
+            r#"{{
+            "capacity": {{
+                "total_mib": 1, "used_mib": 1, "running_sandboxes": 0
+            }},
+            "device_residue_sandboxes": ["{sb}"],
+            "device_residue_known": false
+        }}"#
+        );
+        let hb: HeartbeatRequest =
+            serde_json::from_str(&unclassified).expect("decode residue heartbeat");
+        assert_eq!(hb.device_residue_sandboxes, vec![sb]);
+        assert!(!hb.device_residue_known);
     }
     use engram_core::types::session::SessionMode;
     use engram_core::types::Session;

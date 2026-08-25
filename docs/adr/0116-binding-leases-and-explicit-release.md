@@ -217,6 +217,25 @@ bound arm (the PG-ownership poll) and `ORPHAN_STRIKES` retire; the
 unbound arm keeps its coordinator-confirmed-absence discipline and
 re-keys its create→bind debounce on sandbox-manifest age.
 
+**A-D5 amendment (2026-08-25, engrams#1378).** The ack predicate is
+PRESENCE, not VM-presence: the heartbeat additionally carries
+`device_residue_sandboxes` (+ `device_residue_known`, defaulting `true`
+for mixed-fleet interop) — sandboxes whose kernel NBD binding survives
+on the host as attributed residue of an interrupted teardown (a destroy
+that died between the FC kill and the NBD disconnect; attribution via
+the host's durable `nbd-owners/<dev>` records, written at every
+attach's id-known point). A tombstone is acked by absence only from
+`running ∪ residue`, and the A5 unbound-entomb arm runs over the same
+union, so the tombstone stays advertised — and its re-driven `destroy`
+completes the disconnect on whichever generation is alive — until the
+kernel binding is actually gone. The 2026-08-25
+`rehydrate-unknown-device` firing was exactly the pre-amendment
+mis-ack: the successor orphan-reaped the dead FC, the VM-only absence
+check retired the tombstone at first heartbeat, and the leftover
+binding sat quarantined with no settlement owner until the node was
+replaced. Both `known` flags gate the ack/entomb arms (the issue-#215
+"no information ≠ empty" asymmetry, applied to residue).
+
 **A failure matrix** (proved in design review; the DST scenarios in
 `## Verification` hold each row): planned-slow-roll, SIGKILL without a
 ladder, node preemption, coordinator restart mid-roll (a per-replica

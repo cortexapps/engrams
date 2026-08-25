@@ -42,6 +42,10 @@ fn reap_all(paths: &[PathBuf]) -> ReapList<PathBuf> {
                 liveness: PidLiveness::Dead,
                 holder: DeviceHolder::NoHolder,
                 has_record: false,
+                // engrams#1378: an attributed device never reaps on the
+                // host's own verdict; the terminal class requires an
+                // unattributed slot.
+                attributed: false,
             })
             .collect(),
     )

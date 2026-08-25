@@ -358,6 +358,13 @@ impl HostAgent {
                 }
                 if let Some(pool) = self.nbd_pool.clone() {
                     p = p.with_nbd_pool(pool);
+                    // engrams#1378: the durable device→sandbox owner records
+                    // live beside the sandboxes (the same hostPath volume
+                    // the kernel bindings outlive pod rolls on).
+                    #[cfg(target_os = "linux")]
+                    {
+                        p = p.with_nbd_owner_dir(self.cfg.work_dir.join("nbd-owners"));
+                    }
                 }
                 // ADR 0016 Phase B: wire the coord-bound
                 // live-manifest publisher. The publisher's drain
@@ -1588,6 +1595,11 @@ impl HostAgent {
                     // until the coord's ack names it — the
                     // `checkpoints`/`acked_checkpoints` pattern verbatim.
                     let capture_job_reports = capture_jobs_for_heartbeat.current_reports();
+                    // engrams#1378: attributed residue + its known flag (the
+                    // issue-#215 asymmetry — unclassified is "no
+                    // information", not "no residue").
+                    let (device_residue, device_residue_known) =
+                        pooled_for_heartbeat.nbd_residue_report();
                     let req = coord_client::HeartbeatRequest {
                         capacity: engram_protocol::heartbeat::HostCapacityReport {
                             total_mib: host_total_mib,
@@ -1630,6 +1642,14 @@ impl HostAgent {
                         // ADR 0091: control-plane-dead guests; the coord
                         // flips their sessions Active → Unreachable.
                         unreachable_guests: pooled_for_heartbeat.unreachable_guests(),
+                        // engrams#1378: attributed NBD residue — leftovers of
+                        // interrupted teardowns awaiting a tombstone. The
+                        // coordinator counts these as PRESENT for tombstone
+                        // ack-by-absence and the A5 unbound-entomb arm, so a
+                        // tombstone stays advertised (and gets re-driven into
+                        // `destroy`) until the kernel binding is actually gone.
+                        device_residue_sandboxes: device_residue,
+                        device_residue_known,
                     };
                     match coord_for_heartbeat.heartbeat(host_id, &req).await {
                         Ok(resp) => {

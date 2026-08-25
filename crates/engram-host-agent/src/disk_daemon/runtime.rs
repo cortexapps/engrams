@@ -603,10 +603,14 @@ pub fn device_has_live_holder(device: &std::path::Path) -> engram_host_core::Dev
 /// re-served the survivors they cover (those show as self-owned ⇒ `Serving`).
 pub fn classify_startup_inventory(
     kernel: &dyn NbdKernel,
-    record_devices: &std::collections::HashSet<PathBuf>,
-) -> engram_host_core::StartupClassification<PathBuf> {
+    records: &StartupRecords,
+    owners: &std::collections::HashMap<PathBuf, engram_core::SandboxId>,
+) -> (
+    engram_host_core::StartupClassification<PathBuf>,
+    Vec<(engram_core::SandboxId, PathBuf)>,
+) {
     let self_pid = std::process::id() as i32;
-    let slots = kernel
+    let slots: Vec<engram_host_core::StartupSlot<PathBuf>> = kernel
         .connected_devices()
         .into_iter()
         .map(|dev| {
@@ -617,24 +621,56 @@ pub fn classify_startup_inventory(
             } else {
                 engram_host_core::PidLiveness::Dead
             };
+            // engrams#1378: a durable owner record attributes the device to
+            // its sandbox without any live process.
+            let owner = owners.get(&dev.device).copied();
+            let has_record = owner.is_some_and(|sb| records.sandboxes.contains(&sb))
+                || records.devices.contains(&dev.device);
             // The holder scan (proof of death) only changes a DEAD owner's
-            // verdict — a live/self owner is `Serving` regardless — so we pay the
-            // cold `/proc` scan only there.
-            let holder = if matches!(liveness, engram_host_core::PidLiveness::Dead) {
-                device_has_live_holder(&dev.device)
-            } else {
-                engram_host_core::DeviceHolder::NoHolder
-            };
-            let has_record = record_devices.contains(&dev.device);
+            // verdict — a live/self owner is `Serving` regardless — and an
+            // ATTRIBUTED device's class never consults it either (residue is
+            // coordinator-ordered, never severed on the host's own verdict),
+            // so we pay the cold `/proc` scan only for a dead-owner
+            // unattributed device.
+            let holder =
+                if matches!(liveness, engram_host_core::PidLiveness::Dead) && owner.is_none() {
+                    device_has_live_holder(&dev.device)
+                } else {
+                    engram_host_core::DeviceHolder::NoHolder
+                };
             engram_host_core::StartupSlot {
                 device: dev.device,
                 liveness,
                 holder,
                 has_record,
+                attributed: owner.is_some(),
             }
         })
         .collect();
-    engram_host_core::classify_startup_slots(slots)
+    let classification = engram_host_core::classify_startup_slots(slots);
+    // The residue attribution: sandbox per residue device (every residue slot
+    // is attributed by construction — `attributed: true` is the only path to
+    // the class).
+    let residue_pairs = classification
+        .residue
+        .iter()
+        .filter_map(|device| owners.get(device).map(|sb| (*sb, device.clone())))
+        .collect();
+    (classification, residue_pairs)
+}
+
+/// The tracked-record inputs to [`classify_startup_inventory`] — the Layer-2
+/// reconcile keys (engrams#1378 split the single device-path set in two).
+///
+/// `devices` is the legacy device-path attribution (coord-list survivors,
+/// `ChainHeadRecord`s, and served sandboxes resolved through the live FC
+/// entry's `rootfs_device`, plus the allocator's parked set). `sandboxes` is
+/// the sandbox-id view of the same sources plus the reattached FC list —
+/// matched against the durable owner records, so it needs no live FC entry.
+#[derive(Debug, Default)]
+pub struct StartupRecords {
+    pub devices: std::collections::HashSet<PathBuf>,
+    pub sandboxes: std::collections::HashSet<engram_core::SandboxId>,
 }
 
 /// `true` if `pid` names a live process. `kill(pid, 0)` sends no signal
@@ -828,7 +864,15 @@ impl NbdSandboxState {
         publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
         health: Arc<dyn crate::disk_daemon::DataPlaneHealth>,
         config: crate::disk_daemon::FlushSchedulerConfig,
+        owners: Option<Arc<crate::disk_daemon::owners::NbdOwnerDir>>,
     ) {
+        // engrams#1378: this is THE id-known point of every attach — the
+        // durable device→sandbox owner record is written here, BEFORE the
+        // flush-scheduler kill-switch gate (attribution is not a flush
+        // concern).
+        if let Some(owners) = owners.as_ref() {
+            owners.record(self.device_path(), sandbox_id);
+        }
         if !config.enabled {
             return;
         }

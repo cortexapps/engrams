@@ -1238,6 +1238,21 @@ soft-invariant (ADR 0099 H6 site) + `engram_nbd_rehydrate_unknown_device_total`
 counter so an operator/runbook reconciles the device — never a silent skip, never
 a sever.
 
+*Amended 2026-08-25 (engrams#1378).* The barrier gained a fourth input and a
+fifth class: durable owner records (`nbd-owners/<dev>` → sandbox id, written at
+every attach's id-known point, lazily cleaned) attribute a connected device
+with no live process, and an ATTRIBUTED dead-owner recordless device classifies
+`ResidueAwaitingTombstone` — parked, reported on the heartbeat
+(`device_residue_sandboxes`), and torn down by `destroy` when the coordinator's
+tombstone (kept alive by the residue-aware ack, ADR 0116 A-D5 amendment) comes
+back. The holder scan is skipped for attributed devices: residue settlement is
+coordinator-ordered, never the host's own verdict, which is strictly stronger
+than proof-of-death. `QuarantinedUnknown` (+ its alert) narrows to UNATTRIBUTED
+devices — pre-owner-record leftovers for one fleet roll, the narrow pre-id
+attach window, then genuine corruption. The device-plane sims currently model
+the unattributed world (`attributed: false`); extending the co-sim to the
+attributed/residue flow is tracked on engrams#1378.
+
 *Prod.* `HostNbdKernel::connected_devices` (Linux sysfs); `PooledBackend::classify_startup_slots`
 builds the record set from `rootfs_device` over the coord-list survivors ∪ the
 `ChainHeadRecord`s ∪ the now-served sandboxes, runs the barrier AFTER the two

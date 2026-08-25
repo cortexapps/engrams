@@ -48,13 +48,29 @@ pub enum SlotClass {
     /// process) AND no tracked record. The genuine stale binding — the ONLY
     /// class the destructive sweep may DISCONNECT.
     TerminalSafeToReap,
-    /// A kernel-connected device the reconcile could NOT account for: a
-    /// dead-owner device whose node a live (or unprovable) process still holds
-    /// open, but which NO tracked record references — the #769 gap-A survivor,
-    /// invisible to the records. Parked (left kernel-bound, RECONNECTABLE) and
-    /// ALERTED (`rehydrate-unknown-device`); never severed, never silently
-    /// skipped.
+    /// A kernel-connected UNATTRIBUTED device the reconcile could NOT account
+    /// for: a dead-owner device whose node a live (or unprovable) process
+    /// still holds open, but which NO tracked record references — the #769
+    /// gap-A survivor, invisible to the records. Parked (left kernel-bound,
+    /// RECONNECTABLE) and ALERTED (`rehydrate-unknown-device`); never severed,
+    /// never silently skipped. Post-#1378 every id-bound binding carries a
+    /// durable owner record, so this class shrinks to pre-owner-record
+    /// leftovers (one fleet roll), the narrow pre-id attach window, and
+    /// genuine corruption.
     QuarantinedUnknown,
+    /// engrams#1378: an ATTRIBUTED dead-owner device no tracked record
+    /// accounts for — owner-record-attributed residue of a teardown that died
+    /// mid-flight (a destroy racing a pod roll) or of a survivor whose other
+    /// records were lost. Parked kernel-bound and REPORTED to the coordinator
+    /// on every
+    /// heartbeat (`device_residue_sandboxes`); the coordinator's tombstone —
+    /// existing (the interrupted destroy already wrote one) or minted by the
+    /// ADR 0116 A5 unbound-entomb arm — comes back on the heartbeat and
+    /// `destroy` completes the teardown then. Disposition is always
+    /// coordinator-ordered: the host never severs residue on its own verdict,
+    /// so a live-but-invisible guest is protected without a holder scan (a
+    /// session-bound sandbox is never entombed).
+    ResidueAwaitingTombstone,
 }
 
 /// One kernel-connected NBD slot, reconciled against the tracked records, ready
@@ -80,6 +96,15 @@ pub struct StartupSlot<D> {
     /// inventory is the spine, records are matched AGAINST it. A connected device
     /// with `has_record == false` is a survivor invisible to the records.
     pub has_record: bool,
+    /// engrams#1378: whether a durable owner record maps this device to its
+    /// sandbox (the prod driver's `nbd-owners/<dev>` file, written at the
+    /// id-known point of every attach and rehydrate). An attributed device's
+    /// sandbox is known without any rehydrate record, so a dead-owner
+    /// recordless attributed device is
+    /// [`SlotClass::ResidueAwaitingTombstone`] (coordinator-ordered
+    /// settlement), never [`SlotClass::QuarantinedUnknown`] and never the
+    /// holder-scan-gated [`SlotClass::TerminalSafeToReap`].
+    pub attributed: bool,
 }
 
 /// The reapable device set — the ONLY input a destructive stale-binding sweep
@@ -128,6 +153,10 @@ pub struct StartupClassification<D> {
     /// [`SlotClass::QuarantinedUnknown`] devices — park + alert
     /// (`rehydrate-unknown-device`).
     pub quarantined: Vec<D>,
+    /// [`SlotClass::ResidueAwaitingTombstone`] devices — park, report on the
+    /// heartbeat, and complete the teardown when the coordinator's tombstone
+    /// orders it (engrams#1378).
+    pub residue: Vec<D>,
     /// [`SlotClass::TerminalSafeToReap`] devices — the sweep's sole input.
     pub reap: ReapList<D>,
 }
@@ -150,30 +179,40 @@ pub fn classify_startup_slot(
     liveness: PidLiveness,
     holder: DeviceHolder,
     has_record: bool,
+    attributed: bool,
 ) -> SlotClass {
     use DeviceHolder::{LiveHolder, NoHolder, Unknown};
     use PidLiveness::{Alive, Dead, NoPid, SelfPid};
-    match (liveness, holder, has_record) {
+    match (liveness, holder, has_record, attributed) {
         // A live / self / no-binding owner already serves the device (or there
-        // is nothing bound to reap) — leave it. The holder and the record are
-        // irrelevant, but every combination is enumerated so neither enum can
-        // grow a silently-uncovered variant.
-        (NoPid | SelfPid | Alive, LiveHolder | NoHolder | Unknown, true | false) => {
+        // is nothing bound to reap) — leave it. The holder, the record, and the
+        // stamp are irrelevant, but every combination is enumerated so no enum
+        // can grow a silently-uncovered variant.
+        (NoPid | SelfPid | Alive, LiveHolder | NoHolder | Unknown, true | false, true | false) => {
             SlotClass::Serving
         }
         // Dead owner WITH a tracked record: a known resident survivor. The
         // rehydrate passes re-serve it; the sweep never reaps a device we hold a
         // record for (a failed serve is retryable). Holds regardless of the
-        // holder scan.
-        (Dead, LiveHolder | NoHolder | Unknown, true) => SlotClass::ReconnectMe,
-        // Dead owner, NO record, PROOF OF DEATH (a completed scan found no live
-        // holder): the genuine stale binding — the sole reapable class.
-        (Dead, NoHolder, false) => SlotClass::TerminalSafeToReap,
-        // Dead owner, NO record, but a live (or unprovable) process still holds
-        // the node open: the gap-A survivor invisible to the records. Quarantine
-        // + alert; never sever.
-        (Dead, LiveHolder, false) => SlotClass::QuarantinedUnknown,
-        (Dead, Unknown, false) => SlotClass::QuarantinedUnknown,
+        // holder scan and the stamp.
+        (Dead, LiveHolder | NoHolder | Unknown, true, true | false) => SlotClass::ReconnectMe,
+        // engrams#1378: dead owner, NO record, but the kernel binding is
+        // sandbox-attributed — attributed residue. Settlement is
+        // coordinator-ordered (report on the heartbeat; the tombstone comes
+        // back and `destroy` completes the teardown), so neither the
+        // holder-scan reap arm nor the quarantine alert applies. The holder is
+        // enumerated but irrelevant: the host never severs residue on its own
+        // verdict, which is a strictly stronger guarantee than the scan.
+        (Dead, LiveHolder | NoHolder | Unknown, false, true) => SlotClass::ResidueAwaitingTombstone,
+        // Dead owner, NO record, UNATTRIBUTED (pre-#1378 binding or foreign),
+        // PROOF OF DEATH (a completed scan found no live holder): the genuine
+        // stale binding — the sole reapable class.
+        (Dead, NoHolder, false, false) => SlotClass::TerminalSafeToReap,
+        // Dead owner, NO record, UNATTRIBUTED, but a live (or unprovable) process
+        // still holds the node open: the gap-A survivor invisible to the
+        // records. Quarantine + alert; never sever.
+        (Dead, LiveHolder, false, false) => SlotClass::QuarantinedUnknown,
+        (Dead, Unknown, false, false) => SlotClass::QuarantinedUnknown,
     }
 }
 
@@ -186,12 +225,14 @@ pub fn classify_startup_slots<D>(slots: Vec<StartupSlot<D>>) -> StartupClassific
     let mut serving = Vec::new();
     let mut reconnect = Vec::new();
     let mut quarantined = Vec::new();
+    let mut residue = Vec::new();
     let mut reap = Vec::new();
     for slot in slots {
-        match classify_startup_slot(slot.liveness, slot.holder, slot.has_record) {
+        match classify_startup_slot(slot.liveness, slot.holder, slot.has_record, slot.attributed) {
             SlotClass::Serving => serving.push(slot.device),
             SlotClass::ReconnectMe => reconnect.push(slot.device),
             SlotClass::QuarantinedUnknown => quarantined.push(slot.device),
+            SlotClass::ResidueAwaitingTombstone => residue.push(slot.device),
             SlotClass::TerminalSafeToReap => reap.push(slot.device),
         }
     }
@@ -199,6 +240,7 @@ pub fn classify_startup_slots<D>(slots: Vec<StartupSlot<D>>) -> StartupClassific
         serving,
         reconnect,
         quarantined,
+        residue,
         reap: ReapList { devices: reap },
     }
 }
@@ -228,28 +270,38 @@ mod tests {
         for liveness in livenesses {
             for holder in holders {
                 for has_record in [true, false] {
-                    let class = classify_startup_slot(liveness, holder, has_record);
-                    // A live/self/no owner is always Serving.
-                    if !matches!(liveness, PidLiveness::Dead) {
-                        assert_eq!(class, SlotClass::Serving, "{liveness:?}/{holder:?}");
-                        continue;
-                    }
-                    // Dead owner: a record always wins (ReconnectMe), never reap.
-                    if has_record {
-                        assert_eq!(class, SlotClass::ReconnectMe, "{holder:?}");
-                        continue;
-                    }
-                    // Dead + no record: the reap arm matches sweep_verdict's
-                    // Disconnect exactly; a Park becomes QuarantinedUnknown.
-                    match sweep_verdict(liveness, holder) {
-                        SweepAction::Disconnect => {
-                            assert_eq!(class, SlotClass::TerminalSafeToReap, "{holder:?}")
+                    for attributed in [true, false] {
+                        let class = classify_startup_slot(liveness, holder, has_record, attributed);
+                        // A live/self/no owner is always Serving.
+                        if !matches!(liveness, PidLiveness::Dead) {
+                            assert_eq!(class, SlotClass::Serving, "{liveness:?}/{holder:?}");
+                            continue;
                         }
-                        SweepAction::Park => {
-                            assert_eq!(class, SlotClass::QuarantinedUnknown, "{holder:?}")
+                        // Dead owner: a record always wins (ReconnectMe), never reap.
+                        if has_record {
+                            assert_eq!(class, SlotClass::ReconnectMe, "{holder:?}");
+                            continue;
                         }
-                        SweepAction::NotStuck => {
-                            unreachable!("a dead owner is never NotStuck")
+                        // engrams#1378: dead + no record + ATTRIBUTED is residue —
+                        // coordinator-ordered settlement, never the holder-scan
+                        // reap and never the quarantine alert.
+                        if attributed {
+                            assert_eq!(class, SlotClass::ResidueAwaitingTombstone, "{holder:?}");
+                            continue;
+                        }
+                        // Dead + no record + unattributed: the reap arm matches
+                        // sweep_verdict's Disconnect exactly; a Park becomes
+                        // QuarantinedUnknown.
+                        match sweep_verdict(liveness, holder) {
+                            SweepAction::Disconnect => {
+                                assert_eq!(class, SlotClass::TerminalSafeToReap, "{holder:?}")
+                            }
+                            SweepAction::Park => {
+                                assert_eq!(class, SlotClass::QuarantinedUnknown, "{holder:?}")
+                            }
+                            SweepAction::NotStuck => {
+                                unreachable!("a dead owner is never NotStuck")
+                            }
                         }
                     }
                 }
@@ -257,20 +309,39 @@ mod tests {
         }
     }
 
-    /// The gap-A property: a dead-owner device a live guest still holds open,
-    /// with NO record, is Quarantined — CLASSIFIED, never reaped.
+    /// The gap-A property: a dead-owner UNATTRIBUTED device a live guest still
+    /// holds open, with NO record, is Quarantined — CLASSIFIED, never reaped.
     #[test]
     fn gap_a_live_survivor_without_a_record_is_quarantined_never_reaped() {
         assert_eq!(
-            classify_startup_slot(PidLiveness::Dead, DeviceHolder::LiveHolder, false),
+            classify_startup_slot(PidLiveness::Dead, DeviceHolder::LiveHolder, false, false),
             SlotClass::QuarantinedUnknown,
         );
         // An unprovable holder (scan error) is likewise quarantined, never
         // reaped — absence of proof is not proof of death.
         assert_eq!(
-            classify_startup_slot(PidLiveness::Dead, DeviceHolder::Unknown, false),
+            classify_startup_slot(PidLiveness::Dead, DeviceHolder::Unknown, false, false),
             SlotClass::QuarantinedUnknown,
         );
+    }
+
+    /// engrams#1378: a attributed dead-owner recordless device is residue for
+    /// EVERY holder verdict — never reaped by the host's own verdict (even
+    /// with proof of death: the disposition is the coordinator's), never
+    /// quarantine-alerted (it is attributed, not unknown).
+    #[test]
+    fn attributed_recordless_device_is_residue_never_reaped_never_quarantined() {
+        for holder in [
+            DeviceHolder::LiveHolder,
+            DeviceHolder::NoHolder,
+            DeviceHolder::Unknown,
+        ] {
+            assert_eq!(
+                classify_startup_slot(PidLiveness::Dead, holder, false, true),
+                SlotClass::ResidueAwaitingTombstone,
+                "{holder:?}"
+            );
+        }
     }
 
     /// `classify_startup_slots` partitions and only `TerminalSafeToReap` reaches
@@ -284,6 +355,7 @@ mod tests {
                 liveness: PidLiveness::SelfPid,
                 holder: DeviceHolder::LiveHolder,
                 has_record: true,
+                attributed: true,
             },
             // ReconnectMe (dead owner, record).
             StartupSlot {
@@ -291,26 +363,41 @@ mod tests {
                 liveness: PidLiveness::Dead,
                 holder: DeviceHolder::LiveHolder,
                 has_record: true,
+                attributed: true,
             },
-            // QuarantinedUnknown (dead owner, live holder, no record — gap A).
+            // QuarantinedUnknown (dead owner, live holder, no record, no stamp
+            // — gap A).
             StartupSlot {
                 device: 3,
                 liveness: PidLiveness::Dead,
                 holder: DeviceHolder::LiveHolder,
                 has_record: false,
+                attributed: false,
             },
-            // TerminalSafeToReap (dead owner, proof of death, no record).
+            // TerminalSafeToReap (dead owner, proof of death, no record, no
+            // stamp).
             StartupSlot {
                 device: 4,
                 liveness: PidLiveness::Dead,
                 holder: DeviceHolder::NoHolder,
                 has_record: false,
+                attributed: false,
+            },
+            // ResidueAwaitingTombstone (dead owner, no record, ATTRIBUTED —
+            // engrams#1378; proof of death does not reap it).
+            StartupSlot {
+                device: 5,
+                liveness: PidLiveness::Dead,
+                holder: DeviceHolder::NoHolder,
+                has_record: false,
+                attributed: true,
             },
         ];
         let c = classify_startup_slots(slots);
         assert_eq!(c.serving, vec![1]);
         assert_eq!(c.reconnect, vec![2]);
         assert_eq!(c.quarantined, vec![3]);
+        assert_eq!(c.residue, vec![5]);
         assert_eq!(c.reap.devices(), &[4]);
         assert_eq!(c.reap.len(), 1);
         assert!(!c.reap.is_empty());
