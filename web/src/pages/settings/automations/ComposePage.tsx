@@ -66,7 +66,7 @@ export function ComposePage() {
   };
 
   return (
-    <div className="mx-auto max-w-2xl space-y-6 py-8" data-testid="automation-compose">
+    <div className="mx-auto max-w-4xl space-y-6 py-8" data-testid="automation-compose">
       <div className="space-y-2">
         <p className="text-muted-foreground text-xs font-medium tracking-wide uppercase">
           New automation
@@ -84,7 +84,6 @@ export function ComposePage() {
         submitLabel="Start drafting"
         pendingLabel="Starting…"
         pending={draft.isPending}
-        quiet
         placeholder="When a PR opens, run the tests and…"
         {...(prefill !== null ? { initialPrompt: prefill } : {})}
         onStateChange={setComposerState}
