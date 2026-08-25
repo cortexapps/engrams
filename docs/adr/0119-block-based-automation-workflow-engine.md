@@ -287,9 +287,18 @@ schema normalizes it, so every stored version has the array form.
   delivery against every entrypoint's trigger; cron, integration, and manual
   triggers can coexist in one automation.
 - `step:__snapshot__:0` records the entrypoint id with the pinned version,
-  and the interpreter walks that entrypoint's blocks. This changes what the
-  registered body does with the snapshot, so it bumps
-  `ENGINE_STEP_CONTRACT`.
+  and the interpreter walks that entrypoint's blocks. Shipped ADDITIVE
+  (divergence from the first draft of this decision): an absent
+  `entrypointId` in an old checkpointed snapshot means the main entrypoint,
+  whose blocks are the top-level list — replay walks exactly what it always
+  walked, so `ENGINE_STEP_CONTRACT` did NOT bump and no in-flight run
+  stranded.
+- Shipped constraints (#1372): at most ONE cron trigger per automation (the
+  row tracks one `next_fire_at`); the legacy `webhook` trigger stays
+  main-only; block ids are unique across ALL entrypoints (one `steps.*`
+  namespace); the main entrypoint keeps the historical two-part run id, an
+  extra entrypoint mints `autorun:<auto>:<ep>:<deliveryKey>`, and both
+  dedupe uniques carry `entrypoint_id`.
 - Concurrency claims stay **automation-scoped**: two entrypoints whose runs
   compute the same `concurrencyKey` (for example `ticket:<id>`) serialize
   through one claim row, whatever entrypoint opened them.
@@ -383,9 +392,11 @@ Phase 2 adds `integration_event`. Phase 4 adds `review.automation_run_id`
 and the window flag, then drops `review_session`, `review_enrollment`,
 `webhook_sample`, and `review.workflow_id`.
 
-Phase 5 (D9–D11) adds `automation_state` (migration 0083). Entrypoints
-need no migration — definitions are jsonb — and adoption re-uses
-`automation_session.run_id`.
+Phase 5 (D9–D11) adds `automation_state` (migration 0083) and, diverging
+from the first draft, migration 0084: `automation_version.entrypoints`
+(the version row stores columns, not one jsonb document) plus
+`automation_run.entrypoint_id` with both dedupe uniques rebuilt around it.
+Adoption re-uses `automation_session.run_id`.
 
 ## API surface
 
@@ -412,9 +423,10 @@ retry). `IntegrationService` gains `ListEventCatalog` and `ListActionCatalog`.
    per-repo flag (window opens), Slack relay + built-in + per-channel flag
    (window opens), then the two deletion PRs and the ADR bookends
    (this ADR → Accepted; ADR 0060/0100/0102 amended).
-5. **Stateful automations** (D9–D11, amended 2026-08-24) — `automation_state`
-   + state blocks, multiple entrypoints, session adoption + `session.status`.
-   Ships after the phase-4 windows open; no dependency on the deletions.
+5. **Stateful automations** (D9–D11, amended 2026-08-24; shipped 2026-08-25
+   in #1369–#1374) — `automation_state` + state blocks, multiple
+   entrypoints, session adoption + `session_status`, and the Build tab's
+   entrypoint projection editor. No dependency on the phase-4 deletions.
 
 ## Correctness and security invariants
 
