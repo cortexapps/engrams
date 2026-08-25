@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  blockKind,
+  insertableBlockKinds,
   applyOverrides,
   diffOverrides,
   findBlock,
@@ -152,5 +154,22 @@ describe("parseBlockErrors", () => {
     expect(parseBlockErrors("something odd happened")).toEqual([
       { blockId: "", field: "form", message: "something odd happened" },
     ]);
+  });
+});
+
+describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
+  it("every engine block the orchestrator registers has a typed catalog entry", () => {
+    for (const kind of ["state_get", "state_set", "state_delete", "state_list", "session_status"]) {
+      const spec = blockKind(kind);
+      expect(spec.description).not.toBe("Unknown block kind.");
+      expect(spec.system).not.toBe(true);
+      expect(insertableBlockKinds().some((s) => s.kind === kind)).toBe(true);
+    }
+  });
+
+  it("defaults satisfy the summary renderers", () => {
+    for (const spec of insertableBlockKinds()) {
+      expect(() => spec.summary(spec.defaults())).not.toThrow();
+    }
   });
 });

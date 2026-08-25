@@ -11,10 +11,14 @@ import type { LucideIcon } from "lucide-react";
 import {
   Braces,
   CircleStop,
+  Database,
+  Eraser,
   Filter,
   FilePlus2,
   GitBranch,
+  HeartPulse,
   Hourglass,
+  List,
   Lock,
   MailOpen,
   Play,
@@ -235,6 +239,15 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     defaults: () => ({ session: { blockId: "" }, until: "idle" }),
   },
   {
+    kind: "session_status",
+    label: "Session status",
+    description: "Probe a session read-only: status, idle time, and whether a live run owns it.",
+    icon: HeartPulse,
+    fields: [{ type: "session_ref", key: "session", label: "Session" }],
+    summary: (c) => `probe ${sessionRefLabel(c["session"])}`,
+    defaults: () => ({ session: { template: "" } }),
+  },
+  {
     kind: "wait_event",
     label: "Wait for event",
     description: "Receive the next delivery joined into this run (join concurrency).",
@@ -298,6 +311,78 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
         : "No files";
     },
     defaults: () => ({ session: { blockId: "" }, files: [] }),
+  },
+  {
+    kind: "state_get",
+    label: "Read state",
+    description: "Read one entry from this automation's shared state.",
+    icon: Database,
+    fields: [
+      {
+        type: "template",
+        key: "key",
+        label: "Key",
+        help: "One document per entity, e.g. ticket:${{ event.raw.id }}",
+      },
+    ],
+    summary: (c) => truncate(str(c["key"]), 48) || "No key",
+    defaults: () => ({ key: "" }),
+  },
+  {
+    kind: "state_set",
+    label: "Write state",
+    description: "Write one entry; an expected version turns the write into a compare-and-swap.",
+    icon: Database,
+    fields: [
+      {
+        type: "template",
+        key: "key",
+        label: "Key",
+        help: "One document per entity, e.g. ticket:${{ event.raw.id }}",
+      },
+      {
+        type: "json",
+        key: "value",
+        label: "Value",
+        help: 'JSON, or a run-time reference like {"$ref": "steps.facts.value"}.',
+      },
+      {
+        type: "number",
+        key: "expectVersion",
+        label: "Expect version",
+        min: 0,
+        help: "Optional CAS: 0 = create only. A miss is steps.<id>.ok = false, never an error.",
+      },
+    ],
+    summary: (c) => truncate(str(c["key"]), 48) || "No key",
+    defaults: () => ({ key: "", value: {} }),
+  },
+  {
+    kind: "state_delete",
+    label: "Delete state",
+    description: "Delete one entry (idempotent); an expected version makes it conditional.",
+    icon: Eraser,
+    fields: [
+      { type: "template", key: "key", label: "Key" },
+      { type: "number", key: "expectVersion", label: "Expect version", min: 0 },
+    ],
+    summary: (c) => truncate(str(c["key"]), 48) || "No key",
+    defaults: () => ({ key: "" }),
+  },
+  {
+    kind: "state_list",
+    label: "List state",
+    description: "List entries by key prefix (up to 500), oldest key first.",
+    icon: List,
+    fields: [
+      { type: "template", key: "prefix", label: "Key prefix", help: "Empty = every entry." },
+      { type: "number", key: "limit", label: "Limit", min: 1, max: 500 },
+    ],
+    summary: (c) => {
+      const prefix = str(c["prefix"]);
+      return prefix ? `prefix ${truncate(prefix, 40)}` : "every entry";
+    },
+    defaults: () => ({ prefix: "" }),
   },
   {
     kind: "integration_action",

@@ -70,6 +70,18 @@ const KNOWN_OUTPUTS: Record<string, readonly string[]> = {
   branch: ["taken"],
   loop: ["iterations"],
   end_session: ["ended"],
+  session_status: [
+    "found",
+    "status",
+    "last_active_at",
+    "last_event_at",
+    "idle_seconds",
+    "owner_run_live",
+  ],
+  state_get: ["found", "value", "version"],
+  state_set: ["ok", "version", "current_version", "current_value"],
+  state_delete: ["ok", "deleted"],
+  state_list: ["entries", "count", "truncated"],
 };
 
 function sessionSourcesFor(definition: AutomationDefinition, selectedId: string | null): string[] {
