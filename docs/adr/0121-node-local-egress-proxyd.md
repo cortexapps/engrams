@@ -1,6 +1,17 @@
 # ADR 0121: Node-local egress proxyd — in-flight guest egress survives host-agent rolls
 
-Status: Proposed (2026-08-26)
+Status: Accepted (2026-08-26)
+
+Commit chain: #1407 (this ADR, Proposed) → #1408 (`engram-egress-proto`
++ `engram-egress-proxyd`, unwired) → #1411 (host-agent switch-over:
+ensure/adopt/supervise, the `HostEgress` facade, chart/Tilt/CI wiring)
+→ the stream-survival proof (`egress_stream_survives_roll`, CI KVM
+root lane) + this Accepted flip.
+
+Divergence from the Proposed draft, recorded in Decision §6: the app
+relay dial-back passes a socketpair end and host-agent pumps, instead
+of passing the raw guest fd (FC's guest streams are epoch-severed
+wrappers; VZ's are in-process objects).
 
 Terms used in this document:
 
