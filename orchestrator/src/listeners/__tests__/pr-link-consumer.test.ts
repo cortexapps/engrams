@@ -295,3 +295,80 @@ describe("PR-link consumer", () => {
     expect([...recorder.rows.values()][0]?.authoringTaskId).toBeNull();
   });
 });
+
+describe("PR-link consumer instance handles (ADR 0120)", () => {
+  function ledger(preOwned: Record<string, string> = {}) {
+    const owners = new Map(Object.entries(preOwned));
+    const writes: Array<{ automationId: string; handle: string; instanceId: string; writtenBy: string }> = [];
+    return {
+      writes,
+      async record(input: { automationId: string; handle: string; instanceId: string; writtenBy: string }) {
+        writes.push(input);
+        const holder = owners.get(input.handle);
+        if (holder === undefined) {
+          owners.set(input.handle, input.instanceId);
+          return { kind: "recorded" as const };
+        }
+        return holder === input.instanceId
+          ? { kind: "already_ours" as const }
+          : { kind: "conflict" as const, instanceId: holder };
+      },
+    };
+  }
+
+  test("a session owned by an instance-bound run binds its PR as a workstream handle, case-folded", async () => {
+    const recorder = prRefRecorder();
+    const l = ledger();
+    const consumer = makePrLinkConsumer({
+      prRefs: recorder.store,
+      findTaskId: async () => "task-1",
+      findAutomationBinding: async () => ({ automationId: "auto-1", instanceId: "ai_one" }),
+      recordInstanceHandle: l.record,
+    });
+    await consumer.handle(pullRequestAsset(), { sessionId: "session-1" });
+    expect(recorder.upserts).toHaveLength(1);
+    expect(l.writes).toEqual([
+      {
+        automationId: "auto-1",
+        handle: "github:openai/engrams#97",
+        instanceId: "ai_one",
+        writtenBy: "consumer:pr-link:session-1",
+      },
+    ]);
+  });
+
+  test("a conflict never rebinds and never fails the consumer (the pr_ref upsert stands)", async () => {
+    const recorder = prRefRecorder();
+    const l = ledger({ "github:openai/engrams#97": "ai_other" });
+    const consumer = makePrLinkConsumer({
+      prRefs: recorder.store,
+      findTaskId: async () => "task-1",
+      findAutomationBinding: async () => ({ automationId: "auto-1", instanceId: "ai_one" }),
+      recordInstanceHandle: l.record,
+    });
+    await consumer.handle(pullRequestAsset(), { sessionId: "session-1" });
+    expect(recorder.upserts).toHaveLength(1);
+    expect(l.writes).toHaveLength(1);
+  });
+
+  test("unbound sessions and instance-less runs write nothing", async () => {
+    const recorder = prRefRecorder();
+    const l = ledger();
+    const consumer = makePrLinkConsumer({
+      prRefs: recorder.store,
+      findTaskId: async () => "task-1",
+      findAutomationBinding: async () => ({ automationId: "auto-1", instanceId: "" }),
+      recordInstanceHandle: l.record,
+    });
+    await consumer.handle(pullRequestAsset(), { sessionId: "session-1" });
+    const noBinding = makePrLinkConsumer({
+      prRefs: recorder.store,
+      findTaskId: async () => "task-1",
+      findAutomationBinding: async () => null,
+      recordInstanceHandle: l.record,
+    });
+    await noBinding.handle(pullRequestAsset(), { sessionId: "session-2" });
+    expect(l.writes).toEqual([]);
+    expect(recorder.upserts).toHaveLength(2);
+  });
+});

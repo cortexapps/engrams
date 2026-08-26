@@ -52,6 +52,8 @@ export interface RunSnapshot {
 export interface RunContext {
   runId: string;
   automationId: string;
+  /** ADR 0120: the bound workstream ('' = unbound). */
+  instanceId: string;
   automationName: string;
   version: number;
   settings: AutomationSettings;
@@ -122,6 +124,7 @@ export function buildRunContext(
   const ctx: RunContext = {
     runId,
     automationId: snapshot.automationId,
+    instanceId: snapshot.instanceId ?? "",
     automationName: snapshot.automationName,
     version: snapshot.version,
     settings: snapshot.definition.settings,

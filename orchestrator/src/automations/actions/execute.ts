@@ -175,7 +175,7 @@ function mapOutputs(
   return mapped;
 }
 
-async function findAction(
+export async function findAction(
   provider: string,
   actionId: string,
   connectors: ExecuteIntegrationActionDeps["connectors"],
