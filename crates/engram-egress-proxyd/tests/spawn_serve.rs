@@ -396,7 +396,15 @@ async fn dialback_frames_roundtrip_over_a_socketpair() {
         .unwrap();
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
         engram_egress_proto::send_fd(&conn, std::os::fd::AsFd::as_fd(&theirs)).unwrap();
+        // The client received a dup; drop OUR copy or the lingering
+        // read below waits on ourselves.
+        drop(theirs);
         ours.write_all(b"guest-bytes").unwrap();
+        // Hold `ours` open until the client has read and dropped its
+        // end — closing immediately can discard the buffered bytes
+        // under load (the same reason the TLS fixture above lingers).
+        let mut sink = [0u8; 1];
+        let _ = std::io::Read::read(&mut ours, &mut sink);
     });
 
     let mut client = std::os::unix::net::UnixStream::connect(&sock_path).unwrap();
@@ -416,5 +424,9 @@ async fn dialback_frames_roundtrip_over_a_socketpair() {
     let mut buf = [0u8; 11];
     std::io::Read::read_exact(&mut stream, &mut buf).unwrap();
     assert_eq!(&buf, b"guest-bytes");
+    // Close our end BEFORE joining: the server lingers on a read of
+    // its end (so its close cannot race the bytes above), and that
+    // read returns only when this dup goes away.
+    drop(stream);
     server.join().unwrap();
 }
