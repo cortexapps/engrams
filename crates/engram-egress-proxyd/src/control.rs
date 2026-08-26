@@ -101,26 +101,40 @@ fn unregister_session(state: &ControlState, session_id: engram_core::SessionId) 
     state.gateway.session_closed(session_id);
 }
 
-/// Full replace: register everything in the set (a translate failure
-/// skips that policy — the ADR 0111 lossy-replay posture: a config
-/// defect can reduce a policy but never strand the rest), then drop
-/// any registered session NOT in the set (the stale-entry prune).
+/// Full replace: register everything in the set, then drop any
+/// registered session NOT in the set (the stale-entry prune).
+///
+/// A translate failure follows the ADR 0111 lossy posture — a config
+/// defect can reduce a session's policy but must never STRAND it. So
+/// a failed policy's session still lands in the keep-set: its
+/// existing registration (if any) stays live under the last policy
+/// that translated, instead of being pruned into a total egress
+/// lockout. The per-apply path (`ApplyPolicy`) keeps erroring loudly
+/// — only the bulk replace shields survivors.
 fn sync_policies(
     state: &ControlState,
     policies: Vec<engram_core::types::egress::SessionEgressPolicy>,
 ) -> FromProxyd {
     let mut keep = std::collections::HashSet::with_capacity(policies.len());
     let mut failed = 0usize;
+    let mut applied = 0usize;
     let total = policies.len();
     for policy in policies {
         let session_id = policy.session_id;
+        // Shield the session from the prune below regardless of the
+        // translate outcome — a defective UPDATE must not evict a
+        // working registration.
+        keep.insert(session_id);
         match register_policy(&state.registry, policy) {
-            Ok(()) => {
-                keep.insert(session_id);
-            }
+            Ok(()) => applied += 1,
             Err(e) => {
                 failed += 1;
-                tracing::warn!(%session_id, error = %e, "sync: policy translate failed; skipped");
+                tracing::error!(
+                    %session_id,
+                    error = %e,
+                    "sync: policy translate failed; any existing registration for the \
+                     session stays live under its previous policy",
+                );
             }
         }
     }
@@ -134,13 +148,7 @@ fn sync_policies(
         unregister_session(state, stale);
         pruned += 1;
     }
-    tracing::info!(
-        applied = keep.len(),
-        failed,
-        pruned,
-        total,
-        "policies synced"
-    );
+    tracing::info!(applied, failed, pruned, total, "policies synced");
     FromProxyd::Ok
 }
 
@@ -404,6 +412,34 @@ mod tests {
             .registry
             .lookup(Ipv4Addr::new(10, 200, 0, 14))
             .is_some());
+    }
+
+    /// Engrams-review HIGH on #1408: a live session whose UPDATED
+    /// policy carries one untranslatable entry must NOT be pruned into
+    /// a total egress lockout by the sync's replace half. The failed
+    /// update leaves the existing registration live under its previous
+    /// policy (the ADR 0111 "reduce, never strand" posture).
+    #[test]
+    fn sync_keeps_a_live_session_whose_updated_policy_is_untranslatable() {
+        let state = state();
+        let session = SessionId::new();
+        let ip = Ipv4Addr::new(10, 200, 0, 18);
+        register_policy(&state.registry, policy(session, ip)).expect("initial apply");
+        assert!(state.registry.lookup(ip).is_some());
+
+        let mut update = policy(session, ip);
+        update.network_allow_host_patterns = vec!["[".into()]; // untranslatable
+        let reply = sync_policies(&state, vec![update]);
+        assert_eq!(reply, FromProxyd::Ok);
+        let survivor = state
+            .registry
+            .lookup(ip)
+            .expect("the defective update must not strand the live session");
+        // Still the PREVIOUS policy's behavior, not a lockout.
+        assert!(matches!(
+            survivor.decide("example.com"),
+            engram_egress_proxy::Decision::Bypass
+        ));
     }
 
     #[test]
