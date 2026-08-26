@@ -373,3 +373,75 @@ describe("settings.instance (ADR 0120)", () => {
     ).toThrow();
   });
 });
+
+describe("the {{ }} delimiter guard", () => {
+  test("plain {{ }} in a rendered field is refused with the fix in the message", () => {
+    expect(() =>
+      validateDefinition(
+        def({
+          blocks: [
+            {
+              id: "launch",
+              type: "create_session",
+              config: { profileId: "p1", promptTemplate: "Do {{ inputs.thing }}" },
+            },
+          ],
+        }),
+        { kind: "user" },
+      ),
+    ).toThrow(/never rendered/);
+  });
+
+  test("a session {template} ref carries the full template contract", () => {
+    const withSessionRef = (template: string) =>
+      def({
+        blocks: [
+          {
+            id: "nudge",
+            type: "send_prompt",
+            config: {
+              session: { template },
+              promptTemplate: "hello",
+              waitFor: { kind: "none" },
+            },
+          },
+        ],
+      });
+    expect(() => validateDefinition(withSessionRef("{{ steps.x.value }}"), { kind: "user" })).toThrow(
+      /never rendered/,
+    );
+    const parsed = validateDefinition(withSessionRef("${{ steps.x.value }}"), { kind: "user" });
+    expect(parsed.blocks[0]!.type).toBe("send_prompt");
+  });
+
+  test("JS source and condition data keep their braces; the raw-literal escape renders", () => {
+    const parsed = validateDefinition(
+      def({
+        blocks: [
+          {
+            id: "facts",
+            type: "code",
+            config: { mode: "value", source: "export default () => {{ nested: true }};" },
+          },
+          {
+            id: "gate",
+            type: "filter",
+            config: {
+              conditions: {
+                mode: "all",
+                conditions: [{ path: "event.raw.text", op: "equals", value: "{{ literal }}" }],
+              },
+            },
+          },
+          {
+            id: "launch",
+            type: "create_session",
+            config: { profileId: "p1", promptTemplate: "brace via ${{ '{{' }} escape" },
+          },
+        ],
+      }),
+      { kind: "user" },
+    );
+    expect(parsed.blocks).toHaveLength(3);
+  });
+});

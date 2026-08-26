@@ -210,11 +210,28 @@ export function isValueRef(value: unknown): value is { $ref: string } {
  * only when the run resolves them (a `${{ steps.open.head_sha }}` cannot
  * satisfy a SHA regex at save time). Templates are still parse-validated by
  * validateTemplatesIn, and the interpreter re-runs the full schema on the
- * resolved config inside the block's step. Nested objects are walked. */
+ * resolved config inside the block's step. Nested objects are walked, and a
+ * container emptied by stripping is dropped whole — a half-known object
+ * (`session: {}` after its `template` stripped) satisfies no schema and
+ * would fail as noise. */
 export function withoutValueRefs(config: Record<string, unknown>): Record<string, unknown> {
+  return stripRunTimeValues(config).config;
+}
+
+function stripRunTimeValues(config: Record<string, unknown>): {
+  config: Record<string, unknown>;
+  stripped: boolean;
+} {
+  let stripped = false;
   const strip = (value: unknown): unknown => {
-    if (isValueRef(value)) return undefined;
-    if (typeof value === "string" && value.includes("${{")) return undefined;
+    if (isValueRef(value)) {
+      stripped = true;
+      return undefined;
+    }
+    if (typeof value === "string" && value.includes("${{")) {
+      stripped = true;
+      return undefined;
+    }
     if (Array.isArray(value)) {
       const items = value.map(strip).filter((v) => v !== undefined);
       // An array whose every element was templated is unknowable; drop it.
@@ -226,24 +243,38 @@ export function withoutValueRefs(config: Record<string, unknown>): Record<string
         const s = strip(v);
         if (s !== undefined) out[k] = s;
       }
-      return out;
+      // Same rule as arrays: an object emptied by stripping is unknowable.
+      return Object.keys(out).length === 0 && Object.keys(value).length > 0 ? undefined : out;
     }
     return value;
   };
-  return strip(config) as Record<string, unknown>;
+  const result = strip(config);
+  return {
+    config: (typeof result === "object" && result !== null ? result : {}) as Record<
+      string,
+      unknown
+    >,
+    stripped,
+  };
 }
 
-/** The save-time view of a block schema: every key optional, so a key whose
- * value was stripped (run-time-valued) is not a "required" failure, while
- * any key that IS present still validates in full. Block schemas are
- * z.object by convention; anything else validates as-is. */
-function saveTimeSchema(schema: z.ZodType, config: Record<string, unknown>): z.ZodType {
-  // Only relax when a top-level key was actually stripped; a config with
-  // nothing run-time-valued keeps the full required-field check.
-  const stripped = Object.keys(config).some(
-    (k) => isValueRef(config[k]) || (typeof config[k] === "string" && (config[k] as string).includes("${{")),
-  );
-  return stripped && schema instanceof z.ZodObject ? schema.partial() : schema;
+/** Save-time config check: strip run-time values, then validate against the
+ * schema — relaxed to per-key optional iff ANYTHING was stripped, so a key
+ * whose value (or nested value: a templated `session.template` strips its
+ * whole ref) is run-time-valued is not a "required" failure, while any key
+ * that IS present still validates in full. One function on purpose: the
+ * strip and the relaxation deciding differently is exactly the bug that
+ * made every templated session ref fail SaveVersion with "Invalid input".
+ * Block schemas are z.object by convention; anything else validates
+ * as-is. */
+function saveTimeConfigParse(
+  schema: z.ZodType,
+  config: Record<string, unknown>,
+): z.ZodSafeParseResult<unknown> {
+  const { config: strippedConfig, stripped } = stripRunTimeValues(config);
+  const effective =
+    stripped && schema instanceof z.ZodObject ? schema.partial() : schema;
+  return effective.safeParse(strippedConfig);
 }
 
 /** Block overrides as stored on the automation row. */
@@ -320,9 +351,7 @@ export function applyBlockOverrides(
       if (fields) {
         const executor = getBlock(block.type);
         const parsed = executor
-          ? saveTimeSchema(executor.configSchema, merged.config).safeParse(
-              withoutValueRefs(merged.config),
-            )
+          ? saveTimeConfigParse(executor.configSchema, merged.config)
           : undefined;
         if (parsed && !parsed.success) {
           const issue = parsed.error.issues[0];
@@ -491,8 +520,41 @@ function* walkBlocks(blocks: BlockDef[]): Generator<BlockDef> {
   }
 }
 
+/** Top-level config fields the interpreter's config walk leaves UNRENDERED
+ * (see resolveBlockConfig): a code block's `source` is JS, condition
+ * groups / wait specs are data. Template validation skips their strings for
+ * the same reason — a `{{` in JS source or in a compared value is content,
+ * not a template. `session` is deliberately NOT here: the walk skips it,
+ * but the session-facing BLOCK renders `session.template` itself, so it
+ * carries the full template contract. */
+export const NON_TEMPLATE_CONFIG_FIELDS: ReadonlySet<string> = new Set([
+  "source",
+  "conditions",
+  "until",
+  "waitFor",
+]);
+
 function validateTemplatesIn(blockId: string, value: unknown, field: string): void {
-  if (typeof value === "string" && value.includes("${{")) {
+  if (typeof value === "string") {
+    // The one Liquid delimiter is `${{ … }}`. A plain `{{ … }}` in a
+    // rendered field never renders — it flows through as a literal — which
+    // is virtually always a delimiter mistake, and a silent one (the
+    // drafting-agent incident: a session ref of "{{ steps.x.value }}"
+    // validated clean and then adopted the literal string at runtime).
+    // Refuse it at save with the fix in the message.
+    // Remove well-formed template regions first, so a template that OUTPUTS
+    // braces (${{ '{{' }}) is not misread; an unclosed ${{ falls through to
+    // the Liquid parser's own error below.
+    const outsideTemplates = value.replace(/\$\{\{[\s\S]*?\}\}/g, "");
+    if (!outsideTemplates.includes("${{") && outsideTemplates.includes("{{")) {
+      throw new DefinitionError(
+        blockId,
+        field,
+        "plain \"{{ … }}\" is never rendered — automation templates use ${{ … }} delimiters. " +
+          "For a literal \"{{\" in output, write ${{ '{{' }}.",
+      );
+    }
+    if (!value.includes("${{")) return;
     try {
       validateAutomationTemplate(value);
     } catch (error) {
@@ -510,6 +572,9 @@ function validateTemplatesIn(blockId: string, value: unknown, field: string): vo
   }
   if (typeof value === "object" && value !== null) {
     for (const [key, child] of Object.entries(value)) {
+      // The skip applies at the BLOCK-CONFIG top level only, mirroring the
+      // interpreter's walk (field === "" = the config object itself).
+      if (field === "" && NON_TEMPLATE_CONFIG_FIELDS.has(key)) continue;
       validateTemplatesIn(blockId, child, field === "" ? key : `${field}.${key}`);
     }
   }
@@ -567,9 +632,7 @@ export function validateDefinition(
     // final shape only when the run resolves them; validate the statically
     // known remainder now — leniently on the keys that were stripped — and
     // the fully resolved config again in the interpreter step.
-    const config = saveTimeSchema(executor.configSchema, block.config).safeParse(
-      withoutValueRefs(block.config),
-    );
+    const config = saveTimeConfigParse(executor.configSchema, block.config);
     if (!config.success) {
       const issue = config.error.issues[0];
       throw new DefinitionError(
