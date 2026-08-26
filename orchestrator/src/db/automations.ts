@@ -392,6 +392,11 @@ export interface AutomationDispatchStore {
  * production session-op helpers. */
 export interface AutomationEngineStore extends EngineRunStore {
   getRun(id: string): Promise<AutomationRunRow | null>;
+  /** Ids of the instance's currently-running runs, oldest first. Signal
+   * fan-out targets: only a running run can be parked on a recv, and only a
+   * running run is guaranteed to have a DBOS workflow to deliver into
+   * (queue-policy pending runs have none until promoted). */
+  listRunningInstanceRunIds(automationId: string, instanceId: string): Promise<string[]>;
   ensureAutomationTask(input: {
     runId: string;
     automationId: string;
@@ -1412,6 +1417,21 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
 
   return {
     getRun,
+
+    async listRunningInstanceRunIds(automationId, instanceId) {
+      const rows = await db
+        .select({ id: automationRunTable.id })
+        .from(automationRunTable)
+        .where(
+          and(
+            eq(automationRunTable.automationId, automationId),
+            eq(automationRunTable.instanceId, instanceId),
+            eq(automationRunTable.status, "running"),
+          ),
+        )
+        .orderBy(asc(automationRunTable.createdAt), asc(automationRunTable.id));
+      return rows.map((row) => row.id);
+    },
 
     async loadSnapshot(runId): Promise<RunSnapshot> {
       const run = await getRun(runId);

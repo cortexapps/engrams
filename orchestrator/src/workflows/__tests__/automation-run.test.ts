@@ -34,6 +34,9 @@ function fakeEngineStore(overrides: Partial<AutomationEngineStore> = {}): Automa
     async loadSnapshot() {
       return snapshot;
     },
+    async listRunningInstanceRunIds() {
+      return [];
+    },
     async markRunning() {},
     async recordStep() {},
     async finalizeRun() {},

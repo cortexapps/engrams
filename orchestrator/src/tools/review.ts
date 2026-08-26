@@ -162,7 +162,7 @@ export function registerReviewTools(
         await notifyAutomation(
           automation.runId,
           { kind: "signal", name, sessionId: ctx.sessionId, payload },
-          inboxKeys.signal(ctx.sessionId, name, ctx.toolCallId),
+          inboxKeys.signal(ctx.sessionId, name, ctx.toolCallId, automation.runId),
         );
         return;
       }

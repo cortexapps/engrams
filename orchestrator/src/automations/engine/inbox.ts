@@ -56,8 +56,11 @@ export const inboxKeys = {
   sessionEnded: (sessionId: string): string => `autorun:${sessionId}:terminal`,
   sessionEvent: (sessionId: string, eventIdx: bigint | number): string =>
     `autorun:${sessionId}:event:${eventIdx}`,
-  signal: (sessionId: string, name: string, toolCallId: string): string =>
-    `autorun:${sessionId}:signal:${name}:${toolCallId}`,
+  // Destination-qualified (like joinedEvent): DBOS notifications dedupe on a
+  // GLOBAL message_uuid, so one signal fanning out to N runs needs N distinct
+  // keys — a shared key silently drops every destination after the first.
+  signal: (sessionId: string, name: string, toolCallId: string, runId: string): string =>
+    `autorun:${sessionId}:signal:${name}:${toolCallId}:${runId}`,
   joinedEvent: (deliveryKey: string, runId: string): string =>
     `autorun-evt:${deliveryKey}:${runId}`,
   stop: (runId: string, requestId: string): string => `autorun:${runId}:stop:${requestId}`,
