@@ -245,8 +245,12 @@ function WorkstreamDetail({ instance, now }: { instance: AutomationInstance; now
             variant="outline"
             disabled={closeMutation.isPending}
             onClick={async () => {
-              await closeMutation.mutateAsync({ id: instance.id });
-              toast.success(`Closed ${instance.key}`);
+              try {
+                await closeMutation.mutateAsync({ id: instance.id });
+                toast.success(`Closed ${instance.key}`);
+              } catch (error) {
+                toast.error(error instanceof Error ? error.message : String(error));
+              }
             }}
           >
             Close workstream

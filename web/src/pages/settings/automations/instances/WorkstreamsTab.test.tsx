@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRouterTransport } from "@connectrpc/connect";
+import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
 
 import {
   AutomationRunService,
@@ -11,6 +12,10 @@ import {
 import type { InputFieldSpec } from "@/lib/automation-inputs";
 import { renderWithProviders } from "@/test-utils";
 import { WorkstreamsTab } from "./WorkstreamsTab";
+
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+
+beforeEach(() => vi.clearAllMocks());
 
 const NOW = Date.parse("2026-08-25T12:00:00Z");
 
@@ -44,6 +49,7 @@ interface Impl {
   }>;
   runNow?: (req: RunNowRequest) => { runId: string };
   onClose?: (id: string) => void;
+  closeFails?: boolean;
 }
 
 function transportWith(impl: Impl) {
@@ -56,6 +62,7 @@ function transportWith(impl: Impl) {
       }),
       closeInstance: (req) => {
         impl.onClose?.(req.id);
+        if (impl.closeFails) throw new ConnectError("workstream not found", Code.NotFound);
         return { closed: true };
       },
       listRecentDrops: () => ({ drops: impl.drops ?? [] }),
@@ -122,6 +129,23 @@ describe("WorkstreamsTab", () => {
     await waitFor(() => expect(within(detail).getByText("slack:C1:1724.100")).toBeTruthy());
     await userEvent.click(within(detail).getByRole("button", { name: "Close workstream" }));
     await waitFor(() => expect(closed).toEqual(["ai_one"]));
+  });
+
+  it("a failed close surfaces an error toast instead of failing silently", async () => {
+    renderTab({
+      instances: [instance("ai_one", "project-ENG-1", "open")],
+      closeFails: true,
+    });
+    await waitFor(() => expect(screen.getByText("project-ENG-1")).toBeTruthy());
+    await userEvent.click(screen.getByText("project-ENG-1"));
+    const detail = await screen.findByTestId("workstream-detail");
+    await userEvent.click(within(detail).getByRole("button", { name: "Close workstream" }));
+    await waitFor(() =>
+      expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+        expect.stringContaining("workstream not found"),
+      ),
+    );
+    expect(vi.mocked(toast.success)).not.toHaveBeenCalled();
   });
 
   it("kickoff posts RunNow with instance_key and the inputs snapshot", async () => {
