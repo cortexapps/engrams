@@ -803,15 +803,16 @@ export async function dispatchIntegrationEvent(
   // app_mention), and the owning workstream may subscribe to only one of
   // them — but every brain must stand down for both (prod 2026-08-26: the
   // legacy picker answered a mention in an owned channel because no MATCHED
-  // target was instanced, so no handle ever resolved). When a suppressible
-  // catch-all matched and nothing bound, ask the ledger directly whether
-  // any open workstream — in any automation — owns one of the event's
-  // candidate handles.
-  if (
-    !handleBound &&
-    anyInstancedForProvider &&
-    targets.some((t) => t.target.automation.builtinKey === SUPPRESSIBLE_CATCH_ALL)
-  ) {
+  // target was instanced, so no handle ever resolved). When nothing bound,
+  // ask the ledger directly whether any open workstream — in any
+  // automation — owns one of the event's candidate handles. Deliberately
+  // NOT gated on the suppressible built-in being a matched target: the
+  // LEGACY brain reads this delivery's verdict via `builtinSuppressed`
+  // and answers whether or not the built-in automation is enabled
+  // (prod 2026-08-26, second finding: the built-in was disabled, the gate
+  // skipped the check, and the legacy route spawned a session in an owned
+  // channel with the fix fully deployed).
+  if (!handleBound && anyInstancedForProvider) {
     const suppressFacet = facet ?? (await facets(input.provider));
     if (suppressFacet !== undefined) {
       const candidates = extractHandleCandidates({
@@ -825,6 +826,17 @@ export async function dispatchIntegrationEvent(
       }
     }
   }
+  // The suppression VERDICT is a property of the delivery, not of which
+  // brains happen to be enabled: record it whenever ownership held, so the
+  // legacy route stands down even when the built-in is not a target. The
+  // per-target loop below still skips any matched built-in.
+  if (handleBound && !result.suppressed.includes(SUPPRESSIBLE_CATCH_ALL)) {
+    result.suppressed.push(SUPPRESSIBLE_CATCH_ALL);
+    log.info(
+      { provider: input.provider, eventKey: input.eventKey },
+      "instance precedence: a workstream owns this conversation; every brain stands down",
+    );
+  }
 
   // Each target is admitted in isolation: one transient fault must never drop
   // the sibling automations matched by the same delivery. Failures are
@@ -833,16 +845,9 @@ export async function dispatchIntegrationEvent(
   // targets that already succeeded).
   const failures: Array<{ automationId: string; error: unknown }> = [];
   for (const { target, entrypoint, resolution } of resolved) {
-    if (
-      handleBound &&
-      target.automation.builtinKey === SUPPRESSIBLE_CATCH_ALL &&
-      !result.suppressed.includes(SUPPRESSIBLE_CATCH_ALL)
-    ) {
-      result.suppressed.push(SUPPRESSIBLE_CATCH_ALL);
-      log.info(
-        { provider: input.provider, eventKey: input.eventKey },
-        "instance precedence: a workstream owns this thread; the slack brain stands down",
-      );
+    if (handleBound && target.automation.builtinKey === SUPPRESSIBLE_CATCH_ALL) {
+      // The verdict (result.suppressed) and its log were recorded above,
+      // once per delivery; here the matched built-in is only skipped.
       continue;
     }
     const deliveryKey = `${input.provider}:${input.deliveryId}`;
