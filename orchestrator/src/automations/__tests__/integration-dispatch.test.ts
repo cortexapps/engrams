@@ -1140,6 +1140,54 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
     expect(afterClose.builtins).toEqual({ slack_brain: "started" });
   });
 
+  test("the verdict is recorded even when NO brain is a matched target (legacy-only deployments)", async () => {
+    // The prod 2026-08-26 second finding: the slack_brain BUILT-IN was
+    // disabled (the workspace runs the LEGACY thread-brain), so the
+    // suppressible built-in was never among the matched targets, the
+    // ownership check was gated out, `suppressed` stayed empty, and the
+    // legacy route — which consumes this delivery's verdict via
+    // builtinSuppressed — spawned a session inside an owned channel. The
+    // verdict is a property of the DELIVERY: it must be recorded whenever
+    // ownership holds, brains or no brains.
+    const custom = {
+      automation: meta({ id: "custom-1" }),
+      definition: definition(trigger({ provider: "slack", eventKeys: ["message"] }), {
+        settings: {
+          endSessionsOnFinish: false,
+          instance: {
+            keyTemplate: "chan-${{ event.raw.event.channel }}",
+            entrypoints: { main: { admit: "handle_match" as const } },
+          },
+        },
+      }),
+    };
+    const slackFacet = {
+      events: [
+        {
+          key: "app_mention",
+          label: "App mention",
+          handleCandidates: [{ parts: [{ lit: "slack:" }, { path: "event.channel" }] }],
+        },
+      ],
+    };
+    const i = fakeInstances();
+    const owner = i.seed({ automationId: "custom-1", key: "chan-C1" });
+    i.bindHandle("custom-1", "slack:C1", owner.id);
+
+    const h = makeHarness([custom]);
+    const mention = await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "app_mention",
+        payload: { event: { channel: "C1" } },
+      }),
+      { ...deps(h), instances: i.store, facets: async () => slackFacet },
+    );
+    // Zero matched targets — the owner subscribes to `message` and no brain
+    // built-in exists — yet the delivery carries the stand-down verdict.
+    expect(mention).toMatchObject({ matched: 0, started: 0, suppressed: ["slack_brain"] });
+  });
+
   test("builtinSuppressed reads the suppression list", async () => {
     const { builtinSuppressed } = await import("../dispatch.ts");
     const base = {
