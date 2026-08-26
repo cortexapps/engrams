@@ -1,14 +1,19 @@
-//! ADR 0111: a surviving VM keeps its egress across a host-agent roll,
-//! against a REAL Firecracker microVM (2026-08-03 incident, session
-//! 51fc6af7).
+//! ADR 0111 + ADR 0121: a surviving VM keeps its egress across a
+//! host-agent roll, against a REAL Firecracker microVM (2026-08-03
+//! incident, session 51fc6af7).
 //!
-//! What this pins: the egress proxy's guest registry is process RAM
-//! and dies with the host-agent pod. Generation B rebuilds it from the
-//! policy generation A persisted beside its binding record — the real
-//! startup sequence (`reattach_pass` → `rebuild_egress_from_policies`)
-//! — with zero coordinator involvement. Before ADR 0111, this exact
-//! shape stranded a healthy VM with every request refused
-//! (`UnknownGuest`) until an evict/resume cycle.
+//! What this pins, post-ADR-0121: the egress registry lives in the
+//! node-local daemon and OUTLIVES the host-agent generations. Across
+//! the roll (generation A dies with no destructors) the daemon still
+//! resolves the survivor's guest IP — no rebuild needed, the incident
+//! state can no longer exist while the daemon lives. Generation B's
+//! startup sync (`reattach_pass` → `rebuild_egress_from_policies`, the
+//! real sequence) must then agree with the persisted policies and KEEP
+//! the survivor registered (the prune must not eat a live VM's entry).
+//! The daemon-also-died recovery path (fresh daemon + replay from the
+//! ADR 0111 files) is pinned by
+//! `restart_rebuilds_egress_registry_from_persisted_policies` in
+//! `pooled_backend.rs`.
 //!
 //! Sized to the property, not to realism: one guest, one policy, no
 //! checkpoints, no sleeps.
@@ -35,30 +40,51 @@ use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec}
 use engram_host_agent::bindings::BindingStore;
 use engram_host_agent::egress::HostEgress;
 use engram_host_agent::pooled_backend::PooledBackend;
+use engram_host_agent::proxyd_client::ProxydHandle;
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
 
-async fn spawn_egress(dir: &Path) -> HostEgress {
-    let source: Arc<dyn engram_egress_proxy::CaSource> = Arc::new(
-        engram_egress_proxy::LocalDiskCaSource::new(dir.join("egress-ca")),
+fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+    l.local_addr().expect("local addr").port()
+}
+
+/// The node-local daemon (ADR 0121), run as an in-process task over a
+/// real control UDS. It deliberately OUTLIVES both host-agent
+/// generations below — that is the design under test.
+async fn spawn_daemon(work_dir: &Path) -> Arc<ProxydHandle> {
+    let ca =
+        engram_egress_proxy::Ca::load_or_generate(&work_dir.join("egress-ca")).expect("test CA");
+    let mut args = engram_egress_proxyd::DaemonArgs::new(
+        work_dir.to_path_buf(),
+        ca.cert_pem.clone(),
+        ca.key_pair.serialize_pem(),
+        "http://127.0.0.1:1".into(), // never dialed here
+        None,
+        engram_core::HostId::new(),
     );
-    let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    HostEgress::spawn(
-        source,
-        bind,
-        None,
-        None,
-        None,
-        None,
-        Arc::new(engram_egress_proxy::GuestGatewayRegistry::default()),
-        // ADR 0118: no guest-port dialer — this test exercises policy replay
-        // across a roll, not the app-to-app short circuit.
-        None,
-    )
-    .await
-    .expect("spawn egress")
+    args.proxy_port = free_port();
+    args.dns_port = free_port();
+    args.gateway_port = free_port();
+    tokio::spawn(engram_egress_proxyd::run(args));
+    let handle = Arc::new(ProxydHandle::new(
+        work_dir.join(engram_egress_proto::CONTROL_SOCK_NAME),
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if engram_egress_proto::manifest::read_manifest(work_dir).is_some()
+            && handle.hello().await.is_ok()
+        {
+            return handle;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "egress daemon never came up",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
@@ -121,7 +147,9 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
     )
     .await;
 
-    // ---- 2. Generation A: boot, apply + persist the policy ----
+    // ---- 2. The daemon, then generation A: boot, apply + persist ----
+    let handle = spawn_daemon(work.path()).await;
+
     let mut cfg = FirecrackerConfig::with_kernel(kernel);
     let staged = common::stage_agentd_bundle(&work.path().join("bundles"), &agent);
     cfg.bundle_dir = staged.bundle_dir.clone();
@@ -129,7 +157,7 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
     cfg.restore_mode = RestoreMode::File;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
 
-    let egress_a = Arc::new(spawn_egress(work.path()).await);
+    let egress_a = Arc::new(HostEgress::new(handle.clone(), String::new(), None));
     let pooled_a = Arc::new(
         PooledBackend::new(
             Arc::new(FirecrackerBackend::new(work.path(), cfg.clone())) as Arc<dyn SandboxBackend>
@@ -176,7 +204,11 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
         .notify_session_policy(policy.clone())
         .await
         .expect("gen A applies the policy");
-    assert!(egress_a.registry.lookup(guest_ip).is_some());
+    assert!(handle
+        .lookup_guest(guest_ip)
+        .await
+        .expect("lookup")
+        .is_some());
     // The start_agent path's persist (ADR 0111): policy on disk before
     // the ack.
     let bindings_dir = work.path().join("bindings");
@@ -186,10 +218,22 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
         .expect("persist policy");
 
     // ---- 3. The roll: generation A is "dead" (no destructors — a
-    // real pod death). Generation B reattaches the survivor and
-    // rebuilds egress from the persisted policy: the real startup
-    // sequence. ----
+    // real pod death). ADR 0121's claim: the daemon never noticed —
+    // the survivor's egress stays registered THROUGH the gap, before
+    // any successor exists. ----
     let _gen_a_dead = pooled_a;
+    assert!(
+        handle
+            .lookup_guest(guest_ip)
+            .await
+            .expect("lookup")
+            .is_some(),
+        "the daemon must keep the survivor's registration through the roll gap",
+    );
+
+    // Generation B reattaches the survivor and syncs the daemon from
+    // the persisted policies: the real startup sequence. The sync's
+    // prune must KEEP the live survivor's entry.
     let inner_b = Arc::new(FirecrackerBackend::new(work.path(), cfg.clone()));
     let report = engram_host_agent::live_attach::reattach_pass(work.path(), &inner_b)
         .await
@@ -202,11 +246,7 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
         )),
         "generation B must reattach the still-live VM",
     );
-    let egress_b = Arc::new(spawn_egress(work.path()).await);
-    assert!(
-        egress_b.registry.lookup(guest_ip).is_none(),
-        "pre-condition: the restarted registry is empty (the incident state)",
-    );
+    let egress_b = Arc::new(HostEgress::new(handle.clone(), String::new(), None));
     let pooled_b = Arc::new(
         PooledBackend::new(inner_b as Arc<dyn SandboxBackend>).with_egress(egress_b.clone()),
     );
@@ -218,13 +258,28 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
     pooled_b.rebuild_egress_from_policies(policies).await;
 
     // ---- 4. The survivor's guest resolves with the same allow-list ----
-    let state = egress_b
-        .registry
-        .lookup(guest_ip)
-        .expect("survivor guest must resolve after the rebuild");
-    assert_eq!(state.session_id, session_id);
-    assert!(state.network_allow.matches("api.anthropic.com"));
-    assert!(!state.network_allow.matches("evil.example.com"));
+    let guest = handle
+        .lookup_guest(guest_ip)
+        .await
+        .expect("lookup")
+        .expect("survivor guest must resolve after generation B's sync");
+    assert_eq!(guest.session_id, session_id);
+    assert_eq!(
+        handle
+            .decide(guest_ip, "api.anthropic.com")
+            .await
+            .expect("decide")
+            .as_deref(),
+        Some("bypass"),
+    );
+    assert_eq!(
+        handle
+            .decide(guest_ip, "evil.example.com")
+            .await
+            .expect("decide")
+            .as_deref(),
+        Some("reject"),
+    );
 
     pooled_b.destroy(sandbox).await.expect("destroy");
 }

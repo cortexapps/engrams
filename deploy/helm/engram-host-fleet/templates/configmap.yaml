@@ -96,6 +96,10 @@ data:
   # default and unfiltered guest egress. `ENGRAM_EGRESS_PROXY_PORT`
   # exists only to avoid a bind collision — there is no "0 = off".
   ENGRAM_EGRESS_PROXY_PORT: {{ .Values.egress.port | default 8443 | quote }}
+  # ADR 0121: the node-local egress daemon host-agent spawns (or
+  # adopts across a pod roll). Ships in this image beside the
+  # uffd-handler; the running daemon survives the pod on mapped text.
+  ENGRAM_EGRESS_PROXYD_BIN: {{ .Values.egress.proxydBin | default "/usr/local/bin/engram-egress-proxyd" | quote }}
   ENGRAM_EGRESS_CA_SOURCE: {{ .Values.egress.caSource | quote }}
   {{- if eq .Values.egress.caSource "gcp-secret-manager" }}
   {{- if not .Values.egress.caGcpCertSecret }}

@@ -1267,7 +1267,7 @@ impl PooledBackend {
         let allow_all = policy.allow_all;
         let allow_hosts = policy.network_allow_hosts.clone();
         let allow_host_patterns = policy.network_allow_host_patterns.clone();
-        match crate::egress::register_policy(&egress.registry, policy) {
+        match egress.apply_policy(policy).await {
             Ok(()) => {
                 tracing::info!(
                     sandbox_id = %id,
@@ -1283,7 +1283,7 @@ impl PooledBackend {
                 tracing::warn!(
                     sandbox_id = %id,
                     error = %e,
-                    "capture egress: policy translate failed; [warm] hook runs egress-less",
+                    "capture egress: policy apply failed; [warm] hook runs egress-less",
                 );
                 None
             }
@@ -5375,38 +5375,55 @@ impl PooledBackend {
         })
     }
 
-    /// ADR 0111: rebuild the egress registry from the policies the
-    /// previous process persisted beside its binding records. Run
-    /// after reattach (the live set is complete) and before
-    /// coordinator registration. Policies whose sandbox did not
-    /// survive are skipped — they are inert and are removed with
-    /// their binding at unbind. Recovery is a local read: no
-    /// coordinator round-trip, no retries.
+    /// ADR 0111 + ADR 0121: replay the policies the previous process
+    /// persisted beside its binding records into the node-local egress
+    /// daemon, as ONE `SyncPolicies` full replace. Run after reattach
+    /// (the live set is complete) and before coordinator registration,
+    /// and again by the supervisor after a daemon respawn. Policies
+    /// whose sandbox did not survive are skipped, and the sync's prune
+    /// side drops anything the daemon still holds for them (an adopted
+    /// daemon's registry can carry entries for VMs that died with the
+    /// old pod). Recovery is a local read + one UDS round-trip: no
+    /// coordinator involvement, no retries.
+    ///
+    /// A live capture registration (transient, never persisted) is
+    /// pruned by this replace too; the capture's egress then fails and
+    /// the capture job retries — captures are quiesced across shutdown
+    /// anyway, so this only touches a daemon-crash-mid-capture edge.
     pub async fn rebuild_egress_from_policies(
         &self,
         policies: Vec<engram_core::types::egress::SessionEgressPolicy>,
     ) {
         use engram_core::traits::sandbox::SandboxBackend as _;
+        let Some(egress) = self.egress.as_ref() else {
+            return;
+        };
         let live: std::collections::HashSet<SandboxId> =
             self.list().await.unwrap_or_default().into_iter().collect();
+        let mut survivors = Vec::new();
         for policy in policies {
             if !live.contains(&policy.sandbox_id) {
                 continue;
             }
-            let (session_id, sandbox_id) = (policy.session_id, policy.sandbox_id);
-            match self.notify_session_policy(policy).await {
-                Ok(()) => tracing::info!(
-                    %session_id,
-                    %sandbox_id,
-                    "egress registry rebuilt from persisted policy (ADR 0111)",
-                ),
-                Err(e) => tracing::warn!(
-                    %session_id,
-                    %sandbox_id,
-                    error = %e,
-                    "egress registry rebuild failed for survivor",
-                ),
-            }
+            // The sandbox→session map the Phase B publisher resolver
+            // reads must repopulate exactly as a live apply would.
+            self.session_bindings
+                .insert(policy.sandbox_id, policy.session_id);
+            tracing::info!(
+                session_id = %policy.session_id,
+                sandbox_id = %policy.sandbox_id,
+                "replaying persisted egress policy (ADR 0111)",
+            );
+            survivors.push(policy);
+        }
+        let count = survivors.len();
+        match egress.sync_policies(survivors).await {
+            Ok(()) => tracing::info!(count, "egress daemon synced from persisted policies"),
+            Err(e) => tracing::warn!(
+                count,
+                error = %e,
+                "egress daemon sync failed; survivors keep the daemon's current registry",
+            ),
         }
     }
 
@@ -10321,12 +10338,17 @@ impl SandboxBackend for PooledBackend {
             );
             return Ok(());
         };
-        crate::egress::register_policy(&egress.registry, policy)
-            .map_err(|e| SandboxError::InvalidSpec(format!("translate egress policy: {e}")))?;
+        // ADR 0121: the registry lives in the node-local daemon; the
+        // apply is a UDS round-trip whose error keeps the ack honest
+        // (a policy the daemon refused is not enforced).
+        egress
+            .apply_policy(policy)
+            .await
+            .map_err(|e| SandboxError::InvalidSpec(format!("apply egress policy: {e}")))?;
         tracing::debug!(
             %sandbox_id,
             %session_id,
-            "egress policy registered with local proxy",
+            "egress policy registered with the node-local daemon",
         );
         Ok(())
     }
@@ -11657,62 +11679,6 @@ mod tests {
             rx.try_recv().is_err(),
             "no further resend once the guard is dropped"
         );
-    }
-
-    /// A capture-shaped policy (ADR 0080: assembled coordinator-side —
-    /// see `session_boot::assemble_capture_egress_policy`, where the
-    /// posture-mapping tests now live) with a scoped allowlist must
-    /// translate + register cleanly on the proxy.
-    #[test]
-    fn capture_shaped_allowlist_policy_registers_on_the_proxy() {
-        let policy = SessionEgressPolicy {
-            session_id: SessionId::new(),
-            sandbox_id: SandboxId::new(),
-            guest_ip: "169.254.0.2".parse().unwrap(),
-            network_allow_hosts: vec!["accounts.google.com".into()],
-            network_allow_host_patterns: vec!["*.auth0.com".into()],
-            allow_all: false,
-            secrets: Vec::new(),
-            injects: Vec::new(),
-            observes: Vec::new(),
-            guest_services: Vec::new(),
-            tunnels: Vec::new(),
-            apps: Vec::new(),
-            secret_mode: engram_core::types::image::SecretMode::Literal,
-        };
-        let registry = engram_egress_proxy::Registry::new();
-        crate::egress::register_policy(&registry, policy)
-            .expect("proxy must accept the capture-egress allowlist");
-    }
-
-    /// A capture-shaped allow-all policy must register, and the proxy must
-    /// bypass an arbitrary host under it (the dev posture for an image whose
-    /// warm boot needs unrestricted network).
-    #[test]
-    fn capture_shaped_allow_all_policy_bypasses_on_the_proxy() {
-        let policy = SessionEgressPolicy {
-            session_id: SessionId::new(),
-            sandbox_id: SandboxId::new(),
-            guest_ip: "169.254.0.3".parse().unwrap(),
-            network_allow_hosts: Vec::new(),
-            network_allow_host_patterns: Vec::new(),
-            allow_all: true,
-            secrets: Vec::new(),
-            injects: Vec::new(),
-            observes: Vec::new(),
-            guest_services: Vec::new(),
-            tunnels: Vec::new(),
-            apps: Vec::new(),
-            secret_mode: engram_core::types::image::SecretMode::Literal,
-        };
-        let registry = engram_egress_proxy::Registry::new();
-        let guest_ip = policy.guest_ip;
-        crate::egress::register_policy(&registry, policy).expect("register allow-all");
-        let state = registry.lookup(guest_ip).expect("registered");
-        assert!(matches!(
-            state.decide("anything.example.com"),
-            engram_egress_proxy::Decision::Bypass
-        ));
     }
 
     fn live_spec(image: &str) -> SandboxSpec {
@@ -15117,33 +15083,58 @@ mod tests {
             }
         }
 
-        /// Spawn a real `HostEgress` on an ephemeral loopback port with
-        /// a self-generated local-disk CA. This is the same proxy the
-        /// production host-agent stands up; we only need its registry.
-        async fn spawn_test_egress() -> (HostEgress, tempfile::TempDir) {
+        fn free_port() -> u16 {
+            // Bind-then-drop: a small race against other tests, ridden
+            // by the daemon's own bind_with_retry.
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+            l.local_addr().expect("local addr").port()
+        }
+
+        /// Run a REAL egress daemon as an in-process task (ADR 0121)
+        /// and return the facade plus its control handle for
+        /// assertions. Same data plane the production host-agent
+        /// drives over the same UDS; only the process boundary is
+        /// elided (the daemon's own crate covers that).
+        async fn spawn_test_egress() -> (
+            HostEgress,
+            Arc<crate::proxyd_client::ProxydHandle>,
+            tempfile::TempDir,
+        ) {
             let dir = tempfile::tempdir().expect("tempdir");
-            let source: Arc<dyn engram_egress_proxy::CaSource> = Arc::new(
-                engram_egress_proxy::LocalDiskCaSource::new(dir.path().join("egress-ca")),
+            let ca = engram_egress_proxy::Ca::load_or_generate(&dir.path().join("egress-ca"))
+                .expect("test CA");
+            let mut args = engram_egress_proxyd::DaemonArgs::new(
+                dir.path().to_path_buf(),
+                ca.cert_pem.clone(),
+                ca.key_pair.serialize_pem(),
+                "http://127.0.0.1:1".into(), // never dialed in these tests
+                None,
+                engram_core::HostId::new(),
             );
-            // Port 0 ⇒ OS-assigned ephemeral port (no fixed-port
-            // collisions when the suite runs in parallel). DNS proxy
-            // disabled (`None`): these tests exercise only the egress
-            // registry, and a fixed DNS port would collide across the
-            // parallel suite now that a bind failure is fatal (ADR 0083).
-            let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let egress = HostEgress::spawn(
-                source,
-                bind,
-                None,
-                None,
-                None,
-                None,
-                Arc::new(engram_egress_proxy::GuestGatewayRegistry::default()),
-                None,
-            )
-            .await
-            .expect("spawn egress");
-            (egress, dir)
+            args.proxy_port = free_port();
+            args.dns_port = free_port();
+            args.gateway_port = free_port();
+            tokio::spawn(engram_egress_proxyd::run(args));
+            let handle = Arc::new(crate::proxyd_client::ProxydHandle::new(
+                dir.path().join(engram_egress_proto::CONTROL_SOCK_NAME),
+            ));
+            // The daemon writes its manifest only after the listeners
+            // bind; hello succeeding means the control plane is live.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if engram_egress_proto::manifest::read_manifest(dir.path()).is_some()
+                    && handle.hello().await.is_ok()
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "in-process egress daemon never came up",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let egress = HostEgress::new(handle.clone(), ca.cert_pem.clone(), None);
+            (egress, handle, dir)
         }
 
         fn policy_for(
@@ -15178,8 +15169,7 @@ mod tests {
         /// egress. This test pins the now-mandatory behavior.
         #[tokio::test]
         async fn teleport_dest_reestablishes_egress_filter_before_resume() {
-            let (egress, _dir) = spawn_test_egress().await;
-            let registry = egress.registry.clone();
+            let (egress, handle, _dir) = spawn_test_egress().await;
 
             let pooled = PooledBackend::new(Arc::new(NoopInner) as Arc<dyn SandboxBackend>)
                 .with_egress(Arc::new(egress));
@@ -15191,7 +15181,11 @@ mod tests {
             // Before the dest applies policy, the proxy knows nothing
             // about this guest IP — a connection would be refused.
             assert!(
-                registry.lookup(guest_ip).is_none(),
+                handle
+                    .lookup_guest(guest_ip)
+                    .await
+                    .expect("lookup")
+                    .is_none(),
                 "pre-condition: dest proxy must not know the teleported guest yet",
             );
 
@@ -15214,16 +15208,28 @@ mod tests {
             // exfil target). DNS interception keys off the same
             // `network_allow` HostList the resolver consults, so this
             // also proves DNS filtering is in force for the guest.
-            let state = registry
-                .lookup(guest_ip)
+            let guest = handle
+                .lookup_guest(guest_ip)
+                .await
+                .expect("lookup")
                 .expect("dest proxy must resolve the teleported guest IP after policy apply");
-            assert_eq!(state.session_id, session_id);
-            assert!(
-                state.network_allow.matches("api.anthropic.com"),
+            assert_eq!(guest.session_id, session_id);
+            assert_eq!(
+                handle
+                    .decide(guest_ip, "api.anthropic.com")
+                    .await
+                    .expect("decide")
+                    .as_deref(),
+                Some("bypass"),
                 "allow-listed host must be permitted post-teleport",
             );
-            assert!(
-                !state.network_allow.matches("evil.example.com"),
+            assert_eq!(
+                handle
+                    .decide(guest_ip, "evil.example.com")
+                    .await
+                    .expect("decide")
+                    .as_deref(),
+                Some("reject"),
                 "non-allow-listed host (exfil target) must be refused post-teleport",
             );
         }
@@ -15234,8 +15240,7 @@ mod tests {
         /// binding or two conflicting entries for the same IP.
         #[tokio::test]
         async fn teleport_dest_policy_reapply_is_idempotent() {
-            let (egress, _dir) = spawn_test_egress().await;
-            let registry = egress.registry.clone();
+            let (egress, handle, _dir) = spawn_test_egress().await;
             let pooled = PooledBackend::new(Arc::new(NoopInner) as Arc<dyn SandboxBackend>)
                 .with_egress(Arc::new(egress));
 
@@ -15253,10 +15258,21 @@ mod tests {
                 .await
                 .unwrap();
 
-            let state = registry.lookup(guest_ip).expect("guest resolves");
-            assert!(state.network_allow.matches("b.example"));
-            assert!(
-                !state.network_allow.matches("a.example"),
+            assert_eq!(
+                handle
+                    .decide(guest_ip, "b.example")
+                    .await
+                    .expect("decide")
+                    .as_deref(),
+                Some("bypass"),
+            );
+            assert_eq!(
+                handle
+                    .decide(guest_ip, "a.example")
+                    .await
+                    .expect("decide")
+                    .as_deref(),
+                Some("reject"),
                 "re-applied policy must replace the prior allow-list, not union it",
             );
         }
@@ -15310,7 +15326,7 @@ mod tests {
             // start_agent path), then the process "dies" — its
             // registry (egress_a) simply goes away.
             {
-                let (egress_a, _ca_a) = spawn_test_egress().await;
+                let (egress_a, _handle_a, _daemon_a) = spawn_test_egress().await;
                 let pooled_a = PooledBackend::new(Arc::new(NoopInner) as Arc<dyn SandboxBackend>)
                     .with_egress(Arc::new(egress_a));
                 let policy = policy_for(session_id, sandbox_id, guest_ip, &["api.anthropic.com"]);
@@ -15336,16 +15352,20 @@ mod tests {
                 .store_policy(&dead_policy)
                 .expect("persist dead policy");
 
-            // Generation B: fresh registry, fresh store over the same
-            // directory, reattach reported one survivor.
-            let (egress_b, _ca_b) = spawn_test_egress().await;
-            let registry_b = egress_b.registry.clone();
+            // Generation B: a fresh daemon (the daemon ALSO died —
+            // the double-failure recovery path), a fresh store over
+            // the same directory, reattach reported one survivor.
+            let (egress_b, handle_b, _daemon_b) = spawn_test_egress().await;
             let pooled_b = PooledBackend::new(
                 Arc::new(FixedListInner(vec![sandbox_id])) as Arc<dyn SandboxBackend>
             )
             .with_egress(Arc::new(egress_b));
             assert!(
-                registry_b.lookup(guest_ip).is_none(),
+                handle_b
+                    .lookup_guest(guest_ip)
+                    .await
+                    .expect("lookup")
+                    .is_none(),
                 "pre-condition: the restarted registry is empty",
             );
             let policies = crate::bindings::BindingStore::open(bindings_dir.path())
@@ -15354,13 +15374,26 @@ mod tests {
                 .expect("list policies");
             pooled_b.rebuild_egress_from_policies(policies).await;
 
-            let state = registry_b
-                .lookup(guest_ip)
+            let guest = handle_b
+                .lookup_guest(guest_ip)
+                .await
+                .expect("lookup")
                 .expect("survivor guest resolves after rebuild");
-            assert_eq!(state.session_id, session_id);
-            assert!(state.network_allow.matches("api.anthropic.com"));
+            assert_eq!(guest.session_id, session_id);
+            assert_eq!(
+                handle_b
+                    .decide(guest_ip, "api.anthropic.com")
+                    .await
+                    .expect("decide")
+                    .as_deref(),
+                Some("bypass"),
+            );
             assert!(
-                registry_b.lookup(dead_policy.guest_ip).is_none(),
+                handle_b
+                    .lookup_guest(dead_policy.guest_ip)
+                    .await
+                    .expect("lookup")
+                    .is_none(),
                 "a policy whose sandbox did not survive must not register",
             );
         }

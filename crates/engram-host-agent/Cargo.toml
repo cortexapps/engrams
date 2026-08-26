@@ -42,6 +42,7 @@ engram-storage-local.workspace = true
 engram-blob-client.workspace = true
 engram-cloud-sql.workspace = true
 engram-egress-proxy.workspace = true
+engram-egress-proto.workspace = true
 engram-oci.workspace = true
 # ADR 0080 §C: host-side materialization of standard docker images —
 # the `MaterializeImage` RPC's engine (pull → flatten → pack → chunk).
@@ -87,7 +88,8 @@ reqwest.workspace = true
 # crate). `mman` wraps mmap/munmap for the same ADR 0068 probe (a
 # memfd-backed self-test, no guest involved). The extra modules
 # compile to no-ops on non-Linux so the features are portable.
-nix = { version = "0.31", default-features = false, features = ["fs", "mman", "sched", "uio"] }
+# "signal": ADR 0121 — SIGKILL for a wedged egress daemon (identity-verified).
+nix = { version = "0.31", default-features = false, features = ["fs", "mman", "sched", "signal", "uio"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 engram-telemetry.workspace = true
@@ -116,6 +118,8 @@ jemalloc_pprof = { workspace = true }
 
 [dev-dependencies]
 engram-uffd-handler.workspace = true
+# ADR 0121: test harnesses run a REAL egress daemon as an in-process task.
+engram-egress-proxyd.workspace = true
 # ADR 0035 amendment (2026-08-10): startup-publish retry test injects a first-PUT blob fault.
 engram-testkit.workspace = true
 # 2026-08-02 durability-rollback RCA: paused-clock (`start_paused`)

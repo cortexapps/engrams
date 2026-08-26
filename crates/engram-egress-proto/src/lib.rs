@@ -101,6 +101,15 @@ pub enum ToProxyd {
     /// Drop one session's registration and its tunnel state.
     RemoveSession(SessionId),
     Health,
+    /// Debug/test: who is registered at this guest IP?
+    LookupGuest(std::net::Ipv4Addr),
+    /// Debug/test: what would the proxy decide for this guest → host
+    /// pair? Answers the decision NAME (`"bypass"` / `"reject"` /
+    /// `"intercept"` / `"own-app"`), `None` for an unknown guest.
+    Decide {
+        guest_ip: std::net::Ipv4Addr,
+        host: String,
+    },
     /// Exit promptly after acking. The graceful half of an upgrade
     /// replace (`AdoptPlan::RestartForUpgrade`).
     Shutdown,
@@ -113,6 +122,17 @@ pub enum FromProxyd {
     Ok,
     Err(String),
     HealthReport { sessions: usize },
+    Guest(Option<GuestSummary>),
+    Decision(Option<String>),
+}
+
+/// The `LookupGuest` answer: the registration's identity, without the
+/// policy body (which carries resolved secrets and stays inside the
+/// daemon).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GuestSummary {
+    pub session_id: SessionId,
+    pub sandbox_id: SandboxId,
 }
 
 /// What a live daemon reports about itself in `HelloAck` position.

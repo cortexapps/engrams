@@ -140,6 +140,86 @@ impl engram_egress_proxy::GuestPortDialer for BackendGuestPortDialer {
     }
 }
 
+/// ADR 0121 §6: the app-relay dial-back server.
+///
+/// The egress daemon owns the ADR 0118 short circuit but cannot reach
+/// a guest port itself — that takes the sandbox backend and the ADR
+/// 0066 relay handshake, which stay here. The daemon connects this UDS
+/// per dial, names the sandbox + port, and receives one end of a
+/// socketpair via SCM_RIGHTS while this process pumps the other end
+/// against the guest stream.
+///
+/// The pump means an established app-relay stream still traverses this
+/// pod and dies with it — deliberately accepted (ADR 0066 already
+/// treats app-relay resets on lifecycle events as "the browser
+/// reconnects"), because the alternative is extracting raw fds from
+/// backend streams and bypassing FC's epoch-severing wrapper.
+pub fn spawn_dialback_server(
+    work_dir: &std::path::Path,
+    dialer: engram_egress_proxy::SharedGuestPortDialer,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    let sock_path = work_dir.join(engram_egress_proto::DIALBACK_SOCK_NAME);
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = tokio::net::UnixListener::bind(&sock_path)?;
+    tracing::info!(sock = %sock_path.display(), "egress dial-back server listening");
+    Ok(tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((conn, _)) => {
+                    let dialer = dialer.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_dialback_conn(conn, dialer).await {
+                            tracing::debug!(error = %e, "dial-back connection ended");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "dial-back accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }))
+}
+
+async fn serve_dialback_conn(
+    mut conn: tokio::net::UnixStream,
+    dialer: engram_egress_proxy::SharedGuestPortDialer,
+) -> std::io::Result<()> {
+    let req: engram_egress_proto::DialbackRequest =
+        engram_egress_proto::read_frame(&mut conn).await?;
+    let guest = match dialer.dial(req.sandbox_id, req.port).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            engram_egress_proto::write_frame(
+                &mut conn,
+                &engram_egress_proto::DialbackResponse::Err(e.to_string()),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    engram_egress_proto::write_frame(&mut conn, &engram_egress_proto::DialbackResponse::Ok).await?;
+    // The fd rides SCM_RIGHTS on the blocking std socket; convert,
+    // send, and get the conn out of the picture — the daemon owns its
+    // socketpair end from here.
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    let std_conn = conn.into_std()?;
+    std_conn.set_nonblocking(false)?;
+    tokio::task::spawn_blocking(move || {
+        engram_egress_proto::send_fd(&std_conn, std::os::fd::AsFd::as_fd(&theirs))
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("send_fd task: {e}")))??;
+    ours.set_nonblocking(true)?;
+    let mut ours = tokio::net::UnixStream::from_std(ours)?;
+    let mut guest = guest;
+    tokio::spawn(async move {
+        let _ = tokio::io::copy_bidirectional(&mut ours, &mut guest).await;
+    });
+    Ok(())
+}
+
 /// Open a raw-byte tunnel by dialing `dial_ip:port` directly (host root netns,
 /// no per-VM netns). Used only by backends **without** a vsock relay: the
 /// Process backend (`dial_ip` is `127.0.0.1` — agentd is a host subprocess)

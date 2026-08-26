@@ -60,6 +60,7 @@ pub mod orphan_reap;
 pub mod pooled_backend;
 pub mod proxy_port;
 pub mod proxy_shell;
+pub mod proxyd_client;
 pub mod ram_ledger;
 pub mod resource;
 pub mod teardown_reconcile;
@@ -777,16 +778,49 @@ impl HostAgent {
                 std::sync::Arc::new(move |stream| sink_hub.accept_via_session_lookup(stream));
             pooled.set_harness_sink(sink);
 
-            // ADR 0111: rebuild the egress registry from the policies
-            // persisted beside the binding records. The reattach pass
-            // above re-adopted the surviving VMs; without this, their
-            // guests have no egress until the next resume (the registry
-            // died with the previous process).
+            // ADR 0111 + ADR 0121: sync the node-local egress daemon
+            // from the policies persisted beside the binding records.
+            // The reattach pass above re-adopted the surviving VMs; an
+            // adopted daemon keeps their registrations live through the
+            // roll, and this sync makes the daemon's registry agree
+            // with THIS generation's live set either way (a fresh
+            // daemon gets the full replay; an adopted one gets pruned
+            // of entries whose VM died with the old pod).
             match harness_hub.persisted_egress_policies() {
                 Ok(policies) => pooled.rebuild_egress_from_policies(policies).await,
                 Err(e) => {
                     tracing::warn!(error = %e, "list persisted egress policies failed");
                 }
+            }
+            if let Some(egress) = self.egress.as_ref() {
+                // ADR 0121 §6: the app-relay dial-back server — the
+                // daemon asks THIS process to open guest streams (the
+                // sandbox backend + ADR 0066 handshake live here).
+                let dialer = std::sync::Arc::new(crate::proxy_port::BackendGuestPortDialer::new(
+                    pooled.clone() as std::sync::Arc<dyn engram_core::traits::SandboxBackend>,
+                ));
+                if let Err(e) = crate::proxy_port::spawn_dialback_server(&self.cfg.work_dir, dialer)
+                {
+                    tracing::error!(error = %e, "egress dial-back server failed to start; app relay degraded");
+                }
+                // ADR 0121: event-driven daemon supervision — on the
+                // daemon's exit event, respawn + re-sync from the
+                // persisted policies. Not armed until here because the
+                // replay needs the pooled backend.
+                let hub_for_replay = harness_hub.clone();
+                let pooled_for_replay = pooled.clone();
+                egress.spawn_supervisor(std::sync::Arc::new(move || {
+                    let hub = hub_for_replay.clone();
+                    let pooled = pooled_for_replay.clone();
+                    Box::pin(async move {
+                        match hub.persisted_egress_policies() {
+                            Ok(policies) => pooled.rebuild_egress_from_policies(policies).await,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "list persisted egress policies failed on daemon respawn");
+                            }
+                        }
+                    })
+                }));
             }
 
             // ADR 0023 split-mode forge forwarding. The forge sink can't

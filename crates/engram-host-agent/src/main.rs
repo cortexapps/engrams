@@ -629,23 +629,16 @@ async fn main() -> Result<(), HostAgentError> {
             .await
             .map_err(|e| HostAgentError::Config(format!("oci cache: {e}")))?;
 
-    // ADR 0056 Phase 4: capture the coord endpoint + token before `cfg` is
-    // moved into HostAgent — the observe sink below needs them.
+    // ADR 0121: capture the coord endpoint + token before `cfg` is
+    // moved into HostAgent — the egress daemon's spawn env needs them
+    // (the daemon owns the observe sink / inject refresher / Cloud SQL
+    // factory that used to be built here).
     let observe_coord_url = cfg
         .coordinator_endpoint
         .clone()
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
     let observe_token = cfg.coordinator_token.clone();
-    // WS4: the egress proxy's inject refresher needs the same coord endpoint +
-    // token; capture them here too (before `cfg` moves into `HostAgent`).
-    let refresh_coord_url = observe_coord_url.clone();
-    let refresh_token = cfg.coordinator_token.clone();
-    let cloud_sql_coord_url = observe_coord_url.clone();
-    let cloud_sql_token = cfg.coordinator_token.clone();
 
-    // ADR 0118: the egress proxy needs the backend to reach a guest port for
-    // the app-to-app short circuit; `sandbox` moves into HostAgent below.
-    let sandbox_for_egress = sandbox.clone();
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
         .with_chunk_store(chunk_store, materialize_dir)
         .with_chunk_cache(chunk_cache)
@@ -674,118 +667,73 @@ async fn main() -> Result<(), HostAgentError> {
     if let Some(pool) = engram_host_agent::disk_daemon::build_nbd_pool_from_kernel() {
         agent = agent.with_nbd_pool(pool);
     }
-    // The egress proxy is mandatory (issue #240). A host that cannot
-    // stand it up (CA unloadable, port unbindable) must NOT serve a
+    // The egress proxy is mandatory (issue #240) and, since ADR 0121,
+    // lives in `engram-egress-proxyd` — a node-local daemon that
+    // outlives this pod so in-flight guest streams survive a roll.
+    // A host that cannot confirm a serving daemon (CA unloadable,
+    // spawn/adopt failed, accept-loop probe dead) must NOT serve a
     // session — there is no "unfiltered access" fallback. Fail closed.
-    // ADR 0056 Phase 4: the egress proxy's observed-asset sink — forwards each
-    // proxy-built IntegrationAsset to the coord (mirrors the harness-event
-    // path). Best-effort fire-and-forget: spawn the POST, log on failure.
-    // ADR 0098 D1: wall clock is an injected world input. The binary
-    // constructs the production clock once and the observe sink reads the
-    // asset timestamp through it.
-    let observe_clock: Arc<dyn engram_core::traits::Clock> =
-        Arc::new(engram_core::traits::SystemClock::new());
-    let observe_sink: engram_egress_proxy::ObserveSink = Arc::new(move |session_id, asset| {
-        let cc = engram_host_agent::coord_client::HttpCoordClient::new(
-            observe_coord_url.clone(),
-            observe_token.clone(),
-        );
-        let observe_clock = observe_clock.clone();
-        tokio::spawn(async move {
-            let req = engram_host_agent::coord_client::IntegrationAssetReport {
-                provider: asset.provider,
-                asset_kind: asset.asset_kind,
-                surface: asset.surface,
-                data: serde_json::Value::Object(asset.data),
-                fetchable_url: asset.fetchable_url,
-                at: observe_clock.now_utc(),
-            };
-            if let Err(e) = cc.integration_asset(session_id, &req).await {
-                tracing::debug!(%session_id, error = %e, "forward integration asset to coord failed");
-            }
-        });
-    });
-    // WS4: the inject refresher — re-mints a near-expiry minted inject
-    // credential via the coord's inject-refresh route (mirrors the observe
-    // sink's coord bridge, but request/response since the proxy awaits it).
-    let inject_refresher: Arc<dyn engram_egress_proxy::InjectRefresher> =
-        Arc::new(engram_host_agent::egress::CoordInjectRefresher::new(
-            engram_host_agent::coord_client::HttpCoordClient::new(refresh_coord_url, refresh_token),
-            host_id,
-        ));
-    // The pooled Cloud SQL upstream: one native endpoint per (session,
-    // tunnel), rotated before credential expiry. The reaper task reaps
-    // idle endpoints and pre-rotates near-stale ones; it holds only a
-    // weak reference, so it ends with the pool.
-    let cloud_sql_pool = Arc::new(engram_egress_proxy::TunnelPool::new(
-        engram_host_agent::egress::CloudSqlEndpointFactory::new(
-            engram_host_agent::coord_client::HttpCoordClient::new(
-                cloud_sql_coord_url,
-                cloud_sql_token,
-            ),
-            host_id,
-        ),
-        engram_egress_proxy::PoolConfig::default(),
-    ));
-    let _cloud_sql_reaper = cloud_sql_pool.spawn_reaper(std::time::Duration::from_secs(30));
-    let cloud_sql_connector: Arc<dyn engram_egress_proxy::TunnelUpstream> = cloud_sql_pool;
-    match build_host_egress(
-        &cli,
-        Some(observe_sink),
-        Some(inject_refresher),
-        Arc::new(engram_egress_proxy::GuestGatewayRegistry::new(
-            [Arc::new(engram_egress_proxy::GceMetadataService)
-                as Arc<dyn engram_egress_proxy::GuestServiceAdapter>],
-            [cloud_sql_connector],
-        )),
-        Arc::new(engram_host_agent::proxy_port::BackendGuestPortDialer::new(
-            sandbox_for_egress,
-        )),
-    )
-    .await
-    {
-        Ok(egress) => agent = agent.with_egress(Arc::new(egress)),
+    //
+    // The coord-facing request-path glue (inject refresher, observe
+    // sink, Cloud SQL endpoint factory) lives in the daemon now, so a
+    // guest request never depends on this pod being alive.
+    let (ca_cert_pem, ca_key_pem) = load_egress_ca(&cli).await.map_err(|e| {
+        tracing::error!(error = %e, "egress CA load failed; aborting (egress filtering is mandatory)");
+        HostAgentError::Config(format!("egress ca: {e}"))
+    })?;
+    // Port 0 would leave the iptables REDIRECT pointing at a literal
+    // the daemon never binds — the ADR 0083 split-brain. No `0 = off`
+    // sentinel exists (egress is mandatory).
+    if cli.egress_proxy_port == 0 || cli.egress_dns_port == 0 || cli.guest_gateway_port == 0 {
+        return Err(HostAgentError::Config(format!(
+            "egress ports must be non-zero (got proxy={}, dns={}, guest_gateway={})",
+            cli.egress_proxy_port, cli.egress_dns_port, cli.guest_gateway_port,
+        )));
+    }
+    let proxyd_cfg = engram_host_agent::proxyd_client::ProxydSpawnConfig {
+        bin: std::env::var("ENGRAM_EGRESS_PROXYD_BIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("engram-egress-proxyd")),
+        work_dir: cli.work_dir.clone(),
+        proxy_port: cli.egress_proxy_port,
+        dns_port: cli.egress_dns_port,
+        gateway_port: cli.guest_gateway_port,
+        // The same node-cgroup escape the VMs use (ADR 0044 K2), one
+        // fixed leaf for the daemon.
+        cgroup_dir: std::env::var("ENGRAM_FC_VM_CGROUP_PARENT")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(|p| std::path::Path::new(&p).join("egress-proxyd")),
+        ca_cert_pem: ca_cert_pem.clone(),
+        ca_key_pem,
+        coord_url: observe_coord_url,
+        coord_token: observe_token,
+        host_id,
+    };
+    match engram_host_agent::proxyd_client::ensure_proxyd(&proxyd_cfg).await {
+        Ok((handle, process)) => {
+            agent = agent.with_egress(Arc::new(engram_host_agent::egress::HostEgress::new(
+                handle,
+                ca_cert_pem,
+                Some((process, proxyd_cfg)),
+            )));
+        }
         Err(e) => {
-            tracing::error!(error = %e, "egress proxy spawn failed; aborting (egress filtering is mandatory)");
+            tracing::error!(error = %e, "egress daemon not confirmed serving; aborting (egress filtering is mandatory)");
             return Err(HostAgentError::Config(format!("egress: {e}")));
         }
     }
     agent.run().await
 }
 
-/// ADR 0014 M1.12: produce / verify the 16 MiB stub harness ext4 at
-/// `<work_dir>/.stub-harness.ext4`. Warm-pool restore points the
-/// harness symlink at this file so `load_snapshot` can open it as a
-/// virtio-blk device; `swap_harness_drive` repoints to the session's
-/// real harness at warm-lease. Idempotent — skips when the file is
-/// already the expected size. Returns the **absolute** path; the
-/// receiver's harness symlinks resolve relative to their own parent
-/// directory (the bake's `/tmp/.tmpXXX/harness/`), so a relative
-/// `./var/...` target would dangle there.
-async fn build_host_egress(
-    cli: &Cli,
-    observe_sink: Option<engram_egress_proxy::ObserveSink>,
-    inject_refresher: Option<Arc<dyn engram_egress_proxy::InjectRefresher>>,
-    guest_gateway: Arc<engram_egress_proxy::GuestGatewayRegistry>,
-    // ADR 0118: opens a byte stream to a port inside a session's guest, so a
-    // call to one of the session's own app hostnames is spliced back into the
-    // sandbox instead of leaving the host.
-    guest_port_dialer: engram_egress_proxy::SharedGuestPortDialer,
-) -> Result<engram_host_agent::egress::HostEgress, String> {
+/// Load the egress CA material for the daemon (ADR 0121): the daemon
+/// itself only ever reads PEMs from its spawn env, so every CA source
+/// (env / local-disk / GCP Secret Manager) resolves HERE, in the one
+/// process that already holds the deployment's secret plumbing. The
+/// cert PEM is also what `pooled_backend` stamps into guest trust
+/// stores (`host_ca_pem`).
+async fn load_egress_ca(cli: &Cli) -> Result<(String, String), String> {
     use std::sync::Arc;
-    // Port 0 would bind an ephemeral port while the iptables REDIRECT
-    // still targets the literal configured value — the host boots green
-    // and every guest gets ConnectionRefused, the exact split-brain the
-    // fail-closed bind (ADR 0083) exists to kill. There is no `0 = off`
-    // sentinel (egress is mandatory, issue #240), so reject it here.
-    if cli.egress_proxy_port == 0 || cli.egress_dns_port == 0 || cli.guest_gateway_port == 0 {
-        return Err(format!(
-            "egress ports must be non-zero (got proxy={}, dns={}, guest_gateway={}): the iptables \
-             REDIRECT targets the configured port, so an ephemeral (0) bind \
-             leaves :443/:53 or the guest gateway redirected at a dead port",
-            cli.egress_proxy_port, cli.egress_dns_port, cli.guest_gateway_port,
-        ));
-    }
     let source: Arc<dyn engram_egress_proxy::CaSource> = match cli.ca_source {
         CaSourceChoice::Env => Arc::new(engram_egress_proxy::EnvCaSource::new(
             cli.ca_cert_var.clone(),
@@ -811,31 +759,9 @@ async fn build_host_egress(
             )
         }
     };
-    let bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_proxy_port)
-        .parse()
-        .map_err(|e| format!("parse bind addr: {e}"))?;
-    // The DNS proxy binds the port the FC iptables `:53 -> dns` REDIRECT
-    // targets; both come from `--egress-dns-port` (default 5353) so they
-    // can't drift. Configurable so two host-agents sharing a netns (the
-    // e2e two-host stack) don't collide on it.
-    let dns_bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_dns_port)
-        .parse()
-        .map_err(|e| format!("parse dns bind addr: {e}"))?;
-    let guest_gateway_bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.guest_gateway_port)
-        .parse()
-        .map_err(|e| format!("parse guest gateway bind addr: {e}"))?;
-    engram_host_agent::egress::HostEgress::spawn(
-        source,
-        bind,
-        Some(dns_bind),
-        Some(guest_gateway_bind),
-        observe_sink,
-        inject_refresher,
-        guest_gateway,
-        Some(guest_port_dialer),
-    )
-    .await
-    .map_err(|e| e.to_string())
+    let ca = source.load().await.map_err(|e| e.to_string())?;
+    let key_pem = ca.key_pair.serialize_pem();
+    Ok((ca.cert_pem, key_pem))
 }
 
 /// Parse the gRPC listen address from `ENGRAM_GRPC_LISTEN_ADDR`.

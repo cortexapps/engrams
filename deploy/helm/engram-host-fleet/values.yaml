@@ -102,6 +102,11 @@ egress:
   # was retired, silently leaving prod with unfiltered guest egress;
   # this section re-wires them.
   port: 8443
+  # ADR 0121: the proxy runs as `engram-egress-proxyd`, a node-local
+  # daemon host-agent spawns (or adopts across a pod roll) so in-flight
+  # guest streams survive deploys. Path of the daemon binary inside the
+  # host-agent image; override only for a custom image layout.
+  # proxydBin: /usr/local/bin/engram-egress-proxyd
   # Where the CA material loads from. One of:
   #   env                 — read the PEMs from ENGRAM_EGRESS_CA_{CERT,KEY}_PEM,
   #                         injected by the DaemonSet from caEnvSecret (the

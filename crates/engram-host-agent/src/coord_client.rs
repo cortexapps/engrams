@@ -238,89 +238,6 @@ impl HttpCoordClient {
         Ok(())
     }
 
-    /// POST /api/v1/sessions/:session_id/integration-asset
-    ///
-    /// ADR 0056 Phase 4: the egress proxy observed a response on a marked
-    /// endpoint and built an asset. The host-agent forwards it to the coord —
-    /// which appends it as an `IntegrationAsset` session event — mirroring the
-    /// harness-event path. Best-effort: a transport/HTTP failure is logged by
-    /// the caller, not retried (at-least-once observation, ADR 0028).
-    pub async fn integration_asset(
-        &self,
-        session_id: SessionId,
-        req: &IntegrationAssetReport,
-    ) -> Result<(), CoordError> {
-        let url = self.endpoint(&format!("/sessions/{session_id}/integration-asset"));
-        let builder = self.http.post(&url);
-        let resp = self
-            .auth(builder, req)
-            .send()
-            .await
-            .map_err(|e| CoordError::Transport(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(CoordError::Http {
-                status: resp.status().as_u16(),
-                body: resp.text().await.unwrap_or_default(),
-                what: "integration_asset",
-            });
-        }
-        Ok(())
-    }
-
-    /// POST /api/v1/hosts/:id/sessions/:session_id/inject/refresh
-    ///
-    /// WS4: the egress proxy's minted inject credential (a GitHub App
-    /// installation token, ~1h TTL) is nearing expiry. Ask the coord to re-mint
-    /// it against the session's bound capabilities and return the fresh header +
-    /// TTL. Unlike the fire-and-forget observe/harness sinks this is a
-    /// request/response the proxy awaits (it substitutes the returned secret on
-    /// the outbound request). A transport/HTTP failure is an `Err` — the proxy
-    /// then keeps the stale secret rather than failing the guest's request.
-    pub async fn refresh_inject(
-        &self,
-        host_id: HostId,
-        session_id: SessionId,
-        mint_source: &engram_core::types::integration::CredentialMintSource,
-    ) -> Result<RefreshInjectResponse, CoordError> {
-        let url = self.endpoint(&format!(
-            "/hosts/{host_id}/sessions/{session_id}/inject/refresh"
-        ));
-        let builder = self.http.post(&url);
-        let req = RefreshInjectRequest {
-            mint_source: mint_source.clone(),
-            purpose: engram_core::types::integration::CredentialPurpose::api(),
-        };
-        let resp = self
-            .auth(builder, &req)
-            .send()
-            .await
-            .map_err(|e| CoordError::Transport(e.to_string()))?;
-        decode_json(resp, "refresh_inject").await
-    }
-
-    /// Mint a raw host-only credential for one fixed connection purpose.
-    pub async fn mint_connection_credential(
-        &self,
-        host_id: HostId,
-        session_id: SessionId,
-        mint_source: &engram_core::types::integration::CredentialMintSource,
-        purpose: engram_core::types::integration::CredentialPurpose,
-    ) -> Result<RefreshInjectResponse, CoordError> {
-        let url = self.endpoint(&format!(
-            "/hosts/{host_id}/sessions/{session_id}/inject/refresh"
-        ));
-        let req = RefreshInjectRequest {
-            mint_source: mint_source.clone(),
-            purpose,
-        };
-        let resp = self
-            .auth(self.http.post(&url), &req)
-            .send()
-            .await
-            .map_err(|e| CoordError::Transport(e.to_string()))?;
-        decode_json(resp, "mint_connection_credential").await
-    }
-
     /// POST /api/v1/hosts/forge
     ///
     /// ADR 0023 split-mode forge forwarding. The host-agent reads the
@@ -760,41 +677,10 @@ pub struct HarnessEventRequest {
     pub at: DateTime<Utc>,
 }
 
-/// ADR 0056 Phase 4: a proxy-observed integration asset, forwarded to the
-/// coord's `/sessions/:id/integration-asset` ingest. `surface` is opaque here
-/// ("action" | "asset"); the coord maps it to its `AssetSurface`.
-#[derive(Serialize)]
-pub struct IntegrationAssetReport {
-    pub provider: String,
-    pub asset_kind: String,
-    pub surface: String,
-    pub data: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fetchable_url: Option<String>,
-    pub at: DateTime<Utc>,
-}
-
 #[derive(Deserialize)]
 pub struct IdleEvictionCandidatesResponse {
     pub accepted: usize,
     pub failed: usize,
-}
-
-/// WS4: request body for the inject-refresh route — the source whose credential
-/// the proxy needs re-minted.
-#[derive(Serialize)]
-pub struct RefreshInjectRequest {
-    pub mint_source: engram_core::types::integration::CredentialMintSource,
-    pub purpose: engram_core::types::integration::CredentialPurpose,
-}
-
-/// WS4: the coord's re-minted inject credential — the fresh rendered header
-/// value the proxy substitutes, plus its new expiry (drives the next refresh).
-#[derive(Deserialize)]
-pub struct RefreshInjectResponse {
-    pub header_name: String,
-    pub secret: String,
-    pub expires_at: DateTime<Utc>,
 }
 
 // ADR 0016 Phase B live-manifest-publish types + the CoordError type
