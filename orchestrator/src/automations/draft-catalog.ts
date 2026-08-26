@@ -84,11 +84,20 @@ export function draftPatterns(): Record<string, unknown> {
     core_model: [
       "Runs are SHORT and stateless. Waits inside a run cap at 24h and stuck runs are swept at 48h - never design a run to live for a day.",
       "A workflow that spans days = multiple ENTRYPOINTS (one per way in: an integration event, a cron tick, a manual kick) sharing the automation's inputs, settings, and state. Each run enters through one entrypoint, does one step of the lifecycle, and exits.",
+      "A TEMPLATED workflow (the same lifecycle per project/customer/case) declares settings.instance and becomes one automation with many WORKSTREAMS - see the instances section; never duplicate an automation per project.",
       "Conversations (hours, every event carries the same key) are the ONE long-lived-run shape: concurrency policy join + trigger.continueOnly, like the Slack brain built-in.",
       "At most one cron trigger per automation.",
     ],
+    instances: [
+      "settings.instance = {keyTemplate, inputs?, entrypoints?} turns the automation into a TEMPLATE: one open workstream per rendered key (e.g. keyTemplate 'project-${{ inputs.linear_project_id }}'), each with its OWN input snapshot, state, sessions, and cron ticks. The author makes ONE decision - the key; isolation and routing follow.",
+      "Admission per entrypoint: admit 'open' (default - render the key, open or join), 'require' (join an open workstream or DROP - use for mid-lifecycle events that make no sense without a kickoff), 'handle_match' (route ONLY by accumulated external identifiers - use for reply/reaction/review entrypoints).",
+      "Handles are automatic: slack.post_message binds the thread it posts into (and its own ts), a session that opens a PR binds github:<repo>#<n>. A Slack reply or a PR review then routes to the RIGHT workstream with zero routing blocks - do not hand-roll thread:<ts> state keys for routing any more.",
+      "State inside an instance-bound run is automatically scoped to the workstream: write plain keys ('plan', 'tickets') and two projects never collide. Concurrency keys scope the same way.",
+      "Close the lifecycle with the instance_close block (a run closes only its own workstream); later events for it are dropped and audited. Kicking off the same key again starts a FRESH workstream.",
+      "RunNow on an instanced automation takes instance_key + instance_inputs_json to open or join a workstream; the automation row's inputs are only defaults for new workstreams.",
+    ],
     state: [
-      "automation_state is the shared memory across entrypoints and runs: state key = entity (one JSON document per entity, e.g. ticket:ENG-123), and make the automation's concurrency keyTemplate render the SAME entity key with policy queue - then runs touching one entity serialize and get-then-set needs no locks.",
+      "automation_state is the shared memory across entrypoints and runs: state key = entity (one JSON document per entity, e.g. ticket:ENG-123), and make the automation's concurrency keyTemplate render the SAME entity key with policy queue - then runs touching one entity serialize and get-then-set needs no locks. For per-project workflows prefer settings.instance (see instances) - it scopes state per workstream automatically.",
       "Actors that cannot hold the entity claim (a cron sweep over many entities) write with expectVersion (CAS); an ok:false result is a branchable output, and losing a race to a real per-entity run is usually the correct outcome.",
       "There is no lock block and no cross-block transaction on purpose; put facts that must change together in one document.",
     ],

@@ -60,6 +60,15 @@ service AutomationService {
 
 service AutomationRunService {
   rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+
+  // ADR 0120 instances ("workstreams" in the UI): the durable entity many
+  // short runs contribute to.
+  rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
+  rpc GetInstance(GetInstanceRequest) returns (GetInstanceResponse);
+  rpc CloseInstance(CloseInstanceRequest) returns (CloseInstanceResponse);
+  // The admission drops ring: why an event did NOT fire (closed workstream,
+  // no handle match, no open workstream for a require entrypoint).
+  rpc ListRecentDrops(ListRecentDropsRequest) returns (ListRecentDropsResponse);
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
   rpc StopRun(StopRunRequest) returns (StopRunResponse);
   // A fresh run with the same trigger payload. `from_step_id` is recorded
@@ -129,6 +138,8 @@ message AutomationRunBrief {
   optional string started_at = 10;
   optional string ended_at = 11;
   string created_at = 12;
+  // ADR 0120: the bound workstream ("" = unbound).
+  string instance_id = 13;
 }
 
 message DayRunCount {
@@ -354,15 +365,102 @@ message EvalCodeResponse {
 message RunNowRequest {
   string automation_id = 1;
   // Optional one-off input override (merged over the stored values).
+  // REJECTED for an instanced automation: inputs live on the workstream
+  // (use instance_inputs_json at kickoff).
   optional string inputs_json = 2;
   // Optional event payload for integration/webhook-shaped automations.
   optional string payload_json = 3;
   // ADR 0119 D9: which entrypoint to run (default "main").
   optional string entrypoint_id = 4;
+  // ADR 0120: the workstream identity to open or join. Absent on an
+  // instanced automation = resolve via the declared key template.
+  optional string instance_key = 5;
+  // Kickoff-time input values for a NEW workstream (object JSON). Joining
+  // an existing open workstream with non-empty values is an error — a
+  // snapshot is never silently ignored.
+  optional string instance_inputs_json = 6;
 }
 
 message RunNowResponse {
   string run_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0120: workstream instances
+// ---------------------------------------------------------------------------
+
+message AutomationInstance {
+  string id = 1;
+  string automation_id = 2;
+  // The rendered identity key (the UI label), e.g. "project-ENG-42".
+  string key = 3;
+  // "open" | "closed"
+  string status = 4;
+  // The kickoff input snapshot (object JSON) instance-bound runs resolve
+  // inputs.* from.
+  string inputs_json = 5;
+  string opened_by = 6;
+  string opened_at = 7;
+  optional string closed_at = 8;
+  optional string close_reason = 9;
+}
+
+// One external identifier the workstream owns (routing history; handles
+// outlive the instance and never re-route after close).
+message InstanceHandle {
+  string handle = 1;
+  string written_by = 2;
+  string created_at = 3;
+}
+
+message ListInstancesRequest {
+  string automation_id = 1;
+  bool include_closed = 2;
+  // 0 = server default (capped).
+  int32 limit = 3;
+}
+
+message ListInstancesResponse {
+  repeated AutomationInstance instances = 1;
+}
+
+message GetInstanceRequest {
+  string id = 1;
+}
+
+message GetInstanceResponse {
+  AutomationInstance instance = 1;
+  repeated InstanceHandle handles = 2;
+}
+
+message CloseInstanceRequest {
+  string id = 1;
+  optional string reason = 2;
+}
+
+message CloseInstanceResponse {
+  // false = it was already closed.
+  bool closed = 1;
+}
+
+message AutomationDropBrief {
+  string entrypoint_id = 1;
+  string event_key = 2;
+  // "closed_instance" | "no_handle_match" | "no_open_instance"
+  string reason = 3;
+  // The candidate handle or rendered key that failed to route.
+  string detail = 4;
+  string dropped_at = 5;
+}
+
+message ListRecentDropsRequest {
+  string automation_id = 1;
+  // 0 = server default (the ring cap).
+  int32 limit = 2;
+}
+
+message ListRecentDropsResponse {
+  repeated AutomationDropBrief drops = 1;
 }
 
 message EventSample {
@@ -407,6 +505,8 @@ message ListRunsRequest {
   int32 limit = 2;
   // Include filtered runs individually instead of collapsing them.
   bool include_filtered = 3;
+  // ADR 0120: only runs bound to this workstream.
+  optional string instance_id = 4;
 }
 
 // Consecutive filtered runs collapsed between real runs.

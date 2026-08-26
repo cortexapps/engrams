@@ -215,6 +215,16 @@ export interface EngineStateStore {
  * (instance_close). Implemented over the instance store. */
 export interface EngineInstanceOps {
   closeInstance(input: { instanceId: string; reason?: string }): Promise<boolean>;
+  /** The claim_handle block's writer (same contract as every writer:
+   * already_ours converges a replay; conflict never rebinds). */
+  recordInstanceHandle?(input: {
+    automationId: string;
+    handle: string;
+    instanceId: string;
+    writtenBy: string;
+  }): Promise<
+    { kind: "recorded" } | { kind: "already_ours" } | { kind: "conflict"; instanceId: string }
+  >;
 }
 
 /** PR → authoring-session lookup (the pr_ref ledger the link consumer

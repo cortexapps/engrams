@@ -18,6 +18,7 @@ import {
   WebhookRegistrationSchema,
   WebhookRegistrationService,
   type Automation as ProtoAutomation,
+  type AutomationInstance as ProtoAutomationInstance,
   type AutomationRunBrief as ProtoRunBrief,
   type AutomationStepRun as ProtoStepRun,
   type AutomationVersion as ProtoVersion,
@@ -93,7 +94,7 @@ import {
   type AutomationWebhookStarter,
 } from "../automations/dispatch.ts";
 import { resolveInstance } from "../automations/instances.ts";
-import type { AutomationInstanceStore } from "../db/automation-instances.ts";
+import type { AutomationInstanceRow, AutomationInstanceStore } from "../db/automation-instances.ts";
 import {
   defaultAutomationSender,
   inboxKeys,
@@ -372,6 +373,7 @@ function toProtoRunBrief(row: AutomationRunRow): ProtoRunBrief {
     automationId: row.automationId,
     version: row.version,
     status: row.status,
+    instanceId: row.instanceId,
     ...(row.error !== null ? { error: row.error } : {}),
     triggerSource: row.trigger.source,
     ...(row.trigger.eventKey !== undefined ? { eventKey: row.trigger.eventKey } : {}),
@@ -738,6 +740,9 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       deliveryKey: string;
       /** D9: which entrypoint to run (default "main"). */
       entrypointId?: string;
+      /** ADR 0120: explicit workstream kickoff (RunNow's instance_key). */
+      instanceKey?: string;
+      instanceInputs?: Record<string, unknown>;
     },
   ): Promise<string> {
     const definition = effectiveDefinition(row.version, row.blockOverrides);
@@ -757,36 +762,87 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       ...(input.eventKey !== undefined ? { eventKey: input.eventKey } : {}),
     };
     // ADR 0120: an instanced automation resolves its workstream before the
-    // run id is minted. Ad-hoc occurrences carry no provider facet, so
-    // resolution routes by the key template alone. Dry runs stay unbound:
-    // an editor preview must never open a real workstream.
+    // run id is minted. An explicit instance_key opens-or-joins THAT
+    // workstream; otherwise resolution routes by the declared key template
+    // (ad-hoc occurrences carry no provider facet, so never by handle).
+    // Dry runs stay unbound: an editor preview must never open a real
+    // workstream.
     let instanceId = "";
     if (definition.settings.instance !== undefined && !input.dryRun) {
-      const resolution = await resolveInstance(
-        {
-          target: { automation: row, definition },
-          entrypoint: { id: entrypoint.id, trigger: entrypoint.trigger },
-          trigger,
-        },
-        { instances },
-      );
-      if (resolution.kind === "drop") {
-        throw new ConnectError(
-          resolution.reason === "no_open_instance"
-            ? `no open workstream for key "${resolution.detail}" (this entrypoint joins existing workstreams; kick one off first)`
-            : `event does not route to a workstream (${resolution.reason})`,
-          Code.FailedPrecondition,
+      if (input.instanceKey !== undefined) {
+        const admit =
+          definition.settings.instance.entrypoints?.[entrypoint.id]?.admit ?? "open";
+        const existing = await instances.getOpenInstanceByKey(row.id, input.instanceKey);
+        if (existing) {
+          if (input.instanceInputs !== undefined && Object.keys(input.instanceInputs).length > 0) {
+            // Never silently ignore a snapshot: joining an open workstream
+            // means its kickoff inputs already exist.
+            throw new ConnectError(
+              `workstream "${input.instanceKey}" is already open; joining takes no instance inputs`,
+              Code.FailedPrecondition,
+            );
+          }
+          instanceId = existing.id;
+        } else {
+          if (admit === "require") {
+            throw new ConnectError(
+              `no open workstream for key "${input.instanceKey}" (this entrypoint joins existing workstreams; kick one off first)`,
+              Code.FailedPrecondition,
+            );
+          }
+          if (admit === "handle_match") {
+            throw new ConnectError(
+              "this entrypoint routes only by handles; a manual kickoff cannot name one",
+              Code.FailedPrecondition,
+            );
+          }
+          const declared = new Set(row.version.inputsSchema.map((f) => f.key));
+          const unknown = Object.keys(input.instanceInputs ?? {}).filter((k) => !declared.has(k));
+          if (unknown.length > 0) {
+            throw new BlockValidationError(
+              unknown.map((k) =>
+                blockError("", `inputs.${k}`, "unknown_input", `input "${k}" is not declared`),
+              ),
+            );
+          }
+          const defaults = resolveAutomationInputs(row.version.inputsSchema, row.inputs);
+          const merged = { ...defaults, ...(input.instanceInputs ?? {}) };
+          assertInputValues(row.version.inputsSchema, merged);
+          const opened = await instances.openInstance({
+            automationId: row.id,
+            key: input.instanceKey,
+            inputs: merged,
+            openedBy: `manual:${input.deliveryKey}`,
+          });
+          instanceId = opened.id;
+        }
+      } else {
+        const resolution = await resolveInstance(
+          {
+            target: { automation: row, definition },
+            entrypoint: { id: entrypoint.id, trigger: entrypoint.trigger },
+            trigger,
+          },
+          { instances },
         );
-      }
-      if (resolution.kind === "bound") instanceId = resolution.instance.id;
-      else if (resolution.kind === "open") {
-        const opened = await instances.openInstance({
-          automationId: row.id,
-          key: resolution.key,
-          inputs: resolution.inputs,
-          openedBy: `manual:${input.deliveryKey}`,
-        });
-        instanceId = opened.id;
+        if (resolution.kind === "drop") {
+          throw new ConnectError(
+            resolution.reason === "no_open_instance"
+              ? `no open workstream for key "${resolution.detail}" (this entrypoint joins existing workstreams; kick one off first)`
+              : `event does not route to a workstream (${resolution.reason})`,
+            Code.FailedPrecondition,
+          );
+        }
+        if (resolution.kind === "bound") instanceId = resolution.instance.id;
+        else if (resolution.kind === "open") {
+          const opened = await instances.openInstance({
+            automationId: row.id,
+            key: resolution.key,
+            inputs: resolution.inputs,
+            openedBy: `manual:${input.deliveryKey}`,
+          });
+          instanceId = opened.id;
+        }
       }
     }
     const runId = automationRunId(row.id, input.deliveryKey, entrypoint.id, instanceId);
@@ -1114,6 +1170,22 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       await requireAdmin(ctx, getSession);
       const row = await requireAutomation(req.automationId);
       if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
+      const instanced = row.version.settings.instance !== undefined;
+      if (!instanced && (req.instanceKey !== undefined || req.instanceInputsJson !== undefined)) {
+        throw new ConnectError(
+          "this automation has no workstreams (settings.instance is not declared)",
+          Code.InvalidArgument,
+        );
+      }
+      if (instanced && req.inputsJson !== undefined) {
+        // Workstream inputs live on the instance snapshot; the automation
+        // row's values are only defaults for NEW workstreams. The legacy
+        // persist-then-run path would silently mutate every future kickoff.
+        throw new ConnectError(
+          "an instanced automation takes instance_inputs_json at kickoff, not inputs_json",
+          Code.FailedPrecondition,
+        );
+      }
       if (req.inputsJson !== undefined) {
         // A one-off override is applied by persisting it: runs read inputs
         // from the row at snapshot time. Honest and simple; the editor shows
@@ -1137,6 +1209,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         req.payloadJson !== undefined
           ? { payload, eventKey: refreshed.version.trigger.kind === "integration" ? refreshed.version.trigger.eventKeys[0] : undefined }
           : await resolveSample(refreshed, { case: undefined });
+      const instanceInputs =
+        req.instanceInputsJson !== undefined
+          ? parseObjectJson(req.instanceInputsJson, "instance_inputs_json")
+          : undefined;
       const runId = await startAdHocRun(refreshed, {
         source: "manual",
         payload: sample.payload,
@@ -1146,6 +1222,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         ...(req.entrypointId !== undefined && req.entrypointId !== ""
           ? { entrypointId: req.entrypointId }
           : {}),
+        ...(req.instanceKey !== undefined && req.instanceKey !== ""
+          ? { instanceKey: req.instanceKey }
+          : {}),
+        ...(instanceInputs !== undefined ? { instanceInputs } : {}),
       });
       return { runId };
     },
@@ -1290,11 +1370,86 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     },
   });
 
+  function toProtoInstance(row: AutomationInstanceRow): ProtoAutomationInstance {
+    return {
+      $typeName: "engram.app.v1.AutomationInstance",
+      id: row.id,
+      automationId: row.automationId,
+      key: row.key,
+      status: row.status,
+      inputsJson: JSON.stringify(row.inputs),
+      openedBy: row.openedBy,
+      openedAt: row.openedAt.toISOString(),
+      ...(row.closedAt ? { closedAt: row.closedAt.toISOString() } : {}),
+      ...(row.closeReason !== null ? { closeReason: row.closeReason } : {}),
+    };
+  }
+
   router.service(AutomationRunService, {
+    async listInstances(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      const rows = await instances.listInstances(row.id, {
+        includeClosed: req.includeClosed,
+        limit: listLimit(req.limit),
+      });
+      return { instances: rows.map(toProtoInstance) };
+    },
+
+    async getInstance(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await instances.getInstance(requiredText(req.id, "id"));
+      if (!row) throw new ConnectError("workstream not found", Code.NotFound);
+      const handles = await instances.listInstanceHandles(row.id);
+      return {
+        instance: toProtoInstance(row),
+        handles: handles.map((h) => ({
+          $typeName: "engram.app.v1.InstanceHandle" as const,
+          handle: h.handle,
+          writtenBy: h.writtenBy,
+          createdAt: h.createdAt.toISOString(),
+        })),
+      };
+    },
+
+    async closeInstance(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await instances.getInstance(requiredText(req.id, "id"));
+      if (!row) throw new ConnectError("workstream not found", Code.NotFound);
+      const closed = await instances.closeInstance({
+        instanceId: row.id,
+        ...(req.reason !== undefined && req.reason !== "" ? { reason: req.reason } : {}),
+      });
+      return { closed };
+    },
+
+    async listRecentDrops(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      const drops = await instances.listRecentDrops(
+        row.id,
+        req.limit > 0 ? Math.min(req.limit, 50) : undefined,
+      );
+      return {
+        drops: drops.map((d) => ({
+          $typeName: "engram.app.v1.AutomationDropBrief" as const,
+          entrypointId: d.entrypointId,
+          eventKey: d.eventKey,
+          reason: d.reason,
+          detail: d.detail,
+          droppedAt: d.droppedAt.toISOString(),
+        })),
+      };
+    },
+
     async listRuns(req, ctx) {
       await requireAdmin(ctx, getSession);
       const row = await requireAutomation(req.automationId);
-      const rows = await store.listRuns(row.id, listLimit(req.limit));
+      const rows = await store.listRuns(row.id, listLimit(req.limit), {
+        ...(req.instanceId !== undefined && req.instanceId !== ""
+          ? { instanceId: req.instanceId }
+          : {}),
+      });
       if (req.includeFiltered) {
         return { runs: rows.map(toProtoRunBrief), filtered: [] };
       }

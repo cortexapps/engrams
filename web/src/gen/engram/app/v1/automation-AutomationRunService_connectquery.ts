@@ -10,6 +10,32 @@ import { AutomationRunService } from "./automation_pb";
 export const listRuns = AutomationRunService.method.listRuns;
 
 /**
+ * ADR 0120 instances ("workstreams" in the UI): the durable entity many
+ * short runs contribute to.
+ *
+ * @generated from rpc engram.app.v1.AutomationRunService.ListInstances
+ */
+export const listInstances = AutomationRunService.method.listInstances;
+
+/**
+ * @generated from rpc engram.app.v1.AutomationRunService.GetInstance
+ */
+export const getInstance = AutomationRunService.method.getInstance;
+
+/**
+ * @generated from rpc engram.app.v1.AutomationRunService.CloseInstance
+ */
+export const closeInstance = AutomationRunService.method.closeInstance;
+
+/**
+ * The admission drops ring: why an event did NOT fire (closed workstream,
+ * no handle match, no open workstream for a require entrypoint).
+ *
+ * @generated from rpc engram.app.v1.AutomationRunService.ListRecentDrops
+ */
+export const listRecentDrops = AutomationRunService.method.listRecentDrops;
+
+/**
  * @generated from rpc engram.app.v1.AutomationRunService.GetRun
  */
 export const getRun = AutomationRunService.method.getRun;

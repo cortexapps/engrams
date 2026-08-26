@@ -284,6 +284,7 @@ function productionEngineDeps(): EngineDeps {
     integrationActions: makeIntegrationActionRuntime(),
     instances: {
       closeInstance: (input) => makeAutomationInstanceStore().closeInstance(input),
+      recordInstanceHandle: (input) => makeAutomationInstanceStore().recordInstanceHandle(input),
     },
     async startQueuedRun(runId) {
       const run = await store.getRun(runId);
