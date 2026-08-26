@@ -21,7 +21,13 @@ import type {
 } from "../db/integration-connections.ts";
 import { makeUserSecretStore } from "../db/user-secrets.ts";
 import { makeUserIdentityStore } from "../db/users.ts";
-import { coordinationOperation, task, taskSession, type TaskLaunchPolicy } from "../db/schema.ts";
+import {
+  coordinationOperation,
+  sessionListener as sessionListenerTable,
+  task,
+  taskSession,
+  type TaskLaunchPolicy,
+} from "../db/schema.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import { integrationSnapshotHash } from "../integrations/grants.ts";
 import {
@@ -625,6 +631,20 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
             throw error;
           }
         }
+        // Make the child discoverable by the listener scanner. Without this
+        // row NO consumer ever observes a spawned session — its opened PRs
+        // never reach the pr_ref ledger, so review feedback cannot route
+        // back to it (the Tenant Inspector ENG-408 gap). Enrollment happens
+        // AFTER the coordinator session exists, matching every other
+        // creating path: an early row lets the scanner probe a session the
+        // coordinator does not know yet, and that NotFound marks the
+        // listener permanently terminal (review finding on this PR). A
+        // crash inside this window leaves the session unenrolled — the same
+        // narrow exposure the sibling paths accept.
+        await getDb()
+          .insert(sessionListenerTable)
+          .values({ sessionId })
+          .onConflictDoNothing();
         if ((args.file_paths?.length ?? 0) > 0) {
           await sessions.copyFiles({
             sourceSessionId: ctx.sessionId,
