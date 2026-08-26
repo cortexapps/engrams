@@ -34,7 +34,12 @@ function brief(
 
 type ListImpl = (req: ListRunsRequest) => {
   runs: ReturnType<typeof brief>[];
-  filtered: Array<{ count: number; firstAt: string; lastAt: string; beforeRunId: string }>;
+  filtered: Array<{
+    count: number;
+    firstAt: string;
+    lastAt: string;
+    beforeRunId: string;
+  }>;
 };
 
 function transportWith(listRuns: ListImpl) {
@@ -110,7 +115,10 @@ describe("RunsTab", () => {
     });
     await screen.findByText(/no runs yet/i);
     expect(listRuns).toHaveBeenLastCalledWith(
-      expect.objectContaining({ automationId: "auto-1", includeFiltered: false }),
+      expect.objectContaining({
+        automationId: "auto-1",
+        includeFiltered: false,
+      }),
       expect.anything(),
     );
 
@@ -121,5 +129,43 @@ describe("RunsTab", () => {
         expect.anything(),
       ),
     );
+  });
+});
+
+describe("workstream chips (ADR 0120)", () => {
+  it("labels an instance-bound run by its workstream key; unbound rows get no chip", async () => {
+    const transport = createRouterTransport((router) => {
+      router.service(AutomationRunService, {
+        listRuns: () => ({
+          runs: [
+            brief("run-1", "completed", 5, { instanceId: "ai_one" }),
+            brief("run-2", "completed", 9),
+          ],
+          filtered: [],
+        }),
+        listInstances: () => ({
+          instances: [
+            {
+              id: "ai_one",
+              automationId: "auto-1",
+              key: "project-ENG-1",
+              status: "open",
+              inputsJson: "{}",
+              openedBy: "",
+              openedAt: new Date(NOW - 60_000).toISOString(),
+            },
+          ],
+        }),
+        getRun: () => ({ run: undefined }),
+      });
+    });
+    renderWithProviders(<RunsTab automationId="auto-1" now={() => NOW} />, {
+      transport,
+    });
+    await waitFor(() => expect(screen.getAllByTestId("run-row")).toHaveLength(2));
+    await waitFor(() =>
+      expect(screen.getByTestId("run-workstream-chip").textContent).toBe("project-ENG-1"),
+    );
+    expect(screen.getAllByTestId("run-workstream-chip")).toHaveLength(1);
   });
 });

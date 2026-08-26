@@ -85,6 +85,8 @@ const KNOWN_OUTPUTS: Record<string, readonly string[]> = {
   state_delete: ["ok", "deleted"],
   state_list: ["entries", "count", "truncated"],
   lookup_pr_session: ["found", "session_id", "task_id", "head_branch", "url", "title"],
+  instance_close: ["closed", "not_instanced"],
+  claim_handle: ["claimed", "handle"],
 };
 
 function sessionSourcesFor(definition: AutomationDefinition, selectedId: string | null): string[] {
@@ -121,7 +123,10 @@ export function BuildTab({
   const triggerErrors = errors.filter((e) => e.blockId === "");
 
   const updateBlock = (next: BlockDef) =>
-    onChange({ ...definition, blocks: replaceBlock(definition.blocks, next.id, next) });
+    onChange({
+      ...definition,
+      blocks: replaceBlock(definition.blocks, next.id, next),
+    });
   const updateTrigger = (trigger: TriggerSpec) => onChange({ ...definition, trigger });
   const onInsert = (at: ListPath, index: number, kind: string) => {
     const spec = blockKind(kind);
@@ -132,11 +137,17 @@ export function BuildTab({
       block.else = [];
     }
     if (spec.nests === "loop") block.body = [];
-    onChange({ ...definition, blocks: insertBlock(definition.blocks, at, index, block) });
+    onChange({
+      ...definition,
+      blocks: insertBlock(definition.blocks, at, index, block),
+    });
     setSelectedId(id);
   };
   const onMove = (at: ListPath, from: number, to: number) =>
-    onChange({ ...definition, blocks: moveBlock(definition.blocks, at, from, to) });
+    onChange({
+      ...definition,
+      blocks: moveBlock(definition.blocks, at, from, to),
+    });
   const onRemove = (id: string) => {
     onChange({ ...definition, blocks: removeBlock(definition.blocks, id) });
     if (selectedId === id) setSelectedId(TRIGGER_ROW_ID);

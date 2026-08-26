@@ -19,8 +19,10 @@ import {
   GitPullRequest,
   HeartPulse,
   Hourglass,
+  Link2,
   List,
   Lock,
+  SquareCheck,
   MailOpen,
   Play,
   Repeat,
@@ -63,9 +65,18 @@ export interface AutomationDefinition {
   entrypoints?: AutomationEntrypoint[];
   inputsSchema: unknown[];
   settings: {
-    concurrency?: { keyTemplate: string; policy: "queue" | "supersede" | "skip" | "join" };
+    concurrency?: {
+      keyTemplate: string;
+      policy: "queue" | "supersede" | "skip" | "join";
+    };
     runDeadlineSeconds?: number;
     endSessionsOnFinish: boolean;
+    /** ADR 0120: present = the automation has workstreams. */
+    instance?: {
+      keyTemplate: string;
+      inputs?: Record<string, string>;
+      entrypoints?: Record<string, { admit: "open" | "require" | "handle_match" }>;
+    };
   };
 }
 
@@ -160,13 +171,32 @@ export function blockIdsOutsideEntrypoint(
 }
 
 export type FieldSpec =
-  | { type: "template"; key: string; label: string; multiline?: boolean; help?: string }
+  | {
+      type: "template";
+      key: string;
+      label: string;
+      multiline?: boolean;
+      help?: string;
+    }
   | { type: "string"; key: string; label: string; help?: string }
-  | { type: "number"; key: string; label: string; help?: string; min?: number; max?: number }
+  | {
+      type: "number";
+      key: string;
+      label: string;
+      help?: string;
+      min?: number;
+      max?: number;
+    }
   | { type: "boolean"; key: string; label: string; help?: string }
   | { type: "duration"; key: string; label: string; help?: string }
   | { type: "session_ref"; key: string; label: string; help?: string }
-  | { type: "select"; key: string; label: string; options: readonly string[]; help?: string }
+  | {
+      type: "select";
+      key: string;
+      label: string;
+      options: readonly string[];
+      help?: string;
+    }
   | { type: "profile"; key: string; label: string; help?: string }
   | { type: "secret_ref"; key: string; label: string; help?: string }
   | { type: "json"; key: string; label: string; help?: string };
@@ -283,7 +313,11 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       const prompt = truncate(str(c["promptTemplate"]).split("\n")[0] ?? "", 48);
       return profile ? `${profile}${prompt ? ` · ${prompt}` : ""}` : "No profile selected";
     },
-    defaults: () => ({ profileId: "", promptTemplate: "", includeEventContext: false }),
+    defaults: () => ({
+      profileId: "",
+      promptTemplate: "",
+      includeEventContext: false,
+    }),
   },
   {
     kind: "send_prompt",
@@ -292,7 +326,12 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     icon: Send,
     fields: [
       { type: "session_ref", key: "session", label: "Session" },
-      { type: "template", key: "promptTemplate", label: "Prompt", multiline: true },
+      {
+        type: "template",
+        key: "promptTemplate",
+        label: "Prompt",
+        multiline: true,
+      },
       {
         type: "select",
         key: "waitFor.kind",
@@ -307,7 +346,12 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
         help: "Only for wait = signal.",
       },
       WAIT_DEADLINE_FIELD,
-      { type: "string", key: "harnessMode", label: "Harness mode", help: "e.g. plan (optional)" },
+      {
+        type: "string",
+        key: "harnessMode",
+        label: "Harness mode",
+        help: "e.g. plan (optional)",
+      },
     ],
     summary: (c) => {
       const wait = c["waitFor"] as { kind?: string; name?: string } | undefined;
@@ -332,7 +376,12 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     icon: Hourglass,
     fields: [
       { type: "session_ref", key: "session", label: "Session" },
-      { type: "select", key: "until", label: "Until", options: ["idle", "ended"] },
+      {
+        type: "select",
+        key: "until",
+        label: "Until",
+        options: ["idle", "ended"],
+      },
       WAIT_DEADLINE_FIELD,
     ],
     summary: (c) => `${sessionRefLabel(c["session"])} · until ${str(c["until"], "idle")}`,
@@ -383,9 +432,24 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     icon: Terminal,
     fields: [
       { type: "session_ref", key: "session", label: "Session" },
-      { type: "template", key: "commandTemplate", label: "Command", multiline: true },
-      { type: "number", key: "deadlineMs", label: "Deadline (ms)", min: 1000, max: 600000 },
-      { type: "boolean", key: "allowNonZeroExit", label: "Allow non-zero exit" },
+      {
+        type: "template",
+        key: "commandTemplate",
+        label: "Command",
+        multiline: true,
+      },
+      {
+        type: "number",
+        key: "deadlineMs",
+        label: "Deadline (ms)",
+        min: 1000,
+        max: 600000,
+      },
+      {
+        type: "boolean",
+        key: "allowNonZeroExit",
+        label: "Allow non-zero exit",
+      },
     ],
     summary: (c) => truncate(str(c["commandTemplate"]).split("\n")[0] ?? "", 60) || "No command",
     defaults: () => ({ session: { blockId: "" }, commandTemplate: "" }),
@@ -475,7 +539,12 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     description: "List entries by key prefix (up to 500), oldest key first.",
     icon: List,
     fields: [
-      { type: "template", key: "prefix", label: "Key prefix", help: "Empty = every entry." },
+      {
+        type: "template",
+        key: "prefix",
+        label: "Key prefix",
+        help: "Empty = every entry.",
+      },
       { type: "number", key: "limit", label: "Limit", min: 1, max: 500 },
     ],
     summary: (c) => {
@@ -509,6 +578,45 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       return repo ? `PR in ${truncate(repo, 40)}` : "No repository";
     },
     defaults: () => ({ repo: "", prNumber: 1 }),
+  },
+  {
+    kind: "instance_close",
+    label: "Close workstream",
+    description: "Close the run's own workstream; later events for it are dropped (audited).",
+    icon: SquareCheck,
+    fields: [
+      {
+        type: "template",
+        key: "reason",
+        label: "Reason",
+        help: "Kept on the workstream for the audit trail.",
+      },
+    ],
+    summary: (c) => {
+      const reason = str(c["reason"]);
+      return reason ? truncate(reason, 40) : "Close this workstream";
+    },
+    defaults: () => ({}),
+  },
+  {
+    kind: "claim_handle",
+    label: "Claim handle",
+    description:
+      "Route an external identifier to this workstream (a channel, a ticket id). Posts and PRs bind automatically.",
+    icon: Link2,
+    fields: [
+      {
+        type: "template",
+        key: "handle",
+        label: "Handle",
+        help: "Full handle with its namespace prefix, e.g. slack:${{ inputs.channel_id }}",
+      },
+    ],
+    summary: (c) => {
+      const handle = str(c["handle"]);
+      return handle ? truncate(handle, 40) : "No handle";
+    },
+    defaults: () => ({ handle: "" }),
   },
   {
     kind: "integration_action",
