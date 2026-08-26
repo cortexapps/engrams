@@ -106,7 +106,36 @@ export const retryPolicySchema = z.object({
 });
 export type RetryPolicy = z.infer<typeof retryPolicySchema>;
 
+/** ADR 0120 instances: how an entrypoint's events reach a workstream.
+ * `open` renders the key template and opens (or joins) that instance;
+ * `require` joins an existing open instance or DROPS the event (the
+ * instance-level continueOnly); `handle_match` routes ONLY through the
+ * handle ledger (facet-declared candidate handles), dropping unbound
+ * events before a run boots. */
+const instanceAdmitSchema = z.enum(["open", "require", "handle_match"]);
+
+const instanceSettingsSchema = z.object({
+  /** The identity template (e.g. `project-${{ inputs.linear_project_id }}`),
+   * rendered in the concurrency-key scope ({trigger, event.raw, inputs}) —
+   * one template contract for authors. */
+  keyTemplate: z.string().min(1),
+  /** Input-snapshot templates rendered at instance open: field key →
+   * template over the admitting event. Unlisted fields snapshot the
+   * automation row's value (which demotes to "defaults for new
+   * instances"). */
+  inputs: z.record(z.string().regex(/^[a-z][a-z0-9_]*$/), z.string().min(1)).optional(),
+  /** Per-entrypoint admission override; absent = `open`. */
+  entrypoints: z
+    .record(z.string().min(1), z.object({ admit: instanceAdmitSchema }))
+    .optional(),
+});
+export type InstanceSettings = z.infer<typeof instanceSettingsSchema>;
+export type InstanceAdmitPolicy = z.infer<typeof instanceAdmitSchema>;
+
 const settingsBaseSchema = z.object({
+  /** ADR 0120: present = the automation is instanced (a "workstream" per
+   * rendered key). Absence is byte-identical pre-instance behavior. */
+  instance: instanceSettingsSchema.optional(),
   concurrency: z
     .object({
       keyTemplate: z.string().min(1),
@@ -631,6 +660,42 @@ export function validateDefinition(
 
   if (definition.settings.concurrency) {
     validateTemplatesIn("__settings__", definition.settings.concurrency.keyTemplate, "concurrency.keyTemplate");
+  }
+  const instance = definition.settings.instance;
+  if (instance) {
+    validateTemplatesIn("__settings__", instance.keyTemplate, "instance.keyTemplate");
+    const inputKeys = new Set(definition.inputsSchema.map((field) => field.key));
+    for (const [key, template] of Object.entries(instance.inputs ?? {})) {
+      if (!inputKeys.has(key)) {
+        throw new DefinitionError(
+          "__settings__",
+          "instance.inputs",
+          `instance input "${key}" is not an inputsSchema field`,
+        );
+      }
+      validateTemplatesIn("__settings__", template, `instance.inputs.${key}`);
+    }
+    for (const [entrypointId, policy] of Object.entries(instance.entrypoints ?? {})) {
+      const entrypoint = entrypoints.find((candidate) => candidate.id === entrypointId);
+      if (!entrypoint) {
+        throw new DefinitionError(
+          "__settings__",
+          "instance.entrypoints",
+          `instance admission names unknown entrypoint "${entrypointId}"`,
+        );
+      }
+      if (
+        policy.admit === "handle_match" &&
+        entrypoint.trigger.kind !== "integration" &&
+        entrypoint.trigger.kind !== "webhook"
+      ) {
+        throw new DefinitionError(
+          "__settings__",
+          "instance.entrypoints",
+          `admit "handle_match" needs a delivery-bearing trigger on "${entrypointId}" (a ${entrypoint.trigger.kind} event carries no candidate handles)`,
+        );
+      }
+    }
   }
   for (const entrypoint of entrypoints) {
     const trigger = entrypoint.trigger;

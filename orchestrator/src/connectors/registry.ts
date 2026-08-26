@@ -357,6 +357,21 @@ export type FieldSchema =
   | { type: "integer" }
   | { type: "boolean" };
 
+/** ADR 0120 instances: one part of a handle template. A template renders by
+ * concatenating its parts; a `path` part reads the event payload (events) or
+ * the `input.`/`output.` scope (actions), and a template whose path resolves
+ * to nothing produces NO candidate (a top-level Slack message has no
+ * thread_ts — it simply yields no thread handle). */
+export type HandleTemplatePart = { lit: string } | { path: string };
+
+/** An ordered parts list. The first part must be a literal namespace prefix
+ * ("slack:", "github:") so handles never collide across providers, and at
+ * least one part must be a path (a pure-literal handle would be one shared
+ * identifier for every event). */
+export interface HandleTemplateSpec {
+  parts: HandleTemplatePart[];
+}
+
 export interface WebhookEventSpec {
   key: string;
   /** Human picker label (was `displayName`; renamed with the catalog growth). */
@@ -369,6 +384,10 @@ export interface WebhookEventSpec {
   /** Delivered to the event ledger but hidden from trigger pickers (e.g.
    * `installation.*` lifecycle noise). */
   hidden?: true;
+  /** ADR 0120 instances: candidate-handle templates over the event payload —
+   * admission renders each and looks the results up in the instance handle
+   * ledger to route the event to its owning workstream. */
+  handleCandidates?: HandleTemplateSpec[];
 }
 
 /** Provider-owned ingress (ADR 0119 D5): how the integration event route
@@ -442,6 +461,12 @@ export interface ActionSpec {
   idempotency: ActionIdempotency;
   /** HTTP statuses treated as success (default 200/201/204). */
   successStatus?: number[];
+  /** ADR 0120 instances: handle templates an instance-bound run writes to
+   * the ledger after a successful execution. Paths are `input.<field>` /
+   * `output.<field>` over the rendered call; every template whose paths all
+   * resolve is written (redundant handles per side effect — the Message-ID
+   * precedent). */
+  handles?: HandleTemplateSpec[];
 }
 
 export interface Connector {
@@ -1244,6 +1269,75 @@ export function parseFieldSchema(
 
 /** Parse the optional connector webhook facet at the same allowlist boundary as
  * every other connector field. The result is bounded and declarative only. */
+export const MAX_HANDLE_TEMPLATES = 4;
+export const MAX_HANDLE_PARTS = 8;
+const HANDLE_LIT_MAX = 64;
+
+/** Shared parser for `handleCandidates` (events) and `handles` (actions).
+ * `checkPath` returns an error message or null; events check payload-path
+ * shape, actions additionally pin the `input.`/`output.` scope. */
+export function parseHandleTemplates(
+  where: string,
+  raw: unknown,
+  checkPath: (path: string) => string | null,
+): HandleTemplateSpec[] {
+  if (!Array.isArray(raw)) fail(where, "must be an array");
+  if (raw.length === 0) fail(where, "must not be empty when present");
+  if (raw.length > MAX_HANDLE_TEMPLATES) {
+    fail(where, `has ${raw.length} templates (max ${MAX_HANDLE_TEMPLATES})`);
+  }
+  return raw.map((rawTemplate, i): HandleTemplateSpec => {
+    const templateWhere = `${where}[${i}]`;
+    if (typeof rawTemplate !== "object" || rawTemplate === null) {
+      fail(templateWhere, "must be an object");
+    }
+    const t = rawTemplate as Record<string, unknown>;
+    if (!Array.isArray(t.parts)) fail(templateWhere, '"parts" must be an array');
+    if (t.parts.length < 2 || t.parts.length > MAX_HANDLE_PARTS) {
+      fail(templateWhere, `"parts" must have 2..${MAX_HANDLE_PARTS} entries`);
+    }
+    let paths = 0;
+    const parts = t.parts.map((rawPart, j): HandleTemplatePart => {
+      const partWhere = `${templateWhere}.parts[${j}]`;
+      if (typeof rawPart !== "object" || rawPart === null) fail(partWhere, "must be an object");
+      const part = rawPart as Record<string, unknown>;
+      const keys = Object.keys(part);
+      if (keys.length !== 1 || (keys[0] !== "lit" && keys[0] !== "path")) {
+        fail(partWhere, 'must be exactly {"lit": …} or {"path": …}');
+      }
+      if (keys[0] === "lit") {
+        if (typeof part.lit !== "string" || part.lit.length === 0 || part.lit.length > HANDLE_LIT_MAX) {
+          fail(partWhere, `"lit" must be a non-empty string of at most ${HANDLE_LIT_MAX} characters`);
+        }
+        return { lit: part.lit };
+      }
+      if (typeof part.path !== "string") fail(partWhere, '"path" must be a string');
+      const pathError = checkPath(part.path);
+      if (pathError) fail(partWhere, pathError);
+      paths += 1;
+      return { path: part.path };
+    });
+    if (!("lit" in parts[0]!)) {
+      fail(templateWhere, "the first part must be a literal namespace prefix");
+    }
+    if (paths === 0) {
+      fail(templateWhere, "at least one part must be a path (a pure-literal handle is one shared identifier for every event)");
+    }
+    return { parts };
+  });
+}
+
+function checkPayloadPath(path: string): string | null {
+  if (
+    path.length > MAX_WEBHOOK_PATH_LENGTH ||
+    !WEBHOOK_PATH_RE.test(path) ||
+    path.split(".").some((segment) => UNSAFE_OBJECT_PATH_SEGMENTS.has(segment))
+  ) {
+    return '"path" must be a dot-delimited payload path';
+  }
+  return null;
+}
+
 export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
   if (typeof raw !== "object" || raw === null) fail(where, '"webhook" must be an object');
   const o = raw as Record<string, unknown>;
@@ -1290,12 +1384,17 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
     }
     const schema =
       event.schema !== undefined ? parseFieldSchema(`${eventWhere}.schema`, event.schema) : undefined;
+    const handleCandidates =
+      event.handleCandidates !== undefined
+        ? parseHandleTemplates(`${eventWhere}.handleCandidates`, event.handleCandidates, checkPayloadPath)
+        : undefined;
     return {
       key: event.key,
       label: event.label,
       ...(event.description !== undefined ? { description: event.description } : {}),
       ...(schema !== undefined ? { schema } : {}),
       ...(event.hidden === true ? { hidden: true as const } : {}),
+      ...(handleCandidates !== undefined ? { handleCandidates } : {}),
     };
   });
 
@@ -1452,6 +1551,25 @@ export function parseActionsFacet(
       successStatus = a.successStatus as number[];
     }
 
+    let handles: HandleTemplateSpec[] | undefined;
+    if (a.handles !== undefined) {
+      const inputFields = new Set(Object.keys(inputSchema.properties));
+      const outputFields = new Set(Object.keys(output ?? {}));
+      handles = parseHandleTemplates(`${actionWhere}.handles`, a.handles, (path) => {
+        const [scope, field, ...rest] = path.split(".");
+        if (rest.length > 0 || field === undefined) {
+          return '"path" must be "input.<field>" or "output.<field>"';
+        }
+        if (scope === "input") {
+          return inputFields.has(field) ? null : `"input.${field}" is not an inputSchema property`;
+        }
+        if (scope === "output") {
+          return outputFields.has(field) ? null : `"output.${field}" is not a declared output field`;
+        }
+        return '"path" must be "input.<field>" or "output.<field>"';
+      });
+    }
+
     return {
       id: a.id,
       label: a.label,
@@ -1461,6 +1579,7 @@ export function parseActionsFacet(
       ...(output !== undefined ? { output } : {}),
       idempotency,
       ...(successStatus !== undefined ? { successStatus } : {}),
+      ...(handles !== undefined ? { handles } : {}),
     };
   });
 }

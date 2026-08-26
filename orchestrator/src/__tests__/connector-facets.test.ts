@@ -231,6 +231,70 @@ describe("actions facet", () => {
   });
 });
 
+describe("handle templates (ADR 0120 instances)", () => {
+  const event = (handleCandidates: unknown) => ({
+    ...base,
+    webhook: webhook({
+      events: [{ key: "issues.opened", label: "Issue opened", handleCandidates }],
+    }),
+  });
+
+  test("accepts the parts grammar on events and actions", () => {
+    const c = parseConnector(
+      event([
+        { parts: [{ lit: "github:" }, { path: "repository.full_name" }, { lit: "#" }, { path: "issue.number" }] },
+      ]),
+      "x",
+      BUILTIN,
+    );
+    expect(c.webhook?.events[0]?.handleCandidates?.[0]?.parts).toHaveLength(4);
+  });
+
+  test.each([
+    [[], "must not be empty"],
+    [[{ parts: [{ lit: "a:" }] }], "2.."],
+    [[{ parts: [{ path: "a" }, { path: "b" }] }], "first part must be a literal"],
+    [[{ parts: [{ lit: "a:" }, { lit: "b" }] }], "at least one part must be a path"],
+    [[{ parts: [{ lit: "a:" }, { path: "__proto__.x" }] }], "payload path"],
+    [[{ parts: [{ lit: "a:" }, { path: "x", lit: "y" }] }], "exactly"],
+    [[{ parts: [{ lit: "" }, { path: "x" }] }], "non-empty string"],
+  ])("rejects bad candidate grammar %#", (handleCandidates, message) => {
+    expect(() => parseConnector(event(handleCandidates), "x", BUILTIN)).toThrow(message);
+  });
+
+  test("action handles pin the input./output. scope to declared fields", () => {
+    const action = (handles: unknown) => ({
+      ...base,
+      actions: [
+        {
+          id: "post",
+          label: "Post",
+          inputSchema: { type: "object", properties: { channel: { type: "string" } } },
+          execute: { kind: "http", method: "POST", pathTemplate: "/post" },
+          output: { ts: "ts" },
+          idempotency: { kind: "none" },
+          handles,
+        },
+      ],
+    });
+    const ok = parseConnector(
+      action([{ parts: [{ lit: "slack:" }, { path: "input.channel" }, { lit: ":" }, { path: "output.ts" }] }]),
+      "x",
+      BUILTIN,
+    );
+    expect(ok.actions?.[0]?.handles).toHaveLength(1);
+    expect(() =>
+      parseConnector(action([{ parts: [{ lit: "s:" }, { path: "input.nope" }] }]), "x", BUILTIN),
+    ).toThrow("not an inputSchema property");
+    expect(() =>
+      parseConnector(action([{ parts: [{ lit: "s:" }, { path: "output.nope" }] }]), "x", BUILTIN),
+    ).toThrow("not a declared output field");
+    expect(() =>
+      parseConnector(action([{ parts: [{ lit: "s:" }, { path: "raw.thing" }] }]), "x", BUILTIN),
+    ).toThrow('"input.<field>" or "output.<field>"');
+  });
+});
+
 describe("built-in seeds", () => {
   const registry = connectorRegistry();
   const providers: Array<[string, Connector]> = ["github", "slack", "linear"].map((p) => [
@@ -244,6 +308,21 @@ describe("built-in seeds", () => {
       expect(connector.webhook?.ingress, provider).toBeDefined();
       expect(connector.webhook?.scope, provider).toBeDefined();
       expect(connector.actions?.length ?? 0, provider).toBeGreaterThan(0);
+    }
+  });
+
+  test("slack + github declare handle candidates on their routable events", () => {
+    const slackEvents = registry.get("slack")!.webhook!.events;
+    for (const key of ["app_mention", "message", "reaction_added"]) {
+      expect(slackEvents.find((e) => e.key === key)?.handleCandidates, key).toBeDefined();
+    }
+    const githubEvents = registry.get("github")!.webhook!.events;
+    for (const event of githubEvents) {
+      const routable =
+        event.key.startsWith("pull_request") ||
+        event.key.startsWith("issues.") ||
+        event.key === "issue_comment.created";
+      expect(event.handleCandidates !== undefined, event.key).toBe(routable);
     }
   });
 

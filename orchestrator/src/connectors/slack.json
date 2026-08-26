@@ -87,7 +87,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "slack:"
+              },
+              {
+                "path": "event.channel"
+              },
+              {
+                "lit": ":"
+              },
+              {
+                "path": "event.thread_ts"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "message",
@@ -120,7 +138,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "slack:"
+              },
+              {
+                "path": "event.channel"
+              },
+              {
+                "lit": ":"
+              },
+              {
+                "path": "event.thread_ts"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "reaction_added",
@@ -152,7 +188,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "slack:"
+              },
+              {
+                "path": "event.item.channel"
+              },
+              {
+                "lit": ":"
+              },
+              {
+                "path": "event.item.ts"
+              }
+            ]
+          }
+        ]
       }
     ],
     "aliases": [
@@ -588,7 +642,41 @@
       },
       "idempotency": {
         "kind": "none"
-      }
+      },
+      "handles": [
+        {
+          "parts": [
+            {
+              "lit": "slack:"
+            },
+            {
+              "path": "output.channel"
+            },
+            {
+              "lit": ":"
+            },
+            {
+              "path": "input.threadTs"
+            }
+          ]
+        },
+        {
+          "parts": [
+            {
+              "lit": "slack:"
+            },
+            {
+              "path": "output.channel"
+            },
+            {
+              "lit": ":"
+            },
+            {
+              "path": "output.ts"
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "update_message",

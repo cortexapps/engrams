@@ -118,7 +118,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "pull_request.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "pull_request.synchronize",
@@ -210,7 +228,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "pull_request.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "pull_request.ready_for_review",
@@ -302,7 +338,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "pull_request.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "pull_request.closed",
@@ -394,7 +448,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "pull_request.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "pull_request.reopened",
@@ -486,7 +558,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "pull_request.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "pull_request.edited",
@@ -578,7 +668,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "pull_request.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "pull_request.converted_to_draft",
@@ -670,7 +778,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "pull_request.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "issue_comment.created",
@@ -755,7 +881,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "issue.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "pull_request_review_comment.created",
@@ -866,7 +1010,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "pull_request.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "pull_request_review.submitted",
@@ -974,7 +1136,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "pull_request.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "issues.opened",
@@ -1028,7 +1208,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "issue.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "issues.closed",
@@ -1082,7 +1280,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "issue.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "issues.labeled",
@@ -1144,7 +1360,25 @@
               }
             }
           }
-        }
+        },
+        "handleCandidates": [
+          {
+            "parts": [
+              {
+                "lit": "github:"
+              },
+              {
+                "path": "repository.full_name"
+              },
+              {
+                "lit": "#"
+              },
+              {
+                "path": "issue.number"
+              }
+            ]
+          }
+        ]
       },
       {
         "key": "push",
@@ -2397,7 +2631,25 @@
       },
       "idempotency": {
         "kind": "marker_comment"
-      }
+      },
+      "handles": [
+        {
+          "parts": [
+            {
+              "lit": "github:"
+            },
+            {
+              "path": "input.repo"
+            },
+            {
+              "lit": "#"
+            },
+            {
+              "path": "input.prNumber"
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "create_issue_comment",
@@ -2435,7 +2687,25 @@
       },
       "idempotency": {
         "kind": "marker_comment"
-      }
+      },
+      "handles": [
+        {
+          "parts": [
+            {
+              "lit": "github:"
+            },
+            {
+              "path": "input.repo"
+            },
+            {
+              "lit": "#"
+            },
+            {
+              "path": "input.number"
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "update_issue_comment",

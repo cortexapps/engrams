@@ -20,6 +20,7 @@ import {
 } from "../db/automations.ts";
 import type { AutomationRunTrigger, AutomationTrigger } from "../db/schema.ts";
 import type { IntegrationEventDispatchInput } from "./integration-ingress.ts";
+import { CASE_INSENSITIVE_HANDLE_PROVIDERS } from "./handles.ts";
 import { renderAutomationTemplateInScope } from "./template.ts";
 import {
   defaultAutomationSender,
@@ -465,11 +466,11 @@ export function builtinTookDelivery(
 }
 
 /** Providers whose scope noun compares case-insensitively (GitHub owner/repo).
- * Slack channel ids and Linear team keys are exact. */
-const CASE_INSENSITIVE_SCOPE_PROVIDERS = new Set(["github"]);
-
+ * Slack channel ids and Linear team keys are exact. One shared rule with
+ * instance handles (automations/handles.ts) so a write and a later match
+ * never disagree by case. */
 function normalizeScope(provider: string, value: string): string {
-  return CASE_INSENSITIVE_SCOPE_PROVIDERS.has(provider) ? value.toLowerCase() : value;
+  return CASE_INSENSITIVE_HANDLE_PROVIDERS.has(provider) ? value.toLowerCase() : value;
 }
 
 /** Resolve a {fromInput} scope binding against the automation's input values:
