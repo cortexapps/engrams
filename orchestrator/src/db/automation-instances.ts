@@ -15,10 +15,10 @@
  * `already_ours` so DBOS replays converge.
  */
 
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, lt, sql } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
-import { automationInstance, automationInstanceHandle } from "./schema.ts";
+import { automationDrop, automationInstance, automationInstanceHandle } from "./schema.ts";
 
 export interface AutomationInstanceRow {
   id: string;
@@ -36,6 +36,16 @@ export type RecordHandleResult =
   | { kind: "recorded" }
   | { kind: "already_ours" }
   | { kind: "conflict"; instanceId: string };
+
+export interface AutomationDropRow {
+  id: number;
+  automationId: string;
+  entrypointId: string;
+  eventKey: string;
+  reason: string;
+  detail: string;
+  droppedAt: Date;
+}
 
 export interface ResolvedHandle {
   handle: string;
@@ -72,11 +82,24 @@ export interface AutomationInstanceStore {
   }): Promise<RecordHandleResult>;
   /** One query over all of an event's candidate handles. */
   resolveHandles(automationId: string, handles: string[]): Promise<ResolvedHandle[]>;
+  /** The drops ring: record an admission drop (no run row exists for it) and
+   * cap the ring per automation. Callers treat this as best-effort — a
+   * failed audit write must never fail the delivery. */
+  recordDrop(input: {
+    automationId: string;
+    entrypointId: string;
+    eventKey: string;
+    reason: string;
+    detail: string;
+  }): Promise<void>;
+  listRecentDrops(automationId: string, limit?: number): Promise<AutomationDropRow[]>;
 }
 
 export const INSTANCE_KEY_MAX_CHARS = 512;
 export const INSTANCE_HANDLE_MAX_CHARS = 512;
 export const INSTANCE_LIST_MAX = 500;
+export const DROP_RING_CAP = 50;
+const DROP_DETAIL_MAX = 512;
 
 /** ai_<base32> — no ':' or '/', so run ids (`autorun:…:i-<id>:…`) and state
  * prefixes (`i/<id>/`) that embed it stay injective. */
@@ -267,6 +290,52 @@ export function makeAutomationInstanceStore(
       if (!holder) throw new Error(`handle ${input.handle} disappeared after insert conflict`);
       if (holder.instanceId === input.instanceId) return { kind: "already_ours" };
       return { kind: "conflict", instanceId: holder.instanceId };
+    },
+
+    async recordDrop(input) {
+      await db.insert(automationDrop).values({
+        automationId: input.automationId,
+        entrypointId: input.entrypointId,
+        eventKey: input.eventKey,
+        reason: input.reason,
+        detail: input.detail.slice(0, DROP_DETAIL_MAX),
+        droppedAt: now(),
+      });
+      // Cap the ring on the write path (no sweeper): drop everything older
+      // than the newest DROP_RING_CAP rows for this automation.
+      const cutoff = db
+        .select({ id: automationDrop.id })
+        .from(automationDrop)
+        .where(eq(automationDrop.automationId, input.automationId))
+        .orderBy(desc(automationDrop.id))
+        .limit(1)
+        .offset(DROP_RING_CAP - 1);
+      await db
+        .delete(automationDrop)
+        .where(
+          and(
+            eq(automationDrop.automationId, input.automationId),
+            lt(automationDrop.id, sql`(select min(id) from (${cutoff}) newest)`),
+          ),
+        );
+    },
+
+    async listRecentDrops(automationId, limit = DROP_RING_CAP) {
+      const rows = await db
+        .select()
+        .from(automationDrop)
+        .where(eq(automationDrop.automationId, automationId))
+        .orderBy(desc(automationDrop.id))
+        .limit(limit);
+      return rows.map((row) => ({
+        id: row.id,
+        automationId: row.automationId,
+        entrypointId: row.entrypointId,
+        eventKey: row.eventKey,
+        reason: row.reason,
+        detail: row.detail,
+        droppedAt: row.droppedAt,
+      }));
     },
 
     async resolveHandles(automationId, handles) {

@@ -22,7 +22,7 @@ import { isValidSlackRequest } from "@slack/bolt";
 
 import { log as rootLog } from "../log.ts";
 import { SLACK_BRAIN_BUILTIN_KEY } from "../automations/builtins/slack-brain.ts";
-import { builtinTookDelivery } from "../automations/dispatch.ts";
+import { builtinSuppressed, builtinTookDelivery } from "../automations/dispatch.ts";
 import { getSlackSigningSecret } from "../integrations/slack.ts";
 import { classifySlackEvent } from "../integrations/slack-webhook.ts";
 import {
@@ -152,6 +152,17 @@ export function makeSlackEventsRoute(deps: SlackEventsDeps = {}): Hono {
       log.info(
         { channel: m.channel, user: m.user, thread: m.threadRoot },
         "slack: app_mention → thread-brain built-in (legacy workflow skipped)",
+      );
+      return c.body(null, 200);
+    }
+    // ADR 0120 rung-1 precedence: an open workstream owns this thread (a
+    // handle bound it), so EVERY brain stands down — the built-in was
+    // suppressed by the dispatcher, and the legacy path must not answer in
+    // its place. One thread, one responder.
+    if (builtinSuppressed(dispatched, SLACK_BRAIN_BUILTIN_KEY)) {
+      log.info(
+        { channel: m.channel, user: m.user, thread: m.threadRoot },
+        "slack: app_mention suppressed — a workstream owns this thread",
       );
       return c.body(null, 200);
     }

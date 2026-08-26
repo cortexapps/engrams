@@ -58,11 +58,21 @@ export interface EngineRunStore {
     runId: string;
     automationId: string;
     sessionId: string;
+    /** ADR 0120: the adopting run's workstream ('' = unbound). Adoption
+     * never crosses instances — a session another workstream's run created
+     * classifies as "foreign". */
+    instanceId: string;
   }): Promise<"adopted" | "already_ours" | "owner_live" | "foreign">;
   /** Read-only counterpart for the `session_status` probe. */
   getSessionBinding(
     sessionId: string,
-  ): Promise<{ automationId: string; runId: string; ownerTerminal: boolean } | null>;
+  ): Promise<{
+    automationId: string;
+    runId: string;
+    ownerTerminal: boolean;
+    /** The owning run's workstream ('' = unbound). */
+    instanceId: string;
+  } | null>;
 }
 
 export interface EngineCreateSessionResult {

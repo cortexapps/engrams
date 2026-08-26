@@ -51,7 +51,10 @@ function trigger(overrides: Partial<IntegrationTriggerSpec> = {}): IntegrationTr
   };
 }
 
-function definition(t: IntegrationTriggerSpec): AutomationDefinition {
+function definition(
+  t: IntegrationTriggerSpec,
+  overrides: Partial<AutomationDefinition> = {},
+): AutomationDefinition {
   return {
     engine: 1,
     trigger: t,
@@ -64,6 +67,7 @@ function definition(t: IntegrationTriggerSpec): AutomationDefinition {
     ],
     inputsSchema: [],
     settings: { endSessionsOnFinish: false },
+    ...overrides,
   };
 }
 
@@ -276,6 +280,8 @@ describe("dispatchIntegrationEvent", () => {
       joined: 0,
       queued: 0,
       skipped: 0,
+      dropped: 0,
+      suppressed: [],
       failed: 0,
       builtins: {},
     });
@@ -526,7 +532,7 @@ describe("dispatchIntegrationEvent", () => {
 
   test("builtinTookDelivery: started/joined/queued = the engine owns it; absent or skipped = legacy", async () => {
     const { builtinTookDelivery } = await import("../dispatch.ts");
-    const base = { matched: 1, started: 0, joined: 0, queued: 0, skipped: 0, failed: 0 };
+    const base = { matched: 1, started: 0, joined: 0, queued: 0, skipped: 0, dropped: 0, suppressed: [], failed: 0 };
     expect(builtinTookDelivery(undefined, "slack_brain")).toBe(false);
     expect(builtinTookDelivery({ ...base, builtins: {} }, "slack_brain")).toBe(false);
     expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "skipped" } }, "slack_brain")).toBe(false);
@@ -591,5 +597,359 @@ describe("dispatchIntegrationEvent", () => {
     const retry = await dispatchIntegrationEvent(input(), d);
     expect(retry.failed).toBe(0);
     expect(new Set(h.starts.map((s) => s.workflowId)).size).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0120 instances: admission routing + rung-1 brain precedence
+// ---------------------------------------------------------------------------
+
+import type {
+  AutomationInstanceRow,
+  AutomationInstanceStore,
+} from "../../db/automation-instances.ts";
+
+interface InstanceHarness {
+  store: AutomationInstanceStore;
+  rows: Map<string, AutomationInstanceRow>;
+  drops: Array<{ automationId: string; entrypointId: string; eventKey: string; reason: string; detail: string }>;
+  seed(input: { automationId: string; key: string; inputs?: Record<string, unknown>; status?: "open" | "closed" }): AutomationInstanceRow;
+  bindHandle(automationId: string, handle: string, instanceId: string): void;
+}
+
+function fakeInstances(): InstanceHarness {
+  const rows = new Map<string, AutomationInstanceRow>();
+  const handles = new Map<string, string>();
+  const drops: InstanceHarness["drops"] = [];
+  let seq = 0;
+  const openByKey = (automationId: string, key: string) =>
+    [...rows.values()].find(
+      (r) => r.automationId === automationId && r.key === key && r.status === "open",
+    ) ?? null;
+  const store: AutomationInstanceStore = {
+    async openInstance(input) {
+      const existing = openByKey(input.automationId, input.key);
+      if (existing) return existing;
+      const row: AutomationInstanceRow = {
+        id: `ai_test${++seq}`,
+        automationId: input.automationId,
+        key: input.key,
+        status: "open",
+        inputs: input.inputs,
+        openedBy: input.openedBy,
+        openedAt: RECEIVED_AT,
+        closedAt: null,
+        closeReason: null,
+      };
+      rows.set(row.id, row);
+      return row;
+    },
+    async getInstance(id) {
+      return rows.get(id) ?? null;
+    },
+    async getOpenInstanceByKey(automationId, key) {
+      return openByKey(automationId, key);
+    },
+    async listOpenInstances(automationId) {
+      return [...rows.values()].filter(
+        (r) => r.automationId === automationId && r.status === "open",
+      );
+    },
+    async closeInstance({ instanceId }) {
+      const row = rows.get(instanceId);
+      if (!row || row.status !== "open") return false;
+      row.status = "closed";
+      return true;
+    },
+    async recordInstanceHandle(input) {
+      const mapKey = `${input.automationId}:${input.handle}`;
+      const holder = handles.get(mapKey);
+      if (holder === undefined) {
+        handles.set(mapKey, input.instanceId);
+        return { kind: "recorded" };
+      }
+      return holder === input.instanceId
+        ? { kind: "already_ours" }
+        : { kind: "conflict", instanceId: holder };
+    },
+    async resolveHandles(automationId, candidates) {
+      return candidates.flatMap((handle) => {
+        const instanceId = handles.get(`${automationId}:${handle}`);
+        if (instanceId === undefined) return [];
+        const row = rows.get(instanceId);
+        return [{ handle, instanceId, instanceStatus: row?.status ?? "open" }];
+      });
+    },
+    async recordDrop(input) {
+      drops.push(input);
+    },
+    async listRecentDrops() {
+      return [];
+    },
+  };
+  return {
+    store,
+    rows,
+    drops,
+    seed(input) {
+      const row: AutomationInstanceRow = {
+        id: `ai_test${++seq}`,
+        automationId: input.automationId,
+        key: input.key,
+        status: input.status ?? "open",
+        inputs: input.inputs ?? {},
+        openedBy: "seed",
+        openedAt: RECEIVED_AT,
+        closedAt: null,
+        closeReason: null,
+      };
+      rows.set(row.id, row);
+      return row;
+    },
+    bindHandle(automationId, handle, instanceId) {
+      handles.set(`${automationId}:${handle}`, instanceId);
+    },
+  };
+}
+
+const GITHUB_PR_FACET = {
+  events: [
+    {
+      key: "pull_request.opened",
+      label: "PR opened",
+      handleCandidates: [
+        {
+          parts: [
+            { lit: "github:" },
+            { path: "repository.full_name" },
+            { lit: "#" },
+            { path: "pull_request.number" },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+function instancedDefinition(
+  overrides: Partial<AutomationDefinition["settings"]["instance"] & object> = {},
+): AutomationDefinition {
+  return definition(trigger(), {
+    settings: {
+      endSessionsOnFinish: false,
+      instance: { keyTemplate: "pr-${{ event.raw.pull_request.number }}", ...overrides },
+    },
+  });
+}
+
+describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
+  const prPayload = {
+    repository: { full_name: "engrams/engrams" },
+    pull_request: { number: 41 },
+  };
+  const instanceDeps = (h: Harness, i: InstanceHarness) => ({
+    ...deps(h),
+    instances: i.store,
+    facets: async () => GITHUB_PR_FACET,
+  });
+
+  test("admit open: renders the key, opens the instance with rendered inputs, stamps + prefixes", async () => {
+    const target = {
+      automation: meta(),
+      definition: {
+        ...instancedDefinition({ inputs: { pr: "${{ event.raw.pull_request.number }}" } }),
+        inputsSchema: [{ key: "pr", label: "PR", type: "string" as const }],
+      },
+    };
+    // Give it a concurrency template too, so the instance prefix is visible.
+    target.definition.settings.concurrency = { keyTemplate: "fixed", policy: "queue" };
+    const h = makeHarness([target]);
+    const i = fakeInstances();
+
+    const result = await dispatchIntegrationEvent(input({ payload: prPayload }), instanceDeps(h, i));
+    expect(result).toMatchObject({ matched: 1, started: 1, dropped: 0, suppressed: [] });
+
+    const instance = [...i.rows.values()][0]!;
+    expect(instance).toMatchObject({ key: "pr-41", inputs: { pr: "41" }, status: "open" });
+    const run = [...h.runs.values()][0]!;
+    expect(run.instanceId).toBe(instance.id);
+    expect(run.id).toBe(`autorun:automation-1:main:i-${instance.id}:github:gh-delivery-1`);
+    expect([...h.claims.keys()]).toEqual([`automation-1:i:${instance.id}:fixed`]);
+
+    // The same key on a later delivery JOINS the instance instead of opening
+    // a second one.
+    await dispatchIntegrationEvent(
+      input({ payload: prPayload, deliveryId: "gh-delivery-2" }),
+      instanceDeps(h, i),
+    );
+    expect(i.rows.size).toBe(1);
+  });
+
+  test("admit require: no open workstream drops the event with an audited reason and NO run row", async () => {
+    const target = {
+      automation: meta(),
+      definition: instancedDefinition({ entrypoints: { main: { admit: "require" as const } } }),
+    };
+    const h = makeHarness([target]);
+    const i = fakeInstances();
+
+    const result = await dispatchIntegrationEvent(input({ payload: prPayload }), instanceDeps(h, i));
+    expect(result).toMatchObject({ matched: 1, started: 0, dropped: 1 });
+    expect(h.runs.size).toBe(0);
+    expect(i.drops).toEqual([
+      {
+        automationId: "automation-1",
+        entrypointId: "main",
+        eventKey: "pull_request.opened",
+        reason: "no_open_instance",
+        detail: "pr-41",
+      },
+    ]);
+
+    // With an open instance for the rendered key, the same event admits.
+    i.seed({ automationId: "automation-1", key: "pr-41" });
+    const admitted = await dispatchIntegrationEvent(
+      input({ payload: prPayload, deliveryId: "gh-delivery-2" }),
+      instanceDeps(h, i),
+    );
+    expect(admitted).toMatchObject({ started: 1, dropped: 0 });
+  });
+
+  test("handle_match: the ledger routes over the key template; unbound events drop", async () => {
+    const target = {
+      automation: meta(),
+      definition: instancedDefinition({ entrypoints: { main: { admit: "handle_match" as const } } }),
+    };
+    const h = makeHarness([target]);
+    const i = fakeInstances();
+    // The instance's key is UNRELATED to what the key template would render:
+    // only the handle can route this event.
+    const owner = i.seed({ automationId: "automation-1", key: "project-ENG-7" });
+    i.bindHandle("automation-1", "github:engrams/engrams#41", owner.id);
+
+    const bound = await dispatchIntegrationEvent(input({ payload: prPayload }), instanceDeps(h, i));
+    expect(bound).toMatchObject({ started: 1, dropped: 0 });
+    expect([...h.runs.values()][0]!.instanceId).toBe(owner.id);
+
+    const unbound = await dispatchIntegrationEvent(
+      input({
+        payload: { repository: { full_name: "engrams/engrams" }, pull_request: { number: 99 } },
+        deliveryId: "gh-delivery-2",
+      }),
+      instanceDeps(h, i),
+    );
+    expect(unbound).toMatchObject({ started: 0, dropped: 1 });
+    expect(i.drops.at(-1)).toMatchObject({ reason: "no_handle_match" });
+  });
+
+  test("a closed workstream's handle drops the event (v1 policy, audited)", async () => {
+    const target = { automation: meta(), definition: instancedDefinition() };
+    const h = makeHarness([target]);
+    const i = fakeInstances();
+    const owner = i.seed({ automationId: "automation-1", key: "pr-41", status: "closed" });
+    i.bindHandle("automation-1", "github:engrams/engrams#41", owner.id);
+
+    const result = await dispatchIntegrationEvent(input({ payload: prPayload }), instanceDeps(h, i));
+    expect(result).toMatchObject({ started: 0, dropped: 1 });
+    expect(h.runs.size).toBe(0);
+    expect(i.drops).toEqual([
+      {
+        automationId: "automation-1",
+        entrypointId: "main",
+        eventKey: "pull_request.opened",
+        reason: "closed_instance",
+        detail: "github:engrams/engrams#41",
+      },
+    ]);
+  });
+
+  test("rung-1 precedence: a handle-bound workstream stands the slack brain down; unbound events do not", async () => {
+    const slackTrigger = trigger({ provider: "slack", eventKeys: ["message"] });
+    const brain = {
+      automation: meta({ id: "brain-1", builtinKey: "slack_brain", kind: "builtin" }),
+      definition: definition(slackTrigger),
+    };
+    const custom = {
+      automation: meta({ id: "custom-1" }),
+      definition: definition(slackTrigger, {
+        settings: {
+          endSessionsOnFinish: false,
+          instance: {
+            keyTemplate: "thread-${{ event.raw.event.thread_ts }}",
+            entrypoints: { main: { admit: "handle_match" as const } },
+          },
+        },
+      }),
+    };
+    const slackFacet = {
+      events: [
+        {
+          key: "message",
+          label: "Message",
+          handleCandidates: [
+            {
+              parts: [
+                { lit: "slack:" },
+                { path: "event.channel" },
+                { lit: ":" },
+                { path: "event.thread_ts" },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const h = makeHarness([brain, custom]);
+    const i = fakeInstances();
+    const owner = i.seed({ automationId: "custom-1", key: "project-ENG-7" });
+    i.bindHandle("custom-1", "slack:C1:1724.100", owner.id);
+
+    const boundEvent = input({
+      provider: "slack",
+      eventKey: "message",
+      payload: { event: { channel: "C1", thread_ts: "1724.100" } },
+    });
+    const bound = await dispatchIntegrationEvent(boundEvent, {
+      ...deps(h),
+      instances: i.store,
+      facets: async () => slackFacet,
+    });
+    expect(bound).toMatchObject({ started: 1, suppressed: ["slack_brain"] });
+    expect(bound.builtins).toEqual({});
+    expect(h.starts.map((s) => s.automationId)).toEqual(["custom-1"]);
+
+    // An UNBOUND thread: the custom automation drops (handle_match) and the
+    // brain answers as before.
+    const h2 = makeHarness([brain, custom]);
+    const unbound = await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "message",
+        deliveryId: "slack-2",
+        payload: { event: { channel: "C1", thread_ts: "9999.000" } },
+      }),
+      { ...deps(h2), instances: i.store, facets: async () => slackFacet },
+    );
+    expect(unbound).toMatchObject({ started: 1, dropped: 1, suppressed: [] });
+    expect(unbound.builtins).toEqual({ slack_brain: "started" });
+    expect(h2.starts.map((s) => s.automationId)).toEqual(["brain-1"]);
+  });
+
+  test("builtinSuppressed reads the suppression list", async () => {
+    const { builtinSuppressed } = await import("../dispatch.ts");
+    const base = {
+      matched: 1,
+      started: 0,
+      joined: 0,
+      queued: 0,
+      skipped: 0,
+      dropped: 0,
+      suppressed: ["slack_brain"],
+      failed: 0,
+      builtins: {},
+    };
+    expect(builtinSuppressed(base, "slack_brain")).toBe(true);
+    expect(builtinSuppressed(base, "pr_review")).toBe(false);
+    expect(builtinSuppressed(undefined, "slack_brain")).toBe(false);
   });
 });

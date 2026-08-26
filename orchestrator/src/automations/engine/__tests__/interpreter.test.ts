@@ -68,12 +68,17 @@ function makeHarness(
     entrypointId?: string;
     /** Session bindings visible to adoptSession/getSessionBinding:
      * sessionId -> {automationId, runId, ownerTerminal}. */
-    bindings?: Record<string, { automationId: string; runId: string; ownerTerminal: boolean }>;
+    bindings?: Record<
+      string,
+      { automationId: string; runId: string; ownerTerminal: boolean; instanceId?: string }
+    >;
     /** getSession probe results by session id (absent = found: false). */
     probes?: Record<
       string,
       { status: string; lastActiveAt: string; lastEventAt: string | null }
     >;
+    /** ADR 0120: bind the run to a workstream (state auto-scopes). */
+    instanceId?: string;
     /** pr_ref lookups: "repo#number" -> the authoring session. */
     prRefs?: Record<
       string,
@@ -113,6 +118,9 @@ function makeHarness(
     startedAtMs: clock,
     ...(options.dryRun ? { dryRun: true } : {}),
     ...(options.entrypointId !== undefined ? { entrypointId: options.entrypointId } : {}),
+    ...(options.instanceId !== undefined
+      ? { instanceId: options.instanceId, instanceKey: `key-${options.instanceId}` }
+      : {}),
   };
 
   const store: EngineRunStore = {
@@ -134,9 +142,10 @@ function makeHarness(
       released.push(runId);
       return options.promote ?? null;
     },
-    async adoptSession({ runId, automationId, sessionId }) {
+    async adoptSession({ runId, automationId, sessionId, instanceId }) {
       const binding = bindings[sessionId];
       if (!binding || binding.automationId !== automationId) return "foreign";
+      if ((binding.instanceId ?? "") !== instanceId) return "foreign";
       if (binding.runId === runId) return "already_ours";
       if (!binding.ownerTerminal) return "owner_live";
       binding.runId = runId;
@@ -146,7 +155,7 @@ function makeHarness(
     },
     async getSessionBinding(sessionId) {
       const binding = bindings[sessionId];
-      return binding ? { ...binding } : null;
+      return binding ? { instanceId: "", ...binding } : null;
     },
   };
 
@@ -179,7 +188,10 @@ function makeHarness(
     },
   };
 
-  const bindings: Record<string, { automationId: string; runId: string; ownerTerminal: boolean }> =
+  const bindings: Record<
+    string,
+    { automationId: string; runId: string; ownerTerminal: boolean; instanceId?: string }
+  > =
     structuredClone(options.bindings ?? {});
   const adopted: Array<{ runId: string; sessionId: string }> = [];
 
@@ -1526,5 +1538,77 @@ describe("lookup_pr_session (pr_ref ledger)", () => {
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("failed");
     expect(result.error).toContain("pr_ref_lookup_unavailable");
+  });
+});
+
+describe("instance-scoped state (ADR 0120)", () => {
+  test("an instance-bound run reads and writes under its own prefix, transparently", async () => {
+    const definition = makeDefinition([
+      { id: "save", type: "state_set", config: { key: "plan", value: { step: 1 } } },
+      { id: "load", type: "state_get", config: { key: "plan" } },
+      { id: "all", type: "state_list", config: {} },
+    ]);
+    const h = makeHarness(definition, {
+      instanceId: "ai_one",
+      // A sibling workstream's document AND an automation-scoped document:
+      // neither may leak into this run's view.
+      stateEntries: {
+        "i/ai_two/plan": { value: { step: 9 }, version: 3, writer: "other" },
+        plan: { value: { step: 0 }, version: 5, writer: "global" },
+      },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+
+    // The write landed under the instance prefix; the raw map shows it.
+    expect(h.state.get("i/ai_one/plan")).toMatchObject({ value: { step: 1 }, version: 1 });
+    expect(h.state.get("plan")).toMatchObject({ value: { step: 0 }, version: 5 });
+
+    const outputs = Object.fromEntries(h.stepRecords.map((r) => [r.framePath, r.record.outputs ?? {}]));
+    expect(outputs["load"]).toMatchObject({ found: true, value: { step: 1 } });
+    // list sees ONLY this workstream's documents, with the prefix stripped.
+    const listed = outputs["all"] as { entries: Array<{ key: string }> };
+    expect(listed.entries.map((e) => e.key)).toEqual(["plan"]);
+  });
+
+  test("an unbound run of the same automation stays automation-scoped", async () => {
+    const definition = makeDefinition([
+      { id: "load", type: "state_get", config: { key: "plan" } },
+    ]);
+    const h = makeHarness(definition, {
+      stateEntries: { plan: { value: { step: 0 }, version: 5, writer: "global" } },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    const outputs = Object.fromEntries(h.stepRecords.map((r) => [r.framePath, r.record.outputs ?? {}]));
+    expect(outputs["load"]).toMatchObject({ found: true, value: { step: 0 } });
+  });
+
+  test("cross-instance adoption classifies as foreign", async () => {
+    const definition = makeDefinition([
+      {
+        id: "nudge",
+        type: "send_prompt",
+        config: {
+          session: { template: "s-owned" },
+          promptTemplate: "hello",
+          waitFor: { kind: "none" },
+        },
+      },
+    ]);
+    const h = makeHarness(definition, {
+      instanceId: "ai_one",
+      bindings: {
+        "s-owned": {
+          automationId: "auto-1",
+          runId: "autorun:auto-1:old",
+          ownerTerminal: true,
+          instanceId: "ai_two",
+        },
+      },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("not bound to this automation");
   });
 });

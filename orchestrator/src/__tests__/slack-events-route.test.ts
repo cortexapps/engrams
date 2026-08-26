@@ -93,6 +93,8 @@ describe("the Slack automation window", () => {
             joined: 0,
             queued: 0,
             skipped: 0,
+            dropped: 0,
+            suppressed: [],
             failed: 0,
             builtins: on ? { slack_brain: options.outcome ?? "started" } : {},
           };

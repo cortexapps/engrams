@@ -35,6 +35,7 @@
 
 import { evaluateFilter, parseFilterGroup } from "./conditions.ts";
 import { isSafePath, ownPath } from "../paths.ts";
+import { instanceScopedState } from "./state-scope.ts";
 import { buildRunContext, recordStepOutputs, type RunContext, type RunSnapshot } from "./context.ts";
 import type { EngineDeps } from "./deps.ts";
 import { log as rootLog } from "../../log.ts";
@@ -219,7 +220,14 @@ export async function interpretAutomation(
     return { status: "failed", error: message };
   }
 
-  const ctx = buildRunContext(input.runId, snapshot, deps);
+  // ADR 0120: an instance-bound run sees state through the transparent
+  // prefix decorator — blocks, CAS, and writer semantics untouched; two
+  // workstreams can never read each other's documents.
+  const runDeps =
+    snapshot.instanceId !== undefined && snapshot.instanceId !== "" && deps.state !== undefined
+      ? { ...deps, state: instanceScopedState(deps.state, snapshot.instanceId) }
+      : deps;
+  const ctx = buildRunContext(input.runId, snapshot, runDeps);
   const wait: WaitState = { buffer: [], clockSteps: 0 };
   const ledger: TurnLedger = { started: new Map(), idleSeen: new Map() };
   /** Sessions an end_session block already ended (see finalize). */
