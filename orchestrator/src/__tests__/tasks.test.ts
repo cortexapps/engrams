@@ -1517,6 +1517,30 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     expect(resp.task!.sessions[0]!.sessionId).toBe(sessionId);
   });
 
+  test.skipIf(!dbReachable)("GetTask → resolves a NON-primary session binding too", async () => {
+    // An automation's create_session block may bind any role label (the
+    // Tenant Inspector PM binds role "pm"); the session page's task
+    // resolution must not silently drop the task context for it.
+    const roleTaskId = `role-task-${Date.now()}`;
+    const roleSessionId = `role-session-${Date.now()}`;
+    await db!.insert(taskTable).values({
+      id: roleTaskId,
+      title: "role resolution",
+      type: "chat",
+      status: "working",
+      createdByUserId: MEMBER_A,
+    });
+    await db!.insert(taskSessionTable).values({
+      taskId: roleTaskId,
+      sessionId: roleSessionId,
+      role: "pm",
+    });
+    const resp = await client.getTask({ sessionId: roleSessionId });
+    expect(resp.task).toBeDefined();
+    expect(resp.task!.id).toBe(roleTaskId);
+    await db!.delete(taskTable).where(eq(taskTable.id, roleTaskId));
+  });
+
   test.skipIf(!dbReachable)("GetTask → requires exactly one selector", async () => {
     await expect(client.getTask({})).rejects.toMatchObject({ code: Code.InvalidArgument });
     await expect(client.getTask({ taskId: createdTaskId, sessionId })).rejects.toMatchObject({
