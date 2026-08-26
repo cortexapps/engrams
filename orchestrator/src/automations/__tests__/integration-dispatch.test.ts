@@ -680,6 +680,15 @@ function fakeInstances(): InstanceHarness {
         return [{ handle, instanceId, instanceStatus: row?.status ?? "open" }];
       });
     },
+    async anyOpenHandleOwner(candidates) {
+      // Mirrors the PG cross-automation query: any ledger entry for one of
+      // these handles whose owning instance is open.
+      for (const [key, instanceId] of handles) {
+        const handle = key.slice(key.indexOf(":") + 1);
+        if (candidates.includes(handle) && rows.get(instanceId)?.status !== "closed") return true;
+      }
+      return false;
+    },
     async recordDrop(input) {
       drops.push(input);
     },
@@ -1054,6 +1063,81 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
       reason: "closed_instance",
       detail: "slack:C1:1724.100",
     });
+  });
+
+  test("conversation ownership suppresses the brain for event keys the owner does not subscribe to", async () => {
+    // The prod 2026-08-26 shape: a TAGGED message arrives as TWO deliveries
+    // (message + app_mention). The channel-owning workstream subscribes only
+    // to `message`, so the app_mention delivery matches NO instanced target —
+    // suppression must come from the ledger, not from a matched resolution.
+    const brain = {
+      automation: meta({ id: "brain-1", builtinKey: "slack_brain", kind: "builtin" }),
+      definition: definition(trigger({ provider: "slack", eventKeys: ["app_mention"] })),
+    };
+    const custom = {
+      automation: meta({ id: "custom-1" }),
+      definition: definition(trigger({ provider: "slack", eventKeys: ["message"] }), {
+        settings: {
+          endSessionsOnFinish: false,
+          instance: {
+            keyTemplate: "chan-${{ event.raw.event.channel }}",
+            entrypoints: { main: { admit: "handle_match" as const } },
+          },
+        },
+      }),
+    };
+    const slackFacet = {
+      events: [
+        {
+          key: "app_mention",
+          label: "App mention",
+          handleCandidates: [
+            {
+              parts: [
+                { lit: "slack:" },
+                { path: "event.channel" },
+                { lit: ":" },
+                { path: "event.thread_ts" },
+              ],
+            },
+            { parts: [{ lit: "slack:" }, { path: "event.channel" }] },
+          ],
+        },
+      ],
+    };
+    const i = fakeInstances();
+    const owner = i.seed({ automationId: "custom-1", key: "chan-C1" });
+    i.bindHandle("custom-1", "slack:C1", owner.id);
+
+    const h = makeHarness([brain, custom]);
+    const mention = await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "app_mention",
+        payload: { event: { channel: "C1" } },
+      }),
+      { ...deps(h), instances: i.store, facets: async () => slackFacet },
+    );
+    // The custom automation does not match app_mention (started 0 for it);
+    // the brain is suppressed by conversation ownership, so NOTHING answers
+    // this delivery — the message-event twin already reached the owner.
+    expect(mention).toMatchObject({ started: 0, suppressed: ["slack_brain"] });
+    expect(mention.builtins).toEqual({});
+
+    // Control: once the owner closes, the mention reaches the brain again.
+    await i.store.closeInstance({ instanceId: owner.id });
+    const h2 = makeHarness([brain, custom]);
+    const afterClose = await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "app_mention",
+        deliveryId: "slack-after-close",
+        payload: { event: { channel: "C1" } },
+      }),
+      { ...deps(h2), instances: i.store, facets: async () => slackFacet },
+    );
+    expect(afterClose).toMatchObject({ started: 1, suppressed: [] });
+    expect(afterClose.builtins).toEqual({ slack_brain: "started" });
   });
 
   test("builtinSuppressed reads the suppression list", async () => {

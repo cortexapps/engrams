@@ -225,6 +225,35 @@ describe.skipIf(!dbReachable)("automation instance store (live PG)", () => {
     expect(await store.resolveHandles(otherAuto, [handle])).toEqual([]);
   });
 
+  test("anyOpenHandleOwner is cross-automation and open-only (the brain-suppression pre-pass)", async () => {
+    const autoId = await seedAutomation("owner-check");
+    const store = makeAutomationInstanceStore();
+    const owner = await store.openInstance({
+      automationId: autoId,
+      key: "chan",
+      inputs: {},
+      openedBy: "",
+    });
+    const handle = "slack:COWNERCHECK";
+    await store.recordInstanceHandle({
+      automationId: autoId,
+      handle,
+      instanceId: owner.id,
+      writtenBy: "run-1:claim",
+    });
+
+    expect(await store.anyOpenHandleOwner([])).toBe(false);
+    expect(await store.anyOpenHandleOwner(["slack:CUNKNOWN"])).toBe(false);
+    // Deliberately NOT scoped by automation: the check answers "does any
+    // workstream anywhere own this conversation", so a channel owner
+    // suppresses the brain even for event keys it does not subscribe to.
+    expect(await store.anyOpenHandleOwner(["slack:CUNKNOWN", handle])).toBe(true);
+
+    // A closed owner no longer suppresses — the brain resumes.
+    await store.closeInstance({ instanceId: owner.id });
+    expect(await store.anyOpenHandleOwner([handle])).toBe(false);
+  });
+
   test("explicit claim takes over a CLOSED holder's handle; open holders and auto-writers never rebind", async () => {
     const autoId = await seedAutomation("handle-takeover");
     const store = makeAutomationInstanceStore();
