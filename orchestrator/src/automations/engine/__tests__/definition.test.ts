@@ -298,3 +298,78 @@ describe("entrypoints (ADR 0119 D9)", () => {
     );
   });
 });
+
+describe("settings.instance (ADR 0120)", () => {
+  // Raw fixture, deliberately outside the parsed types: validateDefinition
+  // re-parses from unknown, and several cases pass invalid shapes on purpose.
+  const instanced = (instance: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    def({
+      settings: { endSessionsOnFinish: false, instance } as AutomationDefinition["settings"],
+      ...(extra as Partial<AutomationDefinition>),
+    });
+
+  test("accepts a key template with per-entrypoint admission and input templates", () => {
+    const parsed = validateDefinition(
+      instanced(
+        {
+          keyTemplate: "project-${{ inputs.project_id }}",
+          inputs: { project_id: "${{ event.raw.project.id }}" },
+          entrypoints: { main: { admit: "open" } },
+        },
+        {
+          inputsSchema: [{ key: "project_id", label: "Project", type: "string" }],
+        },
+      ),
+      { kind: "user" },
+    );
+    expect(parsed.settings.instance?.keyTemplate).toContain("project-");
+  });
+
+  test("rejects an instance input that is not an inputsSchema field", () => {
+    expect(() =>
+      validateDefinition(
+        instanced({ keyTemplate: "k", inputs: { ghost: "${{ event.raw.x }}" } }),
+        { kind: "user" },
+      ),
+    ).toThrow('not an inputsSchema field');
+  });
+
+  test("rejects admission for an unknown entrypoint", () => {
+    expect(() =>
+      validateDefinition(
+        instanced({ keyTemplate: "k", entrypoints: { ghost: { admit: "open" } } }),
+        { kind: "user" },
+      ),
+    ).toThrow('unknown entrypoint "ghost"');
+  });
+
+  test("handle_match needs a delivery-bearing trigger", () => {
+    expect(() =>
+      validateDefinition(
+        instanced({ keyTemplate: "k", entrypoints: { main: { admit: "handle_match" } } }),
+        { kind: "user" },
+      ),
+    ).toThrow("delivery-bearing trigger");
+    const parsed = validateDefinition(
+      instanced(
+        { keyTemplate: "k", entrypoints: { main: { admit: "handle_match" } } },
+        {
+          trigger: {
+            kind: "integration",
+            provider: "slack",
+            connectionId: "c1",
+            eventKeys: ["message"],
+          },
+        },
+      ),
+      { kind: "user" },
+    );
+    expect(parsed.settings.instance?.entrypoints?.main?.admit).toBe("handle_match");
+  });
+
+  test("a bad key template fails at save time", () => {
+    expect(() =>
+      validateDefinition(instanced({ keyTemplate: "${{ unclosed" }), { kind: "user" }),
+    ).toThrow();
+  });
+});
