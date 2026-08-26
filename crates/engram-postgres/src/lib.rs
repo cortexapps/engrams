@@ -5135,6 +5135,33 @@ impl MetadataStore for PostgresStore {
         .map_err(db_err)
     }
 
+    async fn tool_call_completed_exists(
+        &self,
+        session_id: SessionId,
+        tool_call_id: &str,
+    ) -> Result<bool, MetaError> {
+        // Live timeline only, matching the sibling event lookups: an ADR
+        // 0028 rewind tombstones the past, and a legitimately re-run call's
+        // late result must not be gagged by it.
+        sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM session_events
+                 WHERE session_id = $1
+                   AND kind = 'tool_call_completed'
+                   AND payload->>'tool_call_id' = $2
+                   AND rewound_at IS NULL
+            )
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(tool_call_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
     async fn session_exec_output_high_water(
         &self,
         session_id: SessionId,

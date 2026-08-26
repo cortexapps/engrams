@@ -2183,6 +2183,31 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
+    /// True when this session's live timeline already records a
+    /// `tool_call_completed` event for `tool_call_id`.
+    ///
+    /// A tool result submitted AFTER its call completed can never be
+    /// delivered: the confirming `tool_call_completed` event is what acks a
+    /// ToolResult outbox row (`outbox_ack_id`), and it has already fired.
+    /// Worse, delivering such a result condemns the harness's agent process
+    /// for an id-stable re-fire that never comes — nothing is parked on the
+    /// call any more — so the unackable row redelivers forever and bricks
+    /// the session (prod 2026-08-26: two sessions wedged by two-hour-late
+    /// results replayed through a listener catch-up).
+    /// `complete_tool_call_core` uses this to drop the result at the door.
+    ///
+    /// Default `false` keeps event-less mock stores lightweight (fail-open:
+    /// the result is accepted). `PostgresStore` and `SimMetadataStore`
+    /// implement the real event-log query, covered by the ADR 0098 D4
+    /// conformance suite.
+    async fn tool_call_completed_exists(
+        &self,
+        _session_id: SessionId,
+        _tool_call_id: &str,
+    ) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
     /// Highest recorded absolute byte end-offset among this exec's persisted
     /// output chunk rows for `stream`, or 0 when none are stamped.
     ///

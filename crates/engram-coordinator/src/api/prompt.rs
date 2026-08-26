@@ -225,6 +225,29 @@ pub(crate) async fn complete_tool_call_core(
             session.status.as_str()
         )));
     }
+    // A result for a call the session already recorded terminal is dead on
+    // arrival: the confirming `tool_call_completed` event is what acks a
+    // ToolResult outbox row (`outbox_ack_id`), and it has ALREADY fired —
+    // the row could never be acked. Worse, delivering it condemns the
+    // harness's agent process for an id-stable re-fire that never comes
+    // (nothing is parked on the call any more), so the row redelivers
+    // forever and bricks the session (prod 2026-08-26: two worker sessions
+    // wedged in an 80-second condemn loop by two-hour-late results a
+    // listener catch-up replayed). Accept-and-drop, loudly: the submitter
+    // is fire-and-forget, and a hard error would only make it retry.
+    if state
+        .services
+        .meta
+        .tool_call_completed_exists(id, &tool_call_id)
+        .await?
+    {
+        tracing::warn!(
+            session_id = %id,
+            tool_call_id,
+            "dropping tool result for an already-completed call (unackable; delivery would wedge the harness)",
+        );
+        return Ok("tool result dropped; call already completed");
+    }
 
     let now = state.services.clock.now_utc();
     let row = engram_core::types::outbox::OutboxRow {
@@ -837,5 +860,58 @@ mod tests {
             .await
             .expect("undelivered rows edit without the harness");
         assert_eq!(mini.outbox.lock()[0].payload["text"], "edited");
+    }
+
+    /// A tool result submitted AFTER the session recorded the call terminal
+    /// is unackable (`outbox_ack_id`'s confirming `tool_call_completed` has
+    /// already fired) and its delivery wedges the harness in a condemn loop
+    /// (prod 2026-08-26). The submit drops it at the door: no submitted
+    /// event, no outbox row. A fresh call id is unaffected.
+    #[tokio::test]
+    async fn late_tool_result_for_a_completed_call_is_dropped() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(idle_session(id));
+        state
+            .services
+            .meta
+            .append_session_event(
+                id,
+                "tool_call_completed",
+                serde_json::json!({
+                    "type": "harness_tool_call_completed",
+                    "tool_call_id": "toolu_done",
+                    "tool_name": "wait_sessions",
+                    "ok": false,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let note = complete_tool_call_core(&state, id, "toolu_done".into(), "{}".into())
+            .await
+            .expect("a late result is accepted-and-dropped, not an error");
+        assert_eq!(note, "tool result dropped; call already completed");
+        assert!(
+            mini.events
+                .lock()
+                .iter()
+                .all(|e| e.kind != "tool_result_submitted"),
+            "the dropped result must leave no submitted event",
+        );
+        assert!(
+            mini.outbox.lock().is_empty(),
+            "the dropped result must enqueue no delivery obligation",
+        );
+
+        let note = complete_tool_call_core(&state, id, "toolu_live".into(), "{}".into())
+            .await
+            .expect("a result for a still-open call queues normally");
+        assert_eq!(note, "tool result queued");
+        assert!(mini
+            .events
+            .lock()
+            .iter()
+            .any(|e| e.kind == "tool_result_submitted"),);
+        assert_eq!(mini.outbox.lock().len(), 1);
     }
 }

@@ -2796,6 +2796,24 @@ pub(crate) mod tests {
             });
             Ok(idx)
         }
+        async fn tool_call_completed_exists(
+            &self,
+            _session_id: engram_core::SessionId,
+            tool_call_id: &str,
+        ) -> Result<bool, MetaError> {
+            // Mirrors the PG/Sim live-timeline lookup so the
+            // `complete_tool_call_core` late-result guard is exercisable in
+            // this unit harness.
+            Ok(self.events.lock().iter().any(|event| {
+                event.rewound_at.is_none()
+                    && event.kind == "tool_call_completed"
+                    && event
+                        .payload
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(tool_call_id)
+            }))
+        }
         async fn append_session_event_fenced(
             &self,
             session_id: engram_core::SessionId,
