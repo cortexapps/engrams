@@ -4,6 +4,9 @@ import { z } from "zod";
 import type { CuratedEvent } from "../control-plane/session-events.ts";
 import { getDb } from "../db/client.ts";
 import { makePrRefStore, type PrRefStore } from "../db/pr-refs.ts";
+import { makeAutomationEngineStore } from "../db/automations.ts";
+import { makeAutomationInstanceStore } from "../db/automation-instances.ts";
+import { canonicalHandle } from "../automations/handles.ts";
 import { taskSession } from "../db/schema.ts";
 import { log as rootLog } from "../log.ts";
 import type { SessionConsumer } from "./consumer.ts";
@@ -89,6 +92,19 @@ export function parsePullRequestAsset(event: CuratedEvent): ParseResult {
 export interface PrLinkConsumerDeps {
   prRefs: PrRefStore;
   findTaskId(sessionId: string): Promise<string | null>;
+  /** ADR 0120: the session's automation binding (engine store). A session an
+   * instance-bound run created routes review feedback back through the
+   * handle ledger — the consumer writes github:<repo>#<n> on PR open. */
+  findAutomationBinding?(sessionId: string): Promise<{
+    automationId: string;
+    instanceId: string;
+  } | null>;
+  recordInstanceHandle?(input: {
+    automationId: string;
+    handle: string;
+    instanceId: string;
+    writtenBy: string;
+  }): Promise<{ kind: "recorded" } | { kind: "already_ours" } | { kind: "conflict"; instanceId: string }>;
 }
 
 export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
@@ -132,12 +148,37 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
         baseBranch: data.base_branch ?? "",
         observedAt: new Date(at),
       });
+
+      // ADR 0120: bind the PR to the session's workstream so review events
+      // route back (handle admission). Best-effort AND loud: a conflict
+      // means another workstream already owns this PR — log, never rebind,
+      // and never fail the consumer (the pr_ref upsert above stands).
+      if (deps.findAutomationBinding && deps.recordInstanceHandle) {
+        const binding = await deps.findAutomationBinding(ctx.sessionId);
+        if (binding !== null && binding.instanceId !== "") {
+          const handle = canonicalHandle("github", `github:${repo}#${prNumber}`);
+          const result = await deps.recordInstanceHandle({
+            automationId: binding.automationId,
+            handle,
+            instanceId: binding.instanceId,
+            writtenBy: `consumer:pr-link:${ctx.sessionId}`,
+          });
+          if (result.kind === "conflict") {
+            log.warn(
+              { sessionId: ctx.sessionId, handle, holder: result.instanceId },
+              "pr handle already routes to another workstream; NOT rebinding",
+            );
+          }
+        }
+      }
     },
   };
 }
 
 export function makeProductionPrLinkConsumer(): SessionConsumer {
   const db = getDb();
+  const engine = makeAutomationEngineStore();
+  const instances = makeAutomationInstanceStore();
   return makePrLinkConsumer({
     prRefs: makePrRefStore(db),
     async findTaskId(sessionId) {
@@ -148,5 +189,12 @@ export function makeProductionPrLinkConsumer(): SessionConsumer {
         .limit(1);
       return rows[0]?.taskId ?? null;
     },
+    async findAutomationBinding(sessionId) {
+      const binding = await engine.getSessionBinding(sessionId);
+      return binding
+        ? { automationId: binding.automationId, instanceId: binding.instanceId }
+        : null;
+    },
+    recordInstanceHandle: (input) => instances.recordInstanceHandle(input),
   });
 }

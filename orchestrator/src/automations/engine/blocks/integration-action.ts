@@ -76,6 +76,8 @@ export function registerIntegrationActionBlock(): void {
           params,
           runId: ctx.runId,
           stepPath: ctx.currentPath,
+          automationId: ctx.automationId,
+          instanceId: ctx.instanceId,
         });
       } catch (error) {
         // The runtime raises typed errors carrying `permanent` (see

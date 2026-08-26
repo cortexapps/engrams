@@ -153,6 +153,12 @@ export interface IntegrationActionRuntime {
     /** Frame path of the executing block (not the block id): the identity
      * every idempotency key (client id, marker) derives from. */
     stepPath: string;
+    /** ADR 0120: the executing run's automation + workstream. When bound
+     * ('' = unbound), a successful execution writes the action's declared
+     * handles to the instance ledger in the SAME step. Additive — fakes
+     * that ignore them stay valid. */
+    automationId?: string;
+    instanceId?: string;
   }): Promise<Record<string, unknown>>;
 }
 
