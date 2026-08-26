@@ -104,6 +104,12 @@ export interface AutomationInstanceStore {
   }): Promise<RecordHandleResult>;
   /** One query over all of an event's candidate handles. */
   resolveHandles(automationId: string, handles: string[]): Promise<ResolvedHandle[]>;
+  /** True when ANY open workstream — in ANY automation — owns one of these
+   * handles. The brain-suppression pre-pass asks this when no MATCHED
+   * target bound the event: ownership is about the CONVERSATION, not the
+   * event subscription (a tagged message arrives as two deliveries, and
+   * the owner may subscribe to only one of them). */
+  anyOpenHandleOwner(handles: string[]): Promise<boolean>;
   /** The drops ring: record an admission drop (no run row exists for it) and
    * cap the ring per automation. Callers treat this as best-effort — a
    * failed audit write must never fail the delivery. */
@@ -458,6 +464,25 @@ export function makeAutomationInstanceStore(
         instanceId: r.instanceId,
         instanceStatus: r.instanceStatus === "closed" ? ("closed" as const) : ("open" as const),
       }));
+    },
+
+    async anyOpenHandleOwner(handles) {
+      if (handles.length === 0) return false;
+      const [row] = await db
+        .select({ handle: automationInstanceHandle.handle })
+        .from(automationInstanceHandle)
+        .innerJoin(
+          automationInstance,
+          eq(automationInstanceHandle.instanceId, automationInstance.id),
+        )
+        .where(
+          and(
+            inArray(automationInstanceHandle.handle, handles),
+            eq(automationInstance.status, "open"),
+          ),
+        )
+        .limit(1);
+      return row !== undefined;
     },
   };
 }

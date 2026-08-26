@@ -1268,6 +1268,9 @@ function fakeInstanceStore() {
     async resolveHandles() {
       return [];
     },
+    async anyOpenHandleOwner() {
+      return false;
+    },
     async recordDrop(input) {
       drops.push(input);
     },

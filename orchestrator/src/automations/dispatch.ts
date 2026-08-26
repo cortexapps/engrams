@@ -20,7 +20,7 @@ import {
 } from "../db/automations.ts";
 import type { AutomationRunTrigger, AutomationTrigger } from "../db/schema.ts";
 import type { IntegrationEventDispatchInput } from "./integration-ingress.ts";
-import { CASE_INSENSITIVE_HANDLE_PROVIDERS } from "./handles.ts";
+import { CASE_INSENSITIVE_HANDLE_PROVIDERS, extractHandleCandidates } from "./handles.ts";
 import {
   instanceConcurrencyKey,
   resolveInstance,
@@ -394,6 +394,7 @@ export function defaultInstanceStoreLazy(): AutomationInstanceStore {
     closeInstance: (input) => get().closeInstance(input),
     recordInstanceHandle: (input) => get().recordInstanceHandle(input),
     resolveHandles: (automationId, handles) => get().resolveHandles(automationId, handles),
+    anyOpenHandleOwner: (handles) => get().anyOpenHandleOwner(handles),
     recordDrop: (input) => get().recordDrop(input),
     listRecentDrops: (automationId, limit) => get().listRecentDrops(automationId, limit),
     listInstances: (automationId, opts) => get().listInstances(automationId, opts),
@@ -710,9 +711,20 @@ export async function dispatchIntegrationEvent(
   const instances = deps.instances ?? defaultInstanceStoreLazy();
   const facets = deps.facets ?? defaultWebhookFacetResolver();
 
-  const targets = (
-    await store.listEnabledForIntegrationTrigger(input.provider, input.connectionId)
-  ).flatMap((target) => {
+  const providerTargets = await store.listEnabledForIntegrationTrigger(
+    input.provider,
+    input.connectionId,
+  );
+  // Conversation-ownership gate (rung 2): computed over the PROVIDER's
+  // enabled automations BEFORE event-key filtering — a channel owner
+  // subscribed only to `message` must still suppress the brain for the
+  // `app_mention` twin, where it is not an event-matched target. When no
+  // instanced automation exists for the provider at all, the ledger is
+  // never consulted (the no-instances world stays DB-free).
+  const anyInstancedForProvider = providerTargets.some(
+    (target) => target.definition.settings.instance !== undefined,
+  );
+  const targets = providerTargets.flatMap((target) => {
     // A built-in's kill switch must stop its TRIGGER path too, not only the
     // legacy route's fallback: otherwise a flagged repo/channel is served by
     // both brains at once (the legacy graph via the route, the built-in via
@@ -785,6 +797,33 @@ export async function dispatchIntegrationEvent(
     );
     if (resolution.kind === "bound" && resolution.via === "handle") handleBound = true;
     resolved.push({ target, entrypoint, resolution });
+  }
+  // Rung 2 completion: ownership is about the CONVERSATION, not the event
+  // subscription. A tagged message arrives as TWO deliveries (message +
+  // app_mention), and the owning workstream may subscribe to only one of
+  // them — but every brain must stand down for both (prod 2026-08-26: the
+  // legacy picker answered a mention in an owned channel because no MATCHED
+  // target was instanced, so no handle ever resolved). When a suppressible
+  // catch-all matched and nothing bound, ask the ledger directly whether
+  // any open workstream — in any automation — owns one of the event's
+  // candidate handles.
+  if (
+    !handleBound &&
+    anyInstancedForProvider &&
+    targets.some((t) => t.target.automation.builtinKey === SUPPRESSIBLE_CATCH_ALL)
+  ) {
+    const suppressFacet = facet ?? (await facets(input.provider));
+    if (suppressFacet !== undefined) {
+      const candidates = extractHandleCandidates({
+        provider: input.provider,
+        facet: suppressFacet,
+        eventKey: input.eventKey,
+        payload: input.payload ?? {},
+      });
+      if (candidates.length > 0 && (await instances.anyOpenHandleOwner(candidates))) {
+        handleBound = true;
+      }
+    }
   }
 
   // Each target is admitted in isolation: one transient fault must never drop
