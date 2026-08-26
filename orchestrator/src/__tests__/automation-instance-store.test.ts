@@ -132,7 +132,10 @@ describe.skipIf(!dbReachable)("automation instance store (live PG)", () => {
 
   test("listOpenInstances is oldest-first and capped", async () => {
     const autoId = await seedAutomation("list");
-    const store = makeAutomationInstanceStore();
+    // Injected advancing clock: three same-millisecond opens would tie on
+    // opened_at and fall to the (random) id tiebreak.
+    let tick = Date.parse("2026-08-25T00:00:00Z");
+    const store = makeAutomationInstanceStore({ now: () => new Date(++tick) });
     for (const key of ["k-1", "k-2", "k-3"]) {
       await store.openInstance({ automationId: autoId, key, inputs: {}, openedBy: "" });
     }
