@@ -87,7 +87,7 @@ import sys
 from pathlib import Path
 
 # Binaries that bake into each artifact.
-FC_BINS = {"engram-host-agent", "engram-uffd-handler"}
+FC_BINS = {"engram-host-agent", "engram-uffd-handler", "engram-egress-proxyd"}
 
 # ADR 0098 P9: the host-internal simulation lane. Gated on the release
 # closure of the sim binary's own crate — engram-dst-host pulls
@@ -115,11 +115,18 @@ COSIM_BINS = {"engram-dst-cosim"}
 # without listing it here a handler-only change set images=False and landed
 # only in the dead GCE host_binaries lane: it deployed NOWHERE (PR #193's
 # handler fix sat unrolled until this was caught).
+#
+# engram-egress-proxyd (ADR 0121): same shape as the uffd-handler — it
+# ships inside the host-agent container (docker/host-agent.Dockerfile
+# copies it to /usr/local/bin) and is spawned by path, not a cargo
+# dependency, so it must be listed here or a daemon-only change
+# deploys nowhere.
 CONTAINER_BINS = {
     "engram-coordinator",
     "engram-host-agent",
     "engram-host-operator",
     "engram-uffd-handler",
+    "engram-egress-proxyd",
 }
 # The built-in claude harness binary. ADR 0062: it is NOT baked into any
 # image — it rides the fleet `current_bundles` stamp (the
@@ -157,6 +164,10 @@ E2E_BINS = {
     "engram-agentd",
     "engram-harness-claude",
     "engram-harness-codex",
+    # ADR 0121: host-agent refuses to serve without a confirmed egress
+    # daemon (fail-closed), so every stack that boots host-agent
+    # builds + ships the daemon too.
+    "engram-egress-proxyd",
 }
 
 # Non-crate path prefixes per lane. `Cargo.lock`/root `Cargo.toml`/this
@@ -582,7 +593,8 @@ def main():
         if baselines else ({}, {})
 
     coord_closure = release_closure(meta, {"engram-coordinator"})
-    ha_closure = release_closure(meta, {"engram-host-agent", "engram-uffd-handler"})
+    ha_closure = release_closure(
+        meta, {"engram-host-agent", "engram-uffd-handler", "engram-egress-proxyd"})
     hop_closure = release_closure(meta, {"engram-host-operator"})
     dirs = crate_dirs(meta, repo_root)
 

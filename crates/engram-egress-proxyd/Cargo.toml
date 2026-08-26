@@ -1,0 +1,39 @@
+[package]
+name = "engram-egress-proxyd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ADR 0121: the node-local egress daemon. Owns the ADR 0006 proxy listeners and outlives host-agent pod rolls, so in-flight guest egress streams survive a deploy."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "engram-egress-proxyd"
+path = "src/main.rs"
+
+[dependencies]
+engram-core.workspace = true
+engram-egress-proxy.workspace = true
+engram-egress-proto.workspace = true
+engram-cloud-sql.workspace = true
+engram-tls.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile = "3"
+tokio-rustls.workspace = true
