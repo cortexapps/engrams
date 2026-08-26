@@ -1567,9 +1567,13 @@ jobs:
           # downstream `test-e2e-stack` job can republish the
           # `harness-claude` workflow artifact into the integration
           # registry without a separate cargo build (ADR 0021 P0).
+          # ADR 0121: host-agent refuses to serve without a confirmed
+          # egress daemon (fail-closed), so the stack ships the daemon
+          # binary beside it.
           cargo build --release \
               -p engram-coordinator \
               -p engram-host-agent \
+              -p engram-egress-proxyd \
               -p engram-publish-builtin-harness
 
       - name: Build musl agentd (release)
@@ -1584,6 +1588,7 @@ jobs:
           path: |
             target/release/engram-coordinator
             target/release/engram-host-agent
+            target/release/engram-egress-proxyd
             target/release/engram-publish-builtin-harness
             target/x86_64-unknown-linux-musl/release/engram-agentd
           retention-days: 1
@@ -1804,9 +1809,9 @@ jobs:
 
       - name: Mark e2e binaries executable
         run: |
-          chmod +x target/release/engram-{coordinator,host-agent,publish-builtin-harness}
+          chmod +x target/release/engram-{coordinator,host-agent,egress-proxyd,publish-builtin-harness}
           chmod +x target/x86_64-unknown-linux-musl/release/engram-agentd
-          ls -l target/release/engram-{coordinator,host-agent,publish-builtin-harness} \
+          ls -l target/release/engram-{coordinator,host-agent,egress-proxyd,publish-builtin-harness} \
                 target/x86_64-unknown-linux-musl/release/engram-agentd
 
       # `tilt up` (via tilt-up-ci.sh) boots: postgres + fake-gcs +

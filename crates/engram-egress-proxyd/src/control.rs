@@ -82,6 +82,25 @@ async fn serve_conn(
             ToProxyd::Health => FromProxyd::HealthReport {
                 sessions: state.registry.live_count(),
             },
+            ToProxyd::LookupGuest(guest_ip) => {
+                FromProxyd::Guest(state.registry.lookup(guest_ip).map(|s| {
+                    engram_egress_proto::GuestSummary {
+                        session_id: s.session_id,
+                        sandbox_id: s.sandbox_id,
+                    }
+                }))
+            }
+            ToProxyd::Decide { guest_ip, host } => {
+                FromProxyd::Decision(state.registry.lookup(guest_ip).map(|s| {
+                    match s.decide(&host) {
+                        engram_egress_proxy::Decision::Reject => "reject",
+                        engram_egress_proxy::Decision::Bypass => "bypass",
+                        engram_egress_proxy::Decision::Intercept { .. } => "intercept",
+                        engram_egress_proxy::Decision::OwnApp { .. } => "own-app",
+                    }
+                    .to_string()
+                }))
+            }
             ToProxyd::Shutdown => {
                 tracing::info!("shutdown requested over control socket; exiting");
                 let _ = engram_egress_proto::write_frame(&mut stream, &FromProxyd::Ok).await;
@@ -438,6 +457,38 @@ mod tests {
         // Still the PREVIOUS policy's behavior, not a lockout.
         assert!(matches!(
             survivor.decide("example.com"),
+            engram_egress_proxy::Decision::Bypass
+        ));
+    }
+
+    /// A capture-shaped policy (ADR 0080: assembled coordinator-side —
+    /// see `session_boot::assemble_capture_egress_policy`, where the
+    /// posture-mapping tests live) with a scoped allowlist must
+    /// translate + register cleanly. Moved from `pooled_backend.rs`
+    /// with the translation itself (ADR 0121).
+    #[test]
+    fn capture_shaped_allowlist_policy_registers() {
+        let mut p = policy(SessionId::new(), Ipv4Addr::new(169, 254, 0, 2));
+        p.network_allow_hosts = vec!["accounts.google.com".into()];
+        p.network_allow_host_patterns = vec!["*.auth0.com".into()];
+        let registry = Registry::new();
+        register_policy(&registry, p).expect("proxy must accept the capture-egress allowlist");
+    }
+
+    /// A capture-shaped allow-all policy must register, and the proxy
+    /// must bypass an arbitrary host under it (the dev posture for an
+    /// image whose warm boot needs unrestricted network).
+    #[test]
+    fn capture_shaped_allow_all_policy_bypasses() {
+        let mut p = policy(SessionId::new(), Ipv4Addr::new(169, 254, 0, 3));
+        p.network_allow_hosts = Vec::new();
+        p.allow_all = true;
+        let guest_ip = p.guest_ip;
+        let registry = Registry::new();
+        register_policy(&registry, p).expect("register allow-all");
+        let state = registry.lookup(guest_ip).expect("registered");
+        assert!(matches!(
+            state.decide("anything.example.com"),
             engram_egress_proxy::Decision::Bypass
         ));
     }

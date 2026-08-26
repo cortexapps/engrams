@@ -92,11 +92,18 @@ lifecycle owns.**
    and triggers a replace.
 6. The ADR 0118 app relay dials back: proxyd asks host-agent over a
    second UDS (`<work_dir>/egress-dialback.sock`) to open the guest
-   stream, and receives the connected fd via SCM_RIGHTS. Backend and
-   jail layout stay out of proxyd. Established relayed streams survive
-   a roll (proxyd holds the fds); a NEW app-relay dial during the roll
-   gap fails and the client retries — the same semantics every other
-   new-work path has during a roll.
+   stream. Host-agent opens it (backend + ADR 0066 relay handshake
+   stay there), passes one end of a socketpair to proxyd via
+   SCM_RIGHTS, and pumps the other end against the guest stream.
+   *Implementation divergence from the first draft*: the raw guest
+   fd is NOT passed — FC's guest streams are epoch-severed wrappers
+   (capture semantics) and VZ's are in-process objects, so a raw-fd
+   pass would bypass both. The pump means an established app-relay
+   stream still traverses the pod and dies with it — deliberately
+   accepted: ADR 0066 already treats app-relay resets on lifecycle
+   events as "the browser reconnects", and the streams this ADR
+   exists for (model API, DNS, tunnels) never touch the pump. A NEW
+   app-relay dial during the roll gap fails and the client retries.
 7. The shutdown ladder gets **no** egress rung. SIGTERM must ignore
    proxyd: the daemon is not the pod's to stop. This is deliberate — do
    not "fix" it.
@@ -204,9 +211,11 @@ listeners, registry, and coord callbacks all live in proxyd.
   event-driven respawn. Same severity as one roll today.
 - **The introducing deploy.** The first roll to a proxyd image cuts
   streams once (the old pod's proxy was in-process).
-- **New app-relay dials and new policy applies during a host-agent
-  gap.** They fail until the successor connects; established streams
-  and the in-proxyd refresh path keep working.
+- **App-relay streams during a host-agent gap.** New dials fail until
+  the successor connects, and established relayed streams die with the
+  pod (they traverse the dial-back pump — see Decision §6). Every
+  other established stream and the in-proxyd refresh path keep
+  working.
 - **Turn-level recoverability.** A cut SSE stream is still not
   resumable at the app layer. This ADR removes the routine cause; it
   does not make severance survivable.

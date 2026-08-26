@@ -644,6 +644,9 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # exercisable here for the first time (still opt-in via
         # ENGRAM_FC_RESTORE_MODE=uffd; the dev default stays `file`).
         env['ENGRAM_FC_UFFD_HANDLER_BIN'] = '/opt/engram-dev/bin/engram-uffd-handler'
+        # ADR 0121: the node-local egress daemon is cross-compiled and
+        # synced alongside; host-agent spawns/adopts it by this path.
+        env['ENGRAM_EGRESS_PROXYD_BIN'] = '/opt/engram-dev/bin/engram-egress-proxyd'
         # The idle-evict disk-pressure floor defaults to 20 GiB — LARGER than
         # the fc-dev VM's ~19 GiB rootfs, so free disk can never exceed it and
         # idle eviction would be permanently paused ("disk pressure (free <
@@ -695,7 +698,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # per-build flake eval is a non-issue.
         build_cmd = (
             _nix + ' develop -c cargo build --release --target ' + target +
-            ' -p engram-host-agent -p engram-uffd-handler'
+            ' -p engram-host-agent -p engram-uffd-handler -p engram-egress-proxyd'
         )
         # NOTE on remote-command quoting: `colima ssh -- <args>` does NOT run
         # the joined args through a remote shell, so `&&`/`||`/`|` in a single
@@ -713,7 +716,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
             colima + ' ssh --profile ' + fc_colima_profile +
             ' -- mkdir -p /opt/engram-dev/bin /opt/engram-dev/var/sandboxes && ' +
             'COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C target/' + target + '/release ' +
-            'engram-host-agent engram-uffd-handler | ' +
+            'engram-host-agent engram-uffd-handler engram-egress-proxyd | ' +
             colima + ' ssh --profile ' + fc_colima_profile +
             ' -- tar xf - -C /opt/engram-dev/bin'
         )
@@ -774,9 +777,13 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         if bin_dir:
             ha_bin = bin_dir + '/engram-host-agent'
             build_prefix = ''
+            # ADR 0121: the prebuilt daemon sits beside the host-agent
+            # binary (the CI e2e artifact ships both).
+            env['ENGRAM_EGRESS_PROXYD_BIN'] = bin_dir + '/engram-egress-proxyd'
         else:
             ha_bin = './target/debug/engram-host-agent'
-            build_prefix = 'cargo build -p engram-host-agent && '
+            build_prefix = 'cargo build -p engram-host-agent -p engram-egress-proxyd && '
+            env['ENGRAM_EGRESS_PROXYD_BIN'] = './target/debug/engram-egress-proxyd'
 
         if needs_codesign:
             # VZ (macOS): the binary needs the virtualization entitlement;
