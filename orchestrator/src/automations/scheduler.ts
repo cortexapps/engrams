@@ -144,6 +144,10 @@ export async function runSchedulerTick(
       }
       return false;
     }
+    // Durably started and still running: the occurrence fired; nothing to
+    // start, and the advance must NOT wait for the run to finish (a
+    // long-running sibling would otherwise freeze the whole cadence).
+    if (claim.kind === "in_flight") return true;
 
     const latenessMs = now.getTime() - scheduledFor.getTime();
     if (latenessMs > AUTOMATION_MISSED_FIRE_GRACE_MS) {
@@ -209,14 +213,16 @@ export async function runSchedulerTick(
         if (outcome === null) anyHeld = true;
         if (outcome === true) fired = true;
       }
-      // ANY row lease-held by another pod defers the advance to a later
-      // tick: advancing past scheduledFor while a sibling's claimer might
-      // die pre-start would strand that occurrence forever (the advance CAS
-      // has no instance dimension, and listDueCron reads only the current
-      // next_fire_at). The held row resolves within one lease TTL — its
-      // holder starts it, or the lease expires and a later tick reacquires
-      // it — and THAT tick advances. Same invariant as the single-row path:
-      // the schedule moves only when no occurrence is in flight elsewhere.
+      // ANY pending row lease-held by another pod defers the advance to a
+      // later tick: advancing past scheduledFor while a sibling's claimer
+      // might die pre-start would strand that occurrence forever (the
+      // advance CAS has no instance dimension, and listDueCron reads only
+      // the current next_fire_at). A held row resolves within one lease
+      // TTL — its holder STARTS it (the row leaves pending and classifies
+      // in_flight, which never defers), or the lease expires and a later
+      // tick reacquires it — and THAT tick advances. Same invariant as the
+      // single-row path: the schedule moves only when no occurrence sits
+      // between claim and durable start on another pod.
       if (anyHeld) continue;
 
       await deps.store.advanceCronSchedule({

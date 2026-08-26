@@ -365,6 +365,8 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
     settings?: AutomationDefinition["settings"];
     /** Rows already claimed with a LIVE lease held by another pod. */
     leaseHeld?: string[];
+    /** Rows whose workflow already started and is still RUNNING. */
+    running?: string[];
   }) {
     const settings = input.settings ?? {
       endSessionsOnFinish: false,
@@ -381,6 +383,16 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
         leaseExpiresAt: new Date(NOW.getTime() + 60_000),
       }));
     }
+    for (const instanceId of input.running ?? []) {
+      const id = automationCronWorkflowId("automation-1", NOW, "main", instanceId);
+      runs.set(id, pendingRun(NOW, {
+        id,
+        instanceId,
+        status: "running",
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      }));
+    }
     const advances: Array<{ fired: boolean }> = [];
     const store: AutomationCronStore = {
       async listDueCron(now) {
@@ -389,6 +401,7 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
       async claimCronOccurrence(claim) {
         const existing = runs.get(claim.runId);
         if (existing) {
+          if (existing.status === "running") return { kind: "in_flight", run: existing };
           if (existing.status !== "pending") return { kind: "terminal", run: existing };
           if (existing.leaseExpiresAt !== null && existing.leaseExpiresAt > claim.now) return null;
           return { kind: "claimed", run: existing };
@@ -518,6 +531,27 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
     });
     expect(result3).toMatchObject({ errors: 0 });
     expect(g.advances).toEqual([{ fired: true }]);
+  });
+
+  test("a RUNNING sibling never defers the advance (it already fired)", async () => {
+    // Regression for the cadence-freeze finding: a long-running sibling's
+    // row is in_flight, not held — the schedule must advance past it.
+    const f = fanoutFixture({ open: ["ai_one", "ai_two"], running: ["ai_one"] });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-b",
+      store: f.store,
+      instances: f.instances,
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    // ai_two claims + starts; ai_one is in flight and neither restarted nor
+    // waited for.
+    expect(result).toMatchObject({ claimed: 1, started: 1, errors: 0 });
+    expect(starter.starts.map((s) => s.workflowId)).toEqual([
+      automationCronWorkflowId("automation-1", NOW, "main", "ai_two"),
+    ]);
+    expect(f.advances).toEqual([{ fired: true }]);
   });
 
   test("a non-instanced automation never touches the instance store", async () => {

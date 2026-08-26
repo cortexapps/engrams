@@ -25,6 +25,7 @@ import {
 import { makeAutomationEngineStore, makeAutomationStore } from "../db/automations.ts";
 import {
   automation as automationTable,
+  automationRun as automationRunTable,
   automationSession as automationSessionTable,
 } from "../db/schema.ts";
 import type { AutomationRunTrigger } from "../db/schema.ts";
@@ -323,6 +324,25 @@ describe.skipIf(!dbReachable)("run dedupe split + instance-aware cron claims (li
     expect(reacquired?.kind).toBe("claimed");
     expect(reacquired?.run.instanceId).toBe("ai_one");
     expect(reacquired?.run.leaseOwner).toBe("pod-b");
+
+    // A row whose workflow STARTED (left pending) classifies in_flight —
+    // the occurrence fired; the scheduler must not wait for it to finish.
+    await getDb()
+      .update(automationRunTable)
+      .set({ status: "running", leaseOwner: null, leaseExpiresAt: null })
+      .where(sql`id = ${`autorun:${autoId}:cron:i-ai_one`}`);
+    const inFlight = await store.claimCronOccurrence({
+      runId: `autorun:${autoId}:cron:i-ai_one`,
+      automationId: autoId,
+      version: 1,
+      instanceId: "ai_one",
+      scheduledFor,
+      leaseOwner: "pod-d",
+      leaseExpiresAt: new Date(expiredNow.getTime() + 60_000),
+      now: expiredNow,
+    });
+    expect(inFlight?.kind).toBe("in_flight");
+    expect(inFlight?.run.instanceId).toBe("ai_one");
 
     // Terminal detection is per-instance too.
     await store.markRunSkipped(`autorun:${autoId}:cron:i-ai_two`, "no work");
