@@ -284,9 +284,17 @@ export interface DueCronAutomation {
 }
 
 export interface CronRunClaim {
-  /** A terminal row proves DBOS already ran this occurrence. It is returned so
-   * a scheduler recovering after start-before-advance can finish the CAS. */
-  kind: "claimed" | "terminal";
+  /** "claimed": this caller owns the occurrence and must start it.
+   * "terminal": DBOS already finished it — returned so a scheduler
+   * recovering after start-before-advance can finish the CAS.
+   * "in_flight": the workflow was durably STARTED (the row left `pending`)
+   * and is still running — the occurrence definitively fired, so the
+   * schedule may advance past it; there is nothing to start or wait for.
+   * `null` (no claim) is reserved for a pending row whose lease another
+   * pod holds LIVE: that claimer is mid-flight between claim and start,
+   * and the advance must wait for it to start, die (lease expiry ->
+   * reacquire), or finish. */
+  kind: "claimed" | "terminal" | "in_flight";
   run: AutomationRunRow;
 }
 
@@ -1036,8 +1044,16 @@ export function makeAutomationStore(
         )
         .limit(1);
       if (!existing) return null;
-      if (!TERMINAL_RUN_STATUSES.has(existing.status)) return null;
-      return { kind: "terminal", run: runRow(existing) };
+      if (TERMINAL_RUN_STATUSES.has(existing.status)) {
+        return { kind: "terminal", run: runRow(existing) };
+      }
+      // Non-terminal and not reacquired. A `pending` row is lease-held live
+      // by another pod (mid-claim) -> no claim, the caller defers. Anything
+      // else (running) already left pending via markRunning: the workflow
+      // started durably, so the occurrence FIRED — report it instead of
+      // blocking the schedule until the run finishes.
+      if (existing.status === "pending") return null;
+      return { kind: "in_flight", run: runRow(existing) };
     },
 
     async markRunSkipped(runId, reason) {

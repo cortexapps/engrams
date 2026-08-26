@@ -358,3 +358,220 @@ describe("automation cron scheduler", () => {
     expect(skip.advances).toEqual([{ fired: true, scheduledFor: NOW }]);
   });
 });
+
+describe("cron fan-out over open workstreams (ADR 0120)", () => {
+  function fanoutFixture(input: {
+    open: string[];
+    settings?: AutomationDefinition["settings"];
+    /** Rows already claimed with a LIVE lease held by another pod. */
+    leaseHeld?: string[];
+    /** Rows whose workflow already started and is still RUNNING. */
+    running?: string[];
+  }) {
+    const settings = input.settings ?? {
+      endSessionsOnFinish: false,
+      instance: { keyTemplate: "k" },
+    };
+    let automation = dueAutomation(NOW, settings);
+    const runs = new Map<string, AutomationRunRow>();
+    for (const instanceId of input.leaseHeld ?? []) {
+      const id = automationCronWorkflowId("automation-1", NOW, "main", instanceId);
+      runs.set(id, pendingRun(NOW, {
+        id,
+        instanceId,
+        leaseOwner: "other-pod",
+        leaseExpiresAt: new Date(NOW.getTime() + 60_000),
+      }));
+    }
+    for (const instanceId of input.running ?? []) {
+      const id = automationCronWorkflowId("automation-1", NOW, "main", instanceId);
+      runs.set(id, pendingRun(NOW, {
+        id,
+        instanceId,
+        status: "running",
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      }));
+    }
+    const advances: Array<{ fired: boolean }> = [];
+    const store: AutomationCronStore = {
+      async listDueCron(now) {
+        return automation.nextFireAt <= now ? [automation] : [];
+      },
+      async claimCronOccurrence(claim) {
+        const existing = runs.get(claim.runId);
+        if (existing) {
+          if (existing.status === "running") return { kind: "in_flight", run: existing };
+          if (existing.status !== "pending") return { kind: "terminal", run: existing };
+          if (existing.leaseExpiresAt !== null && existing.leaseExpiresAt > claim.now) return null;
+          return { kind: "claimed", run: existing };
+        }
+        const run = pendingRun(claim.scheduledFor, {
+          id: claim.runId,
+          instanceId: claim.instanceId ?? "",
+          leaseOwner: claim.leaseOwner,
+          leaseExpiresAt: claim.leaseExpiresAt,
+        });
+        runs.set(claim.runId, run);
+        return { kind: "claimed", run };
+      },
+      async markRunSkipped() {},
+      async settleRunConcurrency() {},
+      async claimConcurrency() {
+        return { claimed: true };
+      },
+      async getConcurrencyHolder() {
+        return null;
+      },
+      async casConcurrency() {
+        return true;
+      },
+      async advanceCronSchedule(advance) {
+        if (automation.nextFireAt.getTime() !== advance.scheduledFor.getTime()) return false;
+        advances.push({ fired: advance.fired });
+        automation = { ...automation, nextFireAt: advance.nextFireAt };
+        return true;
+      },
+    };
+    const instances = {
+      async listOpenInstances() {
+        return input.open.map((id) => ({
+          id,
+          automationId: "automation-1",
+          key: `key-${id}`,
+          status: "open" as const,
+          inputs: {},
+          openedBy: "",
+          openedAt: NOW,
+          closedAt: null,
+          closeReason: null,
+        }));
+      },
+    };
+    return { store, instances, advances, runs };
+  }
+
+  test("one tick claims one occurrence per open workstream and advances ONCE", async () => {
+    const f = fanoutFixture({ open: ["ai_one", "ai_two", "ai_three"] });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-a",
+      store: f.store,
+      instances: f.instances,
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    expect(result).toMatchObject({ due: 1, claimed: 3, started: 3, errors: 0 });
+    expect(starter.starts.map((s) => s.workflowId)).toEqual([
+      automationCronWorkflowId("automation-1", NOW, "main", "ai_one"),
+      automationCronWorkflowId("automation-1", NOW, "main", "ai_two"),
+      automationCronWorkflowId("automation-1", NOW, "main", "ai_three"),
+    ]);
+    expect([...f.runs.values()].map((r) => r.instanceId).sort()).toEqual([
+      "ai_one",
+      "ai_three",
+      "ai_two",
+    ]);
+    expect(f.advances).toEqual([{ fired: true }]);
+  });
+
+  test("zero open workstreams is a quiet tick: no rows, schedule advances unfired", async () => {
+    const f = fanoutFixture({ open: [] });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-a",
+      store: f.store,
+      instances: f.instances,
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    expect(result).toMatchObject({ claimed: 0, started: 0 });
+    expect(f.runs.size).toBe(0);
+    expect(f.advances).toEqual([{ fired: false }]);
+  });
+
+  test("rows lease-held by another pod are left alone; the holder advances", async () => {
+    const f = fanoutFixture({ open: ["ai_one", "ai_two"], leaseHeld: ["ai_one", "ai_two"] });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-b",
+      store: f.store,
+      instances: f.instances,
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    expect(result).toMatchObject({ claimed: 0, started: 0 });
+    expect(f.advances).toEqual([]);
+
+    // Mixed: one sibling held, one free — this pod runs the free one but
+    // DEFERS the advance: the held row's claimer might die before starting
+    // it, and advancing now would strand that occurrence forever (the
+    // advance CAS has no instance dimension). Review finding on this PR.
+    const g = fanoutFixture({ open: ["ai_one", "ai_two"], leaseHeld: ["ai_one"] });
+    const result2 = await runSchedulerTick({
+      owner: "pod-b",
+      store: g.store,
+      instances: g.instances,
+      workflowStarter: recordingStarter(),
+      now: () => NOW,
+    });
+    expect(result2).toMatchObject({ claimed: 1, started: 1 });
+    expect(g.advances).toEqual([]);
+
+    // After the held lease expires, the next tick reacquires the sibling
+    // (the free row is already terminal-started, an idempotent restart) and
+    // only THEN advances — no occurrence is ever stranded.
+    const later = new Date(NOW.getTime() + 120_001);
+    const result3 = await runSchedulerTick({
+      owner: "pod-b",
+      store: g.store,
+      instances: g.instances,
+      workflowStarter: recordingStarter(),
+      now: () => later,
+    });
+    expect(result3).toMatchObject({ errors: 0 });
+    expect(g.advances).toEqual([{ fired: true }]);
+  });
+
+  test("a RUNNING sibling never defers the advance (it already fired)", async () => {
+    // Regression for the cadence-freeze finding: a long-running sibling's
+    // row is in_flight, not held — the schedule must advance past it.
+    const f = fanoutFixture({ open: ["ai_one", "ai_two"], running: ["ai_one"] });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-b",
+      store: f.store,
+      instances: f.instances,
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    // ai_two claims + starts; ai_one is in flight and neither restarted nor
+    // waited for.
+    expect(result).toMatchObject({ claimed: 1, started: 1, errors: 0 });
+    expect(starter.starts.map((s) => s.workflowId)).toEqual([
+      automationCronWorkflowId("automation-1", NOW, "main", "ai_two"),
+    ]);
+    expect(f.advances).toEqual([{ fired: true }]);
+  });
+
+  test("a non-instanced automation never touches the instance store", async () => {
+    const f = fanoutFixture({
+      open: [],
+      settings: { endSessionsOnFinish: false },
+    });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-a",
+      store: f.store,
+      instances: {
+        async listOpenInstances(): Promise<never[]> {
+          throw new Error("must not be called for a non-instanced automation");
+        },
+      },
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    expect(result).toMatchObject({ claimed: 1, started: 1 });
+    expect(f.advances).toEqual([{ fired: true }]);
+  });
+});
