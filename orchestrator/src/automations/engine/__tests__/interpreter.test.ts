@@ -38,7 +38,13 @@ interface Harness {
   actions: Array<{ actionId: string; stepPath: string; params: Record<string, unknown> }>;
   state: Map<string, { value: unknown; version: number; writer: string }>;
   closes: Array<{ instanceId: string; reason?: string }>;
-  claims: Array<{ automationId: string; handle: string; instanceId: string; writtenBy: string }>;
+  claims: Array<{
+    automationId: string;
+    handle: string;
+    instanceId: string;
+    writtenBy: string;
+    allowTakeoverFromClosed?: boolean;
+  }>;
 }
 
 function makeDefinition(
@@ -87,6 +93,8 @@ function makeHarness(
     instanceId?: string;
     /** Pre-owned handles for claim_handle conflict cases. */
     handleOwners?: Record<string, string>;
+    /** Instances the fake treats as CLOSED (claim takeover cases). */
+    closedInstanceIds?: string[];
     /** pr_ref lookups: "repo#number" -> the authoring session. */
     prRefs?: Record<
       string,
@@ -205,8 +213,14 @@ function makeHarness(
     structuredClone(options.bindings ?? {});
   const adopted: Array<{ runId: string; sessionId: string }> = [];
   const closes: Array<{ instanceId: string; reason?: string }> = [];
-  const closedInstances = new Set<string>();
-  const claims: Array<{ automationId: string; handle: string; instanceId: string; writtenBy: string }> = [];
+  const closedInstances = new Set<string>(options.closedInstanceIds ?? []);
+  const claims: Array<{
+    automationId: string;
+    handle: string;
+    instanceId: string;
+    writtenBy: string;
+    allowTakeoverFromClosed?: boolean;
+  }> = [];
   const handleOwners = new Map<string, string>(Object.entries(options.handleOwners ?? {}));
 
   const state = new Map<string, { value: unknown; version: number; writer: string }>(
@@ -292,9 +306,12 @@ function makeHarness(
         handleOwners.set(input.handle, input.instanceId);
         return { kind: "recorded" };
       }
-      return holder === input.instanceId
-        ? { kind: "already_ours" }
-        : { kind: "conflict", instanceId: holder };
+      if (holder === input.instanceId) return { kind: "already_ours" };
+      if (input.allowTakeoverFromClosed === true && closedInstances.has(holder)) {
+        handleOwners.set(input.handle, input.instanceId);
+        return { kind: "reclaimed", from: holder };
+      }
+      return { kind: "conflict", instanceId: holder };
     },
   };
   if (options.prRefs) {
@@ -1710,6 +1727,8 @@ describe("claim_handle block (ADR 0120)", () => {
         handle: "github:acme/repo#7",
         instanceId: "ai_one",
         writtenBy: `${RUN.runId}:claim`,
+        // The explicit claim is the one takeover-capable writer.
+        allowTakeoverFromClosed: true,
       },
     ]);
 
@@ -1721,6 +1740,27 @@ describe("claim_handle block (ADR 0120)", () => {
     const failed = await interpretAutomation(RUN, conflicted.deps);
     expect(failed.status).toBe("failed");
     expect(failed.error).toContain("handle_conflict");
+  });
+
+  test("a claim takes over a CLOSED holder's handle and reports reclaimed", async () => {
+    const definition = makeDefinition([
+      { id: "claim", type: "claim_handle", config: { handle: "slack:C0AB" } },
+    ]);
+    const h = makeHarness(definition, {
+      instanceId: "ai_next",
+      handleOwners: { "slack:C0AB": "ai_dead" },
+      closedInstanceIds: ["ai_dead"],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    const record = h.stepRecords.find(
+      (r) => r.framePath === "claim" && r.record.status === "succeeded",
+    );
+    expect(record?.record.outputs).toMatchObject({
+      claimed: true,
+      handle: "slack:C0AB",
+      reclaimed: true,
+    });
   });
 
   test("an unbound run cannot claim; slack handles stay exact", async () => {
