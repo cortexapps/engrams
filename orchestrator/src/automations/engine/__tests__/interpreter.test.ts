@@ -34,6 +34,7 @@ interface Harness {
   actions: Array<{ actionId: string; stepPath: string; params: Record<string, unknown> }>;
   state: Map<string, { value: unknown; version: number; writer: string }>;
   closes: Array<{ instanceId: string; reason?: string }>;
+  claims: Array<{ automationId: string; handle: string; instanceId: string; writtenBy: string }>;
 }
 
 function makeDefinition(
@@ -80,6 +81,8 @@ function makeHarness(
     >;
     /** ADR 0120: bind the run to a workstream (state auto-scopes). */
     instanceId?: string;
+    /** Pre-owned handles for claim_handle conflict cases. */
+    handleOwners?: Record<string, string>;
     /** pr_ref lookups: "repo#number" -> the authoring session. */
     prRefs?: Record<
       string,
@@ -197,6 +200,8 @@ function makeHarness(
   const adopted: Array<{ runId: string; sessionId: string }> = [];
   const closes: Array<{ instanceId: string; reason?: string }> = [];
   const closedInstances = new Set<string>();
+  const claims: Array<{ automationId: string; handle: string; instanceId: string; writtenBy: string }> = [];
+  const handleOwners = new Map<string, string>(Object.entries(options.handleOwners ?? {}));
 
   const state = new Map<string, { value: unknown; version: number; writer: string }>(
     Object.entries(options.stateEntries ?? {}),
@@ -268,6 +273,17 @@ function makeHarness(
       closedInstances.add(input.instanceId);
       return first;
     },
+    async recordInstanceHandle(input) {
+      claims.push(input);
+      const holder = handleOwners.get(input.handle);
+      if (holder === undefined) {
+        handleOwners.set(input.handle, input.instanceId);
+        return { kind: "recorded" };
+      }
+      return holder === input.instanceId
+        ? { kind: "already_ours" }
+        : { kind: "conflict", instanceId: holder };
+    },
   };
   if (options.prRefs) {
     const refs = options.prRefs;
@@ -277,7 +293,7 @@ function makeHarness(
       },
     };
   }
-  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, actions, state, adopted, closes };
+  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, actions, state, adopted, closes, claims };
 }
 
 const RUN = { runId: "autorun:auto-1:manual:x", automationId: "auto-1" };
@@ -1657,5 +1673,47 @@ describe("instance_close block (ADR 0120)", () => {
     const dryResult = await interpretAutomation(RUN, dry.deps);
     expect(dryResult.status).toBe("completed");
     expect(dry.closes).toEqual([]);
+  });
+});
+
+describe("claim_handle block (ADR 0120)", () => {
+  test("claims a rendered handle with provider case-folding; a foreign owner is a typed failure", async () => {
+    const definition = makeDefinition([
+      { id: "claim", type: "claim_handle", config: { handle: "github:${{ inputs.repo }}#7" } },
+    ]);
+    const h = makeHarness(definition, { instanceId: "ai_one", inputs: { repo: "Acme/Repo" } });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.claims).toEqual([
+      {
+        automationId: "auto-1",
+        handle: "github:acme/repo#7",
+        instanceId: "ai_one",
+        writtenBy: `${RUN.runId}:claim`,
+      },
+    ]);
+
+    const conflicted = makeHarness(definition, {
+      instanceId: "ai_one",
+      inputs: { repo: "Acme/Repo" },
+      handleOwners: { "github:acme/repo#7": "ai_other" },
+    });
+    const failed = await interpretAutomation(RUN, conflicted.deps);
+    expect(failed.status).toBe("failed");
+    expect(failed.error).toContain("handle_conflict");
+  });
+
+  test("an unbound run cannot claim; slack handles stay exact", async () => {
+    const definition = makeDefinition([
+      { id: "claim", type: "claim_handle", config: { handle: "slack:C0AB" } },
+    ]);
+    const unbound = makeHarness(definition, {});
+    const result = await interpretAutomation(RUN, unbound.deps);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("not_instanced");
+
+    const bound = makeHarness(definition, { instanceId: "ai_one" });
+    await interpretAutomation(RUN, bound.deps);
+    expect(bound.claims[0]?.handle).toBe("slack:C0AB");
   });
 });
