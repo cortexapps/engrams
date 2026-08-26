@@ -279,7 +279,7 @@ jobs:
           # env into BOTH binaries here as in docker/host-agent.Dockerfile,
           # so a host running from these binaries makes the same
           # adopt-vs-replace decision as the container fleet.
-          FP="$(python3 .github/scripts/egress-proxyd-fingerprint.py)"
+          FP="$(python3 docker/egress-proxyd-fingerprint.py)"
           echo "egress-proxyd fingerprint: $FP"
           ENGRAM_EGRESS_PROXYD_FINGERPRINT="$FP" cargo build \
             --target x86_64-unknown-linux-musl \

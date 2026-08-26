@@ -11,7 +11,7 @@ WORKDIR /src
 # make: #1003 — tikv-jemalloc-sys builds the vendored jemalloc with
 # configure + make; rust:slim ships a C compiler but no make.
 # python3: ADR 0121 — the egress-proxyd source fingerprint
-# (.github/scripts/egress-proxyd-fingerprint.py) runs over `cargo
+# (docker/egress-proxyd-fingerprint.py) runs over `cargo
 # metadata` before the build (builder stage only).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates protobuf-compiler clang libclang-dev make python3 \
@@ -26,7 +26,7 @@ COPY . .
 # deploy and defeats the design).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    FP="$(python3 .github/scripts/egress-proxyd-fingerprint.py)" \
+    FP="$(python3 docker/egress-proxyd-fingerprint.py)" \
     && echo "egress-proxyd fingerprint: $FP" \
     && ENGRAM_EGRESS_PROXYD_FINGERPRINT="$FP" \
        cargo build --release -p engram-host-agent -p engram-uffd-handler -p engram-egress-proxyd \
