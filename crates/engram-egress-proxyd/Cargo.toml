@@ -9,6 +9,10 @@ description = "ADR 0121: the node-local egress daemon. Owns the ADR 0006 proxy l
 [lints]
 workspace = true
 
+[lib]
+name = "engram_egress_proxyd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "engram-egress-proxyd"
 path = "src/main.rs"

@@ -19,6 +19,10 @@ pub(crate) struct ControlState {
     pub registry: Arc<Registry>,
     pub gateway: Arc<GuestGatewayRegistry>,
     pub hello: HelloInfo,
+    /// Flipped by the `Shutdown` op; [`crate::run`] selects on it and
+    /// returns 0. A signal, not `process::exit`, so the in-process
+    /// test harness can run a daemon without arming a process kill.
+    pub shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 /// Accept loop. Accept errors are logged and retried — the control
@@ -81,7 +85,8 @@ async fn serve_conn(
             ToProxyd::Shutdown => {
                 tracing::info!("shutdown requested over control socket; exiting");
                 let _ = engram_egress_proto::write_frame(&mut stream, &FromProxyd::Ok).await;
-                std::process::exit(0);
+                let _ = state.shutdown.send(true);
+                return Ok(());
             }
         };
         engram_egress_proto::write_frame(&mut stream, &reply).await?;
@@ -347,6 +352,7 @@ mod tests {
         ControlState {
             registry: Arc::new(Registry::new()),
             gateway: Arc::new(GuestGatewayRegistry::default()),
+            shutdown: tokio::sync::watch::channel(false).0,
             hello: HelloInfo {
                 proto_version: engram_egress_proto::PROTO_VERSION,
                 source_fingerprint: None,
