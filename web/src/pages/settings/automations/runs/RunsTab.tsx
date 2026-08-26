@@ -4,6 +4,7 @@ import { ChevronRightIcon } from "lucide-react";
 
 import type { AutomationRunBrief, FilteredWindow } from "@/gen/engram/app/v1/automation_pb";
 import { useRunList } from "@/hooks/useAutomationRuns";
+import { useInstanceList } from "@/hooks/useInstances";
 import { relativeTime } from "@/pages/sessions/session-format";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -83,7 +84,18 @@ function WindowRow({ window, now }: { window: FilteredWindow; now: number }) {
   );
 }
 
-function RunRow({ run, now }: { run: AutomationRunBrief; now: number }) {
+function RunRow({
+  run,
+  now,
+  workstreamLabel,
+}: {
+  run: AutomationRunBrief;
+  now: number;
+  /** ADR 0120: the owning workstream's rendered key ("" hides the chip —
+   * either an unbound run, or the per-workstream list where it is
+   * redundant). */
+  workstreamLabel?: string;
+}) {
   return (
     <li>
       <Link
@@ -97,6 +109,14 @@ function RunRow({ run, now }: { run: AutomationRunBrief; now: number }) {
         <span className="min-w-0 flex-1 truncate text-muted-foreground">
           {triggerSourceLabel(run.triggerSource, run.eventKey)}
           {run.dryRun && <span className="ml-2 rounded bg-secondary px-1.5 text-xs">dry run</span>}
+          {workstreamLabel !== undefined && workstreamLabel !== "" && (
+            <span
+              className="ml-2 rounded bg-secondary px-1.5 text-xs"
+              data-testid="run-workstream-chip"
+            >
+              {workstreamLabel}
+            </span>
+          )}
         </span>
         <span className="w-20 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
           {formatDuration(run.startedAt, run.endedAt, now)}
@@ -109,12 +129,51 @@ function RunRow({ run, now }: { run: AutomationRunBrief; now: number }) {
   );
 }
 
+/** The bare run list — reused by the Runs tab and by a workstream's
+ * detail panel (which passes `instanceId` and hides the redundant chip). */
+export function RunList({
+  automationId,
+  instanceId,
+  now = Date.now,
+}: {
+  automationId: string;
+  instanceId?: string;
+  now?: () => number;
+}) {
+  const runs = useRunList(automationId, {
+    includeFiltered: true,
+    ...(instanceId !== undefined ? { instanceId } : {}),
+  });
+  const tick = now();
+  if (!runs.data) return null;
+  if (runs.data.runs.length === 0) {
+    return <p className="text-muted-foreground text-xs">No runs yet.</p>;
+  }
+  return (
+    <ul className="flex flex-col gap-1" data-testid="workstream-runs">
+      {runs.data.runs.map((run) => (
+        <RunRow key={run.id} run={run} now={tick} />
+      ))}
+    </ul>
+  );
+}
+
 export function RunsTab({ automationId, now = Date.now }: RunsTabProps) {
   const [includeFiltered, setIncludeFiltered] = useState(false);
   const runs = useRunList(automationId, { includeFiltered });
   const tick = now();
 
   const rows = interleaveRuns(runs.data?.runs ?? [], runs.data?.filtered ?? []);
+  // ADR 0120: label instance-bound runs by their workstream's rendered key.
+  // The list is only fetched once a bound run is actually visible.
+  const anyBound = (runs.data?.runs ?? []).some((run) => run.instanceId !== "");
+  const instances = useInstanceList(automationId, {
+    includeClosed: true,
+    enabled: anyBound,
+  });
+  const keyById = new Map(
+    (instances.data?.instances ?? []).map((instance) => [instance.id, instance.key]),
+  );
 
   return (
     <section className="flex flex-col gap-3" aria-label="Runs">
@@ -139,7 +198,16 @@ export function RunsTab({ automationId, now = Date.now }: RunsTabProps) {
       <ul className="flex flex-col gap-1">
         {rows.map((row) =>
           row.kind === "run" ? (
-            <RunRow key={row.run.id} run={row.run} now={tick} />
+            <RunRow
+              key={row.run.id}
+              run={row.run}
+              now={tick}
+              workstreamLabel={
+                row.run.instanceId !== ""
+                  ? (keyById.get(row.run.instanceId) ?? row.run.instanceId)
+                  : ""
+              }
+            />
           ) : (
             <WindowRow
               key={`window:${row.window.beforeRunId}:${row.window.firstAt}`}

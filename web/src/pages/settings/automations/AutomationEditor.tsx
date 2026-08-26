@@ -54,10 +54,12 @@ import { BuildTab } from "./build/BuildTab";
 import { EntrypointBar } from "./build/EntrypointBar";
 import { DraftRail } from "./DraftRail";
 import { TestPanel } from "./build/test/TestPanel";
+import { parseInputsJson, parseInputsSchema } from "@/lib/automation-inputs";
 import { InputsTab } from "./inputs/InputsTab";
+import { WorkstreamsTab } from "./instances/WorkstreamsTab";
 import { DryRunButton } from "./build/DryRunButton";
 
-export const EDITOR_TABS = ["build", "inputs", "runs", "settings"] as const;
+export const EDITOR_TABS = ["build", "inputs", "workstreams", "runs", "settings"] as const;
 export type EditorTab = (typeof EDITOR_TABS)[number];
 
 export function isEditorTab(value: unknown): value is EditorTab {
@@ -254,12 +256,19 @@ export function AutomationEditor({
           inputsJson: "{}",
         });
         toast.success("Automation created");
-        void navigate({ to: "/settings/automations/$id", params: { id: created.automation!.id } });
+        void navigate({
+          to: "/settings/automations/$id",
+          params: { id: created.automation!.id },
+        });
         return;
       }
       if (!automation) return;
       if (name.trim() !== automation.name || description !== automation.description) {
-        await updateMeta.mutateAsync({ id: automation.id, name: name.trim(), description });
+        await updateMeta.mutateAsync({
+          id: automation.id,
+          name: name.trim(),
+          description,
+        });
       }
       if (builtin) {
         // Only changed tunable fields travel; the structure never does.
@@ -285,7 +294,10 @@ export function AutomationEditor({
     try {
       const copy = await duplicate.mutateAsync({ automationId: automation.id });
       toast.success("Duplicated — the copy is fully editable");
-      void navigate({ to: "/settings/automations/$id", params: { id: copy.automation!.id } });
+      void navigate({
+        to: "/settings/automations/$id",
+        params: { id: copy.automation!.id },
+      });
     } catch (error) {
       fail(error);
     }
@@ -454,6 +466,11 @@ export function AutomationEditor({
             <TabsTrigger value="inputs" disabled={mode === "create"}>
               Inputs
             </TabsTrigger>
+            {draft.settings.instance !== undefined && (
+              <TabsTrigger value="workstreams" disabled={mode === "create"}>
+                Workstreams
+              </TabsTrigger>
+            )}
             <TabsTrigger value="runs" disabled={mode === "create"}>
               Runs
             </TabsTrigger>
@@ -485,6 +502,15 @@ export function AutomationEditor({
           <TabsContent value="inputs" className="pt-4">
             {inputsTab ?? <InputsTab automationId={id} />}
           </TabsContent>
+          {draft.settings.instance !== undefined && id !== undefined && (
+            <TabsContent value="workstreams" className="pt-4">
+              <WorkstreamsTab
+                automationId={id}
+                inputsSchema={parseInputsSchema(draft.inputsSchema)}
+                defaultInputs={parseInputsJson(automation?.inputsJson)}
+              />
+            </TabsContent>
+          )}
           <TabsContent value="runs" className="pt-4">
             {runsTab ?? <Placeholder item="3.7 (Runs)" />}
           </TabsContent>

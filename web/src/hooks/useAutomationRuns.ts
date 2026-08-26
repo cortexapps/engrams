@@ -12,6 +12,8 @@ import { isActiveRunStatus } from "@/pages/settings/automations/runs/run-format"
 export interface RunListOptions {
   includeFiltered?: boolean;
   limit?: number;
+  /** ADR 0120: only runs bound to this workstream. */
+  instanceId?: string;
 }
 
 /** The run list for one automation (ADR 0119 phase 3.7). Named apart from the
@@ -24,6 +26,7 @@ export function useRunList(automationId: string | undefined, options: RunListOpt
       automationId: automationId ?? "",
       limit: options.limit ?? 50,
       includeFiltered: options.includeFiltered ?? false,
+      ...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
     },
     { enabled: !!automationId, staleTime: 5_000 },
   );
@@ -51,10 +54,16 @@ function useInvalidateRuns() {
   return () =>
     Promise.all([
       queryClient.invalidateQueries({
-        queryKey: createConnectQueryKey({ schema: listRuns, cardinality: "finite" }),
+        queryKey: createConnectQueryKey({
+          schema: listRuns,
+          cardinality: "finite",
+        }),
       }),
       queryClient.invalidateQueries({
-        queryKey: createConnectQueryKey({ schema: getRun, cardinality: "finite" }),
+        queryKey: createConnectQueryKey({
+          schema: getRun,
+          cardinality: "finite",
+        }),
       }),
     ]);
 }
