@@ -358,3 +358,170 @@ describe("automation cron scheduler", () => {
     expect(skip.advances).toEqual([{ fired: true, scheduledFor: NOW }]);
   });
 });
+
+describe("cron fan-out over open workstreams (ADR 0120)", () => {
+  function fanoutFixture(input: {
+    open: string[];
+    settings?: AutomationDefinition["settings"];
+    /** Rows already claimed with a LIVE lease held by another pod. */
+    leaseHeld?: string[];
+  }) {
+    const settings = input.settings ?? {
+      endSessionsOnFinish: false,
+      instance: { keyTemplate: "k" },
+    };
+    let automation = dueAutomation(NOW, settings);
+    const runs = new Map<string, AutomationRunRow>();
+    for (const instanceId of input.leaseHeld ?? []) {
+      const id = automationCronWorkflowId("automation-1", NOW, "main", instanceId);
+      runs.set(id, pendingRun(NOW, {
+        id,
+        instanceId,
+        leaseOwner: "other-pod",
+        leaseExpiresAt: new Date(NOW.getTime() + 60_000),
+      }));
+    }
+    const advances: Array<{ fired: boolean }> = [];
+    const store: AutomationCronStore = {
+      async listDueCron(now) {
+        return automation.nextFireAt <= now ? [automation] : [];
+      },
+      async claimCronOccurrence(claim) {
+        const existing = runs.get(claim.runId);
+        if (existing) {
+          if (existing.status !== "pending") return { kind: "terminal", run: existing };
+          if (existing.leaseExpiresAt !== null && existing.leaseExpiresAt > claim.now) return null;
+          return { kind: "claimed", run: existing };
+        }
+        const run = pendingRun(claim.scheduledFor, {
+          id: claim.runId,
+          instanceId: claim.instanceId ?? "",
+          leaseOwner: claim.leaseOwner,
+          leaseExpiresAt: claim.leaseExpiresAt,
+        });
+        runs.set(claim.runId, run);
+        return { kind: "claimed", run };
+      },
+      async markRunSkipped() {},
+      async settleRunConcurrency() {},
+      async claimConcurrency() {
+        return { claimed: true };
+      },
+      async getConcurrencyHolder() {
+        return null;
+      },
+      async casConcurrency() {
+        return true;
+      },
+      async advanceCronSchedule(advance) {
+        if (automation.nextFireAt.getTime() !== advance.scheduledFor.getTime()) return false;
+        advances.push({ fired: advance.fired });
+        automation = { ...automation, nextFireAt: advance.nextFireAt };
+        return true;
+      },
+    };
+    const instances = {
+      async listOpenInstances() {
+        return input.open.map((id) => ({
+          id,
+          automationId: "automation-1",
+          key: `key-${id}`,
+          status: "open" as const,
+          inputs: {},
+          openedBy: "",
+          openedAt: NOW,
+          closedAt: null,
+          closeReason: null,
+        }));
+      },
+    };
+    return { store, instances, advances, runs };
+  }
+
+  test("one tick claims one occurrence per open workstream and advances ONCE", async () => {
+    const f = fanoutFixture({ open: ["ai_one", "ai_two", "ai_three"] });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-a",
+      store: f.store,
+      instances: f.instances,
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    expect(result).toMatchObject({ due: 1, claimed: 3, started: 3, errors: 0 });
+    expect(starter.starts.map((s) => s.workflowId)).toEqual([
+      automationCronWorkflowId("automation-1", NOW, "main", "ai_one"),
+      automationCronWorkflowId("automation-1", NOW, "main", "ai_two"),
+      automationCronWorkflowId("automation-1", NOW, "main", "ai_three"),
+    ]);
+    expect([...f.runs.values()].map((r) => r.instanceId).sort()).toEqual([
+      "ai_one",
+      "ai_three",
+      "ai_two",
+    ]);
+    expect(f.advances).toEqual([{ fired: true }]);
+  });
+
+  test("zero open workstreams is a quiet tick: no rows, schedule advances unfired", async () => {
+    const f = fanoutFixture({ open: [] });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-a",
+      store: f.store,
+      instances: f.instances,
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    expect(result).toMatchObject({ claimed: 0, started: 0 });
+    expect(f.runs.size).toBe(0);
+    expect(f.advances).toEqual([{ fired: false }]);
+  });
+
+  test("rows lease-held by another pod are left alone; the holder advances", async () => {
+    const f = fanoutFixture({ open: ["ai_one", "ai_two"], leaseHeld: ["ai_one", "ai_two"] });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-b",
+      store: f.store,
+      instances: f.instances,
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    expect(result).toMatchObject({ claimed: 0, started: 0 });
+    expect(f.advances).toEqual([]);
+
+    // Mixed: one sibling held, one free — this pod runs the free one and
+    // advances for the automation.
+    const g = fanoutFixture({ open: ["ai_one", "ai_two"], leaseHeld: ["ai_one"] });
+    const result2 = await runSchedulerTick({
+      owner: "pod-b",
+      store: g.store,
+      instances: g.instances,
+      workflowStarter: recordingStarter(),
+      now: () => NOW,
+    });
+    expect(result2).toMatchObject({ claimed: 1, started: 1 });
+    expect(g.advances).toEqual([{ fired: true }]);
+  });
+
+  test("a non-instanced automation never touches the instance store", async () => {
+    const f = fanoutFixture({
+      open: [],
+      settings: { endSessionsOnFinish: false },
+    });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-a",
+      store: f.store,
+      instances: {
+        async listOpenInstances(): Promise<never[]> {
+          throw new Error("must not be called for a non-instanced automation");
+        },
+      },
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    expect(result).toMatchObject({ claimed: 1, started: 1 });
+    expect(f.advances).toEqual([{ fired: true }]);
+  });
+});

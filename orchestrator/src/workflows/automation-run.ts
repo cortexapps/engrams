@@ -47,6 +47,7 @@ import { makeCodeBlockRuntime } from "../automations/code/runtime.ts";
 import { makeAutomationStateStore } from "../db/automation-state.ts";
 import { makePrRefStore } from "../db/pr-refs.ts";
 import { makeIntegrationActionRuntime } from "../automations/actions/runtime.ts";
+import { makeAutomationInstanceStore } from "../db/automation-instances.ts";
 
 export interface AutomationRunWorkflowInput {
   runId: string;
@@ -281,6 +282,9 @@ function productionEngineDeps(): EngineDeps {
       },
     },
     integrationActions: makeIntegrationActionRuntime(),
+    instances: {
+      closeInstance: (input) => makeAutomationInstanceStore().closeInstance(input),
+    },
     async startQueuedRun(runId) {
       const run = await store.getRun(runId);
       if (!run) return;

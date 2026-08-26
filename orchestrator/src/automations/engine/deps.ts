@@ -211,6 +211,12 @@ export interface EngineStateStore {
   ): Promise<{ entries: EngineStateEntry[]; truncated: boolean }>;
 }
 
+/** ADR 0120: the one instance operation a run may perform on ITSELF
+ * (instance_close). Implemented over the instance store. */
+export interface EngineInstanceOps {
+  closeInstance(input: { instanceId: string; reason?: string }): Promise<boolean>;
+}
+
 /** PR → authoring-session lookup (the pr_ref ledger the link consumer
  * maintains). Read-only; the `lookup_pr_session` block's seam. */
 export interface EnginePrRefLookup {
@@ -234,6 +240,8 @@ export interface EngineDeps {
    * double-start it (DBOS start on an existing id is a no-op). */
   startQueuedRun?(runId: string): Promise<void>;
   state?: EngineStateStore;
+  /** ADR 0120: instance_close's seam. */
+  instances?: EngineInstanceOps;
   prRefs?: EnginePrRefLookup;
   code?: CodeBlockRuntime;
   integrationActions?: IntegrationActionRuntime;

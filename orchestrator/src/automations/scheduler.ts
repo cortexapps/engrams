@@ -5,6 +5,8 @@ import { Cron } from "croner";
 import { hostname } from "node:os";
 
 import { makeAutomationStore, type AutomationCronStore, type DueCronAutomation } from "../db/automations.ts";
+import type { AutomationInstanceStore } from "../db/automation-instances.ts";
+import { defaultInstanceStoreLazy } from "./dispatch.ts";
 import { makeIntegrationEventStore } from "../db/integration-events.ts";
 import { log as rootLog } from "../log.ts";
 import { automationRunWorkflow, type AutomationRunWorkflowInput } from "../workflows/automation-run.ts";
@@ -27,6 +29,8 @@ export interface AutomationSchedulerTickDeps {
   workflowStarter: AutomationWorkflowStarter;
   /** Mailbox sender for join/supersede policies; defaults to DBOS. */
   sender?: AutomationSender;
+  /** ADR 0120: the fan-out enumeration for instanced automations. */
+  instances?: Pick<AutomationInstanceStore, "listOpenInstances">;
   now: () => Date;
   onError?: (automation: DueCronAutomation, error: unknown) => void;
 }
@@ -46,9 +50,15 @@ export function automationCronWorkflowId(
   automationId: string,
   scheduledFor: Date,
   entrypointId?: string,
+  instanceId = "",
 ): string {
-  return automationRunId(automationId, cronDeliveryKey(scheduledFor), entrypointId);
+  return automationRunId(automationId, cronDeliveryKey(scheduledFor), entrypointId, instanceId);
 }
+
+/** ADR 0120: how many open workstreams one cron tick fans out to, per
+ * automation. Above the cap the oldest LIMIT run and a warning names the
+ * rest (no silent truncation). */
+export const CRON_FANOUT_MAX_INSTANCES = 500;
 
 export function nextCronOccurrence(
   automation: Pick<DueCronAutomation, "trigger">,
@@ -86,94 +96,129 @@ export async function runSchedulerTick(
     errors: 0,
   };
 
+  const instances = deps.instances ?? defaultInstanceStoreLazy();
+
+  /** Claim + admit + start ONE occurrence row (per instance for an
+   * instanced automation; the classic single row otherwise). Returns
+   * whether the occurrence FIRED (anything but a filtered/missed row) —
+   * the advance-once aggregation reads it. */
+  async function processOccurrence(
+    dueAutomation: DueCronAutomation,
+    scheduledFor: Date,
+    instanceId: string,
+  ): Promise<boolean | null> {
+    const automation = dueAutomation.automation;
+    const workflowId = automationCronWorkflowId(
+      automation.id,
+      scheduledFor,
+      dueAutomation.entrypointId,
+      instanceId,
+    );
+    const claim = await deps.store.claimCronOccurrence({
+      runId: workflowId,
+      automationId: automation.id,
+      version: automation.currentVersion,
+      entrypointId: dueAutomation.entrypointId,
+      ...(instanceId !== "" ? { instanceId } : {}),
+      scheduledFor,
+      leaseOwner: deps.owner,
+      leaseExpiresAt: new Date(now.getTime() + AUTOMATION_LEASE_TTL_MS),
+      now,
+    });
+    // Another pod holds a live lease on this row: IT advances the schedule.
+    if (claim === null) return null;
+    if (claim.kind === "claimed") result.claimed++;
+
+    const workflowInput: AutomationRunWorkflowInput = {
+      runId: claim.run.id,
+      automationId: automation.id,
+    };
+
+    if (claim.kind === "terminal") {
+      if (claim.run.status !== "filtered") {
+        // This is the start-before-advance crash window. Starting the same
+        // terminal DBOS id is a no-op and never creates a successor epoch.
+        await deps.workflowStarter.start(workflowInput, claim.run.id);
+        result.started++;
+        return true;
+      }
+      return false;
+    }
+
+    const latenessMs = now.getTime() - scheduledFor.getTime();
+    if (latenessMs > AUTOMATION_MISSED_FIRE_GRACE_MS) {
+      await deps.store.markRunSkipped(
+        claim.run.id,
+        `cron occurrence missed by ${latenessMs}ms (grace ${AUTOMATION_MISSED_FIRE_GRACE_MS}ms)`,
+      );
+      result.skipped++;
+      return false;
+    }
+
+    // Concurrency admission on the claimed row (debt ledger 3.1). A
+    // settled/queued occurrence still fired: the occurrence happened, the
+    // policy decided what to do with it.
+    const admission = await admitClaimedCronRun(
+      { target: { automation, definition: dueAutomation.definition }, run: claim.run, trigger: claim.run.trigger },
+      { store: deps.store, sender, now: deps.now },
+    );
+    if (admission !== "started") {
+      result.admitted[admission]++;
+      return true;
+    }
+
+    await deps.workflowStarter.start(workflowInput, claim.run.id);
+    result.started++;
+    return true;
+  }
+
   for (const dueAutomation of due) {
     const automation = dueAutomation.automation;
     try {
       const scheduledFor = dueAutomation.nextFireAt;
-      const workflowId = automationCronWorkflowId(
-        automation.id,
-        scheduledFor,
-        dueAutomation.entrypointId,
-      );
-      const claim = await deps.store.claimCronOccurrence({
-        runId: workflowId,
-        automationId: automation.id,
-        version: automation.currentVersion,
-        entrypointId: dueAutomation.entrypointId,
-        scheduledFor,
-        leaseOwner: deps.owner,
-        leaseExpiresAt: new Date(now.getTime() + AUTOMATION_LEASE_TTL_MS),
-        now,
-      });
-      if (claim === null) continue;
-      if (claim.kind === "claimed") result.claimed++;
-
       const nextFireAt = nextCronOccurrence(dueAutomation, now);
-      const workflowInput: AutomationRunWorkflowInput = {
-        runId: claim.run.id,
-        automationId: automation.id,
-      };
 
-      if (claim.kind === "terminal") {
-        if (claim.run.status !== "filtered") {
-          // This is the start-before-advance crash window. Starting the same
-          // terminal DBOS id is a no-op and never creates a successor epoch.
-          await deps.workflowStarter.start(workflowInput, claim.run.id);
-          result.started++;
-        }
-        await deps.store.advanceCronSchedule({
-          automationId: automation.id,
-          scheduledFor,
-          nextFireAt,
-          fired: claim.run.status !== "filtered",
-          now,
-        });
-        continue;
-      }
-
-      const latenessMs = now.getTime() - scheduledFor.getTime();
-      if (latenessMs > AUTOMATION_MISSED_FIRE_GRACE_MS) {
-        await deps.store.markRunSkipped(
-          claim.run.id,
-          `cron occurrence missed by ${latenessMs}ms (grace ${AUTOMATION_MISSED_FIRE_GRACE_MS}ms)`,
+      // ADR 0120 fan-out: an instanced automation admits ONE occurrence per
+      // OPEN workstream (each with its own durable workflow id, occurrence
+      // row, and instance-scoped run); 0 open workstreams = a quiet tick.
+      // The schedule advances ONCE after the loop — a mid-loop crash leaves
+      // next_fire_at unchanged, and every already-claimed sibling
+      // reconverges idempotently on the retry tick. A workstream closed
+      // between list and claim still runs (admitted while open; runs never
+      // re-check).
+      let fired = false;
+      let handledAny = false;
+      if (dueAutomation.definition.settings.instance !== undefined) {
+        const open = await instances.listOpenInstances(
+          automation.id,
+          CRON_FANOUT_MAX_INSTANCES,
         );
-        await deps.store.advanceCronSchedule({
-          automationId: automation.id,
-          scheduledFor,
-          nextFireAt,
-          fired: false,
-          now,
-        });
-        result.skipped++;
-        continue;
+        if (open.length === CRON_FANOUT_MAX_INSTANCES) {
+          log.warn(
+            { automationId: automation.id, cap: CRON_FANOUT_MAX_INSTANCES },
+            "cron fan-out hit the open-workstream cap; older workstreams ran, newer ones did not",
+          );
+        }
+        for (const instance of open) {
+          const outcome = await processOccurrence(dueAutomation, scheduledFor, instance.id);
+          if (outcome !== null) handledAny = true;
+          if (outcome === true) fired = true;
+        }
+        // 0 open workstreams: a quiet tick this pod still advances.
+        if (open.length === 0) handledAny = true;
+      } else {
+        const outcome = await processOccurrence(dueAutomation, scheduledFor, "");
+        if (outcome !== null) handledAny = true;
+        if (outcome === true) fired = true;
       }
+      // Every row is lease-held by other pods: the holder advances.
+      if (!handledAny) continue;
 
-      // Concurrency admission on the claimed row (debt ledger 3.1). A
-      // settled/queued occurrence still advances the schedule: the
-      // occurrence happened, the policy decided what to do with it.
-      const admission = await admitClaimedCronRun(
-        { target: { automation, definition: dueAutomation.definition }, run: claim.run, trigger: claim.run.trigger },
-        { store: deps.store, sender, now: deps.now },
-      );
-      if (admission !== "started") {
-        result.admitted[admission]++;
-        await deps.store.advanceCronSchedule({
-          automationId: automation.id,
-          scheduledFor,
-          nextFireAt,
-          fired: true,
-          now,
-        });
-        continue;
-      }
-
-      await deps.workflowStarter.start(workflowInput, claim.run.id);
-      result.started++;
       await deps.store.advanceCronSchedule({
         automationId: automation.id,
         scheduledFor,
         nextFireAt,
-        fired: true,
+        fired,
         now,
       });
     } catch (error) {

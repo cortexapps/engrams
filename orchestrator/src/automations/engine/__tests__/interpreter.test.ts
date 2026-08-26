@@ -33,6 +33,7 @@ interface Harness {
   adopted: Array<{ runId: string; sessionId: string }>;
   actions: Array<{ actionId: string; stepPath: string; params: Record<string, unknown> }>;
   state: Map<string, { value: unknown; version: number; writer: string }>;
+  closes: Array<{ instanceId: string; reason?: string }>;
 }
 
 function makeDefinition(
@@ -194,6 +195,8 @@ function makeHarness(
   > =
     structuredClone(options.bindings ?? {});
   const adopted: Array<{ runId: string; sessionId: string }> = [];
+  const closes: Array<{ instanceId: string; reason?: string }> = [];
+  const closedInstances = new Set<string>();
 
   const state = new Map<string, { value: unknown; version: number; writer: string }>(
     Object.entries(options.stateEntries ?? {}),
@@ -258,6 +261,14 @@ function makeHarness(
   };
 
   if (!options.noStateStore) deps.state = fakeState;
+  deps.instances = {
+    async closeInstance(input) {
+      closes.push(input);
+      const first = !closedInstances.has(input.instanceId);
+      closedInstances.add(input.instanceId);
+      return first;
+    },
+  };
   if (options.prRefs) {
     const refs = options.prRefs;
     deps.prRefs = {
@@ -266,7 +277,7 @@ function makeHarness(
       },
     };
   }
-  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, actions, state, adopted };
+  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, actions, state, adopted, closes };
 }
 
 const RUN = { runId: "autorun:auto-1:manual:x", automationId: "auto-1" };
@@ -1610,5 +1621,41 @@ describe("instance-scoped state (ADR 0120)", () => {
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("failed");
     expect(result.error).toContain("not bound to this automation");
+  });
+});
+
+describe("instance_close block (ADR 0120)", () => {
+  test("closes the run's own workstream with the rendered reason; a second close is still ok", async () => {
+    const definition = makeDefinition([
+      { id: "done", type: "instance_close", config: { reason: "shipped ${{ inputs.name }}" } },
+      { id: "again", type: "instance_close", config: {} },
+    ]);
+    const h = makeHarness(definition, { instanceId: "ai_one", inputs: { name: "v1" } });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.closes).toEqual([
+      { instanceId: "ai_one", reason: "shipped v1" },
+      { instanceId: "ai_one" },
+    ]);
+    const outputs = Object.fromEntries(h.stepRecords.map((r) => [r.framePath, r.record.outputs ?? {}]));
+    expect(outputs["done"]).toMatchObject({ closed: true });
+    expect(outputs["again"]).toMatchObject({ closed: false });
+  });
+
+  test("a non-instanced run no-ops instead of failing; a dry run never closes", async () => {
+    const definition = makeDefinition([
+      { id: "done", type: "instance_close", config: {} },
+    ]);
+    const h = makeHarness(definition, {});
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.closes).toEqual([]);
+    const outputs = Object.fromEntries(h.stepRecords.map((r) => [r.framePath, r.record.outputs ?? {}]));
+    expect(outputs["done"]).toMatchObject({ closed: false, not_instanced: true });
+
+    const dry = makeHarness(definition, { instanceId: "ai_one", dryRun: true });
+    const dryResult = await interpretAutomation(RUN, dry.deps);
+    expect(dryResult.status).toBe("completed");
+    expect(dry.closes).toEqual([]);
   });
 });
