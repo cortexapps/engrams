@@ -941,6 +941,121 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
     expect(h2.starts.map((s) => s.automationId)).toEqual(["brain-1"]);
   });
 
+  test("rung 2 channel binding: top-level messages route to the channel's workstream; threads beat the channel; a closed thread never falls through", async () => {
+    const slackTrigger = trigger({ provider: "slack", eventKeys: ["message"] });
+    const brain = {
+      automation: meta({ id: "brain-1", builtinKey: "slack_brain", kind: "builtin" }),
+      definition: definition(slackTrigger),
+    };
+    const custom = {
+      automation: meta({ id: "custom-1" }),
+      definition: definition(slackTrigger, {
+        settings: {
+          endSessionsOnFinish: false,
+          instance: {
+            keyTemplate: "chan-${{ event.raw.event.channel }}",
+            entrypoints: { main: { admit: "handle_match" as const } },
+          },
+        },
+      }),
+    };
+    // The real manifest shape: thread template FIRST, channel second —
+    // declaration order is the whole precedence story.
+    const slackFacet = {
+      events: [
+        {
+          key: "message",
+          label: "Message",
+          handleCandidates: [
+            {
+              parts: [
+                { lit: "slack:" },
+                { path: "event.channel" },
+                { lit: ":" },
+                { path: "event.thread_ts" },
+              ],
+            },
+            { parts: [{ lit: "slack:" }, { path: "event.channel" }] },
+          ],
+        },
+      ],
+    };
+    const i = fakeInstances();
+    const channelOwner = i.seed({ automationId: "custom-1", key: "chan-C1" });
+    i.bindHandle("custom-1", "slack:C1", channelOwner.id);
+
+    // A TOP-LEVEL message (no thread_ts) routes by the channel handle and
+    // stands the brain down channel-wide — previously it produced zero
+    // candidates and fell to the brain.
+    const h = makeHarness([brain, custom]);
+    const topLevel = await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "message",
+        payload: { event: { channel: "C1" } },
+      }),
+      { ...deps(h), instances: i.store, facets: async () => slackFacet },
+    );
+    expect(topLevel).toMatchObject({ started: 1, suppressed: ["slack_brain"] });
+    expect(h.starts.map((s) => s.automationId)).toEqual(["custom-1"]);
+    const started = [...h.runs.values()][0]!;
+    expect(started.instanceId).toBe(channelOwner.id);
+
+    // A thread owned by ANOTHER workstream wins over the channel owner:
+    // the thread template is declared first.
+    const threadOwner = i.seed({ automationId: "custom-1", key: "thread-1724.100" });
+    i.bindHandle("custom-1", "slack:C1:1724.100", threadOwner.id);
+    const h2 = makeHarness([brain, custom]);
+    await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "message",
+        deliveryId: "slack-thread",
+        payload: { event: { channel: "C1", thread_ts: "1724.100" } },
+      }),
+      { ...deps(h2), instances: i.store, facets: async () => slackFacet },
+    );
+    expect([...h2.runs.values()][0]!.instanceId).toBe(threadOwner.id);
+
+    // A CLOSED thread hit is skipped, not terminal: the reply falls through
+    // to the open channel owner — it is just channel traffic now — and the
+    // brain stays suppressed in owned territory. Only when EVERY matching
+    // candidate is closed does the event drop.
+    await i.store.closeInstance({ instanceId: threadOwner.id });
+    const h3 = makeHarness([brain, custom]);
+    const closedThread = await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "message",
+        deliveryId: "slack-closed-thread",
+        payload: { event: { channel: "C1", thread_ts: "1724.100" } },
+      }),
+      { ...deps(h3), instances: i.store, facets: async () => slackFacet },
+    );
+    expect(closedThread).toMatchObject({ started: 1, dropped: 0, suppressed: ["slack_brain"] });
+    expect([...h3.runs.values()][0]!.instanceId).toBe(channelOwner.id);
+
+    // Every matching candidate closed (channel owner closes too): drop,
+    // audited against the most specific candidate.
+    await i.store.closeInstance({ instanceId: channelOwner.id });
+    const h4 = makeHarness([brain, custom]);
+    const allClosed = await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "message",
+        deliveryId: "slack-all-closed",
+        payload: { event: { channel: "C1", thread_ts: "1724.100" } },
+      }),
+      { ...deps(h4), instances: i.store, facets: async () => slackFacet },
+    );
+    expect(allClosed).toMatchObject({ started: 1, dropped: 1, suppressed: [] });
+    expect(allClosed.builtins).toEqual({ slack_brain: "started" });
+    expect(i.drops.at(-1)).toMatchObject({
+      reason: "closed_instance",
+      detail: "slack:C1:1724.100",
+    });
+  });
+
   test("builtinSuppressed reads the suppression list", async () => {
     const { builtinSuppressed } = await import("../dispatch.ts");
     const base = {
