@@ -22,6 +22,7 @@ import type {
 import { makeUserSecretStore } from "../db/user-secrets.ts";
 import { makeUserIdentityStore } from "../db/users.ts";
 import {
+  automationSession as automationSessionTable,
   coordinationOperation,
   sessionListener as sessionListenerTable,
   task,
@@ -621,6 +622,32 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
               }),
             })
             .onConflictDoNothing();
+          // ADR 0120: the automation binding FOLLOWS spawned children. When
+          // the spawning session is automation-owned, the child binds to the
+          // SAME run — so it lives in the same workstream: the pr-link
+          // consumer writes its PRs as workstream handles, adoption can
+          // deliver review feedback to it, and session_status can probe it.
+          // Without this row a spawned child is invisible to the automation
+          // model (the Tenant Inspector ENG-408 gap: tenant-inspector#300
+          // bound no handle and adoption classified the author "foreign").
+          // keep: true — the child's lifecycle belongs to its own task, not
+          // to whichever run's finalize fires next.
+          const spawnerBinding = await tx
+            .select({ runId: automationSessionTable.runId })
+            .from(automationSessionTable)
+            .where(eq(automationSessionTable.sessionId, ctx.sessionId))
+            .limit(1);
+          if (spawnerBinding[0] !== undefined) {
+            await tx
+              .insert(automationSessionTable)
+              .values({
+                sessionId,
+                runId: spawnerBinding[0].runId,
+                blockId: "spawn_session",
+                keep: true,
+              })
+              .onConflictDoNothing();
+          }
         });
         try {
           await sessions.createSession(input);
