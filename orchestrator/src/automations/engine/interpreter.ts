@@ -212,11 +212,20 @@ export async function interpretAutomation(
     // stays held by a dead run forever. No sessions and no finalize hooks
     // exist yet, so finalize is only the status + the release.
     const message = error instanceof Error ? error.message : String(error);
-    await deps.step(async () => {
+    const promoted = await deps.step(async () => {
       await deps.store.finalizeRun(input.runId, "failed", message);
-      const promoted = await deps.store.releaseConcurrency(input.runId);
-      if (promoted !== null && deps.startQueuedRun) await deps.startQueuedRun(promoted);
+      return await deps.store.releaseConcurrency(input.runId);
     }, FINALIZE_STEP);
+    // The promoted successor starts OUTSIDE the step: in production
+    // startQueuedRun is DBOS.startWorkflow, and DBOS rejects a workflow
+    // start from step context ("Invalid call to a `workflow` function from
+    // within a `step`") — the claim CAS had already committed, so the
+    // successor held the key forever without a workflow (prod 2026-08-26).
+    // The typeof guard also skips a pre-fix FINALIZE_STEP checkpoint,
+    // which recorded no return value.
+    if (typeof promoted === "string" && deps.startQueuedRun) {
+      await deps.startQueuedRun(promoted);
+    }
     return { status: "failed", error: message };
   }
 
@@ -806,7 +815,7 @@ export async function interpretAutomation(
   // step:__finalize__:0 — exactly once, from every exit path. Sessions with
   // keep=false end here (keep defaults per D8: keepOnFinish on the block,
   // else the inverse of end_sessions_on_finish).
-  await deps.step(async () => {
+  const promoted = await deps.step(async () => {
     const sessions = await deps.store.listRunSessions(input.runId);
     for (const session of sessions) {
       if (session.keep || endedByBlock.has(session.sessionId)) continue;
@@ -821,10 +830,23 @@ export async function interpretAutomation(
     // can promote it.
     await deps.store.finalizeRun(input.runId, terminal.status, terminal.error);
     if (terminal.status !== "superseded") {
-      const promoted = await deps.store.releaseConcurrency(input.runId);
-      if (promoted !== null && deps.startQueuedRun) await deps.startQueuedRun(promoted);
+      return await deps.store.releaseConcurrency(input.runId);
     }
+    return null;
   }, FINALIZE_STEP);
 
+  // The promoted successor starts OUTSIDE the step: in production
+  // startQueuedRun is DBOS.startWorkflow, and DBOS rejects a workflow start
+  // from step context ("Invalid call to a `workflow` function from within a
+  // `step`") — releaseConcurrency's claim CAS had already committed inside
+  // the step, so the promoted run held its key forever with no workflow to
+  // ever run it, and the whole queue jammed behind it (prod 2026-08-26).
+  // Start-from-workflow is replay-safe: the step checkpoint pins the
+  // promoted id, and DBOS.startWorkflow with a fixed workflowID is
+  // idempotent on recovery re-execution. The typeof guard also skips a
+  // pre-fix FINALIZE_STEP checkpoint, which recorded no return value.
+  if (typeof promoted === "string" && deps.startQueuedRun) {
+    await deps.startQueuedRun(promoted);
+  }
   return terminal;
 }

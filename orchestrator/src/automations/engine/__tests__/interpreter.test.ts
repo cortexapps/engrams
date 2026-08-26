@@ -30,6 +30,10 @@ interface Harness {
   execs: Array<{ sessionId: string; command: string; execId: string }>;
   released: string[];
   promoted: string[];
+  /** Per promoted id: was startQueuedRun invoked from INSIDE a step? Must
+   * always be false — production startQueuedRun is DBOS.startWorkflow, and
+   * DBOS rejects a workflow start from step context. */
+  promotedInStep: boolean[];
   adopted: Array<{ runId: string; sessionId: string }>;
   actions: Array<{ actionId: string; stepPath: string; params: Record<string, unknown> }>;
   state: Map<string, { value: unknown; version: number; writer: string }>;
@@ -102,6 +106,8 @@ function makeHarness(
   const execs: Harness["execs"] = [];
   const released: string[] = [];
   const promoted: string[] = [];
+  const promotedInStep: boolean[] = [];
+  let stepDepth = 0;
   const actions: Array<{ actionId: string; stepPath: string; params: Record<string, unknown> }> = [];
   const recvQueue = [...(options.recv ?? [])];
   const runSessions = options.sessions ?? [];
@@ -242,7 +248,12 @@ function makeHarness(
   const deps: EngineDeps = {
     step: async (fn, name) => {
       names.push(name);
-      return fn();
+      stepDepth += 1;
+      try {
+        return await fn();
+      } finally {
+        stepDepth -= 1;
+      }
     },
     recv: async () => (recvQueue.length > 0 ? recvQueue.shift()! : null),
     store,
@@ -255,6 +266,7 @@ function makeHarness(
     },
     startQueuedRun: async (runId) => {
       promoted.push(runId);
+      promotedInStep.push(stepDepth > 0);
     },
     integrationActions: {
       async execute(input) {
@@ -293,7 +305,7 @@ function makeHarness(
       },
     };
   }
-  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, actions, state, adopted, closes, claims };
+  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted, promotedInStep, actions, state, adopted, closes, claims };
 }
 
 const RUN = { runId: "autorun:auto-1:manual:x", automationId: "auto-1" };
@@ -491,6 +503,7 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 4)
 
     expect(result).toEqual({ status: "failed", error: "inputs.limit: must be a number" });
     expect(h.names).toEqual(["step:__snapshot__:0", "step:__finalize__:0"]);
+    expect(h.promotedInStep).toEqual([false]);
     expect(h.finalized).toEqual([{ status: "failed", error: "inputs.limit: must be a number" }]);
     expect(h.released).toEqual([RUN.runId]);
     expect(h.promoted).toEqual(["autorun:auto-1:manual:next"]);
@@ -844,6 +857,13 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     const h = makeHarness(definition, { promote: "autorun:auto-1:manual:next" });
     await interpretAutomation(RUN, h.deps);
     expect(h.promoted).toEqual(["autorun:auto-1:manual:next"]);
+    // From WORKFLOW context, never from inside the finalize step: production
+    // startQueuedRun is DBOS.startWorkflow, which DBOS rejects from a step
+    // ("Invalid call to a `workflow` function from within a `step`"). When
+    // it ran inside the step, the claim CAS committed but the successor
+    // never got a workflow — it held the key forever and the queue jammed
+    // behind it (prod 2026-08-26).
+    expect(h.promotedInStep).toEqual([false]);
   });
 
   test("includeEventContext appends the redacted payload with the disclaimer (ADR 0102 parity)", async () => {
