@@ -475,7 +475,7 @@ describe("review tools", () => {
         sessionId: "session-1",
         payload: { candidate_count: 3 },
       },
-      idempotencyKey: "autorun:session-1:signal:finder_done:call-1",
+      idempotencyKey: "autorun:session-1:signal:finder_done:call-1:autorun:auto-1:github:d1",
     }]);
     expect(legacy.calls).toEqual([]);
   });
