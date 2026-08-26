@@ -42,6 +42,7 @@ function originalRun(): AutomationRunRow {
     id: "autorun:b1:github:d1",
     automationId: "b1",
     entrypointId: "main",
+    instanceId: "",
     version: 2,
     trigger: {
       source: "integration",
