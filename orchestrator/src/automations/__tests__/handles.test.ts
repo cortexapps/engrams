@@ -47,7 +47,10 @@ describe("canonicalHandle", () => {
 });
 
 describe("extractHandleCandidates (built-in facets over their samples)", () => {
-  test("a slack thread reply yields its thread handle; a top-level message yields none", () => {
+  test("a slack thread reply yields thread-then-channel; a top-level message yields channel only", () => {
+    // Declaration order IS routing precedence (rung 2): the thread handle
+    // comes first, so a thread owned by workstream A wins over the channel
+    // owned by workstream B; a top-level message routes by the channel.
     const payload = sample("slack", "message");
     expect(
       extractHandleCandidates({
@@ -56,7 +59,7 @@ describe("extractHandleCandidates (built-in facets over their samples)", () => {
         eventKey: "message",
         payload,
       }),
-    ).toEqual(["slack:C0AAAAAAA:1755763100.000100"]);
+    ).toEqual(["slack:C0AAAAAAA:1755763100.000100", "slack:C0AAAAAAA"]);
 
     const topLevel = structuredClone(payload);
     delete (topLevel.event as Record<string, unknown>).thread_ts;
@@ -67,10 +70,10 @@ describe("extractHandleCandidates (built-in facets over their samples)", () => {
         eventKey: "message",
         payload: topLevel,
       }),
-    ).toEqual([]);
+    ).toEqual(["slack:C0AAAAAAA"]);
   });
 
-  test("a reaction routes by the reacted message's identity", () => {
+  test("a reaction routes by the reacted message's identity, then its channel", () => {
     expect(
       extractHandleCandidates({
         provider: "slack",
@@ -78,7 +81,7 @@ describe("extractHandleCandidates (built-in facets over their samples)", () => {
         eventKey: "reaction_added",
         payload: sample("slack", "reaction_added"),
       }),
-    ).toEqual(["slack:C0AAAAAAA:1755763260.000200"]);
+    ).toEqual(["slack:C0AAAAAAA:1755763260.000200", "slack:C0AAAAAAA"]);
   });
 
   test("github PR events and PR-comment events agree on the repo#number handle, case-folded", () => {

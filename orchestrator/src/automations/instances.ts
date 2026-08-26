@@ -120,18 +120,23 @@ export async function resolveInstance(
       : [];
   if (candidates.length > 0) {
     const hits = await deps.instances.resolveHandles(automationId, candidates);
-    const hit = candidates
+    const ordered = candidates
       .map((handle) => hits.find((h) => h.handle === handle))
-      .find((h) => h !== undefined);
-    if (hit) {
-      if (hit.instanceStatus === "closed") {
-        // v1 policy (documented in the ADR addendum): a closed workstream's
-        // threads stay closed — drop, audited. Successor instances are the
-        // named future option.
-        return { kind: "drop", reason: "closed_instance", detail: hit.handle };
-      }
+      .filter((h): h is NonNullable<typeof h> => h !== undefined);
+    // The most specific OPEN owner wins (candidates are facet declaration
+    // order: thread before channel — rung 2). A CLOSED hit is skipped, not
+    // terminal: a reply in a dead workstream's thread inside a channel an
+    // open workstream owns is just channel traffic for the channel's owner
+    // (and must keep the brain suppressed there). Only when every matching
+    // candidate is closed does the event drop — audited; successor
+    // instances remain the named future option.
+    for (const hit of ordered) {
+      if (hit.instanceStatus === "closed") continue;
       const instance = await deps.instances.getInstance(hit.instanceId);
       if (instance) return { kind: "bound", instance, via: "handle" };
+    }
+    if (ordered.length > 0) {
+      return { kind: "drop", reason: "closed_instance", detail: ordered[0]!.handle };
     }
   }
   if (admit === "handle_match") {

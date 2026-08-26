@@ -104,6 +104,16 @@
                 "path": "event.thread_ts"
               }
             ]
+          },
+          {
+            "parts": [
+              {
+                "lit": "slack:"
+              },
+              {
+                "path": "event.channel"
+              }
+            ]
           }
         ]
       },
@@ -155,6 +165,16 @@
                 "path": "event.thread_ts"
               }
             ]
+          },
+          {
+            "parts": [
+              {
+                "lit": "slack:"
+              },
+              {
+                "path": "event.channel"
+              }
+            ]
           }
         ]
       },
@@ -203,6 +223,16 @@
               },
               {
                 "path": "event.item.ts"
+              }
+            ]
+          },
+          {
+            "parts": [
+              {
+                "lit": "slack:"
+              },
+              {
+                "path": "event.item.channel"
               }
             ]
           }
