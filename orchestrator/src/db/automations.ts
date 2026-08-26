@@ -4,6 +4,7 @@ import { getDb } from "./client.ts";
 import {
   automation as automationTable,
   automationConcurrencyClaim as claimTable,
+  automationInstance as instanceTable,
   automationRun as automationRunTable,
   automationSession as automationSessionTable,
   automationStepRun as stepRunTable,
@@ -1347,12 +1348,18 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
 
   async function getSessionBinding(
     sessionId: string,
-  ): Promise<{ automationId: string; runId: string; ownerTerminal: boolean } | null> {
+  ): Promise<{
+    automationId: string;
+    runId: string;
+    ownerTerminal: boolean;
+    instanceId: string;
+  } | null> {
     const [row] = await db
       .select({
         runId: automationSessionTable.runId,
         automationId: automationRunTable.automationId,
         status: automationRunTable.status,
+        instanceId: automationRunTable.instanceId,
       })
       .from(automationSessionTable)
       .innerJoin(automationRunTable, eq(automationRunTable.id, automationSessionTable.runId))
@@ -1363,6 +1370,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
       automationId: row.automationId,
       runId: row.runId,
       ownerTerminal: TERMINAL_RUN_STATUSES.has(row.status),
+      instanceId: row.instanceId,
     };
   }
 
@@ -1410,12 +1418,34 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         aliases = await aliasResolver(definition.trigger.registrationId);
       }
 
+      // ADR 0120: an instance-bound run resolves `inputs.*` from the
+      // instance's kickoff snapshot (the automation row demotes to
+      // "defaults for new instances"). Fetched inside this same snapshot
+      // step — additive fields, no contract bump.
+      let instance: { id: string; key: string; inputs: Record<string, unknown> } | null = null;
+      if (run.instanceId !== "") {
+        const [instanceRaw] = await db
+          .select({
+            id: instanceTable.id,
+            key: instanceTable.key,
+            inputs: instanceTable.inputs,
+          })
+          .from(instanceTable)
+          .where(eq(instanceTable.id, run.instanceId))
+          .limit(1);
+        if (!instanceRaw) {
+          throw new Error(`automation run ${runId} is bound to missing instance ${run.instanceId}`);
+        }
+        instance = instanceRaw;
+      }
+
       // ADR 0119 phase 4.3b: a run must never start on inputs the pinned
       // schema rejects (e.g. a built-in version bump tightened a rule after
       // the org saved its values). Throw: the interpreter turns a snapshot
       // failure into the normal finalize (terminal `failed` row + concurrency
       // release), so the row is visible AND the key is free.
-      const resolvedInputs = resolveAutomationInputs(version.inputsSchema, meta.inputs);
+      const rawInputs = instance ? { ...meta.inputs, ...instance.inputs } : meta.inputs;
+      const resolvedInputs = resolveAutomationInputs(version.inputsSchema, rawInputs);
       const inputErrors = validateInputValues(version.inputsSchema, resolvedInputs);
       if (inputErrors.length > 0) throw new InputValidationError(inputErrors);
 
@@ -1426,6 +1456,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         automationName: meta.name,
         version: version.version,
         entrypointId: run.entrypointId,
+        ...(instance ? { instanceId: instance.id, instanceKey: instance.key } : {}),
         trigger: {
           kind: run.trigger.source,
           receivedAt: run.trigger.receivedAt ?? run.createdAt.toISOString(),
@@ -1508,11 +1539,13 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
 
     getSessionBinding,
 
-    async adoptSession({ runId, automationId, sessionId }) {
+    async adoptSession({ runId, automationId, sessionId, instanceId }) {
       // One statement classifies AND transfers: the UPDATE only fires when
-      // the binding row belongs to this automation and its owning run is
-      // terminal. A re-executed step (crash before checkpoint) matches the
-      // already_ours arm below and stays idempotent.
+      // the binding row belongs to this automation, its owning run is
+      // terminal, AND (ADR 0120) the owner shares the adopting run's
+      // workstream — adoption never crosses instances. A re-executed step
+      // (crash before checkpoint) matches the already_ours arm below and
+      // stays idempotent.
       const adopted = await db
         .update(automationSessionTable)
         .set({ runId })
@@ -1527,6 +1560,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
                 .where(
                   and(
                     eq(automationRunTable.automationId, automationId),
+                    eq(automationRunTable.instanceId, instanceId),
                     inArray(automationRunTable.status, [...TERMINAL_RUN_STATUSES]),
                   ),
                 ),
@@ -1536,7 +1570,13 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         .returning({ sessionId: automationSessionTable.sessionId });
       if (adopted.length > 0) return "adopted";
       const binding = await getSessionBinding(sessionId);
-      if (binding === null || binding.automationId !== automationId) return "foreign";
+      if (
+        binding === null ||
+        binding.automationId !== automationId ||
+        binding.instanceId !== instanceId
+      ) {
+        return "foreign";
+      }
       if (binding.runId === runId) return "already_ours";
       return "owner_live";
     },

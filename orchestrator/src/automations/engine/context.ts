@@ -36,6 +36,11 @@ export interface RunSnapshot {
   /** ADR 0119 D9: which entrypoint's blocks this run walks. Absent (an
    * old checkpointed snapshot) = the main entrypoint. */
   entrypointId?: string;
+  /** ADR 0120: the bound workstream. Absent (old snapshot / unbound run) =
+   * automation-scoped behavior — additive, so no contract bump (the D9
+   * precedent). */
+  instanceId?: string;
+  instanceKey?: string;
   trigger: RunTriggerFacts;
   aliases: WebhookAliasMapping[];
   concurrencyKey?: string;
@@ -161,6 +166,7 @@ export function buildRunContext(
         runId,
         automationId: ctx.automationId,
         sessionId: rendered,
+        instanceId: snapshot.instanceId ?? "",
       });
       if (outcome === "foreign") {
         throw new Error(

@@ -88,9 +88,12 @@ import { makeWebhookAliasResolver } from "../automations/aliases.ts";
 import {
   admitAutomationRun,
   automationRunId,
+  defaultInstanceStoreLazy,
   defaultWorkflowStarter,
   type AutomationWebhookStarter,
 } from "../automations/dispatch.ts";
+import { resolveInstance } from "../automations/instances.ts";
+import type { AutomationInstanceStore } from "../db/automation-instances.ts";
 import {
   defaultAutomationSender,
   inboxKeys,
@@ -131,6 +134,8 @@ export interface AutomationDeps {
   aliases?: (registrationId: string) => Promise<readonly WebhookAliasMapping[]>;
   workflowStarter?: AutomationWebhookStarter;
   sender?: AutomationSender;
+  /** ADR 0120 instances (ad-hoc kickoff resolution). */
+  instances?: AutomationInstanceStore;
   inputKeyOptions?: InputKeyOptionSource;
   now?: () => Date;
   randomId?: () => string;
@@ -465,6 +470,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
   const connections = () => deps?.connections ?? makeIntegrationConnectionStore(getDb());
   const eventSample = deps?.eventSample ?? loadEventSample;
   const aliasesFor = deps?.aliases ?? makeWebhookAliasResolver();
+  const instances: AutomationInstanceStore = deps?.instances ?? defaultInstanceStoreLazy();
   const starter = () => deps?.workflowStarter ?? defaultWorkflowStarter();
   const sender = () => deps?.sender ?? defaultAutomationSender;
   const inputKeyOptions =
@@ -743,20 +749,55 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         Code.InvalidArgument,
       );
     }
-    const runId = automationRunId(row.id, input.deliveryKey, entrypoint.id);
     const receivedAt = now().toISOString();
+    const trigger = {
+      source: input.source,
+      receivedAt,
+      payload: input.payload,
+      ...(input.eventKey !== undefined ? { eventKey: input.eventKey } : {}),
+    };
+    // ADR 0120: an instanced automation resolves its workstream before the
+    // run id is minted. Ad-hoc occurrences carry no provider facet, so
+    // resolution routes by the key template alone. Dry runs stay unbound:
+    // an editor preview must never open a real workstream.
+    let instanceId = "";
+    if (definition.settings.instance !== undefined && !input.dryRun) {
+      const resolution = await resolveInstance(
+        {
+          target: { automation: row, definition },
+          entrypoint: { id: entrypoint.id, trigger: entrypoint.trigger },
+          trigger,
+        },
+        { instances },
+      );
+      if (resolution.kind === "drop") {
+        throw new ConnectError(
+          resolution.reason === "no_open_instance"
+            ? `no open workstream for key "${resolution.detail}" (this entrypoint joins existing workstreams; kick one off first)`
+            : `event does not route to a workstream (${resolution.reason})`,
+          Code.FailedPrecondition,
+        );
+      }
+      if (resolution.kind === "bound") instanceId = resolution.instance.id;
+      else if (resolution.kind === "open") {
+        const opened = await instances.openInstance({
+          automationId: row.id,
+          key: resolution.key,
+          inputs: resolution.inputs,
+          openedBy: `manual:${input.deliveryKey}`,
+        });
+        instanceId = opened.id;
+      }
+    }
+    const runId = automationRunId(row.id, input.deliveryKey, entrypoint.id, instanceId);
     const outcome = await admitAutomationRun(
       {
         target: { automation: row, definition },
         runId,
         entrypoint: { id: entrypoint.id, trigger: entrypoint.trigger },
+        ...(instanceId !== "" ? { instanceId } : {}),
         deliveryKey: input.deliveryKey,
-        trigger: {
-          source: input.source,
-          receivedAt,
-          payload: input.payload,
-          ...(input.eventKey !== undefined ? { eventKey: input.eventKey } : {}),
-        },
+        trigger,
         // A cron entrypoint's templates read `trigger.scheduled_for`
         // (strict Liquid: an absent variable fails the render). An ad-hoc
         // run has no tick, so the would-be fire time is "now".

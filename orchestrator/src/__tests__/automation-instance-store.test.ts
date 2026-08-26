@@ -13,6 +13,8 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { inArray } from "drizzle-orm";
 
+import { sql } from "drizzle-orm";
+
 import { checkDb, getDb } from "../db/client.ts";
 import {
   INSTANCE_KEY_MAX_CHARS,
@@ -20,8 +22,11 @@ import {
   makeAutomationInstanceStore,
   newInstanceId,
 } from "../db/automation-instances.ts";
-import { makeAutomationStore } from "../db/automations.ts";
-import { automation as automationTable } from "../db/schema.ts";
+import { makeAutomationEngineStore, makeAutomationStore } from "../db/automations.ts";
+import {
+  automation as automationTable,
+  automationSession as automationSessionTable,
+} from "../db/schema.ts";
 import type { AutomationRunTrigger } from "../db/schema.ts";
 
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
@@ -340,5 +345,154 @@ describe.skipIf(!dbReachable)("run dedupe split + instance-aware cron claims (li
       const id = newInstanceId();
       expect(id).toMatch(/^ai_[a-z2-7]{16}$/);
     }
+  });
+});
+
+describe.skipIf(!dbReachable)("instance-aware engine store (live PG)", () => {
+  async function seedVersion(automationId: string): Promise<void> {
+    await getDb().execute(sql`
+      insert into automation_version (automation_id, version, trigger, blocks, inputs_schema, settings)
+      values (${automationId}, 1, ${JSON.stringify({ kind: "manual" })}::jsonb, '[]'::jsonb,
+              ${JSON.stringify([
+                { key: "channel", label: "Channel", type: "string" },
+                { key: "project", label: "Project", type: "string" },
+              ])}::jsonb,
+              ${JSON.stringify({ endSessionsOnFinish: false })}::jsonb)
+    `);
+  }
+
+  test("loadSnapshot resolves inputs from the instance snapshot and carries id + key", async () => {
+    const autoId = await seedAutomation("snapshot");
+    await seedVersion(autoId);
+    await getDb()
+      .update(automationTable)
+      .set({ inputs: { channel: "#general", project: "row-default" } })
+      .where(sql`id = ${autoId}`);
+    const instances = makeAutomationInstanceStore();
+    const instance = await instances.openInstance({
+      automationId: autoId,
+      key: "project-ENG-9",
+      inputs: { project: "ENG-9" },
+      openedBy: "test",
+    });
+    const store = makeAutomationStore();
+    const engine = makeAutomationEngineStore();
+    await store.insertRun({
+      id: `autorun:${autoId}:main:i-${instance.id}:manual:1`,
+      automationId: autoId,
+      version: 1,
+      instanceId: instance.id,
+      trigger: MANUAL_TRIGGER,
+      deliveryKey: "manual:1",
+      concurrencyKey: null,
+      scheduledFor: null,
+    });
+    const snapshot = await engine.loadSnapshot(`autorun:${autoId}:main:i-${instance.id}:manual:1`);
+    // The instance value wins; unset fields fall back to the automation row.
+    expect(snapshot.inputs).toEqual({ channel: "#general", project: "ENG-9" });
+    expect(snapshot.instanceId).toBe(instance.id);
+    expect(snapshot.instanceKey).toBe("project-ENG-9");
+
+    // An unbound run of the same automation sees the row values untouched.
+    await store.insertRun({
+      id: `autorun:${autoId}:manual:2`,
+      automationId: autoId,
+      version: 1,
+      trigger: MANUAL_TRIGGER,
+      deliveryKey: "manual:2",
+      concurrencyKey: null,
+      scheduledFor: null,
+    });
+    const unbound = await engine.loadSnapshot(`autorun:${autoId}:manual:2`);
+    expect(unbound.inputs).toEqual({ channel: "#general", project: "row-default" });
+    expect(unbound.instanceId).toBeUndefined();
+  });
+
+  test("adoptSession never crosses workstreams", async () => {
+    const autoId = await seedAutomation("adopt");
+    const instances = makeAutomationInstanceStore();
+    const a = await instances.openInstance({
+      automationId: autoId, key: "a", inputs: {}, openedBy: "",
+    });
+    const b = await instances.openInstance({
+      automationId: autoId, key: "b", inputs: {}, openedBy: "",
+    });
+    const store = makeAutomationStore();
+    const engine = makeAutomationEngineStore();
+    // The owner run (instance a) is terminal; its session is adoptable —
+    // but only by another instance-a run.
+    await store.insertRun({
+      id: `autorun:${autoId}:main:i-${a.id}:owner`,
+      automationId: autoId,
+      version: 1,
+      instanceId: a.id,
+      trigger: MANUAL_TRIGGER,
+      deliveryKey: "owner",
+      concurrencyKey: null,
+      scheduledFor: null,
+      status: "completed",
+    });
+    for (const [id, instanceId] of [
+      [`autorun:${autoId}:main:i-${a.id}:next`, a.id],
+      [`autorun:${autoId}:main:i-${b.id}:thief`, b.id],
+    ] as const) {
+      await store.insertRun({
+        id,
+        automationId: autoId,
+        version: 1,
+        instanceId,
+        trigger: MANUAL_TRIGGER,
+        deliveryKey: id,
+        concurrencyKey: null,
+        scheduledFor: null,
+      });
+    }
+    const sessionId = `sess-${UNIQ}-adopt`;
+    await getDb().insert(automationSessionTable).values({
+      sessionId,
+      runId: `autorun:${autoId}:main:i-${a.id}:owner`,
+      blockId: "create",
+      keep: true,
+    });
+
+    const thief = await engine.adoptSession({
+      runId: `autorun:${autoId}:main:i-${b.id}:thief`,
+      automationId: autoId,
+      sessionId,
+      instanceId: b.id,
+    });
+    expect(thief).toBe("foreign");
+
+    const heir = await engine.adoptSession({
+      runId: `autorun:${autoId}:main:i-${a.id}:next`,
+      automationId: autoId,
+      sessionId,
+      instanceId: a.id,
+    });
+    expect(heir).toBe("adopted");
+
+    const binding = await engine.getSessionBinding(sessionId);
+    expect(binding).toMatchObject({
+      runId: `autorun:${autoId}:main:i-${a.id}:next`,
+      instanceId: a.id,
+    });
+  });
+
+  test("the drops ring records and caps", async () => {
+    const autoId = await seedAutomation("drops");
+    const store = makeAutomationInstanceStore();
+    for (let i = 0; i < 55; i++) {
+      await store.recordDrop({
+        automationId: autoId,
+        entrypointId: "main",
+        eventKey: "message",
+        reason: "no_handle_match",
+        detail: `d-${i}`,
+      });
+    }
+    const drops = await store.listRecentDrops(autoId);
+    expect(drops.length).toBe(50);
+    expect(drops[0]).toMatchObject({ detail: "d-54", reason: "no_handle_match" });
+    expect(drops.at(-1)).toMatchObject({ detail: "d-5" });
   });
 });

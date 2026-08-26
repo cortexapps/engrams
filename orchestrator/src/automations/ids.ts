@@ -9,12 +9,19 @@ export function automationRunId(
   automationId: string,
   deliveryKey: string,
   entrypointId: string = MAIN_ENTRYPOINT_ID,
+  instanceId = "",
 ): string {
   // The run id IS the DBOS workflow id. DBOS treats workflowID as the durable
   // execution identity: starting an existing running or terminal id returns
   // its handle and never re-executes the body. The main entrypoint keeps the
   // historical two-part shape so pre-D9 ids never churn; an extra entrypoint
   // adds its id, because the same delivery may open one run per entrypoint.
+  // An instance-bound run (ADR 0120) always spells the entrypoint and adds
+  // `i-<instanceId>` — a cron occurrence fans out one workflow per open
+  // instance, so the instance must be part of the durable identity.
+  if (instanceId !== "") {
+    return `autorun:${automationId}:${entrypointId}:i-${instanceId}:${deliveryKey}`;
+  }
   return entrypointId === MAIN_ENTRYPOINT_ID
     ? `autorun:${automationId}:${deliveryKey}`
     : `autorun:${automationId}:${entrypointId}:${deliveryKey}`;

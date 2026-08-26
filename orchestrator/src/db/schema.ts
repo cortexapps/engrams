@@ -27,6 +27,7 @@ import type {
 import {
   pgTable,
   text,
+  bigserial,
   integer,
   jsonb,
   timestamp,
@@ -1653,6 +1654,29 @@ export const automationInstanceHandle = pgTable(
     primaryKey({ columns: [t.automationId, t.handle] }),
     index("automation_instance_handle_instance_idx").on(t.instanceId),
   ],
+);
+
+/** The instance drops ring (ADR 0120 addendum, research fold-in): every
+ * event admission drops WITHOUT a run row (closed instance, no handle
+ * match, no open instance for a require entrypoint) leaves one row here —
+ * silent drops are the #1 support pain in every keyed routing system. The
+ * write path caps the ring per automation (newest ~50 kept). */
+export const automationDrop = pgTable(
+  "automation_drop",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    automationId: text("automation_id")
+      .notNull()
+      .references(() => automation.id, { onDelete: "cascade" }),
+    entrypointId: text("entrypoint_id").notNull().default("main"),
+    eventKey: text("event_key").notNull().default(""),
+    /** closed_instance | no_handle_match | no_open_instance. */
+    reason: text("reason").notNull(),
+    /** The candidate handle or rendered key that failed to route. */
+    detail: text("detail").notNull().default(""),
+    droppedAt: timestamp("dropped_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("automation_drop_automation_idx").on(t.automationId, t.id)],
 );
 
 export const webhookSample = pgTable(

@@ -544,7 +544,7 @@ describe("session adoption (live PG, ADR 0119 D11)", () => {
       ]);
 
       // Terminal owner in the same automation: transfers.
-      expect(await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: kept })).toBe(
+      expect(await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: kept, instanceId: "" })).toBe(
         "adopted",
       );
       expect(await store.getSessionBinding(kept)).toMatchObject({
@@ -554,22 +554,22 @@ describe("session adoption (live PG, ADR 0119 D11)", () => {
       });
       // A replayed step (crash before checkpoint) is already_ours, not a
       // refusal.
-      expect(await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: kept })).toBe(
+      expect(await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: kept, instanceId: "" })).toBe(
         "already_ours",
       );
 
       // A live owner keeps exclusive routing.
-      expect(await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: busy })).toBe(
+      expect(await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: busy, instanceId: "" })).toBe(
         "owner_live",
       );
       expect((await store.getSessionBinding(busy))?.runId).toBe(liveRun);
 
       // Another automation's binding, and no binding at all, are foreign.
       expect(
-        await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: foreign }),
+        await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: foreign, instanceId: "" }),
       ).toBe("foreign");
       expect(
-        await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: "no-such" }),
+        await store.adoptSession({ runId: meRun, automationId: autoId, sessionId: "no-such", instanceId: "" }),
       ).toBe("foreign");
       expect(await store.getSessionBinding("no-such")).toBeNull();
     },
