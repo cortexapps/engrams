@@ -266,7 +266,7 @@ jobs:
           sudo cp -r /usr/include/linux /usr/include/asm-generic /opt/uapi/
           sudo cp -r /usr/include/x86_64-linux-gnu/asm /opt/uapi/asm
 
-      - name: Build engram-host-agent + engram-uffd-handler (musl-static)
+      - name: Build engram-host-agent + engram-uffd-handler + engram-egress-proxyd (musl-static)
         env:
           # Point the musl C compile (cc-rs) + bindgen/clang at the system
           # kernel uapi headers so userfaultfd-sys finds <linux/types.h>.
@@ -275,14 +275,21 @@ jobs:
           CFLAGS_x86_64_unknown_linux_musl: "-idirafter /opt/uapi"
           BINDGEN_EXTRA_CLANG_ARGS: "-idirafter /opt/uapi"
         run: |
-          cargo build \
+          # ADR 0121: the egress-proxyd source fingerprint rides the same
+          # env into BOTH binaries here as in docker/host-agent.Dockerfile,
+          # so a host running from these binaries makes the same
+          # adopt-vs-replace decision as the container fleet.
+          FP="$(python3 docker/egress-proxyd-fingerprint.py)"
+          echo "egress-proxyd fingerprint: $FP"
+          ENGRAM_EGRESS_PROXYD_FINGERPRINT="$FP" cargo build \
             --target x86_64-unknown-linux-musl \
             --release \
-            -p engram-host-agent -p engram-uffd-handler
+            -p engram-host-agent -p engram-uffd-handler -p engram-egress-proxyd
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/engram-host-agent dist/
           cp target/x86_64-unknown-linux-musl/release/engram-uffd-handler dist/
-          file dist/engram-host-agent dist/engram-uffd-handler
+          cp target/x86_64-unknown-linux-musl/release/engram-egress-proxyd dist/
+          file dist/engram-host-agent dist/engram-uffd-handler dist/engram-egress-proxyd
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -318,13 +325,14 @@ jobs:
           }
           REPO="ghcr.io/${{ github.repository }}/host-binaries"
           SHORT="${SHA:0:7}"
-          # Push the two static binaries as a single OCI artifact tagged by
-          # full SHA. `oras pull <repo>:<sha>` on the consumer side drops both
+          # Push the static binaries as a single OCI artifact tagged by
+          # full SHA. `oras pull <repo>:<sha>` on the consumer side drops all
           # files into cwd verbatim.
           oras push "$REPO:$SHA" \
             --artifact-type application/vnd.engrams.fc-host-binaries.v1 \
             engram-host-agent:application/octet-stream \
-            engram-uffd-handler:application/octet-stream
+            engram-uffd-handler:application/octet-stream \
+            engram-egress-proxyd:application/octet-stream
           # Convenience tags. `oras tag` is a cheap registry-side re-point.
           tag_with_retry "$REPO:$SHA" "$SHORT"
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then

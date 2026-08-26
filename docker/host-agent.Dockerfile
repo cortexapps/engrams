@@ -10,15 +10,29 @@ WORKDIR /src
 # runtime image below doesn't carry them.)
 # make: #1003 — tikv-jemalloc-sys builds the vendored jemalloc with
 # configure + make; rust:slim ships a C compiler but no make.
+# python3: ADR 0121 — the egress-proxyd source fingerprint
+# (docker/egress-proxyd-fingerprint.py) runs over `cargo
+# metadata` before the build (builder stage only).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev ca-certificates protobuf-compiler clang libclang-dev make \
+    pkg-config libssl-dev ca-certificates protobuf-compiler clang libclang-dev make python3 \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
+# ADR 0121: compute the egress-proxyd source fingerprint and inject it
+# into BOTH binaries (`option_env!`) in the same build. The successor
+# host-agent compares its embedded value against the running daemon's
+# and replaces the daemon only on a mismatch — i.e. only when the
+# daemon's source closure actually changed. Never a binary hash
+# (builds are not reproducible; a binary hash restarts on every
+# deploy and defeats the design).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p engram-host-agent -p engram-uffd-handler \
+    FP="$(python3 docker/egress-proxyd-fingerprint.py)" \
+    && echo "egress-proxyd fingerprint: $FP" \
+    && ENGRAM_EGRESS_PROXYD_FINGERPRINT="$FP" \
+       cargo build --release -p engram-host-agent -p engram-uffd-handler -p engram-egress-proxyd \
     && cp target/release/engram-host-agent /tmp/engram-host-agent \
-    && cp target/release/engram-uffd-handler /tmp/engram-uffd-handler
+    && cp target/release/engram-uffd-handler /tmp/engram-uffd-handler \
+    && cp target/release/engram-egress-proxyd /tmp/engram-egress-proxyd
 
 # Trixie matches the builder's glibc — bookworm (2.36) refuses
 # binaries linked against trixie's glibc 2.39+.
@@ -59,4 +73,9 @@ COPY --from=builder /tmp/engram-host-agent /usr/local/bin/engram-host-agent
 # lookup of `engram-uffd-handler` is the FirecrackerConfig default). Without
 # it, every Uffd-mode restore/resume page-faults forever / fails to spawn.
 COPY --from=builder /tmp/engram-uffd-handler /usr/local/bin/engram-uffd-handler
+# ADR 0121: the node-local egress daemon. Spawned by host-agent from
+# this image; it escapes the pod cgroup and OUTLIVES the pod (mapped
+# text keeps the running process alive after the image is unlinked —
+# the FC precedent), so in-flight guest egress survives rolls.
+COPY --from=builder /tmp/engram-egress-proxyd /usr/local/bin/engram-egress-proxyd
 ENTRYPOINT ["/usr/local/bin/engram-host-agent"]

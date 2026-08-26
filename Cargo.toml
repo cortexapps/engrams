@@ -40,6 +40,8 @@ members = [
     "crates/engram-sim",
     "crates/engram-testkit",
     "crates/engram-egress-proxy",
+    "crates/engram-egress-proto",
+    "crates/engram-egress-proxyd",
     "crates/engram-crypto",
     "crates/engram-tls",
     "crates/engram-oci",
@@ -120,6 +122,8 @@ engram-rootfs-materializer = { path = "crates/engram-rootfs-materializer" }
 engram-agentd = { path = "crates/engram-agentd" }
 engram-uffd-handler = { path = "crates/engram-uffd-handler" }
 engram-egress-proxy = { path = "crates/engram-egress-proxy" }
+engram-egress-proto = { path = "crates/engram-egress-proto" }
+engram-egress-proxyd = { path = "crates/engram-egress-proxyd" }
 engram-crypto = { path = "crates/engram-crypto" }
 engram-tls = { path = "crates/engram-tls" }
 engram-oci = { path = "crates/engram-oci" }

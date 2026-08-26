@@ -511,6 +511,13 @@ impl Registry {
     pub fn live_count(&self) -> usize {
         self.inner.read().by_session.len()
     }
+
+    /// Every registered session id. ADR 0121: the daemon's
+    /// `SyncPolicies` handler prunes registrations absent from the
+    /// host-agent's replayed set with this.
+    pub fn session_ids(&self) -> Vec<SessionId> {
+        self.inner.read().by_session.keys().copied().collect()
+    }
 }
 
 impl SessionState {
