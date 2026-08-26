@@ -51,7 +51,7 @@ import { ConnectError, Code } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 import type { ConnectRouter } from "@connectrpc/connect";
 import { subject } from "@casl/ability";
-import { and, eq, exists, ilike, inArray, isNull, or, type SQL } from "drizzle-orm";
+import { and, eq, exists, ilike, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 
 import { TaskSchema, TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Task, TaskSessionRef } from "../gen/engram/app/v1/task_pb.ts";
@@ -1091,15 +1091,17 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
 
       let taskId = req.taskId;
       if (req.sessionId) {
+        // Resolve by ANY binding, preferring "primary" for determinism: the
+        // role is a descriptive label, not part of the session→task identity
+        // (an automation's create_session block may bind role "pm" — the
+        // Tenant Inspector PM — and its session page must still find its
+        // task tree; the primary-only filter silently dropped the whole
+        // task context for every non-primary role).
         const refs = await db
-          .select({ taskId: taskSessionTable.taskId })
+          .select({ taskId: taskSessionTable.taskId, role: taskSessionTable.role })
           .from(taskSessionTable)
-          .where(
-            and(
-              eq(taskSessionTable.sessionId, req.sessionId),
-              eq(taskSessionTable.role, "primary"),
-            ),
-          )
+          .where(eq(taskSessionTable.sessionId, req.sessionId))
+          .orderBy(sql`case when ${taskSessionTable.role} = 'primary' then 0 else 1 end`)
           .limit(1);
         taskId = refs[0]?.taskId ?? "";
       }
