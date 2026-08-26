@@ -92,11 +92,15 @@ rendered identity key that many runs contribute to.
   as side effects — the action executor writes its declared `handles`
   templates post-success in the same step; the pr-link consumer binds PRs
   opened by workstream sessions. One handle routes to one instance per
-  automation, **forever**: a second claim refuses loudly (a typed
-  permanent error in the executor; a loud log in the consumer) and a
-  reopen never re-routes old threads. Exclusivity is the lesson of
+  automation: a second claim against an OPEN holder refuses loudly (a
+  typed permanent error in the executor; a loud log in the consumer) and
+  a reopen never re-routes old threads. Exclusivity is the lesson of
   Zeebe's duplicate-subscription bug (replies routed to arbitrary stale
-  instances); permanence is the audit trail.
+  instances); the audit trail persists through the ONE sanctioned rebind
+  (rung 2 amendment, 2026-08-26): the explicit `claim_handle` block takes
+  over a handle whose holder instance is CLOSED (`reclaimed`), because
+  long-lived places — channels — outlive workstreams and a dead holder
+  must not brick them. Auto-writers never take over.
 - **Admission** runs before the run id mints, handle route first, then
   the key route under the entrypoint's `admit` policy: `open`
   (render/open/join), `require` (join an open workstream or drop — the
@@ -116,7 +120,8 @@ rendered identity key that many runs contribute to.
 
 | Event class | Behavior |
 |---|---|
-| Handle names a CLOSED workstream | drop, audited in the ring |
+| EVERY matching handle names a CLOSED workstream | drop, audited in the ring |
+| A closed hit with a later OPEN candidate (rung 2) | the open owner takes it — a dead thread's reply is channel traffic for the channel's owner |
 | `require` entrypoint, no open workstream | drop, audited |
 | `handle_match` entrypoint, no ledger hit | drop, audited |
 | Kickoff (`open` policy) of a closed key | a FRESH workstream opens |
@@ -128,17 +133,32 @@ future options, NOT in v1: per-entrypoint closed policies and **successor
 instances** (an event on a closed workstream opens a successor carrying
 the handle forward).
 
-### Precedence (rung 1) and the routing ladder
+### Precedence (rungs 1–2) and the routing ladder
 
-When a handle-bound OPEN workstream owns a slack event's thread, the
-`slack_brain` catch-all stands down for that delivery — dispatcher
-suppression (`result.suppressed`) honored by the legacy route too. One
-thread, one responder. The suppressible set is a single reviewed
-constant. The documented ladder: explicit address > thread handle >
-channel handle (future rung 2: an instance claims `slack:<channel>`) >
-the brain — with rung 3 (the brain as router: ListInstances + a
-forward-into-workstream tool, LLM arbitration only for unbound mentions,
-its decision made durable as a handle) as the designed follow-up.
+When a handle-bound OPEN workstream owns a slack event's thread — or,
+since rung 2 (2026-08-26), its channel — the `slack_brain` catch-all
+stands down for that delivery — dispatcher suppression
+(`result.suppressed`) honored by the legacy route too. One conversation,
+one responder. The suppressible set is a single reviewed constant.
+
+**Rung 2 (shipped)**: slack `message`/`app_mention`/`reaction_added`
+declare a second, lower-precedence candidate `slack:<channel>` after the
+thread/item template — facet declaration order IS the precedence, and
+resolution takes the most specific OPEN owner (closed hits are skipped,
+per the matrix above). A channel handle exists only when a flow
+explicitly claims it (`claim_handle` on the post's output channel;
+`slack.join_channel` first — message events only flow where the bot is a
+member), so unclaimed channels are byte-identical to rung 1. Top-level
+channel messages — which produce no thread candidate at all — now route
+to the channel's workstream. **Decided (2026-08-26): the bound channel's
+workstream takes ALL messages, explicit @-mentions of the bot included**
+— the "explicit address" ladder rung is deliberately NOT implemented
+(the workstream is the channel's interface; the brain resumes when every
+bound workstream closes, and stays everywhere unbound). The ladder:
+thread handle > channel handle > the brain — with rung 3 (the brain as
+router: ListInstances + a forward-into-workstream tool, LLM arbitration
+only for unbound mentions, its decision made durable as a handle) as the
+designed follow-up.
 
 ### Kickoff and surfaces
 

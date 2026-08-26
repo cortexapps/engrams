@@ -679,6 +679,32 @@
       ]
     },
     {
+      "id": "join_channel",
+      "label": "Join a channel",
+      "description": "Join a public channel as the app, so channel messages reach the automation (message events only flow where the bot is a member). Idempotent when already joined; private channels need a human /invite instead.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel"
+        ]
+      },
+      "execute": {
+        "kind": "builtin",
+        "id": "slack.join_channel"
+      },
+      "output": {
+        "channel": "channel"
+      },
+      "idempotency": {
+        "kind": "none"
+      }
+    },
+    {
       "id": "update_message",
       "label": "Update a message",
       "description": "Edit a message the app posted.",

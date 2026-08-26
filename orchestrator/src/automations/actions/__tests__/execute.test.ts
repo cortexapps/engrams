@@ -288,12 +288,46 @@ describe("executeIntegrationAction — builtins", () => {
               },
               update: async () => ({}),
             },
+            conversations: {
+              join: async () => ({}),
+            },
           }),
         }),
       }),
     );
     expect(sent[0]).toEqual({ channel: "C1", text: "hi", thread_ts: "1.1" });
     expect(outputs).toEqual({ ts: "1.2", channel: "C1" });
+  });
+
+  test("slack.join_channel joins by id and maps the joined channel through the output", async () => {
+    const joined: Array<Record<string, unknown>> = [];
+    const f = fakeRunOp([]);
+    const outputs = await executeIntegrationAction(
+      {
+        provider: "slack",
+        actionId: "join_channel",
+        params: { channel: "C0BSPCXJBHA" },
+      },
+      CTX,
+      deps(f.runOp, {
+        builtinDeps: builtinDeps(f.runOp, {
+          slackClient: async () => ({
+            chat: {
+              postMessage: async () => ({}),
+              update: async () => ({}),
+            },
+            conversations: {
+              join: async (args) => {
+                joined.push(args);
+                return { channel: { id: "C0BSPCXJBHA" } };
+              },
+            },
+          }),
+        }),
+      }),
+    );
+    expect(joined).toEqual([{ channel: "C0BSPCXJBHA" }]);
+    expect(outputs).toEqual({ channel: "C0BSPCXJBHA" });
   });
 
   test("linear.create_issue mints the deterministic client id", async () => {

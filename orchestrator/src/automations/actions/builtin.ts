@@ -41,6 +41,9 @@ export interface SlackChatClient {
       text: string;
     }): Promise<{ ts?: string; channel?: string }>;
   };
+  conversations: {
+    join(args: { channel: string }): Promise<{ channel?: { id?: string } }>;
+  };
 }
 
 export interface BuiltinActionContext {
@@ -189,6 +192,19 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
       ...(threadTs !== undefined ? { thread_ts: threadTs } : {}),
     });
     return { ts: response.ts ?? null, channel: response.channel ?? null };
+  },
+
+  "slack.join_channel": async (params, _ctx, deps) => {
+    // Rung 2 companion: message events only flow where the bot is a channel
+    // MEMBER, so a flow that claims `slack:<channel>` joins first.
+    // conversations.join is idempotent for public channels (already-in →
+    // ok with a warning); private channels need a human /invite and fail
+    // here with Slack's typed error.
+    const client = await deps.slackClient();
+    const response = await client.conversations.join({
+      channel: requireString(params, "channel"),
+    });
+    return { channel: response.channel?.id ?? null };
   },
 
   "slack.update_message": async (params, _ctx, deps) => {
