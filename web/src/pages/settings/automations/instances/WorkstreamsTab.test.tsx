@@ -178,6 +178,30 @@ describe("WorkstreamsTab", () => {
     expect(requests[0]!.inputsJson).toBeUndefined();
   });
 
+  it("typing an OPEN key switches to join mode: no inputs sent, form hidden", async () => {
+    const requests: RunNowRequest[] = [];
+    renderTab({
+      instances: [instance("ai_one", "project-ENG-1", "open")],
+      runNow: (req) => {
+        requests.push(req);
+        return { runId: "autorun:auto-1:join" };
+      },
+    });
+    await waitFor(() => expect(screen.getByText("project-ENG-1")).toBeTruthy());
+    await userEvent.click(screen.getByRole("button", { name: /Kick off/ }));
+    const form = await screen.findByTestId("kickoff-form");
+    await userEvent.type(screen.getByRole("textbox", { name: "workstream key" }), "project-ENG-1");
+
+    // The inputs form yields to the join hint; the action reads Join.
+    await waitFor(() => expect(screen.getByTestId("kickoff-join-hint")).toBeTruthy());
+    expect(within(form).queryByRole("textbox", { name: "Project" })).toBeNull();
+    await userEvent.click(within(form).getByRole("button", { name: "Join" }));
+
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]).toMatchObject({ automationId: "auto-1", instanceKey: "project-ENG-1" });
+    expect(requests[0]!.instanceInputsJson).toBeUndefined();
+  });
+
   it("surfaces the recent-drops audit list", async () => {
     renderTab({
       instances: [instance("ai_one", "project-ENG-1", "open")],

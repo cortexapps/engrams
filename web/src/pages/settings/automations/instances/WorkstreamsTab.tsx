@@ -150,6 +150,13 @@ export function WorkstreamsTab({
         automationId={automationId}
         inputsSchema={inputsSchema}
         defaultInputs={defaultInputs}
+        openKeys={
+          new Set(
+            (list.data?.instances ?? [])
+              .filter((instance) => instance.status === "open")
+              .map((instance) => instance.key),
+          )
+        }
         open={kickoffOpen}
         onOpenChange={setKickoffOpen}
       />
@@ -265,12 +272,17 @@ function KickoffDialog({
   automationId,
   inputsSchema,
   defaultInputs,
+  openKeys,
   open,
   onOpenChange,
 }: {
   automationId: string;
   inputsSchema: InputFieldSpec[];
   defaultInputs: unknown;
+  /** Keys of currently-open workstreams: typing one switches the dialog to
+   * JOIN mode — no inputs are sent (the server refuses a join snapshot;
+   * the open workstream's kickoff inputs stand). */
+  openKeys: Set<string>;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -284,26 +296,31 @@ function KickoffDialog({
     [inputsSchema, defaultInputs],
   );
   const current = values ?? resolved;
+  const joining = openKeys.has(key.trim());
 
   const kickoff = async () => {
     if (key.trim() === "") {
       toast.error("Name the workstream (its key)");
       return;
     }
-    const clientErrors = validateInputs(inputsSchema, current);
-    if (clientErrors.length > 0) {
-      setErrors(clientErrors);
-      toast.error("Fix the highlighted inputs");
-      return;
+    if (!joining) {
+      const clientErrors = validateInputs(inputsSchema, current);
+      if (clientErrors.length > 0) {
+        setErrors(clientErrors);
+        toast.error("Fix the highlighted inputs");
+        return;
+      }
     }
     try {
       await runNow.mutateAsync({
         automationId,
         instanceKey: key.trim(),
-        instanceInputsJson: buildInputsPayload(inputsSchema, current),
+        // Joining an open workstream sends NO snapshot: its kickoff inputs
+        // stand, and the server refuses a join that carries one.
+        ...(joining ? {} : { instanceInputsJson: buildInputsPayload(inputsSchema, current) }),
       });
       await invalidateInstances();
-      toast.success(`Kicked off ${key.trim()}`);
+      toast.success(joining ? `Joined ${key.trim()}` : `Kicked off ${key.trim()}`);
       onOpenChange(false);
       setKey("");
       setValues(null);
@@ -341,19 +358,32 @@ function KickoffDialog({
               autoFocus
             />
           </Field>
-          <InputsForm
-            schema={inputsSchema}
-            values={current}
-            errors={errors}
-            onChange={(k, next) => {
-              setValues({ ...current, [k]: next });
-              setErrors((prev) => prev.filter((e) => e.key !== k));
-            }}
-            disabled={runNow.isPending}
-          />
+          {joining ? (
+            <p className="text-muted-foreground text-sm" data-testid="kickoff-join-hint">
+              {key.trim()} is already open — this run joins it, and its kickoff inputs stay as they
+              are.
+            </p>
+          ) : (
+            <InputsForm
+              schema={inputsSchema}
+              values={current}
+              errors={errors}
+              onChange={(k, next) => {
+                setValues({ ...current, [k]: next });
+                setErrors((prev) => prev.filter((e) => e.key !== k));
+              }}
+              disabled={runNow.isPending}
+            />
+          )}
           <DialogFooter>
             <Button type="submit" disabled={runNow.isPending}>
-              {runNow.isPending ? "Kicking off…" : "Kick off"}
+              {runNow.isPending
+                ? joining
+                  ? "Joining…"
+                  : "Kicking off…"
+                : joining
+                  ? "Join"
+                  : "Kick off"}
             </Button>
           </DialogFooter>
         </form>
