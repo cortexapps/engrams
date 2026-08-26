@@ -21,7 +21,13 @@ import type {
 } from "../db/integration-connections.ts";
 import { makeUserSecretStore } from "../db/user-secrets.ts";
 import { makeUserIdentityStore } from "../db/users.ts";
-import { coordinationOperation, task, taskSession, type TaskLaunchPolicy } from "../db/schema.ts";
+import {
+  coordinationOperation,
+  sessionListener as sessionListenerTable,
+  task,
+  taskSession,
+  type TaskLaunchPolicy,
+} from "../db/schema.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import { integrationSnapshotHash } from "../integrations/grants.ts";
 import {
@@ -615,6 +621,13 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
               }),
             })
             .onConflictDoNothing();
+          // Make the child discoverable by the listener scanner. Without
+          // this row NO consumer ever observes a spawned session — its
+          // opened PRs never reach the pr_ref ledger, so review feedback
+          // cannot route back to it (the Tenant Inspector ENG-408 gap),
+          // and it binds no workstream handles. Inside the same
+          // transaction: a spawned session must never exist unenrolled.
+          await tx.insert(sessionListenerTable).values({ sessionId }).onConflictDoNothing();
         });
         try {
           await sessions.createSession(input);
