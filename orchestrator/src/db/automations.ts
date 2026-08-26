@@ -141,6 +141,8 @@ export interface AutomationRunRow {
   automationId: string;
   version: number;
   entrypointId: string;
+  /** ADR 0120 instances: the bound workstream; '' = unbound. */
+  instanceId: string;
   trigger: AutomationRunTrigger;
   deliveryKey: string | null;
   concurrencyKey: string | null;
@@ -295,6 +297,11 @@ export interface AutomationCronStore {
     version: number;
     /** D9: the cron entrypoint's id (default "main"). */
     entrypointId?: string;
+    /** Instances: the open instance this occurrence fans out to ('' = the
+     * classic per-automation occurrence). Part of the occurrence identity
+     * AND every reacquire/terminal predicate below — without it a
+     * same-scheduled_for sibling of another instance could be reacquired. */
+    instanceId?: string;
     scheduledFor: Date;
     leaseOwner: string;
     leaseExpiresAt: Date;
@@ -341,6 +348,8 @@ export interface AutomationDispatchStore {
     version: number;
     /** D9: which entrypoint the run enters through (default "main"). */
     entrypointId?: string;
+    /** Instances: the bound workstream (default '' = unbound). */
+    instanceId?: string;
     trigger: AutomationRunTrigger;
     deliveryKey: string | null;
     concurrencyKey: string | null;
@@ -458,6 +467,7 @@ function runRow(row: typeof automationRunTable.$inferSelect): AutomationRunRow {
     automationId: row.automationId,
     version: row.version,
     entrypointId: row.entrypointId,
+    instanceId: row.instanceId,
     trigger: row.trigger,
     deliveryKey: row.deliveryKey ?? null,
     concurrencyKey: row.concurrencyKey ?? null,
@@ -982,6 +992,7 @@ export function makeAutomationStore(
           automationId: input.automationId,
           version: input.version,
           ...(input.entrypointId !== undefined ? { entrypointId: input.entrypointId } : {}),
+          ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
           trigger,
           deliveryKey: cronDeliveryKey(input.scheduledFor),
           scheduledFor: input.scheduledFor,
@@ -1003,6 +1014,7 @@ export function makeAutomationStore(
         .where(
           and(
             eq(automationRunTable.automationId, input.automationId),
+            eq(automationRunTable.instanceId, input.instanceId ?? ""),
             eq(automationRunTable.scheduledFor, input.scheduledFor),
             eq(automationRunTable.status, "pending"),
             lte(automationRunTable.leaseExpiresAt, input.now),
@@ -1017,6 +1029,7 @@ export function makeAutomationStore(
         .where(
           and(
             eq(automationRunTable.automationId, input.automationId),
+            eq(automationRunTable.instanceId, input.instanceId ?? ""),
             eq(automationRunTable.scheduledFor, input.scheduledFor),
           ),
         )
@@ -1089,6 +1102,7 @@ export function makeAutomationStore(
           automationId: input.automationId,
           version: input.version,
           ...(input.entrypointId !== undefined ? { entrypointId: input.entrypointId } : {}),
+          ...(input.instanceId !== undefined ? { instanceId: input.instanceId } : {}),
           trigger: input.trigger,
           deliveryKey: input.deliveryKey,
           concurrencyKey: input.concurrencyKey,

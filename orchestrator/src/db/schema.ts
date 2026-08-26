@@ -1486,6 +1486,10 @@ export const automationRun = pgTable(
      * dedupe identities below — the same delivery (or cron occurrence) may
      * legitimately open one run per matching entrypoint. */
     entrypointId: text("entrypoint_id").notNull().default("main"),
+    /** ADR 0120 instances: the workstream this run is bound to; '' = unbound
+     * (the entrypoint_id precedent — empty string, never NULL, because PG
+     * uniques treat NULLs as distinct rows). */
+    instanceId: text("instance_id").notNull().default(""),
     error: text("error"),
     // A cron claim is the run row. The partial unique key gives one durable row
     // per occurrence; an expired lease can be reacquired and the same DBOS id
@@ -1501,12 +1505,17 @@ export const automationRun = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
+    // ADR 0120 instances — the dedupe split: a cron occurrence fans out one
+    // run per open instance (instance_id joins the occurrence identity); an
+    // external delivery lands in at most ONE instance (the delivery identity
+    // stays instance-blind, scoped to non-cron rows so fan-out rows never
+    // collide on their shared delivery key).
     uniqueIndex("automation_run_occurrence_unique")
-      .on(t.automationId, t.entrypointId, t.scheduledFor)
+      .on(t.automationId, t.entrypointId, t.instanceId, t.scheduledFor)
       .where(sql`scheduled_for is not null`),
     uniqueIndex("automation_run_delivery_unique")
       .on(t.automationId, t.entrypointId, t.deliveryKey)
-      .where(sql`delivery_key is not null`),
+      .where(sql`delivery_key is not null and scheduled_for is null`),
     index("automation_run_automation_created_idx").on(t.automationId, t.createdAt),
     index("automation_run_lease_idx").on(t.leaseExpiresAt),
     index("automation_run_concurrency_idx").on(t.automationId, t.concurrencyKey, t.status),
@@ -1587,6 +1596,63 @@ export const automationState = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [primaryKey({ columns: [t.automationId, t.key] })],
+);
+
+/** ADR 0120 instances ("workstreams" in the UI): the durable product-level
+ * entity many short runs contribute to. One OPEN instance per rendered
+ * identity key; closed instances accumulate as history under the same key.
+ * `inputs` is the kickoff-time snapshot instance-bound runs resolve
+ * `inputs.*` from (the automation row's inputs demote to defaults). */
+export const automationInstance = pgTable(
+  "automation_instance",
+  {
+    /** ai_<base32> — contains no ':' or '/', so run ids and state prefixes
+     * that embed it stay injective. */
+    id: text("id").primaryKey(),
+    automationId: text("automation_id")
+      .notNull()
+      .references(() => automation.id, { onDelete: "cascade" }),
+    /** The rendered identity key (human-readable, e.g. project-ENG-42). */
+    key: text("key").notNull(),
+    status: text("status").notNull().default("open"),
+    inputs: jsonb("inputs").$type<Record<string, unknown>>().notNull().default({}),
+    /** user:<id> | run:<runId> | the admitting event's descriptor. */
+    openedBy: text("opened_by").notNull().default(""),
+    openedAt: timestamp("opened_at", { withTimezone: true }).notNull().defaultNow(),
+    closedAt: timestamp("closed_at", { withTimezone: true }),
+    closeReason: text("close_reason"),
+  },
+  (t) => [
+    uniqueIndex("automation_instance_open_key_unique")
+      .on(t.automationId, t.key)
+      .where(sql`status = 'open'`),
+    index("automation_instance_automation_idx").on(t.automationId, t.status, t.openedAt),
+  ],
+);
+
+/** The handle ledger: one external identifier (slack:<ch>:<ts>,
+ * github:<repo>#<n>) routes to exactly one instance per automation, forever
+ * — a second claim refuses loudly (never a silent rebind), and reopening a
+ * key never re-routes old threads. Handles outlive their instance for
+ * audit. */
+export const automationInstanceHandle = pgTable(
+  "automation_instance_handle",
+  {
+    automationId: text("automation_id")
+      .notNull()
+      .references(() => automation.id, { onDelete: "cascade" }),
+    handle: text("handle").notNull(),
+    instanceId: text("instance_id")
+      .notNull()
+      .references(() => automationInstance.id, { onDelete: "cascade" }),
+    /** <runId>:<framePath> | consumer:<name> — the side effect that wrote it. */
+    writtenBy: text("written_by").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.automationId, t.handle] }),
+    index("automation_instance_handle_instance_idx").on(t.instanceId),
+  ],
 );
 
 export const webhookSample = pgTable(

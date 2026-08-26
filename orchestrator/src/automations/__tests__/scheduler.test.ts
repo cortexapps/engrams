@@ -62,6 +62,7 @@ function pendingRun(
     automationId: "automation-1",
     version: 3,
     entrypointId: "main",
+    instanceId: "",
     trigger: { source: "cron", receivedAt: scheduledFor.toISOString() },
     deliveryKey: `cron:${Math.floor(scheduledFor.getTime() / 1_000)}`,
     dryRun: false,
