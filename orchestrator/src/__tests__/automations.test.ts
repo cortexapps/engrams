@@ -242,9 +242,10 @@ function fakeStore(seed?: {
     async listVersions(automationId) {
       return [...(automations.get(automationId)?.versions.values() ?? [])].sort((x, y) => y.version - x.version);
     },
-    async listRuns(automationId, limit) {
+    async listRuns(automationId, limit, opts) {
       return [...runs.values()]
         .filter((r) => r.automationId === automationId)
+        .filter((r) => opts?.instanceId === undefined || r.instanceId === opts.instanceId)
         .sort((x, y) => y.createdAt.getTime() - x.createdAt.getTime())
         .slice(0, limit);
     },
@@ -1186,5 +1187,286 @@ describe("WebhookRegistrationService", () => {
     await automations.archiveAutomation({ id: created.automation!.id });
     expect((await registrations.deleteWebhookRegistration({ id: "team-hook" })).deleted).toBe(true);
     expect(deletes).toEqual(["webhook.team-hook.secret"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0120: workstream kickoff + instance RPCs
+// ---------------------------------------------------------------------------
+
+import type {
+  AutomationInstanceRow,
+  AutomationInstanceStore,
+} from "../db/automation-instances.ts";
+
+function fakeInstanceStore() {
+  const rows = new Map<string, AutomationInstanceRow>();
+  const handles = new Map<string, { instanceId: string; writtenBy: string; createdAt: Date }>();
+  const drops: Array<{ automationId: string; entrypointId: string; eventKey: string; reason: string; detail: string }> = [];
+  let seq = 0;
+  const openByKey = (automationId: string, key: string) =>
+    [...rows.values()].find(
+      (r) => r.automationId === automationId && r.key === key && r.status === "open",
+    ) ?? null;
+  const store: AutomationInstanceStore = {
+    async openInstance(input) {
+      const existing = openByKey(input.automationId, input.key);
+      if (existing) return existing;
+      const row: AutomationInstanceRow = {
+        id: `ai_rpc${++seq}`,
+        automationId: input.automationId,
+        key: input.key,
+        status: "open",
+        inputs: input.inputs,
+        openedBy: input.openedBy,
+        openedAt: NOW,
+        closedAt: null,
+        closeReason: null,
+      };
+      rows.set(row.id, row);
+      return row;
+    },
+    async getInstance(id) {
+      return rows.get(id) ?? null;
+    },
+    async getOpenInstanceByKey(automationId, key) {
+      return openByKey(automationId, key);
+    },
+    async listOpenInstances(automationId, limit = 500) {
+      return [...rows.values()]
+        .filter((r) => r.automationId === automationId && r.status === "open")
+        .slice(0, limit);
+    },
+    async listInstances(automationId, opts = {}) {
+      return [...rows.values()].filter(
+        (r) =>
+          r.automationId === automationId &&
+          (opts.includeClosed === true || r.status === "open"),
+      );
+    },
+    async listInstanceHandles(instanceId) {
+      return [...handles.entries()]
+        .filter(([, v]) => v.instanceId === instanceId)
+        .map(([handle, v]) => ({ handle, writtenBy: v.writtenBy, createdAt: v.createdAt }));
+    },
+    async closeInstance({ instanceId, reason }) {
+      const row = rows.get(instanceId);
+      if (!row || row.status !== "open") return false;
+      row.status = "closed";
+      row.closedAt = NOW;
+      row.closeReason = reason ?? null;
+      return true;
+    },
+    async recordInstanceHandle(input) {
+      handles.set(input.handle, {
+        instanceId: input.instanceId,
+        writtenBy: input.writtenBy,
+        createdAt: NOW,
+      });
+      return { kind: "recorded" };
+    },
+    async resolveHandles() {
+      return [];
+    },
+    async recordDrop(input) {
+      drops.push(input);
+    },
+    async listRecentDrops(automationId, limit = 50) {
+      return drops
+        .filter((d) => d.automationId === automationId)
+        .slice(-limit)
+        .reverse()
+        .map((d, i) => ({ ...d, id: i + 1, droppedAt: NOW }));
+    },
+  };
+  return { store, rows, handles, drops };
+}
+
+function instancedDefinitionJson(extra: Record<string, unknown> = {}): string {
+  return JSON.stringify(
+    cronDefinition({
+      trigger: { kind: "manual" },
+      inputsSchema: [
+        { key: "project", label: "Project", type: "string", default: "none" },
+        { key: "mention", label: "Mention", type: "string", default: "@engrams" },
+      ],
+      settings: {
+        endSessionsOnFinish: false,
+        instance: { keyTemplate: "project-${{ inputs.project }}", ...extra },
+      },
+    }),
+  );
+}
+
+describe("workstream kickoff + instance RPCs (ADR 0120)", () => {
+  test("an instanced automation rejects legacy inputs_json; a non-instanced one rejects instance_key", async () => {
+    const inst = fakeInstanceStore();
+    const deps = adminDeps({ instances: inst.store });
+    const { automations } = clients(deps);
+    const instanced = await automations.createAutomation({
+      name: "Templated",
+      description: "",
+      enabled: true,
+      definitionJson: instancedDefinitionJson(),
+      inputsJson: "{}",
+    });
+    await expect(
+      automations.runNow({
+        automationId: instanced.automation!.id,
+        inputsJson: JSON.stringify({ project: "ENG-1" }),
+      }),
+    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+
+    const plain = await automations.createAutomation({
+      name: "Plain",
+      description: "",
+      enabled: true,
+      definitionJson: JSON.stringify(cronDefinition({ trigger: { kind: "manual" } })),
+      inputsJson: "{}",
+    });
+    await expect(
+      automations.runNow({ automationId: plain.automation!.id, instanceKey: "project-ENG-1" }),
+    ).rejects.toMatchObject({ code: Code.InvalidArgument });
+  });
+
+  test("instance_key opens with merged validated inputs, joins idempotently, and refuses a join snapshot", async () => {
+    const inst = fakeInstanceStore();
+    const deps = adminDeps({ instances: inst.store });
+    const { automations } = clients(deps);
+    const created = await automations.createAutomation({
+      name: "Templated",
+      description: "",
+      enabled: true,
+      definitionJson: instancedDefinitionJson(),
+      inputsJson: "{}",
+    });
+    const id = created.automation!.id;
+
+    const first = await automations.runNow({
+      automationId: id,
+      instanceKey: "project-ENG-1",
+      instanceInputsJson: JSON.stringify({ project: "ENG-1" }),
+    });
+    const instance = [...inst.rows.values()][0]!;
+    expect(instance).toMatchObject({
+      key: "project-ENG-1",
+      // Snapshot = schema defaults overlaid with the kickoff values.
+      inputs: { project: "ENG-1", mention: "@engrams" },
+    });
+    expect(first.runId).toBe(`autorun:${id}:main:i-${instance.id}:manual:fixed-id`);
+    expect(deps.fake.runs.get(first.runId)?.instanceId).toBe(instance.id);
+
+    // Joining the open workstream: fine bare, refused with a new snapshot.
+    await automations.runNow({ automationId: id, instanceKey: "project-ENG-1" });
+    expect(inst.rows.size).toBe(1);
+    await expect(
+      automations.runNow({
+        automationId: id,
+        instanceKey: "project-ENG-1",
+        instanceInputsJson: JSON.stringify({ project: "ENG-2" }),
+      }),
+    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+
+    // A bad kickoff value never opens: enum/type validation runs first.
+    await expect(
+      automations.runNow({
+        automationId: id,
+        instanceKey: "project-ENG-3",
+        instanceInputsJson: JSON.stringify({ ghost: true }),
+      }),
+    ).rejects.toThrow();
+    expect(inst.rows.size).toBe(1);
+  });
+
+  test("without instance_key the declared key template resolves; require joins-or-refuses", async () => {
+    const inst = fakeInstanceStore();
+    const deps = adminDeps({ instances: inst.store });
+    const { automations } = clients(deps);
+    const open = await automations.createAutomation({
+      name: "Open",
+      description: "",
+      enabled: true,
+      definitionJson: instancedDefinitionJson(),
+      inputsJson: JSON.stringify({ project: "ENG-9" }),
+    });
+    const run = await automations.runNow({ automationId: open.automation!.id });
+    const instance = [...inst.rows.values()][0]!;
+    expect(instance.key).toBe("project-ENG-9");
+    expect(deps.fake.runs.get(run.runId)?.instanceId).toBe(instance.id);
+
+    const gated = await automations.createAutomation({
+      name: "Gated",
+      description: "",
+      enabled: true,
+      definitionJson: instancedDefinitionJson({ entrypoints: { main: { admit: "require" } } }),
+      inputsJson: JSON.stringify({ project: "ENG-10" }),
+    });
+    await expect(
+      automations.runNow({ automationId: gated.automation!.id }),
+    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await expect(
+      automations.runNow({ automationId: gated.automation!.id, instanceKey: "project-ENG-10" }),
+    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+  });
+
+  test("ListInstances/GetInstance/CloseInstance/ListRecentDrops round-trip; ListRuns filters by workstream", async () => {
+    const inst = fakeInstanceStore();
+    const deps = adminDeps({ instances: inst.store });
+    const { automations, runsApi } = clients(deps);
+    const created = await automations.createAutomation({
+      name: "Templated",
+      description: "",
+      enabled: true,
+      definitionJson: instancedDefinitionJson(),
+      inputsJson: "{}",
+    });
+    const id = created.automation!.id;
+    await automations.runNow({ automationId: id, instanceKey: "project-A" });
+    await automations.runNow({ automationId: id, instanceKey: "project-B" });
+    const [a, b] = [...inst.rows.values()];
+    await inst.store.recordInstanceHandle({
+      automationId: id,
+      handle: "slack:C1:1724.1",
+      instanceId: a!.id,
+      writtenBy: "run:post",
+    });
+    inst.drops.push({
+      automationId: id,
+      entrypointId: "main",
+      eventKey: "message",
+      reason: "no_handle_match",
+      detail: "slack:C1:9",
+    });
+
+    const listed = await runsApi.listInstances({ automationId: id, includeClosed: false, limit: 0 });
+    expect(listed.instances.map((i) => i.key).sort()).toEqual(["project-A", "project-B"]);
+
+    const got = await runsApi.getInstance({ id: a!.id });
+    expect(got.instance).toMatchObject({ key: "project-A", status: "open" });
+    expect(got.handles).toMatchObject([{ handle: "slack:C1:1724.1", writtenBy: "run:post" }]);
+
+    const filtered = await runsApi.listRuns({
+      automationId: id,
+      limit: 0,
+      includeFiltered: true,
+      instanceId: a!.id,
+    });
+    expect(filtered.runs.map((r) => r.instanceId)).toEqual([a!.id]);
+
+    const closed = await runsApi.closeInstance({ id: a!.id, reason: "done" });
+    expect(closed.closed).toBe(true);
+    expect((await runsApi.closeInstance({ id: a!.id })).closed).toBe(false);
+    const after = await runsApi.listInstances({ automationId: id, includeClosed: true, limit: 0 });
+    expect(after.instances.find((i) => i.id === a!.id)).toMatchObject({
+      status: "closed",
+      closeReason: "done",
+    });
+
+    const dropList = await runsApi.listRecentDrops({ automationId: id, limit: 0 });
+    expect(dropList.drops).toMatchObject([{ reason: "no_handle_match", detail: "slack:C1:9" }]);
+
+    await expect(runsApi.getInstance({ id: "ai_ghost" })).rejects.toMatchObject({
+      code: Code.NotFound,
+    });
   });
 });

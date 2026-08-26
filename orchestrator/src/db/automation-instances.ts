@@ -69,6 +69,16 @@ export interface AutomationInstanceStore {
   getOpenInstanceByKey(automationId: string, key: string): Promise<AutomationInstanceRow | null>;
   /** Oldest-first, capped — the cron fan-out enumeration. */
   listOpenInstances(automationId: string, limit?: number): Promise<AutomationInstanceRow[]>;
+  /** The UI listing: open first (oldest-first), then closed (newest close
+   * first) when included. */
+  listInstances(
+    automationId: string,
+    opts?: { includeClosed?: boolean; limit?: number },
+  ): Promise<AutomationInstanceRow[]>;
+  /** The workstream's routing history, oldest first. */
+  listInstanceHandles(instanceId: string): Promise<
+    Array<{ handle: string; writtenBy: string; createdAt: Date }>
+  >;
   /** open → closed CAS; false = it was not open (already closed / unknown). */
   closeInstance(input: {
     instanceId: string;
@@ -241,6 +251,37 @@ export function makeAutomationInstanceStore(
         .orderBy(asc(automationInstance.openedAt), asc(automationInstance.id))
         .limit(limit);
       return rows.map(instanceRow);
+    },
+
+    async listInstances(automationId, opts = {}) {
+      const limit = opts.limit ?? INSTANCE_LIST_MAX;
+      const open = await this.listOpenInstances(automationId, limit);
+      if (!opts.includeClosed || open.length >= limit) return open.slice(0, limit);
+      const closed = await db
+        .select()
+        .from(automationInstance)
+        .where(
+          and(
+            eq(automationInstance.automationId, automationId),
+            eq(automationInstance.status, "closed"),
+          ),
+        )
+        .orderBy(desc(automationInstance.closedAt), desc(automationInstance.id))
+        .limit(limit - open.length);
+      return [...open, ...closed.map(instanceRow)];
+    },
+
+    async listInstanceHandles(instanceId) {
+      const rows = await db
+        .select({
+          handle: automationInstanceHandle.handle,
+          writtenBy: automationInstanceHandle.writtenBy,
+          createdAt: automationInstanceHandle.createdAt,
+        })
+        .from(automationInstanceHandle)
+        .where(eq(automationInstanceHandle.instanceId, instanceId))
+        .orderBy(asc(automationInstanceHandle.createdAt), asc(automationInstanceHandle.handle));
+      return rows;
     },
 
     async closeInstance(input) {

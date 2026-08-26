@@ -396,6 +396,8 @@ export function defaultInstanceStoreLazy(): AutomationInstanceStore {
     resolveHandles: (automationId, handles) => get().resolveHandles(automationId, handles),
     recordDrop: (input) => get().recordDrop(input),
     listRecentDrops: (automationId, limit) => get().listRecentDrops(automationId, limit),
+    listInstances: (automationId, opts) => get().listInstances(automationId, opts),
+    listInstanceHandles: (instanceId) => get().listInstanceHandles(instanceId),
   };
 }
 

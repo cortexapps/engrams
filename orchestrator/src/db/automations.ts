@@ -232,7 +232,11 @@ export interface AutomationStore {
   getVersion(automationId: string, version: number): Promise<AutomationVersionRow | null>;
   listVersions(automationId: string): Promise<AutomationVersionRow[]>;
 
-  listRuns(automationId: string, limit: number): Promise<AutomationRunRow[]>;
+  listRuns(
+    automationId: string,
+    limit: number,
+    opts?: { instanceId?: string },
+  ): Promise<AutomationRunRow[]>;
   getRun(id: string): Promise<AutomationRunRow | null>;
   listStepRuns(runId: string): Promise<AutomationStepRunRow[]>;
   listRunSessionIds(runId: string): Promise<Array<{ sessionId: string; blockId: string }>>;
@@ -864,11 +868,18 @@ export function makeAutomationStore(
     // Runs
     // -----------------------------------------------------------------------
 
-    async listRuns(automationId, limit) {
+    async listRuns(automationId, limit, opts) {
       const rows = await db
         .select()
         .from(automationRunTable)
-        .where(eq(automationRunTable.automationId, automationId))
+        .where(
+          and(
+            eq(automationRunTable.automationId, automationId),
+            ...(opts?.instanceId !== undefined
+              ? [eq(automationRunTable.instanceId, opts.instanceId)]
+              : []),
+          ),
+        )
         .orderBy(desc(automationRunTable.createdAt))
         .limit(limit);
       return rows.map(runRow);

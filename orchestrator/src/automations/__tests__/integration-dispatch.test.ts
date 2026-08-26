@@ -686,6 +686,12 @@ function fakeInstances(): InstanceHarness {
     async listRecentDrops() {
       return [];
     },
+    async listInstances() {
+      return [];
+    },
+    async listInstanceHandles() {
+      return [];
+    },
   };
   return {
     store,
