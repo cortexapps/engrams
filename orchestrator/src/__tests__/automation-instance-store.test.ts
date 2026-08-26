@@ -224,6 +224,112 @@ describe.skipIf(!dbReachable)("automation instance store (live PG)", () => {
     const otherAuto = await seedAutomation("handles-other");
     expect(await store.resolveHandles(otherAuto, [handle])).toEqual([]);
   });
+
+  test("explicit claim takes over a CLOSED holder's handle; open holders and auto-writers never rebind", async () => {
+    const autoId = await seedAutomation("handle-takeover");
+    const store = makeAutomationInstanceStore();
+    const open = (key: string) =>
+      store.openInstance({ automationId: autoId, key, inputs: {}, openedBy: "" });
+    const first = await open("quarter-1");
+    const handle = "slack:C7CHANNEL";
+    expect(
+      await store.recordInstanceHandle({
+        automationId: autoId,
+        handle,
+        instanceId: first.id,
+        writtenBy: "run-1:claim",
+      }),
+    ).toEqual({ kind: "recorded" });
+    await store.closeInstance({ instanceId: first.id });
+    const second = await open("quarter-2");
+
+    // An auto-writer (no flag) still refuses — closed or not, routing is
+    // never silently rebound.
+    expect(
+      await store.recordInstanceHandle({
+        automationId: autoId,
+        handle,
+        instanceId: second.id,
+        writtenBy: "consumer:pr-link:s1",
+      }),
+    ).toEqual({ kind: "conflict", instanceId: first.id });
+
+    // The explicit claim path takes over the closed holder, audited.
+    expect(
+      await store.recordInstanceHandle({
+        automationId: autoId,
+        handle,
+        instanceId: second.id,
+        writtenBy: "run-2:claim",
+        allowTakeoverFromClosed: true,
+      }),
+    ).toEqual({ kind: "reclaimed", from: first.id });
+    // Resolution routes to the new OPEN holder.
+    expect(await store.resolveHandles(autoId, [handle])).toEqual([
+      { handle, instanceId: second.id, instanceStatus: "open" },
+    ]);
+    // A DBOS replay of the takeover converges.
+    expect(
+      await store.recordInstanceHandle({
+        automationId: autoId,
+        handle,
+        instanceId: second.id,
+        writtenBy: "run-2:claim",
+        allowTakeoverFromClosed: true,
+      }),
+    ).toEqual({ kind: "already_ours" });
+
+    // An OPEN holder is never taken over, flag or not.
+    const third = await open("quarter-3");
+    expect(
+      await store.recordInstanceHandle({
+        automationId: autoId,
+        handle,
+        instanceId: third.id,
+        writtenBy: "run-3:claim",
+        allowTakeoverFromClosed: true,
+      }),
+    ).toEqual({ kind: "conflict", instanceId: second.id });
+  });
+
+  test("two concurrent takeovers of one closed holder: exactly one wins", async () => {
+    const autoId = await seedAutomation("handle-takeover-race");
+    const store = makeAutomationInstanceStore();
+    const open = (key: string) =>
+      store.openInstance({ automationId: autoId, key, inputs: {}, openedBy: "" });
+    const dead = await open("gone");
+    const handle = "slack:CRACE";
+    await store.recordInstanceHandle({
+      automationId: autoId,
+      handle,
+      instanceId: dead.id,
+      writtenBy: "run-0:claim",
+    });
+    await store.closeInstance({ instanceId: dead.id });
+    const [left, right] = [await open("left"), await open("right")];
+
+    const results = await Promise.all(
+      [left, right].map((instance, i) =>
+        store.recordInstanceHandle({
+          automationId: autoId,
+          handle,
+          instanceId: instance.id,
+          writtenBy: `run-${i}:claim`,
+          allowTakeoverFromClosed: true,
+        }),
+      ),
+    );
+    const kinds = results.map((r) => r.kind).sort();
+    expect(kinds).toEqual(["conflict", "reclaimed"]);
+    const winner = results.find((r) => r.kind === "reclaimed");
+    const loser = results.find((r) => r.kind === "conflict");
+    expect(winner && "from" in winner ? winner.from : null).toBe(dead.id);
+    // The loser sees the WINNER as the holder (an open instance — no
+    // second takeover), and resolution agrees.
+    const [held] = await store.resolveHandles(autoId, [handle]);
+    expect(loser && "instanceId" in loser ? loser.instanceId : null).toBe(held?.instanceId ?? null);
+    expect(held?.instanceStatus).toBe("open");
+  });
 });
 
 describe.skipIf(!dbReachable)("run dedupe split + instance-aware cron claims (live PG)", () => {

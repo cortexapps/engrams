@@ -104,7 +104,14 @@ export interface PrLinkConsumerDeps {
     handle: string;
     instanceId: string;
     writtenBy: string;
-  }): Promise<{ kind: "recorded" } | { kind: "already_ours" } | { kind: "conflict"; instanceId: string }>;
+  }): Promise<
+    | { kind: "recorded" }
+    | { kind: "already_ours" }
+    // Never occurs here: takeover needs the claim-path flag, which this
+    // auto-writer deliberately does not pass.
+    | { kind: "reclaimed"; from: string }
+    | { kind: "conflict"; instanceId: string }
+  >;
 }
 
 export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {

@@ -6,11 +6,14 @@
  * discovered by a code block.
  *
  * Same contract as every writer: `already_ours` converges a replayed
- * step, and a handle another workstream owns is a typed non-retryable
- * error — routing is never silently rebound. Case-folding follows the
- * shared provider rule by sniffing the namespace prefix (`github:…`
- * folds; `slack:…` stays exact), so a claim and a later admission match
- * can never disagree by case.
+ * step, and a handle an OPEN workstream owns is a typed non-retryable
+ * error — routing is never silently rebound. The ONE deliberate rebind
+ * lives here: a handle whose holder is CLOSED is taken over
+ * (`reclaimed`), because long-lived places like channels outlive
+ * workstreams and a dead holder must not brick them. Case-folding
+ * follows the shared provider rule by sniffing the namespace prefix
+ * (`github:…` folds; `slack:…` stays exact), so a claim and a later
+ * admission match can never disagree by case.
  */
 
 import { z } from "zod";
@@ -28,7 +31,7 @@ export type ClaimHandleConfig = z.infer<typeof claimHandleConfigSchema>;
 export function registerClaimHandleBlock(): void {
   registerBlock<ClaimHandleConfig>({
     type: "claim_handle",
-    outputs: ["claimed", "handle"],
+    outputs: ["claimed", "handle", "reclaimed"],
     configSchema: claimHandleConfigSchema,
     async execute(config, ctx) {
       if (ctx.instanceId === "") {
@@ -45,7 +48,13 @@ export function registerClaimHandleBlock(): void {
       if (ctx.dryRun) {
         return {
           kind: "ok",
-          outputs: { claimed: true, handle, dry_run: true, would_execute: { handle } },
+          outputs: {
+            claimed: true,
+            handle,
+            reclaimed: false,
+            dry_run: true,
+            would_execute: { handle },
+          },
         };
       }
       const ops = ctx.deps.instances;
@@ -62,16 +71,22 @@ export function registerClaimHandleBlock(): void {
         handle,
         instanceId: ctx.instanceId,
         writtenBy: `${ctx.runId}:${ctx.currentPath}`,
+        // The explicit claim is the ONE writer allowed to take over a
+        // CLOSED holder's handle (rung 2: channels outlive workstreams).
+        allowTakeoverFromClosed: true,
       });
       if (result.kind === "conflict") {
         return {
           kind: "error",
           code: "handle_conflict",
-          message: `handle "${handle}" already routes to workstream ${result.instanceId} — close or reuse that workstream instead of rebinding`,
+          message: `handle "${handle}" already routes to OPEN workstream ${result.instanceId} — close or reuse that workstream instead of rebinding`,
           retryable: false,
         };
       }
-      return { kind: "ok", outputs: { claimed: true, handle } };
+      return {
+        kind: "ok",
+        outputs: { claimed: true, handle, reclaimed: result.kind === "reclaimed" },
+      };
     },
   });
 }

@@ -216,14 +216,20 @@ export interface EngineStateStore {
 export interface EngineInstanceOps {
   closeInstance(input: { instanceId: string; reason?: string }): Promise<boolean>;
   /** The claim_handle block's writer (same contract as every writer:
-   * already_ours converges a replay; conflict never rebinds). */
+   * already_ours converges a replay; an OPEN holder's conflict never
+   * rebinds). The claim path alone may pass `allowTakeoverFromClosed` to
+   * take over a CLOSED holder's handle (`reclaimed`, rung 2). */
   recordInstanceHandle?(input: {
     automationId: string;
     handle: string;
     instanceId: string;
     writtenBy: string;
+    allowTakeoverFromClosed?: boolean;
   }): Promise<
-    { kind: "recorded" } | { kind: "already_ours" } | { kind: "conflict"; instanceId: string }
+    | { kind: "recorded" }
+    | { kind: "already_ours" }
+    | { kind: "reclaimed"; from: string }
+    | { kind: "conflict"; instanceId: string }
   >;
 }
 

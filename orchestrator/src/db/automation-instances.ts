@@ -8,11 +8,15 @@
  * concurrent kickoffs of the same key JOIN the winner.
  *
  * The handle ledger routes correlation-bearing events: one external
- * identifier (slack:<ch>:<ts>, github:<repo>#<n>) maps to exactly one
- * instance per automation, forever. A second claim refuses loudly
+ * identifier (slack:<ch>, slack:<ch>:<ts>, github:<repo>#<n>) maps to
+ * exactly one instance per automation. A second claim refuses loudly
  * (`conflict`) — never a silent rebind (the Zeebe duplicate-subscription
  * bug class) — and a retried step that already owns the handle reports
- * `already_ours` so DBOS replays converge.
+ * `already_ours` so DBOS replays converge. The ONE sanctioned rebind is
+ * the explicit claim path taking over a handle whose holder instance is
+ * CLOSED (`reclaimed`, rung 2): channels are long-lived places that
+ * outlive workstreams, and a closed holder must not brick them forever.
+ * Auto-writers never take over.
  */
 
 import { and, asc, desc, eq, inArray, lt, sql } from "drizzle-orm";
@@ -35,6 +39,9 @@ export interface AutomationInstanceRow {
 export type RecordHandleResult =
   | { kind: "recorded" }
   | { kind: "already_ours" }
+  /** An explicit claim took the handle over from a CLOSED holder (rung 2:
+   * channels outlive workstreams). Only the claim path may do this. */
+  | { kind: "reclaimed"; from: string }
   | { kind: "conflict"; instanceId: string };
 
 export interface AutomationDropRow {
@@ -89,6 +96,11 @@ export interface AutomationInstanceStore {
     handle: string;
     instanceId: string;
     writtenBy: string;
+    /** Claim-path only (`claim_handle`): a handle whose holder instance is
+     * CLOSED may be taken over (audited `reclaimed`). Auto-writers never
+     * pass this — routing is never silently rebound. An OPEN holder still
+     * conflicts. */
+    allowTakeoverFromClosed?: boolean;
   }): Promise<RecordHandleResult>;
   /** One query over all of an event's candidate handles. */
   resolveHandles(automationId: string, handles: string[]): Promise<ResolvedHandle[]>;
@@ -317,8 +329,15 @@ export function makeAutomationInstanceStore(
         .returning();
       if (inserted[0]) return { kind: "recorded" };
       const [holder] = await db
-        .select()
+        .select({
+          instanceId: automationInstanceHandle.instanceId,
+          holderStatus: automationInstance.status,
+        })
         .from(automationInstanceHandle)
+        .innerJoin(
+          automationInstance,
+          eq(automationInstance.id, automationInstanceHandle.instanceId),
+        )
         .where(
           and(
             eq(automationInstanceHandle.automationId, input.automationId),
@@ -326,10 +345,46 @@ export function makeAutomationInstanceStore(
           ),
         )
         .limit(1);
-      // The ledger is append-only (no deletes), so the holder cannot vanish
-      // between our insert and read.
+      // The ledger never loses rows (no deletes; a takeover is an update),
+      // so the holder cannot vanish between our insert and read.
       if (!holder) throw new Error(`handle ${input.handle} disappeared after insert conflict`);
       if (holder.instanceId === input.instanceId) return { kind: "already_ours" };
+      if (input.allowTakeoverFromClosed === true && holder.holderStatus === "closed") {
+        // Explicit takeover from a closed workstream (rung 2: channels are
+        // long-lived places, and a closed holder would brick the handle
+        // forever). CAS on the exact observed holder: closed is terminal
+        // (nothing reopens an instance), so the only race is another
+        // claimant — one wins the update, the loser re-reads below.
+        const taken = await db
+          .update(automationInstanceHandle)
+          .set({
+            instanceId: input.instanceId,
+            writtenBy: input.writtenBy,
+            createdAt: now(),
+          })
+          .where(
+            and(
+              eq(automationInstanceHandle.automationId, input.automationId),
+              eq(automationInstanceHandle.handle, input.handle),
+              eq(automationInstanceHandle.instanceId, holder.instanceId),
+            ),
+          )
+          .returning({ handle: automationInstanceHandle.handle });
+        if (taken[0]) return { kind: "reclaimed", from: holder.instanceId };
+        const [current] = await db
+          .select({ instanceId: automationInstanceHandle.instanceId })
+          .from(automationInstanceHandle)
+          .where(
+            and(
+              eq(automationInstanceHandle.automationId, input.automationId),
+              eq(automationInstanceHandle.handle, input.handle),
+            ),
+          )
+          .limit(1);
+        if (!current) throw new Error(`handle ${input.handle} disappeared during takeover`);
+        if (current.instanceId === input.instanceId) return { kind: "already_ours" };
+        return { kind: "conflict", instanceId: current.instanceId };
+      }
       return { kind: "conflict", instanceId: holder.instanceId };
     },
 
