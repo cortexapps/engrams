@@ -1210,6 +1210,29 @@ impl MetadataStore for SimMetadataStore {
         }))
     }
 
+    async fn tool_call_completed_exists(
+        &self,
+        session_id: SessionId,
+        tool_call_id: &str,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        // `SELECT EXISTS(... kind = 'tool_call_completed' AND
+        //  payload->>'tool_call_id' = $2 AND rewound_at IS NULL)` — the
+        // live timeline only, matching the sibling event lookups.
+        Ok(db.session_events.get(&session_id).is_some_and(|events| {
+            events.iter().any(|event| {
+                event.rewound_at.is_none()
+                    && event.kind == "tool_call_completed"
+                    && event
+                        .payload
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(tool_call_id)
+            })
+        }))
+    }
+
     async fn session_exec_output_high_water(
         &self,
         session_id: SessionId,

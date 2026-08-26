@@ -223,6 +223,107 @@ async fn session_exec_event_at(ctx: &Ctx) {
     );
 }
 
+/// A tool result submitted after its call already completed is unackable
+/// (the confirming `tool_call_completed` — the ToolResult outbox ack — has
+/// already fired) and its delivery wedges the harness in a condemn loop
+/// (prod 2026-08-26). `complete_tool_call_core` drops such a result at the
+/// door via this lookup. Pinned clauses: tool_call_id match, kind filter
+/// (requested/started rows also carry `tool_call_id`), session isolation,
+/// and the live-timeline restriction.
+async fn tool_call_completed_exists(ctx: &Ctx) {
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/toolcall-completed:latest"))
+        .await
+        .unwrap();
+    let other_sid = ctx
+        .meta
+        .create_session(spec("test.invalid/toolcall-completed-other:latest"))
+        .await
+        .unwrap();
+    let tool_event = |kind: &str| {
+        serde_json::json!({
+            "type": kind,
+            "tool_call_id": "toolu_present",
+            "tool_name": "wait_sessions",
+            "at": ctx.clock.now_utc(),
+        })
+    };
+
+    assert!(
+        !ctx.meta
+            .tool_call_completed_exists(sid, "toolu_present")
+            .await
+            .unwrap(),
+        "an absent call must not match"
+    );
+
+    // The same call id under OTHER kinds in the same session, and completed
+    // in a DIFFERENT session: only the kind filter and the session clause
+    // keep them from answering.
+    ctx.meta
+        .append_session_event(
+            sid,
+            "tool_call_requested",
+            tool_event("tool_call_requested"),
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(sid, "tool_call_started", tool_event("tool_call_started"))
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(
+            other_sid,
+            "tool_call_completed",
+            tool_event("tool_call_completed"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !ctx.meta
+            .tool_call_completed_exists(sid, "toolu_present")
+            .await
+            .unwrap(),
+        "requested/started rows and another session's completion must not match"
+    );
+
+    ctx.meta
+        .append_session_event(
+            sid,
+            "tool_call_completed",
+            tool_event("tool_call_completed"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .tool_call_completed_exists(sid, "toolu_present")
+            .await
+            .unwrap(),
+        "a live completion for the exact call must match"
+    );
+    assert!(
+        !ctx.meta
+            .tool_call_completed_exists(sid, "toolu_different")
+            .await
+            .unwrap(),
+        "a different call id must not match"
+    );
+
+    // ADR 0028 rewind: a replayed step legitimately re-runs a call; the
+    // tombstoned past must not gag its late result.
+    ctx.meta.rewind_session_to_cursor(sid, 0).await.unwrap();
+    assert!(
+        !ctx.meta
+            .tool_call_completed_exists(sid, "toolu_present")
+            .await
+            .unwrap(),
+        "tombstoned (rewound) completions must not satisfy the guard"
+    );
+}
+
 /// ADR 0103: output recording is observation-independent — re-attaches skip
 /// persisting at or below the recorded high-water mark. Pins every predicate
 /// clause: byte-range stamps (unstamped legacy rows invisible), per-stream
@@ -3707,6 +3808,10 @@ conformance!(
     super::binding_disposition_contract
 );
 conformance!(t_session_exec_event_at, super::session_exec_event_at);
+conformance!(
+    t_tool_call_completed_exists,
+    super::tool_call_completed_exists
+);
 conformance!(
     t_session_exec_output_high_water,
     super::session_exec_output_high_water
