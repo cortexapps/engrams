@@ -490,8 +490,10 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
     expect(result).toMatchObject({ claimed: 0, started: 0 });
     expect(f.advances).toEqual([]);
 
-    // Mixed: one sibling held, one free — this pod runs the free one and
-    // advances for the automation.
+    // Mixed: one sibling held, one free — this pod runs the free one but
+    // DEFERS the advance: the held row's claimer might die before starting
+    // it, and advancing now would strand that occurrence forever (the
+    // advance CAS has no instance dimension). Review finding on this PR.
     const g = fanoutFixture({ open: ["ai_one", "ai_two"], leaseHeld: ["ai_one"] });
     const result2 = await runSchedulerTick({
       owner: "pod-b",
@@ -501,6 +503,20 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
       now: () => NOW,
     });
     expect(result2).toMatchObject({ claimed: 1, started: 1 });
+    expect(g.advances).toEqual([]);
+
+    // After the held lease expires, the next tick reacquires the sibling
+    // (the free row is already terminal-started, an idempotent restart) and
+    // only THEN advances — no occurrence is ever stranded.
+    const later = new Date(NOW.getTime() + 120_001);
+    const result3 = await runSchedulerTick({
+      owner: "pod-b",
+      store: g.store,
+      instances: g.instances,
+      workflowStarter: recordingStarter(),
+      now: () => later,
+    });
+    expect(result3).toMatchObject({ errors: 0 });
     expect(g.advances).toEqual([{ fired: true }]);
   });
 

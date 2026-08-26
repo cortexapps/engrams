@@ -187,7 +187,7 @@ export async function runSchedulerTick(
       // between list and claim still runs (admitted while open; runs never
       // re-check).
       let fired = false;
-      let handledAny = false;
+      let anyHeld = false;
       if (dueAutomation.definition.settings.instance !== undefined) {
         const open = await instances.listOpenInstances(
           automation.id,
@@ -201,18 +201,23 @@ export async function runSchedulerTick(
         }
         for (const instance of open) {
           const outcome = await processOccurrence(dueAutomation, scheduledFor, instance.id);
-          if (outcome !== null) handledAny = true;
+          if (outcome === null) anyHeld = true;
           if (outcome === true) fired = true;
         }
-        // 0 open workstreams: a quiet tick this pod still advances.
-        if (open.length === 0) handledAny = true;
       } else {
         const outcome = await processOccurrence(dueAutomation, scheduledFor, "");
-        if (outcome !== null) handledAny = true;
+        if (outcome === null) anyHeld = true;
         if (outcome === true) fired = true;
       }
-      // Every row is lease-held by other pods: the holder advances.
-      if (!handledAny) continue;
+      // ANY row lease-held by another pod defers the advance to a later
+      // tick: advancing past scheduledFor while a sibling's claimer might
+      // die pre-start would strand that occurrence forever (the advance CAS
+      // has no instance dimension, and listDueCron reads only the current
+      // next_fire_at). The held row resolves within one lease TTL — its
+      // holder starts it, or the lease expires and a later tick reacquires
+      // it — and THAT tick advances. Same invariant as the single-row path:
+      // the schedule moves only when no occurrence is in flight elsewhere.
+      if (anyHeld) continue;
 
       await deps.store.advanceCronSchedule({
         automationId: automation.id,
