@@ -383,6 +383,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-autoscaling"
+version = "1.129.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8b54a259ccf3bf85d50d49973e7da958efd937d0e5f73deda7b351eee7af94d"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-ec2"
+version = "1.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b102a1d34b970ccae6722d36a5338ab90b11fd9f5aeecb387b9a158a94ce8f"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.144.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1848,6 +1902,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-cloud-aws"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-sdk-autoscaling",
+ "aws-sdk-ec2",
+ "engram-aws",
+ "engram-core",
+ "tokio",
+ "tracing",
+ "wiremock",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-cloud-gcp"
 version = "0.1.0"
 dependencies = [
@@ -2372,6 +2441,7 @@ name = "engram-host-operator"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "engram-cloud-aws",
  "engram-cloud-gcp",
  "engram-core",
  "engram-protocol",
@@ -8151,7 +8221,6 @@ dependencies = [
  "displaydoc",
  "either",
  "errno",
- "fastrand",
  "form_urlencoded",
  "futures-channel",
  "futures-core",
@@ -8171,7 +8240,6 @@ dependencies = [
  "hyper-util",
  "idna",
  "indexmap",
- "ipnet",
  "lazy_static",
  "libc",
  "log",

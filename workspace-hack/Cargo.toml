@@ -35,7 +35,6 @@ deranged = { version = "0.5", features = ["serde"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["serde", "use_std"] }
-fastrand = { version = "2" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
@@ -55,7 +54,6 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
-ipnet = { version = "2" }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
@@ -118,7 +116,6 @@ crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", d
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 displaydoc = { version = "0.2" }
 either = { version = "1", features = ["serde", "use_std"] }
-fastrand = { version = "2" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }

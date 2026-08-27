@@ -51,9 +51,11 @@ async fn main() -> Result<(), OperatorError> {
     let client = Client::try_default().await?;
     let fleets: Api<HostFleet> = Api::all(client.clone());
 
-    // ADR 0044 K4: select the node-pool scaler. Default noop (logs the desired
-    // size); `gke` actuates a GKE pool via the Container API. Off-GKE detection
-    // fails fast → fall back to noop so a misconfig never wedges the operator.
+    // ADR 0044 K4 / ADR 0122: select the node-pool scaler. Default noop (logs
+    // the desired size); `gke` actuates a GKE pool via the Container API;
+    // `asg` actuates an EC2 Auto Scaling group (the pool identifier in the
+    // HostFleet spec is then the ASG name). Off-cloud detection fails fast →
+    // fall back to noop so a misconfig never wedges the operator.
     let node_scaler: Arc<dyn engram_core::traits::cloud::NodePoolScaler> =
         match std::env::var("ENGRAM_NODE_POOL_SCALER").as_deref() {
             Ok("gke") => match engram_cloud_gcp::gke::GkeNodePoolScaler::detect().await {
@@ -63,6 +65,16 @@ async fn main() -> Result<(), OperatorError> {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "gke scaler init failed (not on GKE?); using noop");
+                    Arc::new(scaler::NoopScaler)
+                }
+            },
+            Ok("asg") => match engram_cloud_aws::asg::AsgNodePoolScaler::detect().await {
+                Ok(s) => {
+                    tracing::info!("node-pool scaler: asg");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "asg scaler init failed (not on AWS?); using noop");
                     Arc::new(scaler::NoopScaler)
                 }
             },
