@@ -71,8 +71,16 @@ impl S3BlobStorage {
     /// no endpoint override is present — a mis-configured process must
     /// refuse to come up, not fail every session create.
     pub async fn connect(bucket: impl Into<String>) -> Result<Self, BlobError> {
-        let endpoint_url = std::env::var("ENGRAM_S3_ENDPOINT_URL").ok();
-        let region = std::env::var("ENGRAM_S3_REGION").ok();
+        // Empty-but-set counts as absent: templated env
+        // (`value: "{{ .region }}"` with the variable unset) renders
+        // "", and `env::var(..).ok()` returns `Some("")` — which
+        // would sail past the `is_none()` fail-closed guards below
+        // and build a client with an empty SigV4 region (or force
+        // path-style at an empty endpoint) that fails every request
+        // instead of failing startup.
+        let non_empty = |v: Result<String, std::env::VarError>| v.ok().filter(|s| !s.is_empty());
+        let endpoint_url = non_empty(std::env::var("ENGRAM_S3_ENDPOINT_URL"));
+        let region = non_empty(std::env::var("ENGRAM_S3_REGION"));
         let has_endpoint_override = endpoint_url.is_some();
 
         let cfg = engram_aws::sdk_config(engram_aws::AwsOverrides {
@@ -480,6 +488,10 @@ mod tests {
 
     /// Without an endpoint override, a process that resolves no region
     /// must refuse to come up (fail-closed, mirroring `from_env`).
+    /// The second half pins the empty-but-SET case: templated env
+    /// renders `""` when the source variable is unset, and
+    /// `Some("")` must collapse to absent — not slip past the
+    /// `is_none()` guards into an empty SigV4 region.
     #[tokio::test(flavor = "current_thread")]
     async fn connect_without_region_fails_closed() {
         std::env::remove_var("ENGRAM_S3_ENDPOINT_URL");
@@ -495,6 +507,14 @@ mod tests {
         let err = S3BlobStorage::connect("bucket")
             .await
             .expect_err("no region must fail closed");
+        assert!(matches!(err, BlobError::Config(_)));
+
+        // Empty-but-set region + endpoint behave exactly like unset.
+        std::env::set_var("ENGRAM_S3_REGION", "");
+        std::env::set_var("ENGRAM_S3_ENDPOINT_URL", "");
+        let err = S3BlobStorage::connect("bucket")
+            .await
+            .expect_err("empty-string region must fail closed too");
         assert!(matches!(err, BlobError::Config(_)));
     }
 
