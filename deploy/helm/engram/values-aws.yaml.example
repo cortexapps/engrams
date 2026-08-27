@@ -1,41 +1,58 @@
-# AWS-flavored overlay. Apply with:
-#   helm install engram ./deploy/helm/engram -f values-aws.yaml
+# AWS (EKS) overlay — the ADR 0122 native-arm shape. Copy, replace
+# the REPLACE_* placeholders, apply:
 #
-# NB: ADR 0007 ships GCS as the first-class blob backend.
-# `ENGRAM_BLOB_BACKEND=s3` is reserved but the engram-storage-s3
-# crate is a stub — see docs/chunked-storage-rollout.md "Tier 4 #1".
-# This overlay is a scaffold for when that lands; mirrors the GCP
-# overlay's shape so the patterns line up.
+#   cp values-aws.yaml.example my-values.yaml
+#   helm install engram ./deploy/helm/engram -n engrams -f my-values.yaml
 #
 # Assumptions:
-# - EKS cluster with IRSA enabled.
-# - An IAM role `engram-coordinator-role` has S3 read/write on the
-#   chunks bucket, kms:Encrypt/Decrypt on the KEK key, and
-#   secretsmanager:GetSecretValue on relevant secrets.
+# - EKS cluster with an OIDC provider (IRSA) and the AWS Load
+#   Balancer Controller installed (the chart's `className: alb`
+#   Ingress is inert without it). The Terraform quickstart's
+#   eks-cluster module provisions both.
+# - An IAM role for the coordinator KSA (IRSA trust on
+#   engrams/engram-coordinator) granting: s3:{Get,Put,Delete,List}*
+#   on the chunks bucket, kms:{Encrypt,Decrypt} on the KEK key, and
+#   secretsmanager:GetSecretValue on the `engram/*` secret prefix.
+# - The host fleet runs as the engram-host-fleet chart's DaemonSet on
+#   a self-managed Intel nodegroup (see that chart's
+#   values-aws.yaml.example) — so no internal LB is needed here.
+# - No identity proxy: the orchestrator's login wall (better-auth +
+#   `orchestrator.auth.adminEmails`) is the auth door (ADR 0118).
+#   ALB's native OIDC/Cognito authentication is NOT supported in
+#   front of this app — it breaks the same way IAP does (no cookie
+#   on CORS preflights, no WebSocket carry; ADR 0118).
 
 # ─── coordinator ──────────────────────────────────────────────────
 
-image:
-  repository: REPLACE_ACCOUNT.dkr.ecr.REPLACE_REGION.amazonaws.com/engram/coordinator
-  tag: ""
-  pullPolicy: IfNotPresent
+# Images come from the published GHCR defaults
+# (ghcr.io/cortexapps/engrams/<coordinator|web|orchestrator>) — no
+# override needed. To mirror into ECR instead:
+# image:
+#   repository: REPLACE_ACCOUNT.dkr.ecr.REPLACE_REGION.amazonaws.com/engram/coordinator
 
 mode: coordinator
 
 blob:
-  # NB: not yet implemented — see rollout doc Tier 4 #1.
-  backend: gcs   # placeholder; flip to `s3` once stubs land.
-  gcs:
+  backend: s3
+  s3:
     bucket: REPLACE_BUCKET
+    # Region for SigV4. Also settable via AWS_REGION on the pod (IRSA
+    # injects it); explicit keeps the chart self-contained.
+    region: REPLACE_REGION
 
 kek:
-  # `aws-kms` provider isn't implemented yet either. Placeholder
-  # for the future AWS path.
-  provider: env-var
-  envVarName: ENGRAM_KEK_MASTER_KEY
+  # The real AWS KMS provider (ADR 0122): wrap/unwrap of the data-
+  # encryption keys via kms:Encrypt/Decrypt under this key. Key ARN
+  # preferred (unambiguous); `alias/...` also works.
+  provider: aws-kms
+  awsKeyId: arn:aws:kms:REPLACE_REGION:REPLACE_ACCOUNT:key/REPLACE_KEY_ID
 
 secrets:
-  backend: env
+  # AWS Secrets Manager via IRSA (ADR 0122). Image-manifest secret
+  # refs resolve as `aws-sm://<name-or-arn>[#stage]`, or by default
+  # namespacing `engram/<repo>/<NAME>`. No extra keys needed — region
+  # and credentials ride the SDK chain.
+  backend: aws
 
 database:
   existingSecret: engram-coordinator-secrets
@@ -49,64 +66,89 @@ serviceAccount:
   create: true
   name: engram-coordinator
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE_ACCOUNT:role/engram-coordinator-role
+    eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE_ACCOUNT:role/engram-coordinator
 
 service:
+  # In-cluster traffic: the web nginx proxy AND the host-fleet
+  # DaemonSet both dial this ClusterIP (ADR 0044).
   type: ClusterIP
   port: 8080
 
+# The in-cluster fleet dials the ClusterIP Service; an enabled
+# internal LB here would mint a classic ELB nobody uses.
 serviceInternal:
-  # Internal NLB targeting the coord, consumed by FC host-agents
-  # dialing in from a sibling ASG inside the same VPC.
-  loadBalancerIP: ""   # AWS NLBs don't honor loadBalancerIP; rely on Route53 + a stable DNS name instead.
-  annotations:
-    service.beta.kubernetes.io/aws-load-balancer-type: nlb
-    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+  enabled: false
 
-# Coord never has a public ingress. Public reach goes through
-# `web.ingress` below.
 ingress:
   enabled: false
 
+# Static 2 replicas + PDB — the production-validated shape (ADR
+# 0047/0048).
+replicaCount: 2
 hpa:
-  enabled: true
-  minReplicas: 3
-  maxReplicas: 20
-  targetCPUUtilizationPercentage: 65
-
+  enabled: false
 pdb:
   enabled: true
-  minAvailable: 2
 
 resources:
   requests:
-    cpu: 1000m
-    memory: 1Gi
+    cpu: 500m
+    memory: 512Mi
   limits:
-    cpu: 4000m
-    memory: 4Gi
+    cpu: 2000m
+    memory: 2Gi
 
 # ─── web ──────────────────────────────────────────────────────────
 
 web:
   enabled: true
+  replicaCount: 2
 
-  image:
-    repository: REPLACE_ACCOUNT.dkr.ecr.REPLACE_REGION.amazonaws.com/engram/web
-    tag: ""
-    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 80
+    annotations: {}
 
   ingress:
-    # ALB fronting the web Service. Pair with Cognito-based auth for
-    # the AWS equivalent of IAP (or AWS Verified Access).
+    # The single public surface: an internet-facing ALB (AWS Load
+    # Balancer Controller) + ACM cert. One "/" rule is the whole
+    # table — no identity proxy, so no per-backend path split.
     enabled: true
     className: alb
     annotations:
-      kubernetes.io/ingress.class: alb
       alb.ingress.kubernetes.io/scheme: internet-facing
+      # Pod IPs as targets (works with ClusterIP Services; no
+      # NodePort needed).
       alb.ingress.kubernetes.io/target-type: ip
+      # The ACM certificate for REPLACE_DOMAIN (the Terraform
+      # quickstart provisions + validates it).
+      alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:REPLACE_REGION:REPLACE_ACCOUNT:certificate/REPLACE_CERT_ID
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+      alb.ingress.kubernetes.io/ssl-redirect: "443"
+      # An ALB idle timeout caps how long a quiet connection lives.
+      # The product holds long SSE + WebSocket legs (the shell, the
+      # IDE, /events); 3600 matches the nginx proxy_read_timeout and
+      # the GCP deployment's socket-lifetime fix — the 60 s default
+      # would cut every quiet session leg.
+      alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600
+      alb.ingress.kubernetes.io/healthcheck-path: /healthz
     hosts:
-      - host: engram.REPLACE_DOMAIN
+      - host: engrams.REPLACE_DOMAIN
         paths:
           - path: /
             pathType: Prefix
+
+# ─── orchestrator (ADR 0051) ──────────────────────────────────────
+
+orchestrator:
+  enabled: true
+  publicUrl: https://engrams.REPLACE_DOMAIN
+  databaseSecret:
+    existingSecret: engram-orchestrator-secrets
+    urlKey: ORCHESTRATOR_DATABASE_URL
+    bearerKey: CONTROL_PLANE_BEARER
+    authSecretKey: BETTER_AUTH_SECRET
+  auth:
+    # Bootstrap admins: promoted to role 'admin' on first sign-in.
+    adminEmails:
+      - REPLACE_ADMIN_EMAIL

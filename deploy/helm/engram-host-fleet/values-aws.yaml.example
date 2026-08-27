@@ -1,0 +1,130 @@
+# AWS (EKS) overlay for the Firecracker host fleet (ADR 0044 /
+# ADR 0122). Copy, replace the REPLACE_* placeholders, install as a
+# second release into a PSA-privileged namespace:
+#
+#   kubectl create namespace engrams-hosts
+#   kubectl label namespace engrams-hosts \
+#     pod-security.kubernetes.io/enforce=privileged
+#   cp values-aws.yaml.example my-fleet-values.yaml
+#   helm install hf ./deploy/helm/engram-host-fleet \
+#     -n engrams-hosts -f my-fleet-values.yaml
+#
+# Assumptions:
+# - A SELF-MANAGED Intel nodegroup (launch template + ASG): KVM needs
+#   bare metal (`m7i.metal-24xl` is the quickstart default — Sapphire
+#   Rapids, deliberate CPUID parity with GCP C3 so snapshots restore
+#   across clouds) or the Xeon-6 C8i/M8i/R8i shapes. No AMD, no
+#   Graviton. Node label `engram.io/kvm=true` + taint
+#   `engram.io/kvm=true:NO_SCHEDULE` via nodeadm; the ASG suspends
+#   AZRebalance, leaves scale-in protection off, and Terraform
+#   `ignore_changes` desired capacity — the operator owns the size
+#   (ADR 0048). The quickstart's kvm-nodegroup module provisions
+#   exactly this.
+# - IRSA roles for the host-fleet KSA and the operator KSA (the
+#   quickstart's irsa + host-operator-iam modules).
+# - The `engram` release (the coordinator chart) installed in the
+#   `engrams` namespace.
+#
+# Identity note (the deliberate GKE difference): IRSA is env/file
+# based — the webhook injects a token file — so it WORKS in these
+# hostNetwork pods, where GKE Workload Identity (a metadata-server
+# intercept) does not. That is why this overlay reads S3 and Secrets
+# Manager directly instead of relaying through an ESO-synced secret.
+
+# Images come from the published GHCR defaults; deploy workflows pin
+# tags to a resolved SHA (the DaemonSet is OnDelete — the operator
+# rolls pods, ADR 0044 K3).
+
+# IRSA: the host pods' KSA assumes the fleet role (S3 on the chunks
+# bucket + secretsmanager:GetSecretValue on the two CA secrets).
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE_ACCOUNT:role/engram-fc-host
+
+tolerations:
+  - { key: engram.io/kvm, operator: Equal, value: "true", effect: NoSchedule }
+
+# Register with the in-cluster coordinator Service (ADR 0044). The
+# host token is one of the coord's ENGRAM_AUTH_TOKENS; the Secret
+# must exist in THIS namespace (External Secrets Operator targets in
+# both namespaces is the standard relay).
+coordinator:
+  endpoint: http://engram-coordinator.engrams:8080
+  tokenSecretName: engram-coordinator-secrets
+  tokenSecretKey: ENGRAM_AUTH_TOKENS
+
+blob:
+  backend: s3
+  # Must match the coordinator's blob.s3.bucket so hosts and coord
+  # read/write the same chunk store.
+  s3Bucket: REPLACE_BUCKET
+  s3Region: REPLACE_REGION
+
+# ADR 0045 D3 / ADR 0092: the unified memory substrate — the same
+# production-validated settings as the GCP overlay.
+firecracker:
+  uffdBaseDir: /var/lib/engram/shm
+  uffdBaseTmpfsSize: 32g
+  freshRestoreMode: "file"
+  baseMemfilePin: "0" # quoted on purpose — bare 0 is falsy in the chart's `with`
+  baseShmMode: "lazy"
+
+# Metal shapes carry local NVMe: list the devices and node-prep
+# RAID0s + mounts them at workDirHostPath (ADR 0070). Empty [] rides
+# the EBS root volume instead (provision it big + fast — gp3 with
+# tuned IOPS/throughput in the quickstart).
+storage:
+  dedicatedDevices: []
+
+# Size the host-agent cgroup to the machine — total_vcpus (and
+# placement packing) derives from the container CPU limit. Example
+# for m7i.metal-24xl (96 vCPU / 384 GiB):
+hostAgent:
+  resources:
+    requests:
+      cpu: "4"
+      memory: 8Gi
+    limits:
+      cpu: "96"
+      memory: 192Gi
+
+# ADR 0006 / ADR 0122: the egress-proxy CA, read DIRECTLY from AWS
+# Secrets Manager over IRSA (see the identity note above — no ESO
+# relay needed, unlike GKE). SecretIds accept a name or full ARN,
+# with an optional `#<version-stage>` suffix.
+egress:
+  caSource: aws-secrets-manager
+  caAwsCertSecret: engram/egress-ca-cert
+  caAwsKeySecret: engram/egress-ca-key
+
+# ADR 0049: bounded NBD slot pool with a warm front.
+nbd:
+  nbdsMax: 128
+  warmSlots: 64
+
+# ADR 0044 K3 + ADR 0048 + ADR 0122: the rollout/autoscaling
+# operator. scaler=asg actuates the EC2 Auto Scaling group via IRSA
+# (autoscaling:{DescribeAutoScalingGroups,SetDesiredCapacity,
+# TerminateInstanceInAutoScalingGroup} + ec2:DescribeInstances,
+# ASG-scoped — the host-operator-iam module's policy).
+operator:
+  enabled: true
+  coordinatorUrl: http://engram-coordinator.engrams:50061
+  scaler: asg
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE_ACCOUNT:role/engram-host-operator
+  createHostFleet: true
+  autoscaling:
+    enabled: true
+    # The ASG name (the quickstart's kvm-nodegroup output). With
+    # scaler=asg the pool identifier IS the Auto Scaling group name.
+    nodePool: engram-kvm
+    minHosts: 2
+    maxHosts: 6
+    targetFreeMib: 32768
+    scaleDown: aggressive
+    scaleDownHysteresisTicks: 5
+    maxShedPerWave: 4
+    maxConcurrentDrains: 2
