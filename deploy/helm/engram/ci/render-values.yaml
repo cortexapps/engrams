@@ -1,0 +1,13 @@
+# CI render stubs (the `deploy-config` lane in ci.yml). The chart
+# fail-fasts on these required deployment values by design, so a bare
+# `helm template` can never render; this file is the MINIMUM stub set
+# that satisfies the guards. It is not a deployment example — see
+# values-gcp.yaml.example / values-aws.yaml.example for those. New
+# required-value guards must add a stub here or the lane goes red.
+blob:
+  gcs:
+    bucket: ci-render-stub
+kek:
+  gcpResource: projects/ci/locations/global/keyRings/ci/cryptoKeys/ci
+secrets:
+  gcpProjectId: ci-render-stub
