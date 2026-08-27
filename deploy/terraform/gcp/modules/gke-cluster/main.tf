@@ -136,4 +136,12 @@ resource "google_container_node_pool" "primary_nodes" {
     auto_repair  = true
     auto_upgrade = true
   }
+
+  # The cluster autoscaler owns the live node count between min and
+  # max. Without this, every `terraform apply` after a scale event
+  # tries to force the pool back to `primary_pool_node_count` and
+  # fights the autoscaler.
+  lifecycle {
+    ignore_changes = [node_count]
+  }
 }
