@@ -101,8 +101,10 @@ resource "aws_launch_template" "kvm" {
     http_tokens   = "required" # IMDSv2
     # hostNetwork host-agent pods share the node netns, so hop limit 1
     # suffices (no bridge hop) — and IRSA is the primary identity
-    # anyway.
-    http_put_response_hop_limit = 2
+    # anyway. Keeping it at 1 also stops bridge-networked pods (and
+    # any guest traffic that escapes the egress policy) one hop short
+    # of the node credentials.
+    http_put_response_hop_limit = 1
   }
 
   tag_specifications {
