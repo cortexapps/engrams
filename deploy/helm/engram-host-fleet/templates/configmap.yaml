@@ -114,6 +114,18 @@ data:
   # SA, so it 403s. Prefer caSource: env on GKE hostNetwork fleets.
   ENGRAM_EGRESS_CA_GCP_CERT_SECRET: {{ .Values.egress.caGcpCertSecret | quote }}
   ENGRAM_EGRESS_CA_GCP_KEY_SECRET: {{ .Values.egress.caGcpKeySecret | quote }}
+  {{- else if eq .Values.egress.caSource "aws-secrets-manager" }}
+  {{- if not .Values.egress.caAwsCertSecret }}
+  {{- fail "egress.caAwsCertSecret is required when egress.caSource == aws-secrets-manager" }}
+  {{- end }}
+  {{- if not .Values.egress.caAwsKeySecret }}
+  {{- fail "egress.caAwsKeySecret is required when egress.caSource == aws-secrets-manager" }}
+  {{- end }}
+  # Secrets Manager SecretIds (not the secret values) — read at boot.
+  # ADR 0122: IRSA is env/file-based and works in this hostNetwork pod
+  # (unlike GKE WI above), so the direct read is the sanctioned EKS path.
+  ENGRAM_EGRESS_CA_AWS_CERT_SECRET: {{ .Values.egress.caAwsCertSecret | quote }}
+  ENGRAM_EGRESS_CA_AWS_KEY_SECRET: {{ .Values.egress.caAwsKeySecret | quote }}
   {{- else if eq .Values.egress.caSource "env" }}
   {{- if not .Values.egress.caEnvSecret }}
   {{- fail "egress.caEnvSecret is required when egress.caSource == env (the K8s secret holding the CA PEMs, injected as ENGRAM_EGRESS_CA_{CERT,KEY}_PEM by the DaemonSet)" }}

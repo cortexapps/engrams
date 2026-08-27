@@ -1,5 +1,10 @@
 # Internal LoadBalancer Service for FC host-agents dialing in over WS.
 #
+# Gated on `serviceInternal.enabled`: the ADR 0044 in-cluster
+# DaemonSet fleet dials the ClusterIP Service, so cloud overlays turn
+# this off — an enabled default on AWS would mint a classic ELB
+# nobody uses.
+#
 # The primary Service (service.yaml) is for in-cluster traffic — the
 # engram-web nginx pod proxying browser API calls. This Service is
 # what consumers *outside* the cluster but *inside* the VPC use,
@@ -13,6 +18,7 @@
 # `google_compute_address` with `address_type = "INTERNAL"`) so the
 # FC MIG's `coordinator_endpoint` can be plumbed by Terraform before
 # Helm installs the chart — that's what breaks the apply-twice cycle.
+{{- if .Values.serviceInternal.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -35,3 +41,4 @@ spec:
       protocol: TCP
   selector:
     {{- include "engram.coordinator.selectorLabels" . | nindent 4 }}
+{{- end }}

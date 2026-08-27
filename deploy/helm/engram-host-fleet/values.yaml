@@ -118,6 +118,11 @@ egress:
   #                         from Secret Manager into the K8s secret instead.
   #   gcp-secret-manager  — host-agent reads Secret Manager directly via WI.
   #                         Only works where WI is honoured (NOT hostNetwork).
+  #   aws-secrets-manager — host-agent reads AWS Secrets Manager directly
+  #                         (ADR 0122). Unlike GKE WI, IRSA is env/file-based
+  #                         and WORKS in hostNetwork pods, so this is the
+  #                         sanctioned EKS path (node instance role via IMDS
+  #                         is the fallback).
   #   local-disk          — auto-generate a per-host self-signed CA. NOT for a
   #                         migrating fleet: a session teleported to another host
   #                         would no longer trust that host's distinct CA.
@@ -132,6 +137,10 @@ egress:
   # paths (projects/<p>/secrets/<name>/versions/latest).
   caGcpCertSecret: ""
   caGcpKeySecret: ""
+  # caSource == aws-secrets-manager: AWS Secrets Manager SecretIds (name or
+  # ARN, optional `#<version-stage>` suffix).
+  caAwsCertSecret: ""
+  caAwsKeySecret: ""
 
 storage:
   # Local NVMe for the chunk cache + per-sandbox work dir.
@@ -311,10 +320,14 @@ operator:
   serviceAccount:
     annotations: {}
     # e.g.: iam.gke.io/gcp-service-account: engram-host-operator@<project>.iam.gserviceaccount.com
-  # ADR 0044 K4: node-pool scaler. `noop` logs the desired size only; `gke`
-  # resizes a GKE pool via the Container API + Workload Identity (the operator
-  # GSA needs container.nodePools.update + compute.instanceGroupManagers.update).
-  scaler: noop          # noop | gke
+  # ADR 0044 K4 / ADR 0122: node-pool scaler. `noop` logs the desired size
+  # only; `gke` resizes a GKE pool via the Container API + Workload Identity
+  # (the operator GSA needs container.nodePools.update +
+  # compute.instanceGroupManagers.update); `asg` resizes an EC2 Auto Scaling
+  # group via IRSA (autoscaling:{DescribeAutoScalingGroups,SetDesiredCapacity,
+  # TerminateInstanceInAutoScalingGroup} + ec2:DescribeInstances) —
+  # `autoscaling.nodePool` is then the ASG NAME.
+  scaler: noop          # noop | gke | asg
   # Render a HostFleet CR for this release's host-agent DaemonSet (the common
   # case). Set false to manage the CR out-of-band.
   createHostFleet: true
@@ -341,7 +354,7 @@ operator:
   # (2D + queue-aware, one-shot), scale-DOWN via the teleport-packed wave
   # (drain the least-loaded nodes onto peers, then remove them). The default
   # scaler (ENGRAM_NODE_POOL_SCALER unset) is a NOOP that only LOGS decisions;
-  # set it to "gke" (operator.scaler below) to actuate a real GKE pool.
+  # set it to "gke" or "asg" (operator.scaler above) to actuate a real pool.
   autoscaling:
     enabled: false
     nodePool: ""           # the cloud node pool the scaler resizes
