@@ -16,6 +16,9 @@ async-trait.workspace = true
 # `default-features = false` is load-bearing on every aws-sdk crate —
 # see the aws sdk note in the root manifest (aws-lc-rs).
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio"] }
+# The per-call operation deadline (a stalled KMS response must fail
+# the seal/open, not wedge it).
+tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 

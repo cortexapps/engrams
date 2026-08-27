@@ -33,6 +33,30 @@ use aws_sdk_kms::Client;
 
 use engram_crypto::{CryptoError, MasterKeyProvider};
 
+/// Per-call deadline. The shared `engram-aws` transport bounds only
+/// the CONNECT (5 s) and disables SDK retries; a KMS response that
+/// stalls after the handshake would otherwise hang the caller —
+/// wrap/unwrap sit on the registry-cred seal/open and session-secret
+/// paths, which must fail fast, not wedge. Mirrors the 10 s bound
+/// engram-secrets-aws applies to GetSecretValue.
+const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bound one KMS call with [`OPERATION_TIMEOUT`], mapping a stall to
+/// a typed provider error.
+async fn with_deadline<T, E, F>(op: &'static str, fut: F) -> Result<T, CryptoError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(OPERATION_TIMEOUT, fut).await {
+        Ok(r) => r.map_err(|e| CryptoError::Provider(format!("kms {op}: {e}"))),
+        Err(_) => Err(CryptoError::Provider(format!(
+            "kms {op} exceeded the {}s deadline",
+            OPERATION_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 /// KMS-backed KEK. One client per instance, cheap to clone.
 #[derive(Clone, Debug)]
 pub struct AwsKmsProvider {
@@ -85,14 +109,15 @@ impl AwsKmsProvider {
 #[async_trait]
 impl MasterKeyProvider for AwsKmsProvider {
     async fn wrap(&self, dek: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let out = self
-            .client
-            .encrypt()
-            .key_id(&self.key)
-            .plaintext(Blob::new(dek))
-            .send()
-            .await
-            .map_err(|e| CryptoError::Provider(format!("kms Encrypt: {e}")))?;
+        let out = with_deadline(
+            "Encrypt",
+            self.client
+                .encrypt()
+                .key_id(&self.key)
+                .plaintext(Blob::new(dek))
+                .send(),
+        )
+        .await?;
         let blob = out
             .ciphertext_blob
             .ok_or_else(|| CryptoError::Provider("kms Encrypt returned no ciphertext".into()))?;
@@ -103,14 +128,15 @@ impl MasterKeyProvider for AwsKmsProvider {
         // KeyId is passed explicitly (see the module doc): a blob
         // produced under a different key errs instead of resolving via
         // the key the blob itself names.
-        let out = self
-            .client
-            .decrypt()
-            .key_id(&self.key)
-            .ciphertext_blob(Blob::new(wrapped))
-            .send()
-            .await
-            .map_err(|e| CryptoError::Provider(format!("kms Decrypt: {e}")))?;
+        let out = with_deadline(
+            "Decrypt",
+            self.client
+                .decrypt()
+                .key_id(&self.key)
+                .ciphertext_blob(Blob::new(wrapped))
+                .send(),
+        )
+        .await?;
         let blob = out
             .plaintext
             .ok_or_else(|| CryptoError::Provider("kms Decrypt returned no plaintext".into()))?;
