@@ -1,0 +1,28 @@
+[package]
+name = "engram-aws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The workspace's AWS SDK bootstrap seam: ring-backed TLS, tuned transport, the only SdkConfig construction point (ADR 0122)."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The config/credential layer. `default-features = false` is the
+# load-bearing part — the default set includes `default-https-client`,
+# which links aws-lc-rs (see the aws sdk note in the root manifest).
+aws-config.workspace = true
+# The TLS/transport layer: `rustls-ring` builds the hyper client on the
+# workspace's single compiled CryptoProvider.
+aws-smithy-http-client.workspace = true
+# TimeoutConfig / RetryConfig types consumed by the loader.
+aws-smithy-types.workspace = true
+# Installs ring as the process provider before any client exists.
+engram-tls.workspace = true
+tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -44,6 +44,7 @@ members = [
     "crates/engram-egress-proxyd",
     "crates/engram-crypto",
     "crates/engram-tls",
+    "crates/engram-aws",
     "crates/engram-oci",
     "crates/engram-oci-auth",
     "crates/engram-storage-local",
@@ -126,6 +127,7 @@ engram-egress-proto = { path = "crates/engram-egress-proto" }
 engram-egress-proxyd = { path = "crates/engram-egress-proxyd" }
 engram-crypto = { path = "crates/engram-crypto" }
 engram-tls = { path = "crates/engram-tls" }
+engram-aws = { path = "crates/engram-aws" }
 engram-oci = { path = "crates/engram-oci" }
 engram-oci-auth = { path = "crates/engram-oci-auth" }
 engram-storage-local = { path = "crates/engram-storage-local" }
@@ -323,6 +325,24 @@ rand_core06 = { package = "rand_core", version = "0.6", default-features = false
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 pem = "4"
 rand_chacha = "0.10"
+
+# aws sdk (ADR 0122). The family moves as one dependabot group. Every
+# aws-sdk-* consumer crate declares its own service crate with
+# `default-features = false` + `rt-tokio`; these shared pins carry the
+# config/transport layer. THE INVARIANT: no crate may enable any SDK's
+# `default-https-client` (aws-config calls it that; service crates call
+# it `default-https-client` too) — it links `aws-lc-rs`, a second rustls
+# CryptoProvider next to the workspace's `ring` (process-level install
+# panic, see engram-tls) and a cmake+nasm C build the musl cross lane
+# cannot carry. TLS comes exclusively from aws-smithy-http-client's
+# `rustls-ring`, and `engram-aws` is the only place an SdkConfig is
+# constructed. CI greps Cargo.lock to keep aws-lc out of the tree.
+# aws-config default features also carry `sso` + `credentials-process`;
+# both are deliberately off (server-side identities: env, IRSA
+# web-identity, ECS, IMDSv2 — all in the core chain).
+aws-config = { version = "1.11", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.4", default-features = false, features = ["rustls-ring"] }
+aws-smithy-types = { version = "1", default-features = false }
 
 # tls + cert mint (host-side egress proxy)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
