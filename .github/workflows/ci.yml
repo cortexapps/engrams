@@ -340,6 +340,14 @@ jobs:
       # this also covers the chunked-storage primitive end-to-end.
       STORAGE_EMULATOR_HOST: http://localhost:4443
       ENGRAM_TEST_GCS_BUCKET: engram-snapshots-test
+      # ADR 0122: the S3 conformance + chunk-store e2e tests are gated
+      # the same way, against MinIO. Static credentials so the SDK's
+      # default chain never probes the IMDS address from CI.
+      ENGRAM_TEST_S3_ENDPOINT: http://localhost:9000
+      ENGRAM_TEST_S3_BUCKET: engram-snapshots-test
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -401,10 +409,19 @@ jobs:
             -scheme http -host 0.0.0.0 -port 4443 \
             -public-host localhost:4443
 
-      # Wait for the emulator to come up + seed the test bucket.
-      # Mirrors `deploy/dev/seed-buckets.sh` exactly so the local +
-      # CI paths share one source of truth.
-      - name: Seed GCS test bucket
+      # S3 emulator for the ADR 0122 conformance + chunk-store e2e
+      # tests. Same plain-`docker run` rationale as fake-gcs above;
+      # mirrors the `local-s3` profile in deploy/docker-compose.dev.yml.
+      - name: Start minio
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+
+      # Wait for the emulators to come up + seed the test buckets
+      # (fake-gcs AND minio — the script covers both). Runs the same
+      # script as local dev so the two paths share one source of truth.
+      - name: Seed blob test buckets
         run: bash deploy/dev/seed-buckets.sh
 
       # ADR 0055 P2: mksquashfs for the engram-coordinator `skill_pack`

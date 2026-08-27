@@ -300,10 +300,12 @@ impl BlobStorage for BlobClient {
 ///   (default `./var/engram`); the directory is created. Dev/test.
 /// - `gcs` — production. Requires `ENGRAM_GCS_BUCKET`; honors
 ///   `STORAGE_EMULATOR_HOST` for fake-gcs-server.
-/// - `s3` — reserved (the SDK retries internally; wire it through
-///   here when it lands).
+/// - `s3` — production (ADR 0122). Requires `ENGRAM_S3_BUCKET`;
+///   honors `ENGRAM_S3_ENDPOINT_URL` (MinIO / R2) and
+///   `ENGRAM_S3_REGION`. SDK-internal retries are disabled
+///   (engram-aws) — this layer owns them.
 ///
-/// Both arms come back wrapped in [`BlobClient`] — one code path, so
+/// Every arm comes back wrapped in [`BlobClient`] — one code path, so
 /// dev exercises the same retry/deadline/metrics layer prod runs.
 /// Fails closed at startup on misconfiguration: a process that can't
 /// reach its chunk backend must refuse to come up, not fail every
@@ -333,14 +335,17 @@ pub async fn from_env() -> Result<Arc<dyn BlobStorage>, String> {
             Arc::new(store)
         }
         "s3" => {
-            return Err(
-                "ENGRAM_BLOB_BACKEND=s3 is reserved; only `local` and `gcs` are supported today"
-                    .into(),
-            )
+            let bucket = std::env::var("ENGRAM_S3_BUCKET")
+                .map_err(|_| "ENGRAM_BLOB_BACKEND=s3 requires ENGRAM_S3_BUCKET".to_string())?;
+            tracing::info!(bucket = %bucket, "blob backend: s3");
+            let store = engram_storage_s3::S3BlobStorage::connect(bucket)
+                .await
+                .map_err(|e| format!("s3 connect: {e}"))?;
+            Arc::new(store)
         }
         other => {
             return Err(format!(
-                "unknown ENGRAM_BLOB_BACKEND={other}; expected `local` or `gcs`"
+                "unknown ENGRAM_BLOB_BACKEND={other}; expected `local`, `gcs`, or `s3`"
             ))
         }
     };
@@ -648,19 +653,21 @@ mod tests {
             restore_env("ENGRAM_BLOB_BACKEND", p);
         }
 
-        // Case 4: s3 → explicit "reserved" message, not just a generic
-        // "unknown".
+        // Case 4: s3 without a bucket → error names the missing var
+        // (fail-closed at startup, same contract as the gcs arm).
         {
-            let p = set_env("ENGRAM_BLOB_BACKEND", Some("s3"));
+            let p1 = set_env("ENGRAM_BLOB_BACKEND", Some("s3"));
+            let p2 = set_env("ENGRAM_S3_BUCKET", None);
             let err = match from_env().await {
-                Ok(_) => panic!("s3 stub must surface as a clear error"),
+                Ok(_) => panic!("s3 without bucket must error"),
                 Err(e) => e,
             };
             assert!(
-                err.contains("s3"),
-                "s3 error must call out s3 explicitly: {err}",
+                err.contains("ENGRAM_S3_BUCKET"),
+                "error must name the missing var: {err}",
             );
-            restore_env("ENGRAM_BLOB_BACKEND", p);
+            restore_env("ENGRAM_BLOB_BACKEND", p1);
+            restore_env("ENGRAM_S3_BUCKET", p2);
         }
     }
 }

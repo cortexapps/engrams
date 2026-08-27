@@ -4,17 +4,26 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "S3 BlobStorage impl. Stage 0 ships a stub returning NotImplemented; Stage 4 wires aws-sdk-s3."
+description = "S3 BlobStorage impl on aws-sdk-s3: sized PUT hot path, bounded multipart for streams, MinIO/R2 via endpoint override (ADR 0122)."
 
 [lints]
 workspace = true
 
 [dependencies]
 engram-core.workspace = true
+# SdkConfig construction (ring TLS, tuned transport, retry-disabled)
+# lives in engram-aws — the only supported way (see that crate).
+engram-aws.workspace = true
+# `default-features = false` is load-bearing: the default set includes
+# `default-https-client` (links aws-lc-rs — see the aws sdk note in the
+# root manifest). `rt-tokio` is the async runtime binding.
+aws-sdk-s3 = { version = "1.144", default-features = false, features = ["rt-tokio"] }
 async-trait.workspace = true
 bytes.workspace = true
+futures.workspace = true
 tracing.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+engram-testkit.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
