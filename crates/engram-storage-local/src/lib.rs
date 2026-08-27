@@ -212,61 +212,51 @@ mod tests {
     use super::*;
 
     use bytes::Bytes;
-    use futures::stream;
+    use engram_testkit::blob_conformance;
     use tempfile::tempdir;
 
-    fn small_body() -> ByteStream {
-        ByteStream::from_bytes(Bytes::from_static(b"hello cold tier"))
+    // The shared trait-contract scenarios (round-trip, streaming,
+    // zero-byte put, failed-put atomicity, prefix listing) live in
+    // `engram_testkit::blob_conformance` and run against every
+    // backend. Tests below the conformance block are local-specific:
+    // key validation and the lexicographic-ordering guarantee this
+    // backend adds on top of the contract.
+
+    #[tokio::test]
+    async fn conformance_round_trip() {
+        let dir = tempdir().unwrap();
+        let store = LocalBlobStorage::new(dir.path());
+        blob_conformance::round_trip(&store).await;
     }
 
     #[tokio::test]
-    async fn put_then_get_round_trips_small_body() {
+    async fn conformance_streaming_round_trip() {
         let dir = tempdir().unwrap();
         let store = LocalBlobStorage::new(dir.path());
-
-        let n = store
-            .put_streaming("snapshots/abc/123.tar.zst", small_body())
-            .await
-            .unwrap();
-        assert_eq!(n, b"hello cold tier".len() as u64);
-
-        let body = store.get("snapshots/abc/123.tar.zst").await.unwrap();
-        assert_eq!(&body[..], b"hello cold tier");
+        // A handful of chunks proves writer advancement; volume is
+        // the wire backends' concern.
+        blob_conformance::streaming_round_trip(&store, 1024, 3).await;
     }
 
     #[tokio::test]
-    async fn head_returns_size_and_etag() {
+    async fn conformance_zero_byte_put() {
         let dir = tempdir().unwrap();
         let store = LocalBlobStorage::new(dir.path());
-
-        store.put("k", Bytes::from_static(b"abc")).await.unwrap();
-        let meta = store.head("k").await.unwrap();
-        assert_eq!(meta.size_bytes, 3);
-        assert!(meta.etag.is_some());
+        blob_conformance::zero_byte_put(&store).await;
     }
 
     #[tokio::test]
-    async fn missing_key_yields_not_found_uniformly() {
+    async fn conformance_failed_put_preserves_prior_blob() {
         let dir = tempdir().unwrap();
         let store = LocalBlobStorage::new(dir.path());
-
-        assert!(matches!(
-            store.head("missing").await,
-            Err(BlobError::NotFound)
-        ));
-        assert!(matches!(
-            store.get_streaming("missing").await,
-            Err(BlobError::NotFound)
-        ));
-        assert!(!store.exists("missing").await.unwrap());
+        blob_conformance::failed_streaming_put_preserves_prior_blob(&store).await;
     }
 
     #[tokio::test]
-    async fn delete_is_idempotent_on_missing() {
+    async fn conformance_list_prefix_scoped() {
         let dir = tempdir().unwrap();
         let store = LocalBlobStorage::new(dir.path());
-        // Never written; delete still succeeds.
-        store.delete("never-existed").await.unwrap();
+        blob_conformance::list_prefix_scoped(&store, 30).await;
     }
 
     #[tokio::test]
@@ -277,26 +267,6 @@ mod tests {
             let res = store.head(bad).await;
             assert!(matches!(res, Err(BlobError::Config(_))), "bad key {bad:?}");
         }
-    }
-
-    #[tokio::test]
-    async fn streaming_put_handles_multi_chunk_body() {
-        let dir = tempdir().unwrap();
-        let store = LocalBlobStorage::new(dir.path());
-
-        // Body in three chunks; tests that the writer advances
-        // properly and the size accumulates correctly.
-        let chunks: Vec<Result<Bytes, BlobError>> = vec![
-            Ok(Bytes::from_static(b"part-1-")),
-            Ok(Bytes::from_static(b"part-2-")),
-            Ok(Bytes::from_static(b"part-3")),
-        ];
-        let body = ByteStream::new(stream::iter(chunks));
-        let n = store.put_streaming("multi", body).await.unwrap();
-        assert_eq!(n, b"part-1-part-2-part-3".len() as u64);
-
-        let got = store.get("multi").await.unwrap();
-        assert_eq!(&got[..], b"part-1-part-2-part-3");
     }
 
     #[tokio::test]
@@ -330,28 +300,5 @@ mod tests {
         let store = LocalBlobStorage::new(dir.path());
         let keys = store.list_prefix("never-existed").await.unwrap();
         assert!(keys.is_empty());
-    }
-
-    #[tokio::test]
-    async fn put_with_partial_body_does_not_replace_existing_good_blob() {
-        let dir = tempdir().unwrap();
-        let store = LocalBlobStorage::new(dir.path());
-
-        // First, write a valid blob.
-        store.put("k", Bytes::from_static(b"good")).await.unwrap();
-
-        // Now, attempt a put whose stream errors mid-way. The
-        // tempfile-then-rename strategy means `k` should still hold
-        // the original bytes after the failed put.
-        let chunks: Vec<Result<Bytes, BlobError>> = vec![
-            Ok(Bytes::from_static(b"new-partial")),
-            Err(BlobError::Protocol("simulated mid-stream failure".into())),
-        ];
-        let body = ByteStream::new(stream::iter(chunks));
-        let res = store.put_streaming("k", body).await;
-        assert!(res.is_err(), "partial body must surface as error");
-
-        let got = store.get("k").await.unwrap();
-        assert_eq!(&got[..], b"good", "good blob preserved on failed retry");
     }
 }

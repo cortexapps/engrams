@@ -322,6 +322,8 @@ impl BlobStorage for GcsBlobStorage {
 mod tests {
     use super::*;
 
+    use engram_testkit::blob_conformance;
+
     /// Pins the rustls CryptoProvider contract for this crate's clients.
     ///
     /// `connect()` reaches TLS twice — the tuned client it builds, and the
@@ -368,204 +370,70 @@ mod tests {
             .expect("connect against emulator");
     }
 
-    /// End-to-end round-trip against the live emulator: put a body,
-    /// get it back, verify byte-for-byte equality, exists/head agree
-    /// on size, delete is idempotent. Gated on
-    /// `STORAGE_EMULATOR_HOST` + `ENGRAM_TEST_GCS_BUCKET` so it
-    /// no-ops on hosts without docker. Run locally via
+    /// Connects to the live emulator, or returns `None` when the
+    /// gating env is absent so the caller no-ops on hosts without
+    /// docker. Run the gated tests locally via
     /// `bash deploy/dev/seed-buckets.sh && \
     ///  ENGRAM_TEST_GCS_BUCKET=engram-snapshots-test \
     ///  STORAGE_EMULATOR_HOST=http://localhost:4443 \
     ///  cargo nextest run -p engram-storage-gcs`.
+    async fn emulator_store() -> Option<GcsBlobStorage> {
+        std::env::var("STORAGE_EMULATOR_HOST").ok()?;
+        let bucket = std::env::var("ENGRAM_TEST_GCS_BUCKET").ok()?;
+        Some(
+            GcsBlobStorage::connect(bucket)
+                .await
+                .expect("connect against emulator"),
+        )
+    }
+
+    // The scenarios below are the shared trait-contract suite
+    // (`engram_testkit::blob_conformance`), run here against the GCS
+    // wire path. Higher-risk than the local backend's runs because
+    // pagination, resumable uploads, and NotFound mapping live in the
+    // GCS API surface — a local-fs test can't catch a wire-level bug.
+
     #[tokio::test(flavor = "current_thread")]
-    async fn round_trip_against_emulator() {
-        let Ok(_emu) = std::env::var("STORAGE_EMULATOR_HOST") else {
+    async fn conformance_round_trip_against_emulator() {
+        let Some(store) = emulator_store().await else {
             return;
         };
-        let Ok(bucket) = std::env::var("ENGRAM_TEST_GCS_BUCKET") else {
-            return;
-        };
-
-        let store = GcsBlobStorage::connect(bucket)
-            .await
-            .expect("connect against emulator");
-
-        // Use a unique key per run so concurrent test invocations
-        // don't collide on the shared emulator state.
-        let key = format!(
-            "engram/snapshots/test/round-trip-{}.bin",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-
-        // Body designed to surface common SDK bugs:
-        //   - Larger than one TCP frame (1 KiB+) so streaming, not
-        //     a single sync flush, is what's exercised.
-        //   - Bytes that include 0x00 + 0xFF + every-other-byte to
-        //     surface any text-mode mangling.
-        let body: Vec<u8> = (0..4096_u16).map(|i| (i % 257) as u8).collect();
-
-        let put_size = store
-            .put(&key, bytes::Bytes::from(body.clone()))
-            .await
-            .expect("put");
-        assert_eq!(put_size, body.len() as u64);
-
-        let head = store.head(&key).await.expect("head");
-        assert_eq!(head.size_bytes, body.len() as u64);
-        assert!(head.etag.is_some(), "GCS responses always include etag");
-
-        let got = store.get(&key).await.expect("get");
-        assert_eq!(&got[..], &body[..], "round-tripped bytes must match");
-
-        // Delete + idempotent re-delete.
-        store.delete(&key).await.expect("delete");
-        assert!(!store.exists(&key).await.unwrap());
-        store
-            .delete(&key)
-            .await
-            .expect("delete on missing key must be idempotent");
-
-        // After delete, get/head should surface NotFound.
-        assert!(matches!(store.head(&key).await, Err(BlobError::NotFound)));
+        blob_conformance::round_trip(&store).await;
     }
 
-    /// Streams a 64 MiB payload through `put_streaming` and verifies
-    /// it round-trips byte-for-byte via `get_streaming`. The chunk
-    /// generator yields 64 KiB at a time, so the upload pipeline is
-    /// exercised across ~1024 chunks — if anything was secretly
-    /// collecting the body to a Vec we'd see it in the test's
-    /// transient memory usage. Gated on the emulator + bucket env
-    /// vars like the small round-trip test.
+    /// 64 MiB in 64 KiB chunks: exercises the upload pipeline across
+    /// ~1024 chunks — if anything secretly collected the body into a
+    /// Vec we'd see it in the test's transient memory usage.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn put_streaming_round_trips_a_large_body() {
-        let Ok(_emu) = std::env::var("STORAGE_EMULATOR_HOST") else {
+    async fn conformance_streaming_large_body_against_emulator() {
+        let Some(store) = emulator_store().await else {
             return;
         };
-        let Ok(bucket) = std::env::var("ENGRAM_TEST_GCS_BUCKET") else {
-            return;
-        };
-
-        let store = GcsBlobStorage::connect(bucket)
-            .await
-            .expect("connect against emulator");
-        let key = format!(
-            "engram/snapshots/test/streamed-{}.bin",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-
-        const CHUNK: usize = 64 * 1024;
-        const CHUNKS: usize = 1024; // 64 MiB total
-        let body: Vec<u8> = (0..CHUNK).map(|i| (i % 257) as u8).collect();
-        let body_bytes = bytes::Bytes::from(body.clone());
-
-        let chunks = (0..CHUNKS).map(move |_| Ok(body_bytes.clone()));
-        let stream = futures::stream::iter(chunks);
-        let put_size = store
-            .put_streaming(&key, ByteStream::new(stream))
-            .await
-            .expect("put_streaming");
-        assert_eq!(put_size, (CHUNK * CHUNKS) as u64);
-
-        let head = store.head(&key).await.expect("head");
-        assert_eq!(head.size_bytes, (CHUNK * CHUNKS) as u64);
-
-        // Pull it back via the streaming get and verify the first +
-        // last chunks match. (Full equality would be 64 MiB in RAM
-        // which defeats the point.)
-        let mut got = store.get_streaming(&key).await.expect("get_streaming");
-        let first = got.next().await.expect("first chunk").expect("first ok");
-        assert_eq!(
-            &first[..CHUNK.min(first.len())],
-            &body[..CHUNK.min(first.len())]
-        );
-
-        store.delete(&key).await.expect("delete");
+        blob_conformance::streaming_round_trip(&store, 64 * 1024, 1024).await;
     }
 
-    /// Validates `list_prefix` against fake-gcs-server: writes
-    /// enough keys to force pagination (>1000 per the SDK's
-    /// recommended max), confirms the full set comes back, and
-    /// confirms prefix filtering works as advertised.
-    ///
-    /// Higher-risk-than-local because pagination + prefix
-    /// filtering live in the GCS API surface; local-fs tests can't
-    /// catch a wire-level bug here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn conformance_zero_byte_put_against_emulator() {
+        let Some(store) = emulator_store().await else {
+            return;
+        };
+        blob_conformance::zero_byte_put(&store).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conformance_failed_put_preserves_prior_blob_against_emulator() {
+        let Some(store) = emulator_store().await else {
+            return;
+        };
+        blob_conformance::failed_streaming_put_preserves_prior_blob(&store).await;
+    }
+
+    /// 1500 keys forces ≥2 list pages with `max_results = 1000`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn list_prefix_paginates_against_emulator() {
-        let Ok(_emu) = std::env::var("STORAGE_EMULATOR_HOST") else {
+    async fn conformance_list_prefix_paginates_against_emulator() {
+        let Some(store) = emulator_store().await else {
             return;
         };
-        let Ok(bucket) = std::env::var("ENGRAM_TEST_GCS_BUCKET") else {
-            return;
-        };
-
-        let store = GcsBlobStorage::connect(bucket)
-            .await
-            .expect("connect against emulator");
-
-        // Unique prefix per run so concurrent test invocations and
-        // prior runs don't interfere.
-        let run_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let prefix = format!("engram/listtest/{run_id}/");
-        let other_prefix = format!("engram/listtest/{run_id}-other/");
-
-        // Write 1500 keys under `prefix` (forces ≥2 list pages with
-        // max_results=1000), plus 5 under `other_prefix` to verify
-        // we don't bleed across.
-        let n = 1500usize;
-        for i in 0..n {
-            let key = format!("{prefix}{i:06}.bin");
-            store
-                .put(&key, bytes::Bytes::from(format!("v{i}")))
-                .await
-                .expect("put");
-        }
-        for i in 0..5 {
-            let key = format!("{other_prefix}{i}.bin");
-            store
-                .put(&key, bytes::Bytes::from_static(b"x"))
-                .await
-                .expect("put");
-        }
-
-        let listed = store.list_prefix(&prefix).await.expect("list_prefix");
-        assert_eq!(
-            listed.len(),
-            n,
-            "expected {n} keys under {prefix}, got {}",
-            listed.len()
-        );
-        // Spot-check ordering doesn't matter; spot-check contents do.
-        let set: std::collections::HashSet<String> = listed.into_iter().collect();
-        for i in 0..n {
-            let expected = format!("{prefix}{i:06}.bin");
-            assert!(
-                set.contains(&expected),
-                "expected key {expected} missing from listing",
-            );
-        }
-        // Nothing from the other prefix.
-        for i in 0..5 {
-            let unwanted = format!("{other_prefix}{i}.bin");
-            assert!(!set.contains(&unwanted));
-        }
-
-        // Cleanup so the emulator's state doesn't grow without bound
-        // across test runs.
-        for i in 0..n {
-            let _ = store.delete(&format!("{prefix}{i:06}.bin")).await;
-        }
-        for i in 0..5 {
-            let _ = store.delete(&format!("{other_prefix}{i}.bin")).await;
-        }
+        blob_conformance::list_prefix_scoped(&store, 1500).await;
     }
 }

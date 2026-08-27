@@ -53,5 +53,6 @@ reqwest-middleware = "0.5"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+engram-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
