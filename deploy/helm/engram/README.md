@@ -52,9 +52,10 @@ coord `ingress` without an auth proxy in front.
   Pass the connection URL via a Secret.
 - **The blob backend** — GCS bucket / S3 bucket is provisioned outside
   the chart (Terraform). Pass the bucket name via values.
-- **FC host fleet** — `engram-host-agent` runs on FC-capable VMs
-  outside the K8s cluster. See `deploy/packer/` + `deploy/terraform/`
-  for the fleet provisioning.
+- **FC host fleet** — `engram-host-agent` runs as the
+  `engram-host-fleet` chart's DaemonSet on KVM-capable cluster nodes
+  (ADR 0044). See `deploy/helm/engram-host-fleet/` for the fleet, and
+  `deploy/terraform/` for node-pool provisioning.
 - **The KEK** — bring your own KMS key (GCP KMS, AWS KMS) or stash a
   base64 master key in the DATABASE_URL secret (dev only).
 - **The managed cert + IAP brand/client** — provisioned in Terraform;
@@ -93,7 +94,7 @@ helm install engram ./deploy/helm/engram \
   --set blob.gcs.bucket="" \
   --set kek.provider=env-var \
   --set secrets.backend=env \
-  --set image.repository=ghcr.io/cortexapps/engram-coordinator \
+  --set image.repository=ghcr.io/cortexapps/engrams/coordinator \
   --set image.tag=0.1.0 \
   --set web.enabled=false
 
@@ -109,12 +110,13 @@ curl localhost:8080/healthz
 #    IP for the coord LB, IAP BackendConfig, managed cert). See
 #    `deploy/terraform/gcp/`.
 
-# 2. Drop the images into Artifact Registry (private CI; the OSS
-#    repo doesn't publish images):
+# 2. Images: the chart defaults point at the published GHCR images
+#    (`ghcr.io/cortexapps/engrams/<coordinator|web|orchestrator>`,
+#    baked by .github/workflows/bake-images.yml). Nothing to build.
+#    To use your own registry instead, override `image.repository`
+#    (and web/orchestrator equivalents), e.g.:
 #    docker buildx build -f docker/coordinator.Dockerfile --push \
 #      -t us-docker.pkg.dev/$PROJECT/engram/coordinator:0.1.0 .
-#    docker buildx build -f docker/web.Dockerfile --push \
-#      -t us-docker.pkg.dev/$PROJECT/engram/web:0.1.0 .
 
 # 3. Stash secrets (use Secret Manager + External Secrets Operator
 #    in prod):
@@ -157,7 +159,7 @@ common knobs:
 | Key | Default | Notes |
 |---|---|---|
 | `replicaCount` | 2 | Ignored when `hpa.enabled=true`; bump `hpa.minReplicas` instead. |
-| `image.repository` | `ghcr.io/cortexapps/engram-coordinator` | Set to your registry. |
+| `image.repository` | `ghcr.io/cortexapps/engrams/coordinator` | Set to your registry. |
 | `image.tag` | `""` → `Chart.AppVersion` | Pin a specific version. |
 | `mode` | `coordinator` | `all` is dev-only. |
 | `blob.backend` | `gcs` | `local` for dev; `s3` reserved. |
@@ -183,7 +185,7 @@ common knobs:
 | Key | Default | Notes |
 |---|---|---|
 | `web.enabled` | `true` | Set false for CLI-only deploys. |
-| `web.image.repository` | `ghcr.io/cortexapps/engram-web` | Set to your registry. |
+| `web.image.repository` | `ghcr.io/cortexapps/engrams/web` | Set to your registry. |
 | `web.image.tag` | `""` → `Chart.AppVersion` | Pin a specific version. |
 | `web.replicaCount` | 2 | No HPA on the web — it's cheap. |
 | `web.containerPort` | 8080 | nginx listens here; lets the pod run as non-root UID 101. |
