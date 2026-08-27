@@ -18,14 +18,16 @@
 //!         ▼
 //!   AuthStrategy    (per-host, per-variant)
 //!     ├── StaticStrategy        — decrypts once, caches BasicCreds
-//!     └── GcpWorkloadIdentityStrategy
-//!                                — calls metadata server / IAM
-//!                                  Credentials API per pull, caches
-//!                                  the OAuth token until ~5min
-//!                                  before expiry.
-//!     (future siblings: AwsInstanceRoleStrategy,
-//!                       AwsAssumeRoleStrategy,
-//!                       VaultStrategy, ...)
+//!     ├── GcpWorkloadIdentityStrategy
+//!     │                          — calls metadata server / IAM
+//!     │                            Credentials API per pull, caches
+//!     │                            the OAuth token until ~5min
+//!     │                            before expiry.
+//!     └── AwsEcrStrategy        — ecr:GetAuthorizationToken via the
+//!                                  ambient IAM identity; caches the
+//!                                  ~12 h token until ~15min before
+//!                                  expiry (ADR 0122).
+//!     (future siblings: VaultStrategy, ...)
 //! ```
 //!
 //! `PgAuthResolver` looks up the [`RegistryCredential`] row by host,
@@ -52,11 +54,23 @@ use engram_crypto::MasterKeyProvider;
 use engram_oci::{BasicCreds, OciError, RegistryAuthResolver};
 use parking_lot::Mutex;
 
+mod aws;
 mod gcp;
 mod static_strategy;
 
+pub use aws::AwsEcrStrategy;
 pub use gcp::GcpWorkloadIdentityStrategy;
 pub use static_strategy::StaticStrategy;
+
+/// Host-shape check for `aws_ecr` credential rows: `Some(region)` iff
+/// `host` is an ECR registry host
+/// (`<account>.dkr.ecr.<region>.amazonaws.com[.cn]`). The coordinator's
+/// add-registry validation rejects non-ECR hosts eagerly — that
+/// pairing can never pull, so a config-time error beats a confusing
+/// per-pull one.
+pub fn ecr_region_for_host(host: &str) -> Option<&str> {
+    aws::parse_ecr_region(host)
+}
 
 /// Per-pull auth strategy. Each impl owns its own caching / refresh
 /// policy: `StaticStrategy` caches a single decryption forever;
@@ -93,6 +107,7 @@ impl PgAuthResolver {
 
     async fn build_strategy(
         &self,
+        host: &str,
         spec: &RegistryAuthSpec,
     ) -> Result<Arc<dyn AuthStrategy>, OciError> {
         match spec {
@@ -120,6 +135,12 @@ impl PgAuthResolver {
                     .map_err(|e| {
                         OciError::Distribution(format!("init gcp workload identity: {e}"))
                     })?;
+                Ok(Arc::new(strategy))
+            }
+            RegistryAuthSpec::AwsEcr { assume_role_arn } => {
+                // The region rides the host name, so the strategy is
+                // per-host by construction (ADR 0122).
+                let strategy = AwsEcrStrategy::new(host, assume_role_arn.clone()).await?;
                 Ok(Arc::new(strategy))
             }
             RegistryAuthSpec::Anonymous => {
@@ -165,7 +186,7 @@ impl RegistryAuthResolver for PgAuthResolver {
         let strategy = match cached {
             Some(s) => s,
             None => {
-                let built = self.build_strategy(&row.auth).await?;
+                let built = self.build_strategy(host, &row.auth).await?;
                 let mut map = self.strategies.lock();
                 map.entry(host.to_string()).or_insert(built).clone()
             }

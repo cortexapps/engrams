@@ -148,8 +148,9 @@ fn base_snapshot_reuse_ok(config: &ImageConfig, force_recapture: bool) -> bool {
 /// `image_uri`'s registry host, decrypted coordinator-side (CredCipher
 /// via the deployment KEK) so the host receives ready-to-use basic
 /// auth in the `MaterializeImage` request. Non-static rows
-/// (GcpWorkloadIdentity / Anonymous) and missing rows resolve to
-/// `None` — the host's ambient resolver covers those per-pull.
+/// (GcpWorkloadIdentity / AwsEcr / Anonymous) and missing rows
+/// resolve to `None` — the host's ambient resolver covers those
+/// per-pull.
 pub(crate) async fn resolve_static_registry_auth(
     state: &SharedState,
     image_uri: &str,
@@ -194,7 +195,11 @@ pub(crate) async fn resolve_static_registry_auth(
                 password: creds.password,
             }))
         }
-        RegistryAuthSpec::GcpWorkloadIdentity { .. } | RegistryAuthSpec::Anonymous => Ok(None),
+        // Cloud-IAM kinds resolve host-side via the host's ambient
+        // resolver (`PgAuthResolver` dispatches per auth_kind).
+        RegistryAuthSpec::GcpWorkloadIdentity { .. }
+        | RegistryAuthSpec::AwsEcr { .. }
+        | RegistryAuthSpec::Anonymous => Ok(None),
     }
 }
 

@@ -3787,11 +3787,92 @@ async fn oauth_refresh_scheduling(ctx: &Ctx) {
     ));
 }
 
+conformance!(
+    t_registry_credential_aws_ecr,
+    super::registry_credential_aws_ecr
+);
 conformance!(t_broker_token_flow, super::broker_token_flow);
 conformance!(
     t_oauth_credential_and_flow,
     super::oauth_credential_and_flow
 );
+
+/// ADR 0122: the `aws_ecr` registry-credential kind round-trips
+/// identically on both stores — upsert (the PG half exercises the
+/// migration-0118 `auth_kind` CHECK), for-host lookup preserving the
+/// variant payload, the upsert-replace path, and the list surface.
+async fn registry_credential_aws_ecr(ctx: &Ctx) {
+    use engram_core::types::registry::{
+        RegistryAuthSpec, RegistryCredential, RegistryCredentialSummary,
+    };
+
+    let host = "123456789012.dkr.ecr.us-west-2.amazonaws.com";
+    let cred = RegistryCredential {
+        id: uuid::Uuid::from_u128(0xEC41),
+        registry_host: host.into(),
+        auth: RegistryAuthSpec::AwsEcr {
+            assume_role_arn: Some("arn:aws:iam::123456789012:role/pull".into()),
+        },
+        created_at: ctx.clock.now_utc(),
+        updated_at: None,
+    };
+    ctx.meta
+        .upsert_registry_credential(cred.clone())
+        .await
+        .unwrap();
+
+    let row = ctx
+        .meta
+        .registry_credential_for_host(host)
+        .await
+        .unwrap()
+        .expect("row must round-trip");
+    match &row.auth {
+        RegistryAuthSpec::AwsEcr { assume_role_arn } => assert_eq!(
+            assume_role_arn.as_deref(),
+            Some("arn:aws:iam::123456789012:role/pull")
+        ),
+        other => panic!("expected AwsEcr, got kind `{}`", other.kind()),
+    }
+    let summary = RegistryCredentialSummary::from(row);
+    assert_eq!(summary.auth_kind, "aws_ecr");
+    assert_eq!(
+        summary.auth_principal.as_deref(),
+        Some("arn:aws:iam::123456789012:role/pull")
+    );
+
+    // Upsert-replace on the same host: flip to the ambient (None)
+    // shape. Same CHECK value, exercises the ON CONFLICT path.
+    ctx.meta
+        .upsert_registry_credential(RegistryCredential {
+            auth: RegistryAuthSpec::AwsEcr {
+                assume_role_arn: None,
+            },
+            ..cred
+        })
+        .await
+        .unwrap();
+    let row = ctx
+        .meta
+        .registry_credential_for_host(host)
+        .await
+        .unwrap()
+        .expect("row survives replace");
+    assert!(matches!(
+        row.auth,
+        RegistryAuthSpec::AwsEcr {
+            assume_role_arn: None
+        }
+    ));
+
+    // Exactly one row for the host in the list surface.
+    let all = ctx.meta.list_registry_credentials().await.unwrap();
+    assert_eq!(
+        all.iter().filter(|c| c.registry_host == host).count(),
+        1,
+        "replace must not duplicate the host row"
+    );
+}
 conformance!(t_oauth_refresh_scheduling, super::oauth_refresh_scheduling);
 conformance!(
     t_user_connector_subject_kind,

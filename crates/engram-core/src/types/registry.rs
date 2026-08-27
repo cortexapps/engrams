@@ -17,9 +17,9 @@
 //!   paste — it's a *claim* about the runtime's identity, exchanged
 //!   for a short-lived token on each pull. The user never types a
 //!   password; the host-agent's ambient cloud identity is the
-//!   credential. Covers GAR-with-Workload-Identity (today's first
-//!   variant), and AWS instance role / cross-account assume role
-//!   (designed-in for; not implemented in this round).
+//!   credential. Covers GAR-with-Workload-Identity and AWS ECR
+//!   (ADR 0122); cross-account assume-role is designed-in but not
+//!   implemented at pull time yet.
 //!
 //! [`RegistryAuthSpec`] is the variant; [`RegistryCredential`] wraps
 //! it with row metadata (id, host, timestamps).
@@ -77,6 +77,19 @@ pub enum RegistryAuthSpec {
         #[serde(default)]
         impersonate_sa: Option<String>,
     },
+    /// AWS ECR via the runtime's ambient IAM identity (ADR 0122):
+    /// `ecr:GetAuthorizationToken` is exchanged for a ~12 h basic-auth
+    /// token on demand (cached until near expiry by the strategy). No
+    /// stored secret material. The region is parsed from the registry
+    /// host (`<acct>.dkr.ecr.<region>.amazonaws.com`).
+    ///
+    /// `assume_role_arn: Some(arn)` chains identity through STS to a
+    /// target role — cross-account pulls. Designed-in like GCP's
+    /// `impersonate_sa`; not implemented in this round.
+    AwsEcr {
+        #[serde(default)]
+        assume_role_arn: Option<String>,
+    },
     /// Public registries that don't require any auth at all (Docker
     /// Hub public images, ghcr.io public, the local dev registry,
     /// etc.). Stored as a row primarily so the dashboard can list
@@ -88,11 +101,12 @@ pub enum RegistryAuthSpec {
 impl RegistryAuthSpec {
     /// Stable wire string used as the `auth_kind` column. Must match
     /// the `serde(rename_all)` rendering and the SQL CHECK constraint
-    /// in migration 0011.
+    /// (migration 0118, the current re-creation).
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Static { .. } => "static",
             Self::GcpWorkloadIdentity { .. } => "gcp_workload_identity",
+            Self::AwsEcr { .. } => "aws_ecr",
             Self::Anonymous => "anonymous",
         }
     }
@@ -146,6 +160,7 @@ impl From<RegistryCredential> for RegistryCredentialSummary {
             RegistryAuthSpec::GcpWorkloadIdentity { impersonate_sa } => {
                 ("gcp_workload_identity", impersonate_sa.clone())
             }
+            RegistryAuthSpec::AwsEcr { assume_role_arn } => ("aws_ecr", assume_role_arn.clone()),
             RegistryAuthSpec::Anonymous => ("anonymous", None),
         };
         Self {
@@ -545,6 +560,30 @@ mod tests {
         assert!(!json.contains("nonce"));
         assert_eq!(summary.auth_kind, "static");
         assert_eq!(summary.auth_principal.as_deref(), Some("_json_key"));
+    }
+
+    #[test]
+    fn auth_spec_serde_round_trip_aws_ecr() {
+        let spec = RegistryAuthSpec::AwsEcr {
+            assume_role_arn: Some("arn:aws:iam::123456789012:role/pull".into()),
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["kind"], "aws_ecr");
+        assert_eq!(
+            json["assume_role_arn"],
+            "arn:aws:iam::123456789012:role/pull"
+        );
+        let back: RegistryAuthSpec = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, RegistryAuthSpec::AwsEcr { .. }));
+        assert_eq!(spec.kind(), "aws_ecr");
+
+        // No `assume_role_arn` field → defaults to None (the ambient
+        // identity), mirroring the GCP WI shape.
+        let ambient: RegistryAuthSpec = serde_json::from_str(r#"{"kind":"aws_ecr"}"#).unwrap();
+        match ambient {
+            RegistryAuthSpec::AwsEcr { assume_role_arn } => assert_eq!(assume_role_arn, None),
+            _ => panic!("expected AwsEcr"),
+        }
     }
 
     #[test]

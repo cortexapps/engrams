@@ -437,6 +437,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ecr"
+version = "1.126.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e239e4d433d4c9c5a0b01ae440a572a0b90b1c7731753148a3ff64ad68152732"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-kms"
 version = "1.117.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2585,7 +2611,10 @@ name = "engram-oci-auth"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-sdk-ecr",
+ "base64 0.23.1",
  "chrono",
+ "engram-aws",
  "engram-core",
  "engram-crypto",
  "engram-oci",
@@ -2596,6 +2625,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
  "workspace-hack",
 ]
 
