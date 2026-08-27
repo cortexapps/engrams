@@ -190,9 +190,20 @@ impl NodePoolScaler for AsgNodePoolScaler {
 
         // 3. Terminate THIS instance and decrement desired capacity in
         //    one atomic call, so the group doesn't recreate it — the
-        //    deleteInstances twin. A validation error here means the
-        //    instance left the group between the check above and now
-        //    (already terminating): idempotent success.
+        //    deleteInstances twin.
+        //
+        //    Error discipline (review finding on this PR): only a
+        //    ValidationError whose message says the instance is not
+        //    found / not managed means "it left the group between the
+        //    membership check above and now" — idempotent success.
+        //    Every other error — ScalingActivityInProgress (a
+        //    transient retry-later fault: the terminate did NOT run),
+        //    min-size ValidationErrors, throttles — must surface as
+        //    Err so the wave driver keeps the victim and retries next
+        //    tick. Returning Ok on a retryable fault deletes the
+        //    coordinator row and clears the victim annotation while
+        //    the instance keeps running: an untracked zombie that
+        //    still counts against ASG capacity.
         match self
             .asg
             .terminate_instance_in_auto_scaling_group()
@@ -211,14 +222,16 @@ impl NodePoolScaler for AsgNodePoolScaler {
                 Ok(())
             }
             Err(e) => {
-                let service_err = e.as_service_error();
-                let is_gone_race = service_err
-                    .map(|se| {
-                        se.meta().code() == Some("ValidationError")
-                            || se.meta().code() == Some("ScalingActivityInProgress")
+                let instance_gone = e
+                    .as_service_error()
+                    .filter(|se| se.meta().code() == Some("ValidationError"))
+                    .and_then(|se| se.meta().message())
+                    .map(|msg| {
+                        let msg = msg.to_ascii_lowercase();
+                        msg.contains("not found") || msg.contains("no managed instance")
                     })
                     .unwrap_or(false);
-                if is_gone_race {
+                if instance_gone {
                     tracing::warn!(
                         node_pool,
                         node_name,
@@ -310,6 +323,26 @@ mod tests {
     <Message>Instance Id not found - No managed instance found for instance ID: i-0deadbeef</Message>
   </Error>
   <RequestId>req-5</RequestId>
+</ErrorResponse>"#;
+
+    const ASG_SCALING_IN_PROGRESS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ErrorResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">
+  <Error>
+    <Type>Sender</Type>
+    <Code>ScalingActivityInProgress</Code>
+    <Message>Activity 12345 is in progress and blocks this action</Message>
+  </Error>
+  <RequestId>req-6</RequestId>
+</ErrorResponse>"#;
+
+    const ASG_MIN_SIZE_VALIDATION_ERROR: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ErrorResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">
+  <Error>
+    <Type>Sender</Type>
+    <Code>ValidationError</Code>
+    <Message>Terminating instance without replacement will violate group's min size constraint of 2</Message>
+  </Error>
+  <RequestId>req-7</RequestId>
 </ErrorResponse>"#;
 
     /// Missing node → `Ok(())` without touching the autoscaling API
@@ -414,6 +447,71 @@ mod tests {
             .remove_node("engram-kvm", "ip-10-0-1-5.ec2.internal")
             .await
             .expect("terminate race must be Ok");
+    }
+
+    /// A transient ScalingActivityInProgress means the terminate did
+    /// NOT run — it must surface as Err so the wave driver keeps the
+    /// victim and retries next tick, never as idempotent success
+    /// (which would leak a running, untracked instance).
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_node_scaling_in_progress_surfaces_as_err() {
+        let server = MockServer::start().await;
+        Mock::given(body_string_contains("Action=DescribeInstances"))
+            .respond_with(xml(EC2_ONE_INSTANCE))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(body_string_contains("Action=DescribeAutoScalingInstances"))
+            .respond_with(xml(ASG_MEMBER_OF_POOL))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(body_string_contains(
+            "Action=TerminateInstanceInAutoScalingGroup",
+        ))
+        .respond_with(ResponseTemplate::new(400).set_body_raw(ASG_SCALING_IN_PROGRESS, "text/xml"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+        let scaler = AsgNodePoolScaler::for_tests(server.uri()).await;
+        scaler
+            .remove_node("engram-kvm", "ip-10-0-1-5.ec2.internal")
+            .await
+            .expect_err("a retry-later fault must NOT read as removed");
+    }
+
+    /// A ValidationError that is NOT instance-gone (here: a min-size
+    /// violation) must also surface as Err — only the
+    /// instance-not-found message reads as idempotent success.
+    #[tokio::test(flavor = "current_thread")]
+    async fn remove_node_min_size_validation_error_surfaces_as_err() {
+        let server = MockServer::start().await;
+        Mock::given(body_string_contains("Action=DescribeInstances"))
+            .respond_with(xml(EC2_ONE_INSTANCE))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(body_string_contains("Action=DescribeAutoScalingInstances"))
+            .respond_with(xml(ASG_MEMBER_OF_POOL))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(body_string_contains(
+            "Action=TerminateInstanceInAutoScalingGroup",
+        ))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_raw(ASG_MIN_SIZE_VALIDATION_ERROR, "text/xml"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+        let scaler = AsgNodePoolScaler::for_tests(server.uri()).await;
+        scaler
+            .remove_node("engram-kvm", "ip-10-0-1-5.ec2.internal")
+            .await
+            .expect_err("a min-size violation must NOT read as removed");
     }
 
     /// `set_size` posts the group name + capacity and treats the empty
