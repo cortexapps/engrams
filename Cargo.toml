@@ -47,6 +47,7 @@ members = [
     "crates/engram-tls",
     "crates/engram-aws",
     "crates/engram-cloud-aws",
+    "crates/engram-kms-aws",
     "crates/engram-oci",
     "crates/engram-oci-auth",
     "crates/engram-storage-local",
@@ -132,6 +133,7 @@ engram-egress-proxyd = { path = "crates/engram-egress-proxyd" }
 engram-crypto = { path = "crates/engram-crypto" }
 engram-tls = { path = "crates/engram-tls" }
 engram-aws = { path = "crates/engram-aws" }
+engram-kms-aws = { path = "crates/engram-kms-aws" }
 engram-oci = { path = "crates/engram-oci" }
 engram-oci-auth = { path = "crates/engram-oci-auth" }
 engram-storage-local = { path = "crates/engram-storage-local" }

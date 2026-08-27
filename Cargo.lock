@@ -437,6 +437,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-kms"
+version = "1.117.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83b602641be84ebe5f96606cfefe4b96efaae1fd947c1b34ea8513b8ac0d2d8d"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.144.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2012,6 +2038,7 @@ dependencies = [
  "engram-git-github",
  "engram-harness-proto",
  "engram-host-agent",
+ "engram-kms-aws",
  "engram-mount-manifest",
  "engram-oci",
  "engram-oci-auth",
@@ -2485,6 +2512,22 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-kms-aws"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-sdk-kms",
+ "base64 0.23.1",
+ "engram-aws",
+ "engram-crypto",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
  "workspace-hack",
 ]
 
