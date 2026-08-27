@@ -125,6 +125,8 @@ struct Cli {
     /// resolves each image manifest's `[secrets.*]` entry via GCP
     /// Secret Manager at session-create time, authenticated through
     /// the instance metadata server (Workload Identity in GKE).
+    /// `aws` resolves via AWS Secrets Manager on the SDK default
+    /// chain (IRSA in EKS) — ADR 0122.
     #[arg(long, env = "ENGRAM_SECRETS_BACKEND", value_parser = parse_secrets_choice, default_value = "env")]
     secrets_backend: SecretsChoice,
 
@@ -180,14 +182,16 @@ enum KekChoice {
 enum SecretsChoice {
     Env,
     Gcp,
+    Aws,
 }
 
 fn parse_secrets_choice(s: &str) -> Result<SecretsChoice, String> {
     match s {
         "env" => Ok(SecretsChoice::Env),
         "gcp" => Ok(SecretsChoice::Gcp),
+        "aws" => Ok(SecretsChoice::Aws),
         other => Err(format!(
-            "unknown secrets backend `{other}` (expected env | gcp)"
+            "unknown secrets backend `{other}` (expected env | gcp | aws)"
         )),
     }
 }
@@ -653,7 +657,8 @@ async fn main() -> Result<(), CoordinatorError> {
     // the coordinator's host shell); `gcp` resolves each image
     // manifest's `[secrets.*]` entry against GCP Secret Manager at
     // session-create time, authenticating via the metadata server
-    // (Workload Identity).
+    // (Workload Identity); `aws` resolves against AWS Secrets Manager
+    // via the SDK default chain (IRSA on EKS) — ADR 0122.
     let deployment_secrets: Arc<dyn SecretStore> = match cli.secrets_backend {
         SecretsChoice::Env => Arc::new(EnvSecretStore::new()),
         SecretsChoice::Gcp => {
@@ -669,6 +674,11 @@ async fn main() -> Result<(), CoordinatorError> {
                     .map_err(|e| CoordinatorError::Config(format!("secrets gcp: {e}")))?,
             )
         }
+        SecretsChoice::Aws => Arc::new(
+            engram_secrets_aws::AwsSecretsManager::new()
+                .await
+                .map_err(|e| CoordinatorError::Config(format!("secrets aws: {e}")))?,
+        ),
     };
 
     // ADR 0057: layer the admin-managed org-secret store ahead of the
