@@ -513,7 +513,14 @@ cloud-specific values in `values-gcp.yaml.example` /
 
 ## Phase 9 — Packer + GCP Terraform
 
-**Status: 🟡 partial — Packer + 3 core Terraform modules shipped; GKE/Postgres/SecretManager/AR deferred to operator-provided modules**
+**Status: ⚰️ HISTORICAL (2026-08-27).** This phase describes the
+retired GCE-MIG topology. ADR 0044 moved the FC fleet to a
+Kubernetes DaemonSet and K5 deleted `deploy/packer/` + the
+`fc-host-mig` module; ADR 0122 replaced the deferred-modules posture
+with full per-cloud module trees + quickstarts
+(`deploy/terraform/{gcp,aws}/`, `docs/deploy-{gcp,aws}.md`). Kept
+verbatim below as the record of what Phase 9 shipped at the time —
+nothing in it is a live pointer.
 
 `deploy/packer/` + `deploy/terraform/gcp/`. The deliberate split:
 own the pieces specific to Engram (chunks bucket, FC host MIG,
