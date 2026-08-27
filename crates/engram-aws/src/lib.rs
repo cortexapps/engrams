@@ -50,7 +50,12 @@
 
 use std::time::Duration;
 
-use aws_config::{BehaviorVersion, Region, SdkConfig};
+use aws_config::{BehaviorVersion, Region};
+
+// Consumers hold the loaded config and hand it to their service
+// client's `Client::new(&cfg)`; re-exporting the type keeps this
+// crate the only direct aws-config dependent outside the SDK family.
+pub use aws_config::SdkConfig;
 use aws_smithy_http_client::{tls, Builder as HttpClientBuilder};
 use aws_smithy_types::retry::RetryConfig;
 use aws_smithy_types::timeout::TimeoutConfig;
