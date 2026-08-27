@@ -127,6 +127,16 @@ impl AwsSecretsManager {
     }
 }
 
+/// Per-call deadline. The shared `engram-aws` transport bounds only
+/// the CONNECT (5 s) and disables SDK retries — correct for the
+/// GB-scale blob path, but a secret read that stalls after the
+/// handshake (an LB draining mid-response, a partial partition)
+/// would otherwise hang forever, wedging session-create and
+/// host-agent boot instead of failing them. 10 s matches the GCP
+/// twin's reqwest operation timeout
+/// (`engram-secrets-gcp`'s client builder).
+const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Low-level `GetSecretValue`: map service errors to typed
 /// [`SecretError`]s, return the string payload. Shared by the
 /// [`SecretStore`] impl (per-image session secrets) and
@@ -138,11 +148,32 @@ pub(crate) async fn get_secret_string(
     client: &Client,
     sref: &SecretRef,
 ) -> Result<Option<String>, SecretError> {
+    get_secret_string_with_deadline(client, sref, OPERATION_TIMEOUT).await
+}
+
+/// Deadline-parameterized inner so the stall path unit-tests in
+/// milliseconds instead of waiting out the production 10 s.
+async fn get_secret_string_with_deadline(
+    client: &Client,
+    sref: &SecretRef,
+    deadline: std::time::Duration,
+) -> Result<Option<String>, SecretError> {
     let mut req = client.get_secret_value().secret_id(&sref.secret_id);
     if let Some(stage) = &sref.version_stage {
         req = req.version_stage(stage);
     }
-    let out = match req.send().await {
+    let sent = tokio::time::timeout(deadline, req.send())
+        .await
+        .map_err(|_| {
+            SecretError::Backend(
+                format!(
+                    "Secrets Manager GetSecretValue for `{}` exceeded the {:?} deadline",
+                    sref.secret_id, deadline
+                )
+                .into(),
+            )
+        })?;
+    let out = match sent {
         Ok(out) => out,
         Err(e) => {
             let id = &sref.secret_id;
@@ -359,6 +390,37 @@ mod tests {
             .await
             .expect_err("binary must error");
         assert!(matches!(err, SecretError::BadValue(_)));
+    }
+
+    /// A response that stalls past the deadline surfaces as a typed
+    /// Backend error instead of hanging the caller (session-create /
+    /// host-agent boot). Tested via the deadline-parameterized inner
+    /// so it runs in milliseconds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_response_hits_the_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(sm_target())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "SecretString": "late" }))
+                    .set_delay(std::time::Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+
+        let m = manager(&server).await;
+        let sref = SecretRef {
+            secret_id: "engram/stalled".into(),
+            version_stage: None,
+        };
+        let err =
+            get_secret_string_with_deadline(&m.client, &sref, std::time::Duration::from_millis(50))
+                .await
+                .expect_err("a stalled response must fail, not hang");
+        assert!(
+            format!("{err}").contains("deadline"),
+            "error must name the deadline: {err}"
+        );
     }
 
     /// A pinned version stage rides the request body.

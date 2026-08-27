@@ -17,6 +17,9 @@ async-trait.workspace = true
 # `default-features = false` is load-bearing on every aws-sdk crate —
 # see the aws sdk note in the root manifest (aws-lc-rs).
 aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio"] }
+# The per-call operation deadline (a stalled response must fail the
+# request, not hang session-create / host-agent boot).
+tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
