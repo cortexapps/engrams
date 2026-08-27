@@ -159,24 +159,20 @@ resource "kubectl_manifest" "orchestrator_external_secret" {
   depends_on = [kubectl_manifest.gcp_secret_store]
 }
 
-# ─── the egress CA + auth token, into BOTH namespaces ─────────────
-# The host fleet needs the CA PEMs (caSource=env) and the coordinator
-# bearer in ITS namespace. Syncing directly into each namespace
-# retires the cross-namespace mirroring step the production deploy
-# workflow used to carry. A DEDICATED CA secret (not folded into the
-# coordinator one) keeps the CA private key out of the coord pod.
+# ─── the egress CA, into the FLEET namespace only ─────────────────
+# The host fleet is the only CA consumer (caSource=env on the
+# host-agent). The private key stays out of the app namespace — the
+# coordinator never touches the CA, and syncing the key there would
+# hand it to anything that can read app-namespace Secrets. A
+# DEDICATED CA secret (not folded into the coordinator one) keeps
+# the same boundary inside the fleet namespace.
 resource "kubectl_manifest" "host_egress_ca_external_secret" {
-  for_each = {
-    app   = kubernetes_namespace_v1.app.metadata[0].name
-    fleet = kubernetes_namespace_v1.fleet.metadata[0].name
-  }
-
   yaml_body = <<-YAML
     apiVersion: external-secrets.io/v1
     kind: ExternalSecret
     metadata:
       name: engram-host-egress-ca
-      namespace: ${each.value}
+      namespace: ${kubernetes_namespace_v1.fleet.metadata[0].name}
     spec:
       refreshInterval: 1h
       secretStoreRef:
