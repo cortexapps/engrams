@@ -8,10 +8,15 @@
 # Everything here has a single source of truth in Terraform; edit the
 # static file, not this one.
 blob:
+  # The selector rides with the config it selects — without it the
+  # chart default (gcs) wins and the coordinator boots against a
+  # bucket that does not exist.
+  backend: s3
   s3:
     bucket: ${bucket}
     region: ${region}
 kek:
+  provider: aws-kms
   awsKeyId: ${kek_key_arn}
 serviceAccount:
   create: true

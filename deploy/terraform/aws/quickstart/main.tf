@@ -141,6 +141,17 @@ module "irsa_coordinator" {
           Action   = ["secretsmanager:GetSecretValue"]
           Resource = ["arn:aws:secretsmanager:${var.region}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}/*"]
         },
+        {
+          # ECR registry auth (aws_ecr rows) is resolved on the
+          # COORDINATOR, not the host-agent — the host POSTs
+          # /auth/resolve-registry and gets back a short-lived token.
+          # GetAuthorizationToken does not accept resource scoping;
+          # "*" is the narrowest possible grant.
+          Sid      = "EcrToken"
+          Effect   = "Allow"
+          Action   = ["ecr:GetAuthorizationToken"]
+          Resource = "*"
+        },
       ]
     })
   }
