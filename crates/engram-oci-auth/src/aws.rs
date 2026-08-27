@@ -1,15 +1,25 @@
-//! AWS ECR strategy (ADR 0122): exchange the host-agent's ambient
+//! AWS ECR strategy (ADR 0122): exchange the COORDINATOR's ambient
 //! AWS IAM identity for an ECR authorization token, present it to the
 //! registry as basic auth — the ECR twin of [`crate::gcp`].
+//!
+//! # Who makes this call (review finding on the introducing PR)
+//!
+//! The strategy runs inside `PgAuthResolver`, which lives in the
+//! COORDINATOR process: the standalone host-agent never builds it —
+//! it POSTs `/api/hosts/:id/auth/resolve-registry` and the
+//! coordinator resolves on its behalf (`HttpAuthResolver` in
+//! `engram-host-agent/src/coord_client.rs`). So
+//! `ecr:GetAuthorizationToken` must be granted to the
+//! **coordinator's** IRSA role, not the host-agent's; in the
+//! collapsed `--mode=all` process the two identities coincide.
 //!
 //! # Mechanics
 //!
 //! `ecr:GetAuthorizationToken` returns a base64 `AWS:<password>` pair
 //! valid for ~12 hours. ECR registries accept it as standard basic
 //! auth. The identity comes from the SDK default chain via
-//! `engram-aws`: IRSA on EKS (works in the hostNetwork host-agent pod
-//! — env/file-based, unlike GKE Workload Identity), or the node
-//! instance role via IMDSv2.
+//! `engram-aws`: IRSA on the coordinator's ServiceAccount, or the
+//! node instance role via IMDSv2.
 //!
 //! The strategy caches the decoded credentials and refreshes when
 //! within 15 minutes of the server-reported expiry — the GCP token
@@ -44,6 +54,13 @@ use crate::AuthStrategy;
 /// refreshing 15 minutes early keeps a long image pull from straddling
 /// the boundary.
 const REFRESH_MARGIN: Duration = Duration::from_secs(15 * 60);
+
+/// Per-call deadline on the token fetch. The shared `engram-aws`
+/// transport bounds only the connect and disables SDK retries; a
+/// stalled GetAuthorizationToken response would otherwise hang the
+/// pull that triggered it. Mirrors the 10 s bound the other AWS
+/// service crates apply.
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Parse the region out of an ECR registry host:
 /// `<account>.dkr.ecr.<region>.amazonaws.com` (or `.com.cn` for the
@@ -138,12 +155,18 @@ impl AuthStrategy for AwsEcrStrategy {
             }
         }
 
-        let out = self
-            .client
-            .get_authorization_token()
-            .send()
-            .await
-            .map_err(|e| OciError::Distribution(format!("ecr GetAuthorizationToken: {e}")))?;
+        let out = tokio::time::timeout(
+            OPERATION_TIMEOUT,
+            self.client.get_authorization_token().send(),
+        )
+        .await
+        .map_err(|_| {
+            OciError::Distribution(format!(
+                "ecr GetAuthorizationToken exceeded the {}s deadline",
+                OPERATION_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|e| OciError::Distribution(format!("ecr GetAuthorizationToken: {e}")))?;
         let data = out
             .authorization_data()
             .first()

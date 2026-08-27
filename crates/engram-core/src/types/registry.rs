@@ -16,10 +16,12 @@
 //! - **Cloud-IAM**: the credential isn't a string the user can
 //!   paste — it's a *claim* about the runtime's identity, exchanged
 //!   for a short-lived token on each pull. The user never types a
-//!   password; the host-agent's ambient cloud identity is the
-//!   credential. Covers GAR-with-Workload-Identity and AWS ECR
-//!   (ADR 0122); cross-account assume-role is designed-in but not
-//!   implemented at pull time yet.
+//!   password; the COORDINATOR's ambient cloud identity is the
+//!   credential (strategies run in `PgAuthResolver`; the host-agent
+//!   resolves through `/auth/resolve-registry`). Covers
+//!   GAR-with-Workload-Identity and AWS ECR (ADR 0122);
+//!   cross-account assume-role is designed-in but not implemented at
+//!   pull time yet.
 //!
 //! [`RegistryAuthSpec`] is the variant; [`RegistryCredential`] wraps
 //! it with row metadata (id, host, timestamps).

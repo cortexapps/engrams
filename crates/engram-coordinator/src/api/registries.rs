@@ -128,7 +128,21 @@ pub(crate) async fn add_registry_core(
                     req.host
                 )));
             }
-            RegistryAuthSpec::AwsEcr { assume_role_arn }
+            // Same eager posture for assume_role_arn: the STS chain is
+            // designed-in but not implemented at pull time, so a row
+            // carrying it can never pull — reject at config time
+            // instead of persisting a credential that fails every
+            // session boot (review finding).
+            if assume_role_arn.as_deref().is_some_and(|a| !a.is_empty()) {
+                return Err(ApiError::BadRequest(
+                    "aws_ecr cross-account assume_role_arn is not yet supported; \
+                     omit it to use the ambient identity"
+                        .into(),
+                ));
+            }
+            RegistryAuthSpec::AwsEcr {
+                assume_role_arn: None,
+            }
         }
         AddRegistryAuth::Anonymous => RegistryAuthSpec::Anonymous,
     };

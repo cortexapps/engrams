@@ -188,7 +188,7 @@ const KIND_CARDS: AuthKindCardSpec[] = [
     kind: "aws_ecr",
     label: "AWS ECR",
     blurb:
-      "Ambient AWS IAM identity (IRSA / instance role) exchanged for an ECR token per pull. No stored secret material.",
+      "The coordinator's ambient AWS IAM identity (IRSA / instance role) is exchanged for an ECR token per pull. No stored secret material.",
   },
 ];
 
@@ -250,10 +250,10 @@ function AddRegistryDialog() {
         value: { username: data.username.trim(), password: data.password },
       };
     } else if (data.authKind === "aws_ecr") {
-      auth = {
-        case: "awsEcr",
-        value: { assumeRoleArn: data.assumeRoleArn.trim() || undefined },
-      };
+      // No assumeRoleArn: the STS chain is not implemented at pull
+      // time and the API rejects a value eagerly — the field below is
+      // disabled until it lands.
+      auth = { case: "awsEcr", value: {} };
     } else {
       auth = {
         case: "gcpWorkloadIdentity",
@@ -403,30 +403,24 @@ function AddRegistryDialog() {
             ) : authKind === "aws_ecr" ? (
               <>
                 <FieldDescription>
-                  No password required. The host-agent's ambient AWS IAM identity (IRSA or the node
-                  instance role) is exchanged for an ECR token on every pull.
+                  No password required. The coordinator's ambient AWS IAM identity (IRSA or the node
+                  instance role) is exchanged for an ECR token on every pull — grant{" "}
+                  <code className="font-mono">ecr:GetAuthorizationToken</code> to the coordinator's
+                  role.
                 </FieldDescription>
-                <Controller
-                  name="assumeRoleArn"
-                  control={form.control}
-                  render={({ field }) => (
-                    <Field>
-                      <FieldLabel htmlFor={field.name}>Assume role (optional)</FieldLabel>
-                      <Input
-                        {...field}
-                        id={field.name}
-                        className="font-mono"
-                        placeholder="arn:aws:iam::123456789012:role/engram-pull"
-                        spellCheck={false}
-                        autoCapitalize="off"
-                      />
-                      <FieldDescription>
-                        Pull cross-account via STS AssumeRole. Leave empty to use the ambient
-                        identity.
-                      </FieldDescription>
-                    </Field>
-                  )}
-                />
+                <Field>
+                  <FieldLabel htmlFor="assumeRoleArn">Assume role</FieldLabel>
+                  <Input
+                    id="assumeRoleArn"
+                    className="font-mono"
+                    placeholder="arn:aws:iam::123456789012:role/engram-pull"
+                    disabled
+                  />
+                  <FieldDescription>
+                    Cross-account pulls via STS AssumeRole — coming soon; the ambient identity is
+                    used until then.
+                  </FieldDescription>
+                </Field>
               </>
             ) : (
               <>

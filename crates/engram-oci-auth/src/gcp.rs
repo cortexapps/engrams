@@ -1,6 +1,9 @@
-//! GCP Workload Identity strategy: exchange the host-agent's
-//! ambient cloud identity for a short-lived OAuth access token,
-//! present it to the registry as basic auth.
+//! GCP Workload Identity strategy: exchange the ambient cloud
+//! identity for a short-lived OAuth access token, present it to the
+//! registry as basic auth. Like every `AuthStrategy`, this runs in
+//! the COORDINATOR process (the host-agent resolves via
+//! `/auth/resolve-registry`), so the token reflects the
+//! coordinator's identity.
 //!
 //! # Mechanics
 //!
