@@ -62,7 +62,9 @@ updates:
            "opentelemetry", "opentelemetry-*", "opentelemetry_*",
            "tracing-opentelemetry", "kube", "kube-*", "k8s-openapi",
            "schemars", "rand", "rand_chacha", "rand_core",
-           "reqwest", "reqwest-middleware", "gcloud-*"]
+           "reqwest", "reqwest-middleware", "gcloud-*",
+           "aws-config", "aws-sdk-*", "aws-smithy-*", "aws-types",
+           "aws-credential-types", "aws-runtime", "aws-sigv4"]
       # Exception to the majors-arrive-individually rule: the tonic/prost
       # family is version-locked to itself (tonic 0.14 codegen emits code
       # that only compiles against prost 0.14 and the tonic 0.14 runtime).
@@ -179,6 +181,20 @@ updates:
       # name is no longer a dependency here.
       gcs-transport:
         patterns: ["reqwest", "reqwest-middleware", "gcloud-*"]
+        update-types: ["major", "minor", "patch"]
+      # Seventh family: the AWS SDK (ADR 0122). AWS releases aws-config,
+      # the aws-sdk-* service crates, and the aws-smithy-* runtime as one
+      # versioned set: a service crate pins exact aws-smithy-* minors, so
+      # a lone bump lands two smithy runtimes in the graph and the config
+      # types stop unifying — the tonic/prost shape again. Grouped at
+      # every level so the family moves as one PR. Feature review on
+      # these PRs has one non-negotiable check: nothing may (re)enable a
+      # default HTTPS client — that path links `aws-lc-rs`, a second
+      # rustls CryptoProvider next to the workspace's `ring` (see the
+      # aws sdk note in the root manifest; CI greps Cargo.lock for it).
+      aws-sdk:
+        patterns: ["aws-config", "aws-sdk-*", "aws-smithy-*", "aws-types",
+                   "aws-credential-types", "aws-runtime", "aws-sigv4"]
         update-types: ["major", "minor", "patch"]
     ignore:
       # ---- hakari-only crates -------------------------------------------

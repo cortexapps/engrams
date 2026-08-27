@@ -303,6 +303,22 @@ jobs:
       - name: cargo hakari generate --diff
         if: always()
         run: cargo hakari generate --diff
+      # ADR 0122: the AWS SDK rides the workspace's single rustls
+      # CryptoProvider (ring). `aws-lc-rs` in the tree means some crate
+      # (re)enabled an SDK default HTTPS client — a second compiled
+      # provider that panics rustls at first TLS use and a cmake+nasm C
+      # build the musl cross lane cannot carry. Catch it as a
+      # deterministic lint failure instead of a runtime panic. Fix:
+      # `default-features = false` on the offending aws crate; TLS comes
+      # only from aws-smithy-http-client's `rustls-ring` (engram-aws).
+      - name: forbid aws-lc in the dependency tree
+        if: always()
+        run: |
+          if grep -q 'name = "aws-lc' Cargo.lock; then
+            echo '::error::aws-lc entered Cargo.lock — an aws-* crate enabled a default HTTPS client. See the aws sdk note in the root manifest.' >&2
+            grep -B1 -A2 'name = "aws-lc' Cargo.lock >&2
+            exit 1
+          fi
 
   test-linux:
     name: tests (linux)

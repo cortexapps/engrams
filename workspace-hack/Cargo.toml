@@ -43,7 +43,7 @@ hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 hyper = { version = "1", features = ["full"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "logging", "native-tokio", "ring", "tls12"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
 ipnet = { version = "2" }
@@ -54,7 +54,7 @@ memchr = { version = "2" }
 nix = { version = "0.31", default-features = false, features = ["fs", "mman", "sched", "signal", "uio"] }
 num-bigint = { version = "0.4" }
 num-bigint-dig = { version = "0.8", default-features = false, features = ["i128", "prime", "u64_digit", "zeroize"] }
-num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
+num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
@@ -165,7 +165,6 @@ zeroize = { version = "1", features = ["derive"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
 nix = { version = "0.31", features = ["ioctl", "mount", "socket"] }
 nom = { version = "7" }
@@ -186,7 +185,6 @@ rustix = { version = "1", features = ["fs"] }
 
 [target.x86_64-unknown-linux-musl.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
 nix = { version = "0.31", features = ["ioctl", "mount", "socket"] }
 nom = { version = "7" }
@@ -208,7 +206,6 @@ rustix = { version = "1", features = ["fs"] }
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 errno = { version = "0.3" }
-hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 nix = { version = "0.31", default-features = false, features = ["socket"] }
 rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
@@ -224,7 +221,6 @@ rustix = { version = "1", features = ["fs"] }
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 errno = { version = "0.3" }
-hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 nix = { version = "0.31", default-features = false, features = ["socket"] }
 rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
