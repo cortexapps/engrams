@@ -27,3 +27,9 @@ output "master_user" {
   value       = var.db_user_name
   description = "The application SQL user."
 }
+
+output "master_password" {
+  value       = random_password.master.result
+  sensitive   = true
+  description = "The application user's password — consumed by the quickstart's one-shot DB-init Job (TF owns the password lifecycle; see the module header)."
+}
