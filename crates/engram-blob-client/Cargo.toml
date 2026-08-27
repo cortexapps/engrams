@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 engram-core.workspace = true
 engram-storage-gcs.workspace = true
+engram-storage-s3.workspace = true
 engram-storage-local.workspace = true
 async-trait.workspace = true
 bytes.workspace = true

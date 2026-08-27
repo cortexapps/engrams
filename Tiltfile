@@ -243,6 +243,27 @@ if gcs_external:
           % storage_emulator_host)
 
 # ----------------------------------------------------------------
+# S3 emulator (ADR 0122): opt-in via ENGRAM_BLOB_BACKEND=s3 in .env.
+# MinIO rides the `local-s3` compose profile the same way fake-gcs
+# rides `local-gcs`, with the same external-reuse probe so a shared
+# emulator on :9000 isn't collided with. Split mode stays on gcs
+# (line ~396) — it mirrors the GCP prod topology; the s3 dev loop is
+# for exercising the AWS arm.
+# ----------------------------------------------------------------
+s3_selected = (not dev_split) and env_or('ENGRAM_BLOB_BACKEND', 'local') == 's3'
+s3_endpoint = env_or('ENGRAM_S3_ENDPOINT_URL', 'http://localhost:9000')
+s3_external = False
+if s3_selected:
+    s3_probe = str(local(
+        'curl -sf -o /dev/null --max-time 2 "' +
+        s3_endpoint + '/minio/health/live" && echo up || echo down',
+        echo_off=True, quiet=True)).strip()
+    s3_external = s3_probe == 'up'
+    if s3_external:
+        print('engram dev: reusing external minio at %s (not starting our own)'
+              % s3_endpoint)
+
+# ----------------------------------------------------------------
 # Infra: postgres + registry via docker-compose.
 # The compose file's `coordinator` service is profile-gated to
 # `docker-only`, so this call brings up just the two infra services.
@@ -256,8 +277,11 @@ compose_files = ['deploy/docker-compose.dev.yml']
 if 'Linux' in uname_str:
     compose_files.append('deploy/docker-compose.linux.yml')
 # fake-gcs-server lives behind the `local-gcs` profile (see the compose
-# file). Activate it only when no external emulator was found.
+# file). Activate it only when no external emulator was found. MinIO
+# (profile `local-s3`) joins only when the s3 backend is selected.
 compose_profiles = [] if gcs_external else ['local-gcs']
+if s3_selected and not s3_external:
+    compose_profiles.append('local-s3')
 docker_compose(compose_files, profiles=compose_profiles)
 dc_resource('postgres',
     labels=['infra'],
@@ -273,6 +297,12 @@ if not gcs_external:
     dc_resource('fake-gcs-server',
         labels=['infra'],
         links=[storage_emulator_host + '/storage/v1/b'])
+# S3 emulator (ADR 0122) — only when the s3 backend is selected and no
+# external MinIO answered the parse-time probe.
+if s3_selected and not s3_external:
+    dc_resource('minio',
+        labels=['infra'],
+        links=[link('http://localhost:9001', 'minio console')])
 # Jaeger — OTLP trace collector + UI for ADR 0019 cold-boot tracing.
 # coord (+ host-agent in split mode) export here via
 # OTEL_EXPORTER_OTLP_ENDPOINT, defaulted below.
@@ -305,13 +335,23 @@ dc_resource('jaeger',
 # bucket, so a broken cold-tier setup must not block the coordinator,
 # orchestrator, or web development loops. Operations that actually need
 # blob storage still fail at their point of use until seeding succeeds.
+seed_env = (
+    'STORAGE_EMULATOR_HOST=' + storage_emulator_host + ' ' +
+    'ENGRAM_GCS_BUCKET=' + env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test') + ' '
+)
+seed_deps = [] if gcs_external else ['fake-gcs-server']
+if s3_selected:
+    # The script's S3 section (mc mb --ignore-existing) activates on
+    # this env var; skipped entirely in GCS-only environments.
+    seed_env += (
+        'ENGRAM_TEST_S3_ENDPOINT=' + s3_endpoint + ' ' +
+        'ENGRAM_S3_BUCKET=' + env_or('ENGRAM_S3_BUCKET', 'engram-snapshots-test') + ' '
+    )
+    if not s3_external:
+        seed_deps.append('minio')
 local_resource('seed-buckets',
-    cmd=(
-        'STORAGE_EMULATOR_HOST=' + storage_emulator_host + ' ' +
-        'ENGRAM_GCS_BUCKET=' + env_or('ENGRAM_GCS_BUCKET', 'engram-snapshots-test') + ' ' +
-        'bash deploy/dev/seed-buckets.sh'
-    ),
-    resource_deps=[] if gcs_external else ['fake-gcs-server'],
+    cmd=seed_env + 'bash deploy/dev/seed-buckets.sh',
+    resource_deps=seed_deps,
     labels=['setup'])
 
 # ----------------------------------------------------------------
@@ -399,6 +439,16 @@ coord_env = {
     'OTEL_EXPORTER_OTLP_ENDPOINT': otel_endpoint,
     'RUST_LOG': 'info,engram=debug',
 }
+
+# ADR 0122: the s3 arm against local MinIO. Static credentials match
+# the MinIO root user in deploy/docker-compose.dev.yml; the SDK's
+# default chain would otherwise probe IMDS off-cloud.
+if s3_selected:
+    coord_env['ENGRAM_S3_BUCKET'] = env_or('ENGRAM_S3_BUCKET', 'engram-snapshots-test')
+    coord_env['ENGRAM_S3_ENDPOINT_URL'] = s3_endpoint
+    coord_env['AWS_ACCESS_KEY_ID'] = env_or('AWS_ACCESS_KEY_ID', 'minioadmin')
+    coord_env['AWS_SECRET_ACCESS_KEY'] = env_or('AWS_SECRET_ACCESS_KEY', 'minioadmin')
+    coord_env['AWS_REGION'] = env_or('AWS_REGION', 'us-east-1')
 
 # The process backend is insecure (un-isolated host subprocesses), so
 # the binary refuses to start it unless explicitly allowed. `just dev`

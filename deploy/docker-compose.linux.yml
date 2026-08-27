@@ -35,3 +35,10 @@ services:
     # with `ports: !reset []`: that tag needs Compose >= 2.24, and the
     # dev-vm / older Docker Desktop installs predate it.
     network_mode: host
+  # Same DNAT-collision rationale as fake-gcs-server above: MinIO
+  # (profile `local-s3`, ADR 0122) is (re)started after the host-agent
+  # may have written iptables rules, so its published ports hit the
+  # same broken-DNAT failure on the dev-vm. Host networking binds
+  # 9000/9001 directly.
+  minio:
+    network_mode: host
