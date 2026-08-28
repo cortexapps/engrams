@@ -11,7 +11,7 @@ replicaCount: 2
 
 image:
   # Override at deploy: `image.repository=us-docker.pkg.dev/...`
-  repository: ghcr.io/cortexapps/engram-coordinator
+  repository: ghcr.io/cortexapps/engrams/coordinator
   tag: ""           # falls back to .Chart.AppVersion when unset
   pullPolicy: IfNotPresent
 
@@ -317,7 +317,7 @@ web:
   replicaCount: 2
 
   image:
-    repository: ghcr.io/cortexapps/engram-web
+    repository: ghcr.io/cortexapps/engrams/web
     tag: ""           # falls back to .Chart.AppVersion when unset
     pullPolicy: IfNotPresent
 
@@ -386,7 +386,7 @@ orchestrator:
   replicaCount: 2
 
   image:
-    repository: ghcr.io/cortexapps/engram-orchestrator
+    repository: ghcr.io/cortexapps/engrams/orchestrator
     tag: ""           # falls back to .Chart.AppVersion when unset
     pullPolicy: IfNotPresent
 
