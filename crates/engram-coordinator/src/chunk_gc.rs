@@ -66,6 +66,24 @@ pub struct ChunkGcConfig {
     /// — the 24h grace absorbs the racy candidate (next sweep will
     /// either re-pin it or sustain it as candidate).
     pub max_restart_attempts: u32,
+    /// Concurrent manifest fetches inside `PinSet::collect`.
+    ///
+    /// The chunk-store default is 16, whose own doc sizes it for
+    /// "fleet-scale (100s of manifests)". Prod is an order of magnitude
+    /// past that: the pin set spans ~5,600 manifest refs (2,234
+    /// live-session disk, 1,407 recoverable-snapshot disk, 1,430 memory,
+    /// 554 cold bases, plus the enabled images), each roughly 722 KiB, so
+    /// a 16-way collect moves ~4 GB and runs tens of seconds.
+    ///
+    /// Collect DURATION is what makes the promote pass's generation
+    /// bracket fail: `chunk_generation` ticks ~2.3x/min in prod, so a
+    /// window measured in tens of seconds is likely to have a bump land
+    /// inside it, and three such attempts in a row exhaust the budget and
+    /// skip a drain. Shortening the window is the direct fix — it cuts the
+    /// chance of a racing publish roughly proportionally, and speeds the
+    /// mark pass too. Defaults to 64. Override via
+    /// `ENGRAM_CHUNK_GC_PIN_SET_CONCURRENCY`.
+    pub pin_set_concurrency: usize,
     /// Promote-pass batch size — candidates fetched from PG per
     /// page. Defaults to 10_000.
     pub promote_batch_size: i64,
@@ -93,6 +111,7 @@ impl Default for ChunkGcConfig {
             interval: Duration::from_secs(3600),
             grace_period: Duration::from_secs(86400),
             max_restart_attempts: 3,
+            pin_set_concurrency: 64,
             promote_batch_size: 10_000,
             promote_concurrency: 64,
             promote_max_per_sweep: 200_000,
@@ -116,6 +135,11 @@ impl ChunkGcConfig {
         if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_GRACE_SECS") {
             if let Ok(secs) = v.parse::<u64>() {
                 cfg.grace_period = Duration::from_secs(secs);
+            }
+        }
+        if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_PIN_SET_CONCURRENCY") {
+            if let Ok(n) = v.parse::<usize>() {
+                cfg.pin_set_concurrency = n.max(1);
             }
         }
         if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_PROMOTE_CONCURRENCY") {
@@ -294,7 +318,8 @@ async fn run_mark_pass(
     // -------- barrier-bounded classification loop --------
     loop {
         let gen_before = meta.chunk_generation().await?;
-        let pin_set = PinSet::collect(meta, chunk_store).await?;
+        let pin_set =
+            PinSet::collect_with_concurrency(meta, chunk_store, cfg.pin_set_concurrency).await?;
 
         // Reset per-iteration counters so a restart doesn't double-
         // count from the previous iteration. The barrier means only
@@ -394,8 +419,13 @@ async fn promote_expired(
     // batch. This is the mark pass's barrier applied to promote: it keeps
     // the freshness guarantee of a per-batch collect without paying for a
     // full manifest fan-out on every page.
-    let Some((mut pin_set, mut pin_gen)) =
-        collect_pin_set_at_generation(meta, chunk_store, cfg.max_restart_attempts).await?
+    let Some((mut pin_set, mut pin_gen)) = collect_pin_set_at_generation(
+        meta,
+        chunk_store,
+        cfg.max_restart_attempts,
+        cfg.pin_set_concurrency,
+    )
+    .await?
     else {
         return Ok((0, 0, 0));
     };
@@ -432,8 +462,13 @@ async fn promote_expired(
         // only genuinely-unpinned chunks get their blob deleted.
         let gen_now = meta.chunk_generation().await?;
         if gen_now != pin_gen {
-            let Some((fresh, fresh_gen)) =
-                collect_pin_set_at_generation(meta, chunk_store, cfg.max_restart_attempts).await?
+            let Some((fresh, fresh_gen)) = collect_pin_set_at_generation(
+                meta,
+                chunk_store,
+                cfg.max_restart_attempts,
+                cfg.pin_set_concurrency,
+            )
+            .await?
             else {
                 break;
             };
@@ -510,10 +545,11 @@ async fn collect_pin_set_at_generation(
     meta: &dyn MetadataStore,
     chunk_store: &ChunkStore,
     max_attempts: u32,
+    concurrency: usize,
 ) -> Result<Option<(PinSet, u64)>, GcError> {
     for _ in 0..max_attempts.max(1) {
         let before = meta.chunk_generation().await?;
-        let pin_set = PinSet::collect(meta, chunk_store).await?;
+        let pin_set = PinSet::collect_with_concurrency(meta, chunk_store, concurrency).await?;
         let after = meta.chunk_generation().await?;
         if before == after {
             return Ok(Some((pin_set, after)));
