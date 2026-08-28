@@ -296,10 +296,11 @@ message RegistryCredentialSummary {
   string id = 1;
   string registry_host = 2;
   // RegistryAuthSpec kind: "static" | "gcp_workload_identity" |
-  // "anonymous". Future cloud-IAM kinds extend this set.
+  // "aws_ecr" | "anonymous". Future cloud-IAM kinds extend this set.
   string auth_kind = 3;
   // For "static": the username. For "gcp_workload_identity": the
-  // impersonated SA email if any, else unset. Always non-secret.
+  // impersonated SA email if any. For "aws_ecr": the assume-role ARN
+  // if any. Always non-secret.
   optional string auth_principal = 4;
   // ISO-8601.
   string created_at = 5;
@@ -320,6 +321,7 @@ message AddRegistryRequest {
     StaticRegistryAuth static = 2;
     GcpWorkloadIdentityRegistryAuth gcp_workload_identity = 3;
     AnonymousRegistryAuth anonymous = 4;
+    AwsEcrRegistryAuth aws_ecr = 5;
   }
 }
 
@@ -335,6 +337,16 @@ message GcpWorkloadIdentityRegistryAuth {
   // API. Unset = use the runtime's ambient identity directly. No secret
   // material either way.
   optional string impersonate_sa = 1;
+}
+
+// AWS ECR via the runtime's ambient IAM identity (ADR 0122):
+// ecr:GetAuthorizationToken is exchanged for a ~12 h basic-auth token
+// per pull (cached by the strategy). No secret material either way.
+message AwsEcrRegistryAuth {
+  // Optional IAM role to sts:AssumeRole into for cross-account pulls.
+  // Unset = use the runtime's ambient identity directly. Designed-in;
+  // pull-time support lands separately (mirrors impersonate_sa above).
+  optional string assume_role_arn = 1;
 }
 
 // Public registry — no auth material. Stored as a row so the catalog

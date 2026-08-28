@@ -52,10 +52,10 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-// Registries panel — operators register Docker registries with either a static
-// credential (sealed under the deployment KEK) or ambient GCP Workload
-// Identity. AWS instance role is a "coming soon" stub so the UI matrix matches
-// the RegistryAuthSpec enum's design intent.
+// Registries panel — operators register Docker registries with a static
+// credential (sealed under the deployment KEK) or an ambient cloud-IAM
+// identity: GCP Workload Identity or AWS ECR (ADR 0122). The kind matrix
+// mirrors the RegistryAuthSpec enum.
 export function RegistriesPanel() {
   const { data, isLoading, error } = useRegistries();
   const rows = data ?? [];
@@ -110,7 +110,13 @@ function RegistryRow({ row }: { row: RegistryCredentialSummary }) {
       <TableCell className="font-mono text-sm">{row.registry_host}</TableCell>
       <TableCell>
         <Badge variant="outline">
-          {row.auth_kind === "static" ? "static" : "workload identity"}
+          {row.auth_kind === "static"
+            ? "static"
+            : row.auth_kind === "aws_ecr"
+              ? "aws ecr"
+              : row.auth_kind === "anonymous"
+                ? "anonymous"
+                : "workload identity"}
         </Badge>
       </TableCell>
       <TableCell className="font-mono text-xs text-muted-foreground">
@@ -158,7 +164,7 @@ function RegistryRow({ row }: { row: RegistryCredentialSummary }) {
 }
 
 interface AuthKindCardSpec {
-  kind: RegistryAuthKind | "aws_instance_role";
+  kind: RegistryAuthKind;
   label: string;
   blurb: string;
   disabled?: boolean;
@@ -179,21 +185,21 @@ const KIND_CARDS: AuthKindCardSpec[] = [
       "Ambient GCP identity exchanged for a short-lived token per pull. No stored secret material.",
   },
   {
-    kind: "aws_instance_role",
-    label: "AWS Instance Role",
-    blurb: "Ambient AWS IAM identity exchanged for an ECR token per pull. Same shape as GCP WI.",
-    disabled: true,
-    hint: "coming soon",
+    kind: "aws_ecr",
+    label: "AWS ECR",
+    blurb:
+      "The coordinator's ambient AWS IAM identity (IRSA / instance role) is exchanged for an ECR token per pull. No stored secret material.",
   },
 ];
 
 const registrySchema = z
   .object({
     host: z.string().trim().min(1, "host is required"),
-    authKind: z.enum(["static", "gcp_workload_identity"]),
+    authKind: z.enum(["static", "gcp_workload_identity", "aws_ecr"]),
     username: z.string(),
     password: z.string(),
     impersonateSa: z.string(),
+    assumeRoleArn: z.string(),
   })
   .superRefine((val, ctx) => {
     if (val.authKind === "static") {
@@ -204,6 +210,16 @@ const registrySchema = z
         ctx.addIssue({ code: "custom", path: ["password"], message: "password is required" });
       }
     }
+    if (
+      val.authKind === "aws_ecr" &&
+      !/\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(\.cn)?$/.test(val.host.trim())
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["host"],
+        message: "AWS ECR auth needs an ECR host (<account>.dkr.ecr.<region>.amazonaws.com)",
+      });
+    }
   });
 type RegistryValues = z.infer<typeof registrySchema>;
 
@@ -212,7 +228,14 @@ function AddRegistryDialog() {
   const add = useAddRegistry();
   const form = useForm<RegistryValues>({
     resolver: zodResolver(registrySchema),
-    defaultValues: { host: "", authKind: "static", username: "", password: "", impersonateSa: "" },
+    defaultValues: {
+      host: "",
+      authKind: "static",
+      username: "",
+      password: "",
+      impersonateSa: "",
+      assumeRoleArn: "",
+    },
   });
   const authKind = form.watch("authKind");
 
@@ -226,6 +249,11 @@ function AddRegistryDialog() {
         case: "static",
         value: { username: data.username.trim(), password: data.password },
       };
+    } else if (data.authKind === "aws_ecr") {
+      // No assumeRoleArn: the STS chain is not implemented at pull
+      // time and the API rejects a value eagerly — the field below is
+      // disabled until it lands.
+      auth = { case: "awsEcr", value: {} };
     } else {
       auth = {
         case: "gcpWorkloadIdentity",
@@ -371,6 +399,28 @@ function AddRegistryDialog() {
                     </Field>
                   )}
                 />
+              </>
+            ) : authKind === "aws_ecr" ? (
+              <>
+                <FieldDescription>
+                  No password required. The coordinator's ambient AWS IAM identity (IRSA or the node
+                  instance role) is exchanged for an ECR token on every pull — grant{" "}
+                  <code className="font-mono">ecr:GetAuthorizationToken</code> to the coordinator's
+                  role.
+                </FieldDescription>
+                <Field>
+                  <FieldLabel htmlFor="assumeRoleArn">Assume role</FieldLabel>
+                  <Input
+                    id="assumeRoleArn"
+                    className="font-mono"
+                    placeholder="arn:aws:iam::123456789012:role/engram-pull"
+                    disabled
+                  />
+                  <FieldDescription>
+                    Cross-account pulls via STS AssumeRole — coming soon; the ambient identity is
+                    used until then.
+                  </FieldDescription>
+                </Field>
               </>
             ) : (
               <>

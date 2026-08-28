@@ -43,6 +43,13 @@ pub enum AddRegistryAuth {
         #[serde(default)]
         impersonate_sa: Option<String>,
     },
+    /// AWS ECR via the runtime's ambient IAM identity (ADR 0122). No
+    /// secret material; `assume_role_arn` is the designed-in
+    /// cross-account chain (not yet implemented at pull time).
+    AwsEcr {
+        #[serde(default)]
+        assume_role_arn: Option<String>,
+    },
     /// Public registry — no auth material to store. Stored as a row
     /// so the dashboard's catalog browser can list the host and so
     /// `enabled_images` POST can validate against a known set.
@@ -107,6 +114,35 @@ pub(crate) async fn add_registry_core(
             // error, and surfacing it here would block a perfectly
             // valid "configure now, deploy host-agent later" flow.
             RegistryAuthSpec::GcpWorkloadIdentity { impersonate_sa }
+        }
+        AddRegistryAuth::AwsEcr { assume_role_arn } => {
+            // Same posture as GCP WI: ambient identity, accepted even
+            // off-AWS (pull-time error, not config-time). The host
+            // shape IS validated eagerly — a non-ECR host can never
+            // work with this kind, so rejecting it here beats a
+            // confusing per-pull failure later.
+            if engram_oci_auth::ecr_region_for_host(&req.host).is_none() {
+                return Err(ApiError::BadRequest(format!(
+                    "`{}` is not an ECR registry host \
+                     (expected <account>.dkr.ecr.<region>.amazonaws.com)",
+                    req.host
+                )));
+            }
+            // Same eager posture for assume_role_arn: the STS chain is
+            // designed-in but not implemented at pull time, so a row
+            // carrying it can never pull — reject at config time
+            // instead of persisting a credential that fails every
+            // session boot (review finding).
+            if assume_role_arn.as_deref().is_some_and(|a| !a.is_empty()) {
+                return Err(ApiError::BadRequest(
+                    "aws_ecr cross-account assume_role_arn is not yet supported; \
+                     omit it to use the ambient identity"
+                        .into(),
+                ));
+            }
+            RegistryAuthSpec::AwsEcr {
+                assume_role_arn: None,
+            }
         }
         AddRegistryAuth::Anonymous => RegistryAuthSpec::Anonymous,
     };

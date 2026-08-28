@@ -900,6 +900,10 @@ pub(crate) fn add_registry_request_from_proto(
             let app::GcpWorkloadIdentityRegistryAuth { impersonate_sa } = g;
             crate::api::registries::AddRegistryAuth::GcpWorkloadIdentity { impersonate_sa }
         }
+        Some(Auth::AwsEcr(a)) => {
+            let app::AwsEcrRegistryAuth { assume_role_arn } = a;
+            crate::api::registries::AddRegistryAuth::AwsEcr { assume_role_arn }
+        }
         Some(Auth::Anonymous(_a)) => crate::api::registries::AddRegistryAuth::Anonymous,
         None => {
             return Err(crate::error::ApiError::BadRequest(

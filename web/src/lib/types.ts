@@ -372,17 +372,17 @@ export interface CheckpointsResponse {
 //
 // Polymorphic on `auth_kind`. `Static` carries a username (the
 // password is sealed coordinator-side; ciphertext never leaves the
-// server). `GcpWorkloadIdentity` stores no secret material — runtime
-// IAM identity is the credential. Future siblings (AwsInstanceRole,
-// GcpImpersonateSa, ...) slot in here as new variants without
-// reshaping anything.
-export type RegistryAuthKind = "static" | "gcp_workload_identity" | "anonymous";
+// server). `GcpWorkloadIdentity` and `AwsEcr` store no secret
+// material — runtime IAM identity is the credential. Future siblings
+// slot in here as new variants without reshaping anything.
+export type RegistryAuthKind = "static" | "gcp_workload_identity" | "aws_ecr" | "anonymous";
 
 /** Variant-discriminated request body for `POST /api/registries`. The
  * server `serde(tag = "kind")` decoder matches on these. */
 export type AddRegistryAuth =
   | { kind: "static"; username: string; password: string }
   | { kind: "gcp_workload_identity"; impersonate_sa?: string | null }
+  | { kind: "aws_ecr"; assume_role_arn?: string | null }
   | { kind: "anonymous" };
 
 export interface AddRegistryRequest {

@@ -178,21 +178,58 @@ describe("AddRegistryForm payload contract", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("aws instance role card is rendered but not selectable", async () => {
-    // The card sits in the auth-model grid as a "coming soon" stub.
-    // We render the row so users see the road map; we *must not*
-    // let them select it (clicking would set authKind to a value
-    // the server's CHECK constraint rejects).
+  test('aws ecr: sends {auth: {case:"awsEcr", value:{}}} with no assume-role field', async () => {
+    const { transport, calls } = installCapturingTransport();
+    renderWithProviders(<RegistriesPanel />, { transport });
+
+    const user = await openAddForm();
+    await user.type(
+      screen.getByPlaceholderText("ghcr.io"),
+      "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+    );
+    await user.click(screen.getByRole("radio", { name: /aws ecr/i }));
+    // Wait for the ECR fragment to mount (AnimatePresence exit-then-
+    // enter, same as the GCP-WI fragment above).
+    await screen.findByText(/ecr:GetAuthorizationToken/);
+
+    await user.click(screen.getByRole("button", { name: /^register$/i }));
+
+    await waitFor(() => {
+      expect(calls.length).toBeGreaterThan(0);
+    });
+    const req = calls.at(-1)!;
+    expect(req.host).toBe("123456789012.dkr.ecr.us-east-1.amazonaws.com");
+    expect(req.auth.case).toBe("awsEcr");
+    // The server rejects any assume_role_arn (not yet supported); the
+    // client must send an empty payload, never the field.
+    expect(req.auth.value).toMatchObject({});
+    const val = req.auth.value as { assumeRoleArn?: string } | undefined;
+    expect(val?.assumeRoleArn ?? undefined).toBeUndefined();
+  });
+
+  test("aws ecr: assume-role input is disabled (coming soon)", async () => {
     const { transport } = installCapturingTransport();
     renderWithProviders(<RegistriesPanel />, { transport });
+
     const user = await openAddForm();
+    await user.click(screen.getByRole("radio", { name: /aws ecr/i }));
 
-    const card = screen.getByRole("radio", { name: /aws instance role/i });
-    expect((card as HTMLButtonElement).disabled).toBe(true);
+    const arnInput = await screen.findByPlaceholderText(/arn:aws:iam::/);
+    expect((arnInput as HTMLInputElement).disabled).toBe(true);
+  });
 
-    // Clicking does nothing — authKind stays on `static`, password
-    // field remains visible.
-    await user.click(card);
-    expect(screen.queryByPlaceholderText("username or _json_key")).not.toBeNull();
+  test("aws ecr with a non-ECR host: rejects locally, never calls AddRegistry", async () => {
+    const { transport, calls } = installCapturingTransport();
+    renderWithProviders(<RegistriesPanel />, { transport });
+
+    const user = await openAddForm();
+    await user.type(screen.getByPlaceholderText("ghcr.io"), "ghcr.io");
+    await user.click(screen.getByRole("radio", { name: /aws ecr/i }));
+    await screen.findByText(/ecr:GetAuthorizationToken/);
+
+    await user.click(screen.getByRole("button", { name: /^register$/i }));
+
+    await screen.findByText(/needs an ECR host/i);
+    expect(calls).toHaveLength(0);
   });
 });

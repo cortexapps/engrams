@@ -26,8 +26,17 @@ chrono.workspace = true
 # deps; localized to this crate so coordinator's main tree doesn't
 # pull GCP unless the resolver is wired.
 gcp_auth = "0.12"
+# AWS ECR (ADR 0122): token exchange via the ambient IAM identity.
+# SdkConfig construction rides engram-aws (ring TLS, retries off).
+# `default-features = false` is load-bearing — see the aws sdk note in
+# the root manifest (aws-lc-rs).
+engram-aws.workspace = true
+aws-sdk-ecr = { version = "1", default-features = false, features = ["rt-tokio"] }
+base64.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 uuid = { workspace = true }
+wiremock = "0.6"
