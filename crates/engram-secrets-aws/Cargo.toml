@@ -1,0 +1,30 @@
+[package]
+name = "engram-secrets-aws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AWS Secrets Manager-backed SecretStore + egress-CA CaSource (ADR 0122)."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-aws.workspace = true
+engram-core.workspace = true
+engram-egress-proxy.workspace = true
+async-trait.workspace = true
+# `default-features = false` is load-bearing on every aws-sdk crate —
+# see the aws sdk note in the root manifest (aws-lc-rs).
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["rt-tokio"] }
+# The per-call operation deadline (a stalled response must fail the
+# request, not hang session-create / host-agent boot).
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"

@@ -207,16 +207,29 @@ struct Cli {
     /// Required when `--ca-source=gcp-secret-manager`.
     #[arg(long, env = "ENGRAM_EGRESS_CA_GCP_KEY_SECRET")]
     ca_gcp_key_secret: Option<String>,
+
+    /// AWS Secrets Manager SecretId (name or ARN, optional
+    /// `#<version-stage>`) holding the CA cert PEM. Required when
+    /// `--ca-source=aws-secrets-manager` (ADR 0122). Unlike the GKE
+    /// case, IRSA works in this hostNetwork pod (env/file-based), so
+    /// the direct read is the sanctioned EKS path.
+    #[arg(long, env = "ENGRAM_EGRESS_CA_AWS_CERT_SECRET")]
+    ca_aws_cert_secret: Option<String>,
+
+    /// AWS Secrets Manager SecretId holding the CA key PEM. Required
+    /// when `--ca-source=aws-secrets-manager`.
+    #[arg(long, env = "ENGRAM_EGRESS_CA_AWS_KEY_SECRET")]
+    ca_aws_key_secret: Option<String>,
 }
 
-/// Choice of CA-loading backend. Extension points: AWS Secrets
-/// Manager, HashiCorp Vault, Azure Key Vault — one variant + one
-/// `CaSource` impl per backend.
+/// Choice of CA-loading backend. Extension points: HashiCorp Vault,
+/// Azure Key Vault — one variant + one `CaSource` impl per backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CaSourceChoice {
     Env,
     LocalDisk,
     GcpSecretManager,
+    AwsSecretsManager,
 }
 
 fn parse_ca_source_choice(s: &str) -> Result<CaSourceChoice, String> {
@@ -224,8 +237,10 @@ fn parse_ca_source_choice(s: &str) -> Result<CaSourceChoice, String> {
         "env" => Ok(CaSourceChoice::Env),
         "local-disk" => Ok(CaSourceChoice::LocalDisk),
         "gcp-secret-manager" => Ok(CaSourceChoice::GcpSecretManager),
+        "aws-secrets-manager" => Ok(CaSourceChoice::AwsSecretsManager),
         other => Err(format!(
-            "unknown CA source `{other}` (expected env | local-disk | gcp-secret-manager)"
+            "unknown CA source `{other}` (expected env | local-disk | \
+             gcp-secret-manager | aws-secrets-manager)"
         )),
     }
 }
@@ -728,7 +743,7 @@ async fn main() -> Result<(), HostAgentError> {
 
 /// Load the egress CA material for the daemon (ADR 0121): the daemon
 /// itself only ever reads PEMs from its spawn env, so every CA source
-/// (env / local-disk / GCP Secret Manager) resolves HERE, in the one
+/// (env / local-disk / GCP or AWS Secrets Manager) resolves HERE, in the one
 /// process that already holds the deployment's secret plumbing. The
 /// cert PEM is also what `pooled_backend` stamps into guest trust
 /// stores (`host_ca_pem`).
@@ -756,6 +771,19 @@ async fn load_egress_ca(cli: &Cli) -> Result<(String, String), String> {
             Arc::new(
                 engram_secrets_gcp::ca::GcpSecretManagerCaSource::new(cert, key)
                     .map_err(|e| format!("gcp-secret-manager source: {e}"))?,
+            )
+        }
+        CaSourceChoice::AwsSecretsManager => {
+            let cert = cli.ca_aws_cert_secret.clone().ok_or_else(|| {
+                "--ca-source=aws-secrets-manager requires --ca-aws-cert-secret".to_string()
+            })?;
+            let key = cli.ca_aws_key_secret.clone().ok_or_else(|| {
+                "--ca-source=aws-secrets-manager requires --ca-aws-key-secret".to_string()
+            })?;
+            Arc::new(
+                engram_secrets_aws::ca::AwsSecretsManagerCaSource::new(cert, key)
+                    .await
+                    .map_err(|e| format!("aws-secrets-manager source: {e}"))?,
             )
         }
     };

@@ -51,6 +51,7 @@ engram-sandbox-firecracker.workspace = true
 engram-sandbox-vz.workspace = true
 engram-cloud-static.workspace = true
 engram-secrets-gcp.workspace = true
+engram-secrets-aws.workspace = true
 engram-harness-proto.workspace = true
 async-trait.workspace = true
 base64.workspace = true

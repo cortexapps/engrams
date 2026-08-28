@@ -31,6 +31,7 @@ members = [
     "crates/engram-transport",
     "crates/engram-secrets-dev",
     "crates/engram-secrets-gcp",
+    "crates/engram-secrets-aws",
     "crates/engram-git-dev",
     "crates/engram-git-github",
     "crates/engram-postgres",
@@ -119,6 +120,7 @@ engram-session-bundles = { path = "crates/engram-session-bundles" }
 engram-mount-manifest = { path = "crates/engram-mount-manifest" }
 engram-secrets-dev = { path = "crates/engram-secrets-dev" }
 engram-secrets-gcp = { path = "crates/engram-secrets-gcp" }
+engram-secrets-aws = { path = "crates/engram-secrets-aws" }
 engram-git-dev = { path = "crates/engram-git-dev" }
 engram-git-github = { path = "crates/engram-git-github" }
 engram-rootfs-materializer = { path = "crates/engram-rootfs-materializer" }

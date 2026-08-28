@@ -474,6 +474,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-secretsmanager"
+version = "1.114.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f23d9f5b5014b74f4867d029b68d782808b76e5559e20fe6be251f61464bab74"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sts"
 version = "1.113.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1993,6 +2019,7 @@ dependencies = [
  "engram-protocol",
  "engram-rootfs-materializer",
  "engram-sandbox-process",
+ "engram-secrets-aws",
  "engram-secrets-dev",
  "engram-secrets-gcp",
  "engram-sim",
@@ -2384,6 +2411,7 @@ dependencies = [
  "engram-sandbox-firecracker",
  "engram-sandbox-process",
  "engram-sandbox-vz",
+ "engram-secrets-aws",
  "engram-secrets-gcp",
  "engram-storage-local",
  "engram-substrate-proto",
@@ -2713,6 +2741,23 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-secrets-aws"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-sdk-secretsmanager",
+ "engram-aws",
+ "engram-core",
+ "engram-egress-proxy",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wiremock",
  "workspace-hack",
 ]
 
