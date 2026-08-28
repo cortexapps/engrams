@@ -394,8 +394,11 @@ async fn promote_expired(
     // batch. This is the mark pass's barrier applied to promote: it keeps
     // the freshness guarantee of a per-batch collect without paying for a
     // full manifest fan-out on every page.
-    let mut pin_set = PinSet::collect(meta, chunk_store).await?;
-    let mut pin_gen = meta.chunk_generation().await?;
+    let Some((mut pin_set, mut pin_gen)) =
+        collect_pin_set_at_generation(meta, chunk_store, cfg.max_restart_attempts).await?
+    else {
+        return Ok((0, 0, 0));
+    };
     let mut pin_refreshes = 0usize;
 
     loop {
@@ -429,8 +432,13 @@ async fn promote_expired(
         // only genuinely-unpinned chunks get their blob deleted.
         let gen_now = meta.chunk_generation().await?;
         if gen_now != pin_gen {
-            pin_set = PinSet::collect(meta, chunk_store).await?;
-            pin_gen = meta.chunk_generation().await?;
+            let Some((fresh, fresh_gen)) =
+                collect_pin_set_at_generation(meta, chunk_store, cfg.max_restart_attempts).await?
+            else {
+                break;
+            };
+            pin_set = fresh;
+            pin_gen = fresh_gen;
             pin_refreshes += 1;
         }
 
@@ -477,6 +485,46 @@ async fn promote_expired(
     }
 
     Ok((deleted, repinned, errors))
+}
+
+/// Collect a pin set that is PROVABLY current, with the generation it is
+/// current as of. `Ok(None)` means it could not be proven within
+/// `max_attempts` — the caller must not delete on the result.
+///
+/// The bracket is load-bearing, not defensive. `PinSet::collect` is NOT
+/// atomic: `collect_manifest_refs` runs seven separate un-transacted list
+/// queries and then fans out manifest fetches over a wall-clock window. A
+/// manifest that commits DURING that window can be absent from the
+/// collected set — its ref was never in the fixed `refs` list — while a
+/// generation read taken AFTER the collect already reflects the bump. Read
+/// that way, "generation unchanged" would then be trusted for the whole
+/// drain even though the set is torn, and a live re-pinned chunk would have
+/// its blob deleted: the wedged-session 404 the promote re-check exists to
+/// prevent. Reading the generation BEFORE and AFTER, and retrying when it
+/// moved, is what makes "unchanged" actually mean "the set is current".
+///
+/// On exhaustion the promote pass STOPS rather than deleting against an
+/// unverified set. Skipping a drain costs one tick of backlog; deleting a
+/// live chunk wedges a session.
+async fn collect_pin_set_at_generation(
+    meta: &dyn MetadataStore,
+    chunk_store: &ChunkStore,
+    max_attempts: u32,
+) -> Result<Option<(PinSet, u64)>, GcError> {
+    for _ in 0..max_attempts.max(1) {
+        let before = meta.chunk_generation().await?;
+        let pin_set = PinSet::collect(meta, chunk_store).await?;
+        let after = meta.chunk_generation().await?;
+        if before == after {
+            return Ok(Some((pin_set, after)));
+        }
+    }
+    tracing::warn!(
+        max_attempts,
+        "chunk-gc promote: pin set kept moving under collect; skipping the drain this sweep \
+         rather than deleting against an unverified set"
+    );
+    Ok(None)
 }
 
 /// Delete one batch of expired candidates, up to `concurrency` deletes in
