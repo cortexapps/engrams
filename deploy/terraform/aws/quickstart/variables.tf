@@ -27,8 +27,8 @@ variable "admin_email" {
 
 variable "kvm_instance_type" {
   type        = string
-  description = "Intel KVM-capable type (see the kvm-nodegroup module)."
-  default     = "m7i.metal-24xl"
+  description = "Intel KVM-capable type (see the kvm-nodegroup module). Default is the nested-virt m8i shape twin of GCP's c3-standard-22; set m7i.metal-24xl for CPUID parity with a GCP C3 fleet."
+  default     = "m8i.6xlarge"
 }
 
 variable "kvm_initial_node_count" {

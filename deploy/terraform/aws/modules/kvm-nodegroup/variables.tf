@@ -41,8 +41,8 @@ variable "security_group_ids" {
 
 variable "instance_type" {
   type        = string
-  description = "Intel KVM-capable type: bare metal (*.metal) or Xeon-6 C8i/M8i/R8i. Default m7i.metal-24xl = Sapphire Rapids, CPUID parity with GCP C3."
-  default     = "m7i.metal-24xl"
+  description = "Intel KVM-capable type: Xeon-6 C8i/M8i/R8i virtual shapes (nested virt) or bare metal (*.metal). Default m8i.6xlarge = the GCP c3-standard-22 shape twin; use m7i.metal-24xl for CPUID parity with a GCP C3 fleet (see main.tf header)."
+  default     = "m8i.6xlarge"
 }
 
 variable "initial_node_count" {

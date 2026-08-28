@@ -12,10 +12,12 @@
 # the `engram_values` / `host_fleet_values` outputs render the
 # TF-derived halves.
 #
-# COST + QUOTA WARNING: the default KVM shape is m7i.metal-24xl
-# (96 vCPU) × 2 — real money per hour, and a fresh account's
-# on-demand vCPU quota will NOT cover it without a service-quota
-# request. See docs/deploy-aws.md before applying.
+# The default KVM shape is m8i.6xlarge (24 vCPU, nested virt) × 2 —
+# 48 on-demand vCPUs, which a fresh account's default quota may not
+# cover. Operators who need one image bake serving BOTH a GCP C3
+# fleet and this one set kvm_instance_type = "m7i.metal-24xl"
+# (CPUID parity; needs a metal quota ticket and costs far more).
+# See docs/deploy-aws.md before applying.
 
 data "aws_caller_identity" "current" {}
 

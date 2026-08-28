@@ -10,13 +10,21 @@
 # Invariants (each is load-bearing — see the GCP twin for the war
 # stories):
 #
-# - **KVM needs Intel hardware.** On EC2 that means bare metal
-#   (`*.metal`) or the Xeon-6 C8i/M8i/R8i shapes. No AMD, no
-#   Graviton. The default `m7i.metal-24xl` is Sapphire Rapids —
-#   deliberate CPUID parity with the GCP quickstart's C3 pool, so
-#   images bake ONCE and snapshots restore on either fleet (CPUID is
-#   a one-way door: newer-platform snapshots never restore on older
-#   hardware).
+# - **KVM needs Intel hardware.** On EC2 that means the Xeon-6
+#   C8i/M8i/R8i virtual shapes (nested virtualization via VMCS
+#   shadowing, launched 2026-02) or bare metal (`*.metal`). No AMD,
+#   no Graviton. The default `m8i.6xlarge` (24 vCPU / 96 GiB) is the
+#   shape twin of the GCP quickstart's `c3-standard-22`, and FC runs
+#   nested exactly the way it does on GCP (L2 under the cloud
+#   hypervisor).
+#
+# - **CPUID is a one-way door.** m8i is Granite Rapids; GCP C3 is
+#   Sapphire Rapids. Images baked on this fleet are GNR-pinned:
+#   newer-platform snapshots never restore on older hardware, so an
+#   AWS fleet on m8i bakes its own images and its snapshots do not
+#   move to a C3 fleet. Operators who need ONE bake serving both
+#   clouds pick `m7i.metal-24xl` instead (Sapphire Rapids, CPUID
+#   parity with C3 — metal because m7i has no nested virt).
 #
 # - **The operator owns the size.** `ignore_changes` on
 #   desired_capacity; `max_size` sits above the operator's ceiling.
