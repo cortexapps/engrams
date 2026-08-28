@@ -16,8 +16,18 @@
 //!    continuous-flush livelock.
 //! 6. **Promote pass** (Full only): list candidates with
 //!    `first_seen_at < now() - grace_period`, delete each from
-//!    BlobStorage, delete the candidate row. Paged so a single
-//!    sweep can't OOM the coord pod.
+//!    BlobStorage, delete the candidate row. Drains in pages until
+//!    the backlog clears or `promote_max_per_sweep` is reached, with
+//!    `promote_concurrency` deletes in flight.
+//!
+//! Steps 1-5 are the **mark pass** and step 6 is the **promote
+//! pass**; they are INDEPENDENT. Mark needs a full `list_prefix` of
+//! the chunk space, promote needs only rows an earlier sweep wrote,
+//! so a mark failure degrades the sweep but never voids it. Chaining
+//! them cost 43 days of GC in prod: from 2026-07-16 `list_prefix`
+//! exceeded its 300s deadline on every sweep, and because promote sat
+//! behind the mark pass's `?` it never ran — 8.9M expired candidates
+//! (~9.5 TB) stayed undeleted while the bucket grew 7.9 TB -> 120.7 TB.
 //!
 //! [`gc_sweep_loop`] is the background task: spawned at coord
 //! startup, gated on `ENGRAM_CHUNK_GC_ENABLED` (default ON in
@@ -56,9 +66,24 @@ pub struct ChunkGcConfig {
     /// — the 24h grace absorbs the racy candidate (next sweep will
     /// either re-pin it or sustain it as candidate).
     pub max_restart_attempts: u32,
-    /// Promote-pass batch size — max candidates fetched and
-    /// deleted per sweep. Defaults to 10_000.
+    /// Promote-pass batch size — candidates fetched from PG per
+    /// page. Defaults to 10_000.
     pub promote_batch_size: i64,
+    /// Max concurrent BlobStorage deletes inside a promote batch.
+    /// Sequential deletes cap the drain at ~20 chunks/s, which
+    /// cannot keep up with a backlog (the 2026-08-28 audit found
+    /// 8.9M expired candidates — 5 days of sequential deletes).
+    /// Concurrency also SHRINKS the pin-set staleness window: the
+    /// window is the batch's wall-clock, so draining a batch faster
+    /// is strictly safer per chunk deleted. Defaults to 64.
+    /// Override via `ENGRAM_CHUNK_GC_PROMOTE_CONCURRENCY`.
+    pub promote_concurrency: usize,
+    /// Max candidates promoted per sweep, across all batches. Bounds
+    /// one sweep's cost so a large backlog drains over several ticks
+    /// instead of monopolising one. Defaults to 200_000 (~4.8M/day
+    /// at the 1h cadence). Override via
+    /// `ENGRAM_CHUNK_GC_PROMOTE_MAX_PER_SWEEP`.
+    pub promote_max_per_sweep: usize,
 }
 
 impl Default for ChunkGcConfig {
@@ -69,6 +94,8 @@ impl Default for ChunkGcConfig {
             grace_period: Duration::from_secs(86400),
             max_restart_attempts: 3,
             promote_batch_size: 10_000,
+            promote_concurrency: 64,
+            promote_max_per_sweep: 200_000,
         }
     }
 }
@@ -89,6 +116,16 @@ impl ChunkGcConfig {
         if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_GRACE_SECS") {
             if let Ok(secs) = v.parse::<u64>() {
                 cfg.grace_period = Duration::from_secs(secs);
+            }
+        }
+        if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_PROMOTE_CONCURRENCY") {
+            if let Ok(n) = v.parse::<usize>() {
+                cfg.promote_concurrency = n.max(1);
+            }
+        }
+        if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_PROMOTE_MAX_PER_SWEEP") {
+            if let Ok(n) = v.parse::<usize>() {
+                cfg.promote_max_per_sweep = n;
             }
         }
         cfg
@@ -148,6 +185,12 @@ pub struct SweepReport {
     /// The candidate row stays in the table so the next sweep
     /// retries; surfaced for visibility.
     pub promote_delete_errors: usize,
+    /// Set when the mark pass failed. The promote pass still ran —
+    /// it deletes candidates recorded by EARLIER sweeps and needs no
+    /// listing — so a mark failure degrades the sweep instead of
+    /// voiding it. `Some` means `listed_chunks` / `candidates_marked`
+    /// are not authoritative for this sweep.
+    pub mark_error: Option<String>,
 }
 
 /// Convenience wrapper that pulls `meta` / `blob` / `chunk_store`
@@ -193,10 +236,65 @@ pub async fn run_one_sweep_inner(
 ) -> Result<SweepReport, GcError> {
     let mut report = SweepReport::default();
 
+    // The mark pass and the promote pass are INDEPENDENT. Mark needs a
+    // full `list_prefix` of the chunk space; promote only needs rows an
+    // earlier sweep already wrote. Chaining promote behind a `?` on the
+    // mark pass meant one failing list disabled deletion entirely: the
+    // 2026-08-28 audit found `list_prefix` had exceeded its 300s deadline
+    // on EVERY sweep since 2026-07-16, stranding 8.9M expired candidates
+    // (~9.5 TB) that needed no listing to delete, while the bucket grew
+    // 7.9 TB -> 120.7 TB. Degrade the sweep; never void it.
+    if let Err(e) = run_mark_pass(
+        meta.as_ref(),
+        blob.as_ref(),
+        chunk_store,
+        cfg,
+        mode,
+        &mut report,
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %e,
+            "chunk-gc mark pass failed; promote pass still runs on existing candidates"
+        );
+        report.mark_error = Some(e.to_string());
+    }
+
+    // -------- promote pass (Full only) --------
+    if mode == SweepMode::Full {
+        let (deletes, repinned, errors) = promote_expired(
+            meta.as_ref(),
+            blob.as_ref(),
+            chunk_store,
+            cfg,
+            clock.now_utc(),
+        )
+        .await?;
+        report.promoted_deletes = deletes;
+        report.promote_repinned_skips = repinned;
+        report.promote_delete_errors = errors;
+    }
+
+    Ok(report)
+}
+
+/// Mark pass: classify every stored chunk against the live pin set and
+/// record the unpinned ones as candidates. Writes only to
+/// `chunk_gc_candidates` (never to BlobStorage), so a failure here is
+/// recoverable — the next sweep re-classifies from scratch.
+async fn run_mark_pass(
+    meta: &dyn MetadataStore,
+    blob: &dyn BlobStorage,
+    chunk_store: &ChunkStore,
+    cfg: &ChunkGcConfig,
+    mode: SweepMode,
+    report: &mut SweepReport,
+) -> Result<(), GcError> {
     // -------- barrier-bounded classification loop --------
     loop {
         let gen_before = meta.chunk_generation().await?;
-        let pin_set = PinSet::collect(meta.as_ref(), chunk_store).await?;
+        let pin_set = PinSet::collect(meta, chunk_store).await?;
 
         // Reset per-iteration counters so a restart doesn't double-
         // count from the previous iteration. The barrier means only
@@ -260,29 +358,18 @@ pub async fn run_one_sweep_inner(
         );
     }
 
-    // -------- promote pass (Full only) --------
-    if mode == SweepMode::Full {
-        let (deletes, repinned, errors) = promote_expired(
-            meta.as_ref(),
-            blob.as_ref(),
-            chunk_store,
-            cfg,
-            clock.now_utc(),
-        )
-        .await?;
-        report.promoted_deletes = deletes;
-        report.promote_repinned_skips = repinned;
-        report.promote_delete_errors = errors;
-    }
-
-    Ok(report)
+    Ok(())
 }
 
 /// Promote-pass: delete candidates older than `grace_period` from
 /// BlobStorage + the candidate table — AFTER re-verifying the live pin
 /// set, so a candidate that was re-pinned since it was marked is skipped
-/// and cleared, never deleted. Paged via `cfg.promote_batch_size` so a
-/// backlog can't lock the loop. Returns `(deleted, repinned_skipped, errors)`.
+/// and cleared, never deleted.
+///
+/// Drains in `cfg.promote_batch_size` pages until the backlog is empty
+/// or `cfg.promote_max_per_sweep` is reached, so a backlog clears over
+/// several ticks instead of one page per hour. Returns
+/// `(deleted, repinned_skipped, errors)`.
 async fn promote_expired(
     meta: &dyn MetadataStore,
     blob: &dyn BlobStorage,
@@ -294,60 +381,87 @@ async fn promote_expired(
         - chrono::Duration::from_std(cfg.grace_period)
             .unwrap_or_else(|_| chrono::Duration::seconds(86_400));
 
-    let expired = meta
-        .list_expired_gc_candidates(cutoff, cfg.promote_batch_size)
-        .await?;
-    if expired.is_empty() {
-        return Ok((0, 0, 0));
-    }
-
-    // Re-verify the LIVE pin set at delete time — the load-bearing
-    // durability step, and parity with the snapshot-blob-gc promote pass
-    // (ADR 0028 addendum) that the chunk-gc promote never got.
-    // `first_seen_at` is sticky and the classification pass never clears a
-    // re-pinned candidate's row (it just skips pinned chunks), so a chunk
-    // marked while transiently unpinned but SINCE re-pinned — e.g. an image
-    // refresh re-referencing a shared base-memory chunk, or any content-
-    // addressed chunk that re-enters a fresh manifest — still carries an
-    // expired row. Deleting it on the stale row alone reaps a chunk that's
-    // currently referenced, so every reader of the pinning manifest 404s on
-    // first fault (the wedged-session class of bug). Skip + clear those;
-    // only genuinely-unpinned chunks get their blob deleted.
-    let pin_set = PinSet::collect(meta, chunk_store).await?;
-
-    let mut resolved: Vec<[u8; 32]> = Vec::with_capacity(expired.len());
     let mut deleted = 0usize;
     let mut repinned = 0usize;
     let mut errors = 0usize;
-    for hash_bytes in expired {
-        let hash = ChunkHash::from_bytes(hash_bytes);
-        if pin_set.contains(&hash) {
-            // Re-pinned since it was marked — rescue: drop the stale
-            // candidate row, keep the blob.
-            repinned += 1;
-            resolved.push(hash_bytes);
-            continue;
+    let mut processed = 0usize;
+
+    // Pin set collected once, then reused across batches ONLY while
+    // `chunk_generation` is unchanged. The generation ticks in the same TX
+    // as every flush / enable_image / record_snapshot, so an unchanged
+    // generation is proof that no manifest — and therefore no pin — has
+    // moved since the collect. When it ticks, re-collect before the next
+    // batch. This is the mark pass's barrier applied to promote: it keeps
+    // the freshness guarantee of a per-batch collect without paying for a
+    // full manifest fan-out on every page.
+    let mut pin_set = PinSet::collect(meta, chunk_store).await?;
+    let mut pin_gen = meta.chunk_generation().await?;
+    let mut pin_refreshes = 0usize;
+
+    loop {
+        let remaining = cfg.promote_max_per_sweep.saturating_sub(processed);
+        if remaining == 0 {
+            tracing::info!(
+                processed,
+                "chunk-gc promote: hit per-sweep cap; backlog continues next tick"
+            );
+            break;
         }
-        match blob.delete(&hash.storage_key()).await {
-            Ok(()) => {
-                resolved.push(hash_bytes);
-                deleted += 1;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    chunk_hash = %hash.to_hex(),
-                    error = %e,
-                    "chunk-gc promote: BlobStorage delete failed; candidate row stays for retry"
-                );
-                errors += 1;
-            }
+        let limit = cfg.promote_batch_size.min(remaining as i64);
+
+        let expired = meta.list_expired_gc_candidates(cutoff, limit).await?;
+        if expired.is_empty() {
+            break;
+        }
+        let batch_len = expired.len();
+
+        // Re-verify the LIVE pin set at delete time — the load-bearing
+        // durability step, and parity with the snapshot-blob-gc promote pass
+        // (ADR 0028 addendum) that the chunk-gc promote never got.
+        // `first_seen_at` is sticky and the classification pass never clears a
+        // re-pinned candidate's row (it just skips pinned chunks), so a chunk
+        // marked while transiently unpinned but SINCE re-pinned — e.g. an image
+        // refresh re-referencing a shared base-memory chunk, or any content-
+        // addressed chunk that re-enters a fresh manifest — still carries an
+        // expired row. Deleting it on the stale row alone reaps a chunk that's
+        // currently referenced, so every reader of the pinning manifest 404s on
+        // first fault (the wedged-session class of bug). Skip + clear those;
+        // only genuinely-unpinned chunks get their blob deleted.
+        let gen_now = meta.chunk_generation().await?;
+        if gen_now != pin_gen {
+            pin_set = PinSet::collect(meta, chunk_store).await?;
+            pin_gen = meta.chunk_generation().await?;
+            pin_refreshes += 1;
+        }
+
+        let (batch_deleted, batch_repinned, batch_errors, resolved) =
+            promote_batch(blob, &pin_set, expired, cfg.promote_concurrency).await;
+
+        // Clear rows for everything resolved this pass — deleted blobs AND
+        // rescued (re-pinned) candidates. Failed deletes keep their row so the
+        // next sweep retries.
+        meta.delete_gc_candidates(&resolved).await?;
+
+        deleted += batch_deleted;
+        repinned += batch_repinned;
+        errors += batch_errors;
+        processed += batch_len;
+
+        // Every candidate in the batch errored, so no row cleared and the
+        // next `list_expired_gc_candidates` returns the SAME page. Stop
+        // instead of spinning on a wedged BlobStorage.
+        if resolved.is_empty() {
+            tracing::warn!(
+                batch_errors,
+                "chunk-gc promote: whole batch failed to delete; stopping drain this sweep"
+            );
+            break;
+        }
+        if (batch_len as i64) < limit {
+            break;
         }
     }
 
-    // Clear rows for everything resolved this pass — deleted blobs AND
-    // rescued (re-pinned) candidates. Failed deletes keep their row so the
-    // next sweep retries.
-    meta.delete_gc_candidates(&resolved).await?;
     if repinned > 0 {
         tracing::info!(
             repinned,
@@ -355,8 +469,94 @@ async fn promote_expired(
              (live chunks the stale rows would have wrongly deleted)"
         );
     }
+    if pin_refreshes > 0 {
+        tracing::debug!(
+            pin_refreshes,
+            "chunk-gc promote: re-collected the pin set on generation bumps"
+        );
+    }
 
     Ok((deleted, repinned, errors))
+}
+
+/// Delete one batch of expired candidates, up to `concurrency` deletes in
+/// flight. Returns `(deleted, repinned_skipped, errors, resolved_hashes)`
+/// where `resolved` is every candidate whose row can now be cleared —
+/// blobs actually deleted plus re-pinned rescues.
+async fn promote_batch(
+    blob: &dyn BlobStorage,
+    pin_set: &PinSet,
+    expired: Vec<[u8; 32]>,
+    concurrency: usize,
+) -> (usize, usize, usize, Vec<[u8; 32]>) {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let mut resolved: Vec<[u8; 32]> = Vec::with_capacity(expired.len());
+    let mut deleted = 0usize;
+    let mut repinned = 0usize;
+    let mut errors = 0usize;
+
+    // Rescues need no I/O — settle them first so only real deletes occupy
+    // a concurrency slot.
+    let mut to_delete: Vec<[u8; 32]> = Vec::with_capacity(expired.len());
+    for hash_bytes in expired {
+        if pin_set.contains(&ChunkHash::from_bytes(hash_bytes)) {
+            // Re-pinned since it was marked — rescue: drop the stale
+            // candidate row, keep the blob.
+            repinned += 1;
+            resolved.push(hash_bytes);
+        } else {
+            to_delete.push(hash_bytes);
+        }
+    }
+
+    let mut pending = FuturesUnordered::new();
+    let mut queue = to_delete.into_iter();
+    let settle = |r: (Result<(), engram_core::BlobError>, [u8; 32]),
+                  resolved: &mut Vec<[u8; 32]>,
+                  deleted: &mut usize,
+                  errors: &mut usize| {
+        let (outcome, hash_bytes) = r;
+        match outcome {
+            Ok(()) => {
+                resolved.push(hash_bytes);
+                *deleted += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    chunk_hash = %ChunkHash::from_bytes(hash_bytes).to_hex(),
+                    error = %e,
+                    "chunk-gc promote: BlobStorage delete failed; candidate row stays for retry"
+                );
+                *errors += 1;
+            }
+        }
+    };
+
+    for _ in 0..concurrency.max(1) {
+        let Some(hash_bytes) = queue.next() else {
+            break;
+        };
+        pending.push(delete_one(blob, hash_bytes));
+    }
+    while let Some(done) = pending.next().await {
+        settle(done, &mut resolved, &mut deleted, &mut errors);
+        if let Some(hash_bytes) = queue.next() {
+            pending.push(delete_one(blob, hash_bytes));
+        }
+    }
+
+    (deleted, repinned, errors, resolved)
+}
+
+/// One promote delete, carrying its hash through so the caller can settle
+/// the result without tracking join order.
+async fn delete_one(
+    blob: &dyn BlobStorage,
+    hash_bytes: [u8; 32],
+) -> (Result<(), engram_core::BlobError>, [u8; 32]) {
+    let key = ChunkHash::from_bytes(hash_bytes).storage_key();
+    (blob.delete(&key).await, hash_bytes)
 }
 
 /// Background sweep loop. Spawned from coord startup; ticks every
@@ -392,6 +592,7 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
                     promote_errors = report.promote_delete_errors,
                     restart_count = report.restart_count,
                     restart_budget_exhausted = report.restart_budget_exhausted,
+                    mark_error = report.mark_error.as_deref().unwrap_or(""),
                     "chunk-gc sweep done"
                 );
             }
