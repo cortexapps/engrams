@@ -1,26 +1,33 @@
-# GCP-flavored overlay. Apply with:
-#   helm install engram ./deploy/helm/engram -f values-gcp.yaml
+# GCP (GKE) overlay — the in-cluster ADR 0044 topology the production
+# deployment runs. Copy, replace the REPLACE_* placeholders, apply:
+#
+#   cp values-gcp.yaml.example my-values.yaml
+#   helm install engram ./deploy/helm/engram -n engrams -f my-values.yaml
 #
 # Assumptions:
-# - GKE cluster with Workload Identity enabled.
+# - GKE Standard cluster with Workload Identity enabled (the charts'
+#   PodMonitoring also wants `managed_prometheus` on the cluster).
 # - A Google Service Account `engram-coordinator@<project>.iam.gserviceaccount.com`
-#   has been granted: roles/storage.objectAdmin on the chunks bucket,
-#   roles/cloudkms.cryptoKeyEncrypterDecrypter on the KEK,
-#   roles/secretmanager.secretAccessor on relevant secrets.
-# - The KSA → GSA binding is in place:
+#   granted: roles/storage.objectAdmin on the chunks bucket and
+#   roles/secretmanager.secretAccessor on the deployment secrets.
+# - The KSA → GSA Workload Identity binding is in place:
 #     gcloud iam service-accounts add-iam-policy-binding \
 #       --role roles/iam.workloadIdentityUser \
-#       --member "serviceAccount:<project>.svc.id.goog[<namespace>/engram-coordinator]" \
-#       engram-coordinator@<project>.iam.gserviceaccount.com
-# - The web component runs as the namespace `default` SA — it makes
-#   no cloud API calls, so no WI binding required.
+#       --member "serviceAccount:<project>.svc.id.goog[engrams/engram-coordinator]" \
+#       engram-coordinator@REPLACE_PROJECT.iam.gserviceaccount.com
+# - The host fleet runs as the engram-host-fleet chart's DaemonSet in
+#   the same cluster (see that chart's values-gcp.yaml.example).
+# - No identity proxy by default: the orchestrator's login wall
+#   (better-auth + `orchestrator.auth.adminEmails`) is the auth door
+#   (ADR 0118). IAP is an opt-in layer — values-iap.yaml.example.
 
 # ─── coordinator ──────────────────────────────────────────────────
 
-image:
-  repository: us-docker.pkg.dev/REPLACE_PROJECT/engram/coordinator
-  tag: ""           # let the chart's appVersion drive it
-  pullPolicy: IfNotPresent
+# Images come from the published GHCR defaults
+# (ghcr.io/cortexapps/engrams/<coordinator|web|orchestrator>) — no
+# override needed. To mirror into Artifact Registry instead:
+# image:
+#   repository: us-docker.pkg.dev/REPLACE_PROJECT/engram/coordinator
 
 mode: coordinator
 
@@ -30,9 +37,13 @@ blob:
     bucket: REPLACE_BUCKET
 
 kek:
-  provider: gcp-kms
-  # Full resource name: projects/<P>/locations/<L>/keyRings/<R>/cryptoKeys/<K>
-  gcpResource: REPLACE_KMS_RESOURCE
+  # env-var is what production runs today: GcpKmsProvider wrap/unwrap
+  # are stubs in the coordinator. Keep the 32-byte base64 master key in
+  # Secret Manager and mirror it into the coordinator Secret's
+  # ENGRAM_KEK_MASTER_KEY field (External Secrets Operator is the
+  # standard relay); the chart's deployment.yaml injects it when
+  # provider=env-var.
+  provider: env-var
 
 secrets:
   backend: gcp
@@ -43,6 +54,8 @@ database:
   secretKey: DATABASE_URL
 
 auth:
+  # The machine bearer (host-agent → coordinator, and the app-gRPC
+  # default). Human auth lives in the orchestrator (ADR 0051).
   existingSecret: engram-coordinator-secrets
   secretKey: ENGRAM_AUTH_TOKENS
 
@@ -53,91 +66,102 @@ serviceAccount:
     iam.gke.io/gcp-service-account: engram-coordinator@REPLACE_PROJECT.iam.gserviceaccount.com
 
 service:
-  # In-cluster traffic only — consumed by the web nginx pod
-  # reverse-proxying browser API calls. The coord has no public
-  # surface; out-of-cluster (FC host MIG) reach goes through the
-  # `serviceInternal` LB below.
+  # In-cluster traffic: the web nginx proxy AND the host-fleet
+  # DaemonSet both dial this ClusterIP (ADR 0044 — the fleet is
+  # in-cluster, so no internal LB is involved).
   type: ClusterIP
   port: 8080
 
+# The internal LB exists for OUT-of-cluster fleets only. The ADR 0044
+# in-cluster DaemonSet dials the ClusterIP Service above, so the LB
+# would be an unused GCP forwarding rule. Re-enable (plus the
+# annotations below) only for a fleet outside the cluster:
 serviceInternal:
-  # Pin to the Terraform-reserved internal address
-  # (`google_compute_address.coord_internal.address`) so the FC
-  # MIG's coordinator_endpoint can be plumbed before Helm installs.
-  loadBalancerIP: REPLACE_RESERVED_INTERNAL_IP
-  annotations:
-    # GKE: provision a regional Internal Application LB.
-    networking.gke.io/load-balancer-type: "Internal"
-    # Let FC hosts in other regions dial in too.
-    networking.gke.io/internal-load-balancer-allow-global-access: "true"
+  enabled: false
+  # loadBalancerIP: REPLACE_RESERVED_INTERNAL_IP
+  # annotations:
+  #   networking.gke.io/load-balancer-type: "Internal"
+  #   networking.gke.io/internal-load-balancer-allow-global-access: "true"
 
-# Coord ingress stays disabled — only the web component has a
-# public surface. Browsers hit the web Ingress → nginx →
-# in-cluster ClusterIP above.
+# Coord ingress stays disabled — only the web component has a public
+# surface.
 ingress:
   enabled: false
 
+# Static 2 replicas + PDB is the production-validated shape (ADR 0047
+# stateless coordinator; ADR 0048 I2 two-replica validation). Turn the
+# HPA on only after that baseline holds for your load.
+replicaCount: 2
 hpa:
-  enabled: true
-  minReplicas: 3
-  maxReplicas: 20
-  targetCPUUtilizationPercentage: 65
-
+  enabled: false
 pdb:
   enabled: true
-  minAvailable: 2
 
 resources:
   requests:
-    cpu: 1000m
-    memory: 1Gi
+    cpu: 500m
+    memory: 512Mi
   limits:
-    cpu: 4000m
-    memory: 4Gi
+    cpu: 2000m
+    memory: 2Gi
 
-# GCP egress tightening: only Postgres + Cloud SQL Auth Proxy
-# socket, GCS object endpoints, Artifact Registry, and the
-# Workload Identity metadata server. Replace with your VPC CIDR
-# ranges. Keeping `networkPolicy.enabled=false` until the operator
-# is ready to lock down egress avoids accidental outage.
-networkPolicy:
-  enabled: false
+# Google Managed Prometheus scrapes /metrics via the chart's
+# PodMonitoring CRD. Needs `managed_prometheus` enabled on the cluster
+# — without it the CRD is inert.
+metrics:
+  podMonitoring:
+    enabled: true
+    interval: "30s"
 
 # ─── web ──────────────────────────────────────────────────────────
 
 web:
   enabled: true
-
-  image:
-    repository: us-docker.pkg.dev/REPLACE_PROJECT/engram/web
-    tag: ""           # let the chart's appVersion drive it
-    pullPolicy: IfNotPresent
-
   replicaCount: 2
 
   service:
     type: ClusterIP
     port: 80
-    # IAP integration: see values-iap.yaml.example. The
-    # `cloud.google.com/backend-config` annotation goes on this
-    # Service, not on the Ingress.
+    # No BackendConfig annotation in the default (no-IAP) posture;
+    # values-iap.yaml.example adds it.
     annotations: {}
 
   ingress:
-    # The single public surface of the deployment. Google HTTPS LB
-    # + Google-managed certificate + IAP (via BackendConfig set in
-    # values-iap.yaml.example).
+    # The single public surface: Google HTTPS LB + managed cert. With
+    # no identity proxy, one "/" rule is the whole table — the
+    # orchestrator's login wall is the auth door (ADR 0118). The
+    # values-iap.yaml.example overlay replaces this with the
+    # per-backend path table IAP requires.
     enabled: true
     className: gce
     annotations:
       kubernetes.io/ingress.class: gce
-      # Reference the managed cert resource by name. Create the
-      # ManagedCertificate CRD separately (or via Terraform).
+      # Create the ManagedCertificate CRD separately (or via the
+      # Terraform quickstart) and reference it by name here.
       networking.gke.io/managed-certificates: engram-web-cert
-      # Optional: a static external IP reserved in Terraform.
+      # Recommended: a static external IP reserved in Terraform so the
+      # DNS record can be created before the LB exists.
       # kubernetes.io/ingress.global-static-ip-name: engram-web-ip
     hosts:
-      - host: engram.REPLACE_DOMAIN
+      - host: engrams.REPLACE_DOMAIN
         paths:
           - path: /
             pathType: Prefix
+
+# ─── orchestrator (ADR 0051) ──────────────────────────────────────
+
+orchestrator:
+  enabled: true
+  # The public URL — same host as the web Ingress above.
+  publicUrl: https://engrams.REPLACE_DOMAIN
+  databaseSecret:
+    existingSecret: engram-orchestrator-secrets
+    urlKey: ORCHESTRATOR_DATABASE_URL
+    bearerKey: CONTROL_PLANE_BEARER
+    authSecretKey: BETTER_AUTH_SECRET
+  auth:
+    # Bootstrap admins: each email is promoted to role 'admin' on
+    # first sign-in — how a fresh deploy gets a root account without a
+    # manual DB UPDATE.
+    adminEmails:
+      - REPLACE_ADMIN_EMAIL

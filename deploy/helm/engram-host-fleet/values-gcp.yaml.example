@@ -1,0 +1,142 @@
+# GCP (GKE) overlay for the Firecracker host fleet (ADR 0044) — the
+# shape the production deployment runs. Copy, replace the REPLACE_*
+# placeholders, install as a second release into a PSA-privileged
+# namespace:
+#
+#   kubectl create namespace engrams-hosts
+#   kubectl label namespace engrams-hosts \
+#     pod-security.kubernetes.io/enforce=privileged
+#   cp values-gcp.yaml.example my-fleet-values.yaml
+#   helm install hf ./deploy/helm/engram-host-fleet \
+#     -n engrams-hosts -f my-fleet-values.yaml
+#
+# Assumptions:
+# - A dedicated nested-virt node pool: Intel machine family (C3 —
+#   nested virtualization is Intel-only and set at pool CREATION),
+#   label `engram.io/kvm=true`, taint `engram.io/kvm=true:NoSchedule`,
+#   auto-upgrade OFF, and Terraform `ignore_changes = [node_count]`
+#   (the operator owns the pool size — ADR 0048). The Terraform
+#   quickstart's gke-kvm-pool module provisions exactly this.
+# - Workload Identity GSAs for the host pods and the operator (the
+#   quickstart's fc-host-gsa + host-operator-iam modules).
+# - The `engram` release (the coordinator chart) installed in the
+#   `engrams` namespace — the endpoints below dial its ClusterIP
+#   Services by DNS name; adjust if your release/namespace differ.
+
+# Images come from the published GHCR defaults. Deploy workflows
+# usually pin image.tag / operator.image.tag / nodeAssets.image.tag to
+# a resolved SHA; a floating tag works but won't auto-roll (the
+# DaemonSet is OnDelete — the operator rolls pods, ADR 0044 K3).
+
+# Workload Identity: host pods impersonate the fleet GSA (chunks
+# bucket objectAdmin + Secret Manager accessor).
+serviceAccount:
+  create: true
+  annotations:
+    iam.gke.io/gcp-service-account: engram-fc-host@REPLACE_PROJECT.iam.gserviceaccount.com
+
+# Land on the nested-virt pool. The chart's default nodeSelector is
+# already engram.io/kvm=true; the toleration matches the pool taint.
+tolerations:
+  - { key: engram.io/kvm, operator: Equal, value: "true", effect: NoSchedule }
+
+# Register with the in-cluster coordinator Service (ADR 0044 — no
+# internal LB). The host token is one of the coord's
+# ENGRAM_AUTH_TOKENS; the Secret must exist in THIS namespace (the
+# standard relay is an External Secrets Operator target in both
+# namespaces).
+coordinator:
+  endpoint: http://engram-coordinator.engrams:8080
+  tokenSecretName: engram-coordinator-secrets
+  tokenSecretKey: ENGRAM_AUTH_TOKENS
+
+blob:
+  backend: gcs
+  # Must match the coordinator's blob.gcs.bucket so hosts and coord
+  # read/write the same chunk store.
+  gcsBucket: REPLACE_BUCKET
+
+# ADR 0045 D3: the unified memory substrate (node-prep mounts the
+# tmpfs; restores lazily page from per-template base shm). These are
+# the production-validated settings.
+firecracker:
+  uffdBaseDir: /var/lib/engram/shm
+  uffdBaseTmpfsSize: 32g
+  # ADR 0092: base memory in reclaimable page cache, not pinned tmpfs.
+  freshRestoreMode: "file"
+  baseMemfilePin: "0" # quoted on purpose — bare 0 is falsy in the chart's `with`
+  baseShmMode: "lazy"
+
+# No local-NVMe stripe: /var/lib/engram rides the node boot disk
+# (provision it big + fast — the quickstart's pool uses 750 GB
+# hyperdisk-balanced). Set dedicatedDevices for machine shapes with
+# local SSDs.
+storage:
+  dedicatedDevices: []
+
+# Size the host-agent cgroup to the machine — total_vcpus (and
+# placement packing) derives from the container's CPU limit, so the
+# chart's small default would under-advertise a big node. Example for
+# c3-standard-22 (22 vCPU / 88 GiB):
+hostAgent:
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "22"
+      memory: 44Gi
+
+# ADR 0006: the egress proxy CA. caSource=env, NOT gcp-secret-manager:
+# the host-agent is hostNetwork, so it bypasses GKE Workload Identity
+# and authenticates as the node's scope-limited default SA — a direct
+# Secret Manager read 403s. External Secrets Operator (proper WI, not
+# hostNetwork) syncs the CA PEMs from Secret Manager into this K8s
+# Secret; the DaemonSet injects them as ENGRAM_EGRESS_CA_{CERT,KEY}_PEM.
+# A shared fleet-wide CA (never local-disk) is required so a
+# teleported/evacuated session still trusts its new host's proxy.
+egress:
+  caSource: env
+  caEnvSecret: engram-host-egress-ca
+
+# ADR 0049: bounded NBD slot pool with a warm front (node-prep loads
+# the module with nbds_max; changing it needs a node recreate).
+nbd:
+  nbdsMax: 128
+  warmSlots: 64
+
+# ADR 0044 K3 + ADR 0048: the rollout/autoscaling operator. scaler=gke
+# actuates the real pool via the Container API + Workload Identity
+# (the host-operator-iam module's 4-permission custom role).
+operator:
+  enabled: true
+  # app-gRPC (:50061), not the REST port — the operator drives the
+  # coordinator over FleetService gRPC (ADR 0051).
+  coordinatorUrl: http://engram-coordinator.engrams:50061
+  scaler: gke
+  serviceAccount:
+    annotations:
+      iam.gke.io/gcp-service-account: engram-host-operator@REPLACE_PROJECT.iam.gserviceaccount.com
+  createHostFleet: true
+  autoscaling:
+    enabled: true
+    # The node pool the scaler resizes (the quickstart's KVM pool name).
+    nodePool: engram-kvm
+    minHosts: 2
+    maxHosts: 6
+    # Aggregate free-RAM headroom to keep. Size it to your largest
+    # session override, not the median.
+    targetFreeMib: 32768
+    # Teleport-packed consolidation down to minHosts (ADR 0048;
+    # production-validated). `off` disables scale-down entirely.
+    scaleDown: aggressive
+    scaleDownHysteresisTicks: 5
+    maxShedPerWave: 4
+    maxConcurrentDrains: 2
+
+# Google Managed Prometheus scrape of the host-agent + operator
+# metrics. Needs `managed_prometheus` on the cluster.
+metrics:
+  podMonitoring:
+    enabled: true
+    interval: "30s"

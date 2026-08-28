@@ -157,13 +157,12 @@ storage:
   # a percent of the filesystem backing workDirHostPath — the line
   # engram_host_disk_headroom_to_kubelet_bytes measures distance to.
   #
-  # TODO: 10 (GKE's documented nodefs.available < 10% default) is a
-  # PLACEHOLDER pending confirmation against the actual nodepool/kubelet
-  # config in the engrams-internal deploy repo — this OSS chart has not
-  # verified it against a real cluster's kubelet flags
-  # (--eviction-hard/--system-reserved can override the GKE default).
-  # Confirm and adjust here before treating the headroom gauge's alarm
-  # threshold as trustworthy.
+  # 10 is the kubelet's upstream `eviction-hard: nodefs.available<10%`
+  # default, which both GKE (COS) and EKS (AL2023 nodeadm) ship
+  # unmodified — the production GKE pool runs it. Adjust only if your
+  # node pool overrides eviction-hard; verify a live node with:
+  #   kubectl get --raw "/api/v1/nodes/<node>/proxy/configz" \
+  #     | jq .kubeletconfig.evictionHard
   kubeletEvictPct: 10
   # ADR 0070: mount workDirHostPath on its own block device(s) instead of
   # sharing the node boot disk. [] (default) = today's behavior — a

@@ -122,6 +122,29 @@ web:
           - path: /api/v1/hooks/
             pathType: Prefix
             service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          # CI-conditional review dispatch (ADR 0100 — e.g. a GitHub
+          # Action): API-key-authed like /rpc/ below; anonymous callers
+          # 401 at the orchestrator.
+          - path: /api/v1/reviews/dispatch
+            pathType: Exact
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          # The `engrams` CLI's surface: the Connect RPCs and the
+          # anonymous device-flow login endpoints. A CLI carries no IAP
+          # cookie, so these must bypass the proxy; the orchestrator's
+          # better-auth seams (API key / session cookie) are the gate.
+          # NOTE: /api/auth/get-session (and the rest of /api/auth)
+          # deliberately stays on the IAP'd "/" rule — it is the SPA's
+          # session bootstrap; the CLI resolves identity via
+          # ApiKeyService.WhoAmI on /rpc instead.
+          - path: /rpc/
+            pathType: Prefix
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          - path: /api/auth/device/code
+            pathType: Exact
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          - path: /api/auth/device/token
+            pathType: Exact
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
           # WebSocket surfaces MUST live on the no-IAP backend. IAP does not
           # carry a WebSocket upgrade — the load balancer answers 502 — and
           # IAP is enabled per backend SERVICE, not per path, so a socket
