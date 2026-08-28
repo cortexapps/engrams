@@ -58,8 +58,9 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.operator.logLevel | quote }}
-            # ADR 0044 K4: node-pool scaler — `noop` (logs only) or `gke`
-            # (resizes a GKE pool via the Container API + Workload Identity).
+            # ADR 0044 K4 / ADR 0122: node-pool scaler — `noop` (logs only),
+            # `gke` (Container API + Workload Identity), or `asg`
+            # (EC2 Auto Scaling via IRSA; the pool id is the ASG name).
             - name: ENGRAM_NODE_POOL_SCALER
               value: {{ .Values.operator.scaler | quote }}
             {{- if .Values.coordinator.tokenSecretName }}

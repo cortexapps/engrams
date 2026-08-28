@@ -21,6 +21,19 @@ data:
   {{- fail "values.blob.gcs.bucket is required when blob.backend=gcs" }}
   {{- end }}
   ENGRAM_GCS_BUCKET: {{ .Values.blob.gcs.bucket | quote }}
+  {{- else if eq .Values.blob.backend "s3" }}
+  {{- if not .Values.blob.s3.bucket }}
+  {{- fail "values.blob.s3.bucket is required when blob.backend=s3" }}
+  {{- end }}
+  {{- /* ADR 0122. Key names match the engram-host-fleet chart's
+       configmap so coord and hosts agree on the env contract. */}}
+  ENGRAM_S3_BUCKET: {{ .Values.blob.s3.bucket | quote }}
+  {{- with .Values.blob.s3.endpointUrl }}
+  ENGRAM_S3_ENDPOINT_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.blob.s3.region }}
+  ENGRAM_S3_REGION: {{ . | quote }}
+  {{- end }}
   {{- end }}
   ENGRAM_KEK_PROVIDER: {{ .Values.kek.provider | quote }}
   {{- if eq .Values.kek.provider "env-var" }}
@@ -30,6 +43,11 @@ data:
   {{- fail "values.kek.gcpResource is required when kek.provider=gcp-kms" }}
   {{- end }}
   ENGRAM_KEK_GCP_RESOURCE: {{ .Values.kek.gcpResource | quote }}
+  {{- else if eq .Values.kek.provider "aws-kms" }}
+  {{- if not .Values.kek.awsKeyId }}
+  {{- fail "values.kek.awsKeyId is required when kek.provider=aws-kms" }}
+  {{- end }}
+  ENGRAM_KEK_AWS_KEY_ID: {{ .Values.kek.awsKeyId | quote }}
   {{- end }}
   ENGRAM_SECRETS_BACKEND: {{ .Values.secrets.backend | quote }}
   {{- if eq .Values.secrets.backend "gcp" }}

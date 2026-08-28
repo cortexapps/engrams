@@ -30,27 +30,43 @@ mode: coordinator
 # coord pod (uncommon for K8s); `vz` is macOS-only and won't help here.
 sandboxBackend: firecracker
 
-# Blob storage backend selection (ADR 0007). Production reads chunks
-# from the same bucket the image-builder writes to.
+# Blob storage backend selection (ADR 0007 / ADR 0122). Production
+# reads chunks from the same bucket the image-builder writes to.
 blob:
-  # `local` or `gcs`. AWS S3 is reserved.
+  # `local` (dev), `gcs`, or `s3`.
   backend: gcs
   # Required when backend=gcs.
   gcs:
     bucket: ""
+  # backend=s3 (ADR 0122). `bucket` is required; `endpointUrl` points
+  # at an S3-compatible store (MinIO, R2 — flips path-style addressing
+  # in the client); `region` overrides the SDK chain (AWS_REGION →
+  # profile → IMDS). Credentials ride the ambient chain (IRSA on EKS).
+  # Key names match the engram-host-fleet chart so coord and hosts
+  # agree.
+  s3:
+    bucket: ""
+    endpointUrl: ""
+    region: ""
 
 # KEK provider for envelope-encrypted creds + cold-tier blob seals.
 kek:
-  # `env-var` (dev/CI) or `gcp-kms` (production).
+  # `env-var` (dev/CI, and GCP production today — gcp-kms wrap/unwrap
+  # is a stub), `gcp-kms`, or `aws-kms` (real, ADR 0122).
   provider: gcp-kms
   # env-var only — name of the env var carrying the base64 master key.
   envVarName: ENGRAM_KEK_MASTER_KEY
   # gcp-kms only — full resource path.
   gcpResource: ""
+  # aws-kms only — the KMS KeyId (key ARN preferred; a key id or
+  # `alias/...` also works). Credentials ride the ambient chain (IRSA).
+  awsKeyId: ""
 
 # Secrets backend for image manifest's `[secrets.*]` references.
 secrets:
-  # `env` (dev) or `gcp` (Secret Manager via Workload Identity).
+  # `env` (dev), `gcp` (Secret Manager via Workload Identity), or
+  # `aws` (AWS Secrets Manager via IRSA — ADR 0122; needs no extra
+  # keys here: region + credentials ride the SDK chain).
   backend: gcp
   # Required when backend=gcp.
   gcpProjectId: ""
@@ -148,14 +164,14 @@ service:
   port: 8080
   annotations: {}
 
-# Internal LoadBalancer Service for FC host-agents dialing in over
-# WS from the host MIG (out of cluster, in VPC). Always created —
-# this chart targets production; `--mode=all` single-binary dev is
-# handled by Tilt/docker-compose, not Helm. Pin `loadBalancerIP`
-# from Terraform (a pre-reserved internal address) so the FC MIG's
-# coordinator_endpoint can be wired before Helm installs and the
-# whole bring-up is one TF apply + one Helm install.
+# Internal LoadBalancer Service for FC host-agents dialing in from
+# OUTSIDE the cluster (the retired GCE-MIG topology, or any
+# out-of-cluster fleet). The ADR 0044 in-cluster DaemonSet fleet
+# dials the ClusterIP Service instead, so cloud overlays set
+# `enabled: false` — on AWS an enabled default would mint a classic
+# ELB nobody uses. Default stays true for topology back-compat.
 serviceInternal:
+  enabled: true
   # Pre-reserved VPC-internal IP, e.g.
   # `google_compute_address.coord_internal.address`. Leaving empty
   # works (auto-assigned) but means a follow-up step to plumb the
