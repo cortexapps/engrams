@@ -1,20 +1,23 @@
-# Minimal end-to-end Engram deployment on GCP.
+# Minimal BYO-cluster Engram footprint on GCP. For the full
+# zero-to-running shape, use ../../quickstart instead.
 #
 # What this builds:
 # - A dedicated VPC with NAT.
 # - A GCS bucket for ADR 0007 chunks + manifests.
 # - A KMS key the coord uses to envelope-encrypt registry creds.
-# - A regional MIG of Firecracker hosts.
-# - Wiring (IAM, SAs) so the coord (deployed separately via Helm)
-#   can authenticate against GCS + KMS via Workload Identity.
+# - Identities + IAM (coordinator GSA, the FC hosts' GSA) so the
+#   Helm-deployed workloads can authenticate against GCS + KMS via
+#   Workload Identity.
 #
 # What this does NOT build:
-# - The GKE cluster the coord runs on. Use Google's published
-#   `terraform-google-modules/kubernetes-engine/google` module
-#   (it knows about Workload Identity setup + the autopilot vs
-#   standard tradeoff better than we'd reinvent here).
-# - Cloud SQL for Postgres. Use the published `cloud-sql` module
-#   or BYO. The coord just needs DATABASE_URL.
+# - The GKE cluster + the nested-virt host pool. Use the sibling
+#   `gke-cluster` + `gke-kvm-pool` modules against this VPC (or
+#   Google's published `terraform-google-modules/kubernetes-engine`
+#   for the cluster — the KVM pool's invariants still want our
+#   module).
+# - Cloud SQL for Postgres. Use the sibling `cloudsql` module, the
+#   published `sql-db` module, or BYO — the coord just needs
+#   DATABASE_URL.
 # - Artifact Registry. One `google_artifact_registry_repository`
 #   resource — small enough that operators inline it per env.
 # - Secret Manager entries for the coord's auth tokens / KEK.
@@ -78,18 +81,17 @@ resource "google_service_account" "coordinator" {
   display_name = "Engram coordinator (${var.name_prefix})"
 }
 
-# Reserved internal IP for the coord's K8s Service of type
-# LoadBalancer (the `<release>-coordinator-internal` Service in the
-# Helm chart). Reserving the address in Terraform lets us pass it to
-# both the FC host MIG (as coordinator_endpoint) AND to Helm (via
-# `serviceInternal.loadBalancerIP`) before the cluster comes up, so
-# the bring-up is one `terraform apply` + one `helm install` with no
-# circular dependency.
+# Reserved internal IP for the coord's OPTIONAL internal-LB Service
+# (`serviceInternal` in the Helm chart — for a host fleet OUTSIDE the
+# cluster). The ADR 0044 in-cluster DaemonSet fleet dials the
+# ClusterIP Service instead and needs none of this; keep it only for
+# an out-of-cluster fleet, where reserving the address up front lets
+# the fleet's coordinator_endpoint be plumbed before Helm binds the
+# Service (one apply + one install, no circular dependency).
 #
 # `SHARED_LOADBALANCER_VIP` is the right purpose for a GCE internal
 # LB consumed by a K8s Service. The address sits idle until Helm
-# binds the Service to it; once bound, FC host-agents that have been
-# retrying their dial connect on the next attempt.
+# binds the Service to it.
 resource "google_compute_address" "coord_internal" {
   name         = "${var.name_prefix}-coord-internal"
   region       = var.region
@@ -99,7 +101,9 @@ resource "google_compute_address" "coord_internal" {
 }
 
 locals {
-  coordinator_endpoint = "ws://${google_compute_address.coord_internal.address}:${var.coordinator_port}"
+  # http, not ws: ADR 0013 retired the WS dial — host-agents register
+  # + heartbeat over plain HTTP POSTs.
+  coordinator_endpoint = "http://${google_compute_address.coord_internal.address}:${var.coordinator_port}"
 }
 
 # Coord needs:
