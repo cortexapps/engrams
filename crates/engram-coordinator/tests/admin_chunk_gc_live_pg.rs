@@ -31,6 +31,13 @@
 //!   — ADR 0022 sources #5/#6 pin the per-template memfile + rootfs
 //!   via the enabled_images row independent of the base snapshot
 //!   row's `recoverable` flag.
+//! - `mark_failure_still_promotes_already_expired_candidates` — a
+//!   failing `list_prefix` degrades the sweep instead of voiding it;
+//!   the promote pass still reaps candidates an earlier sweep marked.
+//! - `promote_drains_multiple_batches_in_one_sweep` — the promote
+//!   pass pages until the backlog clears, not one page per tick.
+//! - `promote_respects_the_per_sweep_cap` — `promote_max_per_sweep`
+//!   bounds one sweep and leaves the remainder queued.
 
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
@@ -233,7 +240,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
         interval: Duration::from_secs(3600),
         grace_period: Duration::from_secs(0),
         max_restart_attempts: 3,
-        promote_batch_size: 10_000,
+        ..Default::default()
     };
     let report = run_one_sweep_inner(
         rig.meta.clone(),
@@ -802,4 +809,188 @@ async fn base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable() {
              even though its base snapshot is non-recoverable",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mark/promote independence + drain-loop regressions.
+// ---------------------------------------------------------------------------
+
+/// The mark pass needs a full `list_prefix`; the promote pass needs only
+/// rows an earlier sweep wrote. Chaining promote behind the mark pass's
+/// `?` meant one failing list disabled deletion entirely — in prod
+/// `list_prefix` exceeded its 300s deadline on every sweep from
+/// 2026-07-16, stranding 8.9M expired candidates that needed no listing
+/// to delete. A mark failure must degrade the sweep, never void it.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn mark_failure_still_promotes_already_expired_candidates() {
+    let Some(rig) = rig().await else { return };
+
+    let orphan = plant_orphan(rig.blob.as_ref()).await;
+
+    // Sweep 1: healthy listing, non-zero grace — the orphan is recorded as
+    // a candidate but not yet deletable.
+    let marking = ChunkGcConfig {
+        grace_period: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let report = run_one_sweep_inner(
+        rig.meta.clone(),
+        rig.blob.clone(),
+        &rig.chunk_store,
+        &marking,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("marking sweep");
+    assert!(
+        report.mark_error.is_none(),
+        "sweep 1 listing should succeed"
+    );
+    assert_eq!(report.candidates_marked, 1, "orphan marked");
+    assert_eq!(report.promoted_deletes, 0, "grace protects it this sweep");
+    assert!(
+        rig.blob
+            .exists(&orphan.storage_key())
+            .await
+            .expect("exists"),
+        "orphan still present after the marking sweep"
+    );
+
+    // Sweep 2: listing is broken exactly the way prod's was, and the grace
+    // window has elapsed. The mark pass fails; the promote pass must still
+    // reap the candidate sweep 1 recorded.
+    let (faulty, counters) = engram_testkit::storage::FaultyBlobStorage::arc(
+        rig.blob.clone(),
+        engram_testkit::storage::FaultPlan::new().fail_list(
+            "chunks/",
+            engram_testkit::storage::InjectedError::Sdk("attempt deadline 300s exceeded".into()),
+        ),
+    );
+    let faulty_store = ChunkStore::new(faulty.clone());
+    let promoting = ChunkGcConfig {
+        grace_period: Duration::from_secs(0),
+        ..Default::default()
+    };
+    let report = run_one_sweep_inner(
+        rig.meta.clone(),
+        faulty.clone(),
+        &faulty_store,
+        &promoting,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("a failed mark pass must not fail the sweep");
+
+    assert!(
+        report.mark_error.is_some(),
+        "the injected list fault should be reported, not swallowed"
+    );
+    assert_eq!(counters.lists_faulted(), 1, "the list fault actually fired");
+    assert_eq!(
+        report.promoted_deletes, 1,
+        "promote must run on the existing candidate despite the mark failure"
+    );
+    assert!(
+        !rig.blob
+            .exists(&orphan.storage_key())
+            .await
+            .expect("exists"),
+        "orphan blob deleted by the promote pass"
+    );
+    assert_eq!(
+        rig.meta.count_gc_candidates().await.expect("count"),
+        0,
+        "candidate row cleared"
+    );
+}
+
+/// One page per sweep cannot drain a backlog: at 10k/hour the 8.9M
+/// candidates found in prod would need 37 days. The promote pass drains
+/// in pages until the backlog clears or the per-sweep cap is hit.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn promote_drains_multiple_batches_in_one_sweep() {
+    let Some(rig) = rig().await else { return };
+
+    let mut orphans = Vec::new();
+    for _ in 0..25 {
+        orphans.push(plant_orphan(rig.blob.as_ref()).await);
+    }
+
+    // Batch size 10 over 25 orphans: a single-page promote would leave 15.
+    let cfg = ChunkGcConfig {
+        grace_period: Duration::from_secs(0),
+        promote_batch_size: 10,
+        ..Default::default()
+    };
+    let report = run_one_sweep_inner(
+        rig.meta.clone(),
+        rig.blob.clone(),
+        &rig.chunk_store,
+        &cfg,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("draining sweep");
+
+    assert_eq!(report.candidates_marked, 25);
+    assert_eq!(
+        report.promoted_deletes, 25,
+        "every expired candidate drained in one sweep, not just the first page"
+    );
+    assert_eq!(
+        rig.meta.count_gc_candidates().await.expect("count"),
+        0,
+        "candidate table drained"
+    );
+    for o in &orphans {
+        assert!(
+            !rig.blob.exists(&o.storage_key()).await.expect("exists"),
+            "orphan {} deleted",
+            o.to_hex()
+        );
+    }
+}
+
+/// `promote_max_per_sweep` bounds one sweep's cost so a huge backlog
+/// drains over several ticks instead of monopolising one.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn promote_respects_the_per_sweep_cap() {
+    let Some(rig) = rig().await else { return };
+
+    for _ in 0..20 {
+        plant_orphan(rig.blob.as_ref()).await;
+    }
+
+    let cfg = ChunkGcConfig {
+        grace_period: Duration::from_secs(0),
+        promote_batch_size: 5,
+        promote_max_per_sweep: 12,
+        ..Default::default()
+    };
+    let report = run_one_sweep_inner(
+        rig.meta.clone(),
+        rig.blob.clone(),
+        &rig.chunk_store,
+        &cfg,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("capped sweep");
+
+    assert_eq!(
+        report.promoted_deletes, 12,
+        "the per-sweep cap bounds the drain"
+    );
+    assert_eq!(
+        rig.meta.count_gc_candidates().await.expect("count"),
+        8,
+        "the remainder stays queued for the next tick"
+    );
 }

@@ -184,6 +184,26 @@ pub enum HeadFaultKind {
     Error(InjectedError),
 }
 
+/// A fault on the listing path (`list_prefix`).
+///
+/// The motivating case is the chunk-GC mark pass: in prod the chunk
+/// space outgrew the client's 300s list deadline, so `list_prefix`
+/// failed on every sweep. A list fault reproduces that without needing
+/// a bucket big enough to actually time out.
+#[derive(Clone, Debug)]
+pub struct ListFault {
+    /// Matched against the listed PREFIX, not against any key.
+    pub prefix: KeyMatch,
+    pub when: When,
+    pub kind: ListFaultKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum ListFaultKind {
+    /// Surface a hard error from `list_prefix`.
+    Error(InjectedError),
+}
+
 /// A deterministic, reproducible script of storage faults.
 ///
 /// Build it fluently:
@@ -201,6 +221,7 @@ pub struct FaultPlan {
     pub puts: Vec<PutFault>,
     pub gets: Vec<GetFault>,
     pub heads: Vec<HeadFault>,
+    pub lists: Vec<ListFault>,
 }
 
 impl FaultPlan {
@@ -225,6 +246,21 @@ impl FaultPlan {
     pub fn with_head(mut self, f: HeadFault) -> Self {
         self.heads.push(f);
         self
+    }
+
+    /// Add a list fault.
+    pub fn with_list(mut self, f: ListFault) -> Self {
+        self.lists.push(f);
+        self
+    }
+
+    /// Shorthand: fail every `list_prefix` under `prefix` with `err`.
+    pub fn fail_list(self, prefix: &str, err: InjectedError) -> Self {
+        self.with_list(ListFault {
+            prefix: KeyMatch::Contains(prefix.to_string()),
+            when: When::Always,
+            kind: ListFaultKind::Error(err),
+        })
     }
 
     /// Shorthand: fail the Nth put of *any* key with `err`.
@@ -252,6 +288,8 @@ pub struct Counters {
     pub gets_faulted: AtomicU64,
     pub heads_attempted: AtomicU64,
     pub heads_faulted: AtomicU64,
+    pub lists_attempted: AtomicU64,
+    pub lists_faulted: AtomicU64,
 }
 
 macro_rules! counter_accessors {
@@ -274,6 +312,8 @@ impl Counters {
         gets_faulted,
         heads_attempted,
         heads_faulted,
+        lists_attempted,
+        lists_faulted,
     );
 }
 
@@ -287,6 +327,7 @@ struct Hits {
     puts: Vec<AtomicU64>,
     gets: Vec<AtomicU64>,
     heads: Vec<AtomicU64>,
+    lists: Vec<AtomicU64>,
 }
 
 /// Scripted fault-injecting wrapper around an `Arc<dyn BlobStorage>`.
@@ -307,6 +348,7 @@ impl FaultyBlobStorage {
             puts: (0..plan.puts.len()).map(|_| AtomicU64::new(0)).collect(),
             gets: (0..plan.gets.len()).map(|_| AtomicU64::new(0)).collect(),
             heads: (0..plan.heads.len()).map(|_| AtomicU64::new(0)).collect(),
+            lists: (0..plan.lists.len()).map(|_| AtomicU64::new(0)).collect(),
         };
         Self {
             inner,
@@ -368,6 +410,20 @@ impl FaultyBlobStorage {
         let mut fired: Option<HeadFaultKind> = None;
         for (rule, hit) in self.plan.heads.iter().zip(self.hits.heads.iter()) {
             if !rule.key.matches(key) {
+                continue;
+            }
+            let count = hit.fetch_add(1, Ordering::Relaxed) + 1;
+            if fired.is_none() && rule.when.fires(count) {
+                fired = Some(rule.kind.clone());
+            }
+        }
+        fired
+    }
+
+    fn list_fault_for(&self, prefix: &str) -> Option<ListFaultKind> {
+        let mut fired: Option<ListFaultKind> = None;
+        for (rule, hit) in self.plan.lists.iter().zip(self.hits.lists.iter()) {
+            if !rule.prefix.matches(prefix) {
                 continue;
             }
             let count = hit.fetch_add(1, Ordering::Relaxed) + 1;
@@ -547,7 +603,16 @@ impl BlobStorage for FaultyBlobStorage {
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, BlobError> {
-        self.inner.list_prefix(prefix).await
+        self.counters
+            .lists_attempted
+            .fetch_add(1, Ordering::Relaxed);
+        match self.list_fault_for(prefix) {
+            Some(ListFaultKind::Error(err)) => {
+                self.counters.lists_faulted.fetch_add(1, Ordering::Relaxed);
+                Err(err.to_blob_error())
+            }
+            None => self.inner.list_prefix(prefix).await,
+        }
     }
 }
 
