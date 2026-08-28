@@ -173,5 +173,67 @@ pub trait BlobStorage: Send + Sync {
     /// is the full set, not a single page. Empty prefix is
     /// allowed (lists everything); callers should be cautious
     /// about using that against large buckets.
+    ///
+    /// **Only for prefixes with a bounded, small key count.** The
+    /// whole listing is buffered in memory under a single client
+    /// deadline, so it does not survive a prefix that grows without
+    /// bound — the chunk space reached ~110M keys in prod and every
+    /// call exceeded the 300s list deadline. Walk an unbounded
+    /// prefix with [`BlobStorage::list_prefix_page`] instead.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, BlobError>;
+
+    /// List ONE page of keys under `prefix`, resuming from `cursor`
+    /// (`None` starts at the beginning). Returns at most `limit`
+    /// keys plus the token for the next page.
+    ///
+    /// This is the scale-safe listing surface: each page carries its
+    /// own request deadline and its own memory cost, so a caller can
+    /// walk a prefix of any size. Use it for the chunk space; prefer
+    /// [`BlobStorage::list_prefix`] only where the key count is known
+    /// to be small.
+    ///
+    /// The default implementation buffers the full listing and slices
+    /// it, which is correct for backends whose listings are small
+    /// (local fs, in-memory test doubles) but gives none of the
+    /// scale benefit. A backend that talks to a real object store
+    /// MUST override this with native pagination — and so MUST every
+    /// decorator that wraps one, or the default will silently route
+    /// back through the unbounded `list_prefix`.
+    async fn list_prefix_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage, BlobError> {
+        let mut keys = self.list_prefix(prefix).await?;
+        // `list_prefix` order is backend-specific; sort so the offset
+        // cursor addresses the same key across calls.
+        keys.sort();
+        let start: usize = match cursor {
+            Some(c) => c.parse().map_err(|_| {
+                BlobError::Protocol(format!("list_prefix_page: malformed cursor {c:?}"))
+            })?,
+            None => 0,
+        };
+        if start >= keys.len() {
+            return Ok(ListPage::default());
+        }
+        let end = start.saturating_add(limit).min(keys.len());
+        let next = (end < keys.len()).then(|| end.to_string());
+        Ok(ListPage {
+            keys: keys[start..end].to_vec(),
+            next,
+        })
+    }
+}
+
+/// One page of a prefix listing, from [`BlobStorage::list_prefix_page`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListPage {
+    /// Full keys in this page (not relative to the prefix).
+    pub keys: Vec<String>,
+    /// Opaque continuation token for the next page. `None` means this
+    /// was the last page. Treat the value as backend-private — pass it
+    /// back unmodified.
+    pub next: Option<String>,
 }

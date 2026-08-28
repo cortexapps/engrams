@@ -994,3 +994,52 @@ async fn promote_respects_the_per_sweep_cap() {
         "the remainder stays queued for the next tick"
     );
 }
+
+/// The mark pass walks the chunk space one page at a time. Buffering
+/// the whole listing was the prod failure: at ~110M keys every
+/// `list_prefix` blew its 300s deadline, so no sweep ever classified
+/// anything after 2026-07-16. A page-size below the key count must
+/// still classify every chunk.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn mark_pass_walks_every_page_of_the_chunk_space() {
+    let Some(rig) = rig().await else { return };
+
+    let mut orphans = Vec::new();
+    for _ in 0..37 {
+        orphans.push(plant_orphan(rig.blob.as_ref()).await);
+    }
+
+    // 37 chunks at 5 keys per page = 8 pages. A single-page mark pass
+    // would see 5.
+    let cfg = ChunkGcConfig {
+        grace_period: Duration::from_secs(3600),
+        list_page_size: 5,
+        ..Default::default()
+    };
+    let report = run_one_sweep_inner(
+        rig.meta.clone(),
+        rig.blob.clone(),
+        &rig.chunk_store,
+        &cfg,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("paged mark sweep");
+
+    assert!(report.mark_error.is_none());
+    assert_eq!(
+        report.listed_chunks, 37,
+        "every page of the chunk space was walked"
+    );
+    assert_eq!(
+        report.candidates_marked, 37,
+        "every unpinned chunk was marked, not just the first page"
+    );
+    assert_eq!(
+        rig.meta.count_gc_candidates().await.expect("count"),
+        37,
+        "all candidates recorded in PG"
+    );
+}

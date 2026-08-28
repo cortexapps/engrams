@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engram_core::error::BlobError;
-use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream};
+use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream, ListPage};
 use futures::{SinkExt, StreamExt};
 use gcloud_storage::client::{Client, ClientConfig};
 use gcloud_storage::http::objects::delete::DeleteObjectRequest;
@@ -316,6 +316,43 @@ impl BlobStorage for GcsBlobStorage {
         }
         Ok(out)
     }
+
+    /// Native single-page listing: one `list_objects` round-trip, the
+    /// GCS `pageToken` carried through verbatim as the cursor. This is
+    /// what lets a caller walk a prefix of unbounded size — the whole-
+    /// listing `list_prefix` above cannot, because every page shares one
+    /// client deadline.
+    async fn list_prefix_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage, BlobError> {
+        let req = ListObjectsRequest {
+            bucket: self.bucket.clone(),
+            prefix: if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix.to_string())
+            },
+            // GCS caps a page at 1000 regardless of what we ask for.
+            max_results: Some(limit.clamp(1, 1000) as i32),
+            page_token: cursor.map(str::to_string),
+            ..Default::default()
+        };
+        let resp = self.client.list_objects(&req).await.map_err(map_http_err)?;
+        let keys = resp
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(|obj| obj.name)
+            .collect();
+        let next = match resp.next_page_token {
+            Some(t) if !t.is_empty() => Some(t),
+            _ => None,
+        };
+        Ok(ListPage { keys, next })
+    }
 }
 
 #[cfg(test)]
@@ -435,5 +472,16 @@ mod tests {
             return;
         };
         blob_conformance::list_prefix_scoped(&store, 1500).await;
+    }
+
+    /// The paged walk must agree with the whole listing. This is the
+    /// surface the chunk-GC mark pass uses, and GCS is the backend whose
+    /// native `pageToken` pagination it exercises.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conformance_list_prefix_page_walks_whole_prefix_against_emulator() {
+        let Some(store) = emulator_store().await else {
+            return;
+        };
+        blob_conformance::list_prefix_page_walks_whole_prefix(&store, 350, 100).await;
     }
 }

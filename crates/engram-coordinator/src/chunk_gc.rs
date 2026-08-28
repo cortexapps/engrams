@@ -4,16 +4,15 @@
 //!
 //! 1. Read `chunk_generation` (gen_before).
 //! 2. Collect the pin set via [`engram_chunk_store::PinSet::collect`].
-//! 3. List `BlobStorage` under `chunks/sha256/`; for each key, parse
-//!    back to a `ChunkHash` and check pin-set membership.
+//! 3. Walk `BlobStorage` under `chunks/sha256/` ONE PAGE AT A TIME
+//!    (`list_prefix_page`, `list_page_size` keys per call); for each
+//!    key, parse back to a `ChunkHash` and check pin-set membership.
 //! 4. Unpinned chunks: in `Full` mode, upsert into the
 //!    `chunk_gc_candidates` PG table (idempotent, sticky
 //!    `first_seen_at`); in `DryRun`, just count.
-//! 5. Read `chunk_generation` (gen_after). If it ticked AND we have
-//!    restart budget left, restart from step 1 (a flush /
-//!    enable_image / record_snapshot raced the sweep; pin set is
-//!    stale). Bounded to `max_restart_attempts` to prevent
-//!    continuous-flush livelock.
+//! 5. Read `chunk_generation` (gen_after) and record whether it moved.
+//!    This is a DIAGNOSTIC only — the sweep does not restart. See
+//!    `run_mark_pass` for why.
 //! 6. **Promote pass** (Full only): list candidates with
 //!    `first_seen_at < now() - grace_period`, delete each from
 //!    BlobStorage, delete the candidate row. Drains in pages until
@@ -21,13 +20,15 @@
 //!    `promote_concurrency` deletes in flight.
 //!
 //! Steps 1-5 are the **mark pass** and step 6 is the **promote
-//! pass**; they are INDEPENDENT. Mark needs a full `list_prefix` of
-//! the chunk space, promote needs only rows an earlier sweep wrote,
-//! so a mark failure degrades the sweep but never voids it. Chaining
-//! them cost 43 days of GC in prod: from 2026-07-16 `list_prefix`
-//! exceeded its 300s deadline on every sweep, and because promote sat
-//! behind the mark pass's `?` it never ran — 8.9M expired candidates
-//! (~9.5 TB) stayed undeleted while the bucket grew 7.9 TB -> 120.7 TB.
+//! pass**; they are INDEPENDENT. Mark walks the whole chunk space,
+//! promote needs only rows an earlier sweep wrote, so a mark failure
+//! degrades the sweep but never voids it. Chaining them cost 43 days
+//! of GC in prod: from 2026-07-16 the mark pass's whole-listing
+//! `list_prefix` exceeded its 300s deadline on every sweep, and
+//! because promote sat behind the mark pass's `?` it never ran — 8.9M
+//! expired candidates (~9.5 TB) stayed undeleted while the bucket grew
+//! 7.9 TB -> 120.7 TB. The paged walk in step 3 removes the deadline
+//! cliff; the split keeps one broken pass from disabling the other.
 //!
 //! [`gc_sweep_loop`] is the background task: spawned at coord
 //! startup, gated on `ENGRAM_CHUNK_GC_ENABLED` (default ON in
@@ -42,6 +43,9 @@ use engram_chunk_store::{ChunkHash, ChunkStore, GcError, PinSet};
 use engram_core::traits::{BlobStorage, MetadataStore};
 
 use crate::state::SharedState;
+
+/// Blob-storage prefix the chunk sweep walks.
+const CHUNK_PREFIX: &str = "chunks/sha256/";
 
 /// Sweep configuration. Defaults match the active-development
 /// posture: GC enabled, hourly cadence, 24h candidate grace.
@@ -59,13 +63,17 @@ pub struct ChunkGcConfig {
     /// pass deletes it from BlobStorage. Defaults to 86400s (24h).
     /// Override via `ENGRAM_CHUNK_GC_GRACE_SECS`.
     pub grace_period: Duration,
-    /// Max barrier-restart attempts inside a single sweep. Prevents
-    /// continuous-flush livelock where every sweep collects a stale
-    /// pin set because `chunk_generation` keeps ticking. Defaults
-    /// to 3. After exhausting restarts, accept the partial result
-    /// — the 24h grace absorbs the racy candidate (next sweep will
-    /// either re-pin it or sustain it as candidate).
+    /// Max barrier-restart attempts inside a single sweep, for the
+    /// bundle + snapshot-blob sweeps. Those walk key spaces of a few
+    /// hundred entries, so a restart is cheap and keeps their
+    /// classification exact. The chunk sweep does NOT restart — see
+    /// `run_mark_pass`. Defaults to 3.
     pub max_restart_attempts: u32,
+    /// Keys fetched per `list_prefix_page` call in the mark pass.
+    /// 1000 is the GCS per-page ceiling, so asking for more buys
+    /// nothing. Defaults to 1000. Override via
+    /// `ENGRAM_CHUNK_GC_LIST_PAGE_SIZE`.
+    pub list_page_size: usize,
     /// Concurrent manifest fetches inside `PinSet::collect`.
     ///
     /// The chunk-store default is 16, whose own doc sizes it for
@@ -112,6 +120,7 @@ impl Default for ChunkGcConfig {
             grace_period: Duration::from_secs(86400),
             max_restart_attempts: 3,
             pin_set_concurrency: 64,
+            list_page_size: 1000,
             promote_batch_size: 10_000,
             promote_concurrency: 64,
             promote_max_per_sweep: 200_000,
@@ -140,6 +149,11 @@ impl ChunkGcConfig {
         if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_PIN_SET_CONCURRENCY") {
             if let Ok(n) = v.parse::<usize>() {
                 cfg.pin_set_concurrency = n.max(1);
+            }
+        }
+        if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_LIST_PAGE_SIZE") {
+            if let Ok(n) = v.parse::<usize>() {
+                cfg.list_page_size = n.clamp(1, 1000);
             }
         }
         if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_PROMOTE_CONCURRENCY") {
@@ -184,14 +198,12 @@ pub struct SweepReport {
     /// was upserted as a candidate; in `DryRun` this is what
     /// *would* be marked.
     pub candidates_marked: usize,
-    /// How many sweep iterations ran inside this call. `>1` means
-    /// the chunk_generation barrier triggered restarts.
-    pub restart_count: u32,
-    /// Whether the sweep hit `max_restart_attempts` and accepted
-    /// the partial result anyway. `true` is benign but worth a
-    /// warn-log — it signals continuous-flush pressure outpacing
-    /// sweep duration.
-    pub restart_budget_exhausted: bool,
+    /// Whether `chunk_generation` moved while the mark pass walked the
+    /// chunk space — a flush / enable_image / record_snapshot raced the
+    /// sweep. Benign: the mark pass only adds candidate rows, and the
+    /// promote pass re-verifies the live pin set before deleting. Kept
+    /// as a diagnostic for pin-churn pressure.
+    pub generation_moved: bool,
     /// Promote-pass: candidates whose first_seen_at predated the
     /// grace cutoff and were deleted from BlobStorage + the
     /// candidate table. Always 0 in `DryRun`.
@@ -315,71 +327,62 @@ async fn run_mark_pass(
     mode: SweepMode,
     report: &mut SweepReport,
 ) -> Result<(), GcError> {
-    // -------- barrier-bounded classification loop --------
-    loop {
-        let gen_before = meta.chunk_generation().await?;
-        let pin_set =
-            PinSet::collect_with_concurrency(meta, chunk_store, cfg.pin_set_concurrency).await?;
+    let gen_before = meta.chunk_generation().await?;
+    let pin_set =
+        PinSet::collect_with_concurrency(meta, chunk_store, cfg.pin_set_concurrency).await?;
 
-        // Reset per-iteration counters so a restart doesn't double-
-        // count from the previous iteration. The barrier means only
-        // the LAST iteration's classification is authoritative.
-        let keys = blob
-            .list_prefix("chunks/sha256/")
+    // Walk the chunk space one page at a time. Buffering the whole
+    // listing was the prod failure: at ~110M keys every `list_prefix`
+    // blew its 300s deadline, and the Vec would have been GBs of coord
+    // heap if it had ever returned. A page carries its own deadline and
+    // its own memory, so the walk scales with the bucket.
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = blob
+            .list_prefix_page(CHUNK_PREFIX, cursor.as_deref(), cfg.list_page_size)
             .await
             .map_err(|e| GcError::ChunkStore(engram_chunk_store::ChunkStoreError::Blob(e)))?;
-        let listed = keys.len();
-        let mut malformed = 0usize;
-        let mut candidates_marked = 0usize;
 
-        for key in &keys {
+        for key in &page.keys {
             let Some(hash) = ChunkHash::from_storage_key(key) else {
-                malformed += 1;
+                report.malformed_keys += 1;
                 continue;
             };
             if pin_set.contains(&hash) {
                 continue;
             }
-            candidates_marked += 1;
+            report.candidates_marked += 1;
             if mode == SweepMode::Full {
                 meta.upsert_chunk_gc_candidate(*hash.as_bytes()).await?;
             }
         }
+        report.listed_chunks += page.keys.len();
 
-        // Barrier check: if chunk_generation ticked, our pin set is
-        // stale — restart with a fresh collection. Bounded retries
-        // prevent continuous-flush livelock.
-        let gen_after = meta.chunk_generation().await?;
-        if gen_after == gen_before {
-            report.listed_chunks = listed;
-            report.malformed_keys = malformed;
-            report.pin_set_size = pin_set.len();
-            report.candidates_marked = candidates_marked;
-            break;
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
         }
+    }
+    report.pin_set_size = pin_set.len();
 
-        report.restart_count += 1;
-        if report.restart_count >= cfg.max_restart_attempts {
-            // Accept the partial result. The 24h grace + next
-            // sweep's re-classification cover any racy candidates.
-            tracing::warn!(
-                gen_before,
-                gen_after,
-                restart_count = report.restart_count,
-                "chunk-gc sweep exhausted restart budget; accepting partial result"
-            );
-            report.restart_budget_exhausted = true;
-            report.listed_chunks = listed;
-            report.malformed_keys = malformed;
-            report.pin_set_size = pin_set.len();
-            report.candidates_marked = candidates_marked;
-            break;
-        }
-        tracing::info!(
+    // The barrier is now a DIAGNOSTIC, not a restart trigger. It used to
+    // re-run the whole classification when `chunk_generation` ticked
+    // mid-sweep. That never made the sweep safer — the mark pass only
+    // ever ADDS candidate rows, and the promote pass re-verifies the live
+    // pin set before it deletes anything, which is the actual durability
+    // guard. At prod scale the restart was guaranteed waste: a full walk
+    // takes minutes and the generation ticks ~2.3x/min, so every sweep
+    // would burn its whole restart budget and then accept the partial
+    // result anyway — 4 walks of the chunk space for one sweep's worth of
+    // marking. A chunk pinned mid-walk is marked, then rescued at promote
+    // time, exactly as a chunk pinned between sweeps already was.
+    let gen_after = meta.chunk_generation().await?;
+    if gen_after != gen_before {
+        report.generation_moved = true;
+        tracing::debug!(
             gen_before,
             gen_after,
-            restart_count = report.restart_count,
-            "chunk-gc sweep restarting on barrier bump"
+            "chunk-gc mark pass raced a pin change; promote-time re-verification covers it"
         );
     }
 
@@ -674,8 +677,7 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
                     promoted = report.promoted_deletes,
                     repinned_skips = report.promote_repinned_skips,
                     promote_errors = report.promote_delete_errors,
-                    restart_count = report.restart_count,
-                    restart_budget_exhausted = report.restart_budget_exhausted,
+                    generation_moved = report.generation_moved,
                     mark_error = report.mark_error.as_deref().unwrap_or(""),
                     "chunk-gc sweep done"
                 );
