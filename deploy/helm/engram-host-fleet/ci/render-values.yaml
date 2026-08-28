@@ -1,0 +1,8 @@
+# CI render stubs (the `deploy-config` lane in ci.yml). The chart
+# fail-fasts on these required deployment values by design, so a bare
+# `helm template` can never render; this file is the MINIMUM stub set
+# that satisfies the guards. It is not a deployment example. New
+# required-value guards must add a stub here or the lane goes red.
+egress:
+  caGcpCertSecret: projects/ci/secrets/ci-cert/versions/latest
+  caGcpKeySecret: projects/ci/secrets/ci-key/versions/latest

@@ -138,6 +138,7 @@ jobs:
       test_cli: ${{ steps.lanes.outputs.test_cli }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
       test_integrations_cli: ${{ steps.lanes.outputs.test_integrations_cli }}
+      test_deploy: ${{ steps.lanes.outputs.test_deploy }}
       # The container-image lane. The detector has always computed these; until
       # now nothing on a PR consumed them, so a Dockerfile-only change ran no
       # lane at all and the gate passed on an unbuilt image.
@@ -186,6 +187,77 @@ jobs:
           env GITHUB_OUTPUT=/tmp/lanes-rs.env python3 \
             .github/scripts/detect-rebake-lanes.py --stdin <<< 'Cargo.lock'
           grep -qxF 'dockerfiles=false' /tmp/lanes-rs.env
+
+  # ADR 0122: the deploy templates are user-facing product surface once
+  # the repo is open source — a broken chart or module is a broken
+  # install for someone we never meet. Lint + render every chart with
+  # every shipped overlay (REPLACE_* placeholders stubbed), and
+  # fmt/validate every terraform root. Path-gated on deploy/terraform +
+  # deploy/helm via the detector's test_deploy flag.
+  deploy-config:
+    name: terraform + helm
+    needs: detect
+    if: needs.detect.outputs.test_deploy == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v7
+      # The Blacksmith runner image ships helm but not terraform.
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Tool versions
+        run: |
+          helm version
+          terraform version
+      # The charts fail-fast on required deployment values by design
+      # (bucket, KMS resource, CA secret paths), so bare defaults never
+      # render. Each chart ships `ci/render-values.yaml` — the minimum
+      # stub set that satisfies its required-value guards — and every
+      # shipped overlay renders LAYERED on it, the way a user's
+      # filled-in copy sits on their base values.
+      - name: helm lint + template (ci render values)
+        run: |
+          set -euo pipefail
+          for chart in deploy/helm/*/; do
+            [ -f "$chart/Chart.yaml" ] || continue
+            echo "==> lint $chart"
+            helm lint "$chart" -f "$chart/ci/render-values.yaml"
+            echo "==> template $chart (ci render values)"
+            helm template test-release "$chart" \
+              -f "$chart/ci/render-values.yaml" > /dev/null
+          done
+      - name: helm template (every shipped overlay, placeholders stubbed)
+        run: |
+          set -euo pipefail
+          for chart in deploy/helm/*/; do
+            [ -f "$chart/Chart.yaml" ] || continue
+            for overlay in "$chart"values-*.yaml.example; do
+              [ -e "$overlay" ] || continue
+              stub="$(mktemp)"
+              # REPLACE_* placeholders become syntactically valid stub
+              # values so the overlay renders as a user's filled-in copy
+              # would. `stub` is safe for every current placeholder kind
+              # (bucket, project, region, domain, resource path, IP).
+              sed -E 's/REPLACE_[A-Z_]+/stub/g' "$overlay" > "$stub"
+              echo "==> template $chart with $(basename "$overlay")"
+              helm template test-release "$chart" \
+                -f "$chart/ci/render-values.yaml" -f "$stub" > /dev/null
+            done
+          done
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive -diff deploy/terraform
+      - name: terraform validate (every root)
+        run: |
+          set -euo pipefail
+          # Every directory holding .tf files validates standalone —
+          # modules included, since each is a BYO-cluster composition
+          # unit for OSS users, not just an internal include.
+          find deploy/terraform -name '*.tf' -not -path '*/.terraform/*' \
+            | xargs -n1 dirname | sort -u | while read -r dir; do
+            echo "==> validate $dir"
+            terraform -chdir="$dir" init -backend=false -input=false > /dev/null
+            terraform -chdir="$dir" validate -no-color
+          done
 
   integrations-cli:
     name: integrations CLI bundle
@@ -2382,6 +2454,9 @@ jobs:
       # A Dockerfile-only change used to run nothing at all; this lane is the
       # one that now proves the image still builds.
       - build-images
+      # ADR 0122: helm lint/template + terraform fmt/validate. A
+      # deploy-template-only change used to run nothing at all.
+      - deploy-config
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Check lane results

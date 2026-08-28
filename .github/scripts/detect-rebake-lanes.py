@@ -570,6 +570,10 @@ def main():
     # buf only lints/breaking-checks/codegen-drifts the protos.
     test_buf = ci_self or proto
     test_integrations_cli = ci_self or any_path(changed, INTEGRATIONS_CLI_PATHS)
+    # ADR 0122: the deploy-config lane (helm lint/template + terraform
+    # fmt/validate). Same path set as the bake-side tf_or_helm flag,
+    # plus ci_self like every test lane.
+    test_deploy = ci_self or tf_or_helm
     # ADR 0098 P9: the host-sim swarm — its binary's own release closure.
     test_host_sim = ci_self or bool(cc & host_sim_closure)
     # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
@@ -652,7 +656,8 @@ def main():
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
           f"test_cli={test_cli} test_buf={test_buf} ci_self={ci_self} proto={proto} "
           f"test_host_sim={test_host_sim} test_cosim={test_cosim} "
-          f"test_integrations_cli={test_integrations_cli}",
+          f"test_integrations_cli={test_integrations_cli} "
+          f"test_deploy={test_deploy}",
           file=sys.stderr)
     print(f"-> dockerfiles={dockerfiles}", file=sys.stderr)
     print(f"-> images_matrix={images_matrix}", file=sys.stderr)
@@ -688,6 +693,7 @@ def main():
             f.write(f"test_host_sim={b(test_host_sim)}\n")
             f.write(f"test_cosim={b(test_cosim)}\n")
             f.write(f"test_integrations_cli={b(test_integrations_cli)}\n")
+            f.write(f"test_deploy={b(test_deploy)}\n")
             # Per-image bake matrix (JSON array → fromJSON in bake-images.yml).
             f.write(f"images_matrix={json.dumps(images_matrix)}\n")
 
