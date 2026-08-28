@@ -37,10 +37,12 @@ quickstart/           ONE apply: all of the above + the KEK KMS key,
 
 ## Quickstart
 
-> **Cost + quota:** the default KVM shape is `m7i.metal-24xl`
-> (96 vCPU) × 2 — real money per hour, and a fresh account's
-> on-demand vCPU quota will not cover it without a service-quota
-> request. Read `docs/deploy-aws.md` first.
+> **Cost + quota:** the default KVM shape is `m8i.6xlarge` (24 vCPU,
+> nested virtualization) × 2 — 48 on-demand vCPUs, which a fresh
+> account's default quota may not cover. The metal alternative
+> (`m7i.metal-24xl`, for CPUID parity with a GCP C3 fleet) needs a
+> metal quota ticket and costs far more. Read `docs/deploy-aws.md`
+> first.
 
 ```sh
 cd deploy/terraform/aws/quickstart

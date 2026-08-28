@@ -252,9 +252,20 @@ conformance suite (ADR 0098 D4) extend in the same PR.
   them by git ref). `deploy/terraform/aws/modules/` mirrors the
   layout (`network`, `storage`, `eks-cluster` wrapping the pinned
   community EKS module, `kvm-nodegroup` as a self-managed ASG of
-  `m7i.metal-24xl` by default — Sapphire Rapids, deliberate CPUID
-  parity with GCP C3 so snapshots restore across clouds — `rds`,
-  `secrets`, `irsa`, `host-operator-iam`).
+  `m8i.6xlarge` by default — the nested-virtualization Xeon-6
+  shape twin of GCP's `c3-standard-22` (EC2 nested virt on virtual
+  C8i/M8i/R8i launched 2026-02; FC runs L2 exactly as it does on
+  GCP C3) — `rds`, `secrets`, `irsa`, `host-operator-iam`).
+  Amended 2026-08-28: the original default was `m7i.metal-24xl`
+  (metal was the only KVM-capable option at authoring time, and
+  Sapphire Rapids gives CPUID parity with C3 so one bake serves
+  both clouds). With nested virt on virtual shapes available, the
+  default optimizes for the single-cloud OSS deployer — no metal
+  quota ticket, ~3.5× cheaper entry, finer scaling — at the cost
+  of cross-cloud snapshot portability: m8i is Granite Rapids, so
+  an m8i fleet bakes its own images. `m7i.metal-24xl` remains the
+  documented choice for operators running both clouds who want
+  CPUID parity.
 - Each cloud gets a `quickstart/` root module: one apply from a fresh
   account to a running cluster — namespaces (fleet namespace
   PSA-privileged), External Secrets install and stores, optional
@@ -276,7 +287,8 @@ conformance suite (ADR 0098 D4) extend in the same PR.
 ## What cannot "just work" (documented manual steps)
 
 Secret-shell population (values must never enter Terraform state),
-DNS records and certificate waits, C3/metal vCPU quota tickets, the
+DNS records and certificate waits, vCPU quota tickets (GCP C3, and
+metal on the AWS CPUID-parity shape), the
 CPUID one-way door (moving to an older CPU platform requires
 re-baking every enabled image), the nested-virt pool invariants, and
 first-image enable plus OIDC client creation.

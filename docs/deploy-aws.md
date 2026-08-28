@@ -12,18 +12,25 @@ the deliberate per-cloud differences are marked ⚡ below.
 
 **Read this first — cost and quota**
 
-- The KVM fleet defaults to **2 × `m7i.metal-24xl`** (96 vCPUs
-  each). That is real money per hour — on-demand metal is on the
-  order of $10+/hr for the pair. Tear down when not in use.
-- A fresh account's **"Running On-Demand Standard instances" vCPU
-  quota will not cover 192 vCPUs.** Request the increase (Service
-  Quotas → EC2) before applying; grants can take hours to days.
-- KVM needs Intel hardware: bare metal (`*.metal`) or the Xeon-6
-  C8i/M8i/R8i shapes. No AMD, no Graviton. The m7i default is
-  Sapphire Rapids — CPUID parity with the GCP quickstart's C3, so
-  images baked on either fleet restore on the other. ⚡ If you pick
-  a different platform, remember CPUID is a one-way door: images
-  baked on newer silicon never restore on older.
+- The KVM fleet defaults to **2 × `m8i.6xlarge`** (24 vCPUs each,
+  nested virtualization) — the shape twin of the GCP quickstart's
+  `c3-standard-22`, roughly $2.9/hr for the pair. Tear down when
+  not in use.
+- Check your **"Running On-Demand Standard instances" vCPU quota**
+  covers the 48 fleet vCPUs plus the control-plane nodes; a fresh
+  account's default may not. Request the increase (Service Quotas →
+  EC2) before applying; grants can take hours to days.
+- KVM needs Intel hardware: the Xeon-6 C8i/M8i/R8i virtual shapes
+  (nested virtualization) or bare metal (`*.metal`). No AMD, no
+  Graviton.
+- ⚡ **CPUID is a one-way door.** m8i is Granite Rapids; the GCP
+  quickstart's C3 is Sapphire Rapids. Images baked on the default
+  AWS fleet are GNR-pinned and their snapshots never restore on a
+  C3 fleet (newer silicon never restores on older). If you run
+  BOTH clouds and want one bake serving them, set
+  `kvm_instance_type = "m7i.metal-24xl"` (Sapphire Rapids — metal
+  because m7i has no nested virt). That path is ~$10+/hr for the
+  pair and needs 192 vCPUs of quota.
 
 **What you need before starting**
 
@@ -42,8 +49,9 @@ aws service-quotas get-service-quota --region $REGION \
   --query 'Quota.Value'   # Running On-Demand Standard instances (vCPUs)
 ```
 
-Need ≥ 192 for the default fleet (plus the small control-plane
-nodes). Request more before continuing if short.
+Need ≥ 48 for the default fleet (plus the small control-plane
+nodes); ≥ 192 if you chose the metal parity shape. Request more
+before continuing if short.
 
 ## 2. Terraform: one apply
 
@@ -65,8 +73,9 @@ one-shot in-cluster Job creating the two logical databases), ⚡ the
 KEK as a real KMS key (`kek.provider: aws-kms` — no KEK secret to
 populate on AWS), the secret shells, every IRSA role, both
 namespaces, the AWS Load Balancer Controller, the External Secrets
-relay, and the ACM certificate request. Expect ~25 minutes; metal
-instances are the slow tail.
+relay, and the ACM certificate request. Expect ~20 minutes; the
+EKS control plane is the slow tail (metal instances take longer
+still, if you chose that shape).
 
 Cluster credentials:
 
@@ -180,13 +189,15 @@ the app: it breaks CORS preflights and WebSockets the same way IAP
 does). Then enable a first image and create a session against it —
 the end-to-end proof.
 
-⚡ If you are reusing images baked on the GCP fleet: the default
-platforms match (Sapphire Rapids both sides), so enabled images
-restore as-is. Any other pairing: re-bake.
+⚡ If you are reusing images baked on a GCP fleet: the default
+platforms do NOT match (AWS m8i = Granite Rapids, GCP C3 =
+Sapphire Rapids) — bake fresh on this fleet. Cross-cloud reuse
+works only on the `m7i.metal-24xl` parity shape (Sapphire Rapids
+both sides).
 
 ## Teardown
 
-Metal bills while it idles — tear down promptly:
+The fleet bills while it idles — tear down promptly:
 
 ```sh
 helm uninstall engram -n engrams; helm uninstall hf -n engrams-hosts
@@ -202,7 +213,7 @@ The bucket refuses destroy unless emptied
 
 | Symptom | Likely cause |
 |---|---|
-| KVM ASG stuck at 0/2 healthy | vCPU quota (step 1) or the metal shape isn't offered in a chosen AZ — check the ASG activity history. |
+| KVM ASG stuck at 0/2 healthy | vCPU quota (step 1) or the chosen shape isn't offered in a chosen AZ (m8i and metal availability varies by AZ) — check the ASG activity history. |
 | Pods CrashLoop on missing Secrets | Step 3 skipped — `kubectl get externalsecret -A` shows the sync state. |
 | Host-agent CrashLoops on the egress CA | The CA shells are empty, or the fleet IRSA role can't read them (it is scoped to exactly those two ARNs). |
 | Ingress has no ALB hostname | The AWS Load Balancer Controller isn't healthy (`kubectl get pods -n kube-system`), or the ACM cert isn't Issued yet. |
