@@ -541,19 +541,18 @@ For the in-guest agent, the fleet needs:
 
 ## Production deployment
 
-For multi-host production (coordinator on GKE behind a load balancer, a pool of FC host VMs on GCE), the topology is:
+Production runs on Kubernetes — GKE or EKS (ADR 0044/0122) — as two Helm releases in one cluster:
 
-- **`engram-coordinator --mode=coordinator`** as a stateless K8s `Deployment` with N replicas. Reads its bootstrap secrets (DB URL, KEK, egress-proxy CA, registry tokens) from env via projected k8s Secrets. Liveness probe on `/healthz`, readiness probe on `/readyz` (which pings Postgres). Replicas reconcile via `LISTEN/NOTIFY` and `pg_try_advisory_lock`.
-- **`engram-host-agent --sandbox-backend=firecracker`** on each GCE FC host. Self-registers via `ENGRAM_COORDINATOR_ENDPOINT` over WebSocket; the coordinator never has to reach back. Hosts are NAT-friendly and can come and go without inventory changes.
-- **GCP Secret Manager** via Workload Identity (the coordinator's k8s SA mapped to a GCP SA with `roles/secretmanager.secretAccessor`) backs per-image session secret resolution.
-- **GCS** for chunked-storage durability (`ENGRAM_BLOB_BACKEND=gcs`). Multi-GB FC `memory.bin` chunks stream through without materialising in host-agent RAM.
-- **`ENGRAM_LOG_FORMAT=json`** on both binaries for Cloud Logging ingestion.
+- **`engram` release**: the stateless coordinator `Deployment` (`--mode=coordinator`, N replicas — Postgres is the only authority, ADR 0047), the orchestrator (human auth — the deployment's login wall, ADR 0118), and the nginx web frontend. Liveness on `/healthz`, readiness on `/readyz`.
+- **`engram-host-fleet` release**: the Firecracker hosts as a privileged DaemonSet on a dedicated Intel nested-virt node pool, plus the rollout/autoscaling operator (drain-gated rolls that reattach to running VMs; queue-driven scale-up and teleport-packed scale-down — ADR 0044/0048). Host-agents register with the coordinator's in-cluster Service over HTTP.
+- **Blob tier**: GCS (`ENGRAM_BLOB_BACKEND=gcs`) or S3 (`s3`). Multi-GB FC `memory.bin` chunks stream through without materialising in RAM.
+- **Secrets + KEK**: GCP Secret Manager via Workload Identity, or AWS Secrets Manager + KMS via IRSA.
 
 Deployment artifacts ship in-tree:
-- [`deploy/helm/engram/`](./deploy/helm/engram/) — Helm chart, cloud-agnostic templates. Deploys the coordinator + optional nginx web frontend.
-- [`deploy/terraform/gcp/`](./deploy/terraform/gcp/) — GCP reference modules (network, storage, fc-host-gsa) + `examples/minimal/`.
+- [`deploy/helm/engram/`](./deploy/helm/engram/) + [`deploy/helm/engram-host-fleet/`](./deploy/helm/engram-host-fleet/) — the two charts, with per-cloud `values-{gcp,aws}.yaml.example` overlays.
+- [`deploy/terraform/`](./deploy/terraform/) — per-cloud modules + one-apply quickstarts (GCP and AWS).
 
-See [`docs/deploy.md`](./docs/deploy.md) for the full env-var inventory, the KEK + egress-proxy CA sourcing path, IAM/Workload-Identity wiring, and the operational gaps (observability, AWS Terraform, multi-region) still slated for v2 with their workarounds.
+See [`docs/deploy.md`](./docs/deploy.md) for the topology + env-var reference, and [`docs/deploy-gcp.md`](./docs/deploy-gcp.md) / [`docs/deploy-aws.md`](./docs/deploy-aws.md) for the step-by-step bring-ups.
 
 ## License
 
