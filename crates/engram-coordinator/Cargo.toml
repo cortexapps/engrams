@@ -36,6 +36,7 @@ engram-secrets-aws.workspace = true
 engram-git-github.workspace = true
 engram-egress-proxy.workspace = true
 engram-crypto.workspace = true
+engram-kms-aws.workspace = true
 engram-oci.workspace = true
 engram-oci-auth.workspace = true
 engram-storage-local.workspace = true

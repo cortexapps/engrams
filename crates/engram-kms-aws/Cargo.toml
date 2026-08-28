@@ -1,0 +1,29 @@
+[package]
+name = "engram-kms-aws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AWS KMS-backed MasterKeyProvider: real DEK wrap/unwrap via kms:Encrypt/Decrypt (ADR 0122)."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-aws.workspace = true
+engram-crypto.workspace = true
+async-trait.workspace = true
+# `default-features = false` is load-bearing on every aws-sdk crate —
+# see the aws sdk note in the root manifest (aws-lc-rs).
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio"] }
+# The per-call operation deadline (a stalled KMS response must fail
+# the seal/open, not wedge it).
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+base64.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"

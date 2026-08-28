@@ -102,6 +102,8 @@ struct Cli {
     /// `env-var` (default) reads a 32-byte key from `--kek-env-var`
     /// (default name `ENGRAM_KEK_MASTER_KEY`, base64-encoded).
     /// `gcp-kms` defers wrap/unwrap to a GCP KMS key (stub today).
+    /// `aws-kms` wraps/unwraps via AWS KMS on the SDK default chain
+    /// (IRSA in EKS) — ADR 0122; requires `--kek-aws-key-id`.
     #[arg(long, env = "ENGRAM_KEK_PROVIDER", value_parser = parse_kek_choice, default_value = "env-var")]
     kek_provider: KekChoice,
 
@@ -119,6 +121,12 @@ struct Cli {
     /// `--kek-provider gcp-kms` is in effect. Required for that mode.
     #[arg(long, env = "ENGRAM_KEK_GCP_RESOURCE")]
     kek_gcp_resource: Option<String>,
+
+    /// AWS KMS KeyId (key ARN preferred; a key id or `alias/...` also
+    /// works) when `--kek-provider aws-kms` is in effect. Required for
+    /// that mode.
+    #[arg(long, env = "ENGRAM_KEK_AWS_KEY_ID")]
+    kek_aws_key_id: Option<String>,
 
     /// Per-session SecretStore backend. `env` reads `$NAME` from the
     /// coordinator's host environment (dev / single-tenant). `gcp`
@@ -176,6 +184,7 @@ struct Cli {
 enum KekChoice {
     EnvVar,
     GcpKms,
+    AwsKms,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,8 +276,9 @@ fn parse_kek_choice(s: &str) -> Result<KekChoice, String> {
     match s {
         "env" | "env-var" | "envvar" => Ok(KekChoice::EnvVar),
         "gcp-kms" | "gcp" => Ok(KekChoice::GcpKms),
+        "aws-kms" | "aws" => Ok(KekChoice::AwsKms),
         other => Err(format!(
-            "unknown KEK provider `{other}` (expected env-var | gcp-kms)"
+            "unknown KEK provider `{other}` (expected env-var | gcp-kms | aws-kms)"
         )),
     }
 }
@@ -401,6 +411,16 @@ async fn main() -> Result<(), CoordinatorError> {
             Arc::new(
                 engram_crypto::GcpKmsProvider::new(resource)
                     .map_err(|e| CoordinatorError::Config(format!("KEK gcp-kms: {e}")))?,
+            )
+        }
+        KekChoice::AwsKms => {
+            let key = cli.kek_aws_key_id.as_deref().ok_or_else(|| {
+                CoordinatorError::Config("--kek-provider aws-kms requires --kek-aws-key-id".into())
+            })?;
+            Arc::new(
+                engram_kms_aws::AwsKmsProvider::new(key)
+                    .await
+                    .map_err(|e| CoordinatorError::Config(format!("KEK aws-kms: {e}")))?,
             )
         }
     };
