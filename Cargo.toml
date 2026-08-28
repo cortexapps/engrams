@@ -45,6 +45,7 @@ members = [
     "crates/engram-crypto",
     "crates/engram-tls",
     "crates/engram-aws",
+    "crates/engram-cloud-aws",
     "crates/engram-oci",
     "crates/engram-oci-auth",
     "crates/engram-storage-local",
@@ -101,6 +102,7 @@ engram-sim = { path = "crates/engram-sim" }
 engram-testkit = { path = "crates/engram-testkit" }
 engram-sandbox-firecracker = { path = "crates/engram-sandbox-firecracker" }
 engram-sandbox-vz = { path = "crates/engram-sandbox-vz" }
+engram-cloud-aws = { path = "crates/engram-cloud-aws" }
 engram-cloud-gcp = { path = "crates/engram-cloud-gcp" }
 engram-cloud-sql = { path = "crates/engram-cloud-sql" }
 engram-cloud-static = { path = "crates/engram-cloud-static" }
