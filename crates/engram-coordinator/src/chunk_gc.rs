@@ -558,6 +558,12 @@ async fn collect_pin_set_at_generation(
             return Ok(Some((pin_set, after)));
         }
     }
+    ::metrics::counter!(
+        crate::metrics::GC_PROMOTE_SKIPPED_TOTAL,
+        "sweep" => "chunk",
+        "reason" => "pin_set_unstable",
+    )
+    .increment(1);
     tracing::warn!(
         max_attempts,
         "chunk-gc promote: pin set kept moving under collect; skipping the drain this sweep \

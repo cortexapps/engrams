@@ -187,6 +187,12 @@ pub fn init(addr: SocketAddr) {
             ::metrics::counter!(GC_SWEEP_TOTAL, "sweep" => sweep, "outcome" => outcome).absolute(0);
         }
         ::metrics::counter!(GC_PROMOTE_ERRORS_TOTAL, "sweep" => sweep).absolute(0);
+        ::metrics::counter!(
+            GC_PROMOTE_SKIPPED_TOTAL,
+            "sweep" => sweep,
+            "reason" => "pin_set_unstable",
+        )
+        .absolute(0);
         ::metrics::counter!(GC_PROMOTED_TOTAL, "sweep" => sweep).absolute(0);
     }
 }
@@ -287,6 +293,19 @@ pub const GC_PROMOTED_TOTAL: &str = "engram_gc_promoted_total";
 /// for the next sweep to retry. Labels: `sweep`. A sustained rate means
 /// the blob tier is rejecting deletes.
 pub const GC_PROMOTE_ERRORS_TOTAL: &str = "engram_gc_promote_errors_total";
+/// Counter. Promote passes that declined to delete because the pin set
+/// could not be collected at a stable `chunk_generation`. Labels:
+/// `sweep`, `reason`.
+///
+/// Zero-normally, and the fail-SAFE direction: the sweep skipped a drain
+/// rather than delete against a set that might be missing a live re-pin.
+/// A sustained rate means reclamation has stalled — pair it with
+/// `engram_gc_candidate_backlog` (rising backlog + rising skips = the
+/// churn is outrunning the collect window; raise
+/// `ENGRAM_CHUNK_GC_PIN_SET_CONCURRENCY` to shorten it). Without this
+/// counter the stall is only a per-sweep warn log, which is exactly how
+/// the 43-day outage stayed invisible.
+pub const GC_PROMOTE_SKIPPED_TOTAL: &str = "engram_gc_promote_skipped_total";
 /// Counter. Expired candidates found RE-PINNED at delete time and
 /// skipped. Labels: `sweep`. The durability guard firing. A low rate is
 /// healthy (content-addressed chunks legitimately re-enter manifests);
