@@ -259,6 +259,16 @@ mod tests {
         blob_conformance::list_prefix_scoped(&store, 30).await;
     }
 
+    /// Local storage takes the trait's DEFAULT `list_prefix_page`, so
+    /// this is the coverage for that default — the walk every backend
+    /// without native pagination inherits.
+    #[tokio::test]
+    async fn conformance_list_prefix_page_walks_whole_prefix() {
+        let dir = tempdir().unwrap();
+        let store = LocalBlobStorage::new(dir.path());
+        blob_conformance::list_prefix_page_walks_whole_prefix(&store, 30, 7).await;
+    }
+
     #[tokio::test]
     async fn keys_with_traversal_segments_rejected() {
         let dir = tempdir().unwrap();

@@ -388,17 +388,25 @@ message ChunkGcResponse {
   // Unpinned chunks observed. In full mode each was upserted as a
   // candidate; in dry-run this is what WOULD be marked.
   uint64 candidates_marked = 4;
-  // Sweep iterations inside this call; >1 means the chunk_generation
-  // barrier triggered restarts.
-  uint32 restart_count = 5;
-  // The sweep hit max_restart_attempts and accepted the partial result.
-  bool restart_budget_exhausted = 6;
+  // 5, 6 were restart_count / restart_budget_exhausted. The chunk
+  // sweep no longer restarts on a barrier bump: the mark pass only
+  // adds candidate rows and the promote pass re-verifies the live pin
+  // set before deleting, so a restart bought no safety and, at prod
+  // scale, guaranteed 4 walks of the chunk space per sweep.
+  reserved 5, 6;
   // Promote-pass deletions (BlobStorage + candidate table). Always 0 in
   // dry-run.
   uint64 promoted_deletes = 7;
   uint64 promote_delete_errors = 8;
   // Echoes the grace_secs used (override or config default).
   uint64 grace_secs = 9;
+  // chunk_generation moved while the mark pass walked the chunk space.
+  // Benign; diagnostic for pin-churn pressure.
+  bool generation_moved = 10;
+  // Set when the mark pass failed. The promote pass still ran, so
+  // promoted_deletes stays meaningful; listed_chunks and
+  // candidates_marked do not.
+  optional string mark_error = 11;
 }
 
 message BundleGcRequest {

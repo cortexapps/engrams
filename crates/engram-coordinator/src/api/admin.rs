@@ -898,10 +898,16 @@ pub struct ChunkGcSweepResult {
     pub malformed_keys: usize,
     pub pin_set_size: usize,
     pub candidates_marked: usize,
-    pub restart_count: u32,
-    pub restart_budget_exhausted: bool,
+    /// `chunk_generation` moved while the mark pass walked the chunk
+    /// space. Benign — promote re-verifies the live pin set before it
+    /// deletes. Diagnostic for pin-churn pressure.
+    pub generation_moved: bool,
     pub promoted_deletes: usize,
     pub promote_delete_errors: usize,
+    /// Present when the mark pass failed. The promote pass still ran,
+    /// so `promoted_deletes` is meaningful even here; `listed_chunks`
+    /// and `candidates_marked` are not.
+    pub mark_error: Option<String>,
     /// Echoes the grace_secs used (whether from query override or
     /// the config default). Diagnostic for the
     /// "promoted_deletes=0, why?" investigation path.
@@ -916,10 +922,10 @@ impl From<(crate::chunk_gc::SweepReport, u64)> for ChunkGcSweepResult {
             malformed_keys: r.malformed_keys,
             pin_set_size: r.pin_set_size,
             candidates_marked: r.candidates_marked,
-            restart_count: r.restart_count,
-            restart_budget_exhausted: r.restart_budget_exhausted,
+            generation_moved: r.generation_moved,
             promoted_deletes: r.promoted_deletes,
             promote_delete_errors: r.promote_delete_errors,
+            mark_error: r.mark_error,
             grace_secs,
         }
     }

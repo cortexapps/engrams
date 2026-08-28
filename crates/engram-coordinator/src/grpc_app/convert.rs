@@ -554,10 +554,10 @@ pub(crate) fn chunk_gc_result_to_proto(
         malformed_keys,
         pin_set_size,
         candidates_marked,
-        restart_count,
-        restart_budget_exhausted,
+        generation_moved,
         promoted_deletes,
         promote_delete_errors,
+        mark_error,
         grace_secs,
     } = r;
     app::ChunkGcResponse {
@@ -565,10 +565,10 @@ pub(crate) fn chunk_gc_result_to_proto(
         malformed_keys: malformed_keys as u64,
         pin_set_size: pin_set_size as u64,
         candidates_marked: candidates_marked as u64,
-        restart_count,
-        restart_budget_exhausted,
+        generation_moved,
         promoted_deletes: promoted_deletes as u64,
         promote_delete_errors: promote_delete_errors as u64,
+        mark_error,
         grace_secs,
     }
 }

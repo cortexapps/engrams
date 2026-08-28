@@ -72,7 +72,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use engram_core::error::BlobError;
-use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream};
+use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream, ListPage};
 
 /// Whether an error is worth another attempt. `Sdk` carries the SDK
 /// backends' transport failures (they fold IO errors into it);
@@ -287,6 +287,31 @@ impl BlobStorage for BlobClient {
             let inner = self.inner.clone();
             let prefix = prefix.to_owned();
             async move { inner.list_prefix(&prefix).await }
+        })
+        .await
+    }
+
+    /// Forwarded, NOT left to the trait default — the default would call
+    /// `self.list_prefix` and put the whole listing back under one
+    /// deadline, which is the failure this method exists to avoid. One
+    /// page is a single round-trip, so it takes the ordinary
+    /// `attempt_timeout` rather than the generous `list_timeout`.
+    async fn list_prefix_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage, BlobError> {
+        let deadline = Some(self.policy.attempt_timeout);
+        self.with_retry("list_prefix_page", deadline, || {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_owned();
+            let cursor = cursor.map(str::to_string);
+            async move {
+                inner
+                    .list_prefix_page(&prefix, cursor.as_deref(), limit)
+                    .await
+            }
         })
         .await
     }

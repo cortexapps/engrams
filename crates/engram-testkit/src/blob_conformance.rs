@@ -226,3 +226,79 @@ pub async fn list_prefix_scoped(store: &dyn BlobStorage, n: usize) {
         let _ = store.delete(&format!("{other_prefix}{i}.bin")).await;
     }
 }
+
+/// Walking a prefix with `list_prefix_page` must return exactly the same
+/// key set as `list_prefix`, in bounded pages, terminating on its own.
+///
+/// This is the scale-safe listing surface. Every backend gets it — real
+/// ones by native pagination, small ones by the trait default — and both
+/// must agree with the whole-listing call, or the chunk-GC mark pass
+/// silently classifies the wrong set.
+pub async fn list_prefix_page_walks_whole_prefix(store: &dyn BlobStorage, n: usize, page: usize) {
+    let base = unique_prefix("listpage");
+    let prefix = format!("{base}/in/");
+    let other_prefix = format!("{base}-other/");
+
+    for i in 0..n {
+        store
+            .put(&format!("{prefix}{i:06}.bin"), Bytes::from(format!("v{i}")))
+            .await
+            .expect("put");
+    }
+    for i in 0..5 {
+        store
+            .put(&format!("{other_prefix}{i}.bin"), Bytes::from_static(b"x"))
+            .await
+            .expect("put");
+    }
+
+    let mut walked: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    // Generous bound: enough pages to cover n, plus slack. Trips only if
+    // an implementation never reports the last page.
+    let max_pages = n / page.max(1) + 8;
+    let mut pages = 0usize;
+    loop {
+        let got = store
+            .list_prefix_page(&prefix, cursor.as_deref(), page)
+            .await
+            .expect("list_prefix_page");
+        assert!(
+            got.keys.len() <= page,
+            "page returned {} keys, over the {page} limit",
+            got.keys.len()
+        );
+        walked.extend(got.keys);
+        pages += 1;
+        assert!(
+            pages <= max_pages,
+            "walk did not terminate after {pages} pages"
+        );
+        match got.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert!(
+        pages > 1,
+        "n={n} page={page} should need more than one page"
+    );
+
+    let walked_set: HashSet<String> = walked.iter().cloned().collect();
+    assert_eq!(
+        walked_set.len(),
+        walked.len(),
+        "the paged walk yielded duplicate keys"
+    );
+    let whole: HashSet<String> = store
+        .list_prefix(&prefix)
+        .await
+        .expect("list_prefix")
+        .into_iter()
+        .collect();
+    assert_eq!(
+        walked_set, whole,
+        "the paged walk and the whole listing must agree"
+    );
+    assert_eq!(walked_set.len(), n, "expected {n} keys under {prefix}");
+}

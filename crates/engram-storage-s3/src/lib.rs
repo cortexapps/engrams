@@ -48,7 +48,7 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 
 use engram_core::error::BlobError;
-use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream};
+use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream, ListPage};
 
 /// Multipart flush threshold. Parts are `[PART_SIZE, PART_SIZE +
 /// last-frame)` bytes — comfortably above S3's 5 MiB part minimum and
@@ -459,6 +459,39 @@ impl BlobStorage for S3BlobStorage {
         }
         Ok(out)
     }
+
+    /// Native single-page listing: one `ListObjectsV2` round-trip, the
+    /// S3 continuation token carried through verbatim as the cursor.
+    /// The whole-listing `list_prefix` above puts every page under one
+    /// client deadline, which does not survive an unbounded prefix —
+    /// the GCS deployment hit exactly that on the chunk space.
+    async fn list_prefix_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage, BlobError> {
+        let mut req = self.client.list_objects_v2().bucket(&self.bucket);
+        if !prefix.is_empty() {
+            req = req.prefix(prefix);
+        }
+        if let Some(token) = cursor {
+            req = req.continuation_token(token);
+        }
+        // S3 caps a page at 1000 regardless of what we ask for.
+        req = req.max_keys(limit.clamp(1, 1000) as i32);
+        let resp = req.send().await.map_err(sdk_err)?;
+        let keys = resp
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key().map(str::to_string))
+            .collect();
+        let next = match resp.next_continuation_token {
+            Some(t) if !t.is_empty() => Some(t),
+            _ => None,
+        };
+        Ok(ListPage { keys, next })
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +678,16 @@ mod tests {
             return;
         };
         blob_conformance::list_prefix_scoped(&store, 1500).await;
+    }
+
+    /// The paged walk must agree with the whole listing — the surface
+    /// the chunk-GC mark pass uses, over S3's native continuation token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conformance_list_prefix_page_walks_whole_prefix_against_emulator() {
+        let Some(store) = emulator_store().await else {
+            return;
+        };
+        blob_conformance::list_prefix_page_walks_whole_prefix(&store, 350, 100).await;
     }
 
     /// S3-specific atomicity: fail the stream AFTER a part has been

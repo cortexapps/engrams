@@ -42,4 +42,4 @@ pub use sandbox::{
 pub use secrets::{
     LayeredSecretStore, ResolvedSecret, SecretBundle, SecretContext, SecretStore, StaticSecretStore,
 };
-pub use storage::{BlobObjectMeta, BlobStorage, ByteStream};
+pub use storage::{BlobObjectMeta, BlobStorage, ByteStream, ListPage};
