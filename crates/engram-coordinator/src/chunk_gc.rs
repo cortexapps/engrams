@@ -558,6 +558,12 @@ async fn collect_pin_set_at_generation(
             return Ok(Some((pin_set, after)));
         }
     }
+    ::metrics::counter!(
+        crate::metrics::GC_PROMOTE_SKIPPED_TOTAL,
+        "sweep" => "chunk",
+        "reason" => "pin_set_unstable",
+    )
+    .increment(1);
     tracing::warn!(
         max_attempts,
         "chunk-gc promote: pin set kept moving under collect; skipping the drain this sweep \
@@ -646,6 +652,70 @@ async fn delete_one(
     (blob.delete(&key).await, hash_bytes)
 }
 
+/// What one sweep did, in the shape the metrics care about. The three
+/// sweeps have different report types but the same observable outcome,
+/// so they converge here rather than each growing its own emission
+/// block.
+pub(crate) struct SweepMetrics {
+    /// `chunk` / `bundle` / `snapshot_blob`.
+    pub sweep: &'static str,
+    /// `success` / `mark_failed` / `failed`.
+    pub outcome: &'static str,
+    pub listed: usize,
+    pub pinned: usize,
+    pub promoted: usize,
+    pub repinned_skips: usize,
+    pub promote_errors: usize,
+    pub elapsed: Duration,
+}
+
+/// The `outcome` label for a chunk sweep.
+///
+/// `mark_failed` is deliberately its own value rather than folded into
+/// either neighbour. The sweep did real work — the promote pass ran and
+/// deleted — so it is not `failed`; but the candidate set stopped being
+/// refreshed, so it is not `success` either. Collapsing it into
+/// `success` would have hidden the 43-day prod outage all over again,
+/// because once the promote pass is decoupled a broken mark pass still
+/// reports deletes.
+pub(crate) fn chunk_sweep_outcome(result: &Result<SweepReport, GcError>) -> &'static str {
+    match result {
+        Err(_) => "failed",
+        Ok(r) if r.mark_error.is_some() => "mark_failed",
+        Ok(_) => "success",
+    }
+}
+
+/// Emit one sweep's metrics.
+///
+/// Before this existed the GC had NO metric surface at all, which is why
+/// the chunk sweep could fail on every tick for 43 days unnoticed: a
+/// sweep that never succeeds produced exactly the same dashboard as one
+/// that works. `engram_gc_sweep_total{sweep,outcome}` is the liveness
+/// signal to alert on.
+pub(crate) fn record_sweep_metrics(m: &SweepMetrics) {
+    ::metrics::counter!(
+        crate::metrics::GC_SWEEP_TOTAL,
+        "sweep" => m.sweep,
+        "outcome" => m.outcome,
+    )
+    .increment(1);
+    ::metrics::histogram!(crate::metrics::GC_SWEEP_SECONDS, "sweep" => m.sweep)
+        .record(m.elapsed.as_secs_f64());
+    ::metrics::counter!(crate::metrics::GC_PROMOTED_TOTAL, "sweep" => m.sweep)
+        .increment(m.promoted as u64);
+    ::metrics::counter!(crate::metrics::GC_PROMOTE_ERRORS_TOTAL, "sweep" => m.sweep)
+        .increment(m.promote_errors as u64);
+    ::metrics::counter!(crate::metrics::GC_REPINNED_SKIPS_TOTAL, "sweep" => m.sweep)
+        .increment(m.repinned_skips as u64);
+    // Only meaningful when the mark pass completed; a failed mark leaves
+    // both at whatever it walked before erroring.
+    if m.outcome == "success" {
+        ::metrics::gauge!(crate::metrics::GC_LISTED_KEYS, "sweep" => m.sweep).set(m.listed as f64);
+        ::metrics::gauge!(crate::metrics::GC_PINNED_KEYS, "sweep" => m.sweep).set(m.pinned as f64);
+    }
+}
+
 /// Background sweep loop. Spawned from coord startup; ticks every
 /// `cfg.interval` and runs a `Full` sweep. Errors log but don't
 /// abort the loop — a transient PG or BlobStorage hiccup shouldn't
@@ -667,7 +737,50 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        match run_one_sweep(&state, &cfg, SweepMode::Full).await {
+        let started = state.services.clock.now_utc();
+        let sweep_result = run_one_sweep(&state, &cfg, SweepMode::Full).await;
+        let elapsed = (state.services.clock.now_utc() - started)
+            .to_std()
+            .unwrap_or_default();
+        match &sweep_result {
+            Ok(report) => {
+                record_sweep_metrics(&SweepMetrics {
+                    sweep: "chunk",
+                    outcome: chunk_sweep_outcome(&sweep_result),
+                    listed: report.listed_chunks,
+                    pinned: report.pin_set_size,
+                    promoted: report.promoted_deletes,
+                    repinned_skips: report.promote_repinned_skips,
+                    promote_errors: report.promote_delete_errors,
+                    elapsed,
+                });
+            }
+            Err(_) => {
+                record_sweep_metrics(&SweepMetrics {
+                    sweep: "chunk",
+                    outcome: chunk_sweep_outcome(&sweep_result),
+                    listed: 0,
+                    pinned: 0,
+                    promoted: 0,
+                    repinned_skips: 0,
+                    promote_errors: 0,
+                    elapsed,
+                });
+            }
+        }
+        // The backlog gauge is the "is GC keeping up" signal — it reached
+        // 8.9M before anyone looked. Read it after the sweep so it
+        // reflects this tick's deletes.
+        match state.services.meta.count_gc_candidates().await {
+            Ok(n) => {
+                ::metrics::gauge!(crate::metrics::GC_CANDIDATE_BACKLOG, "sweep" => "chunk")
+                    .set(n as f64);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "chunk-gc: could not read the candidate backlog");
+            }
+        }
+        match sweep_result {
             Ok(report) => {
                 tracing::info!(
                     listed = report.listed_chunks,
@@ -689,15 +802,39 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
         // ADR 0035 §5: the bundle-generation sweep rides the same tick,
         // barrier, and grace config. Tiny key space (handfuls of
         // generations), so no separate cadence.
-        match crate::bundle_gc::run_one_bundle_sweep(
+        let bundle_started = state.services.clock.now_utc();
+        let bundle_result = crate::bundle_gc::run_one_bundle_sweep(
             state.services.meta.clone(),
             state.services.blob.clone(),
             &cfg,
             SweepMode::Full,
             &state.services.clock,
         )
-        .await
-        {
+        .await;
+        let bundle_elapsed = (state.services.clock.now_utc() - bundle_started)
+            .to_std()
+            .unwrap_or_default();
+        record_sweep_metrics(&SweepMetrics {
+            sweep: "bundle",
+            outcome: if bundle_result.is_ok() {
+                "success"
+            } else {
+                "failed"
+            },
+            listed: bundle_result.as_ref().map(|r| r.listed).unwrap_or(0),
+            pinned: bundle_result.as_ref().map(|r| r.pin_set_size).unwrap_or(0),
+            promoted: bundle_result
+                .as_ref()
+                .map(|r| r.promoted_deletes)
+                .unwrap_or(0),
+            repinned_skips: 0,
+            promote_errors: bundle_result
+                .as_ref()
+                .map(|r| r.promote_delete_errors)
+                .unwrap_or(0),
+            elapsed: bundle_elapsed,
+        });
+        match bundle_result {
             Ok(report) => {
                 tracing::info!(
                     listed = report.listed,
@@ -718,15 +855,42 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
         // `snapshots` row, swept when the row is gone. Replaces the
         // host's inline abort-delete that could brick a recorded
         // snapshot.
-        match crate::snapshot_blob_gc::run_one_snapshot_blob_sweep(
+        let snap_started = state.services.clock.now_utc();
+        let snap_result = crate::snapshot_blob_gc::run_one_snapshot_blob_sweep(
             state.services.meta.clone(),
             state.services.blob.clone(),
             &cfg,
             SweepMode::Full,
             &state.services.clock,
         )
-        .await
-        {
+        .await;
+        let snap_elapsed = (state.services.clock.now_utc() - snap_started)
+            .to_std()
+            .unwrap_or_default();
+        record_sweep_metrics(&SweepMetrics {
+            sweep: "snapshot_blob",
+            outcome: if snap_result.is_ok() {
+                "success"
+            } else {
+                "failed"
+            },
+            listed: snap_result.as_ref().map(|r| r.listed).unwrap_or(0),
+            pinned: snap_result.as_ref().map(|r| r.pin_set_size).unwrap_or(0),
+            promoted: snap_result
+                .as_ref()
+                .map(|r| r.promoted_deletes)
+                .unwrap_or(0),
+            repinned_skips: snap_result
+                .as_ref()
+                .map(|r| r.promote_repinned_skips)
+                .unwrap_or(0),
+            promote_errors: snap_result
+                .as_ref()
+                .map(|r| r.promote_delete_errors)
+                .unwrap_or(0),
+            elapsed: snap_elapsed,
+        });
+        match snap_result {
             Ok(report) => {
                 tracing::info!(
                     listed = report.listed,
@@ -784,6 +948,42 @@ mod tests {
         let cfg = ChunkGcConfig::from_env();
         assert!(cfg.enabled);
         std::env::remove_var("ENGRAM_CHUNK_GC_ENABLED");
+    }
+
+    #[test]
+    fn outcome_distinguishes_a_failed_mark_from_a_healthy_sweep() {
+        let healthy = Ok(SweepReport {
+            listed_chunks: 10,
+            candidates_marked: 2,
+            ..Default::default()
+        });
+        assert_eq!(chunk_sweep_outcome(&healthy), "success");
+
+        // The shape that ran unnoticed in prod for 43 days: the mark pass
+        // is dead, but the promote pass still deletes. It must NOT report
+        // as success, or the liveness alert can never fire.
+        let mark_dead = Ok(SweepReport {
+            promoted_deletes: 9000,
+            mark_error: Some("attempt deadline 300s exceeded".into()),
+            ..Default::default()
+        });
+        assert_eq!(chunk_sweep_outcome(&mark_dead), "mark_failed");
+
+        let dead = Err(GcError::ChunkStore(
+            engram_chunk_store::ChunkStoreError::Blob(engram_core::BlobError::NotFound),
+        ));
+        assert_eq!(chunk_sweep_outcome(&dead), "failed");
+    }
+
+    #[test]
+    fn list_page_size_is_clamped_to_the_backend_ceiling() {
+        // GCS and S3 both cap a page at 1000; a larger request would
+        // silently return 1000 anyway, and 0 would never advance.
+        for (set, want) in [("0", 1), ("50", 50), ("100000", 1000)] {
+            std::env::set_var("ENGRAM_CHUNK_GC_LIST_PAGE_SIZE", set);
+            assert_eq!(ChunkGcConfig::from_env().list_page_size, want);
+        }
+        std::env::remove_var("ENGRAM_CHUNK_GC_LIST_PAGE_SIZE");
     }
 
     #[test]

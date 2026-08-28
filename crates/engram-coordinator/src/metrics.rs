@@ -118,6 +118,13 @@ pub fn init(addr: SocketAddr) {
             eviction_buckets,
         )
         .expect("install eviction histogram buckets")
+        // A chunk sweep walks the whole chunk space; at prod scale that is
+        // minutes, not the sub-30s the default `_seconds` spread resolves.
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(GC_SWEEP_SECONDS.to_string()),
+            eviction_buckets,
+        )
+        .expect("install gc-sweep histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(ENABLE_PRESTAGE_SECONDS.to_string()),
             prestage_buckets,
@@ -172,6 +179,22 @@ pub fn init(addr: SocketAddr) {
     ::metrics::counter!(OUTBOX_RESCAN_CLAIMED_TOTAL).absolute(0);
     ::metrics::counter!(SESSION_OP_RESCAN_CLAIMED_TOTAL).absolute(0);
     ::metrics::counter!(INITIAL_PROMPT_ENV_STAMPED_TOTAL).absolute(0);
+    // GC liveness: the alert is "no successful chunk sweep in 6h", so the
+    // success series must exist before the first success, and the failure
+    // series before the first failure.
+    for sweep in ["chunk", "bundle", "snapshot_blob"] {
+        for outcome in ["success", "mark_failed", "failed"] {
+            ::metrics::counter!(GC_SWEEP_TOTAL, "sweep" => sweep, "outcome" => outcome).absolute(0);
+        }
+        ::metrics::counter!(GC_PROMOTE_ERRORS_TOTAL, "sweep" => sweep).absolute(0);
+        ::metrics::counter!(
+            GC_PROMOTE_SKIPPED_TOTAL,
+            "sweep" => sweep,
+            "reason" => "pin_set_unstable",
+        )
+        .absolute(0);
+        ::metrics::counter!(GC_PROMOTED_TOTAL, "sweep" => sweep).absolute(0);
+    }
 }
 
 // ─── metric name constants ────────────────────────────────────────
@@ -240,6 +263,65 @@ pub const HOSTS_READY: &str = "engram_hosts_ready";
 /// between this and OUTBOX_ACKED going nonzero-and-growing is the
 /// alarmed "delivered but never acked" signal.
 pub const OUTBOX_DELIVERED_TOTAL: &str = "engram_outbox_delivered_total";
+/// Counter. One per GC sweep attempt. Labels: `sweep`
+/// (`chunk` / `bundle` / `snapshot_blob`) and `outcome`
+/// (`success` / `mark_failed` / `failed`).
+///
+/// THE liveness signal for garbage collection. The chunk sweep failed
+/// on every tick from 2026-07-16 to 2026-08-28 and nothing noticed,
+/// because the GC had no metrics at all — a sweep that fails 100% of
+/// the time produced the same dashboard as one that works. Alert on
+/// `increase(engram_gc_sweep_total{sweep="chunk",outcome="success"}[6h]) == 0`.
+///
+/// `mark_failed` is the partial outcome: the mark pass errored but the
+/// promote pass still ran and deleted. It is NOT success — the
+/// candidate set stopped being refreshed — but it is not a dead sweep
+/// either, so it gets its own value rather than collapsing into
+/// `failed`.
+pub const GC_SWEEP_TOTAL: &str = "engram_gc_sweep_total";
+/// Gauge. Rows in the sweep's candidate table after the last sweep.
+/// Labels: `sweep`. This is the backlog: it should fall toward zero
+/// once the grace period elapses. Monotonic growth means the promote
+/// pass is not keeping up (or is not running). It reached 8.9M for the
+/// chunk sweep before anyone looked.
+pub const GC_CANDIDATE_BACKLOG: &str = "engram_gc_candidate_backlog";
+/// Counter. Blobs actually deleted by a promote pass. Labels: `sweep`.
+/// Zero-normally is WRONG here — a healthy steady state deletes
+/// continuously. Flat-at-zero next to a rising backlog is the stall.
+pub const GC_PROMOTED_TOTAL: &str = "engram_gc_promoted_total";
+/// Counter. Promote-pass deletes that errored; the candidate row stays
+/// for the next sweep to retry. Labels: `sweep`. A sustained rate means
+/// the blob tier is rejecting deletes.
+pub const GC_PROMOTE_ERRORS_TOTAL: &str = "engram_gc_promote_errors_total";
+/// Counter. Promote passes that declined to delete because the pin set
+/// could not be collected at a stable `chunk_generation`. Labels:
+/// `sweep`, `reason`.
+///
+/// Zero-normally, and the fail-SAFE direction: the sweep skipped a drain
+/// rather than delete against a set that might be missing a live re-pin.
+/// A sustained rate means reclamation has stalled — pair it with
+/// `engram_gc_candidate_backlog` (rising backlog + rising skips = the
+/// churn is outrunning the collect window; raise
+/// `ENGRAM_CHUNK_GC_PIN_SET_CONCURRENCY` to shorten it). Without this
+/// counter the stall is only a per-sweep warn log, which is exactly how
+/// the 43-day outage stayed invisible.
+pub const GC_PROMOTE_SKIPPED_TOTAL: &str = "engram_gc_promote_skipped_total";
+/// Counter. Expired candidates found RE-PINNED at delete time and
+/// skipped. Labels: `sweep`. The durability guard firing. A low rate is
+/// healthy (content-addressed chunks legitimately re-enter manifests);
+/// a spike means pin churn is racing the sweep.
+pub const GC_REPINNED_SKIPS_TOTAL: &str = "engram_gc_repinned_skips_total";
+/// Gauge. Keys the last mark pass walked, and the size of the pin set
+/// it walked them against. Labels: `sweep`. `listed` minus `pinned`
+/// approximates the collectable set.
+pub const GC_LISTED_KEYS: &str = "engram_gc_listed_keys";
+/// Gauge. Pin-set size at the end of the last mark pass. Labels:
+/// `sweep`. See [`GC_LISTED_KEYS`].
+pub const GC_PINNED_KEYS: &str = "engram_gc_pinned_keys";
+/// Histogram. Wall time of one sweep. Labels: `sweep`. A chunk sweep
+/// that walks ~110M keys is minutes-class, so this shares the eviction
+/// bucket spread rather than the default sub-30s one.
+pub const GC_SWEEP_SECONDS: &str = "engram_gc_sweep_seconds";
 /// Counter (ADR 0108 A6). Create-time prompts stamped into the spawn
 /// env by `boot_on_reserved_host` — the zero-round-trip delivery rail.
 /// Compare against `engram_session_create_total{outcome="success"}`:
