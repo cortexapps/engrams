@@ -2240,11 +2240,23 @@ mod tests {
         }
         // The response only pins that spawn() returned, not that the
         // detached child finished execing — poll for its marker.
-        let deadline = crate::time_source::metrics_now() + Duration::from_secs(2);
-        while !marker.exists() && crate::time_source::metrics_now() < deadline {
+        //
+        // Poll for CONTENT, not existence: the shell's `>` redirection
+        // creates the marker empty before `echo` writes into it, so an
+        // `exists()` gate can read "" in the gap. And the deadline is
+        // generous on purpose — under a fully loaded workspace `just
+        // check` a /bin/sh spawn+exec starved past the 2 s this used
+        // to allow (2026-08-27 flake); the loop breaks as soon as the
+        // content lands, so a green run pays only the real exec time.
+        let deadline = crate::time_source::metrics_now() + Duration::from_secs(15);
+        let mut state = String::new();
+        while crate::time_source::metrics_now() < deadline {
+            state = std::fs::read_to_string(&marker).unwrap_or_default();
+            if !state.trim().is_empty() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let state = std::fs::read_to_string(&marker).unwrap_or_default();
         assert_eq!(
             state.trim(),
             "present",

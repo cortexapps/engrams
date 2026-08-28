@@ -599,7 +599,15 @@ mod tests {
 
         // No direct `write()` in this test: the publish can only carry
         // the byte the tick's own sync delivered.
-        for _ in 0..50 {
+        //
+        // Generous deadline on purpose: the loop breaks on the first
+        // event, so a green run costs one ~70 ms tick — but under a
+        // fully loaded workspace `just check` (the multi-minute DST
+        // seeds saturate every core) the scheduler task can starve
+        // well past the 500 ms this used to allow, and the assert
+        // flaked (2026-08-27). 15 s bounds a hung scheduler, not the
+        // happy path.
+        for _ in 0..1500 {
             tokio::time::sleep(Duration::from_millis(10)).await;
             if !events.lock().unwrap().is_empty() {
                 break;
