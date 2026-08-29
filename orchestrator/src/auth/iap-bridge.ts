@@ -127,21 +127,26 @@ import { extractApiKey } from "./api-key-header.ts";
  *      (401), which would mark the pod / backend perpetually unhealthy.
  *      /healthz only reports {ok, db}, so it is unauthenticated by design.
  *
- *   2. Inbound provider webhooks (ADR 0060/0100). Slack and GitHub POSTs carry
- *      no IAP
- *      assertion and no session cookie — in prod they reach the orchestrator
- *      through a no-IAP GCLB backend (see deploy/helm values-iap overlay), so
- *      the fail-closed path would 401 them before the handler runs. These
- *      routes do NOT rely on the bridge for auth: each verifies the provider's
- *      own signature (Slack signing secret + timestamp window, or GitHub's
- *      X-Hub-Signature-256 HMAC) and rejects a bad signature with 401 itself. The
- *      bridge would only get in the way, so we exempt the exact webhook paths.
- *      Dynamic automation hooks additionally require POST plus exactly one
- *      validated registration slug; the load balancer's broader Prefix rule
- *      is not trusted as the application authorization boundary.
+ *   2. Inbound provider webhooks (ADR 0060/0100/0119). Slack, GitHub and
+ *      Linear POSTs carry no IAP assertion and no session cookie — in prod
+ *      they reach the orchestrator through a no-IAP GCLB backend (see
+ *      deploy/helm values-iap overlay), so the fail-closed path would 401
+ *      them before the handler runs. These routes do NOT rely on the bridge
+ *      for auth: each verifies the provider's own signature (Slack signing
+ *      secret + timestamp window, GitHub's X-Hub-Signature-256 HMAC, or
+ *      Linear's hex Linear-Signature HMAC plus a webhookTimestamp replay
+ *      window) and rejects a bad signature with 401 itself. The bridge would
+ *      only get in the way, so we exempt the exact webhook paths. Dynamic
+ *      automation hooks additionally require POST plus exactly one validated
+ *      registration slug; the load balancer's broader Prefix rule is not
+ *      trusted as the application authorization boundary.
  *      The strings must stay in lockstep with the routes' `app.post(...)`
  *      paths in orchestrator/src/routes/{slack-events,slack-interactivity,
- *      github-events,hooks}.ts.
+ *      github-events,linear-events,hooks}.ts — AND with the ingress path list
+ *      in the deploy repo's values. A path exempted in only one of the two
+ *      places stays closed: the GCLB answers "Invalid IAP credentials: empty
+ *      token" before the pod is ever reached, which is how the Linear route
+ *      shipped dark (prod 2026-08-29: zero Linear deliveries ever ledgered).
  *
  *   3. The device-authorization CLI endpoints (`engrams auth login`). The CLI
  *      requests a code and polls for the token from a bare terminal — no IAP
@@ -159,6 +164,7 @@ const PUBLIC_PATHS: ReadonlySet<string> = new Set([
   "/api/v1/integrations/slack/events",
   "/api/v1/integrations/slack/interactivity",
   "/api/v1/integrations/github/events",
+  "/api/v1/integrations/linear/events",
   "/api/auth/device/code",
   "/api/auth/device/token",
 ]);

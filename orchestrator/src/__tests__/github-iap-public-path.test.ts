@@ -11,6 +11,17 @@ describe("GitHub webhook IAP exemption", () => {
       .toBe(false);
   });
 
+  test("the Linear webhook path is exact-path public", () => {
+    // Shipped dark: the route existed and was mounted, but neither this set
+    // nor the ingress path list carried it, so every Linear delivery died at
+    // the GCLB with "Invalid IAP credentials: empty token".
+    expect(isIapPublicPath("/api/v1/integrations/linear/events")).toBe(true);
+    expect(isIapPublicPath("/api/v1/integrations/linear/events?x=1")).toBe(true);
+    expect(isIapPublicPath("/api/v1/integrations/linear/events", "POST")).toBe(true);
+    expect(isIapPublicPath("/api/v1/integrations/linear/events/extra")).toBe(false);
+    expect(isIapPublicPath("/api/v1/integrations/linear")).toBe(false);
+  });
+
   test("dynamic hooks require POST plus exactly one valid registration slug", () => {
     expect(isIapPublicPath("/api/v1/hooks/my-hook?delivery=1", "POST")).toBe(true);
     expect(isIapPublicPath("/api/v1/hooks/my-hook", "GET")).toBe(false);
