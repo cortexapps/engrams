@@ -183,7 +183,7 @@ pub fn init(addr: SocketAddr) {
     // success series must exist before the first success, and the failure
     // series before the first failure.
     for sweep in ["chunk", "bundle", "snapshot_blob"] {
-        for outcome in ["success", "mark_failed", "failed"] {
+        for outcome in ["success", "mark_failed", "promote_failed", "failed"] {
             ::metrics::counter!(GC_SWEEP_TOTAL, "sweep" => sweep, "outcome" => outcome).absolute(0);
         }
         ::metrics::counter!(GC_PROMOTE_ERRORS_TOTAL, "sweep" => sweep).absolute(0);
@@ -273,11 +273,12 @@ pub const OUTBOX_DELIVERED_TOTAL: &str = "engram_outbox_delivered_total";
 /// the time produced the same dashboard as one that works. Alert on
 /// `increase(engram_gc_sweep_total{sweep="chunk",outcome="success"}[6h]) == 0`.
 ///
-/// `mark_failed` is the partial outcome: the mark pass errored but the
-/// promote pass still ran and deleted. It is NOT success — the
-/// candidate set stopped being refreshed — but it is not a dead sweep
-/// either, so it gets its own value rather than collapsing into
-/// `failed`.
+/// `mark_failed` and `promote_failed` are the partial outcomes: one pass
+/// errored while the other did real work. Neither is `success` — a pass
+/// has silently stopped doing anything — and neither is a dead sweep, so
+/// each gets its own value. Collapsing them is how a broken pass hides
+/// behind a healthy-looking sweep, which is the failure this whole
+/// subsystem keeps reproducing.
 pub const GC_SWEEP_TOTAL: &str = "engram_gc_sweep_total";
 /// Gauge. Rows in the sweep's candidate table after the last sweep.
 /// Labels: `sweep`. This is the backlog: it should fall toward zero

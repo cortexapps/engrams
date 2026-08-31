@@ -1,40 +1,44 @@
 //! ADR 0016 Phase C: chunk-GC sweep orchestrator.
 //!
-//! [`run_one_sweep`] is the work-loop body:
+//! One tick, under the single-writer sweep lease:
 //!
-//! 1. Read `chunk_generation` (gen_before).
-//! 2. Collect the pin set via [`engram_chunk_store::PinSet::collect`].
-//! 3. Walk `BlobStorage` under `chunks/sha256/` ONE PAGE AT A TIME
-//!    (`list_prefix_page`, `list_page_size` keys per call); for each
-//!    key, parse back to a `ChunkHash` and check pin-set membership.
-//! 4. Unpinned chunks: in `Full` mode, upsert into the
-//!    `chunk_gc_candidates` PG table (idempotent, sticky
-//!    `first_seen_at`); in `DryRun`, just count.
-//! 5. Read `chunk_generation` (gen_after) and record whether it moved.
-//!    This is a DIAGNOSTIC only — the sweep does not restart. See
-//!    `run_mark_pass` for why.
-//! 6. **Promote pass** (Full only): list candidates with
-//!    `first_seen_at < now() - grace_period`, delete each from
-//!    BlobStorage, delete the candidate row. Drains in pages until
-//!    the backlog clears or `promote_max_per_sweep` is reached, with
-//!    `promote_concurrency` deletes in flight.
+//! 1. Claim the lease and read the shard cursor
+//!    (`claim_chunk_gc_sweep`). A replica that loses the claim sits the
+//!    tick out — two pods advancing one cursor would skip shards.
+//! 2. **Mark pass**: collect the pin set once, then walk hash-prefix
+//!    shards (`chunks/sha256/<2 hex>/`) from the cursor,
+//!    `shard_concurrency` at a time, paging each shard and batching the
+//!    candidate upserts. Stops at a shard boundary when `mark_budget`
+//!    expires; the cursor persists so the next tick resumes there.
+//! 3. **Promote pass**: delete candidates past `grace_period`, after
+//!    re-verifying the live pin set, until the backlog clears or
+//!    `promote_budget` expires.
+//! 4. Persist the cursor and release the lease.
 //!
-//! Steps 1-5 are the **mark pass** and step 6 is the **promote
-//! pass**; they are INDEPENDENT. Mark walks the whole chunk space,
-//! promote needs only rows an earlier sweep wrote, so a mark failure
-//! degrades the sweep but never voids it. Chaining them cost 43 days
-//! of GC in prod: from 2026-07-16 the mark pass's whole-listing
-//! `list_prefix` exceeded its 300s deadline on every sweep, and
-//! because promote sat behind the mark pass's `?` it never ran — 8.9M
-//! expired candidates (~9.5 TB) stayed undeleted while the bucket grew
-//! 7.9 TB -> 120.7 TB. The paged walk in step 3 removes the deadline
-//! cliff; the split keeps one broken pass from disabling the other.
+//! The two passes are INDEPENDENT: mark walks storage, promote only
+//! needs rows an earlier tick wrote, so a mark failure degrades the tick
+//! but never voids it.
 //!
-//! [`gc_sweep_loop`] is the background task: spawned at coord
-//! startup, gated on `ENGRAM_CHUNK_GC_ENABLED` (default ON in
-//! active-development posture — the 24h grace period is the real
-//! safety net), wakes every `ENGRAM_CHUNK_GC_INTERVAL_SECS` and
-//! calls `run_one_sweep(Full)`.
+//! **Why it is shaped this way** — three production failures, each of
+//! which the previous shape could not have survived:
+//!
+//! - Marking the whole key space at once is not BOUNDED work; it grows
+//!   with garbage. Sharding under a budget is what bounds it. Slicing
+//!   stays correct because every slice is classified against the
+//!   COMPLETE pin set — only the key space is partitioned.
+//! - The whole-listing `list_prefix` blew its 300s deadline on every
+//!   sweep from 2026-07-16; nothing was collected for 43 days while the
+//!   bucket grew 7.9 TB -> 120.7 TB. Hence the paged walk.
+//! - Chaining promote behind mark's `?` meant one failing list disabled
+//!   deletion entirely, stranding 8.9M expired candidates that needed no
+//!   listing to delete. Hence the split.
+//! - One round trip per unpinned chunk metered the mark pass at ~335
+//!   inserts/s, so the first sweep had not finished after 46 hours and
+//!   the promote pass never ran. Hence the batched upsert.
+//!
+//! Each sweep is its own task ([`spawn_gc_loops`]): bundle and
+//! snapshot-blob finish in ~2s and must never be hostage to the chunk
+//! sweep, which is exactly what happened for two days in 2026-08.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +50,15 @@ use crate::state::SharedState;
 
 /// Blob-storage prefix the chunk sweep walks.
 const CHUNK_PREFIX: &str = "chunks/sha256/";
+
+/// Hash-prefix shards the chunk space splits into. Keys are
+/// `chunks/sha256/<2 hex>/<62 hex>`, so the first byte gives 256
+/// independent slices that can be walked separately and in parallel.
+///
+/// Slicing is what makes the sweep bounded. A slice is still classified
+/// against the COMPLETE pin set, so "chunk X is unpinned" stays a sound
+/// conclusion — only the key space is partitioned, never the pin set.
+const SHARD_COUNT: usize = 256;
 
 /// Sweep configuration. Defaults match the active-development
 /// posture: GC enabled, hourly cadence, 24h candidate grace.
@@ -92,6 +105,38 @@ pub struct ChunkGcConfig {
     /// mark pass too. Defaults to 64. Override via
     /// `ENGRAM_CHUNK_GC_PIN_SET_CONCURRENCY`.
     pub pin_set_concurrency: usize,
+    /// Hash-prefix shards walked CONCURRENTLY inside one mark pass.
+    ///
+    /// Chunk keys are `chunks/sha256/<2 hex>/<62 hex>`, so the space
+    /// splits 256 ways on the first byte and the shards are independent.
+    /// Listing is the mark pass's bottleneck — ~113M objects is ~113k
+    /// list round-trips, over an hour walked serially — and the shards
+    /// are the natural unit of parallelism. Defaults to 16. Override via
+    /// `ENGRAM_CHUNK_GC_SHARD_CONCURRENCY`.
+    pub shard_concurrency: usize,
+    /// Candidate rows per multi-row upsert statement.
+    ///
+    /// The mark pass used to issue ONE round-trip per unpinned chunk.
+    /// That was invisible while `list_prefix` failed first; once the
+    /// paged walk worked, it metered the sweep at ~335 inserts/s and the
+    /// first sweep had not finished after 46 hours (2026-08-31).
+    /// Batching is what makes the write side a non-factor. Defaults to
+    /// 1000. Override via `ENGRAM_CHUNK_GC_UPSERT_BATCH`.
+    pub upsert_batch_size: usize,
+    /// Wall-clock budget for one mark pass. When it expires the pass
+    /// stops at a shard boundary and the cursor persists, so the next
+    /// tick resumes where this one stopped. THE guarantee that a sweep
+    /// makes bounded progress and always ends. Defaults to 300s.
+    /// Override via `ENGRAM_CHUNK_GC_MARK_BUDGET_SECS`.
+    pub mark_budget: Duration,
+    /// Wall-clock budget for one promote pass.
+    ///
+    /// Replaces a row cap. A cap makes deletion the binding constraint
+    /// and can leave a backlog stuck for weeks; a time budget makes
+    /// promote THROUGHPUT-bound, which is the property that actually
+    /// drains a backlog. Defaults to 900s. Override via
+    /// `ENGRAM_CHUNK_GC_PROMOTE_BUDGET_SECS`.
+    pub promote_budget: Duration,
     /// Promote-pass batch size — candidates fetched from PG per
     /// page. Defaults to 10_000.
     pub promote_batch_size: i64,
@@ -104,12 +149,6 @@ pub struct ChunkGcConfig {
     /// is strictly safer per chunk deleted. Defaults to 64.
     /// Override via `ENGRAM_CHUNK_GC_PROMOTE_CONCURRENCY`.
     pub promote_concurrency: usize,
-    /// Max candidates promoted per sweep, across all batches. Bounds
-    /// one sweep's cost so a large backlog drains over several ticks
-    /// instead of monopolising one. Defaults to 200_000 (~4.8M/day
-    /// at the 1h cadence). Override via
-    /// `ENGRAM_CHUNK_GC_PROMOTE_MAX_PER_SWEEP`.
-    pub promote_max_per_sweep: usize,
 }
 
 impl Default for ChunkGcConfig {
@@ -121,9 +160,12 @@ impl Default for ChunkGcConfig {
             max_restart_attempts: 3,
             pin_set_concurrency: 64,
             list_page_size: 1000,
+            shard_concurrency: 16,
+            upsert_batch_size: 1000,
+            mark_budget: Duration::from_secs(300),
+            promote_budget: Duration::from_secs(900),
             promote_batch_size: 10_000,
             promote_concurrency: 64,
-            promote_max_per_sweep: 200_000,
         }
     }
 }
@@ -156,14 +198,29 @@ impl ChunkGcConfig {
                 cfg.list_page_size = n.clamp(1, 1000);
             }
         }
+        if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_SHARD_CONCURRENCY") {
+            if let Ok(n) = v.parse::<usize>() {
+                cfg.shard_concurrency = n.clamp(1, SHARD_COUNT);
+            }
+        }
+        if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_UPSERT_BATCH") {
+            if let Ok(n) = v.parse::<usize>() {
+                cfg.upsert_batch_size = n.max(1);
+            }
+        }
+        if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_MARK_BUDGET_SECS") {
+            if let Ok(n) = v.parse::<u64>() {
+                cfg.mark_budget = Duration::from_secs(n);
+            }
+        }
+        if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_PROMOTE_BUDGET_SECS") {
+            if let Ok(n) = v.parse::<u64>() {
+                cfg.promote_budget = Duration::from_secs(n);
+            }
+        }
         if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_PROMOTE_CONCURRENCY") {
             if let Ok(n) = v.parse::<usize>() {
                 cfg.promote_concurrency = n.max(1);
-            }
-        }
-        if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_PROMOTE_MAX_PER_SWEEP") {
-            if let Ok(n) = v.parse::<usize>() {
-                cfg.promote_max_per_sweep = n;
             }
         }
         cfg
@@ -221,6 +278,20 @@ pub struct SweepReport {
     /// The candidate row stays in the table so the next sweep
     /// retries; surfaced for visibility.
     pub promote_delete_errors: usize,
+    /// Shard the NEXT tick should resume at. The caller persists it as
+    /// the cursor; wrapping past 255 back to 0 is a completed cycle.
+    pub next_shard: u32,
+    /// Shards walked by this mark pass. `SHARD_COUNT` means the walk
+    /// covered the whole key space in one tick.
+    pub shards_scanned: usize,
+    /// Whether this mark pass finished a full cycle of the key space
+    /// (wrapped past every shard) rather than stopping on its budget.
+    pub full_cycle_completed: bool,
+    /// Set when the promote pass failed. Symmetric with `mark_error`:
+    /// the pass is recorded as degraded and the sweep still returns its
+    /// report, so the mark pass's cursor progress is never thrown away
+    /// by a promote-side fault.
+    pub promote_error: Option<String>,
     /// Set when the mark pass failed. The promote pass still ran —
     /// it deletes candidates recorded by EARLIER sweeps and needs no
     /// listing — so a mark failure degrades the sweep instead of
@@ -238,7 +309,8 @@ pub async fn run_one_sweep(
     state: &SharedState,
     cfg: &ChunkGcConfig,
     mode: SweepMode,
-) -> Result<SweepReport, GcError> {
+    start_shard: u32,
+) -> SweepReport {
     run_one_sweep_inner(
         state.services.meta.clone(),
         state.services.blob.clone(),
@@ -246,6 +318,7 @@ pub async fn run_one_sweep(
         cfg,
         mode,
         &state.services.clock,
+        start_shard,
     )
     .await
 }
@@ -262,6 +335,10 @@ pub async fn run_one_sweep(
 /// never see a same-sweep candidate as expired under zero grace.
 /// (The host-vs-PG cross-clock comparison predates this seam; D3's
 /// bind-param `now()` unifies it.)
+///
+/// `start_shard` is the hash-prefix shard the mark pass resumes at. The
+/// CALLER owns the cursor and the single-writer lease — this function
+/// stays pure so admin dry-runs and tests can drive it without either.
 pub async fn run_one_sweep_inner(
     meta: Arc<dyn MetadataStore>,
     blob: Arc<dyn BlobStorage>,
@@ -269,8 +346,12 @@ pub async fn run_one_sweep_inner(
     cfg: &ChunkGcConfig,
     mode: SweepMode,
     clock: &Arc<dyn engram_core::traits::Clock>,
-) -> Result<SweepReport, GcError> {
-    let mut report = SweepReport::default();
+    start_shard: u32,
+) -> SweepReport {
+    let mut report = SweepReport {
+        next_shard: start_shard,
+        ..Default::default()
+    };
 
     // The mark pass and the promote pass are INDEPENDENT. Mark needs a
     // full `list_prefix` of the chunk space; promote only needs rows an
@@ -280,16 +361,15 @@ pub async fn run_one_sweep_inner(
     // on EVERY sweep since 2026-07-16, stranding 8.9M expired candidates
     // (~9.5 TB) that needed no listing to delete, while the bucket grew
     // 7.9 TB -> 120.7 TB. Degrade the sweep; never void it.
-    if let Err(e) = run_mark_pass(
-        meta.as_ref(),
-        blob.as_ref(),
+    let mark_ctx = MarkCtx {
+        meta: meta.as_ref(),
+        blob: blob.as_ref(),
         chunk_store,
         cfg,
         mode,
-        &mut report,
-    )
-    .await
-    {
+        clock,
+    };
+    if let Err(e) = run_mark_pass(&mark_ctx, start_shard, &mut report).await {
         tracing::warn!(
             error = %e,
             "chunk-gc mark pass failed; promote pass still runs on existing candidates"
@@ -298,84 +378,137 @@ pub async fn run_one_sweep_inner(
     }
 
     // -------- promote pass (Full only) --------
+    //
+    // Caught, not propagated — symmetric with the mark pass above. A `?`
+    // here discarded the whole report, so `chunk_gc_run_once` could not
+    // read the advanced cursor and wrote back the shard it started at,
+    // throwing away the mark pass's progress. Under a recurring promote
+    // fault with a budget-limited walk, the cursor would never advance
+    // and the unreached shards would never be scanned — the exact
+    // outcome the cursor exists to prevent.
     if mode == SweepMode::Full {
-        let (deletes, repinned, errors) = promote_expired(
-            meta.as_ref(),
-            blob.as_ref(),
-            chunk_store,
-            cfg,
-            clock.now_utc(),
-        )
-        .await?;
-        report.promoted_deletes = deletes;
-        report.promote_repinned_skips = repinned;
-        report.promote_delete_errors = errors;
+        match promote_expired(meta.as_ref(), blob.as_ref(), chunk_store, cfg, clock).await {
+            Ok((deletes, repinned, errors)) => {
+                report.promoted_deletes = deletes;
+                report.promote_repinned_skips = repinned;
+                report.promote_delete_errors = errors;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "chunk-gc promote pass failed; the mark pass's cursor progress still stands"
+                );
+                report.promote_error = Some(e.to_string());
+            }
+        }
     }
 
-    Ok(report)
+    report
 }
 
 /// Mark pass: classify every stored chunk against the live pin set and
 /// record the unpinned ones as candidates. Writes only to
 /// `chunk_gc_candidates` (never to BlobStorage), so a failure here is
 /// recoverable — the next sweep re-classifies from scratch.
-async fn run_mark_pass(
-    meta: &dyn MetadataStore,
-    blob: &dyn BlobStorage,
-    chunk_store: &ChunkStore,
-    cfg: &ChunkGcConfig,
+/// The immutable inputs a mark pass and its shard walks share. Bundled
+/// so both take a handful of arguments instead of a long positional
+/// list, and so `walk_shard` can be handed one borrow.
+struct MarkCtx<'a> {
+    meta: &'a dyn MetadataStore,
+    blob: &'a dyn BlobStorage,
+    chunk_store: &'a ChunkStore,
+    cfg: &'a ChunkGcConfig,
     mode: SweepMode,
+    clock: &'a Arc<dyn engram_core::traits::Clock>,
+}
+
+async fn run_mark_pass(
+    ctx: &MarkCtx<'_>,
+    start_shard: u32,
     report: &mut SweepReport,
 ) -> Result<(), GcError> {
+    let MarkCtx {
+        meta,
+        chunk_store,
+        cfg,
+        clock,
+        ..
+    } = *ctx;
+    // `now_mono`, not `now_utc`: this is an elapsed-time budget, and a
+    // monotonic Duration is what a fake clock can drive (ADR 0098 D1 —
+    // an opaque `Instant` cannot be minted by a simulated clock).
+    let deadline = clock.now_mono() + cfg.mark_budget;
+
     let gen_before = meta.chunk_generation().await?;
     let pin_set =
         PinSet::collect_with_concurrency(meta, chunk_store, cfg.pin_set_concurrency).await?;
-
-    // Walk the chunk space one page at a time. Buffering the whole
-    // listing was the prod failure: at ~110M keys every `list_prefix`
-    // blew its 300s deadline, and the Vec would have been GBs of coord
-    // heap if it had ever returned. A page carries its own deadline and
-    // its own memory, so the walk scales with the bucket.
-    let mut cursor: Option<String> = None;
-    loop {
-        let page = blob
-            .list_prefix_page(CHUNK_PREFIX, cursor.as_deref(), cfg.list_page_size)
-            .await
-            .map_err(|e| GcError::ChunkStore(engram_chunk_store::ChunkStoreError::Blob(e)))?;
-
-        for key in &page.keys {
-            let Some(hash) = ChunkHash::from_storage_key(key) else {
-                report.malformed_keys += 1;
-                continue;
-            };
-            if pin_set.contains(&hash) {
-                continue;
-            }
-            report.candidates_marked += 1;
-            if mode == SweepMode::Full {
-                meta.upsert_chunk_gc_candidate(*hash.as_bytes()).await?;
-            }
-        }
-        report.listed_chunks += page.keys.len();
-
-        match page.next {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
     report.pin_set_size = pin_set.len();
 
-    // The barrier is now a DIAGNOSTIC, not a restart trigger. It used to
-    // re-run the whole classification when `chunk_generation` ticked
-    // mid-sweep. That never made the sweep safer — the mark pass only
-    // ever ADDS candidate rows, and the promote pass re-verifies the live
-    // pin set before it deletes anything, which is the actual durability
-    // guard. At prod scale the restart was guaranteed waste: a full walk
-    // takes minutes and the generation ticks ~2.3x/min, so every sweep
-    // would burn its whole restart budget and then accept the partial
-    // result anyway — 4 walks of the chunk space for one sweep's worth of
-    // marking. A chunk pinned mid-walk is marked, then rescued at promote
-    // time, exactly as a chunk pinned between sweeps already was.
+    // Walk the key space in hash-prefix shards, resuming at the cursor.
+    //
+    // Slicing is what makes the sweep BOUNDED. Marking the whole space
+    // in one tick is not a bounded amount of work — it grows with
+    // accumulated garbage, and in 2026-08 it outgrew a tick entirely:
+    // the mark pass ran 46 hours without finishing, so the promote pass
+    // never ran and nothing was ever deleted.
+    //
+    // Slicing stays CORRECT because each shard is classified against the
+    // COMPLETE pin set collected above. Only the key space is
+    // partitioned, never the pin set, so "chunk X is unpinned" remains a
+    // sound conclusion from one shard.
+    let mut shard = (start_shard as usize) % SHARD_COUNT;
+    let mut scanned = 0usize;
+    while scanned < SHARD_COUNT {
+        if clock.now_mono() >= deadline {
+            tracing::info!(
+                scanned,
+                next_shard = shard,
+                budget_secs = cfg.mark_budget.as_secs(),
+                "chunk-gc mark: budget spent; cursor persists and the next tick resumes"
+            );
+            break;
+        }
+        let group: Vec<usize> = (0..cfg.shard_concurrency.min(SHARD_COUNT - scanned))
+            .map(|i| (shard + i) % SHARD_COUNT)
+            .collect();
+
+        // Shards are independent, so they are the natural unit of
+        // parallelism. Listing dominates the mark pass — ~113M objects
+        // is ~113k list round-trips, over an hour walked serially — and
+        // this is what turns a full cycle into minutes.
+        let scans =
+            futures::future::join_all(group.iter().map(|&sh| walk_shard(ctx, &pin_set, sh))).await;
+
+        // Fold in whatever completed BEFORE surfacing an error, so a
+        // failed shard still leaves the cursor and counters reflecting
+        // real progress (`report` is `&mut`, so the caller sees it even
+        // on the error return).
+        let mut failure = None;
+        for scan in scans {
+            match scan {
+                Ok(s) => {
+                    report.listed_chunks += s.listed;
+                    report.malformed_keys += s.malformed;
+                    report.candidates_marked += s.marked;
+                }
+                Err(e) => failure = Some(e),
+            }
+        }
+        scanned += group.len();
+        shard = (shard + group.len()) % SHARD_COUNT;
+        report.shards_scanned = scanned;
+        report.next_shard = shard as u32;
+        if let Some(e) = failure {
+            return Err(e);
+        }
+    }
+    report.full_cycle_completed = scanned >= SHARD_COUNT;
+
+    // The barrier is a DIAGNOSTIC, not a restart trigger. The mark pass
+    // only ever ADDS candidate rows, and the promote pass re-verifies
+    // the live pin set before it deletes anything — that is the actual
+    // durability guard. A chunk pinned mid-walk is marked, then rescued
+    // at promote time, exactly as a chunk pinned between sweeps was.
     let gen_after = meta.chunk_generation().await?;
     if gen_after != gen_before {
         report.generation_moved = true;
@@ -389,22 +522,94 @@ async fn run_mark_pass(
     Ok(())
 }
 
+/// What one shard walk observed. Kept separate from `SweepReport` so
+/// shards can run concurrently without sharing a mutable borrow.
+#[derive(Debug, Default)]
+struct ShardScan {
+    listed: usize,
+    malformed: usize,
+    marked: usize,
+}
+
+/// Walk one hash-prefix shard, batching candidate upserts.
+///
+/// The batching is the other half of the 2026-08 failure: the mark pass
+/// issued ONE DB round trip per unpinned chunk, which metered the sweep
+/// at ~335 inserts/s. A page's worth per statement makes the write side
+/// a non-factor.
+async fn walk_shard(
+    ctx: &MarkCtx<'_>,
+    pin_set: &PinSet,
+    shard: usize,
+) -> Result<ShardScan, GcError> {
+    let MarkCtx {
+        meta,
+        blob,
+        cfg,
+        mode,
+        ..
+    } = *ctx;
+    let prefix = format!("{CHUNK_PREFIX}{shard:02x}/");
+    let mut out = ShardScan::default();
+    let mut cursor: Option<String> = None;
+    let mut batch: Vec<[u8; 32]> = Vec::with_capacity(cfg.upsert_batch_size);
+
+    loop {
+        let page = blob
+            .list_prefix_page(&prefix, cursor.as_deref(), cfg.list_page_size)
+            .await
+            .map_err(|e| GcError::ChunkStore(engram_chunk_store::ChunkStoreError::Blob(e)))?;
+
+        for key in &page.keys {
+            let Some(hash) = ChunkHash::from_storage_key(key) else {
+                out.malformed += 1;
+                continue;
+            };
+            if pin_set.contains(&hash) {
+                continue;
+            }
+            out.marked += 1;
+            if mode == SweepMode::Full {
+                batch.push(*hash.as_bytes());
+                if batch.len() >= cfg.upsert_batch_size {
+                    meta.upsert_chunk_gc_candidates(&batch).await?;
+                    batch.clear();
+                }
+            }
+        }
+        out.listed += page.keys.len();
+
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    if mode == SweepMode::Full && !batch.is_empty() {
+        meta.upsert_chunk_gc_candidates(&batch).await?;
+    }
+    Ok(out)
+}
+
 /// Promote-pass: delete candidates older than `grace_period` from
 /// BlobStorage + the candidate table — AFTER re-verifying the live pin
 /// set, so a candidate that was re-pinned since it was marked is skipped
 /// and cleared, never deleted.
 ///
-/// Drains in `cfg.promote_batch_size` pages until the backlog is empty
-/// or `cfg.promote_max_per_sweep` is reached, so a backlog clears over
-/// several ticks instead of one page per hour. Returns
+/// Drains in `cfg.promote_batch_size` pages until the backlog is empty or
+/// `cfg.promote_budget` expires. Returns
 /// `(deleted, repinned_skipped, errors)`.
 async fn promote_expired(
     meta: &dyn MetadataStore,
     blob: &dyn BlobStorage,
     chunk_store: &ChunkStore,
     cfg: &ChunkGcConfig,
-    now: chrono::DateTime<chrono::Utc>,
+    clock: &Arc<dyn engram_core::traits::Clock>,
 ) -> Result<(usize, usize, usize), GcError> {
+    let now = clock.now_utc();
+    let deadline = now
+        + chrono::Duration::from_std(cfg.promote_budget)
+            .unwrap_or_else(|_| chrono::Duration::seconds(900));
     let cutoff = now
         - chrono::Duration::from_std(cfg.grace_period)
             .unwrap_or_else(|_| chrono::Duration::seconds(86_400));
@@ -435,17 +640,23 @@ async fn promote_expired(
     let mut pin_refreshes = 0usize;
 
     loop {
-        let remaining = cfg.promote_max_per_sweep.saturating_sub(processed);
-        if remaining == 0 {
+        // A wall-clock budget, not a row cap. A cap makes deletion the
+        // binding constraint: 200k/tick against the 2026-08 backlog of
+        // ~100M rows would have sat at 20 GB of candidate table for
+        // weeks. A budget makes promote throughput-bound, so it drains as
+        // fast as the blob tier allows and stops on time either way.
+        if clock.now_utc() >= deadline {
             tracing::info!(
                 processed,
-                "chunk-gc promote: hit per-sweep cap; backlog continues next tick"
+                budget_secs = cfg.promote_budget.as_secs(),
+                "chunk-gc promote: budget spent; backlog continues next tick"
             );
             break;
         }
-        let limit = cfg.promote_batch_size.min(remaining as i64);
 
-        let expired = meta.list_expired_gc_candidates(cutoff, limit).await?;
+        let expired = meta
+            .list_expired_gc_candidates(cutoff, cfg.promote_batch_size)
+            .await?;
         if expired.is_empty() {
             break;
         }
@@ -503,7 +714,7 @@ async fn promote_expired(
             );
             break;
         }
-        if (batch_len as i64) < limit {
+        if (batch_len as i64) < cfg.promote_batch_size {
             break;
         }
     }
@@ -671,18 +882,18 @@ pub(crate) struct SweepMetrics {
 
 /// The `outcome` label for a chunk sweep.
 ///
-/// `mark_failed` is deliberately its own value rather than folded into
-/// either neighbour. The sweep did real work — the promote pass ran and
-/// deleted — so it is not `failed`; but the candidate set stopped being
-/// refreshed, so it is not `success` either. Collapsing it into
-/// `success` would have hidden the 43-day prod outage all over again,
-/// because once the promote pass is decoupled a broken mark pass still
-/// reports deletes.
-pub(crate) fn chunk_sweep_outcome(result: &Result<SweepReport, GcError>) -> &'static str {
-    match result {
-        Err(_) => "failed",
-        Ok(r) if r.mark_error.is_some() => "mark_failed",
-        Ok(_) => "success",
+/// Four values, because the two passes fail independently and a sweep
+/// where one worked is genuinely different from one where neither did.
+/// `mark_failed` and `promote_failed` are each REAL work plus a real
+/// gap: collapsing either into `success` would hide exactly the class of
+/// outage this whole subsystem keeps producing — a pass that has
+/// silently stopped doing anything while the sweep still reports fine.
+pub(crate) fn chunk_sweep_outcome(report: &SweepReport) -> &'static str {
+    match (report.mark_error.is_some(), report.promote_error.is_some()) {
+        (false, false) => "success",
+        (true, false) => "mark_failed",
+        (false, true) => "promote_failed",
+        (true, true) => "failed",
     }
 }
 
@@ -716,94 +927,153 @@ pub(crate) fn record_sweep_metrics(m: &SweepMetrics) {
     }
 }
 
-/// Background sweep loop. Spawned from coord startup; ticks every
-/// `cfg.interval` and runs a `Full` sweep. Errors log but don't
-/// abort the loop — a transient PG or BlobStorage hiccup shouldn't
-/// take down GC permanently.
-pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
+/// Spawn the three GC drivers as INDEPENDENT tasks.
+///
+/// They used to share one loop body, run back to back on one tick. That
+/// coupling took the fleet down twice over: when the chunk sweep hung on
+/// its 46-hour mark pass (2026-08-29), the bundle and snapshot-blob
+/// sweeps — both healthy, both finishing in ~2s — ran ZERO times for two
+/// days because they sat behind it in the same body. A cheap sweep must
+/// never be hostage to an expensive one.
+///
+/// Each driver is a thin timer wrapper over its own `run_once` step
+/// (ADR 0098 D2), so tests and the simulator drive the step directly.
+pub fn spawn_gc_loops(state: SharedState, cfg: ChunkGcConfig) -> Vec<tokio::task::JoinHandle<()>> {
     if !cfg.enabled {
-        tracing::info!("chunk-gc disabled by config; sweep loop will not run");
-        return;
+        tracing::info!("chunk-gc disabled by config; no sweep loop will run");
+        return Vec::new();
     }
+    vec![
+        tokio::spawn(chunk_gc_loop(state.clone(), cfg.clone())),
+        tokio::spawn(bundle_gc_loop(state.clone(), cfg.clone())),
+        tokio::spawn(snapshot_blob_gc_loop(state, cfg)),
+    ]
+}
+
+/// Thin timer wrapper. Errors log and the loop continues — a transient PG
+/// or BlobStorage hiccup must not take GC down permanently.
+async fn chunk_gc_loop(state: SharedState, cfg: ChunkGcConfig) {
+    // Same claimant convention as the dead-host detector: the pod's
+    // HOSTNAME, minted once at spawn.
+    let claimant = std::env::var("HOSTNAME").unwrap_or_else(|_| "coord".into());
     tracing::info!(
         interval_secs = cfg.interval.as_secs(),
         grace_secs = cfg.grace_period.as_secs(),
-        max_restarts = cfg.max_restart_attempts,
+        mark_budget_secs = cfg.mark_budget.as_secs(),
+        promote_budget_secs = cfg.promote_budget.as_secs(),
+        shard_concurrency = cfg.shard_concurrency,
         "chunk-gc sweep loop starting"
     );
     let mut ticker = tokio::time::interval(cfg.interval);
-    // Skip the immediate tick — let coord finish boot before the
-    // first sweep fires.
+    // Skip the immediate tick — let coord finish boot before the first
+    // sweep fires.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        chunk_gc_run_once(&state, &cfg, &claimant).await;
+    }
+}
+
+/// One chunk-gc tick, under the single-writer lease.
+///
+/// The lease is what makes the shard cursor safe. Both coordinator
+/// replicas run this loop; two pods advancing one cursor would skip
+/// shards, and those shards would then silently never be scanned. A
+/// replica that loses the claim simply sits the tick out.
+///
+/// `stale_after` is the interval plus both budgets: long enough that a
+/// healthy holder is never taken over mid-sweep, short enough that a pod
+/// which dies mid-sweep does not wedge GC for long.
+pub async fn chunk_gc_run_once(state: &SharedState, cfg: &ChunkGcConfig, claimant: &str) {
+    let stale_after = cfg.interval + cfg.mark_budget + cfg.promote_budget;
+    let start_shard = match state
+        .services
+        .meta
+        .claim_chunk_gc_sweep(claimant, stale_after)
+        .await
+    {
+        Ok(Some(shard)) => shard,
+        Ok(None) => {
+            tracing::debug!("chunk-gc: another replica holds the sweep lease; skipping this tick");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "chunk-gc: could not claim the sweep lease; skipping tick");
+            return;
+        }
+    };
+
+    let started = state.services.clock.now_utc();
+    let report = run_one_sweep(state, cfg, SweepMode::Full, start_shard).await;
+    let elapsed = (state.services.clock.now_utc() - started)
+        .to_std()
+        .unwrap_or_default();
+
+    // Always persist the cursor. A sweep ALWAYS yields a report — both
+    // passes record their failure into it rather than discarding it — so
+    // whatever shards the mark pass did reach are never re-walked, no
+    // matter which pass degraded.
+    if let Err(e) = state
+        .services
+        .meta
+        .release_chunk_gc_sweep(claimant, report.next_shard)
+        .await
+    {
+        tracing::warn!(error = %e, "chunk-gc: could not release the sweep lease");
+    }
+
+    record_sweep_metrics(&SweepMetrics {
+        sweep: "chunk",
+        outcome: chunk_sweep_outcome(&report),
+        listed: report.listed_chunks,
+        pinned: report.pin_set_size,
+        promoted: report.promoted_deletes,
+        repinned_skips: report.promote_repinned_skips,
+        promote_errors: report.promote_delete_errors,
+        elapsed,
+    });
+    record_backlog_gauge(state).await;
+    tracing::info!(
+        listed = report.listed_chunks,
+        malformed = report.malformed_keys,
+        pinned = report.pin_set_size,
+        candidates = report.candidates_marked,
+        shards_scanned = report.shards_scanned,
+        next_shard = report.next_shard,
+        full_cycle = report.full_cycle_completed,
+        promoted = report.promoted_deletes,
+        repinned_skips = report.promote_repinned_skips,
+        promote_errors = report.promote_delete_errors,
+        generation_moved = report.generation_moved,
+        mark_error = report.mark_error.as_deref().unwrap_or(""),
+        promote_error = report.promote_error.as_deref().unwrap_or(""),
+        "chunk-gc sweep done"
+    );
+}
+
+/// The "is GC keeping up" gauge. It reached 8.9M before anyone looked,
+/// and 59M before anyone looked again.
+async fn record_backlog_gauge(state: &SharedState) {
+    match state.services.meta.count_gc_candidates().await {
+        Ok(n) => {
+            ::metrics::gauge!(crate::metrics::GC_CANDIDATE_BACKLOG, "sweep" => "chunk")
+                .set(n as f64);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "chunk-gc: could not read the candidate backlog");
+        }
+    }
+}
+
+/// ADR 0035 §5: bundle generations. A few hundred keys, ~2s a sweep — its
+/// own task so the chunk sweep can never starve it.
+async fn bundle_gc_loop(state: SharedState, cfg: ChunkGcConfig) {
+    let mut ticker = tokio::time::interval(cfg.interval);
     ticker.tick().await;
     loop {
         ticker.tick().await;
         let started = state.services.clock.now_utc();
-        let sweep_result = run_one_sweep(&state, &cfg, SweepMode::Full).await;
-        let elapsed = (state.services.clock.now_utc() - started)
-            .to_std()
-            .unwrap_or_default();
-        match &sweep_result {
-            Ok(report) => {
-                record_sweep_metrics(&SweepMetrics {
-                    sweep: "chunk",
-                    outcome: chunk_sweep_outcome(&sweep_result),
-                    listed: report.listed_chunks,
-                    pinned: report.pin_set_size,
-                    promoted: report.promoted_deletes,
-                    repinned_skips: report.promote_repinned_skips,
-                    promote_errors: report.promote_delete_errors,
-                    elapsed,
-                });
-            }
-            Err(_) => {
-                record_sweep_metrics(&SweepMetrics {
-                    sweep: "chunk",
-                    outcome: chunk_sweep_outcome(&sweep_result),
-                    listed: 0,
-                    pinned: 0,
-                    promoted: 0,
-                    repinned_skips: 0,
-                    promote_errors: 0,
-                    elapsed,
-                });
-            }
-        }
-        // The backlog gauge is the "is GC keeping up" signal — it reached
-        // 8.9M before anyone looked. Read it after the sweep so it
-        // reflects this tick's deletes.
-        match state.services.meta.count_gc_candidates().await {
-            Ok(n) => {
-                ::metrics::gauge!(crate::metrics::GC_CANDIDATE_BACKLOG, "sweep" => "chunk")
-                    .set(n as f64);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "chunk-gc: could not read the candidate backlog");
-            }
-        }
-        match sweep_result {
-            Ok(report) => {
-                tracing::info!(
-                    listed = report.listed_chunks,
-                    malformed = report.malformed_keys,
-                    pinned = report.pin_set_size,
-                    candidates = report.candidates_marked,
-                    promoted = report.promoted_deletes,
-                    repinned_skips = report.promote_repinned_skips,
-                    promote_errors = report.promote_delete_errors,
-                    generation_moved = report.generation_moved,
-                    mark_error = report.mark_error.as_deref().unwrap_or(""),
-                    "chunk-gc sweep done"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "chunk-gc sweep failed; will retry on next interval");
-            }
-        }
-        // ADR 0035 §5: the bundle-generation sweep rides the same tick,
-        // barrier, and grace config. Tiny key space (handfuls of
-        // generations), so no separate cadence.
-        let bundle_started = state.services.clock.now_utc();
-        let bundle_result = crate::bundle_gc::run_one_bundle_sweep(
+        let result = crate::bundle_gc::run_one_bundle_sweep(
             state.services.meta.clone(),
             state.services.blob.clone(),
             &cfg,
@@ -811,30 +1081,21 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
             &state.services.clock,
         )
         .await;
-        let bundle_elapsed = (state.services.clock.now_utc() - bundle_started)
+        let elapsed = (state.services.clock.now_utc() - started)
             .to_std()
             .unwrap_or_default();
+        let r = result.as_ref().ok();
         record_sweep_metrics(&SweepMetrics {
             sweep: "bundle",
-            outcome: if bundle_result.is_ok() {
-                "success"
-            } else {
-                "failed"
-            },
-            listed: bundle_result.as_ref().map(|r| r.listed).unwrap_or(0),
-            pinned: bundle_result.as_ref().map(|r| r.pin_set_size).unwrap_or(0),
-            promoted: bundle_result
-                .as_ref()
-                .map(|r| r.promoted_deletes)
-                .unwrap_or(0),
+            outcome: if result.is_ok() { "success" } else { "failed" },
+            listed: r.map(|r| r.listed).unwrap_or(0),
+            pinned: r.map(|r| r.pin_set_size).unwrap_or(0),
+            promoted: r.map(|r| r.promoted_deletes).unwrap_or(0),
             repinned_skips: 0,
-            promote_errors: bundle_result
-                .as_ref()
-                .map(|r| r.promote_delete_errors)
-                .unwrap_or(0),
-            elapsed: bundle_elapsed,
+            promote_errors: r.map(|r| r.promote_delete_errors).unwrap_or(0),
+            elapsed,
         });
-        match bundle_result {
+        match result {
             Ok(report) => {
                 tracing::info!(
                     listed = report.listed,
@@ -850,13 +1111,18 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
                 tracing::warn!(error = %e, "bundle-gc sweep failed; will retry on next interval");
             }
         }
-        // ADR 0028 addendum: portable snapshot blobs (`snapshots/<id>/`)
-        // ride the same tick / barrier / grace config — pinned by a live
-        // `snapshots` row, swept when the row is gone. Replaces the
-        // host's inline abort-delete that could brick a recorded
-        // snapshot.
-        let snap_started = state.services.clock.now_utc();
-        let snap_result = crate::snapshot_blob_gc::run_one_snapshot_blob_sweep(
+    }
+}
+
+/// ADR 0028 addendum: portable snapshot blobs (`snapshots/<id>/`), pinned
+/// by a live `snapshots` row. Own task, same reason as bundle-gc.
+async fn snapshot_blob_gc_loop(state: SharedState, cfg: ChunkGcConfig) {
+    let mut ticker = tokio::time::interval(cfg.interval);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let started = state.services.clock.now_utc();
+        let result = crate::snapshot_blob_gc::run_one_snapshot_blob_sweep(
             state.services.meta.clone(),
             state.services.blob.clone(),
             &cfg,
@@ -864,33 +1130,21 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
             &state.services.clock,
         )
         .await;
-        let snap_elapsed = (state.services.clock.now_utc() - snap_started)
+        let elapsed = (state.services.clock.now_utc() - started)
             .to_std()
             .unwrap_or_default();
+        let r = result.as_ref().ok();
         record_sweep_metrics(&SweepMetrics {
             sweep: "snapshot_blob",
-            outcome: if snap_result.is_ok() {
-                "success"
-            } else {
-                "failed"
-            },
-            listed: snap_result.as_ref().map(|r| r.listed).unwrap_or(0),
-            pinned: snap_result.as_ref().map(|r| r.pin_set_size).unwrap_or(0),
-            promoted: snap_result
-                .as_ref()
-                .map(|r| r.promoted_deletes)
-                .unwrap_or(0),
-            repinned_skips: snap_result
-                .as_ref()
-                .map(|r| r.promote_repinned_skips)
-                .unwrap_or(0),
-            promote_errors: snap_result
-                .as_ref()
-                .map(|r| r.promote_delete_errors)
-                .unwrap_or(0),
-            elapsed: snap_elapsed,
+            outcome: if result.is_ok() { "success" } else { "failed" },
+            listed: r.map(|r| r.listed).unwrap_or(0),
+            pinned: r.map(|r| r.pin_set_size).unwrap_or(0),
+            promoted: r.map(|r| r.promoted_deletes).unwrap_or(0),
+            repinned_skips: r.map(|r| r.promote_repinned_skips).unwrap_or(0),
+            promote_errors: r.map(|r| r.promote_delete_errors).unwrap_or(0),
+            elapsed,
         });
-        match snap_result {
+        match result {
             Ok(report) => {
                 tracing::info!(
                     listed = report.listed,
@@ -951,28 +1205,39 @@ mod tests {
     }
 
     #[test]
-    fn outcome_distinguishes_a_failed_mark_from_a_healthy_sweep() {
-        let healthy = Ok(SweepReport {
+    fn outcome_distinguishes_which_pass_failed() {
+        let healthy = SweepReport {
             listed_chunks: 10,
             candidates_marked: 2,
             ..Default::default()
-        });
+        };
         assert_eq!(chunk_sweep_outcome(&healthy), "success");
 
-        // The shape that ran unnoticed in prod for 43 days: the mark pass
-        // is dead, but the promote pass still deletes. It must NOT report
-        // as success, or the liveness alert can never fire.
-        let mark_dead = Ok(SweepReport {
+        // The shape that ran unnoticed in prod for 43 days: the mark
+        // pass is dead, but the promote pass still deletes.
+        let mark_dead = SweepReport {
             promoted_deletes: 9000,
             mark_error: Some("attempt deadline 300s exceeded".into()),
             ..Default::default()
-        });
+        };
         assert_eq!(chunk_sweep_outcome(&mark_dead), "mark_failed");
 
-        let dead = Err(GcError::ChunkStore(
-            engram_chunk_store::ChunkStoreError::Blob(engram_core::BlobError::NotFound),
-        ));
-        assert_eq!(chunk_sweep_outcome(&dead), "failed");
+        // The mirror: marking advances the cursor, promote is broken.
+        // Must not report success, or a stalled reclaim hides.
+        let promote_dead = SweepReport {
+            candidates_marked: 5000,
+            next_shard: 32,
+            promote_error: Some("list_expired_gc_candidates: pool timed out".into()),
+            ..Default::default()
+        };
+        assert_eq!(chunk_sweep_outcome(&promote_dead), "promote_failed");
+
+        let both_dead = SweepReport {
+            mark_error: Some("boom".into()),
+            promote_error: Some("boom".into()),
+            ..Default::default()
+        };
+        assert_eq!(chunk_sweep_outcome(&both_dead), "failed");
     }
 
     #[test]
