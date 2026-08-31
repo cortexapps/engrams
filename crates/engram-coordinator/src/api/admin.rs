@@ -956,7 +956,9 @@ pub(crate) async fn chunk_gc_core(
     } else {
         crate::chunk_gc::SweepMode::Full
     };
-    let report = crate::chunk_gc::run_one_sweep(state, &cfg, mode)
+    // Admin sweeps start at shard 0 and never touch the cursor or the
+    // lease — they are a diagnostic, not the scheduled sweep.
+    let report = crate::chunk_gc::run_one_sweep(state, &cfg, mode, 0)
         .await
         .map_err(|e| ApiError::Internal(format!("chunk-gc: {e}")))?;
     Ok((report, grace).into())

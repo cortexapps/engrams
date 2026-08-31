@@ -249,6 +249,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
         &cfg,
         SweepMode::DryRun,
         &system_clock(),
+        0,
     )
     .await
     .expect("dry-run sweep");
@@ -374,6 +375,7 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
         &cfg,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("full sweep");
@@ -417,6 +419,7 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
         &cfg,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("second sweep");
@@ -512,6 +515,7 @@ async fn promote_skips_candidate_that_became_repinned() {
         &cfg,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("sweep");
@@ -569,6 +573,7 @@ async fn nonzero_grace_protects_recent_candidates() {
         &cfg,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("full sweep");
@@ -612,6 +617,7 @@ async fn nonzero_grace_protects_recent_candidates() {
         &cfg_zero,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("second sweep zero-grace");
@@ -684,6 +690,7 @@ async fn non_recoverable_snapshots_do_not_pin() {
         &cfg,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("sweep");
@@ -795,6 +802,7 @@ async fn base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable() {
         &cfg,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("sweep");
@@ -841,6 +849,7 @@ async fn mark_failure_still_promotes_already_expired_candidates() {
         &marking,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("marking sweep");
@@ -880,6 +889,7 @@ async fn mark_failure_still_promotes_already_expired_candidates() {
         &promoting,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("a failed mark pass must not fail the sweep");
@@ -888,7 +898,13 @@ async fn mark_failure_still_promotes_already_expired_candidates() {
         report.mark_error.is_some(),
         "the injected list fault should be reported, not swallowed"
     );
-    assert_eq!(counters.lists_faulted(), 1, "the list fault actually fired");
+    // Once per shard in the first concurrent group, not once overall:
+    // the mark pass walks `shard_concurrency` shards at a time and every
+    // one of them hits the injected fault.
+    assert!(
+        counters.lists_faulted() >= 1,
+        "the list fault actually fired"
+    );
     assert_eq!(
         report.promoted_deletes, 1,
         "promote must run on the existing candidate despite the mark failure"
@@ -933,6 +949,7 @@ async fn promote_drains_multiple_batches_in_one_sweep() {
         &cfg,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("draining sweep");
@@ -956,21 +973,24 @@ async fn promote_drains_multiple_batches_in_one_sweep() {
     }
 }
 
-/// `promote_max_per_sweep` bounds one sweep's cost so a huge backlog
-/// drains over several ticks instead of monopolising one.
+/// The promote pass is gated by a WALL-CLOCK budget, not a row cap. A
+/// cap made deletion the binding constraint and could leave a backlog
+/// stuck for weeks; a spent budget must stop the drain cleanly and leave
+/// the backlog for the next tick.
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn promote_respects_the_per_sweep_cap() {
+async fn promote_respects_the_wall_clock_budget() {
     let Some(rig) = rig().await else { return };
 
     for _ in 0..20 {
         plant_orphan(rig.blob.as_ref()).await;
     }
 
+    // Zero budget: the pass must decline to delete anything even though
+    // every candidate is past its (zero) grace.
     let cfg = ChunkGcConfig {
         grace_period: Duration::from_secs(0),
-        promote_batch_size: 5,
-        promote_max_per_sweep: 12,
+        promote_budget: Duration::from_secs(0),
         ..Default::default()
     };
     let report = run_one_sweep_inner(
@@ -980,19 +1000,114 @@ async fn promote_respects_the_per_sweep_cap() {
         &cfg,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
-    .expect("capped sweep");
+    .expect("budgeted sweep");
 
+    assert_eq!(report.candidates_marked, 20, "marking still happened");
     assert_eq!(
-        report.promoted_deletes, 12,
-        "the per-sweep cap bounds the drain"
+        report.promoted_deletes, 0,
+        "a spent promote budget deletes nothing"
     );
     assert_eq!(
         rig.meta.count_gc_candidates().await.expect("count"),
-        8,
-        "the remainder stays queued for the next tick"
+        20,
+        "the backlog is left for the next tick"
     );
+}
+
+/// The mark pass walks the key space in hash-prefix shards and resumes
+/// from a cursor. Marking the whole space in one tick is not bounded
+/// work — it grows with garbage, and in 2026-08 it outgrew a tick
+/// entirely (46h without finishing). A budget that stops the walk must
+/// still leave a cursor that advances.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn mark_pass_resumes_from_the_shard_cursor() {
+    let Some(rig) = rig().await else { return };
+
+    let mut orphans = Vec::new();
+    for _ in 0..40 {
+        orphans.push(plant_orphan(rig.blob.as_ref()).await);
+    }
+
+    // One shard group per tick, so a single sweep cannot cover all 256.
+    let cfg = ChunkGcConfig {
+        grace_period: Duration::from_secs(3600),
+        shard_concurrency: 8,
+        ..Default::default()
+    };
+
+    // Walk the whole space across successive ticks, threading the cursor
+    // exactly as the scheduled sweep does.
+    let mut start = 0u32;
+    let mut ticks = 0;
+    let mut total_marked = 0usize;
+    loop {
+        let report = run_one_sweep_inner(
+            rig.meta.clone(),
+            rig.blob.clone(),
+            &rig.chunk_store,
+            &cfg,
+            SweepMode::Full,
+            &system_clock(),
+            start,
+        )
+        .await
+        .expect("sharded sweep");
+        total_marked += report.candidates_marked;
+        start = report.next_shard;
+        ticks += 1;
+        if report.full_cycle_completed || ticks > 64 {
+            break;
+        }
+    }
+
+    assert!(
+        ticks <= 64,
+        "the cursor must advance and the walk must terminate"
+    );
+    assert_eq!(
+        total_marked, 40,
+        "every orphan is found exactly once across the full cycle"
+    );
+    assert_eq!(
+        rig.meta.count_gc_candidates().await.expect("count"),
+        40,
+        "all 40 recorded, none double-counted"
+    );
+}
+
+/// A shard walk that covers the whole space in one tick reports a
+/// completed cycle and wraps the cursor back to 0.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn full_cycle_wraps_the_cursor() {
+    let Some(rig) = rig().await else { return };
+    plant_orphan(rig.blob.as_ref()).await;
+
+    let cfg = ChunkGcConfig {
+        grace_period: Duration::from_secs(3600),
+        shard_concurrency: 64,
+        ..Default::default()
+    };
+    let report = run_one_sweep_inner(
+        rig.meta.clone(),
+        rig.blob.clone(),
+        &rig.chunk_store,
+        &cfg,
+        SweepMode::Full,
+        &system_clock(),
+        0,
+    )
+    .await
+    .expect("full-cycle sweep");
+
+    assert!(report.full_cycle_completed);
+    assert_eq!(report.shards_scanned, 256);
+    assert_eq!(report.next_shard, 0, "wrapped back to the start");
+    assert_eq!(report.candidates_marked, 1);
 }
 
 /// The mark pass walks the chunk space one page at a time. Buffering
@@ -1024,6 +1139,7 @@ async fn mark_pass_walks_every_page_of_the_chunk_space() {
         &cfg,
         SweepMode::Full,
         &system_clock(),
+        0,
     )
     .await
     .expect("paged mark sweep");

@@ -330,9 +330,9 @@ pub async fn run_with_registry_and_local(
     // `chunk_gc_candidates` absorbs straggling races. Gated by
     // `ENGRAM_CHUNK_GC_ENABLED` (default ON; the grace window is
     // the real safety net in active-development posture).
-    let _chunk_gc_sweep = {
+    let _gc_sweeps = {
         let cfg = chunk_gc::ChunkGcConfig::from_env();
-        tokio::spawn(chunk_gc::gc_sweep_loop(state.clone(), cfg))
+        chunk_gc::spawn_gc_loops(state.clone(), cfg)
     };
 
     // Demo wiring: bind the harness-channel TCP listener so
