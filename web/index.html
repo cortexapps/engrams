@@ -15,6 +15,9 @@
   </head>
   <body>
     <div id="root"></div>
+    <!-- Runtime deployment config (api origin for split-host layouts).
+         Synchronous on purpose: lib/base.ts reads it at module-eval time. -->
+    <script src="/engram-config.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

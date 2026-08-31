@@ -45,7 +45,7 @@ export function Login() {
     let cancelled = false;
     void (async () => {
       try {
-        const res = await fetch(`${API_BASE}/auth-config`, { credentials: "same-origin" });
+        const res = await fetch(`${API_BASE}/auth-config`, { credentials: "include" });
         if (!res.ok) throw new Error(`auth-config ${res.status}`);
         const cfg = (await res.json()) as AuthConfig;
         if (!cancelled) setAuthConfig(cfg);

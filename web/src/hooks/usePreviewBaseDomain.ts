@@ -19,7 +19,7 @@ export function usePreviewBaseDomain(): string | undefined {
   const { data } = useQuery({
     queryKey: ["auth-config"],
     queryFn: async (): Promise<AuthConfig> => {
-      const res = await fetch(`${API_BASE}/auth-config`, { credentials: "same-origin" });
+      const res = await fetch(`${API_BASE}/auth-config`, { credentials: "include" });
       if (!res.ok) throw new Error(`auth-config → ${res.status}`);
       return (await res.json()) as AuthConfig;
     },

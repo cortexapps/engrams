@@ -52,6 +52,18 @@ data:
         return 200 "ok\n";
       }
 
+{{- if .Values.web.apiBaseUrl }}
+      # Split-host layout: override the image's default (same-origin)
+      # runtime config so the SPA calls the api host directly for RPC,
+      # /api/v1, SSE, and WebSockets — bypassing any authenticating proxy
+      # in front of THIS host (web/src/lib/base.ts documents the contract).
+      location = /engram-config.js {
+        default_type application/javascript;
+        add_header Cache-Control "no-store" always;
+        return 200 'window.__ENGRAM_API_ORIGIN__ = "{{ .Values.web.apiBaseUrl }}";\n';
+      }
+{{- end }}
+
       # ADR 0051: /rpc (Connect/gRPC-web) and /api (better-auth /api/auth,
       # the /api/v1 legs, SSE events, the shell WebSocket) both proxy to
       # the orchestrator. The IAP assertion the public LB forwards is
@@ -120,7 +132,17 @@ data:
       }
 
       location / {
+{{- if .Values.web.apiBaseUrl }}
+{{- $api := .Values.web.apiBaseUrl }}
+{{- $wsApi := replace "http" "ws" $api }}
+        # connect-src / frame-src / img-src / media-src widen to the api
+        # host: fetch+SSE+WS ride connect-src, the IDE iframe rides
+        # frame-src, artifact previews ride img/media. Everything else
+        # stays 'self'.
+        add_header Content-Security-Policy "default-src 'self'; connect-src 'self' {{ $api }} {{ $wsApi }}; frame-src 'self' {{ $api }}; img-src 'self' data: {{ $api }}; media-src 'self' {{ $api }}; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+{{- else }}
         add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; media-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+{{- end }}
         add_header X-Content-Type-Options "nosniff" always;
         try_files $uri $uri/ /index.html;
       }

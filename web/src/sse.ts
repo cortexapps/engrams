@@ -1,4 +1,4 @@
-import { API_BASE } from "./lib/base";
+import { API_BASE, API_CREDENTIALS } from "./lib/base";
 import { parseOrchestratorFrame } from "./events";
 import type { IndexedEvent, SessionEventKind } from "./lib/types";
 
@@ -103,7 +103,7 @@ export function subscribeSpec(specId: string, handlers: SseHandlers, since = -1)
 }
 
 function subscribeEventFeed(url: string, handlers: SseHandlers): () => void {
-  const es = new EventSource(url);
+  const es = new EventSource(url, { withCredentials: API_CREDENTIALS === "include" });
 
   // Wire one listener per discriminant so EventSource doesn't deliver
   // them all through `onmessage` (which only catches frames with no
