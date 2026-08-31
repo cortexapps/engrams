@@ -458,9 +458,25 @@ async fn drive_harness(
     // semantics; we're testing the chain works end-to-end. A 401
     // proves the request was issued, the response was received,
     // and Claude CLI parsed it.
+    //
+    // It must be WELL-FORMED-but-invalid, not arbitrary. The token has
+    // to survive the CLI's own client-side shape check and actually get
+    // sent, or the request never leaves the guest and this test stops
+    // exercising the egress chain at all. The previous value
+    // ("sk-bogus-e2e-test-token-not-real", no `sk-ant-oat01-` prefix)
+    // began failing that check on 2026-08-31: the CLI answered "Not
+    // logged in · Please run /login" without dialing out, and both
+    // harness e2e tests went red while every other test in the lane —
+    // including `egress_stream_survives_roll` — stayed green.
+    //
+    // The CLI ships unpinned and the `harness-claude` bundle is baked
+    // per CI run, so a client-side validation change lands here with no
+    // commit in this repo to point at. `sk-ant-oat01-` is the prefix the
+    // rest of the tree already uses for fake Claude Code OAuth tokens
+    // (see the orchestrator's task + seal tests).
     env.insert(
         "CLAUDE_CODE_OAUTH_TOKEN".into(),
-        "sk-bogus-e2e-test-token-not-real".into(),
+        "sk-ant-oat01-e2e00000000000000000000000000000000000000000000000000000000000000AA".into(),
     );
     // The CLI treats 401 as retryable (it clears cached auth and
     // re-attempts, default 10 tries with exponential backoff) — but
@@ -591,6 +607,23 @@ async fn drive_harness(
                 ]
                 .iter()
                 .any(|m| lower.contains(m));
+            // A THIRD failure shape, distinct from both a healthy 401 and
+            // a chain break: the CLI declining locally, before any
+            // request leaves the guest. That means the token no longer
+            // passes its client-side shape check — the egress chain may
+            // be perfectly fine. Name it explicitly, because diagnosing
+            // it from the generic message cost a day on 2026-08-31.
+            let refused_locally = lower.contains("not logged in")
+                || lower.contains("please run /login")
+                || lower.contains("invalid api key");
+            assert!(
+                !refused_locally,
+                "the Claude CLI refused the bogus token LOCALLY and never issued a request, so \
+                 this test proved nothing about egress. The token must be well-formed-but-invalid \
+                 (`sk-ant-oat01-…`) so the CLI sends it and the API 401s. The CLI is unpinned and \
+                 the harness bundle is baked per CI run, so its client-side validation can tighten \
+                 with no commit here — update the token in this file. Got: {text:?}",
+            );
             assert!(
                 reached_api_401 || reached_api_transient,
                 "harness AgentMessage should prove the bogus-token round-trip reached \
