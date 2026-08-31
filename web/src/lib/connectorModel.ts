@@ -326,3 +326,37 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     ...(cli ? { cli } : {}),
   };
 }
+
+/**
+ * Which credential actions a connected provider's detail page should offer.
+ *
+ * The rule is about how a credential can physically be changed, not about how
+ * it is displayed:
+ *
+ *   - A **brokered OAuth** inject carries an EMPTY `secretRef`: the token is
+ *     held server-side by the broker, never in an org secret. It cannot be
+ *     pasted, so the only way to replace it is a fresh consent round-trip.
+ *     Re-authorizing is also the only way a provider re-provisions the
+ *     resources it creates at install time — Linear mints an OAuth-app webhook
+ *     per organization *on authorize*, so an installation that predates the
+ *     app's webhook settings silently never has one.
+ *   - **Mint** fields and **org-secret** injects are hand-replaceable.
+ *   - A connector may be mixed (a brokered token plus a static key), so these
+ *     are independent booleans rather than a single mode.
+ *
+ * `needs_reconnect` already renders a Reconnect in the page header, so the
+ * credential card suppresses its own rather than showing the label twice.
+ */
+export function credentialActions(input: {
+  credentialSource: "mint" | "inject";
+  injects: readonly Pick<ParsedInject, "secretRef">[];
+  hasOauth: boolean;
+  status: "connected" | "available" | "needs_reconnect";
+}): { reconnect: boolean; replace: boolean } {
+  const isMint = input.credentialSource === "mint";
+  const brokeredOauth = !isMint && input.hasOauth && input.injects.some((i) => !i.secretRef);
+  return {
+    reconnect: brokeredOauth && input.status !== "needs_reconnect",
+    replace: isMint || input.injects.some((i) => Boolean(i.secretRef)),
+  };
+}

@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   accessOf,
+  credentialActions,
   defaultDisplayName,
   defaultIconColor,
   defaultIconMono,
@@ -273,5 +274,79 @@ describe("parseConnectorConfig", () => {
     const c = parseConnectorConfig(raw, "x");
     expect(c.oauth?.scopes).toEqual([]);
     expect(c.oauth?.signingSecretRef).toBeUndefined();
+  });
+});
+
+describe("credentialActions", () => {
+  const brokered = [{ secretRef: "" }];
+  const orgSecret = [{ secretRef: "datadog.api_key" }];
+
+  test("a brokered OAuth token offers Reconnect and NOT Replace", () => {
+    // The regression: the detail page offered only "Replace", whose sheet wrote
+    // an empty-named org secret and never touched the broker's token.
+    expect(
+      credentialActions({
+        credentialSource: "inject",
+        injects: brokered,
+        hasOauth: true,
+        status: "connected",
+      }),
+    ).toEqual({ reconnect: true, replace: false });
+  });
+
+  test("an org-secret inject offers Replace and NOT Reconnect", () => {
+    expect(
+      credentialActions({
+        credentialSource: "inject",
+        injects: orgSecret,
+        hasOauth: false,
+        status: "connected",
+      }),
+    ).toEqual({ reconnect: false, replace: true });
+  });
+
+  test("a mint credential offers Replace", () => {
+    expect(
+      credentialActions({
+        credentialSource: "mint",
+        injects: [],
+        hasOauth: false,
+        status: "connected",
+      }),
+    ).toEqual({ reconnect: false, replace: true });
+  });
+
+  test("a mixed connector offers both", () => {
+    expect(
+      credentialActions({
+        credentialSource: "inject",
+        injects: [...brokered, ...orgSecret],
+        hasOauth: true,
+        status: "connected",
+      }),
+    ).toEqual({ reconnect: true, replace: true });
+  });
+
+  test("needs_reconnect suppresses the card's Reconnect (the header has one)", () => {
+    expect(
+      credentialActions({
+        credentialSource: "inject",
+        injects: brokered,
+        hasOauth: true,
+        status: "needs_reconnect",
+      }).reconnect,
+    ).toBe(false);
+  });
+
+  test("an empty secretRef without an OAuth facet is not reconnectable", () => {
+    // Nothing to authorize against: don't offer a button that dead-ends.
+    expect(
+      credentialActions({
+        credentialSource: "inject",
+        injects: brokered,
+        hasOauth: false,
+        status: "connected",
+      }),
+    ).toEqual({ reconnect: false, replace: false });
   });
 });

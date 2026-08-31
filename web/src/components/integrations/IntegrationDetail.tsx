@@ -33,7 +33,7 @@ import {
   useMintKinds,
   useTestConnector,
 } from "@/hooks/useIntegrations";
-import { humanizeAction, parseConnectorConfig } from "@/lib/connectorModel";
+import { credentialActions, humanizeAction, parseConnectorConfig } from "@/lib/connectorModel";
 import { ProviderTile } from "./ProviderTile";
 import { AccessTag, HostChip, StatusDot } from "./chips";
 import { ReplaceCredentialSheet } from "./ReplaceCredentialSheet";
@@ -125,6 +125,27 @@ function DetailBody({ view }: { view: ConnectorView }) {
       )
     : undefined;
 
+  // ADR 0058: a brokered OAuth inject carries NO secretRef — the token is held
+  // server-side by the broker, not in an org secret, so it cannot be pasted.
+  // Re-running consent is the only way to replace it, and the only way a
+  // provider re-provisions the resources it creates at authorization time
+  // (Linear mints an OAuth-app webhook per organization on authorize; an
+  // install that predates the app's webhook settings never gets one).
+  const injects = cfg?.injects ?? [];
+  const brokeredOauth = !isMint && cfg?.oauth !== undefined && injects.some((i) => !i.secretRef);
+  const actions = credentialActions({
+    credentialSource: view.credentialSource,
+    injects,
+    hasOauth: cfg?.oauth !== undefined,
+    status: view.status,
+  });
+
+  // A fresh consent round-trip. `force=1` re-prompts even when the provider
+  // would otherwise silently re-issue the existing grant.
+  const reconnect = () => {
+    window.location.href = `/api/v1/integrations/${encodeURIComponent(view.provider)}/oauth/authorize?force=1`;
+  };
+
   const samples = sampleEvents(view);
 
   const remove = () => {
@@ -161,16 +182,7 @@ function DetailBody({ view }: { view: ConnectorView }) {
             </div>
           </div>
           {view.status === "needs_reconnect" && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                // The provider revoked or rotated away our grant: run a fresh
-                // consent flow (force re-approval) and CAS-replace the sealed
-                // credential.
-                window.location.href = `/api/v1/integrations/${encodeURIComponent(view.provider)}/oauth/authorize?force=1`;
-              }}
-            >
+            <Button variant="outline" size="sm" onClick={reconnect}>
               <RotateCcwIcon className="size-3.5" />
               Reconnect
             </Button>
@@ -239,7 +251,7 @@ function DetailBody({ view }: { view: ConnectorView }) {
               </div>
             ) : (
               <div className="mt-1.5 flex flex-col gap-0.5 font-mono text-xs text-muted-foreground">
-                {(cfg?.injects ?? []).map((inj) => (
+                {injects.map((inj) => (
                   <div key={inj.header}>
                     {inj.secretRef
                       ? `org secret · ${inj.secretRef} · `
@@ -247,13 +259,30 @@ function DetailBody({ view }: { view: ConnectorView }) {
                     header {inj.header}: {inj.template}
                   </div>
                 ))}
+                {brokeredOauth && (
+                  <div className="mt-1.5 font-sans text-xs text-muted-foreground">
+                    Held server-side after consent, so it can't be pasted. Reconnect runs a fresh
+                    authorization — which also re-provisions whatever the provider creates at
+                    install time, such as webhooks.
+                  </div>
+                )}
               </div>
             )}
           </div>
-          <Button variant="ghost" size="sm" onClick={() => setReplacing(true)}>
-            <RotateCcwIcon className="size-3.5" />
-            Replace
-          </Button>
+          <div className="flex shrink-0 items-center gap-1">
+            {actions.reconnect && (
+              <Button variant="ghost" size="sm" onClick={reconnect}>
+                <RotateCcwIcon className="size-3.5" />
+                Reconnect
+              </Button>
+            )}
+            {actions.replace && (
+              <Button variant="ghost" size="sm" onClick={() => setReplacing(true)}>
+                <RotateCcwIcon className="size-3.5" />
+                Replace
+              </Button>
+            )}
+          </div>
         </div>
       </div>
 
