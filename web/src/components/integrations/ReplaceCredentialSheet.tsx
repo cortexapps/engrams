@@ -57,7 +57,12 @@ export function ReplaceCredentialSheet({
         (k) => k.provider === view.provider || k.kind === cfg?.mintKind,
       )
     : undefined;
-  const injects = cfg?.injects ?? [];
+  // Only org-secret-backed injects are hand-replaceable. A server-brokered
+  // OAuth inject carries an EMPTY secretRef: including it rendered a field
+  // whose save called PutSecret with an empty name and never touched the real
+  // token, and printed a dangling "Rotate the org secret ·" subtitle. Those
+  // connectors get Reconnect on the detail page instead (IntegrationDetail).
+  const injects = (cfg?.injects ?? []).filter((inj) => inj.secretRef);
 
   const [values, setValues] = useState<Record<string, string>>({});
   // ADR 0058: one entry per injected header, keyed by its org-secret ref.
