@@ -96,6 +96,19 @@ describe("linear ingress: team scope", () => {
     expect(got.scopeValue).toBe("CD");
   });
 
+  test("an attachment carries only issueId, so it stays unscoped", async () => {
+    // The boundary the fallback deliberately stops at: resolving this team
+    // would need an API lookup inside the 3s ack budget. Verified against a
+    // live attachment.update delivery — no nested issue object.
+    const got = await deliver({
+      type: "Attachment",
+      action: "update",
+      data: { id: "a1", title: "PR", issueId: "b1d35c6d-c7ca-4240-ac83-5bdcaa9bf550" },
+    });
+    expect(got.eventKey).toBe("attachment.update");
+    expect(got.scopeValue).toBeUndefined();
+  });
+
   test("a payload with no team anywhere ledgers with no scope", async () => {
     // Still ledgered — only a SCOPED trigger declines it; an unscoped one fires.
     const got = await deliver({ type: "Project", action: "update", data: { id: "p1" } });
