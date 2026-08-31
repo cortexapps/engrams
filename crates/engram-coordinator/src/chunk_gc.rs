@@ -287,6 +287,11 @@ pub struct SweepReport {
     /// Whether this mark pass finished a full cycle of the key space
     /// (wrapped past every shard) rather than stopping on its budget.
     pub full_cycle_completed: bool,
+    /// Set when the promote pass failed. Symmetric with `mark_error`:
+    /// the pass is recorded as degraded and the sweep still returns its
+    /// report, so the mark pass's cursor progress is never thrown away
+    /// by a promote-side fault.
+    pub promote_error: Option<String>,
     /// Set when the mark pass failed. The promote pass still ran —
     /// it deletes candidates recorded by EARLIER sweeps and needs no
     /// listing — so a mark failure degrades the sweep instead of
@@ -305,7 +310,7 @@ pub async fn run_one_sweep(
     cfg: &ChunkGcConfig,
     mode: SweepMode,
     start_shard: u32,
-) -> Result<SweepReport, GcError> {
+) -> SweepReport {
     run_one_sweep_inner(
         state.services.meta.clone(),
         state.services.blob.clone(),
@@ -342,7 +347,7 @@ pub async fn run_one_sweep_inner(
     mode: SweepMode,
     clock: &Arc<dyn engram_core::traits::Clock>,
     start_shard: u32,
-) -> Result<SweepReport, GcError> {
+) -> SweepReport {
     let mut report = SweepReport {
         next_shard: start_shard,
         ..Default::default()
@@ -373,15 +378,32 @@ pub async fn run_one_sweep_inner(
     }
 
     // -------- promote pass (Full only) --------
+    //
+    // Caught, not propagated — symmetric with the mark pass above. A `?`
+    // here discarded the whole report, so `chunk_gc_run_once` could not
+    // read the advanced cursor and wrote back the shard it started at,
+    // throwing away the mark pass's progress. Under a recurring promote
+    // fault with a budget-limited walk, the cursor would never advance
+    // and the unreached shards would never be scanned — the exact
+    // outcome the cursor exists to prevent.
     if mode == SweepMode::Full {
-        let (deletes, repinned, errors) =
-            promote_expired(meta.as_ref(), blob.as_ref(), chunk_store, cfg, clock).await?;
-        report.promoted_deletes = deletes;
-        report.promote_repinned_skips = repinned;
-        report.promote_delete_errors = errors;
+        match promote_expired(meta.as_ref(), blob.as_ref(), chunk_store, cfg, clock).await {
+            Ok((deletes, repinned, errors)) => {
+                report.promoted_deletes = deletes;
+                report.promote_repinned_skips = repinned;
+                report.promote_delete_errors = errors;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "chunk-gc promote pass failed; the mark pass's cursor progress still stands"
+                );
+                report.promote_error = Some(e.to_string());
+            }
+        }
     }
 
-    Ok(report)
+    report
 }
 
 /// Mark pass: classify every stored chunk against the live pin set and
@@ -860,18 +882,18 @@ pub(crate) struct SweepMetrics {
 
 /// The `outcome` label for a chunk sweep.
 ///
-/// `mark_failed` is deliberately its own value rather than folded into
-/// either neighbour. The sweep did real work — the promote pass ran and
-/// deleted — so it is not `failed`; but the candidate set stopped being
-/// refreshed, so it is not `success` either. Collapsing it into
-/// `success` would have hidden the 43-day prod outage all over again,
-/// because once the promote pass is decoupled a broken mark pass still
-/// reports deletes.
-pub(crate) fn chunk_sweep_outcome(result: &Result<SweepReport, GcError>) -> &'static str {
-    match result {
-        Err(_) => "failed",
-        Ok(r) if r.mark_error.is_some() => "mark_failed",
-        Ok(_) => "success",
+/// Four values, because the two passes fail independently and a sweep
+/// where one worked is genuinely different from one where neither did.
+/// `mark_failed` and `promote_failed` are each REAL work plus a real
+/// gap: collapsing either into `success` would hide exactly the class of
+/// outage this whole subsystem keeps producing — a pass that has
+/// silently stopped doing anything while the sweep still reports fine.
+pub(crate) fn chunk_sweep_outcome(report: &SweepReport) -> &'static str {
+    match (report.mark_error.is_some(), report.promote_error.is_some()) {
+        (false, false) => "success",
+        (true, false) => "mark_failed",
+        (false, true) => "promote_failed",
+        (true, true) => "failed",
     }
 }
 
@@ -982,60 +1004,51 @@ pub async fn chunk_gc_run_once(state: &SharedState, cfg: &ChunkGcConfig, claiman
     };
 
     let started = state.services.clock.now_utc();
-    let sweep_result = run_one_sweep(state, cfg, SweepMode::Full, start_shard).await;
+    let report = run_one_sweep(state, cfg, SweepMode::Full, start_shard).await;
+    let elapsed = (state.services.clock.now_utc() - started)
+        .to_std()
+        .unwrap_or_default();
 
-    // Persist the cursor and free the lease even when the sweep errored:
-    // `run_one_sweep_inner` records progress into the report before it
-    // surfaces an error, so a partial walk still advances.
-    let next_shard = sweep_result
-        .as_ref()
-        .map(|r| r.next_shard)
-        .unwrap_or(start_shard);
+    // Always persist the cursor. A sweep ALWAYS yields a report — both
+    // passes record their failure into it rather than discarding it — so
+    // whatever shards the mark pass did reach are never re-walked, no
+    // matter which pass degraded.
     if let Err(e) = state
         .services
         .meta
-        .release_chunk_gc_sweep(claimant, next_shard)
+        .release_chunk_gc_sweep(claimant, report.next_shard)
         .await
     {
         tracing::warn!(error = %e, "chunk-gc: could not release the sweep lease");
     }
-    let elapsed = (state.services.clock.now_utc() - started)
-        .to_std()
-        .unwrap_or_default();
-    let outcome = chunk_sweep_outcome(&sweep_result);
-    let r = sweep_result.as_ref().ok();
+
     record_sweep_metrics(&SweepMetrics {
         sweep: "chunk",
-        outcome,
-        listed: r.map(|r| r.listed_chunks).unwrap_or(0),
-        pinned: r.map(|r| r.pin_set_size).unwrap_or(0),
-        promoted: r.map(|r| r.promoted_deletes).unwrap_or(0),
-        repinned_skips: r.map(|r| r.promote_repinned_skips).unwrap_or(0),
-        promote_errors: r.map(|r| r.promote_delete_errors).unwrap_or(0),
+        outcome: chunk_sweep_outcome(&report),
+        listed: report.listed_chunks,
+        pinned: report.pin_set_size,
+        promoted: report.promoted_deletes,
+        repinned_skips: report.promote_repinned_skips,
+        promote_errors: report.promote_delete_errors,
         elapsed,
     });
     record_backlog_gauge(state).await;
-    match sweep_result {
-        Ok(report) => {
-            tracing::info!(
-                listed = report.listed_chunks,
-                malformed = report.malformed_keys,
-                pinned = report.pin_set_size,
-                candidates = report.candidates_marked,
-                shards_scanned = report.shards_scanned,
-                full_cycle = report.full_cycle_completed,
-                promoted = report.promoted_deletes,
-                repinned_skips = report.promote_repinned_skips,
-                promote_errors = report.promote_delete_errors,
-                generation_moved = report.generation_moved,
-                mark_error = report.mark_error.as_deref().unwrap_or(""),
-                "chunk-gc sweep done"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "chunk-gc sweep failed; will retry on next interval");
-        }
-    }
+    tracing::info!(
+        listed = report.listed_chunks,
+        malformed = report.malformed_keys,
+        pinned = report.pin_set_size,
+        candidates = report.candidates_marked,
+        shards_scanned = report.shards_scanned,
+        next_shard = report.next_shard,
+        full_cycle = report.full_cycle_completed,
+        promoted = report.promoted_deletes,
+        repinned_skips = report.promote_repinned_skips,
+        promote_errors = report.promote_delete_errors,
+        generation_moved = report.generation_moved,
+        mark_error = report.mark_error.as_deref().unwrap_or(""),
+        promote_error = report.promote_error.as_deref().unwrap_or(""),
+        "chunk-gc sweep done"
+    );
 }
 
 /// The "is GC keeping up" gauge. It reached 8.9M before anyone looked,
@@ -1192,28 +1205,39 @@ mod tests {
     }
 
     #[test]
-    fn outcome_distinguishes_a_failed_mark_from_a_healthy_sweep() {
-        let healthy = Ok(SweepReport {
+    fn outcome_distinguishes_which_pass_failed() {
+        let healthy = SweepReport {
             listed_chunks: 10,
             candidates_marked: 2,
             ..Default::default()
-        });
+        };
         assert_eq!(chunk_sweep_outcome(&healthy), "success");
 
-        // The shape that ran unnoticed in prod for 43 days: the mark pass
-        // is dead, but the promote pass still deletes. It must NOT report
-        // as success, or the liveness alert can never fire.
-        let mark_dead = Ok(SweepReport {
+        // The shape that ran unnoticed in prod for 43 days: the mark
+        // pass is dead, but the promote pass still deletes.
+        let mark_dead = SweepReport {
             promoted_deletes: 9000,
             mark_error: Some("attempt deadline 300s exceeded".into()),
             ..Default::default()
-        });
+        };
         assert_eq!(chunk_sweep_outcome(&mark_dead), "mark_failed");
 
-        let dead = Err(GcError::ChunkStore(
-            engram_chunk_store::ChunkStoreError::Blob(engram_core::BlobError::NotFound),
-        ));
-        assert_eq!(chunk_sweep_outcome(&dead), "failed");
+        // The mirror: marking advances the cursor, promote is broken.
+        // Must not report success, or a stalled reclaim hides.
+        let promote_dead = SweepReport {
+            candidates_marked: 5000,
+            next_shard: 32,
+            promote_error: Some("list_expired_gc_candidates: pool timed out".into()),
+            ..Default::default()
+        };
+        assert_eq!(chunk_sweep_outcome(&promote_dead), "promote_failed");
+
+        let both_dead = SweepReport {
+            mark_error: Some("boom".into()),
+            promote_error: Some("boom".into()),
+            ..Default::default()
+        };
+        assert_eq!(chunk_sweep_outcome(&both_dead), "failed");
     }
 
     #[test]

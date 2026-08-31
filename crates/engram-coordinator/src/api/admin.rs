@@ -958,9 +958,10 @@ pub(crate) async fn chunk_gc_core(
     };
     // Admin sweeps start at shard 0 and never touch the cursor or the
     // lease — they are a diagnostic, not the scheduled sweep.
-    let report = crate::chunk_gc::run_one_sweep(state, &cfg, mode, 0)
-        .await
-        .map_err(|e| ApiError::Internal(format!("chunk-gc: {e}")))?;
+    // A sweep always yields a report; per-pass failures ride in
+    // `mark_error` / `promote_error` so a diagnostic run tells the
+    // operator WHICH pass broke instead of collapsing to a 500.
+    let report = crate::chunk_gc::run_one_sweep(state, &cfg, mode, 0).await;
     Ok((report, grace).into())
 }
 
