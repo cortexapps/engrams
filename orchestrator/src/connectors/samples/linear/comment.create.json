@@ -7,7 +7,13 @@
     "issue": {
       "id": "0f1e2d3c-aaaa-bbbb-cccc-908070605040",
       "identifier": "ENG-123",
-      "title": "Empty payloads crash the parser"
+      "title": "Empty payloads crash the parser",
+      "team": {
+        "id": "23264440-aaaa-bbbb-cccc-91346c47e11b",
+        "key": "ENG",
+        "name": "Engineering"
+      },
+      "teamId": "23264440-aaaa-bbbb-cccc-91346c47e11b"
     }
   },
   "url": "https://linear.app/acme/issue/ENG-123#comment",

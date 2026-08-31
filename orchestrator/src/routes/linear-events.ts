@@ -77,7 +77,23 @@ export function makeLinearEventsRoute(deps: LinearEventsDeps = {}): Hono {
       if (typeof type !== "string" || type === "" || typeof action !== "string" || action === "") {
         return { kind: "skip", reason: "payload without type/action" };
       }
-      const team = ownPath(payload, "data.team.key");
+      // Where the team lives depends on the entity. An issue payload carries
+      // it at `data.team`; a CHILD entity (a comment, and the other
+      // issue-scoped types) has no team on `data` at all and nests it under
+      // the issue instead. Reading only `data.team.key` left every comment
+      // delivery with NO scope, so a team-scoped trigger could never match one
+      // — it is dropped by the `event.scopeValue === undefined` arm of
+      // triggerMatches (dispatch.ts). Prod 2026-08-31: a CD-495 comment
+      // ledgered with an empty scope_value and started no run.
+      //
+      // Deliberate boundary: this covers the child entities that EMBED the
+      // issue (comments do). It does not cover `attachment.*`, which carries
+      // only an `issueId`, nor `issuelabel.*`, which is organization-level and
+      // has no team at all. Scoping an attachment would need an API lookup
+      // inside the 3s ack budget; those stay unscoped, so only a SCOPED
+      // trigger declines them.
+      const team =
+        ownPath(payload, "data.team.key") ?? ownPath(payload, "data.issue.team.key");
       return {
         kind: "event",
         event: {
