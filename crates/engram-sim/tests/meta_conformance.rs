@@ -2392,6 +2392,97 @@ async fn latest_snapshot_reports_recoverable_flag(ctx: &Ctx) {
     );
 }
 
+/// Batched candidate upsert: same sticky-`first_seen_at` semantics as
+/// the singular form, and mixing the two must not double-count.
+async fn gc_candidates_batched(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let a = [1u8; 32];
+    let b = [2u8; 32];
+    let c = [3u8; 32];
+
+    // Empty input is a no-op, not an error (and skips the round trip).
+    meta.upsert_chunk_gc_candidates(&[]).await.unwrap();
+    assert_eq!(meta.count_gc_candidates().await.unwrap(), 0);
+
+    meta.upsert_chunk_gc_candidates(&[a, b]).await.unwrap();
+    assert_eq!(meta.count_gc_candidates().await.unwrap(), 2);
+
+    ctx.clock.advance(Duration::from_secs(100));
+    // Re-upsert `a` in a batch alongside a new `c`: `a` keeps its
+    // original first_seen_at, `c` gets the later one.
+    meta.upsert_chunk_gc_candidates(&[a, c]).await.unwrap();
+    assert_eq!(
+        meta.count_gc_candidates().await.unwrap(),
+        3,
+        "re-upsert in a batch does not double-count"
+    );
+
+    let now = ctx.clock.now_utc();
+    // Cutoff between the two writes: a and b expired, c not yet.
+    let mut expired = meta
+        .list_expired_gc_candidates(now - chrono::Duration::seconds(50), 10)
+        .await
+        .unwrap();
+    expired.sort();
+    assert_eq!(
+        expired,
+        vec![a, b],
+        "batched re-upsert must not reset first_seen_at"
+    );
+
+    // The singular and batched forms share one table.
+    meta.upsert_chunk_gc_candidate(c).await.unwrap();
+    assert_eq!(meta.count_gc_candidates().await.unwrap(), 3);
+}
+
+/// The chunk-sweep lease: exclusive while live, stale takeover, guarded
+/// release, and the shard cursor round-tripping through it.
+async fn chunk_gc_sweep_lease(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let stale = Duration::from_secs(1800);
+
+    // Free row: claimed, cursor starts at shard 0.
+    assert_eq!(
+        meta.claim_chunk_gc_sweep("pod-a", stale).await.unwrap(),
+        Some(0)
+    );
+    // Contested while live — the second replica must skip its tick, or
+    // both would advance one cursor and silently skip shards.
+    assert_eq!(
+        meta.claim_chunk_gc_sweep("pod-b", stale).await.unwrap(),
+        None
+    );
+
+    // Wrong-claimant release is a guarded no-op: it must neither free
+    // the lease nor clobber the cursor.
+    meta.release_chunk_gc_sweep("pod-b", 99).await.unwrap();
+    assert_eq!(
+        meta.claim_chunk_gc_sweep("pod-b", stale).await.unwrap(),
+        None
+    );
+
+    // Right-claimant release frees it and persists the cursor.
+    meta.release_chunk_gc_sweep("pod-a", 16).await.unwrap();
+    assert_eq!(
+        meta.claim_chunk_gc_sweep("pod-b", stale).await.unwrap(),
+        Some(16),
+        "the cursor survives the release and resumes the walk"
+    );
+
+    // Stale takeover: a pod that died mid-sweep must not wedge GC. The
+    // cursor is whatever the dead pod last persisted.
+    ctx.clock.advance(Duration::from_secs(1801));
+    assert_eq!(
+        meta.claim_chunk_gc_sweep("pod-c", stale).await.unwrap(),
+        Some(16)
+    );
+    meta.release_chunk_gc_sweep("pod-c", 255).await.unwrap();
+    assert_eq!(
+        meta.claim_chunk_gc_sweep("pod-a", stale).await.unwrap(),
+        Some(255)
+    );
+}
+
 /// GC candidates: first_seen_at is sticky across re-upserts; the
 /// expiry cutoff keys on it; delete removes.
 async fn gc_candidates(ctx: &Ctx) {
@@ -3939,6 +4030,8 @@ conformance!(
 conformance!(t_outbox_flow, super::outbox_flow);
 conformance!(t_snapshot_durable_head, super::snapshot_durable_head);
 conformance!(t_gc_candidates, super::gc_candidates);
+conformance!(t_gc_candidates_batched, super::gc_candidates_batched);
+conformance!(t_chunk_gc_sweep_lease, super::chunk_gc_sweep_lease);
 conformance!(t_host_lifecycle, super::host_lifecycle);
 conformance!(t_bundle_pin_set_union, super::bundle_pin_set_union);
 conformance!(

@@ -2772,6 +2772,73 @@ impl MetadataStore for SimMetadataStore {
         Ok(())
     }
 
+    /// Batched form; same sticky `first_seen_at` as the singular.
+    async fn upsert_chunk_gc_candidates(&self, hashes: &[[u8; 32]]) -> Result<(), MetaError> {
+        self.gate()?;
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let now = self.now();
+        let mut db = self.db.lock();
+        for hash in hashes {
+            db.chunk_gc
+                .entry(hash.to_vec())
+                .and_modify(|c| c.last_seen_at = now)
+                .or_insert(super::GcCandidate {
+                    first_seen_at: now,
+                    last_seen_at: now,
+                });
+        }
+        Ok(())
+    }
+
+    /// Guarded claim + cursor read, exactly the 0119 SQL: free row or a
+    /// claim older than `stale_after` wins; a live incumbent blocks.
+    async fn claim_chunk_gc_sweep(
+        &self,
+        claimant: &str,
+        stale_after: Duration,
+    ) -> Result<Option<u32>, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let cutoff = now
+            - chrono::Duration::from_std(stale_after)
+                .unwrap_or_else(|_| chrono::Duration::seconds(3600));
+        let mut db = self.db.lock();
+        let held_live = match (&db.chunk_gc_sweep.claimed_by, db.chunk_gc_sweep.claimed_at) {
+            (Some(_), Some(at)) => at >= cutoff,
+            // A claimant with no timestamp cannot be proven stale, so it
+            // blocks — matches the SQL, where `claimed_at < $3` is NULL
+            // (not true) and the guarded UPDATE matches no row.
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if held_live {
+            return Ok(None);
+        }
+        db.chunk_gc_sweep.claimed_by = Some(claimant.to_string());
+        db.chunk_gc_sweep.claimed_at = Some(now);
+        Ok(Some(db.chunk_gc_sweep.next_shard))
+    }
+
+    /// Cursor persist + release, guarded on the claimant.
+    async fn release_chunk_gc_sweep(
+        &self,
+        claimant: &str,
+        next_shard: u32,
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        if db.chunk_gc_sweep.claimed_by.as_deref() == Some(claimant) {
+            db.chunk_gc_sweep.claimed_by = None;
+            db.chunk_gc_sweep.claimed_at = None;
+            db.chunk_gc_sweep.next_shard = next_shard;
+            db.chunk_gc_sweep.updated_at = Some(now);
+        }
+        Ok(())
+    }
+
     async fn list_expired_gc_candidates(
         &self,
         cutoff: DateTime<Utc>,

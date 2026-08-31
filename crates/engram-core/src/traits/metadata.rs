@@ -3407,6 +3407,50 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// Batched form of [`MetadataStore::upsert_chunk_gc_candidate`].
+    ///
+    /// The mark pass issued ONE round trip per unpinned chunk. That was
+    /// invisible while `list_prefix` failed first; once the paged walk
+    /// worked it metered the sweep at ~335 inserts/s, and the first
+    /// sweep had still not finished after 46 hours (2026-08-31). A
+    /// multi-row upsert is what makes the write side a non-factor.
+    /// Same sticky-`first_seen_at` semantics as the singular form.
+    async fn upsert_chunk_gc_candidates(&self, _hashes: &[[u8; 32]]) -> Result<(), MetaError> {
+        Ok(())
+    }
+
+    /// Claim the single-writer chunk-sweep lease and read the shard
+    /// cursor in one round trip. `Some(next_shard)` means this claimant
+    /// now owns the sweep — the row was free, or the incumbent's claim
+    /// is older than `stale_after` (crash takeover). `None` means a live
+    /// incumbent holds it and this replica must skip the tick.
+    ///
+    /// The lease is what makes the cursor safe: both coordinator
+    /// replicas run the sweep loop, and two pods advancing one cursor
+    /// would skip shards that then silently never get scanned.
+    /// Default (mock): acquired at shard 0 — single-replica tests have
+    /// no contention.
+    async fn claim_chunk_gc_sweep(
+        &self,
+        claimant: &str,
+        stale_after: std::time::Duration,
+    ) -> Result<Option<u32>, MetaError> {
+        let _ = (claimant, stale_after);
+        Ok(Some(0))
+    }
+
+    /// Persist the shard cursor and release the sweep lease. Guarded on
+    /// `claimant` so a stale holder that was taken over cannot clobber
+    /// the new holder's cursor. Idempotent. Default (mock): no-op.
+    async fn release_chunk_gc_sweep(
+        &self,
+        claimant: &str,
+        next_shard: u32,
+    ) -> Result<(), MetaError> {
+        let _ = (claimant, next_shard);
+        Ok(())
+    }
+
     /// ADR 0016 Phase C promote-pass query. Returns up to `limit`
     /// candidate hashes whose `first_seen_at` predates `cutoff`,
     /// ordered by `first_seen_at` so the oldest backlog drains

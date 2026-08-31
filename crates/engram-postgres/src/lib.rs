@@ -8654,6 +8654,81 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    /// Batched candidate upsert — one round trip for a whole page of
+    /// the shard walk instead of one per chunk. `unnest` is the house
+    /// idiom for turning a Rust `Vec` into a set of rows (see
+    /// `delete_gc_candidates` below). Sticky `first_seen_at`, same as
+    /// the singular form.
+    async fn upsert_chunk_gc_candidates(&self, hashes: &[[u8; 32]]) -> Result<(), MetaError> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let as_vecs: Vec<&[u8]> = hashes.iter().map(|h| h.as_slice()).collect();
+        sqlx::query(
+            "INSERT INTO chunk_gc_candidates (content_hash, first_seen_at, last_seen_at)
+             SELECT h, $2, $2 FROM unnest($1::bytea[]) AS t(h)
+             ON CONFLICT (content_hash) DO UPDATE SET last_seen_at = $2",
+        )
+        .bind(&as_vecs)
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Claim the sweep lease + read the cursor. The singleton row is
+    /// seeded by migration 0119, so this is a guarded UPDATE rather than
+    /// the INSERT-or-take-over shape `dead_host_inflight` needs. Same
+    /// staleness model: the caller supplies the window, takeover is the
+    /// reaper.
+    async fn claim_chunk_gc_sweep(
+        &self,
+        claimant: &str,
+        stale_after: std::time::Duration,
+    ) -> Result<Option<u32>, MetaError> {
+        let now = self.clock.now_utc();
+        let stale_cutoff = now
+            - chrono::Duration::from_std(stale_after)
+                .unwrap_or_else(|_| chrono::Duration::seconds(3600));
+        let shard: Option<i32> = sqlx::query_scalar(
+            "UPDATE chunk_gc_sweep_state
+                SET claimed_by = $1, claimed_at = $2
+              WHERE id
+                AND (claimed_by IS NULL OR claimed_at < $3)
+             RETURNING next_shard",
+        )
+        .bind(claimant)
+        .bind(now)
+        .bind(stale_cutoff)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(shard.map(|s| s as u32))
+    }
+
+    /// Persist the cursor and free the lease, guarded on the claimant so
+    /// a taken-over holder cannot clobber the new owner's cursor.
+    async fn release_chunk_gc_sweep(
+        &self,
+        claimant: &str,
+        next_shard: u32,
+    ) -> Result<(), MetaError> {
+        sqlx::query(
+            "UPDATE chunk_gc_sweep_state
+                SET claimed_by = NULL, claimed_at = NULL,
+                    next_shard = $2, updated_at = $3
+              WHERE id AND claimed_by = $1",
+        )
+        .bind(claimant)
+        .bind(next_shard as i32)
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     /// ADR 0016 Phase C promote-pass query.
     async fn list_expired_gc_candidates(
         &self,

@@ -177,6 +177,15 @@ pub struct OpRow {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+/// Mirrors the `chunk_gc_sweep_state` singleton (migration 0119).
+#[derive(Debug, Clone, Default)]
+pub struct ChunkGcSweepState {
+    pub next_shard: u32,
+    pub claimed_by: Option<String>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct GcCandidate {
     pub first_seen_at: DateTime<Utc>,
@@ -231,6 +240,9 @@ pub struct SimDb {
     pub bundle_gc: std::collections::BTreeMap<String, GcCandidate>,
     pub snapshot_blob_gc: std::collections::BTreeMap<SnapshotId, GcCandidate>,
     pub chunk_gc: std::collections::BTreeMap<Vec<u8>, GcCandidate>,
+    /// Migration 0119's singleton sweep row: the shard cursor plus the
+    /// single-writer lease `(claimed_by, claimed_at)`.
+    pub chunk_gc_sweep: ChunkGcSweepState,
     pub chunk_generation: u64,
     /// `dead_host_inflight`: host -> (claimed_by, claimed_at).
     pub dead_host_inflight: std::collections::BTreeMap<HostId, (String, DateTime<Utc>)>,
