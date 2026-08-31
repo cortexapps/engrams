@@ -134,7 +134,9 @@ data:
       location / {
 {{- if .Values.web.apiBaseUrl }}
 {{- $api := .Values.web.apiBaseUrl }}
-{{- $wsApi := replace "http" "ws" $api }}
+{{- /* anchored: only the scheme prefix flips - a hostname containing
+     "http" (e.g. httpapi.example.com) must survive intact */}}
+{{- $wsApi := regexReplaceAll "^http" $api "ws" }}
         # connect-src / frame-src / img-src / media-src widen to the api
         # host: fetch+SSE+WS ride connect-src, the IDE iframe rides
         # frame-src, artifact previews ride img/media. Everything else

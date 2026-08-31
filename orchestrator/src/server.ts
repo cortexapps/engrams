@@ -238,7 +238,15 @@ export function buildServer(
       // split-host layout, a guest-authored preview page could otherwise
       // open an authenticated socket to the api host. No Origin header
       // (CLI / non-browser clients) passes — their auth is the route guard.
-      if (!wsOriginAllowed(request)) {
+      //
+      // Preview hosts are exempt, mirroring the HTTP CORS gate: ADR 0118
+      // terminates preview upgrades at the proxy hook below, whose wall +
+      // cookie-strip is the policy there — and sibling apps of one session
+      // legitimately open sockets to each other (dev-server proxies, HMR),
+      // which this gate would otherwise kill before the hook ever ran.
+      // This gate protects the ORCHESTRATOR'S OWN routes.
+      const isPreviewUpgrade = isUnderPreviewDomain(request.headers.host, previewBaseDomain);
+      if (!isPreviewUpgrade && !wsOriginAllowed(request)) {
         log.warn(
           {
             component: "ws",
