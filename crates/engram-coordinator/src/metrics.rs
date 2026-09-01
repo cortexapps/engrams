@@ -437,6 +437,10 @@ pub const OUTBOX_ACKED_TOTAL: &str = "engram_outbox_acked_total";
 pub const OUTBOX_DEFERRED_TOTAL: &str = "engram_outbox_deferred_total";
 /// Counter (ADR 0073). Rows dropped because the session went terminal.
 pub const OUTBOX_DROPPED_TERMINAL_TOTAL: &str = "engram_outbox_dropped_terminal_total";
+/// Counter. Rows retired because their delivery budget exhausted
+/// (DELIVER_ROW_MAX_ATTEMPTS) — the harness-never-starts class; each
+/// increment pairs with a `prompt_undeliverable` session event.
+pub const OUTBOX_DROPPED_BUDGET_TOTAL: &str = "engram_outbox_dropped_budget_total";
 
 /// ADR 0045 C1: live-teleport leg timings. Labels: leg =
 /// capture|restore|total, outcome = success|error|fallback.

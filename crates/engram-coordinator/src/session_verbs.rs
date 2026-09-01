@@ -633,6 +633,18 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
     }
 }
 
+/// Per-ROW delivery budget. `OutboxRow.attempts` bumps on every relay
+/// handoff; a row that keeps failing is redelivered forever otherwise —
+/// the Deliver op is deliberately budget-less at the OP level (the shim
+/// re-mints ops for due rows), so the bound has to live on the row. The
+/// walk that found this watched a doomed prompt ride the harness
+/// reattach ladder indefinitely (a dead-on-arrival harness respawned
+/// every ~35s) while the UI showed "delivering…" with no error ever
+/// surfaced. 20 attempts ≈ 10–12 minutes of that ladder: long enough to
+/// absorb a real resume/boot tail, short enough that a human is still
+/// looking when the failure event lands.
+const DELIVER_ROW_MAX_ATTEMPTS: i32 = 20;
+
 /// Evict-verb retry budget. Mirrors the retired eviction scanner's
 /// `max_attempts = 20` (~3 minutes of continuous pipeline failure at the
 /// executor's capped backoff) before the HostLost fallback breaks the
@@ -1007,6 +1019,39 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
             );
             let _ = state.services.meta.outbox_ack(&row.prompt_id).await;
             ::metrics::counter!(crate::metrics::OUTBOX_DROPPED_TERMINAL_TOTAL).increment(1);
+            continue;
+        }
+        if row.attempts >= DELIVER_ROW_MAX_ATTEMPTS {
+            // The row's delivery budget is exhausted — retire it with a
+            // USER-VISIBLE event instead of redelivering forever. The
+            // classic cause is a harness that dies on spawn (a broken
+            // guest image, a musl guest with a glibc harness): every
+            // reattach succeeds at the transport layer and the delivery
+            // still never lands.
+            tracing::warn!(
+                session_id = %id,
+                prompt_id = %row.prompt_id,
+                attempts = row.attempts,
+                "deliver op: row delivery budget exhausted; retiring undeliverable row",
+            );
+            if let Err(e) = state
+                .services
+                .meta
+                .append_session_event(
+                    id,
+                    "prompt_undeliverable",
+                    serde_json::json!({
+                        "reason": "the prompt could not be delivered to the harness after                                    repeated attempts — the harness may be failing to start                                    (check the image is glibc-based and the session's                                    Diagnostics tab); send the prompt again to retry",
+                        "prompt_id": row.prompt_id,
+                        "attempts": row.attempts,
+                    }),
+                )
+                .await
+            {
+                tracing::warn!(session_id = %id, error = %e, "prompt_undeliverable event failed");
+            }
+            let _ = state.services.meta.outbox_ack(&row.prompt_id).await;
+            ::metrics::counter!(crate::metrics::OUTBOX_DROPPED_BUDGET_TOTAL).increment(1);
             continue;
         }
         let deliverable = match session.status {
@@ -2244,6 +2289,60 @@ mod tests {
                 .lock()
                 .contains(&"answer:legacy-call".to_string()),
             "a pre-flag-day answer row must be terminally retired"
+        );
+    }
+
+    /// A row whose delivery budget is exhausted must be retired with a
+    /// user-visible `prompt_undeliverable` event — never redelivered
+    /// forever. The regression this pins: a dead-on-arrival harness
+    /// (musl guest, glibc CLI) rode the reattach ladder indefinitely
+    /// while the UI showed "delivering…" with no error ever surfaced.
+    #[tokio::test]
+    async fn deliver_retires_row_past_budget_with_visible_event() {
+        let id = SessionId::new();
+        let mut session = idle_session(id);
+        session.status = SessionState::Active;
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(session);
+        let mut row = outbox_legacy_answer(id, "unused");
+        row.prompt_id = format!("create:{id}");
+        row.kind = engram_core::types::outbox::OutboxKind::Prompt;
+        row.payload = serde_json::json!({ "text": "just reply pong" });
+        row.attempts = DELIVER_ROW_MAX_ATTEMPTS;
+        state.services.meta.outbox_enqueue(&row).await.unwrap();
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Deliver, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue deliver")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            epoch: op.epoch.unwrap(),
+            op: &op,
+        };
+
+        match deliver(&ctx).await {
+            OpOutcome::Done => {}
+            other => panic!("expected Done after retiring the row, got {other:?}"),
+        }
+        assert!(
+            mini.acked_outbox.lock().contains(&format!("create:{id}")),
+            "the exhausted row must be terminally acked"
+        );
+        let events = state
+            .services
+            .meta
+            .list_session_events_since(id, -1, 100)
+            .await
+            .expect("list events");
+        assert!(
+            events.iter().any(|e| e.kind == "prompt_undeliverable"),
+            "a prompt_undeliverable event must be appended; got kinds: {:?}",
+            events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
         );
     }
 
