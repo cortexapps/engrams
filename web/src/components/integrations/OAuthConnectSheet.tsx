@@ -7,6 +7,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { API_ORIGIN } from "@/lib/base";
 import { ArrowUpRightIcon, CheckIcon, CopyIcon, InfoIcon, LockIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -131,7 +132,10 @@ export function OAuthConnectSheet({
                   onClick={() =>
                     copy(
                       "manifest",
-                      buildSlackManifest({ origin: window.location.origin, scopes: oauth.scopes }),
+                      buildSlackManifest({
+                        origin: API_ORIGIN || window.location.origin,
+                        scopes: oauth.scopes,
+                      }),
                     )
                   }
                 >

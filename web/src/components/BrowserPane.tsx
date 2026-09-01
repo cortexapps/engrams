@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { API_BASE } from "../lib/base";
+import { apiWsUrl } from "../lib/base";
 import { PaneStatus } from "./PaneStatus";
 
 // In-browser BROWSER tab (ADR 0065). Lazy-loads `@novnc/novnc` (the RFB
@@ -68,9 +68,7 @@ export function BrowserPane({ sessionId }: BrowserPaneProps) {
       }
 
       setStatus("connecting");
-      const wsUrl = `${
-        location.protocol === "https:" ? "wss:" : "ws:"
-      }//${location.host}${API_BASE}/sessions/${encodeURIComponent(sessionId)}/vnc`;
+      const wsUrl = apiWsUrl(`/sessions/${encodeURIComponent(sessionId)}/vnc`);
 
       try {
         rfb = new mod.default(container, wsUrl, { wsProtocols: [] });

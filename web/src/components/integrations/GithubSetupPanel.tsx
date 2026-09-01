@@ -14,6 +14,7 @@
  */
 
 import { useState } from "react";
+import { API_ORIGIN } from "@/lib/base";
 import {
   ArrowUpRightIcon,
   CheckIcon,
@@ -41,7 +42,7 @@ const NEW_APP_URL = "https://github.com/settings/apps/new";
 export function GithubSetupPanel({ view }: { view: ConnectorView }) {
   const [copied, setCopied] = useState<"url" | "manifest" | null>(null);
 
-  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const origin = API_ORIGIN || (typeof window !== "undefined" ? window.location.origin : "");
   const permissions = permissionsForCapabilities(view.capabilities);
   const webhookUrl = githubWebhookUrl(origin);
   const manifest = buildGithubManifest({ origin, permissions, events: WEBHOOK_EVENTS });

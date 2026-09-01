@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { API_BASE } from "../lib/base";
+import { apiWsUrl } from "../lib/base";
 import { PaneStatus } from "./PaneStatus";
 
 // In-browser shell tab. Lazy-loads `ghostty-web` (~400 KB WASM) on
@@ -205,9 +205,7 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
       }
 
       setStatus("connecting");
-      const wsUrl = `${
-        location.protocol === "https:" ? "wss:" : "ws:"
-      }//${location.host}${API_BASE}/sessions/${encodeURIComponent(sessionId)}/shell`;
+      const wsUrl = apiWsUrl(`/sessions/${encodeURIComponent(sessionId)}/shell`);
       const localWs = new WebSocket(wsUrl, "tty");
       ws = localWs;
       localWs.binaryType = "arraybuffer";

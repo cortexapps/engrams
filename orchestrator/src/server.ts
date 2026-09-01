@@ -46,6 +46,7 @@ import { connectNodeAdapter } from "@connectrpc/connect-node";
 import type { ConnectRouter } from "@connectrpc/connect";
 import type { NodeWebSocket } from "@hono/node-ws";
 import { iapBridge } from "./auth/iap-bridge.ts";
+import { applyCors, wsOriginAllowed } from "./auth/cors.ts";
 import { isUnderPreviewDomain } from "./apps/hostname.ts";
 import { config } from "./config.ts";
 import { log } from "./log.ts";
@@ -95,7 +96,23 @@ export function buildServer(
   const honoListener = getRequestListener(app.fetch);
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    // IAP bridge runs first — before /rpc vs Hono dispatch — so it covers
+    // CORS gate runs before EVERYTHING — a preflight OPTIONS carries no
+    // cookie and no IAP assertion by spec, so the fail-closed bridge below
+    // would 401 it and no cross-origin call (split-host SPA → api host)
+    // could ever start. See auth/cors.ts.
+    //
+    // Preview hosts are exempt: ADR 0118 forwards a preview preflight to the
+    // guest app, whose own CORS policy answers it (see preview-proxy.ts).
+    // Gating here would swallow it and break every cross-app call a session
+    // app makes.
+    if (
+      !isUnderPreviewDomain(req.headers.host, previewBaseDomain) &&
+      applyCors(req, res)
+    ) {
+      return;
+    }
+
+    // IAP bridge runs next — before /rpc vs Hono dispatch — so it covers
     // every HTTP entry path. See iap-bridge.ts for placement rationale.
     // When IAP_AUDIENCES is empty this is a synchronous no-op.
     iapBridge(req, res, () => {
@@ -210,6 +227,34 @@ export function buildServer(
             version: wsVersion,
           },
           "refusing a malformed websocket upgrade",
+        );
+        socket.destroy();
+        return;
+      }
+
+      // Cross-site WS handshakes are refused up front. Browsers attach the
+      // session cookie to a WS opened by ANY page (WebSockets are outside
+      // CORS), and with the cookie widened to the parent domain for the
+      // split-host layout, a guest-authored preview page could otherwise
+      // open an authenticated socket to the api host. No Origin header
+      // (CLI / non-browser clients) passes — their auth is the route guard.
+      //
+      // Preview hosts are exempt, mirroring the HTTP CORS gate: ADR 0118
+      // terminates preview upgrades at the proxy hook below, whose wall +
+      // cookie-strip is the policy there — and sibling apps of one session
+      // legitimately open sockets to each other (dev-server proxies, HMR),
+      // which this gate would otherwise kill before the hook ever ran.
+      // This gate protects the ORCHESTRATOR'S OWN routes.
+      const isPreviewUpgrade = isUnderPreviewDomain(request.headers.host, previewBaseDomain);
+      if (!isPreviewUpgrade && !wsOriginAllowed(request)) {
+        log.warn(
+          {
+            component: "ws",
+            host: request.headers.host,
+            url: request.url,
+            origin: request.headers.origin,
+          },
+          "refusing a cross-origin websocket upgrade",
         );
         socket.destroy();
         return;

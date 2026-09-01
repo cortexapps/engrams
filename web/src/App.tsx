@@ -3,6 +3,7 @@ import { RouterProvider } from "@tanstack/react-router";
 import { TransportProvider } from "@connectrpc/connect-query";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { AuthProvider, useOptionalAuth } from "./auth/AuthProvider";
+import { RPC_BASE, API_CREDENTIALS } from "./lib/base";
 import { router } from "./router";
 
 const queryClient = new QueryClient({
@@ -14,10 +15,14 @@ const queryClient = new QueryClient({
   },
 });
 
-// ADR 0051 Task 23: Connect transport targeting /rpc (Vite proxy → orchestrator :8787).
-// TransportProvider makes it available to all useQuery/useMutation connect-query hooks
-// without threading a transport prop everywhere.
-const transport = createConnectTransport({ baseUrl: "/rpc" });
+// ADR 0051 Task 23: Connect transport targeting /rpc (Vite proxy → orchestrator :8787;
+// split-host deployments point RPC_BASE at the api host and ride the session cookie
+// cross-origin — see lib/base.ts). TransportProvider makes it available to all
+// useQuery/useMutation connect-query hooks without threading a transport prop everywhere.
+const transport = createConnectTransport({
+  baseUrl: RPC_BASE,
+  fetch: (input, init) => fetch(input, { ...init, credentials: API_CREDENTIALS }),
+});
 
 function InnerApp() {
   const auth = useOptionalAuth();

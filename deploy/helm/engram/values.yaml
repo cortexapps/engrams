@@ -330,6 +330,18 @@ terminationGracePeriodSeconds: 45
 web:
   enabled: true
 
+  # Split-host layout (optional): the origin the SPA calls for RPC,
+  # /api/v1, SSE, and WebSockets — e.g. "https://api.engrams.example.com".
+  # Set this when THIS host sits behind an authenticating proxy (GCP IAP)
+  # that breaks WebSocket upgrades and caps SSE lifetimes: the machine
+  # surface is then served from a second, proxy-free hostname routed to
+  # the orchestrator, and the SPA calls it cross-origin. Requires, on the
+  # orchestrator: this app's origin in TRUSTED_ORIGINS, and the session
+  # cookie widened to the shared parent domain
+  # (ORCHESTRATOR_SESSION_COOKIE_DOMAIN). Empty = same-origin (default;
+  # nothing changes).
+  apiBaseUrl: ""
+
   replicaCount: 2
 
   image:
