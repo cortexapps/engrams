@@ -237,6 +237,9 @@ describe("SessionProfileEditor (create)", () => {
         label: "OpenRouter",
         protocols: ["anthropic_messages"],
         egressHosts: ["openrouter.ai"],
+        // The Route picker lists only CONNECTED routers (the key is
+        // saved) — an unconfigured router is invisible product-wide.
+        credentialConfigured: true,
       },
     ];
     const user = userEvent.setup();

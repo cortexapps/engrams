@@ -232,8 +232,12 @@ export function SessionHarnessControls({
   );
   const routersQuery = useModelRouters();
   const routers = routersQuery.data?.routers ?? [];
-  const compatibleRouters = routers.filter((router) =>
-    descriptor?.routerProtocols?.some((protocol) => router.protocols.includes(protocol)),
+  // Only connected routers are selectable — a router without its key
+  // saved must not appear anywhere outside the admin settings panel.
+  const compatibleRouters = routers.filter(
+    (router) =>
+      router.credentialConfigured &&
+      descriptor?.routerProtocols?.some((protocol) => router.protocols.includes(protocol)),
   );
   const effectiveRouter =
     value.modelRouter === null ? profileModelRouter : value.modelRouter || undefined;

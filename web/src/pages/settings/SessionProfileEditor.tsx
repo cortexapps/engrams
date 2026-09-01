@@ -715,10 +715,14 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                       <SelectContent>
                         <SelectItem value="__direct__">Direct</SelectItem>
                         {(modelRouterData?.routers ?? [])
-                          .filter((router) =>
-                            harnessDescriptor?.routerProtocols?.some((protocol) =>
-                              router.protocols.includes(protocol),
-                            ),
+                          .filter(
+                            (router) =>
+                              // Connected routers only — same boundary as
+                              // the composer's SessionHarnessControls.
+                              router.credentialConfigured &&
+                              harnessDescriptor?.routerProtocols?.some((protocol) =>
+                                router.protocols.includes(protocol),
+                              ),
                           )
                           .map((router) => (
                             <SelectItem key={router.id} value={router.id}>

@@ -31,6 +31,7 @@ import {
   type IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
 import { getOpenRouterClient } from "../integrations/openrouter.ts";
+import { isRouterConnected } from "../model-routers/connected.ts";
 import { log as rootLog } from "../log.ts";
 
 const log = rootLog.child({ component: "profile-picker" });
@@ -95,6 +96,9 @@ export interface ProfilePickerDeps {
   userHistogram(ownerUserId: string): Promise<Histogram>;
   /** One model call. May throw (no key, timeout, bad output) — the caller
    *  degrades to ask_user. */
+  /** Whether the picker's model router is connected; false degrades
+   *  straight to ask_user without calling the model. */
+  routerConnected(): Promise<boolean>;
   generatePick(promptText: string): Promise<RawPickDecision>;
 }
 
@@ -217,6 +221,16 @@ export function makePicker(deps: ProfilePickerDeps): ProfilePicker {
         deps.userHistogram(input.ownerUserId),
       ]);
       const fallback = fallbackOrder(candidates, channelHist, userHist);
+      // Without a connected router there is no picker model to call —
+      // skip straight to the ask_user degrade instead of walking
+      // generatePick into a credential resolution that cannot succeed.
+      if (!(await deps.routerConnected())) {
+        log.info({ channel: input.channel }, "no model router connected; asking the user");
+        return {
+          decision: "ask_user",
+          options: fallback.slice(0, MAX_OPTIONS).map(option),
+        };
+      }
       try {
         const raw = await deps.generatePick(
           buildPickerPrompt(input, candidates, channelHist, userHist),
@@ -325,6 +339,7 @@ export function makeProfilePicker(deps: ProductionPickerDeps = {}): ProfilePicke
       return fold(rows);
     },
 
+    routerConnected: () => isRouterConnected("openrouter"),
     async generatePick(promptText) {
       const openrouter = await getOpenRouterClient();
       const { object } = await generateObject({
