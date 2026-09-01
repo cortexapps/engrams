@@ -22,6 +22,24 @@
 #   front of this app — it breaks the same way IAP does (no cookie
 #   on CORS preflights, no WebSocket carry; ADR 0118).
 
+# Image TAGS must be set (chart empty-tag fallback = the unpublished
+# chart appVersion). `main` tracks the latest build; pin a SHA for
+# reproducible rollouts. While the repository is private, GHCR also
+# needs a pull secret in the release namespace:
+#
+#   kubectl create secret docker-registry ghcr-pull -n engrams \
+#     --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
+image:
+  tag: main
+web:
+  image:
+    tag: main
+orchestrator:
+  image:
+    tag: main
+imagePullSecrets:
+  - name: ghcr-pull
+
 # ─── coordinator ──────────────────────────────────────────────────
 
 # Images come from the published GHCR defaults

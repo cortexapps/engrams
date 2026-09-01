@@ -23,11 +23,28 @@
 
 # ─── coordinator ──────────────────────────────────────────────────
 
-# Images come from the published GHCR defaults
+# Image REPOSITORIES come from the published GHCR defaults
 # (ghcr.io/cortexapps/engrams/<coordinator|web|orchestrator>) — no
 # override needed. To mirror into Artifact Registry instead:
 # image:
 #   repository: us-docker.pkg.dev/REPLACE_PROJECT/engram/coordinator
+#
+# Image TAGS must be set (here and in the web/orchestrator blocks
+# below): the chart's empty-tag fallback is the chart appVersion,
+# which the bake pipeline does not publish. `main` tracks the latest
+# build; pin a SHA tag for reproducible rollouts.
+image:
+  tag: main
+
+# While the repository is private, GHCR needs a pull secret in the
+# release namespace (a GitHub PAT with read:packages):
+#
+#   kubectl create secret docker-registry ghcr-pull -n engrams \
+#     --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
+#
+# Delete this once the packages are public.
+imagePullSecrets:
+  - name: ghcr-pull
 
 mode: coordinator
 
@@ -118,12 +135,28 @@ metrics:
 web:
   enabled: true
   replicaCount: 2
+  image:
+    tag: main   # see the tag note above
 
   service:
     type: ClusterIP
     port: 80
-    # No BackendConfig annotation in the default (no-IAP) posture;
-    # values-iap.yaml.example adds it.
+    # The GCLB's DEFAULT backend timeout is 30s and it caps a
+    # connection's LIFETIME — every WebSocket (shell, VNC, spec sync)
+    # and SSE leg dies at that mark with no close frame. The quickstart
+    # applies the BackendConfig this references (engram-web,
+    # timeoutSec 3600); a manual install must apply it too:
+    #
+    #   apiVersion: cloud.google.com/v1
+    #   kind: BackendConfig
+    #   metadata: { name: engram-web }
+    #   spec: { timeoutSec: 3600 }
+    #
+    # Allow ~10 minutes after applying for the load balancer to
+    # program before judging WebSockets. (values-iap.yaml.example
+    # replaces this with its own IAP-enabled pair.)
+    annotations:
+      cloud.google.com/backend-config: '{"default":"engram-web"}'
     annotations: {}
 
   ingress:
@@ -152,6 +185,8 @@ web:
 
 orchestrator:
   enabled: true
+  image:
+    tag: main   # see the tag note above
   # The public URL — same host as the web Ingress above.
   publicUrl: https://engrams.REPLACE_DOMAIN
   databaseSecret:

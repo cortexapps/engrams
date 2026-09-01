@@ -34,7 +34,10 @@
 
 # Images come from the published GHCR defaults; deploy workflows pin
 # tags to a resolved SHA (the DaemonSet is OnDelete — the operator
-# rolls pods, ADR 0044 K3).
+# rolls pods, ADR 0044 K3). image.tag MUST be set (the empty-tag
+# fallback is the unpublished chart appVersion); while the repo is
+# private, the ghcr-pull secret must also exist in engrams-hosts —
+# both are set at the bottom of this file.
 
 # IRSA: the host pods' KSA assumes the fleet role (S3 on the chunks
 # bucket + secretsmanager:GetSecretValue on the two CA secrets).
@@ -130,3 +133,8 @@ operator:
     scaleDownHysteresisTicks: 5
     maxShedPerWave: 4
     maxConcurrentDrains: 2
+
+image:
+  tag: main
+imagePullSecrets:
+  - name: ghcr-pull
