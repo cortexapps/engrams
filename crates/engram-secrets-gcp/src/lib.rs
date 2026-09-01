@@ -226,6 +226,15 @@ impl GcpSecretManager {
         if let Some(r) = schema.r#ref.as_deref() {
             return parse_ref(&self.project, r);
         }
+        // Deployment-level lookups (org secrets, resolved with an empty
+        // repo) use the bare name. Composing the repo prefix anyway
+        // produced `--openrouter.api_key` — a name Secret Manager
+        // rejects with 400, which the caller then surfaced as a backend
+        // error instead of the clean "not set" a fresh deployment
+        // should see (found on the first Phase G walk).
+        if ctx.repo.is_empty() {
+            return format!("projects/{}/secrets/{}/versions/latest", self.project, name);
+        }
         // `cortex/api` + `GITHUB_TOKEN` → cortex--api--GITHUB_TOKEN
         let repo_safe = ctx.repo.replace('/', "--");
         format!(
@@ -440,6 +449,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value.as_deref(), Some("ghp_real_value"));
+    }
+
+    #[test]
+    fn repo_less_context_composes_the_bare_name() {
+        // Org secrets resolve with `repo: ""` (deployment-wide, not
+        // repo-scoped). The path must be the bare name — the old
+        // `{repo}--{name}` compose produced `--openrouter.api_key`,
+        // which Secret Manager 400s, turning "not set" into a backend
+        // error on every fresh deployment.
+        let m = GcpSecretManager::new("cortex-prod").unwrap();
+        let ctx = SecretContext {
+            repo: "",
+            image_tag: "",
+        };
+        assert_eq!(
+            m.resolve_path(&ctx, "openrouter.api_key", &schema(None)),
+            "projects/cortex-prod/secrets/openrouter.api_key/versions/latest",
+        );
     }
 
     #[tokio::test]
