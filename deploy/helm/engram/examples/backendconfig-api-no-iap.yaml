@@ -1,0 +1,43 @@
+# The BackendConfig pair for the split-host IAP layout.
+#
+# Apply this alongside the Helm release (same namespace), then layer
+# values-iap.yaml.example over your values — its Service annotations
+# reference these two configs by name:
+#
+#   kubectl apply -n <release-namespace> -f backendconfig-api-no-iap.yaml
+#
+# Why this exists
+# ---------------
+# IAP is enabled per GCP *backend service*, not per path or host. The
+# split-host layout (values-iap.yaml.example) therefore uses two
+# backends on one load balancer:
+#
+#   - the web nginx Service (the app host, `engram.<domain>`) with
+#     IAP ON — the dashboard and everything the SPA serves;
+#   - the orchestrator's webhook Service (the api host,
+#     `api.engram.<domain>`, fronting the SAME orchestrator pods)
+#     with IAP OFF — RPC, /api/v1, SSE, WebSockets, provider
+#     webhooks. The orchestrator's own seams (session cookie / API
+#     key / webhook signatures) gate every route; an authenticating
+#     proxy here would break the WebSocket and SSE legs, which is
+#     the whole reason the api host exists.
+#
+# `timeoutSec` on the api backend caps a connection's LIFETIME (not
+# idleness): the 30s default — or the web host's 300s — would cut
+# every quiet SSE/WebSocket leg, so it is raised to an hour.
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: engram-web-iap
+spec:
+  iap:
+    enabled: true
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: engram-api-no-iap
+spec:
+  iap:
+    enabled: false
+  timeoutSec: 3600
