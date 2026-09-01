@@ -13,7 +13,6 @@
  */
 
 import type { ConnectRouter } from "@connectrpc/connect";
-import { invalidateConnectedCache } from "../model-routers/connected.ts";
 
 import { OrgSecretService } from "../gen/engram/app/v1/org_secret_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
@@ -64,16 +63,12 @@ export function registerOrgSecret(router: ConnectRouter, deps?: OrgSecretDeps): 
     async putSecret(req, ctx) {
       await requireAdmin(ctx, getSession);
       const resp = await client.putSecret({ name: req.name, value: req.value });
-      // Saving a router key flips its connected-ness; make the flip
-      // visible immediately instead of after the predicate's TTL.
-      invalidateConnectedCache();
       return { secret: resp.secret };
     },
 
     async deleteSecret(req, ctx) {
       await requireAdmin(ctx, getSession);
       const resp = await client.deleteSecret({ name: req.name });
-      invalidateConnectedCache();
       return { deleted: resp.deleted };
     },
   });

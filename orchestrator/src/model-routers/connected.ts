@@ -9,13 +9,15 @@
  * the router's API, no title generation or profile picking through it —
  * a fresh deployment runs entirely on direct harness credentials.
  * (Found on the first fresh-deployment walk: a router surface that
- * assumed the key existed put the guest credential broker into an
- * infinite retry against a secret nobody had created.)
+ * assumed the key existed put a consumer into an infinite retry against
+ * a secret nobody had created.)
  *
- * The name listing is cached briefly: the callers here sit on hot paths
- * (task events, catalog timers) and the answer only changes when an
- * admin saves or deletes a key. Saving a key calls
- * `invalidateConnectedCache()` so the flip is visible immediately.
+ * Deliberately uncached: the callers are low-frequency (a task's first
+ * prompt, a Slack routing decision, a six-hourly catalog refresh) and
+ * the check is one control-plane NAME listing. A cache here would need
+ * cross-replica invalidation to avoid serving a stale "not connected"
+ * right after an admin saves the key — complexity the call volume does
+ * not buy back.
  */
 
 import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
@@ -28,40 +30,21 @@ export interface SecretNameClient {
   listSecrets(req: Record<string, never>): Promise<{ secrets: Array<{ name: string }> }>;
 }
 
-const CACHE_TTL_MS = 60_000;
-
-let cache: { at: number; names: Set<string> } | null = null;
-
-export function invalidateConnectedCache(): void {
-  cache = null;
-}
-
-/** The org-secret names that currently exist, cached for CACHE_TTL_MS.
- * Fails OPEN to the empty set: if the control plane is unreachable the
- * product behaves as "no routers connected", which every caller treats
- * as a graceful degrade — never a crash loop. */
-export async function configuredSecretNames(
-  client: SecretNameClient = defaultOrgSecret,
-): Promise<Set<string>> {
-  if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.names;
-  try {
-    const res = await client.listSecrets({});
-    const names = new Set(res.secrets.map((secret) => secret.name));
-    cache = { at: Date.now(), names };
-    return names;
-  } catch (err) {
-    log.warn({ err }, "org-secret listing failed; treating all model routers as not connected");
-    return new Set();
-  }
-}
-
 /** Whether `routerId`'s credential secret exists. Unknown routers are
- * never connected. */
+ * never connected. Fails OPEN to false: if the control plane is
+ * unreachable the product behaves as "no routers connected", which
+ * every caller treats as a graceful degrade — never a crash loop. */
 export async function isRouterConnected(
   routerId: string,
   client: SecretNameClient = defaultOrgSecret,
 ): Promise<boolean> {
   const definition = getModelRouterDefinition(routerId);
   if (!definition) return false;
-  return (await configuredSecretNames(client)).has(definition.credentialSecret);
+  try {
+    const res = await client.listSecrets({});
+    return res.secrets.some((secret) => secret.name === definition.credentialSecret);
+  } catch (err) {
+    log.warn({ err, routerId }, "org-secret listing failed; treating the router as not connected");
+    return false;
+  }
 }
