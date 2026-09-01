@@ -239,7 +239,7 @@ describe("preview hosts terminate before /rpc", () => {
     const app = new Hono();
     // Stands in for the preview middleware: proves the request reached Hono.
     app.all("*", (c) => c.text("HONO", 200));
-    previewServer = buildServer(app, () => {}, undefined, [], BASE_DOMAIN);
+    previewServer = buildServer(app, () => {}, [], BASE_DOMAIN);
     await new Promise<void>((resolve) => {
       previewServer.listen(0, "127.0.0.1", () => {
         previewUrl = `http://127.0.0.1:${(previewServer.address() as AddressInfo).port}`;

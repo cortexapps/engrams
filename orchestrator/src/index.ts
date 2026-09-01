@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { logger as honoLogger } from "hono/logger";
-import { createNodeWebSocket } from "@hono/node-ws";
 import { config } from "./config.ts";
 import { log } from "./log.ts";
 import { buildServer } from "./server.ts";
@@ -29,8 +28,8 @@ import { startOidcKeyRotation } from "./integrations/oidc-key-rotation.ts";
 import { makeIntegrationOidcKeyStore } from "./db/integration-oidc-keys.ts";
 // Importing registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
-import { makeShellRoute } from "./routes/shell.ts";
-import { makeVncRoute } from "./routes/vnc.ts";
+import { makeShellUpgradeHandler } from "./routes/shell.ts";
+import { makeVncUpgradeHandler } from "./routes/vnc.ts";
 import { makeIdeRoute, makeIdeUpgradeHandler } from "./routes/ide.ts";
 import { makeSpecSyncUpgradeHandler, SpecSyncHub } from "./routes/spec-sync.ts";
 import { makePreviewProxyMiddleware } from "./routes/preview-proxy.ts";
@@ -275,20 +274,6 @@ const specSyncHub = new SpecSyncHub({
 });
 setSpecPresence(specSyncHub);
 
-// ADR 0051 Task 21: WebSocket shell route via @hono/node-ws.
-// createNodeWebSocket must be called with the Hono app BEFORE routes are mounted
-// so injectWebSocket can install the upgrade handler on the node:http server.
-const { upgradeWebSocket, injectWebSocket, wss } = createNodeWebSocket({ app });
-
-// Subprotocol selection, read by ws's handleUpgrade on each connection.
-// The /shell client offers 'tty' (xterm.js hard-fails without it echoed back).
-// The /vnc noVNC client offers no subprotocol (modern) or 'binary' (older), so
-// echo 'binary' when offered and otherwise select none (return false → no
-// subprotocol selected, the upgrade still proceeds per RFC 6455). The 'tty'
-// branch stays first so the shell path is unaffected.
-wss.options.handleProtocols = (protocols: Set<string>) =>
-  protocols.has("tty") ? "tty" : protocols.has("binary") ? "binary" : false;
-
 // Request logging (hono/logger) routed through pino, so every HTTP leg — the
 // Slack webhooks included — logs `<-- METHOD path` / `--> METHOD path status ms`.
 const httpLog = log.child({ component: "http" });
@@ -477,17 +462,6 @@ app.route("/", linearEventsRoute);
 app.route("/", hooksRoute);
 app.route("/", reviewsDispatchRoute);
 
-// ADR 0051 Task 21: Shell WebSocket route.
-const { app: shellApp, injectUpgrade } = makeShellRoute();
-injectUpgrade(upgradeWebSocket);
-app.route("/", shellApp);
-
-// ADR 0065/0066: VNC WebSocket route (browser tab → noVNC → EnsureBrowser +
-// raw RFB over the port relay).
-const { app: vncApp, injectUpgrade: injectVncUpgrade } = makeVncRoute();
-injectVncUpgrade(upgradeWebSocket);
-app.route("/", vncApp);
-
 // ADR 0085: in-guest IDE (code-server) HTTP proxy. Session-scoped + guarded;
 // the WS half is the upgrade hook passed to buildServer below. Mounted after
 // shell/vnc (paths are disjoint; the preview middleware above is Host-keyed
@@ -608,17 +582,16 @@ const server = buildServer(
       },
     });
   },
-  // Pass the full NodeWebSocket handle so buildServer can install the
-  // Bun-compatible upgrade handler (wss.handleUpgrade instead of socket.end).
-  // injectWebSocket is included for completeness but the custom upgrade handler
-  // is used instead of calling nodeWs.injectWebSocket(server).
-  { upgradeWebSocket, wss, injectWebSocket },
-  // Raw WS-upgrade hooks, tried in order before the shell/vnc path: the
-  // preview proxy first (Host-keyed — a preview host is a different origin,
-  // so it wins outright), then the IDE proxy (path-keyed, ADR 0085).
+  // Raw WS-upgrade hooks, tried in order: the preview proxy first
+  // (Host-keyed — a preview host is a different origin, so it wins
+  // outright), then the path-keyed handlers. ALL WebSocket surfaces are
+  // hooks now (accept-first, ws-util.ts) — the @hono/node-ws path and its
+  // Bun workaround are retired.
   [
     makePreviewUpgradeHandler(),
     makeIdeUpgradeHandler(),
+    makeShellUpgradeHandler(),
+    makeVncUpgradeHandler(),
     makeSpecSyncUpgradeHandler(
       {
         documents: specDocuments,

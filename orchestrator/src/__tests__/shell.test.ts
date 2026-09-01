@@ -77,21 +77,18 @@ describe("frameFromWsData", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Server-level tests (guard + subprotocol + process-survives)
+// Server-level tests (guard + subprotocol + process-survives + THE regression)
 // ---------------------------------------------------------------------------
 
 import { Hono } from "hono";
-import { createNodeWebSocket } from "@hono/node-ws";
 import { buildServer } from "../server.ts";
-import { makeShellRoute } from "../routes/shell.ts";
+import { makeShellUpgradeHandler } from "../routes/shell.ts";
+import type { ShellDeps } from "../routes/shell.ts";
 import type { RelayShellResponse } from "../gen/engram/app/v1/session_pb.ts";
 import type { AddressInfo } from "node:net";
 
 const MEMBER_A_WS = "member-a-ws-test";
-const MEMBER_B_WS = "member-b-ws-test";
 const SESSION_OF_A_WS = "session-owned-by-a-ws";
-
-type ShellDeps = NonNullable<Parameters<typeof makeShellRoute>[0]>;
 
 function makeGetSessionWs(userId: string | null): ShellDeps["getSession"] {
   return async () =>
@@ -99,12 +96,12 @@ function makeGetSessionWs(userId: string | null): ShellDeps["getSession"] {
 }
 
 function makeResolveOwnerWs(): ShellDeps["resolveOwner"] {
-  return async (sid) => (sid === SESSION_OF_A_WS ? MEMBER_A_WS : null);
+  return async (sid: string) => (sid === SESSION_OF_A_WS ? MEMBER_A_WS : null);
 }
 
 // Fake relay: keeps yielding text frames until aborted.
 const slowFakeRelay: ShellDeps["shellRelay"] = {
-  async *relay(_inbound, opts) {
+  async *relay(_inbound: AsyncIterable<unknown>, opts?: { signal?: AbortSignal }) {
     for (let i = 0; i < 200; i++) {
       if (opts?.signal?.aborted) break;
       await new Promise((r) => setTimeout(r, 10));
@@ -122,24 +119,10 @@ const fastFakeRelay: ShellDeps["shellRelay"] = {
 
 async function startWsServer(deps: ShellDeps) {
   const app = new Hono();
-  const { upgradeWebSocket, injectWebSocket, wss } = createNodeWebSocket({ app });
-  // Echo 'tty' subprotocol.
-  (wss as { options: { handleProtocols?: (p: Set<string>) => string | false } }).options.handleProtocols =
-    (p: Set<string>) => (p.has("tty") ? "tty" : false);
-  const { app: shellApp, injectUpgrade } = makeShellRoute(deps);
-  injectUpgrade(upgradeWebSocket);
-  app.route("/", shellApp);
   app.notFound((c) => c.json({ error: "not found" }, 404));
-  app.onError((err, c) => {
-    if ("status" in err && typeof (err as { status?: number }).status === "number") {
-      const e = err as { status: number; message: string };
-      return c.json({ error: e.message }, e.status as 401 | 404 | 500);
-    }
-    return c.json({ error: String(err) }, 500);
-  });
-  // Pass the full NodeWebSocket handle so buildServer can install the
-  // Bun-compatible upgrade handler (wss.handleUpgrade instead of socket.end).
-  const server = buildServer(app, () => {}, { upgradeWebSocket, injectWebSocket, wss });
+  // The shell is an accept-first upgrade HOOK now — no Hono route, no
+  // @hono/node-ws. This wiring mirrors index.ts exactly.
+  const server = buildServer(app, () => {}, [makeShellUpgradeHandler(deps)]);
   return new Promise<{ wsUrl: string; baseUrl: string; server: ReturnType<typeof buildServer> }>(
     (resolve) => {
       server.listen(0, "127.0.0.1", () => {
@@ -155,34 +138,32 @@ async function startWsServer(deps: ShellDeps) {
 }
 
 function stopWsServer(server: ReturnType<typeof buildServer>): Promise<void> {
-  return new Promise((r, j) => server.close((e) => (e ? j(e) : r())));
+  (server as ReturnType<typeof buildServer> & { closeAllConnections(): void }).closeAllConnections();
+  return new Promise((r) => server.close(() => r()));
 }
 
-describe("Shell WS route — guard", () => {
-  test("6: unauthenticated → 401 before upgrade", async () => {
+/** Open a socket and await its close code (the guard speaks in 4000+status). */
+function closeCodeOf(url: string, protocols?: string[]): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const ws = protocols ? new WebSocket(url, protocols) : new WebSocket(url);
+    const t = setTimeout(() => reject(new Error("timeout waiting for close")), 5000);
+    ws.addEventListener("close", (e) => {
+      clearTimeout(t);
+      resolve(e.code);
+    });
+  });
+}
+
+describe("Shell WS hook — guard", () => {
+  test("6: plain HTTP GET is not a shell surface anymore → Hono 404", async () => {
     const { baseUrl, server } = await startWsServer({
       shellRelay: fastFakeRelay,
       getSession: makeGetSessionWs(null),
       resolveOwner: makeResolveOwnerWs(),
     });
     try {
-      // Plain HTTP GET (no Upgrade header) — guard fires in the Hono handler
-      // and returns a proper 401 HTTP response before any WS upgrade.
-      const res = await fetch(`${baseUrl}/api/v1/sessions/${SESSION_OF_A_WS}/shell`);
-      expect(res.status).toBe(401);
-    } finally {
-      await stopWsServer(server);
-    }
-  });
-
-  test("7: wrong owner → 404 before upgrade", async () => {
-    const { baseUrl, server } = await startWsServer({
-      shellRelay: fastFakeRelay,
-      getSession: makeGetSessionWs(MEMBER_B_WS),
-      resolveOwner: makeResolveOwnerWs(),
-    });
-    try {
-      // Plain HTTP GET — guard fires before WS upgrade; returns 404.
+      // The shell moved off Hono entirely; a non-upgrade GET falls through
+      // to the app and 404s. Auth refusals are WS close codes (below).
       const res = await fetch(`${baseUrl}/api/v1/sessions/${SESSION_OF_A_WS}/shell`);
       expect(res.status).toBe(404);
     } finally {
@@ -190,50 +171,76 @@ describe("Shell WS route — guard", () => {
     }
   });
 
+  test("7: wrong owner → close code 4404 (accept-first, refuse-after)", async () => {
+    const { wsUrl, server } = await startWsServer({
+      shellRelay: fastFakeRelay,
+      getSession: makeGetSessionWs("someone-else"),
+      resolveOwner: makeResolveOwnerWs(),
+    });
+    try {
+      const code = await closeCodeOf(`${wsUrl}/api/v1/sessions/${SESSION_OF_A_WS}/shell`, ["tty"]);
+      expect(code).toBe(4404);
+    } finally {
+      await stopWsServer(server);
+    }
+  });
+
   test("8: unauthenticated WS upgrade → close code 4401", async () => {
-    // Use the `ws` npm client (not Bun's native WebSocket) because Bun's native
-    // WS strips custom request headers, breaking any auth that relies on them.
-    // The ws client sends a real HTTP Upgrade request with full headers.
     const { wsUrl, server } = await startWsServer({
       shellRelay: fastFakeRelay,
       getSession: makeGetSessionWs(null), // null → no session → 401
       resolveOwner: makeResolveOwnerWs(),
     });
     try {
-      const closeCode = await new Promise<number>((resolve, reject) => {
-        const ws = new WebSocketClient(
-          `${wsUrl}/api/v1/sessions/${SESSION_OF_A_WS}/shell`,
-          ["tty"],
-        );
-        const t = setTimeout(() => {
-          ws.terminate();
-          reject(new Error("timeout waiting for close"));
-        }, 4000);
-        ws.on("close", (code: number) => {
-          clearTimeout(t);
-          // setImmediate defers the resolve so Bun's event loop can flush the
-          // ws-client microtasks before the Promise continuation runs.
-          setImmediate(() => resolve(code));
-        });
-        ws.on("error", (_err: Error) => {
-          // ws may emit an error before close on non-101 responses; ignore and
-          // wait for the close event which carries the code.
-        });
-      });
-      expect(closeCode).toBe(4401);
+      const code = await closeCodeOf(`${wsUrl}/api/v1/sessions/${SESSION_OF_A_WS}/shell`, ["tty"]);
+      expect(code).toBe(4401);
     } finally {
-      // closeAllConnections() forces immediate teardown of any lingering sockets
-      // (e.g. the handleUpgrade connection); without it server.close() blocks
-      // waiting for the WS connection to drain.  After closing connections we
-      // call server.close() directly (stopWsServer would throw ERR_SERVER_NOT_RUNNING
-      // if closeAllConnections already stopped it in Bun 1.3).
-      (server as ReturnType<typeof buildServer> & { closeAllConnections(): void }).closeAllConnections();
-      await new Promise<void>((r) => server.close(() => r()));
+      await stopWsServer(server);
     }
   });
 });
 
-describe("Shell WS route — subprotocol + process-survives", () => {
+describe("Shell WS hook — accept-first regression", () => {
+  test("REGRESSION: accepted upgrade behind REAL async auth (a macrotask)", async () => {
+    // THE #1333-class pin. Under Bun, the handshake must complete inside the
+    // request's own event-loop turn: an auth guard that awaits real I/O (here
+    // a setTimeout macrotask — same scheduling class as a Postgres read)
+    // before the accept breaks native `server.upgrade()`, and the client sees
+    // a dead socket. The old Hono-middleware shape failed EXACTLY this test;
+    // immediate-resolve fakes (microtasks) cannot catch it, which is how the
+    // shell shipped broken for 11 days. If this test hangs or closes without
+    // "hello-from-relay", the accept-first invariant has regressed.
+    const macrotaskGetSession: ShellDeps["getSession"] = async () => {
+      await new Promise((r) => setTimeout(r, 25));
+      return { user: { id: MEMBER_A_WS, role: "user", email: "a@test" } };
+    };
+    const { wsUrl, server } = await startWsServer({
+      shellRelay: fastFakeRelay,
+      getSession: macrotaskGetSession,
+      resolveOwner: makeResolveOwnerWs(),
+    });
+    try {
+      const first = await new Promise<string>((resolve, reject) => {
+        const ws = new WebSocket(`${wsUrl}/api/v1/sessions/${SESSION_OF_A_WS}/shell`, ["tty"]);
+        const t = setTimeout(() => reject(new Error("no frame — accept-first regressed")), 5000);
+        ws.addEventListener("message", (e) => {
+          clearTimeout(t);
+          resolve(String(e.data));
+          ws.close();
+        });
+        ws.addEventListener("close", (e) => {
+          clearTimeout(t);
+          reject(new Error(`closed before frame: code=${e.code} reason=${e.reason}`));
+        });
+      });
+      expect(first).toBe("hello-from-relay");
+    } finally {
+      await stopWsServer(server);
+    }
+  });
+});
+
+describe("Shell WS hook — subprotocol + process-survives", () => {
   test("9: subprotocol 'tty' echoed", async () => {
     const { wsUrl, server } = await startWsServer({
       // Use slowFakeRelay so the connection stays open long enough to capture protocol.
@@ -250,9 +257,7 @@ describe("Shell WS route — subprotocol + process-survives", () => {
           resolve(ws.protocol);
           ws.close();
         });
-        ws.addEventListener("error", (e) => { clearTimeout(t); reject(new Error(String(e))); });
         ws.addEventListener("close", (e) => {
-          // If close fires without open, reject with the close code.
           clearTimeout(t);
           reject(new Error(`WS closed before open: code=${e.code} reason=${e.reason}`));
         });
@@ -265,12 +270,14 @@ describe("Shell WS route — subprotocol + process-survives", () => {
 
   test("10: process survives abrupt client close — no unhandledRejection", async () => {
     const unhandled: Error[] = [];
-    const trap = (e: Error) => { unhandled.push(e); };
+    const trap = (e: Error) => {
+      unhandled.push(e);
+    };
     process.on("unhandledRejection", trap);
 
     let relayFinalized = false;
     const trackingRelay: ShellDeps["shellRelay"] = {
-      async *relay(_inbound, opts) {
+      async *relay(_inbound: AsyncIterable<unknown>, opts?: { signal?: AbortSignal }) {
         try {
           for (let i = 0; i < 100; i++) {
             if (opts?.signal?.aborted) break;
@@ -293,8 +300,15 @@ describe("Shell WS route — subprotocol + process-survives", () => {
       const ws = new WebSocket(`${wsUrl}/api/v1/sessions/${SESSION_OF_A_WS}/shell`, ["tty"]);
       await new Promise<void>((resolve, reject) => {
         const t = setTimeout(() => reject(new Error("open timeout")), 5000);
-        ws.addEventListener("open", () => { clearTimeout(t); ws.close(); resolve(); });
-        ws.addEventListener("error", (e) => { clearTimeout(t); reject(new Error(String(e))); });
+        ws.addEventListener("open", () => {
+          clearTimeout(t);
+          ws.close();
+          resolve();
+        });
+        ws.addEventListener("error", (e) => {
+          clearTimeout(t);
+          reject(new Error(String(e)));
+        });
       });
       // Give pump time to notice the close.
       await new Promise((r) => setTimeout(r, 300));
