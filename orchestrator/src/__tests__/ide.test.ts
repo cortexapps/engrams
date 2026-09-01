@@ -12,7 +12,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import net from "node:net";
 import http from "node:http";
 import { Hono } from "hono";
-import { createNodeWebSocket } from "@hono/node-ws";
 import { WebSocketServer, WebSocket as WsClient } from "ws";
 import { create } from "@bufbuild/protobuf";
 
@@ -165,8 +164,7 @@ describe("IDE WS bridge", () => {
     cleanups.push(() => guest.close());
 
     const app = new Hono();
-    const nodeWs = createNodeWebSocket({ app });
-    const server = buildServer(app, () => {}, nodeWs, [
+    const server = buildServer(app, () => {}, [
       makeIdeUpgradeHandler({
         sessions: { ensureIde: async () => ({ port: guestPort }) },
         portRelay: fakeRelayToPort(guestPort),
@@ -202,8 +200,7 @@ describe("IDE WS bridge", () => {
 
   test("rejects an unauthenticated IDE WS with close code 4401", async () => {
     const app = new Hono();
-    const nodeWs = createNodeWebSocket({ app });
-    const server = buildServer(app, () => {}, nodeWs, [
+    const server = buildServer(app, () => {}, [
       makeIdeUpgradeHandler({
         sessions: { ensureIde: async () => ({ port: 1 }) },
         portRelay: fakeRelayToPort(0), // never dialed — auth fails first

@@ -132,7 +132,7 @@ export function makeIdeRoute(deps?: IdeDeps): { app: Hono } {
 
 /** Build the `server.on("upgrade")` hook for IDE WebSockets. Returns `true`
  * if it handled the request (an `/api/v1/sessions/:id/ide/*` path), `false`
- * to let the next hook / the shell+vnc @hono/node-ws path run. */
+ * to let the next hook run (an unmatched upgrade is destroyed). */
 export function makeIdeUpgradeHandler(
   deps?: IdeDeps,
 ): (req: IncomingMessage, socket: Socket, head: Buffer) => Promise<boolean> {

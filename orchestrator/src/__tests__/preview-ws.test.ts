@@ -9,7 +9,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import net from "node:net";
 import { Hono } from "hono";
-import { createNodeWebSocket } from "@hono/node-ws";
 import { WebSocketServer, WebSocket as WsClient } from "ws";
 import { create } from "@bufbuild/protobuf";
 
@@ -106,11 +105,9 @@ describe("preview WS passthrough", () => {
     // 2. Orchestrator: buildServer with the preview upgrade hook + a fake relay
     //    that pipes to the guest.
     const app = new Hono();
-    const nodeWs = createNodeWebSocket({ app });
     const server = buildServer(
       app,
       () => {},
-      nodeWs,
       [
         makePreviewUpgradeHandler({
           store: fakeStore(sessionApp),
@@ -147,11 +144,9 @@ describe("preview WS passthrough", () => {
 
   test("rejects an unauthenticated preview WS (close code 4401)", async () => {
     const app = new Hono();
-    const nodeWs = createNodeWebSocket({ app });
     const server = buildServer(
       app,
       () => {},
-      nodeWs,
       [
         makePreviewUpgradeHandler({
           store: fakeStore(sessionApp),
@@ -287,8 +282,7 @@ describe("malformed websocket upgrade", () => {
   async function serverWithWs(): Promise<number> {
     const app = new Hono();
     app.get("/healthz", (c) => c.json({ ok: true }));
-    const nodeWs = createNodeWebSocket({ app });
-    const server = buildServer(app, () => {}, nodeWs, []);
+    const server = buildServer(app, () => {}, []);
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     cleanups.push(() => server.close());
     return (server.address() as net.AddressInfo).port;

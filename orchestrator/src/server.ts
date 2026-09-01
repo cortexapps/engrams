@@ -8,34 +8,16 @@
  *   - everything else → Hono via getRequestListener(app.fetch), which is pure
  *     node:http code: streams SSE correctly, preserves multiple Set-Cookie
  *     headers, and wires client-disconnect→request abort.
+ *   - WebSocket upgrades → the UpgradeHook list, tried in order. EVERY WS
+ *     surface is an accept-first raw handler (routes/ws-util.ts documents the
+ *     Bun invariant: the handshake must complete inside the request's own
+ *     event-loop turn, before any awaited I/O). The old @hono/node-ws path —
+ *     and the Bun socket.write workaround it needed — is retired; an upgrade
+ *     no hook claims is destroyed.
  *
  * RUNTIME OVERRIDE (ADR 0051 said Node; user chose Bun 2026-06-11):
  *   Bun implements node:http fully, so node:http createServer + connectNodeAdapter
  *   + @hono/node-server's getRequestListener all run unchanged under Bun.
- *
- * BUN WS BUG WORKAROUND (2026-06-11):
- *   Under Bun 1.3.14, socket.write() / socket.end() in the node:http 'upgrade'
- *   event handler is silently a no-op — the bytes are never flushed to the
- *   client (confirmed by scratch script: write callback fires but client
- *   receives nothing).  @hono/node-ws's injectWebSocket() uses socket.end() to
- *   send HTTP 4xx rejection responses, so the rejection path hangs under Bun.
- *
- *   Workaround: we install our OWN 'upgrade' event handler instead of calling
- *   nodeWs.injectWebSocket(server).  The custom handler mirrors the @hono/node-ws
- *   logic exactly, except the rejection path uses wss.handleUpgrade + ws.close()
- *   instead of socket.end() — the ws package's handleUpgrade works correctly
- *   under Bun (also confirmed by scratch script).
- *
- *   For auth-failure cases: the upgrade completes (101) but the WS is immediately
- *   closed with code 4401 ("Unauthorized") or 4404 ("Not Found") so the client
- *   can distinguish the rejection reason.  WS close codes 4000–4999 are reserved
- *   for application use; we encode HTTP status as 4000+status (4401, 4404, etc.).
- *   Browsers see onerror/onclose(4401) rather than an HTTP 401; this is a known
- *   limitation of the Bun socket bug.
- *
- *   For smoke test 14a ("anonymous WS → 401 (no upgrade)"): the test is now a
- *   plain HTTP GET (no Upgrade headers) so the guard fires in the Hono request
- *   handler and returns a real HTTP 401 — the upgrade event is never reached.
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -44,7 +26,6 @@ import type { Hono } from "hono";
 import { getRequestListener } from "@hono/node-server";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 import type { ConnectRouter } from "@connectrpc/connect";
-import type { NodeWebSocket } from "@hono/node-ws";
 import { iapBridge } from "./auth/iap-bridge.ts";
 import { applyCors, wsOriginAllowed } from "./auth/cors.ts";
 import { isUnderPreviewDomain } from "./apps/hostname.ts";
@@ -53,12 +34,13 @@ import { log } from "./log.ts";
 
 export type RouteRegistrar = (router: ConnectRouter) => void;
 
-/** A raw WS-upgrade hook, tried in order BEFORE the @hono/node-ws (shell/vnc)
- * dispatch. Returns `true` if it handled the upgrade, `false` to fall through
- * to the next hook. Handled here (not via the Hono app) because these proxies
- * need the raw socket, not a parsed request. Today's hooks: the preview proxy
- * (ADR 0064 P2b-ws, keyed on the `<slug>.<previewBaseDomain>` Host header) and
- * the IDE proxy (ADR 0085, keyed on the `/api/v1/sessions/:id/ide/*` path). */
+/** A raw WS-upgrade hook, tried in order; an upgrade no hook claims is
+ * destroyed. Returns `true` if it handled the upgrade, `false` to fall
+ * through to the next hook. Raw (not via the Hono app) because every WS
+ * surface needs the accept-first handshake (routes/ws-util.ts). Today's
+ * hooks: the preview proxy (ADR 0064 P2b-ws, Host-keyed), the IDE proxy
+ * (ADR 0085), spec sync (ADR 0117), the shell (ADR 0051) and VNC
+ * (ADR 0065/0066), all path-keyed. */
 export type UpgradeHook = (
   req: IncomingMessage,
   socket: Socket,
@@ -73,14 +55,10 @@ export type UpgradeHook = (
  *
  * Exported so tests can call buildServer(...) on an ephemeral port.
  *
- * @param nodeWs Optional @hono/node-ws handle. When provided, a custom upgrade
- *   handler (Bun-compatible) is installed instead of nodeWs.injectWebSocket().
- *   See module-level comment for the Bun WS bug workaround.
  */
 export function buildServer(
   app: Hono,
   routes: RouteRegistrar = () => {},
-  nodeWs?: NodeWebSocket,
   upgradeHooks: UpgradeHook[] = [],
   /** Preview base domain, for the termination check below. Defaults to config;
    *  a test that passes "" opts out, since no host is under an empty domain. */
@@ -148,154 +126,115 @@ export function buildServer(
     });
   });
 
-  // Wire WebSocket upgrade handler if @hono/node-ws is provided.
-  if (nodeWs) {
-    // BUN WS BUG WORKAROUND: do NOT call nodeWs.injectWebSocket(server).
-    // Instead, install our own 'upgrade' handler that uses wss.handleUpgrade
-    // for both the accept and reject paths, avoiding Bun's broken socket.write.
+  // WebSocket upgrades: dispatch to the accept-first hooks.
+  server.on("upgrade", async (request: IncomingMessage, socket: Socket, head: Buffer) => {
+    // EVERYTHING below runs inside this try. An `upgrade` listener is async,
+    // so anything it throws becomes an unhandled rejection — and under Bun
+    // that exits the process. One client's failed handshake then takes the
+    // whole orchestrator down, which is exactly what happened in prod on
+    // 2026-08-20: a preview WebSocket hit an error path inside `ws`
+    // (abortHandshake with a code http.STATUS_CODES has no entry for), the
+    // rejection escaped, and both pods crash-looped 11 times.
     //
-    // Flow:
-    //   1. Run the Hono app against the upgrade request (same as @hono/node-ws).
-    //      This executes the auth guard + registers the WS waiter if auth passes.
-    //   2a. Auth passes (response 200) → wss.handleUpgrade + wss.emit("connection")
-    //       → @hono/node-ws's internal wss.on("connection") resolves the waiter
-    //       → upgradeWebSocket's async closure runs → onOpen/onMessage/onClose fire.
-    //   2b. Auth fails (response 4xx) → wss.handleUpgrade + ws.close(4000+status)
-    //       so the WS close code encodes the HTTP status (4401 = Unauthorized,
-    //       4404 = Not Found, etc.).  Bun socket.end() is not used at all.
-    const { wss } = nodeWs;
-    server.on("upgrade", async (request: IncomingMessage, socket: Socket, head: Buffer) => {
-      // EVERYTHING below runs inside this try. An `upgrade` listener is async,
-      // so anything it throws becomes an unhandled rejection — and under Bun
-      // that exits the process. One client's failed handshake then takes the
-      // whole orchestrator down, which is exactly what happened in prod on
-      // 2026-08-20: a preview WebSocket hit an error path inside `ws`
-      // (abortHandshake with a code http.STATUS_CODES has no entry for), the
-      // rejection escaped, and both pods crash-looped 11 times.
-      //
-      // An upgrade concerns ONE connection. The blast radius has to be that
-      // connection, so the catch destroys the socket and nothing else.
+    // An upgrade concerns ONE connection. The blast radius has to be that
+    // connection, so the catch destroys the socket and nothing else.
+    try {
+      await handleUpgradeRequest(request, socket, head);
+    } catch (err) {
+      log.error(
+        { component: "ws", err, url: request.url, host: request.headers.host },
+        "websocket upgrade failed; destroying the socket",
+      );
+      // Best-effort: the socket may already be gone, which is frequently the
+      // reason we are here at all.
       try {
-        await handleUpgradeRequest(request, socket, head);
-      } catch (err) {
-        log.error(
-          { component: "ws", err, url: request.url, host: request.headers.host },
-          "websocket upgrade failed; destroying the socket",
-        );
-        // Best-effort: the socket may already be gone, which is frequently the
-        // reason we are here at all.
-        try {
-          socket.destroy();
-        } catch {
-          /* already destroyed */
-        }
-      }
-    });
-
-    async function handleUpgradeRequest(
-      request: IncomingMessage,
-      socket: Socket,
-      head: Buffer,
-    ): Promise<void> {
-      // Refuse a malformed handshake before `ws` ever sees it.
-      //
-      // This is what took prod down on 2026-08-20. An upgrade with no valid
-      // `Sec-WebSocket-Key` drives Bun's BUILTIN `ws` into its abort path —
-      // note the crash frames read `ws:671` with no file, so the npm package in
-      // node_modules is not what runs — and that path mishandles its own
-      // arguments. Reproduced locally on Bun 1.3.14, where it answers
-      // `HTTP/1.1 400 [object Object]`; on the 1.4.0 the pods run it throws
-      // `TypeError: undefined is not an object (evaluating 'message')` instead,
-      // which is how one bad handshake killed the process.
-      //
-      // Dropping the socket is the only available answer, not a shortcut:
-      // `socket.end(...)` in an upgrade listener is a NO-OP under Bun (measured
-      // — the client receives nothing), and completing the handshake to send a
-      // close frame needs the very key that is missing. A client that omits it
-      // is not a conforming WebSocket client, so there is nobody to explain
-      // ourselves to. Preview hostnames are internet-reachable (ADR 0118 moved
-      // the wall into this process), so this arrives as background noise.
-      const wsKey = request.headers["sec-websocket-key"];
-      const wsVersion = request.headers["sec-websocket-version"];
-      if (typeof wsKey !== "string" || wsKey.length === 0 || wsVersion !== "13") {
-        log.warn(
-          {
-            component: "ws",
-            host: request.headers.host,
-            url: request.url,
-            hasKey: typeof wsKey === "string" && wsKey.length > 0,
-            version: wsVersion,
-          },
-          "refusing a malformed websocket upgrade",
-        );
         socket.destroy();
-        return;
+      } catch {
+        /* already destroyed */
       }
-
-      // Cross-site WS handshakes are refused up front. Browsers attach the
-      // session cookie to a WS opened by ANY page (WebSockets are outside
-      // CORS), and with the cookie widened to the parent domain for the
-      // split-host layout, a guest-authored preview page could otherwise
-      // open an authenticated socket to the api host. No Origin header
-      // (CLI / non-browser clients) passes — their auth is the route guard.
-      //
-      // Preview hosts are exempt, mirroring the HTTP CORS gate: ADR 0118
-      // terminates preview upgrades at the proxy hook below, whose wall +
-      // cookie-strip is the policy there — and sibling apps of one session
-      // legitimately open sockets to each other (dev-server proxies, HMR),
-      // which this gate would otherwise kill before the hook ever ran.
-      // This gate protects the ORCHESTRATOR'S OWN routes.
-      const isPreviewUpgrade = isUnderPreviewDomain(request.headers.host, previewBaseDomain);
-      if (!isPreviewUpgrade && !wsOriginAllowed(request)) {
-        log.warn(
-          {
-            component: "ws",
-            host: request.headers.host,
-            url: request.url,
-            origin: request.headers.origin,
-          },
-          "refusing a cross-origin websocket upgrade",
-        );
-        socket.destroy();
-        return;
-      }
-
-      // Raw-socket proxy hooks (preview by Host, IDE by path — see UpgradeHook)
-      // run in order; unmatched upgrades fall through to the shell/vnc path.
-      for (const hook of upgradeHooks) {
-        if (await hook(request, socket, head)) return;
-      }
-      const url = new URL(request.url ?? "/", "http://localhost");
-      const headers = new Headers();
-      for (const key in request.headers) {
-        const value = request.headers[key];
-        if (!value) continue;
-        headers.append(key, Array.isArray(value) ? value[0] : value);
-      }
-      // env.incoming is the key @hono/node-ws uses to correlate the request
-      // to the waiterMap entry set up by upgradeWebSocket().
-      const env: Record<string, unknown> = { incoming: request, outgoing: undefined };
-
-      const response = await app.request(url, { headers }, env);
-
-      if (response.status !== 200) {
-        // Auth/guard rejected the request.  Use handleUpgrade+close because
-        // Bun's socket.write() is a no-op in the upgrade event handler.
-        // Close code 4000+httpStatus encodes the rejection reason for clients
-        // (e.g. 4401 = Unauthorized, 4404 = Not Found).
-        // Cap at 4999 (WS application close codes run 4000–4999).
-        const closeCode = Math.min(4000 + response.status, 4999);
-        wss.handleUpgrade(request, socket, head, (ws) => {
-          ws.close(closeCode, response.statusText || String(response.status));
-        });
-        return;
-      }
-
-      // Auth passed — complete the upgrade and let @hono/node-ws drive the session.
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit("connection", ws, request);
-      });
     }
+  });
+
+  async function handleUpgradeRequest(
+    request: IncomingMessage,
+    socket: Socket,
+    head: Buffer,
+  ): Promise<void> {
+    // Refuse a malformed handshake before `ws` ever sees it.
+    //
+    // This is what took prod down on 2026-08-20. An upgrade with no valid
+    // `Sec-WebSocket-Key` drives Bun's BUILTIN `ws` into its abort path —
+    // note the crash frames read `ws:671` with no file, so the npm package in
+    // node_modules is not what runs — and that path mishandles its own
+    // arguments. Reproduced locally on Bun 1.3.14, where it answers
+    // `HTTP/1.1 400 [object Object]`; on the 1.4.0 the pods run it throws
+    // `TypeError: undefined is not an object (evaluating 'message')` instead,
+    // which is how one bad handshake killed the process.
+    //
+    // Dropping the socket is the only available answer, not a shortcut:
+    // `socket.end(...)` in an upgrade listener is a NO-OP under Bun (measured
+    // — the client receives nothing), and completing the handshake to send a
+    // close frame needs the very key that is missing. A client that omits it
+    // is not a conforming WebSocket client, so there is nobody to explain
+    // ourselves to. Preview hostnames are internet-reachable (ADR 0118 moved
+    // the wall into this process), so this arrives as background noise.
+    const wsKey = request.headers["sec-websocket-key"];
+    const wsVersion = request.headers["sec-websocket-version"];
+    if (typeof wsKey !== "string" || wsKey.length === 0 || wsVersion !== "13") {
+      log.warn(
+        {
+          component: "ws",
+          host: request.headers.host,
+          url: request.url,
+          hasKey: typeof wsKey === "string" && wsKey.length > 0,
+          version: wsVersion,
+        },
+        "refusing a malformed websocket upgrade",
+      );
+      socket.destroy();
+      return;
+    }
+
+    // Cross-site WS handshakes are refused up front. Browsers attach the
+    // session cookie to a WS opened by ANY page (WebSockets are outside
+    // CORS), and with the cookie widened to the parent domain for the
+    // split-host layout, a guest-authored preview page could otherwise
+    // open an authenticated socket to the api host. No Origin header
+    // (CLI / non-browser clients) passes — their auth is the route guard.
+    //
+    // Preview hosts are exempt, mirroring the HTTP CORS gate: ADR 0118
+    // terminates preview upgrades at the proxy hook below, whose wall +
+    // cookie-strip is the policy there — and sibling apps of one session
+    // legitimately open sockets to each other (dev-server proxies, HMR),
+    // which this gate would otherwise kill before the hook ever ran.
+    // This gate protects the ORCHESTRATOR'S OWN routes.
+    const isPreviewUpgrade = isUnderPreviewDomain(request.headers.host, previewBaseDomain);
+    if (!isPreviewUpgrade && !wsOriginAllowed(request)) {
+      log.warn(
+        {
+          component: "ws",
+          host: request.headers.host,
+          url: request.url,
+          origin: request.headers.origin,
+        },
+        "refusing a cross-origin websocket upgrade",
+      );
+      socket.destroy();
+      return;
+    }
+
+    // Accept-first raw handlers (preview by Host; IDE, spec-sync, shell and
+    // VNC by path — see UpgradeHook), tried in order.
+    for (const hook of upgradeHooks) {
+      if (await hook(request, socket, head)) return;
+    }
+
+    // No hook claimed it: not a WebSocket surface this server offers.
+    log.warn(
+      { component: "ws", host: request.headers.host, url: request.url },
+      "unmatched websocket upgrade; destroying the socket",
+    );
+    socket.destroy();
   }
 
   return server;

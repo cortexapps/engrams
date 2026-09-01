@@ -2,7 +2,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { AddressInfo } from "node:net";
 import { Hono } from "hono";
-import { createNodeWebSocket } from "@hono/node-ws";
 import { WebSocket as WebSocketClient, type RawData } from "ws";
 import * as awarenessProtocol from "y-protocols/awareness";
 import * as Y from "yjs";
@@ -77,7 +76,6 @@ async function listenForSpecSync(input: {
   draftGate?: Promise<void>;
 }) {
   const app = new Hono();
-  const nodeWs = createNodeWebSocket({ app });
   const participants: SpecParticipantStore = input.participants ?? {
     connect: async () => 1n,
     renew: async () => true,
@@ -113,7 +111,7 @@ async function listenForSpecSync(input: {
   };
   const hub = new SpecSyncHub(deps);
   await hub.start();
-  const server = buildServer(app, () => {}, nodeWs, [makeSpecSyncUpgradeHandler(deps, hub)]);
+  const server = buildServer(app, () => {}, [makeSpecSyncUpgradeHandler(deps, hub)]);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   cleanups.push(async () => {
     await hub.stop();
