@@ -1,4 +1,4 @@
-# GKE Identity-Aware Proxy overlay for the web Ingress.
+# GKE Identity-Aware Proxy overlay — the SPLIT-HOST layout.
 #
 # Layer this on top of `values-gcp.yaml.example`:
 #
@@ -8,61 +8,81 @@
 #
 # What this does
 # --------------
-# IAP guards the single public surface (the web nginx Service) so
-# only authorized principals can reach the dashboard and the API
-# calls nginx proxies through to the coord. The coord itself stays
-# unreachable from the internet — that invariant is set in the base
-# GCP overlay (`service.type: ClusterIP`, `serviceInternal.annotations`
-# = internal-only); this file does NOT attach IAP to the coord and
-# never should.
+# IAP guards the app host (the web nginx Service) so only authorized
+# principals reach the dashboard. The machine surface — Connect RPC,
+# /api/v1, SSE, WebSockets — is served from a SECOND hostname
+# (`api.<domain>`) with no IAP in front, because an authenticating
+# proxy breaks exactly that surface: IAP does not carry a WebSocket
+# upgrade (the load balancer answers 502) and its backend timeout
+# caps SSE lifetimes. The SPA calls the api host cross-origin
+# (`web.apiBaseUrl` below); the orchestrator's CORS gate admits
+# exactly `orchestrator.trustedOrigins`, and its own auth seams
+# (session cookie / API key / webhook signatures) gate every route
+# there. Anonymous callers get 401s from the app, not a proxy page.
+#
+# (Historical note: before the split-host layout this overlay carved
+# a dozen per-path no-IAP exceptions out of the app host's URL map —
+# one per webhook, CLI, and streaming route. That pattern broke every
+# time a new streaming route shipped and is retired; only the two
+# OIDC discovery paths below remain on the app host, because the
+# OIDC issuer URI derives from `orchestrator.publicUrl`.)
+#
+# The coord itself stays unreachable from the internet — that
+# invariant is set in the base GCP overlay (`service.type:
+# ClusterIP`, `serviceInternal.annotations` = internal-only); this
+# file does NOT attach IAP to the coord and never should.
 #
 # Pre-requisites the chart can't do for you
 # -----------------------------------------
-# 1. OAuth consent screen configured in the GCP console (User Type
-#    "Internal", support email set). One-time per project. Required
-#    so users see a branded login page; otherwise a generic Google
-#    consent prompt appears. No OAuth *client* needed — see (2).
+# 1. TWO DNS A records, both to the SAME load-balancer IP:
+#    `engram.<domain>` and `api.engram.<domain>`.
 #
-# 2. A `BackendConfig` CRD applied alongside the Helm release. The
-#    post-Jan-2026 spec is minimal — the IAP OAuth Admin API was
-#    retired so the old `oauthclientCredentials` flow no longer
-#    functions. IAP now uses a Google-managed OAuth client per
-#    request:
+# 2. TWO ManagedCertificates (Google-managed certs cannot hold
+#    wildcards; provision one per host and list both in the Ingress
+#    annotation below):
+#
+#      apiVersion: networking.gke.io/v1
+#      kind: ManagedCertificate
+#      metadata: { name: engram-web-cert }
+#      spec: { domains: [engram.REPLACE_DOMAIN] }
+#      ---
+#      apiVersion: networking.gke.io/v1
+#      kind: ManagedCertificate
+#      metadata: { name: engram-api-cert }
+#      spec: { domains: [api.engram.REPLACE_DOMAIN] }
+#
+# 3. OAuth consent screen configured in the GCP console (User Type
+#    "Internal", support email set). One-time per project. No OAuth
+#    *client* is needed — post-Jan-2026 IAP uses a Google-managed
+#    client (https://cloud.google.com/iap/docs/deprecations/migrate-oauth-client).
+#
+# 4. A `BackendConfig` pair applied alongside the Helm release. IAP
+#    is enabled per GCP *backend service*, so the app host's Service
+#    carries an IAP-on config and the api host's webhook Service an
+#    IAP-off one:
 #
 #      apiVersion: cloud.google.com/v1
 #      kind: BackendConfig
-#      metadata:
-#        name: engram-web-iap
+#      metadata: { name: engram-web-iap }
 #      spec:
-#        iap:
-#          enabled: true
+#        iap: { enabled: true }
+#        # 300s is fine here — no sockets or streams ride this host.
+#      ---
+#      apiVersion: cloud.google.com/v1
+#      kind: BackendConfig
+#      metadata: { name: engram-api-no-iap }
+#      spec:
+#        iap: { enabled: false }
+#        # A backend timeout caps a SOCKET'S LIFETIME, not idleness:
+#        # the default 30s (or the web host's 300s) would cut every
+#        # quiet SSE/WebSocket leg. One hour matches the AWS ALB
+#        # overlay's idle-timeout posture.
+#        timeoutSec: 3600
 #
-#    See https://cloud.google.com/iap/docs/deprecations/migrate-oauth-client.
-#    The chart only needs to reference this BackendConfig by name
-#    via the Service annotation below.
-#
-# 3. `roles/iap.httpsResourceAccessor` bound to your authorized
-#    principals on the project (or on the backend service for tighter
-#    scoping). On GCP: `google_iap_web_iam_member` resources, one
-#    per principal. Bind this ONLY to the web backend — the no-IAP
-#    Slack backend (below) needs no accessor.
-#
-# 4. A second, no-IAP `BackendConfig` for the orchestrator's public
-#    provider and automation webhooks. IAP is enabled per GCP *backend service*, not per
-#    path, so the only way to expose a path without IAP is to route it
-#    to a different backend whose BackendConfig has IAP off. Apply it
-#    from the chart's examples dir:
-#
-#      kubectl apply -n <ns> -f examples/backendconfig-slack-no-iap.yaml
-#
-#    This overlay then (a) enables a dedicated webhook Service
-#    (`orchestrator.webhookService`) — fronting the SAME orchestrator
-#    pods — and binds the no-IAP BackendConfig to IT (not to the primary
-#    orchestrator Service, so IAP stays available there), and (b) adds
-#    provider Exact paths plus the dynamic automation-hook Prefix to the web
-#    Ingress, retargeted at that webhook Service. The orchestrator verifies
-#    every webhook signature and its IAP bridge applies the narrower exact
-#    application matcher before exempting dynamic hooks (ADRs 0060/0100/0102).
+# 5. `roles/iap.httpsResourceAccessor` bound to your authorized
+#    principals (project-wide, or on the web backend service for
+#    tighter scoping). Bind this ONLY to the web backend — the api
+#    host's backend needs no accessor.
 #
 # What this overlay sets
 # ----------------------
@@ -71,113 +91,76 @@ web:
   service:
     # The annotation that hooks the GKE Service → GCP Backend
     # Service → BackendConfig pipeline. The BackendConfig itself
-    # lives outside the chart (see pre-req #2).
+    # lives outside the chart (pre-req #4).
     annotations:
       cloud.google.com/backend-config: '{"default":"engram-web-iap"}'
 
+  # The SPA calls the api host directly for RPC, /api/v1, SSE and
+  # WebSockets. Renders the /engram-config.js runtime override and
+  # widens the SPA's CSP to the api origin (web-configmap.yaml).
+  apiBaseUrl: https://api.engram.REPLACE_DOMAIN
+
   ingress:
-    # Public HTTPS LB. The BackendConfig referenced above gives this
-    # LB its IAP layer; no IAP-specific field on the Ingress.
+    # One public HTTPS LB, two hosts. The BackendConfigs referenced
+    # above give each backend its IAP posture; no IAP-specific field
+    # exists on the Ingress itself.
     enabled: true
     className: gce
     annotations:
       kubernetes.io/ingress.class: gce
-      # Provision separately; this annotation points at it by name.
-      networking.gke.io/managed-certificates: engram-web-cert
+      # Pre-req #2; both certs on the one LB.
+      networking.gke.io/managed-certificates: engram-web-cert,engram-api-cert
       # Optional but recommended: a static external IP reserved in
-      # Terraform so DNS records can be pre-created.
+      # Terraform so both DNS records can be pre-created.
       # kubernetes.io/ingress.global-static-ip-name: engram-web-ip
     hosts:
       - host: engram.REPLACE_DOMAIN
         paths:
-          # Provider webhooks: Slack external triggers (ADR 0060) + the GitHub
-          # PR-review App (ADR 0100). Exact-match so ONLY these URLs are
-          # retargeted at the dedicated no-IAP webhook Service; the
-          # more-specific match wins in the URL map. They must precede the "/"
-          # rule. The orchestrator verifies each provider's own signature
-          # (Slack signing secret / GitHub X-Hub-Signature-256 HMAC) and its
-          # IAP bridge exempts these paths, so dropping IAP here is safe.
-          # `tpl`'d to the webhook Service fullname (resolved by
-          # web-ingress.yaml).
-          - path: /api/v1/integrations/slack/events
-            pathType: Exact
-            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          - path: /api/v1/integrations/slack/interactivity
-            pathType: Exact
-            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          - path: /api/v1/integrations/github/events
-            pathType: Exact
-            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          # Google WIF must fetch these two public, read-only OIDC documents.
-          # No token or credential endpoint is exposed on this backend.
+          # The ONLY carve-outs left on the app host: Google WIF
+          # fetches these two public, read-only OIDC documents, and
+          # the issuer URI inside them derives from
+          # `orchestrator.publicUrl` — i.e. THIS host — so they
+          # cannot move to the api host. No token or credential
+          # endpoint is exposed here, and the orchestrator's IAP
+          # bridge exempts exactly these paths.
           - path: /api/v1/integrations/google-cloud/oidc/.well-known/openid-configuration
             pathType: Exact
             service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
           - path: /api/v1/integrations/google-cloud/oidc/jwks
             pathType: Exact
             service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          # Dynamic automation hooks need a Prefix rule at the load balancer;
-          # the orchestrator's IAP bridge remains the exact POST + one-slug
-          # application boundary within this no-IAP prefix (ADR 0102).
-          - path: /api/v1/hooks/
-            pathType: Prefix
-            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          # CI-conditional review dispatch (ADR 0100 — e.g. a GitHub
-          # Action): API-key-authed like /rpc/ below; anonymous callers
-          # 401 at the orchestrator.
-          - path: /api/v1/reviews/dispatch
-            pathType: Exact
-            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          # The `engrams` CLI's surface: the Connect RPCs and the
-          # anonymous device-flow login endpoints. A CLI carries no IAP
-          # cookie, so these must bypass the proxy; the orchestrator's
-          # better-auth seams (API key / session cookie) are the gate.
-          # NOTE: /api/auth/get-session (and the rest of /api/auth)
-          # deliberately stays on the IAP'd "/" rule — it is the SPA's
-          # session bootstrap; the CLI resolves identity via
-          # ApiKeyService.WhoAmI on /rpc instead.
-          - path: /rpc/
-            pathType: Prefix
-            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          - path: /api/auth/device/code
-            pathType: Exact
-            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          - path: /api/auth/device/token
-            pathType: Exact
-            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          # WebSocket surfaces MUST live on the no-IAP backend. IAP does not
-          # carry a WebSocket upgrade — the load balancer answers 502 — and
-          # IAP is enabled per backend SERVICE, not per path, so a socket
-          # routed at the IAP'd web backend can never connect. Any path left
-          # to the default "/" rule below inherits IAP.
-          #
-          # Both prefixes below are guarded by the orchestrator itself
-          # (makeHeaderGuard / makeSpecMemberHeaderGuard); an anonymous
-          # caller completes the handshake and is closed with 4401, so
-          # dropping IAP here does not widen access.
-          #   - sessions: the shell (ADR 0051), the IDE proxy (ADR 0085),
-          #     plus the SSE + artifact routes the CLI reads.
-          #   - specs: the Yjs spec-document socket at
-          #     /api/v1/specs/:id/sync (ADR 0117). Note that
-          #     /api/v1/spec-templates is a separate prefix and stays IAP'd.
-          - path: /api/v1/sessions/
-            pathType: Prefix
-            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          - path: /api/v1/specs/
-            pathType: Prefix
-            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
-          # Everything else → web nginx (IAP-protected).
+          # Everything else on the app host → web nginx (IAP).
           - path: /
             pathType: Prefix
+      # The api host: the whole machine surface on one rule. Provider
+      # webhooks (signature-verified), the CLI's RPC + device-flow
+      # login, dynamic automation hooks, the SSE feeds, and every
+      # WebSocket (shell, VNC, spec sync) — each gated by the
+      # orchestrator's own seams. Register Slack/GitHub webhook URLs
+      # against this host (the dashboard's manifest generators emit
+      # it automatically once `web.apiBaseUrl` is set).
+      - host: api.engram.REPLACE_DOMAIN
+        paths:
+          - path: /
+            pathType: Prefix
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
 
 orchestrator:
-  # A dedicated Service for the public webhook paths, fronting the SAME
-  # orchestrator pods. The no-IAP BackendConfig binds HERE — NOT on the primary
-  # orchestrator Service — so IAP stays available on the primary Service for any
-  # other Ingress (e.g. orchestrator.ingress). The web Ingress above routes the
-  # Slack Exact paths at `<release>-orchestrator-webhooks`; GKE mints a separate
-  # backend service for it, bound to the no-IAP BackendConfig below.
+  # The SPA's origin, admitted by the orchestrator's credentialed
+  # CORS gate and better-auth's CSRF check for the cross-origin
+  # calls to the api host.
+  trustedOrigins:
+    - https://engram.REPLACE_DOMAIN
+  # The session cookie must be scoped to the shared parent domain so
+  # the browser attaches it on calls to the api host. Scope it to
+  # YOUR deployment's subdomain (the leading dot matters), never to
+  # a public suffix.
+  sessionCookieDomain: .engram.REPLACE_DOMAIN
+  # A dedicated Service for the api host + the two OIDC paths,
+  # fronting the SAME orchestrator pods. The no-IAP BackendConfig
+  # binds HERE — NOT on the primary orchestrator Service — so IAP
+  # stays available on the primary Service for any other Ingress.
   webhookService:
     enabled: true
     annotations:
-      cloud.google.com/backend-config: '{"default":"engram-slack-no-iap"}'
+      cloud.google.com/backend-config: '{"default":"engram-api-no-iap"}'
