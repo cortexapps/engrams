@@ -381,17 +381,37 @@ mod adapter {
         pub tool_manifest: ToolManifest,
     }
 
+    /// True when the guest's libc is musl (Alpine-class images). The
+    /// loader path is the discriminator: glibc rootfses ship
+    /// `/lib64/ld-linux-*`; musl rootfses ship `/lib/ld-musl-*`. This
+    /// wrapper itself is a static musl build, so it runs on both — the
+    /// CLI it launches is the libc-sensitive piece.
+    fn guest_is_musl() -> bool {
+        std::path::Path::new("/lib/ld-musl-x86_64.so.1").exists()
+            || std::path::Path::new("/lib/ld-musl-aarch64.so.1").exists()
+    }
+
     /// Resolve the `claude` binary path. If the user supplied
     /// `--claude-bin` / `ENGRAM_CLAUDE_BIN`, honour it verbatim.
-    /// Otherwise look for a sibling named `claude` next to this
-    /// wrapper (the harness pack convention) — falls back to the
-    /// bare name `claude` so $PATH lookup still works in dev shells.
+    /// Otherwise look next to this wrapper (the harness pack
+    /// convention): on a musl guest prefer the `claude-musl` sibling
+    /// (Anthropic publishes both builds; the pack stages both — a
+    /// glibc `claude` on Alpine dies at the dynamic loader with a
+    /// bare exit 1, which presented as an eternal "delivering…" on
+    /// the first fresh-deployment walk). Falls back to the bare name
+    /// `claude` so $PATH lookup still works in dev shells.
     fn resolve_claude_bin(override_value: Option<&str>) -> String {
         if let Some(path) = override_value {
             return path.to_string();
         }
         if let Ok(self_exe) = std::env::current_exe() {
             if let Some(parent) = self_exe.parent() {
+                if guest_is_musl() {
+                    let musl = parent.join("claude-musl");
+                    if musl.exists() {
+                        return musl.to_string_lossy().into_owned();
+                    }
+                }
                 let sibling = parent.join("claude");
                 if sibling.exists() {
                     return sibling.to_string_lossy().into_owned();
