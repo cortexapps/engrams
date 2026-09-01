@@ -218,3 +218,21 @@ resource "kubectl_manifest" "fleet_coordinator_secret" {
 
   depends_on = [kubectl_manifest.gcp_secret_store]
 }
+
+# ─── the web BackendConfig (WebSocket/SSE lifetime) ───────────────
+# The GCLB's default 30s backend timeout caps a connection's LIFETIME
+# — every WebSocket (shell, VNC, spec sync) and SSE leg dies at that
+# mark with no close frame. values-gcp.yaml.example annotates the web
+# Service with this BackendConfig's name. Allow ~10 minutes after an
+# apply for the load balancer to program the change.
+resource "kubectl_manifest" "web_backendconfig" {
+  yaml_body = <<-YAML
+    apiVersion: cloud.google.com/v1
+    kind: BackendConfig
+    metadata:
+      name: engram-web
+      namespace: ${kubernetes_namespace_v1.app.metadata[0].name}
+    spec:
+      timeoutSec: 3600
+  YAML
+}

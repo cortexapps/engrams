@@ -146,6 +146,14 @@ cp deploy/helm/engram/values-aws.yaml.example /tmp/engram-values.yaml
 cp deploy/helm/engram-host-fleet/values-aws.yaml.example /tmp/fleet-values.yaml
 # The tfvalues overlays override every REPLACE_* the TF layer knows.
 
+# While the engrams repository is private, its GHCR images need a
+# pull secret in BOTH namespaces (a GitHub PAT with read:packages) —
+# the values examples reference the name `ghcr-pull`:
+kubectl create secret docker-registry ghcr-pull -n engrams \
+  --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
+kubectl create secret docker-registry ghcr-pull -n engrams-hosts \
+  --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
+
 helm install engram deploy/helm/engram \
   -n engrams -f /tmp/engram-values.yaml -f /tmp/engram.tfvalues.yaml
 
@@ -186,8 +194,12 @@ leg).
 Sign up with `$ADMIN_EMAIL` (bootstrap-promoted to admin — the
 ADR 0118 login wall; ⚡ do NOT put ALB OIDC/Cognito auth in front of
 the app: it breaks CORS preflights and WebSockets the same way IAP
-does). Then enable a first image and create a session against it —
-the end-to-end proof.
+does). Then enable a first image — `eclipse-temurin:21-jre` is a
+good first pick; **use a glibc-based image** (Alpine/musl images are
+not yet supported by the built-in harnesses), and add your model
+credentials (Settings → Harness environment, or connect OpenRouter
+under Settings → Model routers) — and create a session against it:
+the agent's first reply is the end-to-end proof.
 
 ⚡ If you are reusing images baked on a GCP fleet: the default
 platforms do NOT match (AWS m8i = Granite Rapids, GCP C3 =

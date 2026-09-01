@@ -22,6 +22,18 @@
 #   front of this app — it breaks the same way IAP does (no cookie
 #   on CORS preflights, no WebSocket carry; ADR 0118).
 
+# Image TAGS must be set (chart empty-tag fallback = the unpublished
+# chart appVersion). `main` tracks the latest build; pin a SHA for
+# reproducible rollouts. While the repository is private, GHCR also
+# needs a pull secret in the release namespace:
+#
+#   kubectl create secret docker-registry ghcr-pull -n engrams \
+#     --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
+image:
+  tag: main   # web + orchestrator tags are set in their blocks below
+imagePullSecrets:
+  - name: ghcr-pull
+
 # ─── coordinator ──────────────────────────────────────────────────
 
 # Images come from the published GHCR defaults
@@ -103,6 +115,8 @@ resources:
 web:
   enabled: true
   replicaCount: 2
+  image:
+    tag: main   # see the tag note at the top
 
   service:
     type: ClusterIP
@@ -142,6 +156,8 @@ web:
 
 orchestrator:
   enabled: true
+  image:
+    tag: main   # see the tag note at the top
   publicUrl: https://engrams.REPLACE_DOMAIN
   databaseSecret:
     existingSecret: engram-orchestrator-secrets

@@ -107,8 +107,11 @@ record for `$DOMAIN` pointing at:
 terraform output -raw web_static_ip
 ```
 
-The Google-managed certificate provisions only after DNS resolves —
-expect ~15 minutes after the record lands. Check with
+The Google-managed certificate provisions only after BOTH the DNS
+record resolves AND the Ingress exists — and the Ingress is created
+by the helm install in step 5. Until then the cert sits in
+`Provisioning` no matter how long you wait; that is expected, not
+stuck. After step 5, expect ~15–40 minutes. Check with
 `kubectl describe managedcertificate -n engrams engram-web-cert`
 (status `Active` when done).
 
@@ -127,6 +130,15 @@ cp deploy/helm/engram/values-gcp.yaml.example /tmp/engram-values.yaml
 cp deploy/helm/engram-host-fleet/values-gcp.yaml.example /tmp/fleet-values.yaml
 # The tfvalues overlays override every REPLACE_* the TF layer knows;
 # edit the /tmp copies only for taste (replica counts, resources).
+
+# While the engrams repository is private, its GHCR images need a
+# pull secret in BOTH namespaces (a GitHub PAT with read:packages) —
+# the values examples already reference the name `ghcr-pull`. Skip
+# this once the packages are public.
+kubectl create secret docker-registry ghcr-pull -n engrams \
+  --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
+kubectl create secret docker-registry ghcr-pull -n engrams-hosts \
+  --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
 
 helm install engram deploy/helm/engram \
   -n engrams -f /tmp/engram-values.yaml -f /tmp/engram.tfvalues.yaml
@@ -164,10 +176,20 @@ extra A record (`api.<domain>`, same IP) and a second managed cert.
 
 Sessions need an enabled image (a base snapshot baked on this
 fleet). From Settings → Images (or the `engrams` CLI), register your
-registry if it's private and enable an image; the enable pipeline
-materializes it, boots a capture VM on the KVM pool, and snapshots.
-When the image shows **ready**, create a session against it — that
-session booting is the end-to-end proof.
+registry if it's private and enable an image — `eclipse-temurin:21-jre`
+is a good first pick. **Use a glibc-based image**: Alpine/musl images
+are not yet supported by the built-in harnesses (the bundled agent
+CLI is a glibc binary; on a musl guest it exits immediately and the
+session hangs at "delivering…"). The enable pipeline materializes
+the image, boots a capture VM on the KVM pool, and snapshots.
+
+The harness also needs model credentials: add your Claude
+credentials under Settings → Harness environment (e.g.
+`CLAUDE_CODE_OAUTH_TOKEN`) before the first session, or connect
+OpenRouter under Settings → Model routers to use routed models.
+
+When the image shows **ready**, create a session against it — the
+agent's first reply is the end-to-end proof.
 
 ## Teardown
 

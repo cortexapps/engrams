@@ -27,6 +27,17 @@
 # usually pin image.tag / operator.image.tag / nodeAssets.image.tag to
 # a resolved SHA; a floating tag works but won't auto-roll (the
 # DaemonSet is OnDelete — the operator rolls pods, ADR 0044 K3).
+#
+# The host-agent tag MUST be set: the chart's empty-tag fallback is
+# the unpublished chart appVersion. While the repository is private,
+# also create the ghcr-pull secret in THIS namespace:
+#
+#   kubectl create secret docker-registry ghcr-pull -n engrams-hosts \
+#     --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
+image:
+  tag: main
+imagePullSecrets:
+  - name: ghcr-pull
 
 # Workload Identity: host pods impersonate the fleet GSA (chunks
 # bucket objectAdmin + Secret Manager accessor).
