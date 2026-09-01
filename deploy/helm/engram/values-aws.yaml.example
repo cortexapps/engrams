@@ -30,13 +30,7 @@
 #   kubectl create secret docker-registry ghcr-pull -n engrams \
 #     --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
 image:
-  tag: main
-web:
-  image:
-    tag: main
-orchestrator:
-  image:
-    tag: main
+  tag: main   # web + orchestrator tags are set in their blocks below
 imagePullSecrets:
   - name: ghcr-pull
 
@@ -121,6 +115,8 @@ resources:
 web:
   enabled: true
   replicaCount: 2
+  image:
+    tag: main   # see the tag note at the top
 
   service:
     type: ClusterIP
@@ -160,6 +156,8 @@ web:
 
 orchestrator:
   enabled: true
+  image:
+    tag: main   # see the tag note at the top
   publicUrl: https://engrams.REPLACE_DOMAIN
   databaseSecret:
     existingSecret: engram-orchestrator-secrets

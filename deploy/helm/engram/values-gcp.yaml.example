@@ -157,7 +157,6 @@ web:
     # replaces this with its own IAP-enabled pair.)
     annotations:
       cloud.google.com/backend-config: '{"default":"engram-web"}'
-    annotations: {}
 
   ingress:
     # The single public surface: Google HTTPS LB + managed cert. With
