@@ -754,10 +754,18 @@ jobs:
             "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
             -o /tmp/claude
           chmod +x /tmp/claude
+          # Anthropic publishes a musl build too; the shim picks
+          # claude-musl on Alpine-class guests (the glibc CLI dies at
+          # the dynamic loader there — first fresh-deployment walk).
+          curl -fsSL --retry 3 \
+            "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64-musl/claude" \
+            -o /tmp/claude-musl
+          chmod +x /tmp/claude-musl
           STAGE="$PWD/var/harness-claude-stage"
           rm -rf "$STAGE" && mkdir -p "$STAGE"
           cp -p target/x86_64-unknown-linux-musl/release/engram-harness-claude "$STAGE/harness"
           cp -p /tmp/claude "$STAGE/claude"
+          cp -p /tmp/claude-musl "$STAGE/claude-musl"
           cp -p deploy/harness-claude/harness.toml "$STAGE/harness.toml"
 
       - name: Stage harness-codex tree

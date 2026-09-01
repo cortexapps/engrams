@@ -793,10 +793,19 @@ bundles-squashfs: dev-link-shared
                     "https://downloads.claude.ai/claude-code-releases/$CLAUDE_VERSION/$carch/claude" \
                     -o "$cache" && chmod +x "$cache" || ok=0
             fi
+            # The musl build rides alongside; the shim picks it on
+            # Alpine-class guests.
+            cachemusl="$cache-musl"
+            if [ "$ok" = 1 ] && [ ! -x "$cachemusl" ]; then
+                curl -fsSL --retry 3 \
+                    "https://downloads.claude.ai/claude-code-releases/$CLAUDE_VERSION/$carch-musl/claude" \
+                    -o "$cachemusl" && chmod +x "$cachemusl" || ok=0
+            fi
             if [ "$ok" = 1 ]; then
                 rm -rf "$tree"; mkdir -p "$tree"
                 cp -p "target/$htarget/release/engram-harness-claude" "$tree/harness"
                 cp -p "$cache" "$tree/claude"
+                cp -p "$cachemusl" "$tree/claude-musl"
                 cp -p deploy/harness-claude/harness.toml "$tree/harness.toml"
                 harness_tree="$tree"
             else
