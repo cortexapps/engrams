@@ -120,6 +120,18 @@ impl AwsSecretsManager {
         if let Some(r) = schema.r#ref.as_deref() {
             return parse_ref(r);
         }
+        // Deployment-level lookups (org secrets, resolved with an empty
+        // repo) live directly under the namespace. Composing the repo
+        // segment anyway produced `engram//name` — Secrets Manager
+        // tolerates the double slash but nothing sane is stored under
+        // it, so the lookup could never succeed (the GCP twin of this
+        // bug 400'd instead; both found on the first Phase G walk).
+        if ctx.repo.is_empty() {
+            return SecretRef {
+                secret_id: format!("{DEFAULT_NAMESPACE}/{name}"),
+                version_stage: None,
+            };
+        }
         SecretRef {
             secret_id: format!("{DEFAULT_NAMESPACE}/{}/{name}", ctx.repo),
             version_stage: None,
@@ -252,6 +264,21 @@ mod tests {
         let s = AwsSecretsManager::with_endpoint("http://127.0.0.1:1").await;
         let sref = s.resolve_ref(&ctx(), "GITHUB_TOKEN", &schema(None));
         assert_eq!(sref.secret_id, "engram/cortex/api/GITHUB_TOKEN");
+        assert_eq!(sref.version_stage, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repo_less_context_composes_directly_under_the_namespace() {
+        // Org secrets resolve with `repo: ""` (deployment-wide). The
+        // path must be `engram/<name>` — the old compose produced
+        // `engram//<name>`, which nothing sane is stored under.
+        let s = AwsSecretsManager::with_endpoint("http://127.0.0.1:1").await;
+        let ctx = SecretContext {
+            repo: "",
+            image_tag: "",
+        };
+        let sref = s.resolve_ref(&ctx, "openrouter.api_key", &schema(None));
+        assert_eq!(sref.secret_id, "engram/openrouter.api_key");
         assert_eq!(sref.version_stage, None);
     }
 
