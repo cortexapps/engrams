@@ -2,6 +2,7 @@ import type { ModelRouterStore } from "../db/model-routers.ts";
 import { runIntegrationOp } from "../integrations/run-op.ts";
 import { errorMessage, log } from "../log.ts";
 import { getModelRouterDefinition, listModelRouterDefinitions } from "./registry.ts";
+import { isRouterConnected } from "./connected.ts";
 import { parseOpenRouterCatalog } from "./openrouter.ts";
 
 export interface RouterCatalogRefreshResult {
@@ -55,7 +56,13 @@ export class ModelRouterCatalogRefresher {
 
   async runOnce(): Promise<void> {
     await Promise.allSettled(
-      listModelRouterDefinitions().map((router) => refreshRouterCatalog(router.id, this.deps)),
+      listModelRouterDefinitions().map(async (router) => {
+        // A router without its credential is invisible to the product —
+        // refreshing its catalog would only hammer an API we cannot
+        // authenticate to and log failures nobody can act on.
+        if (!(await isRouterConnected(router.id))) return;
+        return refreshRouterCatalog(router.id, this.deps);
+      }),
     );
   }
 

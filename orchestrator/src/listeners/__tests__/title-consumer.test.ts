@@ -27,6 +27,7 @@ function harness(
   const generated: string[] = [];
   const saved: Array<{ taskId: string; title: string }> = [];
   const consumer = makeTitleConsumer({
+    routerConnected: async () => true,
     findTitleableTask: async () => task,
     generateTitle: async (prompt) => {
       generated.push(prompt);
@@ -89,9 +90,32 @@ describe("title consumer", () => {
     expect(h.saved).toEqual([]);
   });
 
+  test("no connected router: the raw title stands and the model is never called", async () => {
+    const generated: string[] = [];
+    const saved: string[] = [];
+    const consumer = makeTitleConsumer({
+      routerConnected: async () => false,
+      findTitleableTask: async () => untitled,
+      generateTitle: async (prompt) => {
+        generated.push(prompt);
+        return "never";
+      },
+      saveSuggestedTitle: async (_taskId, title) => {
+        saved.push(title);
+      },
+      isPermanentError: () => false,
+    });
+    // Must not throw either — a closed gate is a quiet skip, not a
+    // retryable failure the pump would redeliver.
+    await consumer.handle(agentMessage("user", "fix the login button"), ctx);
+    expect(generated).toHaveLength(0);
+    expect(saved).toHaveLength(0);
+  });
+
   test("ignores assistant messages without touching the DB or the model", async () => {
     let lookups = 0;
     const consumer = makeTitleConsumer({
+      routerConnected: async () => true,
       findTitleableTask: async () => {
         lookups += 1;
         return untitled;

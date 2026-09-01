@@ -29,6 +29,7 @@ import type { CuratedEvent } from "../control-plane/session-events.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import { getOpenRouterClient } from "../integrations/openrouter.ts";
+import { isRouterConnected } from "../model-routers/connected.ts";
 import { log as rootLog } from "../log.ts";
 import type { SessionConsumer } from "./consumer.ts";
 
@@ -80,6 +81,10 @@ export interface TitleConsumerDeps {
    *  Null for child tasks, review workers, ownerless automations, and
    *  unattributed sessions. */
   findTitleableTask(sessionId: string): Promise<TitleableTask | null>;
+  /** Whether the model router behind generateTitle is connected. A
+   *  false skips title generation entirely — the raw prompt title
+   *  stands (fresh deployments have no router key). */
+  routerConnected(): Promise<boolean>;
   /** Ask the model for the title. May throw. */
   generateTitle(prompt: string): Promise<string>;
   /** Write the title iff `suggested_title` is still NULL. */
@@ -108,6 +113,11 @@ export function makeTitleConsumer(deps: TitleConsumerDeps): SessionConsumer {
       // must see a title written by an earlier event or a user rename.
       const task = await deps.findTitleableTask(ctx.sessionId);
       if (task === null || task.suggestedTitle != null || task.customTitle != null) return;
+      // No connected model router -> no title model to call. Keep the raw
+      // prompt title instead of walking generateTitle into a credential
+      // resolution that cannot succeed (a fresh deployment hits this on
+      // its very first task).
+      if (!(await deps.routerConnected())) return;
       let title: string;
       try {
         title = await deps.generateTitle(prompt);
@@ -161,6 +171,7 @@ export function makeProductionTitleConsumer(): SessionConsumer {
         ? { taskId: row.taskId, suggestedTitle: row.suggestedTitle, customTitle: row.customTitle }
         : null;
     },
+    routerConnected: () => isRouterConnected("openrouter"),
     async generateTitle(prompt) {
       const openrouter = await getOpenRouterClient();
       const { object } = await generateObject({

@@ -37,6 +37,7 @@ const CANDIDATES = [card("a", "Backend"), card("b", "Infra"), card("c", "Web")];
 
 function deps(over: Partial<ProfilePickerDeps> = {}): ProfilePickerDeps {
   return {
+    routerConnected: async () => true,
     loadCandidates: async () => CANDIDATES,
     channelHistogram: async () => new Map([["b", 12], ["a", 2]]),
     userHistogram: async () => new Map([["a", 5]]),
@@ -102,6 +103,25 @@ describe("makePicker", () => {
       profile: { id: "only", name: "Solo", description: "Solo profile" },
     });
     expect(called).toBe(false);
+  });
+
+  test("no connected router: degrades straight to ask_user without a model call", async () => {
+    let calls = 0;
+    const picker = makePicker(
+      deps({
+        routerConnected: async () => false,
+        generatePick: async () => {
+          calls += 1;
+          throw new Error("must not be called");
+        },
+      }),
+    );
+    const decision = await picker.pick(INPUT);
+    expect(calls).toBe(0);
+    expect(decision.decision).toBe("ask_user");
+    if (decision.decision === "ask_user") {
+      expect(decision.options.length).toBeGreaterThan(0);
+    }
   });
 
   test("a confident model decision routes to its top profile", async () => {

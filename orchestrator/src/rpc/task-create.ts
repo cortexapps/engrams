@@ -364,7 +364,7 @@ export async function compileSessionCreateInput(
     }
     if (!availableSecrets.has(router.credentialSecret)) {
       throw new ConnectError(
-        `${router.label} needs the organization secret ${router.credentialSecret}`,
+        `${router.label} is not connected — an admin must save the ${router.credentialSecret} key under Settings before routed launches work`,
         Code.FailedPrecondition,
       );
     }

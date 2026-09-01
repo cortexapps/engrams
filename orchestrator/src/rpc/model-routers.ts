@@ -63,13 +63,19 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
   router.service(ModelRouterService, {
     async listModelRouters(_req, ctx) {
       const user = await requireUser(ctx, getSession);
+      // Computed for every role — it is a boolean about a NAME, not
+      // secret material. Non-admins only ever see connected routers
+      // (filtered below); admins see the rest too, because the
+      // settings panel is where the key gets saved in the first place.
       const configured = new Set(
-        user.role === "admin"
-          ? (await secrets.listSecrets({})).secrets.map((secret) => secret.name)
-          : [],
+        (await secrets.listSecrets({})).secrets.map((secret) => secret.name),
+      );
+      const visible = listModelRouterDefinitions().filter(
+        (definition) =>
+          user.role === "admin" || configured.has(definition.credentialSecret),
       );
       const routers = await Promise.all(
-        listModelRouterDefinitions().map(async (definition) => {
+        visible.map(async (definition) => {
           const [models, state] = await Promise.all([
             store.listModels(definition.id, "admin"),
             store.getSyncState(definition.id),
@@ -96,8 +102,20 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
 
     async listRouterModels(req, ctx) {
       const user = await requireUser(ctx, getSession);
-      if (!getModelRouterDefinition(req.routerId)) {
+      const definition = getModelRouterDefinition(req.routerId);
+      if (!definition) {
         throw new ConnectError("model router not found", Code.NotFound);
+      }
+      // A router without its credential is invisible to non-admins —
+      // same boundary as listModelRouters, held here too so a stale
+      // client cannot browse a catalog it can never launch against.
+      if (user.role !== "admin") {
+        const configured = new Set(
+          (await secrets.listSecrets({})).secrets.map((secret) => secret.name),
+        );
+        if (!configured.has(definition.credentialSecret)) {
+          throw new ConnectError("model router not found", Code.NotFound);
+        }
       }
       let audience: StoreAudience;
       switch (req.audience) {
@@ -121,8 +139,20 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
 
     async refreshRouterModels(req, ctx) {
       await requireAdmin(ctx, getSession);
-      if (!getModelRouterDefinition(req.routerId)) {
+      const definition = getModelRouterDefinition(req.routerId);
+      if (!definition) {
         throw new ConnectError("model router not found", Code.NotFound);
+      }
+      {
+        const configured = new Set(
+          (await secrets.listSecrets({})).secrets.map((secret) => secret.name),
+        );
+        if (!configured.has(definition.credentialSecret)) {
+          throw new ConnectError(
+            `save the ${definition.label} key first — the catalog cannot be fetched without it`,
+            Code.FailedPrecondition,
+          );
+        }
       }
       try {
         return await refresh(req.routerId, { store });
