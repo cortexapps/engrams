@@ -16,8 +16,7 @@
     "@bufbuild/protobuf": "^2.12.0",
     "@connectrpc/connect": "^2.1.1",
     "@connectrpc/connect-node": "^2.1.1",
-    "commander": "^14.0.2",
-    "smol-toml": "^1.4.2"
+    "commander": "^14.0.2"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

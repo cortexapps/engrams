@@ -191,35 +191,54 @@ imageCmd
     const { clients, json } = ctx();
     return image.list(clients(), json);
   });
-imageCmd
-  .command("enable")
-  .description("enable an image (captures its base snapshot; polls to ready)")
-  .requiredOption("--uri <uri>", "full OCI URI: <host>[:port]/<repo>:<tag>")
-  .option("--config <path>", "image-config TOML (REQUIRED on first enable)")
-  .option("--no-wait", "print the job id and return without polling")
-  .action((o: { uri: string; config?: string; wait: boolean }) => {
+/** commander accumulator for a repeatable option. */
+const collect = (v: string, acc: string[]) => [...acc, v];
+
+const configFlags = (cmd: Command) =>
+  cmd
+    .option("--name <name>", "display name shown in pickers (required on first enable)")
+    .option("--description <text>", "what the image is for")
+    .option("--workdir <path>", "working directory; defaults to the Dockerfile WORKDIR")
+    .option("--vcpus <n>", "guest vCPUs (required on first enable)")
+    .option("--memory-mib <n>", "guest memory in MiB")
+    .option("--disk-gib <n>", "disk budget in GiB")
+    .option("--swap-mib <n>", "ephemeral swap in MiB; 0 for none")
+    .option("--env <KEY=VALUE>", "non-secret env for every session (repeatable)", collect, []);
+
+imageCmd.addCommand(
+  configFlags(
+    new Command("enable")
+      .description(
+        "enable an image (captures its base snapshot; polls to ready). " +
+          "The warm hook is set in the dashboard under Operator → Images.",
+      )
+      .requiredOption("--uri <uri>", "full OCI URI: <host>[:port]/<repo>:<tag>")
+      .option("--no-wait", "print the job id and return without polling"),
+  ).action((o: image.ConfigFlags & { uri: string; wait: boolean }) => {
     const { clients, json } = ctx();
-    return image.enable(clients(), o.uri, o.config, !o.wait, json);
-  });
+    return image.enable(clients(), o.uri, o, !o.wait, json);
+  }),
+);
 imageCmd
   .command("config")
-  .description("print an enabled image's live stored config as image-config TOML")
+  .description("print an enabled image's stored config as JSON")
   .requiredOption("--uri <uri>", "full OCI URI of an enabled image")
   .action((o: { uri: string }) => {
-    const { clients, json } = ctx();
-    return image.config(clients(), o.uri, json);
+    const { clients } = ctx();
+    return image.config(clients(), o.uri);
   });
-imageCmd
-  .command("update")
-  .description("edit an enabled image's config (full replace)")
-  .requiredOption("--uri <uri>", "full OCI URI of an already-enabled image")
-  .requiredOption("--config <path>", "the complete new image-config TOML")
-  .option("--allow-recapture", "consent to a recapture when the diff needs one", false)
-  .option("--no-wait", "don't poll a recapture job to completion")
-  .action((o: { uri: string; config: string; allowRecapture: boolean; wait: boolean }) => {
+imageCmd.addCommand(
+  configFlags(
+    new Command("update")
+      .description("change an enabled image's config; unset flags keep their stored values")
+      .requiredOption("--uri <uri>", "full OCI URI of an already-enabled image")
+      .option("--allow-recapture", "consent to a recapture when the change needs one", false)
+      .option("--no-wait", "don't poll a recapture job to completion"),
+  ).action((o: image.ConfigFlags & { uri: string; allowRecapture: boolean; wait: boolean }) => {
     const { clients, json } = ctx();
-    return image.update(clients(), o.uri, o.config, o.allowRecapture, !o.wait, json);
-  });
+    return image.update(clients(), o.uri, o, o.allowRecapture, !o.wait, json);
+  }),
+);
 imageCmd
   .command("disable")
   .description("disable an image (registry artifact untouched)")

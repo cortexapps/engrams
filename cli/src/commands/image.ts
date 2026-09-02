@@ -1,14 +1,13 @@
 /**
  * engrams image … / engrams registry … — ImageService passthrough verbs.
  *
- * `enable --config` parses the image-config TOML client-side into the proto
- * shape; STRICT validation stays server-side (the coordinator rejects typos /
- * retired sections with the serde message) — the retired Rust CLI duplicated
- * engram-core's validate(), which the one-server-validator model replaces.
+ * An image's config is a structured message (name, description, env, workdir,
+ * resources, and the warm hook). The dashboard's enable dialog is the full
+ * editor; the CLI covers the fields a script needs as flags and leaves the
+ * warm hook to the dashboard. STRICT validation stays server-side.
  */
 
 import { readFileSync } from "node:fs";
-import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 
 import type { Clients } from "../client.ts";
 import { detail, fail, failWith, printJson, table, truncate } from "../output.ts";
@@ -18,86 +17,81 @@ import type { ImageConfigSchema } from "../gen/engram/app/v1/image_pb.ts";
 
 type ImageConfigInit = MessageInitShape<typeof ImageConfigSchema>;
 
-// ---- image-config TOML → proto ------------------------------------------
+// ---- config flags → proto ---------------------------------------------------
 
-/** The TOML shape (engram_core::types::image::ImageConfig, snake_case). */
-interface ConfigToml {
+/** The config fields the CLI exposes. Everything else (the warm hook) is set in the dashboard. */
+export interface ConfigFlags {
   name?: string;
   description?: string;
-  env?: Record<string, string>;
   workdir?: string;
-  resources?: {
-    suggested_memory_mib?: number;
-    suggested_vcpus?: number;
-    suggested_disk_gib?: number;
-    suggested_swap_mib?: number;
-  };
-  warm?: {
-    command?: string[];
-    timeout_secs?: number;
-    workdir?: string;
-    env?: Array<{ name?: string; value?: string; secret_ref?: string }>;
-    network?: {
-      default?: string;
-      allow_hosts?: string[];
-      allow_host_patterns?: string[];
-    };
-  };
+  vcpus?: string;
+  memoryMib?: string;
+  diskGib?: string;
+  swapMib?: string;
+  env?: string[];
 }
 
-export function loadImageConfig(path: string): ImageConfigInit {
-  let text: string;
-  try {
-    text = readFileSync(path, "utf8");
-  } catch (e) {
-    fail(`read ${path}: ${e instanceof Error ? e.message : e}`);
+const CONFIG_FLAG_KEYS: (keyof ConfigFlags)[] = [
+  "name",
+  "description",
+  "workdir",
+  "vcpus",
+  "memoryMib",
+  "diskGib",
+  "swapMib",
+  "env",
+];
+
+export function hasConfigFlags(f: ConfigFlags): boolean {
+  return CONFIG_FLAG_KEYS.some((k) => f[k] !== undefined && f[k] !== null);
+}
+
+function positive(flag: string, v: string | undefined): number | undefined {
+  if (v === undefined) return undefined;
+  if (!/^[1-9]\d*$/.test(v)) fail(`--${flag} must be a positive integer, got ${JSON.stringify(v)}`);
+  return Number(v);
+}
+
+function nonNegative(flag: string, v: string | undefined): number | undefined {
+  if (v === undefined) return undefined;
+  if (!/^\d+$/.test(v)) fail(`--${flag} must be a non-negative integer, got ${JSON.stringify(v)}`);
+  return Number(v);
+}
+
+function parseEnv(entries: string[] | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const e of entries ?? []) {
+    const i = e.indexOf("=");
+    if (i <= 0) fail(`--env expects KEY=VALUE, got ${JSON.stringify(e)}`);
+    out[e.slice(0, i)] = e.slice(i + 1);
   }
-  let c: ConfigToml;
-  try {
-    c = parseToml(text) as ConfigToml;
-  } catch (e) {
-    fail(`${path} is not valid TOML: ${e instanceof Error ? e.message : e}`);
-  }
-  if (!c.name) fail(`${path}: image config requires a non-empty \`name\``);
+  return out;
+}
+
+/**
+ * Build the config to send. With a `base` (the stored config of an enabled
+ * image) the flags overlay it: `--env` adds or overrides keys, the warm hook
+ * passes through untouched. Without a base this is a first enable, and the
+ * server requires a name and a vCPU count.
+ */
+export function buildImageConfig(flags: ConfigFlags, base?: ImageConfig): ImageConfigInit {
+  const env = { ...(base?.env ?? {}), ...parseEnv(flags.env) };
+  const name = flags.name ?? base?.name;
+  if (!name) fail("--name is required on first enable");
+  const vcpus = positive("vcpus", flags.vcpus) ?? base?.resources?.suggestedVcpus;
+  if (!vcpus) fail("--vcpus is required on first enable (placement reserves it)");
   return {
-    name: c.name,
-    description: c.description,
-    env: c.env ?? {},
-    workdir: c.workdir,
+    name,
+    description: flags.description ?? base?.description,
+    env,
+    workdir: flags.workdir ?? base?.workdir,
     resources: {
-      suggestedMemoryMib: c.resources?.suggested_memory_mib,
-      suggestedVcpus: c.resources?.suggested_vcpus,
-      suggestedDiskGib: c.resources?.suggested_disk_gib,
-      suggestedSwapMib: c.resources?.suggested_swap_mib,
+      suggestedVcpus: vcpus,
+      suggestedMemoryMib: positive("memory-mib", flags.memoryMib) ?? base?.resources?.suggestedMemoryMib,
+      suggestedDiskGib: positive("disk-gib", flags.diskGib) ?? base?.resources?.suggestedDiskGib,
+      suggestedSwapMib: nonNegative("swap-mib", flags.swapMib) ?? base?.resources?.suggestedSwapMib,
     },
-    warm: c.warm
-      ? {
-          command: c.warm.command ?? [],
-          timeoutSecs:
-            c.warm.timeout_secs !== undefined ? BigInt(c.warm.timeout_secs) : undefined,
-          workdir: c.warm.workdir,
-          env: (c.warm.env ?? []).map((e) => {
-            if (!e.name) fail(`${path}: [[warm.env]] entry missing \`name\``);
-            if ((e.value === undefined) === (e.secret_ref === undefined)) {
-              fail(`${path}: [[warm.env]] ${e.name}: exactly one of value/secret_ref`);
-            }
-            return {
-              name: e.name,
-              value:
-                e.value !== undefined
-                  ? { case: "literal" as const, value: e.value }
-                  : { case: "secretRef" as const, value: e.secret_ref! },
-            };
-          }),
-          network: c.warm.network
-            ? {
-                default: c.warm.network.default ?? "deny",
-                allowHosts: c.warm.network.allow_hosts ?? [],
-                allowHostPatterns: c.warm.network.allow_host_patterns ?? [],
-              }
-            : undefined,
-        }
-      : undefined,
+    warm: base?.warm,
   };
 }
 
@@ -191,72 +185,46 @@ export async function pollJob(c: Clients, jobId: string, json: boolean): Promise
 
 // ---- image verbs ----------------------------------------------------------
 
-/** Drop keys whose value is undefined so smol-toml can serialize the object. */
-function compact<T extends Record<string, unknown>>(o: T): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
-}
-
-/**
- * Print an enabled image's LIVE stored config (the enabled_images row — the
- * source of truth the UI edits) as image-config TOML. The output round-trips
- * through `enable --config` / `update --config`, so this is the backup and
- * disaster-recovery path now that repos no longer keep a config file.
- */
-export async function config(c: Clients, uri: string, json: boolean): Promise<void> {
+/** Print an enabled image's stored config, the row the dashboard edits, as JSON. */
+export async function config(c: Clients, uri: string): Promise<void> {
   const resp = await c.image.listEnabledImages({}).catch(failWith);
   const img = resp.images.find((i) => i.imageUri === uri);
   if (!img) fail(`no enabled image with uri ${uri}`);
   const cfg = img.config;
   if (!cfg) fail(`enabled image ${uri} has no stored config`);
-  const out = compact({
+  printJson({
     name: cfg.name,
     description: cfg.description,
-    env: Object.keys(cfg.env).length > 0 ? cfg.env : undefined,
+    env: cfg.env,
     workdir: cfg.workdir,
     resources: cfg.resources
-      ? compact({
-          suggested_memory_mib: cfg.resources.suggestedMemoryMib,
+      ? {
           suggested_vcpus: cfg.resources.suggestedVcpus,
+          suggested_memory_mib: cfg.resources.suggestedMemoryMib,
           suggested_disk_gib: cfg.resources.suggestedDiskGib,
           suggested_swap_mib: cfg.resources.suggestedSwapMib,
-        })
+        }
       : undefined,
     warm: cfg.warm
-      ? compact({
+      ? {
           command: cfg.warm.command,
-          timeout_secs:
-            cfg.warm.timeoutSecs !== undefined ? Number(cfg.warm.timeoutSecs) : undefined,
+          timeout_secs: cfg.warm.timeoutSecs !== undefined ? Number(cfg.warm.timeoutSecs) : undefined,
           workdir: cfg.warm.workdir,
-          env: cfg.warm.env.length > 0
-            ? cfg.warm.env.map((e) =>
-                compact({
-                  name: e.name,
-                  value: e.value.case === "literal" ? e.value.value : undefined,
-                  secret_ref: e.value.case === "secretRef" ? e.value.value : undefined,
-                }),
-              )
-            : undefined,
+          env: cfg.warm.env.map((e) => ({
+            name: e.name,
+            kind: e.value.case === "literal" ? "literal" : "secret_ref",
+            ...(e.value.case === "literal" ? { value: e.value.value } : { secret_ref: e.value.value }),
+          })),
           network: cfg.warm.network
-            ? compact({
+            ? {
                 default: cfg.warm.network.default,
-                allow_hosts:
-                  cfg.warm.network.allowHosts.length > 0
-                    ? cfg.warm.network.allowHosts
-                    : undefined,
-                allow_host_patterns:
-                  cfg.warm.network.allowHostPatterns.length > 0
-                    ? cfg.warm.network.allowHostPatterns
-                    : undefined,
-              })
+                allow_hosts: cfg.warm.network.allowHosts,
+                allow_host_patterns: cfg.warm.network.allowHostPatterns,
+              }
             : undefined,
-        })
+        }
       : undefined,
   });
-  if (json) {
-    printJson(out);
-    return;
-  }
-  console.log(stringifyToml(out));
 }
 
 export async function list(c: Clients, json: boolean): Promise<void> {
@@ -276,7 +244,7 @@ export async function list(c: Clients, json: boolean): Promise<void> {
     return;
   }
   if (resp.images.length === 0) {
-    console.log("(no images enabled — `engrams image enable --uri <uri>` to add one)");
+    console.log("(no images enabled — `engrams image enable --uri <uri> --name <name> --vcpus <n>` to add one)");
     return;
   }
   table(
@@ -289,11 +257,12 @@ export async function list(c: Clients, json: boolean): Promise<void> {
 export async function enable(
   c: Clients,
   uri: string,
-  configPath: string | undefined,
+  flags: ConfigFlags,
   noWait: boolean,
   json: boolean,
 ): Promise<void> {
-  const config = configPath ? loadImageConfig(configPath) : undefined;
+  // No config flags on an already-enabled URI re-uses the stored config.
+  const config = hasConfigFlags(flags) ? buildImageConfig(flags) : undefined;
   const resp = await c.image.enableImage({ imageUri: uri, config }).catch(failWith);
   const job = resp.job;
   if (!job) failWith(new Error("enable response carried no job"));
@@ -308,12 +277,16 @@ export async function enable(
 export async function update(
   c: Clients,
   uri: string,
-  configPath: string,
+  flags: ConfigFlags,
   allowRecapture: boolean,
   noWait: boolean,
   json: boolean,
 ): Promise<void> {
-  const config = loadImageConfig(configPath);
+  if (!hasConfigFlags(flags)) fail("nothing to change: pass at least one config flag");
+  const listed = await c.image.listEnabledImages({}).catch(failWith);
+  const img = listed.images.find((i) => i.imageUri === uri);
+  if (!img) fail(`no enabled image with uri ${uri}`);
+  const config = buildImageConfig(flags, img.config);
   const resp = await c.image
     .updateImage({ imageUri: uri, config, allowRecapture })
     .catch(failWith);

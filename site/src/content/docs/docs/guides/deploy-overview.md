@@ -69,7 +69,7 @@ created and cannot be flipped later.
 ## The egress proxy
 
 Every host runs a proxy that intercepts each VM's TLS on port 443 and its DNS, and enforces
-the allow-list from the session's image config and profile. It is mandatory. Every host loads
+the allow-list from the session's profile. It is mandatory. Every host loads
 the same certificate authority so a session that migrates keeps trusting its new host; the
 [configuration reference](../../reference/configuration/) covers how each cloud delivers the
 CA pair to hosts, which differs because host-agent pods share the node's network. One

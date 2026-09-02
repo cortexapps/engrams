@@ -1,8 +1,7 @@
-# Authoring an image's `[warm]` hook
+# Authoring an image's warm hook
 
-An image's config (ADR 0080: the image-config TOML applied at enable
-time via `engram image enable --config` / the ImageService — never
-baked) can declare a `[warm]` block (see
+An image's config can
+declare a warm hook (see
 [`WarmConfig`](../crates/engram-core/src/types/image.rs)): a command run
 inside the capture VM, once `agentd` is ready, just before the base
 snapshot is frozen. The command must **start its long-lived process
@@ -16,29 +15,25 @@ capture-time enforcement around it (stall detection, per-stage deadlines,
 a carried output tail) — this is the companion "what a hook may assume,
 and how to report progress" reference.
 
-## What a `[warm]` hook may assume
+## What a warm hook may assume
 
 - **A ready guest.** `agentd` has already reached its readiness dial;
   the image's effective `[env]` (config `[env]` over the Dockerfile
   `ENV` — `JAVA_HOME`, `PATH`, …) is merged with the resolved
-  `[[warm.env]]` entries and injected into the hook's exec environment.
-- **Egress per `[warm.network]`.** Absent (the default) → the capture VM
+  "Warm capture env" entries and injected into the hook's exec environment.
+- **Egress per "Warm network".** Absent (the default) → the capture VM
   is **egress-less**: no policy is registered, so the proxy denies all
   traffic. An image whose warm boot needs the network (eager OIDC
-  discovery, an `op inject`) opts in via `[warm.network] default =
-  "allow"` (dev posture — no agent runs at capture) or a scoped `"deny"`
-  + `allow_hosts`/`allow_host_patterns` allowlist. ADR 0080: the policy
+  discovery, an `op inject`) opts in via "Allow all egress" (dev posture — no agent runs at capture) or a scoped `"deny"`
+  + `allow_hosts`/`allow_host_patterns` allowlist. The policy
   is assembled coordinator-side (the same builder sessions use) and
-  edited via `UpdateImage` — like everything under `[warm]`, changing it
+  edited via `UpdateImage` — like everything in the warm hook, changing it
   requires a recapture (`--allow-recapture`).
 - **No per-session secrets.** The capture VM's `agentd` holds no durable
-  session env and never gets a session bind. `[[warm.env]]` (ADR 0080:
-  the capture-time-only env on the warm config — literals or secret refs
-  resolved against the same `SecretStore` a session uses, FAIL-LOUD on
-  an unresolvable ref) is the only secret-bearing input a `[warm]` hook
+  session env and never gets a session bind. "Warm capture env" is the only secret-bearing input a warm hook
   gets; it is distinct from a session's profile-injected runtime secrets
   and is captured (frozen) into the base snapshot along with everything
-  else the hook does, so treat it as secret-bearing storage (ADR 0007).
+  else the hook does, so treat it as secret-bearing storage.
 - **No TTY.** The hook runs as a plain exec, not an interactive shell.
 - **A fresh VM per attempt.** Every capture attempt (including a scanner
   retry) boots a brand-new capture VM from a fresh image pull — the hook
@@ -53,7 +48,7 @@ and how to report progress" reference.
 
 A non-zero exit, a stall, a blown stage deadline, or the global timeout
 all abort the capture and the enable — the platform never ships a "cold"
-base snapshot that a `[warm]` hook claimed to warm. There is no partial
+base snapshot that a warm hook claimed to warm. There is no partial
 credit: fix the hook, retry the enable (`RetryEnableJob`).
 
 ## Deadline semantics (issue #539)
@@ -73,7 +68,7 @@ Three independent budgets apply, tightest-wins:
   (a `kubectl wait`-style condition, a poll loop) must emit heartbeats,
   or the platform can't tell "slow but alive" from "wedged".**
 - **Global timeout** (`WarmConfig.timeout_secs`, default 600s, set in
-  the image config's `[warm]` block): the same backstop this always had — `agentd` SIGKILLs
+  the warm hook's timeout): the same backstop this always had — `agentd` SIGKILLs
   the child in-guest at this deadline regardless of the other two. Has
   supremacy: it fires even if a stage/stall budget would otherwise allow
   more time.

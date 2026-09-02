@@ -5,47 +5,43 @@ sidebar:
   order: 4
 ---
 
-An image config can declare a `[warm]` block: a command that runs inside the capture VM, once
-the in-guest daemon is ready and just before the base snapshot is frozen. Whatever the command
+An image's warm capture hook is a command that runs inside the capture VM, once the
+in-guest daemon is ready and just before the base snapshot is frozen. Whatever the command
 leaves behind is in the snapshot, so every session of that image starts with it. The classic
 case is a build daemon: `gradle --daemon help` starts the Gradle daemon as a separate process
 and returns, the daemon is captured live, and every restored session inherits a warm,
 cache-hot daemon with no cold start.
 
+You set it in the Warm capture hook section of the image's config, under Operator → Images.
 This page is the contract for writing one.
 
-```toml
-[warm]
-command = ["./warm.sh"]
-timeout_secs = 600
+![The Warm capture hook section of the image config: warm command, timeout, workdir, and the capture env](../../../../assets/screenshots/image-enable-warm.png)
 
-[warm.network]
-default = "deny"
-allow_hosts = ["repo1.maven.org"]
+| Field | Meaning |
+|---|---|
+| Warm command | The command, as space-separated arguments. It runs inside the capture VM once the in-guest daemon is ready and before the snapshot is frozen. It must exit; anything it leaves running is captured live. Empty means no hook. |
+| Timeout secs | The global deadline, 600 seconds by default. The in-guest daemon kills the command at this point and the capture fails. |
+| Warm workdir | The command's working directory. Defaults to the image's workdir. |
+| Warm capture env | Capture-time environment entries. Each is a literal value or a reference to an org secret by name. References are resolved at capture through the same store sessions use and are never stored resolved; an unresolvable reference fails the capture. |
+| Warm network | The capture VM's network while the command runs: no network (the default), deny by default with an allow-list of hosts and host patterns such as `*.githubusercontent.com`, or allow all. |
 
-[[warm.env]]
-name = "GRADLE_OPTS"
-value = { kind = "literal", value = "-Dorg.gradle.daemon=true" }
-
-[[warm.env]]
-name = "NPM_TOKEN"
-value = { kind = "secret_ref", secret_ref = "NPM_TOKEN" }
-```
+Everything in this section is captured into the base snapshot, so any change to it means a
+recapture, and the dialog asks you to confirm.
 
 ## What a hook may assume
 
 **A ready guest.** The in-guest daemon has come up, and the image's effective environment,
-the config's `[env]` over the Dockerfile's `ENV`, is merged with the `[[warm.env]]` entries
-and injected into the hook's environment.
+the image env over the Dockerfile's `ENV`, is merged with the warm capture env and injected
+into the hook's environment.
 
-**Egress per `[warm.network]`.** Without that block the capture VM has no network at all: no
+**Egress per the warm network setting.** By default the capture VM has no network at all: no
 policy is registered, so the proxy denies everything. A hook that needs the network opts in,
-either with `default = "allow"` for a development image where no agent runs at capture, or
-with `default = "deny"` plus `allow_hosts` and `allow_host_patterns`. Changing the network
-block, like anything under `[warm]`, means a recapture.
+either with allow-all for a development image where no agent runs at capture, or with
+deny-by-default plus allowed hosts and host patterns. Changing the network setting, like
+anything in the warm hook, means a recapture.
 
 **No per-session secrets.** The capture VM never gets a session, so it never gets a session's
-secrets. `[[warm.env]]` is the only secret-bearing input a hook gets; its values may be
+secrets. The warm capture env is the only secret-bearing input a hook gets; its values may be
 literals or secret references resolved against the same store a session uses, and an
 unresolvable reference fails the capture. Everything the hook writes is frozen into the base
 snapshot, so treat the snapshot as secret-bearing storage if the hook used a secret.
@@ -77,8 +73,8 @@ Three budgets apply and the tightest wins.
   hook has emitted its first valid progress line; a hook that never emits one gets only the
   global timeout. Any stage that waits, on a health check or a poll loop, must emit
   heartbeats, or the platform cannot tell slow from wedged.
-- **The global timeout**, `timeout_secs` in the `[warm]` block with a default of 600 seconds,
-  is the backstop. The in-guest daemon kills the hook at this deadline no matter what the
+- **The global timeout**, the hook's timeout field with a default of 600 seconds, is the
+  backstop. The in-guest daemon kills the hook at this deadline no matter what the
   other two would allow.
 
 ## The progress protocol
