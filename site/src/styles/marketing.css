@@ -1,0 +1,328 @@
+/* Layout primitives for the marketing pages. The palette and fonts come from
+   tokens.css; this file only arranges them. Claude Design reskins these pages
+   later, so the rules stay plain and the class names stay literal. */
+
+html {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+main {
+  flex: 1;
+}
+a {
+  color: var(--ring);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+:root[data-theme="dark"] a {
+  color: var(--primary);
+}
+code,
+pre {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+pre {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+:not(pre) > code {
+  background: var(--secondary);
+  border-radius: calc(var(--radius) - 6px);
+  padding: 0.1em 0.35em;
+}
+h1,
+h2,
+h3 {
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  font-weight: 600;
+  margin: 0 0 0.5em;
+}
+h1 {
+  font-size: clamp(2rem, 5vw, 3.25rem);
+}
+h2 {
+  font-size: clamp(1.5rem, 3vw, 2rem);
+  margin-top: 0;
+}
+h3 {
+  font-size: 1.125rem;
+}
+p {
+  margin: 0 0 1em;
+}
+p.lede {
+  font-size: 1.2rem;
+  color: var(--muted-foreground);
+  max-width: 40rem;
+}
+.muted {
+  color: var(--muted-foreground);
+}
+
+.container {
+  width: min(72rem, 100% - 3rem);
+  margin-inline: auto;
+}
+.section {
+  padding-block: clamp(3rem, 7vw, 5.5rem);
+}
+.section + .section {
+  border-top: 1px solid var(--border);
+}
+.section.on-pane {
+  background: var(--pane);
+}
+.grid {
+  display: grid;
+  gap: 1.5rem;
+}
+.grid.two {
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+}
+.grid.three {
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+}
+.card h3 {
+  margin-top: 0;
+}
+.card p:last-child {
+  margin-bottom: 0;
+}
+
+/* The header: wordmark + trace on the left, the routes on the right. */
+.site-header {
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+.site-header .container {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  height: 3.5rem;
+}
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 600;
+  color: var(--foreground);
+}
+.wordmark:hover {
+  text-decoration: none;
+}
+.wordmark img {
+  width: 1.6rem;
+  height: 1.6rem;
+}
+.site-header nav {
+  display: flex;
+  gap: 1.25rem;
+  margin-inline-start: auto;
+  align-items: center;
+}
+.site-header nav a {
+  color: var(--muted-foreground);
+  font-size: 0.95rem;
+}
+.site-header nav a:hover {
+  color: var(--foreground);
+  text-decoration: none;
+}
+.theme-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius) - 4px);
+  color: var(--muted-foreground);
+  cursor: pointer;
+  padding: 0.3rem 0.5rem;
+  line-height: 1;
+}
+.theme-toggle:hover {
+  color: var(--foreground);
+}
+
+/* Buttons: lime is the one action color, and it is a fill. */
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: calc(var(--radius) - 2px);
+  padding: 0 1rem;
+  height: 2.5rem;
+  font-weight: 600;
+  font-size: 0.95rem;
+  border: 1px solid transparent;
+}
+.button:hover {
+  text-decoration: none;
+}
+.button.primary {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.button.primary:hover {
+  filter: brightness(0.96);
+}
+.button.ghost {
+  border-color: var(--border);
+  color: var(--foreground);
+}
+.button.ghost:hover {
+  background: var(--accent);
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
+/* The hero. */
+.hero {
+  padding-block: clamp(3.5rem, 9vw, 7rem) clamp(2.5rem, 6vw, 4rem);
+}
+.hero h1 {
+  max-width: 44rem;
+}
+.hero .lede {
+  font-size: 1.25rem;
+}
+.hero pre {
+  margin-top: 2rem;
+  max-width: 44rem;
+}
+
+/* The numbers band. */
+.numbers {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 1.5rem;
+}
+.numbers .figure {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 2rem;
+  font-weight: 500;
+  line-height: 1.1;
+}
+.numbers .caption {
+  color: var(--muted-foreground);
+  margin-top: 0.4rem;
+}
+
+/* The logo wall. */
+.logo-wall {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(6rem, 1fr));
+  gap: 1rem;
+  align-items: center;
+}
+.logo-wall figure {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--muted-foreground);
+  font-size: 0.8rem;
+}
+.logo-wall img {
+  width: 2rem;
+  height: 2rem;
+}
+:root[data-theme="dark"] .logo-wall img {
+  filter: brightness(0) invert(0.9);
+}
+
+/* Tables. */
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.95rem;
+}
+th,
+td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+th {
+  color: var(--muted-foreground);
+  font-weight: 600;
+  font-size: 0.8rem;
+  text-transform: none;
+}
+.table-scroll {
+  overflow-x: auto;
+}
+
+/* Definition lists for the "what it is not" block. */
+.nots {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 1rem;
+}
+.nots li {
+  padding-left: 1.25rem;
+  border-left: 3px solid var(--border);
+}
+.nots strong {
+  display: block;
+}
+
+/* Footer. */
+.site-footer {
+  border-top: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted-foreground);
+  font-size: 0.9rem;
+  padding-block: 2rem;
+}
+.site-footer .container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 2rem;
+  justify-content: space-between;
+}
+.site-footer nav {
+  display: flex;
+  gap: 1.25rem;
+}
+
+/* Diagrams are preformatted text; keep them from ever scrolling the page. */
+.diagram {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+@media (max-width: 40rem) {
+  .site-header nav a.secondary {
+    display: none;
+  }
+}

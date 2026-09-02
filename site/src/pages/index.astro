@@ -1,0 +1,233 @@
+---
+import Marketing from "../layouts/Marketing.astro";
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const docs = `${base}/docs`;
+
+const logos = Object.entries(
+  import.meta.glob<{ default: ImageMetadata }>("../assets/connector-logos/*.svg", { eager: true }),
+)
+  .map(([path, mod]) => {
+    const slug = path.split("/").pop()!.replace(".svg", "");
+    return { slug, src: mod.default.src, label: slug.replace(/_/g, " ") };
+  })
+  .sort((a, b) => a.slug.localeCompare(b.slug));
+
+const numbers = [
+  { figure: "< 1 s", caption: "cold start from an image's base snapshot, with no pre-warmed pool" },
+  { figure: "< 100 ms", caption: "resume on the host that took the snapshot" },
+  { figure: "1–2 s", caption: "resume on any other host, which is also the cost of migrating a session" },
+  { figure: "≈ 100 GiB", caption: "blob storage for a thousand sessions of a 4 GiB image, not 4 TiB" },
+];
+---
+
+<Marketing
+  title="engrams"
+  description="A self-hosted orchestrator for AI coding agents. Each agent runs in its own Firecracker microVM, snapshots when idle, and resumes on the next prompt."
+>
+  <section class="hero">
+    <div class="container">
+      <h1>Sandboxes for coding agents, on your own machines.</h1>
+      <p class="lede">
+        engrams is a self-hosted orchestrator for AI coding agents. It runs each agent in its own
+        Firecracker microVM, snapshots the VM when the agent goes idle, and restores it when the
+        next prompt arrives. Claude Code and Codex ship as harnesses.
+      </p>
+      <div class="actions">
+        <a class="button primary" href={`${docs}/getting-started/local-quickstart/`}>Run it locally</a>
+        <a class="button ghost" href={`${docs}/guides/deploy-overview/`}>Deploy to your cloud</a>
+        <a class="button ghost" href="https://github.com/cortexapps/engrams">Source on GitHub</a>
+      </div>
+      <pre><code>engrams session create \
+  --image registry.example.com/team/api:warm-1 \
+  --harness claude \
+  --prompt "Fix the flaky test in CI and open a pull request."</code></pre>
+      <p class="muted">
+        A session is a plain OCI image you built with <code>docker build</code>, plus the agent.
+        The VM boots from the image's snapshot in under a second, streams its transcript to the
+        dashboard, Slack, or this terminal, and snapshots itself away when it goes quiet.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>How it works</h2>
+      <div class="grid three">
+        <div class="card">
+          <h3>1. Enable an image</h3>
+          <p>
+            Push any Linux image with <code>/bin/sh</code> to a registry and enable it once.
+            engrams writes it as content-addressed chunks, boots it on the fleet, runs your
+            warm-up command, and freezes a base snapshot.
+          </p>
+        </div>
+        <div class="card">
+          <h3>2. Run a task</h3>
+          <p>
+            A task is a profile plus a prompt. The host restores the snapshot into a fresh
+            microVM, mounts the harness, and the agent starts with its caches already warm. You
+            watch the transcript and every tool call as they happen.
+          </p>
+        </div>
+        <div class="card">
+          <h3>3. Snapshot, resume, fork</h3>
+          <p>
+            When the agent goes idle the VM is snapshotted to chunks and destroyed. The next
+            prompt restores it, on any host. Forking a session is a manifest copy of a few
+            kilobytes.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section on-pane">
+    <div class="container">
+      <h2>Why engrams</h2>
+      <div class="grid two">
+        <div>
+          <h3>It runs in your cloud</h3>
+          <p>
+            One Terraform apply and two Helm releases bring it up on GKE or EKS, with GCS or S3
+            for blobs and your cloud's secret manager for credentials. No transcript, workspace,
+            or key leaves your account.
+          </p>
+          <h3>Every session is a real virtual machine</h3>
+          <p>
+            Isolation is KVM, enforced by hardware. Outbound traffic from a session goes through
+            a filtering proxy on the host, so an agent reaches only the hosts you allow.
+          </p>
+          <h3>Your image stays yours</h3>
+          <p>
+            The agent runtime, the in-guest daemon, and the tools are staged by the host and
+            mounted at boot. Upgrading the agent never means rebuilding an image.
+          </p>
+        </div>
+        <div>
+          <h3>Idle sessions cost nothing to keep</h3>
+          <p>
+            A paused session is a set of chunks in the blob store, deduplicated against its
+            image and every other session, and a row in Postgres. It holds no host resources
+            until the next prompt.
+          </p>
+          <h3>Storage is deduplicated by construction</h3>
+          <p>
+            Chunks are named by their hash, so a base image is stored once no matter how many
+            sessions use it, and a snapshot writes only what changed.
+          </p>
+          <h3>It is a product, not a library</h3>
+          <p>
+            A dashboard, tasks and profiles, Slack threads that drive an agent, pull request
+            review, a CLI, and built-in connectors come with it.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>The numbers</h2>
+      <div class="numbers">
+        {numbers.map((n) => (
+          <div>
+            <div class="figure">{n.figure}</div>
+            <div class="caption">{n.caption}</div>
+          </div>
+        ))}
+      </div>
+      <p class="muted" style="margin-top:1.5rem">
+        Measured on the reference deployment: GKE, C3 nodes, Firecracker with lazy memory paging.
+        Measure your own fleet before you promise them to anyone.
+      </p>
+    </div>
+  </section>
+
+  <section class="section on-pane">
+    <div class="container">
+      <h2>What engrams is not</h2>
+      <ul class="nots">
+        <li>
+          <strong>Not a hosted service.</strong> You run it. If you want someone else to run the
+          sandboxes, E2B and Modal do that well.
+        </li>
+        <li>
+          <strong>Not a development environment for people.</strong> Sessions exist for agents.
+          You can open a shell or an IDE into one, but workspaces for engineers at their editors
+          are what Coder is for.
+        </li>
+        <li>
+          <strong>Not a container runner.</strong> Production isolation is Firecracker on Linux
+          with KVM. The macOS backend and the process backend exist for development only.
+        </li>
+        <li>
+          <strong>Not a model provider.</strong> You bring an Anthropic or OpenAI key, or point a
+          harness at OpenRouter.
+        </li>
+        <li>
+          <strong>Not finished.</strong> A 0.x project that runs one company's production. Wire
+          formats and APIs change, and it carries a fork of Firecracker that is rebased on
+          upstream daily.
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <h2>Agents, clouds, and integrations</h2>
+      <div class="grid three">
+        <div class="card">
+          <h3>Harnesses</h3>
+          <p>
+            Claude Code and Codex, with their models, a Build and a Plan mode, and effort levels.
+            Either can be pointed at OpenRouter.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Backends</h3>
+          <p>
+            Firecracker on Linux with KVM for production. Apple Virtualization on a Mac and plain
+            subprocesses for development.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Clouds</h3>
+          <p>
+            GKE and EKS with Terraform quickstarts and Helm charts. GCS or S3 for chunks, Secret
+            Manager or Secrets Manager with KMS for credentials.
+          </p>
+        </div>
+      </div>
+      <h3 style="margin-top:2.5rem">Built-in connectors</h3>
+      <p class="muted">
+        Credentials for these are held by engrams and injected per session, so an agent can call
+        the API without ever holding the key.
+      </p>
+      <div class="logo-wall">
+        {logos.map((l) => (
+          <figure>
+            <img src={l.src} alt="" width="32" height="32" loading="lazy" />
+            <figcaption>{l.label}</figcaption>
+          </figure>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <section class="section on-pane">
+    <div class="container">
+      <h2>Start</h2>
+      <p class="lede">
+        The local quickstart runs the whole stack on one machine in a few minutes. The
+        deployment guides take a fresh GCP project or AWS account to a running fleet.
+      </p>
+      <div class="actions">
+        <a class="button primary" href={`${docs}/getting-started/local-quickstart/`}>Run it locally</a>
+        <a class="button ghost" href={`${docs}/guides/deploy-gcp/`}>Deploy on GCP</a>
+        <a class="button ghost" href={`${docs}/guides/deploy-aws/`}>Deploy on AWS</a>
+      </div>
+    </div>
+  </section>
+</Marketing>
