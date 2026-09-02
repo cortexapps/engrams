@@ -120,4 +120,6 @@ Storage is the part that makes the rest cheap. Disk and memory state live as has
 
 ## License
 
+Copyright (C) 2026 Cortex Applications, Inc.
+
 engrams is free software under the GNU Affero General Public License v3.0. See [`LICENSE`](LICENSE).
