@@ -14,12 +14,12 @@
 //! guards against (the BrowserActivity gap that motivated ADR 0099 H3 PR 2).
 #![allow(dead_code)]
 
-use engram_core::{SandboxId, SessionId};
 use engram_harness_proto::{
     AgentRole, AttachReject, CheckpointAck, CheckpointReason, EditHunk, FileChange, ForgeOp,
     ForgeRequest, ForgeResponse, HarnessAttach, HarnessAttachAck, HarnessCommand, HarnessEvent,
     HarnessFrame, RelayAck, RelayConnect, UploadOp, UploadRequest, UploadResponse,
 };
+use engram_ids::{SandboxId, SessionId};
 use proptest::prelude::*;
 
 // ---- primitive strategies (small values keep the shape-(b) truncation

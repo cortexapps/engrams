@@ -42,11 +42,11 @@
 
 use std::path::PathBuf;
 
-use engram_core::SessionId;
 use engram_harness_proto::{
     AgentRole, CheckpointReason, EditHunk, FileChange, ForgeOp, ForgeResponse, HarnessCommand,
     HarnessEvent, HarnessFrame, UploadOp, UploadResponse,
 };
+use engram_ids::SessionId;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -65,8 +65,8 @@ fn fixed_session_id() -> SessionId {
     ]))
 }
 
-fn fixed_sandbox_id() -> engram_core::SandboxId {
-    engram_core::SandboxId::from(Uuid::from_bytes([
+fn fixed_sandbox_id() -> engram_ids::SandboxId {
+    engram_ids::SandboxId::from(Uuid::from_bytes([
         0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
         0x10,
     ]))

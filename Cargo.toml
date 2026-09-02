@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/engram-core",
+    "crates/engram-ids",
     "crates/engram-protocol",
     "crates/engram-coordinator",
     "crates/engram-host-agent",
@@ -94,6 +95,7 @@ blake3 = "1"
 schemars = "1.2"
 # internal
 engram-core = { path = "crates/engram-core" }
+engram-ids = { path = "crates/engram-ids" }
 engram-protocol = { path = "crates/engram-protocol" }
 engram-postgres = { path = "crates/engram-postgres" }
 engram-coordinator = { path = "crates/engram-coordinator" }

@@ -35,7 +35,7 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use engram_core::{SandboxId, SessionId};
+use engram_ids::{SandboxId, SessionId};
 
 /// Vsock port the in-guest harness dials to reach the host. Distinct
 /// from the agentd exec port (1024) so the host can demux at `accept`

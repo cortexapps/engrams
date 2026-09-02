@@ -1,0 +1,19 @@
+[package]
+name = "engram-ids"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "UUID newtypes shared by the harness SDK and the engrams platform crates"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+serde_json.workspace = true
