@@ -326,3 +326,25 @@ th {
     display: none;
   }
 }
+
+/* Screenshots on the marketing pages. */
+.shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 1px 2px oklch(0 0 0 / 0.06), 0 12px 32px -12px oklch(0 0 0 / 0.25);
+}
+.shot .caption,
+.shot figcaption {
+  color: var(--muted-foreground);
+  font-size: 0.9rem;
+  margin-top: 0.75rem;
+}
+figure.shot {
+  margin: 0;
+}
+section.shot .container {
+  max-width: 64rem;
+}
