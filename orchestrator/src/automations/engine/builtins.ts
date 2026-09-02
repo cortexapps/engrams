@@ -9,6 +9,9 @@ import type { AutomationDefinition } from "./definition.ts";
 export interface BuiltinAutomation {
   key: string;
   name: string;
+  /** Earlier display names. A row still carrying one is renamed at seed, so a
+   * product rename reaches existing deployments; a name an admin chose stays. */
+  previousNames?: string[];
   description: string;
   /** Bump on any graph or inputs-schema change; the seeder inserts a new
    * version when the stored content hash differs. */

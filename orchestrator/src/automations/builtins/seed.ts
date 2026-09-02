@@ -40,7 +40,7 @@ const log = rootLog.child({ component: "builtin-seed" });
 
 export type BuiltinSeedStore = Pick<
   AutomationStore,
-  "getByBuiltinKey" | "create" | "saveVersion" | "setInputs" | "setBlockOverrides"
+  "getByBuiltinKey" | "create" | "saveVersion" | "setInputs" | "setBlockOverrides" | "updateMeta"
 >;
 
 export interface BuiltinSeedDeps {
@@ -61,6 +61,8 @@ export interface BuiltinSeedResult {
   created: string[];
   bumped: Array<{ key: string; from: number; to: number }>;
   unchanged: string[];
+  /** Rows whose display name was one of the built-in's previousNames. */
+  renamed?: string[];
 }
 
 /** Stable hash over the parts a version bump is keyed on. */
@@ -196,6 +198,12 @@ async function seedOne(
     result.created.push(builtin.key);
     logger.info({ key: builtin.key, repos: Object.keys((inputs["repos"] as object) ?? {}).length }, "built-in automation seeded (disabled)");
     return;
+  }
+
+  if (builtin.previousNames?.includes(existing.name) && existing.name !== builtin.name) {
+    await deps.store.updateMeta(existing.id, { name: builtin.name, description: builtin.description });
+    (result.renamed ??= []).push(builtin.key);
+    logger.info({ key: builtin.key, from: existing.name, to: builtin.name }, "built-in automation renamed");
   }
 
   const current = existing.version;

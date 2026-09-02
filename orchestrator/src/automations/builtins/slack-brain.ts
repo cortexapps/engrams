@@ -367,9 +367,10 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
 
 export const SLACK_BRAIN_BUILTIN: BuiltinAutomation = {
   key: SLACK_BRAIN_BUILTIN_KEY,
-  name: "Slack thread brain",
+  name: "Slack threads",
+  previousNames: ["Slack thread brain"],
   description:
-    "Answers @-mentions in Slack threads with a session per thread, relaying the conversation both ways.",
+    "Answers @-mentions in Slack with one session per thread, relaying the conversation both ways.",
   definitionVersion: SLACK_BRAIN_DEFINITION_VERSION,
   definition: SLACK_BRAIN_DEFINITION,
   async defaultInputs() {

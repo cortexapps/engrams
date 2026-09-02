@@ -1,6 +1,6 @@
-# Runbook: the Slack thread-brain engine window (ADR 0119 phase 4.6)
+# Runbook: the Slack threads engine window (ADR 0119 phase 4.6)
 
-The Slack thread brain exists twice during the parity window:
+The Slack threads automation exists twice during the parity window:
 
 - **Legacy**: the per-thread DBOS workflow `slack-thread.ts` (ADR 0060).
 - **Engine**: the `slack_brain` built-in automation — a definition on the
@@ -40,9 +40,9 @@ the default one).
 1. Find the channel **id** (`C…`, from the channel's details in Slack or
    the `channel` field of a ledgered event). Use the id, not `#name`: the
    route and the trigger scope compare against the event's channel id.
-2. Pick the profile the brain uses in that channel (a profile id from the
+2. Pick the profile the automation uses in that channel (a profile id from the
    Profiles page).
-3. Open **Settings → Automations → Slack thread brain → Inputs** and add a
+3. Open **Settings → Automations → Slack threads → Inputs** and add a
    row to **Channels**: key = the channel id, value = the profile id. Save.
    This is `AutomationService.SetInputs` with
    `inputs_json = {"channels": {"C0123456789": "<profile_id>"}, …}` — send
@@ -52,7 +52,7 @@ the default one).
    `enabled: true`). Until the row is enabled, flagged channels stay on
    legacy.
 5. Confirm in the pod log on the next mention in that channel:
-   `slack: app_mention → thread-brain built-in (legacy workflow skipped)`.
+   `slack: app_mention → Slack threads built-in (legacy workflow skipped)`.
    An unflagged channel keeps logging `slack: app_mention → thread workflow`.
 
 To take a channel back off the engine, remove its row from **Channels**
@@ -81,7 +81,7 @@ to use the switch; the flags survive, so lifting it re-opens the same window.
 
 ## What to watch
 
-- **Runs**: Settings → Automations → Slack thread brain → Runs. One run per
+- **Runs**: Settings → Automations → Slack threads → Runs. One run per
   thread (concurrency key `team:channel:thread_ts`, policy `join`). A
   healthy thread: `facts` → `admit` → `identity` → `session` → `relay` →
   `first_turn` → `thread[n].next` → `thread[n].has_turn.repoint` (the

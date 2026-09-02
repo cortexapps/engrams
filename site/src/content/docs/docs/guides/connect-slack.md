@@ -7,8 +7,8 @@ sidebar:
 
 Connecting Slack gives you two things: sessions can post to Slack through the organization's
 connection, and a person can start a session by mentioning the bot in a channel. The second
-is the Slack thread brain, a built-in automation that keeps one session per thread and
-relays the conversation both ways.
+is [Slack threads](../../platform/slack-threads/), a built-in automation that keeps one
+session per thread and relays the conversation both ways.
 
 You bring your own Slack app. The dashboard writes its manifest for you.
 
@@ -45,10 +45,10 @@ paste it if you want mentions to work. Select Add Slack. engrams seals the three
 org secrets, sends you through Slack's consent screen, and returns to the integration page
 marked connected. Reconnect from that page at any time forces a fresh consent.
 
-## Turn on the thread brain
+## Turn on Slack threads
 
 Mentions do nothing until a channel is mapped to a profile. Open Settings → Automations →
-Slack thread brain → Inputs and add the channel to the `channels` map, choosing the profile
+Slack threads → Inputs and add the channel to the `channels` map, choosing the profile
 its sessions run on. A channel that is not in the map is never answered. The other inputs
 are `default_profile`, `idle_timeout` (how long a thread may go quiet before its run ends,
 one minute to a day, an hour by default), and `max_turns`. Then enable the automation.

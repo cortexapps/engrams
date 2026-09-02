@@ -19,7 +19,7 @@ An **image** is a plain OCI image you build with `docker build` and push to any 
 contract is any Linux image with `/bin/sh`. You enable an image once; engrams turns it into a
 chunked root filesystem and captures a base snapshot on the fleet, and sessions boot from that
 snapshot. Runtime settings that are not part of the image, like environment variables, memory,
-and a warm-up command, live in an image config that you supply when you enable it.
+and a warm-up command, are entered when you enable it.
 
 A **harness** is the agent runtime that runs inside the VM. Claude Code and Codex ship as
 harnesses. A harness is never baked into your image: the host stages it as a read-only bundle
@@ -40,8 +40,9 @@ more sessions. Tasks are what you see in the dashboard, in a Slack thread, and i
 
 An **automation** is a trigger, a tree of blocks, and typed inputs. It starts sessions in
 response to a schedule, a Slack mention, a pull request, a Linear issue, or a webhook, and
-every run keeps a step-by-step record. Pull request review and the Slack thread brain ship
-as automations. [Automations](../../concepts/automations/) has the whole model.
+every run keeps a step-by-step record. [Pull request review](../../platform/reviews/) and
+[Slack threads](../../platform/slack-threads/) ship as automations.
+[Automations](../../platform/automations/) has the whole model.
 
 A **host** is a Linux machine with KVM that runs microVMs. Hosts dial the coordinator, report
 their capacity, and receive sessions. Hosts never need an inbound port.
