@@ -22,7 +22,7 @@ Status: **Proposed**
 > ([ADR 0055](0055-dynamic-per-session-directory-mounts.md)), the erofs bundle packaging from
 > [ADR 0061](0061-vz-builtin-skills-erofs.md), the egress proxy ([ADR 0006](0006-host-agent-egress-proxy.md)),
 > session profiles ([ADR 0053](0053-session-profiles.md)) and eviction durability
-> ([ADR 0028](0028-eviction-durability-under-host-roll.md) / [ADR 0034](0034-idle-eviction-state-machine.md)).
+> ([ADR 0028](0028-eviction-durability-under-host-roll.md) / [ADR 0034](0034-idle-eviction-control-plane-and-detection.md)).
 
 ## TL;DR
 
@@ -548,7 +548,7 @@ the commit chain at the end. Stacked phases (one PR each, worktree per phase):
 - [ADR 0061](0061-vz-builtin-skills-erofs.md) — erofs bundle packaging (`-b 4096` gotcha)
 - [ADR 0006](0006-host-agent-egress-proxy.md) — egress proxy
 - [ADR 0053](0053-session-profiles.md) — session profiles
-- [ADR 0028](0028-eviction-durability-under-host-roll.md) / [ADR 0034](0034-idle-eviction-state-machine.md) — eviction/snapshot durability
+- [ADR 0028](0028-eviction-durability-under-host-roll.md) / [ADR 0034](0034-idle-eviction-control-plane-and-detection.md) — eviction/snapshot durability
 - `crates/engram-protocol/proto/host_service.proto` — `ProxyShell` / `ProxyShellMessage`
 - `crates/engram-protocol/proto/engram/app/v1/session.proto` — `ShellRelayService.Relay`
 - `crates/engram-agentd/src/shell.rs` — ttyd lazy-spawn pattern
