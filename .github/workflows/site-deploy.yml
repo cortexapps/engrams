@@ -20,6 +20,7 @@ on:
     branches: [main]
     paths:
       - 'site/**'
+      - 'crates/engram-protocol/proto/engram/app/**'
       - '.github/workflows/site-deploy.yml'
   workflow_dispatch: {}
 

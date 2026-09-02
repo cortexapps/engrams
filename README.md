@@ -4,7 +4,7 @@ engrams is a self-hosted orchestrator for AI coding agents. It runs each agent i
 
 A session is a plain OCI image plus an agent harness. You build the image with `docker build`, enable it once, and engrams boots it on a host in your own cloud, streams the transcript and tool calls to the dashboard, Slack, or the CLI, and snapshots the VM away when it goes quiet. Claude Code and Codex ship as harnesses. The pattern is the one behind hosted sandbox products like E2B, Modal Sandboxes, and Ramp's Inspect; engrams is the version you run yourself.
 
-![The engrams dashboard streaming a session](docs/evidence/1113-spec-session.png)
+![A session in the engrams dashboard. Asked for a PNG of a pelican riding a bicycle with no image libraries and no internet, the agent wrote a PNG encoder in Python and shared the file in the thread.](site/src/assets/screenshots/session-pelican.png)
 
 ## Why should I use engrams?
 
@@ -13,7 +13,7 @@ A session is a plain OCI image plus an agent harness. You build the image with `
 - **Idle sessions cost nothing to keep.** When an agent stops talking, engrams snapshots the VM's memory and disk into content-addressed chunks and destroys the VM. The next prompt restores it: under 100 ms on the same host, one to two seconds on another host, and under a second from cold with no pre-warming.
 - **Storage is deduplicated by construction.** Chunks are keyed by their hash, so a base image is stored once no matter how many sessions use it. A thousand sessions of a 4 GiB image take about 100 GiB, not 4 TiB.
 - **Your image stays yours.** The agent runtime, the in-guest daemon, and the tools are staged by the host and mounted into the VM at boot. The image contract is any Linux image with `/bin/sh`.
-- **It is a product, not a library.** A dashboard, tasks and profiles, Slack threads that drive an agent, pull request review, a CLI, and 24 built-in connectors come with it.
+- **It is a product, not a library.** A dashboard, tasks and profiles, a CLI, 24 built-in connectors, and automations: trigger-driven pipelines of agent runs that start from a schedule, a Slack thread, a pull request, or a webhook, with a durable record of every step. Pull request review and the Slack thread brain ship as automations you enable.
 
 ## What engrams is not
 

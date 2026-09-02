@@ -56,7 +56,11 @@ cli/dist/engrams session logs "$SID"
 
 This tails the session's event log: the agent's messages, each tool call as it starts and
 finishes, and the run's completion. `--since 0` replays from the beginning. The same events
-are what the dashboard renders, so open the session there too.
+are what the dashboard renders, so open the session there too. The right pane has the
+session's overview, the files it changed with their diffs, a shell into the VM, and
+diagnostics.
+
+![A session in the dashboard with the Changes tab open, listing three changed files](../../../../assets/screenshots/session-changes.png)
 
 Run a command inside the VM while the agent works:
 
@@ -64,7 +68,10 @@ Run a command inside the VM while the agent works:
 cli/dist/engrams session exec "$SID" 'uname -a; ls /workspace'
 ```
 
-`session exec` streams stdout and stderr and exits with the remote command's exit code.
+`session exec` streams stdout and stderr and exits with the remote command's exit code. The
+dashboard's Shell tab is the interactive version, a terminal in the VM as root.
+
+![The Shell tab: a root prompt inside the session's VM](../../../../assets/screenshots/session-shell.png)
 
 ## Watch it snapshot and resume
 
