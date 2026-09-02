@@ -17,7 +17,7 @@ egress policy, integration access, skills, and session apps.
 
 **Automation.** A trigger, a tree of blocks, and typed inputs that start and drive sessions
 without a person typing a prompt. Runs are durable and recorded step by step. See
-[Automations](../../concepts/automations/).
+[Automations](../../platform/automations/).
 
 **Model router.** A service such as OpenRouter that supplies models to a harness in place of
 the provider's own API, with a per-model policy for who may launch them. See
@@ -30,8 +30,8 @@ login wall. See [Session apps](../../guides/session-apps/).
 session boots from. See [Images and harnesses](../../concepts/images-and-harnesses/).
 
 **Image config.** The runtime settings for an image that are not in the image: name,
-environment, resources, secrets, and the warm hook. Supplied as a TOML file when the image is
-enabled. See the [image config reference](../../reference/image-config/).
+environment, working directory, resources, and the warm hook. Entered in the dashboard when
+the image is enabled. See [Images and harnesses](../../concepts/images-and-harnesses/).
 
 **Enable.** The step that turns a pushed image into something sessions can boot: engrams
 materializes the image into chunks, boots a capture VM on the fleet, runs the warm hook, and

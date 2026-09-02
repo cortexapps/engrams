@@ -2,7 +2,7 @@
 title: Automations
 description: Trigger-driven pipelines of agent sessions, with durable runs, typed inputs, and a visual builder.
 sidebar:
-  order: 5
+  order: 2
 ---
 
 An automation is a small program that starts agent sessions in response to something
@@ -139,7 +139,8 @@ Two automations ship with engrams. They are created disabled and stay that way u
 configure them. Their structure is locked, their inputs and a few marked fields are yours to
 set, and Duplicate gives you a fully editable copy.
 
-**PR review** listens for pull requests on the repositories you list. It opens a review pass,
+**PR review** listens for pull requests on the repositories you list. [Pull request
+review](../reviews/) has the whole product; in short, it opens a review pass,
 posts an acknowledgment comment, starts a finder session and a verifier session on the
 reviewer profile with a deny-default network and no profile secrets, clones the pull request
 head, runs the finder and then the verifier, settles the findings through a policy gate,
@@ -147,12 +148,13 @@ posts them as a single GitHub review, and updates the acknowledgment with the co
 push supersedes the review in flight. Each repository is `auto`, which reviews every pull
 request, or `on_request`, which reviews when someone comments `@<handle> review`.
 
-**Slack thread brain** answers mentions in the channels you map to profiles. A mention opens
-one run for the thread; the author must be a linked engrams user, and the session runs as
-that person. The run relays the agent's output into the thread as it streams, round-trips the
+**Slack threads** answers mentions in the channels you map to profiles. A mention opens one
+run for the thread; the author must be a linked engrams user, and the session runs as that
+person. The run relays the agent's output into the thread as it streams, round-trips the
 agent's questions as Slack forms, marks each turn with a reaction, and loops on thread
 replies until the thread goes quiet for the idle timeout you set. The session is kept when
-the run ends, so a person can pick it up later.
+the run ends, so a person can pick it up later. [Slack threads](../slack-threads/) has the
+setup.
 
 ## Custom webhooks
 
@@ -180,4 +182,4 @@ An automation has at most 64 blocks, 8 entrypoints, and 8 finalize hooks. A loop
 100 iterations. A wait is at most 24 hours and a run at most 48. A command's output is kept up
 to 256 KiB, and Write files takes up to 32 files and 4 MiB. There is no HTTP block, no sleep
 block, and no approval block; a Slack question round-trip exists only inside the Slack
-built-in. Retry restarts a run from the beginning.
+threads built-in. Retry restarts a run from the beginning.

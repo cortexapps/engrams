@@ -31,44 +31,43 @@ platform's, so they go in your Dockerfile.
 `/workspace` is the working directory. engrams runs no git operations of its own; the
 repositories a profile lists are cloned into it, and the agent takes it from there.
 
-## The image config
+## Enabling an image
 
-Settings that are not part of the image live in a TOML file you pass when you enable it:
-a display name, environment variables, a working directory, the VM's size, and a warm hook.
-The config describes what the image is. What a session may reach and what secrets it holds
-are session policy, set on the profile, so the same image serves a locked-down profile and a
-permissive one. The config is stored by engrams, not in the image, so a settings change is
-not a rebuild.
+Settings that are not part of the image are entered when you enable it, under Operator →
+Images → Enable a new image: a display name, environment variables, a working directory, the
+VM's size, and a warm hook. They describe what the image is. What a session may reach and
+what secrets it holds are session policy, set on the profile, so the same image serves a
+locked-down profile and a permissive one. engrams stores the settings, not the image, so a
+settings change is not a rebuild.
 
-```toml
-name = "team-api"
-description = "The backend API service"
+![The Enable a new image dialog: image URI, name, description, image env, workdir, and the VM's vCPUs, memory, disk, and swap](../../../../assets/screenshots/image-enable.png)
 
-[env]
-NODE_ENV = "development"
+| Field | Meaning |
+|---|---|
+| Image URI | The full OCI reference, `<host>[:port]/<repo>:<tag>`. Fixed once enabled. |
+| Name, Description | The display name in pickers, and free text. |
+| Image env | Non-secret environment variables for every session of this image. The Dockerfile's `ENV` is read at enable time and merged underneath, so a key here overrides the same key in the image, and a value the session supplies overrides both. |
+| Workdir | The working directory for the harness and for `engrams session exec`. Defaults to the Dockerfile's `WORKDIR`, then to `/`. The directory must exist in the image. |
+| vCPUs | Required. Placement reserves it against a host's CPU budget. |
+| Memory MiB, Disk GiB, Swap MiB | The guest's memory, the session's disk budget, and an ephemeral swap device that is discarded at every snapshot. Swap of 0 means none; a good default is a quarter of memory, clamped between 1 GiB and 8 GiB. |
+| Warm capture hook | A command run once at enable time, with its own timeout, working directory, capture-time environment, and network policy. See [Authoring a warm hook](../../guides/warm-hooks/). |
 
-[resources]
-suggested_vcpus = 2
-suggested_memory_mib = 4096
-
-[warm]
-command = ["pnpm", "install"]
-timeout_secs = 300
-```
+The CLI covers the fields a script needs. The warm hook is set in the dashboard.
 
 ```sh
-engrams image enable --uri registry.example.com/team/api:warm-1 --config ./image-config.toml
+engrams image enable --uri registry.example.com/team/api:warm-1 --name team-api --vcpus 2 --memory-mib 4096
 ```
 
 Enabling is the expensive step. engrams pulls the image, writes it as chunks into the blob
 store, boots a capture VM on the fleet, runs the warm hook, and freezes the result as the
 image's base snapshot. Sessions boot from that snapshot in under a second, with whatever the
-warm hook left running still running. `engrams image jobs` shows the capture as it happens.
+warm hook left running still running. The Images page shows the capture as it happens, and
+so does `engrams image jobs`.
 
 Cheap fields, like the name and environment, take effect on the next session. Changing the
-resources or the warm hook means a new capture, and `engrams image update` asks you to say
-so with `--allow-recapture`. The [image config reference](../../reference/image-config/)
-lists every field.
+resources or the warm hook means a new capture, so the dialog asks you to confirm, and
+`engrams image update` asks for `--allow-recapture`. Sessions keep working against the old
+snapshot until the new one is ready.
 
 ## Harnesses
 

@@ -47,7 +47,7 @@ docker push "$REGISTRY/demo:warm-1"
 
 echo ""
 echo "✓ pushed $REGISTRY/demo:warm-1"
-echo "  enable it: engram image enable --uri $REGISTRY/demo:warm-1 --config deploy/demo/image-config.toml"
+echo "  enable it: engrams image enable --uri $REGISTRY/demo:warm-1 --name demo --vcpus 4"
 echo "  (the enable materializes on a host — ext4 packing is pure Rust"
 echo "   since ADR 0093, no e2fsprogs needed;"
 echo "   dev-fc/Colima: just fc-colima-provision fc-dev)"

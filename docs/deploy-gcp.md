@@ -166,7 +166,7 @@ kubectl logs -n engrams deploy/engram-coordinator | grep -i "host registered"
 Open `https://$DOMAIN` (after the cert is Active). Sign up with
 `$ADMIN_EMAIL` — the bootstrap allow-list promotes it to admin on
 first sign-in. There is no identity proxy in this posture: the
-orchestrator's login wall is the auth door (ADR 0118). To add IAP on
+orchestrator's login wall is the auth door. To add IAP on
 top later, see `deploy/helm/engram/values-iap.yaml.example` — the
 split-host layout: IAP guards the app host while the machine surface
 (RPC, SSE, WebSockets) moves to a second hostname, so plan on one

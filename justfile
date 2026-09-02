@@ -640,8 +640,7 @@ bake-demo:
     bash deploy/dev/bake-demo.sh
 
 # Bake the demo image AND make it live on the running coord in one step — the
-# inner-loop cycle after editing deploy/demo/ (engram.toml vcpus/mem, or the
-# rootfs). `bake-demo` only pushes; this then registers it and BLOCKS until the
+# inner-loop cycle after editing deploy/demo/ (the Dockerfile). `bake-demo` only pushes; this then registers it and BLOCKS until the
 # base-snapshot capture (the enable job) reports ready, exiting non-zero if it
 # fails. Because `warm-1` is a fixed tag, a re-bake moves it to a NEW digest: if
 # the image is already enabled we `image refresh` (re-fetch the moved tag + force
@@ -666,7 +665,7 @@ bake-demo-enable:
         cli image refresh --uri "$uri" --recapture
     else
         echo "==> enabling $uri (captures base snapshot)"
-        cli image enable --uri "$uri"
+        cli image enable --uri "$uri" --name demo --vcpus 4
     fi
 
 # Fetch the kernel artifact this host's backend needs (VZ → Kata arm64
@@ -968,7 +967,7 @@ bake repo dir='.':
     docker push "$URI"; \
     echo ""; \
     echo "✓ pushed $URI"; \
-    echo "  enable it: engram image enable --uri $URI --config <image-config.toml>"; \
+    echo "  enable it: engrams image enable --uri $URI --name <name> --vcpus <n>"; \
     echo "  then:      engram session create --image $URI ..."
 
 # ------------------------------------------------------------------

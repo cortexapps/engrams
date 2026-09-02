@@ -44,7 +44,7 @@ export async function seedReviewerProfile(
       {
         name: "PR Reviewer",
         description:
-          "engrams code reviewer for pull requests (ADR 0100). Repoint the image/model as needed; do not delete.",
+          "engrams code reviewer for pull requests. Repoint the image/model as needed; do not delete.",
         icon: "ScanSearch",
         imageId: templateProfile.imageId,
         harness: templateProfile.harness,

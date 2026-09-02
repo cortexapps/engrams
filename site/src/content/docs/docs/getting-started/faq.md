@@ -36,8 +36,8 @@ glibc-based image: the bundled agent binaries do not run on Alpine.
 
 Yes. Automations start sessions from a schedule, a Slack mention, a pull request event, a
 Linear issue, or a signed webhook, and can prompt them, wait for them, run commands inside
-them, and post results to Slack or GitHub. Pull request review and the Slack thread brain
-ship as automations you enable. There is no general approval block yet; a person is in the
+them, and post results to Slack or GitHub. Pull request review and Slack threads ship as
+automations you enable. There is no general approval block yet; a person is in the
 loop through the Slack thread, the dashboard, and the pull request review itself.
 
 ## Which agents run inside?

@@ -63,6 +63,11 @@ function harness() {
     async setBlockOverrides(id) {
       return rows.get(id)!;
     },
+    async updateMeta(id, patch) {
+      const row = rows.get(id)!;
+      rows.set(id, { ...row, name: patch.name ?? row.name, description: patch.description ?? row.description });
+      return rows.get(id)!;
+    },
   };
   const deps = {
     store,
@@ -95,6 +100,21 @@ describe("seedBuiltinAutomations — slack_brain", () => {
     expect(h.providers).toEqual(["slack"]);
     // A thread's session outlives its run.
     expect(row.version.settings.endSessionsOnFinish).toBe(false);
+  });
+
+  test("a row still named by a previous product name is renamed; a custom name is kept", async () => {
+    const h = harness();
+    await seedBuiltinAutomations({ ...h.deps, builtins: [SLACK_BRAIN_BUILTIN] });
+    const id = `auto-${SLACK_BRAIN_BUILTIN_KEY}`;
+    h.rows.set(id, { ...h.rows.get(id)!, name: "Slack thread brain" });
+    const renamed = await seedBuiltinAutomations({ ...h.deps, builtins: [SLACK_BRAIN_BUILTIN] });
+    expect(renamed.renamed).toEqual([SLACK_BRAIN_BUILTIN_KEY]);
+    expect(h.rows.get(id)!.name).toBe("Slack threads");
+
+    h.rows.set(id, { ...h.rows.get(id)!, name: "Ops helper" });
+    const kept = await seedBuiltinAutomations({ ...h.deps, builtins: [SLACK_BRAIN_BUILTIN] });
+    expect(kept.renamed).toBeUndefined();
+    expect(h.rows.get(id)!.name).toBe("Ops helper");
   });
 
   test("re-run is a no-op", async () => {

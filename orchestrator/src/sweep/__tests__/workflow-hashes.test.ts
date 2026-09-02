@@ -91,7 +91,7 @@ describe("DBOS workflow hash snapshots", () => {
     expect(prApplicationVersionWarningMessages(original, current)).toEqual([
       "this PR changes the DBOS application version: workflow AlphaWorkflow " +
         "body changed vs main — in-flight executions will be stranded and " +
-        "swept on the next rollout (ADR 0104)",
+        "swept on the next rollout",
     ]);
   });
 
@@ -107,13 +107,13 @@ describe("DBOS workflow hash snapshots", () => {
     expect(prApplicationVersionWarningMessages(original, current)).toEqual([
       "this PR changes the DBOS application version: workflow AddedWorkflow " +
         "was added vs main — in-flight executions will be stranded and swept " +
-        "on the next rollout (ADR 0104)",
+        "on the next rollout",
       "this PR changes the DBOS application version: workflow RemovedWorkflow " +
         "was removed vs main — in-flight executions will be stranded and " +
-        "swept on the next rollout (ADR 0104)",
+        "swept on the next rollout",
       "this PR changes the DBOS application version: DBOS SDK changed vs main " +
         "(4.21.6 → 4.22.0) — in-flight executions will be stranded and swept " +
-        "on the next rollout (ADR 0104)",
+        "on the next rollout",
     ]);
   });
 

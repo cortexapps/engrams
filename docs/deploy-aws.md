@@ -1,7 +1,6 @@
 # Deploy engrams on AWS, from zero
 
-A fresh AWS account → a working engrams deployment on EKS
-(ADR 0122). Every command is meant to run as written; if a step
+A fresh AWS account → a working engrams deployment on EKS. Every command is meant to run as written; if a step
 needs knowledge this page doesn't give you, that's a bug in this
 page — file it.
 
@@ -192,7 +191,7 @@ leg).
 ## 7. First login + first image
 
 Sign up with `$ADMIN_EMAIL` (bootstrap-promoted to admin — the
-ADR 0118 login wall; ⚡ do NOT put ALB OIDC/Cognito auth in front of
+login wall; ⚡ do NOT put ALB OIDC/Cognito auth in front of
 the app: it breaks CORS preflights and WebSockets the same way IAP
 does). Then enable a first image — `eclipse-temurin:21-jre` is a
 good first pick; **use a glibc-based image** (Alpine/musl images are

@@ -108,7 +108,11 @@ log "==> step 2/3: enable image over app-gRPC (blocks until the enable job is re
 # collapses the old "POST /enabled-images then poll /enable-jobs/:id"
 # into one command. `set -e` aborts on a non-zero exit.
 T0=$(date +%s.%N)
-if ! engrams image enable --uri "$IMAGE_URI" --config deploy/demo/image-config.toml >&2; then
+# The demo image's config: a name and the vCPU count placement reserves
+# (4, not 2: the claude CLI needs the headroom to start). Everything else
+# is the dashboard's, under Operator → Images.
+if ! engrams image enable --uri "$IMAGE_URI" --name demo --vcpus 4 \
+    --description "Canonical workspace image: debian:bookworm-slim + git + ttyd. The harness is a per-session selection; this image is just the workspace." >&2; then
     log "ERROR: enabling $IMAGE_URI failed (enable job did not reach ready)"
     exit 1
 fi

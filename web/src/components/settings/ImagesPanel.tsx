@@ -139,8 +139,9 @@ export function ImagesPanel() {
       ) : visibleJobs.length === 0 && imageRows.length === 0 ? (
         <Card>
           <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            No images enabled. Bake + push an image with{" "}
-            <code className="font-mono">engram image build --push</code>, then enable its URI here.
+            No images enabled. Build and push an image with{" "}
+            <code className="font-mono">docker build && docker push</code>, then enable its URI
+            here.
           </CardContent>
         </Card>
       ) : imageRows.length > 0 ? (
@@ -337,7 +338,7 @@ const enableImageSchema = z
     allowPatternsText: z.string(),
   })
   .refine((v) => v.warmCommand.trim() !== "" || v.captureEnv.every((r) => r.name.trim() === ""), {
-    message: "warm env needs a warm command — everything warm rides the [warm] block",
+    message: "warm env needs a warm command",
     path: ["warmCommand"],
   });
 type EnableImageValues = z.infer<typeof enableImageSchema>;
@@ -728,16 +729,15 @@ function EnableImageDialog({
           <DialogDescription>
             {isEdit ? (
               <>
-                Full-replace edit (ADR 0080): name, description, image env and workdir apply
-                immediately; a change to resources or the warm hook asks for confirmation, then
-                recaptures the base snapshot.
+                Name, description, image env and workdir apply immediately; a change to resources or
+                the warm hook asks for confirmation, then recaptures the base snapshot.
               </>
             ) : (
               <>
                 Full OCI reference:{" "}
                 <code className="font-mono">&lt;host&gt;[:port]/&lt;repo&gt;:&lt;tag&gt;</code>. The
-                config below is applied at enable time (ADR 0080). The coordinator queues an enable
-                job — materialization progress shows in the list above.
+                config below is applied at enable time. The coordinator queues an enable job —
+                materialization progress shows in the list above.
               </>
             )}
           </DialogDescription>
@@ -815,8 +815,8 @@ function EnableImageDialog({
               </div>
               <FieldDescription>
                 Non-secret env applied to every sandbox of this image — merged over the Dockerfile's{" "}
-                <code className="font-mono">ENV</code>, under session env (ADR 0080). Applies
-                immediately on save, no recapture.
+                <code className="font-mono">ENV</code>, under session env. Applies immediately on
+                save, no recapture.
               </FieldDescription>
               {envArray.fields.length === 0 ? (
                 <p className="text-xs text-muted-foreground">No image env vars.</p>
@@ -965,8 +965,7 @@ function EnableImageDialog({
                       aria-invalid={fieldState.invalid}
                     />
                     <FieldDescription>
-                      Space-separated argv. Leave empty for no{" "}
-                      <code className="font-mono">[warm]</code> hook.
+                      Space-separated argv. Leave empty for no warm hook.
                     </FieldDescription>
                     {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
                   </Field>
@@ -1030,9 +1029,8 @@ function EnableImageDialog({
                 </div>
                 <FieldDescription>
                   Injected into the warm command's environment at base-snapshot capture (not a
-                  session secret) — ADR 0080: rides the <code className="font-mono">[warm]</code>{" "}
-                  block, so it needs a warm command. Each is a literal value or an org-secret ref
-                  resolved server-side at capture (names only — never values).
+                  session secret), so it needs a warm command. Each is a literal value or an
+                  org-secret ref resolved server-side at capture (names only — never values).
                 </FieldDescription>
                 {fields.length === 0 ? (
                   <p className="text-xs text-muted-foreground">No warm env vars.</p>
@@ -1075,9 +1073,9 @@ function EnableImageDialog({
                     )}
                   />
                   <FieldDescription>
-                    Egress policy for the capture VM while the warm hook runs (ADR 0080; same shape
-                    as a profile's allow-list). No network — or deny with an empty allow-list — is
-                    an egress-less capture.
+                    Egress policy for the capture VM while the warm hook runs, the same shape as a
+                    profile's allow-list. No network — or deny with an empty allow-list — is an
+                    egress-less capture.
                   </FieldDescription>
                   {netDefaultLive === "deny" && (
                     <div className="grid gap-3 sm:grid-cols-2">
@@ -1434,7 +1432,7 @@ function EnableJobRow({
           {failed && job.error && <p className="text-xs text-destructive">{job.error}</p>}
           {failed && job.warm_stage && (
             <p className="text-xs text-muted-foreground">
-              failed at [warm] stage <span className="font-mono">{job.warm_stage}</span>
+              failed at warm stage <span className="font-mono">{job.warm_stage}</span>
             </p>
           )}
           {/* The live tail is the "something is happening" signal a

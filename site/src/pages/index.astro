@@ -51,7 +51,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
             <span>{hero.graphTitle}</span>
             <span>run #<span data-run-no>{RUN_START}</span> · <span data-clock>06:00:00</span> UTC</span>
           </div>
-          <div class="graph-scale" data-graph-scale>
+          <div class="graph-scale" data-fit="720" data-fit-spill="48">
             <div class="graph" aria-hidden="true">
               <svg width="720" height="416" viewBox="0 0 720 416" fill="none">
                 {edges.map((d, i) => <path d={d} class:list={["edge", { loop: i === 6 }]} data-edge />)}

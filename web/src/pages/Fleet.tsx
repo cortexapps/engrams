@@ -169,7 +169,7 @@ function HostCard({
           {host.capabilities_schema === 0 && (
             <Badge
               variant="outline"
-              title="This host has never reported an ADR 0068 capability vector (pre-rollout row, or mid-roll) — placement soft-passes it like a schema-0/wire-version-0 host."
+              title="This host has never reported a capability vector (pre-rollout row, or mid-roll) — placement soft-passes it like a schema-0/wire-version-0 host."
             >
               caps unreported
             </Badge>
@@ -180,7 +180,7 @@ function HostCard({
           {(host.live_materializes > 0 || host.live_capture_jobs > 0) && (
             <Badge
               variant="secondary"
-              title="In-flight image-enable work bound to this host (live materialize / base-snapshot capture). Fleet rolls and drains wait for it (ADR 0088)."
+              title="In-flight image-enable work bound to this host (live materialize / base-snapshot capture). Fleet rolls and drains wait for it."
             >
               {[
                 host.live_materializes > 0 ? `${host.live_materializes} materializing` : null,

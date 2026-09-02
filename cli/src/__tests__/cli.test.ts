@@ -23,7 +23,7 @@ import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import { ApiKeyService } from "../gen/engram/app/v1/api_key_pb.ts";
 import { normalizeHost, resolveHost, storeCredential, storedCredential } from "../config.ts";
 import { formatEventLine } from "../commands/session.ts";
-import { loadImageConfig } from "../commands/image.ts";
+import { buildImageConfig, hasConfigFlags } from "../commands/image.ts";
 import { truncate } from "../output.ts";
 
 // ---------------------------------------------------------------------------
@@ -68,50 +68,46 @@ describe("output", () => {
   });
 });
 
-describe("image config TOML", () => {
-  test("maps the engram_core shape to the proto init", () => {
-    const dir = mkdtempSync(join(tmpdir(), "engrams-toml-"));
-    const path = join(dir, "image-config.toml");
-    writeFileSync(
-      path,
-      `
-name = "dev-engrams"
-description = "dogfood"
-workdir = "/workspace"
-
-[env]
-FOO = "bar"
-
-[resources]
-suggested_memory_mib = 8192
-suggested_vcpus = 4
-
-[warm]
-command = ["just", "dev"]
-timeout_secs = 900
-
-[[warm.env]]
-name = "LITERAL"
-value = "v"
-
-[[warm.env]]
-name = "SECRET"
-secret_ref = "org://token"
-
-[warm.network]
-default = "deny"
-allow_hosts = ["github.com"]
-`,
-    );
-    const c = loadImageConfig(path);
+describe("image config flags", () => {
+  test("maps flags to the proto init on first enable", () => {
+    const c = buildImageConfig({
+      name: "dev-engrams",
+      description: "dogfood",
+      workdir: "/workspace",
+      vcpus: "4",
+      memoryMib: "8192",
+      swapMib: "0",
+      env: ["FOO=bar", "URL=http://x?a=b=c"],
+    });
     expect(c.name).toBe("dev-engrams");
-    expect(c.env).toEqual({ FOO: "bar" });
+    expect(c.env).toEqual({ FOO: "bar", URL: "http://x?a=b=c" });
+    expect(c.resources?.suggestedVcpus).toBe(4);
     expect(c.resources?.suggestedMemoryMib).toBe(8192);
-    expect(c.warm?.command).toEqual(["just", "dev"]);
-    expect(c.warm?.timeoutSecs).toBe(900n);
-    expect(c.warm?.env?.[0]?.value).toEqual({ case: "literal", value: "v" });
-    expect(c.warm?.env?.[1]?.value).toEqual({ case: "secretRef", value: "org://token" });
-    expect(c.warm?.network?.allowHosts).toEqual(["github.com"]);
+    expect(c.resources?.suggestedSwapMib).toBe(0);
+    expect(c.warm).toBeUndefined();
+  });
+
+  test("overlays flags on a stored config and keeps the warm hook", () => {
+    const base = {
+      name: "demo",
+      description: "old",
+      env: { A: "1", B: "2" },
+      workdir: "/workspace",
+      resources: { suggestedVcpus: 2, suggestedMemoryMib: 2048 },
+      warm: { command: ["./warm.sh"], env: [], network: undefined },
+    } as unknown as Parameters<typeof buildImageConfig>[1];
+    const c = buildImageConfig({ memoryMib: "4096", env: ["B=3"] }, base);
+    expect(c.name).toBe("demo");
+    expect(c.description).toBe("old");
+    expect(c.env).toEqual({ A: "1", B: "3" });
+    expect(c.resources?.suggestedVcpus).toBe(2);
+    expect(c.resources?.suggestedMemoryMib).toBe(4096);
+    expect(c.warm?.command).toEqual(["./warm.sh"]);
+  });
+
+  test("hasConfigFlags ignores commander's empty --env default", () => {
+    expect(hasConfigFlags({ env: [] })).toBe(true);
+    expect(hasConfigFlags({})).toBe(false);
   });
 });
 

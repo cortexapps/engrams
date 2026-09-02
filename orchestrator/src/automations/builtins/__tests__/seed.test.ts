@@ -60,6 +60,11 @@ function harness(
     async getByBuiltinKey(key) {
       return [...rows.values()].find((r) => r.builtinKey === key) ?? null;
     },
+    async updateMeta(id, patch) {
+      const row = rows.get(id)!;
+      rows.set(id, { ...row, name: patch.name ?? row.name, description: patch.description ?? row.description });
+      return rows.get(id)!;
+    },
     async create(input) {
       calls.push("create");
       if (options.raceOnCreate) {

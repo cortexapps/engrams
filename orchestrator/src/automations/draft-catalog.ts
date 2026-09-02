@@ -85,7 +85,7 @@ export function draftPatterns(): Record<string, unknown> {
       "Runs are SHORT and stateless. Waits inside a run cap at 24h and stuck runs are swept at 48h - never design a run to live for a day.",
       "A workflow that spans days = multiple ENTRYPOINTS (one per way in: an integration event, a cron tick, a manual kick) sharing the automation's inputs, settings, and state. Each run enters through one entrypoint, does one step of the lifecycle, and exits.",
       "A TEMPLATED workflow (the same lifecycle per project/customer/case) declares settings.instance and becomes one automation with many WORKSTREAMS - see the instances section; never duplicate an automation per project.",
-      "Conversations (hours, every event carries the same key) are the ONE long-lived-run shape: concurrency policy join + trigger.continueOnly, like the Slack brain built-in.",
+      "Conversations (hours, every event carries the same key) are the ONE long-lived-run shape: concurrency policy join + trigger.continueOnly, like the Slack threads built-in.",
       "At most one cron trigger per automation.",
       "ONE template contract everywhere: every rendered string uses ${{ ... }} (Liquid) - session {template} refs included. Plain {{ ... }} NEVER renders (it flows through as a literal) and save refuses it; code block source is JS, not a template.",
     ],

@@ -88,7 +88,7 @@ the project's API keys.
 | `chat <model>` | `generation` event (one per API call for claude; one per turn for codex) | `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens`, `gen_ai.response.id` |
 | `execute_tool <name>` | `tool_call_completed` (harness-measured `duration_ms` derives the start) | `gen_ai.tool.name`, `gen_ai.tool.call.id`; ERROR on `ok:false` |
 
-The trace id derives from the ROOT task, so an ADR 0113 sub-session tree
+The trace id derives from the ROOT task, so a sub-session tree
 shares one trace. Timestamps are coordinator-stamped (`at` in the event
 payload); they include guest→host→coordinator transit, so treat sub-100ms
 differences as noise.

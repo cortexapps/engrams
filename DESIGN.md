@@ -750,10 +750,10 @@ Building + pushing the image requires a Docker-compatible runtime on the dev's /
 
 ### Runtime config
 
-Runtime config is supplied out-of-band at **enable time** via an image-config TOML (`ImageConfig`), never baked into the image (ADR 0080). It carries `name`, `description`, `env`, `workdir`, `resources`, and an optional `warm` section (the warm-capture `command` / `timeout_secs` / `workdir` / `env` / `network`):
+Runtime config is supplied out-of-band at **enable time** as a structured `ImageConfig` (the dashboard's enable dialog under Operator → Images, or the CLI's flags), never baked into the image (ADR 0080). It carries `name`, `description`, `env`, `workdir`, `resources`, and an optional `warm` section (the warm-capture `command` / `timeout_secs` / `workdir` / `env` / `network`):
 
 ```toml
-# image-config.toml — passed to `engram image enable --config` / `image update --config`
+# the ImageConfig fields, shown here in TOML for readability
 name = "cortex-api"
 description = "Backend API service"
 
@@ -775,7 +775,7 @@ timeout_secs = 300
   allow_hosts = ["registry.npmjs.org"]
 ```
 
-The config is set via `engram image enable --uri <uri> --config <toml>` (required on first enable) and edited via `engram image update --uri <uri> --config <toml>`: cheap fields (name / description / env / workdir) apply immediately; a diff touching `resources` or anything under `warm` needs `--allow-recapture` and re-enqueues a capture job. Values persist in Postgres (`enabled_images.image_config`), merged with the image's `OciRuntimeDefaults` at session-create time. Per-image *secrets* and per-session *network* policy are session-policy concerns (ADR 0057), not image-config; harness credentials live one layer above the image (see below).
+The config is set in the dashboard's enable dialog (or `engrams image enable --uri <uri> --name … --vcpus …`, which covers the non-warm fields) and edited in the same dialog (or `engrams image update`): cheap fields (name / description / env / workdir) apply immediately; a diff touching `resources` or anything under `warm` needs `--allow-recapture` and re-enqueues a capture job. Values persist in Postgres (`enabled_images.image_config`), merged with the image's `OciRuntimeDefaults` at session-create time. Per-image *secrets* and per-session *network* policy are session-policy concerns (ADR 0057), not image-config; harness credentials live one layer above the image (see below).
 
 ### `SecretStore` — hot-swappable backend
 
@@ -877,7 +877,7 @@ Each phase has its own verification, summarized:
 | 3 ✅ | Stand up 2 hosts. Spawn sessions, verify even distribution per `engram host list`. `kill -9` one host, observe sessions transition `Active → Dead` within 30s via the dead-host detector. Restart a coordinator replica; SSE streams reconnect via `Last-Event-ID`. |
 | 4 ✅ | Same orchestration runs against the same coord backend whether the host is FC, VZ, or process. Per-run git checkpoint pushes; idle-evict + auto-resume; `engram session fork` from a Dead session. ADRs 0001 + 0002. |
 | 4.5 ✅ | macOS Apple Silicon: `just pull-kernel && just bake-demo && just dev` (auto-detects VZ). Cold boot <1s; full lifecycle (`harness_idle → snapshot_taken → evicted → idle → resumed → active`) end-to-end. ADR 0003. |
-| 5 | `docker build && docker push` a plain OCI image (ADR 0080), then `engram image enable --uri <uri> --config <toml>`; verify the enable job materializes the rootfs host-side and the image lands enabled, and that new sessions pick it up without disrupting in-flight sessions. |
+| 5 | `docker build && docker push` a plain OCI image (ADR 0080), then enable it (the dashboard dialog, or `engrams image enable --uri <uri> --name … --vcpus …`); verify the enable job materializes the rootfs host-side and the image lands enabled, and that new sessions pick it up without disrupting in-flight sessions. |
 | 6 | ~~Run on GCE Spot~~ RETIRED 2026-07-21: the fleet runs standard (non-preemptible) GKE nodes and the preemption drain was removed — host loss is handled by the checkpoint/HostLost recovery machinery (ADR 0028/0101) instead. Production hardening (TLS, auth, broker proxy, jailer) all green. |
 | 7 | Load test with locust/k6: 100 concurrent sessions. Chaos test: kill coordinator, kill hosts, kill Postgres briefly. Web app + Slack bot consume `/events` SSE in real time. |
 

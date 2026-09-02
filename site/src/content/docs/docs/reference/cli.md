@@ -82,9 +82,9 @@ Tasks are the product-level unit of work: a profile plus a prompt.
 | Command | What it does |
 |---|---|
 | `image list` | List the enabled images sessions may use. |
-| `image enable --uri <uri> [--config <path>] [--no-wait]` | Enable an image: materialize it and capture its base snapshot. The [image config](../image-config/) is required the first time. Polls the job to ready unless `--no-wait`. |
-| `image config --uri <uri>` | Print an enabled image's stored config as TOML. |
-| `image update --uri <uri> --config <path> [--allow-recapture] [--no-wait]` | Replace an image's config. Edits that change the base snapshot need `--allow-recapture`. |
+| `image enable --uri <uri> --name <name> --vcpus <n> [--description <text>] [--workdir <path>] [--memory-mib <n>] [--disk-gib <n>] [--swap-mib <n>] [--env KEY=VALUE]... [--no-wait]` | Enable an image: materialize it and capture its base snapshot. `--name` and `--vcpus` are required the first time. The warm hook is set in the dashboard. Polls the job to ready unless `--no-wait`. |
+| `image config --uri <uri>` | Print an enabled image's stored config as JSON. |
+| `image update --uri <uri> [the same flags] [--allow-recapture] [--no-wait]` | Change an image's config; flags you do not pass keep their stored values. Edits that change the base snapshot need `--allow-recapture`. |
 | `image disable --uri <uri>` | Disable an image. The registry artifact is untouched. |
 | `image refresh --uri <uri> [--recapture]` | Re-fetch a tag that moved, and optionally force a new capture. |
 | `image jobs` | List recent enable and refresh jobs. |

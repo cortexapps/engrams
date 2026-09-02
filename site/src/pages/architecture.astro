@@ -49,25 +49,83 @@ const processes = [
         VM. Postgres, a blob store, and an OCI registry are the only services around them.
       </p>
       <div class="codepane">
-        <div class="bar"><span>Fig. A.1 · topology</span><span>dashboard → orchestrator → coordinator → hosts</span></div>
-        <pre>   dashboard · CLI · Slack · webhooks
-                 │
-        ┌────────▼────────┐        ┌─────────────────┐
-        │   orchestrator  │───────▶│   coordinator   │────▶ Postgres
-        │  auth · tasks · │        │ scheduler · idle│
-        │  integrations   │        │ eviction · events│
-        └─────────────────┘        └────────┬────────┘
-                                            │  hosts dial in
-                     ┌──────────────────────┼──────────────────────┐
-              ┌──────▼──────┐        ┌──────▼──────┐        ┌──────▼──────┐
-              │  host agent │        │  host agent │        │     ...     │
-              │ ┌────┐┌────┐│        │ ┌────┐┌────┐│        │             │
-              │ │ VM ││ VM ││        │ │ VM ││ VM ││        │             │
-              │ └────┘└────┘│        │ └────┘└────┘│        │             │
-              └──────┬──────┘        └──────┬──────┘        └─────────────┘
-                     └──────────────┬───────┘
-                          blob store (GCS · S3 · local)
-                     image chunks · memory chunks · snapshots</pre>
+        <div class="bar"><span>Fig. A.1 · topology</span><span>dashboard → orchestrator → coordinator → hosts → blob store</span></div>
+        <div class="arch-wrap">
+          <div class="arch" data-fit="1248" aria-label="Topology: the dashboard, CLI, Slack, and webhooks reach the orchestrator; the orchestrator calls the coordinator, which owns Postgres and the OCI registry; host agents dial the coordinator and run microVMs; every host reads and writes the blob store.">
+            <svg width="1248" height="620" viewBox="0 0 1248 620" fill="none" aria-hidden="true">
+              <defs>
+                <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+                  <path d="M0 0 L8 4 L0 8 Z" fill="currentColor" opacity=".7"></path>
+                </marker>
+              </defs>
+              <path class="wire" d="M110 40 V64 H530 V40 M250 40 V64 M390 40 V64 M160 64 V116"></path>
+              <path class="wire" d="M280 156 H358" marker-end="url(#arr)"></path>
+              <path class="wire" d="M600 136 H678" marker-end="url(#arr)"></path>
+              <path class="wire" d="M600 180 H678" marker-end="url(#arr)"></path>
+              <path class="wire live" d="M190 340 V300 H830 V340 M510 300 V340 M480 300 V198" marker-end="url(#arr)"></path>
+              <path class="wire" d="M190 490 V560 M510 490 V560 M830 490 V560"></path>
+              <text x="496" y="290">hosts dial in · no inbound port</text>
+            </svg>
+
+            <div class="arch-entry" style="left:40px;top:0">
+              {["dashboard", "CLI", "Slack", "webhooks"].map((e) => <span>{e}</span>)}
+            </div>
+
+            <div class="arch-group" style="left:16px;top:84px;width:888px;height:156px"><span>control plane · stateless pods</span></div>
+            <div class="arch-node" style="left:40px;top:116px;width:240px;height:80px">
+              <div class="kind"><span>process</span><span>login wall</span></div>
+              <div class="name">orchestrator</div>
+              <div class="meta">auth · tasks · integrations</div>
+            </div>
+            <div class="arch-node" style="left:360px;top:116px;width:240px;height:80px">
+              <div class="kind"><span>process</span><span>n replicas</span></div>
+              <div class="name">coordinator</div>
+              <div class="meta">scheduling · eviction · gc</div>
+            </div>
+            <div class="arch-node service" style="left:680px;top:100px;width:200px;height:52px">
+              <div class="kind"><span>service</span></div>
+              <div class="name">Postgres</div>
+            </div>
+            <div class="arch-node service" style="left:680px;top:164px;width:200px;height:52px">
+              <div class="kind"><span>service</span></div>
+              <div class="name">OCI registry</div>
+            </div>
+
+            <div class="arch-key" style="left:1040px;top:84px;width:208px;height:156px">
+              <div class="k">key</div>
+              <div><i class="process"></i>a process engrams ships</div>
+              <div><i class="service"></i>a service you run</div>
+              <div><i class="vm"></i>one session's microVM</div>
+              <div><i class="wire"></i>hosts dial out</div>
+            </div>
+
+            <div class="arch-group" style="left:16px;top:316px;width:1000px;height:204px"><span>host fleet · linux + kvm</span></div>
+            {[0, 1].map((i) => (
+              <div class="arch-node host" style={`left:${40 + i * 320}px;top:340px;width:300px;height:150px`}>
+                <div class="kind"><span>process · per machine</span><span>kvm · nvme</span></div>
+                <div class="name">host agent</div>
+                <div class="meta">chunk cache · nbd · lazy paging · egress proxy</div>
+                <div class="vms">
+                  <div class="vm"><b>microVM</b><span>harness · daemon</span></div>
+                  <div class="vm"><b>microVM</b><span>harness · daemon</span></div>
+                </div>
+              </div>
+            ))}
+            <div class="arch-node host ghost" style="left:680px;top:340px;width:300px;height:150px">
+              <div class="kind"><span>process · per machine</span></div>
+              <div class="name">host agent</div>
+              <div class="meta">as many as the fleet needs</div>
+              <div class="vms">
+                <div class="vm"><b>…</b><span></span></div>
+              </div>
+            </div>
+
+            <div class="arch-node service wide" style="left:40px;top:560px;width:960px;height:56px">
+              <div class="kind"><span>service</span><span>gcs · s3 · local</span></div>
+              <div class="name">blob store <em>image chunks · memory chunks · snapshots</em></div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </section>
@@ -121,3 +179,7 @@ const processes = [
   </section>
   <div style="height:128px"></div>
 </Marketing>
+
+<script>
+  import "../scripts/fit";
+</script>

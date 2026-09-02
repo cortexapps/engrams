@@ -94,6 +94,7 @@ export default defineConfig({
       },
       sidebar: [
         { label: "Getting started", items: [{ autogenerate: { directory: "docs/getting-started" } }] },
+        { label: "Platform", items: [{ autogenerate: { directory: "docs/platform" } }] },
         { label: "Concepts", items: [{ autogenerate: { directory: "docs/concepts" } }] },
         { label: "Guides", items: [{ autogenerate: { directory: "docs/guides" } }] },
         { label: "Reference", items: [{ autogenerate: { directory: "docs/reference" } }] },

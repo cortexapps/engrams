@@ -13,7 +13,7 @@ A session is a plain OCI image plus an agent harness. You build the image with `
 - **Idle sessions cost nothing to keep.** When an agent stops talking, engrams snapshots the VM's memory and disk into content-addressed chunks and destroys the VM. The next prompt restores it: under 100 ms on the same host, one to two seconds on another host, and under a second from cold with no pre-warming.
 - **Storage is deduplicated by construction.** Chunks are keyed by their hash, so a base image is stored once no matter how many sessions use it. A thousand sessions of a 4 GiB image take about 100 GiB, not 4 TiB.
 - **Your image stays yours.** The agent runtime, the in-guest daemon, and the tools are staged by the host and mounted into the VM at boot. The image contract is any Linux image with `/bin/sh`.
-- **It is a product, not a library.** A dashboard, tasks and profiles, a CLI, 24 built-in connectors, and automations: trigger-driven pipelines of agent runs that start from a schedule, a Slack thread, a pull request, or a webhook, with a durable record of every step. Pull request review and the Slack thread brain ship as automations you enable.
+- **It is a product, not a library.** A dashboard, tasks and profiles, a CLI, 24 built-in connectors, and automations: trigger-driven pipelines of agent runs that start from a schedule, a Slack thread, a pull request, or a webhook, with a durable record of every step. Pull request review and Slack threads ship as automations you enable.
 
 ## What engrams is not
 
@@ -109,11 +109,10 @@ Storage is the part that makes the rest cheap. Disk and memory state live as has
 ## Documentation
 
 - [`docs/deploy.md`](docs/deploy.md), [`docs/deploy-gcp.md`](docs/deploy-gcp.md), [`docs/deploy-aws.md`](docs/deploy-aws.md): production deployment.
-- [`docs/images.md`](docs/images.md): building session images and the image config.
+- [`docs/images.md`](docs/images.md): building session images and enabling them.
 - [`docs/warm-hooks.md`](docs/warm-hooks.md): running a command once at enable time so sessions start warm.
 - [`docs/telemetry.md`](docs/telemetry.md): OpenTelemetry spans for every model call and tool call.
 - [`cli/README.md`](cli/README.md): the `engrams` CLI.
-- [`docs/adr/`](docs/adr/): the decision records behind the design.
 
 ## Contributing
 
