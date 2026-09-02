@@ -1,0 +1,89 @@
+name: site-deploy
+
+# Publish site/ (the public docs + landing page, Astro + Starlight) to GitHub
+# Pages on every push to main that touches it. Not part of CI Gate — the `site`
+# lane in ci.yml validates the build on PRs — so a native `paths:` filter is
+# fine here (ci.yml cannot use one, because its gate needs every lane to
+# report).
+#
+# One-time setup by a repo admin: Settings → Pages → Source "GitHub Actions".
+# While the repo is internal, set Visibility to "Private" so only org members
+# can open the site; access-controlled Pages serve at the ROOT of a dedicated
+# <random>.pages.github.io host with no /<repo>/ prefix. actions/configure-pages
+# reports the origin and base path for whichever mode Pages is in (private
+# host, public project page, or a custom domain), and the build reads them, so
+# switching modes needs no edit here. A custom domain is a site/public/CNAME
+# file plus the Pages setting.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/site-deploy.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# One deploy at a time, never cancelled: deploy-pages must finish or the
+# environment can be left pointing at a half-uploaded artifact.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build site
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      pages: read
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+
+      # Emits `origin` and `base_path` for the current Pages configuration.
+      - id: pages
+        uses: actions/configure-pages@v5
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm build
+        run: pnpm build
+        env:
+          SITE_URL: ${{ steps.pages.outputs.origin }}
+          BASE_PATH: ${{ steps.pages.outputs.base_path || '/' }}
+
+      # `path` is relative to the workspace, not to working-directory. With a
+      # subpath base the build nests into dist/<base>, and uploading dist/ as
+      # the root keeps the site at that exact path.
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: ./site/dist
+
+  deploy:
+    name: deploy to github pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
