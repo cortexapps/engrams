@@ -2,7 +2,8 @@
 name = "engram-harness-proto"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Apache-2.0, not the workspace AGPL-3.0: custom harnesses link this crate.
+license = "Apache-2.0"
 repository.workspace = true
 description = "Wire types for the harness ↔ host vsock channel: tool-call events, checkpoint/shutdown commands."
 
@@ -16,7 +17,7 @@ path = "src/lib.rs"
 async-trait.workspace = true
 bincode.workspace = true
 chrono.workspace = true
-engram-core.workspace = true
+engram-ids.workspace = true
 serde.workspace = true
 tokio.workspace = true
 uuid.workspace = true

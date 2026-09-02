@@ -2,7 +2,8 @@
 name = "engram-transport"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Apache-2.0, not the workspace AGPL-3.0: custom harnesses link this crate.
+license = "Apache-2.0"
 repository.workspace = true
 description = "In-guest host↔guest byte-stream transport over virtio-vsock (Firecracker + Apple Virtualization). Selected at runtime via ENGRAM_TRANSPORT."
 

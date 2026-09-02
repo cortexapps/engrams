@@ -19,11 +19,11 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use engram_core::{SandboxId, SessionId};
 use engram_harness_proto::{
     read_msg, write_msg, AttachReject, HarnessAttach, HarnessAttachAck, HarnessCommand,
     HarnessEvent, HarnessFrame,
 };
+use engram_ids::{SandboxId, SessionId};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, Notify};
 

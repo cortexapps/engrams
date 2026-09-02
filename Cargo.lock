@@ -2121,6 +2121,7 @@ dependencies = [
  "bincode",
  "bytes",
  "chrono",
+ "engram-ids",
  "futures",
  "futures-util",
  "hex",
@@ -2410,7 +2411,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "chrono",
- "engram-core",
+ "engram-ids",
  "proptest",
  "serde",
  "tokio",
@@ -2422,8 +2423,8 @@ dependencies = [
 name = "engram-harness-sdk"
 version = "0.1.0"
 dependencies = [
- "engram-core",
  "engram-harness-proto",
+ "engram-ids",
  "engram-transport",
  "serde",
  "serde_json",
@@ -2538,6 +2539,17 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-ids"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "uuid",
  "workspace-hack",
 ]
 

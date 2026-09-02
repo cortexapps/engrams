@@ -123,3 +123,5 @@ Storage is the part that makes the rest cheap. Disk and memory state live as has
 Copyright (C) 2026 Cortex Applications, Inc.
 
 engrams is free software under the GNU Affero General Public License v3.0. See [`LICENSE`](LICENSE).
+
+The crates a custom harness links (`engram-harness-sdk`, `engram-harness-proto`, `engram-transport`, `engram-ids`) are Apache-2.0, so your harness does not take on AGPL terms. Each of those crates carries its own `LICENSE`.

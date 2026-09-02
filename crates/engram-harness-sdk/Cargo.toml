@@ -2,7 +2,8 @@
 name = "engram-harness-sdk"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# Apache-2.0, not the workspace AGPL-3.0: custom harnesses link this crate.
+license = "Apache-2.0"
 repository.workspace = true
 description = "Shared resilient transport and lifecycle primitives for Engram harness adapters"
 
@@ -10,7 +11,7 @@ description = "Shared resilient transport and lifecycle primitives for Engram ha
 workspace = true
 
 [dependencies]
-engram-core.workspace = true
+engram-ids.workspace = true
 engram-harness-proto.workspace = true
 engram-transport.workspace = true
 serde.workspace = true
