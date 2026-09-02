@@ -6,7 +6,7 @@ Modal, E2B, Firecracker, htmx, Django and Diátaxis, plus the Google and Microso
 style guides and PostHog's handbook. The full report with verbatim excerpts per project
 is kept outside the repo at `~/Projects/docs-references/REPORT.md`, next to shallow clones of
 the sources. Read this file before writing any public prose for engrams. The site's build
-lint (`site/scripts/check-leaks.mjs`) enforces the greppable parts of the never-list.
+lint (`scripts/check-leaks.mjs`) enforces the greppable parts of the never-list.
 
 Two house rules that sit above the survey: the product name is `engrams`, lowercase, even at
 the start of a sentence (crate and binary names keep their real spelling), and the license is
