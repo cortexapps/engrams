@@ -29,7 +29,8 @@ curl -s "$ENGRAMS_URL/rpc/engram.app.v1.SessionService/ListSessions" \
 
 The orchestrator implements some services itself and forwards others to the coordinator.
 The distinction does not matter to a client; every method is at the same path with the same
-authentication.
+authentication. The [API reference](../../api/) has one page per service with every method
+and message, generated from the proto files.
 
 | Service | What it covers |
 |---|---|
@@ -45,7 +46,6 @@ authentication.
 | `ModelRouterService` | Model routers such as OpenRouter and their model catalogs. |
 | `ReviewService` | Pull request reviews and per-repository enrollment. |
 | `AutomationService`, `AutomationRunService`, `WebhookRegistrationService` | Automations, their runs, and inbound webhooks. |
-| `SpecService` | Specs, the collaborative documents written with an agent. |
 | `ArtifactService` | Documents published from a session. |
 | `MountCatalogService` | Skills available to profiles. |
 | `OAuthCredentialService` | Per-user OAuth credentials for Claude Code, ChatGPT, Slack, Linear, and GitHub. |
