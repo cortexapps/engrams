@@ -1,0 +1,11 @@
+---
+// Starlight's sidebar on the cover: carbon twill behind it and a note for
+// agents at the foot. The list itself is Starlight's, restyled in starlight.css.
+import Default from "@astrojs/starlight/components/Sidebar.astro";
+---
+
+<div class="sb-carbon bg-carbon-fade" aria-hidden="true"></div>
+<Default {...Astro.props}><slot /></Default>
+<div class="sb-note">
+  <span class="lime">agents:</span> every page is Markdown under <span class="dim">site/src/content/docs/</span>. Same text as this site.
+</div>

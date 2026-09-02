@@ -1,0 +1,60 @@
+---
+// The article masthead: breadcrumb, title, description, and a meta strip with
+// the read time and the edit link. The docs home gets the hero variant instead:
+// an eyebrow, the title, and the description as a lede.
+// Starlight anchors the page title at #_top; the skip link and the TOC rely on it.
+const PAGE_TITLE_ID = "_top";
+
+const { entry, editUrl, sidebar } = Astro.locals.starlightRoute;
+const isHome = /^docs(\/index)?$/.test(entry.id);
+
+/** The labels of the groups that lead to the current page, outermost first. */
+type SidebarEntry = (typeof sidebar)[number];
+function trail(entries: SidebarEntry[]): string[] | undefined {
+  for (const e of entries) {
+    if (e.type === "link") {
+      if (e.isCurrent) return [];
+      continue;
+    }
+    const inner = trail(e.entries);
+    if (inner) return [e.label, ...inner];
+  }
+  return undefined;
+}
+const crumbs = trail(sidebar) ?? [];
+const words = (entry.body ?? "").split(/\s+/).filter(Boolean).length;
+const minutes = Math.max(1, Math.round(words / 200));
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+---
+
+{
+  isHome ? (
+    <div class="doc-hero">
+      <div class="doc-eyebrow"><span class="pulse"></span>Documentation · v0.x</div>
+      <h1 id={PAGE_TITLE_ID}>{entry.data.title}</h1>
+      {entry.data.description && <p class="doc-lede">{entry.data.description}</p>}
+    </div>
+  ) : (
+    <div class="doc-masthead">
+      <div class="doc-crumb">
+        <a href={`${base}/docs/`}>docs</a>
+        {crumbs.map((c) => (
+          <>
+            <span>/</span>
+            <span>{c}</span>
+          </>
+        ))}
+        <span>/</span>
+        <span class="here">{entry.data.title}</span>
+      </div>
+      <h1 id={PAGE_TITLE_ID}>{entry.data.title}</h1>
+      {entry.data.description && <p class="doc-desc">{entry.data.description}</p>}
+      <div class="doc-meta">
+        <span>≈ {minutes} min</span>
+        {editUrl && (
+          <a href={editUrl.href} class="edit">edit on github ↗</a>
+        )}
+      </div>
+    </div>
+  )
+}

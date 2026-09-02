@@ -1,18 +1,25 @@
 ---
 // The layout for the pages outside Starlight: /, /compare/, /architecture/.
-// It shares tokens.css with the docs and honors the same theme choice, stored
-// under Starlight's localStorage key, so a reader who picks dark in the docs
-// gets dark here too.
+// The header sits on the cover (bottle-green) in every theme; the page below
+// it is paper unless a section says otherwise. The footer is a cover band with
+// the license line and the tri-color stripe. Theme choice is stored under
+// Starlight's localStorage key, so a reader who picks dark in the docs gets
+// dark here too.
+import "@fontsource-variable/jetbrains-mono";
+import "@fontsource-variable/saira/wdth.css";
 import "../styles/tokens.css";
 import "../styles/marketing.css";
-import "@fontsource-variable/jetbrains-mono";
-import trace from "../assets/engram-trace.svg";
+import TraceMark from "../components/TraceMark.astro";
+import ThemeToggle from "../components/ThemeToggle.astro";
 
 interface Props {
   title: string;
   description: string;
+  /** The landing page runs its own cover hero under the header and its own
+   * Start band above the footer, so it asks the layout to leave both edges open. */
+  landing?: boolean;
 }
-const { title, description } = Astro.props;
+const { title, description, landing = false } = Astro.props;
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 const canonical = new URL(Astro.url.pathname, Astro.site);
 ---
@@ -47,42 +54,41 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
     </script>
   </head>
   <body>
-    <header class="site-header">
-      <div class="container">
-        <a class="wordmark" href={`${base}/`}>
-          <img src={trace.src} alt="" width="26" height="26" />
-          engrams
-        </a>
-        <nav aria-label="Site">
-          <a href={`${base}/docs/`}>Docs</a>
-          <a class="secondary" href={`${base}/compare/`}>Compare</a>
-          <a class="secondary" href={`${base}/architecture/`}>Architecture</a>
-          <a href="https://github.com/cortexapps/engrams">GitHub</a>
-          <button class="theme-toggle" type="button" aria-label="Toggle dark mode" data-theme-toggle>◐</button>
-        </nav>
+    <div class:list={["cover", "masthead", { landing }]}>
+      <div class="layer grid"></div>
+      <div class="layer scan"></div>
+      <div class="wrap">
+        <div class="stripe"><span class="sage"></span><span class="amber"></span><span class="lime"></span><span></span></div>
+        <header class="site-header">
+          <a class="wordmark" href={`${base}/`}><TraceMark />engrams</a>
+          <nav class="site-nav" aria-label="Site">
+            <a class="secondary" href={`${base}/architecture/`}>Architecture</a>
+            <a class="secondary" href={`${base}/compare/`}>Compare</a>
+            <a href={`${base}/docs/`}>Docs</a>
+            <a href="https://github.com/cortexapps/engrams">GitHub</a>
+            <ThemeToggle />
+            <a class="cta-small" href={`${base}/docs/getting-started/local-quickstart/`}>Run it locally</a>
+          </nav>
+        </header>
       </div>
-    </header>
+    </div>
     <main>
       <slot />
     </main>
-    <footer class="site-footer">
-      <div class="container">
-        <span>engrams is free software under the GNU Affero General Public License v3.0.</span>
-        <nav aria-label="Footer">
-          <a href={`${base}/docs/`}>Docs</a>
-          <a href="https://github.com/cortexapps/engrams">Source</a>
-          <a href="https://github.com/cortexapps/engrams/issues">Issues</a>
-        </nav>
+    <footer class:list={["cover", "site-footer", { tight: !landing }]}>
+      {!landing && <div class="layer carbon bg-carbon-fade"></div>}
+      {!landing && <div class="layer scan"></div>}
+      <div class="wrap">
+        <div class="row">
+          <span>engrams · agpl-3.0</span>
+          <nav aria-label="Footer">
+            <a href={`${base}/architecture/`}>Architecture</a>
+            <a href={`${base}/docs/`}>Docs</a>
+            <a href="https://github.com/cortexapps/engrams">GitHub</a>
+          </nav>
+        </div>
+        <div class="stripe"><span class="lime"></span><span class="amber"></span><span class="sage"></span><span></span></div>
       </div>
     </footer>
-    <script is:inline>
-      document.querySelector("[data-theme-toggle]")?.addEventListener("click", () => {
-        const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-        document.documentElement.dataset.theme = next;
-        try {
-          localStorage.setItem("starlight-theme", next);
-        } catch {}
-      });
-    </script>
   </body>
 </html>

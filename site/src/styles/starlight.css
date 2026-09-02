@@ -1,10 +1,11 @@
-/* Map Starlight's theme variables onto the engrams tokens (tokens.css).
+/* The docs skin on Starlight. Same paper as the marketing pages, a bottle-green
+ * top bar and spine, Saira headings, chamfered code blocks on the cover, the
+ * amber NB callout. Lime is never text on paper: text accents use --ring.
  *
  * Starlight's own convention is bare :root = dark and [data-theme='light'] =
  * light. Both blocks are set explicitly here so neither theme inherits a
- * Starlight default hue. The one rule that matters most: --sl-color-text-accent
- * (links) is racing green in light mode and lime in dark mode, because lime is
- * a fill and never light-mode text. */
+ * Starlight default hue. Everything below the variable blocks is unlayered, so
+ * it wins over Starlight's @layer rules without specificity games. */
 
 :root,
 :root[data-theme="light"] {
@@ -26,13 +27,13 @@
   --sl-color-text-accent: var(--ring);
   --sl-color-text-invert: var(--primary-foreground);
   --sl-color-bg: var(--background);
-  --sl-color-bg-nav: var(--card);
-  --sl-color-bg-sidebar: var(--pane);
-  --sl-color-bg-inline-code: var(--secondary);
+  --sl-color-bg-nav: var(--bottle-green);
+  --sl-color-bg-sidebar: var(--bottle-green);
+  --sl-color-bg-inline-code: transparent;
   --sl-color-bg-accent: var(--primary);
   --sl-color-hairline-light: oklch(0.93 0.012 128);
-  --sl-color-hairline: var(--border);
-  --sl-color-hairline-shade: var(--input);
+  --sl-color-hairline: var(--hairline-soft);
+  --sl-color-hairline-shade: var(--hairline-soft);
 
   --sl-color-green: var(--instrument-nominal-ink);
   --sl-color-orange: var(--instrument-caution-ink);
@@ -58,13 +59,13 @@
   --sl-color-text-accent: var(--primary);
   --sl-color-text-invert: var(--primary-foreground);
   --sl-color-bg: var(--background);
-  --sl-color-bg-nav: var(--shell);
-  --sl-color-bg-sidebar: var(--sidebar);
-  --sl-color-bg-inline-code: var(--secondary);
+  --sl-color-bg-nav: var(--bottle-green);
+  --sl-color-bg-sidebar: var(--bottle-green);
+  --sl-color-bg-inline-code: transparent;
   --sl-color-bg-accent: var(--primary);
   --sl-color-hairline-light: oklch(0.9 0.035 125 / 6%);
-  --sl-color-hairline: var(--border);
-  --sl-color-hairline-shade: var(--input);
+  --sl-color-hairline: var(--hairline-soft);
+  --sl-color-hairline-shade: var(--hairline-soft);
 
   --sl-color-green: var(--instrument-nominal-ink);
   --sl-color-orange: var(--instrument-caution-ink);
@@ -74,50 +75,881 @@
 :root {
   --sl-font: var(--font-sans);
   --sl-font-mono: var(--font-mono);
+  --sl-nav-height: 64px;
+  --sl-nav-pad-x: 0px;
+  --sl-nav-pad-y: 0px;
+  --sl-sidebar-width: 280px;
+  --sl-content-width: 760px;
+  --sl-content-pad-x: 64px;
+  --sl-line-height: 1.7;
+  --sl-text-body: 16px;
+  --sl-sidebar-pad-x: 0px;
+  --sl-mobile-toc-height: 3rem;
+  --display: var(--font-display);
 }
 
-/* Graphite corners on the surfaces Starlight draws. */
-.sl-markdown-content pre,
-.starlight-aside,
-.sl-link-button,
-.sl-markdown-content :not(pre) > code,
-.card {
-  border-radius: var(--radius);
+body {
+  -webkit-font-smoothing: antialiased;
+}
+.lime {
+  color: var(--primary);
+}
+.dim {
+  opacity: 0.6;
 }
 
-.sl-markdown-content :not(pre) > code {
-  border-radius: calc(var(--radius) - 6px);
+/* ---- top bar ---- */
+.page > .header {
+  padding: 0;
+  background: var(--bottle-green);
+  color: var(--sage-on-cover);
+  border-bottom: 1px solid color-mix(in oklch, var(--primary) 50%, transparent);
+  box-shadow: 0 0 30px color-mix(in oklch, var(--primary) 15%, transparent);
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+  background-size: 48px 48px;
 }
-
-/* Links in body copy get an underline on hover only; the color already
-   carries the affordance. */
-.sl-markdown-content a:not(.sl-link-button) {
+.hd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 100%;
+  padding-right: 32px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.hd a {
+  color: inherit;
   text-decoration: none;
 }
-.sl-markdown-content a:not(.sl-link-button):hover {
-  text-decoration: underline;
+.hd a:hover {
+  opacity: 0.8;
 }
-
-/* The site title in the header: lowercase wordmark next to the trace. */
-.site-title {
-  font-weight: 600;
-  letter-spacing: -0.01em;
+.hd-left,
+.hd-right {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  min-width: 0;
 }
-.site-nav {
+.hd-right {
+  gap: 20px;
+}
+.hd-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: var(--sl-sidebar-width);
+  height: 100%;
+  padding: 0 28px;
+  border-right: 1px solid rgba(255, 255, 255, 0.15);
+  font-family: var(--display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: 0.18em;
+  flex: none;
+}
+.hd-crumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 28px;
+  white-space: nowrap;
+}
+.hd-links {
+  display: flex;
+  gap: 20px;
+}
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.theme-toggle .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #e8a04a;
+}
+:root[data-theme="dark"] .theme-toggle .dot {
+  background: var(--primary);
+}
+.theme-toggle .when-dark,
+:root[data-theme="dark"] .theme-toggle .when-light {
   display: none;
-  gap: 1.25rem;
-  margin-inline-start: 1.5rem;
-  font-size: var(--sl-text-sm);
 }
-.site-nav a {
-  color: var(--sl-color-gray-2);
-  text-decoration: none;
+:root[data-theme="dark"] .theme-toggle .when-dark {
+  display: inline;
 }
-.site-nav a:hover {
-  color: var(--sl-color-white);
+
+/* Search: the chamfered field in the bar; Starlight's dialog is untouched. */
+site-search button[data-open-modal] {
+  color: var(--sage-on-cover);
+  font-family: var(--font-mono);
+  font-size: 12px;
 }
 @media (min-width: 50rem) {
-  .site-nav {
-    display: flex;
+  site-search button[data-open-modal] {
+    width: 360px;
+    height: 38px;
+    padding: 0 14px;
+    gap: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 0;
+    background: rgba(0, 0, 0, 0.25);
+    clip-path: var(--chamfer-8);
+    color: var(--sage-on-cover);
+    letter-spacing: 0.04em;
   }
+  site-search button[data-open-modal] > span {
+    flex: 1;
+    text-align: left;
+    opacity: 0.6;
+  }
+  site-search button[data-open-modal] > kbd {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 0;
+    padding: 1px 6px;
+    font-size: 10px;
+    color: inherit;
+    font-family: var(--font-mono);
+  }
+  site-search button[data-open-modal] > kbd kbd {
+    color: inherit;
+  }
+  site-search button[data-open-modal] svg {
+    opacity: 0.6;
+  }
+}
+@media (max-width: 1100px) {
+  .hd-links {
+    display: none;
+  }
+  site-search button[data-open-modal] {
+    width: 240px;
+  }
+}
+@media (max-width: 50rem) {
+  .hd {
+    padding-right: 72px;
+  }
+  .hd-brand {
+    width: auto;
+    border-right: 0;
+    padding: 0 16px;
+    font-size: 18px;
+  }
+  .hd-crumb {
+    display: none;
+  }
+  .hd-right {
+    gap: 8px;
+  }
+  .theme-toggle .when-light,
+  .theme-toggle .when-dark {
+    display: none !important;
+  }
+}
+starlight-menu-button button {
+  background: var(--primary) !important;
+  color: var(--primary-foreground) !important;
+  box-shadow: none;
+  border-radius: 0;
+}
+
+/* ---- sidebar spine ---- */
+.sidebar-pane {
+  border-inline-end: 0 !important;
+  color: var(--sage-on-cover);
+}
+.sidebar-content {
+  position: relative;
+  padding: 28px 0 48px !important;
+  gap: 0 !important;
+}
+.sb-carbon {
+  position: absolute;
+  inset: 0;
+  opacity: 0.45;
+  pointer-events: none;
+}
+.sidebar-content > * {
+  position: relative;
+}
+.sidebar-content ul {
+  --sl-sidebar-item-padding-inline: 0;
+}
+.sidebar-content ul ul li {
+  margin-inline-start: 0;
+  border-inline-start: 0;
+  padding-inline-start: 0;
+}
+.sidebar-content .top-level > li + li {
+  margin-top: 22px;
+}
+.sidebar-content summary {
+  padding: 0 28px 10px;
+  gap: 10px;
+}
+.sidebar-content .group-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+}
+.sidebar-content .group-label .large {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-weight: 400;
+  color: var(--sage-on-cover);
+  opacity: 0.6;
+}
+.sidebar-content .group-label::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.15);
+}
+.sidebar-content .caret {
+  color: var(--sage-on-cover);
+  opacity: 0.45;
+}
+.sidebar-content a {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 28px 7px 26px;
+  font-size: 14px !important;
+  line-height: 1.4;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+  color: var(--sage-on-cover);
+  font-weight: 400 !important;
+}
+.sidebar-content a:hover,
+.sidebar-content a:focus {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--sage-on-cover);
+}
+.sidebar-content a[aria-current="page"],
+.sidebar-content a[aria-current="page"]:hover,
+.sidebar-content a[aria-current="page"]:focus {
+  border-left-color: var(--primary);
+  color: var(--primary);
+  background: rgba(255, 255, 255, 0.06);
+  font-weight: 400;
+}
+.sb-note {
+  margin: 12px 28px 0;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  clip-path: var(--chamfer-10);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  letter-spacing: 0.04em;
+  opacity: 0.85;
+}
+.sb-note .dim {
+  opacity: 0.8;
+}
+/* The mobile menu footer (theme + social) is redundant with the top bar. */
+.sidebar-content .md\:sl-hidden {
+  display: none;
+}
+
+/* ---- article masthead ---- */
+.doc-masthead h1,
+.doc-hero h1 {
+  font-family: var(--display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 56px;
+  line-height: 0.95;
+  text-transform: uppercase;
+  color: var(--foreground);
+  margin-top: 20px;
+  text-wrap: balance;
+}
+.doc-crumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+.doc-crumb a {
+  color: inherit;
+  text-decoration: none;
+}
+.doc-crumb .here {
+  color: var(--foreground);
+}
+.doc-desc {
+  font-size: 18px;
+  line-height: 1.55;
+  margin-top: 20px;
+  opacity: 0.85;
+}
+.doc-meta {
+  display: flex;
+  gap: 16px;
+  margin-top: 20px;
+  padding: 12px 0;
+  border-top: 1px solid var(--hairline-soft);
+  border-bottom: 1px solid var(--hairline-soft);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+.doc-meta .edit {
+  margin-left: auto;
+  color: var(--ring);
+  text-decoration: none;
+}
+.doc-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.pulse {
+  width: 8px;
+  height: 8px;
+  background: var(--primary);
+  animation: pulse 2s infinite;
+}
+.doc-hero {
+  padding-top: 24px;
+}
+.doc-hero h1 {
+  font-size: 72px;
+  line-height: 0.92;
+  max-width: 760px;
+}
+.doc-lede {
+  font-size: 18px;
+  line-height: 1.55;
+  margin-top: 24px;
+  max-width: 720px;
+}
+.doc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.sl-markdown-content .doc-actions {
+  margin-top: 0;
+}
+.doc-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 48px;
+  padding: 0 20px;
+  border: 1px solid color-mix(in oklch, var(--foreground) 40%, transparent);
+  font-family: var(--display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--foreground);
+  text-decoration: none;
+}
+.doc-btn:hover {
+  background: color-mix(in oklch, var(--foreground) 6%, transparent);
+}
+.doc-btn.primary {
+  border: 0;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  box-shadow: var(--glow-cta);
+  clip-path: var(--chamfer-10);
+}
+.doc-btn.primary:hover {
+  background: var(--primary);
+  box-shadow: var(--glow-cta-hover);
+}
+.doc-sec-head {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  margin-top: 48px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+.doc-sec-head .badge {
+  border: 1px solid var(--primary);
+  padding: 2px 10px;
+  box-shadow: 0 0 12px color-mix(in oklch, var(--primary) 35%, transparent);
+}
+.doc-sec-head .rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--primary), transparent 70%);
+}
+.hud-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+.sl-markdown-content .hud-grid {
+  margin-top: 28px;
+}
+.hud-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 24px 22px 20px;
+  min-height: 190px;
+  border: 1px solid var(--hairline);
+  clip-path: var(--chamfer-12);
+  background: var(--wash);
+  transition: all 0.2s;
+  color: var(--foreground);
+  text-decoration: none;
+}
+.hud-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 0 0 1px var(--lime-50), 0 0 40px var(--lime-18);
+}
+.hud-card .rail {
+  position: absolute;
+  top: 0;
+  left: 12px;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--primary), transparent);
+  box-shadow: 0 0 10px var(--primary);
+}
+.hud-card .kicker {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+.sl-markdown-content .hud-card h3 {
+  font-family: var(--display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 22px;
+  line-height: 1;
+  text-transform: uppercase;
+  margin-top: 18px;
+  color: var(--foreground);
+}
+.sl-markdown-content .hud-card p {
+  font-size: 14px;
+  line-height: 1.5;
+  margin-top: 10px;
+  flex: 1;
+  opacity: 0.85;
+}
+.hud-card .open {
+  margin-top: 16px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ring);
+}
+@media (max-width: 1100px) {
+  .hud-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+@media (max-width: 640px) {
+  .hud-grid {
+    grid-template-columns: 1fr;
+  }
+  .doc-hero h1,
+  .doc-masthead h1 {
+    font-size: 40px;
+  }
+}
+/* The content panels: the hero's hairline is the panel divider. */
+.content-panel {
+  padding-top: 24px;
+}
+.content-panel + .content-panel {
+  border-top: 1px solid var(--hairline-soft);
+}
+
+/* ---- body copy ---- */
+.sl-markdown-content {
+  font-size: 16px;
+  line-height: 1.7;
+}
+.sl-markdown-content h2 {
+  font-family: var(--display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 28px;
+  line-height: 1.1;
+  text-transform: uppercase;
+  margin-top: 56px;
+  padding-top: 24px;
+  border-top: 1px solid var(--hairline-soft);
+  color: var(--foreground);
+}
+.sl-markdown-content h3 {
+  font-family: var(--display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 20px;
+  line-height: 1.15;
+  text-transform: uppercase;
+  color: var(--foreground);
+}
+.sl-markdown-content h4 {
+  font-family: var(--display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 16px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--foreground);
+}
+.sl-markdown-content :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  padding: 1px 6px;
+  border: 1px solid var(--hairline-soft);
+  border-radius: 0;
+  background: transparent;
+  margin-inline: 0;
+}
+.sl-markdown-content a:not(.sl-link-button):not(.doc-btn):not(.hud-card) {
+  color: var(--ring);
+  text-decoration: none;
+  border-bottom: 1px solid var(--ring);
+}
+.sl-markdown-content a:not(.sl-link-button):not(.doc-btn):not(.hud-card):hover {
+  opacity: 0.8;
+}
+.sl-markdown-content strong {
+  font-weight: 600;
+}
+.sl-markdown-content img {
+  border: 1px solid var(--hairline);
+}
+
+/* Tables: hairline rows, mono caps headers. */
+.sl-markdown-content table {
+  font-size: 15px;
+}
+.sl-markdown-content th {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  font-weight: 400;
+  opacity: 0.75;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--hairline);
+  padding: 0 16px 10px 0;
+}
+.sl-markdown-content td {
+  border: 0;
+  border-bottom: 1px solid var(--hairline-soft);
+  padding: 12px 16px 12px 0;
+  vertical-align: top;
+}
+.sl-markdown-content tr:nth-child(2n) {
+  background: transparent;
+}
+.sl-markdown-content td:first-child code,
+.sl-markdown-content td:first-child {
+  color: var(--ring);
+}
+
+/* ---- code blocks: the frame is always on the cover ---- */
+.sl-markdown-content .expressive-code {
+  color: var(--sage-on-cover);
+}
+.expressive-code .frame {
+  clip-path: var(--chamfer-12);
+  position: relative;
+  background: var(--panel-code);
+  border: 1px solid var(--lime-45);
+}
+.expressive-code .frame .header {
+  display: flex !important;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 64px 8px 16px !important;
+  min-height: 33px;
+  border: 0 !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12) !important;
+  background: transparent !important;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--sage-on-cover);
+  opacity: 0.75;
+}
+.expressive-code .frame .header::before,
+.expressive-code .frame .header::after {
+  display: none !important;
+}
+.expressive-code .frame .header .title {
+  background: transparent !important;
+  border: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  color: inherit !important;
+  font: inherit !important;
+  flex: 1;
+}
+.expressive-code .frame .header .title:empty {
+  display: none;
+}
+.expressive-code .frame .header .title::after {
+  display: none !important;
+}
+.expressive-code .frame .header .lang {
+  margin-left: auto;
+}
+.expressive-code .frame.is-terminal .header .title:not(.sr-only) + .sr-only {
+  display: none;
+}
+.expressive-code .frame pre {
+  border: 0 !important;
+  background: var(--panel-code) !important;
+}
+.expressive-code .frame pre > code {
+  font-family: var(--font-mono);
+}
+.expressive-code .copy {
+  position: absolute !important;
+  top: 0 !important;
+  right: 0 !important;
+  inset-inline-end: 0 !important;
+  inset-block-start: 0 !important;
+  height: 33px;
+  width: auto;
+  display: block;
+  padding: 0;
+  margin: 0 !important;
+  z-index: 2;
+}
+.expressive-code .copy > div[aria-live] {
+  position: absolute;
+  right: 16px;
+  top: 33px;
+}
+.expressive-code .copy button {
+  opacity: 1 !important;
+  width: auto !important;
+  height: auto !important;
+  border: 0 !important;
+  background: transparent !important;
+  color: var(--primary) !important;
+  font-family: var(--font-mono) !important;
+  font-size: 10px !important;
+  line-height: 1 !important;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  cursor: pointer;
+  padding: 0 !important;
+  margin: 0 !important;
+  min-width: 0 !important;
+  display: block !important;
+  position: absolute !important;
+  top: 0 !important;
+  right: 16px !important;
+  height: 33px !important;
+  line-height: 33px !important;
+  align-self: auto !important;
+}
+.expressive-code .copy button::before,
+.expressive-code .copy button > div {
+  display: none !important;
+}
+/* EC draws its icon in ::after as an absolutely positioned mask; make that
+   pseudo-element the visible label instead. */
+.expressive-code .copy button::after {
+  content: "copy";
+  position: static !important;
+  inset: auto !important;
+  display: inline !important;
+  line-height: 33px !important;
+  -webkit-mask: none !important;
+  mask: none !important;
+  background: none !important;
+  width: auto !important;
+  height: auto !important;
+}
+.expressive-code .copy .feedback {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+}
+
+/* ---- asides: the NB callout ---- */
+.starlight-aside {
+  display: grid;
+  grid-template-columns: minmax(36px, auto) 1fr;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid color-mix(in oklch, var(--amber) 70%, transparent);
+  border-radius: 0;
+  background: color-mix(in oklch, var(--amber) 8%, transparent);
+  color: var(--foreground);
+  font-size: 14px;
+  line-height: 1.6;
+}
+.starlight-aside__title {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--amber);
+  padding-top: 3px;
+  margin: 0;
+  gap: 0;
+  font-weight: 400;
+  line-height: 1.4;
+}
+.starlight-aside__icon {
+  display: none;
+}
+.starlight-aside__content {
+  margin: 0;
+}
+.starlight-aside--danger {
+  border-color: color-mix(in oklch, var(--instrument-critical) 70%, transparent);
+  background: color-mix(in oklch, var(--instrument-critical) 8%, transparent);
+}
+.starlight-aside--danger .starlight-aside__title {
+  color: var(--instrument-critical-ink);
+}
+.starlight-aside__content a {
+  color: var(--ring) !important;
+}
+
+/* ---- prev / next ---- */
+.pagination-links a {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 18px 20px;
+  border: 1px solid var(--hairline);
+  border-radius: 0;
+  box-shadow: none;
+  clip-path: polygon(12px 0, 100% 0, 100% 100%, 0 100%, 0 12px);
+  color: color-mix(in oklch, var(--foreground) 70%, transparent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  line-height: 1.3;
+}
+.pagination-links a[rel="next"] {
+  align-items: flex-end;
+  text-align: right;
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);
+}
+.pagination-links a:hover {
+  border-color: var(--primary);
+}
+.pagination-links svg {
+  display: none;
+}
+.pagination-links .link-title {
+  display: block;
+  margin-top: 8px;
+  font-family: var(--display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: 0;
+  text-transform: uppercase;
+  color: var(--foreground);
+  line-height: 1.1;
+}
+/* The meta strip carries the edit link; the footer keeps only the pagination. */
+footer .meta {
+  display: none;
+}
+
+/* ---- on this page ---- */
+#starlight__on-this-page {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  opacity: 0.6;
+  font-weight: 400;
+  color: var(--foreground);
+}
+starlight-toc > nav > ul {
+  margin-top: 12px;
+  border-left: 1px solid var(--hairline-soft);
+}
+starlight-toc a {
+  display: block;
+  padding: 6px 14px !important;
+  font-size: 13px;
+  margin-left: -1px;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+  color: color-mix(in oklch, var(--foreground) 65%, transparent);
+  line-height: 1.4;
+}
+starlight-toc a:hover {
+  color: var(--foreground);
+}
+starlight-toc a[aria-current="true"] {
+  border-left-color: var(--primary);
+  color: var(--foreground);
+}
+starlight-toc ul ul a {
+  padding-left: 28px !important;
+}
+mobile-starlight-toc nav {
+  background: var(--background);
+  border-bottom: 1px solid var(--hairline-soft);
+}
+
+/* ---- Starlight cards and link buttons, in case a page uses them ---- */
+.sl-markdown-content .card {
+  border: 1px solid var(--hairline);
+  border-radius: 0;
+  background: var(--wash);
+  clip-path: var(--chamfer-12);
+}
+.sl-link-button {
+  border-radius: 0;
 }

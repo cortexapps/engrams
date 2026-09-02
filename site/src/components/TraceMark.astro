@@ -1,0 +1,14 @@
+---
+// The header's squared-node variant of the trace mark: the path rides
+// currentColor, the entry node is amber, the terminal node is lime.
+interface Props {
+  size?: number;
+}
+const { size = 28 } = Astro.props;
+---
+
+<svg width={size} height={size} viewBox="0 0 100 100" fill="none" aria-hidden="true">
+  <path d="M14 68 L32 50 L50 68 L68 32 L86 50" stroke="currentColor" stroke-width="7" stroke-linecap="square" stroke-linejoin="miter"></path>
+  <rect x="7" y="61" width="14" height="14" fill="var(--amber)"></rect>
+  <rect x="79" y="43" width="14" height="14" fill="var(--primary)"></rect>
+</svg>
