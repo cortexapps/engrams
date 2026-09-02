@@ -1,0 +1,21 @@
+---
+title: engrams documentation
+description: Run AI coding agents in Firecracker microVMs on your own infrastructure.
+tableOfContents: false
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+engrams is a self-hosted orchestrator for AI coding agents. A session is a plain OCI image plus
+an agent harness, booted in a microVM on a host you run, snapshotted when the agent goes idle,
+and restored when the next prompt arrives.
+
+<CardGrid>
+  <LinkCard title="Run engrams locally" description="Start the whole stack on one machine and give an agent its first task." href="getting-started/local-quickstart/" />
+  <LinkCard title="Deploy to your cloud" description="One Terraform apply and two Helm releases on GKE or EKS." href="guides/deploy-overview/" />
+  <LinkCard title="Build a session image" description="Any Linux image with /bin/sh, plus an image config applied at enable time." href="concepts/images-and-harnesses/" />
+  <LinkCard title="CLI reference" description="Every engrams command, its flags, and the JSON output contract." href="reference/cli/" />
+</CardGrid>
+
+If you are reading these docs as an agent, every page is Markdown in the repository under
+`site/src/content/docs/docs/`, and the [source on GitHub](https://github.com/cortexapps/engrams/tree/main/site/src/content/docs/docs) is the same text as this site.
