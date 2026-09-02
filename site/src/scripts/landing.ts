@@ -2,7 +2,7 @@
 // its eight steps, scrolls the run log, rotates the runs board, and fills the
 // chunk field. Under prefers-reduced-motion everything is drawn once, mid-run,
 // and never moves. The marquee, the dashed edges, and the blinks are CSS.
-import { frame, glyph, logs, RUN_START } from "../data/landing-demo";
+import { frame, glyph, logs, RUN_START } from "../landing/demo";
 
 const $ = <T extends Element>(sel: string) => document.querySelector<T>(sel);
 const $$ = <T extends Element>(sel: string) => Array.from(document.querySelectorAll<T>(sel));
