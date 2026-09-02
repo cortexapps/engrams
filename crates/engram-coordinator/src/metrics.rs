@@ -187,12 +187,7 @@ pub fn init(addr: SocketAddr) {
             ::metrics::counter!(GC_SWEEP_TOTAL, "sweep" => sweep, "outcome" => outcome).absolute(0);
         }
         ::metrics::counter!(GC_PROMOTE_ERRORS_TOTAL, "sweep" => sweep).absolute(0);
-        ::metrics::counter!(
-            GC_PROMOTE_SKIPPED_TOTAL,
-            "sweep" => sweep,
-            "reason" => "pin_set_unstable",
-        )
-        .absolute(0);
+        ::metrics::counter!(GC_PIN_SET_UNCONVERGED_TOTAL, "sweep" => sweep).absolute(0);
         ::metrics::counter!(GC_PROMOTED_TOTAL, "sweep" => sweep).absolute(0);
     }
 }
@@ -306,7 +301,20 @@ pub const GC_PROMOTE_ERRORS_TOTAL: &str = "engram_gc_promote_errors_total";
 /// `ENGRAM_CHUNK_GC_PIN_SET_CONCURRENCY` to shorten it). Without this
 /// counter the stall is only a per-sweep warn log, which is exactly how
 /// the 43-day outage stayed invisible.
-pub const GC_PROMOTE_SKIPPED_TOTAL: &str = "engram_gc_promote_skipped_total";
+/// Counter. Pin-set collects that hit the round cap without the ref set
+/// going quiet. Labels: `sweep`.
+///
+/// NOT a failure, and deliberately not a reason to skip a drain: every
+/// ref seen has been fetched, so the set is a valid superset as of the
+/// last read. It measures publish pressure — a sustained rate means the
+/// fleet writes manifests faster than the collect converges, and
+/// `pin_set_concurrency` wants raising.
+///
+/// This replaces `engram_gc_promote_skipped_total`, which counted drains
+/// abandoned because `chunk_generation` (a lossy proxy for "did the pin
+/// set change") kept moving. That cost 43% of sweeps in prod for no
+/// safety gain.
+pub const GC_PIN_SET_UNCONVERGED_TOTAL: &str = "engram_gc_pin_set_unconverged_total";
 /// Counter. Expired candidates found RE-PINNED at delete time and
 /// skipped. Labels: `sweep`. The durability guard firing. A low rate is
 /// healthy (content-addressed chunks legitimately re-enter manifests);

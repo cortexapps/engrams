@@ -440,8 +440,7 @@ async fn run_mark_pass(
     let deadline = clock.now_mono() + cfg.mark_budget;
 
     let gen_before = meta.chunk_generation().await?;
-    let pin_set =
-        PinSet::collect_with_concurrency(meta, chunk_store, cfg.pin_set_concurrency).await?;
+    let pin_set = collect_pin_set(meta, chunk_store, cfg).await?;
     report.pin_set_size = pin_set.len();
 
     // Walk the key space in hash-prefix shards, resuming at the cursor.
@@ -627,16 +626,8 @@ async fn promote_expired(
     // batch. This is the mark pass's barrier applied to promote: it keeps
     // the freshness guarantee of a per-batch collect without paying for a
     // full manifest fan-out on every page.
-    let Some((mut pin_set, mut pin_gen)) = collect_pin_set_at_generation(
-        meta,
-        chunk_store,
-        cfg.max_restart_attempts,
-        cfg.pin_set_concurrency,
-    )
-    .await?
-    else {
-        return Ok((0, 0, 0));
-    };
+    let mut pin_set = collect_pin_set(meta, chunk_store, cfg).await?;
+    let mut pin_gen = meta.chunk_generation().await?;
     let mut pin_refreshes = 0usize;
 
     loop {
@@ -676,18 +667,8 @@ async fn promote_expired(
         // only genuinely-unpinned chunks get their blob deleted.
         let gen_now = meta.chunk_generation().await?;
         if gen_now != pin_gen {
-            let Some((fresh, fresh_gen)) = collect_pin_set_at_generation(
-                meta,
-                chunk_store,
-                cfg.max_restart_attempts,
-                cfg.pin_set_concurrency,
-            )
-            .await?
-            else {
-                break;
-            };
-            pin_set = fresh;
-            pin_gen = fresh_gen;
+            pin_set = collect_pin_set(meta, chunk_store, cfg).await?;
+            pin_gen = meta.chunk_generation().await?;
             pin_refreshes += 1;
         }
 
@@ -736,51 +717,50 @@ async fn promote_expired(
     Ok((deleted, repinned, errors))
 }
 
-/// Collect a pin set that is PROVABLY current, with the generation it is
-/// current as of. `Ok(None)` means it could not be proven within
-/// `max_attempts` — the caller must not delete on the result.
+/// Collect a pin set for the promote pass.
 ///
-/// The bracket is load-bearing, not defensive. `PinSet::collect` is NOT
-/// atomic: `collect_manifest_refs` runs seven separate un-transacted list
-/// queries and then fans out manifest fetches over a wall-clock window. A
-/// manifest that commits DURING that window can be absent from the
-/// collected set — its ref was never in the fixed `refs` list — while a
-/// generation read taken AFTER the collect already reflects the bump. Read
-/// that way, "generation unchanged" would then be trusted for the whole
-/// drain even though the set is torn, and a live re-pinned chunk would have
-/// its blob deleted: the wedged-session 404 the promote re-check exists to
-/// prevent. Reading the generation BEFORE and AFTER, and retrying when it
-/// moved, is what makes "unchanged" actually mean "the set is current".
+/// Delegates to [`PinSet::collect_converging`], which converges on the
+/// REF SET instead of on `chunk_generation`. The old bracket retried
+/// whenever the generation moved, but the generation ticks on every
+/// flush / enable_image / record_snapshot — most of which cannot change
+/// the pin set — so it fired constantly, and each false positive cost a
+/// full ~4 GB manifest re-fetch. In prod 43% of sweeps exhausted the
+/// budget and skipped their drain outright (2026-09-01).
 ///
-/// On exhaustion the promote pass STOPS rather than deleting against an
-/// unverified set. Skipping a drain costs one tick of backlog; deleting a
-/// live chunk wedges a session.
-async fn collect_pin_set_at_generation(
+/// A ref is `(manifest_id, version)`, so re-reading the ref set detects
+/// exactly the publishes that matter, for seven cheap SQL queries. The
+/// result is a superset of the live pin set, which is the safe direction
+/// for both passes.
+///
+/// There is deliberately NO skip path any more. A non-converged collect
+/// has still fetched every ref it saw, so the set remains valid as of
+/// the last read — declining to drain would forfeit reclamation for no
+/// safety gain.
+async fn collect_pin_set(
     meta: &dyn MetadataStore,
     chunk_store: &ChunkStore,
-    max_attempts: u32,
-    concurrency: usize,
-) -> Result<Option<(PinSet, u64)>, GcError> {
-    for _ in 0..max_attempts.max(1) {
-        let before = meta.chunk_generation().await?;
-        let pin_set = PinSet::collect_with_concurrency(meta, chunk_store, concurrency).await?;
-        let after = meta.chunk_generation().await?;
-        if before == after {
-            return Ok(Some((pin_set, after)));
-        }
-    }
-    ::metrics::counter!(
-        crate::metrics::GC_PROMOTE_SKIPPED_TOTAL,
-        "sweep" => "chunk",
-        "reason" => "pin_set_unstable",
+    cfg: &ChunkGcConfig,
+) -> Result<PinSet, GcError> {
+    let collected = PinSet::collect_converging(
+        meta,
+        chunk_store,
+        cfg.pin_set_concurrency,
+        cfg.max_restart_attempts as usize,
     )
-    .increment(1);
-    tracing::warn!(
-        max_attempts,
-        "chunk-gc promote: pin set kept moving under collect; skipping the drain this sweep \
-         rather than deleting against an unverified set"
-    );
-    Ok(None)
+    .await?;
+    if !collected.converged {
+        ::metrics::counter!(
+            crate::metrics::GC_PIN_SET_UNCONVERGED_TOTAL,
+            "sweep" => "chunk",
+        )
+        .increment(1);
+        tracing::info!(
+            rounds = collected.rounds,
+            "chunk-gc: ref set still moving at the round cap; the pin set is a valid superset \
+             as of the last read, so the drain proceeds"
+        );
+    }
+    Ok(collected.pin_set)
 }
 
 /// Delete one batch of expired candidates, up to `concurrency` deletes in
