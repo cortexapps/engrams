@@ -23,5 +23,5 @@ at `/`.
 A custom domain is `SITE_URL=https://<domain>` plus a `public/CNAME` file.
 
 Docs pages are hand-written Markdown under `src/content/docs/docs/`, one directory per sidebar
-section. Read `STYLE.md` before writing one. The site never cites decision records or
-internal infrastructure, and `pnpm lint` fails the build if a page does.
+section. The site never cites decision records or internal infrastructure, and `pnpm lint`
+fails the build if a page does.

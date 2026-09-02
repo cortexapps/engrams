@@ -12,7 +12,7 @@ import { extname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const SCAN = ["src", "public", "astro.config.mjs", "README.md", "STYLE.md"];
+const SCAN = ["src", "public", "astro.config.mjs", "README.md"];
 const TEXT = new Set([
   ".md", ".mdx", ".astro", ".ts", ".mjs", ".js", ".css", ".json", ".svg", ".txt", ".yml", ".yaml", ".html",
 ]);
@@ -45,16 +45,14 @@ const RULES = [
   {
     id: "ai-tell",
     re: new RegExp(`\\b(?:${AI_TELL_WORDS.map(escape).join("|")})\\b`, "gi"),
-    why: "reads as machine-written; see STYLE.md",
+    why: "reads as machine-written",
     prose: true,
-    skipFiles: new Set(["STYLE.md"]),
   },
   {
     id: "ai-tell",
     re: new RegExp(`(?:${AI_TELL_FRAMES.map(escape).join("|")})`, "g"),
-    why: "reads as machine-written; see STYLE.md",
+    why: "reads as machine-written",
     prose: true,
-    skipFiles: new Set(["STYLE.md"]),
   },
 ];
 const ALLOW = /leak-ok:\s*\S/;

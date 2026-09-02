@@ -44,7 +44,7 @@ layer: how to build, test, and the conventions we hold.
 Prefer `nix develop` for the toolchain (pinned via `rust-toolchain.toml` + `flake.nix`:
 rust, just, tilt, nextest, hakari, sqlx-cli, protobuf, node/pnpm, musl cross). `web/`
 is pnpm; `orchestrator/` is bun; `site/` (the public docs + landing page, Astro +
-Starlight, `just site`) is pnpm. Read `site/STYLE.md` before writing site or README prose.
+Starlight, `just site`) is pnpm.
 
 ## Sandbox backends
 
