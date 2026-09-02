@@ -77,7 +77,11 @@ and mounts into the VM at boot, alongside the in-guest daemon and the skills. Yo
 contains it, so a new agent version rolls out to the whole fleet without a rebuild, and one
 image can run under different harnesses.
 
-Two harnesses ship.
+Two harnesses ship, and Settings → Harnesses shows them with their models, effort levels, and
+credential status. [Bring your own harness](../../guides/custom-harness/) is the contract for
+registering a third.
+
+![The Harnesses page: Claude Code and Codex with their models, effort levels, and org credentials](../../../../assets/screenshots/harnesses.png)
 
 **Claude Code** runs Anthropic's agent. It offers the Opus, Sonnet, and Haiku models, a Build
 mode and a Plan mode, and three effort levels that map to the agent's thinking budget. For

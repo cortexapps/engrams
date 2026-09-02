@@ -28,14 +28,25 @@ and mounts it into the VM at boot, so upgrading the agent does not mean rebuildi
 A **profile** is an admin-curated bundle of session settings: the image, the repositories to
 clone, environment variables, the egress policy, which integrations the agent may use, and
 which skills and session apps it gets. Profiles are how an organization hands developers a
-known-good configuration.
+known-good configuration. The profile editor shows, beside the form, exactly what a session
+launched from it is granted: the image, the powers, the hosts it can reach, and how each
+credential is delivered.
+
+![The profile editor, with the session policy panel listing powers, reachable hosts, and credentials](../../../../assets/screenshots/profile-editor.png)
 
 A **task** is one unit of agent work. It starts from a profile, gets a prompt, and owns one or
 more sessions. Tasks are what you see in the dashboard, in a Slack thread, and in
 `engrams task list`.
 
+An **automation** is a trigger, a tree of blocks, and typed inputs. It starts sessions in
+response to a schedule, a Slack mention, a pull request, a Linear issue, or a webhook, and
+every run keeps a step-by-step record. Pull request review and the Slack thread brain ship
+as automations. [Automations](../../concepts/automations/) has the whole model.
+
 A **host** is a Linux machine with KVM that runs microVMs. Hosts dial the coordinator, report
 their capacity, and receive sessions. Hosts never need an inbound port.
+
+![The Start a task composer: a prompt, a profile, and the harness, route, model, and effort pickers](../../../../assets/screenshots/start-a-task.png)
 
 ## The life of a session
 
