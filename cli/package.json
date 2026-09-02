@@ -2,6 +2,7 @@
   "name": "engrams-cli",
   "version": "0.1.0",
   "private": true,
+  "license": "AGPL-3.0-only",
   "description": "The engrams product CLI. Talks to the orchestrator's Connect RPC surface (never the coordinator).",
   "type": "module",
   "bin": {
