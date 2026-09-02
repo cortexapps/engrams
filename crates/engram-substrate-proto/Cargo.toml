@@ -2,6 +2,8 @@
 name = "engram-substrate-proto"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
+repository.workspace = true
 
 # ADR 0075: the populate protocol between the chunk-cache WRITER (the
 # host-agent — later engram-substrated, ADR 0076) and its read-only
