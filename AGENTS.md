@@ -43,7 +43,8 @@ layer: how to build, test, and the conventions we hold.
 
 Prefer `nix develop` for the toolchain (pinned via `rust-toolchain.toml` + `flake.nix`:
 rust, just, tilt, nextest, hakari, sqlx-cli, protobuf, node/pnpm, musl cross). `web/`
-is pnpm; `orchestrator/` is bun.
+is pnpm; `orchestrator/` is bun; `site/` (the public docs + landing page, Astro +
+Starlight, `just site`) is pnpm. Read `site/STYLE.md` before writing site or README prose.
 
 ## Sandbox backends
 
@@ -110,6 +111,9 @@ the final full-repository result.
 
 - **Docs only**: run `git diff --check`. Run a document-specific formatter or validator
   when the changed format has one.
+- **Site only**: from `site/`, run `pnpm build` (the leak + style lint, `astro check`, and
+  the build). The site never cites decision records or internal hosts; the lint fails if
+  it does.
 - **Web only**: from `web/`, run `pnpm format:check`, `pnpm lint`, focused `pnpm test`
   targets, and `pnpm build`.
 - **Orchestrator only**: from `orchestrator/`, run `bun run typecheck` and the focused
