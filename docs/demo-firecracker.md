@@ -1,4 +1,4 @@
-# Engram demo runbook — real Firecracker on the GCE dev VM
+# engrams demo runbook — real Firecracker on the GCE dev VM
 
 Sister to `docs/demo.md`, but this one runs against a real
 microVM through `engram-sandbox-firecracker` on the
@@ -171,7 +171,7 @@ curl -s -X POST http://localhost:8090/sessions/$SID/prompt \
    without the kernel arg the kernel tried to boot debian's systemd
    (which we don't ship), the VM hung in early init, and exec timed
    out. The FC backend now ends boot args with `init=/sbin/engram-init`
-   so any Engram image launches the agent automatically.
+   so any engrams image launches the agent automatically.
 
 3. **`exec_stream` raced against guest boot.** The agent inside
    the guest takes a couple of seconds to bind on vsock 1024;

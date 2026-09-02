@@ -1,6 +1,6 @@
-# Engram — Design
+# engrams — Design
 
-A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. Engram orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: chunked-OCI rootfs + canonical-memory restore (sub-second cold start without pre-warming), FC snapshot lifecycle (UFFD-backed hot resume), multi-host scheduling, chunked-immutable content-addressed durability, and a pluggable cloud abstraction. A subprocess-based dev backend lets the entire orchestration layer run on macOS for fastest-possible iteration; an Apple Silicon backend drives Apple's Virtualization.framework for real microVM isolation locally. Production isolation is always Firecracker.
+A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. engrams orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: chunked-OCI rootfs + canonical-memory restore (sub-second cold start without pre-warming), FC snapshot lifecycle (UFFD-backed hot resume), multi-host scheduling, chunked-immutable content-addressed durability, and a pluggable cloud abstraction. A subprocess-based dev backend lets the entire orchestration layer run on macOS for fastest-possible iteration; an Apple Silicon backend drives Apple's Virtualization.framework for real microVM isolation locally. Production isolation is always Firecracker.
 
 > This file is the **design** layer — architecture, traits, components,
 > rationale. The chronological "what shipped when" log lives in
@@ -56,9 +56,9 @@ A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. Engram
 
 We want a Modal-style sandbox-as-a-service for AI coding agents (think Stripe's Minions, Ramp's Inspect) — but **open-source and self-hostable**, so any organization can run their own without vendor lock-in.
 
-The unsolved gap: existing open-source primitives (Firecracker, Cloud Hypervisor, libkrun, E2B's infra repo) give you per-VM mechanics. Nobody ships the **orchestration layer above the VM** in a clean, portable way: chunked-OCI image distribution, snapshot tiering, multi-host scheduling, cloud-backend abstraction, host-loss-tolerant eviction handling. Engram fills that gap, on top of Firecracker.
+The unsolved gap: existing open-source primitives (Firecracker, Cloud Hypervisor, libkrun, E2B's infra repo) give you per-VM mechanics. Nobody ships the **orchestration layer above the VM** in a clean, portable way: chunked-OCI image distribution, snapshot tiering, multi-host scheduling, cloud-backend abstraction, host-loss-tolerant eviction handling. engrams fills that gap, on top of Firecracker.
 
-Cortex (our org) runs on GCP. Other adopters will run on AWS, Hetzner, k8s, or bare metal. Engram is built **GCP-first but cloud-agnostic**: all cloud-specific surfaces live behind traits with stub implementations for non-GCP backends shipped from day one.
+Cortex (our org) runs on GCP. Other adopters will run on AWS, Hetzner, k8s, or bare metal. engrams is built **GCP-first but cloud-agnostic**: all cloud-specific surfaces live behind traits with stub implementations for non-GCP backends shipped from day one.
 
 The architecture comes out of an extended design discussion that explored: Stripe Minions / Ramp Inspect / Modal mechanics, single-box vs multi-host scaling, snapshot lifecycle, K8s vs raw VMs, spot tolerance, and graceful failure. This document captures the conclusions.
 
@@ -73,12 +73,12 @@ The architecture comes out of an extended design discussion that explored: Strip
 5. **Host-loss-tolerant** by default — eviction = forced snapshot + resume elsewhere, not data loss. (The fleet runs on standard nodes; the old spot/preemption drain was removed 2026-07-21.)
 6. **Recoverable from host loss** without losing user work — the cold tier (`BlobStorage`) survives host loss, disk-pressure flushing, and operator drains (ADR 0005). Sessions die only when both snapshot tiers are gone.
 7. **Single-binary single-host** mode for trivial deployment; **multi-host** mode when scale demands.
-8. **Open-source, Apache-2.0**, idiomatic Rust, well-tested, contributable.
+8. **Open-source, AGPL-3.0**, idiomatic Rust, well-tested, contributable.
 
 ## Non-goals
 
-- **Not an agent harness.** Engram hosts sandboxes; the LLM agent runs inside. Out-of-scope to wrap any specific harness (claw-code, OpenCode, Goose, etc.) — Engram exposes a generic execution API.
-- **Not a CDE for humans.** No code-server, no VS Code plugin, no human IDE workflows. Engram is for unattended/programmatic use. Other tools (Coder, DevPod) handle the human case.
+- **Not an agent harness.** engrams hosts sandboxes; the LLM agent runs inside. Out-of-scope to wrap any specific harness (claw-code, OpenCode, Goose, etc.) — engrams exposes a generic execution API.
+- **Not a CDE for humans.** No code-server, no VS Code plugin, no human IDE workflows. engrams is for unattended/programmatic use. Other tools (Coder, DevPod) handle the human case.
 - **No multi-tenancy hardening for untrusted code in v1.** Sandboxes are isolated VMs but we assume tenants are trusted (single-org deployment). True multi-tenant isolation comes later if at all.
 - **No K8s-native integration in v1.** K8s for the control plane is fine (just deploy the binaries as pods); putting microVMs *inside* K8s pods is explicitly out of scope (architectural mismatch covered in design discussion).
 
@@ -86,7 +86,7 @@ The architecture comes out of an extended design discussion that explored: Strip
 
 ## Background (one paragraph)
 
-The Modal/E2B/Ramp pattern: spawn an ephemeral, isolated environment per task; pre-warm a pool so cold starts feel instant; snapshot the FS+memory state when sessions go idle; evict idle sessions from RAM and resume from snapshot when they come back. This pattern is what makes "1000+ unattended PRs/week" economically viable — RAM is the binding constraint, and snapshot-evict is the load-bearing trick that lets you multiplex N×more sessions onto fixed hardware. Engram brings this to open source with a clean architecture.
+The Modal/E2B/Ramp pattern: spawn an ephemeral, isolated environment per task; pre-warm a pool so cold starts feel instant; snapshot the FS+memory state when sessions go idle; evict idle sessions from RAM and resume from snapshot when they come back. This pattern is what makes "1000+ unattended PRs/week" economically viable — RAM is the binding constraint, and snapshot-evict is the load-bearing trick that lets you multiplex N×more sessions onto fixed hardware. engrams brings this to open source with a clean architecture.
 
 ---
 
@@ -94,7 +94,7 @@ The Modal/E2B/Ramp pattern: spawn an ephemeral, isolated environment per task; p
 
 ```
                   ┌──────────────────────────────┐
-                  │   Engram Coordinator (axum)  │
+                  │   engrams Coordinator (axum)  │
                   │   - HTTP API + SSE bus       │
                   │   - Scheduler / host registry│
                   │   - Idle evictor             │
@@ -585,7 +585,7 @@ engram/
 ├── Cargo.toml                         # workspace root
 ├── README.md
 ├── DESIGN.md                          # this doc, edited as design evolves
-├── LICENSE                            # Apache 2.0
+├── LICENSE                            # AGPL-3.0
 ├── .github/
 │   └── workflows/                     # CI: fmt, clippy, test, build
 ├── docker/
@@ -712,9 +712,9 @@ There is **no `engram.toml`** (retired with ADR 0080). Runtime config lives out-
 - **The OCI image is portable** — the same artifact runs as a container too (great for CI, debugging); the host-side materializer converts it to a chunked ext4 rootfs for Firecracker production (ADR 0080).
 - **Convergence with the field** — Modal, AWS App Runner, Cloud Run, Fly Machines all work this way. There's a reason: container images are the unit of deployable code in 2026.
 
-A small set of Dockerfile concepts don't translate cleanly to a microVM rootfs, and Engram maps them as follows:
+A small set of Dockerfile concepts don't translate cleanly to a microVM rootfs, and engrams maps them as follows:
 
-| Dockerfile directive | In Engram |
+| Dockerfile directive | In engrams |
 |---|---|
 | `FROM`, `RUN`, `COPY`, `ADD`, `ENV` | Honored as-is — they shape the rootfs. |
 | `CMD`, `ENTRYPOINT` | **Ignored.** The kernel boots, init starts `engram-agentd`, agentd waits for exec RPCs. The user's `CMD` would be a process they start via exec, not the entrypoint. |
@@ -862,7 +862,7 @@ Where do warm images live? Options: GCS bucket of OCI tarballs, local Docker reg
 
 ### Open Q — eager-clone trick
 
-Ramp's "agents start git-fetching as user types" optimization. Mostly an agent-harness concern, but Engram should expose hooks for it (e.g., `POST /sessions/:id/prefetch` that pulls in flight). Defer to post-v1.
+Ramp's "agents start git-fetching as user types" optimization. Mostly an agent-harness concern, but engrams should expose hooks for it (e.g., `POST /sessions/:id/prefetch` that pulls in flight). Defer to post-v1.
 
 ---
 
@@ -959,4 +959,4 @@ The pieces that load-bear the Phase 1+2 surface, for new contributors finding th
 - **Coordinator**: stateless service that schedules sessions onto hosts.
 - **Host agent**: per-VM-host daemon managing pool, snapshots, resources.
 - **engram-agentd**: small in-guest daemon (Phase 2) that listens on vsock and proxies exec / stdin / stdout. Required because Firecracker has no native exec primitive.
-- **Engram**: a stored memory trace. In our system: a persisted session state (snapshot + Postgres history).
+- **engram**: a stored memory trace. In our system: a persisted session state (snapshot + Postgres history).

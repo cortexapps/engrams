@@ -1,4 +1,4 @@
-# Engram demo runbook
+# engrams demo runbook
 
 A 5-minute walkthrough that exercises every Phase 4 surface
 end-to-end on macOS using `ProcessBackend` + the `engram-harness-noop`

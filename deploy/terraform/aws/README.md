@@ -1,4 +1,4 @@
-# Engram on AWS — Terraform
+# engrams on AWS — Terraform
 
 The AWS (EKS) deployment surface (ADR 0122), mirroring
 [`../gcp/`](../gcp/README.md): **composable modules + a quickstart

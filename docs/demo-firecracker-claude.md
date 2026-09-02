@@ -1,4 +1,4 @@
-# Engram demo runbook — real Claude Code in Firecracker
+# engrams demo runbook — real Claude Code in Firecracker
 
 Sister to `docs/demo-firecracker.md`. Same FC setup, but the
 auto-spawned harness is the real `claude` CLI instead of the

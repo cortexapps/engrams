@@ -1,6 +1,6 @@
 # Google Cloud connections
 
-Engrams uses Google Workload Identity Federation (WIF). It does not accept a
+engrams uses Google Workload Identity Federation (WIF). It does not accept a
 service-account key and it does not use the deployment VM identity.
 
 ## Requirements
@@ -29,14 +29,14 @@ Common endpoints are `compute.googleapis.com`, `logging.googleapis.com`,
 2. Select **Add connection**.
 3. Enter a connection name, the numeric Google Cloud project number, and the
    target service-account email. Select the Google APIs that sessions may
-   reach. Engrams generates the connection alias and WIF provider resource.
+   reach. engrams generates the connection alias and WIF provider resource.
    Pool and provider IDs remain available under **Advanced settings**.
-4. Create the disabled connection. Engrams opens its dedicated setup page.
+4. Create the disabled connection. engrams opens its dedicated setup page.
 5. Apply either the generated Terraform or `gcloud` configuration from that
    page. The output
    fixes the allowed audience, claim mapping, connection condition, and
    `roles/iam.workloadIdentityUser` principal set.
-6. Select **Test**. Engrams performs both the STS exchange and service-account
+6. Select **Test**. engrams performs both the STS exchange and service-account
    impersonation.
 7. Enable the connection only after the test passes.
 8. Add the connection operations to a profile.
@@ -65,7 +65,7 @@ operations validate their expected path shape. For example:
 /compute/v1/projects/acme-prod/zones/us-central1-a/instances/engram-dev/start
 ```
 
-`logging.entries.list` puts resource names in the request body. Engrams rejects
+`logging.entries.list` puts resource names in the request body. engrams rejects
 profile resource constraints for that operation because the proxy cannot enforce
 them at the path boundary. Use IAM and a dedicated service account instead.
 
@@ -75,7 +75,7 @@ The credential broker records the user, session, immutable profile snapshot,
 connection, service account, and mint outcome. The egress proxy records the
 session, connection credential source, target host, HTTP method, path without
 its query string, and policy outcome. Correlate the records by session and
-connection. Engrams does not record tokens, authorization headers, query
+connection. engrams does not record tokens, authorization headers, query
 strings, or request bodies.
 
 In Google Cloud, enable Data Access audit logs for:
@@ -85,7 +85,7 @@ In Google Cloud, enable Data Access audit logs for:
 - each data API that the connection can call.
 
 Use the WIF subject and connection attribute from the Google audit entry to
-correlate it with the Engrams session and connection audit fields. See Google's
+correlate it with the engrams session and connection audit fields. See Google's
 [product federation guide](https://docs.cloud.google.com/iam/docs/use-workload-identity-federation-to-let-customers-access-their-cloud-resources)
 and [WIF security guidance](https://docs.cloud.google.com/iam/docs/best-practices-for-using-workload-identity-federation).
 

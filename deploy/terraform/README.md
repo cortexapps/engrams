@@ -1,4 +1,4 @@
-# Engram Terraform — pick your cloud
+# engrams Terraform — pick your cloud
 
 - [`gcp/`](gcp/README.md) — GKE. The production-validated deployment.
 - `aws/` — EKS (ADR 0122; lands with the AWS quickstart).
