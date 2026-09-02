@@ -156,7 +156,7 @@ export const extensible = {
       title: "Bring your own connector.",
       body: "Credentials are held by engrams and brokered at the egress proxy, so an agent can call an API without ever holding the key. Define a connector for any service and it is brokered the same way.",
       foot: "23 built in · unlimited custom",
-      href: "guides/connect-slack/",
+      href: "concepts/egress-and-brokering/",
     },
   ],
 };
