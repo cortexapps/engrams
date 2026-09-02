@@ -4,11 +4,12 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "astro dev",
+    "dev": "pnpm gen && astro dev",
     "lint": "node scripts/check-leaks.mjs",
     "check": "astro check",
-    "build": "pnpm lint && astro check && astro build",
-    "preview": "astro preview"
+    "build": "pnpm gen && pnpm lint && astro check && astro build",
+    "preview": "astro preview",
+    "gen": "node scripts/gen-api.mjs"
   },
   "dependencies": {
     "@astrojs/starlight": "^0.41.11",

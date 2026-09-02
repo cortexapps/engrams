@@ -54,6 +54,7 @@ export default defineConfig({
         { label: "Concepts", items: [{ autogenerate: { directory: "docs/concepts" } }] },
         { label: "Guides", items: [{ autogenerate: { directory: "docs/guides" } }] },
         { label: "Reference", items: [{ autogenerate: { directory: "docs/reference" } }] },
+        { label: "API reference", collapsed: true, items: [{ autogenerate: { directory: "docs/api" } }] },
         { label: "Contributing", items: [{ autogenerate: { directory: "docs/contributing" } }] },
       ],
       plugins: [starlightLinksValidator({ errorOnRelativeLinks: false, errorOnLocalLinks: false })],

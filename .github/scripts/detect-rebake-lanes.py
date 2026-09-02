@@ -268,9 +268,10 @@ CI_SELF_PATHS = [".github/workflows/ci.yml",
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
 WEB_PATHS = ["web/", "orchestrator/packages/spec-document/"]
 # The public docs + landing site (site/, Astro + Starlight). Its content is
-# hand-written under site/ and nothing else feeds it, so only its own tree
-# gates the lane; site-deploy.yml publishes it on push to main.
-SITE_PATHS = ["site/"]
+# hand-written under site/; the API reference is generated at build time
+# from the public app protos, so those gate the lane too. site-deploy.yml
+# publishes it on push to main.
+SITE_PATHS = ["site/", "crates/engram-protocol/proto/engram/app/"]
 # The Google credential denylist (ADR 0109) is one checked-in table shared by
 # the Rust egress proxy and the orchestrator's endpoint validator. It lives with
 # the proxy, so a cargo-closure change already runs the Rust lanes — this entry
