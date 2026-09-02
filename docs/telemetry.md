@@ -1,6 +1,6 @@
 # Session telemetry (OTel GenAI → Langfuse or any OTLP collector)
 
-Engrams can export traces of agent sessions — turns, generations (model +
+engrams can export traces of agent sessions — turns, generations (model +
 token usage + cost), and tool calls — to a customer-hosted
 [Langfuse](https://langfuse.com) or to any OpenTelemetry collector. The
 feature is off by default and costs nothing while unset.

@@ -6,7 +6,7 @@ Two intertwined goals that should ship together because they're each meaningless
 
 1. **Production-grade storage substrate**: replace the current `tar+zstd → BlobStorage` cold-tier pipeline with a chunked-immutable-disk-and-memory model. The current path solves "store the state in GCS" but loses the operationally-important properties — fast cross-host migration, low-storage-cost dedup, sub-100ms restore, COW at three levels (disk, memory, session fork). Without these, spot/preemptible hosts aren't viable, rolling deploys trash user state, and per-session cost stays high.
 
-2. **Cloud-agnostic deployment artifacts**: Helm chart for the coordinator, Packer images and Terraform modules for FC hosts, an explicit infrastructure contract that other clouds can satisfy. Today Engram has a working dev stack but zero production deployment artifacts (no `.tf`, no Helm chart, no Packer manifest). The deploy story for the user (Cortex on GCP) needs to be both *real and reusable*.
+2. **Cloud-agnostic deployment artifacts**: Helm chart for the coordinator, Packer images and Terraform modules for FC hosts, an explicit infrastructure contract that other clouds can satisfy. Today engrams has a working dev stack but zero production deployment artifacts (no `.tf`, no Helm chart, no Packer manifest). The deploy story for the user (Cortex on GCP) needs to be both *real and reusable*.
 
 User-stated constraints:
 - **No backwards compatibility.** Delete the tar.zst flush pipeline, the seal-blob-ref machinery, the cold-tier columns on `snapshots`, the disk-pressure detector. Nothing is deployed yet.
@@ -229,7 +229,7 @@ The biggest piece. Replaces `engram-uffd-handler`'s current "read from memory.bi
 1. FC asks for memory file at restore time:
    FC: "give me a fd backing the guest's memory address space"
    
-2. Engram's UFFD handler responds:
+2. engrams's UFFD handler responds:
    - mmap canonical_memory.bin (canonical_base_path) with MAP_PRIVATE
    - This is the FD given to FC
    - host page cache holds canonical once; private pages allocated lazily
@@ -645,7 +645,7 @@ Order chosen so each phase is independently shippable and lower phases never dep
 
 ### Phase 9 — Packer + GCP Terraform
 
-**Goal**: `terraform apply` in `deploy/terraform/gcp/examples/minimal/` produces a working Engram deployment.
+**Goal**: `terraform apply` in `deploy/terraform/gcp/examples/minimal/` produces a working engrams deployment.
 
 **Deliverables**:
 - Packer manifest for GCE FC host image
@@ -724,7 +724,7 @@ Order chosen so each phase is independently shippable and lower phases never dep
 
 **Context** — why the change:
 - ADR 0005's tar.zst cold-tier flush gets the job done but loses operationally important properties: cross-host migration is slow (30s+ per session), spot/preemption windows can't accommodate flush of multi-session hosts, storage cost is N× redundant across similar sessions, memory dedup across VMs is impossible.
-- Production references (AWS Lambda, Replit, Fly.io, AWS Aurora DSQL) have converged on chunked-immutable storage with content-addressed dedup as the right primitive. The published benefits — sub-100ms restore, near-free fork, COW at multiple layers, cross-host portability — are all things Engram needs.
+- Production references (AWS Lambda, Replit, Fly.io, AWS Aurora DSQL) have converged on chunked-immutable storage with content-addressed dedup as the right primitive. The published benefits — sub-100ms restore, near-free fork, COW at multiple layers, cross-host portability — are all things engrams needs.
 
 **Decision**:
 - Sandboxes' disk and memory state both live in a **chunk store**: content-addressed, immutable, in `BlobStorage`. Disk chunks 16 MiB; memory chunks 512 KB. Manifests are versioned, immutable references.

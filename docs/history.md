@@ -1,6 +1,6 @@
 # History — phase chronology
 
-Engram shipped in roughly seven phases between Q1 and Q2 2026. This
+engrams shipped in roughly seven phases between Q1 and Q2 2026. This
 document is the milestone log — what landed in each phase, what
 later ADRs revised, and where the implementation lives today.
 
@@ -109,7 +109,7 @@ zero coordinator-side config.
 protocol.
 
 Originally framed as "git as the workspace durability primitive"
-(ADR 0001) — agents would `git push` checkpoints and Engram would
+(ADR 0001) — agents would `git push` checkpoints and engrams would
 manage the branches. Phase 6 (ADR 0005) retired that framing: git
 is no longer a platform-layer concern. Agents that want to push
 code do it themselves inside the sandbox using credentials mounted

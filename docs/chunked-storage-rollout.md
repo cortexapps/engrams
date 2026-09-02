@@ -523,7 +523,7 @@ verbatim below as the record of what Phase 9 shipped at the time —
 nothing in it is a live pointer.
 
 `deploy/packer/` + `deploy/terraform/gcp/`. The deliberate split:
-own the pieces specific to Engram (chunks bucket, FC host MIG,
+own the pieces specific to engrams (chunks bucket, FC host MIG,
 host image build); defer the well-trodden pieces (GKE cluster,
 Cloud SQL Postgres, Artifact Registry) to Google's published
 modules. Reasoning in `deploy/terraform/gcp/README.md`.
@@ -539,7 +539,7 @@ modules. Reasoning in `deploy/terraform/gcp/README.md`.
   outputs the values the Helm chart's values.yaml needs
   (chunks bucket name, KEK resource path, coordinator SA email).
 - ✅ **Infrastructure contract** in
-  `deploy/terraform/gcp/README.md` — what Engram needs from the
+  `deploy/terraform/gcp/README.md` — what engrams needs from the
   cloud + what operators bring themselves.
 - ⬜ Real `terraform apply` against a live GCP project (have
   validated HCL syntax + module wiring; haven't actually
@@ -850,7 +850,7 @@ cargo test -p engram-protocol --lib codec::tests::encode_decode_round_trips_noti
 
 ### Tier 4 — Productionization on GCP
 
-**Goal**: real users on `cortex.<domain>`, served by Engram on GKE +
+**Goal**: real users on `cortex.<domain>`, served by engrams on GKE +
 a GCE MIG of Firecracker hosts.
 
 **Entry criteria**: Tier 3 green; Tier 3 surfaces any wire-level or

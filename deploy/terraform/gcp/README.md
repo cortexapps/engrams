@@ -1,4 +1,4 @@
-# Engram on GCP — Terraform
+# engrams on GCP — Terraform
 
 The GCP deployment surface (ADR 0122): **composable modules + a
 quickstart root that wires them all**. Use the quickstart for a fresh

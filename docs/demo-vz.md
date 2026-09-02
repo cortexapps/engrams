@@ -1,6 +1,6 @@
 # Demo runbook — Apple Silicon (`engram-sandbox-vz`)
 
-The arm64 sibling of `docs/demo-firecracker-claude.md`. Drives Engram on
+The arm64 sibling of `docs/demo-firecracker-claude.md`. Drives engrams on
 macOS Apple Silicon via Apple's Virtualization.framework instead of
 Firecracker. Same wire surface (vsock UDS at
 `<work_dir>/<sandbox>.vsock_*`), same chat-shaped event stream

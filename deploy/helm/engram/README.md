@@ -1,6 +1,6 @@
 # engram Helm chart
 
-Deploys the Engram coordinator (always) plus an optional nginx web
+Deploys the engrams coordinator (always) plus an optional nginx web
 frontend (default on) to any K8s cluster. The chart is cloud-agnostic
 — cloud-specific bindings (Workload Identity, KMS, LB annotations,
 IAP) live in the `values-*.yaml.example` overlays.
