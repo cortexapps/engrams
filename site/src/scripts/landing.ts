@@ -3,6 +3,7 @@
 // chunk field. Under prefers-reduced-motion everything is drawn once, mid-run,
 // and never moves. The marquee, the dashed edges, and the blinks are CSS.
 import { frame, glyph, logs, RUN_START } from "../landing/demo";
+import { fitAll } from "./fit";
 
 const $ = <T extends Element>(sel: string) => document.querySelector<T>(sel);
 const $$ = <T extends Element>(sel: string) => Array.from(document.querySelectorAll<T>(sel));
@@ -17,8 +18,6 @@ const boardCount = $("[data-board-count]");
 const cells = $$<HTMLElement>("[data-chunk]");
 const sessions = $("[data-sessions]");
 const stored = $("[data-stored]");
-const scale = $<HTMLElement>("[data-graph-scale]");
-const col = $<HTMLElement>("[data-graph-col]");
 
 const pad = (n: number) => String(n).padStart(2, "0");
 const utc = () => {
@@ -86,15 +85,6 @@ function render(tick: number, step: number, run: number) {
   if (stored) stored.textContent = f.stored;
 }
 
-function fit() {
-  if (!scale || !col) return;
-  // The canvas is 720px wide and may spill 48px into the page gutter, as the
-  // design does at 1440. Narrower than that it scales down.
-  const s = Math.min(1, (col.clientWidth + 48) / 720);
-  scale.style.transform = `scale(${s})`;
-  scale.style.height = `${scale.scrollHeight * s}px`;
-}
-
 const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 if (reduced) {
   render(5, 6, RUN_START);
@@ -115,6 +105,4 @@ if (reduced) {
   }, 900);
 }
 void logs;
-fit();
-window.addEventListener("resize", fit);
-document.fonts?.ready.then(fit);
+fitAll();

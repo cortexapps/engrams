@@ -1176,6 +1176,208 @@ code {
   line-height: 1.5;
   overflow: auto;
 }
+/* The architecture diagram: nodes on a deep panel, the same grammar as the
+   hero graph. Fixed 1248×620 canvas, scaled to its column by fit.ts. */
+.arch-wrap {
+  padding: 24px;
+}
+.arch {
+  position: relative;
+  width: 1248px;
+  height: 620px;
+  font-family: var(--font-mono);
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+.arch svg {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  color: var(--sage-on-cover);
+}
+.arch .wire {
+  stroke: rgba(255, 255, 255, 0.45);
+  stroke-width: 1.5;
+}
+.arch .wire.live {
+  stroke: var(--primary);
+  stroke-dasharray: 6 6;
+  animation: dash 1.2s linear infinite;
+}
+.arch text {
+  fill: currentColor;
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+.arch-entry {
+  position: absolute;
+  display: flex;
+  width: 560px;
+  height: 40px;
+}
+.arch-entry span {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.arch-entry span:last-child {
+  margin-right: 0;
+}
+.arch-group {
+  position: absolute;
+  border: 1px dashed rgba(255, 255, 255, 0.22);
+}
+.arch-group span {
+  position: absolute;
+  top: -8px;
+  left: 12px;
+  padding: 0 6px;
+  background: var(--panel-code);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+.arch-node {
+  position: absolute;
+  border: 2px solid var(--sage-on-cover);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+}
+.arch-node.service {
+  border: 1px dashed rgba(255, 255, 255, 0.45);
+  background: rgba(0, 0, 0, 0.2);
+}
+.arch-node.ghost {
+  border-style: dashed;
+  border-color: rgba(255, 255, 255, 0.28);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.6);
+}
+.arch-node .kind {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+.arch-node .name {
+  font-family: var(--font-display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.arch-node .name em {
+  font-family: var(--font-mono);
+  font-style: normal;
+  font-weight: 400;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  opacity: 0.75;
+  margin-left: 14px;
+}
+.arch-node .meta {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+.arch-node.host {
+  justify-content: flex-start;
+}
+.arch-node .vms {
+  display: flex;
+  gap: 10px;
+  margin-top: auto;
+}
+.arch-node .vm {
+  flex: 1;
+  border: 1px solid var(--primary);
+  color: var(--primary);
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  min-height: 40px;
+  justify-content: center;
+}
+.arch-node.ghost .vm {
+  border-color: rgba(255, 255, 255, 0.28);
+  color: inherit;
+  flex: 0 0 120px;
+}
+.arch-node .vm b {
+  font-family: var(--font-display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.arch-node .vm span {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.8;
+}
+.arch-key {
+  position: absolute;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.85;
+}
+.arch-key .k {
+  letter-spacing: 0.18em;
+  opacity: 0.6;
+}
+.arch-key > div:not(.k) {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.arch-key i {
+  width: 22px;
+  height: 12px;
+  flex: none;
+}
+.arch-key i.process {
+  border: 2px solid var(--sage-on-cover);
+  background: rgba(255, 255, 255, 0.06);
+}
+.arch-key i.service {
+  border: 1px dashed rgba(255, 255, 255, 0.45);
+}
+.arch-key i.vm {
+  border: 1px solid var(--primary);
+}
+.arch-key i.wire {
+  height: 0;
+  border-top: 2px dashed var(--primary);
+}
+
 .hairline-table {
   width: 100%;
   border-collapse: collapse;
