@@ -62,6 +62,20 @@ use crate::store::ChunkStore;
 /// operator tuning.
 pub const DEFAULT_COLLECT_CONCURRENCY: usize = 16;
 
+/// Outcome of [`PinSet::collect_converging`].
+#[derive(Debug)]
+pub struct PinSetCollection {
+    /// A superset of the live pin set as of the final ref read.
+    pub pin_set: PinSet,
+    /// Fetch rounds it took. `1` means nothing was published while the
+    /// manifests were being read — the common case.
+    pub rounds: usize,
+    /// Whether the ref set went quiet before `max_rounds`. `false` still
+    /// yields a usable set (see the method docs); it signals publish
+    /// pressure, not an error.
+    pub converged: bool,
+}
+
 /// Errors from [`PinSet::collect`].
 #[derive(Debug)]
 pub enum GcError {
@@ -131,6 +145,115 @@ impl PinSet {
         chunk_store: &ChunkStore,
     ) -> Result<Self, GcError> {
         Self::collect_with_concurrency(meta, chunk_store, DEFAULT_COLLECT_CONCURRENCY).await
+    }
+
+    /// Collect a pin set that is provably complete as of a recent
+    /// instant, by CONVERGING ON THE REF SET rather than on
+    /// `chunk_generation`.
+    ///
+    /// `collect` is not atomic: it runs seven un-transacted list queries
+    /// and then fans out manifest fetches over a wall-clock window, so a
+    /// manifest published mid-collect can be missed. The previous guard
+    /// bracketed the collect between two `chunk_generation` reads and
+    /// retried when it moved.
+    ///
+    /// That used the wrong signal. `chunk_generation` ticks on EVERY
+    /// flush / enable_image / record_snapshot, most of which do not
+    /// change the ref set at all — so it fires constantly, and each false
+    /// positive costs a full re-fetch of every manifest (~4 GB in prod).
+    /// Measured 2026-09-01: 43% of sweeps exhausted the retry budget and
+    /// skipped their drain entirely.
+    ///
+    /// A `ManifestRef` is `(manifest_id, version)`, so a new manifest
+    /// VERSION is a new ref. Re-reading the ref set therefore detects
+    /// exactly the publishes that can affect the pin set, and nothing
+    /// else — and it costs seven cheap SQL queries instead of gigabytes
+    /// of blob reads. Each round fetches only refs not already fetched,
+    /// so convergence is cheap even when it takes several passes.
+    ///
+    /// The result is a SUPERSET of the true pin set as of the final ref
+    /// read. A superset is the safe direction for both callers: the mark
+    /// pass marks fewer chunks and the promote pass deletes fewer, so an
+    /// extra entry costs a little efficiency and never a live chunk.
+    ///
+    /// Hitting `max_rounds` is NOT a failure and never justifies skipping
+    /// a drain: every ref seen up to that point has been fetched, so the
+    /// set is still valid as of the last read. It only means the fleet is
+    /// publishing manifests faster than the walk converges, which is
+    /// worth a metric.
+    ///
+    /// The residual race — a manifest published after the final ref read
+    /// but before a delete — is inherent to any lock-free design and is
+    /// what the promote pass's per-candidate re-check exists to narrow.
+    pub async fn collect_converging(
+        meta: &dyn MetadataStore,
+        chunk_store: &ChunkStore,
+        concurrency: usize,
+        max_rounds: usize,
+    ) -> Result<PinSetCollection, GcError> {
+        let concurrency = concurrency.max(1);
+        let max_rounds = max_rounds.max(1);
+        let mut fetched: HashSet<ManifestRef> = HashSet::new();
+        let mut chunks: HashSet<ChunkHash> = HashSet::new();
+        let mut rounds = 0usize;
+
+        loop {
+            let refs = collect_manifest_refs(meta).await?;
+            let new: Vec<ManifestRef> = refs.difference(&fetched).copied().collect();
+            if new.is_empty() {
+                // The ref set went quiet: nothing was published while we
+                // fetched, so the set is complete as of this read.
+                return Ok(PinSetCollection {
+                    pin_set: Self { chunks },
+                    rounds,
+                    converged: true,
+                });
+            }
+
+            Self::fetch_into(chunk_store, &new, concurrency, &mut chunks).await?;
+            fetched.extend(new);
+            rounds += 1;
+
+            if rounds >= max_rounds {
+                // Everything seen so far HAS been fetched, so the set is
+                // still a valid superset as of the last read — just not
+                // proven quiet. Callers must not treat this as a failure.
+                return Ok(PinSetCollection {
+                    pin_set: Self { chunks },
+                    rounds,
+                    converged: false,
+                });
+            }
+        }
+    }
+
+    /// Fetch `refs` with a bounded fan-out, folding their chunk hashes
+    /// into `chunks`.
+    async fn fetch_into(
+        chunk_store: &ChunkStore,
+        refs: &[ManifestRef],
+        concurrency: usize,
+        chunks: &mut HashSet<ChunkHash>,
+    ) -> Result<(), GcError> {
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let mut fetches = FuturesUnordered::new();
+        for r in refs.iter().copied() {
+            let permit_sem = semaphore.clone();
+            let cs = chunk_store;
+            fetches.push(async move {
+                let _permit = permit_sem
+                    .acquire_owned()
+                    .await
+                    .expect("PinSet semaphore must not be closed");
+                cs.get_manifest(r).await
+            });
+        }
+        while let Some(result) = fetches.next().await {
+            for chunk_ref in result?.chunks {
+                chunks.insert(chunk_ref.hash);
+            }
+        }
+        Ok(())
     }
 
     /// Variant with an explicit concurrency cap for the manifest-
@@ -243,6 +366,12 @@ mod tests {
         // ADR 0022 sources #5 + #6.
         enabled_base_mem: Vec<ManifestRef>,
         enabled_base_disk: Vec<ManifestRef>,
+        /// Refs revealed on LATER reads, modelling manifests published
+        /// while a collect is in flight. Read `k` (0-indexed) returns
+        /// `live` plus `staged[0..k]`, so read 0 sees none of them and
+        /// each subsequent read reveals one more.
+        staged: Vec<ManifestRef>,
+        reads: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -456,7 +585,12 @@ mod tests {
             Ok(self.enabled.clone())
         }
         async fn list_live_session_disk_manifest_ids(&self) -> Result<Vec<ManifestRef>, MetaError> {
-            Ok(self.live.clone())
+            let k = self
+                .reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut out = self.live.clone();
+            out.extend(self.staged.iter().take(k).copied());
+            Ok(out)
         }
         async fn list_recoverable_snapshot_disk_manifests(
             &self,
@@ -648,5 +782,76 @@ mod tests {
             .await
             .expect("collect with concurrency=1");
         assert_eq!(pin_set.len(), 2);
+    }
+
+    /// A quiet ref set converges after one fetch round.
+    #[tokio::test]
+    async fn quiet_ref_set_converges_in_one_round() {
+        let (store, _dir) = fresh_store();
+        let a = seed_manifest(&store, &[b"a", b"b"], ManifestKind::Disk).await;
+        let meta = PinSetMockMeta {
+            live: vec![a],
+            ..Default::default()
+        };
+        let got = PinSet::collect_converging(&meta, &store, 4, 3)
+            .await
+            .expect("collect");
+        assert!(got.converged, "a quiet ref set must converge");
+        assert_eq!(got.rounds, 1, "one fetch round, then a quiet re-read");
+        assert_eq!(got.pin_set.len(), 2);
+    }
+
+    /// A manifest published BETWEEN the fetch and the re-read is picked
+    /// up by the next round. This is the exact race the old
+    /// `chunk_generation` bracket existed to catch — now caught directly,
+    /// at ref granularity, instead of through a lossy proxy.
+    #[tokio::test]
+    async fn ref_published_mid_collect_is_not_missed() {
+        let (store, _dir) = fresh_store();
+        let a = seed_manifest(&store, &[b"a"], ManifestKind::Disk).await;
+        let late = seed_manifest(&store, &[b"late"], ManifestKind::Disk).await;
+        let meta = PinSetMockMeta {
+            live: vec![a],
+            staged: vec![late],
+            ..Default::default()
+        };
+        let got = PinSet::collect_converging(&meta, &store, 4, 4)
+            .await
+            .expect("collect");
+        assert!(got.converged);
+        assert_eq!(got.rounds, 2, "a second round fetched the late ref");
+        assert_eq!(
+            got.pin_set.len(),
+            2,
+            "the mid-collect publish is IN the pin set — missing it is what deletes a live chunk"
+        );
+    }
+
+    /// A ref set that never goes quiet still returns a USABLE superset:
+    /// every ref seen was fetched before the cap. Refusing to drain here
+    /// would forfeit reclamation for no safety gain — which is exactly
+    /// what the old generation bracket did on 43% of prod sweeps.
+    #[tokio::test]
+    async fn unconverged_still_holds_every_ref_it_saw() {
+        let (store, _dir) = fresh_store();
+        let a = seed_manifest(&store, &[b"a"], ManifestKind::Disk).await;
+        let mut staged = Vec::new();
+        for i in 0..8u8 {
+            staged.push(seed_manifest(&store, &[&[b'x', i]], ManifestKind::Disk).await);
+        }
+        let meta = PinSetMockMeta {
+            live: vec![a],
+            staged,
+            ..Default::default()
+        };
+        let got = PinSet::collect_converging(&meta, &store, 4, 2)
+            .await
+            .expect("collect");
+        assert!(!got.converged, "a never-quiet ref set hits the cap");
+        assert_eq!(got.rounds, 2, "stopped at max_rounds");
+        assert!(
+            got.pin_set.len() >= 2,
+            "every ref fetched before the cap is present — not an empty or partial set"
+        );
     }
 }
