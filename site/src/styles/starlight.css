@@ -1,0 +1,123 @@
+/* Map Starlight's theme variables onto the engrams tokens (tokens.css).
+ *
+ * Starlight's own convention is bare :root = dark and [data-theme='light'] =
+ * light. Both blocks are set explicitly here so neither theme inherits a
+ * Starlight default hue. The one rule that matters most: --sl-color-text-accent
+ * (links) is racing green in light mode and lime in dark mode, because lime is
+ * a fill and never light-mode text. */
+
+:root,
+:root[data-theme="light"] {
+  --sl-color-white: var(--foreground);
+  --sl-color-gray-1: var(--secondary-foreground);
+  --sl-color-gray-2: var(--muted-foreground);
+  --sl-color-gray-3: oklch(0.55 0.025 200);
+  --sl-color-gray-4: oklch(0.75 0.02 128);
+  --sl-color-gray-5: var(--border);
+  --sl-color-gray-6: var(--secondary);
+  --sl-color-gray-7: var(--background);
+  --sl-color-black: var(--card);
+
+  --sl-color-accent-low: oklch(0.95 0.06 121);
+  --sl-color-accent: var(--ring);
+  --sl-color-accent-high: oklch(0.35 0.08 140);
+
+  --sl-color-text: var(--foreground);
+  --sl-color-text-accent: var(--ring);
+  --sl-color-text-invert: var(--primary-foreground);
+  --sl-color-bg: var(--background);
+  --sl-color-bg-nav: var(--card);
+  --sl-color-bg-sidebar: var(--pane);
+  --sl-color-bg-inline-code: var(--secondary);
+  --sl-color-bg-accent: var(--primary);
+  --sl-color-hairline-light: oklch(0.93 0.012 128);
+  --sl-color-hairline: var(--border);
+  --sl-color-hairline-shade: var(--input);
+
+  --sl-color-green: var(--instrument-nominal-ink);
+  --sl-color-orange: var(--instrument-caution-ink);
+  --sl-color-red: var(--instrument-critical-ink);
+}
+
+:root[data-theme="dark"] {
+  --sl-color-white: oklch(0.96 0.03 125);
+  --sl-color-gray-1: var(--foreground);
+  --sl-color-gray-2: var(--muted-foreground);
+  --sl-color-gray-3: oklch(0.6 0.03 150);
+  --sl-color-gray-4: oklch(0.4 0.03 200);
+  --sl-color-gray-5: var(--accent);
+  --sl-color-gray-6: var(--card);
+  --sl-color-gray-7: var(--shell);
+  --sl-color-black: var(--background);
+
+  --sl-color-accent-low: oklch(0.3 0.06 130);
+  --sl-color-accent: oklch(0.7 0.16 125);
+  --sl-color-accent-high: var(--primary);
+
+  --sl-color-text: var(--foreground);
+  --sl-color-text-accent: var(--primary);
+  --sl-color-text-invert: var(--primary-foreground);
+  --sl-color-bg: var(--background);
+  --sl-color-bg-nav: var(--shell);
+  --sl-color-bg-sidebar: var(--sidebar);
+  --sl-color-bg-inline-code: var(--secondary);
+  --sl-color-bg-accent: var(--primary);
+  --sl-color-hairline-light: oklch(0.9 0.035 125 / 6%);
+  --sl-color-hairline: var(--border);
+  --sl-color-hairline-shade: var(--input);
+
+  --sl-color-green: var(--instrument-nominal-ink);
+  --sl-color-orange: var(--instrument-caution-ink);
+  --sl-color-red: var(--instrument-critical-ink);
+}
+
+:root {
+  --sl-font: var(--font-sans);
+  --sl-font-mono: var(--font-mono);
+}
+
+/* Graphite corners on the surfaces Starlight draws. */
+.sl-markdown-content pre,
+.starlight-aside,
+.sl-link-button,
+.sl-markdown-content :not(pre) > code,
+.card {
+  border-radius: var(--radius);
+}
+
+.sl-markdown-content :not(pre) > code {
+  border-radius: calc(var(--radius) - 6px);
+}
+
+/* Links in body copy get an underline on hover only; the color already
+   carries the affordance. */
+.sl-markdown-content a:not(.sl-link-button) {
+  text-decoration: none;
+}
+.sl-markdown-content a:not(.sl-link-button):hover {
+  text-decoration: underline;
+}
+
+/* The site title in the header: lowercase wordmark next to the trace. */
+.site-title {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.site-nav {
+  display: none;
+  gap: 1.25rem;
+  margin-inline-start: 1.5rem;
+  font-size: var(--sl-text-sm);
+}
+.site-nav a {
+  color: var(--sl-color-gray-2);
+  text-decoration: none;
+}
+.site-nav a:hover {
+  color: var(--sl-color-white);
+}
+@media (min-width: 50rem) {
+  .site-nav {
+    display: flex;
+  }
+}

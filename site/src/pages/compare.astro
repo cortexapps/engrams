@@ -1,0 +1,123 @@
+---
+import Marketing from "../layouts/Marketing.astro";
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const docs = `${base}/docs`;
+---
+
+<Marketing
+  title="engrams compared"
+  description="How engrams differs from hosted sandbox APIs and from development environments for people."
+>
+  <section class="hero">
+    <div class="container">
+      <h1>Where engrams sits</h1>
+      <p class="lede">
+        Hosted sandbox APIs run the VMs for you. Development-environment products give people a
+        workspace at their editor. engrams is the third thing: sandboxes for agents, on
+        infrastructure you run.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th>engrams</th>
+            <th>Hosted sandbox APIs (E2B, Modal Sandboxes)</th>
+            <th>Development environments (Coder)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Who runs it</td>
+            <td>You, in your cloud or on your hardware.</td>
+            <td>The vendor.</td>
+            <td>You.</td>
+          </tr>
+          <tr>
+            <td>Built for</td>
+            <td>Agents. A person can open a shell or IDE into a session, but the session is the agent's.</td>
+            <td>Agents and code execution, through an SDK.</td>
+            <td>People at their editors.</td>
+          </tr>
+          <tr>
+            <td>Isolation</td>
+            <td>A Firecracker microVM per session, on KVM.</td>
+            <td>A microVM or container per sandbox, vendor-managed.</td>
+            <td>Whatever the workspace template provisions: a VM, a pod, a container.</td>
+          </tr>
+          <tr>
+            <td>Pause and resume</td>
+            <td>Snapshot to content-addressed chunks on idle; restore in under 100 ms on the same host, one to two seconds elsewhere.</td>
+            <td>Pause and resume within the vendor's limits and pricing tiers.</td>
+            <td>Stop and start the workspace; state depends on the template.</td>
+          </tr>
+          <tr>
+            <td>Fork</td>
+            <td>A manifest copy of a few kilobytes; the fork shares every chunk until it writes.</td>
+            <td>Varies by vendor.</td>
+            <td>Not a session concept.</td>
+          </tr>
+          <tr>
+            <td>Agent runtime</td>
+            <td>Claude Code and Codex mounted by the host at boot; never in your image.</td>
+            <td>Bring your own, inside the sandbox.</td>
+            <td>Agents run as workspace processes.</td>
+          </tr>
+          <tr>
+            <td>Your image</td>
+            <td>Any Linux image with <code>/bin/sh</code>, built with <code>docker build</code>.</td>
+            <td>A vendor image format or a Dockerfile, per vendor.</td>
+            <td>A Terraform template.</td>
+          </tr>
+          <tr>
+            <td>Cloud</td>
+            <td>GKE or EKS, GCS or S3, with Terraform and Helm in the repository.</td>
+            <td>The vendor's.</td>
+            <td>Any.</td>
+          </tr>
+          <tr>
+            <td>Product surface</td>
+            <td>Dashboard, tasks and profiles, Slack, pull request review, CLI, API, connectors.</td>
+            <td>SDK and dashboard.</td>
+            <td>Dashboard, templates, CLI, IDE integrations.</td>
+          </tr>
+          <tr>
+            <td>License</td>
+            <td>AGPL-3.0.</td>
+            <td>Proprietary service.</td>
+            <td>AGPL-3.0 with a paid tier.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="section on-pane">
+    <div class="container">
+      <h2>When to pick the others</h2>
+      <p>
+        If you do not want to run infrastructure, a hosted sandbox API is the right call: you
+        get sandboxes in a minute, and you pay per second. engrams asks you for a Kubernetes
+        cluster with a KVM node pool, a Postgres, a bucket, and someone to run them.
+      </p>
+      <p>
+        If the people on your team are the ones who need the environment, at their editors, all
+        day, a development-environment product is built for exactly that. engrams gives a person
+        a shell into an agent's session; it does not give them a workspace.
+      </p>
+      <p>
+        If your hosts cannot run KVM, engrams has no production mode for you. It does not run
+        sessions as containers.
+      </p>
+      <div class="actions">
+        <a class="button primary" href={`${docs}/getting-started/overview/`}>Read what engrams is</a>
+        <a class="button ghost" href={`${base}/architecture/`}>See the architecture</a>
+      </div>
+    </div>
+  </section>
+</Marketing>

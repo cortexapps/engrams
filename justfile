@@ -1154,3 +1154,17 @@ web-install:
 # is wired up yet — the dashboard is a dev-time tool.
 web port='5173': web-install
     cd web && pnpm dev --port {{port}} --strictPort
+
+# ------------------------------------------------------------------
+# The public docs + landing site (site/, Astro + Starlight). `site-build`
+# is the CI `site` lane locally: the leak lint + astro check + astro build.
+# ------------------------------------------------------------------
+
+site-install:
+    cd site && pnpm install
+
+site port='4321': site-install
+    cd site && pnpm dev --port {{port}}
+
+site-build: site-install
+    cd site && pnpm build

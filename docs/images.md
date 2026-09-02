@@ -33,7 +33,7 @@ suggested_memory_mib = 4096
 # Optional warm-capture config (a command run once at enable/rebase time,
 # plus its env + egress). Omit for a cold-boot image.
 [warm]
-command = "pnpm install"
+command = ["pnpm", "install"]
 timeout_secs = 300
 ```
 

@@ -267,6 +267,10 @@ CI_SELF_PATHS = [".github/workflows/ci.yml",
                  ".github/scripts/detect-rebake-lanes.py"]
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
 WEB_PATHS = ["web/", "orchestrator/packages/spec-document/"]
+# The public docs + landing site (site/, Astro + Starlight). Its content is
+# hand-written under site/ and nothing else feeds it, so only its own tree
+# gates the lane; site-deploy.yml publishes it on push to main.
+SITE_PATHS = ["site/"]
 # The Google credential denylist (ADR 0109) is one checked-in table shared by
 # the Rust egress proxy and the orchestrator's endpoint validator. It lives with
 # the proxy, so a cargo-closure change already runs the Rust lanes — this entry
@@ -574,6 +578,8 @@ def main():
     # fmt/validate). Same path set as the bake-side tf_or_helm flag,
     # plus ci_self like every test lane.
     test_deploy = ci_self or tf_or_helm
+    # The site lane: leak lint + astro build, build-only (no deploy on PRs).
+    test_site = ci_self or any_path(changed, SITE_PATHS)
     # ADR 0098 P9: the host-sim swarm — its binary's own release closure.
     test_host_sim = ci_self or bool(cc & host_sim_closure)
     # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
@@ -657,7 +663,7 @@ def main():
           f"test_cli={test_cli} test_buf={test_buf} ci_self={ci_self} proto={proto} "
           f"test_host_sim={test_host_sim} test_cosim={test_cosim} "
           f"test_integrations_cli={test_integrations_cli} "
-          f"test_deploy={test_deploy}",
+          f"test_deploy={test_deploy} test_site={test_site}",
           file=sys.stderr)
     print(f"-> dockerfiles={dockerfiles}", file=sys.stderr)
     print(f"-> images_matrix={images_matrix}", file=sys.stderr)
@@ -694,6 +700,7 @@ def main():
             f.write(f"test_cosim={b(test_cosim)}\n")
             f.write(f"test_integrations_cli={b(test_integrations_cli)}\n")
             f.write(f"test_deploy={b(test_deploy)}\n")
+            f.write(f"test_site={b(test_site)}\n")
             # Per-image bake matrix (JSON array → fromJSON in bake-images.yml).
             f.write(f"images_matrix={json.dumps(images_matrix)}\n")
 

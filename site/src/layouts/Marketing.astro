@@ -1,0 +1,88 @@
+---
+// The layout for the pages outside Starlight: /, /compare/, /architecture/.
+// It shares tokens.css with the docs and honors the same theme choice, stored
+// under Starlight's localStorage key, so a reader who picks dark in the docs
+// gets dark here too.
+import "../styles/tokens.css";
+import "../styles/marketing.css";
+import "@fontsource-variable/jetbrains-mono";
+import trace from "../assets/engram-trace.svg";
+
+interface Props {
+  title: string;
+  description: string;
+}
+const { title, description } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const canonical = new URL(Astro.url.pathname, Astro.site);
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href={`${base}/favicon.ico`} sizes="32x32" />
+    <link rel="icon" href={`${base}/engram-trace.svg`} type="image/svg+xml" />
+    <link rel="apple-touch-icon" href={`${base}/apple-touch-icon.png`} />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonical} />
+    <meta name="theme-color" content="#081A1B" />
+    <script is:inline>
+      // Same key and same fallback as Starlight's ThemeProvider, run before paint.
+      (() => {
+        let stored = null;
+        try {
+          stored = localStorage.getItem("starlight-theme");
+        } catch {}
+        const theme =
+          stored || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+        document.documentElement.dataset.theme = theme === "light" ? "light" : "dark";
+      })();
+    </script>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container">
+        <a class="wordmark" href={`${base}/`}>
+          <img src={trace.src} alt="" width="26" height="26" />
+          engrams
+        </a>
+        <nav aria-label="Site">
+          <a href={`${base}/docs/`}>Docs</a>
+          <a class="secondary" href={`${base}/compare/`}>Compare</a>
+          <a class="secondary" href={`${base}/architecture/`}>Architecture</a>
+          <a href="https://github.com/cortexapps/engrams">GitHub</a>
+          <button class="theme-toggle" type="button" aria-label="Toggle dark mode" data-theme-toggle>◐</button>
+        </nav>
+      </div>
+    </header>
+    <main>
+      <slot />
+    </main>
+    <footer class="site-footer">
+      <div class="container">
+        <span>engrams is free software under the GNU Affero General Public License v3.0.</span>
+        <nav aria-label="Footer">
+          <a href={`${base}/docs/`}>Docs</a>
+          <a href="https://github.com/cortexapps/engrams">Source</a>
+          <a href="https://github.com/cortexapps/engrams/issues">Issues</a>
+        </nav>
+      </div>
+    </footer>
+    <script is:inline>
+      document.querySelector("[data-theme-toggle]")?.addEventListener("click", () => {
+        const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = next;
+        try {
+          localStorage.setItem("starlight-theme", next);
+        } catch {}
+      });
+    </script>
+  </body>
+</html>

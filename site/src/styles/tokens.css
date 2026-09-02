@@ -1,0 +1,96 @@
+/* The engrams palette, ported from web/src/index.css ("the page on the cover").
+ *
+ * The chrome is one continuous bottle-green cover; the work is a celadon sheet
+ * lifted off it. Ink is petrol on paper, pale sage at night. The accent is lime
+ * and it means one thing: this is the action. Lime is a FILL, never light-mode
+ * text (chartreuse on celadon is invisible). Structure is graphite: 12px
+ * corners, one system sans, low-contrast rules. Two fonts, not three: sans for
+ * everything a person reads, mono for machine data.
+ *
+ * Starlight sets data-theme on <html> before first paint; the marketing layout
+ * does the same with the same localStorage key, so one choice carries across
+ * the whole site. Bare :root is the light palette for the no-script case.
+ */
+:root,
+:root[data-theme="light"] {
+  --radius: 0.75rem;
+
+  --background: oklch(0.964 0.013 128);
+  --foreground: oklch(0.301 0.02 206);
+  --card: oklch(0.995 0.005 128);
+  --card-foreground: oklch(0.301 0.02 206);
+  --primary: oklch(0.878 0.181 121);
+  --primary-foreground: oklch(0.22 0.04 150);
+  --secondary: oklch(0.938 0.016 128);
+  --secondary-foreground: oklch(0.33 0.018 206);
+  --muted: oklch(0.94 0.015 128);
+  --muted-foreground: oklch(0.43 0.026 200);
+  --accent: oklch(0.948 0.018 128);
+  --accent-foreground: oklch(0.3 0.018 206);
+  --destructive: oklch(0.52 0.2 27);
+  --border: oklch(0.898 0.013 128);
+  --input: oklch(0.885 0.014 128);
+  --ring: oklch(0.55 0.15 132);
+
+  --shell: oklch(0.315 0.045 190);
+  --pane: oklch(0.934 0.018 128);
+  --sidebar: oklch(0.222 0.038 190);
+  --sidebar-foreground: oklch(0.93 0.03 125);
+  --sidebar-primary: oklch(0.878 0.181 121);
+  --sidebar-primary-foreground: oklch(0.18 0.02 200);
+  --sidebar-accent: oklch(0.378 0.048 190);
+  --sidebar-accent-foreground: oklch(0.96 0.025 120);
+  --sidebar-border: oklch(0.93 0.03 125 / 12%);
+
+  --instrument-nominal: oklch(0.6 0.15 150);
+  --instrument-caution: oklch(0.7 0.155 71);
+  --instrument-critical: oklch(0.55 0.21 27);
+  --instrument-nominal-ink: oklch(0.52 0.14 150);
+  --instrument-caution-ink: oklch(0.5 0.13 71);
+  --instrument-critical-ink: oklch(0.52 0.2 27);
+
+  --mark-terminal: #3a6b5c;
+
+  --font-sans:
+    system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji",
+    "Segoe UI Emoji", sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+:root[data-theme="dark"] {
+  --background: oklch(0.216 0.024 200);
+  --foreground: oklch(0.9 0.035 125);
+  --card: oklch(0.252 0.026 200);
+  --card-foreground: oklch(0.9 0.035 125);
+  --primary: oklch(0.85 0.18 121);
+  --primary-foreground: oklch(0.2 0.03 150);
+  --secondary: oklch(0.278 0.026 200);
+  --secondary-foreground: oklch(0.9 0.035 125);
+  --muted: oklch(0.276 0.026 200);
+  --muted-foreground: oklch(0.752 0.03 125);
+  --accent: oklch(0.3 0.028 200);
+  --accent-foreground: oklch(0.92 0.035 125);
+  --destructive: oklch(0.65 0.2 25);
+  --border: oklch(0.9 0.035 125 / 10%);
+  --input: oklch(0.9 0.035 125 / 14%);
+  --ring: oklch(0.8 0.16 121);
+
+  --shell: oklch(0.185 0.022 200);
+  --pane: oklch(0.205 0.023 200);
+  --sidebar: oklch(0.145 0.02 200);
+  --sidebar-foreground: oklch(0.88 0.033 125);
+  --sidebar-primary: oklch(0.85 0.18 121);
+  --sidebar-primary-foreground: oklch(0.2 0.03 150);
+  --sidebar-accent: oklch(0.262 0.026 200);
+  --sidebar-accent-foreground: oklch(0.94 0.035 125);
+  --sidebar-border: oklch(0.9 0.035 125 / 8%);
+
+  --instrument-nominal: oklch(0.72 0.16 150);
+  --instrument-caution: oklch(0.8 0.15 75);
+  --instrument-critical: oklch(0.66 0.2 25);
+  --instrument-nominal-ink: oklch(0.78 0.16 150);
+  --instrument-caution-ink: oklch(0.83 0.14 75);
+  --instrument-critical-ink: oklch(0.74 0.19 25);
+
+  --mark-terminal: oklch(0.7 0.085 178);
+}

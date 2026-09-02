@@ -313,6 +313,19 @@ updates:
       web-minor-patch:
         update-types: ["minor", "patch"]
 
+  # The public docs + landing site (pnpm, Astro + Starlight) --------------
+  - package-ecosystem: "npm"
+    directory: "/site"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(site)"
+      include: "scope"
+    groups:
+      site-minor-patch:
+        update-types: ["minor", "patch"]
+
   # Container base images --------------------------------------------------
   # Matched by case-insensitive substring "dockerfile", so the
   # `<service>.Dockerfile` files in this directory are picked up.
