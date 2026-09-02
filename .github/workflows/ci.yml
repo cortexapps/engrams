@@ -139,6 +139,7 @@ jobs:
       test_buf: ${{ steps.lanes.outputs.test_buf }}
       test_integrations_cli: ${{ steps.lanes.outputs.test_integrations_cli }}
       test_deploy: ${{ steps.lanes.outputs.test_deploy }}
+      test_site: ${{ steps.lanes.outputs.test_site }}
       # The container-image lane. The detector has always computed these; until
       # now nothing on a PR consumed them, so a Dockerfile-only change ran no
       # lane at all and the gate passed on an unbuilt image.
@@ -187,6 +188,12 @@ jobs:
           env GITHUB_OUTPUT=/tmp/lanes-rs.env python3 \
             .github/scripts/detect-rebake-lanes.py --stdin <<< 'Cargo.lock'
           grep -qxF 'dockerfiles=false' /tmp/lanes-rs.env
+          # The site lane fires on its own tree and stays quiet otherwise.
+          grep -qxF 'test_site=false' /tmp/lanes-rs.env
+          env GITHUB_OUTPUT=/tmp/lanes-site.env python3 \
+            .github/scripts/detect-rebake-lanes.py --stdin <<< 'site/package.json'
+          grep -qxF 'test_site=true' /tmp/lanes-site.env
+          grep -qxF 'test_web=false' /tmp/lanes-site.env
 
   # ADR 0122: the deploy templates are user-facing product surface once
   # the repo is open source — a broken chart or module is a broken
@@ -758,6 +765,45 @@ jobs:
 
       - name: D2 production CSP and renderer browser test
         run: pnpm test:browser
+
+  # The public docs + landing site (site/: Astro + Starlight). Build-only —
+  # site-deploy.yml publishes it to GitHub Pages on push to main. The leak
+  # lint runs first: the site must never mention internal decision records,
+  # repos, or hosts, and its prose must pass the style denylist. Gated on the
+  # detector's test_site flag (site/ only).
+  site:
+    name: site (leak lint + astro build)
+    needs: detect
+    if: needs.detect.outputs.test_site == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm lint (leak + style denylist)
+        run: pnpm lint
+
+      # astro check + astro build in the public project-page mode; the deploy
+      # workflow derives the real origin and base from actions/configure-pages,
+      # so this pair only needs to be *a* valid mode.
+      - name: pnpm build (astro check + astro build)
+        run: pnpm build
+        env:
+          SITE_URL: https://cortexapps.github.io
+          BASE_PATH: /engrams
 
   # ADR 0051 Task 14: the orchestration tier (Bun/Hono). install + tsc
   # --noEmit + bun test. A Postgres service backs (a) the live DB-gated tests
@@ -2441,6 +2487,7 @@ jobs:
       - test-linux
       - cross-musl-linux
       - web
+      - site
       - orchestrator
       - cli
       - buf
