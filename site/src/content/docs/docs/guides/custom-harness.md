@@ -193,6 +193,10 @@ with named paths for the files a harness keeps, the mode stamp that survives res
 parked-call store for deferred tools, the question and plan-decision shapes, a stderr drain
 so a chatty agent cannot deadlock on a full pipe, and a UTF-8-safe truncation for summaries.
 
+The SDK and the crates it pulls in (`engram-harness-proto`, `engram-transport`, `engram-ids`) are
+Apache-2.0. <!-- leak-ok: the harness SDK crates really are Apache-2.0 -->
+Your harness links them without taking on the AGPL-3.0 terms that cover the rest of engrams.
+
 The shape of a harness built on it:
 
 ```rust

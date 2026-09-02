@@ -40,7 +40,7 @@ const RULES = [
   { id: "dev-box", re: /\bengram-dev\b/g, why: "the internal dev machine" },
   { id: "claude-dir", re: /\.claude\//g, why: "personal skills and scripts directory" },
   { id: "hosted", re: /engrams\.cortex\.io/g, why: "the site does not mention a hosted deployment" },
-  { id: "license", re: /\bApache\b/g, why: "the license is AGPL-3.0" },
+  { id: "license", re: /\bApache\b/g, why: "the license is AGPL-3.0; only the harness SDK crates are Apache-2.0 (leak-ok)" },
   { id: "brand-case", re: /\bEngrams?\b/g, why: "the product name is lowercase engrams", prose: true },
   {
     id: "ai-tell",

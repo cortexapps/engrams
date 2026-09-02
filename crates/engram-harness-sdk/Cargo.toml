@@ -11,7 +11,7 @@ description = "Shared resilient transport and lifecycle primitives for Engram ha
 workspace = true
 
 [dependencies]
-engram-core.workspace = true
+engram-ids.workspace = true
 engram-harness-proto.workspace = true
 engram-transport.workspace = true
 serde.workspace = true
