@@ -1,11 +1,15 @@
-/* The engrams palette, ported from web/src/index.css ("the page on the cover").
+/* The engrams palette, ported from web/src/index.css, plus the tokens the
+ * site's "retro-futurist logbook" skin adds on top of it.
  *
- * The chrome is one continuous bottle-green cover; the work is a celadon sheet
- * lifted off it. Ink is petrol on paper, pale sage at night. The accent is lime
- * and it means one thing: this is the action. Lime is a FILL, never light-mode
- * text (chartreuse on celadon is invisible). Structure is graphite: 12px
- * corners, one system sans, low-contrast rules. Two fonts, not three: sans for
- * everything a person reads, mono for machine data.
+ * Paper is celadon under petrol ink by day and racing-green-black under pale
+ * sage at night. The cover is bottle-green in BOTH themes: green surfaces are
+ * theme-independent, only the paper flips. Lime is a fill and the one action
+ * color; it is never text on paper (use --ring there, which is racing green in
+ * light and lime in dark). Amber is the second accent: stripes, the "writing
+ * now" chunk, the NB callout, the LED readouts.
+ *
+ * Three typefaces: Saira for display and labels, JetBrains Mono for readouts,
+ * the system sans for body copy.
  *
  * Starlight sets data-theme on <html> before first paint; the marketing layout
  * does the same with the same localStorage key, so one choice carries across
@@ -54,6 +58,7 @@
   --font-sans:
     system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji",
     "Segoe UI Emoji", sans-serif;
+  --font-display: "Saira Variable", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
 }
 
@@ -93,4 +98,111 @@
   --instrument-critical-ink: oklch(0.74 0.19 25);
 
   --mark-terminal: oklch(0.7 0.085 178);
+}
+
+/* Theme-independent: the cover and everything drawn on it. */
+:root {
+  --bottle-green: oklch(0.32 0.05 190);
+  --sage-on-cover: oklch(0.93 0.03 125);
+  --amber: #d97a1f;
+  --led-amber: #ffb347;
+  --led-glow: rgba(255, 160, 40, 0.7);
+  --rec-red: #ff6b57;
+  --status-green: #8fe3a8;
+  --panel-deep: oklch(0.2 0.03 190);
+  --panel-code: oklch(0.19 0.03 190);
+  --panel-table: oklch(0.17 0.03 190);
+  --led-tile: #0a0f0e;
+  --screen: #0a1412;
+
+  /* Hairlines and washes on paper are mixed from the ink so they flip with it. */
+  --hairline: color-mix(in oklch, var(--foreground) 30%, transparent);
+  --hairline-soft: color-mix(in oklch, var(--foreground) 20%, transparent);
+  --wash: color-mix(in oklch, var(--foreground) 4%, transparent);
+  --lime-50: color-mix(in oklch, var(--primary) 50%, transparent);
+  --lime-45: color-mix(in oklch, var(--primary) 45%, transparent);
+  --lime-18: color-mix(in oklch, var(--primary) 18%, transparent);
+  --glow: 0 0 0 1px var(--lime-50), 0 0 48px var(--lime-18);
+  --glow-cta: 0 0 24px var(--lime-45);
+  --glow-cta-hover: 0 0 40px color-mix(in oklch, var(--primary) 70%, transparent);
+
+  --chamfer-8: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+  --chamfer-10: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
+  --chamfer-12: polygon(12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%, 0 12px);
+  --chamfer-14: polygon(14px 0, 100% 0, 100% calc(100% - 14px), calc(100% - 14px) 100%, 0 100%, 0 14px);
+
+  --carbon-thread: oklch(0 0 0 / 0.14);
+  --carbon-sheen: oklch(1 0 0 / 0.05);
+  --carbon-tile: 11px;
+}
+
+/* Carbon-fibre twill: two sets of diagonal threads offset to read as a woven
+   lattice, plus a soft vertical sheen. Densest at the foot, dissolving upward. */
+.bg-carbon-fade {
+  background:
+    linear-gradient(27deg, var(--carbon-thread) 4px, transparent 4px) 0 4px,
+    linear-gradient(207deg, var(--carbon-thread) 4px, transparent 4px) 8px 0,
+    linear-gradient(27deg, var(--carbon-sheen) 4px, transparent 4px) 0 8px,
+    linear-gradient(207deg, var(--carbon-sheen) 4px, transparent 4px) 8px 4px,
+    linear-gradient(90deg, var(--carbon-thread) 8px, transparent 8px),
+    linear-gradient(
+      var(--carbon-sheen) 25%,
+      var(--carbon-thread) 25%,
+      var(--carbon-thread) 50%,
+      transparent 50%,
+      transparent 75%,
+      var(--carbon-sheen) 75%
+    );
+  background-size: var(--carbon-tile) var(--carbon-tile);
+  -webkit-mask-image: linear-gradient(
+    to top,
+    transparent 10%,
+    oklch(0 0 0 / 0.32) 28%,
+    oklch(0 0 0 / 0.32) 58%,
+    transparent 82%
+  );
+  mask-image: linear-gradient(
+    to top,
+    transparent 10%,
+    oklch(0 0 0 / 0.32) 28%,
+    oklch(0 0 0 / 0.32) 58%,
+    transparent 82%
+  );
+}
+
+@keyframes dash {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+@keyframes marquee {
+  to {
+    transform: translateX(-50%);
+  }
+}
+@keyframes blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in oklch, var(--primary) 60%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 10px transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+
+  * {
+    animation-duration: 0.001s !important;
+    animation-iteration-count: 1 !important;
+  }
 }

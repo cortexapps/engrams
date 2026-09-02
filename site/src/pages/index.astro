@@ -1,12 +1,12 @@
 ---
 import Marketing from "../layouts/Marketing.astro";
 import pelican from "../assets/screenshots/session-pelican.png";
-import builder from "../assets/screenshots/automation-builder.png";
 import compose from "../assets/screenshots/automation-compose.png";
-import operator from "../assets/screenshots/operator-overview.png";
+import { hero, modules, automations, how, session, extensible, belt, start } from "../data/landing";
+import { nodes, edges, glyph, frame, RUN_START } from "../data/landing-demo";
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
-const docs = `${base}/docs`;
+const docs = `${base}/docs/`;
 
 const logos = Object.entries(
   import.meta.glob<{ default: ImageMetadata }>("../assets/connector-logos/*.svg", { eager: true }),
@@ -16,279 +16,254 @@ const logos = Object.entries(
     return { slug, src: mod.default.src, label: slug.replace(/_/g, " ") };
   })
   .sort((a, b) => a.slug.localeCompare(b.slug));
+const beltItems = [...logos, ...logos];
 
-const numbers = [
-  { figure: "< 1 s", caption: "cold start from an image's base snapshot, with no pre-warmed pool" },
-  { figure: "< 100 ms", caption: "resume on the host that took the snapshot" },
-  { figure: "1–2 s", caption: "resume on any other host, which is also the cost of migrating a session" },
-  { figure: "≈ 100 GiB", caption: "blob storage for a thousand sessions of a 4 GiB image, not 4 TiB" },
-];
+// The first frame, so the page is complete before the script runs.
+const first = frame(0, 0);
+const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
 ---
 
 <Marketing
   title="engrams"
-  description="A self-hosted orchestrator for AI coding agents. Runs are started by schedules, Slack threads, pull requests, and webhooks; each one gets its own microVM on servers you own and keeps its record."
+  description="A self-hosted software factory for AI coding agents. Runs are started by schedules, Slack threads, pull requests, and webhooks; each one gets its own microVM on servers you own and keeps its record."
+  landing
 >
-  <section class="hero">
-    <div class="container">
-      <h1>Where your coding agents do the routine work.</h1>
-      <p class="lede">
-        engrams runs Claude Code and Codex in Firecracker microVMs on servers you own. A schedule,
-        a Slack thread, a pull request, or a webhook starts a run. Every run keeps its transcript,
-        its diff, and its snapshot, and a person is one message away.
-      </p>
-      <div class="actions">
-        <a class="button primary" href={`${docs}/getting-started/local-quickstart/`}>Run it locally</a>
-        <a class="button ghost" href={`${docs}/guides/deploy-overview/`}>Deploy to your cloud</a>
-        <a class="button ghost" href="https://github.com/cortexapps/engrams">Source on GitHub</a>
-      </div>
-    </div>
-  </section>
-
-  <section class="section shot">
-    <div class="container">
-      <img src={pelican.src} width={pelican.width} height={pelican.height} alt="A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane shows the session's profile, its changed files, and three published apps." loading="eager" />
-      <p class="caption">A session, asked for a PNG of a pelican on a bicycle, with no image libraries and no internet. It wrote a PNG encoder in Python and shared the file in the thread.</p>
-    </div>
-  </section>
-
-  <section class="section">
-    <div class="container">
-      <h2>How it works</h2>
-      <div class="grid three">
-        <div class="card">
-          <h3>1. Enable an image</h3>
-          <p>
-            Push any Linux image with <code>/bin/sh</code> to a registry and enable it once.
-            engrams writes it as content-addressed chunks, boots it on the fleet, runs your
-            warm-up command, and freezes a base snapshot.
-          </p>
-        </div>
-        <div class="card">
-          <h3>2. Start a run</h3>
-          <p>
-            A person types a prompt, or a trigger fires. The host restores the snapshot into a
-            fresh microVM, mounts the harness, and the agent starts with its caches already warm.
-            The transcript and every tool call stream to the dashboard, to Slack, or to the CLI.
-          </p>
-        </div>
-        <div class="card">
-          <h3>3. Snapshot, resume, fork</h3>
-          <p>
-            When the agent goes idle the VM is snapshotted to chunks and destroyed. The next
-            prompt restores it, on any host. Forking a session is a manifest copy of a few
-            kilobytes.
-          </p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="section on-pane">
-    <div class="container">
-      <h2>Automations</h2>
-      <p class="lede">
-        The routine work is the point. An automation is one trigger, a tree of blocks, and typed
-        inputs: start a session, send it a prompt, wait for it, run a command inside it, post to
-        Slack or GitHub, branch, loop. Runs are durable, so a run survives a restart and can wait
-        hours for a reply without holding anything open.
-      </p>
-      <div class="grid two">
-        <figure class="shot">
-          <img src={compose.src} width={compose.width} height={compose.height} alt="The New automation page asks what the automation should do; a drafting agent assembles it on the canvas." loading="lazy" />
-          <figcaption>Describe it in a sentence and a drafting agent assembles the automation on the canvas. Nothing runs until you enable it.</figcaption>
-        </figure>
-        <figure class="shot">
-          <img src={builder.src} width={builder.width} height={builder.height} alt="The automation builder: a schedule trigger and a create-session block on a canvas, with the trigger's cron and timezone in the inspector." loading="lazy" />
-          <figcaption>Or build it by hand. The trigger is the first node; a plus on any edge inserts a block.</figcaption>
-        </figure>
-      </div>
-      <div class="grid three" style="margin-top:1.5rem">
-        <div class="card">
-          <h3>One run per thread</h3>
-          <p>
-            Mention the bot in Slack and a session opens for that thread, as the person who asked,
-            with their credentials. Replies join the same run. The thread relays the agent's
-            messages and questions both ways.
-          </p>
-        </div>
-        <div class="card">
-          <h3>Pull request review</h3>
-          <p>
-            A finder and a verifier review each pull request on the repositories you list, and
-            post the confirmed findings as one GitHub review. A new push supersedes the review in
-            flight.
-          </p>
-        </div>
-        <div class="card">
-          <h3>The record</h3>
-          <p>
-            Every run is a step timeline. Each step opens to its inputs, its outputs, its output
-            text, and the session it used. Trace spans for every model call and tool call can go
-            to Langfuse or any OpenTelemetry collector.
-          </p>
-        </div>
-      </div>
-      <div class="actions">
-        <a class="button ghost" href={`${docs}/concepts/automations/`}>How automations work</a>
-      </div>
-    </div>
-  </section>
-
-  <section class="section">
-    <div class="container">
-      <h2>Why engrams</h2>
-      <div class="grid two">
+  <!-- COVER -->
+  <section class="cover">
+    <div class="layer carbon bg-carbon-fade"></div>
+    <div class="layer grid cont"></div>
+    <div class="layer scan cont"></div>
+    <div class="layer floor"></div>
+    <div class="wrap">
+      <div class="hero">
         <div>
-          <h3>It runs in your cloud</h3>
-          <p>
-            One Terraform apply and two Helm releases bring it up on GKE or EKS, with GCS or S3
-            for blobs and your cloud's secret manager for credentials. No transcript, workspace,
-            or key leaves your account.
-          </p>
-          <h3>Every session is a real virtual machine</h3>
-          <p>
-            Isolation is KVM, enforced by hardware. Outbound traffic from a session goes through
-            a filtering proxy on the host, so an agent reaches only the hosts you allow, and
-            credentials are brokered at that proxy rather than handed to the agent.
-          </p>
-          <h3>Any agent runtime</h3>
-          <p>
-            Claude Code and Codex ship as harnesses. A harness is a bundle the host mounts at
-            boot, so your image never contains the agent, and you can register your own.
-          </p>
+          <div class="eyebrow label"><span class="pulse"></span>{hero.eyebrow}</div>
+          <h1 class="display">{hero.title} <span class="lime">{hero.titleAccent}</span></h1>
+          <p class="lede">{hero.lede}</p>
+          <div class="actions">
+            <a class="btn primary" href={docs + hero.primary.href}>{hero.primary.label}</a>
+            <a class="btn outline" href={docs + hero.secondary.href}>{hero.secondary.label}</a>
+          </div>
+          <div class="chips">{hero.chips.map((c) => <span>{c}</span>)}</div>
         </div>
-        <div>
-          <h3>Idle sessions cost nothing to keep</h3>
-          <p>
-            A paused session is a set of chunks in the blob store, deduplicated against its
-            image and every other session, and a row in Postgres. It holds no host resources
-            until the next prompt. Your own model keys, or OpenRouter, pay for the tokens.
-          </p>
-          <h3>Storage is deduplicated by construction</h3>
-          <p>
-            Chunks are named by their hash, so a base image is stored once no matter how many
-            sessions use it, and a snapshot writes only what changed.
-          </p>
-          <h3>An operator's view</h3>
-          <p>
-            Hosts, capacity, live sandboxes, snapshot durability, and what needs attention, on
-            one page. Drain a host and its sessions move.
-          </p>
+        <div class="graph-col" data-graph-col>
+          <div class="graph-meta label sm">
+            <span>{hero.graphTitle}</span>
+            <span>run #<span data-run-no>{RUN_START}</span> · <span data-clock>06:00:00</span> UTC</span>
+          </div>
+          <div class="graph-scale" data-graph-scale>
+            <div class="graph" aria-hidden="true">
+              <svg width="720" height="416" viewBox="0 0 720 416" fill="none">
+                {edges.map((d, i) => <path d={d} class:list={["edge", { loop: i === 6 }]} data-edge />)}
+                <text x="60" y="276">LOOP ⟲</text>
+              </svg>
+              {nodes.map((n, i) => (
+                <div class:list={["node", { active: i === 0 }]} style={`left:${n.x}px;top:${n.y}px`} data-node>
+                  <div class="kind"><span>{n.kind}</span><span>{n.t}</span></div>
+                  <div class="name">{n.label}</div>
+                </div>
+              ))}
+            </div>
+            <div class="runlog" data-log aria-hidden="true"><span class="cursor"></span></div>
+          </div>
         </div>
       </div>
     </div>
   </section>
 
-  <section class="section on-pane shot">
-    <div class="container">
-      <img src={operator.src} width={operator.width} height={operator.height} alt="The Operator page: capacity and locality gauges, fleet counts, and storage durability figures." loading="lazy" />
-      <p class="caption">The Operator page for a two-host fleet.</p>
-    </div>
-  </section>
-
-  <section class="section">
-    <div class="container">
-      <h2>The numbers</h2>
-      <div class="numbers">
-        {numbers.map((n) => (
-          <div>
-            <div class="figure">{n.figure}</div>
-            <div class="caption">{n.caption}</div>
+  <!-- SEC. 0 — MISSION PARAMETERS -->
+  <section class="sec first">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-badge">{modules.badge}</span><span>{modules.label}</span><span class="sec-rule"></span></div>
+      <div class="modules">
+        {modules.cards.map((m) => (
+          <div class="hud">
+            <div class="rail"></div>
+            <div class="kicker"><span>{m.kicker}</span><i></i></div>
+            <div class="num">{m.num}</div>
+            <h2 class="display">{m.title}</h2>
+            <p>{m.body}</p>
+            <div class="foot">{m.foot}</div>
           </div>
         ))}
       </div>
-      <p class="muted" style="margin-top:1.5rem">
-        Measured on the reference deployment: GKE, C3 nodes, Firecracker with lazy memory paging.
-        Measure your own fleet before you promise them to anyone.
-      </p>
     </div>
   </section>
 
-  <section class="section on-pane">
-    <div class="container">
-      <h2>What engrams is not</h2>
-      <ul class="nots">
-        <li>
-          <strong>Not a hosted service.</strong> You run it. If you want someone else to run the
-          sandboxes, E2B and Modal do that well.
-        </li>
-        <li>
-          <strong>Not a development environment for people.</strong> Sessions exist for agents.
-          You can open a shell or an IDE into one, but workspaces for engineers at their editors
-          are what Coder is for.
-        </li>
-        <li>
-          <strong>Not a container runner.</strong> Production isolation is Firecracker on Linux
-          with KVM. The macOS backend and the process backend exist for development only.
-        </li>
-        <li>
-          <strong>Not a model provider.</strong> You bring an Anthropic or OpenAI key, or point a
-          harness at OpenRouter.
-        </li>
-        <li>
-          <strong>Not finished.</strong> A 0.x project that runs one company's production. Wire
-          formats and APIs change, and it carries a fork of Firecracker that is rebased on
-          upstream daily.
-        </li>
-      </ul>
-    </div>
-  </section>
+  <!-- SEC. 1 — AUTOMATIONS -->
+  <section class="sec">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-badge">{automations.badge}</span><span>{automations.label}</span><span class="sec-rule"></span><span>{automations.meta}</span></div>
+      <div class="sec-intro">
+        <h2 class="display">{automations.title}</h2>
+        <p class="lede">{automations.lede}</p>
+      </div>
+      <div class="holo">
+        <div class="screen">
+          <img src={compose.src} width={compose.width} height={compose.height} alt={automations.screenshotAlt} loading="lazy" />
+          <div class="rec"><i></i>REC</div>
+          <div class="ch">{automations.channel} · <span data-clock>06:00:00</span></div>
+        </div>
+        <div class="caption"><span>{automations.caption}</span><span class="signal">{automations.signal}</span></div>
+      </div>
 
-  <section class="section">
-    <div class="container">
-      <h2>Agents, clouds, and integrations</h2>
-      <div class="grid three">
-        <div class="card">
-          <h3>Harnesses</h3>
-          <p>
-            Claude Code and Codex, with their models, a Build and a Plan mode, and effort levels.
-            Either can be pointed at OpenRouter. Or bring your own.
-          </p>
+      <div class="split">
+        <div>
+          <div class="label">{automations.board.fig}</div>
+          <h3 class="display title">{automations.board.title}</h3>
+          <p class="body">{automations.board.body}</p>
+          <div class="items">
+            {automations.board.items.map((it) => (
+              <div>
+                <h3 class="display">{it.title}</h3>
+                <p>{it.body}</p>
+              </div>
+            ))}
+          </div>
         </div>
-        <div class="card">
-          <h3>Backends</h3>
-          <p>
-            Firecracker on Linux with KVM for production. Apple Virtualization on a Mac and plain
-            subprocesses for development.
-          </p>
-        </div>
-        <div class="card">
-          <h3>Clouds</h3>
-          <p>
-            GKE and EKS with Terraform quickstarts and Helm charts. GCS or S3 for chunks, Secret
-            Manager or Secrets Manager with KMS for credentials.
-          </p>
+        <div class="board" aria-label="Recent automation runs">
+          <div class="head"><span>time</span><span>automation</span><span>trigger</span><span>duration</span><span>status</span></div>
+          <div data-board-rows>
+            {first.board.map((r) => (
+              <div class="row">
+                <span class="time">{r.time}</span>
+                <span class="name">{r.name}</span>
+                <span class="trigger">{r.trigger}</span>
+                <span class="dur">{r.dur}</span>
+                <span class:list={["status", r.status]}>{glyph[r.status]} {r.status}</span>
+              </div>
+            ))}
+          </div>
+          <div class="foot"><span data-board-count>{first.boardCount} runs today</span><span>{automations.board.footRight}</span></div>
         </div>
       </div>
-      <h3 style="margin-top:2.5rem">Built-in connectors</h3>
-      <p class="muted">
-        Credentials for these are held by engrams and brokered at the egress proxy, so an agent
-        can call the API without ever holding the key.
-      </p>
-      <div class="logo-wall">
-        {logos.map((l) => (
-          <figure>
-            <img src={l.src} alt="" width="32" height="32" loading="lazy" />
-            <figcaption>{l.label}</figcaption>
-          </figure>
+    </div>
+  </section>
+
+  <!-- SEC. 2 — HOW IT WORKS -->
+  <section class="cover how">
+    <div class="layer carbon soft bg-carbon-fade"></div>
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-badge">{how.badge}</span><span>{how.label}</span><span class="sec-rule"></span><span>{how.meta}</span></div>
+      <div class="grid2">
+        <div>
+          <h2 class="display">{how.title}<br /><span class="lime">{how.titleAccent}</span></h2>
+          <div class="steps">
+            {how.steps.map((s) => (
+              <div>
+                <span class="s">{s.s}</span>
+                <div>
+                  <h3 class="display">{s.title}</h3>
+                  <p set:html={code(s.body)} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div>
+          <div class="chunks" aria-hidden="true">
+            <div class="cells">
+              {first.chunks.map((c) => <i class={c} data-chunk></i>)}
+            </div>
+            <div class="meta label sm"><span>chunk store</span><span><span data-sessions>{first.sessions}</span> sessions · <span data-stored>{first.stored}</span></span></div>
+          </div>
+          <div class="legend">
+            {how.legend.map((l) => <span><i class={l.cls} style={l.cls === "base" ? "background:rgba(255,255,255,.35)" : l.cls === "delta" ? "background:var(--primary)" : "background:var(--amber)"}></i>{l.label}</span>)}
+          </div>
+          <div class="leds">
+            {how.leds.map((l) => (
+              <div class="led">
+                <div class="k">{l.k}</div>
+                <div class="v"><span class="ghost" aria-hidden="true">{l.ghost}</span><span class="lit">{l.v}</span></div>
+              </div>
+            ))}
+          </div>
+          <p class="footnote">{how.footnote}</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SEC. 3 — A SESSION -->
+  <section class="sec">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-badge">{session.badge}</span><span>{session.label}</span><span class="sec-rule"></span><span>{session.meta}</span></div>
+      <div class="figure">
+        <figure class="plate">
+          <div class="shot">
+            <img src={pelican.src} width={pelican.width} height={pelican.height} alt={session.screenshotAlt} loading="lazy" />
+            <div class="pin" style="left:18%;top:22%"><b>1</b><i></i></div>
+            <div class="pin" style="left:46%;top:58%"><b>2</b><i></i></div>
+            <div class="pin rev" style="right:8%;top:36%"><b>3</b><i></i></div>
+          </div>
+          <figcaption><span>{session.caption}</span><span class="ring">{session.live}</span></figcaption>
+        </figure>
+        <div>
+          <h2 class="display">{session.title}</h2>
+          <p class="body">{session.body}</p>
+          <div class="ledger">
+            {session.callouts.map((c, i) => (
+              <div><span class="n">({i + 1})</span><span>{c}</span></div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SEC. 4 — EXTENSIBLE -->
+  <section class="sec">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-badge">{extensible.badge}</span><span>{extensible.label}</span><span class="sec-rule"></span></div>
+      <div class="sec-intro">
+        <h2 class="display md">{extensible.title}</h2>
+        <p class="lede">{extensible.lede}</p>
+      </div>
+      <div class="pair">
+        {extensible.cards.map((c) => (
+          <a class="hud wide" href={docs + c.href}>
+            <div class="rail"></div>
+            <div class="kicker"><span>{c.kicker}</span></div>
+            <h3 class="display">{c.title}</h3>
+            <p>{c.body}</p>
+            <div class="foot">{c.foot}</div>
+          </a>
         ))}
       </div>
     </div>
   </section>
 
-  <section class="section on-pane">
-    <div class="container">
-      <h2>Start</h2>
-      <p class="lede">
-        The local quickstart runs the whole stack on one machine in a few minutes. The
-        deployment guides take a fresh GCP project or AWS account to a running fleet.
-      </p>
-      <div class="actions">
-        <a class="button primary" href={`${docs}/getting-started/local-quickstart/`}>Run it locally</a>
-        <a class="button ghost" href={`${docs}/guides/deploy-gcp/`}>Deploy on GCP</a>
-        <a class="button ghost" href={`${docs}/guides/deploy-aws/`}>Deploy on AWS</a>
+  <!-- CONNECTOR BELT -->
+  <section class="cover belt" aria-label="Built-in connectors">
+    <div class="tag">{belt.label}</div>
+    <div class="track">
+      {beltItems.map((l) => (
+        <div class="item"><i style={`--logo:url(${l.src})`}></i><span>{l.label}</span></div>
+      ))}
+    </div>
+  </section>
+
+  <!-- START -->
+  <section class="cover start">
+    <div class="layer carbon bg-carbon-fade"></div>
+    <div class="layer scan"></div>
+    <div class="wrap">
+      <div class="grid2">
+        <div>
+          <div class="label" style="opacity:.8">{start.eyebrow}</div>
+          <h2 class="display">{start.title}<span class="lime">.</span></h2>
+          <p class="lede">{start.lede}</p>
+        </div>
+        <div class="ctas">
+          {start.ctas.map((c) => (
+            <a class:list={["btn", "between", c.primary ? "primary" : "outline"]} href={docs + c.href}>{c.label} <span>→</span></a>
+          ))}
+        </div>
       </div>
     </div>
   </section>
 </Marketing>
+
+<script>
+  import "../scripts/landing";
+</script>

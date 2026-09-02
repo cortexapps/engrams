@@ -1,0 +1,19 @@
+---
+// A chamfered card for the docs home: section kicker, title, one line, and
+// an "open →" readout. Links are relative to the docs root.
+interface Props {
+  section: string;
+  title: string;
+  href: string;
+}
+const { section, title, href } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+---
+
+<a class="hud-card" href={`${base}/docs/${href}`}>
+  <div class="rail"></div>
+  <div class="kicker">{section}</div>
+  <h3>{title}</h3>
+  <p><slot /></p>
+  <div class="open">open →</div>
+</a>
