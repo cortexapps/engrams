@@ -86,8 +86,7 @@ export function prApplicationVersionWarningMessages(
   checkedOut: WorkflowHashSnapshot,
 ): string[] {
   const consequence =
-    " — in-flight executions will be stranded and swept on the next rollout " +
-    "(ADR 0104)";
+    " — in-flight executions will be stranded and swept on the next rollout";
 
   return diffWorkflowHashSnapshots(main, checkedOut).map((diff) => {
     const prefix = "this PR changes the DBOS application version: ";

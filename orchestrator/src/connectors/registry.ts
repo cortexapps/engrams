@@ -870,7 +870,7 @@ function parseCli(where: string, raw: unknown): CliFacet {
     // `uploaded` rides the ADR 0055 P2 catalog (UB1: an admin-uploaded binary
     // bundle); `npx` (runtime fetch) is designed-for but still not wired.
     if (binSource === "npx") {
-      fail(where, `"cli.binSource" "npx" is not yet implemented (ADR 0058: runtime npx is a later arm)`);
+      fail(where, `"cli.binSource" "npx" is not yet implemented`);
     }
   }
 
@@ -929,7 +929,7 @@ function parseCli(where: string, raw: unknown): CliFacet {
       fail(where, `"cli.credentialDelivery" must be one of inject|substitute|in-guest-token|request-signing (got ${JSON.stringify(d)})`);
     }
     if (!IMPLEMENTED_DELIVERIES.has(d)) {
-      fail(where, `"cli.credentialDelivery" "${d}" is a designed-for strategy not yet wired (ADR 0058 P1 implements "inject"); using it would ship an unauthenticated CLI`);
+      fail(where, `"cli.credentialDelivery" "${d}" is a designed-for strategy not yet wired (only "inject" is implemented); using it would ship an unauthenticated CLI`);
     }
     credentialDelivery = d;
   }
@@ -1697,7 +1697,7 @@ export function parseConnector(
 
   if (typeof o.provider !== "string" || !o.provider) fail(where, '"provider" must be a non-empty string');
   if (!PROVIDER_RE.test(o.provider)) fail(where, `"provider" "${o.provider}" must be a lowercase identifier ([a-z0-9][a-z0-9_-]*)`);
-  if (o.protocol !== "http") fail(where, `"protocol" must be "http" (got ${JSON.stringify(o.protocol)}); GraphQL rides http via a "{operation, field}" match (ADR 0059), grpc is not yet implemented`);
+  if (o.protocol !== "http") fail(where, `"protocol" must be "http" (got ${JSON.stringify(o.protocol)}); GraphQL rides http via a "{operation, field}" match; grpc is not yet implemented`);
 
   const cred = o.credential as Record<string, unknown> | undefined;
   if (typeof cred !== "object" || cred === null) fail(where, '"credential" must be an object');

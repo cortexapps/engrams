@@ -83,20 +83,20 @@ Three process classes, four storage primitives, three wire surfaces.
 
 **`engram-coordinator`** — stateless HTTP service (axum). Owns the public API, scheduling, idle eviction, dead-host detection, chunk-store GC, the persistent SSE event bus. Backed by Postgres. Multiple replicas behind a load balancer; replicas reconcile via `LISTEN/NOTIFY` on `session_events` + `host_dead` and race via `pg_try_advisory_lock` for exclusive-write operations (dead-host eviction). `--mode=all` registers a local host-agent in-process for single-binary `just dev`.
 
-**`engram-host-agent`** — per-VM-host daemon. Dials the coordinator over WebSocket (NAT-friendly; coord never has to reach back). Composes a local `SandboxBackend` (FC / VZ / Process — the VMM driver) and a `HarnessHub` (in-VM adapter routing) into a `LocalHostClient`; that's what's served over the WS to the coord (ADR 0011 splits the trait surfaces: `SandboxBackend` = "what kind of VM," `HostClient` = "where the work happens"). Hosts the chunked-OCI image cache + tiered chunk resolver, the NBD daemon (chunked disks for FC), the chunk cache (NVMe-backed LRU), the materialize-dir orphan reaper, the filtering egress proxy on TCP/443 + UDP/53 + TCP/53 (ADRs 0006, 0010). Heartbeats `(capacity, utilization, draining, running_sandboxes)` every 5 s.
+**`engram-host-agent`** — per-VM-host daemon. Dials the coordinator over WebSocket (NAT-friendly; coord never has to reach back). Composes a local `SandboxBackend` (FC / VZ / Process — the VMM driver) and a `HarnessHub` (in-VM adapter routing) into a `LocalHostClient`; that's what's served over the WS to the coord. Hosts the chunked-OCI image cache + tiered chunk resolver, the NBD daemon (chunked disks for FC), the chunk cache (NVMe-backed LRU), the materialize-dir orphan reaper, the filtering egress proxy on TCP/443 + UDP/53 + TCP/53. Heartbeats `(capacity, utilization, draining, running_sandboxes)` every 5 s.
 
-**In-guest binaries** (live inside each microVM; none are baked into the rootfs — the only engrams-owned file baked in is the stage-1 `/sbin/engram-init` shim, injected by the host-side rootfs materializer, ADR 0080):
-- `engram-agentd` — PID 1's exec after the init shim (which copies it out of the fleet `bundle-agentd` slot to tmpfs, ADR 0080 — an agentd change ships by republishing the bundle, no image re-bakes). The in-VM control surface: serves length-prefixed bincode RPCs over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `StartShell`, `Ping`, `Shutdown`, `SpawnHarness`. Owns the harness child process (kill+respawn on each fresh `SpawnHarness`, so the host has a clean re-spawn point on resume). On startup, dials the host on `ENGRAM_AGENTD_READY_PORT` so the host knows when the in-VM listener is bound — no boot-race polling on the host side.
+**In-guest binaries** (live inside each microVM; none are baked into the rootfs — the only engrams-owned file baked in is the stage-1 `/sbin/engram-init` shim, injected by the host-side rootfs materializer):
+- `engram-agentd` — PID 1's exec after the init shim (which copies it out of the fleet `bundle-agentd` slot to tmpfs — an agentd change ships by republishing the bundle, no image re-bakes). The in-VM control surface: serves length-prefixed bincode RPCs over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `StartShell`, `Ping`, `Shutdown`, `SpawnHarness`. Owns the harness child process (kill+respawn on each fresh `SpawnHarness`, so the host has a clean re-spawn point on resume). On startup, dials the host on `ENGRAM_AGENTD_READY_PORT` so the host knows when the in-VM listener is bound — no boot-race polling on the host side.
 - `engram-harness-{noop,claude}` — the agent runtime (Claude Code or a deterministic test harness), exec'd as agentd's harness child on `SpawnHarness`. Reports run state + tool calls back through the harness hub.
 
-### Storage substrate (ADR 0007)
+### Storage substrate
 
 The durability primitive of engrams is **chunked-immutable content-addressed storage**. Disk + memory state lives as sha256-keyed chunks in any `BlobStorage` backend (GCS / S3 / local fs); manifests are versioned references that point at them.
 
 | Tier | What | Where | Cost model |
 |---|---|---|---|
 | **Persistent** | sha256-keyed chunks (16 MiB disk, 512 KiB memory), versioned manifests, per-host working-set traces | `BlobStorage` impl (GCS / S3 / local) | dedup is automatic (content-addressed); the base image's GiBs are stored once regardless of session count |
-| **Cache** | local NVMe chunk cache (LRU + pin-list + singleflight), per-host materialize-dir for assembled `.ext4` files | each host's `<work_dir>` | disk-derived absolute ceiling by default (ADR 0070: `min(60% of the disk, 80%)`, ~179 GiB on a 298 GiB disk) plus a 20% free-space floor; `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` overrides the ceiling outright |
+| **Cache** | local NVMe chunk cache (LRU + pin-list + singleflight), per-host materialize-dir for assembled `.ext4` files | each host's `<work_dir>` | disk-derived absolute ceiling by default ( `min(60% of the disk, 80%)`, ~179 GiB on a 298 GiB disk) plus a 20% free-space floor; `ENGRAM_CHUNK_CACHE_BUDGET_BYTES` overrides the ceiling outright |
 | **In-memory** | FC's memory.bin canonical mmap (`MAP_PRIVATE`) + per-session UFFD-populated divergent pages | host RAM | hardware-enforced COW; one canonical copy serves N sessions of the same image |
 | **Metadata** | sessions, conversation log, snapshot manifest refs, hosts, secrets | Postgres | managed/backups |
 
@@ -122,10 +122,10 @@ Three protocol layers, each with explicit version negotiation where it matters.
 | **Public API** | clients → coord | JSON over HTTP + SSE | `/v1/` prefix planned |
 | **Control plane** | coord ↔ host-agent | bincode `Frame` over WebSocket | `WIRE_VERSION=1` in `Hello`; mismatch refuses connection |
 | **In-guest** | host-agent ↔ agentd / bootstrap / harness | length-prefixed bincode over vsock (FC) or virtio-console (VZ) | first-frame token handshake |
-| **Image distribution** | materializer → OCI registry | standard registry pull | plain OCI/Docker image (ADR 0080); no engram-specific media types — agentd / harness / guest-tools ride host-staged bundles |
+| **Image distribution** | materializer → OCI registry | standard registry pull | plain OCI/Docker image; no engram-specific media types — agentd / harness / guest-tools ride host-staged bundles |
 | **Storage** | chunk-store ↔ blob backend | `BlobStorage` trait | impl-specific (GCS, S3, local fs) |
 
-**Control plane wire** (`engram-protocol`). The trait the wire serves is `HostClient` (`engram-core::traits::host_client`), which composes the sandbox surface (FC/VZ/Process) with harness routing (bind/unbind/send_prompt) and a couple of admin operations. `RemoteHostClient` in `engram-protocol::client` is the coord-side wrapper; `LocalHostClient` in `engram-host-agent::host_client` is the host-side composition. ADR 0011.
+**Control plane wire** (`engram-protocol`). The trait the wire serves is `HostClient` (`engram-core::traits::host_client`), which composes the sandbox surface (FC/VZ/Process) with harness routing (bind/unbind/send_prompt) and a couple of admin operations. `RemoteHostClient` in `engram-protocol::client` is the coord-side wrapper; `LocalHostClient` in `engram-host-agent::host_client` is the host-side composition..
 - `RequestKind`:
   - sandbox lifecycle — `CreateSandbox`, `DestroySandbox`, `ListSandboxes`, `ExecStart`, `Snapshot`, `Restore`, `StartAgent`, `GuestIp`;
   - harness routing — `BindHarnessSession`, `UnbindHarnessSession`, `SendHarnessPrompt`;
@@ -147,7 +147,7 @@ Coord scheduler picks a host:
   ↓
 host-agent.PooledBackend.create(spec)
   ├─ ImageCache.ensure_image(uri) → chunked rootfs manifest
-  │   (materialized host-side at enable/rebase time, ADR 0080)
+  │   (materialized host-side at enable/rebase time)
   ├─ resolve_rootfs(uri, cached):
   │   - NBD daemon path (Linux + FC + ENGRAM_NBD_DEVICES set)
   │   - materialize-to-file (anywhere else, from chunks)
@@ -214,7 +214,7 @@ crates/
   engram-oci, engram-oci-auth       # OCI registry client + auth resolver
   engram-postgres                   # MetadataStore impl
   engram-crypto                     # envelope encryption (KEK wrap, registry creds)
-  engram-egress-proxy               # per-host egress proxy (ADR 0006)
+  engram-egress-proxy               # per-host egress proxy
 ```
 
 ### Sandbox backends
@@ -224,7 +224,7 @@ The orchestration layer is VMM-agnostic — anything that implements `SandboxBac
 | Backend | Isolation | Snapshots | Where it runs | When to use |
 |---|---|---|---|---|
 | `engram-sandbox-process` | **None** — host subprocess | Tarball of workdir | Anywhere (macOS, Linux) | Iterating on the orchestration layer without firing up a VMM. |
-| `engram-sandbox-vz` | microVM (Hypervisor.framework) | APFS clone of rootfs | macOS 12+ on Apple Silicon | Mac dev with real microVM isolation. Sub-second cold boot, sub-second cold resume. ADR 0003. |
+| `engram-sandbox-vz` | microVM (Hypervisor.framework) | APFS clone of rootfs | macOS 12+ on Apple Silicon | Mac dev with real microVM isolation. Sub-second cold boot, sub-second cold resume.. |
 | `engram-sandbox-firecracker` | microVM (KVM) | FC memory snapshot + UFFD lazy paging + NBD chunked disk | Linux + KVM | Production. Real isolation, real resource enforcement, sub-100ms hot resume. |
 
 `process` and `vz` are dev-side: `process` for the fastest possible iteration loop, `vz` for fidelity to the FC code paths (same `engram-agentd` + harness binaries; same chunked-OCI session-create semantics). Production isolation is always Firecracker.
@@ -232,7 +232,7 @@ The orchestration layer is VMM-agnostic — anything that implements `SandboxBac
 
 ## Sessions are OCI-image sandboxes with chunked-immutable durability
 
-A session is one bounded unit of agent work. It's two things on the wire: an `image` (a plain OCI image URI — `docker build && docker push`, ADR 0080) and an optional `harness` (which agent process to attach). The image's `/workspace` is the workspace; the platform doesn't run any git operations itself.
+A session is one bounded unit of agent work. It's two things on the wire: an `image` (a plain OCI image URI — `docker build && docker push`) and an optional `harness` (which agent process to attach). The image's `/workspace` is the workspace; the platform doesn't run any git operations itself.
 
 ```
 create → Created → Active                                  (sandbox bound; then agentd up + harness running)
@@ -244,11 +244,11 @@ create → Created → Active                                  (sandbox bound; t
        → DELETE /sessions/:id → Completed                  (terminal)
 ```
 
-The state machine is ADR 0015 M2 — `SessionState` in `engram-core::types::session`, with a single validated `transition_session` trait method behind every `UPDATE sessions SET status`. **Active is honest**: the row reaches it only after `start_agent` returns OK, so `/exec` / `/shell` / `/prompt` against an `Active` session no longer race agentd readiness. Earlier states (e.g. `Created`) return typed 409s with state-specific bodies instead of falling through.
+The state machine is `SessionState` in `engram-core::types::session`, with a single validated `transition_session` trait method behind every `UPDATE sessions SET status`. **Active is honest**: the row reaches it only after `start_agent` returns OK, so `/exec` / `/shell` / `/prompt` against an `Active` session no longer race agentd readiness. Earlier states (e.g. `Created`) return typed 409s with state-specific bodies instead of falling through.
 
 `POST /sessions/:id/resume` is a single-tier dispatcher: **Idle** → restore from the snapshot's chunked manifests (snapshot-affinity-scheduled to the host that captured it); **Dead** / **HostLost** without a recoverable snapshot → 410 Gone; anything else → 409. `ensure_active` auto-resumes Idle sessions on the next exec/prompt/SSE-subscribe so callers don't have to know whether the session is live or paused.
 
-**Materialize-dir reap keeps host-local disk bounded.** `POST /api/admin/reap-materialize-dir` reaps the per-host assembled-`.ext4` file cache; in `--mode=coordinator` it fans out across every connected host via WS-RPC. The chunk-store GC that previously paired with this was removed 2026-05-23 (see ADR 0015 M5 "Known regression — chunk-store GC deleted"); BlobStorage cost grows unbounded until a redesigned sweep ships.
+**Materialize-dir reap keeps host-local disk bounded.** `POST /api/admin/reap-materialize-dir` reaps the per-host assembled-`.ext4` file cache; in `--mode=coordinator` it fans out across every connected host via WS-RPC. The chunk-store GC that previously paired with this was removed 2026-05-23; BlobStorage cost grows unbounded until a redesigned sweep ships.
 
 **Agents push code from inside the sandbox** when their task is code-edit-shaped. Mount `GITHUB_TOKEN` (or an SSH key) via the image manifest's `[secrets.GITHUB_TOKEN]` block; the secret flows into the harness's env via the same pipeline that delivers `CLAUDE_CODE_OAUTH_TOKEN`. The platform doesn't care whether the agent runs `git push` or `slack.post()` or anything else — that's the agent's job, not the platform's.
 
@@ -279,7 +279,7 @@ The dev backend is for orchestration iteration. Real Firecracker needs Linux + K
 - A Linux laptop or workstation
 - CI
 
-On a Linux + KVM host, `just dev` auto-detects `/dev/kvm` and runs the Firecracker backend (no flag, no per-arch recipe — ADR 0024); `just pull-kernel` fetches a vmlinux into the standard cache. The rootfs is materialized host-side from the enabled OCI image into chunked ext4 (ADR 0080); `engram-agentd` is not baked in — it rides the fleet `bundle-agentd` slot and the stage-1 init execs it, so `exec_stream` works against any plain image.
+On a Linux + KVM host, `just dev` auto-detects `/dev/kvm` and runs the Firecracker backend (no flag, no per-arch recipe); `just pull-kernel` fetches a vmlinux into the standard cache. The rootfs is materialized host-side from the enabled OCI image into chunked ext4; `engram-agentd` is not baked in — it rides the fleet `bundle-agentd` slot and the stage-1 init execs it, so `exec_stream` works against any plain image.
 
 The crate ships an integration suite that covers the full surface against real microVMs:
 
@@ -301,5 +301,5 @@ For NBD chunked disks, the host needs:
 - `ENGRAM_NBD_DEVICES=/dev/nbd0,/dev/nbd1,...` set in the host-agent env
 
 For the in-guest agent, the fleet needs:
-- A static-musl `engram-agentd` published as the `bundle-agentd` slot (ADR 0080) and staged on each host — the stage-1 init copies it out of the bundle to tmpfs and execs it (no rootfs bake).
+- A static-musl `engram-agentd` published as the `bundle-agentd` slot and staged on each host — the stage-1 init copies it out of the bundle to tmpfs and execs it (no rootfs bake).
 - `init=/sbin/engram-init` in the kernel boot args (set by the FC backend via `FirecrackerConfig::default_boot_args`)
