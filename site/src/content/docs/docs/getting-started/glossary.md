@@ -15,6 +15,17 @@ more sessions and is what the dashboard, Slack, and `engrams task` show.
 **Profile.** An admin-curated bundle of session settings: image, repositories, environment,
 egress policy, integration access, skills, and session apps.
 
+**Automation.** A trigger, a tree of blocks, and typed inputs that start and drive sessions
+without a person typing a prompt. Runs are durable and recorded step by step. See
+[Automations](../../concepts/automations/).
+
+**Model router.** A service such as OpenRouter that supplies models to a harness in place of
+the provider's own API, with a per-model policy for who may launch them. See
+[Model routers](../../guides/model-routers/).
+
+**Session app.** An HTTP service inside a session, published at its own hostname behind the
+login wall. See [Session apps](../../guides/session-apps/).
+
 **Image.** A plain OCI image, built with `docker build` and pushed to any registry, that a
 session boots from. See [Images and harnesses](../../concepts/images-and-harnesses/).
 
@@ -58,9 +69,6 @@ workspace or a Google Cloud service account, that profiles can grant to sessions
 
 **Skill.** A read-only bundle of tools mounted into the VM alongside the harness: shared
 browser, IDE, git credentials, and admin-uploaded packs.
-
-**Session app.** A named HTTP service a session hosts, published at a stable hostname so a
-person or another session can reach it.
 
 **API key.** A credential for the API and CLI. Personal keys come from `engrams auth login`;
 admin service keys are minted in Settings for scripts and CI.
