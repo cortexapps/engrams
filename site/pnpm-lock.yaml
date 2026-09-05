@@ -10,7 +10,7 @@ importers:
     dependencies:
       '@astrojs/starlight':
         specifier: ^0.41.11
-        version: 0.41.11(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(typescript@5.9.3)
+        version: 0.41.11(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(supports-color@10.2.2)(typescript@6.0.3)
       '@fontsource-variable/jetbrains-mono':
         specifier: ^5.3.0
         version: 5.3.0
@@ -25,14 +25,14 @@ importers:
         version: 0.35.4(@types/node@24.13.3)
       starlight-links-validator:
         specifier: ^0.25.3
-        version: 0.25.3(@astrojs/starlight@0.41.11(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(typescript@5.9.3))(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))
+        version: 0.25.3(@astrojs/starlight@0.41.11(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(supports-color@10.2.2)(typescript@6.0.3))(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(supports-color@10.2.2)
     devDependencies:
       '@astrojs/check':
         specifier: ^0.9.9
-        version: 0.9.10(prettier@3.9.6)(typescript@5.9.3)
+        version: 0.9.10(prettier@3.9.6)(typescript@6.0.3)
       typescript:
-        specifier: ^5.9.3
-        version: 5.9.3
+        specifier: ^6.0.3
+        version: 6.0.3
 
 packages:
 
@@ -59,24 +59,28 @@ packages:
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
   '@astrojs/compiler-binding-linux-arm64-musl@0.4.0':
     resolution: {integrity: sha512-HPbvWqbxFxyaoQJhLxCaSjtYBx9KBo7JGVzEFZCmMl968a2PsSH0UfiODYgYPXofTOIsIH2aoCcrHXML0IA3ig==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
   '@astrojs/compiler-binding-linux-x64-gnu@0.4.0':
     resolution: {integrity: sha512-tQKolMxoJ/+0AmLWm1PmJ/i+z3i10ZU1bNuVjEDulCf48azEMtUNjTZgHJ5MPtpYRNc7dlETr8QujUfduzoC7Q==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
   '@astrojs/compiler-binding-linux-x64-musl@0.4.0':
     resolution: {integrity: sha512-5v5YymudsxMHp3NBLCS8BUlu5CRqeLtWD9cKS/4nIhIEHCbpz9okmVV6I0HWqmBAPhWYcDa3vw/vltYPrOQCTA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
   '@astrojs/compiler-binding-wasm32-wasi@0.4.0':
     resolution: {integrity: sha512-m/phuH3x3PREvv1OnkM44NoPh4MatUadix1fB1u5SvMLCyDTUZykDJbKnWf1cjnYmHdlB8HcjTjl6JrCqAIXcw==}
@@ -207,41 +211,49 @@ packages:
     resolution: {integrity: sha512-glkYXZCJywjP13v67eAyAMSJdF+ncvEbYvgi/wOtffL9tQ27lr/zsyzUfgs+ovjJ9d8JNQKiXeiArJcX8PJL9w==}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
   '@bruits/satteri-linux-arm64-gnu@0.9.5':
     resolution: {integrity: sha512-u51id17uJwNEMK9nBlICsq6U31c+XVqQueVBkwRIzZG+gMpS8TOJctt5h5Wz33Z8xnMdTd+adtACVz0yHgGuOA==}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
   '@bruits/satteri-linux-arm64-musl@0.10.5':
     resolution: {integrity: sha512-yWdgG1g17Nh2QyGVlFUxGRa3FEFwiMcpZEyMNWkbM3deC94cmVc+/i9OuyFpdKuWo3GkgoCtYVOoxk1uCnCZIA==}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
   '@bruits/satteri-linux-arm64-musl@0.9.5':
     resolution: {integrity: sha512-v39HxiwGC5Rqm01HksP6+5Y+xKLPlsuVFgIgpEAo+SiQ22c+mJVhS3u7Z6ePAKdhL5NJoK1xq70kLz3L13AhpQ==}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
   '@bruits/satteri-linux-x64-gnu@0.10.5':
     resolution: {integrity: sha512-FVaLoPT1fBgGl0J+AYebyyXJYBachGl8Oyyrf1lye4RTqCB4S0Gwkj1uM9RJyThUOvx5VUmAT1CnNh1SFHA+kw==}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
   '@bruits/satteri-linux-x64-gnu@0.9.5':
     resolution: {integrity: sha512-F3uO8uFp3pAP5ZGXttwvh57GS7s0lL953tnNdyI2gRyP4kOOkp6pyGojNJzCjkDvWI2Cvb9iNrKok3aqQPauAw==}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
   '@bruits/satteri-linux-x64-musl@0.10.5':
     resolution: {integrity: sha512-EHpVAx2bqW3GINHTKkljtxVfQmVDGWIuwOYOP5YghTj+0PkBa2o8oKPRtQ9Kbsr1Fye8jtUcDjhwj2jMNugZKg==}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
   '@bruits/satteri-linux-x64-musl@0.9.5':
     resolution: {integrity: sha512-bicEqglLlz++mWyADaZoP0JY20s4vDfLjaPYgQqC+NI4zZLTOOg1T4GB8aqtc822Pqji8SQBmSrTb7CrP8i08Q==}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
   '@bruits/satteri-wasm32-wasi@0.10.5':
     resolution: {integrity: sha512-ypz8c/Zmipxp4IoeDa228Gstv6TLzVmNs3yC6wKCoNSOjx1iwpgzu87Y3hTkXFdwChVGU85qeUDuOIarGUZQLw==}
@@ -531,89 +543,105 @@ packages:
     resolution: {integrity: sha512-0DaL0A6Xu6sQSQFwe4iVCrKWU2cCTItnRsYsCdxAMm9NF6twAA9BKnoqy4hqz4+azQ0JHuA26qiUKsf1XJ/v5A==}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-libvips-linux-arm@1.3.3':
     resolution: {integrity: sha512-3rbU4vqXXc3hY/OiXdl52xZvT0F1yEngWfvqudtPJg/KkyiaQw2DRsFrNzpmLvfavbwOq3qXn36GP8obHRULQA==}
     cpu: [arm]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-libvips-linux-ppc64@1.3.3':
     resolution: {integrity: sha512-cdn1OvUBwsXhbC0zSzJnNzf5MZ/mTrobawDvNXBTxe8VtqKAm0sRuEY2Evzovb/w9JMk4TvRxqt1mekSuJz64w==}
     cpu: [ppc64]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-libvips-linux-riscv64@1.3.3':
     resolution: {integrity: sha512-HjPVx7yKz+0lqdhDlTw1tt90wamBoxhiXpvl1XZpJLiHH4RCJ5yDTqH+VlYPv2fwFs89JFw4c1IexYOcQUi4IQ==}
     cpu: [riscv64]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-libvips-linux-s390x@1.3.3':
     resolution: {integrity: sha512-neWLh+3yCNThxnfy3c4BbVBeGgt9aftno+XbT56iK28RgeDs3UOFWviLWlUu0bArYVYJaFDK+RRohbicUNCm8Q==}
     cpu: [s390x]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-libvips-linux-x64@1.3.3':
     resolution: {integrity: sha512-4vKmvAst9nrowcqquKFAyZJUDolUaIp8uRiN0mWFguJ1IplC9/pitXtlnnlU4aa/eJw3J7i67V+pwUL+wZGdsA==}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-libvips-linuxmusl-arm64@1.3.3':
     resolution: {integrity: sha512-Y9kQaLMuNoB0bPYOOdcZMaseNrFpPodIWWMrx+CZyydf2xn68j9WYc6sWWRrDwNkzCQjKYfc68L7jKjGlHMibw==}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
   '@img/sharp-libvips-linuxmusl-x64@1.3.3':
     resolution: {integrity: sha512-fj8Mv0HHfD1Rr+4I68+3agJynxDWtBFgicTbSOb9Bke6pIwzGcJ+RX/yHjmiEGFMCavY/dxvem7MyNaJF+wDiw==}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
   '@img/sharp-linux-arm64@0.35.4':
     resolution: {integrity: sha512-De4jpEnAU8Hd5oT0j1G3uL4ZvTuipVMn7YC6vPaJhy6/7EwEae0SVAoBrUMYQbkLGDm85taVWwuPc1a44LTzCQ==}
     engines: {node: '>=20.9.0'}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-linux-arm@0.35.4':
     resolution: {integrity: sha512-7OAS8gI0EReKGVN2HssHlM6umJgxF5VI3xN0p9FA91p/YO+ou5hiNghLdZ5BEHztwaaK5+bLKRf8x/o2L2nk9A==}
     engines: {node: '>=20.9.0'}
     cpu: [arm]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-linux-ppc64@0.35.4':
     resolution: {integrity: sha512-2oYZJeIl4kCcMGk4ouZVjnkCtFrpQFlNEtJ6GbxzhHQchwH0NH/qEb9ykmOl29dqwMq+JhFdZn+1ak2FKhI9fQ==}
     engines: {node: '>=20.9.0'}
     cpu: [ppc64]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-linux-riscv64@0.35.4':
     resolution: {integrity: sha512-cPbNChoRURAWdebDIHSenxRpgEdy7JkPydSnUxRm9VvKD7m0/xVaR/8Fzlu81pk5nHEvHH87UZUA7cTtwnbJSA==}
     engines: {node: '>=20.9.0'}
     cpu: [riscv64]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-linux-s390x@0.35.4':
     resolution: {integrity: sha512-RY0JFY8Fd6RonCBtHz+DvadaPkXDSI1AUn6yWL9TipqkZ1vY8w8evqdgyDFnkm4/K1ve1TvZiaePP5oSd4+WVQ==}
     engines: {node: '>=20.9.0'}
     cpu: [s390x]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-linux-x64@0.35.4':
     resolution: {integrity: sha512-9qvvEAuk8k89TfWUoX2htWjbAMX8p+NxCppjpcg5k6xMsjhBQPTsoIh36h9Qde4WRuGpJeYnOjdosDn/cnv+OA==}
     engines: {node: '>=20.9.0'}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
   '@img/sharp-linuxmusl-arm64@0.35.4':
     resolution: {integrity: sha512-KB5jxpfWQTr0nc3xdHtWChdbifHrBGsd2SM62Eyxrl8afikm+f5qGBU75SJIZBT/S1MC8XyacdlXBMSWq6OURA==}
     engines: {node: '>=20.9.0'}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
   '@img/sharp-linuxmusl-x64@0.35.4':
     resolution: {integrity: sha512-f+eZJZIQNEEd26RPSW+76chwOf1XtA2Y/O+5ocVyLliHkeih3e+jhLVBdNTd2rS3IbNXK8+ug93Vf5ZXtF5Lxg==}
     engines: {node: '>=20.9.0'}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
   '@img/sharp-wasm32@0.35.4':
     resolution: {integrity: sha512-zQnl4Kwp7Q6NHsENtU2T/00Zi+w3AQNwz3+UaTyVBy2FpXrzXzGjndpK61onhZjRtRpQXxCTeqw19bVyXOh7jA==}
@@ -740,36 +768,42 @@ packages:
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
   '@rolldown/binding-linux-arm64-musl@1.2.6':
     resolution: {integrity: sha512-muWCk27FVBEZtv0MsK8gnfSmgczA8KQ0uRVJbTABKhkRfQc38aUrcb7fhi3BNiyseFmgcRsoMfQsSNJ+DbZdSw==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
   '@rolldown/binding-linux-ppc64-gnu@1.2.6':
     resolution: {integrity: sha512-eWDoSfU7Co2qj3vgB3Dt4lj1mG6CoWbcJQkRMP3XJplyCMtuaq3LHvPFjS9QIPvMGWVadJC04Xiy0IdcVPtnwQ==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [ppc64]
     os: [linux]
+    libc: [glibc]
 
   '@rolldown/binding-linux-s390x-gnu@1.2.6':
     resolution: {integrity: sha512-2bWNjRSIayvupRKxXUY2tWG9fYdoUlTqWywHRvE8Eq3GvuQ+f2HeIkve697fIt+IQs/PV8yFsdWuhp1aJ1PdnA==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [s390x]
     os: [linux]
+    libc: [glibc]
 
   '@rolldown/binding-linux-x64-gnu@1.2.6':
     resolution: {integrity: sha512-KekI0gS0wLxe1UBSQSjenBVwou/JkcQPDzBPICGZjxUv9k3RteHDPBQaiOicZUFKRIH2wKEimGwVpnJsbPzu7w==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
   '@rolldown/binding-linux-x64-musl@1.2.6':
     resolution: {integrity: sha512-TvtPnfVr+HtyGiDmPK4VWmlNm7QhNNAcK5Q9A7aOXsI8545yCyaoMaicXrFZ72JzeYjaUVk7yT243zT0jzjFKQ==}
     engines: {node: ^20.19.0 || >=22.12.0}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
   '@rolldown/binding-openharmony-arm64@1.2.6':
     resolution: {integrity: sha512-iOo0VEay2XFhaCcH0sps5XIimkSuOnNaZrf6+ZkoSOQBJPKNU48RkmJv0/lSpipexu5P+ouFgafe5IGr/DiQfg==}
@@ -1437,24 +1471,28 @@ packages:
     engines: {node: '>= 12.0.0'}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
   lightningcss-linux-arm64-musl@1.33.0:
     resolution: {integrity: sha512-yiO5ROMuYQgXbC60yjZU5CYSFZGKXL0HFATXt9mHJn1+zW55oCtMI9NfcVhYLMFDL7gV7oBPon/EmMMGg2OvtQ==}
     engines: {node: '>= 12.0.0'}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
   lightningcss-linux-x64-gnu@1.33.0:
     resolution: {integrity: sha512-ar+Ju7LmcN0Jo4FpL4hpFybwNG9/3A/Br5KW2n2jyODg3MEZXaDYADdemoNS+BDNfMgKvylJLj4S5tyRActuAg==}
     engines: {node: '>= 12.0.0'}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
   lightningcss-linux-x64-musl@1.33.0:
     resolution: {integrity: sha512-RYiYbkokw0trfKqqzfF55lginwEPrD3OJDfTuJzFs1MK6iFnDenaz1fqLLtX4ITG3OktJQXOeTaw1awrBAlZPw==}
     engines: {node: '>= 12.0.0'}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
   lightningcss-win32-arm64-msvc@1.33.0:
     resolution: {integrity: sha512-1K+MPfLSFVpphzpdbfkhlWk6wBrTObBzS2T6db10PNOZgR9GoVsAWzwNyuhUYYbTp23j+4RrncfujZ4uAzXvwA==}
@@ -2022,8 +2060,8 @@ packages:
   typescript-auto-import-cache@0.3.6:
     resolution: {integrity: sha512-RpuHXrknHdVdK7wv/8ug3Fr0WNsNi5l5aB8MYYuXhq2UH5lnEB1htJ1smhtD5VeCsGr2p8mUDtd83LCQDFVgjQ==}
 
-  typescript@5.9.3:
-    resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
+  typescript@6.0.3:
+    resolution: {integrity: sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==}
     engines: {node: '>=14.17'}
     hasBin: true
 
@@ -2358,12 +2396,12 @@ packages:
 
 snapshots:
 
-  '@astrojs/check@0.9.10(prettier@3.9.6)(typescript@5.9.3)':
+  '@astrojs/check@0.9.10(prettier@3.9.6)(typescript@6.0.3)':
     dependencies:
-      '@astrojs/language-server': 2.16.16(prettier@3.9.6)(typescript@5.9.3)
+      '@astrojs/language-server': 2.16.16(prettier@3.9.6)(typescript@6.0.3)
       chokidar: 4.0.3
       kleur: 4.1.5
-      typescript: 5.9.3
+      typescript: 6.0.3
       yargs: 18.1.0
     transitivePeerDependencies:
       - prettier
@@ -2447,12 +2485,12 @@ snapshots:
       smol-toml: 1.8.0
       unified: 11.0.5
 
-  '@astrojs/language-server@2.16.16(prettier@3.9.6)(typescript@5.9.3)':
+  '@astrojs/language-server@2.16.16(prettier@3.9.6)(typescript@6.0.3)':
     dependencies:
       '@astrojs/compiler': 2.13.1
       '@astrojs/yaml2ts': 0.2.4
       '@jridgewell/sourcemap-codec': 1.6.0
-      '@volar/kit': 2.4.28(typescript@5.9.3)
+      '@volar/kit': 2.4.28(typescript@6.0.3)
       '@volar/language-core': 2.4.28
       '@volar/language-server': 2.4.28
       '@volar/language-service': 2.4.28
@@ -2472,7 +2510,7 @@ snapshots:
     transitivePeerDependencies:
       - typescript
 
-  '@astrojs/markdown-remark@7.2.4':
+  '@astrojs/markdown-remark@7.2.4(supports-color@10.2.2)':
     dependencies:
       '@astrojs/internal-helpers': 0.10.4
       '@astrojs/prism': 4.0.2
@@ -2482,8 +2520,8 @@ snapshots:
       mdast-util-definitions: 6.0.0
       rehype-raw: 7.0.0
       rehype-stringify: 10.0.1
-      remark-gfm: 4.0.1
-      remark-parse: 11.0.0
+      remark-gfm: 4.0.1(supports-color@10.2.2)
+      remark-parse: 11.0.0(supports-color@10.2.2)
       remark-rehype: 11.1.2
       remark-smartypants: 3.0.3
       unified: 11.0.5
@@ -2508,11 +2546,11 @@ snapshots:
       github-slugger: 2.0.0
       satteri: 0.10.5
 
-  '@astrojs/mdx@7.0.8(@astrojs/markdown-satteri@0.3.8)(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))':
+  '@astrojs/mdx@7.0.8(@astrojs/markdown-satteri@0.3.8)(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(supports-color@10.2.2)':
     dependencies:
       '@astrojs/internal-helpers': 0.10.4
-      '@astrojs/markdown-remark': 7.2.4
-      '@mdx-js/mdx': 3.1.1
+      '@astrojs/markdown-remark': 7.2.4(supports-color@10.2.2)
+      '@mdx-js/mdx': 3.1.1(supports-color@10.2.2)
       acorn: 8.18.0
       astro: 7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0)
       es-module-lexer: 2.3.2
@@ -2520,7 +2558,7 @@ snapshots:
       hast-util-to-html: 9.0.5
       piccolore: 0.1.3
       rehype-raw: 7.0.0
-      remark-gfm: 4.0.1
+      remark-gfm: 4.0.1(supports-color@10.2.2)
       remark-smartypants: 3.0.3
       source-map: 0.7.6
       unist-util-visit: 5.1.0
@@ -2539,10 +2577,10 @@ snapshots:
       sitemap: 9.0.1
       zod: 4.5.4
 
-  '@astrojs/starlight@0.41.11(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(typescript@5.9.3)':
+  '@astrojs/starlight@0.41.11(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(supports-color@10.2.2)(typescript@6.0.3)':
     dependencies:
       '@astrojs/markdown-satteri': 0.3.8
-      '@astrojs/mdx': 7.0.8(@astrojs/markdown-satteri@0.3.8)(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))
+      '@astrojs/mdx': 7.0.8(@astrojs/markdown-satteri@0.3.8)(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(supports-color@10.2.2)
       '@astrojs/sitemap': 3.7.4
       '@pagefind/default-ui': 1.5.2
       '@types/hast': 3.0.5
@@ -2555,17 +2593,17 @@ snapshots:
       hast-util-select: 6.0.4
       hast-util-to-string: 3.0.1
       hastscript: 9.0.1
-      i18next: 26.4.1(typescript@5.9.3)
+      i18next: 26.4.1(typescript@6.0.3)
       js-yaml: 4.3.2
       klona: 2.0.6
       magic-string: 0.30.21
-      mdast-util-directive: 3.1.0
+      mdast-util-directive: 3.1.0(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
       mdast-util-to-string: 4.0.0
       pagefind: 1.5.2
       rehype: 13.0.2
       rehype-format: 5.0.1
-      remark-directive: 4.0.0
+      remark-directive: 4.0.0(supports-color@10.2.2)
       satteri: 0.9.5
       ultrahtml: 1.7.0
       unified: 11.0.5
@@ -2938,7 +2976,7 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.6.0': {}
 
-  '@mdx-js/mdx@3.1.1':
+  '@mdx-js/mdx@3.1.1(supports-color@10.2.2)':
     dependencies:
       '@types/estree': 1.0.9
       '@types/estree-jsx': 1.0.5
@@ -2950,14 +2988,14 @@ snapshots:
       estree-util-is-identifier-name: 3.0.0
       estree-util-scope: 1.0.1
       estree-walker: 3.0.3
-      hast-util-to-jsx-runtime: 2.3.6
+      hast-util-to-jsx-runtime: 2.3.6(supports-color@10.2.2)
       markdown-extensions: 2.0.0
       recma-build-jsx: 1.0.0
       recma-jsx: 1.0.1(acorn@8.18.0)
       recma-stringify: 1.0.0
-      rehype-recma: 1.0.0
-      remark-mdx: 3.1.1
-      remark-parse: 11.0.0
+      rehype-recma: 1.0.0(supports-color@10.2.2)
+      remark-mdx: 3.1.1(supports-color@10.2.2)
+      remark-parse: 11.0.0(supports-color@10.2.2)
       remark-rehype: 11.1.2
       source-map: 0.7.6
       unified: 11.0.5
@@ -3145,12 +3183,12 @@ snapshots:
 
   '@ungap/structured-clone@1.4.0': {}
 
-  '@volar/kit@2.4.28(typescript@5.9.3)':
+  '@volar/kit@2.4.28(typescript@6.0.3)':
     dependencies:
       '@volar/language-service': 2.4.28
       '@volar/typescript': 2.4.28
       typesafe-path: 0.2.2
-      typescript: 5.9.3
+      typescript: 6.0.3
       vscode-languageserver-textdocument: 1.0.14
       vscode-uri: 3.2.0
 
@@ -3426,9 +3464,11 @@ snapshots:
     dependencies:
       css-tree: 2.2.1
 
-  debug@4.4.3:
+  debug@4.4.3(supports-color@10.2.2):
     dependencies:
       ms: 2.1.3
+    optionalDependencies:
+      supports-color: 10.2.2
 
   decode-named-character-reference@1.3.0:
     dependencies:
@@ -3736,7 +3776,7 @@ snapshots:
       unist-util-visit: 5.1.0
       zwitch: 2.0.4
 
-  hast-util-to-estree@3.1.3:
+  hast-util-to-estree@3.1.3(supports-color@10.2.2):
     dependencies:
       '@types/estree': 1.0.9
       '@types/estree-jsx': 1.0.5
@@ -3746,9 +3786,9 @@ snapshots:
       estree-util-attach-comments: 3.0.0
       estree-util-is-identifier-name: 3.0.0
       hast-util-whitespace: 3.0.0
-      mdast-util-mdx-expression: 2.0.1
-      mdast-util-mdx-jsx: 3.2.0
-      mdast-util-mdxjs-esm: 2.0.1
+      mdast-util-mdx-expression: 2.0.1(supports-color@10.2.2)
+      mdast-util-mdx-jsx: 3.2.0(supports-color@10.2.2)
+      mdast-util-mdxjs-esm: 2.0.1(supports-color@10.2.2)
       property-information: 7.2.0
       space-separated-tokens: 2.0.2
       style-to-js: 1.1.21
@@ -3771,7 +3811,7 @@ snapshots:
       stringify-entities: 4.0.4
       zwitch: 2.0.4
 
-  hast-util-to-jsx-runtime@2.3.6:
+  hast-util-to-jsx-runtime@2.3.6(supports-color@10.2.2):
     dependencies:
       '@types/estree': 1.0.9
       '@types/hast': 3.0.5
@@ -3780,9 +3820,9 @@ snapshots:
       devlop: 1.1.0
       estree-util-is-identifier-name: 3.0.0
       hast-util-whitespace: 3.0.0
-      mdast-util-mdx-expression: 2.0.1
-      mdast-util-mdx-jsx: 3.2.0
-      mdast-util-mdxjs-esm: 2.0.1
+      mdast-util-mdx-expression: 2.0.1(supports-color@10.2.2)
+      mdast-util-mdx-jsx: 3.2.0(supports-color@10.2.2)
+      mdast-util-mdxjs-esm: 2.0.1(supports-color@10.2.2)
       property-information: 7.2.0
       space-separated-tokens: 2.0.2
       style-to-js: 1.1.21
@@ -3832,9 +3872,9 @@ snapshots:
 
   http-cache-semantics@4.2.0: {}
 
-  i18next@26.4.1(typescript@5.9.3):
+  i18next@26.4.1(typescript@6.0.3):
     optionalDependencies:
-      typescript: 5.9.3
+      typescript: 6.0.3
 
   inline-style-parser@0.2.7: {}
 
@@ -3948,13 +3988,13 @@ snapshots:
       '@types/unist': 3.0.3
       unist-util-visit: 5.1.0
 
-  mdast-util-directive@3.1.0:
+  mdast-util-directive@3.1.0(supports-color@10.2.2):
     dependencies:
       '@types/mdast': 4.0.4
       '@types/unist': 3.0.3
       ccount: 2.0.1
       devlop: 1.1.0
-      mdast-util-from-markdown: 2.0.3
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
       parse-entities: 4.0.2
       stringify-entities: 4.0.4
@@ -3969,14 +4009,14 @@ snapshots:
       unist-util-is: 6.0.1
       unist-util-visit-parents: 6.0.2
 
-  mdast-util-from-markdown@2.0.3:
+  mdast-util-from-markdown@2.0.3(supports-color@10.2.2):
     dependencies:
       '@types/mdast': 4.0.4
       '@types/unist': 3.0.3
       decode-named-character-reference: 1.3.0
       devlop: 1.1.0
       mdast-util-to-string: 4.0.0
-      micromark: 4.0.2
+      micromark: 4.0.2(supports-color@10.2.2)
       micromark-util-decode-numeric-character-reference: 2.0.2
       micromark-util-decode-string: 2.0.1
       micromark-util-normalize-identifier: 2.0.1
@@ -3994,67 +4034,67 @@ snapshots:
       mdast-util-find-and-replace: 3.0.2
       micromark-util-character: 2.1.1
 
-  mdast-util-gfm-footnote@2.1.0:
+  mdast-util-gfm-footnote@2.1.0(supports-color@10.2.2):
     dependencies:
       '@types/mdast': 4.0.4
       devlop: 1.1.0
-      mdast-util-from-markdown: 2.0.3
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
       micromark-util-normalize-identifier: 2.0.1
     transitivePeerDependencies:
       - supports-color
 
-  mdast-util-gfm-strikethrough@2.0.0:
+  mdast-util-gfm-strikethrough@2.0.0(supports-color@10.2.2):
     dependencies:
       '@types/mdast': 4.0.4
-      mdast-util-from-markdown: 2.0.3
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
     transitivePeerDependencies:
       - supports-color
 
-  mdast-util-gfm-table@2.0.0:
+  mdast-util-gfm-table@2.0.0(supports-color@10.2.2):
     dependencies:
       '@types/mdast': 4.0.4
       devlop: 1.1.0
       markdown-table: 3.0.4
-      mdast-util-from-markdown: 2.0.3
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
     transitivePeerDependencies:
       - supports-color
 
-  mdast-util-gfm-task-list-item@2.0.0:
+  mdast-util-gfm-task-list-item@2.0.0(supports-color@10.2.2):
     dependencies:
       '@types/mdast': 4.0.4
       devlop: 1.1.0
-      mdast-util-from-markdown: 2.0.3
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
     transitivePeerDependencies:
       - supports-color
 
-  mdast-util-gfm@3.1.0:
+  mdast-util-gfm@3.1.0(supports-color@10.2.2):
     dependencies:
-      mdast-util-from-markdown: 2.0.3
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
       mdast-util-gfm-autolink-literal: 2.0.1
-      mdast-util-gfm-footnote: 2.1.0
-      mdast-util-gfm-strikethrough: 2.0.0
-      mdast-util-gfm-table: 2.0.0
-      mdast-util-gfm-task-list-item: 2.0.0
+      mdast-util-gfm-footnote: 2.1.0(supports-color@10.2.2)
+      mdast-util-gfm-strikethrough: 2.0.0(supports-color@10.2.2)
+      mdast-util-gfm-table: 2.0.0(supports-color@10.2.2)
+      mdast-util-gfm-task-list-item: 2.0.0(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
     transitivePeerDependencies:
       - supports-color
 
-  mdast-util-mdx-expression@2.0.1:
+  mdast-util-mdx-expression@2.0.1(supports-color@10.2.2):
     dependencies:
       '@types/estree-jsx': 1.0.5
       '@types/hast': 3.0.5
       '@types/mdast': 4.0.4
       devlop: 1.1.0
-      mdast-util-from-markdown: 2.0.3
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
     transitivePeerDependencies:
       - supports-color
 
-  mdast-util-mdx-jsx@3.2.0:
+  mdast-util-mdx-jsx@3.2.0(supports-color@10.2.2):
     dependencies:
       '@types/estree-jsx': 1.0.5
       '@types/hast': 3.0.5
@@ -4062,7 +4102,7 @@ snapshots:
       '@types/unist': 3.0.3
       ccount: 2.0.1
       devlop: 1.1.0
-      mdast-util-from-markdown: 2.0.3
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
       parse-entities: 4.0.2
       stringify-entities: 4.0.4
@@ -4071,23 +4111,23 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  mdast-util-mdx@3.0.0:
+  mdast-util-mdx@3.0.0(supports-color@10.2.2):
     dependencies:
-      mdast-util-from-markdown: 2.0.3
-      mdast-util-mdx-expression: 2.0.1
-      mdast-util-mdx-jsx: 3.2.0
-      mdast-util-mdxjs-esm: 2.0.1
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
+      mdast-util-mdx-expression: 2.0.1(supports-color@10.2.2)
+      mdast-util-mdx-jsx: 3.2.0(supports-color@10.2.2)
+      mdast-util-mdxjs-esm: 2.0.1(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
     transitivePeerDependencies:
       - supports-color
 
-  mdast-util-mdxjs-esm@2.0.1:
+  mdast-util-mdxjs-esm@2.0.1(supports-color@10.2.2):
     dependencies:
       '@types/estree-jsx': 1.0.5
       '@types/hast': 3.0.5
       '@types/mdast': 4.0.4
       devlop: 1.1.0
-      mdast-util-from-markdown: 2.0.3
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
       mdast-util-to-markdown: 2.1.2
     transitivePeerDependencies:
       - supports-color
@@ -4381,10 +4421,10 @@ snapshots:
 
   micromark-util-types@2.0.2: {}
 
-  micromark@4.0.2:
+  micromark@4.0.2(supports-color@10.2.2):
     dependencies:
       '@types/debug': 4.1.13
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       decode-named-character-reference: 1.3.0
       devlop: 1.1.0
       micromark-core-commonmark: 2.0.3
@@ -4591,11 +4631,11 @@ snapshots:
       hast-util-raw: 9.1.0
       vfile: 6.0.3
 
-  rehype-recma@1.0.0:
+  rehype-recma@1.0.0(supports-color@10.2.2):
     dependencies:
       '@types/estree': 1.0.9
       '@types/hast': 3.0.5
-      hast-util-to-estree: 3.1.3
+      hast-util-to-estree: 3.1.3(supports-color@10.2.2)
     transitivePeerDependencies:
       - supports-color
 
@@ -4612,37 +4652,37 @@ snapshots:
       rehype-stringify: 10.0.1
       unified: 11.0.5
 
-  remark-directive@4.0.0:
+  remark-directive@4.0.0(supports-color@10.2.2):
     dependencies:
       '@types/mdast': 4.0.4
-      mdast-util-directive: 3.1.0
+      mdast-util-directive: 3.1.0(supports-color@10.2.2)
       micromark-extension-directive: 4.0.0
       unified: 11.0.5
     transitivePeerDependencies:
       - supports-color
 
-  remark-gfm@4.0.1:
+  remark-gfm@4.0.1(supports-color@10.2.2):
     dependencies:
       '@types/mdast': 4.0.4
-      mdast-util-gfm: 3.1.0
+      mdast-util-gfm: 3.1.0(supports-color@10.2.2)
       micromark-extension-gfm: 3.0.0
-      remark-parse: 11.0.0
+      remark-parse: 11.0.0(supports-color@10.2.2)
       remark-stringify: 11.0.0
       unified: 11.0.5
     transitivePeerDependencies:
       - supports-color
 
-  remark-mdx@3.1.1:
+  remark-mdx@3.1.1(supports-color@10.2.2):
     dependencies:
-      mdast-util-mdx: 3.0.0
+      mdast-util-mdx: 3.0.0(supports-color@10.2.2)
       micromark-extension-mdxjs: 3.0.0
     transitivePeerDependencies:
       - supports-color
 
-  remark-parse@11.0.0:
+  remark-parse@11.0.0(supports-color@10.2.2):
     dependencies:
       '@types/mdast': 4.0.4
-      mdast-util-from-markdown: 2.0.3
+      mdast-util-from-markdown: 2.0.3(supports-color@10.2.2)
       micromark-util-types: 2.0.2
       unified: 11.0.5
     transitivePeerDependencies:
@@ -4822,16 +4862,16 @@ snapshots:
 
   space-separated-tokens@2.0.2: {}
 
-  starlight-links-validator@0.25.3(@astrojs/starlight@0.41.11(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(typescript@5.9.3))(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0)):
+  starlight-links-validator@0.25.3(@astrojs/starlight@0.41.11(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(supports-color@10.2.2)(typescript@6.0.3))(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(supports-color@10.2.2):
     dependencies:
       '@astrojs/markdown-satteri': 0.3.8
-      '@astrojs/starlight': 0.41.11(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(typescript@5.9.3)
+      '@astrojs/starlight': 0.41.11(astro@7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0))(supports-color@10.2.2)(typescript@6.0.3)
       '@types/picomatch': 4.0.3
       astro: 7.2.10(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@24.13.3)(yaml@2.9.0)
       github-slugger: 2.0.0
       hast-util-from-html: 2.0.3
       is-absolute-url: 5.0.0
-      mdast-util-mdx-jsx: 3.2.0
+      mdast-util-mdx-jsx: 3.2.0(supports-color@10.2.2)
       mdast-util-to-hast: 13.2.1
       picomatch: 4.0.7
       satteri: 0.9.5
@@ -4915,7 +4955,7 @@ snapshots:
     dependencies:
       semver: 7.8.5
 
-  typescript@5.9.3: {}
+  typescript@6.0.3: {}
 
   ufo@1.6.4: {}
 
