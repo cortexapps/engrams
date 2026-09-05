@@ -21,7 +21,7 @@
 # `server.upgrade()`, which broke every WebSocket in the product — the spec
 # document, the IDE, previews — with CI fully green, because on 1.3.14 the same
 # code is fine. Bumping Bun is a decision that belongs in a reviewed diff.
-FROM oven/bun:1.4.0-alpine AS deps
+FROM oven/bun:1.4.2-alpine AS deps
 WORKDIR /app/orchestrator
 
 # Lockfile + manifest first so the production install layer stays warm across
@@ -35,7 +35,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 
 # ── runtime ──────────────────────────────────────────────────────────────
 # Keep in lockstep with the deps stage and `.bun-version` (see above).
-FROM oven/bun:1.4.0-alpine
+FROM oven/bun:1.4.2-alpine
 WORKDIR /app/orchestrator
 
 # The orchestrator runs the TypeScript entry directly under Bun (no compile
