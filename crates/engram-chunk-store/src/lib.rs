@@ -61,7 +61,7 @@ pub use budget::{UploadBudget, UploadClass};
 pub use cache::{ChunkCache, ChunkCacheConfig};
 pub use error::{ChunkStoreError, Result};
 pub use file::ChunkFileStats;
-pub use gc::{GcError, PinSet, DEFAULT_COLLECT_CONCURRENCY};
+pub use gc::{shard_hash_bounds, GcError, PinSet, DEFAULT_COLLECT_CONCURRENCY, SHARD_SPACE};
 pub use manifest::{
     ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind, ManifestRef, DEFAULT_DISK_CHUNK_SIZE,
     DEFAULT_MEMORY_CHUNK_SIZE,

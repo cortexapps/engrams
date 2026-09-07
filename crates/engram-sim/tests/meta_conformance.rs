@@ -2392,6 +2392,89 @@ async fn latest_snapshot_reports_recoverable_flag(ctx: &Ctx) {
     );
 }
 
+/// Shard-scoped expiry: the `content_hash` range selects exactly its
+/// shard, the grace cutoff still applies inside it, and the limit caps
+/// the page. This is what lets the promote pass hold only one shard
+/// group's pin set instead of the whole thing.
+async fn gc_candidates_shard_range(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let mut h00 = [0u8; 32];
+    h00[0] = 0x00;
+    h00[31] = 1;
+    let mut h00b = [0u8; 32];
+    h00b[0] = 0x00;
+    h00b[31] = 2;
+    let mut h7f = [0u8; 32];
+    h7f[0] = 0x7f;
+    let mut hff = [0u8; 32];
+    hff[0] = 0xff;
+
+    meta.upsert_chunk_gc_candidates(&[h00, h00b, h7f, hff])
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(100));
+    let cutoff = ctx.clock.now_utc();
+
+    let bounds = |shard: u8| -> (Vec<u8>, Vec<u8>) {
+        let mut lo = vec![0u8; 32];
+        lo[0] = shard;
+        if shard == u8::MAX {
+            (lo, vec![0xffu8; 33])
+        } else {
+            let mut hi = vec![0u8; 32];
+            hi[0] = shard + 1;
+            (lo, hi)
+        }
+    };
+
+    // Shard 0x00 holds exactly its two hashes.
+    let (lo, hi) = bounds(0x00);
+    let mut got = meta
+        .list_expired_gc_candidates_in_range(cutoff, &lo, &hi, 10)
+        .await
+        .unwrap();
+    got.sort();
+    assert_eq!(got, vec![h00, h00b], "the range selects only shard 0x00");
+
+    // The LAST shard must not be truncated by an unrepresentable upper
+    // bound — 0xff.. is where an off-by-one silently drops a whole shard.
+    let (lo, hi) = bounds(0xff);
+    let got = meta
+        .list_expired_gc_candidates_in_range(cutoff, &lo, &hi, 10)
+        .await
+        .unwrap();
+    assert_eq!(got, vec![hff], "shard 0xff is reachable, not clipped");
+
+    // An empty shard yields nothing.
+    let (lo, hi) = bounds(0x42);
+    assert!(meta
+        .list_expired_gc_candidates_in_range(cutoff, &lo, &hi, 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The grace cutoff still applies inside the range.
+    let early = cutoff - chrono::Duration::seconds(150);
+    let (lo, hi) = bounds(0x00);
+    assert!(
+        meta.list_expired_gc_candidates_in_range(early, &lo, &hi, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a cutoff before first_seen_at excludes the shard's rows"
+    );
+
+    // The limit caps the page.
+    let (lo, hi) = bounds(0x00);
+    assert_eq!(
+        meta.list_expired_gc_candidates_in_range(cutoff, &lo, &hi, 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 /// Batched candidate upsert: same sticky-`first_seen_at` semantics as
 /// the singular form, and mixing the two must not double-count.
 async fn gc_candidates_batched(ctx: &Ctx) {
@@ -4031,6 +4114,10 @@ conformance!(t_outbox_flow, super::outbox_flow);
 conformance!(t_snapshot_durable_head, super::snapshot_durable_head);
 conformance!(t_gc_candidates, super::gc_candidates);
 conformance!(t_gc_candidates_batched, super::gc_candidates_batched);
+conformance!(
+    t_gc_candidates_shard_range,
+    super::gc_candidates_shard_range
+);
 conformance!(t_chunk_gc_sweep_lease, super::chunk_gc_sweep_lease);
 conformance!(t_host_lifecycle, super::host_lifecycle);
 conformance!(t_bundle_pin_set_union, super::bundle_pin_set_union);
