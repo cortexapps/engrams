@@ -1,6 +1,18 @@
+# The three required inputs are validated NON-EMPTY: `-var region=$REGION`
+# with $REGION unset in a fresh shell passes "" (Terraform accepts it, the
+# provider silently falls back to the ambient region) and the first AWS
+# bring-up applied that — it destroyed the S3 gateway endpoint (service name
+# `com.amazonaws..s3`) and wrote a region-less ARN into the coordinator's
+# IAM policy. Step 2 of docs/deploy-aws.md writes terraform.tfvars once so
+# later applies carry no flags at all.
 variable "region" {
   type        = string
-  description = "AWS region."
+  description = "AWS region (e.g. us-west-2)."
+
+  validation {
+    condition     = can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]$", var.region))
+    error_message = "region must be an AWS region id like us-west-2 (empty means $REGION was unset)."
+  }
 }
 
 variable "name_prefix" {
@@ -12,6 +24,11 @@ variable "name_prefix" {
 variable "domain" {
   type        = string
   description = "Public domain for the web Ingress (e.g. engrams.example.com). Drives the ACM certificate + the values output; DNS validation + the final CNAME are `route53_zone_id` or manual records."
+
+  validation {
+    condition     = can(regex("^[a-z0-9.-]+\\.[a-z]{2,}$", var.domain))
+    error_message = "domain must be a hostname like engrams.example.com (empty means $DOMAIN was unset)."
+  }
 }
 
 variable "route53_zone_id" {
@@ -23,12 +40,17 @@ variable "route53_zone_id" {
 variable "admin_email" {
   type        = string
   description = "Bootstrap admin: promoted to role 'admin' on first sign-in."
+
+  validation {
+    condition     = can(regex("^[^@\\s]+@[^@\\s]+$", var.admin_email))
+    error_message = "admin_email must be an email address (empty means $ADMIN_EMAIL was unset)."
+  }
 }
 
 variable "kvm_instance_type" {
   type        = string
-  description = "Intel KVM-capable type (see the kvm-nodegroup module). Default is the nested-virt m8i shape twin of GCP's c3-standard-22; set m7i.metal-24xl for CPUID parity with a GCP C3 fleet."
-  default     = "m8i.6xlarge"
+  description = "Intel KVM-capable type (see the kvm-nodegroup module). Default is the nested-virt m8i shape nearest above GCP's c3-standard-22; set m7i.metal-24xl for CPUID parity with a GCP C3 fleet (metal quota, ~3× the cost)."
+  default     = "m8i.8xlarge"
 }
 
 variable "kvm_initial_node_count" {

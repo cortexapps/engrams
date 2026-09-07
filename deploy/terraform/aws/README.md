@@ -23,7 +23,8 @@ modules/
   rds/                Postgres 16 + the two DSN secrets (with the
                       load-bearing sslmode split)
   secret-shells/      Empty Secrets Manager shells (slash-namespaced;
-                      no KEK shell — the KEK is a KMS key on AWS)
+                      the kek-master shell is the ORCHESTRATOR's raw
+                      key — the coordinator's KEK is a KMS key on AWS)
   irsa/               IRSA role factory (OIDC trust + caller policy)
   host-operator-iam/  The asg scaler's least-privilege role, scoped
                       to the fleet ASG
@@ -37,20 +38,22 @@ quickstart/           ONE apply: all of the above + the KEK KMS key,
 
 ## Quickstart
 
-> **Cost + quota:** the default KVM shape is `m8i.6xlarge` (24 vCPU,
-> nested virtualization) × 2 — 48 on-demand vCPUs, which a fresh
-> account's default quota may not cover. The metal alternative
-> (`m7i.metal-24xl`, for CPUID parity with a GCP C3 fleet) needs a
-> metal quota ticket and costs far more. Read `docs/deploy-aws.md`
-> first.
+> **Cost + quota:** the default KVM shape is `m8i.8xlarge` (32 vCPU,
+> nested virtualization enabled at launch) × 2 — 64 on-demand vCPUs,
+> which a fresh account's default quota may not cover. The metal
+> alternative (`m7i.metal-24xl`, for CPUID parity with a GCP C3
+> fleet) needs a metal quota ticket and costs ~3× more. Read
+> `docs/deploy-aws.md` first.
 
 ```sh
 cd deploy/terraform/aws/quickstart
 terraform init
-terraform apply \
-  -var region=us-west-2 \
-  -var domain=engrams.example.com \
-  -var admin_email=you@example.com
+cat > terraform.tfvars <<EOF   # gitignored; every later command reads it
+region      = "us-west-2"
+domain      = "engrams.example.com"
+admin_email = "you@example.com"
+EOF
+terraform apply
 ```
 
 Then follow `docs/deploy-aws.md`: populate the secret shells

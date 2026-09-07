@@ -14,8 +14,9 @@
 #   an older platform restore on a newer one (feature superset);
 #   the REVERSE does not hold. Moving this pool to an older machine
 #   family requires a re-bake of every enabled image. Cross-cloud:
-#   the AWS quickstart defaults to m7i (also Sapphire Rapids) for
-#   deliberate CPUID parity, so images bake once for both fleets.
+#   the AWS quickstart defaults to m8i (Granite Rapids — its own
+#   bakes); its `m7i.metal-24xl` option (also Sapphire Rapids) gives
+#   CPUID parity so images bake once for both fleets.
 #
 # - **`auto_upgrade = false`** — GKE must never drain the stateful
 #   fleet on its own schedule. Rolls go through the engram
