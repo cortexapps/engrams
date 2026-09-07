@@ -265,6 +265,20 @@ resource "helm_release" "alb_controller" {
     name  = "clusterName"
     value = module.eks_cluster.cluster_name
   }
+  # Explicit VPC + region: the controller otherwise discovers both from
+  # instance metadata, and the managed node group's IMDS hop limit is 1
+  # (the EKS module v21 default), which a bridge-networked pod cannot
+  # reach. Without these it CrashLoops on "failed to fetch VPC ID from
+  # instance metadata" — and every Ingress delete hangs on its
+  # finalizer (the first AWS teardown, 2026-09-07).
+  set {
+    name  = "vpcId"
+    value = module.network.vpc_id
+  }
+  set {
+    name  = "region"
+    value = var.region
+  }
   set {
     name  = "serviceAccount.create"
     value = "true"
