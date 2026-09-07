@@ -21,18 +21,21 @@
 # module stays pure-AWS.
 
 module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "~> 20.31"
+  source = "terraform-aws-modules/eks/aws"
+  # v21: AWS provider ≥ 6.59. The kvm-nodegroup's launch-time nested-
+  # virtualization flag needs provider ≥ 6.33, which v20 (< 6.0) pins
+  # out.
+  version = "~> 21.25"
 
-  cluster_name    = var.name
-  cluster_version = var.cluster_version
+  name               = var.name
+  kubernetes_version = var.cluster_version
 
   vpc_id     = var.vpc_id
   subnet_ids = var.private_subnet_ids
 
   # Public endpoint (kubectl from anywhere; the API server is
   # auth-gated), private nodes.
-  cluster_endpoint_public_access = true
+  endpoint_public_access = true
 
   enable_irsa = true
 
@@ -41,7 +44,7 @@ module "eks" {
   # run.
   enable_cluster_creator_admin_permissions = true
 
-  cluster_addons = {
+  addons = {
     coredns    = {}
     kube-proxy = {}
     vpc-cni    = {}

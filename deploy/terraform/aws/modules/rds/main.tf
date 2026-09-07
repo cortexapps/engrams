@@ -60,6 +60,13 @@ resource "aws_db_instance" "this" {
   engine_version = var.engine_version
   instance_class = var.instance_class
 
+  # engine_version is a MAJOR ("16"): RDS retires minors on its own
+  # schedule (16.6 vanished within months of authoring), and a pinned
+  # minor fails CreateDBInstance with "Cannot find version". The
+  # prefix resolves to the current default minor and this flag keeps
+  # the instance on RDS's patch train from then on.
+  auto_minor_version_upgrade = true
+
   allocated_storage     = 50
   max_allocated_storage = 200
   storage_type          = "gp3"

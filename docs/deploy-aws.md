@@ -11,31 +11,34 @@ the deliberate per-cloud differences are marked ⚡ below.
 
 **Read this first — cost and quota**
 
-- The KVM fleet defaults to **2 × `m8i.6xlarge`** (24 vCPUs each,
-  nested virtualization) — the shape twin of the GCP quickstart's
-  `c3-standard-22`, roughly $2.9/hr for the pair. Tear down when
-  not in use.
+- The KVM fleet defaults to **2 × `m8i.8xlarge`** (32 vCPUs each,
+  nested virtualization) — the nearest shape above the GCP
+  quickstart's `c3-standard-22`, roughly $3.4/hr for the pair
+  (us-west-2 on-demand). Tear down when not in use.
 - Check your **"Running On-Demand Standard instances" vCPU quota**
-  covers the 48 fleet vCPUs plus the control-plane nodes; a fresh
+  covers the 64 fleet vCPUs plus the control-plane nodes; a fresh
   account's default may not. Request the increase (Service Quotas →
   EC2) before applying; grants can take hours to days.
-- KVM needs Intel hardware: the Xeon-6 C8i/M8i/R8i virtual shapes
-  (nested virtualization) or bare metal (`*.metal`). No AMD, no
-  Graviton.
+- KVM needs Intel hardware: an 8th-gen Xeon-6 virtual shape (C8i,
+  M8i, R8i or their -flex variants — the only families EC2 enables
+  nested virtualization on, and only as a launch-time flag the
+  quickstart sets) or bare metal (`*.metal`). No AMD, no Graviton,
+  no 7th-gen virtual shapes.
 - ⚡ **CPUID is a one-way door.** m8i is Granite Rapids; the GCP
   quickstart's C3 is Sapphire Rapids. Images baked on the default
   AWS fleet are GNR-pinned and their snapshots never restore on a
   C3 fleet (newer silicon never restores on older). If you run
   BOTH clouds and want one bake serving them, set
-  `kvm_instance_type = "m7i.metal-24xl"` (Sapphire Rapids — metal
-  because m7i has no nested virt). That path is ~$10+/hr for the
-  pair and needs 192 vCPUs of quota.
+  `kvm_instance_type = "m7i.metal-24xl"` (Sapphire Rapids — metal,
+  because EC2 does not enable nested virtualization on 7th-gen
+  virtual shapes). That path is ~$10/hr for the pair and needs a
+  metal quota ticket (192 vCPUs).
 
 **What you need before starting**
 
 - An AWS account with admin credentials configured (`aws sts
   get-caller-identity` works).
-- `aws`, `terraform` ≥ 1.5, `helm` ≥ 3.10, `kubectl`, `openssl`.
+- `aws`, `terraform` ≥ 1.5.7, `helm` ≥ 3.10, `kubectl`, `openssl`, `jq`, `dig`.
 - A domain you control (one validation CNAME + one final CNAME).
 
 Throughout: `REGION`, `DOMAIN`, `ADMIN_EMAIL` are yours.
@@ -48,29 +51,36 @@ aws service-quotas get-service-quota --region $REGION \
   --query 'Quota.Value'   # Running On-Demand Standard instances (vCPUs)
 ```
 
-Need ≥ 48 for the default fleet (plus the small control-plane
+Need ≥ 64 for the default fleet (plus the small control-plane
 nodes); ≥ 192 if you chose the metal parity shape. Request more
 before continuing if short.
 
 ## 2. Terraform: one apply
 
+Write the inputs to `terraform.tfvars` once (gitignored; every later
+`terraform` command reads it, so a fresh shell with `$REGION` unset
+can never apply an empty region — the inputs are also validated
+non-empty):
+
 ```sh
 cd deploy/terraform/aws/quickstart
+cat > terraform.tfvars <<EOF
+region      = "$REGION"
+domain      = "$DOMAIN"
+admin_email = "$ADMIN_EMAIL"
+EOF
 terraform init
-terraform apply \
-  -var region=$REGION \
-  -var domain=$DOMAIN \
-  -var admin_email=$ADMIN_EMAIL
+terraform apply
 ```
 
-(Optional: `-var route53_zone_id=<hosted zone>` automates the ACM
-validation records; step 4 covers the manual alternative.)
+(Optional: `route53_zone_id = "<hosted zone>"` in the file automates
+the ACM validation records; step 4 covers the manual alternative.)
 
 This provisions the VPC (with the S3 gateway endpoint), the chunks
 bucket, the EKS cluster + the self-managed KVM ASG, RDS (plus a
 one-shot in-cluster Job creating the two logical databases), ⚡ the
-KEK as a real KMS key (`kek.provider: aws-kms` — no KEK secret to
-populate on AWS), the secret shells, every IRSA role, both
+coordinator's KEK as a real KMS key (`kek.provider: aws-kms`), the
+secret shells, every IRSA role, both
 namespaces, the AWS Load Balancer Controller, the External Secrets
 relay, and the ACM certificate request. Expect ~20 minutes; the
 EKS control plane is the slow tail (metal instances take longer
@@ -85,8 +95,10 @@ aws eks update-kubeconfig --region $REGION \
 
 ## 3. Populate the secret shells
 
-⚡ Three shells + the CA pair — no KEK entry (the KEK is the KMS
-key). **Do this before the Helm installs** — the relay leaves the
+⚡ Four shells + the CA pair. The coordinator's KEK is the KMS key,
+so there is no coordinator KEK entry; the orchestrator still needs a
+raw key because it seals its own tables in-process and has no KMS
+path. **Do this before the Helm installs** — the relay leaves the
 in-cluster Secrets unsynced until the shells have values, and pods
 CrashLoop until the first sync.
 
@@ -100,6 +112,11 @@ aws secretsmanager put-secret-value --region $REGION \
 aws secretsmanager put-secret-value --region $REGION \
   --secret-id engram/better-auth-secret \
   --secret-string "$(openssl rand -base64 48)"
+
+# The orchestrator's 32-byte sealing key (raw; the coordinator uses KMS).
+aws secretsmanager put-secret-value --region $REGION \
+  --secret-id engram/kek-master \
+  --secret-string "$(openssl rand -base64 32)"
 
 # The egress-proxy CA pair (fleet-wide, ten-year cert). ⚡ The
 # host-agent reads these DIRECTLY from Secrets Manager over IRSA
@@ -123,15 +140,41 @@ kubectl get externalsecret -A
 
 ## 4. Certificate validation
 
-If you passed `route53_zone_id`, the validation records were created
-— wait for `terraform output` / the ACM console to show **Issued**.
-Otherwise create the CNAMEs from:
+Step 2 *requested* an ACM certificate for `$DOMAIN`; ACM issues it
+only after you prove control of the name with a DNS record. The ALB
+(step 5) carries this certificate, so nothing serves HTTPS until it
+is **Issued**.
+
+If you passed `route53_zone_id`, Terraform created the validation
+record and waited for issuance — skip to step 5. Otherwise print
+the record and create it in your DNS zone:
 
 ```sh
 terraform output acm_validation_records
 ```
 
-Issuance follows within minutes of the records resolving.
+The `name` is the fully-qualified record name. Most DNS consoles
+(Cloud DNS, Cloudflare, Route53) take the name *relative to the
+zone* and append the zone themselves: for zone `example.com` and
+name `_abc.engrams.example.com.`, enter `_abc.engrams`. Keep every
+label — a dropped label is the usual reason validation never
+completes. Confirm the record from the zone's authoritative server,
+then wait for ACM:
+
+```sh
+NAME=$(terraform output -json acm_validation_records | jq -r '.[0].name')
+dig +short CNAME "$NAME" @"$(dig +short NS "${DOMAIN#*.}" | head -1)"
+#   → the acm-validations.aws. target; empty means the record is missing or misnamed
+aws acm wait certificate-validated --region $REGION \
+  --certificate-arn "$(terraform output -raw acm_certificate_arn)"
+#   returns once Status is ISSUED (usually within minutes of the record resolving)
+```
+
+You can run step 5 while the certificate is pending: the Helm
+installs succeed, but the Load Balancer Controller cannot create
+the HTTPS listener until issuance, so the Ingress has no hostname
+and step 6 cannot start. The controller retries on its own once
+the certificate is Issued.
 
 ## 5. Helm: the two releases
 
@@ -163,13 +206,14 @@ helm install hf deploy/helm/engram-host-fleet \
 (Release names matter — same coupling as the GCP page: the fleet
 dials `engram-coordinator.engrams`, and the IRSA trust policies name
 the `hf-*` ServiceAccounts. Different names → re-apply step 2 with
-the matching `-var *_ksa` values.)
+the matching `*_ksa` values in `terraform.tfvars`.)
 
 Watch it come up:
 
 ```sh
+kubectl get nodes -l engram.io/kvm=true   # the KVM instances, 2 Ready
 kubectl get pods -n engrams
-kubectl get pods -n engrams-hosts
+kubectl get pods -n engrams-hosts          # hf-operator + one hf-host-agent per KVM node
 kubectl logs -n engrams deploy/engram-coordinator | grep -i "host registered"
 ```
 
@@ -214,7 +258,7 @@ The fleet bills while it idles — tear down promptly:
 helm uninstall engram -n engrams; helm uninstall hf -n engrams-hosts
 # Delete any ALBs the controller created before destroying the VPC:
 kubectl delete ingress -n engrams --all
-cd deploy/terraform/aws/quickstart && terraform destroy -var ... # same vars as apply
+cd deploy/terraform/aws/quickstart && terraform destroy   # reads terraform.tfvars
 ```
 
 The bucket refuses destroy unless emptied
@@ -225,7 +269,12 @@ The bucket refuses destroy unless emptied
 | Symptom | Likely cause |
 |---|---|
 | KVM ASG stuck at 0/2 healthy | vCPU quota (step 1) or the chosen shape isn't offered in a chosen AZ (m8i and metal availability varies by AZ) — check the ASG activity history. |
+| ASG instances InService but `kubectl get nodes -l engram.io/kvm=true` is empty and the DaemonSet shows 0 desired | The kubelets can't authenticate: the node role needs an EKS access entry (the kvm-nodegroup module creates it — `aws eks list-access-entries --cluster-name <cluster>` must list `<name>-node`). Nodes join on their own once it exists; no relaunch needed. |
+| `terraform apply` fails on a `helm_release` with `no endpoints available for service "aws-load-balancer-webhook-service"` | The AWS Load Balancer Controller registers a fail-closed webhook on every Service before its pods are ready; the quickstart serializes ESO behind it, so this means the controller itself is unhealthy (`kubectl get pods -n kube-system`). Fix that, then re-run `apply`. |
 | Pods CrashLoop on missing Secrets | Step 3 skipped — `kubectl get externalsecret -A` shows the sync state. |
+| Orchestrator `CreateContainerConfigError`: `couldn't find key ENGRAM_KEK_MASTER_KEY` | The `engram/kek-master` shell is empty, or the relay has not re-synced since you filled it (`kubectl annotate externalsecret -n engrams engram-orchestrator-secrets force-sync=$(date +%s)`). |
 | Host-agent CrashLoops on the egress CA | The CA shells are empty, or the fleet IRSA role can't read them (it is scoped to exactly those two ARNs). |
 | Ingress has no ALB hostname | The AWS Load Balancer Controller isn't healthy (`kubectl get pods -n kube-system`), or the ACM cert isn't Issued yet. |
+| ACM cert stays `PENDING_VALIDATION` | The validation CNAME is missing or misnamed (a dropped label when the console appended the zone). `dig` it against the zone's authoritative nameserver (step 4); fix the name — ACM re-checks on its own. |
 | `no capacity` / sessions queued forever | Hosts never registered — check host-agent logs for the coordinator endpoint + bearer. |
+| Enabling an image fails with `Error creating KVM object: No such file or directory` | `/dev/kvm` is missing on the host: the instance was launched without nested virtualization (a launch template from before the flag, or a 7th-gen shape). `kubectl exec -n engrams-hosts <host-agent pod> -- grep -c vmx /proc/cpuinfo` prints 0. The flag is launch-time only: `terraform apply`, then replace each instance with `aws autoscaling terminate-instance-in-auto-scaling-group --instance-id <id> --no-should-decrement-desired-capacity`. |

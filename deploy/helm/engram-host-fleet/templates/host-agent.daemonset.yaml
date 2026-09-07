@@ -71,6 +71,15 @@ spec:
           args:
             - |
               set -eu
+              # KVM is the whole point of this node. Fail LOUDLY here rather
+              # than register a host whose first capture dies with "Error
+              # creating KVM object: No such file or directory" (EKS: nested
+              # virtualization is a launch-time flag; GKE: the node pool's
+              # enable-nested-virtualization).
+              if [ ! -e /dev/kvm ]; then
+                echo "[node-prep] FATAL: /dev/kvm is missing — this VM was launched without nested virtualization (vmx flag count: $(grep -c -w vmx /proc/cpuinfo || true)); replace the instance"
+                exit 1
+              fi
               # ADR 0049: nbds_max only takes effect on a fresh module load.
               # A loaded module can only change after the node is drained.
               WANT_NBDS_MAX={{ .Values.nbd.nbdsMax }}

@@ -41,8 +41,8 @@ variable "security_group_ids" {
 
 variable "instance_type" {
   type        = string
-  description = "Intel KVM-capable type: Xeon-6 C8i/M8i/R8i virtual shapes (nested virt) or bare metal (*.metal). Default m8i.6xlarge = the GCP c3-standard-22 shape twin; use m7i.metal-24xl for CPUID parity with a GCP C3 fleet (see main.tf header)."
-  default     = "m8i.6xlarge"
+  description = "Intel KVM-capable type: an 8th-gen C8i/M8i/R8i (-flex) virtual shape — the module enables nested virtualization at launch — or bare metal (*.metal). Default m8i.8xlarge = the nearest shape above the GCP c3-standard-22; use m7i.metal-24xl for CPUID parity with a GCP C3 fleet (see main.tf header)."
+  default     = "m8i.8xlarge"
 }
 
 variable "initial_node_count" {

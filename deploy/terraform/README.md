@@ -21,12 +21,14 @@ Per ADR 0007/0122, engram's only hard requirements on a cloud are:
    relay that lands K8s Secrets (External Secrets Operator).
 4. **Linux + KVM-capable nodes** for the Firecracker hosts. This is
    the binding constraint: nested virtualization is **Intel-only** on
-   every managed provider (GKE C3 family; EKS bare-metal `*.metal` or
-   Xeon-6 C8i/M8i/R8i), it is set at node-pool creation, and the CPU
-   platform is a **one-way door for snapshots** — images baked on a
-   newer platform never restore on an older one. The two quickstarts
-   default to Sapphire Rapids on both clouds (GCP C3 / AWS m7i) so
-   images bake once.
+   every managed provider (GKE C3 family; EKS 8th-gen C8i/M8i/R8i
+   virtual shapes via a launch-time flag, or bare-metal `*.metal`), it
+   is set at node-pool creation, and the CPU platform is a **one-way
+   door for snapshots** — images baked on a newer platform never
+   restore on an older one. The quickstarts default GCP to Sapphire
+   Rapids (C3) and AWS to Granite Rapids (m8i); AWS offers
+   `m7i.metal-24xl` for CPUID parity when one bake must serve both
+   clouds.
 5. **Kubernetes** for the control plane and the host-fleet DaemonSet
    (ADR 0044).
 

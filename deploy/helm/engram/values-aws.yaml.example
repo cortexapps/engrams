@@ -164,6 +164,14 @@ orchestrator:
     urlKey: ORCHESTRATOR_DATABASE_URL
     bearerKey: CONTROL_PLANE_BEARER
     authSecretKey: BETTER_AUTH_SECRET
+  # The orchestrator seals its own tables in-process with a RAW 32-byte
+  # key and has no KMS path, so with the coordinator on aws-kms the key
+  # cannot come from the coordinator's Secret (the chart default). The
+  # quickstart relays the `engram/kek-master` shell into the
+  # orchestrator's Secret under this key.
+  kekSecret:
+    existingSecret: engram-orchestrator-secrets
+    key: ENGRAM_KEK_MASTER_KEY
   auth:
     # Bootstrap admins: promoted to role 'admin' on first sign-in.
     adminEmails:

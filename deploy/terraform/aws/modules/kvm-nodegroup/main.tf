@@ -10,13 +10,26 @@
 # Invariants (each is load-bearing — see the GCP twin for the war
 # stories):
 #
-# - **KVM needs Intel hardware.** On EC2 that means the Xeon-6
-#   C8i/M8i/R8i virtual shapes (nested virtualization via VMCS
-#   shadowing, launched 2026-02) or bare metal (`*.metal`). No AMD,
-#   no Graviton. The default `m8i.6xlarge` (24 vCPU / 96 GiB) is the
-#   shape twin of the GCP quickstart's `c3-standard-22`, and FC runs
-#   nested exactly the way it does on GCP (L2 under the cloud
-#   hypervisor).
+# - **KVM needs Intel hardware.** On EC2 that means the 8th-gen
+#   Xeon-6 virtual shapes — C8i/M8i/R8i and their -flex variants, the
+#   only families RunInstances accepts `NestedVirtualization=enabled`
+#   for (EC2 API reference, CpuOptionsRequest) — or bare metal
+#   (`*.metal`). No AMD, no Graviton, and NOT the 7th-gen virtual
+#   shapes: `describe-instance-types` lists `nested-virtualization`
+#   under m7i/c7i/r7i too, but the launch flag is 8th-gen only. The
+#   default `m8i.8xlarge` (32 vCPU / 128 GiB) is the nearest shape
+#   above the GCP quickstart's `c3-standard-22` (22 vCPU / 88 GiB) —
+#   sizes jump from 4xlarge (16 vCPU) to 8xlarge (32 vCPU); there is
+#   no 6xlarge. FC runs nested exactly the way it does on GCP (L2
+#   under the cloud hypervisor).
+#
+# - **Nested virtualization is a LAUNCH-TIME flag, off by default.**
+#   `cpu_options.nested_virtualization = "enabled"` on the launch
+#   template. Without it the guest has no `vmx` and no `/dev/kvm`,
+#   kubelet joins happily, the host registers, and the first capture
+#   dies with "Error creating KVM object: No such file or directory"
+#   (the first AWS bring-up, 2026-09-07). It cannot be flipped on a
+#   running instance — replace the instances after changing it.
 #
 # - **CPUID is a one-way door.** m8i is Granite Rapids; GCP C3 is
 #   Sapphire Rapids. Images baked on this fleet are GNR-pinned:
@@ -24,7 +37,8 @@
 #   AWS fleet on m8i bakes its own images and its snapshots do not
 #   move to a C3 fleet. Operators who need ONE bake serving both
 #   clouds pick `m7i.metal-24xl` instead (Sapphire Rapids, CPUID
-#   parity with C3 — metal because m7i has no nested virt).
+#   parity with C3 — metal, because EC2 does not enable nested virt
+#   on 7th-gen virtual shapes; needs a metal quota, ~3× the cost).
 #
 # - **The operator owns the size.** `ignore_changes` on
 #   desired_capacity; `max_size` sits above the operator's ceiling.
@@ -42,6 +56,14 @@
 # - The **label/taint pair** matches the host-fleet chart:
 #   `engram.io/kvm=true` label + `engram.io/kvm=true:NoSchedule`
 #   taint, set via nodeadm in user data.
+#
+# - **The node role is registered with the cluster here.** A
+#   self-managed group gets no aws-auth / access-entry mapping from
+#   the EKS module (only its managed groups do), so without the
+#   `aws_eks_access_entry` below kubelet boots cleanly and then fails
+#   authentication forever: instances sit InService, no CSR, no node,
+#   the host-agent DaemonSet has zero targets (the first AWS
+#   bring-up, 2026-09-04). The ASG waits for the entry.
 
 data "aws_ssm_parameter" "eks_ami" {
   # EKS-optimized AL2023 AMI for the cluster's K8s version.
@@ -82,6 +104,15 @@ resource "aws_launch_template" "kvm" {
 
   vpc_security_group_ids = var.security_group_ids
   user_data              = local.user_data
+
+  # The launch-time nested-virtualization flag (see the header). Metal
+  # shapes have KVM natively and do not take the flag.
+  dynamic "cpu_options" {
+    for_each = strcontains(var.instance_type, ".metal") ? [] : [1]
+    content {
+      nested_virtualization = "enabled"
+    }
+  }
 
   iam_instance_profile {
     arn = aws_iam_instance_profile.node.arn
@@ -126,6 +157,15 @@ resource "aws_launch_template" "kvm" {
   tags = var.tags
 }
 
+# EKS access entry (API_AND_CONFIG_MAP / API auth modes): lets kubelets
+# under the node role join. EC2_LINUX carries the system:nodes policy.
+resource "aws_eks_access_entry" "node" {
+  cluster_name  = var.cluster_name
+  principal_arn = aws_iam_role.node.arn
+  type          = "EC2_LINUX"
+  tags          = var.tags
+}
+
 resource "aws_autoscaling_group" "kvm" {
   name = var.name
 
@@ -165,6 +205,9 @@ resource "aws_autoscaling_group" "kvm" {
   lifecycle {
     ignore_changes = [desired_capacity] # the ADR 0048 operator owns the size
   }
+
+  # Kubelets must be able to authenticate the moment they boot.
+  depends_on = [aws_eks_access_entry.node]
 }
 
 # ── node IAM ──────────────────────────────────────────────────────

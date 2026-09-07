@@ -503,8 +503,10 @@ orchestrator:
   #   - Default (existingSecret: "") sources the key from the COORDINATOR's secret
   #     (.Values.database.existingSecret) — the shared engrams key; correct for
   #     `kek.provider: env-var` deployments (key in a k8s Secret / Secret Manager).
-  #   - For a `gcp-kms` coordinator (no raw key in a Secret), point this at a
-  #     Secret holding a raw 32-byte base64 key for the orchestrator.
+  #   - For a `gcp-kms` / `aws-kms` coordinator (no raw key in a Secret), point
+  #     this at a Secret holding a raw 32-byte base64 key for the orchestrator
+  #     (values-aws: the quickstart relays `engram/kek-master` into
+  #     engram-orchestrator-secrets).
   kekSecret:
     existingSecret: ""          # "" -> falls back to .Values.database.existingSecret
     key: ENGRAM_KEK_MASTER_KEY

@@ -36,6 +36,7 @@ module "irsa_eso" {
           module.rds.orchestrator_database_url_secret_arn,
           module.secret_shells.secret_arns["auth-tokens"],
           module.secret_shells.secret_arns["better-auth-secret"],
+          module.secret_shells.secret_arns["kek-master"],
         ]
       }]
     })
@@ -64,7 +65,14 @@ resource "helm_release" "external_secrets" {
     value = module.irsa_eso.role_arn
   }
 
-  depends_on = [module.eks_cluster]
+  # The AWS Load Balancer Controller chart registers a fail-closed
+  # MutatingWebhookConfiguration on every Service
+  # (mservice.elbv2.k8s.aws) the moment it installs, before its pods
+  # are ready. ESO's own webhook Service hits that webhook, so an
+  # install racing the controller fails with "no endpoints available
+  # for service aws-load-balancer-webhook-service". Serialize behind
+  # the controller release (helm waits for its Deployment).
+  depends_on = [module.eks_cluster, helm_release.alb_controller]
 }
 
 resource "kubectl_manifest" "aws_secret_store" {
@@ -89,8 +97,9 @@ resource "kubectl_manifest" "aws_secret_store" {
 }
 
 # ─── engram-coordinator-secrets ───────────────────────────────────
-# DATABASE_URL + ENGRAM_AUTH_TOKENS. No KEK entry — on AWS the KEK is
-# the KMS key (kek.provider=aws-kms), not an env var.
+# DATABASE_URL + ENGRAM_AUTH_TOKENS. No KEK entry — on AWS the
+# coordinator's KEK is the KMS key (kek.provider=aws-kms), not an env
+# var. The orchestrator's raw KEK rides ITS secret below.
 resource "kubectl_manifest" "coordinator_external_secret" {
   yaml_body = <<-YAML
     apiVersion: external-secrets.io/v1
@@ -123,6 +132,14 @@ resource "kubectl_manifest" "coordinator_external_secret" {
 # allow-list and a comma list is not a valid bearer — the sprig
 # pipeline emits the first element (the same non-obvious wiring as
 # the GCP relay).
+#
+# ENGRAM_KEK_MASTER_KEY is here, not in the coordinator's secret: the
+# orchestrator seals its own tables (user secrets, OIDC keys) IN
+# PROCESS with a raw 32-byte key and has no KMS path (config.ts makes
+# the var required). Neither tier opens the other's sealed rows, so
+# the coordinator on KMS + the orchestrator on this key is sound. The
+# chart's `orchestrator.kekSecret.existingSecret` (values-aws) points
+# at this Secret.
 resource "kubectl_manifest" "orchestrator_external_secret" {
   yaml_body = <<-YAML
     apiVersion: external-secrets.io/v1
@@ -145,7 +162,11 @@ resource "kubectl_manifest" "orchestrator_external_secret" {
             ORCHESTRATOR_DATABASE_URL: "{{ .databaseUrl }}"
             BETTER_AUTH_SECRET: "{{ .betterAuthSecret }}"
             CONTROL_PLANE_BEARER: '{{ .authTokens | splitList "," | first }}'
+            ENGRAM_KEK_MASTER_KEY: "{{ .kekMaster }}"
       data:
+        - secretKey: kekMaster
+          remoteRef:
+            key: ${module.secret_shells.secret_names["kek-master"]}
         - secretKey: databaseUrl
           remoteRef:
             key: ${module.rds.orchestrator_database_url_secret_name}

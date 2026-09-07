@@ -11,11 +11,11 @@
 #
 # Assumptions:
 # - A SELF-MANAGED Intel nodegroup (launch template + ASG): KVM needs
-#   the Xeon-6 C8i/M8i/R8i virtual shapes (nested virt;
-#   `m8i.6xlarge` is the quickstart default — the GCP c3-standard-22
-#   shape twin) or bare metal (`m7i.metal-24xl` = Sapphire Rapids,
-#   CPUID parity with GCP C3 so one bake serves both clouds). No
-#   AMD, no Graviton. Node label `engram.io/kvm=true` + taint
+#   an 8th-gen C8i/M8i/R8i virtual shape launched with
+#   NestedVirtualization=enabled (`m8i.8xlarge` is the quickstart
+#   default — the nearest shape above GCP's c3-standard-22) or bare
+#   metal (`m7i.metal-24xl` = Sapphire Rapids, CPUID parity with GCP
+#   C3 so one bake serves both clouds). No AMD, no Graviton. Node label `engram.io/kvm=true` + taint
 #   `engram.io/kvm=true:NO_SCHEDULE` via nodeadm; the ASG suspends
 #   AZRebalance, leaves scale-in protection off, and Terraform
 #   `ignore_changes` desired capacity — the operator owns the size
@@ -83,7 +83,7 @@ storage:
 
 # Size the host-agent cgroup to the machine — total_vcpus (and
 # placement packing) derives from the container CPU limit. Example
-# for m8i.6xlarge (24 vCPU / 96 GiB); on m7i.metal-24xl use
+# for m8i.8xlarge (32 vCPU / 128 GiB); on m7i.metal-24xl use
 # cpu: "96" / memory: 192Gi.
 hostAgent:
   resources:
@@ -91,8 +91,8 @@ hostAgent:
       cpu: "4"
       memory: 8Gi
     limits:
-      cpu: "24"
-      memory: 48Gi
+      cpu: "32"
+      memory: 64Gi
 
 # ADR 0006 / ADR 0122: the egress-proxy CA, read DIRECTLY from AWS
 # Secrets Manager over IRSA (see the identity note above — no ESO

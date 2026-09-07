@@ -20,8 +20,8 @@ variable "allowed_security_group_ids" {
 
 variable "engine_version" {
   type        = string
-  description = "Postgres major.minor."
-  default     = "16.6"
+  description = "Postgres MAJOR version (a prefix — RDS resolves the current minor; see main.tf). Pinning a minor breaks once RDS retires it."
+  default     = "16"
 }
 
 variable "instance_class" {
