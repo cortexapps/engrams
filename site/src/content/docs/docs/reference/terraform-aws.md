@@ -37,20 +37,22 @@ quickstart/           ONE apply: all of the above plus the master-key KMS key,
 
 ## Quickstart
 
-The default KVM shape is two `m8i.6xlarge` instances, 48 on-demand vCPUs, which a fresh
+The default KVM shape is two `m8i.8xlarge` instances, 64 on-demand vCPUs, which a fresh
 account's quota may not cover. The metal alternative, `m7i.metal-24xl`, exists for CPU parity
 with a GCP C3 fleet and needs a metal quota ticket. Read the bring-up guide first.
 
 ```sh
 cd deploy/terraform/aws/quickstart
 terraform init
-terraform apply \
-  -var region=us-west-2 \
-  -var domain=engrams.example.com \
-  -var admin_email=you@example.com
+cat > terraform.tfvars <<EOF   # gitignored; every later command reads it
+region      = "us-west-2"
+domain      = "engrams.example.com"
+admin_email = "you@example.com"
+EOF
+terraform apply
 ```
 
-Pass `-var route53_zone_id=<hosted zone>` to have the certificate validation records
+Set `route53_zone_id` in `terraform.tfvars` to have the certificate validation records
 created. The outputs you use next are `secret_shell_names`, `acm_validation_records` when you
 validate by hand, `cluster_name`, and the two rendered values overlays:
 

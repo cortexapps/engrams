@@ -211,6 +211,18 @@ keeps `env-var`. AWS gets the real provider because it ships in the
 same effort; nothing migrates between KEK providers — sealed data is
 provider-bound via `key_id()`, a new-deployment concern only.
 
+Amended 2026-09-04 (first real apply): the KMS KEK covers the
+COORDINATOR only. The orchestrator seals its own tables in process
+with a raw 32-byte key (`ENGRAM_KEK_MASTER_KEY`, required by
+config.ts) and has no KMS path; the first AWS bring-up failed with
+`couldn't find key ENGRAM_KEK_MASTER_KEY` because the quickstart had
+dropped the KEK shell entirely. Neither tier opens the other's sealed
+rows, so the fix is a separate raw key for the orchestrator: an
+`engram/kek-master` shell relayed into `engram-orchestrator-secrets`,
+selected by the chart's `orchestrator.kekSecret.existingSecret`. A
+KMS path for the orchestrator (or a shared provider abstraction) is
+follow-up work, not part of this ADR.
+
 It is a separate crate, not code inside `engram-crypto`:
 `engram-crypto` is a dependency of musl guest binaries and every
 sealing consumer, and must not pull an AWS SDK.
@@ -252,7 +264,7 @@ conformance suite (ADR 0098 D4) extend in the same PR.
   them by git ref). `deploy/terraform/aws/modules/` mirrors the
   layout (`network`, `storage`, `eks-cluster` wrapping the pinned
   community EKS module, `kvm-nodegroup` as a self-managed ASG of
-  `m8i.6xlarge` by default — the nested-virtualization Xeon-6
+  `m8i.8xlarge` by default — the nested-virtualization Xeon-6
   shape twin of GCP's `c3-standard-22` (EC2 nested virt on virtual
   C8i/M8i/R8i launched 2026-02; FC runs L2 exactly as it does on
   GCP C3) — `rds`, `secrets`, `irsa`, `host-operator-iam`).
@@ -266,6 +278,19 @@ conformance suite (ADR 0098 D4) extend in the same PR.
   an m8i fleet bakes its own images. `m7i.metal-24xl` remains the
   documented choice for operators running both clouds who want
   CPUID parity.
+  Amended 2026-09-04/07 (first real apply): `m8i.6xlarge` does not
+  exist — m8i sizes jump from 4xlarge (16 vCPU) to 8xlarge (32
+  vCPU) — so the default is `m8i.8xlarge` (32 vCPU / 128 GiB, the
+  nearest shape above c3-standard-22). Nested virtualization is a
+  LAUNCH-TIME flag (`CpuOptions.NestedVirtualization=enabled`), off
+  by default and accepted only on C8i/M8i/R8i (+flex); the original
+  launch template never set it, so the first capture failed with no
+  `/dev/kvm`. The kvm-nodegroup module now sets it, which needs AWS
+  provider ≥ 6.33 and therefore the EKS module v21. Trap recorded:
+  `describe-instance-types` lists `nested-virtualization` under the
+  7th-gen m7i/c7i/r7i virtual shapes too, but RunInstances honors
+  the flag on 8th gen only — `m7i.metal-24xl` stays the parity
+  choice.
 - Each cloud gets a `quickstart/` root module: one apply from a fresh
   account to a running cluster — namespaces (fleet namespace
   PSA-privileged), External Secrets install and stores, optional
