@@ -3471,6 +3471,27 @@ pub trait MetadataStore: Send + Sync {
     /// BlobStorage delete succeeded. Order doesn't matter; missing
     /// rows are silently skipped (idempotent so a re-run on a
     /// partial promote pass is safe).
+    /// Expired candidates whose `content_hash` falls in `[lo, hi)`.
+    ///
+    /// The shard-scoped form of [`Self::list_expired_gc_candidates`].
+    /// Deliberately UNORDERED: the range predicate rides the
+    /// `content_hash` primary key, and adding `ORDER BY first_seen_at`
+    /// would force a sort of the whole range. Ordering only ever bought
+    /// oldest-first fairness, which shard-scoped promotion supersedes —
+    /// every shard is visited each cycle regardless.
+    ///
+    /// Verified against the 67M-row prod table: Bitmap Index Scan on
+    /// `chunk_gc_candidates_pkey`, no sort.
+    async fn list_expired_gc_candidates_in_range(
+        &self,
+        _cutoff: chrono::DateTime<chrono::Utc>,
+        _lo: &[u8],
+        _hi: &[u8],
+        _limit: i64,
+    ) -> Result<Vec<[u8; 32]>, MetaError> {
+        Ok(Vec::new())
+    }
+
     async fn delete_gc_candidates(&self, _hashes: &[[u8; 32]]) -> Result<(), MetaError> {
         Ok(())
     }

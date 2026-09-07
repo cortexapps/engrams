@@ -105,6 +105,15 @@ pub struct ChunkGcConfig {
     /// mark pass too. Defaults to 64. Override via
     /// `ENGRAM_CHUNK_GC_PIN_SET_CONCURRENCY`.
     pub pin_set_concurrency: usize,
+    /// Shards this tick covers, starting at the cursor.
+    ///
+    /// THE memory knob. The pin set is filtered to exactly these shards,
+    /// so coordinator heap is `pin_set * shards_per_tick / 256` instead
+    /// of the whole ~14M-hash set. Lower it if the sweep approaches its
+    /// memory limit; raise it to finish a full cycle in fewer ticks.
+    /// Defaults to 32 (12.5% of the pin set). Override via
+    /// `ENGRAM_CHUNK_GC_SHARDS_PER_TICK`.
+    pub shards_per_tick: usize,
     /// Hash-prefix shards walked CONCURRENTLY inside one mark pass.
     ///
     /// Chunk keys are `chunks/sha256/<2 hex>/<62 hex>`, so the space
@@ -160,6 +169,7 @@ impl Default for ChunkGcConfig {
             max_restart_attempts: 3,
             pin_set_concurrency: 64,
             list_page_size: 1000,
+            shards_per_tick: 32,
             shard_concurrency: 16,
             upsert_batch_size: 1000,
             mark_budget: Duration::from_secs(300),
@@ -196,6 +206,11 @@ impl ChunkGcConfig {
         if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_LIST_PAGE_SIZE") {
             if let Ok(n) = v.parse::<usize>() {
                 cfg.list_page_size = n.clamp(1, 1000);
+            }
+        }
+        if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_SHARDS_PER_TICK") {
+            if let Ok(n) = v.parse::<usize>() {
+                cfg.shards_per_tick = n.clamp(1, SHARD_COUNT);
             }
         }
         if let Ok(v) = std::env::var("ENGRAM_CHUNK_GC_SHARD_CONCURRENCY") {
@@ -369,7 +384,16 @@ pub async fn run_one_sweep_inner(
         mode,
         clock,
     };
-    if let Err(e) = run_mark_pass(&mark_ctx, start_shard, &mut report).await {
+    let (shard_list, shard_mask) = tick_shards(start_shard, cfg.shards_per_tick);
+    if let Err(e) = run_mark_pass(
+        &mark_ctx,
+        start_shard,
+        &shard_list,
+        &shard_mask,
+        &mut report,
+    )
+    .await
+    {
         tracing::warn!(
             error = %e,
             "chunk-gc mark pass failed; promote pass still runs on existing candidates"
@@ -387,7 +411,17 @@ pub async fn run_one_sweep_inner(
     // and the unreached shards would never be scanned — the exact
     // outcome the cursor exists to prevent.
     if mode == SweepMode::Full {
-        match promote_expired(meta.as_ref(), blob.as_ref(), chunk_store, cfg, clock).await {
+        match promote_expired(
+            meta.as_ref(),
+            blob.as_ref(),
+            chunk_store,
+            cfg,
+            clock,
+            &shard_list,
+            &shard_mask,
+        )
+        .await
+        {
             Ok((deletes, repinned, errors)) => {
                 report.promoted_deletes = deletes;
                 report.promote_repinned_skips = repinned;
@@ -425,6 +459,8 @@ struct MarkCtx<'a> {
 async fn run_mark_pass(
     ctx: &MarkCtx<'_>,
     start_shard: u32,
+    shard_list: &[usize],
+    shard_mask: &[bool; SHARD_COUNT],
     report: &mut SweepReport,
 ) -> Result<(), GcError> {
     let MarkCtx {
@@ -440,7 +476,11 @@ async fn run_mark_pass(
     let deadline = clock.now_mono() + cfg.mark_budget;
 
     let gen_before = meta.chunk_generation().await?;
-    let pin_set = collect_pin_set(meta, chunk_store, cfg).await?;
+    // Filtered to this tick's shards only — see `collect_pin_set`. The
+    // set is dropped before the promote pass collects its own, so the two
+    // are never resident at once (that 2x spike is what OOMKilled the
+    // coordinator on 2026-09-03).
+    let pin_set = collect_pin_set(meta, chunk_store, cfg, shard_mask).await?;
     report.pin_set_size = pin_set.len();
 
     // Walk the key space in hash-prefix shards, resuming at the cursor.
@@ -457,7 +497,8 @@ async fn run_mark_pass(
     // sound conclusion from one shard.
     let mut shard = (start_shard as usize) % SHARD_COUNT;
     let mut scanned = 0usize;
-    while scanned < SHARD_COUNT {
+    let group_len = shard_list.len();
+    while scanned < group_len {
         if clock.now_mono() >= deadline {
             tracing::info!(
                 scanned,
@@ -467,7 +508,7 @@ async fn run_mark_pass(
             );
             break;
         }
-        let group: Vec<usize> = (0..cfg.shard_concurrency.min(SHARD_COUNT - scanned))
+        let group: Vec<usize> = (0..cfg.shard_concurrency.min(group_len - scanned))
             .map(|i| (shard + i) % SHARD_COUNT)
             .collect();
 
@@ -501,7 +542,9 @@ async fn run_mark_pass(
             return Err(e);
         }
     }
-    report.full_cycle_completed = scanned >= SHARD_COUNT;
+    // A tick covers its group, not the whole space; a full cycle is when
+    // the cursor wraps past the last shard.
+    report.full_cycle_completed = (shard as u32) < start_shard || group_len >= SHARD_COUNT;
 
     // The barrier is a DIAGNOSTIC, not a restart trigger. The mark pass
     // only ever ADDS candidate rows, and the promote pass re-verifies
@@ -604,11 +647,13 @@ async fn promote_expired(
     chunk_store: &ChunkStore,
     cfg: &ChunkGcConfig,
     clock: &Arc<dyn engram_core::traits::Clock>,
+    shard_list: &[usize],
+    shard_mask: &[bool; SHARD_COUNT],
 ) -> Result<(usize, usize, usize), GcError> {
     let now = clock.now_utc();
-    let deadline = now
-        + chrono::Duration::from_std(cfg.promote_budget)
-            .unwrap_or_else(|_| chrono::Duration::seconds(900));
+    // Monotonic, like the mark pass: a fake clock can drive an elapsed
+    // Duration but cannot mint an opaque Instant (ADR 0098 D1).
+    let deadline = clock.now_mono() + cfg.promote_budget;
     let cutoff = now
         - chrono::Duration::from_std(cfg.grace_period)
             .unwrap_or_else(|_| chrono::Duration::seconds(86_400));
@@ -626,77 +671,50 @@ async fn promote_expired(
     // batch. This is the mark pass's barrier applied to promote: it keeps
     // the freshness guarantee of a per-batch collect without paying for a
     // full manifest fan-out on every page.
-    let mut pin_set = collect_pin_set(meta, chunk_store, cfg).await?;
-    let mut pin_gen = meta.chunk_generation().await?;
-    let mut pin_refreshes = 0usize;
+    // Collected AFTER the mark pass dropped its own, so only one filtered
+    // pin set is ever resident. That 2x spike is what OOMKilled the
+    // coordinator on 2026-09-03. Fresh rather than reused, so the
+    // promote-time verification reads recent state.
+    let pin_set = collect_pin_set(meta, chunk_store, cfg, shard_mask).await?;
 
-    loop {
-        // A wall-clock budget, not a row cap. A cap makes deletion the
-        // binding constraint: 200k/tick against the 2026-08 backlog of
-        // ~100M rows would have sat at 20 GB of candidate table for
-        // weeks. A budget makes promote throughput-bound, so it drains as
-        // fast as the blob tier allows and stops on time either way.
-        if clock.now_utc() >= deadline {
-            tracing::info!(
-                processed,
-                budget_secs = cfg.promote_budget.as_secs(),
-                "chunk-gc promote: budget spent; backlog continues next tick"
-            );
-            break;
-        }
+    'shards: for &shard in shard_list {
+        let (lo, hi) = engram_chunk_store::shard_hash_bounds(shard as u8);
+        loop {
+            if clock.now_mono() >= deadline {
+                tracing::info!(
+                    processed,
+                    budget_secs = cfg.promote_budget.as_secs(),
+                    "chunk-gc promote: budget spent; backlog continues next tick"
+                );
+                break 'shards;
+            }
+            let expired = meta
+                .list_expired_gc_candidates_in_range(cutoff, &lo, &hi, cfg.promote_batch_size)
+                .await?;
+            if expired.is_empty() {
+                break;
+            }
+            let batch_len = expired.len();
 
-        let expired = meta
-            .list_expired_gc_candidates(cutoff, cfg.promote_batch_size)
-            .await?;
-        if expired.is_empty() {
-            break;
-        }
-        let batch_len = expired.len();
+            let (batch_deleted, batch_repinned, batch_errors, resolved) =
+                promote_batch(blob, &pin_set, expired, cfg.promote_concurrency).await;
+            meta.delete_gc_candidates(&resolved).await?;
 
-        // Re-verify the LIVE pin set at delete time — the load-bearing
-        // durability step, and parity with the snapshot-blob-gc promote pass
-        // (ADR 0028 addendum) that the chunk-gc promote never got.
-        // `first_seen_at` is sticky and the classification pass never clears a
-        // re-pinned candidate's row (it just skips pinned chunks), so a chunk
-        // marked while transiently unpinned but SINCE re-pinned — e.g. an image
-        // refresh re-referencing a shared base-memory chunk, or any content-
-        // addressed chunk that re-enters a fresh manifest — still carries an
-        // expired row. Deleting it on the stale row alone reaps a chunk that's
-        // currently referenced, so every reader of the pinning manifest 404s on
-        // first fault (the wedged-session class of bug). Skip + clear those;
-        // only genuinely-unpinned chunks get their blob deleted.
-        let gen_now = meta.chunk_generation().await?;
-        if gen_now != pin_gen {
-            pin_set = collect_pin_set(meta, chunk_store, cfg).await?;
-            pin_gen = meta.chunk_generation().await?;
-            pin_refreshes += 1;
-        }
+            deleted += batch_deleted;
+            repinned += batch_repinned;
+            errors += batch_errors;
+            processed += batch_len;
 
-        let (batch_deleted, batch_repinned, batch_errors, resolved) =
-            promote_batch(blob, &pin_set, expired, cfg.promote_concurrency).await;
-
-        // Clear rows for everything resolved this pass — deleted blobs AND
-        // rescued (re-pinned) candidates. Failed deletes keep their row so the
-        // next sweep retries.
-        meta.delete_gc_candidates(&resolved).await?;
-
-        deleted += batch_deleted;
-        repinned += batch_repinned;
-        errors += batch_errors;
-        processed += batch_len;
-
-        // Every candidate in the batch errored, so no row cleared and the
-        // next `list_expired_gc_candidates` returns the SAME page. Stop
-        // instead of spinning on a wedged BlobStorage.
-        if resolved.is_empty() {
-            tracing::warn!(
-                batch_errors,
-                "chunk-gc promote: whole batch failed to delete; stopping drain this sweep"
-            );
-            break;
-        }
-        if (batch_len as i64) < cfg.promote_batch_size {
-            break;
+            if resolved.is_empty() {
+                tracing::warn!(
+                    batch_errors,
+                    "chunk-gc promote: whole batch failed to delete; stopping drain this sweep"
+                );
+                break 'shards;
+            }
+            if (batch_len as i64) < cfg.promote_batch_size {
+                break;
+            }
         }
     }
 
@@ -707,14 +725,22 @@ async fn promote_expired(
              (live chunks the stale rows would have wrongly deleted)"
         );
     }
-    if pin_refreshes > 0 {
-        tracing::debug!(
-            pin_refreshes,
-            "chunk-gc promote: re-collected the pin set on generation bumps"
-        );
-    }
 
     Ok((deleted, repinned, errors))
+}
+
+/// The shards this tick covers, and the mask that filters the pin set to
+/// them. Wraps past 255 back to 0.
+fn tick_shards(start_shard: u32, count: usize) -> (Vec<usize>, [bool; SHARD_COUNT]) {
+    let count = count.clamp(1, SHARD_COUNT);
+    let mut mask = [false; SHARD_COUNT];
+    let mut list = Vec::with_capacity(count);
+    for i in 0..count {
+        let sh = ((start_shard as usize) + i) % SHARD_COUNT;
+        mask[sh] = true;
+        list.push(sh);
+    }
+    (list, mask)
 }
 
 /// Collect a pin set for the promote pass.
@@ -740,12 +766,14 @@ async fn collect_pin_set(
     meta: &dyn MetadataStore,
     chunk_store: &ChunkStore,
     cfg: &ChunkGcConfig,
+    shards: &[bool; SHARD_COUNT],
 ) -> Result<PinSet, GcError> {
-    let collected = PinSet::collect_converging(
+    let collected = PinSet::collect_converging_for_shards(
         meta,
         chunk_store,
         cfg.pin_set_concurrency,
         cfg.max_restart_attempts as usize,
+        shards,
     )
     .await?;
     if !collected.converged {

@@ -2859,6 +2859,25 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
+    /// Shard-scoped expiry read; unordered, exactly like the SQL.
+    async fn list_expired_gc_candidates_in_range(
+        &self,
+        cutoff: DateTime<Utc>,
+        lo: &[u8],
+        hi: &[u8],
+        limit: i64,
+    ) -> Result<Vec<[u8; 32]>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db
+            .chunk_gc
+            .iter()
+            .filter(|(h, c)| c.first_seen_at < cutoff && h.as_slice() >= lo && h.as_slice() < hi)
+            .take(limit.max(0) as usize)
+            .map(|(h, _)| <[u8; 32]>::try_from(h.as_slice()).expect("32-byte hash"))
+            .collect())
+    }
+
     async fn delete_gc_candidates(&self, hashes: &[[u8; 32]]) -> Result<(), MetaError> {
         self.gate()?;
         let mut db = self.db.lock();
