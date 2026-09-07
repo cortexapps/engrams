@@ -663,19 +663,26 @@ async fn promote_expired(
     let mut errors = 0usize;
     let mut processed = 0usize;
 
-    // Pin set collected once, then reused across batches ONLY while
-    // `chunk_generation` is unchanged. The generation ticks in the same TX
-    // as every flush / enable_image / record_snapshot, so an unchanged
-    // generation is proof that no manifest — and therefore no pin — has
-    // moved since the collect. When it ticks, re-collect before the next
-    // batch. This is the mark pass's barrier applied to promote: it keeps
-    // the freshness guarantee of a per-batch collect without paying for a
-    // full manifest fan-out on every page.
-    // Collected AFTER the mark pass dropped its own, so only one filtered
-    // pin set is ever resident. That 2x spike is what OOMKilled the
-    // coordinator on 2026-09-03. Fresh rather than reused, so the
-    // promote-time verification reads recent state.
-    let pin_set = collect_pin_set(meta, chunk_store, cfg, shard_mask).await?;
+    // Collected AFTER the mark pass dropped its own, so only ONE filtered
+    // pin set is ever resident — the 2x spike is what OOMKilled the
+    // coordinator on 2026-09-03.
+    //
+    // Reused across batches only while `chunk_generation` is unchanged.
+    // The generation moves in the same transaction as every flush /
+    // enable_image / record_snapshot, so an unchanged generation is proof
+    // that no manifest — and therefore no pin — has moved since the
+    // collect. When it moves, re-collect BEFORE the next batch.
+    //
+    // This re-check is load-bearing, not an optimisation. The drain runs
+    // up to `promote_budget` (900s by default) across every shard in the
+    // tick, and the generation ticks ~2.3x/min in prod. Holding one
+    // snapshot for that whole window would delete a chunk that got
+    // re-pinned mid-drain — the content-addressed "image refresh
+    // re-pins a shared base-memory chunk" case — and 404 the manifest
+    // that now references it.
+    let mut pin_set = collect_pin_set(meta, chunk_store, cfg, shard_mask).await?;
+    let mut pin_gen = meta.chunk_generation().await?;
+    let mut pin_refreshes = 0usize;
 
     'shards: for &shard in shard_list {
         let (lo, hi) = engram_chunk_store::shard_hash_bounds(shard as u8);
@@ -695,6 +702,18 @@ async fn promote_expired(
                 break;
             }
             let batch_len = expired.len();
+
+            let gen_now = meta.chunk_generation().await?;
+            if gen_now != pin_gen {
+                // Free the stale set BEFORE collecting, so the two are
+                // never resident together — that is what keeps the
+                // memory property while restoring the freshness check.
+                // `take` for the drop side effect, not the value.
+                drop(std::mem::take(&mut pin_set));
+                pin_set = collect_pin_set(meta, chunk_store, cfg, shard_mask).await?;
+                pin_gen = meta.chunk_generation().await?;
+                pin_refreshes += 1;
+            }
 
             let (batch_deleted, batch_repinned, batch_errors, resolved) =
                 promote_batch(blob, &pin_set, expired, cfg.promote_concurrency).await;
@@ -718,6 +737,12 @@ async fn promote_expired(
         }
     }
 
+    if pin_refreshes > 0 {
+        tracing::debug!(
+            pin_refreshes,
+            "chunk-gc promote: re-collected the shard-filtered pin set on generation bumps"
+        );
+    }
     if repinned > 0 {
         tracing::info!(
             repinned,
