@@ -262,7 +262,12 @@ cd deploy/terraform/aws/quickstart && terraform destroy   # reads terraform.tfva
 ```
 
 The bucket refuses destroy unless emptied
-(`aws s3 rm s3://<bucket> --recursive` first).
+(`aws s3 rm s3://<bucket> --recursive` first). If the destroy ends on
+`DependencyViolation` for the VPC, the Load Balancer Controller's
+shared backend security group (`k8s-traffic-<cluster>-*`) is the
+usual leftover — it is created outside Terraform and never deleted:
+`aws ec2 delete-security-group --group-id <id>`, then run
+`terraform destroy` again.
 
 ## When something doesn't come up
 
