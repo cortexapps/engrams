@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { History } from "lucide-react";
 
 import { CheckpointDiff } from "@/components/spec/CheckpointDiff";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -13,6 +15,7 @@ import {
 } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { type SpecCheckpointSummary, useSpecCheckpoint } from "@/hooks/useSpecRead";
+import { relativeTime } from "@/lib/relative-time";
 
 export function CheckpointButton({
   specId,
@@ -97,31 +100,20 @@ export function CheckpointButton({
             })}
           </ol>
           {ordered.length === 0 ? (
-            <Text tone="muted">
+            <EmptyState inline>
               No versions yet. A version is saved each time a section settles, and at publish.
-            </Text>
+            </EmptyState>
           ) : selectedIds.length < 2 ? (
             <Text tone="muted">Select one more checkpoint to compare.</Text>
           ) : before.isPending || after.isPending ? (
-            <Text tone="muted">Loading comparison…</Text>
+            <SkeletonRows rows={3} />
           ) : before.data && after.data ? (
             <CheckpointDiff before={before.data.markdown} after={after.data.markdown} />
           ) : (
-            <Text tone="muted">The comparison is not available.</Text>
+            <EmptyState inline>The comparison is not available.</EmptyState>
           )}
         </div>
       </SheetContent>
     </Sheet>
   );
-}
-
-function relativeTime(value: string): string {
-  const elapsedMs = Date.now() - Date.parse(value);
-  if (!Number.isFinite(elapsedMs)) return value;
-  if (elapsedMs < 60_000) return "now";
-  const minutes = Math.floor(elapsedMs / 60_000);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
 }

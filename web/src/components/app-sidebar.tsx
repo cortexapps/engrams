@@ -119,7 +119,7 @@ export function MainSidebar() {
                 >
                   <EngramMark size={24} mode="static" />
                 </span>
-                <span className="text-[15px] font-semibold tracking-[-0.01em]">engrams</span>
+                <span className="text-base font-semibold tracking-[-0.01em]">engrams</span>
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>

@@ -6,7 +6,7 @@ import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useAutomationVersions } from "@/hooks/useAutomationEditor";
-import { relativeTime } from "@/lib/automations";
+import { relativeTime } from "@/lib/relative-time";
 
 import { VersionDiff } from "./VersionDiff";
 

@@ -10,6 +10,8 @@ import {
 import { useOrgSecrets, usePutOrgSecret } from "../../hooks/useOrgSecrets";
 import type { HarnessSummary } from "../../gen/engram/app/v1/harness_pb";
 import { PageHeading } from "../page-heading";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -54,18 +56,14 @@ export function HarnessesPanel() {
         actions={<RegisterDialog />}
       />
 
-      {error && (
-        <p className="text-sm text-destructive">Could not load harnesses — {String(error)}</p>
-      )}
+      {error && <EmptyState tone="error">Could not load harnesses — {String(error)}</EmptyState>}
 
       {isLoading ? (
-        <p className="py-6 text-sm text-muted-foreground">Loading…</p>
+        <SkeletonRows rows={3} />
       ) : harnesses.length === 0 ? (
-        <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            No harnesses registered. Register one by OCI ref to make it selectable on profiles.
-          </CardContent>
-        </Card>
+        <EmptyState>
+          No harnesses registered. Register one by OCI ref to make it selectable on profiles.
+        </EmptyState>
       ) : (
         <div className="space-y-4">
           {harnesses.map((h) => (
@@ -152,7 +150,9 @@ function HarnessCard({ harness }: { harness: HarnessSummary }) {
         )}
 
         {del.error && (
-          <p className="text-xs text-destructive">Could not remove — {String(del.error)}</p>
+          <EmptyState tone="error" inline>
+            Could not remove — {String(del.error)}
+          </EmptyState>
         )}
       </CardContent>
     </Card>

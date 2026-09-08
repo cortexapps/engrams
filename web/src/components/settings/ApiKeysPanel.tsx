@@ -7,9 +7,10 @@ import { Copy } from "lucide-react";
 import { useApiKeys, useCreateApiKey, useRevokeApiKey } from "../../hooks/useApiKeys";
 import type { ApiKeyMeta } from "../../gen/engram/app/v1/api_key_pb";
 import { PageHeading } from "../page-heading";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -21,6 +22,7 @@ import {
 } from "@/components/ui/dialog";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { relativeAge } from "@/lib/relative-time";
 import {
   Select,
   SelectContent,
@@ -67,16 +69,25 @@ export function ApiKeysPanel() {
         actions={<CreateKeyDialog />}
       />
 
-      {error && <p className="text-sm text-destructive">Could not load keys — {String(error)}</p>}
+      {error && <EmptyState tone="error">Could not load keys — {String(error)}</EmptyState>}
 
       {isLoading ? (
-        <p className="py-6 text-sm text-muted-foreground">Loading…</p>
+        <SkeletonRows
+          rows={3}
+          columns={[
+            "minmax(8rem,1fr)",
+            "minmax(10rem,1fr)",
+            "5rem",
+            "8rem",
+            "7rem",
+            "7rem",
+            "5rem",
+          ]}
+        />
       ) : rows.length === 0 ? (
-        <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            No API keys yet. Create one to call the engrams API from CI or scripts.
-          </CardContent>
-        </Card>
+        <EmptyState>
+          No API keys yet. Create one to call the engrams API from CI or scripts.
+        </EmptyState>
       ) : (
         <Table>
           <TableHeader>
@@ -116,7 +127,7 @@ function KeyRow({ row }: { row: ApiKeyMeta }) {
         {isServiceOwner(row.ownerEmail) ? <Badge variant="outline">global</Badge> : row.ownerEmail}
       </TableCell>
       <TableCell>
-        <Badge variant={row.role === "admin" ? "default" : "secondary"}>{row.role}</Badge>
+        <Badge variant={row.role === "admin" ? "outline" : "secondary"}>{row.role}</Badge>
       </TableCell>
       <TableCell className="font-mono text-xs text-muted-foreground">{row.start}…</TableCell>
       <TableCell
@@ -129,7 +140,7 @@ function KeyRow({ row }: { row: ApiKeyMeta }) {
         className="text-xs text-muted-foreground"
         title={row.lastUsedAt ? new Date(row.lastUsedAt).toLocaleString() : undefined}
       >
-        {row.lastUsedAt ? timeAgo(row.lastUsedAt) : "Never"}
+        {row.lastUsedAt ? relativeAge(row.lastUsedAt) : "Never"}
       </TableCell>
       <TableCell>
         <div className="flex items-center justify-end gap-1">
@@ -157,9 +168,9 @@ function KeyRow({ row }: { row: ApiKeyMeta }) {
           </AlertDialog>
         </div>
         {revoke.error && (
-          <p className="mt-1 text-right text-xs text-destructive">
+          <EmptyState tone="error" inline className="mt-1 items-end text-right">
             Could not revoke — {String(revoke.error)}
-          </p>
+          </EmptyState>
         )}
       </TableCell>
     </TableRow>
@@ -354,19 +365,4 @@ function CreateKeyDialog() {
       </DialogContent>
     </Dialog>
   );
-}
-
-function timeAgo(iso: string): string {
-  const then = new Date(iso).getTime();
-  const now = Date.now();
-  if (Number.isNaN(then)) return iso;
-  const seconds = Math.max(0, Math.floor((now - then) / 1000));
-  if (seconds < 60) return "just now";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  return new Date(iso).toLocaleDateString();
 }

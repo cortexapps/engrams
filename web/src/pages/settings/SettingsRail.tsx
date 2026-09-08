@@ -156,7 +156,7 @@ function FleetStatus() {
   const { tone, reason } = useOperatorHealth();
   if (!tone) return null;
   return (
-    <span className="ml-auto inline-flex min-w-0 shrink items-center gap-1.5 font-mono text-[11px] tabular-nums">
+    <span className="ml-auto inline-flex min-w-0 shrink items-center gap-1.5 font-mono text-2xs tabular-nums">
       <span
         aria-hidden
         className="size-1.5 shrink-0 rounded-full"
@@ -172,8 +172,6 @@ function PapercutsCount() {
   const n = data?.papercuts.length ?? 0;
   if (n === 0) return null;
   return (
-    <span className="ml-auto font-mono text-[11px] tabular-nums text-sidebar-foreground/70">
-      {n}
-    </span>
+    <span className="ml-auto font-mono text-2xs tabular-nums text-sidebar-foreground/70">{n}</span>
   );
 }

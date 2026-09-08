@@ -1,6 +1,7 @@
 import { Link } from "@tanstack/react-router";
 
 import { Button } from "@/components/ui/button";
+import { StatusDot } from "@/components/status-dot";
 import type { SpecTicketSyncLedger } from "@/hooks/useSpecTicketSync";
 
 export interface SpecTicketSyncLedgerRailProps {
@@ -29,7 +30,7 @@ export function SpecTicketSyncLedgerRail({
   return (
     <aside className="spec-ticket-rail" aria-label="Linear sync">
       <div className="spec-ticket-rail-head">
-        <span className="spec-ticket-rail-title">Linear sync</span>
+        <h2 className="spec-ticket-rail-title">Linear sync</h2>
         <span className="spec-ticket-rail-count">
           {ledger.synced} / {ledger.total}
         </span>
@@ -41,23 +42,23 @@ export function SpecTicketSyncLedgerRail({
       {ledger.connector.connected ? (
         <dl className="spec-ticket-target">
           <div>
-            <dt>team</dt>
-            <dd>{ledger.target.teamName ?? ledger.target.teamId ?? "not chosen"}</dd>
+            <dt>Team</dt>
+            <dd>{ledger.target.teamName ?? ledger.target.teamId ?? "Not chosen"}</dd>
           </div>
           <div>
-            <dt>project</dt>
-            <dd>{ledger.target.projectName ?? ledger.target.projectId ?? "none"}</dd>
+            <dt>Project</dt>
+            <dd>{ledger.target.projectName ?? ledger.target.projectId ?? "None"}</dd>
           </div>
           <div>
-            <dt>labels</dt>
+            <dt>Labels</dt>
             <dd>
-              {ledger.target.labelNames.length > 0 ? ledger.target.labelNames.join(", ") : "none"}
+              {ledger.target.labelNames.length > 0 ? ledger.target.labelNames.join(", ") : "None"}
             </dd>
           </div>
           {ledger.overridden ? (
             <div>
-              <dt>scope</dt>
-              <dd>this spec only</dd>
+              <dt>Scope</dt>
+              <dd>This spec only</dd>
             </div>
           ) : null}
         </dl>
@@ -75,7 +76,10 @@ export function SpecTicketSyncLedgerRail({
 
       {failures.map((row) => (
         <div className="spec-ticket-failure" key={row.ticketId}>
-          <span className="spec-ticket-failure-title">sync failed · {row.title}</span>
+          <h3 className="spec-ticket-failure-title">
+            <StatusDot tone="critical" size={6} />
+            Sync failed · {row.title}
+          </h3>
           <p>{row.error ?? "Linear refused this ticket."}</p>
           <p className="spec-ticket-rail-note">
             The other rows were not blocked. Retry is safe to press twice — it never creates a

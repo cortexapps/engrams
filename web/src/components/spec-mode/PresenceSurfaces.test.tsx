@@ -49,7 +49,7 @@ describe("presence surfaces", () => {
 
     const view = render(<PresenceHarness awareness={receiver} />);
 
-    expect(screen.getByText("you", { selector: ".spec-mode-presence-label" })).toBeTruthy();
+    expect(screen.getByText("You", { selector: ".spec-mode-presence-label" })).toBeTruthy();
     expect(screen.getAllByText("Alice")).toHaveLength(2);
     expect(screen.getByText("engram · §Problem")).toBeTruthy();
     expect(view.container.querySelectorAll(".spec-mode-section-presence-dot")).toHaveLength(2);

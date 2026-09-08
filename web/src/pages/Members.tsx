@@ -3,6 +3,9 @@ import { MoreHorizontal } from "lucide-react";
 import { authClient } from "@/lib/auth-client";
 import { useAuth } from "../auth/AuthProvider";
 import { PageHeading } from "../components/page-heading";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot } from "@/components/status-dot";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -95,12 +98,19 @@ export function Members() {
       ),
   });
 
-  if (isLoading) return <p className="p-6 text-sm text-muted-foreground">Loading…</p>;
+  if (isLoading)
+    return (
+      <SkeletonRows
+        rows={3}
+        columns={["minmax(12rem,1fr)", "6rem", "7rem", "7rem", "3rem"]}
+        className="p-6"
+      />
+    );
   if (error)
     return (
-      <p className="p-6 text-sm text-destructive">
+      <EmptyState tone="error" className="m-6">
         Could not load members — {(error as Error).message}
-      </p>
+      </EmptyState>
     );
 
   const admins = users.filter((u) => u.role === "admin" && u.active).length;
@@ -146,11 +156,14 @@ export function Members() {
                   </span>
                 </TableCell>
                 <TableCell>
-                  <Badge variant={u.role === "admin" ? "default" : "secondary"}>{u.role}</Badge>
+                  <Badge variant={u.role === "admin" ? "outline" : "secondary"}>{u.role}</Badge>
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground">{u.role_source}</TableCell>
-                <TableCell className="text-sm text-muted-foreground">
-                  {u.active ? "active" : "disabled"}
+                <TableCell>
+                  <span className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
+                    <StatusDot tone={u.active ? "nominal" : "muted"} size={6} />
+                    {u.active ? "Active" : "Disabled"}
+                  </span>
                 </TableCell>
                 <TableCell>
                   {!isYou && (
@@ -195,9 +208,16 @@ export function Members() {
               </TableRow>
             );
           })}
+          {users.length === 0 && (
+            <TableRow>
+              <TableCell colSpan={5}>
+                <EmptyState inline>No members found.</EmptyState>
+              </TableCell>
+            </TableRow>
+          )}
         </TableBody>
       </Table>
-      <p className="max-w-prose text-sm text-muted-foreground">
+      <p className="max-w-prose text-xs text-muted-foreground">
         Roles are provisioned from your identity provider on first sign-in and stay in sync over
         SCIM; promote or revoke here and the change is marked "set by an admin". A deactivated
         member keeps their sessions but can't sign in.

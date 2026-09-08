@@ -2,7 +2,7 @@ import { lazy, Suspense } from "react";
 import type { WebsocketProvider } from "y-websocket";
 import type * as Y from "yjs";
 
-import { Skeleton } from "@/components/ui/skeleton";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import type { SpecPresenceEntry } from "@/components/spec-mode/section-presence";
 import type { SpecSurface } from "@/components/spec-mode/spec-surface";
 import type { SpecSelectionActions } from "./SpecSelectionActions";
@@ -36,10 +36,8 @@ export function LazySpecCanvas({
   return (
     <Suspense
       fallback={
-        <div className="space-y-3 p-8" aria-label="Loading spec editor">
-          <Skeleton className="h-7 w-2/5" />
-          <Skeleton className="h-4 w-full" />
-          <Skeleton className="h-4 w-5/6" />
+        <div className="p-8" aria-label="Loading spec editor">
+          <SkeletonRows rows={3} />
         </div>
       }
     >

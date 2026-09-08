@@ -138,7 +138,7 @@ describe("AutomationEditor hook order", () => {
     window.addEventListener("error", onError);
     try {
       render(<AutomationEditor mode="edit" />);
-      expect(screen.getByText(/loading/i)).toBeTruthy();
+      expect(screen.getByRole("status", { name: /loading/i })).toBeTruthy();
 
       // The automation arrives: the shell must re-render without changing
       // its hook count. React #310 surfaces here as a thrown render error.

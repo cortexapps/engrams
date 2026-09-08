@@ -1,5 +1,4 @@
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { FileBox } from "lucide-react";
 
 import { ArtifactViewer } from "../../components/artifacts/ArtifactViewer";
 import { useTheme } from "../../components/theme-provider";
@@ -7,7 +6,8 @@ import { useArtifact } from "../../hooks/useArtifacts";
 import { artifactBytesUrl, mediaKind } from "../../lib/artifacts";
 import { errorMessage } from "../../lib/errors";
 import { EngramMark } from "../../components/EngramMark";
-import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Text } from "@/components/ui/text";
 import {
   Select,
@@ -33,23 +33,17 @@ export function ArtifactViewPage() {
 
   if (isPending) {
     return (
-      <div className="flex h-svh flex-col">
-        <div className="flex h-12 items-center border-b px-4">
-          <Skeleton className="h-4 w-48" />
-        </div>
-        <div className="flex-1 p-6">
-          <Skeleton className="h-64 w-full" />
-        </div>
+      <div className="h-svh p-6">
+        <SkeletonRows rows={4} />
       </div>
     );
   }
   if (error || !artifact) {
     return (
-      <div className="flex h-svh flex-col items-center justify-center gap-3 text-muted-foreground">
-        <FileBox className="size-10" strokeWidth={1} />
-        <Text as="p" tone="muted">
+      <div className="flex h-svh items-center justify-center">
+        <EmptyState tone={error ? "error" : "default"}>
           {error ? errorMessage(error) : "Artifact not found."}
-        </Text>
+        </EmptyState>
       </div>
     );
   }
@@ -76,7 +70,7 @@ export function ArtifactViewPage() {
           <EngramMark size={20} mode="static" />
         </Link>
         <Text as="span" variant="label" tone="muted">
-          artifact
+          Artifact
         </Text>
         <span className="min-w-0 truncate text-sm font-medium">{artifact.title}</span>
         <div className="ml-auto flex items-center gap-2">
@@ -108,7 +102,7 @@ export function ArtifactViewPage() {
           )}
           {!isCurrent && (
             <Text as="span" variant="label" tone="muted">
-              read-only
+              Read-only
             </Text>
           )}
         </div>

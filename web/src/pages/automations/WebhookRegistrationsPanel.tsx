@@ -16,6 +16,8 @@ import {
 } from "@/hooks/useAutomations";
 import { webhookConnectorHints, type VerificationScheme } from "@/lib/automations";
 import { errorMessage } from "@/lib/errors";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -346,14 +348,12 @@ export function WebhookRegistrationsPanel() {
         </div>
         <CreateRegistrationDialog />
       </div>
-      {registrations.isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
+      {registrations.isPending && <SkeletonRows rows={2} />}
       {registrations.error && (
-        <p className="text-sm text-destructive">{errorMessage(registrations.error)}</p>
+        <EmptyState tone="error">{errorMessage(registrations.error)}</EmptyState>
       )}
       {!registrations.isPending && (registrations.data?.registrations.length ?? 0) === 0 && (
-        <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">
-          No registered webhook endpoints. Cron automations do not need one.
-        </div>
+        <EmptyState>No registered webhook endpoints. Cron automations do not need one.</EmptyState>
       )}
       <div className="grid gap-3 lg:grid-cols-2">
         {registrations.data?.registrations.map((registration) => (

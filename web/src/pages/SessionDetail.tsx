@@ -401,7 +401,7 @@ export function SessionDetail() {
   // The thread sheet: the conversation is the subject of this page, so it is
   // the lightest, most raised surface on screen. It carries its own masthead.
   const leftColumn = (
-    <div className="work-sheet flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border bg-background">
+    <div className="work-sheet flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border bg-background">
       {masthead}
       <div className="min-h-0 flex-1 overflow-hidden">{transcript}</div>
     </div>

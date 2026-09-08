@@ -13,6 +13,7 @@ import { Lock, RotateCcw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
+import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useSetInputs } from "@/hooks/useAutomationInputs";
@@ -66,9 +67,7 @@ export function InputsTab({ automationId }: InputsTabProps) {
 
   if (!automationId) {
     return (
-      <p className="text-muted-foreground rounded-lg border border-dashed p-6 text-sm">
-        Save the automation first; inputs are set on a saved automation.
-      </p>
+      <EmptyState>Save the automation first; inputs are set on a saved automation.</EmptyState>
     );
   }
   if (query.isLoading || !automation) {
@@ -76,10 +75,10 @@ export function InputsTab({ automationId }: InputsTabProps) {
   }
   if (schema.length === 0) {
     return (
-      <p className="text-muted-foreground rounded-lg border border-dashed p-6 text-sm">
+      <EmptyState>
         This automation declares no inputs. Inputs are the per-org settings a locked graph exposes —
         add them to the definition's input schema.
-      </p>
+      </EmptyState>
     );
   }
 

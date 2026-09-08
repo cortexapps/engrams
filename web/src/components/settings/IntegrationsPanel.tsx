@@ -7,11 +7,12 @@
  */
 
 import { useMemo, useState } from "react";
-import { PlusIcon, SearchIcon, SearchXIcon } from "lucide-react";
+import { PlusIcon, SearchIcon } from "lucide-react";
 
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Text } from "@/components/ui/text";
 import { ConnectSheet } from "@/components/integrations/ConnectSheet";
 import { CustomConnectorModal } from "@/components/integrations/CustomConnectorModal";
 import { ProviderCard } from "@/components/integrations/ProviderCard";
@@ -81,11 +82,11 @@ export function IntegrationsPanel() {
       </div>
 
       {error != null && (
-        <p className="text-sm text-destructive">Could not load integrations — {String(error)}</p>
+        <EmptyState tone="error">Could not load integrations — {String(error)}</EmptyState>
       )}
 
       {isLoading ? (
-        <p className="py-6 text-sm text-muted-foreground">Loading…</p>
+        <SkeletonRows rows={3} />
       ) : (
         <>
           {connected.length > 0 && (
@@ -102,12 +103,7 @@ export function IntegrationsPanel() {
               ))}
             </Section>
           )}
-          {shown.length === 0 && (
-            <div className="py-12 text-center text-muted-foreground">
-              <SearchXIcon className="mx-auto size-6 opacity-60" />
-              <p className="mt-2 text-sm">No providers match "{q}".</p>
-            </div>
-          )}
+          {shown.length === 0 && <EmptyState>No providers match "{q}".</EmptyState>}
         </>
       )}
 
@@ -143,7 +139,7 @@ function Section({
   return (
     <div className="space-y-3">
       <div className="flex items-baseline gap-2">
-        <Text variant="label">{label}</Text>
+        <h2 className="text-sm font-semibold">{label}</h2>
         <span className="font-mono text-xs text-muted-foreground">{count}</span>
       </div>
       <div

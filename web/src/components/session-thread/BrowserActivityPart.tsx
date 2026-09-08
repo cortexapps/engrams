@@ -36,7 +36,7 @@ export function BrowserActivityPart({
         )}
       </div>
       {detail && (
-        <pre className="mt-2 max-h-40 overflow-auto border-t pt-2 font-mono text-xs whitespace-pre-wrap text-destructive">
+        <pre className="mt-2 max-h-40 overflow-auto border-t pt-2 font-mono text-xs whitespace-pre-wrap text-foreground">
           {detail}
         </pre>
       )}

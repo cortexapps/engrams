@@ -13,13 +13,15 @@ import { cn } from "@/lib/utils";
 // voice that works on one thing per page and turns to noise on twenty.
 //
 // `stat` is its partner: oversized tabular mono for the figure. The
-// variant/tone split is the whole point of the gauge — a dark mono number
-// (tone=default) under a quiet caption (variant=label, tone=muted).
+// variant/tone split is the whole point of a readout — a dark mono number
+// (tone=default) over a quiet caption (variant=label, tone=muted).
 const textVariants = cva("", {
   variants: {
     variant: {
-      // Page-title masthead voice (the PageHeading h1 lives here).
-      display: "text-2xl leading-tight font-semibold tracking-tight text-balance",
+      // Page-title masthead voice (the PageHeading h1 lives here): the one
+      // place Saira appears, set a little wide. Nothing else on the page is
+      // tracked, capitalised, or in the display face.
+      display: "font-display text-xl leading-tight font-semibold [font-stretch:108%] text-balance",
       // The masthead title when the page's subject IS machine data (a session
       // id, a digest): the mono lab-readout voice. NOT tracking-tight — negative
       // spacing on a long hex id runs the glyphs together (worse on the dark
@@ -27,14 +29,14 @@ const textVariants = cva("", {
       // and the size sits a notch below `display` so a 36-char id reads as a
       // legible title, not a cramped wall.
       displayMono: "font-mono text-lg leading-tight tracking-normal",
-      heading: "text-base leading-snug font-semibold tracking-tight",
+      heading: "text-sm leading-snug font-semibold",
       body: "text-sm leading-relaxed",
       // Section caption / table header / tab. Callers set color via `tone` and
       // may override size.
       label: "text-xs leading-none font-semibold",
-      // The figure in a gauge: big, aligned, machine.
+      // The figure in a readout: big, aligned, machine.
       stat: "font-mono text-2xl leading-none tabular-nums",
-      code: "font-mono text-[0.8rem]",
+      code: "font-mono text-sm",
     },
     tone: {
       default: "text-foreground",

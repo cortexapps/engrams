@@ -1,10 +1,9 @@
 .spec-canvas-shell {
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
+  border-radius: var(--radius-lg);
   background: var(--card);
   color: var(--card-foreground);
-  box-shadow: 0 1px 2px color-mix(in oklab, var(--foreground) 6%, transparent);
 }
 
 .spec-canvas-bar {
@@ -53,7 +52,7 @@
 
 .spec-canvas-editor h2 {
   margin-bottom: 1.5rem;
-  font-size: clamp(1.65rem, 3vw, 2.25rem);
+  font-size: 1.625rem;
   font-weight: 650;
   letter-spacing: -0.035em;
 }
@@ -78,17 +77,17 @@
   overflow-x: auto;
   margin: 1.25rem 0;
   border: 1px solid var(--border);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-lg);
   padding: 1rem;
   background: var(--muted);
   font-family: var(--font-mono);
-  font-size: 0.8125rem;
+  font-size: 0.875rem;
 }
 
 .spec-diagram-block {
   margin: 1.5rem 0;
   border: 1px dashed var(--border);
-  border-radius: 0.75rem;
+  border-radius: var(--radius-lg);
   padding: 1rem;
   background: color-mix(in oklab, var(--muted) 55%, transparent);
 }
@@ -97,8 +96,6 @@
   color: var(--muted-foreground);
   font-size: 0.6875rem;
   font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 
 .spec-canvas-loading {
@@ -108,7 +105,7 @@
   gap: 1rem;
   padding: clamp(2rem, 6vw, 5rem);
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
+  border-radius: var(--radius-lg);
 }
 
 .spec-canvas-editor .collaboration-carets__caret {
@@ -122,7 +119,7 @@
   position: absolute;
   top: -1.65rem;
   left: -1px;
-  border-radius: 0.25rem 0.25rem 0.25rem 0;
+  border-radius: var(--radius-sm) var(--radius-sm) var(--radius-sm) 0;
   padding: 0.15rem 0.4rem;
   color: white;
   font-size: 0.6875rem;
@@ -134,7 +131,7 @@
   width: min(30rem, calc(100vw - 2rem));
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
+  border-radius: var(--radius-lg);
   background: var(--popover);
   color: var(--popover-foreground);
   box-shadow: 0 18px 45px color-mix(in oklab, var(--foreground) 18%, transparent);

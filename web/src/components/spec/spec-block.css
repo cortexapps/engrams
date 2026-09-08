@@ -2,10 +2,9 @@
   overflow: hidden;
   margin: 1.15rem 0;
   border: 1px solid var(--border);
-  border-radius: 0.5625rem;
+  border-radius: var(--radius-lg);
   background: var(--card);
   color: var(--card-foreground);
-  box-shadow: 0 1px 3px color-mix(in oklab, var(--foreground) 7%, transparent);
 }
 
 .spec-canvas-editor .spec-block[data-provenance="illustrative"] {
@@ -35,14 +34,13 @@
   align-items: center;
   gap: 0.3rem;
   border: 1px solid var(--border);
-  border-radius: 0.4375rem;
+  border-radius: var(--radius-md);
   padding: 0.24rem 0.48rem;
   background: var(--card);
   color: var(--foreground);
   font-size: 0.6875rem;
   font-weight: 650;
   line-height: 1.15;
-  box-shadow: 0 1px 1px color-mix(in oklab, var(--foreground) 5%, transparent);
 }
 
 .spec-canvas-editor .spec-block-iterate-trigger:hover {
@@ -65,21 +63,20 @@
 
 .spec-canvas-editor .spec-block-kind {
   color: var(--muted-foreground);
-  font-family: var(--font-mono);
-  font-size: 0.65625rem;
+  font-size: 0.6875rem;
   font-weight: 650;
-  letter-spacing: 0.06em;
   line-height: 1.2;
-  text-transform: uppercase;
 }
 
 .spec-canvas-editor .spec-block-provenance {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
   border: 1px solid color-mix(in oklab, var(--border) 78%, transparent);
-  border-radius: 0.375rem;
+  border-radius: var(--radius-sm);
   padding: 0.12rem 0.38rem;
   color: var(--muted-foreground);
-  font-family: var(--font-mono);
-  font-size: 0.625rem;
+  font-size: 0.6875rem;
   font-weight: 550;
   line-height: 1.2;
 }
@@ -87,7 +84,7 @@
 .spec-canvas-editor .spec-block[data-provenance="verified"] .spec-block-provenance {
   border-color: color-mix(in oklab, var(--instrument-nominal) 40%, var(--border));
   background: color-mix(in oklab, var(--instrument-nominal) 8%, var(--card));
-  color: var(--instrument-nominal-ink);
+  color: var(--foreground);
 }
 
 .spec-canvas-editor .spec-block[data-provenance="illustrative"] .spec-block-provenance {
@@ -120,7 +117,6 @@
 .spec-canvas-editor .spec-block-fallback-label {
   padding: 0.8rem;
   color: var(--muted-foreground);
-  font-family: var(--font-mono);
   font-size: 0.6875rem;
 }
 
@@ -134,10 +130,9 @@
 .spec-canvas-editor .spec-block-chat {
   margin: 0 0.65rem 0.65rem;
   border: 1px solid var(--border);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-lg);
   padding: 0.6rem;
   background: color-mix(in oklab, var(--muted) 38%, var(--card));
-  box-shadow: 0 1px 2px color-mix(in oklab, var(--foreground) 6%, transparent);
 }
 
 .spec-canvas-editor .spec-block-chat-title {
@@ -153,11 +148,8 @@
 .spec-canvas-editor .spec-block-chat-pin {
   margin-left: auto;
   color: var(--muted-foreground);
-  font-family: var(--font-mono);
-  font-size: 0.59375rem;
+  font-size: 0.6875rem;
   font-weight: 500;
-  letter-spacing: 0.045em;
-  text-transform: uppercase;
 }
 
 .spec-canvas-editor .spec-block-chat-receipt {
@@ -166,17 +158,16 @@
   margin-top: 0.5rem;
   border: 1px solid color-mix(in oklab, var(--instrument-nominal) 28%, var(--border));
   border-left: 2px solid var(--instrument-nominal);
-  border-radius: 0.375rem;
+  border-radius: var(--radius-sm);
   padding: 0.38rem 0.5rem;
   background: color-mix(in oklab, var(--instrument-nominal) 6%, var(--card));
   color: var(--foreground);
-  font-size: 0.71875rem;
+  font-size: 0.75rem;
 }
 
 .spec-canvas-editor .spec-block-chat-receipt small {
   color: var(--muted-foreground);
-  font-family: var(--font-mono);
-  font-size: 0.625rem;
+  font-size: 0.6875rem;
 }
 
 .spec-canvas-editor .spec-block-chat-composer {
@@ -191,7 +182,7 @@
   flex: 1;
   resize: vertical;
   border: 1px solid var(--border);
-  border-radius: 0.4375rem;
+  border-radius: var(--radius-md);
   padding: 0.5rem 0.58rem;
   background: var(--card);
   color: var(--foreground);
@@ -212,17 +203,15 @@
   height: 2rem;
   place-items: center;
   border: 1px solid color-mix(in oklab, var(--primary) 75%, var(--border));
-  border-radius: 0.4375rem;
+  border-radius: var(--radius-md);
   background: var(--primary);
   color: var(--primary-foreground);
-  box-shadow: 0 1px 2px color-mix(in oklab, var(--foreground) 9%, transparent);
 }
 
 .spec-canvas-editor .spec-block-chat-composer button:disabled {
   border-color: var(--border);
   background: var(--muted);
   color: var(--muted-foreground);
-  box-shadow: none;
   opacity: 0.65;
 }
 

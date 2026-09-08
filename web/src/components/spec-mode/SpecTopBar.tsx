@@ -41,7 +41,7 @@ export function SpecTopBar({
             {title}
           </Text>
         )}
-        <Text as="span" variant="code" tone="muted" className="spec-mode-template-name">
+        <Text as="span" tone="muted" className="spec-mode-template-name">
           {templateName}
         </Text>
       </div>

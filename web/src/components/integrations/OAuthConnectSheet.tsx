@@ -11,6 +11,7 @@ import { API_ORIGIN } from "@/lib/base";
 import { ArrowUpRightIcon, CheckIcon, CopyIcon, InfoIcon, LockIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
@@ -87,7 +88,7 @@ export function OAuthConnectSheet({
         <header className="flex items-center gap-3 border-b p-5">
           <ProviderTile {...view.icon} name={view.name} size={40} />
           <div className="min-w-0 flex-1">
-            <div className="text-[1.05rem] font-semibold">Connect {view.name}</div>
+            <div className="text-base font-semibold">Connect {view.name}</div>
             <div className="text-xs text-muted-foreground">{view.category}</div>
           </div>
         </header>
@@ -97,7 +98,7 @@ export function OAuthConnectSheet({
             <LockIcon className="mt-0.5 size-4 shrink-0 text-instrument-nominal" />
             <div>
               <div className="text-sm font-semibold">Bring your own {view.name} app</div>
-              <div className="mt-0.5 text-[0.78rem] leading-relaxed text-muted-foreground">
+              <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
                 Create an app in {view.name}, add this redirect URL, then paste its client
                 credentials below. You'll approve access on {view.name}; the workspace token is
                 obtained and sealed server-side — it never reaches the browser.
@@ -107,7 +108,7 @@ export function OAuthConnectSheet({
 
           <div className="flex flex-col gap-1.5">
             <Text variant="label">Redirect URL (add this to your {view.name} app)</Text>
-            <code className="select-all rounded-md border bg-card px-3 py-2 font-mono text-[0.72rem] break-all">
+            <code className="select-all rounded-md border bg-card px-3 py-2 font-mono text-xs break-all">
               {redirectUri}
             </code>
             <div className="mt-1 flex flex-wrap gap-2">
@@ -153,9 +154,7 @@ export function OAuthConnectSheet({
           <label className="flex flex-col gap-1.5">
             <span className="flex items-baseline gap-2">
               <Text variant="label">Client ID</Text>
-              <code className="font-mono text-[0.62rem] text-muted-foreground">
-                {oauth.clientIdRef}
-              </code>
+              <code className="font-mono text-2xs text-muted-foreground">{oauth.clientIdRef}</code>
             </span>
             <Input
               className="font-mono"
@@ -169,7 +168,7 @@ export function OAuthConnectSheet({
           <label className="flex flex-col gap-1.5">
             <span className="flex items-baseline gap-2">
               <Text variant="label">Client secret</Text>
-              <code className="font-mono text-[0.62rem] text-muted-foreground">
+              <code className="font-mono text-2xs text-muted-foreground">
                 {oauth.clientSecretRef}
               </code>
             </span>
@@ -180,25 +179,29 @@ export function OAuthConnectSheet({
             <label className="flex flex-col gap-1.5">
               <span className="flex items-baseline gap-2">
                 <Text variant="label">Signing secret</Text>
-                <code className="font-mono text-[0.62rem] text-muted-foreground">
+                <code className="font-mono text-2xs text-muted-foreground">
                   {oauth.signingSecretRef}
                 </code>
               </span>
               <SecretField value={signingSecret} onChange={setSigningSecret} placeholder="••••••" />
-              <span className="text-[0.72rem] text-muted-foreground">
+              <span className="text-xs text-muted-foreground">
                 Optional — needed only to receive {view.name} events (e.g. @mention triggers). Find
                 it under your app's Basic Information → App Credentials.
               </span>
             </label>
           )}
 
-          <p className="flex gap-2 text-[0.74rem] text-muted-foreground">
+          <p className="flex gap-2 text-xs text-muted-foreground">
             <InfoIcon className="mt-0.5 size-3.5 shrink-0" />
             The client id + secret are sealed in the org secret store; the obtained tokens are
             sealed in the server-side credential store and refreshed automatically.
           </p>
 
-          {error && <p className="text-sm text-destructive">{error}</p>}
+          {error && (
+            <EmptyState tone="error" inline>
+              {error}
+            </EmptyState>
+          )}
         </div>
 
         <footer className="flex items-center justify-between gap-2 border-t p-5">

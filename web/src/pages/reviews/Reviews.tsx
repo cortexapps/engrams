@@ -6,13 +6,14 @@ import { useNow } from "../../hooks/useNow";
 import { useReviews } from "../../hooks/useReviews";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
 import { errorMessage } from "../../lib/errors";
-import { relativeTime } from "../sessions/session-format";
+import { relativeAge } from "@/lib/relative-time";
 import { FilterBar, type FilterField } from "../sessions/filter-bar";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { X } from "lucide-react";
-import { ReviewGlyph, ReviewStage } from "./ReviewGlyph";
+import { ReviewStage } from "./ReviewGlyph";
 import { Sep } from "./Sep";
 import { groupByPr, type PrGroup } from "./review-groups";
 import {
@@ -163,40 +164,19 @@ export function Reviews() {
       </div>
 
       {isPending ? (
-        // Two lines, because the row has two. A one-line silhouette under a
-        // two-line row makes the list jump the moment the fetch lands.
-        <ul
-          className="overflow-hidden rounded-lg border"
-          role="status"
-          aria-label="Loading reviews"
-        >
-          {Array.from({ length: 5 }).map((_, i) => (
-            <li key={i} className="flex items-center gap-3 border-b px-3 py-2.5 last:border-b-0">
-              <span className="flex min-w-0 flex-1 flex-col gap-1.5">
-                <Skeleton className="h-3.5 w-2/3" />
-                <Skeleton className="h-3 w-40" />
-              </span>
-              <Skeleton className="h-1.5 w-16 rounded-full" />
-              <Skeleton className="h-3 w-20" />
-              <Skeleton className="h-3 w-9" />
-            </li>
-          ))}
-        </ul>
+        <SkeletonRows
+          rows={5}
+          columns={["minmax(0,1fr)", "64px", "80px", "36px"]}
+          className="overflow-hidden rounded-lg border px-3"
+        />
       ) : error && groups.length === 0 ? (
-        <div role="alert" className="rounded-lg border border-dashed py-12 text-center">
-          <p className="text-sm text-destructive">Couldn’t load reviews. {errorMessage(error)}</p>
-        </div>
+        <EmptyState tone="error">Couldn’t load reviews. {errorMessage(error)}</EmptyState>
       ) : rows.length === 0 ? (
-        <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-16 text-center">
-          <span className="text-xl leading-none">
-            <ReviewGlyph status="queued" beat={false} />
-          </span>
-          <p className="max-w-sm text-sm text-muted-foreground">
-            {groups.length === 0
-              ? "No pull requests reviewed yet. Enrol a repository in settings, or ask for a review on a PR with @engrams review."
-              : "No pull requests match these filters."}
-          </p>
-        </div>
+        <EmptyState>
+          {groups.length === 0
+            ? "No pull requests reviewed yet. Enrol a repository in settings, or ask for a review on a PR with @engrams review."
+            : "No pull requests match these filters."}
+        </EmptyState>
       ) : (
         <ul className="overflow-hidden rounded-lg border">
           {rows.map((group) => (
@@ -237,7 +217,7 @@ function SeverityBar({ counts, total }: { counts: Array<[Severity, number]>; tot
   // A single finding still has to be visible, so the fill has a floor.
   const fill = Math.max(Math.min(total / BAR_FULL_AT, 1), 0.09);
   return (
-    <span aria-hidden className="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+    <span aria-hidden className="h-1.5 w-16 overflow-hidden rounded-sm bg-muted">
       <span className="flex h-full gap-px" style={{ width: `${fill * 100}%` }}>
         {counts.map(([severity, count]) => (
           <span
@@ -342,7 +322,7 @@ function PrRow({ group, now }: { group: PrGroup; now: number }) {
             </span>
           </>
         ) : isActive(review) ? null : (
-          <span className="text-xs text-muted-foreground">none</span>
+          <span className="text-xs text-muted-foreground">None</span>
         )}
       </span>
 
@@ -356,7 +336,7 @@ function PrRow({ group, now }: { group: PrGroup; now: number }) {
         title={at?.toLocaleString()}
         className="w-9 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground"
       >
-        {at ? relativeTime(at.toISOString(), now) : "—"}
+        {at ? relativeAge(at.toISOString(), now) : "—"}
       </span>
     </Link>
   );

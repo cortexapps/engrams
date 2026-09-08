@@ -2,7 +2,7 @@
  *
  * One row per automation — name, server-rendered trigger summary, enabled
  * switch, last-run status dot + relative time, a seven-day sparkline, and a
- * built-in pill. Built-ins pin to the top. The editor (3.3), inputs (3.6),
+ * built-in descriptor chip. Built-ins pin to the top. The editor (3.3), inputs (3.6),
  * and runs (3.7) live behind the row links.
  */
 import { Link, useNavigate } from "@tanstack/react-router";
@@ -17,6 +17,9 @@ import {
   WebhookIcon,
 } from "lucide-react";
 
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot as SharedStatusDot } from "@/components/status-dot";
 import type { AutomationSummary } from "@/gen/engram/app/v1/automation_pb";
 import {
   useArchiveAutomation,
@@ -25,13 +28,8 @@ import {
   useDuplicateAutomation,
   useSetAutomationEnabled,
 } from "@/hooks/useAutomations";
-import {
-  relativeTime,
-  runStatusTone,
-  toneDotClass,
-  automationStatusLabel,
-  type RunTone,
-} from "@/lib/automations";
+import { runStatusTone, automationStatusLabel, type RunTone } from "@/lib/automations";
+import { relativeTime } from "@/lib/relative-time";
 import { errorMessage } from "@/lib/errors";
 import { PageHeading } from "@/components/page-heading";
 import { Badge } from "@/components/ui/badge";
@@ -68,12 +66,7 @@ function StatusDot({ status, at }: { status: string | undefined; at: string | un
   const text = status ? `${automationStatusLabel(status)} · ${relativeTime(at)}` : "never run";
   return (
     <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-      <span
-        data-testid="status-dot"
-        data-tone={tone}
-        className={`inline-block size-2 rounded-full ${toneDotClass(tone)}`}
-        aria-hidden
-      />
+      <SharedStatusDot tone={tone} />
       <span>{text}</span>
     </span>
   );
@@ -117,7 +110,7 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
     <div
       data-testid="automation-row"
       data-kind={automation.kind}
-      className="grid gap-4 rounded-lg border bg-card p-4 shadow-xs md:grid-cols-[minmax(0,1fr)_auto_auto] md:items-center"
+      className="grid gap-4 rounded-lg border bg-card p-4 md:grid-cols-[minmax(0,1fr)_auto_auto] md:items-center"
     >
       <Link
         to="/automations/$id"
@@ -128,7 +121,7 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-base font-semibold group-hover:underline">{automation.name}</span>
           {builtin && (
-            <Badge variant="secondary" className="gap-1">
+            <Badge variant="secondary" className="gap-1 rounded-sm">
               <LockIcon className="size-3" aria-hidden />
               built-in
             </Badge>
@@ -245,22 +238,23 @@ export function AutomationsList() {
         <h2 id="automation-list-heading" className="sr-only">
           Automations
         </h2>
-        {automations.isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
+        {automations.isPending && <SkeletonRows />}
         {automations.error && (
-          <p className="text-sm text-destructive">{errorMessage(automations.error)}</p>
+          <EmptyState tone="error">{errorMessage(automations.error)}</EmptyState>
         )}
         {!automations.isPending && !automations.error && rows.length === 0 && (
-          <div className="rounded-lg border border-dashed p-8 text-center">
-            <p className="text-sm text-muted-foreground">
-              No automations yet. Start from the built-in review pipeline or from scratch.
-            </p>
-            <div className="mt-4 flex flex-wrap justify-center gap-2">
-              <DuplicatePrReviewButton />
-              <Button asChild>
-                <Link to="/automations/new">New automation</Link>
-              </Button>
-            </div>
-          </div>
+          <EmptyState
+            action={
+              <div className="flex flex-wrap justify-center gap-2">
+                <DuplicatePrReviewButton />
+                <Button asChild>
+                  <Link to="/automations/new">New automation</Link>
+                </Button>
+              </div>
+            }
+          >
+            No automations yet. Start from the built-in review pipeline or from scratch.
+          </EmptyState>
         )}
         <div className="space-y-3">
           {rows.map((summary) => (

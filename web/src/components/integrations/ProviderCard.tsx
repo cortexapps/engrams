@@ -32,13 +32,13 @@ export function ProviderCard({
     <div
       role="group"
       aria-label={`${view.name} integration`}
-      className="flex min-h-[168px] flex-col gap-3 rounded-lg border bg-card p-4 shadow-xs"
+      className="flex min-h-[168px] flex-col gap-3 rounded-lg border bg-card p-4"
     >
       <div className="flex items-start gap-3">
         <ProviderTile {...view.icon} name={view.name} size={42} />
         <div className="min-w-0 flex-1">
-          <div className="text-[0.98rem] font-semibold">{view.name}</div>
-          <Text variant="label" tone="muted" className="text-[0.56rem]">
+          <div className="text-base font-semibold">{view.name}</div>
+          <Text variant="label" tone="muted" className="text-2xs">
             {view.category}
           </Text>
         </div>
@@ -47,13 +47,13 @@ export function ProviderCard({
         ) : view.status === "needs_reconnect" ? (
           <StatusDot tone="caution" label="reconnect" />
         ) : (
-          <span className="text-[0.7rem] font-medium capitalize text-muted-foreground">
+          <span className="text-2xs font-medium capitalize text-muted-foreground">
             {view.builtin ? "built-in" : view.credentialSource}
           </span>
         )}
       </div>
 
-      <p className="flex-1 text-[0.82rem] leading-relaxed text-muted-foreground">{view.blurb}</p>
+      <p className="flex-1 text-sm leading-relaxed text-muted-foreground">{view.blurb}</p>
 
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
         <span className="inline-flex items-center gap-1.5">

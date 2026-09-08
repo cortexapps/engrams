@@ -9,6 +9,7 @@ import { useMemo, useState } from "react";
 import { ChevronRightIcon, PlusIcon } from "lucide-react";
 import { toast } from "sonner";
 
+import { EmptyState } from "@/components/empty-state";
 import type { AutomationInstance } from "@/gen/engram/app/v1/automation_pb";
 import { Button } from "@/components/ui/button";
 import {
@@ -40,7 +41,7 @@ import {
   type InputFieldSpec,
   type InputValues,
 } from "@/lib/automation-inputs";
-import { relativeTime } from "@/pages/sessions/session-format";
+import { relativeTime } from "@/lib/relative-time";
 import { cn } from "@/lib/utils";
 
 import { InputsForm } from "../inputs/InputsForm";
@@ -106,10 +107,10 @@ export function WorkstreamsTab({
 
       {list.isLoading && <Skeleton className="h-24 w-full" data-testid="workstreams-loading" />}
       {list.data && rows.length === 0 && (
-        <p className="text-muted-foreground rounded-md border border-dashed p-6 text-center text-sm">
+        <EmptyState>
           No {includeClosed ? "" : "open "}workstreams. Kick one off, or let a matching event open
           one.
-        </p>
+        </EmptyState>
       )}
       <ul className="flex flex-col gap-1">
         {rows.map((instance) => (
@@ -137,9 +138,7 @@ export function WorkstreamsTab({
                 <span className="min-w-0 flex-1 truncate">
                   {drop.eventKey || drop.entrypointId} · {drop.detail}
                 </span>
-                <span className="shrink-0 tabular-nums">
-                  {relativeTime(drop.droppedAt, tick)} ago
-                </span>
+                <span className="shrink-0 tabular-nums">{relativeTime(drop.droppedAt, tick)}</span>
               </li>
             ))}
           </ul>
@@ -198,7 +197,7 @@ function WorkstreamRow({
           </span>
         )}
         <span className="text-muted-foreground w-20 shrink-0 text-right text-xs tabular-nums">
-          {relativeTime(instance.openedAt, now)} ago
+          {relativeTime(instance.openedAt, now)}
         </span>
       </button>
       {expanded && <WorkstreamDetail instance={instance} now={now} />}

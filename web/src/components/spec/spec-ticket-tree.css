@@ -17,9 +17,8 @@
 }
 
 .spec-ticket-count {
-  font-size: 0.8rem;
+  font-size: 0.75rem;
   font-weight: 600;
-  letter-spacing: 0.02em;
 }
 
 .spec-ticket-bar-actions {
@@ -31,10 +30,9 @@
 .spec-ticket-error {
   margin: 0;
   border: 1px solid var(--destructive);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-lg);
   padding: 0.5rem 0.7rem;
-  font-size: 0.8rem;
-  color: var(--destructive);
+  font-size: 0.75rem;
 }
 
 .spec-ticket-rows {
@@ -50,13 +48,12 @@
   --ticket-depth: 0;
   margin-left: calc(var(--ticket-depth) * 1.6rem);
   border: 1px solid var(--border);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-lg);
   background: var(--card);
 }
 
 .spec-ticket-row[data-selected="true"] {
   border-color: var(--primary);
-  box-shadow: 0 0 0 1px var(--primary);
 }
 
 .spec-ticket-row[data-dragging="true"] {
@@ -74,7 +71,7 @@
   align-items: center;
   gap: 0.5rem;
   padding: 0.45rem 0.7rem;
-  font-size: 0.85rem;
+  font-size: 0.875rem;
 }
 
 .spec-ticket-grip {
@@ -85,7 +82,7 @@
   background: none;
   border: none;
   padding: 0.1rem;
-  border-radius: 0.25rem;
+  border-radius: var(--radius-sm);
 }
 
 .spec-ticket-grip:focus-visible {
@@ -124,11 +121,10 @@
 }
 
 .spec-ticket-backlink {
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
   color: var(--muted-foreground);
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   padding: 0.05rem 0.45rem;
   white-space: nowrap;
   text-decoration: none;
@@ -139,13 +135,13 @@
 }
 
 .spec-ticket-flag {
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
   border-color: color-mix(in oklab, var(--destructive) 35%, transparent);
 }
 
 .spec-ticket-linear {
   font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
   color: var(--muted-foreground);
 }
 
@@ -166,16 +162,16 @@
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   color: var(--muted-foreground);
 }
 
 .spec-ticket-editor select {
   border: 1px solid var(--border);
-  border-radius: 0.4rem;
+  border-radius: var(--radius-md);
   background: var(--background);
   padding: 0.35rem 0.5rem;
-  font-size: 0.8rem;
+  font-size: 0.75rem;
   color: var(--foreground);
 }
 
@@ -186,9 +182,9 @@
 .spec-ticket-hint {
   margin: 0;
   border: 1px dashed var(--border);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-lg);
   padding: 0.5rem 0.8rem;
-  font-size: 0.78rem;
+  font-size: 0.75rem;
   color: var(--muted-foreground);
 }
 
@@ -196,9 +192,9 @@
    its own block rather than a quiet omission (R29). */
 .spec-ticket-orphans {
   border: 1px solid color-mix(in oklab, var(--destructive) 35%, transparent);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-lg);
   padding: 0.6rem 0.8rem;
-  font-size: 0.8rem;
+  font-size: 0.75rem;
 }
 
 .spec-ticket-orphans h3 {
@@ -206,11 +202,9 @@
   align-items: center;
   gap: 0.35rem;
   margin: 0 0 0.35rem;
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--destructive);
+  color: var(--foreground);
 }
 
 .spec-ticket-orphans ul {
@@ -221,6 +215,5 @@
 
 .spec-ticket-orphan-section {
   margin-left: 0.4rem;
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
 }

@@ -4,7 +4,7 @@ import { ListChecks, TriangleAlert } from "lucide-react";
 
 import { useNow } from "../../hooks/useNow";
 import { useReviews } from "../../hooks/useReviews";
-import { relativeTime } from "../sessions/session-format";
+import { relativeAge } from "@/lib/relative-time";
 import { LivePulse } from "../../components/LivePulse";
 import { ReviewGlyph } from "./ReviewGlyph";
 import { groupByPr } from "./review-groups";
@@ -136,7 +136,7 @@ export function ReviewsRail() {
                               no room for the stage word, so the word goes to
                               assistive tech only — otherwise a rail row announces
                               a PR with no indication of what happened to it. */}
-                          <span className="mt-0.5 shrink-0 text-[0.7rem] leading-none">
+                          <span className="mt-0.5 shrink-0 text-2xs leading-none">
                             <ReviewGlyph status={review.status} />
                             <span className="sr-only">{stageOf(review.status).label}</span>
                           </span>
@@ -147,16 +147,14 @@ export function ReviewsRail() {
                                 recorded before capture landed) keep the number
                                 alone rather than showing a blank. */}
                             <span className="flex min-w-0 items-baseline gap-1.5">
-                              <span className="shrink-0 font-mono text-[0.7rem] leading-tight tabular-nums text-sidebar-foreground/85">
+                              <span className="shrink-0 font-mono text-2xs leading-tight tabular-nums text-sidebar-foreground/85">
                                 #{group.prNumber}
                               </span>
                               {title && (
-                                <span className="truncate text-[0.8rem] leading-tight">
-                                  {title}
-                                </span>
+                                <span className="truncate text-sm leading-tight">{title}</span>
                               )}
                             </span>
-                            <span className="flex min-w-0 items-baseline gap-1.5 text-[0.7rem] leading-tight text-sidebar-foreground/85">
+                            <span className="flex min-w-0 items-baseline gap-1.5 text-2xs leading-tight text-sidebar-foreground/85">
                               <span className="truncate font-mono">{group.repo}</span>
                               {total > 0 && (
                                 <span className="shrink-0 tabular-nums">
@@ -180,9 +178,9 @@ export function ReviewsRail() {
                             {at && (
                               <span
                                 title={at.toLocaleString()}
-                                className="mt-0.5 font-mono text-[0.65rem] tabular-nums text-sidebar-foreground/85"
+                                className="mt-0.5 font-mono text-2xs tabular-nums text-sidebar-foreground/85"
                               >
-                                {relativeTime(at.toISOString(), now)}
+                                {relativeAge(at.toISOString(), now)}
                               </span>
                             )}
                           </span>

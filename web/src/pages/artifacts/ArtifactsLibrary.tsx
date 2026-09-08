@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { FileBox } from "lucide-react";
 
 import { useIsAdmin } from "../../auth/AuthProvider";
 import { useArtifacts, type ArtifactScope } from "../../hooks/useArtifacts";
@@ -9,8 +8,8 @@ import { ArtifactCard } from "./ArtifactCard";
 import { PageHeading } from "@/components/page-heading";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Text } from "@/components/ui/text";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 
 // The gallery index: a card grid of the caller's documents. Scope rides
 // the URL (?scope=shared|all) so a filtered view is linkable; non-admins
@@ -76,26 +75,17 @@ export function ArtifactsLibrary() {
       </div>
 
       {isPending ? (
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-          {Array.from({ length: 6 }).map((_, i) => (
-            <Skeleton key={i} className="h-52 rounded-md" />
-          ))}
-        </div>
+        <SkeletonRows rows={6} />
       ) : error ? (
-        <Text as="p" tone="destructive" className="py-8">
-          {errorMessage(error)}
-        </Text>
+        <EmptyState tone="error">Couldn’t load artifacts. {errorMessage(error)}</EmptyState>
       ) : rows.length === 0 ? (
-        <div className="flex flex-col items-center gap-3 py-20 text-muted-foreground">
-          <FileBox className="size-10" strokeWidth={1} />
-          <Text as="p" variant="body" tone="muted">
-            {filter
-              ? "No artifacts match the filter."
-              : scope === "shared"
-                ? "Nothing has been shared with the org yet."
-                : "No artifacts yet — agents publish documents here with the Artifact tool."}
-          </Text>
-        </div>
+        <EmptyState>
+          {filter
+            ? "No artifacts match the filter."
+            : scope === "shared"
+              ? "Nothing has been shared with the org yet."
+              : "No artifacts yet — agents publish documents here with the Artifact tool."}
+        </EmptyState>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
           {rows.map((a) => (

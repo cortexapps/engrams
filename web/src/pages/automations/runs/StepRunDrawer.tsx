@@ -21,9 +21,7 @@ function JsonBlock({ title, text }: { title: string; text: string }) {
   const pretty = parsed ? JSON.stringify(parsed, null, 2) : text;
   return (
     <section className="flex flex-col gap-1">
-      <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        {title}
-      </h4>
+      <h4 className="text-xs font-semibold text-muted-foreground">{title}</h4>
       <pre className="max-h-64 overflow-auto rounded-md bg-secondary p-3 font-mono text-xs">
         {pretty || "—"}
       </pre>
@@ -35,9 +33,7 @@ function TextBlock({ title, text }: { title: string; text: string }) {
   if (!text) return null;
   return (
     <section className="flex flex-col gap-1">
-      <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        {title}
-      </h4>
+      <h4 className="text-xs font-semibold text-muted-foreground">{title}</h4>
       <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-secondary p-3 font-mono text-xs">
         {text}
       </pre>

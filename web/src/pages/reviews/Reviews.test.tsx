@@ -328,7 +328,7 @@ describe("Reviews ledger", () => {
 
     // Only the finished pass claims zero. The running one stays silent.
     await screen.findByText("Still reading the diff");
-    expect(screen.getAllByText("none")).toHaveLength(1);
+    expect(screen.getAllByText("None")).toHaveLength(1);
   });
 
   it("falls back to the PR number when no title was captured", async () => {

@@ -75,6 +75,8 @@ import {
   type SecretRow,
 } from "../../components/profiles/ProfileSecretsEditor";
 import { derivePolicy } from "../../lib/profilePolicy";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -510,7 +512,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   // fetched profile. Otherwise they first mount with EMPTY and Radix notifies
   // their change handlers as the saved values arrive, clearing model/effort.
   if (mode === "edit" && hydratedProfileId !== editingId) {
-    return <Text tone="muted">Loading profile…</Text>;
+    return <SkeletonRows rows={3} />;
   }
 
   return (
@@ -590,8 +592,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                       aria-label="PR reviewer profile"
                     />
                     <div className="flex-1">
-                      <div className="text-[0.84rem]">Designate as the PR reviewer</div>
-                      <div className="text-[0.74rem] text-muted-foreground">
+                      <div className="text-sm">Designate as the PR reviewer</div>
+                      <div className="text-xs text-muted-foreground">
                         Pull-request reviews run on this profile&apos;s image, model, and skills.
                         Only one profile can be the reviewer.
                       </div>
@@ -829,9 +831,9 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                       >
                         <ProviderTile {...v.icon} name={v.name} size={32} />
                         <div className="min-w-0 flex-1">
-                          <div className="text-[0.92rem] font-semibold">{v.name}</div>
+                          <div className="text-base font-semibold">{v.name}</div>
                           {on ? (
-                            <div className="flex flex-wrap items-center gap-2.5 text-[0.72rem] text-muted-foreground">
+                            <div className="flex flex-wrap items-center gap-2.5 text-xs text-muted-foreground">
                               <span className="inline-flex items-center gap-1">
                                 {v.credentialSource === "mint" ? (
                                   <ShieldCheckIcon className="size-3 text-instrument-nominal" />
@@ -848,16 +850,14 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                               </span>
                             </div>
                           ) : (
-                            <div className="truncate text-[0.78rem] text-muted-foreground">
-                              {v.blurb}
-                            </div>
+                            <div className="truncate text-xs text-muted-foreground">{v.blurb}</div>
                           )}
                         </div>
                         <div className="flex items-center gap-2.5">
                           <Text
                             variant="label"
                             tone={on ? "inherit" : "muted"}
-                            className={`text-[0.62rem] ${on ? "text-instrument-nominal" : ""}`}
+                            className={`text-2xs ${on ? "text-instrument-nominal" : ""}`}
                           >
                             {on ? "Enabled" : "Off"}
                           </Text>
@@ -882,10 +882,10 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                       {on && v.userCredential && (
                         <div className="flex items-center justify-between gap-3 border-t px-3 py-2">
                           <div className="min-w-0">
-                            <Text variant="label" className="text-[0.72rem]">
+                            <Text variant="label" className="text-xs">
                               Use each member&apos;s personal credential
                             </Text>
-                            <div className="text-[0.72rem] text-muted-foreground">
+                            <div className="text-xs text-muted-foreground">
                               Sessions act as the person who starts them; a launch is blocked until
                               they connect {v.name} under Settings → Credentials. Automations keep
                               the org credential.
@@ -932,11 +932,11 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                           GC
                         </span>
                         <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2 text-[0.92rem] font-semibold">
+                          <div className="flex items-center gap-2 text-base font-semibold">
                             {connection.displayName}
                             {!connection.enabled && <Badge variant="secondary">Disabled</Badge>}
                           </div>
-                          <div className="truncate font-mono text-[0.7rem] text-muted-foreground">
+                          <div className="truncate font-mono text-2xs text-muted-foreground">
                             {connection.googleCloud?.serviceAccountEmail}
                           </div>
                         </div>
@@ -945,7 +945,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                         </Text>
                       </div>
                       {!connection.enabled && (
-                        <p className="border-t px-3.5 py-2 text-[0.74rem] text-muted-foreground">
+                        <p className="border-t px-3.5 py-2 text-xs text-muted-foreground">
                           This connection is disabled — sessions cannot use these powers. Test and
                           enable it again from{" "}
                           <Link
@@ -996,7 +996,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
           >
             <div className="flex items-center gap-2.5 rounded-md border bg-background px-3.5 py-2.5">
               <LockIcon className="size-4 shrink-0 text-instrument-nominal" />
-              <div className="flex-1 text-[0.82rem]">
+              <div className="flex-1 text-sm">
                 <strong>{networkDefault === "allow" ? "Open egress." : "Automatic egress."}</strong>{" "}
                 <span className="text-muted-foreground">
                   {networkDefault === "allow"
@@ -1022,7 +1022,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             <button
               type="button"
               onClick={() => setNetOpen((v) => !v)}
-              className="mt-3 inline-flex items-center gap-1.5 text-[0.78rem] text-muted-foreground hover:text-foreground"
+              className="mt-3 inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground"
             >
               <ChevronDownIcon
                 className={`size-3.5 transition-transform ${netOpen ? "rotate-180" : ""}`}
@@ -1085,8 +1085,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               <ChevronDownIcon
                 className={`size-4 text-muted-foreground transition-transform ${advanced ? "rotate-180" : ""}`}
               />
-              <Text variant="label">Advanced</Text>
-              <span className="text-[0.76rem] text-muted-foreground">
+              <span className="text-sm font-semibold">Advanced</span>
+              <span className="text-xs text-muted-foreground">
                 skills · environment · ports · custom secrets · user token
               </span>
             </button>
@@ -1212,11 +1212,7 @@ function ReposSection({
 
   return (
     <div className="flex flex-col gap-3">
-      {repos.length === 0 && (
-        <Text variant="body" className="text-[0.8rem]">
-          No repositories configured.
-        </Text>
-      )}
+      {repos.length === 0 && <EmptyState inline>No repositories configured.</EmptyState>}
       {repos.map((r, i) => (
         <div key={i} className="flex items-center gap-2">
           <Input
@@ -1263,24 +1259,24 @@ function ReposSection({
           {discover.isPending ? "Scanning image… (about a minute)" : "Autodiscover"}
         </Button>
         {!profileId && (
-          <Text variant="body" className="text-[0.76rem]">
+          <Text variant="body" className="text-xs">
             Save the profile first to scan its image.
           </Text>
         )}
       </div>
       {candidates !== null && (
         <div className="rounded-md border p-3" data-testid="repo-candidates">
-          <Text variant="label" className="text-[0.8rem]">
+          <h3 className="text-sm font-semibold">
             Found {candidates.length} {candidates.length === 1 ? "checkout" : "checkouts"}
-          </Text>
+          </h3>
           {candidates.length === 0 && (
-            <Text variant="body" className="mt-1 text-[0.78rem]">
+            <EmptyState inline className="mt-1">
               No git checkouts in the image's workspace roots.
-            </Text>
+            </EmptyState>
           )}
           <div className="mt-2 flex flex-col gap-1.5">
             {candidates.map((c) => (
-              <div key={c.path} className="flex items-center gap-2 text-[0.82rem]">
+              <div key={c.path} className="flex items-center gap-2 text-sm">
                 <span className="font-mono">{c.path}</span>
                 {c.remoteUrl && (
                   <span className="truncate font-mono text-muted-foreground">{c.remoteUrl}</span>
@@ -1306,14 +1302,15 @@ function ReposSection({
 
 function EmptyIntegrations() {
   return (
-    <div className="rounded-md border border-dashed p-6 text-center">
-      <p className="text-[0.84rem] text-muted-foreground">
-        No integrations connected yet — there are no powers to grant.
-      </p>
-      <Button asChild variant="outline" size="sm" className="mt-3">
-        <Link to="/settings/integrations">Go to Integrations</Link>
-      </Button>
-    </div>
+    <EmptyState
+      action={
+        <Button asChild variant="outline" size="sm">
+          <Link to="/settings/integrations">Go to Integrations</Link>
+        </Button>
+      }
+    >
+      No integrations connected yet — there are no powers to grant.
+    </EmptyState>
   );
 }
 
@@ -1416,7 +1413,7 @@ function Advanced({
     <div className="flex flex-col gap-6">
       {/* skills */}
       <div>
-        <Text variant="label">Skills</Text>
+        <h3 className="text-sm font-semibold">Skills</h3>
         <div className="mt-2 flex flex-col gap-1.5">
           {skillCatalog.map((s) => {
             const on = skills.includes(s.name);
@@ -1433,20 +1430,18 @@ function Advanced({
                   }
                 />
                 <div className="flex-1">
-                  <div className="flex items-center gap-2 text-[0.84rem]">
+                  <div className="flex items-center gap-2 text-sm">
                     {s.label}
-                    {!s.builtin && (
-                      <span className="text-[0.62rem] text-muted-foreground">uploaded</span>
-                    )}
+                    {!s.builtin && <span className="text-2xs text-muted-foreground">uploaded</span>}
                   </div>
-                  <div className="text-[0.74rem] text-muted-foreground">{s.description}</div>
+                  <div className="text-xs text-muted-foreground">{s.description}</div>
                 </div>
               </div>
             );
           })}
         </div>
         <div className="mt-2 flex flex-col gap-2 rounded-md border border-dashed p-3">
-          <Text variant="label">Upload a skill</Text>
+          <h3 className="text-sm font-semibold">Upload a skill</h3>
           <Input
             data-testid="skill-upload-name"
             placeholder="skill name (lowercase, dashes)"
@@ -1476,7 +1471,11 @@ function Advanced({
           <p className="text-sm text-muted-foreground" aria-live="polite">
             {skillFile ? `Selected: ${skillFile.name}` : "No skill file selected"}
           </p>
-          {uploadErr && <p className="text-sm text-destructive">{uploadErr}</p>}
+          {uploadErr && (
+            <EmptyState tone="error" inline>
+              {uploadErr}
+            </EmptyState>
+          )}
           <Button
             type="button"
             variant="outline"
@@ -1504,8 +1503,8 @@ function Advanced({
 
       {/* apps (ADR 0118) */}
       <div>
-        <Text variant="label">Apps</Text>
-        <p className="mt-1 text-[0.74rem] text-muted-foreground">
+        <h3 className="text-sm font-semibold">Apps</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
           The services every session from this profile hosts. Each one gets a stable public address,
           and the platform injects <code className="font-mono">&lt;NAME&gt;_INGRESS_HOST</code> and{" "}
           <code className="font-mono">&lt;NAME&gt;_INGRESS_URL</code> for every app into the
@@ -1518,7 +1517,7 @@ function Advanced({
         </p>
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
           {apps.length === 0 && (
-            <span className="text-[0.74rem] text-muted-foreground">
+            <span className="text-xs text-muted-foreground">
               None — sessions publish nothing by default.
             </span>
           )}
@@ -1582,15 +1581,17 @@ function Advanced({
           </Button>
         </div>
         {portErr && (
-          <p className="mt-1 text-sm text-destructive" data-testid="port-add-error">
-            {portErr}
-          </p>
+          <div className="mt-1" data-testid="port-add-error">
+            <EmptyState tone="error" inline>
+              {portErr}
+            </EmptyState>
+          </div>
         )}
       </div>
 
       {/* env vars */}
       <div>
-        <Text variant="label">Environment variables</Text>
+        <h3 className="text-sm font-semibold">Environment variables</h3>
         <div className="mt-2">
           <EnvVarsEditor
             rows={envRows}
@@ -1603,8 +1604,8 @@ function Advanced({
 
       {/* custom secrets */}
       <div>
-        <Text variant="label">Custom injected secrets</Text>
-        <p className="mt-1 mb-2 text-[0.74rem] text-muted-foreground">
+        <h3 className="text-sm font-semibold">Custom injected secrets</h3>
+        <p className="mt-1 mb-2 text-xs text-muted-foreground">
           For values not tied to an integration (a DB URL, an internal token). Broker keeps them out
           of the sandbox.
         </p>
@@ -1623,8 +1624,8 @@ function Advanced({
           aria-label="Include the launching user's other saved tokens"
         />
         <div className="flex-1">
-          <div className="text-[0.84rem]">Include the launching user's other tokens</div>
-          <div className="text-[0.74rem] text-muted-foreground">
+          <div className="text-sm">Include the launching user's other tokens</div>
+          <div className="text-xs text-muted-foreground">
             The harness's own credential always rides along. This additionally carries the
             developer's other saved tokens into the sandbox. Leave off for untrusted images.
           </div>

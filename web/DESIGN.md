@@ -27,30 +27,37 @@ colors:
   critical-ink: "oklch(0.52 0.2 27)"
 typography:
   display:
+    fontFamily: "'Saira Variable', system-ui, sans-serif"
+    fontSize: "26px"
+    fontWeight: 600
+    lineHeight: 1.2
+    fontStretch: "108%"
+  masthead:
+    fontFamily: "{typography.display.fontFamily}"
+    fontSize: "20px"
+    fontWeight: 600
+    lineHeight: 1.3
+  sans:
     fontFamily: "system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
-    fontSize: "1.5rem"
-    fontWeight: 600
-    lineHeight: 1.2
-    letterSpacing: "-0.01em"
-  title:
-    fontFamily: "{typography.display.fontFamily}"
-    fontSize: "1rem"
-    fontWeight: 500
-    lineHeight: 1.4
   body:
-    fontFamily: "{typography.display.fontFamily}"
-    fontSize: "0.95rem"
+    fontFamily: "{typography.sans.fontFamily}"
+    fontSize: "14px"
     fontWeight: 400
-    lineHeight: 1.6
+    lineHeight: 1.45
+  prose:
+    fontFamily: "{typography.sans.fontFamily}"
+    fontSize: "16px"
+    fontWeight: 400
+    lineHeight: 1.55
   label:
-    fontFamily: "{typography.display.fontFamily}"
-    fontSize: "0.78rem"
+    fontFamily: "{typography.sans.fontFamily}"
+    fontSize: "12px"
     fontWeight: 600
-    lineHeight: 1.2
+    lineHeight: 1.3
     letterSpacing: "normal"
   mono:
     fontFamily: "'JetBrains Mono Variable', ui-monospace, 'SF Mono', Menlo, monospace"
-    fontSize: "0.75rem"
+    fontSize: "12px"
     fontWeight: 400
     fontFeature: "tabular-nums"
 rounded:
@@ -200,8 +207,16 @@ The one place the two converge is inside `.work-pane`: the ground there is dark
 in both themes, so a single set clears both floors.
 
 **Running** is not one of these three. It has its own tone, `{colors.ring}`,
-set by `Glyph`'s `toneFor` — racing green on paper, lime at night. That is the
-deliberate exception to the Lime-Is-Action rule, and the only one.
+set by `Glyph`'s `toneFor` and by `StatusDot`'s `active` — racing green on
+paper, lime at night. That is the deliberate exception to the Lime-Is-Action
+rule, and the only one.
+
+**Thresholds live with the primitive**, not the caller (`components/meter.tsx`,
+`operator-health.ts`): a usage meter (disk, memory, cpu, capacity) is nominal
+below 70%, caution from 70%, critical from 90%; base locality is nominal from
+80%, caution from 50%, critical below; a last flush is nominal inside the 60s
+window and caution past it — staleness, never recency. `--destructive` is for
+destructive actions, not for a meter.
 
 ### Named Rules
 
@@ -227,25 +242,42 @@ not merely dim.
 
 ## Typography
 
-**Display / Body / Label Font:** system UI stack
+**Display Font:** Saira Variable — page titles only, 600, set 8% wide
+**Body / Label Font:** system UI stack
 **Machine Font:** JetBrains Mono Variable
 
-**Character:** One workhorse family carries chrome, headings and prose. The
-display face is retired: Saira's tracked caps were the source of the borrowed,
-generated feel, and a title earns its rank through size and weight instead.
-Monospace is reserved for things a machine produced — ids, digests, paths,
-branch names, byte counts, diff numbers, code.
+**Character:** One workhorse family carries chrome, headings and prose; the
+display face appears exactly once per page, on the title (`Text
+variant="display"`). The borrowed, generated feel came from tracked caps on
+every label, not from the face, so Saira keeps the title and loses everything
+else. Monospace is reserved for things a machine produced — ids, digests,
+paths, branch names, byte counts, diff numbers, code.
+
+### The type scale
+
+Seven sizes, as Tailwind utilities, and every size in the app is one of them.
+Arbitrary `text-[…]` values are banned.
+
+| Utility | px | Use |
+|---|---|---|
+| `text-2xs` | 11 | mono ages, counts, ids in dense rows; rail meta |
+| `text-xs` | 12 | captions, field labels, table heads, secondary lines |
+| `text-sm` | 14 | body — rows, buttons, descriptions |
+| `text-base` | 16 | prose (transcript) and inputs (keeps iOS from zooming a field) |
+| `text-lg` | 20 | a section masthead (a builder's name) |
+| `text-xl` | 26 | the page title |
+| `text-2xl` | 30 | the title of a centered composer page |
 
 ### Hierarchy
 
-- **Display** (600, 1.5rem, 1.2): page titles. Paired with a count chip rather
-  than a subtitle.
-- **Title** (500, 1rem, 1.4): session masthead, card headings, pane headings.
-- **Body** (400, 0.95rem, 1.6): transcript prose and descriptions. Measure caps
-  at roughly 65–75 characters.
-- **Label** (600, 0.78rem): rail group headers and small section labels, in
-  sentence case.
-- **Mono** (400, 0.75rem, tabular): all machine data.
+- **Display** (Saira 600, 26px, 108% width): page titles. Paired with a count
+  chip rather than a subtitle. 30px on a centered composer page.
+- **Heading** (600, 14px): section and card headings, sentence case — never a
+  tracked kicker, never `Text variant="label"` used as a heading.
+- **Body** (400, 14px): rows and descriptions. Prose in the transcript is 16px;
+  measure caps at roughly 65–75 characters.
+- **Label** (600, 12px): field captions and table heads, in sentence case.
+- **Mono** (400, 12px or 11px, tabular): all machine data.
 
 ### Named Rules
 
@@ -258,6 +290,10 @@ than its own contents divides nothing.
 
 **The Mono-Means-Machine Rule.** Monospace is for data a machine emitted. It is
 never a costume for "technical".
+
+**The One Clock Rule.** Every relative time comes from `lib/relative-time`:
+`relativeTime` for the sentence voice ("4m ago", "in 2h", "just now", "never")
+and `relativeAge` for dense columns ("3m"). No surface appends " ago" by hand.
 
 ## Layout
 
@@ -317,10 +353,15 @@ shadow is a glow, and a glow reads as focus or error, not as height.
 
 ## Shapes
 
-Corners are **gently rounded and consistent**: 12px on lifted surfaces and
-cards, 10px on controls, 8px on chips and tab pills, full-round on counts and
-status pills. The previous 8px-everywhere corner made a 400px card and a 24px
-button read as the same kind of object.
+Corners are **gently rounded and consistent**: 12px (`rounded-lg`) on lifted
+surfaces and cards, 10px (`rounded-md`) on controls, 8px (`rounded-sm`) on
+small buttons, tab pills and chips that describe (`built-in`, a tag),
+full-round only on counts and status badges. The previous 8px-everywhere
+corner made a 400px card and a 24px button read as the same kind of object.
+
+**The Pills-Never-Act Rule.** A full-round shape is a readout — a count, a
+state. A button, a link or a filter that is shaped like one promises to be
+read, not pressed.
 
 Borders are hairlines at low contrast. Their job is to close an object, not to
 build a grid. Where a surface can be distinguished by fill, it is — the border
@@ -362,10 +403,27 @@ the whole app its sentence case.
 
 ### Chips
 
-- **Style:** full-round, muted fill, no border, `{typography.mono}` for counts
-  and `{typography.label}` for words.
-- **Use:** counts beside a page title, tags, PR numbers, branch state. A chip
-  never carries an action.
+- **Counts and states:** full-round, muted fill, `{typography.mono}` for the
+  count, sentence case for the word. The count beside a page title; a status
+  badge.
+- **Descriptors:** 8px corners (`built-in`, a tag, a category). Never lime:
+  `Badge`'s default variant says "you can do this", not "this is what it is".
+- A chip never carries an action.
+
+### Status dots, meters, empty and loading states
+
+One component each, in `components/`:
+
+- **`StatusDot`** — the only dot. Tones nominal / caution / critical / active
+  (running, `{colors.ring}`) / muted; 6px in dense rows, 8px in lists, 10px on
+  a masthead. Always beside a word.
+- **`Meter`** — a 6px bar in an instrument tone, with the thresholds above.
+  `Progress` is for work in flight (the running tone), never for a reading.
+- **`EmptyState`** — a dashed card holding one quiet sentence and at most one
+  action; `tone="error"` adds the alert glyph in ink; `inline` inside a surface
+  that already is a card. The only empty idiom.
+- **`SkeletonRows`** — placeholder bars in the column geometry of the coming
+  data. The only loading idiom; there is no "Loading…" string.
 
 ### Cards / Containers
 
@@ -394,9 +452,9 @@ the whole app its sentence case.
 - **Session list:** grouped rows on the cover. Group headers are label-weight
   with a count chip, separated by 20px of space and a hairline. A row carries a
   status glyph, a title, an age, and an optional one-line note.
-- **Tabs:** stock shadcn `Tabs`. Every tab carries its icon. The active pill
-  must clear its own track by a visible step — verify it; on green they
-  collapsed to 0.012 lightness apart and the selection vanished.
+- **Tabs:** stock shadcn `Tabs`, styled as pill tabs — 30px, 8px corners, no
+  track, the active pill on `--secondary` at 600 with no shadow. On the pane,
+  `.work-pane`'s own `--secondary` keeps the step visible.
 
 ### The Work Pane
 
@@ -434,3 +492,5 @@ override would leave petrol ink on bottle green.
 - **Don't** hand-roll a component that shadcn ships. The retired `TabRow` is the
   cautionary example: it existed only because stock `Tabs` was never tried.
 - **Don't** use lime for status, or an instrument colour for an action.
+- **Don't** invent a size (`text-[0.7rem]`), a dot, an empty state, a loader,
+  or a relative-time format. Each has one home.

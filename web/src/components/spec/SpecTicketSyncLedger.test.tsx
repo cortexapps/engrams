@@ -106,7 +106,7 @@ describe("SpecTicketRows", () => {
     const rows = screen.getAllByRole("listitem");
     expect(rows).toHaveLength(3);
     expect(rows[1]?.textContent).toContain("Enforce org quota in the gateway limiter");
-    expect(rows[1]?.textContent).toContain("failed · 401");
+    expect(rows[1]?.textContent).toContain("Failed · 401");
     expect(rows[1]?.className).toContain("spec-ticket-row-failed");
   });
 
@@ -121,8 +121,8 @@ describe("SpecTicketRows", () => {
       />,
     );
 
-    expect(screen.getByText("syncing…")).not.toBeNull();
-    expect(screen.getByText("draft")).not.toBeNull();
+    expect(screen.getByText("Syncing…")).not.toBeNull();
+    expect(screen.getByText("Draft")).not.toBeNull();
   });
 });
 
@@ -157,7 +157,7 @@ describe("SpecTicketSyncLedgerRail", () => {
     expect(screen.getByText("Quota & billing")).not.toBeNull();
     expect(screen.getByText("spec-mode, quota")).not.toBeNull();
     // R45: the person can see that this choice does not change the org default.
-    expect(screen.getByText("this spec only")).not.toBeNull();
+    expect(screen.getByText("This spec only")).not.toBeNull();
   });
 
   test("no connector points at connecting, and never at an error", async () => {

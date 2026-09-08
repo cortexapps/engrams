@@ -47,7 +47,7 @@ export function UserMenu() {
               </span>
               <span className="grid min-w-0 flex-1 text-left leading-tight">
                 <span className="truncate text-xs font-medium">{label}</span>
-                <span className="truncate text-[10.5px] text-sidebar-foreground/60">{subline}</span>
+                <span className="truncate text-2xs text-sidebar-foreground/60">{subline}</span>
               </span>
             </SidebarMenuButton>
           </DropdownMenuTrigger>

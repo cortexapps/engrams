@@ -159,7 +159,7 @@ function DropdownMenuShortcut({ className, ...props }: React.ComponentProps<"spa
   return (
     <span
       data-slot="dropdown-menu-shortcut"
-      className={cn("ml-auto text-xs tracking-widest text-muted-foreground", className)}
+      className={cn("ml-auto text-xs text-muted-foreground", className)}
       {...props}
     />
   );

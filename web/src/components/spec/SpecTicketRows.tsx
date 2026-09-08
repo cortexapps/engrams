@@ -1,4 +1,5 @@
 import type { SpecTicket, SpecTicketLinearIssue } from "@/hooks/useSpecTicketSync";
+import { StatusDot, type StatusTone } from "@/components/status-dot";
 
 export interface SpecTicketRowsProps {
   tickets: SpecTicket[];
@@ -25,7 +26,7 @@ export function SpecTicketRows({ tickets, issues }: SpecTicketRowsProps) {
             className={`spec-ticket-row spec-ticket-row-${ticket.syncState}`}
             style={{ marginInlineStart: `${Math.min(ticket.depth, 4) * 1.6}rem` }}
           >
-            <span className={`spec-ticket-dot spec-ticket-dot-${ticket.syncState}`} aria-hidden />
+            <StatusDot tone={syncStateTone(ticket.syncState)} size={8} />
             <span className="spec-ticket-title">{ticket.title}</span>
             {ticket.openQuestions.length > 0 ? (
               <span
@@ -42,6 +43,14 @@ export function SpecTicketRows({ tickets, issues }: SpecTicketRowsProps) {
       })}
     </ul>
   );
+}
+
+function syncStateTone(state: SpecTicket["syncState"]): StatusTone {
+  if (state === "synced") return "nominal";
+  if (state === "syncing") return "active";
+  if (state === "queued") return "caution";
+  if (state === "failed") return "critical";
+  return "muted";
 }
 
 /** The right-hand status of one row: an identity, a state, or a reason. */
@@ -61,20 +70,20 @@ function SyncState({ ticket, issue }: { ticket: SpecTicket; issue: SpecTicketLin
           {issue.identifier} ↗
         </a>
       ) : (
-        <span className="spec-ticket-identity">synced</span>
+        <span className="spec-ticket-identity">Synced</span>
       );
     case "failed":
       return (
         <span className="spec-ticket-pill spec-ticket-pill-failed" title={ticket.syncError ?? ""}>
-          failed{shortReason(ticket.syncError)}
+          Failed{shortReason(ticket.syncError)}
         </span>
       );
     case "syncing":
-      return <span className="spec-ticket-state">syncing…</span>;
+      return <span className="spec-ticket-state">Syncing…</span>;
     case "queued":
-      return <span className="spec-ticket-state">queued</span>;
+      return <span className="spec-ticket-state">Queued</span>;
     default:
-      return <span className="spec-ticket-state">draft</span>;
+      return <span className="spec-ticket-state">Draft</span>;
   }
 }
 
