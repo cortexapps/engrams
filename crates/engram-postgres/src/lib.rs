@@ -9269,12 +9269,39 @@ impl MetadataStore for PostgresStore {
 
     /// ADR 0029: count of chunks parked in `chunk_gc_candidates`
     /// awaiting their grace window — the Storage surface's "gc pending".
-    async fn count_gc_candidates(&self) -> Result<u64, MetaError> {
-        let count: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM chunk_gc_candidates")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(count.max(0) as u64)
+    async fn count_gc_candidates(
+        &self,
+        exact_cap: u64,
+    ) -> Result<engram_core::traits::GcCandidateBacklog, MetaError> {
+        use engram_core::traits::GcCandidateBacklog;
+        let cap = i64::try_from(exact_cap).unwrap_or(i64::MAX);
+        // Count at most `cap` rows: a bounded index walk, never a full scan.
+        let counted: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM (SELECT 1 FROM chunk_gc_candidates LIMIT $1) t",
+        )
+        .bind(cap)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if counted < cap {
+            return Ok(GcCandidateBacklog {
+                count: counted.max(0) as u64,
+                exact: true,
+            });
+        }
+        // Past the cap: the stats system's live-tuple estimate, maintained
+        // on every insert and delete, so it costs nothing to read. Never
+        // below what was just counted (the estimate lags a fresh table).
+        let estimate: Option<i64> = sqlx::query_scalar(
+            "SELECT n_live_tup::bigint FROM pg_stat_user_tables WHERE relname = 'chunk_gc_candidates'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(GcCandidateBacklog {
+            count: estimate.unwrap_or(0).max(counted) as u64,
+            exact: false,
+        })
     }
 }
 

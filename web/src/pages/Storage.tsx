@@ -43,6 +43,13 @@ export function flushTone(lastFlushAt: string | null): StatusTone {
 }
 
 /** Rows that carry unflushed work, most at risk first; the rest fold away. */
+const COMPACT = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
+
+/** An exact backlog reads as its digits; an estimate reads as "≈22.7M". */
+export function formatBacklog(count: number, exact: boolean): string {
+  return exact ? String(count) : `≈${COMPACT.format(count)}`;
+}
+
 export function splitLedger(rows: DurabilityRow[]): {
   active: DurabilityRow[];
   quiet: DurabilityRow[];
@@ -135,7 +142,11 @@ export function Storage() {
           value={data ? pastWindow : "—"}
           sub={`window ${FLUSH_WINDOW_S}s`}
         />
-        <ReadoutCell label="GC pending" value={data?.gc_pending ?? "—"} sub="candidates" />
+        <ReadoutCell
+          label="GC pending"
+          value={data ? formatBacklog(data.gc_pending, data.gc_pending_exact) : "—"}
+          sub={data && !data.gc_pending_exact ? "candidates · estimate" : "candidates"}
+        />
       </ReadoutStrip>
 
       <div className="rounded-lg border bg-card">

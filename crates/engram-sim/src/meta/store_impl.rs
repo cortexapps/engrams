@@ -3673,11 +3673,18 @@ impl MetadataStore for SimMetadataStore {
         Ok(self.db.lock().cold_bases.iter().copied().collect())
     }
 
-    /// `SELECT count(*) FROM chunk_gc_candidates` — the fleet view's
-    /// dirty-chunk backlog gauge.
-    async fn count_gc_candidates(&self) -> Result<u64, MetaError> {
+    /// The chunk-gc backlog. The sim always knows the exact length; it
+    /// mirrors the PG cap rule so the `exact` flag conforms.
+    async fn count_gc_candidates(
+        &self,
+        exact_cap: u64,
+    ) -> Result<engram_core::traits::GcCandidateBacklog, MetaError> {
         self.gate()?;
-        Ok(self.db.lock().chunk_gc.len() as u64)
+        let count = self.db.lock().chunk_gc.len() as u64;
+        Ok(engram_core::traits::GcCandidateBacklog {
+            count,
+            exact: count < exact_cap,
+        })
     }
 
     async fn create_or_get_enable_job(

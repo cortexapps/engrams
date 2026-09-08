@@ -1085,12 +1085,19 @@ pub async fn chunk_gc_run_once(state: &SharedState, cfg: &ChunkGcConfig, claiman
 }
 
 /// The "is GC keeping up" gauge. It reached 8.9M before anyone looked,
-/// and 59M before anyone looked again.
+/// and 59M before anyone looked again. An estimate past the cap: a gauge
+/// at that scale does not need the last digit, and an exact count of
+/// 22.7M rows was a 30s scan every sweep.
 async fn record_backlog_gauge(state: &SharedState) {
-    match state.services.meta.count_gc_candidates().await {
-        Ok(n) => {
+    match state
+        .services
+        .meta
+        .count_gc_candidates(engram_core::traits::GC_CANDIDATE_EXACT_CAP)
+        .await
+    {
+        Ok(backlog) => {
             ::metrics::gauge!(crate::metrics::GC_CANDIDATE_BACKLOG, "sweep" => "chunk")
-                .set(n as f64);
+                .set(backlog.count as f64);
         }
         Err(e) => {
             tracing::warn!(error = %e, "chunk-gc: could not read the candidate backlog");

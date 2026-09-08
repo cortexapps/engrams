@@ -43,6 +43,7 @@ const storage = (p: Partial<StorageSummaryResponse>): StorageSummaryResponse => 
   snapshots: 0,
   snapshot_bytes: 0,
   gc_pending: 0,
+  gc_pending_exact: true,
   tracked_sandboxes: 0,
   dirty_chunks: 0,
   unflushed_bytes: 0,
