@@ -438,7 +438,7 @@ describe("SpecShellPage", () => {
     renderWithProviders(<SpecShellPage specId="spec-1" />);
 
     expect(await screen.findByRole("main", { name: "Spec ideation" })).toBeTruthy();
-    expect(screen.getByText("Thinking it through")).toBeTruthy();
+    expect(screen.queryByText("Thinking it through")).toBeNull();
     expect(screen.queryByRole("region", { name: "Spec document" })).toBeNull();
     expect(screen.queryByRole("complementary", { name: "Spec sections" })).toBeNull();
   });

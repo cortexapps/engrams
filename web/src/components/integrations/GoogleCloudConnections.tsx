@@ -11,7 +11,9 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot } from "@/components/status-dot";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
@@ -423,7 +425,11 @@ export function GoogleCloudConnectDialog({
           </Collapsible>
         </div>
 
-        {create.error && <p className="text-sm text-destructive">{errorMessage(create.error)}</p>}
+        {create.error && (
+          <EmptyState tone="error" inline>
+            {errorMessage(create.error)}
+          </EmptyState>
+        )}
         <DialogFooter>
           <Button variant="outline" onClick={close}>
             Cancel
@@ -531,7 +537,11 @@ export function GoogleCloudEndpointDialog({
           </p>
         </div>
 
-        {update.error && <p className="text-sm text-destructive">{errorMessage(update.error)}</p>}
+        {update.error && (
+          <EmptyState tone="error" inline>
+            {errorMessage(update.error)}
+          </EmptyState>
+        )}
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
@@ -600,7 +610,7 @@ export function GoogleCloudConnections() {
               <p className="text-xs text-muted-foreground">Workload Identity Federation only</p>
             </div>
           </div>
-          <div className="mt-4 flex flex-wrap items-center gap-2 font-mono text-[11px] text-muted-foreground">
+          <div className="mt-4 flex flex-wrap items-center gap-2 font-mono text-2xs text-muted-foreground">
             <span className="rounded border px-2 py-1">Engrams session</span>
             <span aria-hidden>→</span>
             <span className="rounded border px-2 py-1">Customer WIF provider</span>
@@ -614,12 +624,12 @@ export function GoogleCloudConnections() {
       </div>
 
       <div className="divide-y">
-        {isLoading && <p className="p-5 text-sm text-muted-foreground">Loading connections…</p>}
+        {isLoading && <SkeletonRows rows={3} className="px-5" />}
         {!isLoading && connections.length === 0 && (
-          <p className="p-5 text-sm text-muted-foreground">
+          <EmptyState inline className="p-5">
             Add a connection to generate the customer-side WIF configuration. No key file is
             accepted.
-          </p>
+          </EmptyState>
         )}
         {connections.map((connection) => {
           const rowResult = rowResults[connection.id];
@@ -630,13 +640,14 @@ export function GoogleCloudConnections() {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-medium">{connection.displayName}</span>
-                    <Badge variant={connection.enabled ? "default" : "secondary"}>
+                    <span className="inline-flex items-center gap-1.5 text-xs">
+                      <StatusDot tone={connection.enabled ? "nominal" : "muted"} size={6} />
                       {connection.enabled
                         ? "Enabled"
                         : connection.testedAt
                           ? "Tested"
                           : "Setup required"}
-                    </Badge>
+                    </span>
                   </div>
                   <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
                     {connection.alias} · {connection.googleCloud?.serviceAccountEmail}
@@ -692,8 +703,9 @@ export function GoogleCloudConnections() {
               {rowResult && (
                 <p
                   role="status"
-                  className={`text-xs ${rowResult.ok ? "text-muted-foreground" : "text-destructive"}`}
+                  className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"
                 >
+                  <StatusDot tone={rowResult.ok ? "nominal" : "critical"} size={6} />
                   {rowResult.message}
                 </p>
               )}
@@ -710,7 +722,7 @@ export function GoogleCloudConnections() {
 function SectionHeading({ number, title }: { number: string; title: string }) {
   return (
     <div className="flex items-center gap-2">
-      <span className="flex size-5 items-center justify-center rounded-full border font-mono text-[10px] text-muted-foreground">
+      <span className="flex size-5 items-center justify-center rounded-full border font-mono text-2xs text-muted-foreground">
         {number}
       </span>
       <h3 className="text-sm font-semibold">{title}</h3>
@@ -744,9 +756,10 @@ function CustomEndpointsField({
 function WifIdHint({ value }: { value: string }) {
   if (!value || isValidWifId(value)) return null;
   return (
-    <p className="mt-1.5 text-xs text-destructive">
+    <span className="mt-1.5 inline-flex items-center gap-1.5 text-xs text-foreground">
+      <StatusDot tone="critical" size={6} />
       Use 4-32 characters from a-z, 0-9, and hyphens. Google reserves the "gcp-" prefix.
-    </p>
+    </span>
   );
 }
 

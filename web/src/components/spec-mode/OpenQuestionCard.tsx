@@ -29,7 +29,7 @@ export function OpenQuestionCard({ node }: NodeViewProps) {
             <Text as="span" variant="body">
               {question?.text ?? "Open question"}
             </Text>
-            <Text as="span" variant="code" tone="muted">
+            <Text as="span" tone="muted" className="text-xs">
               Open question
             </Text>
           </span>

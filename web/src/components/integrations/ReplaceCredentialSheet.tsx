@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { MintFieldKind } from "@/gen/engram/app/v1/mint_pb";
@@ -119,7 +120,7 @@ export function ReplaceCredentialSheet({
         <header className="flex items-center gap-3 border-b p-5">
           <ProviderTile {...view.icon} name={view.name} size={38} />
           <div className="min-w-0 flex-1">
-            <div className="text-[1.02rem] font-semibold">Replace {view.name} credential</div>
+            <div className="text-base font-semibold">Replace {view.name} credential</div>
             <div className="text-xs text-muted-foreground">
               {isMint
                 ? "Rotate the minted credentials"
@@ -135,7 +136,7 @@ export function ReplaceCredentialSheet({
             ) : (
               <LockIcon className="mt-0.5 size-4 shrink-0 text-instrument-nominal" />
             )}
-            <div className="text-[0.78rem] leading-relaxed text-muted-foreground">
+            <div className="text-xs leading-relaxed text-muted-foreground">
               The new value is sealed in the org secret store and used from the next session on.
             </div>
           </div>
@@ -146,7 +147,7 @@ export function ReplaceCredentialSheet({
                   <span className="flex items-baseline gap-2">
                     <Text variant="label">{f.label}</Text>
                     {f.fieldKind === MintFieldKind.SEALED_SECRET && (
-                      <span className="text-[0.68rem] text-muted-foreground">
+                      <span className="text-2xs text-muted-foreground">
                         •••• set · leave blank to keep
                       </span>
                     )}
@@ -171,10 +172,10 @@ export function ReplaceCredentialSheet({
                 <label key={inj.secretRef} className="flex flex-col gap-1.5">
                   <span className="flex items-baseline gap-2">
                     <Text variant="label">{inj.header}</Text>
-                    <code className="font-mono text-[0.62rem] text-muted-foreground">
+                    <code className="font-mono text-2xs text-muted-foreground">
                       {inj.secretRef}
                     </code>
-                    <span className="text-[0.68rem] text-muted-foreground">
+                    <span className="text-2xs text-muted-foreground">
                       •••• set · leave blank to keep
                     </span>
                   </span>
@@ -189,7 +190,7 @@ export function ReplaceCredentialSheet({
           {view.usedBy > 0 && (
             <div className="flex gap-2 rounded-md border border-instrument-caution/45 bg-instrument-caution/10 p-3">
               <InfoIcon className="mt-0.5 size-3.5 shrink-0 text-instrument-caution" />
-              <span className="text-[0.74rem] leading-relaxed text-muted-foreground">
+              <span className="text-xs leading-relaxed text-muted-foreground">
                 {view.usedBy} profile{view.usedBy === 1 ? "" : "s"} use this integration. Running
                 sessions keep their current credential; new sessions pick up the replacement.
               </span>
@@ -210,17 +211,23 @@ export function ReplaceCredentialSheet({
               )}
             </Button>
             {testState === "ok" && (
-              <span className="inline-flex items-center gap-1.5 text-[0.78rem] text-instrument-nominal">
+              <span className="inline-flex items-center gap-1.5 text-xs text-instrument-nominal">
                 <CircleCheckIcon className="size-3.5" />
                 <span className="font-mono text-muted-foreground">{testMessage}</span>
               </span>
             )}
             {testState === "fail" && (
-              <span className="text-[0.78rem] text-destructive">{testMessage}</span>
+              <EmptyState tone="error" inline>
+                {testMessage}
+              </EmptyState>
             )}
           </div>
 
-          {error && <p className="text-sm text-destructive">{error}</p>}
+          {error && (
+            <EmptyState tone="error" inline>
+              {error}
+            </EmptyState>
+          )}
         </div>
 
         <footer className="flex items-center justify-end gap-2 border-t p-5">

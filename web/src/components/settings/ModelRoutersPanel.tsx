@@ -24,6 +24,8 @@ import {
   useUpdateRouterModelPolicy,
 } from "@/hooks/useModelRouters";
 import type { ModelRouter, RouterModel } from "@/gen/engram/app/v1/model_router_pb";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 
 export function ModelRoutersPanel() {
   const { data, isLoading, error } = useModelRouters();
@@ -31,18 +33,18 @@ export function ModelRoutersPanel() {
   return (
     <div className="space-y-6">
       <PageHeading title="Model routers" count={routers.length || undefined} />
-      <p className="max-w-3xl text-sm text-muted-foreground">
-        Routers supply models independently of the agent harness. A harness can use a routed model
-        when both sides share a protocol.
-      </p>
       {error && (
-        <p className="text-sm text-destructive">Could not load model routers — {String(error)}</p>
+        <EmptyState tone="error">Could not load model routers — {String(error)}</EmptyState>
       )}
       {isLoading ? (
-        <p className="py-8 text-sm text-muted-foreground">Loading…</p>
+        <SkeletonRows rows={3} />
       ) : (
         routers.map((router) => <RouterCard key={router.id} router={router} />)
       )}
+      <p className="max-w-3xl text-xs text-muted-foreground">
+        Routers supply models independently of the agent harness. A harness can use a routed model
+        when both sides share a protocol.
+      </p>
     </div>
   );
 }
@@ -141,14 +143,14 @@ function RouterCard({ router }: { router: ModelRouter }) {
             </span>
           </div>
           {router.lastSyncError && (
-            <p className="mt-2 text-xs text-destructive">
+            <EmptyState tone="error" inline className="mt-2">
               Last refresh failed: {router.lastSyncError}
-            </p>
+            </EmptyState>
           )}
           {(putSecret.error || refresh.error) && (
-            <p className="mt-2 text-xs text-destructive">
+            <EmptyState tone="error" inline className="mt-2">
               {String(putSecret.error ?? refresh.error)}
-            </p>
+            </EmptyState>
           )}
         </div>
 
@@ -163,9 +165,14 @@ function RouterCard({ router }: { router: ModelRouter }) {
             />
           </div>
           {error ? (
-            <p className="text-sm text-destructive">Could not load models — {String(error)}</p>
+            <EmptyState tone="error" inline>
+              Could not load models — {String(error)}
+            </EmptyState>
           ) : isLoading ? (
-            <p className="py-8 text-sm text-muted-foreground">Loading catalog…</p>
+            <SkeletonRows
+              rows={3}
+              columns={["minmax(18rem,1fr)", "10rem", "6rem", "8rem", "5rem", "9rem"]}
+            />
           ) : (
             <ModelTable
               models={models}
@@ -272,8 +279,8 @@ function ModelTable({
         ))}
         {models.length === 0 && (
           <TableRow>
-            <TableCell colSpan={6} className="h-28 text-center text-muted-foreground">
-              No models match this search.
+            <TableCell colSpan={6} className="h-28">
+              <EmptyState inline>No models match this search.</EmptyState>
             </TableCell>
           </TableRow>
         )}

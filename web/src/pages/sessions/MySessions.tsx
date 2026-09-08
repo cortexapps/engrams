@@ -5,6 +5,7 @@ import { useDebouncedValue } from "../../hooks/useDebouncedValue";
 import { useTasksInfiniteAsSessionList } from "../../hooks/useTasks";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { PageHeading } from "../../components/page-heading";
 import { SessionsList } from "./sessions-list";
 import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
@@ -74,8 +75,8 @@ export function MySessions() {
         />
 
         {hasNextPage && (
-          <div ref={loadMoreRef} className="py-2 text-center text-xs text-muted-foreground">
-            Loading more…
+          <div ref={loadMoreRef} className="py-2">
+            <SkeletonRows rows={1} />
           </div>
         )}
         {total > 0 && (

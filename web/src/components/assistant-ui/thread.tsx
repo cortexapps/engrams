@@ -58,6 +58,8 @@ import { UploadButton } from "@/components/session-files/UploadButton";
 import { UploadPathText } from "@/components/session-files/UploadPathText";
 import { isSubmitKey, useEnterToSend } from "@/hooks/useEnterToSend";
 import { ModeChip } from "@/components/ModeChip";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import type { SessionState } from "@/lib/types";
 
 // The session transcript, on assistant-ui primitives. This is NOT a chatbot:
@@ -120,10 +122,7 @@ const TranscriptBackfillNotice: FC<{
   return (
     <div className="flex justify-center pb-2">
       {loadingOlder ? (
-        <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <Loader2Icon className="size-3 animate-spin" />
-          Loading earlier messages…
-        </span>
+        <SkeletonRows rows={1} className="w-48" />
       ) : (
         <button
           type="button"
@@ -180,7 +179,7 @@ const ThreadMessage: FC = () => {
       >
         {inner}
         {delivering && (
-          <p className="mt-1 text-right text-xs text-muted-foreground italic">delivering…</p>
+          <p className="mt-1 text-right text-xs text-muted-foreground italic">Delivering…</p>
         )}
       </div>
     );
@@ -190,7 +189,9 @@ const ThreadMessage: FC = () => {
 
 const ThreadEmpty: FC = () => {
   return (
-    <div className="my-12 text-center text-sm text-muted-foreground italic">No activity yet.</div>
+    <EmptyState inline className="my-12 items-center text-center">
+      No activity yet.
+    </EmptyState>
   );
 };
 
@@ -200,7 +201,7 @@ const ThreadScrollToBottom: FC = () => {
       <TooltipIconButton
         tooltip="Scroll to bottom"
         variant="outline"
-        className="absolute -top-10 z-10 self-center rounded-full p-4 disabled:invisible"
+        className="absolute -top-10 z-10 self-center rounded-md p-4 disabled:invisible"
       >
         <ArrowDownIcon />
       </TooltipIconButton>
@@ -216,7 +217,7 @@ const WorkingIndicator: FC = () => {
   return (
     <span className="flex items-center gap-2 text-sm text-muted-foreground">
       <Loader2Icon className="size-3.5 animate-spin" />
-      <span className="animate-pulse">working…</span>
+      <span className="animate-pulse">Working…</span>
     </span>
   );
 };
@@ -288,8 +289,10 @@ const AssistantMessage: FC = () => {
           </MessagePrimitive.GroupedParts>
         </div>
         <MessagePrimitive.Error>
-          <ErrorPrimitive.Root className="mt-2 rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive dark:bg-destructive/5 dark:text-red-200">
-            <ErrorPrimitive.Message className="line-clamp-2" />
+          <ErrorPrimitive.Root>
+            <EmptyState inline tone="error" className="mt-2">
+              <ErrorPrimitive.Message className="line-clamp-2" />
+            </EmptyState>
           </ErrorPrimitive.Root>
         </MessagePrimitive.Error>
       </div>
@@ -331,7 +334,7 @@ const UserMessage: FC = () => {
       data-role="user"
       className="animate-in fade-in slide-in-from-bottom-1 flex justify-end duration-150"
     >
-      <div className="max-w-[80%] rounded-2xl bg-muted px-4 py-2.5 text-foreground wrap-break-word">
+      <div className="max-w-[80%] rounded-lg bg-muted px-4 py-2.5 text-foreground wrap-break-word">
         <MessagePrimitive.Parts components={{ Text: UploadPathText }} />
       </div>
     </MessagePrimitive.Root>
@@ -464,7 +467,7 @@ const Composer: FC = () => {
       }}
     >
       <QueuedRail items={queued} onRemove={removeQueued} />
-      <div className="flex w-full flex-wrap items-end gap-2 rounded-2xl border bg-background p-2 transition-shadow focus-within:ring-2 focus-within:ring-ring/20">
+      <div className="flex w-full flex-wrap items-end gap-2 rounded-lg border bg-background p-2 transition-shadow focus-within:ring-2 focus-within:ring-ring/20">
         <InlineUploadComposer
           ref={editorRef}
           value={text}
@@ -564,7 +567,7 @@ const ComposerAction: FC = () => {
         type="button"
         variant="default"
         size="icon"
-        className="size-8 rounded-full"
+        className="size-8 rounded-md"
         aria-label="Stop the run"
         onClick={() => interrupt("stop-button")}
       >
@@ -580,7 +583,7 @@ const ComposerAction: FC = () => {
       type="button"
       variant="default"
       size="icon"
-      className="h-8 w-auto gap-0.5 rounded-full px-3 font-mono text-xs"
+      className="h-8 w-auto gap-0.5 rounded-md px-3 font-mono text-xs"
       aria-label={isRunning ? "Queue message" : "Send message"}
       disabled={isEmpty || sendBlocked}
       onClick={() => {

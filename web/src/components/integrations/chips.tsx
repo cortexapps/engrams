@@ -9,6 +9,7 @@
 
 import { EyeIcon, GlobeIcon, PencilIcon } from "lucide-react";
 
+import { StatusDot as BaseStatusDot } from "@/components/status-dot";
 import { cn } from "@/lib/utils";
 import type { Access } from "@/lib/connectorModel";
 
@@ -18,7 +19,7 @@ export function AccessTag({ access, className }: { access: Access; className?: s
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.7rem] font-medium capitalize",
+        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-2xs font-medium capitalize",
         write
           ? "border-instrument-caution/50 bg-instrument-caution/12 text-foreground"
           : "border-border bg-secondary text-muted-foreground",
@@ -46,7 +47,7 @@ export function HostChip({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 font-mono text-xs",
+        "inline-flex items-center gap-1.5 rounded-sm border px-2.5 py-0.5 font-mono text-xs",
         derived
           ? "border-border bg-secondary text-foreground"
           : "border-dashed bg-transparent text-muted-foreground",
@@ -70,17 +71,11 @@ export function StatusDot({
   label?: string;
   className?: string;
 }) {
-  const dot =
-    tone === "nominal"
-      ? "bg-instrument-nominal"
-      : tone === "caution"
-        ? "bg-instrument-caution"
-        : "bg-muted-foreground";
   return (
     <span className={cn("inline-flex items-center gap-1.5", className)}>
-      <span className={cn("size-1.5 rounded-full", dot)} aria-hidden />
+      <BaseStatusDot tone={tone} size={6} />
       {label && (
-        <span className="text-[0.7rem] font-medium capitalize text-muted-foreground">{label}</span>
+        <span className="text-xs font-medium capitalize text-muted-foreground">{label}</span>
       )}
     </span>
   );

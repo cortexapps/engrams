@@ -57,7 +57,7 @@ export interface PaneViewDef {
 // by FILL, not by a rule: on the cover the pill is two clear steps above the
 // pane, which reads at a glance where a 2px underline does not.
 const TAB_CLASS_NAME = "h-8 shrink-0 gap-1.5 px-2 text-muted-foreground hover:text-foreground";
-const TAB_ACTIVE_CLASS_NAME = "bg-accent text-foreground shadow-xs hover:bg-accent";
+const TAB_ACTIVE_CLASS_NAME = "bg-accent text-foreground hover:bg-accent";
 
 export interface StripLayout {
   /** Number of tabs rendered in the strip; the rest live in the More menu. */
@@ -336,7 +336,7 @@ export function WorkPane({
     <section
       className={cn(
         "work-pane flex h-full min-h-0 flex-col bg-pane",
-        variant === "panel" && "work-sheet overflow-hidden rounded-xl border",
+        variant === "panel" && "work-sheet overflow-hidden rounded-lg border",
       )}
       aria-label="Work pane"
     >

@@ -10,7 +10,9 @@ import { useArchivePapercut, usePapercuts, useUnarchivePapercut } from "../../ho
 import { useNow } from "../../hooks/useNow";
 import { errorMessage } from "../../lib/errors";
 import type { Papercut } from "../../gen/engram/app/v1/papercut_pb";
-import { relativeTime } from "../sessions/session-format";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { relativeTime } from "@/lib/relative-time";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -36,7 +38,7 @@ function CreatedAt({ papercut, now }: { papercut: Papercut; now: number }) {
       className="font-mono text-xs tabular-nums text-muted-foreground"
       title={createdAt.toLocaleString()}
     >
-      {relativeTime(createdAt.toISOString(), now)} ago
+      {relativeTime(createdAt.toISOString(), now)}
     </span>
   );
 }
@@ -81,7 +83,7 @@ function PapercutRow({
 
   return (
     <article
-      className={cn("rounded-lg border bg-card p-4 shadow-xs", papercut.archived && "opacity-75")}
+      className={cn("rounded-lg border bg-card p-4", papercut.archived && "opacity-75")}
       data-testid={`papercut-${papercut.id}`}
     >
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
@@ -112,7 +114,7 @@ function PapercutRow({
               {papercut.tags.map((tag, index) => (
                 <span
                   key={`${tag}-${index}`}
-                  className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                  className="rounded-sm bg-muted px-2 py-0.5 text-xs text-muted-foreground"
                 >
                   {tag}
                 </span>
@@ -226,20 +228,16 @@ export function Papercuts() {
         }
       />
 
-      {isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
+      {isPending && <SkeletonRows rows={3} />}
 
       {!isPending && error && papercuts.length === 0 && (
-        <div role="alert" className="rounded-lg border border-dashed p-8 text-center">
-          <p className="text-sm text-destructive">Couldn’t load papercuts. {errorMessage(error)}</p>
-        </div>
+        <EmptyState tone="error">Couldn’t load papercuts. {errorMessage(error)}</EmptyState>
       )}
 
       {!isPending && !error && papercuts.length === 0 && (
-        <div className="rounded-lg border border-dashed p-8 text-center">
-          <p className="text-sm text-muted-foreground">
-            Agents log papercuts — small frictions they hit while working. None yet.
-          </p>
-        </div>
+        <EmptyState>
+          Agents log papercuts — small frictions they hit while working. None yet.
+        </EmptyState>
       )}
 
       <div className="flex flex-col gap-3">

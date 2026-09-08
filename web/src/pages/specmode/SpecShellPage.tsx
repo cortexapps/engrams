@@ -14,7 +14,8 @@ import { useSpecSurface } from "@/components/spec-mode/spec-surface";
 import { useScrollAnchors } from "@/components/spec-mode/useScrollAnchors";
 import { LazySpecCanvas } from "@/components/spec/LazySpecCanvas";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Text } from "@/components/ui/text";
 import { API_BASE } from "@/lib/base";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
@@ -88,9 +89,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
         onShowProvenanceChange={setShowProvenance}
       >
         <div className="spec-mode-loading" aria-label="Loading spec">
-          <Skeleton className="h-7 w-2/5" />
-          <Skeleton className="h-4 w-full" />
-          <Skeleton className="h-4 w-5/6" />
+          <SkeletonRows rows={3} />
         </div>
       </SpecShell>
     );
@@ -104,7 +103,9 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
         <Text as="h1" variant="heading">
           Spec not available
         </Text>
-        <Text tone="muted">The spec does not exist, or you do not have access.</Text>
+        <EmptyState inline tone="error" className="px-0">
+          The spec does not exist, or you do not have access.
+        </EmptyState>
         <Button asChild variant="outline">
           <Link to="/specs">Back to Tech Specs</Link>
         </Button>
@@ -148,7 +149,9 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
         <Text as="h1" variant="heading">
           Published version not available
         </Text>
-        <Text tone="muted">The pinned document is not available.</Text>
+        <EmptyState inline tone="error" className="px-0">
+          The pinned document is not available.
+        </EmptyState>
       </main>
     );
   }
@@ -190,16 +193,16 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
         if (!failure) {
           return (
             <div className="spec-mode-loading" aria-label="Loading collaborative spec">
-              <Skeleton className="h-7 w-2/5" />
-              <Skeleton className="h-4 w-full" />
-              <Skeleton className="h-4 w-5/6" />
+              <SkeletonRows rows={3} />
             </div>
           );
         }
         return (
-          <div className="spec-mode-link-error" role="alert">
+          <div className="spec-mode-link-error">
             <Text variant="heading">{failure.title}</Text>
-            <Text tone="muted">{failure.detail}</Text>
+            <EmptyState inline tone="error" className="px-0">
+              {failure.detail}
+            </EmptyState>
             {link.kind === "unreachable" ? (
               <Button type="button" variant="outline" size="sm" onClick={retryLink}>
                 Try again

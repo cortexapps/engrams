@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
@@ -133,7 +134,7 @@ export function ConnectSheet({
         <header className="flex items-center gap-3 border-b p-5">
           <ProviderTile {...view.icon} name={view.name} size={40} />
           <div className="min-w-0 flex-1">
-            <div className="text-[1.05rem] font-semibold">Connect {view.name}</div>
+            <div className="text-base font-semibold">Connect {view.name}</div>
             <div className="text-xs text-muted-foreground">{view.category}</div>
           </div>
         </header>
@@ -142,7 +143,7 @@ export function ConnectSheet({
           {steps.map((s, i) => (
             <div key={s} className="flex flex-1 items-center gap-2">
               <span
-                className={`inline-flex size-5 shrink-0 items-center justify-center rounded-full border font-mono text-[0.66rem] font-bold ${
+                className={`inline-flex size-5 shrink-0 items-center justify-center rounded-full border font-mono text-2xs font-bold ${
                   i < step
                     ? "border-primary bg-primary text-primary-foreground"
                     : i === step
@@ -152,11 +153,7 @@ export function ConnectSheet({
               >
                 {i < step ? <CheckIcon className="size-3" /> : i + 1}
               </span>
-              <Text
-                variant="label"
-                tone={i === step ? "default" : "muted"}
-                className="text-[0.62rem]"
-              >
+              <Text variant="label" tone={i === step ? "default" : "muted"} className="text-2xs">
                 {s}
               </Text>
             </div>
@@ -179,7 +176,7 @@ export function ConnectSheet({
                       ? "Engram mints credentials per session"
                       : "Brokered credential — never in the sandbox"}
                   </div>
-                  <div className="mt-0.5 text-[0.78rem] leading-relaxed text-muted-foreground">
+                  <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
                     {isMint
                       ? "Your credentials are exchanged for a short-lived, scoped token at session start — nothing is stored in the sandbox."
                       : "Stored once as an org secret, brokered into the request at the egress proxy — the value never enters the sandbox."}
@@ -193,9 +190,7 @@ export function ConnectSheet({
                       <span className="flex items-baseline gap-2">
                         <Text variant="label">{f.label}</Text>
                         {f.required && (
-                          <span className="text-[0.7rem] text-instrument-caution-ink">
-                            Required
-                          </span>
+                          <span className="text-2xs text-instrument-caution-ink">Required</span>
                         )}
                       </span>
                       {f.fieldKind === MintFieldKind.SEALED_SECRET ? (
@@ -218,7 +213,7 @@ export function ConnectSheet({
                     <label key={inj.secretRef} className="flex flex-col gap-1.5">
                       <span className="flex items-baseline gap-2">
                         <Text variant="label">{inj.header}</Text>
-                        <code className="font-mono text-[0.62rem] text-muted-foreground">
+                        <code className="font-mono text-2xs text-muted-foreground">
                           {inj.secretRef}
                         </code>
                       </span>
@@ -230,7 +225,7 @@ export function ConnectSheet({
                     </label>
                   ))}
 
-              <p className="flex gap-2 text-[0.74rem] text-muted-foreground">
+              <p className="flex gap-2 text-xs text-muted-foreground">
                 <InfoIcon className="mt-0.5 size-3.5 shrink-0" />
                 {isMint ? (
                   "Stored as org secrets; the platform exchanges them for a short-lived token at session start."
@@ -294,7 +289,7 @@ export function ConnectSheet({
           {step === 2 && (
             <div className="flex flex-col gap-5">
               <div className="flex flex-col gap-2">
-                <Text variant="label">Powers this unlocks</Text>
+                <h3 className="text-sm font-semibold">Powers this unlocks</h3>
                 {view.capabilities.map((cap) => (
                   <div
                     key={cap.action}
@@ -309,20 +304,24 @@ export function ConnectSheet({
                 ))}
               </div>
               <div className="flex flex-col gap-2">
-                <Text variant="label">Egress this can open</Text>
+                <h3 className="text-sm font-semibold">Egress this can open</h3>
                 <div className="flex flex-wrap gap-1.5">
                   {view.hosts.map((h) => (
                     <HostChip key={h} host={h} derived />
                   ))}
                 </div>
-                <p className="text-[0.74rem] text-muted-foreground">
+                <p className="text-xs text-muted-foreground">
                   Only opened for sessions whose profile grants a power above. Everything else stays
                   denied.
                 </p>
               </div>
             </div>
           )}
-          {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+          {error && (
+            <EmptyState tone="error" inline className="mt-3">
+              {error}
+            </EmptyState>
+          )}
         </div>
 
         <footer className="flex items-center justify-between gap-2 border-t p-5">

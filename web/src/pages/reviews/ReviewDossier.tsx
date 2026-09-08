@@ -17,11 +17,12 @@ import { useNow } from "../../hooks/useNow";
 import { useAbility } from "../../auth/AuthProvider";
 import type { SessionSubject } from "../../lib/ability";
 import { errorMessage } from "../../lib/errors";
-import { relativeTime } from "../sessions/session-format";
+import { relativeTime } from "@/lib/relative-time";
 import { Text } from "@/components/ui/text";
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Card, CardFooter } from "@/components/ui/card";
-import { Skeleton } from "@/components/ui/skeleton";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import {
   DropdownMenu,
@@ -79,11 +80,7 @@ export function ReviewDossier() {
   if (detail.isPending && !review) {
     return (
       <Frame>
-        <div className="flex flex-col gap-3">
-          <Skeleton className="h-8 w-80" />
-          <Skeleton className="h-4 w-56" />
-        </div>
-        <Skeleton className="h-24 w-full" />
+        <SkeletonRows rows={4} />
       </Frame>
     );
   }
@@ -93,11 +90,11 @@ export function ReviewDossier() {
       <Frame>
         <div className="flex flex-col gap-4">
           <BackToLedger />
-          <p role="alert" className="text-sm text-destructive">
+          <EmptyState tone="error">
             {detail.error
               ? `Couldn’t load this review. ${errorMessage(detail.error)}`
               : "This review no longer exists."}
-          </p>
+          </EmptyState>
         </div>
       </Frame>
     );
@@ -211,11 +208,7 @@ function PrHeader({
   return (
     <header className="flex flex-col gap-2.5">
       <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
-        <Text
-          as="h1"
-          variant={title ? "display" : "displayMono"}
-          className="min-w-0 text-2xl md:text-[1.75rem]"
-        >
+        <Text as="h1" variant={title ? "display" : "displayMono"} className="min-w-0">
           {title ?? `Pull request #${pass.prNumber}`}
         </Text>
         <div className="flex shrink-0 items-center gap-1">
@@ -250,9 +243,9 @@ function PrHeader({
       <PrMeta review={pass} />
 
       {retry.isError && (
-        <p role="alert" className="text-xs text-destructive">
+        <EmptyState inline tone="error" className="px-0">
           Couldn’t re-run this review. {errorMessage(retry.error)}
-        </p>
+        </EmptyState>
       )}
     </header>
   );
@@ -378,7 +371,7 @@ function PassLine({
             {duration && <Dot show={lone}>{duration}</Dot>}
             {at && (
               <Dot show={lone || Boolean(duration)}>
-                <span title={at.toLocaleString()}>{relativeTime(at.toISOString(), now)} ago</span>
+                <span title={at.toLocaleString()}>{relativeTime(at.toISOString(), now)}</span>
               </Dot>
             )}
           </span>
@@ -411,7 +404,7 @@ function PassLine({
           {superseded && (
             <p className="text-muted-foreground">
               A newer pass ran
-              {supersededAt ? ` ${relativeTime(supersededAt.toISOString(), now)} ago` : ""}.{" "}
+              {supersededAt ? ` ${relativeTime(supersededAt.toISOString(), now)}` : ""}.{" "}
               <Link
                 to="/reviews/$id"
                 params={{ id: superseded.id }}
@@ -484,7 +477,7 @@ function PassSwitcher({ passes, pass, now }: { passes: Review[]; pass: Review; n
               >
                 <Check className={cn("size-3.5 shrink-0", !current && "invisible")} aria-hidden />
                 {current && <span className="sr-only">Currently open —</span>}
-                <span className="w-4 shrink-0 font-mono text-[0.7rem] tabular-nums text-muted-foreground">
+                <span className="w-4 shrink-0 font-mono text-2xs tabular-nums text-muted-foreground">
                   {ordinal(item)}
                 </span>
                 {/* The word, not just the glyph: seven rows of `✓ abc1234 3d` make
@@ -500,7 +493,7 @@ function PassSwitcher({ passes, pass, now }: { passes: Review[]; pass: Review; n
                     <span className="sr-only">{trigger.label}</span>
                   </>
                 )}
-                <span className="ml-auto shrink-0 font-mono text-[0.7rem] tabular-nums text-muted-foreground">
+                <span className="ml-auto shrink-0 font-mono text-2xs tabular-nums text-muted-foreground">
                   {at ? relativeTime(at.toISOString(), now) : "—"}
                 </span>
               </Link>

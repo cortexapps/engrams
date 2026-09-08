@@ -15,9 +15,7 @@ export function SectionList({
   return (
     <div className="spec-mode-section-list-shell">
       <header className="spec-mode-section-list-header">
-        <Text as="span" variant="label" tone="muted">
-          This spec
-        </Text>
+        <h2 className="text-sm font-semibold">This spec</h2>
         <div className="spec-mode-section-tally">
           <Text as="strong" variant="stat">
             {surface.settledCount}
@@ -53,12 +51,7 @@ export function SectionList({
                     {section.title}
                   </Text>
                   {section.state === "settled" && section.credit ? (
-                    <Text
-                      as="span"
-                      variant="code"
-                      tone="muted"
-                      className="spec-mode-section-credit"
-                    >
+                    <Text as="span" tone="muted" className="spec-mode-section-credit">
                       Settled by {section.credit.by.name}
                     </Text>
                   ) : null}
@@ -95,7 +88,7 @@ export function SectionList({
         <Text as="span" variant="label" tone="muted">
           Legend
         </Text>
-        <Text as="span" variant="code" tone="muted">
+        <Text as="span" tone="muted" className="text-xs">
           ✓ settled · ◐ proposed · ○ open · ⚑ questions
         </Text>
       </footer>

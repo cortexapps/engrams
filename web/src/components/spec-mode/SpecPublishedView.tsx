@@ -4,8 +4,9 @@ import { useState } from "react";
 import { Markdown } from "@/components/Markdown";
 import { SpecTicketSyncPanel } from "@/components/spec/SpecTicketSyncPanel";
 import { SpecTicketTree } from "@/components/spec/SpecTicketTree";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
 import { Text } from "@/components/ui/text";
 import {
   useSpecDecisions,
@@ -65,26 +66,23 @@ export function SpecPublishedView({
     <div className="spec-mode-published-surface">
       <main className="spec-mode-published" aria-label="Published spec">
         <header className="spec-mode-published-header">
+          <Text as="h1" variant="heading" className="spec-mode-published-title">
+            {title}
+          </Text>
           <div className="spec-mode-published-meta">
-            <Text as="span" variant="label" tone="muted">
-              Published
-            </Text>
             <Text as="span" variant="code" tone="muted">
               {/* The pinned date, never the internal doc_seq: a first publish
                 once introduced itself as "v11". */}
               Published {formatDate(publishedAt ?? checkpoint.createdAt)} · immutable
             </Text>
           </div>
-          <Text as="h1" variant="heading" className="spec-mode-published-title">
-            {title}
-          </Text>
           <div className="spec-mode-published-byline">
             {decisions.isPending ? (
-              <Text tone="muted">Loading decision attribution…</Text>
+              <SkeletonRows rows={1} className="w-64" />
             ) : people.length > 0 ? (
               <Text>Decided by {people.map((person) => person.name).join(", ")} · with engram</Text>
             ) : (
-              <Text tone="muted">Decision attribution is not available.</Text>
+              <EmptyState inline>Decision attribution is not available.</EmptyState>
             )}
             <span aria-hidden="true" />
             <Text as="span" variant="code" tone="muted">
@@ -121,7 +119,7 @@ export function SpecPublishedView({
                   <span aria-hidden="true">⚑</span>
                   <span>
                     <Text>{question.text}</Text>
-                    <Text as="span" variant="code" tone="muted">
+                    <Text as="span" tone="muted" className="text-xs">
                       Open question · §{question.sectionTitle} · carried into the rollout tickets
                     </Text>
                   </span>
@@ -144,7 +142,7 @@ export function SpecPublishedView({
             </Button>
           </div>
           {currentRevision !== checkpoint.docSeq ? (
-            <Text as="span" variant="code" tone="muted">
+            <Text as="span" tone="muted" className="text-xs">
               The draft has moved on since this version.
             </Text>
           ) : null}
@@ -174,26 +172,23 @@ function DecisionCard({
   return (
     <section className="spec-mode-decisions" aria-labelledby="published-decisions">
       <header>
-        <Text as="h2" variant="label" id="published-decisions">
+        <h2 id="published-decisions" className="text-sm font-semibold">
           Decisions
-        </Text>
+        </h2>
         <Text as="span" variant="code" tone="muted">
           {decisions.length} recorded
         </Text>
       </header>
       {pending ? (
-        <div className="spec-mode-decisions-loading" aria-label="Loading decisions">
-          <Skeleton className="h-4 w-4/5" />
-          <Skeleton className="h-4 w-3/5" />
-        </div>
+        <SkeletonRows rows={2} className="spec-mode-decisions-loading" />
       ) : error ? (
-        <Text className="spec-mode-decisions-message" tone="destructive" role="alert">
+        <EmptyState inline tone="error" className="spec-mode-decisions-message">
           The decision record is not available. {error.message}
-        </Text>
+        </EmptyState>
       ) : decisions.length === 0 ? (
-        <Text className="spec-mode-decisions-message" tone="muted">
+        <EmptyState inline className="spec-mode-decisions-message">
           No section settlements or question resolutions were recorded for this version.
-        </Text>
+        </EmptyState>
       ) : (
         <ol>
           {decisions.map((decision) => (
@@ -205,7 +200,7 @@ function DecisionCard({
                     ? `Settled §${sectionTitle(decision)}`
                     : `Resolved: “${decision.question}”`}
                 </Text>
-                <Text as="span" variant="code" tone="muted">
+                <Text as="span" tone="muted" className="text-xs">
                   {decision.actor.name}
                   {decision.kind === "question_resolved" ? ` · §${sectionTitle(decision)}` : ""}
                 </Text>
@@ -275,23 +270,18 @@ function PublishedTicketTree({
     <div className="spec-mode-published-surface">
       <main className="spec-mode-published-tickets">
         <header>
-          <div>
-            <Text as="span" variant="label" tone="muted">
-              Published tickets
-            </Text>
-            <Text as="h1" variant="heading">
-              {title}
-            </Text>
-          </div>
+          <Text as="h1" variant="heading">
+            {title}
+          </Text>
           <Button type="button" variant="outline" onClick={onBack}>
             Back to spec
           </Button>
         </header>
-        {tickets.isPending ? <Skeleton className="h-40 w-full" /> : null}
+        {tickets.isPending ? <SkeletonRows rows={3} /> : null}
         {tickets.error ? (
-          <Text tone="destructive" role="alert">
+          <EmptyState tone="error">
             The ticket tree is not available. {tickets.error.message}
-          </Text>
+          </EmptyState>
         ) : null}
         {tickets.data ? (
           <SpecTicketTree

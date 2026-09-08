@@ -5,6 +5,7 @@
 
 import { Link, Navigate } from "@tanstack/react-router";
 
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { useBuiltinAutomation } from "@/hooks/useAutomations";
 
 export const PR_REVIEW_BUILTIN_KEY = "pr_review";
@@ -16,7 +17,7 @@ export interface RedirectToBuiltinProps {
 export function RedirectToBuiltin({ builtinKey = PR_REVIEW_BUILTIN_KEY }: RedirectToBuiltinProps) {
   const query = useBuiltinAutomation(builtinKey);
   if (query.isPending) {
-    return <p className="text-muted-foreground text-sm">Loading…</p>;
+    return <SkeletonRows />;
   }
   const automation = query.data?.automation;
   if (automation) {

@@ -51,7 +51,7 @@ export function EdgeLayer({ layout }: { layout: CanvasLayout }) {
                 x={x}
                 y={fan.y - 5}
                 textAnchor="middle"
-                className="fill-muted-foreground font-mono text-[10px] uppercase"
+                className="fill-muted-foreground font-mono text-2xs"
               >
                 {edge.label}
               </text>

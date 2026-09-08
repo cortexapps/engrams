@@ -107,10 +107,10 @@ function DurabilityRollback({
   return (
     <Card className="border-destructive/50 bg-destructive/5 py-0">
       <CardContent className="flex flex-col gap-1.5 p-4">
-        <div className="flex items-center gap-2 text-xs text-destructive">
-          <AlertTriangleIcon className="size-3.5" />
+        <div className="flex items-center gap-2 text-xs text-foreground">
+          <AlertTriangleIcon className="size-3.5 text-destructive" />
           <Text as="span" variant="label">
-            guest disk rolled back — recent changes were lost
+            Guest disk rolled back — recent changes were lost
           </Text>
           <span className="ml-auto font-mono tabular-nums text-muted-foreground">
             {hms(marker.at)}

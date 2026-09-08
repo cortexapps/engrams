@@ -15,7 +15,7 @@
 }
 
 .spec-ticket-panel-title {
-  font-size: 1.05rem;
+  font-size: 1rem;
   font-weight: 600;
   letter-spacing: -0.01em;
 }
@@ -26,8 +26,13 @@
 .spec-ticket-identity,
 .spec-ticket-rail-count {
   font-family: var(--font-mono);
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
   color: var(--muted-foreground);
+}
+
+.spec-ticket-state,
+.spec-ticket-backlink {
+  font-family: inherit;
 }
 
 .spec-ticket-head-actions {
@@ -38,7 +43,7 @@
 
 .spec-ticket-empty {
   color: var(--muted-foreground);
-  font-size: 0.85rem;
+  font-size: 0.875rem;
   max-width: 62ch;
 }
 
@@ -73,33 +78,10 @@
   border-radius: var(--radius);
   background: var(--card);
   padding: 0.55rem 0.8rem;
-  font-size: 0.85rem;
+  font-size: 0.875rem;
 }
 
 .spec-ticket-row-failed {
-  border-color: var(--instrument-critical);
-}
-
-.spec-ticket-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  border: 1.5px solid var(--muted-foreground);
-  flex: 0 0 auto;
-}
-
-.spec-ticket-dot-synced {
-  background: var(--instrument-nominal);
-  border-color: var(--instrument-nominal);
-}
-
-.spec-ticket-dot-syncing,
-.spec-ticket-dot-queued {
-  background: var(--instrument-caution);
-  border-color: var(--instrument-caution);
-}
-
-.spec-ticket-dot-failed {
   border-color: var(--instrument-critical);
 }
 
@@ -111,19 +93,19 @@
 
 .spec-ticket-questions {
   font-family: var(--font-mono);
-  font-size: 0.66rem;
+  font-size: 0.6875rem;
   color: var(--instrument-caution-ink);
 }
 
 .spec-ticket-backlink {
   background: var(--muted);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: 0.08em 0.45em;
   white-space: nowrap;
 }
 
 .spec-ticket-identity {
-  color: var(--instrument-nominal-ink);
+  color: var(--foreground);
   text-decoration: none;
   white-space: nowrap;
 }
@@ -133,15 +115,14 @@
 }
 
 .spec-ticket-pill {
-  font-family: var(--font-mono);
-  font-size: 0.64rem;
+  font-size: 0.6875rem;
   border-radius: 999px;
   padding: 0.1em 0.55em;
   white-space: nowrap;
 }
 
 .spec-ticket-pill-failed {
-  color: var(--instrument-critical-ink);
+  color: var(--foreground);
   border: 1px solid var(--instrument-critical);
   background: color-mix(in oklab, var(--instrument-critical) 12%, var(--card));
 }
@@ -165,10 +146,8 @@
 }
 
 .spec-ticket-rail-title {
-  font-family: var(--font-mono);
-  font-size: 0.66rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-size: 0.6875rem;
+  font-weight: 600;
   color: var(--muted-foreground);
 }
 
@@ -178,14 +157,14 @@
 
 .spec-ticket-progress {
   height: 6px;
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   background: var(--muted);
   overflow: hidden;
 }
 
 .spec-ticket-progress-fill {
   height: 100%;
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   background: var(--instrument-nominal);
 }
 
@@ -193,8 +172,7 @@
   display: grid;
   gap: 0.3rem;
   margin: 0;
-  font-family: var(--font-mono);
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
   color: var(--muted-foreground);
 }
 
@@ -213,7 +191,7 @@
 }
 
 .spec-ticket-rail-note {
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   color: var(--muted-foreground);
   margin: 0;
 }
@@ -222,7 +200,7 @@
 .spec-ticket-failure {
   display: grid;
   gap: 0.4rem;
-  border-radius: calc(var(--radius) - 2px);
+  border-radius: var(--radius-md);
   padding: 0.55rem 0.7rem;
   font-size: 0.75rem;
 }
@@ -238,11 +216,11 @@
 }
 
 .spec-ticket-failure-title {
-  font-family: var(--font-mono);
-  font-size: 0.64rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--instrument-critical-ink);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.6875rem;
+  color: var(--foreground);
 }
 
 .spec-ticket-disconnected p,

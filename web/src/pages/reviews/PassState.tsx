@@ -13,9 +13,8 @@ import {
 
 import type { Review, ReviewEvent } from "../../gen/engram/app/v1/review_pb";
 import { LivePulse } from "../../components/LivePulse";
-import { Text } from "@/components/ui/text";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import { ReviewStage } from "./ReviewGlyph";
@@ -45,7 +44,7 @@ export function PassState({
 }) {
   const live = isActive(review);
 
-  if (loading && events.length === 0) return <Skeleton className="h-7 w-40" />;
+  if (loading && events.length === 0) return <SkeletonRows rows={1} className="w-40" />;
 
   // No milestones recorded yet: still say what the pass is, because a row that
   // silently loses its state is indistinguishable from one that failed to load.
@@ -96,9 +95,7 @@ export function PassState({
       </PopoverTrigger>
       <PopoverContent align="start" className="w-96 p-0">
         <div className="flex items-baseline justify-between gap-4 border-b px-3 py-2">
-          <Text variant="label" tone="muted">
-            Activity
-          </Text>
+          <h3 className="text-sm font-semibold">Activity</h3>
           <span className="font-mono text-xs tabular-nums text-muted-foreground">
             {events.length} {events.length === 1 ? "step" : "steps"}
             {duration ? ` · ${duration}` : ""}

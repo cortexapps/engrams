@@ -110,7 +110,7 @@ export function SearchableOptionMenu({
                   <div className="min-w-0">
                     <div className="truncate">{option.label}</div>
                     {option.detail && (
-                      <div className="truncate font-mono text-[11px] text-muted-foreground">
+                      <div className="truncate font-mono text-2xs text-muted-foreground">
                         {option.detail}
                       </div>
                     )}

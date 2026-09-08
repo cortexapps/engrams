@@ -6,6 +6,8 @@ import type { Awareness } from "y-protocols/awareness";
 import { useAuth } from "@/auth/AuthProvider";
 import { interrupt as interruptMethod } from "@/gen/engram/app/v1/session-SessionService_connectquery";
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
+import { StatusDot } from "@/components/status-dot";
 import { Text } from "@/components/ui/text";
 import { useSendSpecMessage } from "@/hooks/useSpecMessages";
 import { collaboratorColor } from "./collaborator-colors";
@@ -65,16 +67,11 @@ export function IdeationScreen({
     <main className="spec-mode-ideation-viewport" aria-label="Spec ideation">
       <div className="spec-mode-ideation" style={{ maxWidth: 700 }}>
         <header className="spec-mode-ideation-header">
-          <div className="spec-mode-ideation-context">
-            <Text as="span" variant="label" tone="muted">
-              Thinking it through
-            </Text>
-            <Text as="span" variant="code" tone="muted">
-              {templateName}
-            </Text>
-          </div>
           <Text as="h1" variant="display" className="spec-mode-ideation-title">
             {title}
+          </Text>
+          <Text as="span" tone="muted" className="text-xs">
+            {templateName}
           </Text>
           <IdeationPresence awareness={awareness} />
         </header>
@@ -100,7 +97,8 @@ export function IdeationScreen({
 
         <footer className="spec-mode-ideation-footer">
           {conversation.hasError ? (
-            <Text className="spec-mode-conversation-warning" tone="destructive" role="status">
+            <Text className="spec-mode-conversation-warning" role="status">
+              <StatusDot tone="caution" size={6} />
               Conversation updates are reconnecting.
             </Text>
           ) : null}
@@ -120,14 +118,9 @@ export function IdeationScreen({
             </Text>
           </div>
           {startDraftingError ? (
-            <Text
-              as="div"
-              className="spec-mode-ideation-start-error"
-              tone="destructive"
-              role="alert"
-            >
+            <EmptyState inline tone="error" className="spec-mode-ideation-start-error">
               {startDraftingError}
-            </Text>
+            </EmptyState>
           ) : null}
         </footer>
       </div>

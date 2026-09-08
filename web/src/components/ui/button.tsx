@@ -4,8 +4,9 @@ import { Slot } from "radix-ui";
 
 import { cn } from "@/lib/utils";
 
-// Stock shadcn, with one deliberate change: the focus ring is 2px, not 3px.
-// A 3px ring reads as a halo on a 12px corner.
+// Stock shadcn, with two deliberate changes: the focus ring is 2px, not 3px
+// (a 3px ring reads as a halo on a 12px corner), and the radius follows the
+// ladder — 10px on a control, 8px on a small one.
 //
 // Every variant is sentence case in the sans face, filled ones included: a
 // button says what it does at the volume of the page it sits on.
@@ -26,12 +27,12 @@ const buttonVariants = cva(
       },
       size: {
         default: "h-9 px-4 py-2 has-[>svg]:px-3",
-        xs: "h-6 gap-1 rounded-md px-2 text-xs has-[>svg]:px-1.5 [&_svg:not([class*='size-'])]:size-3",
-        sm: "h-8 gap-1.5 rounded-md px-3 has-[>svg]:px-2.5",
+        xs: "h-6 gap-1 rounded-sm px-2 text-xs has-[>svg]:px-1.5 [&_svg:not([class*='size-'])]:size-3",
+        sm: "h-8 gap-1.5 rounded-sm px-3 has-[>svg]:px-2.5",
         lg: "h-10 rounded-md px-6 has-[>svg]:px-4",
         icon: "size-9",
-        "icon-xs": "size-6 rounded-md [&_svg:not([class*='size-'])]:size-3",
-        "icon-sm": "size-8",
+        "icon-xs": "size-6 rounded-sm [&_svg:not([class*='size-'])]:size-3",
+        "icon-sm": "size-8 rounded-sm",
         "icon-lg": "size-10",
       },
     },

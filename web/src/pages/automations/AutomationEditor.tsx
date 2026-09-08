@@ -14,7 +14,9 @@ import { Copy, Lock } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
+import { EmptyState } from "@/components/empty-state";
 import { PageHeading } from "@/components/page-heading";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Field, FieldError, FieldLabel } from "@/components/ui/field";
@@ -75,15 +77,6 @@ interface Props {
   /** 3.4 mounts TestPanel by default; these override it (tests, siblings). */
   testPanel?: ReactNode;
   variableValues?: Readonly<Record<string, string>>;
-}
-
-function Placeholder({ item }: { item: string }) {
-  return (
-    <p className="text-muted-foreground rounded-lg border border-dashed p-6 text-sm">
-      {/* TODO: filled in by stack item {item}. */}
-      Coming in {item}.
-    </p>
-  );
 }
 
 export function AutomationEditor({
@@ -329,16 +322,20 @@ export function AutomationEditor({
   });
 
   if (mode === "edit" && existing.isPending) {
-    return <p className="text-muted-foreground text-sm">Loading…</p>;
+    return <SkeletonRows />;
   }
   if (mode === "edit" && (existing.error || !automation)) {
     return (
-      <div className="space-y-3">
-        <p className="text-destructive text-sm">Automation not found.</p>
-        <Link to="/automations" className="text-sm underline">
-          Back to automations
-        </Link>
-      </div>
+      <EmptyState
+        tone="error"
+        action={
+          <Link to="/automations" className="text-sm underline">
+            Back to automations
+          </Link>
+        }
+      >
+        Automation not found.
+      </EmptyState>
     );
   }
 
@@ -512,10 +509,10 @@ export function AutomationEditor({
             </TabsContent>
           )}
           <TabsContent value="runs" className="pt-4">
-            {runsTab ?? <Placeholder item="3.7 (Runs)" />}
+            {runsTab}
           </TabsContent>
           <TabsContent value="settings" className="pt-4">
-            {settingsTab ?? <Placeholder item="3.8 (Settings)" />}
+            {settingsTab}
           </TabsContent>
         </Tabs>
       </div>

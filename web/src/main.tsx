@@ -3,7 +3,10 @@
 // available to anything using `--font-mono` (code, IDs, tabular numbers).
 import "@fontsource-variable/jetbrains-mono/wght.css";
 import "@fontsource-variable/jetbrains-mono/wght-italic.css";
-// The sans face is system-ui, so there is nothing to import for it.
+// Saira carries page titles only (`--font-display`, set 8% wide). The `wdth`
+// file ships the weight AND width axes; the sans body face is system-ui, so
+// there is nothing to import for it.
+import "@fontsource-variable/saira/wdth.css";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { ThemeProvider } from "./components/theme-provider";

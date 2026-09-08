@@ -11,6 +11,7 @@ import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { toast } from "sonner";
 
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { errorMessage } from "@/lib/errors";
 
 import {
@@ -128,7 +129,7 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
 
   if (!id) return null;
   if (!automation) {
-    return <p className="text-muted-foreground text-sm">Loading…</p>;
+    return <SkeletonRows rows={4} />;
   }
 
   const dirty =

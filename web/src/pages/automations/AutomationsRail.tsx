@@ -5,7 +5,7 @@ import type { AutomationSummary } from "@/gen/engram/app/v1/automation_pb";
 import { useAutomations } from "@/hooks/useAutomations";
 import { useNow } from "@/hooks/useNow";
 import { runStatusTone } from "@/lib/automations";
-import { relativeTime } from "../sessions/session-format";
+import { relativeAge } from "@/lib/relative-time";
 import { orderAutomations } from "./AutomationsList";
 import {
   SidebarContent,
@@ -56,7 +56,7 @@ export function AutomationsRail() {
           <SidebarGroupLabel className="h-auto justify-between px-2.5 pt-2 pb-1.5 text-xs font-semibold text-sidebar-foreground">
             Automations
             {rows.length > 0 && (
-              <span className="font-mono text-[11px] font-normal tabular-nums text-sidebar-foreground/70">
+              <span className="font-mono text-2xs font-normal tabular-nums text-sidebar-foreground/70">
                 {rows.length}
               </span>
             )}
@@ -137,7 +137,7 @@ function AutomationRow({
         <Link to="/automations/$id" params={{ id: automation.id }} search={{ tab: "build" }}>
           <span
             aria-hidden
-            className="w-3.5 shrink-0 text-center text-[10px] leading-none"
+            className="w-3.5 shrink-0 text-center text-2xs leading-none"
             style={{
               color: tone === "muted" ? undefined : `var(--color-instrument-${tone})`,
               opacity: tone === "muted" ? 0.55 : 1,
@@ -146,8 +146,8 @@ function AutomationRow({
             {tone === "muted" ? "○" : "●"}
           </span>
           <span className="min-w-0 flex-1 truncate">{automation.name}</span>
-          <span className="ml-auto shrink-0 font-mono text-[11px] tabular-nums text-sidebar-foreground/[0.65]">
-            {paused ? "paused" : at ? relativeTime(at, now) : "—"}
+          <span className="ml-auto shrink-0 font-mono text-2xs tabular-nums text-sidebar-foreground/[0.65]">
+            {paused ? "paused" : at ? relativeAge(at, now) : "—"}
           </span>
         </Link>
       </SidebarMenuButton>

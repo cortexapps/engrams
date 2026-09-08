@@ -48,7 +48,7 @@ export function ProfilePanel() {
         </CardHeader>
         <CardContent className="space-y-3">
           <Row label="Role">
-            <Badge variant={isAdmin ? "default" : "secondary"}>{principal.role}</Badge>
+            <Badge variant={isAdmin ? "outline" : "secondary"}>{principal.role}</Badge>
             {principal.role_source && (
               <span className="text-sm text-muted-foreground">
                 · set by {principal.role_source}

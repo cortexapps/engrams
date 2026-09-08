@@ -67,7 +67,7 @@ function FieldOptionList({ field, selectedValues, onToggle }: FieldOptionListPro
                   <Check className={cn("size-3", !selected && "opacity-0")} />
                 </span>
                 {option.icon != null && (
-                  <span aria-hidden="true" className="text-[0.7rem] leading-none">
+                  <span aria-hidden="true" className="text-2xs leading-none">
                     {option.icon}
                   </span>
                 )}
@@ -119,7 +119,7 @@ export function FilterBar({
             key={field.key}
             role="group"
             aria-label={`${field.label} filter`}
-            className="inline-flex h-7 items-stretch overflow-hidden rounded-full border bg-background text-xs text-muted-foreground shadow-xs"
+            className="inline-flex h-7 items-stretch overflow-hidden rounded-md border bg-background text-xs text-muted-foreground"
           >
             <Popover open={openTarget === target} onOpenChange={setSurfaceOpen(target)}>
               <PopoverTrigger asChild>

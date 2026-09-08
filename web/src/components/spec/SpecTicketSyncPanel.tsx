@@ -1,6 +1,8 @@
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import {
   useSpecTickets,
   useSpecTicketSyncLedger,
@@ -58,7 +60,7 @@ export function SpecTicketSyncPanel({ specId, onBack }: SpecTicketSyncPanelProps
   return (
     <section className="spec-ticket-panel" aria-label="Tickets">
       <div className="spec-ticket-head">
-        <span className="spec-ticket-panel-title">Tickets · {tickets.length}</span>
+        <h1 className="spec-ticket-panel-title">Tickets · {tickets.length}</h1>
         {tree.data ? (
           <span className="spec-ticket-pinned">spec v{tree.data.docSeq} pinned</span>
         ) : null}
@@ -76,12 +78,12 @@ export function SpecTicketSyncPanel({ specId, onBack }: SpecTicketSyncPanelProps
         </span>
       </div>
 
-      {tree.isPending ? <p className="spec-ticket-empty">Loading the tree…</p> : null}
+      {tree.isPending ? <SkeletonRows rows={3} /> : null}
       {!tree.isPending && tickets.length === 0 ? (
-        <p className="spec-ticket-empty">
+        <EmptyState inline>
           This spec has no proposed tickets yet. The agent proposes the first tree from the pinned
           spec once it is published.
-        </p>
+        </EmptyState>
       ) : null}
 
       <div className="spec-ticket-layout">
@@ -101,7 +103,11 @@ export function SpecTicketSyncPanel({ specId, onBack }: SpecTicketSyncPanelProps
           syncing.
         </p>
       ) : null}
-      {error ? <p className="spec-action-error">{error}</p> : null}
+      {error ? (
+        <EmptyState inline tone="error">
+          {error}
+        </EmptyState>
+      ) : null}
     </section>
   );
 }
