@@ -35,9 +35,11 @@ import { Sparkline } from "./Sparkline";
 
 export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
-const TABLE_COLUMNS = ["minmax(0,1.6fr)", "minmax(0,1.2fr)", "150px", "110px", "90px"];
-const TABLE_GRID =
-  "grid grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)_minmax(200px,0.9fr)_64px_90px] items-center gap-x-4 px-4";
+// One set of tracks for the header, the rows and the loading skeleton, applied
+// as an inline template so the three cannot drift.
+const TABLE_COLUMNS = ["minmax(0,1.5fr)", "minmax(0,1fr)", "minmax(200px,0.9fr)", "64px", "90px"];
+const TABLE_TEMPLATE = { gridTemplateColumns: TABLE_COLUMNS.join(" ") };
+const TABLE_GRID = "grid items-center gap-x-4 px-4";
 
 /** Built-ins first (stable by name), then the rest by name. */
 export function orderAutomations(items: AutomationSummary[]): AutomationSummary[] {
@@ -62,6 +64,7 @@ function AutomationTableHeader() {
     <div
       role="row"
       className={cn(TABLE_GRID, "h-9 border-b text-xs font-semibold text-muted-foreground")}
+      style={TABLE_TEMPLATE}
     >
       <span role="columnheader">Automation</span>
       <span role="columnheader">Trigger</span>
@@ -111,10 +114,11 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
       style={
         failed
           ? {
+              ...TABLE_TEMPLATE,
               backgroundColor:
                 "color-mix(in oklch, var(--color-instrument-critical) 5%, transparent)",
             }
-          : undefined
+          : TABLE_TEMPLATE
       }
     >
       <Link
