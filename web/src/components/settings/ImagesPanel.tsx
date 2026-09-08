@@ -190,12 +190,14 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
 
   return (
     <TableRow>
-      <TableCell className="font-mono text-sm whitespace-nowrap">{row.image_uri}</TableCell>
+      <TableCell className="max-w-[26rem] truncate font-mono text-sm" title={row.image_uri}>
+        {row.image_uri}
+      </TableCell>
       <TableCell className="text-sm text-muted-foreground whitespace-normal">
         <div className="max-w-md">
           {row.name || "—"}
           {row.description && (
-            <span className="mt-0.5 block text-xs line-clamp-2" title={row.description}>
+            <span className="mt-0.5 line-clamp-2 text-xs" title={row.description}>
               {row.description}
             </span>
           )}

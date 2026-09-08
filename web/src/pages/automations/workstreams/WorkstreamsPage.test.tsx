@@ -10,7 +10,7 @@ import { WorkstreamsPage } from "./WorkstreamsPage";
 
 const NOW = "2026-08-25T12:00:00Z";
 
-function transport() {
+function transport(handles = ["github:engrams/engrams#42"]) {
   return createRouterTransport((router) => {
     router.service(AutomationService, {
       listAutomations: () => ({
@@ -55,7 +55,7 @@ function transport() {
         ],
       }),
       getInstance: () => ({
-        handles: [{ handle: "github:engrams/engrams#42", writtenBy: "run-1", createdAt: NOW }],
+        handles: handles.map((handle) => ({ handle, writtenBy: "run-1", createdAt: NOW })),
       }),
       listRuns: () => ({
         runs: [
@@ -87,5 +87,17 @@ describe("WorkstreamsPage", () => {
     await userEvent.click(screen.getByRole("button", { name: "Open a workstream" }));
     await waitFor(() => expect(screen.getByTestId("open-workstream-form")).toBeTruthy());
     expect(screen.getByRole("combobox", { name: "Automation" })).toBeTruthy();
+  });
+
+  it("folds a long list of places behind +N more", async () => {
+    const handles = Array.from({ length: 5 }, (_, i) => `github:engrams/engrams#${i + 1}`);
+    renderWithProviders(<WorkstreamsPage />, { transport: transport(handles) });
+
+    expect(await screen.findByText("engrams/engrams#3")).toBeTruthy();
+    expect(screen.queryByText("engrams/engrams#4")).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "+2 more" }));
+    expect(screen.getByText("engrams/engrams#5")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Show fewer" })).toBeTruthy();
   });
 });

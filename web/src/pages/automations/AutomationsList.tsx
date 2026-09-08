@@ -37,7 +37,7 @@ export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 const TABLE_COLUMNS = ["minmax(0,1.6fr)", "minmax(0,1.2fr)", "150px", "110px", "90px"];
 const TABLE_GRID =
-  "grid grid-cols-[minmax(0,1.6fr)_minmax(0,1.2fr)_150px_110px_90px] items-center gap-x-4 px-4";
+  "grid grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)_minmax(200px,0.9fr)_64px_90px] items-center gap-x-4 px-4";
 
 /** Built-ins first (stable by name), then the rest by name. */
 export function orderAutomations(items: AutomationSummary[]): AutomationSummary[] {
@@ -170,7 +170,7 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
         {lastRun ? (
           <>
             <span>{automationStatusLabel(lastRun.status)}</span>
-            <span className="truncate font-mono tabular-nums">
+            <span className="whitespace-nowrap font-mono tabular-nums">
               {relativeTime(lastRun.startedAt)}
               {duration && ` · ${duration}`}
             </span>

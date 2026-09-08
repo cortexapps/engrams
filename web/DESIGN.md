@@ -488,7 +488,7 @@ boot. The vocabulary lives in `index.css` under "Motion".
   every 2.8s (`.row-running`). A changed figure ticks — old up and out, new in
   from below — in 500ms (`TickNumber`).
 - **Data ink**: a meter fills 0 → value over 1.1s, 150ms per meter (`Meter
-  index`); a sparkline's bars draw once when it enters view; a skeleton's
+  index`); a sparkline's bars draw once on mount; a skeleton's
   hairlines draw over 900ms, 150ms apart, then its bars shimmer at 1.8s.
 - **Dark**: identical moves; the sheet adds its top edge. No glows anywhere.
 

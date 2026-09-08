@@ -118,7 +118,7 @@ export function SettingsRail() {
   let row = 0;
 
   return (
-    <SidebarContent className="px-[10px] pt-1 pb-3">
+    <SidebarContent className="px-[10px] pt-[14px] pb-3">
       {groups.map((group, gi) => (
         <SidebarGroup key={group.label} className={cn("p-0", gi > 0 && "mt-3")}>
           {/* Louder than its rows: full ink, semibold — a heading quieter than
