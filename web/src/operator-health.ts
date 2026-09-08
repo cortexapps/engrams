@@ -2,19 +2,30 @@ import type { HostView, StorageSummaryResponse } from "./lib/types";
 import { secondsSince } from "./format";
 
 // The single source of truth for what counts as a fleet/storage problem and how
-// serious it is. Both surfaces that judge platform health — the Operator cockpit
-// verdict (pages/operator/Overview.tsx) and the rail telltale
-// (hooks/useOperatorHealth.ts) — read from here, so the dot and the dashboard can
+// serious it is. Both surfaces that judge platform health — the Fleet page's
+// verdict cell (pages/Fleet.tsx) and the Settings rail's Fleet row
+// (hooks/useOperatorHealth.ts) — read from here, so the dot and the page can
 // never disagree about whether something is wrong.
 
 export type HealthTone = "caution" | "critical";
+export type HealthIssueKind =
+  | "offline"
+  | "capacity"
+  | "locality"
+  | "draining"
+  | "flush_window"
+  | "caps";
 export interface HealthIssue {
+  kind: HealthIssueKind;
   tone: HealthTone;
   /** Short phrase for a verdict headline, tooltip, or screen reader. */
   text: string;
 }
 
-const RPO_WINDOW_S = 60; // a chunk-tracked sandbox past this since last flush is "stale"
+/** The flush window: a chunk-tracked sandbox whose last flush is older than
+ * this has dirty chunks at risk. The Storage ledger judges each row by it. */
+export const FLUSH_WINDOW_S = 60;
+const RPO_WINDOW_S = FLUSH_WINDOW_S;
 
 export interface HealthMetrics {
   dead: number;
@@ -55,42 +66,66 @@ export function deriveHealthMetrics(
 // order encodes priority (Array.prototype.sort is stable). So `issues[0]` is
 // always the one thing an operator should look at first.
 export function operatorIssues(m: HealthMetrics): HealthIssue[] {
-  const issues: { sev: 2 | 3; tone: HealthTone; text: string }[] = [];
+  const issues: (HealthIssue & { sev: 2 | 3 })[] = [];
   // Critical — needs eyes now.
   if (m.dead > 0)
     issues.push({
+      kind: "offline",
       sev: 3,
       tone: "critical",
       text: `${m.dead} host${m.dead > 1 ? "s" : ""} offline`,
     });
   if (m.capPct >= 90)
-    issues.push({ sev: 3, tone: "critical", text: `fleet at ${m.capPct}% capacity` });
+    issues.push({
+      kind: "capacity",
+      sev: 3,
+      tone: "critical",
+      text: `fleet at ${m.capPct}% capacity`,
+    });
   if (m.locality != null && m.locality < 50)
-    issues.push({ sev: 3, tone: "critical", text: `base locality ${m.locality}%` });
+    issues.push({
+      kind: "locality",
+      sev: 3,
+      tone: "critical",
+      text: `base locality ${m.locality}%`,
+    });
   // Caution — worth a glance.
   if (m.draining > 0)
     issues.push({
+      kind: "draining",
       sev: 2,
       tone: "caution",
       text: `${m.draining} host${m.draining > 1 ? "s" : ""} draining`,
     });
   if (m.capPct >= 70 && m.capPct < 90)
-    issues.push({ sev: 2, tone: "caution", text: `fleet at ${m.capPct}% capacity` });
+    issues.push({
+      kind: "capacity",
+      sev: 2,
+      tone: "caution",
+      text: `fleet at ${m.capPct}% capacity`,
+    });
   if (m.locality != null && m.locality >= 50 && m.locality < 80)
-    issues.push({ sev: 2, tone: "caution", text: `base locality ${m.locality}%` });
+    issues.push({
+      kind: "locality",
+      sev: 2,
+      tone: "caution",
+      text: `base locality ${m.locality}%`,
+    });
   if (m.rpoStale > 0)
     issues.push({
+      kind: "flush_window",
       sev: 2,
       tone: "caution",
       text: `${m.rpoStale} sandbox${m.rpoStale > 1 ? "es" : ""} past flush window`,
     });
   if (m.capsFailing > 0)
     issues.push({
+      kind: "caps",
       sev: 2,
       tone: "caution",
       text: `${m.capsFailing} host${m.capsFailing > 1 ? "s" : ""} failing capability checks`,
     });
 
   issues.sort((a, b) => b.sev - a.sev);
-  return issues.map(({ tone, text }) => ({ tone, text }));
+  return issues.map(({ kind, tone, text }) => ({ kind, tone, text }));
 }

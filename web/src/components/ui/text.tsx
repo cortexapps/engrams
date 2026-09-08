@@ -35,7 +35,7 @@ const textVariants = cva("", {
       // may override size.
       label: "text-xs leading-none font-semibold",
       // The figure in a readout: big, aligned, machine.
-      stat: "font-mono text-2xl leading-none tabular-nums",
+      stat: "font-mono text-lg leading-none tabular-nums",
       code: "font-mono text-sm",
     },
     tone: {

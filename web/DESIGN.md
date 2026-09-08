@@ -196,7 +196,7 @@ alone.
 
 Each signal ships in **two** values, and picking the wrong one is the most
 common way to fail contrast here. The plain token is the *graphic* value —
-gauge arcs, meter fills, 6px dots — tuned to stay vivid at small sizes against
+meter fills and 6px dots — tuned to stay vivid at small sizes against
 a 3:1 floor. The `-ink` token (`{colors.nominal-ink}`, `{colors.caution-ink}`,
 `{colors.critical-ink}`) is the *text* value, dark enough on paper and light
 enough at night to clear 4.5:1. Measured as text on paper, the graphic values
