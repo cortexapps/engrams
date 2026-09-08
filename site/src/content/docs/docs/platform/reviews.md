@@ -60,6 +60,6 @@ GitHub links straight to the dossier.
 ## Where it lives
 
 Pull request review is an automation like any other. Its structure is locked; its inputs are
-yours, and Duplicate gives you a fully editable copy if you want a different flow. Runs show
-up under the automation's Runs tab with the same step timeline every automation gets. See
+yours, and Duplicate gives you a fully editable copy if you want a different flow. Each review
+is an entry on the automation's Activity tab, with the same step trace every automation gets. See
 [Automations](../automations/).

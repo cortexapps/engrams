@@ -72,8 +72,10 @@ import {
   isEditorTab,
   type EditorTab,
 } from "./pages/automations/AutomationEditor";
-import { RunPage } from "./pages/automations/runs/RunPage";
-import { RunsTab } from "./pages/automations/runs/RunsTab";
+import { ActivityTab } from "./pages/automations/activity/ActivityTab";
+import { ActivityPage } from "./pages/automations/activity/ActivityPage";
+import { WorkstreamsPage } from "./pages/automations/workstreams/WorkstreamsPage";
+import { WorkstreamPage } from "./pages/automations/workstreams/WorkstreamPage";
 import { SettingsTab } from "./pages/automations/settings/SettingsTab";
 import { RedirectToBuiltin } from "./pages/automations/settings/RedirectToBuiltin";
 
@@ -488,9 +490,17 @@ const papercutsRoute = createRoute({
 export type AutomationEditorTab = EditorTab;
 export interface AutomationEditorSearch {
   tab?: EditorTab;
+  run?: string;
 }
-const editorSearch = (search: Record<string, unknown>): AutomationEditorSearch =>
-  isEditorTab(search["tab"]) ? { tab: search["tab"] } : {};
+/** `?tab=` plus `?run=` (opens that entry's trace on the Activity tab). The
+ * retired `runs` tab name still resolves, to Activity. */
+const editorSearch = (search: Record<string, unknown>): AutomationEditorSearch => {
+  const raw = search["tab"] === "runs" ? "activity" : search["tab"];
+  return {
+    ...(isEditorTab(raw) ? { tab: raw } : {}),
+    ...(typeof search["run"] === "string" ? { run: search["run"] } : {}),
+  };
+};
 
 const automationsLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
@@ -515,29 +525,55 @@ const automationsNewManualRoute = createRoute({
   path: "new/manual",
   component: () => <AutomationEditor mode="create" />,
 });
-/** The editor with the sibling tabs mounted (3.7 runs, 3.8 settings; 3.4/3.5/3.6
- * plug their slots in the same way). Tab components read `$id` themselves. */
+/** The editor with the sibling tabs mounted. Tab components read `$id`
+ * themselves. */
 function AutomationEditorPage() {
   const { id } = automationEditRoute.useParams();
   return (
     <AutomationEditor
       mode="edit"
-      runsTab={<RunsTab automationId={id} />}
+      activityTab={<ActivityTab automationId={id} />}
       settingsTab={<SettingsTab automationId={id} />}
     />
   );
 }
+// The section pages: every open workstream across automations, and every
+// automation's activity in one ledger. Static segments, so they outrank `$id`.
+const workstreamsRoute = createRoute({
+  getParentRoute: () => automationsLayoutRoute,
+  path: "workstreams",
+  component: WorkstreamsPage,
+});
+const workstreamRoute = createRoute({
+  getParentRoute: () => automationsLayoutRoute,
+  path: "workstreams/$id",
+  component: WorkstreamPage,
+});
+const activityRoute = createRoute({
+  getParentRoute: () => automationsLayoutRoute,
+  path: "activity",
+  component: ActivityPage,
+});
 const automationEditRoute = createRoute({
   getParentRoute: () => automationsLayoutRoute,
   path: "$id",
-  // ?tab=build|inputs|runs|settings (ADR 0119 phase 3.3); anything else → build.
+  // ?tab=build|inputs|workstreams|activity|settings; anything else → build.
   validateSearch: editorSearch,
   component: AutomationEditorPage,
 });
+// Retired: the standalone run page. A run is an entry on the Activity tab,
+// so the old link opens that entry's trace in place.
 const automationRunRoute = createRoute({
   getParentRoute: () => automationsLayoutRoute,
   path: "$id/runs/$runId",
-  component: RunPage,
+  beforeLoad: ({ params }) => {
+    throw redirect({
+      to: "/automations/$id",
+      params: { id: params.id },
+      search: { tab: "activity", run: params.runId },
+      replace: true,
+    });
+  },
 });
 
 // Retired: automations under Settings. The `$id` redirects carry the tab.
@@ -610,6 +646,9 @@ export const routeTree = rootRoute.addChildren([
       automationsIndexRoute,
       automationsNewRoute,
       automationsNewManualRoute,
+      workstreamsRoute,
+      workstreamRoute,
+      activityRoute,
       automationEditRoute,
       automationRunRoute,
     ]),

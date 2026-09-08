@@ -7,28 +7,24 @@ export function dayTotal(day: DayRunCount): number {
   return day.completed + day.failed + day.filtered + day.other;
 }
 
-/** Colour class for one day's bar: instrument tokens only (lime is a fill
- * reserved for the accent, never a status — web/DESIGN.md). Failures win;
- * then any verdict (completed/filtered); an other-only day (superseded or
- * in flight) is real activity without a verdict, so it reads as caution
- * rather than as the zero stub. */
-export function dayTone(day: DayRunCount): "nominal" | "caution" | "critical" | "muted" {
+/** Colour class for one day's bar. Failures win; every other run reads as
+ * nominal activity, including a day that only has in-flight or superseded
+ * entries. */
+export function dayTone(day: DayRunCount): "nominal" | "critical" | "muted" {
   if (dayTotal(day) === 0) return "muted";
-  if (day.failed > 0 && day.completed === 0) return "critical";
-  if (day.failed > 0) return "caution";
-  if (day.completed > 0 || day.filtered > 0) return "nominal";
-  return "caution";
+  if (day.failed > 0) return "critical";
+  return "nominal";
 }
 
 const FILL: Record<ReturnType<typeof dayTone>, string> = {
   nominal: "fill-instrument-nominal",
-  caution: "fill-instrument-caution",
   critical: "fill-instrument-critical",
-  muted: "fill-muted-foreground/30",
+  muted: "fill-border",
 };
 
-const W = 84;
-const H = 24;
+const W = 47;
+const H = 18;
+const BAR_WIDTH = 5;
 const GAP = 2;
 
 const UTC_DAY_MS = 86_400_000;
@@ -75,7 +71,6 @@ export function Sparkline({
   now?: Date;
 }) {
   const week = sevenDayWindow(days, now);
-  const slot = (W - GAP * 6) / 7;
   const max = Math.max(1, ...week.map(dayTotal));
   return (
     <svg
@@ -93,9 +88,9 @@ export function Sparkline({
           <rect
             key={day.day || i}
             data-tone={dayTone(day)}
-            x={i * (slot + GAP)}
+            x={i * (BAR_WIDTH + GAP)}
             y={H - h}
-            width={slot}
+            width={BAR_WIDTH}
             height={h}
             rx={1}
             className={FILL[dayTone(day)]}

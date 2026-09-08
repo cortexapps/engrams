@@ -1,5 +1,13 @@
-import { createConnectQueryKey, useMutation, useQuery } from "@connectrpc/connect-query";
-import { useQueryClient } from "@tanstack/react-query";
+import {
+  createConnectQueryKey,
+  createQueryOptions,
+  useMutation,
+  useQuery,
+  useTransport,
+} from "@connectrpc/connect-query";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
+
+import type { AutomationRunBrief, FilteredWindow } from "@/gen/engram/app/v1/automation_pb";
 
 import {
   getRun,
@@ -30,6 +38,47 @@ export function useRunList(automationId: string | undefined, options: RunListOpt
     },
     { enabled: !!automationId, staleTime: 5_000 },
   );
+}
+
+/** Every automation's runs in one ledger, newest first. The service lists
+ * per automation, so this fans out one query per id and merges; a window
+ * carries its automation id so the ledger can name it. */
+export function useAllRuns(
+  automationIds: readonly string[],
+  options: { includeFiltered?: boolean; limit?: number } = {},
+): {
+  runs: AutomationRunBrief[];
+  windows: (FilteredWindow & { automationId: string })[];
+  isPending: boolean;
+  error: unknown;
+} {
+  const transport = useTransport();
+  const results = useQueries({
+    queries: automationIds.map((automationId) => ({
+      ...createQueryOptions(
+        listRuns,
+        {
+          automationId,
+          limit: options.limit ?? 25,
+          includeFiltered: options.includeFiltered ?? false,
+        },
+        { transport },
+      ),
+      staleTime: 5_000,
+    })),
+  });
+  const runs = results
+    .flatMap((r) => r.data?.runs ?? [])
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  const windows = results.flatMap((r, i) =>
+    (r.data?.filtered ?? []).map((w) => ({ ...w, automationId: automationIds[i]! })),
+  );
+  return {
+    runs,
+    windows,
+    isPending: results.some((r) => r.isPending),
+    error: results.find((r) => r.error)?.error,
+  };
 }
 
 const ACTIVE_POLL_MS = 2_000;

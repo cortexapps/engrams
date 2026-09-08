@@ -1,8 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { toast } from "sonner";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
+import { createRouterTransport } from "@connectrpc/connect";
 
 import {
   AutomationRunService,
@@ -11,6 +10,7 @@ import {
 } from "@/gen/engram/app/v1/automation_pb";
 import type { InputFieldSpec } from "@/lib/automation-inputs";
 import { renderWithProviders } from "@/test-utils";
+
 import { WorkstreamsTab } from "./WorkstreamsTab";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -47,24 +47,17 @@ interface Impl {
     detail: string;
     droppedAt: string;
   }>;
-  runNow?: (req: RunNowRequest) => { runId: string };
-  onClose?: (id: string) => void;
-  closeFails?: boolean;
+  runNow?: (request: RunNowRequest) => { runId: string };
 }
 
 function transportWith(impl: Impl) {
   return createRouterTransport((router) => {
     router.service(AutomationRunService, {
       listInstances: () => ({ instances: impl.instances ?? [] }),
-      getInstance: (req) => ({
-        instance: (impl.instances ?? []).find((i) => i.id === req.id),
+      getInstance: (request) => ({
+        instance: (impl.instances ?? []).find((item) => item.id === request.id),
         handles: impl.handles ?? [],
       }),
-      closeInstance: (req) => {
-        impl.onClose?.(req.id);
-        if (impl.closeFails) throw new ConnectError("workstream not found", Code.NotFound);
-        return { closed: true };
-      },
       listRecentDrops: () => ({ drops: impl.drops ?? [] }),
       listRuns: () => ({ runs: [], filtered: [] }),
     });
@@ -89,27 +82,26 @@ function renderTab(impl: Impl) {
 }
 
 describe("WorkstreamsTab", () => {
-  it("lists open workstreams by key, hides closed ones behind the toggle", async () => {
+  it("renders a human name and keeps the exact key, then shows closed workstreams on their tab", async () => {
     renderTab({
       instances: [
-        instance("ai_one", "project-ENG-1", "open"),
+        instance("ai_one", "project-ENG_1", "open"),
         instance("ai_two", "project-ENG-2", "closed", {
           closedAt: new Date(NOW - 60_000).toISOString(),
           closeReason: "shipped",
         }),
       ],
     });
-    await waitFor(() => expect(screen.getByText("project-ENG-1")).toBeTruthy());
-    expect(screen.queryByText("project-ENG-2")).toBeNull();
-    expect(screen.getByText("1 open workstreams")).toBeTruthy();
 
-    await userEvent.click(screen.getByRole("switch", { name: "show closed workstreams" }));
-    await waitFor(() => expect(screen.getByText("project-ENG-2")).toBeTruthy());
-    expect(screen.getByText(/closed · shipped/)).toBeTruthy();
+    expect(await screen.findByText("project ENG 1")).toBeTruthy();
+    expect(screen.getByText("project-ENG_1")).toBeTruthy();
+    expect(screen.queryByText("project ENG 2")).toBeNull();
+
+    await userEvent.click(screen.getByRole("tab", { name: /Closed/ }));
+    await waitFor(() => expect(screen.getByText("project ENG 2")).toBeTruthy());
   });
 
-  it("expanding a row shows the input snapshot, handles, and a close button that closes", async () => {
-    const closed: string[] = [];
+  it("shows owned places as chips and links rows to the detail page", async () => {
     renderTab({
       instances: [instance("ai_one", "project-ENG-1", "open")],
       handles: [
@@ -119,90 +111,72 @@ describe("WorkstreamsTab", () => {
           createdAt: new Date(NOW).toISOString(),
         },
       ],
-      onClose: (id) => closed.push(id),
     });
-    await waitFor(() => expect(screen.getByText("project-ENG-1")).toBeTruthy());
-    await userEvent.click(screen.getByText("project-ENG-1"));
 
-    const detail = await screen.findByTestId("workstream-detail");
-    expect(within(detail).getByText("ENG-1")).toBeTruthy();
-    await waitFor(() => expect(within(detail).getByText("slack:C1:1724.100")).toBeTruthy());
-    await userEvent.click(within(detail).getByRole("button", { name: "Close workstream" }));
-    await waitFor(() => expect(closed).toEqual(["ai_one"]));
-  });
-
-  it("a failed close surfaces an error toast instead of failing silently", async () => {
-    renderTab({
-      instances: [instance("ai_one", "project-ENG-1", "open")],
-      closeFails: true,
-    });
-    await waitFor(() => expect(screen.getByText("project-ENG-1")).toBeTruthy());
-    await userEvent.click(screen.getByText("project-ENG-1"));
-    const detail = await screen.findByTestId("workstream-detail");
-    await userEvent.click(within(detail).getByRole("button", { name: "Close workstream" }));
-    await waitFor(() =>
-      expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
-        expect.stringContaining("workstream not found"),
-      ),
+    const row = await screen.findByTestId("workstream-row");
+    expect(await within(row).findByText("#C1 · thread")).toBeTruthy();
+    expect(within(row).getByRole("link", { name: "project ENG 1" }).getAttribute("href")).toBe(
+      "/automations/workstreams/ai_one",
     );
-    expect(vi.mocked(toast.success)).not.toHaveBeenCalled();
   });
 
-  it("kickoff posts RunNow with instance_key and the inputs snapshot", async () => {
+  it("keeps close controls on the detail page instead of expanding rows", async () => {
+    renderTab({ instances: [instance("ai_one", "project-ENG-1", "open")] });
+    expect(await screen.findByText("project ENG 1")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Close workstream" })).toBeNull();
+    expect(screen.queryByTestId("workstream-detail")).toBeNull();
+  });
+
+  it("opens a workstream with its name and input snapshot", async () => {
     const requests: RunNowRequest[] = [];
     renderTab({
       instances: [],
-      runNow: (req) => {
-        requests.push(req);
+      runNow: (request) => {
+        requests.push(request);
         return { runId: "autorun:auto-1:main:i-ai_new:manual:1" };
       },
     });
-    await waitFor(() => expect(screen.getByText(/No open workstreams/)).toBeTruthy());
-    await userEvent.click(screen.getByRole("button", { name: /Kick off/ }));
-    const form = await screen.findByTestId("kickoff-form");
-    await userEvent.type(screen.getByRole("textbox", { name: "workstream key" }), "project-ENG-9");
+    expect(await screen.findByText(/No open workstreams/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Open a workstream" }));
+    const form = await screen.findByTestId("open-workstream-form");
+    await userEvent.type(screen.getByRole("textbox", { name: "workstream name" }), "ENG-9");
     const projectField = within(form).getByRole("textbox", { name: "Project" });
     await userEvent.clear(projectField);
     await userEvent.type(projectField, "ENG-9");
-    await userEvent.click(within(form).getByRole("button", { name: "Kick off" }));
+    await userEvent.click(within(form).getByRole("button", { name: "Open a workstream" }));
 
     await waitFor(() => expect(requests).toHaveLength(1));
-    expect(requests[0]).toMatchObject({
-      automationId: "auto-1",
-      instanceKey: "project-ENG-9",
-    });
-    expect(JSON.parse(requests[0]!.instanceInputsJson ?? "{}")).toEqual({
-      project: "ENG-9",
-    });
-    // Never the legacy field.
+    expect(requests[0]).toMatchObject({ automationId: "auto-1", instanceKey: "ENG-9" });
+    expect(JSON.parse(requests[0]!.instanceInputsJson ?? "{}")).toEqual({ project: "ENG-9" });
     expect(requests[0]!.inputsJson).toBeUndefined();
   });
 
-  it("typing an OPEN key switches to join mode: no inputs sent, form hidden", async () => {
+  it("opens the next run for an already-open name without replacing its inputs", async () => {
     const requests: RunNowRequest[] = [];
     renderTab({
-      instances: [instance("ai_one", "project-ENG-1", "open")],
-      runNow: (req) => {
-        requests.push(req);
+      instances: [instance("ai_one", "ENG-1", "open")],
+      runNow: (request) => {
+        requests.push(request);
         return { runId: "autorun:auto-1:join" };
       },
     });
-    await waitFor(() => expect(screen.getByText("project-ENG-1")).toBeTruthy());
-    await userEvent.click(screen.getByRole("button", { name: /Kick off/ }));
-    const form = await screen.findByTestId("kickoff-form");
-    await userEvent.type(screen.getByRole("textbox", { name: "workstream key" }), "project-ENG-1");
+    expect(await screen.findByText("ENG 1")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Open a workstream" }));
+    const form = await screen.findByTestId("open-workstream-form");
+    await userEvent.type(screen.getByRole("textbox", { name: "workstream name" }), "ENG-1");
 
-    // The inputs form yields to the join hint; the action reads Join.
-    await waitFor(() => expect(screen.getByTestId("kickoff-join-hint")).toBeTruthy());
+    expect((await screen.findByTestId("open-workstream-join-hint")).textContent).toBe(
+      "ENG-1 is already open — this opens its next run",
+    );
     expect(within(form).queryByRole("textbox", { name: "Project" })).toBeNull();
-    await userEvent.click(within(form).getByRole("button", { name: "Join" }));
+    await userEvent.click(within(form).getByRole("button", { name: "Open a workstream" }));
 
     await waitFor(() => expect(requests).toHaveLength(1));
-    expect(requests[0]).toMatchObject({ automationId: "auto-1", instanceKey: "project-ENG-1" });
+    expect(requests[0]).toMatchObject({ automationId: "auto-1", instanceKey: "ENG-1" });
     expect(requests[0]!.instanceInputsJson).toBeUndefined();
   });
 
-  it("surfaces the recent-drops audit list", async () => {
+  it("summarizes and expands recent events that did not fire", async () => {
     renderTab({
       instances: [instance("ai_one", "project-ENG-1", "open")],
       drops: [
@@ -215,10 +189,11 @@ describe("WorkstreamsTab", () => {
         },
       ],
     });
-    await waitFor(() => expect(screen.getByText("1 recent events did not fire")).toBeTruthy());
-    await userEvent.click(screen.getByText("1 recent events did not fire"));
+    expect((await screen.findByTestId("recent-drops-summary")).textContent).toContain(
+      "1 events did not fire in the last day",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Show them →" }));
     const drops = screen.getByTestId("recent-drops");
-    expect(within(drops).getByText("no workstream owns this")).toBeTruthy();
     expect(within(drops).getByText(/slack:C1:999/)).toBeTruthy();
   });
 });

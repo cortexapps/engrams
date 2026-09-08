@@ -7,6 +7,7 @@ import {
   AutomationRunBriefSchema,
   AutomationSchema,
   AutomationSummarySchema,
+  AutomationVersionSchema,
   DayRunCountSchema,
   type AutomationSummary,
 } from "@/gen/engram/app/v1/automation_pb";
@@ -15,7 +16,6 @@ import { AutomationsList, orderAutomations } from "./AutomationsList";
 
 const setEnabled = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const duplicate = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "copy-1" } }));
-const archive = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const state = vi.hoisted(() => ({
   automations: [] as unknown[],
   builtin: null as unknown,
@@ -31,7 +31,6 @@ vi.mock("@/hooks/useAutomations", () => ({
   useBuiltinAutomation: () => ({ data: state.builtin ? { automation: state.builtin } : undefined }),
   useSetAutomationEnabled: () => ({ mutateAsync: setEnabled, isPending: false }),
   useDuplicateAutomation: () => ({ mutateAsync: duplicate, isPending: false }),
-  useArchiveAutomation: () => ({ mutateAsync: archive, isPending: false }),
   // The registrations panel (moved verbatim) is exercised by its own tests.
   useWebhookRegistrations: () => ({ data: { registrations: [] }, isPending: false, error: null }),
   useCreateWebhookRegistration: () => ({ mutateAsync: vi.fn(), isPending: false }),
@@ -44,7 +43,15 @@ vi.mock("@/hooks/useIntegrations", () => ({
 function summary(
   id: string,
   name: string,
-  opts: { kind?: string; enabled?: boolean; lastStatus?: string; startedAt?: string } = {},
+  opts: {
+    kind?: string;
+    enabled?: boolean;
+    lastStatus?: string;
+    startedAt?: string;
+    endedAt?: string;
+    failedToday?: number;
+    workstreams?: boolean;
+  } = {},
 ): AutomationSummary {
   return create(AutomationSummarySchema, {
     automation: create(AutomationSchema, {
@@ -53,6 +60,21 @@ function summary(
       kind: opts.kind ?? "user",
       enabled: opts.enabled ?? true,
       currentVersion: 1,
+      ...(opts.workstreams
+        ? {
+            version: create(AutomationVersionSchema, {
+              automationId: id,
+              number: 1,
+              definitionJson: JSON.stringify({
+                engine: 1,
+                trigger: { kind: "manual" },
+                blocks: [],
+                inputsSchema: [],
+                settings: { endSessionsOnFinish: false, instance: { keyTemplate: "{{pr}}" } },
+              }),
+            }),
+          }
+        : {}),
     }),
     triggerSummary: "GitHub · PR opened · 2 repos",
     ...(opts.lastStatus
@@ -62,11 +84,17 @@ function summary(
             automationId: id,
             status: opts.lastStatus,
             startedAt: opts.startedAt ?? new Date().toISOString(),
+            ...(opts.endedAt ? { endedAt: opts.endedAt } : {}),
           }),
         }
       : {}),
     runs7d: Array.from({ length: 7 }, (_, i) =>
-      create(DayRunCountSchema, { day: `d${i}`, completed: i, failed: 0, filtered: 0 }),
+      create(DayRunCountSchema, {
+        day: `d${i}`,
+        completed: i,
+        failed: i === 6 ? (opts.failedToday ?? 0) : 0,
+        filtered: 0,
+      }),
     ),
   });
 }
@@ -75,10 +103,22 @@ beforeEach(() => {
   setEnabled.mockClear();
   duplicate.mockClear();
   state.pending = false;
-  state.builtin = null;
+  state.builtin = create(AutomationSchema, {
+    id: "builtin-pr",
+    name: "PR review",
+    kind: "builtin",
+    builtinKey: "pr_review",
+  });
   state.automations = [
     summary("a-zeta", "Zeta nightly", { lastStatus: "completed" }),
-    summary("a-builtin", "PR review", { kind: "builtin", lastStatus: "failed" }),
+    summary("a-builtin", "PR review", {
+      kind: "builtin",
+      lastStatus: "failed",
+      startedAt: "2026-08-21T10:00:00Z",
+      endedAt: "2026-08-21T10:02:00Z",
+      failedToday: 3,
+      workstreams: true,
+    }),
     summary("a-alpha", "Alpha triage", { enabled: false }),
   ];
 });
@@ -95,15 +135,23 @@ describe("orderAutomations", () => {
 });
 
 describe("AutomationsList", () => {
-  it("renders rows with the built-in pinned and labelled", async () => {
+  it("renders one table with the built-in pinned and labelled", async () => {
     renderWithProviders(<AutomationsList />);
+    expect(await screen.findByRole("table")).toBeTruthy();
+    expect(screen.getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+      "Automation",
+      "Trigger",
+      "Last run",
+      "7 days",
+      "On",
+    ]);
     const rows = await screen.findAllByTestId("automation-row");
     expect(rows).toHaveLength(3);
     expect(rows[0]!.getAttribute("data-kind")).toBe("builtin");
     expect(within(rows[0]!).getByText("built-in")).toBeTruthy();
-    // Built-ins cannot be archived from the list.
-    expect(within(rows[0]!).queryByRole("button", { name: /archive/i })).toBeNull();
-    expect(within(rows[1]!).getByRole("button", { name: /archive/i })).toBeTruthy();
+    expect(within(rows[0]!).getByText("workstreams")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /archive/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "Duplicate PR review" })).toBeTruthy();
   });
 
   it("encodes the last run as an instrument-toned status dot", async () => {
@@ -115,26 +163,30 @@ describe("AutomationsList", () => {
     expect(tone(rows[1]!)).toBe("muted"); // Alpha: never run
     expect(tone(rows[2]!)).toBe("nominal"); // Zeta: completed
     expect(within(rows[1]!).getByText("never run")).toBeTruthy();
+    expect(within(rows[0]!).getByText("3 today")).toBeTruthy();
+    expect(within(rows[0]!).getByText(/2m 0s/)).toBeTruthy();
+    expect(rows[0]!.getAttribute("style")).toContain("instrument-critical");
   });
 
   it("toggles enabled through the mutation", async () => {
     const user = userEvent.setup();
     renderWithProviders(<AutomationsList />);
-    const toggle = await screen.findByRole("switch", { name: /enable alpha triage/i });
+    const toggle = await screen.findByRole("switch", { name: /turn on alpha triage/i });
     await user.click(toggle);
     await waitFor(() => expect(setEnabled).toHaveBeenCalledWith({ id: "a-alpha", enabled: true }));
   });
 
   it("renders a sparkline per row linking to the runs tab", async () => {
     renderWithProviders(<AutomationsList />);
-    const links = await screen.findAllByRole("link", { name: /runs for/i });
+    const links = await screen.findAllByRole("link", { name: /activity for/i });
     expect(links).toHaveLength(3);
-    expect(links[0]!.getAttribute("href")).toContain("tab=runs");
+    expect(links[0]!.getAttribute("href")).toContain("tab=activity");
     expect(links[0]!.querySelector("svg[role=img]")).not.toBeNull();
   });
 
   it("shows the empty state with 'Duplicate PR review' only when the built-in exists", async () => {
     state.automations = [];
+    state.builtin = null;
     renderWithProviders(<AutomationsList />);
     expect(await screen.findByText(/no automations yet/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /duplicate/i })).toBeNull();
@@ -142,7 +194,7 @@ describe("AutomationsList", () => {
     expect(screen.getAllByRole("link", { name: /new automation/i })).toHaveLength(2);
   });
 
-  it("duplicates the built-in from the empty state", async () => {
+  it("duplicates the built-in from the masthead and the empty state", async () => {
     const user = userEvent.setup();
     state.automations = [];
     state.builtin = create(AutomationSchema, {
@@ -152,8 +204,9 @@ describe("AutomationsList", () => {
       builtinKey: "pr_review",
     });
     renderWithProviders(<AutomationsList />);
-    const button = await screen.findByRole("button", { name: /duplicate/i });
-    await user.click(button);
+    const buttons = await screen.findAllByRole("button", { name: "Duplicate PR review" });
+    expect(buttons).toHaveLength(2);
+    await user.click(buttons[0]!);
     await waitFor(() => expect(duplicate).toHaveBeenCalledWith({ automationId: "builtin-pr" }));
   });
 });

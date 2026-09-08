@@ -1,8 +1,9 @@
-/** The automation editor shell (ADR 0119 phase 3.3).
+/** The automation editor shell — the Builder.
  *
- * Header (name, enabled, built-in banner + Duplicate) and four tabs driven by
- * the `?tab=` search param. This PR ships Build; Inputs (3.6), Runs (3.7),
- * and Settings (3.8) mount into the tab slots below.
+ * A fixed-height frame: a 60px masthead (the name as an inline-editable
+ * title, the version chip, the tabs, On/Paused, Dry run, Save) over the tab
+ * body. Build fills the remaining height with the canvas; the other tabs
+ * scroll. Tabs are driven by the `?tab=` search param.
  *
  * Saving follows the editing model: a user automation saves a full new
  * version (SaveVersion); a built-in saves only the changed tunable fields
@@ -15,13 +16,14 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/empty-state";
-import { PageHeading } from "@/components/page-heading";
 import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Field, FieldError, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
+import { FieldError } from "@/components/ui/field";
 import { Switch } from "@/components/ui/switch";
+import { useRunList } from "@/hooks/useAutomationRuns";
+import { relativeTime } from "@/lib/relative-time";
+import { cn } from "@/lib/utils";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   useCreateAutomationV2,
@@ -33,13 +35,9 @@ import {
   useUpdateAutomationMetaV2,
 } from "@/hooks/useAutomationEditor";
 import {
-  removeEntrypoint,
   projectEntrypoint,
-  mergeEntrypoint,
   MAIN_ENTRYPOINT_ID,
   entrypointIds,
-  blockIdsOutsideEntrypoint,
-  addEntrypoint,
   applyOverrides,
   diffOverrides,
   EMPTY_DEFINITION,
@@ -53,15 +51,12 @@ import {
 import { useAutomationTest } from "@/hooks/useAutomationTest";
 
 import { BuildTab } from "./build/BuildTab";
-import { EntrypointBar } from "./build/EntrypointBar";
-import { DraftRail } from "./DraftRail";
-import { TestPanel } from "./build/test/TestPanel";
 import { parseInputsJson, parseInputsSchema } from "@/lib/automation-inputs";
 import { InputsTab } from "./inputs/InputsTab";
 import { WorkstreamsTab } from "./instances/WorkstreamsTab";
 import { DryRunButton } from "./build/DryRunButton";
 
-export const EDITOR_TABS = ["build", "inputs", "workstreams", "runs", "settings"] as const;
+export const EDITOR_TABS = ["build", "inputs", "workstreams", "activity", "settings"] as const;
 export type EditorTab = (typeof EDITOR_TABS)[number];
 
 export function isEditorTab(value: unknown): value is EditorTab {
@@ -72,7 +67,7 @@ interface Props {
   mode: "create" | "edit";
   /** Slots for the sibling PRs (3.6 / 3.7 / 3.8). */
   inputsTab?: ReactNode;
-  runsTab?: ReactNode;
+  activityTab?: ReactNode;
   settingsTab?: ReactNode;
   /** 3.4 mounts TestPanel by default; these override it (tests, siblings). */
   testPanel?: ReactNode;
@@ -82,7 +77,7 @@ interface Props {
 export function AutomationEditor({
   mode,
   inputsTab,
-  runsTab,
+  activityTab,
   settingsTab,
   testPanel,
   variableValues,
@@ -276,7 +271,7 @@ export function AutomationEditor({
           definitionJson: JSON.stringify(draft),
         });
       }
-      toast.success(builtin ? "Overrides saved" : "Saved as a new version");
+      toast.success("Saved");
     } catch (error) {
       fail(error);
     }
@@ -286,7 +281,7 @@ export function AutomationEditor({
     if (!automation) return;
     try {
       const copy = await duplicate.mutateAsync({ automationId: automation.id });
-      toast.success("Duplicated — the copy is fully editable");
+      toast.success("Duplicated — edit the copy freely");
       void navigate({
         to: "/automations/$id",
         params: { id: copy.automation!.id },
@@ -320,202 +315,208 @@ export function AutomationEditor({
     inputsJson: automation?.inputsJson || "{}",
     onErrors: setErrors,
   });
+  // The Activity tab's count: what the ledger holds (it lists up to 50).
+  const activity = useRunList(automation?.id, { limit: 50 });
+  const activityCount = activity.data?.runs.length;
 
   if (mode === "edit" && existing.isPending) {
-    return <SkeletonRows />;
+    return (
+      <div className="p-6">
+        <SkeletonRows />
+      </div>
+    );
   }
   if (mode === "edit" && (existing.error || !automation)) {
     return (
-      <EmptyState
-        tone="error"
-        action={
-          <Link to="/automations" className="text-sm underline">
-            Back to automations
-          </Link>
-        }
-      >
-        Automation not found.
-      </EmptyState>
+      <div className="p-6">
+        <EmptyState
+          tone="error"
+          action={
+            <Link to="/automations" className="text-sm underline">
+              Back to automations
+            </Link>
+          }
+        >
+          Automation not found.
+        </EmptyState>
+      </div>
     );
   }
 
   const nameError = errors.find((e) => e.blockId === "" && e.field === "name")?.message;
-  const triggerSummary = existingSummary(
-    automation?.id,
-    projectEntrypoint(draft, effectiveEntrypointId),
-  );
-
-  const panel = testPanel ?? (automation ? <TestPanel test={test} /> : null);
+  const triggerSummaryFor = (way: string) =>
+    existingSummary(automation?.id, projectEntrypoint(draft, way));
   const liveValues = variableValues ?? test.variableValues;
+  const hasWorkstreams = draft.settings.instance !== undefined;
 
-  const draftSessionId = automation?.draftSessionId;
   return (
-    <div className={draftSessionId ? "flex items-start gap-6" : undefined}>
-      {draftSessionId && <DraftRail sessionId={draftSessionId} />}
-      <div className="min-w-0 flex-1 space-y-6" data-testid="automation-editor">
-        <PageHeading
-          title={mode === "create" ? "New automation" : name || "Automation"}
-          actions={
-            <div className="flex items-center gap-2">
-              {automation && (
-                <label className="flex items-center gap-2 text-sm">
-                  <Switch
-                    checked={automation.enabled}
-                    disabled={setEnabled.isPending}
-                    onCheckedChange={(enabled) =>
-                      setEnabled.mutate({ id: automation.id, enabled }, { onError: fail })
-                    }
-                    aria-label="Enabled"
-                  />
-                  Enabled
-                </label>
-              )}
-              {builtin && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={onDuplicate}
-                  disabled={duplicate.isPending}
-                >
-                  <Copy className="size-4" aria-hidden /> Duplicate
-                </Button>
-              )}
-              {mode === "edit" &&
-                automation && (
-                  // A dry run executes the SAVED definition; unsaved edits would
-                  // mislead, so it waits for a clean editor.
-                  <DryRunButton
-                    automationId={automation.id}
-                    entrypointId={effectiveEntrypointId}
-                    disabled={dirty}
-                  />
-                )}
-              <Button
-                type="button"
-                onClick={save}
-                disabled={saving || !dirty}
-                data-testid="save-button"
-              >
-                {mode === "create" ? "Create" : builtin ? "Save overrides" : "Save version"}
-              </Button>
-            </div>
-          }
-        />
-
-        {builtin && (
-          <div
-            className="bg-muted flex items-start gap-2 rounded-lg border p-3 text-sm"
-            data-testid="builtin-banner"
-          >
-            <Lock className="mt-0.5 size-4 shrink-0" aria-hidden />
-            <div>
-              <span className="font-medium">Built-in automation</span>
-              <Badge variant="secondary" className="ml-2">
-                {automation?.builtinKey}
-              </Badge>
-              <p className="text-muted-foreground mt-0.5">
-                Its blocks and wiring are fixed. Properties marked as editable, and the Inputs tab,
-                are yours to change; Duplicate makes a fully editable copy.
-              </p>
-            </div>
-          </div>
-        )}
-
-        <div className="grid gap-4 md:grid-cols-2">
-          <Field data-invalid={nameError ? true : undefined}>
-            <FieldLabel htmlFor="automation-name">Name</FieldLabel>
-            <Input
-              id="automation-name"
+    <div className="flex min-h-0 flex-1 flex-col" data-testid="automation-editor">
+      <Tabs
+        value={tab}
+        onValueChange={(v) => setTab(v as EditorTab)}
+        className="flex min-h-0 flex-1 flex-col gap-0"
+      >
+        {/* The masthead: 60px, hairline below. The name IS the title — Saira,
+            editable in place; the rest of the row is the automation's state
+            and its two verbs. */}
+        <header className="flex h-[60px] shrink-0 items-center gap-3 border-b px-6">
+          {builtin ? (
+            <h1 className="min-w-0 truncate font-display text-lg font-semibold [font-stretch:108%]">
+              {name}
+            </h1>
+          ) : (
+            <input
+              aria-label="Automation name"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              disabled={builtin}
+              placeholder="Name your automation"
+              aria-invalid={nameError ? true : undefined}
+              className={cn(
+                "min-w-0 flex-none bg-transparent font-display text-lg font-semibold [font-stretch:108%] outline-none placeholder:text-muted-foreground/60",
+                "w-[min(40vw,360px)] rounded-sm focus-visible:ring-2 focus-visible:ring-ring/60",
+              )}
             />
-            {nameError && <FieldError>{nameError}</FieldError>}
-          </Field>
-          <Field>
-            <FieldLabel htmlFor="automation-description">Description</FieldLabel>
-            <Input
-              id="automation-description"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              disabled={builtin}
-            />
-          </Field>
-        </div>
+          )}
+          {nameError && <FieldError>{nameError}</FieldError>}
+          {builtin && (
+            <Badge
+              variant="secondary"
+              className="shrink-0 gap-1 rounded-sm"
+              data-testid="builtin-banner"
+              title="Its steps and wiring are fixed. Fields marked as editable, and the Inputs tab, are yours to change; Duplicate makes a fully editable copy."
+            >
+              <Lock className="size-3" aria-hidden />
+              built-in
+            </Badge>
+          )}
+          {automation && (
+            <span className="shrink-0 rounded-full bg-secondary px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground">
+              v{automation.currentVersion} · saved {relativeTime(automation.updatedAt)}
+            </span>
+          )}
+          <div className="min-w-4 flex-1" />
+          <TabsList>
+            <TabsTrigger value="build">Build</TabsTrigger>
+            <TabsTrigger value="inputs" disabled={mode === "create"}>
+              Inputs
+            </TabsTrigger>
+            {hasWorkstreams && (
+              <TabsTrigger value="workstreams" disabled={mode === "create"}>
+                Workstreams
+              </TabsTrigger>
+            )}
+            <TabsTrigger value="activity" disabled={mode === "create"}>
+              Activity
+              {activityCount !== undefined && activityCount > 0 && (
+                <span className="font-mono text-2xs tabular-nums text-muted-foreground">
+                  {activityCount}
+                </span>
+              )}
+            </TabsTrigger>
+            <TabsTrigger value="settings" disabled={mode === "create"}>
+              Settings
+            </TabsTrigger>
+          </TabsList>
+          <span className="h-6 w-px shrink-0 bg-border" aria-hidden />
+          {automation && (
+            <label className="flex shrink-0 items-center gap-2 text-sm">
+              <Switch
+                checked={automation.enabled}
+                disabled={setEnabled.isPending}
+                onCheckedChange={(enabled) =>
+                  setEnabled.mutate({ id: automation.id, enabled }, { onError: fail })
+                }
+                aria-label={automation.enabled ? "On" : "Paused"}
+              />
+              {automation.enabled ? "On" : "Paused"}
+            </label>
+          )}
+          {builtin && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={onDuplicate}
+              disabled={duplicate.isPending}
+            >
+              <Copy aria-hidden /> Duplicate
+            </Button>
+          )}
+          {mode === "edit" &&
+            automation && (
+              // A dry run executes the SAVED definition; unsaved edits would
+              // mislead, so it waits for a clean editor.
+              <DryRunButton
+                automationId={automation.id}
+                entrypointId={effectiveEntrypointId}
+                disabled={dirty}
+              />
+            )}
+          <Button
+            type="button"
+            size="sm"
+            onClick={save}
+            disabled={saving || !dirty}
+            data-testid="save-button"
+          >
+            {mode === "create" ? "Create" : "Save"}
+          </Button>
+        </header>
 
         {staleVersion !== null && (
           <div
-            className="border-instrument-caution/50 bg-instrument-caution/10 flex items-center gap-3 rounded-md border px-3 py-2 text-sm"
+            className="flex shrink-0 items-center gap-3 border-b bg-secondary px-6 py-1.5 text-xs"
             data-testid="draft-stale-banner"
           >
             <span className="min-w-0 flex-1">
               The drafting agent saved a new version while you were editing. Reloading discards your
               unsaved edits.
             </span>
-            <Button type="button" size="sm" variant="outline" onClick={adoptCurrent}>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7"
+              onClick={adoptCurrent}
+            >
               Reload
             </Button>
           </div>
         )}
-        <Tabs value={tab} onValueChange={(v) => setTab(v as EditorTab)}>
-          <TabsList>
-            <TabsTrigger value="build">Build</TabsTrigger>
-            <TabsTrigger value="inputs" disabled={mode === "create"}>
-              Inputs
-            </TabsTrigger>
-            {draft.settings.instance !== undefined && (
-              <TabsTrigger value="workstreams" disabled={mode === "create"}>
-                Workstreams
-              </TabsTrigger>
-            )}
-            <TabsTrigger value="runs" disabled={mode === "create"}>
-              Runs
-            </TabsTrigger>
-            <TabsTrigger value="settings" disabled={mode === "create"}>
-              Settings
-            </TabsTrigger>
-          </TabsList>
-          <TabsContent value="build" className="space-y-3 pt-4">
-            <EntrypointBar
-              definition={draft}
-              selected={effectiveEntrypointId}
-              onSelect={setEntrypointId}
-              onAdd={(epId) => setDraft(addEntrypoint(draft, epId))}
-              onRemove={(epId) => setDraft(removeEntrypoint(draft, epId))}
-              locked={builtin}
-            />
-            <BuildTab
-              key={effectiveEntrypointId}
-              definition={projectEntrypoint(draft, effectiveEntrypointId)}
-              onChange={(next) => setDraft(mergeEntrypoint(draft, effectiveEntrypointId, next))}
-              builtin={builtin}
-              errors={errors}
-              triggerSummary={triggerSummary}
-              testPanel={panel}
-              variableValues={liveValues}
-              reservedBlockIds={blockIdsOutsideEntrypoint(draft, effectiveEntrypointId)}
+
+        <TabsContent value="build" className="flex min-h-0 flex-1 flex-col">
+          <BuildTab
+            definition={draft}
+            entrypointId={effectiveEntrypointId}
+            onSelectEntrypoint={setEntrypointId}
+            onChange={setDraft}
+            builtin={builtin}
+            errors={errors}
+            triggerSummaryFor={triggerSummaryFor}
+            test={automation ? test : undefined}
+            testPanel={testPanel}
+            variableValues={liveValues}
+          />
+        </TabsContent>
+        <TabsContent value="inputs" className="min-h-0 flex-1 overflow-y-auto p-6">
+          {inputsTab ?? <InputsTab automationId={id} />}
+        </TabsContent>
+        {hasWorkstreams && id !== undefined && (
+          <TabsContent value="workstreams" className="min-h-0 flex-1 overflow-y-auto p-6">
+            <WorkstreamsTab
+              automationId={id}
+              inputsSchema={parseInputsSchema(draft.inputsSchema)}
+              defaultInputs={parseInputsJson(automation?.inputsJson)}
             />
           </TabsContent>
-          <TabsContent value="inputs" className="pt-4">
-            {inputsTab ?? <InputsTab automationId={id} />}
-          </TabsContent>
-          {draft.settings.instance !== undefined && id !== undefined && (
-            <TabsContent value="workstreams" className="pt-4">
-              <WorkstreamsTab
-                automationId={id}
-                inputsSchema={parseInputsSchema(draft.inputsSchema)}
-                defaultInputs={parseInputsJson(automation?.inputsJson)}
-              />
-            </TabsContent>
-          )}
-          <TabsContent value="runs" className="pt-4">
-            {runsTab}
-          </TabsContent>
-          <TabsContent value="settings" className="pt-4">
-            {settingsTab}
-          </TabsContent>
-        </Tabs>
-      </div>
+        )}
+        <TabsContent value="activity" className="min-h-0 flex-1 overflow-y-auto p-6">
+          {activityTab}
+        </TabsContent>
+        <TabsContent value="settings" className="min-h-0 flex-1 overflow-y-auto p-6">
+          {settingsTab}
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }

@@ -89,6 +89,10 @@ vi.mock("@/components/ui/resizable", () => ({
 
 import { AutomationEditor } from "./AutomationEditor";
 
+vi.mock("@/hooks/useAutomationRuns", () => ({
+  useRunList: () => ({ data: undefined, isPending: false, error: null }),
+}));
+
 const loaded = {
   automation: {
     id: "a1",

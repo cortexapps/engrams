@@ -1,11 +1,19 @@
-/** The canvas's single SVG: loop group boxes, edge paths, then/else labels,
- * and the loop Repeat glyph. Deliberately non-interactive
- * (`pointer-events-none`) — every interactive element (nodes, "+") is HTML
- * layered above, which sidesteps SVG focus and a11y entirely. */
+/** The canvas's single SVG: the dashed lanes (a loop's body, a branch's two
+ * legs), the edge paths, and each lane's label tab. Deliberately
+ * non-interactive (`pointer-events-none`) — every interactive element (nodes,
+ * "+") is HTML layered above, which sidesteps SVG focus and a11y entirely.
+ *
+ * Edges are 1.5px ink at 45%, orthogonal with 8px rounding; the tail run to
+ * the "Add step" node is dashed, as is a loop's back edge. */
 
-import { Repeat } from "lucide-react";
+import { roundedOrthPath, type CanvasLayout, type LayoutGroup } from "./layout";
 
-import { roundedOrthPath, type CanvasLayout } from "./layout";
+const EDGE_STROKE = "color-mix(in oklch, var(--color-foreground) 45%, transparent)";
+const LANE_STROKE = "color-mix(in oklch, var(--color-foreground) 28%, transparent)";
+
+function laneLabel(group: LayoutGroup): string {
+  return group.kind === "loop" ? "repeat until …" : group.kind;
+}
 
 export function EdgeLayer({ layout }: { layout: CanvasLayout }) {
   return (
@@ -23,8 +31,10 @@ export function EdgeLayer({ layout }: { layout: CanvasLayout }) {
             y={group.y}
             width={group.w}
             height={group.h}
-            rx={10}
-            className="fill-muted/30 stroke-border"
+            rx={14}
+            fill="none"
+            stroke={LANE_STROKE}
+            strokeWidth={1}
             strokeDasharray="4 4"
           />
         ))}
@@ -32,40 +42,24 @@ export function EdgeLayer({ layout }: { layout: CanvasLayout }) {
           <path
             key={edge.id}
             d={roundedOrthPath(edge.points)}
-            className={edge.kind === "tail" ? "stroke-border/70" : "stroke-border"}
-            strokeWidth={1.25}
-            strokeDasharray={edge.kind === "loop-back" ? "4 4" : undefined}
+            stroke={EDGE_STROKE}
+            strokeWidth={1.5}
+            strokeDasharray={edge.kind === "tail" || edge.kind === "loop-back" ? "4 4" : undefined}
             fill="none"
           />
         ))}
-        {layout.edges
-          .filter((edge) => edge.label)
-          .map((edge) => {
-            // The label sits above the fan-out's horizontal segment.
-            const fan = edge.points[1]!;
-            const target = edge.points[2] ?? fan;
-            const x = (fan.x + target.x) / 2;
-            return (
-              <text
-                key={`label-${edge.id}`}
-                x={x}
-                y={fan.y - 5}
-                textAnchor="middle"
-                className="fill-muted-foreground font-mono text-2xs"
-              >
-                {edge.label}
-              </text>
-            );
-          })}
       </svg>
+      {/* The lane's label sits on a small `--background` tab over the lane's
+          top-left corner, so it reads as the bracket's caption rather than as
+          a node. HTML, so the type scale applies. */}
       {layout.groups.map((group) => (
         <span
-          key={`repeat-${group.id}`}
-          className="text-muted-foreground pointer-events-none absolute z-10"
-          style={{ left: group.x + 6, top: group.y + group.h - 20 }}
+          key={`label-${group.id}`}
+          className="pointer-events-none absolute z-10 rounded-sm bg-background px-1.5 text-2xs font-semibold leading-4 text-muted-foreground"
+          style={{ left: group.x + 8, top: group.y - 8 }}
           aria-hidden
         >
-          <Repeat className="size-3.5" />
+          {laneLabel(group)}
         </span>
       ))}
     </>

@@ -166,7 +166,6 @@ test.each([
   ["/settings/automations", "/automations"],
   ["/settings/automations/new", "/automations/new"],
   ["/settings/automations/new/manual", "/automations/new/manual"],
-  ["/settings/automations/a1/runs/autorun:a1:manual:x", "/automations/a1/runs/autorun:a1:manual:x"],
 ])("redirects the retired path %s to %s", async (from, to) => {
   const router = makeTestRouter(ADMIN_AUTH, from);
   await router.load();
@@ -175,11 +174,18 @@ test.each([
   expect(decodeURIComponent(router.state.location.pathname)).toBe(to);
 });
 
-test("a retired automation editor link keeps its tab", async () => {
+test("a retired automation editor link keeps its tab, with `runs` now meaning Activity", async () => {
   const router = makeTestRouter(ADMIN_AUTH, "/settings/automations/a1?tab=runs");
   await router.load();
   expect(router.state.location.pathname).toBe("/automations/a1");
-  expect(router.state.location.search).toEqual({ tab: "runs" });
+  expect(router.state.location.search).toEqual({ tab: "activity" });
+});
+
+test("a retired run page link opens that entry on the Activity tab", async () => {
+  const router = makeTestRouter(ADMIN_AUTH, "/automations/a1/runs/autorun:a1:manual:x");
+  await router.load();
+  expect(router.state.location.pathname).toBe("/automations/a1");
+  expect(router.state.location.search).toEqual({ tab: "activity", run: "autorun:a1:manual:x" });
 });
 
 test("a member deep-linking to Automations lands on their profile", async () => {

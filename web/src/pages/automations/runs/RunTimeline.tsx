@@ -3,7 +3,7 @@ import { ChevronRightIcon } from "lucide-react";
 
 import type { AutomationStepRun } from "@/gen/engram/app/v1/automation_pb";
 import { cn } from "@/lib/utils";
-import { RunStatusDot } from "./RunsTab";
+import { RunStatusDot } from "./RunStatusDot";
 import {
   buildTimeline,
   formatDuration,

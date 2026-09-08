@@ -42,14 +42,6 @@ export function useBuiltinAutomation(builtinKey: string) {
   );
 }
 
-export function useAutomationRuns(id: string | undefined, limit = 25) {
-  return useQuery(
-    listRuns,
-    { automationId: id ?? "", limit, includeFiltered: true },
-    { enabled: !!id, staleTime: 5_000 },
-  );
-}
-
 export function useWebhookRegistrations() {
   return useQuery(listWebhookRegistrations, {}, { staleTime: 10_000 });
 }
