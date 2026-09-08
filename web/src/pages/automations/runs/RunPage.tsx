@@ -92,7 +92,7 @@ export function RunPage(props: RunPageProps = {}) {
       const res = await retry.mutateAsync({ runId });
       toast.success("Retry started");
       await navigate({
-        to: "/settings/automations/$id/runs/$runId",
+        to: "/automations/$id/runs/$runId",
         params: { id: automationId, runId: res.runId },
       });
     } catch (err) {
@@ -130,7 +130,7 @@ export function RunPage(props: RunPageProps = {}) {
           <dt className="text-xs text-muted-foreground">Automation</dt>
           <dd>
             <Link
-              to="/settings/automations/$id"
+              to="/automations/$id"
               params={{ id: automationId }}
               className="underline underline-offset-2"
             >

@@ -257,7 +257,7 @@ export function AutomationEditor({
         });
         toast.success("Automation created");
         void navigate({
-          to: "/settings/automations/$id",
+          to: "/automations/$id",
           params: { id: created.automation!.id },
         });
         return;
@@ -295,7 +295,7 @@ export function AutomationEditor({
       const copy = await duplicate.mutateAsync({ automationId: automation.id });
       toast.success("Duplicated — the copy is fully editable");
       void navigate({
-        to: "/settings/automations/$id",
+        to: "/automations/$id",
         params: { id: copy.automation!.id },
       });
     } catch (error) {
@@ -335,7 +335,7 @@ export function AutomationEditor({
     return (
       <div className="space-y-3">
         <p className="text-destructive text-sm">Automation not found.</p>
-        <Link to="/settings/automations" className="text-sm underline">
+        <Link to="/automations" className="text-sm underline">
           Back to automations
         </Link>
       </div>

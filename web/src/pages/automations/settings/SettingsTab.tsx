@@ -167,7 +167,7 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
       return;
     }
     toast.success("Automation archived");
-    void navigate({ to: "/settings/automations" });
+    void navigate({ to: "/automations" });
   };
 
   const onDuplicate = async () => {
@@ -181,7 +181,7 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
     if (copy) {
       toast.success("Duplicated");
       void navigate({
-        to: "/settings/automations/$id",
+        to: "/automations/$id",
         params: { id: copy.id },
         search: { tab: "build" },
       });

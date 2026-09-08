@@ -31,7 +31,7 @@ describe("RedirectToBuiltin", () => {
     await vi.waitFor(() =>
       expect(navigated).toHaveBeenCalledWith(
         expect.objectContaining({
-          to: "/settings/automations/$id",
+          to: "/automations/$id",
           params: { id: "auto-builtin" },
           search: { tab: "inputs" },
           replace: true,

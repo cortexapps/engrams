@@ -33,7 +33,7 @@ repositories a profile lists are cloned into it, and the agent takes it from the
 
 ## Enabling an image
 
-Settings that are not part of the image are entered when you enable it, under Operator →
+Settings that are not part of the image are entered when you enable it, under Settings →
 Images → Enable a new image: a display name, environment variables, a working directory, the
 VM's size, and a warm hook. They describe what the image is. What a session may reach and
 what secrets it holds are session policy, set on the profile, so the same image serves a

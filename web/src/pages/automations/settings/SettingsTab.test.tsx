@@ -188,9 +188,7 @@ describe("SettingsTab", () => {
       ),
     );
     await waitFor(() =>
-      expect(navigate).toHaveBeenCalledWith(
-        expect.objectContaining({ to: "/settings/automations" }),
-      ),
+      expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ to: "/automations" })),
     );
   });
 

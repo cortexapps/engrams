@@ -10,7 +10,7 @@ import {
   DayRunCountSchema,
   type AutomationSummary,
 } from "@/gen/engram/app/v1/automation_pb";
-import { renderWithProviders } from "../../../test-utils";
+import { renderWithProviders } from "../../test-utils";
 import { AutomationsList, orderAutomations } from "./AutomationsList";
 
 const setEnabled = vi.hoisted(() => vi.fn().mockResolvedValue({}));

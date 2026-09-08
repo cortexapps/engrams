@@ -7,7 +7,7 @@ import {
   retryRun,
   stopRun,
 } from "@/gen/engram/app/v1/automation-AutomationRunService_connectquery";
-import { isActiveRunStatus } from "@/pages/settings/automations/runs/run-format";
+import { isActiveRunStatus } from "@/pages/automations/runs/run-format";
 
 export interface RunListOptions {
   includeFiltered?: boolean;

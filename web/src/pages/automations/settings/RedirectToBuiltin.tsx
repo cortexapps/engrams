@@ -22,7 +22,7 @@ export function RedirectToBuiltin({ builtinKey = PR_REVIEW_BUILTIN_KEY }: Redire
   if (automation) {
     return (
       <Navigate
-        to="/settings/automations/$id"
+        to="/automations/$id"
         params={{ id: automation.id }}
         search={{ tab: "inputs" }}
         replace
@@ -36,7 +36,7 @@ export function RedirectToBuiltin({ builtinKey = PR_REVIEW_BUILTIN_KEY }: Redire
         Which repositories get reviews is now an input on the built-in “PR review” automation. This
         deployment has not seeded that automation yet; once it has, this page opens its Inputs tab.
       </p>
-      <Link to="/settings/automations" className="text-sm underline">
+      <Link to="/automations" className="text-sm underline">
         Open Automations
       </Link>
     </div>

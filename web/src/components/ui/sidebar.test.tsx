@@ -80,7 +80,7 @@ const widthVar = (wrapper: HTMLElement) => wrapper.style.getPropertyValue("--sid
 
 test("leaves --sidebar-width at the rem default when nothing is stored", () => {
   const { wrapper } = renderRail();
-  expect(widthVar(wrapper)).toBe("16rem");
+  expect(widthVar(wrapper)).toBe("17rem");
 });
 
 test("restores a stored width in px", () => {
@@ -101,7 +101,7 @@ test("clamps a stored width below the floor", () => {
 
 test("ignores a garbled stored width", () => {
   localStorage.setItem(WIDTH_KEY, "wide please");
-  expect(widthVar(renderRail().wrapper)).toBe("16rem");
+  expect(widthVar(renderRail().wrapper)).toBe("17rem");
 });
 
 test("a drag resizes the rail and persists the width on release", () => {
@@ -150,7 +150,7 @@ test("Home clears the stored width, back to the rem default", () => {
   const { wrapper, handle } = renderRail();
 
   act(() => fireEvent.keyDown(handle, { key: "Home" }));
-  expect(widthVar(wrapper)).toBe("16rem");
+  expect(widthVar(wrapper)).toBe("17rem");
   expect(localStorage.getItem(WIDTH_KEY)).toBeNull();
 });
 
@@ -185,7 +185,7 @@ test("resetting an already-default rail keeps the default", () => {
   const { wrapper, handle } = renderRail();
 
   act(() => fireEvent.keyDown(handle, { key: "Home" }));
-  expect(widthVar(wrapper)).toBe("16rem");
+  expect(widthVar(wrapper)).toBe("17rem");
   expect(localStorage.getItem(WIDTH_KEY)).toBeNull();
 });
 
@@ -194,6 +194,6 @@ test("double-click resets the width", () => {
   const { wrapper, handle } = renderRail();
 
   act(() => fireEvent.doubleClick(handle));
-  expect(widthVar(wrapper)).toBe("16rem");
+  expect(widthVar(wrapper)).toBe("17rem");
   expect(localStorage.getItem(WIDTH_KEY)).toBeNull();
 });

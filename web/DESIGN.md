@@ -262,8 +262,16 @@ never a costume for "technical".
 ## Layout
 
 The shell is a fixed-height frame that clips its own overflow; only the work
-surface scrolls. Left to right: destinations rail (208px), section rail
-(288px for sessions, 256px for the link rails), then the work surface.
+surface scrolls. Left to right: the spine (208px, collapsible to an icon rail),
+the section rail (272px; the Tasks rail is drag-resizable), then the work
+surface. One component, `SectionLayout`, builds that frame for every section;
+a section supplies its rail and its page and nothing else.
+
+The spine holds products only — Tasks, Reviews, Artifacts, Automations — and
+Settings as a normal row at its foot, above the avatar. Everything an admin
+configures (the workspace, the runtime, the fleet, storage, papercuts) is a
+Settings page in one of five flat groups; there is no Operator hat and no
+one-item section.
 
 The work surface sits in an **8px gutter** on all four sides, so the cover shows
 through evenly around it. In the session view it splits into two sheets — the
@@ -378,8 +386,11 @@ the whole app its sentence case.
 
 ### Navigation
 
-- **Destinations rail:** icon plus sentence-case label, 32px rows, 10px radius.
-  Active is a raised wash plus medium weight — never a coloured bar.
+- **Spine:** icon plus sentence-case label, 34px rows, 10px radius. Active is
+  the raised wash, a heavier weight, and a 3×16px lime bar at the spine's edge —
+  the one place lime marks a place rather than an action.
+- **Section rail:** 32px rows, 10px radius, sentence case. Group headers are
+  12px semibold in full ink with an optional mono count on the right.
 - **Session list:** grouped rows on the cover. Group headers are label-weight
   with a count chip, separated by 20px of space and a hairline. A row carries a
   status glyph, a title, an age, and an optional one-line note.
