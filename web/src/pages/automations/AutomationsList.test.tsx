@@ -110,7 +110,7 @@ describe("AutomationsList", () => {
     renderWithProviders(<AutomationsList />);
     const rows = await screen.findAllByTestId("automation-row");
     const tone = (row: HTMLElement) =>
-      within(row).getByTestId("status-dot").getAttribute("data-tone");
+      row.querySelector('[data-slot="status-dot"]')?.getAttribute("data-tone");
     expect(tone(rows[0]!)).toBe("critical"); // PR review: failed
     expect(tone(rows[1]!)).toBe("muted"); // Alpha: never run
     expect(tone(rows[2]!)).toBe("nominal"); // Zeta: completed

@@ -14,6 +14,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { TaskComposer, type TaskComposerState } from "@/components/composer/TaskComposer";
+import { Text } from "@/components/ui/text";
 import { draftAutomation } from "@/gen/engram/app/v1/automation-AutomationService_connectquery";
 
 const SUGGESTIONS = [
@@ -67,17 +68,9 @@ export function ComposePage() {
 
   return (
     <div className="mx-auto max-w-4xl space-y-6 py-8" data-testid="automation-compose">
-      <div className="space-y-2">
-        <p className="text-muted-foreground text-xs font-medium tracking-wide uppercase">
-          New automation
-        </p>
-        <h1 className="text-2xl font-semibold text-balance">What should it do?</h1>
-        <p className="text-muted-foreground max-w-[56ch] text-sm leading-relaxed">
-          Rough is fine. A drafting agent reads the repository and your existing automations, asks
-          when a decision is yours, and assembles the draft in your Builder while you watch. Nothing
-          runs until you enable it.
-        </p>
-      </div>
+      <Text as="h1" variant="display" className="text-2xl">
+        New automation
+      </Text>
 
       <TaskComposer
         key={prefill ?? "blank"}
@@ -91,12 +84,17 @@ export function ComposePage() {
         submitTestId="start-drafting"
       />
 
+      <p className="text-xs text-muted-foreground">
+        A drafting agent reads your repository and assembles the automation while you watch; nothing
+        runs until you turn it on.
+      </p>
+
       <div className="flex flex-wrap gap-2">
         {SUGGESTIONS.map((suggestion) => (
           <button
             key={suggestion}
             type="button"
-            className="text-muted-foreground hover:text-foreground hover:border-ring rounded-full border px-3 py-1 text-xs"
+            className="text-muted-foreground hover:text-foreground hover:border-ring rounded-sm border px-3 py-1 text-xs"
             onClick={() => setPrefill(suggestion)}
           >
             {suggestion}

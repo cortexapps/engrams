@@ -48,7 +48,7 @@ describe("durabilitySummary", () => {
     const safe = durabilitySummary("idle", null, [ckpt({ recoverable: true })]);
     expect(safe).toEqual({
       tone: "nominal",
-      label: "safe · recoverable",
+      label: "Safe · recoverable",
       title: expect.any(String),
     });
 
@@ -64,16 +64,16 @@ describe("durabilitySummary", () => {
       [],
     );
     expect(flushed?.tone).toBe("nominal");
-    expect(flushed?.label.startsWith("work saved ·")).toBe(true);
+    expect(flushed?.label.startsWith("Work saved ·")).toBe(true);
 
     // A recent checkpoint counts as an anchor even with no flush yet.
     const checkpointed = durabilitySummary("active", cow(), [ckpt()]);
-    expect(checkpointed?.label.startsWith("work saved ·")).toBe(true);
+    expect(checkpointed?.label.startsWith("Work saved ·")).toBe(true);
   });
 
   it("flags dirty-but-undurable work as in-flight, calmly (caution, not alarm)", () => {
     const saving = durabilitySummary("active", cow({ dirty_chunks: 3 }), []);
-    expect(saving).toEqual({ tone: "caution", label: "saving…", title: expect.any(String) });
+    expect(saving).toEqual({ tone: "caution", label: "Saving…", title: expect.any(String) });
   });
 
   it("stays silent when there's no live telemetry or nothing written yet", () => {

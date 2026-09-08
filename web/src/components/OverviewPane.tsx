@@ -8,6 +8,7 @@ import {
   RadioTowerIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { EmptyState } from "@/components/empty-state";
 import { usePrRefs } from "../hooks/usePrRefs";
 import type { IndexedEvent } from "../events";
 import type { ProfileSnapshotView, Session } from "../lib/types";
@@ -119,10 +120,7 @@ export function OverviewPane({
         )}
 
         {prRefs.length === 0 ? (
-          <div className="flex items-center gap-3 rounded-lg border border-dashed p-3">
-            <GitPullRequestArrowIcon className="size-4 shrink-0 text-muted-foreground" />
-            <p className="text-sm text-muted-foreground">No pull requests yet.</p>
-          </div>
+          <EmptyState>No pull requests yet.</EmptyState>
         ) : (
           // One card per pull request, not one card holding a list of them —
           // each PR is its own thing to open.

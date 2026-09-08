@@ -1,4 +1,4 @@
-/** Entrypoint switcher (ADR 0119 D9): one pill per way into the automation.
+/** Entrypoint switcher (ADR 0119 D9): one button per way into the automation.
  *
  * The Build tab edits one entrypoint at a time through a projection; this
  * bar owns which one. It renders only when the automation has (or is
@@ -53,16 +53,14 @@ export function EntrypointBar({
 
   return (
     <div className="flex flex-wrap items-center gap-2" data-testid="entrypoint-bar">
-      <span className="text-muted-foreground text-xs font-medium uppercase tracking-wide">
-        Entrypoints
-      </span>
+      <span className="text-xs font-medium text-muted-foreground">Entrypoints</span>
       {ids.map((id) => (
         <span key={id} className="inline-flex items-center">
           <Button
             type="button"
             size="sm"
             variant={id === selected ? "default" : "outline"}
-            className={cn("h-7 rounded-full px-3 text-xs", id !== selected && "font-normal")}
+            className={cn("h-7 rounded-sm px-3 text-xs", id !== selected && "font-normal")}
             onClick={() => onSelect(id)}
             data-testid={`entrypoint-${id}`}
           >

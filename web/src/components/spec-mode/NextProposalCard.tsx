@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import { Text } from "@/components/ui/text";
 import type { NextProposal } from "./spec-surface";
 
@@ -48,9 +49,7 @@ export function NextProposalCard({
 
   return (
     <section className="spec-mode-next" aria-label="Next proposal">
-      <Text as="h2" variant="label" tone="muted">
-        Next — I propose
-      </Text>
+      <h2 className="text-sm font-semibold">Next — I propose</h2>
       <Text className="spec-mode-next-copy">{content.description}</Text>
       {accepted ? null : (
         <div className="spec-mode-next-actions">
@@ -84,12 +83,23 @@ export function NextProposalCard({
         </Text>
       ) : null}
       {failedPrompt ? (
-        <div className="spec-mode-next-error" role="alert">
-          <Text tone="destructive">Next step not sent.</Text>
-          <Button type="button" size="xs" variant="outline" onClick={() => void send(failedPrompt)}>
-            Retry
-          </Button>
-        </div>
+        <EmptyState
+          inline
+          tone="error"
+          className="spec-mode-next-error"
+          action={
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              onClick={() => void send(failedPrompt)}
+            >
+              Retry
+            </Button>
+          }
+        >
+          Next step not sent.
+        </EmptyState>
       ) : null}
     </section>
   );

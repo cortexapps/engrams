@@ -2,13 +2,16 @@ import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { ChevronRightIcon } from "lucide-react";
 
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot } from "@/components/status-dot";
 import type { AutomationRunBrief, FilteredWindow } from "@/gen/engram/app/v1/automation_pb";
 import { useRunList } from "@/hooks/useAutomationRuns";
 import { useInstanceList } from "@/hooks/useInstances";
-import { relativeTime } from "@/pages/sessions/session-format";
+import { relativeTime } from "@/lib/relative-time";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { runStatusTone, toneDotClass } from "@/lib/automations";
+import { runStatusTone } from "@/lib/automations";
 import { cn } from "@/lib/utils";
 import { formatDuration, runStatusLabel, triggerSourceLabel } from "./run-format";
 
@@ -21,15 +24,10 @@ export interface RunsTabProps {
 /** Status dot: form carries the state, so a scan needs no reading. */
 export function RunStatusDot({ status, className }: { status: string; className?: string }) {
   return (
-    <span
-      role="img"
-      aria-label={`status ${runStatusLabel(status)}`}
-      data-tone={runStatusTone(status)}
-      className={cn(
-        "inline-block size-2 shrink-0 rounded-full",
-        toneDotClass(runStatusTone(status)),
-        className,
-      )}
+    <StatusDot
+      tone={runStatusTone(status)}
+      label={`status ${runStatusLabel(status)}`}
+      className={className}
     />
   );
 }
@@ -71,7 +69,7 @@ function WindowRow({ window, now }: { window: FilteredWindow; now: number }) {
         <span>
           {window.count} filtered {window.count === 1 ? "event" : "events"}
         </span>
-        <span className="ml-auto tabular-nums">{relativeTime(window.lastAt, now)} ago</span>
+        <span className="ml-auto tabular-nums">{relativeTime(window.lastAt, now)}</span>
       </button>
       {open && (
         <p className="px-3 pb-2 pl-8">
@@ -122,7 +120,7 @@ function RunRow({
           {formatDuration(run.startedAt, run.endedAt, now)}
         </span>
         <span className="w-16 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-          {relativeTime(run.createdAt, now)} ago
+          {relativeTime(run.createdAt, now)}
         </span>
       </Link>
     </li>
@@ -147,7 +145,7 @@ export function RunList({
   const tick = now();
   if (!runs.data) return null;
   if (runs.data.runs.length === 0) {
-    return <p className="text-muted-foreground text-xs">No runs yet.</p>;
+    return <EmptyState inline>No runs yet.</EmptyState>;
   }
   return (
     <ul className="flex flex-col gap-1" data-testid="workstream-runs">
@@ -179,7 +177,7 @@ export function RunsTab({ automationId, now = Date.now }: RunsTabProps) {
     <section className="flex flex-col gap-3" aria-label="Runs">
       <div className="flex items-center justify-between">
         <p className="text-sm text-muted-foreground">
-          {runs.data ? `${runs.data.runs.length} runs` : "Loading runs…"}
+          {runs.data ? `${runs.data.runs.length} runs` : ""}
         </p>
         <Label className="flex items-center gap-2 text-sm">
           <Switch
@@ -190,10 +188,9 @@ export function RunsTab({ automationId, now = Date.now }: RunsTabProps) {
           Show filtered
         </Label>
       </div>
+      {!runs.data && <SkeletonRows columns={["8px", "96px", "minmax(0,1fr)", "80px", "64px"]} />}
       {runs.data && rows.length === 0 && (
-        <p className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
-          No runs yet. The next trigger occurrence lands here.
-        </p>
+        <EmptyState>No runs yet. The next trigger occurrence lands here.</EmptyState>
       )}
       <ul className="flex flex-col gap-1">
         {rows.map((row) =>

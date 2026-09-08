@@ -36,6 +36,7 @@ import { useEffect, useRef, useState } from "react";
 import { SpecTicketSyncBadge } from "@/pages/specs/SpecTicketSyncBadge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import type { SpecTicket, SpecTicketCommand, SpecTicketTree } from "@/hooks/useSpecTickets";
@@ -166,7 +167,7 @@ export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps)
   return (
     <div className="spec-ticket-tree">
       <header className="spec-ticket-bar">
-        <span className="spec-ticket-count">Tickets · {rows.length}</span>
+        <h2 className="spec-ticket-count">Tickets · {rows.length}</h2>
         <div className="spec-ticket-bar-actions">
           <Button
             variant="outline"
@@ -183,9 +184,9 @@ export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps)
       </header>
 
       {error && (
-        <p className="spec-ticket-error" role="alert">
+        <EmptyState inline tone="error" className="spec-ticket-error">
           {error}
-        </p>
+        </EmptyState>
       )}
 
       <ol className="spec-ticket-rows" aria-label="Ticket tree">

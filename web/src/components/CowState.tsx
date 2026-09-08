@@ -1,6 +1,7 @@
 import { useSessionCowState } from "../hooks/useCowState";
 import { useSession } from "../hooks/useSessions";
-import { fmtAgo, fmtBytes } from "../format";
+import { fmtBytes } from "../format";
+import { relativeTime } from "@/lib/relative-time";
 import { MetricRow } from "./MetricRow";
 
 // ADR 0016 Phase A: per-session COW diagnostic.
@@ -67,7 +68,7 @@ export function SessionCowState({ sessionId }: { sessionId: string }) {
       />
       <MetricRow
         label="rpo"
-        value={`flush ${fmtAgo(state.last_flush_at)}`}
+        value={`flush ${relativeTime(state.last_flush_at)}`}
         title={`last flush ${state.last_flush_at ?? "never"} · last snapshot ${state.last_snapshot_at ?? "never"}`}
       />
     </dl>

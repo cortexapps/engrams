@@ -84,7 +84,7 @@ export function SpecThread({
         if (entry.kind === "phase_change") {
           return (
             <div key={entry.id} className="spec-mode-phase-chip spec-mode-fadein" role="status">
-              <Text as="span" variant="code" tone="muted">
+              <Text as="span" tone="muted" className="text-xs">
                 {entry.requestedBy} started drafting
               </Text>
               <Time value={entry.createdAt} />
@@ -141,7 +141,7 @@ export function SpecThread({
           <div className="spec-mode-human-bubble spec-mode-markdown">
             <Markdown text={message.text} />
           </div>
-          <Text as="span" variant="code" tone="muted" role="status">
+          <Text as="span" tone="muted" className="text-xs" role="status">
             Sending…
           </Text>
         </article>

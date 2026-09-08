@@ -27,6 +27,8 @@ import { ProfileNetworkSchema } from "../../gen/engram/app/v1/profile_pb";
 import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "../page-heading";
 import { OrgSecretCombobox } from "../integrations/OrgSecretCombobox";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -69,6 +71,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { relativeAge } from "@/lib/relative-time";
 
 // Enabled-images panel — Stage D + ADR 0036. Operators curate the OCI URIs
 // sessions may reference. The list reads `GET /api/enabled-images`
@@ -129,21 +132,19 @@ export function ImagesPanel() {
       )}
 
       {error && (
-        <p className="text-sm text-destructive">
-          Could not load enabled images — {errorMessage(error)}
-        </p>
+        <EmptyState tone="error">Could not load enabled images — {errorMessage(error)}</EmptyState>
       )}
 
       {isLoading ? (
-        <p className="py-6 text-sm text-muted-foreground">Loading…</p>
+        <SkeletonRows
+          rows={3}
+          columns={["minmax(12rem,1fr)", "minmax(8rem,1fr)", "8rem", "8rem", "6rem", "6rem"]}
+        />
       ) : visibleJobs.length === 0 && imageRows.length === 0 ? (
-        <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            No images enabled. Build and push an image with{" "}
-            <code className="font-mono">docker build && docker push</code>, then enable its URI
-            here.
-          </CardContent>
-        </Card>
+        <EmptyState>
+          No images enabled. Build and push an image with{" "}
+          <code className="font-mono">docker build && docker push</code>, then enable its URI here.
+        </EmptyState>
       ) : imageRows.length > 0 ? (
         <Table>
           <TableHeader>
@@ -201,7 +202,7 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
         </div>
       </TableCell>
       <TableCell>
-        <Badge variant="outline" className="font-mono text-[0.65rem]" title={row.manifest_digest}>
+        <Badge variant="outline" className="font-mono text-2xs" title={row.manifest_digest}>
           {shortDigest}
         </Badge>
       </TableCell>
@@ -212,7 +213,7 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
         className="font-mono text-xs text-muted-foreground"
         title={new Date(row.last_refreshed_at).toLocaleString()}
       >
-        {timeAgo(row.last_refreshed_at)}
+        {relativeAge(row.last_refreshed_at)}
       </TableCell>
       <TableCell>
         <div className="flex items-center justify-end gap-2">
@@ -256,14 +257,14 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
           </AlertDialog>
         </div>
         {refresh.error && (
-          <p className="mt-1 text-right text-xs text-destructive">
+          <EmptyState tone="error" inline className="mt-1 items-end text-right">
             Could not refresh — {errorMessage(refresh.error)}
-          </p>
+          </EmptyState>
         )}
         {del.error && (
-          <p className="mt-1 text-right text-xs text-destructive">
+          <EmptyState tone="error" inline className="mt-1 items-end text-right">
             Could not disable — {errorMessage(del.error)}
-          </p>
+          </EmptyState>
         )}
       </TableCell>
     </TableRow>
@@ -282,7 +283,7 @@ function CaptureEnvCell({ entries }: { entries: EnabledImageSummary["capture_env
       {entries.map((v) => (
         <div key={v.name} className="flex items-center gap-1.5">
           <code className="font-mono whitespace-nowrap">{v.name}</code>
-          <Badge variant="outline" className="text-[0.6rem]">
+          <Badge variant="outline" className="text-2xs">
             {v.kind === "secret_ref" ? "ref" : "literal"}
           </Badge>
           <span className="truncate text-muted-foreground" title={v.value}>
@@ -819,7 +820,7 @@ function EnableImageDialog({
                 save, no recapture.
               </FieldDescription>
               {envArray.fields.length === 0 ? (
-                <p className="text-xs text-muted-foreground">No image env vars.</p>
+                <EmptyState inline>No image env vars.</EmptyState>
               ) : (
                 <div className="space-y-2">
                   {envArray.fields.map((f, i) => (
@@ -1033,7 +1034,7 @@ function EnableImageDialog({
                   org-secret ref resolved server-side at capture (names only — never values).
                 </FieldDescription>
                 {fields.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">No warm env vars.</p>
+                  <EmptyState inline>No warm env vars.</EmptyState>
                 ) : (
                   <div className="space-y-2">
                     {fields.map((f, i) => (
@@ -1125,7 +1126,7 @@ function EnableImageDialog({
               allow_recapture=true. */}
           {pendingRecapture && (
             <div className="mt-4 space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
-              <p className="text-sm font-medium text-destructive">
+              <p className="text-sm font-medium text-foreground">
                 This edit changes capture-affecting fields
               </p>
               <p className="font-mono text-xs text-muted-foreground">{pendingRecapture.reason}</p>
@@ -1285,7 +1286,7 @@ function StageTimeline({
   }
   return (
     <div className="flex flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
-      <span className="text-[0.7rem] font-medium">{label}</span>
+      <span className="text-2xs font-medium">{label}</span>
       {stages.map((s, i) => {
         const open = s.ended_at === null;
         const d = stageDurationMs(s);
@@ -1429,7 +1430,11 @@ function EnableJobRow({
           />
           <StageTimeline label="warm" stages={warmStages} reference={refWarm} jobFailed={failed} />
           {pct !== null && !failed && <Progress value={pct} className="h-1 max-w-md" />}
-          {failed && job.error && <p className="text-xs text-destructive">{job.error}</p>}
+          {failed && job.error && (
+            <EmptyState tone="error" inline>
+              {job.error}
+            </EmptyState>
+          )}
           {failed && job.warm_stage && (
             <p className="text-xs text-muted-foreground">
               failed at warm stage <span className="font-mono">{job.warm_stage}</span>
@@ -1460,19 +1465,4 @@ function EnableJobRow({
       </Card>
     </li>
   );
-}
-
-function timeAgo(iso: string): string {
-  const then = new Date(iso).getTime();
-  const now = Date.now();
-  if (Number.isNaN(then)) return iso;
-  const seconds = Math.max(0, Math.floor((now - then) / 1000));
-  if (seconds < 60) return "just now";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  return new Date(iso).toLocaleDateString();
 }

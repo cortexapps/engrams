@@ -1,9 +1,12 @@
 import { useStorageSummary } from "../hooks/useStorageSummary";
-import { fmtAgo, fmtBytes, secondsSince, shortId } from "../format";
+import { fmtBytes, secondsSince, shortId } from "../format";
 import { PageHeading } from "../components/page-heading";
 import { StatReadout } from "../components/stat-readout";
-import { Text } from "@/components/ui/text";
-import { Progress } from "@/components/ui/progress";
+import { EmptyState } from "@/components/empty-state";
+import { localityTone, Meter } from "@/components/meter";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot } from "@/components/status-dot";
+import { relativeTime } from "@/lib/relative-time";
 import {
   Table,
   TableBody,
@@ -13,6 +16,13 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import type { DurabilityRow } from "../lib/types";
+
+/** The flush window: a sandbox whose last flush is older than this has dirty
+ * chunks at risk, so its last-flush reading turns caution. Recency is not the
+ * signal — a flush ten seconds ago is good news, not an alarm. */
+const FLUSH_WINDOW_SECS = 60;
+
+const LEDGER_COLUMNS = ["minmax(0, 1.6fr)", "120px", "90px", "110px", "190px", "100px"];
 
 export function Storage() {
   const { data, isPending, error } = useStorageSummary();
@@ -34,9 +44,7 @@ export function Storage() {
 
       <div>
         <div className="mb-2 flex items-baseline justify-between">
-          <Text as="h2" variant="label" tone="muted">
-            Durability ledger
-          </Text>
+          <h2 className="text-sm font-semibold">Durability ledger</h2>
           <span className="font-mono text-xs tabular-nums text-muted-foreground">
             {rows.length}
           </span>
@@ -62,21 +70,29 @@ export function Storage() {
                 Base locality
               </TableHead>
               <TableHead className="text-right" title="Time since the last flush.">
-                RPO
+                Last flush
               </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {error ? (
               <TableRow>
-                <TableCell colSpan={6} className="text-sm text-destructive">
-                  {(error as Error).message}
+                <TableCell colSpan={6}>
+                  <EmptyState inline tone="error">
+                    Couldn’t load the ledger. {(error as Error).message}
+                  </EmptyState>
+                </TableCell>
+              </TableRow>
+            ) : isPending ? (
+              <TableRow>
+                <TableCell colSpan={6}>
+                  <SkeletonRows rows={4} columns={LEDGER_COLUMNS} />
                 </TableCell>
               </TableRow>
             ) : rows.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={6} className="text-sm text-muted-foreground">
-                  {isPending ? "Loading…" : "No chunk-tracked sandboxes"}
+                <TableCell colSpan={6}>
+                  <EmptyState inline>No chunk-tracked sandboxes.</EmptyState>
                 </TableCell>
               </TableRow>
             ) : (
@@ -92,7 +108,14 @@ export function Storage() {
 function LedgerRow({ row }: { row: DurabilityRow }) {
   const pct =
     row.base_chunks > 0 ? Math.round((row.base_chunks_local / row.base_chunks) * 100) : null;
-  const rpoHot = secondsSince(row.last_flush_at) <= 10;
+  // Staleness, not recency: inside the window is nominal, past it is caution,
+  // and a sandbox that has never flushed has nothing to judge yet.
+  const flushTone =
+    row.last_flush_at === null
+      ? "muted"
+      : secondsSince(row.last_flush_at) <= FLUSH_WINDOW_SECS
+        ? "nominal"
+        : "caution";
   return (
     <TableRow>
       <TableCell className="font-mono text-sm">
@@ -110,15 +133,16 @@ function LedgerRow({ row }: { row: DurabilityRow }) {
           "—"
         ) : (
           <span className="flex items-center gap-2">
-            <Progress value={pct} className="h-1.5 w-16" />
+            <Meter value={pct} tone={localityTone(pct)} label="base locality" className="w-16" />
             <span className="font-mono text-xs tabular-nums">{pct}%</span>
           </span>
         )}
       </TableCell>
-      <TableCell
-        className={`text-right font-mono text-xs tabular-nums ${rpoHot ? "text-destructive" : "text-muted-foreground"}`}
-      >
-        {fmtAgo(row.last_flush_at)}
+      <TableCell className="text-right">
+        <span className="inline-flex items-center gap-1.5 font-mono text-xs tabular-nums text-muted-foreground">
+          <StatusDot tone={flushTone} size={6} />
+          {relativeTime(row.last_flush_at)}
+        </span>
       </TableCell>
     </TableRow>
   );

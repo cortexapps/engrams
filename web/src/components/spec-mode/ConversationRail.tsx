@@ -4,6 +4,7 @@ import { toast } from "sonner";
 
 import { interrupt as interruptMethod } from "@/gen/engram/app/v1/session-SessionService_connectquery";
 import { Text } from "@/components/ui/text";
+import { StatusDot } from "@/components/status-dot";
 import { useSendSpecMessage, type SpecMessage } from "@/hooks/useSpecMessages";
 import { NextProposalCard } from "./NextProposalCard";
 import { SpecComposer } from "./SpecComposer";
@@ -116,10 +117,8 @@ export function ConversationRail({
   return (
     <>
       <header className="spec-mode-conversation-header">
-        <Text as="h2" variant="label" tone="muted">
-          Conversation
-        </Text>
-        <Text as="span" variant="code" tone="muted">
+        <h2 className="text-sm font-semibold">Conversation</h2>
+        <Text as="span" tone="muted" className="text-xs">
           {participantSummary(presence)}
         </Text>
       </header>
@@ -132,7 +131,8 @@ export function ConversationRail({
         onStop={stopRun}
       />
       {conversation.hasError ? (
-        <Text as="div" className="spec-mode-conversation-warning" tone="destructive" role="status">
+        <Text as="div" className="spec-mode-conversation-warning" role="status">
+          <StatusDot tone="caution" size={6} />
           Conversation updates are reconnecting.
         </Text>
       ) : null}

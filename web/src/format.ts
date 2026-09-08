@@ -14,19 +14,6 @@ export function fmtBytes(n: number): string {
   return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
 }
 
-/** "Xs ago" / "Xm ago" / … from an ISO-8601 timestamp; `never` for null. */
-export function fmtAgo(iso: string | null): string {
-  if (!iso) return "never";
-  const then = new Date(iso).getTime();
-  const seconds = Math.max(0, Math.floor((Date.now() - then) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.floor(hours / 24)}d ago`;
-}
-
 /** Seconds since `iso` (for thresholding); `Infinity` for null. */
 export function secondsSince(iso: string | null): number {
   if (!iso) return Infinity;

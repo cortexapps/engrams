@@ -68,7 +68,7 @@ function CapKeys({ cap }: { cap: Cap }) {
       <KbdGroup>
         {cap.keys.map((k, i) => (
           <Fragment key={i}>
-            {i > 0 && <span className="text-[0.7rem] text-muted-foreground/70">then</span>}
+            {i > 0 && <span className="text-2xs text-muted-foreground/70">then</span>}
             <Kbd>{k}</Kbd>
           </Fragment>
         ))}
@@ -83,7 +83,7 @@ function CapKeys({ cap }: { cap: Cap }) {
       <KbdGroup>
         <Kbd>{mod}</Kbd>
         <Kbd>{a}</Kbd>
-        <span className="text-[0.7rem] text-muted-foreground/70">{sep}</span>
+        <span className="text-2xs text-muted-foreground/70">{sep}</span>
         <Kbd>{mod}</Kbd>
         <Kbd>{b}</Kbd>
       </KbdGroup>

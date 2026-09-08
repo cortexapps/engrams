@@ -19,6 +19,7 @@ import { ModeChip } from "@/components/ModeChip";
 import { ProviderTile } from "@/components/integrations/ProviderTile";
 import { catalogToViews } from "@/components/integrations/useConnectorViews";
 import { ProfileIcon } from "@/components/profiles/ProfileIcon";
+import { EmptyState } from "@/components/empty-state";
 import {
   InlineUploadComposer,
   type InlineUploadComposerHandle,
@@ -38,7 +39,6 @@ import {
 } from "@/components/ui/command";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Text } from "@/components/ui/text";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCredentials } from "@/hooks/useCredentials";
 import { useEnabledImages } from "@/hooks/useEnabledImages";
@@ -380,7 +380,7 @@ export function TaskComposer({
       )}
 
       <div
-        className="@container/composer rounded-xl border bg-card shadow-sm transition-[color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/40"
+        className="@container/composer rounded-lg border bg-card transition-[color,box-shadow] focus-within:border-ring focus-within:shadow-[0_0_0_3px_color-mix(in_oklch,var(--ring)_22%,transparent)]"
         onDragOver={(event) => event.preventDefault()}
         onDrop={(event) => {
           event.preventDefault();
@@ -401,7 +401,7 @@ export function TaskComposer({
           onKeyDown={onComposerKeyDown}
           ariaLabel={ariaLabel}
           placeholder={placeholder}
-          className="max-h-[calc(10lh+1.125rem)] min-h-[5.25rem] px-4 pt-3.5 pb-1 text-[0.95rem] leading-relaxed md:text-[0.95rem]"
+          className="max-h-[calc(10lh+1.125rem)] min-h-[5.25rem] px-4 pt-3.5 pb-1 text-base leading-relaxed md:text-base"
         />
         <div className="flex flex-col gap-2 px-2.5 pt-1 pb-2.5 @md/composer:flex-row @md/composer:items-end">
           <div className="flex flex-wrap items-center gap-2 @md/composer:min-w-0 @md/composer:flex-1">
@@ -485,7 +485,7 @@ export function TaskComposer({
             {!pending && (
               <kbd
                 aria-hidden
-                className="ml-0.5 hidden items-center gap-0.5 rounded border border-primary-foreground/25 px-1 font-sans text-[0.65rem] font-medium tracking-normal text-primary-foreground/80 normal-case sm:inline-flex"
+                className="ml-0.5 hidden items-center gap-0.5 rounded border border-primary-foreground/25 px-1 font-sans text-2xs font-medium tracking-normal text-primary-foreground/80 normal-case sm:inline-flex"
               >
                 {!enterToSend && MOD_LABEL}
                 <CornerDownLeft className="size-3" />
@@ -505,16 +505,18 @@ export function TaskComposer({
 
       {noProfiles &&
         (isAdmin ? (
-          <p className="text-sm text-muted-foreground">
-            No profiles yet.{" "}
-            <Link to="/settings/profiles/new" className="underline underline-offset-4">
-              Create your first profile →
-            </Link>
-          </p>
+          <EmptyState
+            inline
+            action={
+              <Button asChild variant="outline" size="sm">
+                <Link to="/settings/profiles/new">Create your first profile →</Link>
+              </Button>
+            }
+          >
+            No profiles yet.
+          </EmptyState>
         ) : (
-          <p className="text-sm text-muted-foreground">
-            No profiles configured — ask an admin to set one up.
-          </p>
+          <EmptyState inline>No profiles configured — ask an admin to set one up.</EmptyState>
         ))}
     </div>
   );
@@ -635,7 +637,7 @@ function PolicyReceipt({
     >
       <CollapsibleTrigger className="flex w-full items-center gap-2 px-3 py-2.5 text-left transition-colors hover:bg-accent/50 focus-visible:ring-[3px] focus-visible:ring-ring/40 focus-visible:outline-none">
         <ShieldCheck className="size-3.5 shrink-0 text-instrument-nominal" />
-        <span className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 text-[0.78rem]">
+        <span className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 text-xs">
           <span className="text-muted-foreground">This session can reach</span>
           {policy.providers.length > 0 && (
             <span className="flex items-center gap-1">
@@ -650,12 +652,12 @@ function PolicyReceipt({
             </span>
           )}
           {policy.capCount > 0 && (
-            <span className="font-mono text-[0.7rem] text-muted-foreground">
+            <span className="font-mono text-2xs text-muted-foreground">
               {policy.capCount} {policy.capCount === 1 ? "power" : "powers"}
             </span>
           )}
           {policy.reachable.length > 0 && (
-            <span className="text-[0.7rem] text-muted-foreground">
+            <span className="text-2xs text-muted-foreground">
               {policy.reachable.length} {policy.reachable.length === 1 ? "host" : "hosts"}
             </span>
           )}
@@ -674,9 +676,9 @@ function PolicyReceipt({
             <div key={provider.view.provider} className="flex flex-col gap-1">
               <div className="flex items-center gap-2">
                 <ProviderTile {...provider.view.icon} name={provider.view.name} size={16} />
-                <span className="text-[0.78rem] font-semibold">{provider.view.name}</span>
+                <span className="text-xs font-semibold">{provider.view.name}</span>
                 {userScopedProviders.has(provider.view.provider) && (
-                  <span className="rounded-sm bg-secondary px-1.5 py-0.5 text-[0.66rem] text-muted-foreground">
+                  <span className="rounded-sm bg-secondary px-1.5 py-0.5 text-2xs text-muted-foreground">
                     uses your credential
                   </span>
                 )}
@@ -688,7 +690,7 @@ function PolicyReceipt({
                   ) : (
                     <Eye className="size-3 text-muted-foreground" />
                   )}
-                  <span className="text-[0.76rem] text-muted-foreground">
+                  <span className="text-xs text-muted-foreground">
                     {humanizeAction(capability.action)}
                   </span>
                 </div>
@@ -702,14 +704,12 @@ function PolicyReceipt({
                 policy.providers.length > 0 && "border-t pt-2.5",
               )}
             >
-              <Text variant="label" tone="muted" className="text-[0.6rem]">
-                Reaches
-              </Text>
+              <h3 className="text-sm font-semibold">Reaches</h3>
               <div className="flex flex-wrap gap-1.5">
                 {policy.reachable.map((host) => (
                   <span
                     key={host}
-                    className="rounded-full border bg-secondary px-2 py-px font-mono text-[0.68rem]"
+                    className="rounded-sm border bg-secondary px-2 py-px font-mono text-2xs"
                   >
                     {host}
                   </span>
@@ -718,7 +718,7 @@ function PolicyReceipt({
             </div>
           )}
           {imageName && (
-            <span className="font-mono text-[0.7rem] text-muted-foreground">boots {imageName}</span>
+            <span className="font-mono text-2xs text-muted-foreground">Boots {imageName}</span>
           )}
         </div>
       </CollapsibleContent>

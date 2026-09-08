@@ -14,7 +14,9 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot } from "@/components/status-dot";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -42,13 +44,13 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
   const connection = connections.data?.connections.find((entry) => entry.id === connectionId);
 
   if (connections.isLoading) {
-    return <p className="py-6 text-sm text-muted-foreground">Loading Google Cloud setup…</p>;
+    return <SkeletonRows rows={3} />;
   }
   if (!connection || connection.provider !== "gcp") {
     return (
       <div className="mx-auto max-w-3xl">
         <BackToGoogleCloud />
-        <p className="mt-4 text-sm text-muted-foreground">Google Cloud connection not found.</p>
+        <EmptyState className="mt-4">Google Cloud connection not found.</EmptyState>
       </div>
     );
   }
@@ -83,9 +85,10 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h1 className="text-2xl font-semibold">Set up {connection.displayName}</h1>
-              <Badge variant={enabled ? "default" : "secondary"}>
+              <span className="inline-flex items-center gap-1.5 text-xs">
+                <StatusDot tone={enabled ? "nominal" : "muted"} size={6} />
                 {enabled ? "Enabled" : tested ? "Tested" : "Setup required"}
-              </Badge>
+              </span>
             </div>
             <p className="mt-1 text-sm text-muted-foreground">
               Apply one configuration in Google Cloud, then verify and enable this connection.
@@ -133,10 +136,7 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
                 <dt className="text-muted-foreground">Allowed APIs</dt>
                 <dd className="mt-2 flex flex-wrap gap-1.5">
                   {connection.googleCloud?.endpoints.map((endpoint) => (
-                    <span
-                      key={endpoint}
-                      className="rounded border px-1.5 py-1 font-mono text-[10px]"
-                    >
+                    <span key={endpoint} className="rounded border px-1.5 py-1 font-mono text-2xs">
                       {endpoint}
                     </span>
                   ))}

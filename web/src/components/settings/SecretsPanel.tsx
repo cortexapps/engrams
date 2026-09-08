@@ -5,9 +5,10 @@ import * as z from "zod";
 import { useOrgSecrets, usePutOrgSecret, useDeleteOrgSecret } from "../../hooks/useOrgSecrets";
 import type { OrgSecretMeta } from "../../gen/engram/app/v1/org_secret_pb";
 import { PageHeading } from "../page-heading";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -38,6 +39,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { relativeAge } from "@/lib/relative-time";
 
 // Org secrets (ADR 0057 C0) — the admin-managed, KEK-sealed value store that
 // profile secrets, integration inject credentials, and the GitHub App mint key
@@ -57,19 +59,18 @@ export function SecretsPanel() {
         actions={<SecretDialog />}
       />
 
-      {error && (
-        <p className="text-sm text-destructive">Could not load secrets — {String(error)}</p>
-      )}
+      {error && <EmptyState tone="error">Could not load secrets — {String(error)}</EmptyState>}
 
       {isLoading ? (
-        <p className="py-6 text-sm text-muted-foreground">Loading…</p>
+        <SkeletonRows
+          rows={3}
+          columns={["minmax(12rem,1fr)", "minmax(8rem,1fr)", "6rem", "6rem"]}
+        />
       ) : rows.length === 0 ? (
-        <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            No org secrets yet. Add one, then reference it by name from a profile's secrets or an
-            integration's credential.
-          </CardContent>
-        </Card>
+        <EmptyState>
+          No org secrets yet. Add one, then reference it by name from a profile's secrets or an
+          integration's credential.
+        </EmptyState>
       ) : (
         <Table>
           <TableHeader>
@@ -103,7 +104,7 @@ function SecretRow({ row }: { row: OrgSecretMeta }) {
         className="font-mono text-xs text-muted-foreground"
         title={row.updatedAt ? new Date(row.updatedAt).toLocaleString() : undefined}
       >
-        {row.updatedAt ? timeAgo(row.updatedAt) : "—"}
+        {relativeAge(row.updatedAt)}
       </TableCell>
       <TableCell>
         <div className="flex items-center justify-end gap-1">
@@ -132,9 +133,9 @@ function SecretRow({ row }: { row: OrgSecretMeta }) {
           </AlertDialog>
         </div>
         {del.error && (
-          <p className="mt-1 text-right text-xs text-destructive">
+          <EmptyState tone="error" inline className="mt-1 items-end text-right">
             Could not remove — {String(del.error)}
-          </p>
+          </EmptyState>
         )}
       </TableCell>
     </TableRow>
@@ -267,19 +268,4 @@ function SecretDialog({ existingName }: { existingName?: string }) {
       </DialogContent>
     </Dialog>
   );
-}
-
-function timeAgo(iso: string): string {
-  const then = new Date(iso).getTime();
-  const now = Date.now();
-  if (Number.isNaN(then)) return iso;
-  const seconds = Math.max(0, Math.floor((now - then) / 1000));
-  if (seconds < 60) return "just now";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  return new Date(iso).toLocaleDateString();
 }

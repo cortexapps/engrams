@@ -30,6 +30,8 @@ import { ProviderTile } from "../../components/integrations/ProviderTile";
 import { derivePolicy } from "../../lib/profilePolicy";
 import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import { PageHeading } from "../../components/page-heading";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -65,7 +67,7 @@ interface ProfileLike {
 function Meta({ icon, text, caution }: { icon: React.ReactNode; text: string; caution?: boolean }) {
   return (
     <span
-      className={`inline-flex items-center gap-1 text-[0.74rem] ${caution ? "text-instrument-caution" : "text-muted-foreground"}`}
+      className={`inline-flex items-center gap-1 text-xs ${caution ? "text-instrument-caution" : "text-muted-foreground"}`}
     >
       {icon}
       {text}
@@ -116,7 +118,7 @@ function Row({
           <span className="text-base font-semibold">{p.name}</span>
           {p.archived && <Badge variant="secondary">archived</Badge>}
         </div>
-        <div className="truncate text-[0.82rem] text-muted-foreground">{p.description}</div>
+        <div className="truncate text-sm text-muted-foreground">{p.description}</div>
         <div className="mt-2 flex flex-wrap items-center gap-3.5">
           {policy.providers.length > 0 ? (
             <span className="inline-flex items-center gap-1">
@@ -130,7 +132,7 @@ function Row({
               ))}
             </span>
           ) : (
-            <span className="text-[0.74rem] text-muted-foreground">no integrations</span>
+            <span className="text-xs text-muted-foreground">no integrations</span>
           )}
           <Meta
             icon={<ZapIcon className="size-3 opacity-75" />}
@@ -159,7 +161,7 @@ function Row({
 
   return (
     <div
-      className="flex items-center gap-4 rounded-lg border bg-card p-4 shadow-xs"
+      className="flex items-center gap-4 rounded-lg border bg-card p-4"
       data-testid={`profile-${p.id}`}
     >
       {p.archived ? (
@@ -251,14 +253,17 @@ export function SessionProfiles() {
         }
       />
 
-      {isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
+      {isPending && <SkeletonRows rows={3} />}
       {!isPending && active.length === 0 && (
-        <div className="rounded-lg border border-dashed p-8 text-center">
-          <p className="text-sm text-muted-foreground">No profiles yet</p>
-          <Button asChild className="mt-3">
-            <Link to="/settings/profiles/new">Create profile</Link>
-          </Button>
-        </div>
+        <EmptyState
+          action={
+            <Button asChild>
+              <Link to="/settings/profiles/new">Create profile</Link>
+            </Button>
+          }
+        >
+          No profiles yet.
+        </EmptyState>
       )}
 
       <div className="flex flex-col gap-3">

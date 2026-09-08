@@ -83,7 +83,7 @@ function BlockResult({ block, tally }: { block: BlockRenderResult; tally?: Filte
         {tally ? <TallyPill tally={tally} /> : null}
       </div>
       <CollapsibleContent>
-        <pre className="bg-muted max-h-64 overflow-auto rounded-md p-2 font-mono text-[11px] leading-snug">
+        <pre className="bg-muted max-h-64 overflow-auto rounded-md p-2 font-mono text-2xs leading-snug">
           {JSON.stringify(block.rendered, null, 2)}
         </pre>
       </CollapsibleContent>

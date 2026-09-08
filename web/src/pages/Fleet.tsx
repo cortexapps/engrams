@@ -4,9 +4,11 @@ import { useDrainHost } from "../hooks/useDrainHost";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { PageHeading } from "../components/page-heading";
 import { StatReadout } from "../components/stat-readout";
+import { EmptyState } from "@/components/empty-state";
+import { Meter } from "@/components/meter";
+import { StatusDot, type StatusTone } from "@/components/status-dot";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -21,14 +23,28 @@ import {
 import { cn } from "@/lib/utils";
 import type { HostStatus, HostView, SessionListItem } from "../lib/types";
 
-const statusVariant = (s: HostStatus) =>
-  s === "ready" ? "default" : s === "draining" ? "secondary" : "destructive";
+// Host state is a dot and a word, never a lime or red fill: lime means "you
+// can do this", and a filled red badge shouts over the rest of the row.
+const STATUS_TONE: Record<HostStatus, StatusTone> = {
+  ready: "nominal",
+  draining: "caution",
+  dead: "critical",
+};
+
+function HostStatusWord({ status }: { status: HostStatus }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs">
+      <StatusDot tone={STATUS_TONE[status]} />
+      {status}
+    </span>
+  );
+}
 
 // One labelled utilization meter (disk / mem / cpu). For disk + mem
 // pass `usedMib`/`totalMib` and the readout shows GiB; for cpu pass
-// `pct` directly. The fill turns destructive past 80% — the "this host
-// is about to fall over" threshold an operator scans for.
-function Meter({
+// `pct` directly. The fill steps through the product's usage thresholds
+// (caution from 70%, critical from 90%) — see components/meter.tsx.
+function UtilMeter({
   label,
   usedMib,
   totalMib,
@@ -42,7 +58,6 @@ function Meter({
   const ratio =
     pct !== undefined ? pct : totalMib && totalMib > 0 ? ((usedMib ?? 0) / totalMib) * 100 : 0;
   const shown = Math.min(100, Math.max(0, Math.round(ratio)));
-  const hot = shown >= 80;
   const known = pct !== undefined || (totalMib ?? 0) > 0;
   const readout =
     pct !== undefined
@@ -52,10 +67,8 @@ function Meter({
         : "—";
   return (
     <div className="flex items-center gap-3" title={`${label}: ${shown}%`}>
-      <span className="w-10 shrink-0 text-[0.72rem] font-medium text-muted-foreground">
-        {label}
-      </span>
-      <Progress value={shown} className="h-2" indicatorClassName={cn(hot && "bg-destructive")} />
+      <span className="w-10 shrink-0 text-xs font-medium text-muted-foreground">{label}</span>
+      <Meter value={known ? shown : null} label={label} />
       <span className="w-24 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground">
         {readout}
       </span>
@@ -87,13 +100,7 @@ export function Fleet() {
         count={h.length ? `${h.length} host${h.length === 1 ? "" : "s"}` : undefined}
         actions={
           <span className="flex items-center gap-2 text-sm text-muted-foreground">
-            <span
-              aria-hidden
-              className={cn(
-                "size-2 rounded-full",
-                anyDraining ? "bg-instrument-caution" : "bg-instrument-nominal",
-              )}
-            />
+            <StatusDot tone={anyDraining ? "caution" : "nominal"} />
             {anyDraining ? "Reconciler rebalancing" : "Reconciler steady"}
           </span>
         }
@@ -109,11 +116,7 @@ export function Fleet() {
       />
 
       {h.length === 0 ? (
-        <div className="rounded-lg border border-dashed p-8 text-center">
-          <p className="text-sm text-muted-foreground">
-            No hosts registered. A host appears here after its first heartbeat.
-          </p>
-        </div>
+        <EmptyState>No hosts registered. A host appears here after its first heartbeat.</EmptyState>
       ) : (
         <div className="space-y-3">
           {h.map((host) => (
@@ -149,16 +152,17 @@ function HostCard({
       <CardHeader className="flex flex-row items-center justify-between gap-3 space-y-0">
         <CardTitle className="font-mono text-base">{host.id}</CardTitle>
         <div className="flex items-center gap-3">
-          <Badge variant={statusVariant(host.status)}>{host.status}</Badge>
+          <HostStatusWord status={host.status} />
           {host.failing_capabilities.length > 0 && (
-            <Badge
-              variant="destructive"
+            <span
+              className="inline-flex items-center gap-1.5 text-xs"
               title={`Failing capabilities: ${host.failing_capabilities.join(", ")}`}
             >
+              <StatusDot tone="critical" />
               {host.failing_capabilities.length === 1
                 ? host.failing_capabilities[0]
                 : `${host.failing_capabilities.length} caps failing`}
-            </Badge>
+            </span>
           )}
           {/* ADR 0068: schema 0 means this host has never reported a
               capability vector (pre-0068 row, or mid-roll) — the soft-pass
@@ -216,7 +220,7 @@ function HostCard({
       </CardHeader>
       <CardContent className="space-y-3">
         {host.running_sandboxes === 0 ? (
-          <p className="text-sm text-muted-foreground">No sandboxes.</p>
+          <EmptyState inline>No sandboxes.</EmptyState>
         ) : (
           <div className="flex flex-wrap gap-1" aria-label={`${host.running_sandboxes} sandboxes`}>
             {Array.from({ length: host.running_sandboxes }, (_, i) => (
@@ -226,20 +230,25 @@ function HostCard({
                   "size-2.5 rounded-[3px]",
                   // Running sandboxes take the app's "active" tone, not lime —
                   // these are status, and lime means something you can do.
-                  i < live ? "bg-ring" : "bg-muted-foreground/35",
+                  // Parked ones are the hairline colour: present, not lit.
+                  i < live ? "bg-ring" : "bg-border",
                 )}
               />
             ))}
           </div>
         )}
         <div className="space-y-2">
-          <Meter
+          <UtilMeter
             label="disk"
             usedMib={host.util_disk_used_mib}
             totalMib={host.util_disk_total_mib}
           />
-          <Meter label="mem" usedMib={host.util_mem_used_mib} totalMib={host.util_mem_total_mib} />
-          <Meter label="cpu" pct={host.util_cpu_pct} />
+          <UtilMeter
+            label="mem"
+            usedMib={host.util_mem_used_mib}
+            totalMib={host.util_mem_total_mib}
+          />
+          <UtilMeter label="cpu" pct={host.util_cpu_pct} />
         </div>
         <div className="font-mono text-xs text-muted-foreground">
           {host.running_sandboxes} sandboxes

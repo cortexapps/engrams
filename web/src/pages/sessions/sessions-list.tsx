@@ -2,10 +2,12 @@ import type { ComponentPropsWithoutRef, ReactNode, Ref, RefObject } from "react"
 import { Link } from "@tanstack/react-router";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { StatusGlyph } from "../../components/Glyph";
 import type { SessionListItem } from "../../lib/types";
-import { relativeTime, shortId, statusLabel } from "./session-format";
+import { shortId, statusLabel } from "./session-format";
+import { relativeAge } from "@/lib/relative-time";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
 import { useNow } from "../../hooks/useNow";
 
@@ -44,24 +46,14 @@ export function SessionsList({
   if (isPending) return <SkeletonRows />;
   if (error && sessions.length === 0) {
     return (
-      <div role="alert" className="rounded-lg border border-dashed py-12 text-center">
-        <p className="text-sm text-destructive">
-          Couldn’t load tasks.{error instanceof Error ? ` ${error.message}` : ""}
-        </p>
-      </div>
+      <EmptyState tone="error">
+        Couldn’t load tasks.{error instanceof Error ? ` ${error.message}` : ""}
+      </EmptyState>
     );
   }
 
   if (sessions.length === 0) {
-    return (
-      <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-16 text-center">
-        <span className="text-xl leading-none text-muted-foreground">
-          <StatusGlyph status="idle" beat={false} />
-        </span>
-        <p className="max-w-sm text-sm text-muted-foreground">{emptyText}</p>
-        {emptyAction}
-      </div>
-    );
+    return <EmptyState action={emptyAction}>{emptyText}</EmptyState>;
   }
 
   return <SessionRows sessions={sessions} showOwner={showOwner} scrollRef={scrollRef} />;
@@ -111,27 +103,6 @@ export function SessionRows({
   );
 }
 
-// First-load placeholder: the row silhouette, not a spinner, so the list keeps
-// its shape while the fetch resolves (mirrors the rail's skeleton behaviour).
-export function SkeletonRows() {
-  return (
-    <div role="status" aria-label="Loading tasks">
-      <ul className="divide-y divide-border overflow-hidden rounded-lg border">
-        {Array.from({ length: 5 }).map((_, i) => (
-          <li key={i} className="flex items-center gap-3 px-3 py-2.5">
-            <Skeleton className="size-2.5 shrink-0 rounded-full" />
-            <Skeleton className="h-4 w-24 shrink-0" />
-            <Skeleton className="h-3 w-32" />
-            <span className="flex-1" />
-            <Skeleton className="h-3 w-14 shrink-0" />
-            <Skeleton className="h-3 w-7 shrink-0" />
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
 /** Owner column label: display name first, email as the fallback. The same
  *  rule covers service-account owners (ADR 0086 API keys) — their user NAME is
  *  the key's name (e.g. `ci-engineering-blog`) while the email is the
@@ -168,7 +139,7 @@ export function SessionRow({
         title={s.id}
         className="flex items-center gap-3 px-3 py-2.5 outline-none transition-colors hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset"
       >
-        <span className="inline-flex w-3 shrink-0 justify-center text-[0.7rem] leading-none">
+        <span className="inline-flex w-3 shrink-0 justify-center text-2xs leading-none">
           <StatusGlyph status={s.status} attention={s.needsAttention} />
         </span>
         {/* Identity: the title carries the row (falling back to the short id
@@ -184,11 +155,11 @@ export function SessionRow({
         {showOwner && (
           <span className="hidden w-40 shrink-0 items-center gap-2 sm:flex">
             {s.owner_kind === "system" ? (
-              <span className="text-xs italic text-muted-foreground">system</span>
+              <span className="text-xs italic text-muted-foreground">System</span>
             ) : (
               <>
                 <Avatar className="size-5 shrink-0">
-                  <AvatarFallback className="text-[10px]">
+                  <AvatarFallback className="text-2xs">
                     {(s.owner_name || s.owner_email || "?").charAt(0).toUpperCase()}
                   </AvatarFallback>
                 </Avatar>
@@ -204,14 +175,14 @@ export function SessionRow({
         <span
           className={
             s.needsAttention
-              ? "w-20 shrink-0 text-xs text-instrument-caution"
+              ? "w-20 shrink-0 text-xs text-foreground"
               : "w-20 shrink-0 text-xs text-muted-foreground"
           }
         >
           {s.needsAttention ? "needs review" : statusLabel(s.status)}
         </span>
         <span className="w-9 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground">
-          {relativeTime(s.last_active_at, now)}
+          {relativeAge(s.last_active_at, now)}
         </span>
       </Link>
     </li>

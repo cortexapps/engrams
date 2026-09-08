@@ -133,11 +133,11 @@ export function CommandMenu() {
                       run(() => navigate({ to: "/sessions/$id", params: { id: r.id } }))
                     }
                   >
-                    <span className="text-[0.7rem] leading-none">
+                    <span className="text-2xs leading-none">
                       <StatusGlyph status={r.status} beat={false} />
                     </span>
                     <span className="flex min-w-0 flex-1 items-baseline gap-2">
-                      <span className="truncate font-mono text-[0.8rem]">{shortId(r.id)}</span>
+                      <span className="truncate font-mono text-sm">{shortId(r.id)}</span>
                       <span className="truncate text-xs text-muted-foreground">
                         {stripImageHost(r.image)}
                       </span>

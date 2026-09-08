@@ -1,5 +1,5 @@
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { Check, Copy, DownloadIcon, ExternalLinkIcon, FileBox } from "lucide-react";
+import { Check, Copy, DownloadIcon, ExternalLinkIcon } from "lucide-react";
 import { useState } from "react";
 
 import { useTheme } from "../../components/theme-provider";
@@ -15,6 +15,8 @@ import { useAuth } from "../../auth/AuthProvider";
 import { artifactBytesUrl, artifactPageUrl, mediaKind } from "../../lib/artifacts";
 import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "@/components/page-heading";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Button, buttonVariants } from "@/components/ui/button";
 import {
   Select,
@@ -23,7 +25,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Skeleton } from "@/components/ui/skeleton";
 import { Text } from "@/components/ui/text";
 
 // The artifact page: a themed masthead + toolbar around the document
@@ -37,22 +38,24 @@ export function ArtifactDetail() {
 
   if (isPending) {
     return (
-      <div className="flex-1 space-y-4 p-4 md:p-6">
-        <Skeleton className="h-16 w-full max-w-xl" />
-        <Skeleton className="h-64 w-full" />
+      <div className="flex-1 p-4 md:p-6">
+        <SkeletonRows rows={4} />
       </div>
     );
   }
   if (error || !artifact) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
-        <FileBox className="size-10" strokeWidth={1} />
-        <Text as="p" tone="muted">
+      <div className="flex flex-1 items-center justify-center">
+        <EmptyState
+          tone={error ? "error" : "default"}
+          action={
+            <Button asChild variant="outline" size="sm">
+              <Link to="/artifacts">Back to artifacts</Link>
+            </Button>
+          }
+        >
           {error ? errorMessage(error) : "Artifact not found."}
-        </Text>
-        <Button asChild variant="outline" size="sm">
-          <Link to="/artifacts">Back to artifacts</Link>
-        </Button>
+        </EmptyState>
       </div>
     );
   }
@@ -113,9 +116,9 @@ function ArtifactBody({
         {!isCurrent && (
           <div className="mt-2 rounded-md border border-instrument-caution/40 bg-muted/40 px-3 py-1.5">
             <Text as="span" variant="label" tone="muted">
-              viewing v{version} — read-only ·{" "}
+              Viewing v{version} — read-only ·{" "}
               <Link to="/artifacts/$artifactId" params={{ artifactId: artifact.id }}>
-                jump to v{artifact.currentVersion}
+                Jump to v{artifact.currentVersion}
               </Link>
             </Text>
           </div>

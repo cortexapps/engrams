@@ -26,7 +26,7 @@ export function PresenceGroup({
               <span className="spec-mode-presence-avatar is-agent" aria-hidden="true">
                 ✦
               </span>
-              <Text as="span" variant="code" className="spec-mode-presence-label">
+              <Text as="span" className="spec-mode-presence-label">
                 {label}
               </Text>
             </span>
@@ -41,8 +41,8 @@ export function PresenceGroup({
             >
               {initials(entry.name)}
             </span>
-            <Text as="span" variant="code" className="spec-mode-presence-label">
-              {entry.isSelf ? "you" : entry.name}
+            <Text as="span" className="spec-mode-presence-label">
+              {entry.isSelf ? "You" : entry.name}
             </Text>
           </span>
         );

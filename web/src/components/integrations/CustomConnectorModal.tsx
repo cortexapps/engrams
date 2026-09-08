@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import {
   Dialog,
   DialogContent,
@@ -294,14 +295,14 @@ const OperationRow = memo(function OperationRow({
       {g && (
         <div className="flex flex-wrap items-center gap-2 pl-1 text-muted-foreground">
           <CornerDownRightIcon className="size-3 opacity-60" />
-          <code className="rounded-full border bg-secondary px-2 py-px font-mono text-[0.72rem]">
+          <code className="rounded-sm border bg-secondary px-2 py-px font-mono text-xs">
             {provider}:{g}
           </code>
-          <span className="text-[0.74rem]">"{humanizeAction(g)}"</span>
+          <span className="text-xs">"{humanizeAction(g)}"</span>
           <AccessTag access={access} />
           {o.kind === "graphql"
             ? o.field && (
-                <span className="text-[0.72rem]">
+                <span className="text-xs">
                   · gate{" "}
                   <code className="font-mono">
                     {o.operation} {o.field}
@@ -309,7 +310,7 @@ const OperationRow = memo(function OperationRow({
                 </span>
               )
             : o.path && (
-                <span className="text-[0.72rem]">
+                <span className="text-xs">
                   · gate{" "}
                   <code className="font-mono">
                     {(o.method || "GET").toUpperCase()} {o.path}
@@ -537,7 +538,7 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
               <div className="flex min-w-0 flex-1 flex-col gap-2">
                 <div className="flex items-center gap-2">
                   <Input
-                    className="w-16 text-center font-mono uppercase"
+                    className="w-16 text-center font-mono"
                     placeholder={autoMono}
                     maxLength={2}
                     value={mono}
@@ -560,7 +561,7 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
                   </div>
                 </div>
                 <div className="flex items-center gap-3">
-                  <label className="inline-flex cursor-pointer items-center gap-1.5 text-[0.76rem] text-primary">
+                  <label className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-primary">
                     <UploadIcon className="size-3.5" />
                     {logo ? "Replace logo" : "Upload logo"}
                     <input
@@ -574,13 +575,13 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
                     <button
                       type="button"
                       onClick={() => setLogo(null)}
-                      className="inline-flex items-center gap-1 text-[0.76rem] text-muted-foreground"
+                      className="inline-flex items-center gap-1 text-xs text-muted-foreground"
                     >
                       <XIcon className="size-3" />
                       Remove
                     </button>
                   )}
-                  <span className="text-[0.7rem] text-muted-foreground">
+                  <span className="text-2xs text-muted-foreground">
                     SVG or square PNG · falls back to the monogram
                   </span>
                 </div>
@@ -590,7 +591,7 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
 
           <div className="flex items-center gap-2.5 rounded-md border bg-secondary p-3">
             <LockIcon className="size-4 shrink-0 text-instrument-nominal" />
-            <span className="text-[0.78rem] leading-relaxed text-muted-foreground">
+            <span className="text-xs leading-relaxed text-muted-foreground">
               <strong className="text-foreground">Brokered credential.</strong> The token is sealed
               as an org secret and substituted into the request at the egress proxy — it never
               enters the sandbox. Platform-minted providers (like GitHub) are built-in and can't be
@@ -611,8 +612,8 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
 
           {/* credential headers — one or more, each backed by its own org secret */}
           <div className="flex flex-col gap-2">
-            <Text variant="label">Credential header(s)</Text>
-            <p className="text-[0.74rem] leading-relaxed text-muted-foreground">
+            <h3 className="text-sm font-semibold">Credential header(s)</h3>
+            <p className="text-xs leading-relaxed text-muted-foreground">
               Each header is injected at the egress proxy from its own org secret. Most APIs need
               one; some (e.g. Datadog) need several.
             </p>
@@ -640,8 +641,8 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
 
           {/* operations */}
           <div className="flex flex-col gap-2">
-            <Text variant="label">Operations</Text>
-            <p className="text-[0.74rem] leading-relaxed text-muted-foreground">
+            <h3 className="text-sm font-semibold">Operations</h3>
+            <p className="text-xs leading-relaxed text-muted-foreground">
               The <strong>action slug</strong> is the capability a profile grants. For{" "}
               <strong>REST</strong> the <strong>method + path</strong> are the proxy's gate (the
               path is a glob — <code className="font-mono">*</code> matches any characters); for{" "}
@@ -651,7 +652,7 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
             </p>
             {hasGraphql && (
               <div className="grid grid-cols-[1.4fr_1fr] items-center gap-2">
-                <span className="text-[0.74rem] text-muted-foreground">GraphQL endpoint</span>
+                <span className="text-xs text-muted-foreground">GraphQL endpoint</span>
                 <Input
                   className="font-mono text-xs"
                   placeholder="/graphql"
@@ -694,7 +695,7 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
               />
               <Text variant="label">Drive a CLI (optional)</Text>
             </label>
-            <p className="text-[0.74rem] leading-relaxed text-muted-foreground">
+            <p className="text-xs leading-relaxed text-muted-foreground">
               Give the agent a command-line tool for this integration. Auth is brokered — the CLI
               runs with a harmless placeholder; the proxy injects the real credential on the hosts
               above. The binary is staged read-only into sessions that grant a power.
@@ -755,7 +756,7 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
                         />
                       </label>
                     </div>
-                    <p className="text-[0.72rem] leading-relaxed text-muted-foreground">
+                    <p className="text-xs leading-relaxed text-muted-foreground">
                       The archive must contain your executable at the path(s) above plus a top-level{" "}
                       <code className="font-mono">SKILL.md</code> describing the tool. It's
                       content-addressed and staged fleet-wide; the binary runs against the base
@@ -788,7 +789,7 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
 
           {/* appears-as */}
           <div className="flex flex-col gap-2">
-            <Text variant="label">Appears as</Text>
+            <h3 className="text-sm font-semibold">Appears as</h3>
             <div className="flex flex-wrap items-center gap-4 rounded-md border border-dashed p-3">
               <span className="inline-flex items-center gap-2">
                 <ProviderTile
@@ -812,12 +813,16 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
                 <ExternalLinkIcon className="size-3 text-muted-foreground" />
               </span>
             </div>
-            <span className="text-[0.72rem] leading-relaxed text-muted-foreground">
+            <span className="text-xs leading-relaxed text-muted-foreground">
               This mark follows the integration everywhere — the catalog, profile powers, the
               session policy, and in-session events.
             </span>
           </div>
-          {error && <p className="text-sm text-destructive">{error}</p>}
+          {error && (
+            <EmptyState tone="error" inline>
+              {error}
+            </EmptyState>
+          )}
         </div>
 
         <DialogFooter className="mt-2">

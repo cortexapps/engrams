@@ -47,13 +47,13 @@ export function CategoryFilter({ cats, counts, active, onChange }: CategoryFilte
         <span className={cn(textVariants({ variant: "label" }), "whitespace-nowrap")}>
           {labelOf(active)}
         </span>
-        <span className="font-mono text-[0.66rem] tabular-nums text-muted-foreground">
+        <span className="font-mono text-2xs tabular-nums text-muted-foreground">
           {counts[active] ?? 0}
         </span>
         <ChevronDownIcon className="size-3.5 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
       </DropdownMenuTrigger>
 
-      <DropdownMenuContent align="end" className="max-h-[360px] min-w-[240px] p-1.5 shadow-lg">
+      <DropdownMenuContent align="end" className="max-h-[360px] min-w-[240px] p-1.5">
         {cats.map((c) => {
           const isActive = c === active;
           return (
@@ -73,7 +73,7 @@ export function CategoryFilter({ cats, counts, active, onChange }: CategoryFilte
                 )}
               />
               <span className={cn(textVariants({ variant: "label" }), "flex-1")}>{labelOf(c)}</span>
-              <span className="font-mono text-[0.68rem] tabular-nums text-muted-foreground/75">
+              <span className="font-mono text-2xs tabular-nums text-muted-foreground/75">
                 {counts[c] ?? 0}
               </span>
             </DropdownMenuItem>

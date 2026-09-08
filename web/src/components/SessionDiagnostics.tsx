@@ -5,12 +5,13 @@ import { useHosts } from "../hooks/useHosts";
 import { useTeleportSession } from "../hooks/useTeleportSession";
 import { usePauseResumeSession } from "../hooks/usePauseResumeSession";
 import { useIsAdmin } from "../auth/AuthProvider";
-import { fmtAgo } from "../format";
-import { relativeTime } from "../pages/sessions/session-format";
+
+import { relativeTime } from "@/lib/relative-time";
 import { SessionCowState } from "./CowState";
 import { DurabilityTimeline } from "./DurabilityTimeline";
 import { MetricRow } from "./MetricRow";
 import { Button } from "@/components/ui/button";
+import { StatusDot } from "@/components/status-dot";
 import { Text } from "@/components/ui/text";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -98,8 +99,8 @@ export function durabilitySummary(
     if (recoverable) {
       return {
         tone: "nominal",
-        label: "safe · recoverable",
-        title: `recoverable from a checkpoint ${fmtAgo(recoverable.created_at)}`,
+        label: "Safe · recoverable",
+        title: `Recoverable from a checkpoint ${relativeTime(recoverable.created_at)}`,
       };
     }
     return null;
@@ -119,8 +120,8 @@ export function durabilitySummary(
     const n = checkpoints.length;
     return {
       tone: "nominal",
-      label: `work saved · ${fmtAgo(anchor)}`,
-      title: `last flush ${fmtAgo(state.last_flush_at)} · last snapshot ${fmtAgo(
+      label: `Work saved · ${relativeTime(anchor)}`,
+      title: `Last flush ${relativeTime(state.last_flush_at)} · last snapshot ${relativeTime(
         state.last_snapshot_at,
       )} · ${n} checkpoint${n === 1 ? "" : "s"}`,
     };
@@ -129,8 +130,8 @@ export function durabilitySummary(
   if (state.dirty_chunks > 0) {
     return {
       tone: "caution",
-      label: "saving…",
-      title: "changes not yet flushed to durable storage",
+      label: "Saving…",
+      title: "Changes are not yet flushed to durable storage",
     };
   }
   // A clean slate with nothing written yet.
@@ -154,20 +155,12 @@ export function useDurabilitySummary(
  * adjacent ProfileChip uses). Colour is reinforcement; the word stands alone
  * (PRODUCT.md status grammar). Carries its own provider so it's safe anywhere. */
 export function DurabilityReadout({ summary }: { summary: DurabilitySummary }) {
-  const color =
-    summary.tone === "nominal"
-      ? "var(--color-instrument-nominal)"
-      : "var(--color-instrument-caution)";
   return (
     <TooltipProvider delayDuration={100}>
       <Tooltip>
         <TooltipTrigger asChild>
           <span className="inline-flex items-center gap-1.5 text-muted-foreground">
-            <span
-              aria-hidden
-              className="size-1.5 shrink-0 rounded-full"
-              style={{ backgroundColor: color }}
-            />
+            <StatusDot tone={summary.tone} size={6} />
             {summary.label}
           </span>
         </TooltipTrigger>
@@ -182,11 +175,7 @@ export function DurabilityReadout({ summary }: { summary: DurabilitySummary }) {
 // ---------------------------------------------------------------------------
 
 function SectionLabel({ children }: { children: ReactNode }) {
-  return (
-    <Text variant="label" tone="muted" className="mb-2.5 block text-[0.65rem]">
-      {children}
-    </Text>
-  );
+  return <h2 className="mb-2.5 text-sm font-semibold">{children}</h2>;
 }
 
 export function DiagnosticsPanel({
@@ -218,7 +207,7 @@ export function DiagnosticsPanel({
             session it describes. Durability is keyed by id, so it renders even
             before the session row resolves. */}
         <section>
-          <SectionLabel>durability</SectionLabel>
+          <SectionLabel>Durability</SectionLabel>
           <SessionCowState sessionId={sessionId} />
           <div className="mt-3">
             <DurabilityTimeline sessionId={sessionId} />
@@ -227,19 +216,19 @@ export function DiagnosticsPanel({
 
         {session && (
           <section className="border-t pt-4">
-            <SectionLabel>session</SectionLabel>
+            <SectionLabel>Session</SectionLabel>
             <dl className="space-y-2.5 text-sm">
               <div>
-                <dt className="text-muted-foreground">image</dt>
-                <dd className="mt-0.5 font-mono text-[0.8rem] break-all text-foreground">
+                <dt className="text-muted-foreground">Image</dt>
+                <dd className="mt-0.5 font-mono text-sm break-all text-foreground">
                   {session.image}
                 </dd>
               </div>
-              <MetricRow label="created" value={`${relativeTime(session.created_at)} ago`} />
+              <MetricRow label="Created" value={relativeTime(session.created_at)} />
               {/* The count keeps its own element: any poller reads
                   Number(textContent) of exactly this span. */}
               <MetricRow
-                label="events"
+                label="Events"
                 value={<span data-testid="event-count">{eventCount}</span>}
               />
             </dl>
@@ -265,7 +254,7 @@ export function DiagnosticsPanel({
 // inactive content), so the list isn't built until asked for.
 function RawEvents({ events }: { events: IndexedEvent[] }) {
   return (
-    <div className="h-full space-y-0.5 overflow-auto px-5 py-4 font-mono text-[0.72rem] text-muted-foreground">
+    <div className="h-full space-y-0.5 overflow-auto px-5 py-4 font-mono text-xs text-muted-foreground">
       {events.map((e) => (
         <div
           key={e.idx}
@@ -275,7 +264,7 @@ function RawEvents({ events }: { events: IndexedEvent[] }) {
         >
           <span className="tabular-nums text-muted-foreground/70">{e.idx}</span>
           {/* An event type is a wire identifier, so it reads as machine data. */}
-          <span className="font-mono text-[0.7rem]">{e.event.type}</span>
+          <span className="font-mono text-2xs">{e.event.type}</span>
           <span className="truncate text-foreground/80" title={JSON.stringify(e.event)}>
             {summarizeRaw(e.event)}
           </span>
@@ -315,16 +304,16 @@ function TeleportControl({ session }: { session: Session }) {
 
   return (
     <div className="border-t pt-4">
-      <SectionLabel>teleport</SectionLabel>
+      <SectionLabel>Teleport</SectionLabel>
       {candidates.length === 0 ? (
         <Text tone="muted" className="text-xs">
-          no other ready host available
+          No other ready host is available.
         </Text>
       ) : (
         <div className="space-y-2">
           <Select value={target} onValueChange={setTarget}>
             <SelectTrigger className="h-8 text-xs">
-              <SelectValue placeholder="destination host…" />
+              <SelectValue placeholder="Destination host…" />
             </SelectTrigger>
             <SelectContent>
               {candidates.map((h) => {
@@ -345,7 +334,7 @@ function TeleportControl({ session }: { session: Session }) {
             disabled={!target || teleport.isPending}
             onClick={() => teleport.mutate(target)}
           >
-            {teleport.isPending ? "teleporting…" : "Teleport"}
+            {teleport.isPending ? "Teleporting…" : "Teleport"}
           </Button>
         </div>
       )}
@@ -365,7 +354,7 @@ function PauseResumeControl({ session }: { session: Session }) {
 
   return (
     <div className="border-t pt-4">
-      <SectionLabel>freeze</SectionLabel>
+      <SectionLabel>Freeze</SectionLabel>
       <div className="flex gap-2">
         <Button
           size="sm"
@@ -374,7 +363,7 @@ function PauseResumeControl({ session }: { session: Session }) {
           disabled={pause.isPending}
           onClick={() => pause.mutate()}
         >
-          {pause.isPending ? "pausing…" : "Pause"}
+          {pause.isPending ? "Pausing…" : "Pause"}
         </Button>
         <Button
           size="sm"
@@ -383,7 +372,7 @@ function PauseResumeControl({ session }: { session: Session }) {
           disabled={resume.isPending}
           onClick={() => resume.mutate()}
         >
-          {resume.isPending ? "resuming…" : "Resume"}
+          {resume.isPending ? "Resuming…" : "Resume"}
         </Button>
       </div>
     </div>

@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { SkeletonRows } from "@/components/skeleton-rows";
 
 interface AuthConfig {
   passwordAuth: boolean;
@@ -131,8 +132,8 @@ export function Login() {
         {authConfig === undefined ? (
           // Posture still loading — keep the chrome stable, no flash of a form.
           <Card className="w-full">
-            <CardContent className="py-8 text-center text-sm text-muted-foreground">
-              Loading…
+            <CardContent className="py-4">
+              <SkeletonRows rows={2} />
             </CardContent>
           </Card>
         ) : !passwordAuth ? (

@@ -78,7 +78,7 @@ export function PlanCard({ marker }: { marker: PlanMarker }) {
             {live ? "plan ready — awaiting your review" : "plan proposed"}
           </Text>
           {marker.revision > 1 && (
-            <Badge variant="outline" className="text-[10px]">
+            <Badge variant="outline" className="text-2xs">
               rev {marker.revision}
             </Badge>
           )}
@@ -185,7 +185,7 @@ function PlanReceipt({
           </Text>
           <span className="truncate text-muted-foreground">{planTitle(marker.plan)}</span>
           {marker.revision > 1 && (
-            <Badge variant="outline" className="text-[10px]">
+            <Badge variant="outline" className="text-2xs">
               rev {marker.revision}
             </Badge>
           )}

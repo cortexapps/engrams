@@ -13,9 +13,10 @@ import { useProfiles } from "../../hooks/useProfiles";
 import type { RepoEnrollment } from "../../gen/engram/app/v1/review_pb";
 import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "../page-heading";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -87,19 +88,18 @@ export function ReviewedReposPanel() {
       )}
 
       {error && (
-        <p className="text-sm text-destructive">
-          Could not load enrollments — {errorMessage(error)}
-        </p>
+        <EmptyState tone="error">Could not load enrollments — {errorMessage(error)}</EmptyState>
       )}
 
       {isPending ? (
-        <p className="py-6 text-sm text-muted-foreground">Loading…</p>
+        <SkeletonRows
+          rows={3}
+          columns={["minmax(12rem,1fr)", "6rem", "6rem", "minmax(8rem,1fr)", "6rem"]}
+        />
       ) : rows.length === 0 ? (
-        <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            No repos enrolled yet. Enroll one to have engrams review its pull requests.
-          </CardContent>
-        </Card>
+        <EmptyState>
+          No repos enrolled yet. Enroll one to have engrams review its pull requests.
+        </EmptyState>
       ) : (
         <Table>
           <TableHeader>
@@ -125,7 +125,11 @@ export function ReviewedReposPanel() {
 type ProfileLite = { id: string; name: string; designation?: string };
 
 function TriggerBadge({ mode }: { mode: string }) {
-  return mode === "auto" ? <Badge>auto</Badge> : <Badge variant="secondary">@mention</Badge>;
+  return mode === "auto" ? (
+    <Badge variant="outline">auto</Badge>
+  ) : (
+    <Badge variant="secondary">@mention</Badge>
+  );
 }
 
 function profileLabel(row: RepoEnrollment, profiles: ProfileLite[]): string {
@@ -170,9 +174,9 @@ function EnrollmentRow({ row, profiles }: { row: RepoEnrollment; profiles: Profi
           </AlertDialog>
         </div>
         {remove.error && (
-          <p className="mt-1 text-right text-xs text-destructive">
+          <EmptyState tone="error" inline className="mt-1 items-end text-right">
             Could not remove — {errorMessage(remove.error)}
-          </p>
+          </EmptyState>
         )}
       </TableCell>
     </TableRow>

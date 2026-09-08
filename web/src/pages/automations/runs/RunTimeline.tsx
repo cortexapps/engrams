@@ -83,7 +83,7 @@ function IterationGroup({
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 px-3 py-1 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+        className="flex w-full items-center gap-2 px-3 py-1 text-left text-xs font-semibold text-muted-foreground"
       >
         <ChevronRightIcon className={cn("size-3 transition-transform", open && "rotate-90")} />
         {group.loopId} · iteration {group.iteration + 1}

@@ -19,6 +19,9 @@ import {
 import { NodeViewWrapper, type NodeViewProps } from "@tiptap/react";
 import { Loader2Icon, MessageSquareIcon, SendIcon } from "lucide-react";
 
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot } from "@/components/status-dot";
 import { renderSpecBlock, sanitizeSvg } from "./block-renderers";
 import { useSpecBlockIteration, type SpecBlockIterationRequest } from "./block-iteration";
 import "./spec-block.css";
@@ -134,7 +137,10 @@ export function SpecBlockView({ attrs, onCache, sectionId, onIterate }: SpecBloc
       <figcaption className="spec-block-heading">
         <span className="spec-block-kind">{label}</span>
         <span className="spec-block-heading-actions">
-          <span className="spec-block-provenance">{provenanceLabel}</span>
+          <span className="spec-block-provenance">
+            <StatusDot tone={provenance.type === "verified" ? "nominal" : "muted"} size={6} />
+            {provenanceLabel}
+          </span>
           {canIterate ? (
             <button
               type="button"
@@ -161,9 +167,7 @@ export function SpecBlockView({ attrs, onCache, sectionId, onIterate }: SpecBloc
       ) : error ? (
         <SourceFallback label={`${label} could not render: ${error}`} source={source} />
       ) : (
-        <div className="spec-block-loading" role="status">
-          Rendering {label.toLowerCase()}…
-        </div>
+        <SkeletonRows rows={2} className="spec-block-loading" />
       )}
       {chatOpen && canIterate ? (
         <div className="spec-block-chat" onClick={(event) => event.stopPropagation()}>
@@ -194,7 +198,11 @@ export function SpecBlockView({ attrs, onCache, sectionId, onIterate }: SpecBloc
               {sending ? <Loader2Icon className="spec-block-spin" /> : <SendIcon />}
             </button>
           </form>
-          {sendError ? <p className="spec-block-chat-error">{sendError}</p> : null}
+          {sendError ? (
+            <EmptyState inline tone="error" className="spec-block-chat-error">
+              {sendError}
+            </EmptyState>
+          ) : null}
         </div>
       ) : null}
     </NodeViewWrapper>
