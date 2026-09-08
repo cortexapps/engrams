@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Link, type LinkProps } from "@tanstack/react-router";
+import { Link, useRouterState, type LinkProps } from "@tanstack/react-router";
 import type { LucideIcon } from "lucide-react";
 
 import { Sidebar, SidebarProvider, SidebarResizeHandle } from "@/components/ui/sidebar";
@@ -103,9 +103,14 @@ export function SectionNav({ items, className }: { items: SectionNavItem[]; clas
  * The switcher-rail sections (Tasks, Reviews, Artifacts) leave padding to the
  * page, because a transcript or a dossier fills the height itself. */
 export function SectionPage({ children }: { children: ReactNode }) {
+  // Keyed on the path so a route change re-mounts the body and it rises in
+  // (240ms); the rails around it never move.
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
-      <div className="p-4 md:px-9 md:pt-7 md:pb-8">{children}</div>
+      <div key={pathname} className="page-in p-4 md:px-9 md:pt-7 md:pb-8">
+        {children}
+      </div>
     </div>
   );
 }

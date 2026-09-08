@@ -84,7 +84,7 @@ export const Thread: FC = () => {
         ref={viewportRef}
         className="relative flex flex-1 flex-col overflow-x-auto overflow-y-scroll scroll-smooth"
       >
-        <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-1 flex-col px-4 pt-4">
+        <div className="ruled-paper mx-auto flex w-full max-w-(--thread-max-width) flex-1 flex-col px-4 pt-4">
           <TranscriptBackfillNotice
             hasMore={transcriptWindow.hasMore}
             loadingOlder={transcriptWindow.loadingOlder}

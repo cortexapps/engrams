@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { Link, useRouterState, type LinkProps } from "@tanstack/react-router";
 
 import { useIsAdmin } from "../../auth/AuthProvider";
@@ -114,6 +114,8 @@ export function SettingsRail() {
   const isAdmin = useIsAdmin();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const groups = visibleSettingsGroups(isAdmin);
+  // Row position across every group, for the boot stagger.
+  let row = 0;
 
   return (
     <SidebarContent className="px-[10px] pt-1 pb-3">
@@ -127,7 +129,7 @@ export function SettingsRail() {
           <SidebarGroupContent>
             <SidebarMenu className="gap-0.5">
               {group.items.map((it) => (
-                <SidebarMenuItem key={it.label}>
+                <SidebarMenuItem key={it.label} style={{ "--i": row++ } as CSSProperties}>
                   <SidebarMenuButton
                     asChild
                     isActive={isSettingsItemActive(pathname, it.to as string)}

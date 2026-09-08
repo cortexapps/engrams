@@ -108,7 +108,7 @@ export function ActivityList({
           {filter === "all" ? emptyText : `Nothing ${LABEL[filter].toLowerCase()}.`}
         </EmptyState>
       ) : (
-        <ol className="flex flex-col gap-0.5" data-testid="activity-list">
+        <ol className="ruled-paper flex flex-col gap-0.5" data-testid="activity-list">
           {rows.map((row) =>
             row.kind === "run" ? (
               <ActivityEntry

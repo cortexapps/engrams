@@ -57,7 +57,7 @@ export function ActivityEntry({
     <li
       data-testid="activity-entry"
       data-status={run.status}
-      className={cn("rounded-md", QUIET.has(run.status) && "opacity-65")}
+      className={cn("rounded-md", QUIET.has(run.status) && "opacity-65", active && "row-running")}
       style={
         tone === "critical"
           ? {

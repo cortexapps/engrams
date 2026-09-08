@@ -1,4 +1,7 @@
+import { useEffect, useRef, useState, type CSSProperties } from "react";
+
 import type { DayRunCount } from "@/gen/engram/app/v1/automation_pb";
+import { cn } from "@/lib/utils";
 
 /** Every run the server counted for the day. `other` is the server's bucket
  * for pending/running/waiting/superseded/halted — a superseding automation
@@ -72,8 +75,25 @@ export function Sparkline({
 }) {
   const week = sevenDayWindow(days, now);
   const max = Math.max(1, ...week.map(dayTotal));
+  // The bars draw once, when the sparkline first scrolls into view. Without an
+  // IntersectionObserver (jsdom) they simply sit drawn.
+  const ref = useRef<SVGSVGElement | null>(null);
+  const [drawn, setDrawn] = useState(typeof IntersectionObserver === "undefined");
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || drawn) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) {
+        setDrawn(true);
+        observer.disconnect();
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [drawn]);
   return (
     <svg
+      ref={ref}
       width={W}
       height={H}
       viewBox={`0 0 ${W} ${H}`}
@@ -87,13 +107,14 @@ export function Sparkline({
         return (
           <rect
             key={day.day || i}
+            className={cn(FILL[dayTone(day)], drawn && "bar-draw")}
+            style={{ "--i": i } as CSSProperties}
             data-tone={dayTone(day)}
             x={i * (BAR_WIDTH + GAP)}
             y={H - h}
             width={BAR_WIDTH}
             height={h}
             rx={1}
-            className={FILL[dayTone(day)]}
           />
         );
       })}

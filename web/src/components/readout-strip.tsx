@@ -2,6 +2,7 @@ import type { CSSProperties, ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 import type { StatusTone } from "./status-dot";
+import { TickNumber } from "./tick-number";
 
 // THE rollup: one card, hairline-separated cells, each a caption over a mono
 // figure with an optional sub-line or meter. Fleet's health strip and Storage's
@@ -67,7 +68,9 @@ export function ReadoutCell({
     >
       <div className="text-xs font-semibold text-muted-foreground">{label}</div>
       {value !== undefined && (
-        <div className="font-mono text-lg leading-none tabular-nums text-foreground">{value}</div>
+        <div className="font-mono text-lg leading-none tabular-nums text-foreground">
+          <TickNumber value={value} />
+        </div>
       )}
       {children}
       {sub !== undefined && (

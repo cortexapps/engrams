@@ -1,3 +1,5 @@
+import type { CSSProperties } from "react";
+
 import { cn } from "@/lib/utils";
 import type { StatusTone } from "./status-dot";
 
@@ -36,6 +38,7 @@ export function Meter({
   value,
   tone,
   label,
+  index = 0,
   className,
 }: {
   value: number | null;
@@ -43,6 +46,8 @@ export function Meter({
   tone?: StatusTone;
   /** Accessible name, e.g. "disk". */
   label?: string;
+  /** Position among sibling meters: each fills 150ms after the one before. */
+  index?: number;
   className?: string;
 }) {
   const pct = value === null ? null : Math.min(100, Math.max(0, Math.round(value)));
@@ -60,8 +65,8 @@ export function Meter({
     >
       {pct !== null && (
         <span
-          className={cn("block h-full rounded-[3px]", FILL[fill])}
-          style={{ width: `${pct}%` }}
+          className={cn("meter-fill block h-full rounded-[3px]", FILL[fill])}
+          style={{ width: `${pct}%`, "--i": index } as CSSProperties}
         />
       )}
     </span>

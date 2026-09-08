@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import { Activity, Layers, Plus } from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 
@@ -114,10 +115,11 @@ export function AutomationsRail() {
               </p>
             ) : (
               <SidebarMenu className="gap-0.5">
-                {rows.map((summary) => (
+                {rows.map((summary, index) => (
                   <AutomationRow
                     key={summary.automation?.id}
                     summary={summary}
+                    index={index}
                     active={
                       !!summary.automation &&
                       pathname.startsWith(`/automations/${summary.automation.id}`)
@@ -147,10 +149,13 @@ function AutomationRow({
   summary,
   active,
   now,
+  index,
 }: {
   summary: AutomationSummary;
   active: boolean;
   now: number;
+  /** Position in the rail, for the boot stagger. */
+  index: number;
 }) {
   const automation = summary.automation;
   if (!automation) return null;
@@ -159,7 +164,7 @@ function AutomationRow({
   const at = summary.lastRun?.startedAt;
 
   return (
-    <SidebarMenuItem>
+    <SidebarMenuItem style={{ "--i": index } as CSSProperties}>
       <SidebarMenuButton
         asChild
         isActive={active}

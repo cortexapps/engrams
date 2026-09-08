@@ -467,6 +467,59 @@ ink, cards, borders, and all four status hues — scoped to `.work-pane`. This i
 the same technique `.sidebar-section` uses in `index.css`. A background-only
 override would leave petrol ink on bottle green.
 
+## Motion
+
+Quiet and purposeful: one easing (`cubic-bezier(.2,.7,.2,1)`), a handful of
+durations, and every animation honours `prefers-reduced-motion` (instant, or
+already drawn). Nothing scales on press. Nothing glows. Rails never move after
+boot. The vocabulary lives in `index.css` under "Motion".
+
+- **Boot** (once per load, never on a route change): the sheet rises 14px and
+  fades in over 700ms after a 200ms beat; rail rows follow, 40ms apart; the
+  mark draws on. `RootLayout` carries `data-boot` for 1.4s and then detaches it.
+- **Page in**: on a route change the sheet's body rises 6px and fades in over
+  240ms (`SectionPage` re-keys on the path). Rails do not move.
+- **Tabs**: the active pill slides between triggers in 180ms (one framer
+  `layoutId` per list). **Hover** is the accent wash in 120ms; **focus** is the
+  2px ring in `--ring` (kept from the earlier measurement; the handoff's 3px
+  reads as a halo on a 12px corner).
+- **Live**: a running dot or glyph breathes 1 → .35 → 1 over 2.4s
+  (`.animate-live`); a running row carries a 34%-wide `--ring`-tinted sweep
+  every 2.8s (`.row-running`). A changed figure ticks — old up and out, new in
+  from below — in 500ms (`TickNumber`).
+- **Data ink**: a meter fills 0 → value over 1.1s, 150ms per meter (`Meter
+  index`); a sparkline's bars draw once when it enters view; a skeleton's
+  hairlines draw over 900ms, 150ms apart, then its bars shimmer at 1.8s.
+- **Ruled paper** on reading surfaces only — the transcript, an activity
+  ledger, a workstream timeline: a 28px rule in ink at 6% and one amber margin
+  line at 56px (`.ruled-paper`). Never on a ledger table or a form.
+- **Dark**: identical moves; the sheet adds its top edge. No glows anywhere.
+
+## Logomark
+
+The engram trace has one silhouette: the path `M14 68 L32 50 L50 68 L68 32
+L86 50` in a 100-unit box, round caps and joins, in `currentColor`. Two nodes
+carry meaning by shape — the entry RING (amber, `--mark-entry`; `#e0913d` on
+the cover) at the start and the terminal DOT (the ground's action colour:
+`--mark-terminal` verdigris on paper, lime on the cover and at night) at the
+end. No middle nodes, no lattice, no shape-swapping. Stroke 9 at 64px and up,
+10 at 32px, 12 at 16px; below 20px the ring is dropped.
+
+- **Static** is the default. **Draw-on** runs once, at boot or resume: the
+  ring is present from the first frame, the path draws over 900ms, the dot
+  lands in 240ms. The mark is identity, not a status light — nothing pulses it.
+- **Loader**: the trace ghosted at 24% with a 60-unit lit segment travelling
+  it every 1.8s — for the connection states the app shows (a pane connecting,
+  the auth stage). Lime on the spine, ink on paper.
+- **Wordmark**: lowercase `engrams`, sans 600, `letter-spacing: -0.02em`, the
+  mark at cap height, gap = the stroke width.
+- **Monochrome** (`mono`): ring and dot in one colour; the shapes still read.
+- **App icon** (`web/scripts/gen-icons.mjs`): a tile with a 23% radius, the
+  bottle-green gradient, a carbon twill at 10%, a light top edge and a dark
+  bottom edge; the trace inset 16% in sage, the amber ring, the lime dot. At
+  16px: stroke 13, dot r 11, no ring. The script writes the SVG, the PNGs and
+  the ICO into `web/public` and mirrors them into the site.
+
 ## Do's and Don'ts
 
 ### Do:
@@ -494,3 +547,5 @@ override would leave petrol ink on bottle green.
 - **Don't** use lime for status, or an instrument colour for an action.
 - **Don't** invent a size (`text-[0.7rem]`), a dot, an empty state, a loader,
   or a relative-time format. Each has one home.
+- **Don't** animate outside the motion vocabulary, and never without a
+  reduced-motion fallback. Nothing scales on press; nothing glows.

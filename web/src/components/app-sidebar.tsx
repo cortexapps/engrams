@@ -117,9 +117,11 @@ export function MainSidebar() {
                   className="flex size-6 shrink-0 items-center justify-center"
                   style={{ color: "var(--sidebar-primary)" }}
                 >
-                  <EngramMark size={24} mode="static" />
+                  {/* Identity, not a status light: it draws on once at boot
+                      and then sits. */}
+                  <EngramMark size={24} mode="draw" ground="cover" />
                 </span>
-                <span className="text-base font-semibold tracking-[-0.01em]">engrams</span>
+                <span className="text-base font-semibold tracking-[-0.02em]">engrams</span>
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>

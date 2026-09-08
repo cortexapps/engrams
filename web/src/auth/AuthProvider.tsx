@@ -178,7 +178,7 @@ function BootScreen() {
   return (
     <AuthStage>
       <div className="flex flex-col items-center gap-3 text-center">
-        <EngramMark size={72} mode="loop" />
+        <EngramMark size={72} mode="loader" title="authenticating" />
         <p className="text-sm italic text-muted-foreground">authenticating…</p>
       </div>
     </AuthStage>

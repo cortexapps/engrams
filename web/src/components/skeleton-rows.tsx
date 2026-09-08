@@ -1,4 +1,3 @@
-import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
 // THE loading state for a list or a table: placeholder bars in the column
@@ -6,8 +5,9 @@ import { cn } from "@/lib/utils";
 // lands. Replaces every "Loading…" sentence. Pass the coming table's
 // `grid-template-columns` tracks as `columns`; a single track makes a list.
 //
-// Bar widths vary by a fixed pattern (not at random) so a re-render never
-// makes the placeholder twitch.
+// Motion: the hairlines between rows draw in first (900ms, 150ms apart), then
+// the bars shimmer at 1.8s. Bar widths vary by a fixed pattern (not at
+// random) so a re-render never makes the placeholder twitch.
 const WIDTHS = ["72%", "48%", "61%", "39%", "55%"];
 
 export function SkeletonRows({
@@ -25,18 +25,21 @@ export function SkeletonRows({
       aria-busy="true"
       aria-label="Loading"
       data-slot="skeleton-rows"
-      className={cn("flex flex-col divide-y divide-border", className)}
+      className={cn("shimmer-container flex flex-col [--shimmer-duration:1800ms]", className)}
     >
       {Array.from({ length: rows }, (_, r) => (
         <div
           key={r}
-          className="grid items-center gap-4 py-3.5"
-          style={{ gridTemplateColumns: columns.join(" ") }}
+          className="relative grid items-center gap-4 py-3.5"
+          style={{ gridTemplateColumns: columns.join(" "), "--i": r } as React.CSSProperties}
         >
+          {r > 0 && (
+            <span aria-hidden className="hairline-draw absolute inset-x-0 top-0 h-px bg-border" />
+          )}
           {columns.map((_, c) => (
-            <Skeleton
+            <span
               key={c}
-              className="h-2.5 rounded-[3px]"
+              className="shimmer-bg block h-2.5 rounded-[3px] bg-accent"
               style={{ width: WIDTHS[(r * columns.length + c) % WIDTHS.length] }}
             />
           ))}
