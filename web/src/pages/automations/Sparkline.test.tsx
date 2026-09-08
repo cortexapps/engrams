@@ -18,17 +18,17 @@ describe("dayTone", () => {
     expect(dayTone(day(0))).toBe("muted");
     expect(dayTone(day(3))).toBe("nominal");
     expect(dayTone(day(0, 0, 2))).toBe("nominal"); // filtered-only is not a failure
-    expect(dayTone(day(2, 1))).toBe("caution");
+    expect(dayTone(day(2, 1))).toBe("critical");
     expect(dayTone(day(0, 2))).toBe("critical");
   });
 
   it("an other-only day (superseded / in flight) is activity, not a zero stub", () => {
     // A superseding automation can have whole days of superseded runs.
-    expect(dayTone(day(0, 0, 0, D(6), 5))).toBe("caution");
+    expect(dayTone(day(0, 0, 0, D(6), 5))).toBe("nominal");
     expect(dayTotal(day(1, 0, 0, D(6), 4))).toBe(5);
     const { container } = render(<Sparkline days={[day(0, 0, 0, D(6), 5)]} now={NOW} />);
     const today = container.querySelectorAll("rect")[6]!;
-    expect(today.getAttribute("data-tone")).toBe("caution");
+    expect(today.getAttribute("data-tone")).toBe("nominal");
     expect(Number(today.getAttribute("height"))).toBeGreaterThan(2);
   });
 });
@@ -61,15 +61,25 @@ describe("Sparkline", () => {
       "muted",
       "muted",
       "muted",
-      "caution", // D4: two days ago — a gap-separated slot, not adjacent to D0
+      "critical", // D4: two days ago — a gap-separated slot, not adjacent to D0
       "muted",
       "nominal", // D6: today, on the RIGHT
     ]);
     // Zero days keep a 2px stub; the busiest day fills the full height.
     expect(bars[1]!.getAttribute("height")).toBe("2");
-    expect(bars[6]!.getAttribute("height")).toBe("24");
-    expect(bars[1]!.getAttribute("class")).toContain("muted");
-    expect(bars[4]!.getAttribute("class")).toContain("instrument-caution");
+    expect(bars[6]!.getAttribute("height")).toBe("18");
+    expect(bars[0]!.getAttribute("width")).toBe("5");
+    expect(bars.map((bar) => bar.getAttribute("x"))).toEqual([
+      "0",
+      "7",
+      "14",
+      "21",
+      "28",
+      "35",
+      "42",
+    ]);
+    expect(bars[1]!.getAttribute("class")).toContain("fill-border");
+    expect(bars[4]!.getAttribute("class")).toContain("instrument-critical");
   });
 
   it("a single run two days ago renders as one bar in its slot, not at the far left", () => {

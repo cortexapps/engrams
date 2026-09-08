@@ -1,18 +1,30 @@
-/** The Builder canvas (replaces BlockList): the block tree rendered as
- * nodes + orthogonal edges, scaled to fit its panel. Same callback
- * contract as the list it replaced; layout is `layoutCanvas`'s pure
- * geometry, and everything render-only (selection, lock, errors, ghosts,
- * run status) resolves by node id here. */
+/** One way in, drawn: the trigger node at the top, the steps below it as
+ * cards, branch legs as dashed lanes, and a dashed "Add step" node at the
+ * tail. Layout is `layoutCanvas`'s pure geometry; everything render-only
+ * (selection, lock, errors, ghosts, run status) resolves by node id here.
+ *
+ * The canvas scales to fit its column unless the Build tab hands it a zoom. */
 
-import { Lock } from "lucide-react";
+import { Lock, Plus } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { BlockDef, ListPath, TriggerSpec } from "@/lib/automation-blocks";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  insertableBlockKinds,
+  type BlockDef,
+  type ListPath,
+  type TriggerSpec,
+} from "@/lib/automation-blocks";
 
 import { CanvasNode, type CanvasNodeStatus } from "./CanvasNode";
 import { EdgeLayer } from "./EdgeLayer";
 import { InsertMenu } from "./InsertMenu";
-import { layoutCanvas, MAX_SCALE, MIN_SCALE, TRIGGER_ROW_ID } from "./layout";
+import { layoutCanvas, MAX_SCALE, MIN_SCALE, NODE_W, TRIGGER_ROW_ID } from "./layout";
 
 export { TRIGGER_ROW_ID };
 export type { CanvasNodeStatus };
@@ -20,6 +32,9 @@ export type { CanvasNodeStatus };
 export interface CanvasProps {
   trigger: TriggerSpec;
   triggerSummary: string;
+  /** The way in this canvas draws (its trigger node's second line and the
+   * canvas's test id). Omitted for a single-entrypoint automation. */
+  entrypointId?: string;
   blocks: readonly BlockDef[];
   selectedId: string | null;
   onSelect: (id: string) => void;
@@ -34,6 +49,8 @@ export interface CanvasProps {
   ghostIds?: ReadonlySet<string>;
   /** Run replay (later): per-block status chips. */
   nodeStatus?: Readonly<Record<string, CanvasNodeStatus>>;
+  /** "fit" (default) scales down to the column; a number is an explicit zoom. */
+  zoom?: number | "fit";
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -43,6 +60,7 @@ function clamp(value: number, min: number, max: number): number {
 export function Canvas({
   trigger,
   triggerSummary,
+  entrypointId,
   blocks,
   selectedId,
   onSelect,
@@ -53,8 +71,9 @@ export function Canvas({
   onRemove,
   ghostIds,
   nodeStatus,
+  zoom = "fit",
 }: CanvasProps) {
-  void trigger; // the trigger node's summary line is `triggerSummary`
+  void trigger; // the trigger node's title is `triggerSummary`
   const layout = useMemo(() => layoutCanvas(blocks), [blocks]);
   const blocksById = useMemo(() => {
     const map = new Map<string, BlockDef>();
@@ -70,7 +89,7 @@ export function Canvas({
     return map;
   }, [blocks]);
 
-  // Scale-to-fit: the canvas shrinks (never grows) to the panel width.
+  // Scale-to-fit: the canvas shrinks (never grows) to the column width.
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [containerWidth, setContainerWidth] = useState(0);
   useEffect(() => {
@@ -83,7 +102,8 @@ export function Canvas({
     return () => observer.disconnect();
   }, []);
   // jsdom (stubbed observer) lands on width 0 → scale 1, untransformed.
-  const scale = containerWidth > 0 ? clamp(containerWidth / layout.width, MIN_SCALE, MAX_SCALE) : 1;
+  const fit = containerWidth > 0 ? clamp(containerWidth / layout.width, MIN_SCALE, MAX_SCALE) : 1;
+  const scale = zoom === "fit" ? fit : clamp(zoom, MIN_SCALE, MAX_SCALE);
 
   // Roving arrow-key focus in document order (nodes render in that order).
   const nodeRefs = useRef(new Map<string, HTMLDivElement>());
@@ -93,17 +113,18 @@ export function Canvas({
     if (next) nodeRefs.current.get(next)?.focus();
   };
 
+  const tail = layout.edges.find((edge) => edge.kind === "tail");
+
   return (
-    <div className="flex h-full flex-col" data-testid="block-canvas">
-      <div className="text-muted-foreground flex items-center justify-between px-3 py-2 text-xs font-medium">
-        <span>Blocks</span>
-        {locked && (
-          <span className="inline-flex items-center gap-1">
-            <Lock className="size-3" aria-hidden /> structure set by the built-in
-          </span>
-        )}
-      </div>
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto" aria-label="Automation blocks">
+    <div
+      className="flex h-full min-w-0 flex-col"
+      data-testid={entrypointId ? `entrypoint-canvas-${entrypointId}` : "block-canvas"}
+    >
+      <div
+        ref={scrollRef}
+        className="min-h-0 flex-1 overflow-auto"
+        aria-label={entrypointId ? `Steps for ${entrypointId}` : "Automation blocks"}
+      >
         <div style={{ width: layout.width * scale, height: layout.height * scale }}>
           <div
             className="relative"
@@ -123,6 +144,7 @@ export function Canvas({
                   node={node}
                   block={block}
                   triggerSummary={triggerSummary}
+                  triggerDetail={entrypointId}
                   selected={selectedId === (block ? node.id : TRIGGER_ROW_ID)}
                   errored={erroredIds.has(block ? node.id : TRIGGER_ROW_ID)}
                   locked={locked}
@@ -156,7 +178,7 @@ export function Canvas({
             })}
             {!locked &&
               layout.edges
-                .filter((edge) => edge.insert)
+                .filter((edge) => edge.insert && edge.kind !== "tail")
                 .map((edge) => (
                   <InsertMenu
                     key={`insert-${edge.id}`}
@@ -167,9 +189,69 @@ export function Canvas({
                     onInsert={onInsert}
                   />
                 ))}
+            {!locked && tail?.insert && (
+              <AddStepNode
+                x={tail.points.at(-1)!.x}
+                y={tail.points.at(-1)!.y}
+                at={tail.insert.at}
+                index={tail.insert.index}
+                onInsert={onInsert}
+              />
+            )}
           </div>
         </div>
       </div>
+      {locked && (
+        <div className="flex shrink-0 items-center gap-1 px-3 py-1.5 text-2xs text-muted-foreground">
+          <Lock className="size-3" aria-hidden /> structure set by the built-in
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The dashed node at the end of the trail: the one place to append a step
+ * when the "+" affordances between steps are not what you reach for. Carries
+ * the same accessible name as those affordances — it IS one. */
+function AddStepNode({
+  x,
+  y,
+  at,
+  index,
+  onInsert,
+}: {
+  x: number;
+  y: number;
+  at: ListPath;
+  index: number;
+  onInsert: (at: ListPath, index: number, kind: string) => void;
+}) {
+  return (
+    <div
+      className="absolute z-20 -translate-x-1/2 -translate-y-1/2"
+      style={{ left: x, top: y, width: NODE_W }}
+    >
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            aria-label="Insert block here"
+            data-testid="add-step"
+            className="flex h-9 w-full items-center justify-center gap-1.5 rounded-lg border border-dashed bg-transparent text-xs text-muted-foreground transition-colors hover:border-ring/50 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none"
+          >
+            <Plus className="size-3.5" aria-hidden />
+            Add step
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="center">
+          {insertableBlockKinds().map((spec) => (
+            <DropdownMenuItem key={spec.kind} onSelect={() => onInsert(at, index, spec.kind)}>
+              <spec.icon className="size-4" aria-hidden />
+              {spec.label}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
     </div>
   );
 }

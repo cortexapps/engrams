@@ -102,6 +102,7 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
   const builtin = automation?.kind === "builtin";
   const settings = parseDefinition(automation?.version?.definitionJson).settings;
 
+  const [description, setDescription] = useState("");
   const [policy, setPolicy] = useState<string>(NONE);
   const [keyTemplate, setKeyTemplate] = useState("");
   const [deadlineMinutes, setDeadlineMinutes] = useState("");
@@ -114,6 +115,7 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
     const key = `${automation.id}:${automation.currentVersion}`;
     if (key === loadedVersion) return;
     setLoadedVersion(key);
+    setDescription(automation.description);
     setPolicy(settings.concurrency?.policy ?? NONE);
     setKeyTemplate(settings.concurrency?.keyTemplate ?? "");
     setDeadlineMinutes(
@@ -180,7 +182,7 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
       return;
     }
     if (copy) {
-      toast.success("Duplicated");
+      toast.success("Duplicated — edit the copy freely");
       void navigate({
         to: "/automations/$id",
         params: { id: copy.id },
@@ -191,8 +193,46 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
 
   const lockedHint = builtin ? <FieldDescription>Set by the built-in.</FieldDescription> : null;
 
+  // The description lives here, not in the Builder masthead: it is a note
+  // about the automation, not part of building it.
+  const descriptionDirty = !builtin && description !== automation.description;
+  const saveDescription = async () => {
+    try {
+      await updateMeta.mutateAsync({ id, description });
+      toast.success("Saved");
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  };
+
   return (
     <div className="flex flex-col gap-8">
+      <section className="flex max-w-xl flex-col gap-4" aria-label="about">
+        <h3 className="text-sm font-semibold">About</h3>
+        <Field>
+          <FieldLabel htmlFor="settings-description">Description</FieldLabel>
+          <Input
+            id="settings-description"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            disabled={builtin}
+            placeholder="What this automation is for"
+          />
+          {lockedHint}
+        </Field>
+        {descriptionDirty && (
+          <div>
+            <Button
+              type="button"
+              size="sm"
+              onClick={saveDescription}
+              disabled={updateMeta.isPending}
+            >
+              Save description
+            </Button>
+          </div>
+        )}
+      </section>
       <section className="flex max-w-xl flex-col gap-4" aria-label="run settings">
         <h3 className="text-sm font-semibold">Run settings</h3>
         <Field>

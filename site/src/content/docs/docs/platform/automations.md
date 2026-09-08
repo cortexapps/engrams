@@ -91,12 +91,12 @@ can retry up to five times on transient errors.
 ## Runs
 
 A run is `completed`, `filtered` (a filter or a boolean code block ended it on purpose),
-`failed`, `superseded`, `halted` (stopped by a person), or `deadline`. The Runs tab lists them
-with the trigger that started each one, and consecutive filtered runs collapse so noise does
-not bury the runs that did work. A run's page is a step timeline; each step opens to its
-inputs, its outputs, its output text, and the session it used.
-
-![The Runs tab of a scheduled automation](../../../../assets/screenshots/automation-runs.png)
+`failed`, `superseded`, `halted` (stopped by a person), or `deadline`. The Activity tab lists
+each run as an entry with the trigger that started it, and consecutive filtered runs fold into
+one quiet row so noise does not bury the runs that did work. An entry unfolds in place into
+its step trace; each step shows its outcome, its duration, and the error verbatim when it
+failed. The Activity page in the Automations section shows every automation's entries in one
+ledger.
 
 Retry starts a fresh run with the same trigger payload. Stop asks a run to halt at its next
 checkpoint. A run deadline, up to 48 hours, ends a run that outlived its usefulness.

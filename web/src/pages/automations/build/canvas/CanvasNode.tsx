@@ -1,16 +1,15 @@
-/** One node card on the canvas: block variant or trigger variant.
+/** One node card on the canvas: a step (card on the sheet) or a trigger (the
+ * way in, on the cover's fill so it reads as a header, not as another step).
  *
- * Keeps the BlockList row's external contract byte-for-byte —
- * `data-testid="block-row-<id>"`, `aria-current`, the "has errors" dot, the
- * `Remove <id>` label — so the editor-level tests pass unchanged. Ghost and
- * status are pure class/element toggles with no layout impact: the AI
- * drafting and run-replay features wire them later without touching
- * geometry.
- */
+ * Keeps the external contract — `data-testid="block-row-<id>"`,
+ * `aria-current`, the "has errors" dot, the `Remove <id>` label — so the
+ * editor-level tests pass unchanged. Ghost and status are pure class/element
+ * toggles with no layout impact. */
 
 import { ArrowDown, ArrowUp, MoreVertical, Trash2, Zap } from "lucide-react";
 import type { KeyboardEvent, ReactNode } from "react";
 
+import { StatusDot, type StatusTone } from "@/components/status-dot";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -25,18 +24,21 @@ import type { LayoutNode } from "./layout";
 
 export type CanvasNodeStatus = "running" | "ok" | "failed" | "skipped";
 
-const STATUS_CLASS: Record<CanvasNodeStatus, string> = {
-  running: "bg-instrument-caution",
-  ok: "bg-instrument-nominal",
-  failed: "bg-instrument-critical",
-  skipped: "bg-muted-foreground/50",
+const STATUS_TONE: Record<CanvasNodeStatus, StatusTone> = {
+  running: "active",
+  ok: "nominal",
+  failed: "critical",
+  skipped: "muted",
 };
 
 export interface CanvasNodeProps {
   node: LayoutNode;
   /** Absent = the trigger variant. */
   block?: BlockDef;
+  /** The trigger variant's title: the human trigger ("Every day at 02:00 UTC"). */
   triggerSummary?: string;
+  /** The trigger variant's second line, e.g. the way in it names. */
+  triggerDetail?: string;
   selected: boolean;
   errored: boolean;
   locked: boolean;
@@ -57,6 +59,7 @@ export function CanvasNode({
   node,
   block,
   triggerSummary,
+  triggerDetail,
   selected,
   errored,
   locked,
@@ -73,8 +76,7 @@ export function CanvasNode({
 }: CanvasNodeProps) {
   const spec = block ? blockKind(block.type) : null;
   const Icon = spec?.icon ?? Zap;
-  const label = spec?.label ?? "Trigger";
-  const summary = block ? spec!.summary(block.config) : (triggerSummary ?? "");
+  const summary = block ? spec!.summary(block.config) : "";
 
   const onKeyDown = (e: KeyboardEvent) => {
     if (e.key === "Enter" || e.key === " ") {
@@ -92,13 +94,13 @@ export function CanvasNode({
   let statusChip: ReactNode = null;
   if (status) {
     statusChip = (
-      <span
-        className={cn("absolute -top-1.5 -right-1.5 size-3 rounded-full", STATUS_CLASS[status])}
-        aria-label={`step ${status}`}
-      />
+      <span className="absolute -top-1 -right-1" aria-label={`step ${status}`} role="img">
+        <StatusDot tone={STATUS_TONE[status]} size={10} />
+      </span>
     );
   }
 
+  const trigger = !block;
   return (
     <div
       ref={nodeRef}
@@ -108,66 +110,87 @@ export function CanvasNode({
       aria-current={selected ? "true" : undefined}
       onClick={onSelect}
       onKeyDown={onKeyDown}
-      style={{ left: node.x, top: node.y, width: node.w, height: node.h }}
+      style={{
+        left: node.x,
+        top: node.y,
+        width: node.w,
+        height: node.h,
+        ...(errored
+          ? { borderColor: "color-mix(in oklch, var(--color-destructive) 60%, transparent)" }
+          : {}),
+      }}
       className={cn(
-        "group absolute z-10 flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-[border-color,box-shadow]",
-        ghost ? "border-dashed bg-transparent opacity-60" : "bg-card shadow-xs",
-        selected ? "ring-ring ring-2" : "hover:border-ring/40 hover:shadow-sm",
-        errored ? "border-destructive/60" : block ? "border-border" : "border-primary/50",
+        "group absolute z-10 flex flex-col justify-center gap-0.5 rounded-lg border px-3 pt-[11px] pb-3 text-left transition-[border-color,outline-color] duration-150 outline-none",
+        trigger
+          ? "border-transparent bg-sidebar text-sidebar-foreground"
+          : ghost
+            ? "border-dashed bg-transparent opacity-60"
+            : "bg-card shadow-[0_1px_2px_oklch(0_0_0/.06)]",
+        selected && "outline-2 outline-offset-1 outline-ring",
+        !selected && !trigger && "hover:border-ring/40",
       )}
     >
       {statusChip}
-      <Icon
-        className={cn(
-          "size-5 shrink-0 rounded p-0.5",
-          block ? "bg-muted text-muted-foreground" : "bg-primary text-primary-foreground",
-        )}
-        aria-hidden
-      />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="truncate font-medium">{label}</span>
-          {block && <code className="text-muted-foreground truncate text-xs">{block.id}</code>}
-          {errored && (
-            <span
-              className="bg-destructive size-1.5 shrink-0 rounded-full"
-              aria-label="has errors"
-            />
+      <div className="flex items-center gap-2">
+        <Icon
+          className={cn(
+            "size-3.5 shrink-0",
+            trigger ? "text-sidebar-primary" : "text-muted-foreground",
           )}
-        </div>
-        <div className="text-muted-foreground truncate text-xs">{summary}</div>
+          aria-hidden
+        />
+        <span className="min-w-0 flex-1 truncate text-sm font-semibold">
+          {trigger ? triggerSummary || "Trigger" : spec!.label}
+        </span>
+        {errored && <StatusDot tone="critical" size={6} label="has errors" />}
+        <span
+          className={cn(
+            "shrink-0 font-mono text-2xs",
+            trigger ? "text-sidebar-foreground/70" : "text-muted-foreground",
+          )}
+        >
+          {trigger ? "trigger" : block!.type}
+        </span>
+        {block && !locked && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                className="-mr-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"
+                aria-label={`Actions for ${block.id}`}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <MoreVertical />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+              <DropdownMenuItem disabled={!canMoveUp} onSelect={onMoveUp}>
+                <ArrowUp aria-hidden /> Move up
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={!canMoveDown} onSelect={onMoveDown}>
+                <ArrowDown aria-hidden /> Move down
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                variant="destructive"
+                aria-label={`Remove ${block.id}`}
+                onSelect={onRemove}
+              >
+                <Trash2 aria-hidden /> Remove
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
       </div>
-      {block && !locked && (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-7 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"
-              aria-label={`Actions for ${block.id}`}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <MoreVertical className="size-4" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
-            <DropdownMenuItem disabled={!canMoveUp} onSelect={onMoveUp}>
-              <ArrowUp className="size-4" aria-hidden /> Move up
-            </DropdownMenuItem>
-            <DropdownMenuItem disabled={!canMoveDown} onSelect={onMoveDown}>
-              <ArrowDown className="size-4" aria-hidden /> Move down
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              variant="destructive"
-              aria-label={`Remove ${block.id}`}
-              onSelect={onRemove}
-            >
-              <Trash2 className="size-4" aria-hidden /> Remove
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
+      <div
+        className={cn(
+          "truncate pl-[22px] text-xs",
+          trigger ? "font-mono text-sidebar-foreground/70" : "text-muted-foreground",
+        )}
+      >
+        {trigger ? triggerDetail : summary}
+      </div>
     </div>
   );
 }

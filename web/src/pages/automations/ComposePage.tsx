@@ -1,34 +1,65 @@
-/** The "New automation" front door (Builder v2): describe the workflow in
- * plain English; a drafting agent recons the repo and the org's automations,
- * then assembles a validated draft in the Builder while you watch — with
- * "build by hand" as the escape hatch to the blank editor.
- *
- * The idempotency key follows the NewSpecPage pattern: it regenerates
- * whenever the composed request changes, so a double-click replays the same
- * create and an edited prompt mints a fresh draft.
- */
-
+/** The new-automation front door. The drafting conversation stays beside the
+ * request until the agent saves the first editable version. */
 import { useMutation } from "@connectrpc/connect-query";
 import { Link, useNavigate } from "@tanstack/react-router";
+import { Sparkles } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { TaskComposer, type TaskComposerState } from "@/components/composer/TaskComposer";
+import { SessionThread } from "@/components/session-thread/SessionThread";
+import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
 import { draftAutomation } from "@/gen/engram/app/v1/automation-AutomationService_connectquery";
+import { useEditorAutomation } from "@/hooks/useAutomationEditor";
+import { useBuiltinAutomation, useDuplicateAutomation } from "@/hooks/useAutomations";
+import { useSessionEvents } from "@/hooks/useSessionEvents";
+import { errorMessage } from "@/lib/errors";
 
 const SUGGESTIONS = [
   "When a PR opens, run the tests and page #eng-alerts if they fail",
   "Triage nightly CI failures into a session that files issues",
   "Post a Slack digest of merged PRs at 9:00 every weekday",
-  "When a Linear ticket is tagged 'engrams', spawn a session to work it",
 ];
+
+function DraftingThread({ sessionId }: { sessionId: string }) {
+  const { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx } =
+    useSessionEvents(sessionId);
+
+  return (
+    <section
+      className="overflow-hidden rounded-lg border bg-card"
+      data-testid="drafting-thread"
+      aria-label="Drafting agent conversation"
+    >
+      <div className="flex items-center gap-2 border-b px-3 py-2 text-xs font-medium text-muted-foreground">
+        <Sparkles className="size-3.5" aria-hidden />
+        Drafting agent
+      </div>
+      <div className="max-h-[520px] overflow-y-auto px-3">
+        <SessionThread
+          sessionId={sessionId}
+          events={events}
+          status={undefined}
+          streamingText={streamingText}
+          transcriptWindow={{ hasMore, loadingOlder, loadOlder, oldestIdx }}
+        />
+      </div>
+    </section>
+  );
+}
 
 export function ComposePage() {
   const navigate = useNavigate();
   const draft = useMutation(draftAutomation);
+  const builtin = useBuiltinAutomation("pr_review");
+  const duplicate = useDuplicateAutomation();
   const [composerState, setComposerState] = useState<TaskComposerState | null>(null);
   const [prefill, setPrefill] = useState<string | null>(null);
+  const [automationId, setAutomationId] = useState<string>();
+  const editor = useEditorAutomation(automationId);
+  const automation = editor.data?.automation;
+  const isDrafting = automationId !== undefined;
 
   const signature = JSON.stringify([
     composerState?.prompt ?? "",
@@ -42,8 +73,17 @@ export function ComposePage() {
   const [idempotencyKey, setIdempotencyKey] = useState(() => crypto.randomUUID());
   useEffect(() => setIdempotencyKey(crypto.randomUUID()), [signature]);
 
+  useEffect(() => {
+    if (!automationId || !automation || automation.currentVersion <= 0) return;
+    void navigate({
+      to: "/automations/$id",
+      params: { id: automationId },
+      search: { tab: "build" },
+    });
+  }, [automation, automationId, navigate]);
+
   const submit = async (state: TaskComposerState) => {
-    if (!state.valid || !state.profileId || draft.isPending) return;
+    if (!state.valid || !state.profileId || draft.isPending || isDrafting) return;
     const { harnessOverride } = state;
     try {
       const result = await draft.mutateAsync({
@@ -56,62 +96,100 @@ export function ComposePage() {
         ...(harnessOverride.effort ? { effort: harnessOverride.effort } : {}),
         ...(harnessOverride.mode ? { harnessMode: harnessOverride.mode } : {}),
       });
-      void navigate({
-        to: "/automations/$id",
-        params: { id: result.automationId },
-        search: { tab: "build" },
-      });
+      setAutomationId(result.automationId);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Could not start drafting");
     }
   };
 
+  const duplicateBuiltin = async () => {
+    const source = builtin.data?.automation;
+    if (!source) return;
+    try {
+      const result = await duplicate.mutateAsync({ automationId: source.id });
+      toast.success("Duplicated — edit the copy freely");
+      const id = result.automation?.id;
+      if (id) {
+        await navigate({
+          to: "/automations/$id",
+          params: { id },
+          search: { tab: "build" },
+        });
+      }
+    } catch (error) {
+      toast.error(errorMessage(error));
+    }
+  };
+
   return (
-    <div className="mx-auto max-w-4xl space-y-6 py-8" data-testid="automation-compose">
+    <div className="mx-auto max-w-[720px] space-y-6 py-8" data-testid="automation-compose">
       <Text as="h1" variant="display" className="text-2xl">
         New automation
       </Text>
 
-      <TaskComposer
-        key={prefill ?? "blank"}
-        submitLabel="Start drafting"
-        pendingLabel="Starting…"
-        pending={draft.isPending}
-        placeholder="When a PR opens, run the tests and…"
-        {...(prefill !== null ? { initialPrompt: prefill } : {})}
-        onStateChange={setComposerState}
-        onSubmit={submit}
-        submitTestId="start-drafting"
-      />
-
-      <p className="text-xs text-muted-foreground">
-        A drafting agent reads your repository and assembles the automation while you watch; nothing
-        runs until you turn it on.
-      </p>
-
-      <div className="flex flex-wrap gap-2">
-        {SUGGESTIONS.map((suggestion) => (
-          <button
-            key={suggestion}
-            type="button"
-            className="text-muted-foreground hover:text-foreground hover:border-ring rounded-sm border px-3 py-1 text-xs"
-            onClick={() => setPrefill(suggestion)}
-          >
-            {suggestion}
-          </button>
-        ))}
+      <div inert={isDrafting} aria-disabled={isDrafting}>
+        <TaskComposer
+          key={prefill ?? "blank"}
+          submitLabel="Draft it"
+          pendingLabel={isDrafting ? "Drafting…" : "Starting…"}
+          pending={draft.isPending || isDrafting}
+          disabled={isDrafting}
+          placeholder="When a PR opens, run the tests and…"
+          {...(prefill !== null ? { initialPrompt: prefill } : {})}
+          onStateChange={setComposerState}
+          onSubmit={submit}
+          submitTestId="start-drafting"
+        />
       </div>
 
-      <p className="text-muted-foreground text-xs">
-        The draft lands as a disabled automation you can edit at any point.{" "}
-        <Link
-          to="/automations/new/manual"
-          className="decoration-muted-foreground/50 underline decoration-dotted underline-offset-2"
-          data-testid="build-by-hand"
-        >
-          or build by hand in the Builder →
-        </Link>
-      </p>
+      <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
+        <p className="text-xs text-muted-foreground">
+          An agent reads the repo and your existing automations, then assembles a draft you can
+          watch, edit and turn on. Nothing runs until you turn it on.
+        </p>
+        <Button variant="outline" asChild className="shrink-0">
+          <Link to="/automations/new/manual" data-testid="build-by-hand">
+            Build by hand
+          </Link>
+        </Button>
+      </div>
+
+      {automation?.draftSessionId && <DraftingThread sessionId={automation.draftSessionId} />}
+
+      <section className="space-y-2" aria-labelledby="starting-points-heading">
+        <h2 id="starting-points-heading" className="text-sm font-semibold">
+          Starting points
+        </h2>
+        <div>
+          {SUGGESTIONS.map((suggestion) => (
+            <button
+              key={suggestion}
+              type="button"
+              className="flex h-9 w-full items-center gap-2 rounded-md px-2 text-left text-sm hover:bg-accent/60 disabled:pointer-events-none disabled:opacity-50"
+              onClick={() => setPrefill(suggestion)}
+              disabled={isDrafting}
+            >
+              <span className="text-muted-foreground" aria-hidden>
+                →
+              </span>
+              {suggestion}
+            </button>
+          ))}
+          {builtin.data?.automation && (
+            <button
+              type="button"
+              className="flex h-9 w-full items-center gap-2 rounded-md px-2 text-left text-sm hover:bg-accent/60 disabled:pointer-events-none disabled:opacity-50"
+              onClick={duplicateBuiltin}
+              disabled={duplicate.isPending || isDrafting}
+            >
+              <span className="text-muted-foreground" aria-hidden>
+                →
+              </span>
+              Duplicate the built-in PR review and change the repos
+            </button>
+          )}
+        </div>
+      </section>
     </div>
   );
 }

@@ -1,8 +1,9 @@
-import { Plus } from "lucide-react";
+import { Activity, Layers, Plus } from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 
 import type { AutomationSummary } from "@/gen/engram/app/v1/automation_pb";
 import { useAutomations } from "@/hooks/useAutomations";
+import { useAllInstances } from "@/hooks/useInstances";
 import { useNow } from "@/hooks/useNow";
 import { runStatusTone } from "@/lib/automations";
 import { relativeAge } from "@/lib/relative-time";
@@ -31,6 +32,10 @@ export function AutomationsRail() {
   const { data, isPending, error } = useAutomations();
   const rows = orderAutomations(data?.automations ?? []);
   const onNew = pathname.startsWith("/automations/new");
+  const onWorkstreams = pathname.startsWith("/automations/workstreams");
+  const onActivity = pathname.startsWith("/automations/activity");
+  const ids = rows.map((s) => s.automation?.id).filter((id): id is string => !!id);
+  const open = useAllInstances(ids).instances.filter((i) => i.status === "open").length;
 
   return (
     <>
@@ -45,6 +50,35 @@ export function AutomationsRail() {
               <Link to="/automations/new">
                 <Plus />
                 <span>New automation</span>
+              </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              asChild
+              isActive={onWorkstreams}
+              className="rounded-[10px] px-2.5 text-sidebar-foreground/[0.84] data-[active=true]:font-semibold"
+            >
+              <Link to="/automations/workstreams">
+                <Layers />
+                <span>Workstreams</span>
+                {open > 0 && (
+                  <span className="ml-auto font-mono text-2xs tabular-nums text-sidebar-foreground/[0.65]">
+                    {open} open
+                  </span>
+                )}
+              </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              asChild
+              isActive={onActivity}
+              className="rounded-[10px] px-2.5 text-sidebar-foreground/[0.84] data-[active=true]:font-semibold"
+            >
+              <Link to="/automations/activity">
+                <Activity />
+                <span>Activity</span>
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>

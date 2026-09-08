@@ -7,7 +7,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
-import { RunStatusDot } from "./RunsTab";
+import { RunStatusDot } from "./RunStatusDot";
 import { formatDuration, parseJsonObject, runStatusLabel, type TimelineStep } from "./run-format";
 
 export interface StepRunDrawerProps {

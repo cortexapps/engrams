@@ -20,10 +20,8 @@ const duplicate = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id:
 
 // 3.5: the header's DryRun button uses a connect-query mutation; this suite
 // renders without a QueryClient, so stub it like every other hook here.
-vi.mock("./DraftRail", () => ({
-  DraftRail: ({ sessionId }: { sessionId: string }) => (
-    <div data-testid="draft-rail">{sessionId}</div>
-  ),
+vi.mock("@/hooks/useAutomationRuns", () => ({
+  useRunList: () => ({ data: undefined, isPending: false, error: null }),
 }));
 vi.mock("@/hooks/useAutomationCode", () => ({
   useDryRun: () => ({ mutate: vi.fn(), isPending: false }),
@@ -146,7 +144,9 @@ describe("AutomationEditor", () => {
     };
     automationHolder.value = { automation: base };
     const view = render(<AutomationEditor mode="edit" />);
-    expect(screen.getByTestId("draft-rail").textContent).toBe("draft-sess-1");
+    // The drafting conversation lives on the compose page now; the Builder
+    // shows only the agent's versions landing.
+    expect(screen.queryByTestId("draft-rail")).toBeNull();
     expect(screen.queryByTestId("draft-stale-banner")).toBeNull();
 
     // CLEAN editor: the agent saves v2 → the editor adopts silently.
@@ -301,14 +301,13 @@ describe("AutomationEditor", () => {
       },
     };
     render(<AutomationEditor mode="edit" />);
-    expect(screen.getByTestId("entrypoint-bar")).toBeTruthy();
-    // Main shows its own blocks.
+    // Every way in is its own column on the canvas, each headed by its
+    // trigger node; there is no entrypoint bar to switch between them.
+    expect(screen.queryByTestId("entrypoint-bar")).toBeNull();
+    expect(screen.getByTestId("entrypoint-canvas-main")).toBeTruthy();
+    expect(screen.getByTestId("entrypoint-canvas-sweep")).toBeTruthy();
     expect(screen.getByTestId("block-row-finder")).toBeTruthy();
-    expect(screen.queryByTestId("block-row-nudge")).toBeNull();
-
-    fireEvent.click(screen.getByTestId("entrypoint-sweep"));
     expect(screen.getByTestId("block-row-nudge")).toBeTruthy();
-    expect(screen.queryByTestId("block-row-finder")).toBeNull();
 
     // Edit the extra entrypoint's prompt and save: the payload carries the
     // edit inside entrypoints[0] while main's blocks stay untouched.
@@ -324,9 +323,11 @@ describe("AutomationEditor", () => {
 
   it("selects the tab from the search param and navigates on tab change", async () => {
     automationHolder.value = { automation: automation("user") };
-    searchHolder.value = { tab: "runs" };
+    searchHolder.value = { tab: "activity" };
     render(<AutomationEditor mode="edit" />);
-    expect(screen.getByRole("tab", { name: "Runs" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("tab", { name: "Activity" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Build" }));
     fireEvent.click(screen.getByRole("tab", { name: "Build" }));
     await waitFor(() => expect(navigate).toHaveBeenCalled());

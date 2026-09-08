@@ -14,8 +14,8 @@
 
 import { blockKind, type BlockDef, type ListPath } from "@/lib/automation-blocks";
 
-export const NODE_W = 230;
-export const NODE_H = 56;
+export const NODE_W = 264;
+export const NODE_H = 60;
 /** Vertical run between sequential nodes; hosts the "+" affordance. */
 export const V_GAP = 36;
 /** Branch node to the top of its child columns (room for then/else labels). */
@@ -29,8 +29,11 @@ export const LOOP_GAP = 12;
 export const EMPTY_W = 80;
 /** Minimum inner height of an empty loop body. */
 export const EMPTY_H = 28;
-/** Append stub below the last root block. */
-export const TAIL_H = 28;
+/** Append run below the last root block; the dashed "Add step" node sits at
+ * its end. */
+export const TAIL_H = 44;
+/** How far a branch lane extends past its leg's column on each side. */
+export const LANE_PAD = 6;
 export const CANVAS_PAD = 24;
 export const MIN_SCALE = 0.5;
 export const MAX_SCALE = 1;
@@ -48,9 +51,12 @@ export interface LayoutNode {
   listLength?: number;
 }
 
-/** A loop's dashed body box; id = the loop block's id. */
+/** A dashed lane: a loop's body box (id = the loop block's id) or one leg of
+ * a branch (id = `<block>:then` / `<block>:else`). The lane carries the
+ * leg's label, so edges need none. */
 export interface LayoutGroup {
   id: string;
+  kind: "loop" | "then" | "else";
   x: number;
   y: number;
   w: number;
@@ -225,6 +231,18 @@ function placeBlock(
 
     const leg = (legList: readonly BlockDef[], legAxis: number, slot: "then" | "else"): void => {
       const legAt: ListPath = { parentId: block.id, slot };
+      // The lane: the leg's whole column between the fan-out and the fan-in,
+      // padded a little past the widest node so it reads as a bracket.
+      const legW = Math.max(measureList(legList, { emptyW: EMPTY_W, emptyH: 0 }).w, EMPTY_W);
+      out.groups.push({
+        id: `${block.id}:${slot}`,
+        kind: slot,
+        x: legAxis - legW / 2 - LANE_PAD,
+        y: fanY + LANE_PAD,
+        w: legW + 2 * LANE_PAD,
+        h: joinFanY - fanY - 2 * LANE_PAD,
+        emptyBody: legList.length === 0,
+      });
       if (legList.length === 0) {
         // One fan-through edge IS the empty leg: it carries the label and
         // the leg's only insert point (index 0).
@@ -295,8 +313,9 @@ function placeBlock(
     const bm = measureList(bodyList, { emptyW: NODE_W, emptyH: EMPTY_H });
     const groupW = Math.max(bm.w, NODE_W) + 2 * GROUP_PAD;
     const groupH = bm.h + 2 * GROUP_PAD;
-    const rect = {
+    const rect: LayoutGroup = {
       id: block.id,
+      kind: "loop",
       x: axis - groupW / 2,
       y: y + NODE_H + LOOP_GAP,
       w: groupW,

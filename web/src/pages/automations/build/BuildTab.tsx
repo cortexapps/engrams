@@ -1,19 +1,38 @@
-/** The Build tab (ADR 0119 phase 3.3): block list left, inspector right.
+/** The Build tab: the canvas (one column per way in) with the inspector as a
+ * side sheet on the right and the test drawer along the bottom.
  *
  * Owns nothing durable — the shell holds the draft definition and passes
- * change callbacks down; this component is layout + selection. The
- * `testPanel` slot is where 3.4 mounts "Test with sample" results. */
+ * change callbacks down; this component is layout + selection. Block ids are
+ * unique automation-wide, so selecting a node in any column also selects that
+ * column's way in for the inspector. */
 
+import { ChevronDown, ChevronUp, MoreHorizontal, Plus, Trash2, X } from "lucide-react";
 import { useMemo, useState, type ReactNode } from "react";
 
-import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+import { Button } from "@/components/ui/button";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import type { AutomationTestState } from "@/hooks/useAutomationTest";
+import {
+  addEntrypoint,
+  blockIdsOutsideEntrypoint,
   blockKind,
+  entrypointIdError,
+  entrypointIds,
   findBlock,
   insertBlock,
+  MAIN_ENTRYPOINT_ID,
+  mergeEntrypoint,
   moveBlock,
   nextBlockId,
+  projectEntrypoint,
   removeBlock,
+  removeEntrypoint,
   replaceBlock,
   walkBlocks,
   type AutomationDefinition,
@@ -22,23 +41,31 @@ import {
   type ListPath,
   type TriggerSpec,
 } from "@/lib/automation-blocks";
+import { cn } from "@/lib/utils";
 
 import { BlockInspector } from "./BlockInspector";
 import { Canvas, TRIGGER_ROW_ID } from "./canvas/Canvas";
+import { MAX_SCALE, MIN_SCALE } from "./canvas/layout";
+import { TestPanel } from "./test/TestPanel";
 import { TriggerInspector } from "./TriggerInspector";
 
 export interface BuildTabProps {
+  /** The whole automation, every way in included. */
   definition: AutomationDefinition;
+  /** The way in the inspector edits. */
+  entrypointId: string;
+  onSelectEntrypoint: (id: string) => void;
   onChange: (next: AutomationDefinition) => void;
   builtin: boolean;
   errors: readonly BlockErrorRef[];
-  triggerSummary: string;
-  /** 3.4: TestPanel mounts here (below the inspector). */
+  /** The human trigger for a way in, for its trigger node's title. */
+  triggerSummaryFor: (entrypointId: string) => string;
+  /** The test-with-sample state; drives the bottom drawer. */
+  test?: AutomationTestState;
+  /** Tests inject a stand-in for the drawer's body. */
   testPanel?: ReactNode;
-  /** 3.4: live variable values keyed by path for the selected sample. */
+  /** Live variable values keyed by path for the selected sample. */
   variableValues?: Readonly<Record<string, string>>;
-  /** D9: block ids in OTHER entrypoints — ids stay unique automation-wide. */
-  reservedBlockIds?: readonly string[];
 }
 
 /** Static variable paths available to a block: trigger/inputs/event roots
@@ -98,19 +125,46 @@ function sessionSourcesFor(definition: AutomationDefinition, selectedId: string 
   return ids;
 }
 
+/** Where a block sits: the list holding it, its index, and that list's
+ * length — what Move up / Move down need. */
+export function locateBlock(
+  blocks: readonly BlockDef[],
+  id: string,
+  at: ListPath = { root: true },
+): { at: ListPath; index: number; length: number } | null {
+  for (const [index, block] of blocks.entries()) {
+    if (block.id === id) return { at, index, length: blocks.length };
+    for (const slot of ["then", "else", "body"] as const) {
+      const list = block[slot];
+      if (!list) continue;
+      const found = locateBlock(list, id, { parentId: block.id, slot });
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 export function BuildTab({
   definition,
+  entrypointId,
+  onSelectEntrypoint,
   onChange,
   builtin,
   errors,
-  triggerSummary,
+  triggerSummaryFor,
+  test,
   testPanel,
   variableValues,
-  reservedBlockIds,
 }: BuildTabProps) {
-  const firstId = definition.blocks[0]?.id ?? TRIGGER_ROW_ID;
+  const ways = entrypointIds(definition);
+  const active = projectEntrypoint(definition, entrypointId);
+  const firstId = active.blocks[0]?.id ?? TRIGGER_ROW_ID;
   const [selectedId, setSelectedId] = useState<string>(firstId);
-  const selected = selectedId === TRIGGER_ROW_ID ? null : findBlock(definition.blocks, selectedId);
+  const [zoom, setZoom] = useState<number | "fit">("fit");
+  const [adding, setAdding] = useState(false);
+  const [draftWay, setDraftWay] = useState("");
+
+  const selected = selectedId === TRIGGER_ROW_ID ? null : findBlock(active.blocks, selectedId);
   // A removed block leaves a dangling selection; fall back to the trigger.
   const effectiveId = selectedId === TRIGGER_ROW_ID || selected ? selectedId : TRIGGER_ROW_ID;
 
@@ -122,68 +176,235 @@ export function BuildTab({
   const blockErrors = errors.filter((e) => e.blockId === effectiveId);
   const triggerErrors = errors.filter((e) => e.blockId === "");
 
+  const changeWay = (way: string, next: AutomationDefinition) =>
+    onChange(mergeEntrypoint(definition, way, next));
+
   const updateBlock = (next: BlockDef) =>
-    onChange({
-      ...definition,
-      blocks: replaceBlock(definition.blocks, next.id, next),
-    });
-  const updateTrigger = (trigger: TriggerSpec) => onChange({ ...definition, trigger });
-  const onInsert = (at: ListPath, index: number, kind: string) => {
+    changeWay(entrypointId, { ...active, blocks: replaceBlock(active.blocks, next.id, next) });
+  const updateTrigger = (trigger: TriggerSpec) => changeWay(entrypointId, { ...active, trigger });
+
+  const select = (way: string, id: string) => {
+    if (way !== entrypointId) onSelectEntrypoint(way);
+    setSelectedId(id);
+  };
+  const onInsert = (way: string, at: ListPath, index: number, kind: string) => {
+    const projected = projectEntrypoint(definition, way);
     const spec = blockKind(kind);
-    const id = nextBlockId(definition.blocks, kind, reservedBlockIds ?? []);
+    const id = nextBlockId(projected.blocks, kind, blockIdsOutsideEntrypoint(definition, way));
     const block: BlockDef = { id, type: kind, config: spec.defaults() };
     if (spec.nests === "branch") {
       block.then = [];
       block.else = [];
     }
     if (spec.nests === "loop") block.body = [];
-    onChange({
-      ...definition,
-      blocks: insertBlock(definition.blocks, at, index, block),
-    });
-    setSelectedId(id);
+    changeWay(way, { ...projected, blocks: insertBlock(projected.blocks, at, index, block) });
+    select(way, id);
   };
-  const onMove = (at: ListPath, from: number, to: number) =>
-    onChange({
-      ...definition,
-      blocks: moveBlock(definition.blocks, at, from, to),
-    });
-  const onRemove = (id: string) => {
-    onChange({ ...definition, blocks: removeBlock(definition.blocks, id) });
+  const onMove = (way: string, at: ListPath, from: number, to: number) => {
+    const projected = projectEntrypoint(definition, way);
+    changeWay(way, { ...projected, blocks: moveBlock(projected.blocks, at, from, to) });
+  };
+  const onRemove = (way: string, id: string) => {
+    const projected = projectEntrypoint(definition, way);
+    changeWay(way, { ...projected, blocks: removeBlock(projected.blocks, id) });
     if (selectedId === id) setSelectedId(TRIGGER_ROW_ID);
   };
 
+  const confirmAddWay = () => {
+    const id = draftWay.trim();
+    if (id === "" || entrypointIdError(definition, id) !== null) return;
+    onChange(addEntrypoint(definition, id));
+    onSelectEntrypoint(id);
+    setSelectedId(TRIGGER_ROW_ID);
+    setDraftWay("");
+    setAdding(false);
+  };
+  const removeWay = () => {
+    onChange(removeEntrypoint(definition, entrypointId));
+    onSelectEntrypoint(MAIN_ENTRYPOINT_ID);
+    setSelectedId(TRIGGER_ROW_ID);
+  };
+
   const variablePaths = useMemo(
-    () => variablePathsFor(definition, selected?.id ?? null),
-    [definition, selected?.id],
+    () => variablePathsFor(active, selected?.id ?? null),
+    [active, selected?.id],
   );
   const sessionSources = useMemo(
-    () => sessionSourcesFor(definition, selected?.id ?? null),
-    [definition, selected?.id],
+    () => sessionSourcesFor(active, selected?.id ?? null),
+    [active, selected?.id],
   );
+  const position = selected ? locateBlock(active.blocks, selected.id) : null;
+  const draftWayError = draftWay === "" ? null : entrypointIdError(definition, draftWay);
 
   return (
-    <ResizablePanelGroup orientation="horizontal" className="min-h-[480px] rounded-lg border">
-      <ResizablePanel defaultSize={42} minSize={28}>
-        <Canvas
-          trigger={definition.trigger}
-          triggerSummary={triggerSummary}
-          blocks={definition.blocks}
-          selectedId={effectiveId}
-          onSelect={setSelectedId}
-          erroredIds={erroredIds}
-          locked={builtin}
-          onInsert={onInsert}
-          onMove={onMove}
-          onRemove={onRemove}
-        />
-      </ResizablePanel>
-      <ResizableHandle />
-      <ResizablePanel defaultSize={58} minSize={32}>
-        <div className="flex h-full flex-col gap-4 overflow-y-auto p-4">
+    <div className="flex min-h-0 flex-1" data-testid="build-tab">
+      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+        {/* The canvas ground: a dot grid in ink at 14%, 20px. */}
+        <div
+          className="relative flex min-h-0 flex-1 flex-col"
+          style={{
+            backgroundImage:
+              "radial-gradient(color-mix(in oklch, var(--color-foreground) 14%, transparent) 1px, transparent 1px)",
+            backgroundSize: "20px 20px",
+          }}
+        >
+          <div className="absolute top-3 right-3 z-30 flex items-center gap-1" aria-label="Zoom">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 w-7 px-0"
+              aria-label="Zoom out"
+              onClick={() => setZoom((z) => Math.max(MIN_SCALE, (z === "fit" ? 1 : z) - 0.1))}
+            >
+              −
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 w-7 px-0"
+              aria-label="Zoom in"
+              onClick={() => setZoom((z) => Math.min(MAX_SCALE, (z === "fit" ? 1 : z) + 0.1))}
+            >
+              +
+            </Button>
+            <Button variant="outline" size="sm" className="h-7" onClick={() => setZoom("fit")}>
+              Fit
+            </Button>
+          </div>
+          <div className="flex min-h-0 flex-1 gap-6 overflow-x-auto p-6 pt-12">
+            {ways.map((way) => {
+              const projected = way === entrypointId ? active : projectEntrypoint(definition, way);
+              return (
+                <div key={way} className="flex min-h-0 min-w-[300px] flex-1 flex-col">
+                  <Canvas
+                    trigger={projected.trigger}
+                    triggerSummary={triggerSummaryFor(way)}
+                    entrypointId={ways.length > 1 || way !== MAIN_ENTRYPOINT_ID ? way : undefined}
+                    blocks={projected.blocks}
+                    selectedId={way === entrypointId ? effectiveId : null}
+                    onSelect={(id) => select(way, id)}
+                    erroredIds={way === entrypointId ? erroredIds : new Set()}
+                    locked={builtin}
+                    onInsert={(at, index, kind) => onInsert(way, at, index, kind)}
+                    onMove={(at, from, to) => onMove(way, at, from, to)}
+                    onRemove={(id) => onRemove(way, id)}
+                    zoom={zoom}
+                  />
+                </div>
+              );
+            })}
+            {!builtin && (
+              <div className="flex w-[264px] shrink-0 flex-col pt-0">
+                {adding ? (
+                  <form
+                    className="flex flex-col gap-2 rounded-lg border border-dashed bg-card/60 p-3"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      confirmAddWay();
+                    }}
+                  >
+                    <Input
+                      value={draftWay}
+                      onChange={(e) => setDraftWay(e.target.value)}
+                      placeholder="review_feedback"
+                      aria-label="Name for the new way in"
+                      className="font-mono text-xs"
+                      autoFocus
+                    />
+                    {draftWayError && (
+                      <p className="text-xs text-muted-foreground">{draftWayError}</p>
+                    )}
+                    <div className="flex gap-2">
+                      <Button type="submit" size="sm" disabled={draftWay === "" || !!draftWayError}>
+                        Add
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => setAdding(false)}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  </form>
+                ) : (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-9 justify-start border border-dashed text-muted-foreground"
+                    onClick={() => setAdding(true)}
+                    data-testid="add-way-in"
+                  >
+                    <Plus aria-hidden />
+                    Add another way in
+                  </Button>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+        <TestDrawer test={test} panel={testPanel} />
+      </div>
+
+      <aside
+        className="flex w-[360px] shrink-0 flex-col border-l bg-card"
+        aria-label="Inspector"
+        data-testid="inspector"
+      >
+        <div className="flex items-start gap-2 px-[18px] pt-5 pb-3.5">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <h3 className="truncate text-sm font-semibold">
+                {selected ? blockKind(selected.type).label : "Trigger"}
+              </h3>
+              <span className="rounded-sm bg-secondary px-1.5 py-px font-mono text-2xs text-muted-foreground">
+                {selected ? selected.type : ways.length > 1 ? entrypointId : "way in"}
+              </span>
+            </div>
+            <div className="font-mono text-2xs text-muted-foreground">
+              {selected ? selected.id : triggerSummaryFor(entrypointId)}
+            </div>
+          </div>
+          {selected && !builtin && position && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon-xs" aria-label={`Actions for ${selected.id}`}>
+                  <MoreHorizontal />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  disabled={position.index === 0}
+                  onSelect={() =>
+                    onMove(entrypointId, position.at, position.index, position.index - 1)
+                  }
+                >
+                  <ChevronUp aria-hidden /> Move up
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={position.index >= position.length - 1}
+                  onSelect={() =>
+                    onMove(entrypointId, position.at, position.index, position.index + 1)
+                  }
+                >
+                  <ChevronDown aria-hidden /> Move down
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  variant="destructive"
+                  onSelect={() => onRemove(entrypointId, selected.id)}
+                >
+                  <Trash2 aria-hidden /> Remove
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-[18px] pb-4">
           {effectiveId === TRIGGER_ROW_ID ? (
             <TriggerInspector
-              trigger={definition.trigger}
+              trigger={active.trigger}
               onChange={updateTrigger}
               builtin={builtin}
               errors={triggerErrors}
@@ -200,9 +421,116 @@ export function BuildTab({
               variableValues={variableValues}
             />
           ) : null}
-          {testPanel}
         </div>
-      </ResizablePanel>
-    </ResizablePanelGroup>
+        {!builtin && (
+          <div className="flex items-center gap-1 border-t px-3 py-2">
+            {selected && position ? (
+              <>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={position.index === 0}
+                  onClick={() =>
+                    onMove(entrypointId, position.at, position.index, position.index - 1)
+                  }
+                >
+                  <ChevronUp aria-hidden /> Move up
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={position.index >= position.length - 1}
+                  onClick={() =>
+                    onMove(entrypointId, position.at, position.index, position.index + 1)
+                  }
+                >
+                  <ChevronDown aria-hidden /> Move down
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="ml-auto text-destructive hover:text-destructive"
+                  onClick={() => onRemove(entrypointId, selected.id)}
+                >
+                  <Trash2 aria-hidden /> Remove
+                </Button>
+              </>
+            ) : entrypointId !== MAIN_ENTRYPOINT_ID ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="ml-auto text-destructive hover:text-destructive"
+                onClick={removeWay}
+                aria-label={`Remove way in ${entrypointId}`}
+              >
+                <X aria-hidden /> Remove this way in
+              </Button>
+            ) : null}
+          </div>
+        )}
+      </aside>
+    </div>
+  );
+}
+
+/** The test-with-sample surface as a bottom drawer: a 44px bar that says what
+ * the last sample did and offers the two actions, opening to ~40% of the
+ * canvas for the full panel. */
+function TestDrawer({ test, panel }: { test?: AutomationTestState; panel?: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  if (!test && !panel) return null;
+  const readout = !test
+    ? ""
+    : test.latest
+      ? `${test.latest.blocks.length} block${test.latest.blocks.length === 1 ? "" : "s"} rendered`
+      : test.sample.kind === "none"
+        ? "no sample picked"
+        : "sample picked";
+  const canRun = !!test && (test.sample.kind !== "none" || test.isTimed) && !test.running;
+  return (
+    <div
+      className={cn("flex shrink-0 flex-col border-t bg-card", open && "h-[40%] min-h-[220px]")}
+      data-testid="test-drawer"
+      data-state={open ? "open" : "closed"}
+    >
+      <div className="flex h-11 shrink-0 items-center gap-3 px-3">
+        <button
+          type="button"
+          className="flex items-center gap-2 text-sm font-semibold"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+        >
+          <ChevronUp
+            className={cn(
+              "size-4 text-muted-foreground transition-transform",
+              open && "rotate-180",
+            )}
+            aria-hidden
+          />
+          Test with a sample
+        </button>
+        <span className="truncate text-xs text-muted-foreground">{readout}</span>
+        <div className="ml-auto flex items-center gap-1">
+          <Button variant="ghost" size="sm" onClick={() => setOpen(true)}>
+            Pick sample
+          </Button>
+          {test && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!canRun}
+              onClick={() => void test.runOnce()}
+            >
+              Run test
+            </Button>
+          )}
+        </div>
+      </div>
+      {open && (
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3">
+          {panel ?? (test ? <TestPanel test={test} /> : null)}
+        </div>
+      )}
+    </div>
   );
 }

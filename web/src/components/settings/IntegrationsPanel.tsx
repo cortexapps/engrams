@@ -20,6 +20,7 @@ import { CategoryFilter } from "@/components/integrations/CategoryFilter";
 import { GoogleCloudConnectDialog } from "@/components/integrations/GoogleCloudConnections";
 import { useConnectorViews, type ConnectorView } from "@/components/integrations/useConnectorViews";
 import { PageHeading } from "../page-heading";
+import { WebhookRegistrationsPanel } from "./WebhookRegistrationsPanel";
 
 export function IntegrationsPanel() {
   const { views, isLoading, error } = useConnectorViews();
@@ -106,6 +107,10 @@ export function IntegrationsPanel() {
           {shown.length === 0 && <EmptyState>No providers match "{q}".</EmptyState>}
         </>
       )}
+
+      {/* Custom webhook endpoints are ingress credentials, so they live with
+          the other connections rather than under the automations list. */}
+      <WebhookRegistrationsPanel />
 
       {connectView?.connectionModel === "named" && (
         <GoogleCloudConnectDialog
