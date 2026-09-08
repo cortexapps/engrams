@@ -73,10 +73,6 @@ export function TriggerInspector({ trigger, onChange, builtin, errors }: Trigger
 
   return (
     <div className="flex flex-col gap-4" data-testid="trigger-inspector">
-      <header>
-        <h3 className="font-medium">Trigger</h3>
-        <p className="text-muted-foreground text-sm">What starts a run.</p>
-      </header>
       <Field data-testid="field-trigger.kind">
         <FieldLabel className="flex items-center gap-1.5">Kind {builtin && <Pinned />}</FieldLabel>
         <Select

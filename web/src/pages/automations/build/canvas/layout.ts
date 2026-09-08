@@ -15,7 +15,7 @@
 import { blockKind, type BlockDef, type ListPath } from "@/lib/automation-blocks";
 
 export const NODE_W = 264;
-export const NODE_H = 60;
+export const NODE_H = 66;
 /** Vertical run between sequential nodes; hosts the "+" affordance. */
 export const V_GAP = 36;
 /** Branch node to the top of its child columns (room for then/else labels). */

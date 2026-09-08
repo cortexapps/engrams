@@ -2,6 +2,8 @@ import {
   FileBox,
   FilePenLine,
   GitPullRequestArrow,
+  PanelLeftClose,
+  PanelLeftOpen,
   Settings,
   SquareTerminal,
   Workflow,
@@ -23,6 +25,7 @@ import {
   SidebarMenuItem,
   SidebarRail,
   SidebarSeparator,
+  useSidebar,
 } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
 
@@ -107,10 +110,11 @@ export function MainSidebar() {
       <div aria-hidden className="bg-carbon-fade pointer-events-none absolute inset-0 -z-10" />
       <SidebarHeader className="px-[10px] pt-[14px] pb-[14px]">
         <SidebarMenu>
-          <SidebarMenuItem>
+          {/* Collapsed to icons, the toggle stacks under the mark. */}
+          <SidebarMenuItem className="flex items-center gap-1 group-data-[collapsible=icon]:flex-col">
             <SidebarMenuButton
               asChild
-              className="h-9 gap-2.5 px-2 hover:bg-transparent active:bg-transparent"
+              className="h-9 min-w-0 flex-1 gap-2.5 px-2 hover:bg-transparent active:bg-transparent"
             >
               <Link to="/sessions" aria-label="engrams — tasks">
                 <span
@@ -124,6 +128,7 @@ export function MainSidebar() {
                 <span className="text-base font-semibold tracking-[-0.02em]">engrams</span>
               </Link>
             </SidebarMenuButton>
+            <SpineToggle />
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
@@ -151,6 +156,25 @@ export function MainSidebar() {
       </SidebarFooter>
       <SidebarRail />
     </Sidebar>
+  );
+}
+
+/** The one visible way to fold the spine to icons (⌘B and the edge strip
+ * stay). Without it the spine read as stuck at full width. */
+function SpineToggle() {
+  const { state, toggleSidebar } = useSidebar();
+  const collapsed = state === "collapsed";
+  return (
+    <button
+      type="button"
+      onClick={toggleSidebar}
+      aria-label={collapsed ? "Expand the sidebar" : "Collapse the sidebar"}
+      title={`${collapsed ? "Expand" : "Collapse"} sidebar (⌘B)`}
+      data-testid="spine-toggle"
+      className="flex size-7 shrink-0 items-center justify-center rounded-md text-sidebar-foreground/60 outline-none transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+    >
+      {collapsed ? <PanelLeftOpen className="size-4" /> : <PanelLeftClose className="size-4" />}
+    </button>
   );
 }
 

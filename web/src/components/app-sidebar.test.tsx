@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { SidebarProvider } from "@/components/ui/sidebar";
 import { renderWithProviders } from "../test-utils";
 import { ThemeProvider } from "./theme-provider";
@@ -51,4 +52,23 @@ test("member sees shared products but not Automations", async () => {
   expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
   expect(screen.queryByRole("link", { name: "Automations" })).toBeNull();
   expect(screen.queryByRole("link", { name: "Tech Specs" })).toBeNull();
+});
+
+test("the spine has a visible toggle that folds it to icons and back", async () => {
+  renderWithProviders(
+    <ThemeProvider>
+      <SidebarProvider>
+        <MainSidebar />
+      </SidebarProvider>
+    </ThemeProvider>,
+  );
+  await screen.findByRole("link", { name: "Tasks" });
+  const sidebar = document.querySelector('[data-slot="sidebar"][data-state]')!;
+  expect(sidebar.getAttribute("data-state")).toBe("expanded");
+
+  await userEvent.click(screen.getByRole("button", { name: "Collapse the sidebar" }));
+  expect(sidebar.getAttribute("data-state")).toBe("collapsed");
+
+  await userEvent.click(screen.getByRole("button", { name: "Expand the sidebar" }));
+  expect(sidebar.getAttribute("data-state")).toBe("expanded");
 });

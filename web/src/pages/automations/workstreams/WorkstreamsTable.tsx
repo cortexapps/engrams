@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 
 import { StatusDot, type StatusTone } from "@/components/status-dot";
@@ -15,6 +16,34 @@ import { HandleChip } from "./HandleChip";
 
 export function humanizeWorkstreamName(key: string): string {
   return key.replace(/[-_]+/g, " ");
+}
+
+/** How many places a row shows before it folds the rest behind "+N more". */
+export const VISIBLE_HANDLES = 3;
+
+function HandleCell({ handles, pending }: { handles: string[]; pending: boolean }) {
+  const [showAll, setShowAll] = useState(false);
+  const shown = showAll ? handles : handles.slice(0, VISIBLE_HANDLES);
+  const hidden = handles.length - shown.length;
+  return (
+    <div role="cell" className="flex min-w-0 flex-wrap items-center gap-1.5">
+      {shown.map((handle) => (
+        <HandleChip key={handle} handle={handle} />
+      ))}
+      {(hidden > 0 || showAll) && handles.length > VISIBLE_HANDLES && (
+        <button
+          type="button"
+          className="rounded-sm px-1 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+          onClick={() => setShowAll((v) => !v)}
+        >
+          {showAll ? "Show fewer" : `+${hidden} more`}
+        </button>
+      )}
+      {!pending && handles.length === 0 && (
+        <span className="text-xs text-muted-foreground">No linked place</span>
+      )}
+    </div>
+  );
 }
 
 function workstreamTone(instance: AutomationInstance, latest?: AutomationRunBrief): StatusTone {
@@ -116,14 +145,10 @@ function WorkstreamRow({
           {automationName ?? "Unknown automation"}
         </span>
       )}
-      <div role="cell" className="flex min-w-0 flex-wrap gap-1.5">
-        {(detail.data?.handles ?? []).map((item) => (
-          <HandleChip key={item.handle} handle={item.handle} />
-        ))}
-        {!detail.isPending && (detail.data?.handles.length ?? 0) === 0 && (
-          <span className="text-xs text-muted-foreground">No linked place</span>
-        )}
-      </div>
+      <HandleCell
+        handles={detail.data?.handles.map((h) => h.handle) ?? []}
+        pending={detail.isPending}
+      />
       <div role="cell" className="min-w-0 text-xs">
         {latest ? (
           <span className="flex items-center gap-1.5">
