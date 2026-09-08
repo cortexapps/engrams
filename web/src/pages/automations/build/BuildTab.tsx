@@ -275,7 +275,7 @@ export function BuildTab({
             {ways.map((way) => {
               const projected = way === entrypointId ? active : projectEntrypoint(definition, way);
               return (
-                <div key={way} className="flex min-h-0 min-w-[300px] flex-1 flex-col">
+                <div key={way} className="flex min-h-0 min-w-[240px] flex-1 flex-col">
                   <Canvas
                     trigger={projected.trigger}
                     triggerSummary={triggerSummaryFor(way)}
@@ -294,7 +294,7 @@ export function BuildTab({
               );
             })}
             {!builtin && (
-              <div className="flex w-[264px] shrink-0 flex-col pt-0">
+              <div className={cn("flex shrink-0 flex-col", adding ? "w-[264px]" : "w-auto")}>
                 {adding ? (
                   <form
                     className="flex flex-col gap-2 rounded-lg border border-dashed bg-card/60 p-3"

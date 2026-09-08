@@ -120,7 +120,7 @@ export function CanvasNode({
           : {}),
       }}
       className={cn(
-        "group absolute z-10 flex flex-col justify-center gap-0.5 rounded-lg border px-3 pt-[11px] pb-3 text-left transition-[border-color,outline-color] duration-150 outline-none",
+        "group absolute z-10 flex flex-col justify-center gap-0.5 rounded-lg border px-3 py-2.5 text-left transition-[border-color,outline-color] duration-150 outline-none",
         trigger
           ? "border-transparent bg-sidebar text-sidebar-foreground"
           : ghost
@@ -145,7 +145,7 @@ export function CanvasNode({
         {errored && <StatusDot tone="critical" size={6} label="has errors" />}
         <span
           className={cn(
-            "shrink-0 font-mono text-2xs",
+            "max-w-[45%] shrink-0 truncate font-mono text-2xs",
             trigger ? "text-sidebar-foreground/70" : "text-muted-foreground",
           )}
         >

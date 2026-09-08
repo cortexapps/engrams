@@ -359,9 +359,9 @@ export function AutomationEditor({
         {/* The masthead: 60px, hairline below. The name IS the title — Saira,
             editable in place; the rest of the row is the automation's state
             and its two verbs. */}
-        <header className="flex h-[60px] shrink-0 items-center gap-3 border-b px-6">
+        <header className="@container flex h-[60px] min-w-0 shrink-0 items-center gap-3 border-b px-6">
           {builtin ? (
-            <h1 className="min-w-0 truncate font-display text-lg font-semibold [font-stretch:108%]">
+            <h1 className="min-w-0 flex-1 truncate font-display text-lg font-semibold [font-stretch:108%]">
               {name}
             </h1>
           ) : (
@@ -372,8 +372,8 @@ export function AutomationEditor({
               placeholder="Name your automation"
               aria-invalid={nameError ? true : undefined}
               className={cn(
-                "min-w-0 flex-none bg-transparent font-display text-lg font-semibold [font-stretch:108%] outline-none placeholder:text-muted-foreground/60",
-                "w-[min(40vw,360px)] rounded-sm focus-visible:ring-2 focus-visible:ring-ring/60",
+                "min-w-[120px] flex-1 bg-transparent font-display text-lg font-semibold [font-stretch:108%] outline-none placeholder:text-muted-foreground/60",
+                "max-w-[360px] rounded-sm focus-visible:ring-2 focus-visible:ring-ring/60",
               )}
             />
           )}
@@ -390,12 +390,14 @@ export function AutomationEditor({
             </Badge>
           )}
           {automation && (
-            <span className="shrink-0 rounded-full bg-secondary px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground">
+            // The version chip is the first thing to yield when the row is
+            // tight; the tabs and the verbs never do.
+            <span className="hidden shrink-0 rounded-full bg-secondary px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground @4xl:inline">
               v{automation.currentVersion} · saved {relativeTime(automation.updatedAt)}
             </span>
           )}
-          <div className="min-w-4 flex-1" />
-          <TabsList>
+          <div className="min-w-2 flex-1" />
+          <TabsList className="shrink-0">
             <TabsTrigger value="build">Build</TabsTrigger>
             <TabsTrigger value="inputs" disabled={mode === "create"}>
               Inputs
