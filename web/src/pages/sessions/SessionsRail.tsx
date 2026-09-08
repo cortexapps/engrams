@@ -268,7 +268,7 @@ function RailTaskRow({
 }) {
   const showNum = jumpHeld && index < 9;
   return (
-    <SidebarMenuItem>
+    <SidebarMenuItem style={{ "--i": index } as CSSProperties}>
       <SidebarMenuButton
         asChild
         isActive={open}

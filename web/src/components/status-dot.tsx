@@ -8,13 +8,15 @@ import { cn } from "@/lib/utils";
 //
 // A dot is never alone: the word beside it carries the meaning for anyone
 // who cannot read the colour. Pass `label` when there is no adjacent text.
+// The running dot breathes at the system's one live cadence (`.animate-live`,
+// 2.4s), which prefers-reduced-motion switches off.
 export type StatusTone = "nominal" | "caution" | "critical" | "active" | "muted";
 
 const FILL: Record<StatusTone, string> = {
   nominal: "bg-instrument-nominal",
   caution: "bg-instrument-caution",
   critical: "bg-instrument-critical",
-  active: "bg-ring animate-pulse motion-reduce:animate-none",
+  active: "bg-ring animate-live",
   muted: "bg-muted-foreground/30",
 };
 

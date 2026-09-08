@@ -34,7 +34,7 @@ export function PaneStatus({ phase, caption, message, onReconnect }: PaneStatusP
     >
       {busy ? (
         <div className="flex flex-col items-center gap-3.5">
-          <EngramMark size={56} mode="loop" title={caption} />
+          <EngramMark size={56} mode="loader" title={caption} />
           <p className="text-base text-muted-foreground italic">{caption}</p>
         </div>
       ) : (

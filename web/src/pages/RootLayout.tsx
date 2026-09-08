@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { Outlet } from "@tanstack/react-router";
 import { MainSidebar } from "../components/app-sidebar";
 import { KeyboardShortcuts } from "../keyboard/KeyboardShortcuts";
@@ -23,7 +23,17 @@ import { Toaster } from "@/components/ui/sonner";
 /** The spine's width — 208px. The section rails take the primitive's default. */
 const SPINE_WIDTH = "13rem";
 
+/** How long the shell counts as booting: the sheet's 200ms delay + 700ms
+ * rise, plus the rail rows' stagger. After this the boot styles detach so a
+ * route change never replays them. */
+const BOOT_MS = 1_400;
+
 export function RootLayout() {
+  const [booting, setBooting] = useState(true);
+  useEffect(() => {
+    const t = window.setTimeout(() => setBooting(false), BOOT_MS);
+    return () => window.clearTimeout(t);
+  }, []);
   return (
     // Fixed-height app shell: the wrapper is pinned to the viewport and clips
     // its own overflow, so the spine and each section's rail stay put while
@@ -33,6 +43,7 @@ export function RootLayout() {
     <SidebarProvider
       className="h-svh overflow-hidden"
       style={{ "--sidebar-width": SPINE_WIDTH } as CSSProperties}
+      data-boot={booting ? "" : undefined}
     >
       <MainSidebar />
       {/* The inset is the GROUND, not a page: every section lifts its own

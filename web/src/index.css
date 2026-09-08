@@ -94,9 +94,11 @@
   --instrument-caution-ink: oklch(0.5 0.13 71);
   --instrument-critical-ink: oklch(0.52 0.2 27);
 
-  /* Logomark terminal node — the verdigris endpoint of the engram trace. Paper-era
-     dark value for light grounds; the dark theme overrides to a brighter teal so it
-     reads against the deep green-black background. */
+  /* The logomark's two nodes. The entry ring is amber; the terminal dot is the
+     ground's action colour — verdigris on paper, lime on the cover and at
+     night (the mark component reads --sidebar-primary there). Both lift for
+     the dark ground below. */
+  --mark-entry: #b85c0a;
   --mark-terminal: #3a6b5c;
 }
 
@@ -155,6 +157,7 @@
   --instrument-caution-ink: oklch(0.83 0.14 75);
   --instrument-critical-ink: oklch(0.74 0.19 25);
 
+  --mark-entry: #e0913d; /* amber goes muddy on green-black; lift it */
   --mark-terminal: oklch(0.7 0.085 178); /* #5EB09E — brighter verdigris on dark ground */
 }
 
@@ -516,6 +519,196 @@
   margin-block: 1em;
   border: 0;
   border-block-start: 1px solid var(--border);
+}
+
+/* ── Motion ─────────────────────────────────────────────────────────────
+   One easing, a handful of durations, and every animation respects
+   prefers-reduced-motion (the block at the end switches them off). Nothing
+   scales on press; nothing glows; rails never move after boot.
+
+     boot      once per load: the sheet rises 14px and fades in over 700ms
+               (after 200ms), rail rows follow at 40ms per row
+     page-in   route change: content rises 6px and fades in over 240ms
+     live      a running dot breathes 1 → .35 → 1 over 2.4s; a running row
+               carries a 34%-wide ring-tinted sweep every 2.8s
+     data ink  a meter fills 0 → value over 1.1s, 150ms per meter; a
+               sparkline draws once when it enters view; a changed figure
+               ticks (old up and out, new in from below) in 500ms
+     skeleton  hairlines draw 0 → 1 over 900ms, 150ms apart, then the bars
+               shimmer at 1.8s */
+:root {
+  --ease-out-soft: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+@keyframes sheet-boot {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes row-boot {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes page-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+@keyframes row-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+@keyframes meter-fill {
+  from {
+    width: 0;
+  }
+}
+@keyframes bar-draw {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+@keyframes hairline-draw {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+@keyframes tick-in {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+@keyframes tick-out {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(-100%);
+  }
+}
+
+@layer components {
+  /* Boot: only while the shell carries `data-boot` (RootLayout drops it once). */
+  [data-boot] .section-sheet {
+    animation: sheet-boot 700ms var(--ease-out-soft) 200ms both;
+  }
+  [data-boot] .sidebar-section [data-slot="sidebar-menu-item"] {
+    animation: row-boot 450ms var(--ease-out-soft) calc(200ms + var(--i, 0) * 40ms) both;
+  }
+  .page-in {
+    animation: page-in 240ms var(--ease-out-soft) both;
+  }
+  .animate-live {
+    animation: live-pulse 2.4s ease-in-out infinite;
+  }
+  .row-running {
+    position: relative;
+    overflow: hidden;
+  }
+  .row-running::after {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 34%;
+    pointer-events: none;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in oklch, var(--ring) 10%, transparent),
+      transparent
+    );
+    animation: row-sweep 2.8s var(--ease-out-soft) infinite;
+  }
+  .meter-fill {
+    animation: meter-fill 1.1s var(--ease-out-soft) calc(var(--i, 0) * 150ms) both;
+  }
+  .bar-draw {
+    transform-origin: bottom;
+    animation: bar-draw 600ms var(--ease-out-soft) calc(var(--i, 0) * 60ms) both;
+  }
+  .hairline-draw {
+    transform-origin: left;
+    animation: hairline-draw 900ms var(--ease-out-soft) calc(var(--i, 0) * 150ms) both;
+  }
+  .tick-in {
+    animation: tick-in 500ms var(--ease-out-soft) both;
+  }
+  .tick-out {
+    animation: tick-out 500ms var(--ease-out-soft) both;
+  }
+
+  /* Ruled paper: reading surfaces only (the transcript, an activity ledger,
+     a workstream timeline) — never a table or a form. A 28px rule and one
+     amber margin line at 56px, the notebook's own margin. */
+  .ruled-paper {
+    background-image:
+      repeating-linear-gradient(
+        to bottom,
+        transparent 0 27px,
+        color-mix(in oklch, var(--foreground) 6%, transparent) 27px 28px
+      ),
+      linear-gradient(
+        to right,
+        transparent 56px,
+        color-mix(in oklch, var(--mark-entry) 45%, transparent) 56px 57px,
+        transparent 57px
+      );
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    [data-boot] .section-sheet,
+    [data-boot] .sidebar-section [data-slot="sidebar-menu-item"],
+    .page-in,
+    .animate-live,
+    .meter-fill,
+    .bar-draw,
+    .hairline-draw,
+    .tick-in,
+    .tick-out {
+      animation: none !important;
+    }
+    .row-running::after {
+      display: none;
+    }
+  }
 }
 
 @utility bg-carbon-fade {
