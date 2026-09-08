@@ -12,7 +12,7 @@ case is a build daemon: `gradle --daemon help` starts the Gradle daemon as a sep
 and returns, the daemon is captured live, and every restored session inherits a warm,
 cache-hot daemon with no cold start.
 
-You set it in the Warm capture hook section of the image's config, under Operator → Images.
+You set it in the Warm capture hook section of the image's config, under Settings → Images.
 This page is the contract for writing one.
 
 ![The Warm capture hook section of the image config: warm command, timeout, workdir, and the capture env](../../../../assets/screenshots/image-enable-warm.png)

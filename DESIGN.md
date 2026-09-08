@@ -750,7 +750,7 @@ Building + pushing the image requires a Docker-compatible runtime on the dev's /
 
 ### Runtime config
 
-Runtime config is supplied out-of-band at **enable time** as a structured `ImageConfig` (the dashboard's enable dialog under Operator → Images, or the CLI's flags), never baked into the image (ADR 0080). It carries `name`, `description`, `env`, `workdir`, `resources`, and an optional `warm` section (the warm-capture `command` / `timeout_secs` / `workdir` / `env` / `network`):
+Runtime config is supplied out-of-band at **enable time** as a structured `ImageConfig` (the dashboard's enable dialog under Settings → Images, or the CLI's flags), never baked into the image (ADR 0080). It carries `name`, `description`, `env`, `workdir`, `resources`, and an optional `warm` section (the warm-capture `command` / `timeout_secs` / `workdir` / `env` / `network`):
 
 ```toml
 # the ImageConfig fields, shown here in TOML for readability

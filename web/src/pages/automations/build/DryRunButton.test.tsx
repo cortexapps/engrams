@@ -35,7 +35,7 @@ describe("DryRunButton", () => {
     expect(request).toEqual({ automationId: "a1", sample: { case: "sampleId", value: "s9" } });
     await waitFor(() =>
       expect(navigate).toHaveBeenCalledWith({
-        href: "/settings/automations/a1/runs/autorun:a1:manual:x",
+        href: "/automations/a1/runs/autorun:a1:manual:x",
       }),
     );
   });

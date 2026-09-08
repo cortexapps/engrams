@@ -56,7 +56,7 @@ export function ComposePage() {
         ...(harnessOverride.mode ? { harnessMode: harnessOverride.mode } : {}),
       });
       void navigate({
-        to: "/settings/automations/$id",
+        to: "/automations/$id",
         params: { id: result.automationId },
         search: { tab: "build" },
       });
@@ -107,7 +107,7 @@ export function ComposePage() {
       <p className="text-muted-foreground text-xs">
         The draft lands as a disabled automation you can edit at any point.{" "}
         <Link
-          to="/settings/automations/new/manual"
+          to="/automations/new/manual"
           className="decoration-muted-foreground/50 underline decoration-dotted underline-offset-2"
           data-testid="build-by-hand"
         >

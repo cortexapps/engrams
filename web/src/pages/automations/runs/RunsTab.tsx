@@ -99,7 +99,7 @@ function RunRow({
   return (
     <li>
       <Link
-        to="/settings/automations/$id/runs/$runId"
+        to="/automations/$id/runs/$runId"
         params={{ id: run.automationId, runId: run.id }}
         className="flex items-center gap-3 rounded-md px-3 py-2 text-sm hover:bg-secondary/60"
         data-testid="run-row"

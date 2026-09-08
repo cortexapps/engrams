@@ -120,7 +120,7 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
       className="grid gap-4 rounded-lg border bg-card p-4 shadow-xs md:grid-cols-[minmax(0,1fr)_auto_auto] md:items-center"
     >
       <Link
-        to="/settings/automations/$id"
+        to="/automations/$id"
         params={{ id: automation.id }}
         search={{ tab: "build" }}
         className="group min-w-0 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
@@ -147,7 +147,7 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
         </div>
       </Link>
       <Link
-        to="/settings/automations/$id"
+        to="/automations/$id"
         params={{ id: automation.id }}
         search={{ tab: "runs" }}
         className="justify-self-start rounded-md p-1 outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 md:justify-self-end"
@@ -205,7 +205,7 @@ function DuplicatePrReviewButton() {
       const id = result.automation?.id;
       if (id) {
         await navigate({
-          to: "/settings/automations/$id",
+          to: "/automations/$id",
           params: { id },
           search: { tab: "build" },
         });
@@ -233,7 +233,7 @@ export function AutomationsList() {
         count={rows.length}
         actions={
           <Button asChild size="sm">
-            <Link to="/settings/automations/new">
+            <Link to="/automations/new">
               <PlusIcon className="size-3.5" />
               New automation
             </Link>
@@ -257,7 +257,7 @@ export function AutomationsList() {
             <div className="mt-4 flex flex-wrap justify-center gap-2">
               <DuplicatePrReviewButton />
               <Button asChild>
-                <Link to="/settings/automations/new">New automation</Link>
+                <Link to="/automations/new">New automation</Link>
               </Button>
             </div>
           </div>

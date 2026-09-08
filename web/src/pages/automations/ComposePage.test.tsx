@@ -72,7 +72,7 @@ describe("ComposePage", () => {
       }),
     );
     expect(navigate.mock.calls[0]![0]).toMatchObject({
-      to: "/settings/automations/$id",
+      to: "/automations/$id",
       params: { id: "auto-9" },
       search: { tab: "build" },
     });

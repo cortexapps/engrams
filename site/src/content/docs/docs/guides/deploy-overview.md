@@ -83,11 +83,9 @@ which is 200 only when Postgres answers. Wire the liveness probe to the first an
 readiness probe to the second, so a coordinator that lost its database leaves the load
 balancer instead of serving errors. The charts do this.
 
-The dashboard's Operator section is the view for whoever runs the fleet: capacity and
-locality gauges, what needs attention, hosts ready, live sandboxes, and snapshot durability
-on one page, then a Fleet page with each host's disk, memory, CPU, and sandboxes, and a Drain
-button that moves its sessions elsewhere.
-
-![The Operator overview: gauges for capacity and locality, fleet counts, and storage durability](../../../../assets/screenshots/operator-overview.png)
+The dashboard's Settings › Fleet page is the view for whoever runs the fleet: each host's
+status, disk, memory, CPU, and sandboxes, and a Drain button that moves its sessions
+elsewhere. Settings › Storage shows snapshot durability per sandbox. When a host drains or
+goes offline, the Fleet row in the Settings rail says so from any page.
 
 ![The Fleet page: two hosts with disk, memory, and CPU bars and a Drain button each](../../../../assets/screenshots/fleet.png)

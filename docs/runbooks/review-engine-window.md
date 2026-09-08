@@ -47,7 +47,7 @@ the PR-review automation on the Automations page is **enabled** with
 
 ## What to watch on the first flagged repo
 
-- The **run page** (`/settings/automations/<pr-review id>/runs`): each PR event
+- The **run page** (`/automations/<pr-review id>/runs`): each PR event
   should start a run that walks open-pass → finder → (verifier) → policy gate →
   post, and end `completed`.
 - The **Reviews dossier** (`/reviews`): a pass appears with findings, same as

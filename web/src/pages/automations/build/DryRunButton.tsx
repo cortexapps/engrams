@@ -46,7 +46,7 @@ export function DryRunButton({
               toast.success("Dry run started");
               // 3.7's run page route; addressed by href so this compiles on a
               // base where that route is not registered yet.
-              void navigate({ href: `/settings/automations/${automationId}/runs/${runId}` });
+              void navigate({ href: `/automations/${automationId}/runs/${runId}` });
             },
             onError: (error) => toast.error(`Dry run failed: ${error.message}`),
           },

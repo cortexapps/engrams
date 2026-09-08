@@ -5,7 +5,7 @@ import { renderWithProviders } from "../test-utils";
 import { ThemeProvider } from "./theme-provider";
 import { MainSidebar } from "./app-sidebar";
 
-test("admin sees the two hats: Tasks and Operator", async () => {
+test("admin sees the four products, and Settings as a row", async () => {
   renderWithProviders(
     <ThemeProvider>
       <SidebarProvider>
@@ -17,15 +17,19 @@ test("admin sees the two hats: Tasks and Operator", async () => {
   // Exact-string names target the destination links (not the logo link, whose
   // accessible name also contains "tasks").
   expect(await screen.findByRole("link", { name: "Tasks" })).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Reviews" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Artifacts" })).toBeTruthy();
-  expect(screen.getByRole("link", { name: "Operator" })).toBeTruthy();
-  // Tech Specs is unreleased: out of the rail for admins too, not just members.
+  expect(screen.getByRole("link", { name: "Automations" })).toBeTruthy();
+  // Settings is a spine destination at the foot, not an avatar-menu item.
+  expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
+  // The Operator and Kaizen hats retired into Settings.
+  expect(screen.queryByRole("link", { name: "Operator" })).toBeNull();
+  expect(screen.queryByRole("link", { name: "Kaizen" })).toBeNull();
+  // Tech Specs is unreleased: out of the spine for admins too, not just members.
   expect(screen.queryByRole("link", { name: "Tech Specs" })).toBeNull();
-  // Settings is not a rail destination; it lives in the avatar menu.
-  expect(screen.queryByRole("link", { name: "Settings" })).toBeNull();
 });
 
-test("member sees shared destinations but not admin destinations in the rail", async () => {
+test("member sees shared products but not Automations", async () => {
   renderWithProviders(
     <ThemeProvider>
       <SidebarProvider>
@@ -44,6 +48,7 @@ test("member sees shared destinations but not admin destinations in the rail", a
   );
   expect(await screen.findByRole("link", { name: "Tasks" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Artifacts" })).toBeTruthy();
-  expect(screen.queryByRole("link", { name: "Operator" })).toBeNull();
+  expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
+  expect(screen.queryByRole("link", { name: "Automations" })).toBeNull();
   expect(screen.queryByRole("link", { name: "Tech Specs" })).toBeNull();
 });

@@ -1,17 +1,15 @@
 import { Layers, ListChecks, SquarePlus } from "lucide-react";
-import { Link, Outlet, useRouterState, type LinkProps } from "@tanstack/react-router";
+import { Outlet, useRouterState, type LinkProps } from "@tanstack/react-router";
 import { useIsAdmin } from "../../auth/AuthProvider";
-import { Sidebar, SidebarProvider, SidebarResizeHandle } from "@/components/ui/sidebar";
-import type { NavItem } from "@/components/nav";
+import { SectionLayout, type SectionNavItem } from "@/components/section-layout";
 import { SessionsRail } from "./SessionsRail";
-import { cn } from "@/lib/utils";
 
-// The /sessions section shell. Its second sidebar is the persistent
-// SessionsRail (a live switcher), which stays mounted across the list views
-// AND the transcript — SessionDetail is now a child route, so opening a session
-// moves the rail's highlight instead of swapping the whole layout. The outlet
-// is layout-neutral: each child owns its padding/scroll (the list pages pad +
-// scroll; the detail page fills the height with its own panes).
+// The /sessions section shell. Its rail is the persistent SessionsRail (a live
+// switcher), which stays mounted across the list views AND the transcript —
+// SessionDetail is a child route, so opening a session moves the rail's
+// highlight instead of swapping the whole layout. The outlet is layout-neutral:
+// each child owns its padding/scroll (the list pages pad + scroll; the detail
+// page fills the height with its own panes).
 // A long task title needs more room than a nav rail does, so the rail is
 // drag-resizable and remembers the width per browser.
 const RAIL_WIDTH_STORAGE_KEY = "engrams.sessionsRailWidth";
@@ -24,7 +22,7 @@ export function SessionsLayout() {
   // mobile scope strip stays up on them and only hides inside a session detail.
   const onDetail = !!seg && seg !== "all" && seg !== "list";
 
-  const scopes: (NavItem & { active: boolean })[] = [
+  const scopes: SectionNavItem[] = [
     {
       to: "/sessions",
       label: "Start",
@@ -49,48 +47,20 @@ export function SessionsLayout() {
       : []),
   ];
 
+  // The list views are one page, so they lift as one sheet. A transcript is two
+  // working surfaces — the thread and the work pane — so it builds its own pair
+  // of sheets and the container stays a plain region on the cover. The mobile
+  // strip hides inside a transcript too, so it doesn't crowd the detail view.
   return (
-    // Bind the whole section to the viewport height (minus the mobile top bar,
-    // which is `md:hidden`), so BOTH rails stay fixed with their own internal
-    // scroll and only the content column scrolls — for the list views and the
-    // transcript alike. `min-h-0` neutralises the provider's base `min-h-svh`.
-    <SidebarProvider className="h-[calc(100svh-3rem)] min-h-0 md:h-svh">
-      {/* desktop (md+): the persistent sessions rail */}
-      <Sidebar collapsible="none" className="sidebar-section hidden shrink-0 md:flex">
-        <SessionsRail />
-        {/* Owns the whole width preference itself: a drag writes the CSS var to
-            the DOM, so it never re-renders this layout — which renders the rail
-            list AND the route Outlet (the transcript). */}
-        <SidebarResizeHandle storageKey={RAIL_WIDTH_STORAGE_KEY} label="Resize task list" />
-      </Sidebar>
-      {/* The list views are one page, so they lift as one sheet. A transcript
-          is two working surfaces — the thread and the work pane — so it builds
-          its own pair of sheets and this container stays a plain region on the
-          cover. */}
-      <div
-        className={cn("flex min-w-0 flex-1 flex-col overflow-hidden", !onDetail && "section-sheet")}
-      >
-        {/* mobile (<md): horizontal scope strip — the rail is desktop-only, and
-            we hide it inside a transcript so it doesn't crowd the detail view. */}
-        {!onDetail && (
-          <nav className="flex gap-1 overflow-x-auto border-b p-2 md:hidden">
-            {scopes.map((it) => (
-              <Link
-                key={it.label}
-                to={it.to}
-                className={cn(
-                  "inline-flex items-center gap-2 whitespace-nowrap rounded-md px-3 py-1.5 text-sm",
-                  it.active ? "bg-accent text-accent-foreground" : "text-muted-foreground",
-                )}
-              >
-                <it.icon className="size-4" />
-                {it.label}
-              </Link>
-            ))}
-          </nav>
-        )}
-        <Outlet />
-      </div>
-    </SidebarProvider>
+    <SectionLayout
+      rail={<SessionsRail />}
+      railLabel="Tasks"
+      resizeStorageKey={RAIL_WIDTH_STORAGE_KEY}
+      resizeLabel="Resize task list"
+      nav={onDetail ? undefined : scopes}
+      sheet={!onDetail}
+    >
+      <Outlet />
+    </SectionLayout>
   );
 }

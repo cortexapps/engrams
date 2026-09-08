@@ -128,7 +128,7 @@ describe("RunPage", () => {
     await userEvent.setup().click(retry);
     await waitFor(() =>
       expect(navigate).toHaveBeenCalledWith({
-        to: "/settings/automations/$id/runs/$runId",
+        to: "/automations/$id/runs/$runId",
         params: { id: "auto-1", runId: "autorun:auto-1:retry:x" },
       }),
     );
