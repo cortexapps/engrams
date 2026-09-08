@@ -45,6 +45,34 @@ describe("EngramMark", () => {
     expect(q(container, "terminal")).toBeNull();
   });
 
+  it("in draw mode renders already drawn where it cannot animate", () => {
+    // jsdom has no Web Animations API, which is exactly the fallback a
+    // reduced-motion browser takes: the resting state must be the drawn mark,
+    // never the hidden pre-animation frame.
+    const { container } = render(<EngramMark size={24} mode="draw" />);
+    const trace = q(container, "trace") as SVGPathElement;
+    const dot = q(container, "terminal") as SVGCircleElement;
+    expect(trace.style.strokeDashoffset).toBe("");
+    expect(dot.style.opacity).toBe("");
+    expect(q(container, "entry")).not.toBeNull();
+  });
+
+  it("in draw mode renders already drawn under prefers-reduced-motion", () => {
+    const animate = Element.prototype.animate;
+    const matchMedia = window.matchMedia;
+    Element.prototype.animate = (() => ({ cancel() {} })) as unknown as typeof animate;
+    window.matchMedia = ((query: string) =>
+      ({ matches: query.includes("reduce") }) as MediaQueryList) as typeof matchMedia;
+    try {
+      const { container } = render(<EngramMark size={24} mode="draw" />);
+      expect((q(container, "trace") as SVGPathElement).style.strokeDashoffset).toBe("");
+      expect((q(container, "terminal") as SVGCircleElement).style.opacity).toBe("");
+    } finally {
+      Element.prototype.animate = animate;
+      window.matchMedia = matchMedia;
+    }
+  });
+
   it("names itself for a screen reader", () => {
     const { getByRole } = render(<EngramMark title="Connecting…" />);
     expect(getByRole("img", { name: "Connecting…" })).toBeTruthy();

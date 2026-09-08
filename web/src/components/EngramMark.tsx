@@ -57,6 +57,18 @@ function prefersReducedMotion(): boolean {
   );
 }
 
+/** Whether a draw-on can actually run here: the Web Animations API exists
+ * and the person has not asked for reduced motion. When it cannot, the mark
+ * renders already drawn — the hidden pre-animation state must never be the
+ * resting state. */
+function canAnimate(): boolean {
+  return (
+    typeof Element !== "undefined" &&
+    typeof Element.prototype.animate === "function" &&
+    !prefersReducedMotion()
+  );
+}
+
 export function EngramMark({
   size = 30,
   mode = "static",
@@ -79,15 +91,17 @@ export function EngramMark({
       : "var(--mark-terminal)";
   const groundFill = ground === "cover" ? "var(--sidebar)" : "var(--background)";
 
+  // Draw-on happens only where it can; otherwise the mark is simply drawn.
+  const willDraw = mode === "draw" && canAnimate();
+
   // Draw-on: the Web Animations API on the declarative elements, so the
   // static frame is what stays when the animation ends (fill: forwards) and
   // nothing re-runs on re-render.
   useEffect(() => {
-    if (mode !== "draw") return;
+    if (!willDraw) return;
     const path = pathRef.current;
     const dot = dotRef.current;
-    if (!path || !dot || typeof path.animate !== "function") return;
-    if (prefersReducedMotion()) return;
+    if (!path || !dot) return;
     const drawing = path.animate([{ strokeDashoffset: PATH_LENGTH }, { strokeDashoffset: 0 }], {
       duration: 900,
       easing: "cubic-bezier(0.2, 0.7, 0.2, 1)",
@@ -104,7 +118,7 @@ export function EngramMark({
       drawing.cancel();
       landing.cancel();
     };
-  }, [mode]);
+  }, [willDraw]);
 
   const loader = mode === "loader";
   return (
@@ -151,7 +165,7 @@ export function EngramMark({
                   : `engram-travel-${id.replace(/:/g, "")} 1.8s linear infinite`,
                 opacity: prefersReducedMotion() ? 0 : 1,
               }
-            : mode === "draw"
+            : willDraw
               ? { strokeDasharray: PATH_LENGTH, strokeDashoffset: PATH_LENGTH }
               : undefined
         }
@@ -176,7 +190,7 @@ export function EngramMark({
           fill={terminalFill}
           data-slot="terminal"
           style={
-            mode === "draw"
+            willDraw
               ? { opacity: 0, transformBox: "fill-box", transformOrigin: "center" }
               : undefined
           }
