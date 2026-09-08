@@ -31,6 +31,7 @@ function protoStorageSummaryToLegacy(r: GetStorageSummaryResponse): StorageSumma
     snapshots: Number(r.snapshots),
     snapshot_bytes: Number(r.snapshotBytes),
     gc_pending: Number(r.gcPending),
+    gc_pending_exact: r.gcPendingExact,
     tracked_sandboxes: Number(r.trackedSandboxes),
     dirty_chunks: Number(r.dirtyChunks),
     unflushed_bytes: Number(r.unflushedBytes),

@@ -48,7 +48,7 @@ use std::time::Duration;
 use chrono::Utc;
 use engram_chunk_store::{ChunkHash, ChunkRef, ChunkStore, Manifest, ManifestKind, ManifestRef};
 use engram_coordinator::chunk_gc::{run_one_sweep_inner, ChunkGcConfig, SweepMode, SweepReport};
-use engram_core::traits::{BlobStorage, MetadataStore};
+use engram_core::traits::{BlobStorage, MetadataStore, GC_CANDIDATE_EXACT_CAP};
 use engram_core::types::registry::EnabledImage;
 use engram_core::types::session::SessionMode;
 use engram_core::types::{SandboxId, SessionSpec, SnapshotId, SnapshotRecord};
@@ -916,7 +916,11 @@ async fn mark_failure_still_promotes_already_expired_candidates() {
         "orphan blob deleted by the promote pass"
     );
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         0,
         "candidate row cleared"
     );
@@ -959,7 +963,11 @@ async fn promote_drains_multiple_batches_in_one_sweep() {
         "every expired candidate drained in one sweep, not just the first page"
     );
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         0,
         "candidate table drained"
     );
@@ -1010,7 +1018,11 @@ async fn promote_respects_the_wall_clock_budget() {
         "a spent promote budget deletes nothing"
     );
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         20,
         "the backlog is left for the next tick"
     );
@@ -1074,7 +1086,11 @@ async fn mark_pass_resumes_from_the_shard_cursor() {
         "every orphan is found exactly once across the full cycle"
     );
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         40,
         "all 40 recorded, none double-counted"
     );
@@ -1155,7 +1171,11 @@ async fn mark_pass_walks_every_page_of_the_chunk_space() {
         "every unpinned chunk was marked, not just the first page"
     );
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         37,
         "all candidates recorded in PG"
     );
@@ -1253,7 +1273,11 @@ async fn promote_failure_preserves_mark_cursor_progress() {
     assert_eq!(report.shards_scanned, 256);
     assert_eq!(report.candidates_marked, 1, "the orphan was still marked");
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         1,
         "the candidate row is committed despite the promote failure"
     );

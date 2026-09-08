@@ -8,7 +8,7 @@ import { DurabilityRowSchema, FleetService } from "../gen/engram/app/v1/fleet_pb
 import { TaskService } from "../gen/engram/app/v1/task_pb";
 import { renderWithProviders } from "../test-utils";
 import type { DurabilityRow } from "../lib/types";
-import { flushTone, splitLedger, Storage } from "./Storage";
+import { flushTone, formatBacklog, splitLedger, Storage } from "./Storage";
 
 function row(id: string, over: Partial<DurabilityRow> = {}): DurabilityRow {
   return {
@@ -30,6 +30,14 @@ describe("flushTone", () => {
     expect(flushTone(new Date(Date.now() - 48_000).toISOString())).toBe("nominal");
     expect(flushTone(new Date(Date.now() - 90_000).toISOString())).toBe("caution");
     expect(flushTone(null)).toBe("muted");
+  });
+});
+
+describe("formatBacklog", () => {
+  it("reads an exact backlog as digits and an estimate as a compact approximation", () => {
+    expect(formatBacklog(312, true)).toBe("312");
+    expect(formatBacklog(22_703_147, false)).toBe("≈22.7M");
+    expect(formatBacklog(100_000, false)).toBe("≈100K");
   });
 });
 
@@ -64,6 +72,7 @@ describe("Storage page", () => {
           snapshots: 1284n,
           snapshotBytes: 2n * 1024n * 1024n * 1024n * 1024n,
           gcPending: 312n,
+          gcPendingExact: true,
           trackedSandboxes: 3n,
           dirtyChunks: 412n,
           unflushedBytes: 38n * 1024n * 1024n,

@@ -311,6 +311,8 @@ export interface StorageSummaryResponse {
   snapshots: number;
   snapshot_bytes: number;
   gc_pending: number;
+  /** False when `gc_pending` is an estimate (the table passed the exact-count cap). */
+  gc_pending_exact: boolean;
   tracked_sandboxes: number;
   dirty_chunks: number;
   unflushed_bytes: number;
