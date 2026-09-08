@@ -675,24 +675,6 @@
     animation: tick-out 500ms var(--ease-out-soft) both;
   }
 
-  /* Ruled paper: reading surfaces only (the transcript, an activity ledger,
-     a workstream timeline) — never a table or a form. A 28px rule and one
-     amber margin line at 56px, the notebook's own margin. */
-  .ruled-paper {
-    background-image:
-      repeating-linear-gradient(
-        to bottom,
-        transparent 0 27px,
-        color-mix(in oklch, var(--foreground) 6%, transparent) 27px 28px
-      ),
-      linear-gradient(
-        to right,
-        transparent 56px,
-        color-mix(in oklch, var(--mark-entry) 45%, transparent) 56px 57px,
-        transparent 57px
-      );
-  }
-
   @media (prefers-reduced-motion: reduce) {
     [data-boot] .section-sheet,
     [data-boot] .sidebar-section [data-slot="sidebar-menu-item"],
