@@ -1,54 +1,50 @@
 // Every word on the landing page, in one place. Links are docs-relative; the
 // page prefixes them with the deployment's base path.
 //
-// This copy came out of the design pass and is the placeholder the owner will
-// finalise; edit it here and nothing else has to change.
+// Each section connects an outcome to the product behavior that makes it possible.
 
 export const hero = {
-  eyebrow: "Software factory · Automation running",
-  title: "Automate your",
-  titleAccent: "SDLC.",
-  lede: "engrams is a self-hosted software factory. It runs Claude Code and Codex in Firecracker microVMs on servers you own. A schedule, a Slack thread, a pull request, or a webhook starts a run. Every run keeps its transcript, its diff, and its snapshot, and a person is one message away.",
-  primary: {
-    label: "Run it locally →",
-    href: "getting-started/local-quickstart/",
-  },
-  secondary: { label: "Deploy to your cloud", href: "guides/deploy-overview/" },
+  eyebrow: "Your agents, working in your cloud",
+  title: "Describe it once.",
+  titleAccent: "Run it again.",
+  lede: "Turn repeat work into an automation. engrams runs Claude Code, Codex, or your own agent when a schedule fires, a pull request changes, or someone asks in Slack. Inspect the changes and continue the conversation, on infrastructure you control.",
+  primary: { label: "Explore automations", href: "platform/automations/" },
+  secondary: { label: "Run it locally", href: "getting-started/local-quickstart/" },
   chips: ["AGPL-3.0", "Firecracker · KVM", "GKE · EKS", "Claude Code · Codex"],
-  graphTitle: "Automation · nightly-flaky-tests",
+  graphTitle: "Example workflow · fix failing tests",
 };
 
 export const modules = {
   badge: "Sec. 0",
-  label: "Mission parameters",
+  label: "Work on your terms",
   cards: [
     {
-      kicker: "Self-hosted",
+      kicker: "Human control",
       num: "01",
-      title: "Your cloud.",
-      body: "One Terraform apply and two Helm releases bring it up on GKE or EKS. No transcript, workspace, or key leaves your account.",
-      foot: "GKE · EKS · GCS · S3",
+      title: "Stay involved.",
+      body: "Delegate a task, inspect its changes, and send a follow-up. The dashboard and Slack keep you in the conversation while agents work in your cloud.",
+      foot: "Inspect · reply · steer",
     },
     {
-      kicker: "Any harness",
+      kicker: "Agent choice",
       num: "02",
-      title: "Any agent.",
-      body: "A harness is a bundle the host mounts at boot, so your image never contains the agent, and you can register your own.",
+      title: "Use your agents.",
+      body: "Run Claude Code, Codex, or a custom harness with the same session controls. Upgrade the agent without rebuilding your development image.",
       foot: "Claude Code · Codex · BYO",
     },
     {
-      kicker: "Any model",
+      kicker: "Controlled access",
       num: "03",
-      title: "Your keys.",
-      body: "You bring an Anthropic or OpenAI key, or point a harness at OpenRouter. Build and Plan modes, effort levels.",
-      foot: "Anthropic · OpenAI · OpenRouter",
+      title: "Keep keys out.",
+      body: "Give an agent the API operations it needs. For brokered integrations, the proxy inserts the credential outside the VM and blocks requests the policy does not allow.",
+      foot: "Brokered credentials · egress policy",
     },
     {
-      kicker: "Idle = 0",
+      kicker: "Work that lasts",
       num: "04",
-      title: "Idle is free.",
-      body: "A paused session is chunks in the blob store and a row in Postgres. It holds no host resources until the next prompt.",
-      foot: "Deduplicated · Content-addressed",
+      title: "Pick it back up.",
+      body: "Step away without losing the environment. An idle VM is snapshotted and removed; your next prompt restores it. Stored snapshots remain, without a running VM per paused session.",
+      foot: "Snapshot · resume · continue",
     },
   ],
 };
@@ -57,25 +53,24 @@ export const automations = {
   badge: "Sec. 1",
   label: "Automations",
   meta: "Fig. 1.1 – 1.2",
-  title: "The routine work is the point.",
-  lede: "An automation is one trigger, a tree of blocks, and typed inputs: start a session, send it a prompt, wait for it, run a command inside it, post to Slack or GitHub, branch, loop. Runs are durable, so a run survives a restart and can wait hours for a reply without holding anything open.",
+  title: "Build the workflow. Stop repeating the setup.",
+  lede: "Describe what should happen. A drafting agent builds an editable workflow: start sessions, run commands, check results, and decide what comes next. Enable it when it is ready. A schedule or event starts each run, and saved progress lets it continue after a server restart.",
   screenshotAlt:
     "The New automation page asks what the automation should do; a drafting agent assembles it on the canvas.",
-  channel: "CH 01 · Fig. 1.1",
-  caption:
-    "Describe it in a sentence · a drafting agent assembles the automation on the canvas · nothing runs until you enable it",
-  signal: "Signal ● Locked",
+  channel: "Automation composer",
+  caption: "Start with a request. The agent drafts a workflow you can edit before you enable it.",
+  signal: "Product screenshot",
   board: {
     fig: "Fig. 1.2 · runs board",
-    title: "Every run is a step timeline.",
-    body: "Each step opens to its inputs, its outputs, its output text, and the session it used. Trace spans for every model call and tool call can go to Langfuse or any OpenTelemetry collector.",
+    title: "See what happened. Decide what comes next.",
+    body: "Open a run to see each step, its inputs and outputs, and the session that did the work. Inspect an error or a changed file without reconstructing the run from separate logs.",
     items: [
       {
-        title: "One run per thread",
+        title: "Keep the conversation together",
         body: "Mention the bot in Slack and a session opens for that thread, as the person who asked, with their credentials. Replies join the same run.",
       },
       {
-        title: "Pull request review",
+        title: "Review with evidence",
         body: "A finder and a verifier review each pull request on the repositories you list, and post the confirmed findings as one GitHub review.",
       },
     ],
@@ -87,8 +82,8 @@ export const how = {
   badge: "Sec. 2",
   label: "How it works",
   meta: "Fig. 2.1 · chunk store",
-  title: "Enable once.",
-  titleAccent: "Restore forever.",
+  title: "Keep the environment.",
+  titleAccent: "Continue the work.",
   steps: [
     {
       s: "S₀",
@@ -154,20 +149,20 @@ export const session = {
 export const extensible = {
   badge: "Sec. 4",
   label: "Extensible",
-  title: "Built to be extended.",
-  lede: "Claude Code, Codex and the 23 connectors are what ships in the box. The box is open: register your own harness, add your own connector, and the factory treats them exactly like the built-ins.",
+  title: "Make it work with your stack.",
+  lede: "Connect an internal service or run another agent without building a separate control plane. Custom harnesses use the same session UI; custom connectors use the same credential broker and access policies as the built-ins.",
   cards: [
     {
       kicker: "Harnesses",
-      title: "Bring your own agent.",
-      body: "A harness is a bundle the host mounts at boot, so your image never contains the agent. Claude Code and Codex ship as harnesses; register yours and it gets the same models, modes and effort levels.",
+      title: "Change agents. Keep your setup.",
+      body: "Register an agent through the harness SDK and descriptor. It appears in the picker with its models, modes, and effort levels. The host mounts it at boot, separately from your image.",
       foot: "claude code · codex · yours",
       href: "guides/custom-harness/",
     },
     {
       kicker: "Connectors",
-      title: "Bring your own connector.",
-      body: "Credentials are held by engrams and brokered at the egress proxy, so an agent can call an API without ever holding the key. Define a connector for any service and it is brokered the same way.",
+      title: "Connect the tools your work needs.",
+      body: "Define a service’s hosts, credential headers, and allowed operations. The proxy enforces those rules and inserts the key outside the VM. Profiles choose which connections each session can use.",
       foot: "23 built in · unlimited custom",
       href: "concepts/egress-and-brokering/",
     },
@@ -177,15 +172,11 @@ export const extensible = {
 export const belt = { label: "23 connectors built in · plus yours" };
 
 export const start = {
-  eyebrow: "A few minutes on one machine",
+  eyebrow: "Start with one task",
   title: "Start",
-  lede: "The local quickstart runs the whole stack on one machine in a few minutes. The deployment guides take a fresh GCP project or AWS account to a running fleet.",
+  lede: "Run the stack locally and give an agent its first task. When you are ready for a shared deployment, follow the GCP or AWS guide to run engrams in your own cloud.",
   ctas: [
-    {
-      label: "Run it locally",
-      href: "getting-started/local-quickstart/",
-      primary: true,
-    },
+    { label: "Run it locally", href: "getting-started/local-quickstart/", primary: true },
     { label: "Deploy on GCP", href: "guides/deploy-gcp/", primary: false },
     { label: "Deploy on AWS", href: "guides/deploy-aws/", primary: false },
   ],
