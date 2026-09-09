@@ -28,6 +28,7 @@ axum = { version = "0.8", features = ["macros", "ws"] }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+crc32fast = { version = "1" }
 crossbeam-utils = { version = "0.8" }
 crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom"] }
 crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }

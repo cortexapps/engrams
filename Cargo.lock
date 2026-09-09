@@ -8351,6 +8351,7 @@ dependencies = [
  "bytes",
  "cc",
  "chrono",
+ "crc32fast",
  "crossbeam-utils",
  "crypto-common 0.1.7",
  "crypto-common 0.2.2",
