@@ -28,6 +28,7 @@ import { ProfileChip } from "../../components/profiles/ProfileChip";
 import { useRailStore } from "./rail-store";
 import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
 import { useNow } from "../../hooks/useNow";
+import { EngramMark } from "../../components/EngramMark";
 
 // The persistent sessions rail: a live switcher between the caller's tasks that
 // stays mounted across the list views AND the transcript (the rail is the
@@ -220,13 +221,15 @@ export function SessionsRail() {
             the loaded rows stop growing the rail, so the sentinel would sit in
             view and pull page after page of history nobody asked to see — and
             the poll refetches every loaded page. */}
+        {/* The sentinel is the loader: the trace runs while the next page reads,
+            the same mark the other connecting states show. */}
         {hasMore && lastBandOpen && (
           <div
             ref={loadMoreRef}
             aria-hidden
-            className="py-1 text-center text-xs text-sidebar-foreground/70"
+            className="flex justify-center py-1.5 text-sidebar-foreground/70"
           >
-            …
+            <EngramMark size={16} mode="loader" ground="cover" />
           </div>
         )}
       </SidebarContent>
