@@ -6,7 +6,7 @@ import { renderWithProviders } from "../test-utils";
 import { ThemeProvider } from "./theme-provider";
 import { MainSidebar } from "./app-sidebar";
 
-test("admin sees the four products, and Settings as a row", async () => {
+test("admin sees the four products; Settings is in the avatar menu, not a row", async () => {
   renderWithProviders(
     <ThemeProvider>
       <SidebarProvider>
@@ -21,8 +21,8 @@ test("admin sees the four products, and Settings as a row", async () => {
   expect(screen.getByRole("link", { name: "Reviews" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Artifacts" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Automations" })).toBeTruthy();
-  // Settings is a spine destination at the foot, not an avatar-menu item.
-  expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
+  // Settings sits under the monogram (user-menu.test.tsx), not on the spine.
+  expect(screen.queryByRole("link", { name: "Settings" })).toBeNull();
   // The Operator and Kaizen hats retired into Settings.
   expect(screen.queryByRole("link", { name: "Operator" })).toBeNull();
   expect(screen.queryByRole("link", { name: "Kaizen" })).toBeNull();
@@ -49,7 +49,6 @@ test("member sees shared products but not Automations", async () => {
   );
   expect(await screen.findByRole("link", { name: "Tasks" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Artifacts" })).toBeTruthy();
-  expect(screen.getByRole("link", { name: "Settings" })).toBeTruthy();
   expect(screen.queryByRole("link", { name: "Automations" })).toBeNull();
   expect(screen.queryByRole("link", { name: "Tech Specs" })).toBeNull();
 });

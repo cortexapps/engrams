@@ -16,16 +16,18 @@ function renderMenu() {
   );
 }
 
-test("shows who is signed in, with the theme and sign-out actions when opened", async () => {
+test("shows who is signed in, with Settings, the theme and sign-out when opened", async () => {
   renderMenu();
   // The row itself carries the role and the workspace domain.
   expect(await screen.findByText("admin · engram.local")).toBeTruthy();
   await userEvent.click(screen.getByRole("button", { name: /local admin/i }));
   // The email renders in the open dropdown label.
   expect((await screen.findAllByText("dev@engram.local")).length).toBeGreaterThan(0);
-  // Settings is a spine destination now, not a menu item; the menu is about
-  // this person's session — theme + sign out.
-  expect(screen.queryByRole("menuitem", { name: /settings/i })).toBeNull();
+  // Settings lives under the monogram, with the gear, above the theme and
+  // sign out — the menu is about this person.
+  expect(screen.getByRole("menuitem", { name: /settings/i }).getAttribute("href")).toBe(
+    "/settings",
+  );
   expect(screen.getByRole("menuitem", { name: /dark theme/i })).toBeTruthy();
   expect(screen.getByRole("menuitem", { name: /sign out/i })).toBeTruthy();
 });

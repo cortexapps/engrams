@@ -303,11 +303,11 @@ the section rail (272px; the Tasks rail is drag-resizable), then the work
 surface. One component, `SectionLayout`, builds that frame for every section;
 a section supplies its rail and its page and nothing else.
 
-The spine holds products only — Tasks, Reviews, Artifacts, Automations — and
-Settings as a normal row at its foot, above the avatar. Everything an admin
-configures (the workspace, the runtime, the fleet, storage, papercuts) is a
-Settings page in one of five flat groups; there is no Operator hat and no
-one-item section.
+The spine holds products only — Tasks, Reviews, Artifacts, Automations — with
+the avatar at its foot. The avatar's menu is about the person: Settings (with
+its gear), the theme, and sign out. Everything an admin configures (the
+workspace, the runtime, the fleet, storage, papercuts) is a Settings page in
+one of five flat groups; there is no Operator hat and no one-item section.
 
 The work surface sits in an **8px gutter** on all four sides, so the cover shows
 through evenly around it. In the session view it splits into two sheets — the
