@@ -167,7 +167,7 @@ export function SessionDetail() {
           effort: task.effort || undefined,
         }
       : null;
-  const { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx } =
+  const { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx, opening } =
     useSessionEvents(id);
 
   // The in-guest browser (Xvfb + VNC, ADR 0065) is an optional capability,
@@ -295,7 +295,7 @@ export function SessionDetail() {
       events={events}
       status={session?.status}
       streamingText={streamingText}
-      transcriptWindow={{ hasMore, loadingOlder, loadOlder, oldestIdx }}
+      transcriptWindow={{ hasMore, loadingOlder, loadOlder, oldestIdx, opening }}
     />
   );
 

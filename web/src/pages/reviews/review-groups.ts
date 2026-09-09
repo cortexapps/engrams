@@ -59,8 +59,3 @@ export function groupByPr(reviews: readonly Review[]): PrGroup[] {
   out.sort((a, b) => createdAtMs(b.latest) - createdAtMs(a.latest));
   return out;
 }
-
-/** The group a given pass belongs to, or undefined when it isn't in the list. */
-export function groupOf(groups: readonly PrGroup[], reviewId: string): PrGroup | undefined {
-  return groups.find((g) => g.passes.some((p) => p.id === reviewId));
-}

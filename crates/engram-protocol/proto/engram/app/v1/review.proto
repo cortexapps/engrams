@@ -195,13 +195,49 @@ message ReviewVerdict {
   string session_id = 5;
 }
 
+// The list is of PULL REQUESTS, not passes: a page holds N pull requests and
+// EVERY pass over each of them, newest pull request (by its newest pass) first.
+// Filters read the newest pass of each pull request, so "stage = failed" is
+// "the last thing that happened to this PR was a failure", not "some pass
+// once failed".
 message ListReviewsRequest {
-  // Optional filter, "owner/name".
-  optional string repo = 1;
+  // Repositories, "owner/name". OR within the field; empty = every repository.
+  repeated string repos = 1;
+  // Case-insensitive substring over the repository, "#number", the title and
+  // the author.
+  string search = 2;
+  // Pull-request authors (forge logins). Empty = no filter.
+  repeated string authors = 3;
+  // Pull-request states ("open", "merged", "closed"). Empty = no filter.
+  repeated string pr_states = 4;
+  // Review statuses of the newest pass ("posted", "failed", …). Empty = no filter.
+  repeated string statuses = 5;
+  // The newest pass reported at least one finding at any of these severities.
+  repeated string severities = 6;
+  // 1-based page over the filtered pull requests.
+  // page_size 0 = unpaginated; clamped to 1000 otherwise.
+  int32 page = 7;
+  int32 page_size = 8;
 }
 
 message ListReviewsResponse {
+  // Every pass of the pull requests on this page. Group by `target_id`.
   repeated Review reviews = 1;
+  // Pull requests matching the filters, BEFORE pagination.
+  int32 total_count = 2;
+  // The values the filters can take, over EVERY reviewed pull request, scoped
+  // by no filter — so a menu never offers a value that returns nothing, never
+  // omits one that sits on a page the client has not read, and a multi-select
+  // can always be widened (a facet scoped by its own dimension collapses to
+  // the current selection).
+  ReviewFacets facets = 3;
+}
+
+message ReviewFacets {
+  repeated string repos = 1;
+  repeated string authors = 2;
+  repeated string pr_states = 3;
+  repeated string statuses = 4;
 }
 
 message GetReviewRequest {
@@ -224,6 +260,10 @@ message GetReviewResponse {
   Review review = 1;
   repeated ReviewFinding findings = 2;
   repeated ReviewVerdict verdicts = 3;
+  // Every pass over the same pull request, newest first — `review` included —
+  // each with its finding counts. The dossier's pass history comes from here,
+  // not from the paged list, which need not hold this pull request.
+  repeated Review passes = 5;
   // The review's step-by-step activity log, oldest first (ADR 0100). Milestones
   // the control plane records as it drives the review — queued, cloning the
   // repo, reviewing, verifying, posted — so the UI can show progress inside a

@@ -4,13 +4,17 @@ import {
   and,
   desc,
   eq,
+  exists,
   getTableColumns,
   gte,
+  ilike,
   inArray,
   isNull,
   ne,
   or,
   sql,
+  type SQL,
+  type SQLWrapper,
 } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
@@ -153,6 +157,50 @@ export interface ReviewListRow extends ReviewRow {
   findingCounts: FindingCounts;
 }
 
+/**
+ * A page of the reviews list is a page of PULL REQUESTS, not of passes. Every
+ * filter reads the newest pass of each pull request — "status = failed" is
+ * "the last thing that happened to this PR was a failure" — and the page
+ * carries every pass of the pull requests it holds, so a client can group them
+ * without a second read.
+ */
+export interface ReviewListQuery {
+  /** "owner/name". OR within the field; empty = every repository. */
+  repos?: string[];
+  /** Case-insensitive substring over the repository, "#number", the title and
+   *  the author. */
+  search?: string;
+  authors?: string[];
+  prStates?: string[];
+  /** Review statuses of the newest pass. */
+  statuses?: string[];
+  /** The newest pass reported at least one finding at any of these. */
+  severities?: string[];
+  /** 1-based. */
+  page?: number;
+  /** 0 (the default) = unpaginated. */
+  pageSize?: number;
+}
+
+/** The values the list filters can take, over EVERY reviewed pull request —
+ *  scoped by no filter, not even `repos`: a facet scoped by its own dimension
+ *  collapses to the current selection, and a multi-select could never be
+ *  widened. Sorted, so a menu reads in one order. */
+export interface ReviewFacets {
+  repos: string[];
+  authors: string[];
+  prStates: string[];
+  statuses: string[];
+}
+
+export interface ReviewListPage {
+  /** Every pass of the pull requests on this page, newest pass first. */
+  reviews: ReviewListRow[];
+  /** Pull requests matching the filters, before pagination. */
+  totalCount: number;
+  facets: ReviewFacets;
+}
+
 export interface ReviewFindingInput {
   reviewId: string;
   path: string;
@@ -264,7 +312,9 @@ export interface ReviewStore {
     targetId: string,
     opts: { excludeReviewId: string; limit: number },
   ): Promise<PriorReviewPass[]>;
-  listReviews(opts: { repo?: string }): Promise<ReviewListRow[]>;
+  listReviews(query: ReviewListQuery): Promise<ReviewListPage>;
+  /** Every pass over one pull request, newest first, with finding counts. */
+  listPasses(targetId: string): Promise<ReviewListRow[]>;
   getActiveReviewForTask(taskId: string): Promise<ReviewRow | null>;
   getActiveReviewForTarget(targetId: string): Promise<ReviewRow | null>;
   getActiveReviewByCoordinate(
@@ -431,9 +481,57 @@ const listSelection = {
   total: sql<number>`count(${findingTable.id})::int`,
 };
 
+type ListSelectionRow = JoinedReviewRow & {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  total: number;
+};
+
+function toListRow(row: ListSelectionRow): ReviewListRow {
+  return {
+    ...toReviewRow(row),
+    findingCounts: {
+      critical: row.critical,
+      high: row.high,
+      medium: row.medium,
+      low: row.low,
+      total: row.total,
+    },
+  };
+}
+
+/** Escape a literal substring for use as a PostgreSQL ILIKE pattern. */
+function likePattern(needle: string): string {
+  return `%${needle.replace(/[\\%_]/g, "\\$&")}%`;
+}
+
+/** A sorted, null-free `text[]` of the distinct values of a column. Empty when
+ *  no row matches: `array_agg` over zero rows is NULL. */
+function distinctValues(column: SQLWrapper): SQL<string[]> {
+  return sql<string[]>`coalesce(array_agg(distinct ${column} order by ${column}) filter (where ${column} is not null), '{}')`;
+}
+
 export function makeReviewStore(
   db: ReturnType<typeof getDb> = getDb(),
 ): ReviewStore {
+  /** Passes with their finding counts, newest first. An empty `inArray` is a
+   *  `false` condition in drizzle, so an empty page reads nothing. */
+  async function listPassRows(where: SQL): Promise<ReviewListRow[]> {
+    const rows = await db
+      .select(listSelection)
+      .from(reviewTable)
+      .innerJoin(targetTable, eq(reviewTable.targetId, targetTable.id))
+      .leftJoin(findingTable, eq(findingTable.reviewId, reviewTable.id))
+      .where(where)
+      // Grouped by both primary keys because the selection spans two tables:
+      // `review.id` alone leaves the target's columns unaggregated.
+      .groupBy(reviewTable.id, targetTable.id)
+      .orderBy(desc(reviewTable.createdAt), desc(reviewTable.id));
+    return rows.map(toListRow);
+  }
+
   return {
     async claimTargetId(input) {
       // Transitional, and deliberately narrow. Rows backfilled from before this
@@ -765,33 +863,104 @@ export function makeReviewStore(
       }));
     },
 
-    async listReviews({ repo }) {
-      const query = db
-        .select(listSelection)
+    async listReviews(query) {
+      // The newest pass of every pull request: the row the filters read and
+      // the row the list orders by. DISTINCT ON keeps the first row per target
+      // under this ORDER BY, which is the newest pass.
+      const latest = db
+        .selectDistinctOn([reviewTable.targetId], {
+          id: reviewTable.id,
+          targetId: reviewTable.targetId,
+          status: reviewTable.status,
+          createdAt: reviewTable.createdAt,
+        })
         .from(reviewTable)
-        .innerJoin(targetTable, eq(reviewTable.targetId, targetTable.id))
-        .leftJoin(findingTable, eq(findingTable.reviewId, reviewTable.id));
-      // Grouped by both primary keys because the selection now spans two
-      // tables: `review.id` alone leaves the target's columns unaggregated.
-      const rows = repo == null
-        ? await query
-            .groupBy(reviewTable.id, targetTable.id)
-            .orderBy(desc(reviewTable.createdAt))
-        : await query
-            .where(eq(targetTable.repo, repo))
-            .groupBy(reviewTable.id, targetTable.id)
-            .orderBy(desc(reviewTable.createdAt));
+        .orderBy(reviewTable.targetId, desc(reviewTable.createdAt), desc(reviewTable.id))
+        .as("latest");
 
-      return rows.map((row) => ({
-        ...toReviewRow(row),
-        findingCounts: {
-          critical: row.critical,
-          high: row.high,
-          medium: row.medium,
-          low: row.low,
-          total: row.total,
-        },
-      }));
+      const repos = query.repos ?? [];
+      const scope = repos.length > 0 ? inArray(targetTable.repo, repos) : undefined;
+      const conditions: SQL[] = [];
+      if (scope) conditions.push(scope);
+      if (query.authors?.length) conditions.push(inArray(targetTable.author, query.authors));
+      if (query.prStates?.length) conditions.push(inArray(targetTable.state, query.prStates));
+      if (query.statuses?.length) conditions.push(inArray(latest.status, query.statuses));
+      if (query.severities?.length) {
+        conditions.push(
+          exists(
+            db
+              .select({ one: sql`1` })
+              .from(findingTable)
+              .where(
+                and(
+                  eq(findingTable.reviewId, latest.id),
+                  inArray(findingTable.severity, query.severities),
+                ),
+              ),
+          ),
+        );
+      }
+      const needle = query.search?.trim();
+      if (needle) {
+        const pattern = likePattern(needle);
+        const hit = or(
+          ilike(targetTable.repo, pattern),
+          ilike(sql`'#' || ${targetTable.number}::text`, pattern),
+          ilike(targetTable.title, pattern),
+          ilike(targetTable.author, pattern),
+        );
+        if (hit) conditions.push(hit);
+      }
+      const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+      const [counted] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(latest)
+        .innerJoin(targetTable, eq(latest.targetId, targetTable.id))
+        .where(where);
+      const totalCount = counted?.count ?? 0;
+
+      // Newest pull request (by its newest pass) first; the id breaks ties so
+      // two pages never share or drop a row.
+      const pageQuery = db
+        .select({ targetId: latest.targetId })
+        .from(latest)
+        .innerJoin(targetTable, eq(latest.targetId, targetTable.id))
+        .where(where)
+        .orderBy(desc(latest.createdAt), desc(latest.id));
+      const pageSize = query.pageSize ?? 0;
+      const page = Math.max(1, query.page ?? 1);
+      const targets =
+        pageSize > 0
+          ? await pageQuery.limit(pageSize).offset((page - 1) * pageSize)
+          : await pageQuery;
+
+      // Unscoped on purpose — see `ReviewFacets`. With `repos` applied here the
+      // repository menu held only the repositories already chosen.
+      const [facets] = await db
+        .select({
+          repos: distinctValues(targetTable.repo),
+          authors: distinctValues(targetTable.author),
+          prStates: distinctValues(targetTable.state),
+          statuses: distinctValues(latest.status),
+        })
+        .from(latest)
+        .innerJoin(targetTable, eq(latest.targetId, targetTable.id));
+
+      return {
+        reviews: await listPassRows(
+          inArray(
+            reviewTable.targetId,
+            targets.map((t) => t.targetId),
+          ),
+        ),
+        totalCount,
+        facets: facets ?? { repos: [], authors: [], prStates: [], statuses: [] },
+      };
+    },
+
+    async listPasses(targetId) {
+      return listPassRows(eq(reviewTable.targetId, targetId));
     },
 
     async getActiveReviewForTask(taskId) {

@@ -12,6 +12,9 @@ export interface TranscriptWindow {
   loadingOlder: boolean;
   loadOlder: () => void;
   oldestIdx: number | null;
+  /** The tail window has not landed yet. The transcript is unknown rather
+   *  than empty, so the thread shows the loader, not "No activity yet." */
+  opening: boolean;
 }
 
 /** A transcript that holds its whole log: nothing to backfill. Surfaces that
@@ -21,6 +24,7 @@ export const NO_TRANSCRIPT_BACKFILL: TranscriptWindow = {
   loadingOlder: false,
   loadOlder: () => {},
   oldestIdx: null,
+  opening: false,
 };
 
 export const TranscriptWindowContext = createContext<TranscriptWindow>(NO_TRANSCRIPT_BACKFILL);

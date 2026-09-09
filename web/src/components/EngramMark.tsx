@@ -9,7 +9,7 @@ import { useEffect, useId, useRef } from "react";
 //
 //   mode="static"  — the trace sits drawn.
 //   mode="draw"    — boot / resume, once: the ring is present from the first
-//                    frame, the path draws on over 900ms (ease-out), then the
+//                    frame, the path draws on over 420ms at ONE rate, then the
 //                    dot fades and scales .4 → 1 in 240ms. No overshoot.
 //   mode="loader"  — indeterminate: the whole trace ghosted at 24%, a 60-unit
 //                    lit segment travelling it every 1.8s.
@@ -27,6 +27,12 @@ const PATH = "M14 68 L32 50 L50 68 L68 32 L86 50";
 const PATH_LENGTH = 4 * Math.hypot(18, 18);
 const ENTRY = { cx: 14, cy: 68, r: 6.5, stroke: 5 };
 const TERMINAL = { cx: 86, cy: 50, r: 7.5 };
+/** The draw-on. The trace is four equal diagonals, so it draws LINEARLY: under
+ * the house ease-out three strokes flicked by in the first quarter of the run
+ * and the last one crawled through the remaining three — the final stroke read
+ * as slower than the rest. One rate, then the dot's landing is the soft end. */
+const DRAW_MS = 420;
+const LAND_MS = 240;
 
 export type MarkGround = "paper" | "cover";
 export type MarkMode = "static" | "draw" | "loader";
@@ -103,8 +109,8 @@ export function EngramMark({
     const dot = dotRef.current;
     if (!path || !dot) return;
     const drawing = path.animate([{ strokeDashoffset: PATH_LENGTH }, { strokeDashoffset: 0 }], {
-      duration: 900,
-      easing: "cubic-bezier(0.2, 0.7, 0.2, 1)",
+      duration: DRAW_MS,
+      easing: "linear",
       fill: "forwards",
     });
     const landing = dot.animate(
@@ -112,7 +118,12 @@ export function EngramMark({
         { opacity: 0, transform: "scale(0.4)" },
         { opacity: 1, transform: "scale(1)" },
       ],
-      { duration: 240, delay: 900, easing: "cubic-bezier(0.2, 0.7, 0.2, 1)", fill: "both" },
+      {
+        duration: LAND_MS,
+        delay: DRAW_MS,
+        easing: "cubic-bezier(0.2, 0.7, 0.2, 1)",
+        fill: "both",
+      },
     );
     return () => {
       drawing.cancel();

@@ -1,5 +1,5 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { act, screen } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderWithProviders } from "../../test-utils";
 import { Reviews } from "./Reviews";
@@ -146,14 +146,39 @@ const view: {
   events: typeof events;
   /** Extra passes over OTHER pull requests, for grouping tests. */
   others: Array<typeof newerPass>;
+  /** The server's count of matching pull requests; undefined = derive it
+   *  from the passes in hand. */
+  totalCount: number | undefined;
+  hasNextPage: boolean;
 } = {
   id: "review-1",
   status: "posted",
   findings,
   events,
   others: [],
+  totalCount: undefined,
+  hasNextPage: false,
 };
 const retryMutate = vi.fn<(input: { id: string }, options?: { onSuccess?: () => void }) => void>();
+/** What the ledger and the rail asked the server for, newest call last. */
+const listParams: Array<Record<string, unknown>> = [];
+const fetchNextPage = vi.fn();
+
+/** Every pass the fake server holds, in no particular order. */
+function allPasses() {
+  return [
+    {
+      ...olderPass,
+      status: view.id === "review-1" ? view.status : olderPass.status,
+      active:
+        view.id === "review-1"
+          ? ["queued", "finding", "verifying"].includes(view.status)
+          : olderPass.active,
+    },
+    newerPass,
+    ...view.others,
+  ];
+}
 
 vi.mock("@tanstack/react-router", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("@tanstack/react-router");
@@ -161,24 +186,27 @@ vi.mock("@tanstack/react-router", async () => {
 });
 
 vi.mock("../../hooks/useReviews", () => ({
-  useReviews: () => ({
-    data: {
-      reviews: [
-        {
-          ...olderPass,
-          status: view.id === "review-1" ? view.status : olderPass.status,
-          active:
-            view.id === "review-1"
-              ? ["queued", "finding", "verifying"].includes(view.status)
-              : olderPass.active,
-        },
-        newerPass,
-        ...view.others,
-      ],
-    },
-    isPending: false,
-    error: null,
-  }),
+  useReviewsInfinite: (params: Record<string, unknown>) => {
+    listParams.push(params);
+    const reviews = allPasses();
+    const distinct = (values: Array<string | undefined>) =>
+      [...new Set(values.filter((v): v is string => !!v))].sort();
+    return {
+      reviews,
+      totalCount: view.totalCount ?? new Set(reviews.map((r) => r.targetId)).size,
+      facets: {
+        repos: distinct(reviews.map((r) => r.repo)),
+        authors: distinct(reviews.map((r) => r.prAuthor)),
+        prStates: distinct(reviews.map((r) => r.prState)),
+        statuses: distinct(reviews.map((r) => r.status)),
+      },
+      hasNextPage: view.hasNextPage,
+      isFetchingNextPage: false,
+      fetchNextPage,
+      isPending: false,
+      error: null,
+    };
+  },
   useReview: () => ({
     data: {
       review: {
@@ -189,6 +217,11 @@ vi.mock("../../hooks/useReviews", () => ({
       findings: view.findings,
       verdicts,
       events: view.events,
+      // The pass history rides the detail, newest first — the same pull
+      // request only, the way the server builds it.
+      passes: allPasses()
+        .filter((pass) => pass.targetId === "target-100")
+        .sort((a, b) => Number(b.createdAt.seconds - a.createdAt.seconds)),
     },
     isPending: false,
     error: null,
@@ -201,6 +234,29 @@ vi.mock("../../hooks/useReviews", () => ({
   }),
 }));
 vi.mock("../../hooks/useNow", () => ({ useNow: () => 0 }));
+
+// jsdom has no IntersectionObserver. Record what the sentinel observes and let
+// a test bring it into view.
+const observed: Element[] = [];
+let intersect: (target: Element) => void = () => {};
+class FakeIntersectionObserver {
+  constructor(private readonly callback: IntersectionObserverCallback) {
+    intersect = (target) =>
+      this.callback(
+        [{ isIntersecting: true, target } as IntersectionObserverEntry],
+        this as unknown as IntersectionObserver,
+      );
+  }
+  observe(target: Element) {
+    observed.push(target);
+  }
+  disconnect() {}
+  unobserve() {}
+  takeRecords() {
+    return [];
+  }
+}
+vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
 // The transcript pane streams over SSE, which jsdom has no EventSource for; the
 // pane's job here is to mount the right session, not to replay a transcript.
 vi.mock("../../hooks/useSessionEvents", () => ({
@@ -223,7 +279,12 @@ beforeEach(() => {
   view.findings = findings;
   view.events = events;
   view.others = [];
+  view.totalCount = undefined;
+  view.hasNextPage = false;
+  listParams.length = 0;
+  observed.length = 0;
   retryMutate.mockClear();
+  fetchNextPage.mockClear();
 });
 
 describe("Reviews ledger", () => {
@@ -232,8 +293,8 @@ describe("Reviews ledger", () => {
 
     // Two review rows over one PR collapse to a single entry…
     expect(await screen.findByText("Bump quinn-proto from 0.11.14 to 0.11.16")).toBeTruthy();
-    // The count lives in the masthead chip, and only says "of" once a filter
-    // narrows the list.
+    // The count lives in the masthead chip: the server's count of matching
+    // pull requests, whether or not every page has been read.
     expect(screen.getByText("1 pull request")).toBeTruthy();
     // …and it reports the newer pass's stage, not the older one's.
     expect(screen.getByText("Verifying")).toBeTruthy();
@@ -329,6 +390,34 @@ describe("Reviews ledger", () => {
     // Only the finished pass claims zero. The running one stays silent.
     await screen.findByText("Still reading the diff");
     expect(screen.getAllByText("None")).toHaveLength(1);
+  });
+
+  // The search and the filters run on the server over every reviewed pull
+  // request; the page in hand is not what they read.
+  it("sends the search to the server", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<Reviews />);
+    await screen.findByText("Bump quinn-proto from 0.11.14 to 0.11.16");
+
+    await user.type(screen.getByLabelText("Search pull requests"), "quinn");
+
+    await waitFor(() => expect(listParams.at(-1)).toMatchObject({ search: "quinn" }));
+    // The rows are whatever the server answered with — nothing is filtered here.
+    expect(screen.getByText("Bump quinn-proto from 0.11.14 to 0.11.16")).toBeTruthy();
+  });
+
+  it("reads the next page from a sentinel and says how much is in hand", async () => {
+    view.totalCount = 40;
+    view.hasNextPage = true;
+    renderWithProviders(<Reviews />);
+
+    expect(await screen.findByText("40 pull requests")).toBeTruthy();
+    expect(screen.getByText("1 of 40 pull requests")).toBeTruthy();
+    // The sentinel is in the document; when it scrolls into view the observer
+    // asks for the next page.
+    await waitFor(() => expect(observed.length).toBeGreaterThan(0));
+    act(() => intersect(observed[0]!));
+    expect(fetchNextPage).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to the PR number when no title was captured", async () => {

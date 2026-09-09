@@ -35,6 +35,11 @@ export interface SessionEventsState {
   /** The oldest idx held in full fidelity. It changes ONLY on a prepend, so
    *  the viewport uses it as the scroll-anchor key. */
   oldestIdx: number | null;
+  /** The tail window is still being read, so nothing is known about the log
+   *  yet — an empty `events` here is unknown, not empty. False once the read
+   *  settles (the SSE fallback then fills the log in), and when there is no
+   *  session to open. */
+  opening: boolean;
 }
 
 /**
@@ -72,6 +77,9 @@ export function useSessionEvents(sessionId: string | undefined): SessionEventsSt
   const [hasMore, setHasMore] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [oldestIdx, setOldestIdx] = useState<number | null>(null);
+  // True from the first render with a session, so the transcript never paints
+  // its empty state in the frame before the effect below starts the read.
+  const [opening, setOpening] = useState(Boolean(sessionId));
 
   // The highest idx observed — used by the dedup pass below.
   const highWater = useRef<number>(-1);
@@ -135,7 +143,10 @@ export function useSessionEvents(sessionId: string | undefined): SessionEventsSt
   }, [list, setHasMoreTracked]);
 
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId) {
+      setOpening(false);
+      return;
+    }
 
     const gen = generation.current;
     const controller = new AbortController();
@@ -146,6 +157,7 @@ export function useSessionEvents(sessionId: string | undefined): SessionEventsSt
     setHasMoreTracked(false);
     setLoadingOlder(false);
     setOldestIdx(null);
+    setOpening(true);
     highWater.current = -1;
     overlay.current = new Map();
     finalized.current = new Set();
@@ -221,6 +233,7 @@ export function useSessionEvents(sessionId: string | undefined): SessionEventsSt
         highWater.current = -1;
       }
       if (gen !== generation.current) return;
+      setOpening(false);
       unsubscribe = subscribeSession(sessionId, handlers, since);
     })();
 
@@ -232,7 +245,7 @@ export function useSessionEvents(sessionId: string | undefined): SessionEventsSt
     };
   }, [sessionId, list, setHasMoreTracked]);
 
-  return { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx };
+  return { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx, opening };
 }
 
 /**

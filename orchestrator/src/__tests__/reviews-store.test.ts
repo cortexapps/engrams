@@ -111,6 +111,7 @@ describe("ReviewStore", () => {
       const store = makeReviewStore(db);
       const taskId = `review-store-${crypto.randomUUID()}`;
       const repo = `review-store-${crypto.randomUUID()}/engrams`;
+      const otherRepo = `${repo}-other`;
       const reviewIds: string[] = [];
       await db.insert(taskTable).values({
         id: taskId,
@@ -218,13 +219,26 @@ describe("ReviewStore", () => {
           .set({ createdAt: new Date("2026-07-17T12:00:00Z") })
           .where(eq(reviewTable.id, activeReviewId));
 
+        // A pull request in ANOTHER repository, outside every `repos: [repo]`
+        // read below: it must never appear in those pages or counts, and must
+        // always appear in the facets.
+        const otherRepoReviewId = await createPass(store, taskId, {
+          repo: otherRepo,
+          prNumber: 7,
+          status: "posted",
+          headSha: "other-head",
+        });
+        reviewIds.push(otherRepoReviewId);
+
         expect((await store.getActiveReviewForTask(taskId))?.id).toBe(activeReviewId);
         const activeTargetId = (await store.getReview(activeReviewId))!.review.targetId;
         const terminalTargetId = (await store.getReview(terminalReviewId))!.review.targetId;
         expect((await store.getActiveReviewForTarget(activeTargetId))?.id).toBe(activeReviewId);
         expect(await store.getActiveReviewForTarget(terminalTargetId)).toBeNull();
 
-        const listed = await store.listReviews({ repo });
+        const { reviews: listed, totalCount, facets } = await store.listReviews({
+          repos: [repo],
+        });
         expect(listed.map((row) => row.id).slice(0, 3)).toEqual([
           activeReviewId,
           terminalReviewId,
@@ -237,6 +251,50 @@ describe("ReviewStore", () => {
           low: 1,
           total: 2,
         });
+        // Three pull requests (100, 101, 102), each with one pass.
+        expect(totalCount).toBe(3);
+        // The facets span EVERY reviewed pull request — this database is
+        // shared with other tests, so they contain these values rather than
+        // equal them. `otherRepo` sits outside the `repos` filter and is still
+        // on offer, which is what lets a repository multi-select widen.
+        expect(facets.repos).toContain(repo);
+        expect(facets.repos).toContain(otherRepo);
+        expect(facets.statuses).toEqual(expect.arrayContaining(["posted", "verifying"]));
+        expect(facets.repos).toEqual([...facets.repos].sort());
+
+        // A page is a page of PULL REQUESTS: the second page of two holds the
+        // one that is left, with every pass over it.
+        const pageOne = await store.listReviews({ repos: [repo], page: 1, pageSize: 2 });
+        expect(pageOne.totalCount).toBe(3);
+        expect(pageOne.reviews.map((row) => row.id)).toEqual([activeReviewId, terminalReviewId]);
+        const pageTwo = await store.listReviews({ repos: [repo], page: 2, pageSize: 2 });
+        expect(pageTwo.reviews.map((row) => row.id)).toEqual([firstReviewId]);
+        const pageThree = await store.listReviews({ repos: [repo], page: 3, pageSize: 2 });
+        expect(pageThree.reviews).toEqual([]);
+        expect(pageThree.totalCount).toBe(3);
+
+        // Filters read the newest pass of each pull request.
+        const verifying = await store.listReviews({ repos: [repo], statuses: ["verifying"] });
+        expect(verifying.reviews.map((row) => row.id)).toEqual([activeReviewId]);
+        expect(verifying.totalCount).toBe(1);
+        // The facets stay whole under a filter, so a menu can still widen it.
+        expect(verifying.facets.statuses).toEqual(
+          expect.arrayContaining(["posted", "verifying"]),
+        );
+        expect(verifying.facets.repos).toContain(otherRepo);
+        const critical = await store.listReviews({ repos: [repo], severities: ["critical"] });
+        expect(critical.reviews.map((row) => row.id)).toEqual([firstReviewId]);
+        const bySearch = await store.listReviews({ repos: [repo], search: "#10" });
+        expect(bySearch.totalCount).toBe(3);
+        const byNumber = await store.listReviews({ repos: [repo], search: "#102" });
+        expect(byNumber.reviews.map((row) => row.id)).toEqual([activeReviewId]);
+        // `_` is a LIKE wildcard; as a search term it is a literal.
+        const literal = await store.listReviews({ repos: [repo], search: "_" });
+        expect(literal.totalCount).toBe(0);
+
+        expect((await store.listPasses(activeTargetId)).map((row) => row.id)).toEqual([
+          activeReviewId,
+        ]);
       } finally {
         if (reviewIds.length > 0) {
           await db
@@ -246,7 +304,10 @@ describe("ReviewStore", () => {
         }
         await db.delete(taskTable).where(eq(taskTable.id, taskId)).catch(() => {});
         // Passes cascade from their target, but the target itself outlives them.
-        await db.delete(targetTable).where(eq(targetTable.repo, repo)).catch(() => {});
+        await db
+          .delete(targetTable)
+          .where(inArray(targetTable.repo, [repo, otherRepo]))
+          .catch(() => {});
       }
     },
   );

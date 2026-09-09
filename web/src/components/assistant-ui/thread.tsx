@@ -59,6 +59,7 @@ import { UploadPathText } from "@/components/session-files/UploadPathText";
 import { isSubmitKey, useEnterToSend } from "@/hooks/useEnterToSend";
 import { ModeChip } from "@/components/ModeChip";
 import { EmptyState } from "@/components/empty-state";
+import { EngramMark } from "@/components/EngramMark";
 import { SkeletonRows } from "@/components/skeleton-rows";
 import type { SessionState } from "@/lib/types";
 
@@ -92,7 +93,7 @@ export const Thread: FC = () => {
           />
 
           <AuiIf condition={(s) => s.thread.isEmpty}>
-            <ThreadEmpty />
+            {transcriptWindow.opening ? <ThreadOpening /> : <ThreadEmpty />}
           </AuiIf>
 
           <div className="mb-8 flex flex-col gap-y-6 empty:hidden">
@@ -192,6 +193,21 @@ const ThreadEmpty: FC = () => {
     <EmptyState inline className="my-12 items-center text-center">
       No activity yet.
     </EmptyState>
+  );
+};
+
+// The tail window is still being read. The transcript is unknown, not empty,
+// so this is the connection loader — the empty state used to flash "No
+// activity yet." over every task in the moment before its log landed.
+const ThreadOpening: FC = () => {
+  return (
+    <div
+      role="status"
+      aria-label="Opening the transcript"
+      className="my-12 flex justify-center text-muted-foreground"
+    >
+      <EngramMark size={28} mode="loader" />
+    </div>
   );
 };
 

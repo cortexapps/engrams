@@ -11,6 +11,7 @@ import { createRouterTransport } from "@connectrpc/connect";
 import { renderWithProviders } from "../../test-utils";
 import { SessionService } from "../../gen/engram/app/v1/session_pb";
 import { SessionThread } from "./SessionThread";
+import { NO_TRANSCRIPT_BACKFILL } from "./transcript-window";
 import type { IndexedEvent, SessionEvent } from "../../lib/types";
 
 afterEach(cleanup);
@@ -274,6 +275,33 @@ describe("SessionThread", () => {
     view.unmount();
     renderWithProviders(<SessionThread sessionId="s1" status="idle" events={events} />);
     expect(await screen.findAllByLabelText("Tracked spec edit")).toHaveLength(1);
+  });
+
+  // A task whose log has not landed is unknown, not empty. The empty state
+  // used to flash over every task in the moment before its window arrived.
+  test("shows the loader, not the empty state, while the transcript is opening", async () => {
+    const view = renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={[]}
+        transcriptWindow={{ ...NO_TRANSCRIPT_BACKFILL, opening: true }}
+      />,
+    );
+    expect(await screen.findByRole("status", { name: "Opening the transcript" })).toBeTruthy();
+    expect(screen.queryByText("No activity yet.")).toBeNull();
+
+    view.unmount();
+    renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={[]}
+        transcriptWindow={{ ...NO_TRANSCRIPT_BACKFILL, opening: false }}
+      />,
+    );
+    expect(await screen.findByText("No activity yet.")).toBeTruthy();
+    expect(screen.queryByRole("status", { name: "Opening the transcript" })).toBeNull();
   });
 
   test("an unanswered legacy question is read-only after the protocol upgrade", async () => {

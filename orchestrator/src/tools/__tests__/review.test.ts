@@ -117,6 +117,13 @@ function fakeReviewStore(options: {
       return detail;
     },
     async listReviews() {
+      return {
+        reviews: [],
+        totalCount: 0,
+        facets: { repos: [], authors: [], prStates: [], statuses: [] },
+      };
+    },
+    async listPasses() {
       return [];
     },
     async getActiveReviewForTask() {
