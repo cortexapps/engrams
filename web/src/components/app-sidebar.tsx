@@ -4,7 +4,6 @@ import {
   GitPullRequestArrow,
   PanelLeftClose,
   PanelLeftOpen,
-  Settings,
   SquareTerminal,
   Workflow,
 } from "lucide-react";
@@ -24,7 +23,6 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarRail,
-  SidebarSeparator,
   useSidebar,
 } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
@@ -43,8 +41,10 @@ interface Dest extends NavItem {
 // The spine holds PRODUCTS only: Tasks is the developer surface; Reviews is
 // the shared PR review ledger; Artifacts the document library; Automations the
 // event-driven work. Everything an admin configures — the account, the
-// workspace, the runtime, the fleet — is one destination, Settings, at the
-// foot of the spine as a normal row (not hidden in the avatar menu).
+// workspace, the runtime, the fleet — is one destination, Settings, in the
+// avatar menu at the foot of the spine (user-menu.tsx): the menu is about
+// this person — their settings, their theme, their session — and a gear that
+// sat alone as a spine row left the menu holding only the theme and sign out.
 const DESTS: Dest[] = [
   {
     to: "/sessions",
@@ -88,14 +88,6 @@ const DESTS: Dest[] = [
     match: (p) => p.startsWith("/automations"),
   },
 ];
-
-const SETTINGS: Dest = {
-  to: "/settings",
-  label: "Settings",
-  icon: Settings,
-  adminOnly: false,
-  match: (p) => p.startsWith("/settings"),
-};
 
 export function MainSidebar() {
   const isAdmin = useIsAdmin();
@@ -145,13 +137,8 @@ export function MainSidebar() {
         </SidebarGroup>
       </SidebarContent>
 
-      {/* Settings is a destination row like the others; the hairline below it
-          separates navigation from identity (the avatar row). */}
-      <SidebarFooter className="bg-sidebar gap-1.5 px-[10px] pb-3">
-        <SidebarMenu>
-          <SpineRow dest={SETTINGS} active={SETTINGS.match(pathname)} />
-        </SidebarMenu>
-        <SidebarSeparator className="mx-0" />
+      {/* Identity at the foot: the avatar row, whose menu carries Settings. */}
+      <SidebarFooter className="bg-sidebar px-[10px] pb-3">
         <UserMenu />
       </SidebarFooter>
       <SidebarRail />

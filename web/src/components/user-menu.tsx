@@ -1,4 +1,5 @@
-import { LogOut, Moon, Sun } from "lucide-react";
+import { LogOut, Moon, Settings, Sun } from "lucide-react";
+import { Link } from "@tanstack/react-router";
 import { signOut } from "../auth/AuthProvider";
 import { useAuth } from "../auth/AuthProvider";
 import { useTheme } from "./theme-provider";
@@ -19,8 +20,10 @@ import {
 
 // The avatar row at the foot of the spine: who is signed in, on one line, with
 // the role and the workspace domain under it. The menu holds what is about
-// this PERSON's session — the theme and signing out. Settings is a spine
-// destination, not a menu item.
+// this PERSON: Settings (the account, the workspace, the runtime, the fleet —
+// one destination), the theme, and signing out. Settings was a spine row for
+// a while; on its own under the products it read as strange, and it left this
+// menu holding only the theme and sign out.
 export function UserMenu() {
   const { principal } = useAuth();
   const { theme, toggle } = useTheme();
@@ -66,6 +69,12 @@ export function UserMenu() {
                 <span className="text-xs text-muted-foreground">{principal.email}</span>
               </div>
             </DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem asChild>
+              <Link to="/settings">
+                <Settings /> Settings
+              </Link>
+            </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem onClick={toggle}>
               {theme === "dark" ? <Sun /> : <Moon />}
