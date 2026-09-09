@@ -16,6 +16,7 @@ import type {
   ReviewDetail,
   ReviewEventRow,
   ReviewFindingRow,
+  ReviewListQuery,
   ReviewListRow,
   ReviewRow,
   ReviewStore,
@@ -103,14 +104,27 @@ function verdictRow(): ReviewVerdictRow {
 }
 
 interface FakeReviewStore extends ReviewStore {
-  listCalls: Array<{ repo?: string }>;
+  listCalls: ReviewListQuery[];
 }
 
 function makeStore(
   detail: ReviewDetail | null,
   events: ReviewEventRow[] = [],
 ): FakeReviewStore {
-  const listCalls: Array<{ repo?: string }> = [];
+  const listCalls: ReviewListQuery[] = [];
+  const listRow = (): ReviewListRow | null =>
+    detail
+      ? {
+          ...detail.review,
+          findingCounts: {
+            critical: 0,
+            high: 1,
+            medium: 0,
+            low: 0,
+            total: 1,
+          },
+        }
+      : null;
   return {
     listCalls,
     async claimTargetId() {
@@ -138,20 +152,24 @@ function makeStore(
     async listEvents() {
       return events;
     },
-    async listReviews(opts) {
-      listCalls.push(opts);
-      if (!detail || (opts.repo != null && detail.review.repo !== opts.repo)) return [];
-      const row: ReviewListRow = {
-        ...detail.review,
-        findingCounts: {
-          critical: 0,
-          high: 1,
-          medium: 0,
-          low: 0,
-          total: 1,
+    async listReviews(query) {
+      listCalls.push(query);
+      const row = listRow();
+      const hit = row && (!query.repos?.length || query.repos.includes(row.repo));
+      return {
+        reviews: hit ? [row] : [],
+        totalCount: hit ? 1 : 0,
+        facets: {
+          repos: row ? [row.repo] : [],
+          authors: [],
+          prStates: [],
+          statuses: row ? [row.status] : [],
         },
       };
-      return [row];
+    },
+    async listPasses() {
+      const row = listRow();
+      return row ? [row] : [];
     },
     async getActiveReviewForTask() {
       return null;
@@ -293,9 +311,26 @@ describe("ReviewService", () => {
 
   test("ListReviews filters by repo and maps counts and timestamps", async () => {
     const store = makeStore(detail);
-    const response = await spawn(store).listReviews({ repo: "openai/engrams" });
+    const response = await spawn(store).listReviews({
+      repos: ["openai/engrams"],
+      pageSize: 25,
+      page: 3,
+    });
 
-    expect(store.listCalls).toEqual([{ repo: "openai/engrams" }]);
+    expect(store.listCalls).toEqual([
+      {
+        repos: ["openai/engrams"],
+        search: "",
+        authors: [],
+        prStates: [],
+        statuses: [],
+        severities: [],
+        page: 3,
+        pageSize: 25,
+      },
+    ]);
+    expect(response.totalCount).toBe(1);
+    expect(response.facets).toMatchObject({ repos: ["openai/engrams"], statuses: ["verifying"] });
     expect(response.reviews[0]).toMatchObject({
       id: REVIEW_ID,
       repo: "openai/engrams",
@@ -312,10 +347,13 @@ describe("ReviewService", () => {
     expect(timestampDate(response.reviews[0]!.updatedAt!)).toEqual(UPDATED_AT);
   });
 
-  test("GetReview returns the durable row, findings, and verdicts", async () => {
+  test("GetReview returns the durable row, findings, verdicts and passes", async () => {
     const response = await spawn(makeStore(detail)).getReview({ id: REVIEW_ID });
 
     expect(response.review?.findingCounts).toMatchObject({ high: 1, total: 1 });
+    // The pass history rides the detail, not the paged list.
+    expect(response.passes.map((pass) => pass.id)).toEqual([REVIEW_ID]);
+    expect(response.passes[0]?.findingCounts).toMatchObject({ high: 1, total: 1 });
     expect(response.findings[0]).toMatchObject({
       id: FINDING_ID,
       reviewId: REVIEW_ID,

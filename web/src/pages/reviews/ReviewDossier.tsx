@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { subject } from "@casl/ability";
 import {
@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 
 import type { Review } from "../../gen/engram/app/v1/review_pb";
-import { useRetryReview, useReview, useReviews } from "../../hooks/useReviews";
+import { useRetryReview, useReview } from "../../hooks/useReviews";
 import { useNow } from "../../hooks/useNow";
 import { useAbility } from "../../auth/AuthProvider";
 import type { SessionSubject } from "../../lib/ability";
@@ -37,7 +37,6 @@ import { Dot, Sep } from "./Sep";
 import { PassState } from "./PassState";
 import { FindingsLedger } from "./FindingsLedger";
 import { ReviewTranscriptPane, roleSession, type WorkerRole } from "./ReviewTranscriptPane";
-import { groupByPr, groupOf } from "./review-groups";
 import { judgeFindings } from "./review-findings";
 import {
   diffSummary,
@@ -64,20 +63,12 @@ import {
  */
 export function ReviewDossier() {
   const { id } = useParams({ from: "/_app/reviews/$id" });
-  const list = useReviews();
-  const groups = useMemo(() => groupByPr(list.data?.reviews ?? []), [list.data?.reviews]);
-  const group = groupOf(groups, id);
-
-  // The list is already warm from the rail, so the PR's identity and its pass
-  // switcher render immediately while the selected pass's detail loads.
-  const listed = group?.passes.find((p) => p.id === id);
-  const active = listed ? isActive(listed) : true;
-  const detail = useReview(id, { active });
-  const review = detail.data?.review ?? listed;
+  const detail = useReview(id);
+  const review = detail.data?.review;
 
   const [role, setRole] = useState<WorkerRole | null>(null);
 
-  if (detail.isPending && !review) {
+  if (detail.isPending) {
     return (
       <Frame>
         <SkeletonRows rows={4} />
@@ -100,9 +91,10 @@ export function ReviewDossier() {
     );
   }
 
-  // Passes newest first. Without the list (a direct load that hasn't landed, or a
-  // pass the list doesn't carry) the selected pass stands alone.
-  const passes = group?.passes ?? [review];
+  // Passes newest first, from the detail itself: the paged list need not hold
+  // this pull request. A server that predates the field leaves the selected
+  // pass standing alone.
+  const passes = detail.data?.passes.length ? detail.data.passes : [review];
   // The review is an input to outcome derivation, not just a subject of it: a
   // finding's reason for not posting depends on whether the posting gate ran.
   const judged = judgeFindings(detail.data?.findings ?? [], detail.data?.verdicts ?? [], review);

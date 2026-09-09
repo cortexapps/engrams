@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/review.proto.
  */
 export const file_engram_app_v1_review: GenFile = /*@__PURE__*/
-  fileDesc("ChplbmdyYW0vYXBwL3YxL3Jldmlldy5wcm90bxINZW5ncmFtLmFwcC52MSLdAQoOUmVwb0Vucm9sbG1lbnQSDAoEcmVwbxgBIAEoCRIUCgx0cmlnZ2VyX21vZGUYAiABKAkSDwoHYXV0b2ZpeBgDIAEoCRIXCgpwcm9maWxlX2lkGAQgASgJSACIAQESLgoKY3JlYXRlZF9hdBgFIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASDgoGZW5naW5lGAcgASgJQg0KC19wcm9maWxlX2lkIhgKFkxpc3RFbnJvbGxtZW50c1JlcXVlc3QiTQoXTGlzdEVucm9sbG1lbnRzUmVzcG9uc2USMgoLZW5yb2xsbWVudHMYASADKAsyHS5lbmdyYW0uYXBwLnYxLlJlcG9FbnJvbGxtZW50IpYBChdVcHNlcnRFbnJvbGxtZW50UmVxdWVzdBIMCgRyZXBvGAEgASgJEhQKDHRyaWdnZXJfbW9kZRgCIAEoCRIPCgdhdXRvZml4GAMgASgJEhcKCnByb2ZpbGVfaWQYBCABKAlIAIgBARITCgZlbmdpbmUYBSABKAlIAYgBAUINCgtfcHJvZmlsZV9pZEIJCgdfZW5naW5lIk0KGFVwc2VydEVucm9sbG1lbnRSZXNwb25zZRIxCgplbnJvbGxtZW50GAEgASgLMh0uZW5ncmFtLmFwcC52MS5SZXBvRW5yb2xsbWVudCInChdEZWxldGVFbnJvbGxtZW50UmVxdWVzdBIMCgRyZXBvGAEgASgJIhoKGERlbGV0ZUVucm9sbG1lbnRSZXNwb25zZSK/BwoGUmV2aWV3EgoKAmlkGAEgASgJEgwKBHJlcG8YAiABKAkSEQoJcHJfbnVtYmVyGAMgASgFEg8KB3Rhc2tfaWQYBCABKAkSEAoIaGVhZF9zaGEYBSABKAkSEAoIYmFzZV9zaGEYBiABKAkSDwoHdHJpZ2dlchgHIAEoCRIOCgZzdGF0dXMYCCABKAkSHQoQZ2l0aHViX3Jldmlld19pZBgJIAEoCUgAiAEBEhcKCnN1bW1hcnlfbWQYCiABKAlIAYgBARIuCgpjcmVhdGVkX2F0GAsgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgp1cGRhdGVkX2F0GAwgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBI0Cg5maW5kaW5nX2NvdW50cxgNIAEoCzIcLmVuZ3JhbS5hcHAudjEuRmluZGluZ0NvdW50cxIeChFmaW5kZXJfc2Vzc2lvbl9pZBgOIAEoCUgCiAEBEiAKE3ZlcmlmaWVyX3Nlc3Npb25faWQYDyABKAlIA4gBARIVCghwcl90aXRsZRgQIAEoCUgEiAEBEhYKCXByX2F1dGhvchgRIAEoCUgFiAEBEhgKC2hlYWRfYnJhbmNoGBIgASgJSAaIAQESGAoLYmFzZV9icmFuY2gYEyABKAlIB4gBARIVCghwcl9zdGF0ZRgUIAEoCUgIiAEBEhYKCWFkZGl0aW9ucxgVIAEoBUgJiAEBEhYKCWRlbGV0aW9ucxgWIAEoBUgKiAEBEhoKDWNoYW5nZWRfZmlsZXMYFyABKAVIC4gBARIRCgl0YXJnZXRfaWQYGCABKAkSEAoIcHJvdmlkZXIYGSABKAkSGAoLcHJvdmlkZXJfaWQYGiABKAlIDIgBARITCgZwcl91cmwYGyABKAlIDYgBARIOCgZhY3RpdmUYHCABKAgSFQoNaHVtYW5fdHJpZ2dlchgdIAEoCEITChFfZ2l0aHViX3Jldmlld19pZEINCgtfc3VtbWFyeV9tZEIUChJfZmluZGVyX3Nlc3Npb25faWRCFgoUX3ZlcmlmaWVyX3Nlc3Npb25faWRCCwoJX3ByX3RpdGxlQgwKCl9wcl9hdXRob3JCDgoMX2hlYWRfYnJhbmNoQg4KDF9iYXNlX2JyYW5jaEILCglfcHJfc3RhdGVCDAoKX2FkZGl0aW9uc0IMCgpfZGVsZXRpb25zQhAKDl9jaGFuZ2VkX2ZpbGVzQg4KDF9wcm92aWRlcl9pZEIJCgdfcHJfdXJsIlsKDUZpbmRpbmdDb3VudHMSEAoIY3JpdGljYWwYASABKAUSDAoEaGlnaBgCIAEoBRIOCgZtZWRpdW0YAyABKAUSCwoDbG93GAQgASgFEg0KBXRvdGFsGAUgASgFIpsECg1SZXZpZXdGaW5kaW5nEgoKAmlkGAEgASgJEhEKCXJldmlld19pZBgCIAEoCRIMCgRwYXRoGAMgASgJEhcKCnN0YXJ0X2xpbmUYBCABKAVIAIgBARIVCghlbmRfbGluZRgFIAEoBUgBiAEBEhEKBHNpZGUYBiABKAlIAogBARIQCghjYXRlZ29yeRgHIAEoCRIQCghzZXZlcml0eRgIIAEoCRISCgpjb25maWRlbmNlGAkgASgJEg0KBXRpdGxlGAogASgJEg8KB2JvZHlfbWQYCyABKAkSGgoNc3VnZ2VzdGVkX2ZpeBgMIAEoCUgDiAEBEhAKCGV2aWRlbmNlGA0gAygJEg0KBXN0YXRlGA4gASgJEhsKDnZlcmRpY3RfcmVhc29uGA8gASgJSASIAQESHQoQZ2l0aHViX3RocmVhZF9pZBgQIAEoCUgFiAEBEhcKCnJlc29sdXRpb24YESABKAlIBogBARISCgpzZXNzaW9uX2lkGBIgASgJEi4KCmNyZWF0ZWRfYXQYEyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wQg0KC19zdGFydF9saW5lQgsKCV9lbmRfbGluZUIHCgVfc2lkZUIQCg5fc3VnZ2VzdGVkX2ZpeEIRCg9fdmVyZGljdF9yZWFzb25CEwoRX2dpdGh1Yl90aHJlYWRfaWRCDQoLX3Jlc29sdXRpb24ibwoNUmV2aWV3VmVyZGljdBISCgpmaW5kaW5nX2lkGAEgASgJEg8KB3ZlcmRpY3QYAiABKAkSEgoKY29uZmlkZW5jZRgDIAEoCRIRCglyZWFzb25pbmcYBCABKAkSEgoKc2Vzc2lvbl9pZBgFIAEoCSIwChJMaXN0UmV2aWV3c1JlcXVlc3QSEQoEcmVwbxgBIAEoCUgAiAEBQgcKBV9yZXBvIj0KE0xpc3RSZXZpZXdzUmVzcG9uc2USJgoHcmV2aWV3cxgBIAMoCzIVLmVuZ3JhbS5hcHAudjEuUmV2aWV3Ih4KEEdldFJldmlld1JlcXVlc3QSCgoCaWQYASABKAkiIAoSUmV0cnlSZXZpZXdSZXF1ZXN0EgoKAmlkGAEgASgJIlAKE1JldHJ5UmV2aWV3UmVzcG9uc2USEwoLd29ya2Zsb3dfaWQYASABKAkSFgoJcmV2aWV3X2lkGAIgASgJSACIAQFCDAoKX3Jldmlld19pZCLGAQoRR2V0UmV2aWV3UmVzcG9uc2USJQoGcmV2aWV3GAEgASgLMhUuZW5ncmFtLmFwcC52MS5SZXZpZXcSLgoIZmluZGluZ3MYAiADKAsyHC5lbmdyYW0uYXBwLnYxLlJldmlld0ZpbmRpbmcSLgoIdmVyZGljdHMYAyADKAsyHC5lbmdyYW0uYXBwLnYxLlJldmlld1ZlcmRpY3QSKgoGZXZlbnRzGAQgAygLMhouZW5ncmFtLmFwcC52MS5SZXZpZXdFdmVudCKKAQoLUmV2aWV3RXZlbnQSCgoCaWQYASABKAkSEQoJcmV2aWV3X2lkGAIgASgJEgwKBGtpbmQYAyABKAkSEwoGZGV0YWlsGAQgASgJSACIAQESLgoKY3JlYXRlZF9hdBgFIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBCCQoHX2RldGFpbDK3BAoNUmV2aWV3U2VydmljZRJUCgtMaXN0UmV2aWV3cxIhLmVuZ3JhbS5hcHAudjEuTGlzdFJldmlld3NSZXF1ZXN0GiIuZW5ncmFtLmFwcC52MS5MaXN0UmV2aWV3c1Jlc3BvbnNlEk4KCUdldFJldmlldxIfLmVuZ3JhbS5hcHAudjEuR2V0UmV2aWV3UmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuR2V0UmV2aWV3UmVzcG9uc2USVAoLUmV0cnlSZXZpZXcSIS5lbmdyYW0uYXBwLnYxLlJldHJ5UmV2aWV3UmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuUmV0cnlSZXZpZXdSZXNwb25zZRJgCg9MaXN0RW5yb2xsbWVudHMSJS5lbmdyYW0uYXBwLnYxLkxpc3RFbnJvbGxtZW50c1JlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkxpc3RFbnJvbGxtZW50c1Jlc3BvbnNlEmMKEFVwc2VydEVucm9sbG1lbnQSJi5lbmdyYW0uYXBwLnYxLlVwc2VydEVucm9sbG1lbnRSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5VcHNlcnRFbnJvbGxtZW50UmVzcG9uc2USYwoQRGVsZXRlRW5yb2xsbWVudBImLmVuZ3JhbS5hcHAudjEuRGVsZXRlRW5yb2xsbWVudFJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkRlbGV0ZUVucm9sbG1lbnRSZXNwb25zZWIGcHJvdG8z", [file_google_protobuf_timestamp]);
+  fileDesc("ChplbmdyYW0vYXBwL3YxL3Jldmlldy5wcm90bxINZW5ncmFtLmFwcC52MSLdAQoOUmVwb0Vucm9sbG1lbnQSDAoEcmVwbxgBIAEoCRIUCgx0cmlnZ2VyX21vZGUYAiABKAkSDwoHYXV0b2ZpeBgDIAEoCRIXCgpwcm9maWxlX2lkGAQgASgJSACIAQESLgoKY3JlYXRlZF9hdBgFIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASDgoGZW5naW5lGAcgASgJQg0KC19wcm9maWxlX2lkIhgKFkxpc3RFbnJvbGxtZW50c1JlcXVlc3QiTQoXTGlzdEVucm9sbG1lbnRzUmVzcG9uc2USMgoLZW5yb2xsbWVudHMYASADKAsyHS5lbmdyYW0uYXBwLnYxLlJlcG9FbnJvbGxtZW50IpYBChdVcHNlcnRFbnJvbGxtZW50UmVxdWVzdBIMCgRyZXBvGAEgASgJEhQKDHRyaWdnZXJfbW9kZRgCIAEoCRIPCgdhdXRvZml4GAMgASgJEhcKCnByb2ZpbGVfaWQYBCABKAlIAIgBARITCgZlbmdpbmUYBSABKAlIAYgBAUINCgtfcHJvZmlsZV9pZEIJCgdfZW5naW5lIk0KGFVwc2VydEVucm9sbG1lbnRSZXNwb25zZRIxCgplbnJvbGxtZW50GAEgASgLMh0uZW5ncmFtLmFwcC52MS5SZXBvRW5yb2xsbWVudCInChdEZWxldGVFbnJvbGxtZW50UmVxdWVzdBIMCgRyZXBvGAEgASgJIhoKGERlbGV0ZUVucm9sbG1lbnRSZXNwb25zZSK/BwoGUmV2aWV3EgoKAmlkGAEgASgJEgwKBHJlcG8YAiABKAkSEQoJcHJfbnVtYmVyGAMgASgFEg8KB3Rhc2tfaWQYBCABKAkSEAoIaGVhZF9zaGEYBSABKAkSEAoIYmFzZV9zaGEYBiABKAkSDwoHdHJpZ2dlchgHIAEoCRIOCgZzdGF0dXMYCCABKAkSHQoQZ2l0aHViX3Jldmlld19pZBgJIAEoCUgAiAEBEhcKCnN1bW1hcnlfbWQYCiABKAlIAYgBARIuCgpjcmVhdGVkX2F0GAsgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgp1cGRhdGVkX2F0GAwgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBI0Cg5maW5kaW5nX2NvdW50cxgNIAEoCzIcLmVuZ3JhbS5hcHAudjEuRmluZGluZ0NvdW50cxIeChFmaW5kZXJfc2Vzc2lvbl9pZBgOIAEoCUgCiAEBEiAKE3ZlcmlmaWVyX3Nlc3Npb25faWQYDyABKAlIA4gBARIVCghwcl90aXRsZRgQIAEoCUgEiAEBEhYKCXByX2F1dGhvchgRIAEoCUgFiAEBEhgKC2hlYWRfYnJhbmNoGBIgASgJSAaIAQESGAoLYmFzZV9icmFuY2gYEyABKAlIB4gBARIVCghwcl9zdGF0ZRgUIAEoCUgIiAEBEhYKCWFkZGl0aW9ucxgVIAEoBUgJiAEBEhYKCWRlbGV0aW9ucxgWIAEoBUgKiAEBEhoKDWNoYW5nZWRfZmlsZXMYFyABKAVIC4gBARIRCgl0YXJnZXRfaWQYGCABKAkSEAoIcHJvdmlkZXIYGSABKAkSGAoLcHJvdmlkZXJfaWQYGiABKAlIDIgBARITCgZwcl91cmwYGyABKAlIDYgBARIOCgZhY3RpdmUYHCABKAgSFQoNaHVtYW5fdHJpZ2dlchgdIAEoCEITChFfZ2l0aHViX3Jldmlld19pZEINCgtfc3VtbWFyeV9tZEIUChJfZmluZGVyX3Nlc3Npb25faWRCFgoUX3ZlcmlmaWVyX3Nlc3Npb25faWRCCwoJX3ByX3RpdGxlQgwKCl9wcl9hdXRob3JCDgoMX2hlYWRfYnJhbmNoQg4KDF9iYXNlX2JyYW5jaEILCglfcHJfc3RhdGVCDAoKX2FkZGl0aW9uc0IMCgpfZGVsZXRpb25zQhAKDl9jaGFuZ2VkX2ZpbGVzQg4KDF9wcm92aWRlcl9pZEIJCgdfcHJfdXJsIlsKDUZpbmRpbmdDb3VudHMSEAoIY3JpdGljYWwYASABKAUSDAoEaGlnaBgCIAEoBRIOCgZtZWRpdW0YAyABKAUSCwoDbG93GAQgASgFEg0KBXRvdGFsGAUgASgFIpsECg1SZXZpZXdGaW5kaW5nEgoKAmlkGAEgASgJEhEKCXJldmlld19pZBgCIAEoCRIMCgRwYXRoGAMgASgJEhcKCnN0YXJ0X2xpbmUYBCABKAVIAIgBARIVCghlbmRfbGluZRgFIAEoBUgBiAEBEhEKBHNpZGUYBiABKAlIAogBARIQCghjYXRlZ29yeRgHIAEoCRIQCghzZXZlcml0eRgIIAEoCRISCgpjb25maWRlbmNlGAkgASgJEg0KBXRpdGxlGAogASgJEg8KB2JvZHlfbWQYCyABKAkSGgoNc3VnZ2VzdGVkX2ZpeBgMIAEoCUgDiAEBEhAKCGV2aWRlbmNlGA0gAygJEg0KBXN0YXRlGA4gASgJEhsKDnZlcmRpY3RfcmVhc29uGA8gASgJSASIAQESHQoQZ2l0aHViX3RocmVhZF9pZBgQIAEoCUgFiAEBEhcKCnJlc29sdXRpb24YESABKAlIBogBARISCgpzZXNzaW9uX2lkGBIgASgJEi4KCmNyZWF0ZWRfYXQYEyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wQg0KC19zdGFydF9saW5lQgsKCV9lbmRfbGluZUIHCgVfc2lkZUIQCg5fc3VnZ2VzdGVkX2ZpeEIRCg9fdmVyZGljdF9yZWFzb25CEwoRX2dpdGh1Yl90aHJlYWRfaWRCDQoLX3Jlc29sdXRpb24ibwoNUmV2aWV3VmVyZGljdBISCgpmaW5kaW5nX2lkGAEgASgJEg8KB3ZlcmRpY3QYAiABKAkSEgoKY29uZmlkZW5jZRgDIAEoCRIRCglyZWFzb25pbmcYBCABKAkSEgoKc2Vzc2lvbl9pZBgFIAEoCSKeAQoSTGlzdFJldmlld3NSZXF1ZXN0Eg0KBXJlcG9zGAEgAygJEg4KBnNlYXJjaBgCIAEoCRIPCgdhdXRob3JzGAMgAygJEhEKCXByX3N0YXRlcxgEIAMoCRIQCghzdGF0dXNlcxgFIAMoCRISCgpzZXZlcml0aWVzGAYgAygJEgwKBHBhZ2UYByABKAUSEQoJcGFnZV9zaXplGAggASgFIn8KE0xpc3RSZXZpZXdzUmVzcG9uc2USJgoHcmV2aWV3cxgBIAMoCzIVLmVuZ3JhbS5hcHAudjEuUmV2aWV3EhMKC3RvdGFsX2NvdW50GAIgASgFEisKBmZhY2V0cxgDIAEoCzIbLmVuZ3JhbS5hcHAudjEuUmV2aWV3RmFjZXRzIlMKDFJldmlld0ZhY2V0cxINCgVyZXBvcxgBIAMoCRIPCgdhdXRob3JzGAIgAygJEhEKCXByX3N0YXRlcxgDIAMoCRIQCghzdGF0dXNlcxgEIAMoCSIeChBHZXRSZXZpZXdSZXF1ZXN0EgoKAmlkGAEgASgJIiAKElJldHJ5UmV2aWV3UmVxdWVzdBIKCgJpZBgBIAEoCSJQChNSZXRyeVJldmlld1Jlc3BvbnNlEhMKC3dvcmtmbG93X2lkGAEgASgJEhYKCXJldmlld19pZBgCIAEoCUgAiAEBQgwKCl9yZXZpZXdfaWQi7QEKEUdldFJldmlld1Jlc3BvbnNlEiUKBnJldmlldxgBIAEoCzIVLmVuZ3JhbS5hcHAudjEuUmV2aWV3Ei4KCGZpbmRpbmdzGAIgAygLMhwuZW5ncmFtLmFwcC52MS5SZXZpZXdGaW5kaW5nEi4KCHZlcmRpY3RzGAMgAygLMhwuZW5ncmFtLmFwcC52MS5SZXZpZXdWZXJkaWN0EiUKBnBhc3NlcxgFIAMoCzIVLmVuZ3JhbS5hcHAudjEuUmV2aWV3EioKBmV2ZW50cxgEIAMoCzIaLmVuZ3JhbS5hcHAudjEuUmV2aWV3RXZlbnQiigEKC1Jldmlld0V2ZW50EgoKAmlkGAEgASgJEhEKCXJldmlld19pZBgCIAEoCRIMCgRraW5kGAMgASgJEhMKBmRldGFpbBgEIAEoCUgAiAEBEi4KCmNyZWF0ZWRfYXQYBSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wQgkKB19kZXRhaWwytwQKDVJldmlld1NlcnZpY2USVAoLTGlzdFJldmlld3MSIS5lbmdyYW0uYXBwLnYxLkxpc3RSZXZpZXdzUmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuTGlzdFJldmlld3NSZXNwb25zZRJOCglHZXRSZXZpZXcSHy5lbmdyYW0uYXBwLnYxLkdldFJldmlld1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkdldFJldmlld1Jlc3BvbnNlElQKC1JldHJ5UmV2aWV3EiEuZW5ncmFtLmFwcC52MS5SZXRyeVJldmlld1JlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLlJldHJ5UmV2aWV3UmVzcG9uc2USYAoPTGlzdEVucm9sbG1lbnRzEiUuZW5ncmFtLmFwcC52MS5MaXN0RW5yb2xsbWVudHNSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5MaXN0RW5yb2xsbWVudHNSZXNwb25zZRJjChBVcHNlcnRFbnJvbGxtZW50EiYuZW5ncmFtLmFwcC52MS5VcHNlcnRFbnJvbGxtZW50UmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuVXBzZXJ0RW5yb2xsbWVudFJlc3BvbnNlEmMKEERlbGV0ZUVucm9sbG1lbnQSJi5lbmdyYW0uYXBwLnYxLkRlbGV0ZUVucm9sbG1lbnRSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5EZWxldGVFbnJvbGxtZW50UmVzcG9uc2ViBnByb3RvMw", [file_google_protobuf_timestamp]);
 
 /**
  * A repo enrolled for PR review.
@@ -615,15 +615,70 @@ export const ReviewVerdictSchema: GenMessage<ReviewVerdict> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_review, 10);
 
 /**
+ * The list is of PULL REQUESTS, not passes: a page holds N pull requests and
+ * EVERY pass over each of them, newest pull request (by its newest pass) first.
+ * Filters read the newest pass of each pull request, so "stage = failed" is
+ * "the last thing that happened to this PR was a failure", not "some pass
+ * once failed".
+ *
  * @generated from message engram.app.v1.ListReviewsRequest
  */
 export type ListReviewsRequest = Message<"engram.app.v1.ListReviewsRequest"> & {
   /**
-   * Optional filter, "owner/name".
+   * Repositories, "owner/name". OR within the field; empty = every repository.
    *
-   * @generated from field: optional string repo = 1;
+   * @generated from field: repeated string repos = 1;
    */
-  repo?: string;
+  repos: string[];
+
+  /**
+   * Case-insensitive substring over the repository, "#number", the title and
+   * the author.
+   *
+   * @generated from field: string search = 2;
+   */
+  search: string;
+
+  /**
+   * Pull-request authors (forge logins). Empty = no filter.
+   *
+   * @generated from field: repeated string authors = 3;
+   */
+  authors: string[];
+
+  /**
+   * Pull-request states ("open", "merged", "closed"). Empty = no filter.
+   *
+   * @generated from field: repeated string pr_states = 4;
+   */
+  prStates: string[];
+
+  /**
+   * Review statuses of the newest pass ("posted", "failed", …). Empty = no filter.
+   *
+   * @generated from field: repeated string statuses = 5;
+   */
+  statuses: string[];
+
+  /**
+   * The newest pass reported at least one finding at any of these severities.
+   *
+   * @generated from field: repeated string severities = 6;
+   */
+  severities: string[];
+
+  /**
+   * 1-based page over the filtered pull requests.
+   * page_size 0 = unpaginated; clamped to 1000 otherwise.
+   *
+   * @generated from field: int32 page = 7;
+   */
+  page: number;
+
+  /**
+   * @generated from field: int32 page_size = 8;
+   */
+  pageSize: number;
 };
 
 /**
@@ -638,9 +693,27 @@ export const ListReviewsRequestSchema: GenMessage<ListReviewsRequest> = /*@__PUR
  */
 export type ListReviewsResponse = Message<"engram.app.v1.ListReviewsResponse"> & {
   /**
+   * Every pass of the pull requests on this page. Group by `target_id`.
+   *
    * @generated from field: repeated engram.app.v1.Review reviews = 1;
    */
   reviews: Review[];
+
+  /**
+   * Pull requests matching the filters, BEFORE pagination.
+   *
+   * @generated from field: int32 total_count = 2;
+   */
+  totalCount: number;
+
+  /**
+   * The values the filters can take, over every reviewed pull request (within
+   * `repos` when given) — so a menu never offers a value that returns nothing,
+   * and never omits one that sits on a page the client has not read.
+   *
+   * @generated from field: engram.app.v1.ReviewFacets facets = 3;
+   */
+  facets?: ReviewFacets;
 };
 
 /**
@@ -649,6 +722,38 @@ export type ListReviewsResponse = Message<"engram.app.v1.ListReviewsResponse"> &
  */
 export const ListReviewsResponseSchema: GenMessage<ListReviewsResponse> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_review, 12);
+
+/**
+ * @generated from message engram.app.v1.ReviewFacets
+ */
+export type ReviewFacets = Message<"engram.app.v1.ReviewFacets"> & {
+  /**
+   * @generated from field: repeated string repos = 1;
+   */
+  repos: string[];
+
+  /**
+   * @generated from field: repeated string authors = 2;
+   */
+  authors: string[];
+
+  /**
+   * @generated from field: repeated string pr_states = 3;
+   */
+  prStates: string[];
+
+  /**
+   * @generated from field: repeated string statuses = 4;
+   */
+  statuses: string[];
+};
+
+/**
+ * Describes the message engram.app.v1.ReviewFacets.
+ * Use `create(ReviewFacetsSchema)` to create a new message.
+ */
+export const ReviewFacetsSchema: GenMessage<ReviewFacets> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_review, 13);
 
 /**
  * @generated from message engram.app.v1.GetReviewRequest
@@ -665,7 +770,7 @@ export type GetReviewRequest = Message<"engram.app.v1.GetReviewRequest"> & {
  * Use `create(GetReviewRequestSchema)` to create a new message.
  */
 export const GetReviewRequestSchema: GenMessage<GetReviewRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 13);
+  messageDesc(file_engram_app_v1_review, 14);
 
 /**
  * Re-run the review with the given id.
@@ -684,7 +789,7 @@ export type RetryReviewRequest = Message<"engram.app.v1.RetryReviewRequest"> & {
  * Use `create(RetryReviewRequestSchema)` to create a new message.
  */
 export const RetryReviewRequestSchema: GenMessage<RetryReviewRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 14);
+  messageDesc(file_engram_app_v1_review, 15);
 
 /**
  * @generated from message engram.app.v1.RetryReviewResponse
@@ -710,7 +815,7 @@ export type RetryReviewResponse = Message<"engram.app.v1.RetryReviewResponse"> &
  * Use `create(RetryReviewResponseSchema)` to create a new message.
  */
 export const RetryReviewResponseSchema: GenMessage<RetryReviewResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 15);
+  messageDesc(file_engram_app_v1_review, 16);
 
 /**
  * @generated from message engram.app.v1.GetReviewResponse
@@ -732,6 +837,15 @@ export type GetReviewResponse = Message<"engram.app.v1.GetReviewResponse"> & {
   verdicts: ReviewVerdict[];
 
   /**
+   * Every pass over the same pull request, newest first — `review` included —
+   * each with its finding counts. The dossier's pass history comes from here,
+   * not from the paged list, which need not hold this pull request.
+   *
+   * @generated from field: repeated engram.app.v1.Review passes = 5;
+   */
+  passes: Review[];
+
+  /**
    * The review's step-by-step activity log, oldest first (ADR 0100). Milestones
    * the control plane records as it drives the review — queued, cloning the
    * repo, reviewing, verifying, posted — so the UI can show progress inside a
@@ -747,7 +861,7 @@ export type GetReviewResponse = Message<"engram.app.v1.GetReviewResponse"> & {
  * Use `create(GetReviewResponseSchema)` to create a new message.
  */
 export const GetReviewResponseSchema: GenMessage<GetReviewResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 16);
+  messageDesc(file_engram_app_v1_review, 17);
 
 /**
  * One entry in a review's activity log.
@@ -792,7 +906,7 @@ export type ReviewEvent = Message<"engram.app.v1.ReviewEvent"> & {
  * Use `create(ReviewEventSchema)` to create a new message.
  */
 export const ReviewEventSchema: GenMessage<ReviewEvent> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 17);
+  messageDesc(file_engram_app_v1_review, 18);
 
 /**
  * PR code review record (ADR 0100). Reviews are org-visible: a team

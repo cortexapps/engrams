@@ -224,7 +224,9 @@ describe("ReviewStore", () => {
         expect((await store.getActiveReviewForTarget(activeTargetId))?.id).toBe(activeReviewId);
         expect(await store.getActiveReviewForTarget(terminalTargetId)).toBeNull();
 
-        const listed = await store.listReviews({ repo });
+        const { reviews: listed, totalCount, facets } = await store.listReviews({
+          repos: [repo],
+        });
         expect(listed.map((row) => row.id).slice(0, 3)).toEqual([
           activeReviewId,
           terminalReviewId,
@@ -237,6 +239,45 @@ describe("ReviewStore", () => {
           low: 1,
           total: 2,
         });
+        // Three pull requests (100, 101, 102), each with one pass.
+        expect(totalCount).toBe(3);
+        expect(facets).toEqual({
+          repos: [repo],
+          authors: [],
+          prStates: [],
+          statuses: ["posted", "verifying"],
+        });
+
+        // A page is a page of PULL REQUESTS: the second page of two holds the
+        // one that is left, with every pass over it.
+        const pageOne = await store.listReviews({ repos: [repo], page: 1, pageSize: 2 });
+        expect(pageOne.totalCount).toBe(3);
+        expect(pageOne.reviews.map((row) => row.id)).toEqual([activeReviewId, terminalReviewId]);
+        const pageTwo = await store.listReviews({ repos: [repo], page: 2, pageSize: 2 });
+        expect(pageTwo.reviews.map((row) => row.id)).toEqual([firstReviewId]);
+        const pageThree = await store.listReviews({ repos: [repo], page: 3, pageSize: 2 });
+        expect(pageThree.reviews).toEqual([]);
+        expect(pageThree.totalCount).toBe(3);
+
+        // Filters read the newest pass of each pull request.
+        const verifying = await store.listReviews({ repos: [repo], statuses: ["verifying"] });
+        expect(verifying.reviews.map((row) => row.id)).toEqual([activeReviewId]);
+        expect(verifying.totalCount).toBe(1);
+        // The facets stay whole under a filter, so a menu can still widen it.
+        expect(verifying.facets.statuses).toEqual(["posted", "verifying"]);
+        const critical = await store.listReviews({ repos: [repo], severities: ["critical"] });
+        expect(critical.reviews.map((row) => row.id)).toEqual([firstReviewId]);
+        const bySearch = await store.listReviews({ repos: [repo], search: "#10" });
+        expect(bySearch.totalCount).toBe(3);
+        const byNumber = await store.listReviews({ repos: [repo], search: "#102" });
+        expect(byNumber.reviews.map((row) => row.id)).toEqual([activeReviewId]);
+        // `_` is a LIKE wildcard; as a search term it is a literal.
+        const literal = await store.listReviews({ repos: [repo], search: "_" });
+        expect(literal.totalCount).toBe(0);
+
+        expect((await store.listPasses(activeTargetId)).map((row) => row.id)).toEqual([
+          activeReviewId,
+        ]);
       } finally {
         if (reviewIds.length > 0) {
           await db
