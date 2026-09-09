@@ -8106,6 +8106,7 @@ dependencies = [
  "typenum",
  "uuid",
  "winnow",
+ "zerocopy",
  "zeroize",
 ]
 
