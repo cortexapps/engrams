@@ -182,8 +182,10 @@ export interface ReviewListQuery {
   pageSize?: number;
 }
 
-/** The values the list filters can take, over every reviewed pull request
- *  (within `repos` when given). Sorted, so a menu reads in one order. */
+/** The values the list filters can take, over EVERY reviewed pull request —
+ *  scoped by no filter, not even `repos`: a facet scoped by its own dimension
+ *  collapses to the current selection, and a multi-select could never be
+ *  widened. Sorted, so a menu reads in one order. */
 export interface ReviewFacets {
   repos: string[];
   authors: string[];
@@ -933,6 +935,8 @@ export function makeReviewStore(
           ? await pageQuery.limit(pageSize).offset((page - 1) * pageSize)
           : await pageQuery;
 
+      // Unscoped on purpose — see `ReviewFacets`. With `repos` applied here the
+      // repository menu held only the repositories already chosen.
       const [facets] = await db
         .select({
           repos: distinctValues(targetTable.repo),
@@ -941,8 +945,7 @@ export function makeReviewStore(
           statuses: distinctValues(latest.status),
         })
         .from(latest)
-        .innerJoin(targetTable, eq(latest.targetId, targetTable.id))
-        .where(scope);
+        .innerJoin(targetTable, eq(latest.targetId, targetTable.id));
 
       return {
         reviews: await listPassRows(

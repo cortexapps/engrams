@@ -707,9 +707,11 @@ export type ListReviewsResponse = Message<"engram.app.v1.ListReviewsResponse"> &
   totalCount: number;
 
   /**
-   * The values the filters can take, over every reviewed pull request (within
-   * `repos` when given) — so a menu never offers a value that returns nothing,
-   * and never omits one that sits on a page the client has not read.
+   * The values the filters can take, over EVERY reviewed pull request, scoped
+   * by no filter — so a menu never offers a value that returns nothing, never
+   * omits one that sits on a page the client has not read, and a multi-select
+   * can always be widened (a facet scoped by its own dimension collapses to
+   * the current selection).
    *
    * @generated from field: engram.app.v1.ReviewFacets facets = 3;
    */
