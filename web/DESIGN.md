@@ -503,8 +503,10 @@ end. No middle nodes, no lattice, no shape-swapping. Stroke 9 at 64px and up,
 10 at 32px, 12 at 16px; below 20px the ring is dropped.
 
 - **Static** is the default. **Draw-on** runs once, at boot or resume: the
-  ring is present from the first frame, the path draws over 900ms, the dot
-  lands in 240ms. The mark is identity, not a status light — nothing pulses it.
+  ring is present from the first frame, the path draws over 420ms at one rate
+  (linear, the one exception to the house easing: the four diagonals are
+  equal, and an ease-out crawled through the last one), the dot lands in
+  240ms. The mark is identity, not a status light — nothing pulses it.
 - **Loader**: the trace ghosted at 24% with a 60-unit lit segment travelling
   it every 1.8s — for the connection states the app shows (a pane connecting,
   the auth stage). Lime on the spine, ink on paper.
