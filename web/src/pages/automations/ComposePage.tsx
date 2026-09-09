@@ -23,7 +23,7 @@ const SUGGESTIONS = [
 ];
 
 function DraftingThread({ sessionId }: { sessionId: string }) {
-  const { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx } =
+  const { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx, opening } =
     useSessionEvents(sessionId);
 
   return (
@@ -42,7 +42,7 @@ function DraftingThread({ sessionId }: { sessionId: string }) {
           events={events}
           status={undefined}
           streamingText={streamingText}
-          transcriptWindow={{ hasMore, loadingOlder, loadOlder, oldestIdx }}
+          transcriptWindow={{ hasMore, loadingOlder, loadOlder, oldestIdx, opening }}
         />
       </div>
     </section>
