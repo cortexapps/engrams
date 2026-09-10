@@ -264,7 +264,9 @@ site-search button[data-open-modal] {
     display: none !important;
   }
 }
-starlight-menu-button button {
+/* Starlight 0.42 dropped the <starlight-menu-button> custom element; the
+   mobile menu toggle is now a plain button with the .sl-menu-button class. */
+.sl-menu-button {
   background: var(--primary) !important;
   color: var(--primary-foreground) !important;
   box-shadow: none;
