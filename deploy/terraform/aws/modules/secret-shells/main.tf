@@ -44,6 +44,7 @@ locals {
   shells = {
     "auth-tokens"        = "Comma-separated coordinator bearer allow-list (the first entry doubles as CONTROL_PLANE_BEARER)."
     "better-auth-secret" = "The orchestrator's better-auth session-signing secret."
+    "kek-master"         = "Base64 32-byte KEK for the orchestrator's in-process sealing (ADR 0051). The coordinator's KEK is the KMS key; the orchestrator has no KMS path."
     "egress-ca-cert"     = "Egress proxy CA certificate PEM (fleet-wide — ADR 0006)."
     "egress-ca-key"      = "Egress proxy CA private key PEM."
   }

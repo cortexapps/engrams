@@ -3471,6 +3471,27 @@ pub trait MetadataStore: Send + Sync {
     /// BlobStorage delete succeeded. Order doesn't matter; missing
     /// rows are silently skipped (idempotent so a re-run on a
     /// partial promote pass is safe).
+    /// Expired candidates whose `content_hash` falls in `[lo, hi)`.
+    ///
+    /// The shard-scoped form of [`Self::list_expired_gc_candidates`].
+    /// Deliberately UNORDERED: the range predicate rides the
+    /// `content_hash` primary key, and adding `ORDER BY first_seen_at`
+    /// would force a sort of the whole range. Ordering only ever bought
+    /// oldest-first fairness, which shard-scoped promotion supersedes —
+    /// every shard is visited each cycle regardless.
+    ///
+    /// Verified against the 67M-row prod table: Bitmap Index Scan on
+    /// `chunk_gc_candidates_pkey`, no sort.
+    async fn list_expired_gc_candidates_in_range(
+        &self,
+        _cutoff: chrono::DateTime<chrono::Utc>,
+        _lo: &[u8],
+        _hi: &[u8],
+        _limit: i64,
+    ) -> Result<Vec<[u8; 32]>, MetaError> {
+        Ok(Vec::new())
+    }
+
     async fn delete_gc_candidates(&self, _hashes: &[[u8; 32]]) -> Result<(), MetaError> {
         Ok(())
     }
@@ -3811,13 +3832,38 @@ pub trait MetadataStore: Send + Sync {
         Ok(SnapshotTotals::default())
     }
 
-    /// ADR 0029: the number of chunks currently parked in
-    /// `chunk_gc_candidates` awaiting their grace window — the
-    /// "gc pending" rollup on the Storage surface. A cheap
-    /// `SELECT count(*)`; default `0` for non-PG mocks.
-    async fn count_gc_candidates(&self) -> Result<u64, MetaError> {
-        Ok(0)
+    /// ADR 0029: the chunks currently parked in `chunk_gc_candidates`
+    /// awaiting their grace window — the "gc pending" rollup on the
+    /// Storage surface and the chunk-gc backlog gauge.
+    ///
+    /// Exact while the table holds fewer than `exact_cap` rows. At or
+    /// past the cap the store returns an estimate that is never below
+    /// the rows it did count, and `exact` is false. The cap exists
+    /// because the table reached 22.7M rows in production and a full
+    /// `count(*)` took 30s on every Storage poll. Callers pass
+    /// [`GC_CANDIDATE_EXACT_CAP`]; tests pass what they need. Default
+    /// zero-and-exact for non-PG mocks.
+    async fn count_gc_candidates(&self, exact_cap: u64) -> Result<GcCandidateBacklog, MetaError> {
+        let _ = exact_cap;
+        Ok(GcCandidateBacklog {
+            count: 0,
+            exact: true,
+        })
     }
+}
+
+/// Rows past which [`MetadataStore::count_gc_candidates`] stops counting
+/// and estimates. 100k rows is a few milliseconds of index scan; the
+/// estimate past it is the stats system's live-tuple count, kept for free.
+pub const GC_CANDIDATE_EXACT_CAP: u64 = 100_000;
+
+/// The chunk-gc backlog from [`MetadataStore::count_gc_candidates`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GcCandidateBacklog {
+    /// Exact when `exact`; otherwise an estimate no lower than the rows
+    /// that were counted before the cap.
+    pub count: u64,
+    pub exact: bool,
 }
 
 /// Fleet-wide snapshot aggregate from [`MetadataStore::snapshot_totals`].

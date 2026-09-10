@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { LockKeyhole } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import {
   Dialog,
   DialogContent,
@@ -172,7 +173,7 @@ function ConfirmFace({
             {questions.map((question) => (
               <li key={question.id} className="grid gap-1">
                 <Text>{question.text}</Text>
-                <Text variant="code" tone="muted" className="text-xs">
+                <Text tone="muted" className="text-xs">
                   §{question.sectionTitle}
                 </Text>
               </li>
@@ -195,14 +196,14 @@ function ConfirmFace({
       )}
 
       {error ? (
-        <Text role="alert" tone="destructive">
+        <EmptyState inline tone="error">
           {error}
-        </Text>
+        </EmptyState>
       ) : null}
 
       <div className="flex items-center gap-2 rounded-md bg-secondary px-3 py-2">
         <LockKeyhole aria-hidden="true" className="size-4 shrink-0" />
-        <Text variant="code" tone="muted" className="text-xs">
+        <Text tone="muted" className="text-xs">
           One published version · no return to drafting
         </Text>
       </div>
@@ -240,9 +241,9 @@ function PublishingFace({ publish, onClose }: { publish: SpecPublishRecord; onCl
         </Text>
       ) : null}
       {publish.lastError ? (
-        <Text role="alert" tone="destructive">
+        <EmptyState inline tone="error">
           The last publish step did not finish. It retries automatically.
-        </Text>
+        </EmptyState>
       ) : null}
       <DialogFooter>
         <Button type="button" variant="outline" onClick={onClose}>

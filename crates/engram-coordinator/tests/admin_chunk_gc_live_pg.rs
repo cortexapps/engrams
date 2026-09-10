@@ -48,7 +48,7 @@ use std::time::Duration;
 use chrono::Utc;
 use engram_chunk_store::{ChunkHash, ChunkRef, ChunkStore, Manifest, ManifestKind, ManifestRef};
 use engram_coordinator::chunk_gc::{run_one_sweep_inner, ChunkGcConfig, SweepMode, SweepReport};
-use engram_core::traits::{BlobStorage, MetadataStore};
+use engram_core::traits::{BlobStorage, MetadataStore, GC_CANDIDATE_EXACT_CAP};
 use engram_core::types::registry::EnabledImage;
 use engram_core::types::session::SessionMode;
 use engram_core::types::{SandboxId, SessionSpec, SnapshotId, SnapshotRecord};
@@ -236,6 +236,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
 
     // ---- dry-run sweep ----
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         enabled: true,
         interval: Duration::from_secs(3600),
         grace_period: Duration::from_secs(0),
@@ -364,6 +365,7 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
 
     // grace_period=0 → orphan promotes on the same sweep.
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(0),
         ..ChunkGcConfig::default()
     };
@@ -502,6 +504,7 @@ async fn promote_skips_candidate_that_became_repinned() {
     // grace=0 → the candidate row is "expired" on this sweep, so promote
     // considers it for deletion — and must skip it because it's pinned.
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(0),
         ..ChunkGcConfig::default()
     };
@@ -559,6 +562,7 @@ async fn nonzero_grace_protects_recent_candidates() {
     // grace=1h — candidate ends up in the table but does NOT
     // delete on this sweep.
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(3600),
         ..ChunkGcConfig::default()
     };
@@ -602,6 +606,7 @@ async fn nonzero_grace_protects_recent_candidates() {
     // promotes (proves first_seen_at didn't get bumped on re-
     // sighting, which would extend the window).
     let cfg_zero = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(0),
         ..ChunkGcConfig::default()
     };
@@ -674,6 +679,7 @@ async fn non_recoverable_snapshots_do_not_pin() {
         .expect("record snapshot");
 
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(0),
         ..ChunkGcConfig::default()
     };
@@ -785,6 +791,7 @@ async fn base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable() {
         .expect("upsert enabled image");
 
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(0),
         ..ChunkGcConfig::default()
     };
@@ -831,6 +838,7 @@ async fn mark_failure_still_promotes_already_expired_candidates() {
     // Sweep 1: healthy listing, non-zero grace — the orphan is recorded as
     // a candidate but not yet deletable.
     let marking = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(3600),
         ..Default::default()
     };
@@ -870,6 +878,7 @@ async fn mark_failure_still_promotes_already_expired_candidates() {
     );
     let faulty_store = ChunkStore::new(faulty.clone());
     let promoting = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(0),
         ..Default::default()
     };
@@ -907,7 +916,11 @@ async fn mark_failure_still_promotes_already_expired_candidates() {
         "orphan blob deleted by the promote pass"
     );
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         0,
         "candidate row cleared"
     );
@@ -928,6 +941,7 @@ async fn promote_drains_multiple_batches_in_one_sweep() {
 
     // Batch size 10 over 25 orphans: a single-page promote would leave 15.
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(0),
         promote_batch_size: 10,
         ..Default::default()
@@ -949,7 +963,11 @@ async fn promote_drains_multiple_batches_in_one_sweep() {
         "every expired candidate drained in one sweep, not just the first page"
     );
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         0,
         "candidate table drained"
     );
@@ -978,6 +996,7 @@ async fn promote_respects_the_wall_clock_budget() {
     // Zero budget: the pass must decline to delete anything even though
     // every candidate is past its (zero) grace.
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(0),
         promote_budget: Duration::from_secs(0),
         ..Default::default()
@@ -999,7 +1018,11 @@ async fn promote_respects_the_wall_clock_budget() {
         "a spent promote budget deletes nothing"
     );
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         20,
         "the backlog is left for the next tick"
     );
@@ -1022,6 +1045,9 @@ async fn mark_pass_resumes_from_the_shard_cursor() {
 
     // One shard group per tick, so a single sweep cannot cover all 256.
     let cfg = ChunkGcConfig {
+        // A SMALL group so the walk genuinely spans several ticks —
+        // that is the property under test.
+        shards_per_tick: 8,
         grace_period: Duration::from_secs(3600),
         shard_concurrency: 8,
         ..Default::default()
@@ -1060,7 +1086,11 @@ async fn mark_pass_resumes_from_the_shard_cursor() {
         "every orphan is found exactly once across the full cycle"
     );
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         40,
         "all 40 recorded, none double-counted"
     );
@@ -1075,6 +1105,7 @@ async fn full_cycle_wraps_the_cursor() {
     plant_orphan(rig.blob.as_ref()).await;
 
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(3600),
         shard_concurrency: 64,
         ..Default::default()
@@ -1114,6 +1145,7 @@ async fn mark_pass_walks_every_page_of_the_chunk_space() {
     // 37 chunks at 5 keys per page = 8 pages. A single-page mark pass
     // would see 5.
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(3600),
         list_page_size: 5,
         ..Default::default()
@@ -1139,7 +1171,11 @@ async fn mark_pass_walks_every_page_of_the_chunk_space() {
         "every unpinned chunk was marked, not just the first page"
     );
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         37,
         "all candidates recorded in PG"
     );
@@ -1199,6 +1235,7 @@ async fn promote_failure_preserves_mark_cursor_progress() {
     let faulty_store = ChunkStore::new(faulty.clone());
 
     let cfg = ChunkGcConfig {
+        shards_per_tick: 256,
         grace_period: Duration::from_secs(0),
         shard_concurrency: 64,
         ..Default::default()
@@ -1236,7 +1273,11 @@ async fn promote_failure_preserves_mark_cursor_progress() {
     assert_eq!(report.shards_scanned, 256);
     assert_eq!(report.candidates_marked, 1, "the orphan was still marked");
     assert_eq!(
-        rig.meta.count_gc_candidates().await.expect("count"),
+        rig.meta
+            .count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .expect("count")
+            .count,
         1,
         "the candidate row is committed despite the promote failure"
     );
@@ -1248,5 +1289,91 @@ async fn promote_failure_preserves_mark_cursor_progress() {
             .await
             .expect("exists"),
         "a failed promote must not delete"
+    );
+}
+
+/// The pin set is FILTERED to the tick's shards. This is the property
+/// that stops coordinator heap scaling with the fleet — an unfiltered
+/// ~14M-hash set is what OOMKilled the sweep on 2026-09-03 and froze
+/// reclamation for four days.
+///
+/// Asserted through `pin_set_size`: pin the same manifests, sweep a
+/// narrow shard group, and only the pinned chunks whose hash falls in
+/// that group may be resident.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn pin_set_is_filtered_to_the_tick_shards() {
+    let Some(rig) = rig().await else { return };
+
+    // Enough pinned chunks that they land across many shards.
+    let bodies: Vec<Vec<u8>> = (0..64u8).map(|i| vec![b'p', i]).collect();
+    let refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
+    let pinned_mref = seed_manifest(&rig.chunk_store, &refs, ManifestKind::Disk).await;
+
+    let session_id = rig
+        .meta
+        .create_session(SessionSpec {
+            image: format!("pin-filter:{}", Uuid::new_v4()),
+            mode: SessionMode::Agent,
+        })
+        .await
+        .expect("create session");
+    let sandbox_id = SandboxId::new();
+    rig.meta
+        .transition_session_created(session_id, sandbox_id)
+        .await
+        .expect("assign sandbox");
+    rig.meta
+        .update_live_disk_manifest(session_id, sandbox_id, pinned_mref)
+        .await
+        .expect("update live manifest");
+
+    // Whole space in one tick: every pinned chunk is resident.
+    let wide = ChunkGcConfig {
+        shards_per_tick: 256,
+        grace_period: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let all = run_one_sweep_inner(
+        rig.meta.clone(),
+        rig.blob.clone(),
+        &rig.chunk_store,
+        &wide,
+        SweepMode::DryRun,
+        &system_clock(),
+        0,
+    )
+    .await;
+    assert_eq!(
+        all.pin_set_size, 64,
+        "an unfiltered tick holds every pinned chunk"
+    );
+
+    // One shard: only the pinned chunks whose hash starts with that byte.
+    let narrow = ChunkGcConfig {
+        shards_per_tick: 1,
+        grace_period: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let one = run_one_sweep_inner(
+        rig.meta.clone(),
+        rig.blob.clone(),
+        &rig.chunk_store,
+        &narrow,
+        SweepMode::DryRun,
+        &system_clock(),
+        0,
+    )
+    .await;
+    assert!(
+        one.pin_set_size < all.pin_set_size,
+        "a 1/256th tick must hold strictly less than the whole pin set \
+         (got {} vs {})",
+        one.pin_set_size,
+        all.pin_set_size
+    );
+    assert_eq!(
+        one.shards_scanned, 1,
+        "the tick covered exactly its one shard"
     );
 }

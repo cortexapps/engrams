@@ -21,12 +21,14 @@ import {
   SidebarMenuItem,
   SidebarMenuSkeleton,
 } from "@/components/ui/sidebar";
-import { relativeTime, shortId } from "./session-format";
+import { shortId } from "./session-format";
+import { relativeAge } from "@/lib/relative-time";
 import { useRailSessions, type RailRow } from "./useRailSessions";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
 import { useRailStore } from "./rail-store";
 import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
 import { useNow } from "../../hooks/useNow";
+import { EngramMark } from "../../components/EngramMark";
 
 // The persistent sessions rail: a live switcher between the caller's tasks that
 // stays mounted across the list views AND the transcript (the rail is the
@@ -219,13 +221,15 @@ export function SessionsRail() {
             the loaded rows stop growing the rail, so the sentinel would sit in
             view and pull page after page of history nobody asked to see — and
             the poll refetches every loaded page. */}
+        {/* The sentinel is the loader: the trace runs while the next page reads,
+            the same mark the other connecting states show. */}
         {hasMore && lastBandOpen && (
           <div
             ref={loadMoreRef}
             aria-hidden
-            className="py-1 text-center text-xs text-sidebar-foreground/70"
+            className="flex justify-center py-1.5 text-sidebar-foreground/70"
           >
-            …
+            <EngramMark size={16} mode="loader" ground="cover" />
           </div>
         )}
       </SidebarContent>
@@ -267,20 +271,20 @@ function RailTaskRow({
 }) {
   const showNum = jumpHeld && index < 9;
   return (
-    <SidebarMenuItem>
+    <SidebarMenuItem style={{ "--i": index } as CSSProperties}>
       <SidebarMenuButton
         asChild
         isActive={open}
         className="h-auto items-start gap-2.5 py-1.5 data-[active=true]:font-medium"
       >
         <Link to="/sessions/$id" params={{ id: row.id }} title={row.id}>
-          <span className="mt-0.5 shrink-0 text-[0.7rem] leading-none">
+          <span className="mt-0.5 shrink-0 text-2xs leading-none">
             <StatusGlyph status={row.status} attention={row.needsAttention} />
           </span>
           <span className="flex min-w-0 flex-1 flex-col">
             <span
               className={cn(
-                "truncate text-[0.8rem] leading-tight",
+                "truncate text-sm leading-tight",
                 row.title ? "font-medium" : "font-mono",
               )}
             >
@@ -290,7 +294,7 @@ function RailTaskRow({
               profile={row.profile}
               fallbackImage={row.image}
               disclosure="tooltip"
-              className="text-[0.7rem] leading-tight text-sidebar-foreground/70"
+              className="text-2xs leading-tight text-sidebar-foreground/70"
             />
           </span>
           {/* Trailing slot crossfades the relative time with the ⌥-jump number
@@ -301,11 +305,11 @@ function RailTaskRow({
           <span className="relative flex min-w-[1.4rem] shrink-0 items-start justify-end self-stretch leading-none">
             <span
               className={cn(
-                "mt-0.5 font-mono text-[0.65rem] tabular-nums text-sidebar-foreground/70 transition-opacity duration-150 motion-reduce:transition-none",
+                "mt-0.5 font-mono text-2xs tabular-nums text-sidebar-foreground/70 transition-opacity duration-150 motion-reduce:transition-none",
                 showNum && "opacity-0",
               )}
             >
-              {relativeTime(row.at, now)}
+              {relativeAge(row.at, now)}
             </span>
             {index < 9 && (
               <span
@@ -315,7 +319,10 @@ function RailTaskRow({
                   showNum ? "opacity-100" : "opacity-0",
                 )}
               >
-                <Badge className="min-w-5 justify-center rounded-md px-1.5 py-1 font-semibold leading-none tabular-nums bg-sidebar-primary text-sidebar-primary-foreground">
+                <Badge
+                  variant="secondary"
+                  className="min-w-5 justify-center rounded-full bg-sidebar-accent px-1.5 py-1 font-semibold leading-none text-sidebar-accent-foreground tabular-nums"
+                >
                   {index + 1}
                 </Badge>
               </span>

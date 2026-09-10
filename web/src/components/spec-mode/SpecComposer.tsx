@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
 import { RotateCcwIcon, SendIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import { Text } from "@/components/ui/text";
 
 interface PendingMessage {
@@ -89,13 +90,19 @@ export function SpecComposer({
         </Text>
       ) : null}
       {error ? (
-        <div className="spec-mode-composer-error" role="alert">
-          <Text tone="destructive">{error}</Text>
-          <Button type="button" size="xs" variant="outline" onClick={() => void send()}>
-            <RotateCcwIcon />
-            Retry
-          </Button>
-        </div>
+        <EmptyState
+          inline
+          tone="error"
+          className="spec-mode-composer-error"
+          action={
+            <Button type="button" size="xs" variant="outline" onClick={() => void send()}>
+              <RotateCcwIcon />
+              Retry
+            </Button>
+          }
+        >
+          {error}
+        </EmptyState>
       ) : null}
     </form>
   );

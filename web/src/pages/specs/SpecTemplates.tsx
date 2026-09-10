@@ -1,12 +1,14 @@
-import { ArrowDown, ArrowUp, Copy, Layers3, Plus, RotateCcw, Save, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Copy, Plus, RotateCcw, Save, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Skeleton } from "@/components/ui/skeleton";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot } from "@/components/status-dot";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -123,14 +125,15 @@ export function SpecTemplates() {
         </div>
 
         {templates.isPending ? (
-          <div className="space-y-2 p-3" aria-label="Loading templates">
-            <Skeleton className="h-20 w-full" />
-            <Skeleton className="h-20 w-full" />
-          </div>
+          <SkeletonRows rows={2} className="p-3" />
         ) : templates.error ? (
-          <p className="spec-template-catalog-error" role="alert">
+          <EmptyState inline tone="error" className="m-3">
             Could not load templates. {errorMessage(templates.error)}
-          </p>
+          </EmptyState>
+        ) : templates.data.length === 0 ? (
+          <EmptyState inline className="m-3">
+            No templates yet.
+          </EmptyState>
         ) : (
           <div className="spec-template-list">
             {templates.data.map((template) => (
@@ -156,10 +159,9 @@ export function SpecTemplates() {
 
       <main className="spec-template-editor">
         {!draft ? (
-          <div className="spec-template-empty">
-            <Layers3 aria-hidden />
-            <p>Select a template to view its structure.</p>
-          </div>
+          <EmptyState className="spec-template-empty">
+            Select a template to view its structure.
+          </EmptyState>
         ) : (
           <>
             <header className="spec-template-editor-heading">
@@ -170,7 +172,12 @@ export function SpecTemplates() {
                   {selected?.modifiedFromDefault && (
                     <Badge variant="outline">Modified from default</Badge>
                   )}
-                  {dirty && <Badge>Unsaved</Badge>}
+                  {dirty && (
+                    <Badge variant="outline">
+                      <StatusDot tone="caution" size={6} />
+                      Unsaved
+                    </Badge>
+                  )}
                 </div>
                 <p>
                   Template edits apply to future spec sessions only. Existing specs keep their
@@ -205,9 +212,9 @@ export function SpecTemplates() {
             </header>
 
             {mutationError && (
-              <p className="spec-template-save-error" role="alert">
+              <EmptyState inline tone="error" className="spec-template-save-error">
                 Could not save the template. {errorMessage(mutationError)}
-              </p>
+              </EmptyState>
             )}
 
             <div className="spec-template-editor-body">

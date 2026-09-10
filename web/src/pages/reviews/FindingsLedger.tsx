@@ -5,12 +5,14 @@ import { Markdown } from "../../components/Markdown";
 import { Text } from "@/components/ui/text";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
-import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot, type StatusTone } from "@/components/status-dot";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import { Sep } from "./Sep";
 import { groupByOutcome, type JudgedFinding, type Outcome } from "./review-findings";
-import { blobUrl, isActive, severityTone, threadUrl } from "./review-format";
+import { blobUrl, isActive, threadUrl } from "./review-format";
 
 /**
  * The findings, grouped by what actually happened to them.
@@ -80,13 +82,10 @@ export function FindingsLedger({
   judged: JudgedFinding[];
   loading: boolean;
 }) {
-  if (loading && judged.length === 0) return <Skeleton className="h-20 w-full" />;
+  if (loading && judged.length === 0) return <SkeletonRows rows={2} />;
 
-  // No heading and no dashed box for an empty state: an outlined placeholder gives
-  // absence the visual weight of content, which on a failed pass makes the
-  // loudest thing on the page the thing saying the least.
   if (judged.length === 0) {
-    return <p className="text-sm text-muted-foreground">{emptyLine(review)}</p>;
+    return <EmptyState inline>{emptyLine(review)}</EmptyState>;
   }
 
   const groups = groupByOutcome(judged);
@@ -236,11 +235,7 @@ function FindingCard({
               the word carries the meaning, so the colour is redundant. */}
           <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
             <span className="flex items-center gap-1.5 text-foreground">
-              <span
-                aria-hidden
-                className="size-1.5 shrink-0 rounded-full"
-                style={{ backgroundColor: severityTone(finding.severity) }}
-              />
+              <StatusDot tone={severityStatusTone(finding.severity)} size={6} />
               {finding.severity}
             </span>
             <Sep />
@@ -267,12 +262,10 @@ function FindingCard({
 
             {finding.suggestedFix && (
               <div>
-                <Text variant="label" tone="muted" className="mb-1 block">
-                  Suggested fix
-                </Text>
+                <h3 className="mb-1 text-sm font-semibold">Suggested fix</h3>
                 {/* GitHub receives this as a committable suggestion block, so it
                     is replacement code and renders as code here too. */}
-                <pre className="overflow-x-auto rounded-md border bg-muted px-3 py-2 font-mono text-[0.8rem]">
+                <pre className="overflow-x-auto rounded-md border bg-muted px-3 py-2 font-mono text-sm">
                   {finding.suggestedFix}
                 </pre>
               </div>
@@ -317,6 +310,12 @@ function FindingCard({
       </Card>
     </Collapsible>
   );
+}
+
+function severityStatusTone(severity: ReviewFinding["severity"]): StatusTone {
+  if (severity === "critical" || severity === "high") return "critical";
+  if (severity === "medium") return "caution";
+  return "muted";
 }
 
 function CardLink({

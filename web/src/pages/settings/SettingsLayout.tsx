@@ -1,106 +1,18 @@
-import {
-  KeyRound,
-  KeySquare,
-  Lock,
-  Plug,
-  Users,
-  UserCircle,
-  IdCard,
-  Cpu,
-  RadioTower,
-  Route,
-} from "lucide-react";
-import { Link, Outlet, useRouterState } from "@tanstack/react-router";
-import { useAbility } from "../../auth/AuthProvider";
-import {
-  Sidebar,
-  SidebarContent,
-  SidebarGroup,
-  SidebarGroupContent,
-  SidebarGroupLabel,
-  SidebarMenu,
-  SidebarMenuButton,
-  SidebarMenuItem,
-  SidebarProvider,
-} from "@/components/ui/sidebar";
-import type { NavItem } from "@/components/nav";
-import { cn } from "@/lib/utils";
+import { Outlet } from "@tanstack/react-router";
 
-// Account scope only. Infrastructure config (images, registries) moved to the
-// Operator section; Settings now holds your own account and org-wide membership.
-const MINE: NavItem[] = [
-  { to: "/settings/profile", label: "Profile", icon: UserCircle },
-  { to: "/settings/credentials", label: "Credentials", icon: KeyRound },
-];
-const ORG: NavItem[] = [
-  { to: "/settings/members", label: "Members", icon: Users },
-  { to: "/settings/secrets", label: "Secrets", icon: Lock },
-  { to: "/settings/api-keys", label: "API keys", icon: KeySquare },
-  { to: "/settings/integrations", label: "Integrations", icon: Plug },
-  { to: "/settings/harnesses", label: "Harnesses", icon: Cpu },
-  { to: "/settings/model-routers", label: "Model routers", icon: Route },
-  { to: "/settings/profiles", label: "Profiles", icon: IdCard },
-  { to: "/settings/automations", label: "Automations", icon: RadioTower },
-];
+import { SectionLayout, SectionPage } from "@/components/section-layout";
+import { SettingsRail, useSettingsNav } from "./SettingsRail";
 
+// The /settings section: one nav rail over everything a person or an admin
+// configures (see SettingsRail for the groups), and the page as a padded,
+// scrolling sheet.
 export function SettingsLayout() {
-  const ability = useAbility();
-  const isAdmin = ability.can("manage", "all");
-  const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const group = (label: string, items: NavItem[]) => (
-    <SidebarGroup key={label}>
-      <SidebarGroupLabel>{label}</SidebarGroupLabel>
-      <SidebarGroupContent>
-        <SidebarMenu>
-          {items.map((it) => (
-            <SidebarMenuItem key={it.label}>
-              <SidebarMenuButton asChild isActive={pathname.startsWith(it.to as string)}>
-                <Link to={it.to}>
-                  <it.icon />
-                  <span>{it.label}</span>
-                </Link>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          ))}
-        </SidebarMenu>
-      </SidebarGroupContent>
-    </SidebarGroup>
-  );
-
-  const items = [...MINE, ...(isAdmin ? ORG : [])];
-
+  const nav = useSettingsNav();
   return (
-    <SidebarProvider className="min-h-0 flex-1">
-      {/* desktop (md+): vertical second sidebar */}
-      <Sidebar collapsible="none" className="sidebar-section hidden md:flex">
-        <SidebarContent>
-          {group("My settings", MINE)}
-          {isAdmin && group("Org", ORG)}
-        </SidebarContent>
-      </Sidebar>
-      <div className="section-sheet flex flex-1 flex-col overflow-y-auto">
-        {/* mobile (<md): horizontal nav strip */}
-        <nav className="flex gap-1 overflow-x-auto border-b p-2 md:hidden">
-          {items.map((it) => (
-            <Link
-              key={it.label}
-              to={it.to}
-              className={cn(
-                "inline-flex items-center gap-2 whitespace-nowrap rounded-md px-3 py-1.5 text-sm",
-                pathname.startsWith(it.to as string)
-                  ? "bg-accent text-accent-foreground"
-                  : "text-muted-foreground",
-              )}
-            >
-              <it.icon className="size-4" />
-              {it.label}
-            </Link>
-          ))}
-        </nav>
-        <div className="flex-1 p-4 md:p-6">
-          <Outlet />
-        </div>
-      </div>
-    </SidebarProvider>
+    <SectionLayout rail={<SettingsRail />} railLabel="Settings" nav={nav}>
+      <SectionPage>
+        <Outlet />
+      </SectionPage>
+    </SectionLayout>
   );
 }

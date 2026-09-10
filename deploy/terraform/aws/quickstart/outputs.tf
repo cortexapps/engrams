@@ -42,6 +42,11 @@ output "secret_shell_names" {
   description = "Populate these (docs/deploy-aws.md carries the exact commands) BEFORE installing the Helm releases."
 }
 
+output "acm_certificate_arn" {
+  value       = aws_acm_certificate.web.arn
+  description = "The web certificate — poll `aws acm describe-certificate` on it until Status is ISSUED (docs/deploy-aws.md step 4)."
+}
+
 output "acm_validation_records" {
   value = [
     for dvo in aws_acm_certificate.web.domain_validation_options : {

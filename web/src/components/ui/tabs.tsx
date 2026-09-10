@@ -2,33 +2,63 @@
 
 import * as React from "react";
 import { cva, type VariantProps } from "class-variance-authority";
+import { motion } from "framer-motion";
 import { Tabs as TabsPrimitive } from "radix-ui";
 
 import { cn } from "@/lib/utils";
 
+// Stock shadcn Tabs, styled as pill tabs (30px, 8px corners, the active pill
+// on `--secondary` at 600, no track, no shadow) — with one addition: the
+// active pill SLIDES between triggers (180ms) instead of blinking. Radix keeps
+// the state and the a11y; a small context mirrors the active value so each
+// trigger knows whether it hosts the pill, and framer-motion's `layoutId`
+// moves one pill per list.
+
+interface TabsState {
+  value: string | undefined;
+  /** One pill per list: the layoutId's scope. */
+  listId: string;
+}
+const TabsContext = React.createContext<TabsState>({ value: undefined, listId: "" });
+
 function Tabs({
   className,
   orientation = "horizontal",
+  value,
+  defaultValue,
+  onValueChange,
   ...props
 }: React.ComponentProps<typeof TabsPrimitive.Root>) {
+  // Mirror the active value whether the caller controls it or not.
+  const [inner, setInner] = React.useState(defaultValue);
+  const active = value ?? inner;
+  const listId = React.useId();
   return (
-    <TabsPrimitive.Root
-      data-slot="tabs"
-      data-orientation={orientation}
-      orientation={orientation}
-      className={cn("group/tabs flex gap-2 data-[orientation=horizontal]:flex-col", className)}
-      {...props}
-    />
+    <TabsContext.Provider value={{ value: active, listId }}>
+      <TabsPrimitive.Root
+        data-slot="tabs"
+        data-orientation={orientation}
+        orientation={orientation}
+        value={value}
+        defaultValue={defaultValue}
+        onValueChange={(next) => {
+          setInner(next);
+          onValueChange?.(next);
+        }}
+        className={cn("group/tabs flex gap-2 data-[orientation=horizontal]:flex-col", className)}
+        {...props}
+      />
+    </TabsContext.Provider>
   );
 }
 
 const tabsListVariants = cva(
-  "group/tabs-list inline-flex w-fit items-center justify-center rounded-lg p-[3px] text-muted-foreground group-data-[orientation=horizontal]/tabs:h-9 group-data-[orientation=vertical]/tabs:h-fit group-data-[orientation=vertical]/tabs:flex-col data-[variant=line]:rounded-none",
+  "group/tabs-list inline-flex w-fit items-center justify-center gap-1 text-muted-foreground group-data-[orientation=horizontal]/tabs:h-[30px] group-data-[orientation=vertical]/tabs:h-fit group-data-[orientation=vertical]/tabs:flex-col data-[variant=line]:rounded-none",
   {
     variants: {
       variant: {
-        default: "bg-muted",
-        line: "gap-1 bg-transparent",
+        default: "bg-transparent",
+        line: "bg-transparent",
       },
     },
     defaultVariants: {
@@ -52,19 +82,36 @@ function TabsList({
   );
 }
 
-function TabsTrigger({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.Trigger>) {
+function TabsTrigger({
+  className,
+  children,
+  value,
+  ...props
+}: React.ComponentProps<typeof TabsPrimitive.Trigger>) {
+  const { value: active, listId } = React.useContext(TabsContext);
+  const isActive = active === value;
   return (
     <TabsPrimitive.Trigger
       data-slot="tabs-trigger"
+      value={value}
       className={cn(
-        "relative inline-flex h-[calc(100%-1px)] flex-1 items-center justify-center gap-1.5 rounded-md border border-transparent px-2 py-1 text-sm font-medium whitespace-nowrap text-foreground/60 transition-all group-data-[orientation=vertical]/tabs:w-full group-data-[orientation=vertical]/tabs:justify-start hover:text-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-1 focus-visible:outline-ring disabled:pointer-events-none disabled:opacity-50 group-data-[variant=default]/tabs-list:data-[state=active]:shadow-sm group-data-[variant=line]/tabs-list:data-[state=active]:shadow-none dark:text-muted-foreground dark:hover:text-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
-        "group-data-[variant=line]/tabs-list:bg-transparent group-data-[variant=line]/tabs-list:data-[state=active]:bg-transparent dark:group-data-[variant=line]/tabs-list:data-[state=active]:border-transparent dark:group-data-[variant=line]/tabs-list:data-[state=active]:bg-transparent",
-        "data-[state=active]:bg-background data-[state=active]:text-foreground dark:data-[state=active]:border-input dark:data-[state=active]:bg-input/30 dark:data-[state=active]:text-foreground",
-        "after:absolute after:bg-foreground after:opacity-0 after:transition-opacity group-data-[orientation=horizontal]/tabs:after:inset-x-0 group-data-[orientation=horizontal]/tabs:after:bottom-[-5px] group-data-[orientation=horizontal]/tabs:after:h-0.5 group-data-[orientation=vertical]/tabs:after:inset-y-0 group-data-[orientation=vertical]/tabs:after:-right-1 group-data-[orientation=vertical]/tabs:after:w-0.5 group-data-[variant=line]/tabs-list:data-[state=active]:after:opacity-100",
+        "relative inline-flex h-full flex-1 items-center justify-center gap-1.5 rounded-sm px-2.5 text-sm font-medium whitespace-nowrap text-muted-foreground transition-colors duration-150 group-data-[orientation=vertical]/tabs:w-full group-data-[orientation=vertical]/tabs:justify-start hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "group-data-[variant=line]/tabs-list:hover:bg-transparent",
+        "data-[state=active]:font-semibold data-[state=active]:text-foreground",
         className,
       )}
       {...props}
-    />
+    >
+      {isActive && (
+        <motion.span
+          layoutId={`${listId}-pill`}
+          aria-hidden
+          className="absolute inset-0 -z-10 rounded-sm bg-secondary group-data-[variant=line]/tabs-list:bg-transparent"
+          transition={{ duration: 0.18, ease: [0.2, 0.7, 0.2, 1] }}
+        />
+      )}
+      {children}
+    </TabsPrimitive.Trigger>
   );
 }
 

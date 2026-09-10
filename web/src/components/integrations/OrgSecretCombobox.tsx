@@ -9,6 +9,7 @@
 import { useState } from "react";
 import { CheckIcon, ChevronsUpDownIcon, KeyRoundIcon, PlusIcon } from "lucide-react";
 
+import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -79,9 +80,9 @@ export function OrgSecretCombobox({
           <CommandInput placeholder="Search or create…" value={query} onValueChange={setQuery} />
           <CommandList>
             {matches.length === 0 && !showCreate && (
-              <div className="py-6 text-center text-sm text-muted-foreground">
+              <EmptyState inline className="px-3 py-6">
                 No secrets match.
-              </div>
+              </EmptyState>
             )}
             <CommandGroup>
               {matches.map((n) => (

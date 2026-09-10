@@ -1,6 +1,6 @@
 import { EngramMark } from "./EngramMark";
+import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
 
 // The shared connection-state surface for the live panes (shell + browser).
 // Both used to push a one-line italic banner above the canvas, shifting it on
@@ -34,22 +34,21 @@ export function PaneStatus({ phase, caption, message, onReconnect }: PaneStatusP
     >
       {busy ? (
         <div className="flex flex-col items-center gap-3.5">
-          <EngramMark size={56} mode="loop" title={caption} />
-          <p className="text-[0.92rem] text-muted-foreground italic">{caption}</p>
+          <EngramMark size={56} mode="loader" title={caption} />
+          <p className="text-base text-muted-foreground italic">{caption}</p>
         </div>
       ) : (
         <div className="flex max-w-xs flex-col items-center gap-3">
           <EngramMark size={44} mode="static" />
-          <p
-            className={cn(
-              "text-pretty",
-              phase === "error"
-                ? "font-mono text-[0.78rem] text-destructive"
-                : "text-[0.92rem] text-muted-foreground italic",
-            )}
-          >
-            {message ?? (phase === "error" ? "unavailable" : "connection closed")}
-          </p>
+          {phase === "error" ? (
+            <EmptyState inline tone="error" className="items-center text-pretty text-center">
+              {message ?? "Unavailable"}
+            </EmptyState>
+          ) : (
+            <p className="text-pretty text-base text-muted-foreground italic">
+              {message ?? "Connection closed"}
+            </p>
+          )}
           {onReconnect && (
             <Button size="sm" variant="outline" onClick={onReconnect} className="mt-1">
               Reconnect

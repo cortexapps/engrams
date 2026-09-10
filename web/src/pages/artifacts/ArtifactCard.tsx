@@ -4,7 +4,7 @@ import { Globe } from "lucide-react";
 import type { ArtifactRecord } from "../../gen/engram/app/v1/artifact_pb";
 import { useNow } from "../../hooks/useNow";
 import { artifactBytesUrl, extensionOf, KIND_GLYPHS, mediaKind } from "../../lib/artifacts";
-import { relativeTime } from "../sessions/session-format";
+import { relativeAge } from "@/lib/relative-time";
 import { fmtBytes } from "../../components/transcriptFmt";
 import { Text } from "@/components/ui/text";
 
@@ -58,14 +58,14 @@ export function ArtifactCard({
             />
           )}
         </div>
-        <div className="flex items-center gap-1.5 font-mono text-[0.7rem] text-muted-foreground">
+        <div className="flex items-center gap-1.5 font-mono text-2xs text-muted-foreground">
           <span className="truncate">{artifact.mediaType}</span>
           <span aria-hidden>·</span>
           <span className="tabular-nums">{fmtBytes(Number(artifact.sizeBytes))}</span>
           <span aria-hidden>·</span>
           <span className="tabular-nums">v{artifact.currentVersion}</span>
           <span className="ml-auto shrink-0 tabular-nums">
-            {relativeTime(artifact.updatedAt, now)}
+            {relativeAge(artifact.updatedAt, now)}
           </span>
         </div>
         {showOwner && artifact.createdBy && (

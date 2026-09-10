@@ -3,6 +3,7 @@ import { lazy, Suspense, useMemo } from "react";
 import type { ToolCallMessagePartProps } from "@assistant-ui/react";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import type { FileChangeArgs } from "./buildMessages";
 import { beforeAfter, countChange } from "./fileChanges";
 
@@ -51,11 +52,7 @@ export function FileChangePart({ args }: ToolCallMessagePartProps<FileChangeArgs
       </CollapsibleTrigger>
       <CollapsibleContent>
         <div className="max-h-[32rem] overflow-auto border-t text-xs">
-          <Suspense
-            fallback={
-              <div className="px-3 py-2 text-xs text-muted-foreground italic">Loading diff…</div>
-            }
-          >
+          <Suspense fallback={<SkeletonRows rows={3} className="px-3" />}>
             <PierreDiff path={path} before={before} after={after} />
           </Suspense>
         </div>

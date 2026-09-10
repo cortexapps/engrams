@@ -41,7 +41,7 @@
 }
 
 .spec-template-catalog-heading h2 {
-  font-size: 15px;
+  font-size: 14px;
 }
 
 .spec-template-catalog-heading p,
@@ -65,7 +65,7 @@
   width: 100%;
   padding: 13px 14px;
   border: 1px solid transparent;
-  border-radius: 9px;
+  border-radius: var(--radius-md);
   text-align: left;
   transition:
     background 120ms ease,
@@ -79,18 +79,17 @@
 .spec-template-list > button.is-selected {
   border-color: color-mix(in srgb, hsl(var(--primary)) 35%, hsl(var(--border)));
   background: hsl(var(--background));
-  box-shadow: 0 1px 2px rgb(0 0 0 / 4%);
 }
 
 .spec-template-list-title {
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
 }
 
 .spec-template-list-meta {
   color: hsl(var(--muted-foreground));
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 11px;
 }
 
 .spec-template-list-badges {
@@ -121,7 +120,7 @@
 }
 
 .spec-template-editor-heading h2 {
-  font-size: 18px;
+  font-size: 20px;
 }
 
 .spec-template-title-line,
@@ -145,9 +144,8 @@
 .spec-template-panel {
   overflow: hidden;
   border: 1px solid hsl(var(--border));
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
   background: hsl(var(--card));
-  box-shadow: 0 1px 2px rgb(0 0 0 / 3%);
 }
 
 .spec-template-section-heading {
@@ -177,7 +175,7 @@
 .spec-template-layer {
   overflow: hidden;
   border: 1px solid hsl(var(--border));
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   background: color-mix(in srgb, hsl(var(--muted)) 24%, hsl(var(--card)));
 }
 
@@ -229,7 +227,7 @@
   gap: 12px;
   padding: 14px;
   border: 1px solid hsl(var(--border));
-  border-radius: 8px;
+  border-radius: var(--radius-lg);
   background: hsl(var(--background));
 }
 

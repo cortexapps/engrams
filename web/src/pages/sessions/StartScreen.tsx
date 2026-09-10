@@ -27,9 +27,11 @@ import {
   type TaskComposerState,
 } from "../../components/composer/TaskComposer";
 import { StatusGlyph } from "../../components/Glyph";
-import { compareSessions, relativeTime, shortId } from "./session-format";
+import { compareSessions, shortId } from "./session-format";
+import { relativeAge } from "@/lib/relative-time";
 import type { SessionListItem } from "../../lib/types";
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import { Text } from "@/components/ui/text";
 import { cn } from "@/lib/utils";
 import {
@@ -153,7 +155,7 @@ export function StartScreen() {
             centering, so a growing composer extends DOWNWARD from here instead of
             re-centering and dragging the heading up the page. */}
         <div ref={sectionRef} style={{ marginTop: topPad }} className="flex flex-col gap-5">
-          <Text as="h1" variant="display" className="text-balance">
+          <Text as="h1" variant="display" className="text-2xl text-balance">
             Start a task
           </Text>
 
@@ -170,29 +172,31 @@ export function StartScreen() {
           />
 
           {error && (
-            <div
-              role="alert"
-              className="flex flex-wrap items-center gap-2 text-sm text-destructive"
+            <EmptyState
+              inline
+              action={
+                deferredTaskId ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={deleteTaskMutation.isPending}
+                    onClick={() => {
+                      void deleteTaskMutation.mutateAsync({ taskId: deferredTaskId }).then(() => {
+                        setDeferredTaskId(undefined);
+                        setDeferredSessionId(undefined);
+                        setError(null);
+                      });
+                    }}
+                  >
+                    Delete idle task
+                  </Button>
+                ) : undefined
+              }
+              tone="error"
             >
-              <span>{error}</span>
-              {deferredTaskId && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={deleteTaskMutation.isPending}
-                  onClick={() => {
-                    void deleteTaskMutation.mutateAsync({ taskId: deferredTaskId }).then(() => {
-                      setDeferredTaskId(undefined);
-                      setDeferredSessionId(undefined);
-                      setError(null);
-                    });
-                  }}
-                >
-                  Delete idle task
-                </Button>
-              )}
-            </div>
+              {error}
+            </EmptyState>
           )}
 
           {/* Recent rides with the composer in the centered cluster — re-entry
@@ -217,24 +221,22 @@ function RecentTasks({ rows }: { rows: SessionListItem[] }) {
   if (rows.length === 0) {
     return (
       <section className="mt-1">
-        <Text variant="label" tone="muted">
-          Recent
-        </Text>
-        <p className="mt-2.5 text-sm text-muted-foreground">Tasks you start show up here.</p>
+        <h2 className="text-sm font-semibold">Recent</h2>
+        <EmptyState inline className="mt-2.5 px-0">
+          Tasks you start show up here.
+        </EmptyState>
       </section>
     );
   }
   return (
     <section className="mt-1 flex flex-col gap-2">
       <div className="flex items-center justify-between">
-        <Text variant="label" tone="muted">
-          Recent
-        </Text>
+        <h2 className="text-sm font-semibold">Recent</h2>
         <Link
           to="/sessions/list"
           className="text-xs text-muted-foreground transition-colors hover:text-foreground"
         >
-          See all →
+          All tasks →
         </Link>
       </div>
       <ul className="flex flex-col">
@@ -246,7 +248,7 @@ function RecentTasks({ rows }: { rows: SessionListItem[] }) {
               title={s.id}
               className="flex items-center gap-3 rounded-md px-2 py-2 outline-none transition-colors hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:ring-[3px] focus-visible:ring-ring/40"
             >
-              <span className="inline-flex w-3 shrink-0 justify-center text-[0.7rem] leading-none">
+              <span className="inline-flex w-3 shrink-0 justify-center text-2xs leading-none">
                 <StatusGlyph status={s.status} />
               </span>
               {/* The name, and nothing else. The profile was here too, which on
@@ -261,7 +263,7 @@ function RecentTasks({ rows }: { rows: SessionListItem[] }) {
                 {s.title ?? shortId(s.id)}
               </span>
               <span className="ml-auto shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
-                {relativeTime(s.last_active_at, now)}
+                {relativeAge(s.last_active_at, now)}
               </span>
             </Link>
           </li>

@@ -71,7 +71,7 @@ function renderValue(parts: readonly ValuePart[], tokensByPath: ReadonlyMap<stri
         token?.status === "error" && token.file
           ? `<button type="button" contenteditable="false" data-upload-action="retry" class="-mr-0.5 rounded px-0.5 hover:bg-destructive/15" aria-label="Retry ${escapeHtml(name)}">↻</button>`
           : "";
-      return `<span contenteditable="false" data-upload-path="${escapeHtml(part.value)}" aria-label="${escapeHtml(name)} attachment" class="mx-0.5 inline-flex max-w-full cursor-default select-all items-center gap-1 rounded-md border px-1.5 py-px align-baseline font-mono text-[0.82em] leading-5 shadow-sm transition-colors selection:bg-primary/25${stateClass}" title="${escapeHtml(token?.error ?? part.value)}">${status}<span class="max-w-56 truncate">${escapeHtml(name)}</span>${progress}${retry}</span>`;
+      return `<span contenteditable="false" data-upload-path="${escapeHtml(part.value)}" aria-label="${escapeHtml(name)} attachment" class="mx-0.5 inline-flex max-w-full cursor-default select-all items-center gap-1 rounded-md border px-1.5 py-px align-baseline font-mono text-[0.82em] leading-5 transition-colors selection:bg-primary/25${stateClass}" title="${escapeHtml(token?.error ?? part.value)}">${status}<span class="max-w-56 truncate">${escapeHtml(name)}</span>${progress}${retry}</span>`;
     })
     .join("");
 }

@@ -1,6 +1,10 @@
 import { useMutation, createConnectQueryKey } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
-import { drainHost, listHosts } from "../gen/engram/app/v1/fleet-FleetService_connectquery";
+import {
+  drainHost,
+  listHosts,
+  uncordonHost,
+} from "../gen/engram/app/v1/fleet-FleetService_connectquery";
 import type { ListHostsResponse } from "../gen/engram/app/v1/fleet_pb";
 
 // Cordon a host from the Fleet surface. Optimistic: the host flips to
@@ -26,6 +30,35 @@ export function useDrainHost() {
               ? { ...h, status: "draining", runningSandboxes: 0, capacityUsedMib: 0n }
               : h,
           ),
+        };
+      });
+      return { previous };
+    },
+    onError: (_err, _req, ctx) => {
+      if (ctx?.previous) qc.setQueryData(hostsKey, ctx.previous);
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: hostsKey });
+    },
+  });
+}
+
+// The reverse: clear the durable cordon bit so the scheduler picks the host
+// again. Optimistic in the same way — the row flips back to `ready` at once —
+// and the next heartbeat is authoritative on settle.
+export function useUndrainHost() {
+  const qc = useQueryClient();
+  const hostsKey = createConnectQueryKey({ schema: listHosts, input: {}, cardinality: "finite" });
+  return useMutation(uncordonHost, {
+    onMutate: async (req) => {
+      const hostId = req.hostId ?? "";
+      await qc.cancelQueries({ queryKey: hostsKey });
+      const previous = qc.getQueryData<ListHostsResponse>(hostsKey);
+      qc.setQueryData<ListHostsResponse>(hostsKey, (old) => {
+        if (!old) return old;
+        return {
+          ...old,
+          hosts: old.hosts.map((h) => (h.id === hostId ? { ...h, status: "ready" } : h)),
         };
       });
       return { previous };

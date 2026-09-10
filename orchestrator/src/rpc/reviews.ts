@@ -219,21 +219,38 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
   router.service(ReviewService, {
     async listReviews(req, ctx) {
       await requireUser(ctx, getSession);
-      const repo = req.repo?.trim();
-      const rows = await reviews().listReviews(repo ? { repo } : {});
-      return { reviews: rows.map(listReviewToProto) };
+      const page = await reviews().listReviews({
+        repos: req.repos,
+        search: req.search,
+        authors: req.authors,
+        prStates: req.prStates,
+        statuses: req.statuses,
+        severities: req.severities,
+        page: Math.max(1, req.page || 1),
+        // page_size 0 = unpaginated; clamped otherwise, like ListTasks.
+        pageSize: req.pageSize <= 0 ? 0 : Math.min(req.pageSize, 1000),
+      });
+      return {
+        reviews: page.reviews.map(listReviewToProto),
+        totalCount: page.totalCount,
+        facets: page.facets,
+      };
     },
 
     async getReview(req, ctx) {
       await requireUser(ctx, getSession);
       const detail = await reviews().getReview(req.id);
       if (!detail) throw new ConnectError("not found", Code.NotFound);
-      const events = await reviews().listEvents(req.id);
+      const [events, passes] = await Promise.all([
+        reviews().listEvents(req.id),
+        reviews().listPasses(detail.review.targetId),
+      ]);
       return {
         review: reviewToProto(detail.review, findingCounts(detail.findings)),
         findings: detail.findings.map(findingToProto),
         verdicts: detail.verdicts.map(verdictToProto),
         events: events.map(eventToProto),
+        passes: passes.map(listReviewToProto),
       };
     },
 

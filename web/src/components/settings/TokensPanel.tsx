@@ -9,6 +9,8 @@ import {
   type HarnessEnvVar,
 } from "../../hooks/useHarnessEnv";
 import { PageHeading } from "../page-heading";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -50,13 +52,11 @@ export function TokensPanel() {
         <OAuthCard key={entry.provider} entry={entry} />
       ))}
       {isLoading || credentialsLoading ? (
-        <p className="text-sm text-muted-foreground">Loading…</p>
+        <SkeletonRows rows={3} />
       ) : (!vars || vars.length === 0) && (!oauth || oauth.length === 0) ? (
-        <Card>
-          <CardContent className="py-8 text-center text-sm text-muted-foreground">
-            No registered harness asks for a user credential. Nothing to set here.
-          </CardContent>
-        </Card>
+        <EmptyState>
+          No registered harness asks for a user credential. Nothing to set here.
+        </EmptyState>
       ) : (
         (vars ?? []).map((v) => <EnvVarCard key={v.envVar} entry={v} />)
       )}
@@ -265,16 +265,14 @@ function OAuthCard({ entry }: { entry: OAuthCredentialEntry }) {
               </a>{" "}
               and enter:
             </p>
-            <code className="mt-2 block select-all text-lg font-semibold tracking-widest">
-              {pending.userCode}
-            </code>
+            <code className="mt-2 block select-all text-lg font-semibold">{pending.userCode}</code>
             <p className="mt-2 text-muted-foreground">Waiting for OpenAI…</p>
           </div>
         )}
         {flow.data && terminal && flow.data.status !== "succeeded" && (
-          <p className="text-sm text-destructive">
+          <EmptyState tone="error" inline>
             Connection {flow.data.status.replaceAll("_", " ")}. Try again.
-          </p>
+          </EmptyState>
         )}
         <div className="flex gap-2">
           <Button

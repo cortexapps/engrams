@@ -1,5 +1,6 @@
 import { useAuiState } from "@assistant-ui/react";
 import { CornerDownRightIcon } from "lucide-react";
+import { StatusDot } from "@/components/status-dot";
 import { hms } from "../transcriptFmt";
 import type { RunFooter as RunFooterData } from "./buildMessages";
 
@@ -19,16 +20,22 @@ export function RunFooter() {
   if (run.other) parts.push(`${run.other} other`);
 
   return (
-    <div className="flex items-center gap-1.5 py-0.5 font-mono text-xs text-muted-foreground">
+    <div className="flex items-center gap-1.5 py-0.5 text-xs text-muted-foreground">
       <CornerDownRightIcon className="size-3 shrink-0" />
       {run.interrupted ? (
-        <span className="text-destructive">interrupted</span>
+        <span className="flex items-center gap-1.5 text-foreground">
+          <StatusDot tone="critical" size={6} />
+          Interrupted
+        </span>
       ) : !run.ok ? (
-        <span className="text-destructive">failed</span>
+        <span className="flex items-center gap-1.5 text-foreground">
+          <StatusDot tone="critical" size={6} />
+          Failed
+        </span>
       ) : null}
       {parts.length > 0 && <span className="tabular-nums">{parts.join(" · ")}</span>}
       <span aria-hidden>·</span>
-      <span className="tabular-nums">{hms(run.endAt)}</span>
+      <span className="font-mono tabular-nums">{hms(run.endAt)}</span>
     </div>
   );
 }

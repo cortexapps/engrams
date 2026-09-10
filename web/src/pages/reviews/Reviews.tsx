@@ -3,16 +3,18 @@ import { Link } from "@tanstack/react-router";
 
 import { PageHeading } from "../../components/page-heading";
 import { useNow } from "../../hooks/useNow";
-import { useReviews } from "../../hooks/useReviews";
+import { useReviewsInfinite } from "../../hooks/useReviews";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
+import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
 import { errorMessage } from "../../lib/errors";
-import { relativeTime } from "../sessions/session-format";
+import { relativeAge } from "@/lib/relative-time";
 import { FilterBar, type FilterField } from "../sessions/filter-bar";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { X } from "lucide-react";
-import { ReviewGlyph, ReviewStage } from "./ReviewGlyph";
+import { ReviewStage } from "./ReviewGlyph";
 import { Sep } from "./Sep";
 import { groupByPr, type PrGroup } from "./review-groups";
 import {
@@ -26,6 +28,9 @@ import {
   SEVERITY_BAR_TONE,
   type Severity,
 } from "./review-format";
+
+/** Pull requests per page. The page carries every pass of each. */
+const PAGE_SIZE = 25;
 import { cn } from "@/lib/utils";
 
 // The reviews ledger: one row per reviewed PULL REQUEST, newest pass first.
@@ -38,38 +43,67 @@ import { cn } from "@/lib/utils";
 //
 // The rail beside this page is the switcher; this page is for scanning and
 // filtering many at once, which a rail can't do.
+//
+// The list is paged by pull request and read a page at a time as the reader
+// scrolls, the way the tasks ledger is. The search and every filter run on the
+// server — over every reviewed pull request, not the pages in hand — so a
+// filter never hides a match that sits on a page not yet read. The author is
+// searchable because the row shows it: a fact on screen that the search box
+// ignores reads as a broken search.
 
 export function Reviews() {
-  const { data, error, isPending } = useReviews();
   const now = useNow();
   const [query, setQuery] = useState("");
-  const search = useDebouncedValue(query, 150).trim().toLowerCase();
+  const search = useDebouncedValue(query, 150).trim();
   const [filters, setFilters] = useState<Record<string, string[]>>({});
 
-  const groups = useMemo(() => groupByPr(data?.reviews ?? []), [data?.reviews]);
+  const {
+    reviews,
+    totalCount,
+    facets,
+    hasNextPage,
+    isFetchingNextPage,
+    fetchNextPage,
+    isPending,
+    error,
+  } = useReviewsInfinite(
+    {
+      search,
+      repos: filters["repo"],
+      authors: filters["author"],
+      prStates: filters["pr_state"],
+      statuses: filters["stage"],
+      severities: filters["severity"],
+    },
+    PAGE_SIZE,
+  );
+  const loadMoreRef = useLoadMoreSentinel({
+    hasMore: hasNextPage,
+    isFetching: isFetchingNextPage,
+    onLoadMore: fetchNextPage,
+  });
 
-  // Every option is derived from the rows in hand, so a filter never offers a
-  // value that would return nothing.
-  const fields: FilterField[] = useMemo(() => {
-    const distinct = <T,>(values: Array<T | undefined>) =>
-      [...new Set(values.filter((v): v is T => v != null && v !== ""))].sort();
-    const authors = distinct(groups.map((g) => g.latest.prAuthor));
-    const states = distinct(groups.map((g) => g.latest.prState));
-    return [
+  const rows = useMemo(() => groupByPr(reviews), [reviews]);
+
+  // The options are the server's facets over every reviewed pull request, so a
+  // filter never offers a value that would return nothing — and never omits one
+  // whose pull requests sit on a page the reader has not reached.
+  const fields: FilterField[] = useMemo(
+    () => [
       {
         key: "repo",
         label: "Repository",
-        options: distinct(groups.map((g) => g.repo)).map((repo) => ({ value: repo, label: repo })),
+        options: facets.repos.map((repo) => ({ value: repo, label: repo })),
       },
       {
         key: "author",
         label: "Author",
-        options: authors.map((author) => ({ value: author, label: author })),
+        options: facets.authors.map((author) => ({ value: author, label: author })),
       },
       {
         key: "pr_state",
         label: "Pull request",
-        options: states.map((state) => ({
+        options: facets.prStates.map((state) => ({
           value: state,
           label: PR_STATES[state]?.label ?? state,
         })),
@@ -77,7 +111,7 @@ export function Reviews() {
       {
         key: "stage",
         label: "Stage",
-        options: distinct(groups.map((g) => g.latest.status)).map((status) => ({
+        options: facets.statuses.map((status) => ({
           value: status,
           label: stageOf(status).label,
         })),
@@ -90,49 +124,17 @@ export function Reviews() {
           label: s,
         })),
       },
-    ];
-  }, [groups]);
-
-  const rows = useMemo(() => {
-    const repo = filters["repo"] ?? [];
-    const author = filters["author"] ?? [];
-    const prState = filters["pr_state"] ?? [];
-    const stage = filters["stage"] ?? [];
-    const severity = filters["severity"] ?? [];
-    return groups.filter((group) => {
-      const review = group.latest;
-      if (repo.length > 0 && !repo.includes(group.repo)) return false;
-      if (author.length > 0 && !(review.prAuthor && author.includes(review.prAuthor))) return false;
-      if (prState.length > 0 && !(review.prState && prState.includes(review.prState))) return false;
-      if (stage.length > 0 && !stage.includes(review.status)) return false;
-      if (severity.length > 0) {
-        const counts = review.findingCounts;
-        const hit = severity.some((s) => (counts?.[s as "critical"] ?? 0) > 0);
-        if (!hit) return false;
-      }
-      if (search) {
-        // The author is searchable because the row shows it — a fact on screen
-        // that the search box ignores reads as a broken search.
-        const title = prTitleOf(review) ?? "";
-        const haystack =
-          `${group.repo} #${group.prNumber} ${title} ${review.prAuthor ?? ""}`.toLowerCase();
-        if (!haystack.includes(search)) return false;
-      }
-      return true;
-    });
-  }, [groups, filters, search]);
+    ],
+    [facets],
+  );
 
   const hasFilters = query !== "" || Object.values(filters).some((v) => v.length > 0);
 
-  // One count, in the masthead. It used to be stated twice — a chip up here and
-  // a line under the list — which agree exactly whenever nothing is filtered.
-  const noun = groups.length === 1 ? "pull request" : "pull requests";
-  const count =
-    groups.length === 0
-      ? undefined
-      : rows.length === groups.length
-        ? `${groups.length} ${noun}`
-        : `${rows.length} of ${groups.length} ${noun}`;
+  // One count, in the masthead: the pull requests matching the filters, which
+  // the server knows whether or not the reader has scrolled to them all.
+  const total = totalCount ?? 0;
+  const noun = total === 1 ? "pull request" : "pull requests";
+  const count = total === 0 ? undefined : `${total} ${noun}`;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-auto p-4 md:p-6">
@@ -163,48 +165,39 @@ export function Reviews() {
       </div>
 
       {isPending ? (
-        // Two lines, because the row has two. A one-line silhouette under a
-        // two-line row makes the list jump the moment the fetch lands.
-        <ul
-          className="overflow-hidden rounded-lg border"
-          role="status"
-          aria-label="Loading reviews"
-        >
-          {Array.from({ length: 5 }).map((_, i) => (
-            <li key={i} className="flex items-center gap-3 border-b px-3 py-2.5 last:border-b-0">
-              <span className="flex min-w-0 flex-1 flex-col gap-1.5">
-                <Skeleton className="h-3.5 w-2/3" />
-                <Skeleton className="h-3 w-40" />
-              </span>
-              <Skeleton className="h-1.5 w-16 rounded-full" />
-              <Skeleton className="h-3 w-20" />
-              <Skeleton className="h-3 w-9" />
-            </li>
-          ))}
-        </ul>
-      ) : error && groups.length === 0 ? (
-        <div role="alert" className="rounded-lg border border-dashed py-12 text-center">
-          <p className="text-sm text-destructive">Couldn’t load reviews. {errorMessage(error)}</p>
-        </div>
+        <SkeletonRows
+          rows={5}
+          columns={["minmax(0,1fr)", "64px", "80px", "36px"]}
+          className="overflow-hidden rounded-lg border px-3"
+        />
+      ) : error && rows.length === 0 ? (
+        <EmptyState tone="error">Couldn’t load reviews. {errorMessage(error)}</EmptyState>
       ) : rows.length === 0 ? (
-        <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-16 text-center">
-          <span className="text-xl leading-none">
-            <ReviewGlyph status="queued" beat={false} />
-          </span>
-          <p className="max-w-sm text-sm text-muted-foreground">
-            {groups.length === 0
-              ? "No pull requests reviewed yet. Enrol a repository in settings, or ask for a review on a PR with @engrams review."
-              : "No pull requests match these filters."}
-          </p>
-        </div>
+        <EmptyState>
+          {hasFilters
+            ? "No pull requests match these filters."
+            : "No pull requests reviewed yet. Enrol a repository in settings, or ask for a review on a PR with @engrams review."}
+        </EmptyState>
       ) : (
-        <ul className="overflow-hidden rounded-lg border">
-          {rows.map((group) => (
-            <li key={group.key} className="border-b border-border last:border-b-0">
-              <PrRow group={group} now={now} />
-            </li>
-          ))}
-        </ul>
+        <>
+          <ul className="overflow-hidden rounded-lg border">
+            {rows.map((group) => (
+              <li key={group.key} className="border-b border-border last:border-b-0">
+                <PrRow group={group} now={now} />
+              </li>
+            ))}
+          </ul>
+          {hasNextPage && (
+            <div ref={loadMoreRef} className="py-2">
+              <SkeletonRows rows={1} />
+            </div>
+          )}
+          {rows.length < total && (
+            <p className="font-mono text-xs tabular-nums text-muted-foreground">
+              {rows.length} of {total} {noun}
+            </p>
+          )}
+        </>
       )}
     </div>
   );
@@ -237,7 +230,7 @@ function SeverityBar({ counts, total }: { counts: Array<[Severity, number]>; tot
   // A single finding still has to be visible, so the fill has a floor.
   const fill = Math.max(Math.min(total / BAR_FULL_AT, 1), 0.09);
   return (
-    <span aria-hidden className="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+    <span aria-hidden className="h-1.5 w-16 overflow-hidden rounded-sm bg-muted">
       <span className="flex h-full gap-px" style={{ width: `${fill * 100}%` }}>
         {counts.map(([severity, count]) => (
           <span
@@ -342,7 +335,7 @@ function PrRow({ group, now }: { group: PrGroup; now: number }) {
             </span>
           </>
         ) : isActive(review) ? null : (
-          <span className="text-xs text-muted-foreground">none</span>
+          <span className="text-xs text-muted-foreground">None</span>
         )}
       </span>
 
@@ -356,7 +349,7 @@ function PrRow({ group, now }: { group: PrGroup; now: number }) {
         title={at?.toLocaleString()}
         className="w-9 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground"
       >
-        {at ? relativeTime(at.toISOString(), now) : "—"}
+        {at ? relativeAge(at.toISOString(), now) : "—"}
       </span>
     </Link>
   );

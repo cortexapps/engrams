@@ -6,12 +6,18 @@ import { SpecTicketSyncBadge } from "./SpecTicketSyncBadge";
 describe("SpecTicketSyncBadge", () => {
   test("uses the nominal grammar only when all tickets are synced", () => {
     const { rerender } = render(<SpecTicketSyncBadge state="pending" />);
-    expect(screen.getByText("Syncing").className).not.toContain("instrument-nominal");
+    const syncing = screen.getByText("Syncing");
+    expect(syncing.querySelector('[data-slot="status-dot"]')?.getAttribute("data-tone")).toBe(
+      "active",
+    );
 
     rerender(<SpecTicketSyncBadge state="synced" />);
     const synced = screen.getByText("Synced");
     expect(synced.dataset.state).toBe("synced");
-    expect(synced.className).toContain("text-instrument-nominal-ink");
+    expect(synced.className).toContain("text-foreground");
+    expect(synced.querySelector('[data-slot="status-dot"]')?.getAttribute("data-tone")).toBe(
+      "nominal",
+    );
   });
 
   test("surfaces a failed ticket row", () => {

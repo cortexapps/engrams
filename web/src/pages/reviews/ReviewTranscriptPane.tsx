@@ -8,6 +8,7 @@ import { SessionThread } from "../../components/session-thread/SessionThread";
 import { StatusGlyph } from "../../components/Glyph";
 import { statusLabel } from "../sessions/session-format";
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/empty-state";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 export type WorkerRole = "finder" | "verifier";
@@ -93,9 +94,9 @@ export function ReviewTranscriptPane({
       {sessionId ? (
         <RoleTranscript key={sessionId} sessionId={sessionId} />
       ) : (
-        <p className="p-4 text-sm text-muted-foreground">
+        <EmptyState inline className="p-4">
           This phase never started, so there is no transcript to show.
-        </p>
+        </EmptyState>
       )}
     </div>
   );
@@ -108,7 +109,7 @@ export function ReviewTranscriptPane({
  * true by construction rather than by assumption.
  */
 function RoleTranscript({ sessionId }: { sessionId: string }) {
-  const { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx } =
+  const { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx, opening } =
     useSessionEvents(sessionId);
   const { data: session } = useSession(sessionId);
 
@@ -117,7 +118,7 @@ function RoleTranscript({ sessionId }: { sessionId: string }) {
       <div className="flex shrink-0 items-center gap-1.5 border-b px-3 py-1 text-xs text-muted-foreground">
         {session ? (
           <>
-            <span className="text-[0.7rem] leading-none">
+            <span className="text-2xs leading-none">
               <StatusGlyph status={session.status} />
             </span>
             {statusLabel(session.status)}
@@ -132,7 +133,7 @@ function RoleTranscript({ sessionId }: { sessionId: string }) {
           events={events}
           status={session?.status}
           streamingText={streamingText}
-          transcriptWindow={{ hasMore, loadingOlder, loadOlder, oldestIdx }}
+          transcriptWindow={{ hasMore, loadingOlder, loadOlder, oldestIdx, opening }}
         />
       </div>
     </div>

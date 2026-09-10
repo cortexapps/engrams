@@ -10,12 +10,12 @@ export interface OperatorHealth {
   reason: string | null;
 }
 
-// The whole fleet + storage picture distilled to one rail telltale: the single
-// worst thing an operator should know about without opening the cockpit. The
-// thresholds live in operator-health.ts, shared with the Overview verdict, so the
-// dot and the cockpit can never disagree.
-// The telltale rides every page for every user, so it polls at a background
-// cadence. At 1 s (the cockpit rate) it cost ~1 fleet query per second per
+// The whole fleet + storage picture distilled to one rail readout: the single
+// worst thing an admin should know about without opening the Fleet page. The
+// thresholds live in operator-health.ts, shared with the Fleet verdict cell, so
+// the rail row and the page can never disagree.
+// The readout rides every page for every admin, so it polls at a background
+// cadence. At 1 s (the Fleet page rate) it cost ~1 fleet query per second per
 // open tab, from the spec editor and the login screen alike.
 const TELLTALE_INTERVAL_MS = 30_000;
 

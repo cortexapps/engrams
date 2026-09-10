@@ -209,7 +209,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # The Blacksmith runner image ships helm but not terraform.
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_wrapper: false
       - name: Tool versions

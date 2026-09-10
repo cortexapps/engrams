@@ -64,7 +64,7 @@ export function GithubSetupPanel({ view }: { view: ConnectorView }) {
         <ShieldCheckIcon className="mt-0.5 size-4 shrink-0 text-instrument-nominal" />
         <div>
           <div className="text-sm font-semibold">Set up the GitHub App first</div>
-          <div className="mt-0.5 text-[0.78rem] leading-relaxed text-muted-foreground">
+          <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
             engrams drives GitHub through a <span className="font-medium">GitHub App</span> you own.
             Create it with the permissions and webhook below, install it on the org that owns your
             repos, then paste its App ID + private key here.
@@ -75,7 +75,7 @@ export function GithubSetupPanel({ view }: { view: ConnectorView }) {
       {/* Step 1 — create the app */}
       <section className="flex flex-col gap-2">
         <StepHeader n={1} label="Create a GitHub App" />
-        <p className="text-[0.78rem] leading-relaxed text-muted-foreground">
+        <p className="text-xs leading-relaxed text-muted-foreground">
           Open GitHub →{" "}
           <span className="font-mono">
             Settings → Developer settings → GitHub Apps → New GitHub App
@@ -103,7 +103,7 @@ export function GithubSetupPanel({ view }: { view: ConnectorView }) {
             Copy App manifest
           </Button>
         </div>
-        <p className="text-[0.72rem] text-muted-foreground">
+        <p className="text-xs text-muted-foreground">
           The manifest pre-fills every permission, the webhook URL, and the events — paste it into
           GitHub's <span className="italic">“Register a GitHub App from a manifest”</span> flow.
         </p>
@@ -113,25 +113,25 @@ export function GithubSetupPanel({ view }: { view: ConnectorView }) {
       <section className="flex flex-col gap-2">
         <StepHeader n={2} label="Grant repository permissions" />
         <div className="flex flex-col gap-2">
-          <Text variant="label">Minimum (required)</Text>
+          <h3 className="text-sm font-semibold">Minimum (required)</h3>
           <div className="flex flex-col gap-1.5">
             {minimum.map((p) => (
               <PermRow key={p.key} permKey={p.key} level={p.level} />
             ))}
           </div>
-          <p className="text-[0.72rem] text-muted-foreground">
+          <p className="text-xs text-muted-foreground">
             The floor for git + pull requests. Sessions can do no more than the App is granted.
           </p>
         </div>
         {extra.length > 0 && (
           <div className="mt-1 flex flex-col gap-2">
-            <Text variant="label">Optional — unlock more powers</Text>
+            <h3 className="text-sm font-semibold">Optional — unlock more powers</h3>
             <div className="flex flex-col gap-1.5">
               {extra.map((p) => (
                 <PermRow key={p.key} permKey={p.key} level={p.level} />
               ))}
             </div>
-            <p className="text-[0.72rem] text-muted-foreground">
+            <p className="text-xs text-muted-foreground">
               Add any of these to let profiles grant the matching{" "}
               <span className="font-mono">github:</span> powers (e.g. Actions, checks, deployments).
               Skip the ones you don't need.
@@ -143,7 +143,7 @@ export function GithubSetupPanel({ view }: { view: ConnectorView }) {
       {/* Step 3 — webhook */}
       <section className="flex flex-col gap-2">
         <StepHeader n={3} label="Add the webhook (for review-driven sessions)" />
-        <p className="text-[0.78rem] leading-relaxed text-muted-foreground">
+        <p className="text-xs leading-relaxed text-muted-foreground">
           So a review request or PR comment can trigger a session, point the App's webhook at this
           URL and subscribe to the events below. Set the webhook{" "}
           <span className="font-medium">secret</span> to the value your deployment configures (Helm{" "}
@@ -154,7 +154,7 @@ export function GithubSetupPanel({ view }: { view: ConnectorView }) {
             <WebhookIcon className="size-3.5" />
             Payload URL
           </Text>
-          <code className="select-all rounded-md border bg-card px-3 py-2 font-mono text-[0.72rem] break-all">
+          <code className="select-all rounded-md border bg-card px-3 py-2 font-mono text-xs break-all">
             {webhookUrl}
           </code>
           <div className="mt-1">
@@ -174,12 +174,12 @@ export function GithubSetupPanel({ view }: { view: ConnectorView }) {
           </div>
         </div>
         <div className="flex flex-col gap-1.5">
-          <Text variant="label">Subscribe to events</Text>
+          <h3 className="text-sm font-semibold">Subscribe to events</h3>
           <div className="flex flex-wrap gap-1.5">
             {WEBHOOK_EVENTS.map((e) => (
               <code
                 key={e}
-                className="rounded-full border bg-card px-2.5 py-0.5 font-mono text-[0.68rem] text-foreground"
+                className="rounded-sm border bg-card px-2.5 py-0.5 font-mono text-2xs text-foreground"
               >
                 {e}
               </code>
@@ -191,7 +191,7 @@ export function GithubSetupPanel({ view }: { view: ConnectorView }) {
       {/* Step 4 — install + credentials */}
       <section className="flex flex-col gap-2">
         <StepHeader n={4} label="Install it & copy the credentials" />
-        <p className="flex gap-2 text-[0.78rem] leading-relaxed text-muted-foreground">
+        <p className="flex gap-2 text-xs leading-relaxed text-muted-foreground">
           <KeyRoundIcon className="mt-0.5 size-3.5 shrink-0" />
           <span>
             Install the App on the org/user that owns your repos, then generate a private key. Copy
@@ -207,7 +207,7 @@ export function GithubSetupPanel({ view }: { view: ConnectorView }) {
 function StepHeader({ n, label }: { n: number; label: string }) {
   return (
     <div className="flex items-center gap-2">
-      <span className="inline-flex size-5 shrink-0 items-center justify-center rounded-full border border-primary bg-primary/20 font-mono text-[0.66rem] font-bold">
+      <span className="inline-flex size-5 shrink-0 items-center justify-center rounded-full border border-primary bg-primary/20 font-mono text-2xs font-bold">
         {n}
       </span>
       <span className="text-sm font-semibold">{label}</span>

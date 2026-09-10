@@ -25,9 +25,9 @@
  *   never light-mode text (chartreuse on celadon is invisible), and
  *   never a status — lifecycle keeps its own glyph + text vocabulary.
  *
- *   Structure is graphite: 12px corners, one system sans, low-contrast
- *   rules. Saira is retired — --font-display now points at the sans
- *   stack, so the token survives while the tracked-caps voice does not.
+ *   Structure is graphite: 12px corners, low-contrast rules, one system
+ *   sans for everything a person reads — except the page title, which is
+ *   Saira, set a little wide. Nothing else is tracked or capitalised.
  * ------------------------------------------------------------------ */
 :root {
   --radius: 0.75rem; /* 12px — the graphite corner */
@@ -76,17 +76,17 @@
   --carbon-sheen: oklch(1 0 0 / 0.05);
   --carbon-tile: 11px;
 
-  /* Instrument status — the Operator cockpit's gauge zones and telltales.
+  /* Instrument status — every status dot, meter fill, and telltale.
      A status vocabulary kept strictly apart from the lime accent: lime is
      interactive-only, so these three never touch its hue (121). Vivid enough
-     to read as arcs and lit dots on the card; status text always pairs a
-     colored dot with ink, never colored body copy, so AA holds. */
+     to read as 6px dots and meter fills on the card; status text always pairs
+     a colored dot with ink, never colored body copy, so AA holds. */
   --instrument-nominal: oklch(0.6 0.15 150); /* signal green — emerald, not lime */
   --instrument-caution: oklch(0.7 0.155 71); /* amber */
   --instrument-critical: oklch(0.55 0.21 27); /* instrument red ≈ destructive */
 
   /* The same three signals, dark enough to be TEXT. The tokens above are
-     GRAPHIC colours — dots, gauge arcs, meter fills — which need 3:1 and are
+     GRAPHIC colours — dots, meter fills — which need 3:1 and are
      tuned to stay vivid at 6px. As text on paper they measure 3.34 / 2.48 /
      4.88, so two of the three fail. Anything that colours a word or a figure
      (a diff count, a status label) uses these instead. */
@@ -94,9 +94,11 @@
   --instrument-caution-ink: oklch(0.5 0.13 71);
   --instrument-critical-ink: oklch(0.52 0.2 27);
 
-  /* Logomark terminal node — the verdigris endpoint of the engram trace. Paper-era
-     dark value for light grounds; the dark theme overrides to a brighter teal so it
-     reads against the deep green-black background. */
+  /* The logomark's two nodes. The entry ring is amber; the terminal dot is the
+     ground's action colour — verdigris on paper, lime on the cover and at
+     night (the mark component reads --sidebar-primary there). Both lift for
+     the dark ground below. */
+  --mark-entry: #b85c0a;
   --mark-terminal: #3a6b5c;
 }
 
@@ -155,6 +157,7 @@
   --instrument-caution-ink: oklch(0.83 0.14 75);
   --instrument-critical-ink: oklch(0.74 0.19 25);
 
+  --mark-entry: #e0913d; /* amber goes muddy on green-black; lift it */
   --mark-terminal: oklch(0.7 0.085 178); /* #5EB09E — brighter verdigris on dark ground */
 }
 
@@ -332,17 +335,38 @@
   --color-instrument-caution-ink: var(--instrument-caution-ink);
   --color-instrument-critical-ink: var(--instrument-critical-ink);
 
-  /* Two fonts, not three. Sans carries everything a person reads; mono means
-     machine data — an id, a digest, a timestamp, a byte count, code. Saira and
-     its `--font-display` token are GONE, not aliased: the racing read came from
-     tracked caps on every label, and tracked caps everywhere is not an
-     identity, it is noise. A dead alias would let the voice creep back one call
-     site at a time, so `font-display` is now an unknown utility and fails
-     visibly. Hierarchy comes from size and weight. */
+  /* Three faces, each with one job. Sans carries everything a person reads.
+     Mono means machine data — an id, a digest, a timestamp, a byte count,
+     code. Display is Saira and it is for PAGE TITLES ONLY (`Text
+     variant="display"`), set 8% wide at 600; the racing read that once came
+     from tracked caps on every label now lives in exactly one place per page.
+     Hierarchy below the title comes from size and weight. */
   --font-sans:
     system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji",
     "Segoe UI Emoji", sans-serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-display: "Saira Variable", var(--font-sans);
+
+  /* The type scale. Seven steps, and every size in the app is one of them —
+     no `text-[0.7rem]` one-offs. 2xs is the mono floor (ages, counts, ids in
+     dense rows); xs captions and secondary lines; sm is body; base is prose
+     and inputs (16px also keeps iOS from zooming a focused field); lg is a
+     section masthead; xl the page title; 2xl the title of a centered composer
+     page. */
+  --text-2xs: 0.6875rem; /* 11px */
+  --text-2xs--line-height: calc(1 / 0.6875);
+  --text-xs: 0.75rem; /* 12px */
+  --text-xs--line-height: calc(1 / 0.75);
+  --text-sm: 0.875rem; /* 14px */
+  --text-sm--line-height: calc(1.25 / 0.875);
+  --text-base: 1rem; /* 16px */
+  --text-base--line-height: calc(1.5 / 1);
+  --text-lg: 1.25rem; /* 20px */
+  --text-lg--line-height: 1.3;
+  --text-xl: 1.625rem; /* 26px */
+  --text-xl--line-height: 1.2;
+  --text-2xl: 1.875rem; /* 30px */
+  --text-2xl--line-height: 1.2;
 
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
@@ -351,8 +375,8 @@
 }
 
 /* The label voice lives in the Text component's `label` variant
-   (components/ui/text.tsx) — the single source of truth for every label,
-   table header, and tab across the app. */
+   (components/ui/text.tsx): small, semibold, sentence case — a field caption
+   or a table header, never a kicker over a title. */
 
 @layer base {
   * {
@@ -495,6 +519,178 @@
   margin-block: 1em;
   border: 0;
   border-block-start: 1px solid var(--border);
+}
+
+/* ── Motion ─────────────────────────────────────────────────────────────
+   One easing, a handful of durations, and every animation respects
+   prefers-reduced-motion (the block at the end switches them off). Nothing
+   scales on press; nothing glows; rails never move after boot.
+
+     boot      once per load: the sheet rises 14px and fades in over 700ms
+               (after 200ms), rail rows follow at 40ms per row
+     page-in   route change: content rises 6px and fades in over 240ms
+     live      a running dot breathes 1 → .35 → 1 over 2.4s; a running row
+               carries a 34%-wide ring-tinted sweep every 2.8s
+     data ink  a meter fills 0 → value over 1.1s, 150ms per meter; a
+               sparkline draws once when it enters view; a changed figure
+               ticks (old up and out, new in from below) in 500ms
+     skeleton  hairlines draw 0 → 1 over 900ms, 150ms apart, then the bars
+               shimmer at 1.8s */
+:root {
+  --ease-out-soft: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+@keyframes sheet-boot {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes row-boot {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes page-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+@keyframes row-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+@keyframes meter-fill {
+  from {
+    width: 0;
+  }
+}
+@keyframes bar-draw {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+@keyframes hairline-draw {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+@keyframes tick-in {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+@keyframes tick-out {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(-100%);
+  }
+}
+
+@layer components {
+  /* Boot: only while the shell carries `data-boot` (RootLayout drops it once). */
+  [data-boot] .section-sheet {
+    animation: sheet-boot 700ms var(--ease-out-soft) 200ms both;
+  }
+  [data-boot] .sidebar-section [data-slot="sidebar-menu-item"] {
+    animation: row-boot 450ms var(--ease-out-soft) calc(200ms + var(--i, 0) * 40ms) both;
+  }
+  .page-in {
+    animation: page-in 240ms var(--ease-out-soft) both;
+  }
+  .animate-live {
+    animation: live-pulse 2.4s ease-in-out infinite;
+  }
+  .row-running {
+    position: relative;
+    overflow: hidden;
+  }
+  .row-running::after {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 34%;
+    pointer-events: none;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in oklch, var(--ring) 10%, transparent),
+      transparent
+    );
+    animation: row-sweep 2.8s var(--ease-out-soft) infinite;
+  }
+  .meter-fill {
+    animation: meter-fill 1.1s var(--ease-out-soft) calc(var(--i, 0) * 150ms) both;
+  }
+  .bar-draw {
+    transform-origin: bottom;
+    animation: bar-draw 600ms var(--ease-out-soft) calc(var(--i, 0) * 60ms) both;
+  }
+  .hairline-draw {
+    transform-origin: left;
+    animation: hairline-draw 900ms var(--ease-out-soft) calc(var(--i, 0) * 150ms) both;
+  }
+  .tick-in {
+    animation: tick-in 500ms var(--ease-out-soft) both;
+  }
+  .tick-out {
+    animation: tick-out 500ms var(--ease-out-soft) both;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    [data-boot] .section-sheet,
+    [data-boot] .sidebar-section [data-slot="sidebar-menu-item"],
+    .page-in,
+    .animate-live,
+    .meter-fill,
+    .bar-draw,
+    .hairline-draw,
+    .tick-in,
+    .tick-out {
+      animation: none !important;
+    }
+    .row-running::after {
+      display: none;
+    }
+  }
 }
 
 @utility bg-carbon-fade {

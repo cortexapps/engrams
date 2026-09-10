@@ -12,11 +12,11 @@
 # the `engram_values` / `host_fleet_values` outputs render the
 # TF-derived halves.
 #
-# The default KVM shape is m8i.6xlarge (24 vCPU, nested virt) × 2 —
-# 48 on-demand vCPUs, which a fresh account's default quota may not
-# cover. Operators who need one image bake serving BOTH a GCP C3
-# fleet and this one set kvm_instance_type = "m7i.metal-24xl"
-# (CPUID parity; needs a metal quota ticket and costs far more).
+# The default KVM shape is m8i.8xlarge (32 vCPU, nested virt enabled
+# at launch) × 2 — 64 on-demand vCPUs, which a fresh account's default
+# quota may not cover. Operators who need one image bake serving BOTH
+# a GCP C3 fleet and this one set kvm_instance_type = "m7i.metal-24xl"
+# (CPUID parity; needs a metal quota ticket and costs ~3× more).
 # See docs/deploy-aws.md before applying.
 
 data "aws_caller_identity" "current" {}
@@ -72,9 +72,11 @@ module "kvm_nodegroup" {
 }
 
 # ─── the KEK ──────────────────────────────────────────────────────
-# On AWS the KEK is a real KMS key (kek.provider=aws-kms — the
-# coordinator wraps/unwraps DEKs via kms:Encrypt/Decrypt), not an
-# env-var secret. Deliberate per-cloud difference (ADR 0122 D6).
+# On AWS the COORDINATOR's KEK is a real KMS key (kek.provider=
+# aws-kms — it wraps/unwraps DEKs via kms:Encrypt/Decrypt), not an
+# env-var secret. Deliberate per-cloud difference (ADR 0122 D6). The
+# orchestrator has no KMS path and keeps a raw key: the `kek-master`
+# shell, relayed into its own Secret (eso.tf).
 
 resource "aws_kms_key" "kek" {
   description             = "engram KEK — DEK wrap/unwrap (ADR 0122)"

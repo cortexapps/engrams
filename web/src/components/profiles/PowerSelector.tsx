@@ -9,6 +9,7 @@
 import { useState } from "react";
 import { CheckIcon, EyeIcon, PencilIcon, SearchIcon } from "lucide-react";
 
+import { EmptyState } from "@/components/empty-state";
 import { Input } from "@/components/ui/input";
 import { Text } from "@/components/ui/text";
 import { cn } from "@/lib/utils";
@@ -79,7 +80,7 @@ export function PowerSelector({
             onChange={(e) => setQ(e.target.value)}
           />
         </div>
-        <Text variant="label" tone="muted" className="text-[0.56rem] whitespace-nowrap">
+        <Text variant="label" tone="muted" className="text-2xs whitespace-nowrap">
           {granted} on
         </Text>
         <button
@@ -117,11 +118,9 @@ export function PowerSelector({
               >
                 {g.label}
               </span>
-              {note && <span className="text-[0.66rem] text-instrument-caution">{note}</span>}
+              {note && <span className="text-2xs text-instrument-caution">{note}</span>}
               {g.asset && (
-                <span className="text-[0.66rem] text-muted-foreground">
-                  {g.asset.replace(/_/g, " ")}
-                </span>
+                <span className="text-2xs text-muted-foreground">{g.asset.replace(/_/g, " ")}</span>
               )}
               <div className="flex gap-1.5">
                 {g.read && (
@@ -145,9 +144,9 @@ export function PowerSelector({
           );
         })}
         {shown.length === 0 && (
-          <div className="px-3.5 py-4 text-center text-sm text-muted-foreground">
+          <EmptyState inline className="px-3.5 py-4">
             No powers match "{q}".
-          </div>
+          </EmptyState>
         )}
       </div>
     </div>
@@ -174,7 +173,7 @@ function AccessPill({
       aria-pressed={on}
       aria-label={`${on ? "Granted" : "Grant"} ${label.toLowerCase()}`}
       className={cn(
-        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.7rem] font-medium capitalize transition-colors",
+        "inline-flex items-center gap-1 rounded-sm border px-2 py-0.5 text-2xs font-medium capitalize transition-colors",
         on
           ? write
             ? "border-instrument-caution/55 bg-instrument-caution/15 text-foreground"

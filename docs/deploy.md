@@ -57,12 +57,15 @@ Everything runs in one Kubernetes cluster, two Helm releases:
 - Nested virtualization is **Intel-only** on every managed provider,
   set at node-pool creation, and incompatible with node
   auto-provisioning. GKE: the C3 family (Standard clusters only).
-  EKS: bare metal (`*.metal`) or Xeon-6 C8i/M8i/R8i.
+  EKS: the 8th-gen C8i/M8i/R8i virtual shapes (nested virtualization
+  is a launch-time flag the quickstart sets), or bare metal
+  (`*.metal`).
 - **CPUID is a one-way door for snapshots**: images baked on a newer
   CPU platform never restore on an older one. The quickstarts default
-  both clouds to Sapphire Rapids (GCP C3 / AWS m7i) so images bake
-  once. Moving a fleet to an older platform means re-baking every
-  enabled image.
+  GCP to Sapphire Rapids (C3) and AWS to Granite Rapids (m8i); the
+  AWS `m7i.metal-24xl` option gives CPUID parity when one bake must
+  serve both clouds. Moving a fleet to an older platform means
+  re-baking every enabled image.
 - The pool's taint/label pair (`engram.io/kvm=true`), the PSA-
   privileged namespace, `auto_upgrade off`, and the operator-owned
   size are invariants, not preferences — each has an incident behind

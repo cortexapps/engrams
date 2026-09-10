@@ -20,7 +20,9 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 const SIDEBAR_STORAGE_KEY = "sidebar_state";
-const SIDEBAR_WIDTH = "16rem";
+// The section rail's width (272px). The spine sets its own narrower width in
+// RootLayout; this default is what SidebarResizeHandle resets to.
+const SIDEBAR_WIDTH = "17rem";
 const SIDEBAR_WIDTH_MOBILE = "18rem";
 const SIDEBAR_WIDTH_ICON = "3rem";
 const SIDEBAR_KEYBOARD_SHORTCUT = "b";

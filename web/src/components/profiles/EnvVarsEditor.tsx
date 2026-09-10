@@ -206,7 +206,7 @@ export function EnvVarsEditor({
             </div>
             {resolved && (
               <p
-                className="mt-1 ml-1 font-mono text-[0.7rem] break-all text-muted-foreground"
+                className="mt-1 ml-1 font-mono text-2xs break-all text-muted-foreground"
                 data-testid="env-resolved-preview"
               >
                 → {resolved}
@@ -250,7 +250,7 @@ export function EnvVarsEditor({
           help text would go stale. */}
       {apps.length > 0 && (
         <div className="rounded-md border bg-muted/30 px-2.5 py-2" data-testid="env-app-vars">
-          <p className="text-[0.7rem] text-muted-foreground">
+          <p className="text-2xs text-muted-foreground">
             From your apps — click to insert. <code className="font-mono">_URL</code> carries the
             scheme (base URLs); <code className="font-mono">_HOST</code> is the bare hostname (CORS
             allow-lists, cookie domains).
@@ -258,7 +258,7 @@ export function EnvVarsEditor({
           <div className="mt-1.5 flex flex-col gap-1">
             {apps.map((a) => (
               <div key={a.name} className="flex flex-wrap items-center gap-1.5">
-                <span className="w-20 shrink-0 truncate font-mono text-[0.7rem] text-muted-foreground">
+                <span className="w-20 shrink-0 truncate font-mono text-2xs text-muted-foreground">
                   {a.name}
                 </span>
                 {appVars(a).map((v) => (
@@ -270,7 +270,7 @@ export function EnvVarsEditor({
                     // when the chip is pressed, or there is nowhere to insert.
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => insertToken(v.token)}
-                    className="rounded-md border bg-background px-1.5 py-0.5 font-mono text-[0.7rem] hover:bg-accent"
+                    className="rounded-md border bg-background px-1.5 py-0.5 font-mono text-2xs hover:bg-accent"
                   >
                     {v.token}
                   </button>

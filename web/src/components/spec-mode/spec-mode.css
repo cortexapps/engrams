@@ -50,9 +50,8 @@
   justify-content: center;
   margin-top: auto;
   border: 1px solid var(--sidebar-border);
-  border-radius: 6px;
-  font-family: var(--font-mono);
-  font-size: 0.7rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.6875rem;
 }
 
 .spec-mode-top-bar {
@@ -93,7 +92,7 @@
   overflow: hidden;
   min-width: 0;
   border: 0;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   padding: 0 4px;
   margin: 0 -4px;
   background: none;
@@ -111,7 +110,7 @@
   min-width: 0;
   flex: 1;
   border: 1px solid var(--ring);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   padding: 2px 6px;
   background: var(--background);
   color: var(--foreground);
@@ -163,8 +162,7 @@
   place-items: center;
   border-radius: 999px;
   color: white;
-  font-family: var(--font-mono);
-  font-size: 0.58rem;
+  font-size: 0.6875rem;
   font-weight: 700;
 }
 
@@ -176,7 +174,7 @@
 .spec-mode-presence-label {
   max-width: 150px;
   overflow: hidden;
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -189,8 +187,7 @@
 
 .spec-mode-checkpoint-trigger {
   gap: 7px;
-  font-family: var(--font-mono);
-  font-size: 0.7rem;
+  font-size: 0.6875rem;
   color: var(--muted-foreground);
 }
 
@@ -228,11 +225,11 @@
 }
 
 .spec-mode-section-tally strong {
-  font-size: 1.35rem;
+  font-size: 1.25rem;
 }
 
 .spec-mode-section-tally span {
-  font-size: 0.72rem;
+  font-size: 0.75rem;
 }
 
 .spec-mode-section-list {
@@ -250,7 +247,7 @@
   width: 100%;
   align-items: center;
   gap: 9px;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   padding: 8px 9px;
   color: inherit;
   text-align: left;
@@ -281,7 +278,7 @@
 
 .spec-mode-section-row-title {
   overflow: hidden;
-  font-size: 0.82rem;
+  font-size: 0.875rem;
   line-height: 1.35;
   letter-spacing: -0.005em;
   text-overflow: ellipsis;
@@ -294,7 +291,7 @@
 
 .spec-mode-section-credit {
   overflow: hidden;
-  font-size: 0.66rem;
+  font-size: 0.6875rem;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -304,7 +301,7 @@
   flex: none;
   color: var(--muted-foreground);
   font-family: var(--font-mono);
-  font-size: 0.8rem;
+  font-size: 0.75rem;
   line-height: 1;
   text-align: center;
 }
@@ -328,7 +325,7 @@
 .spec-mode-section-flags {
   flex: none;
   color: var(--instrument-caution);
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-section-presence-dots {
@@ -353,7 +350,7 @@
 }
 
 .spec-mode-section-legend > :last-child {
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
   line-height: 1.7;
 }
 
@@ -406,12 +403,12 @@
 
 .spec-mode-section-heading h2 {
   margin: 0;
-  font-size: 1.12rem;
+  font-size: 1.25rem;
   line-height: 1.35;
 }
 
 .spec-mode-document-credit {
-  font-size: 0.66rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-inline-cursors,
@@ -434,10 +431,10 @@
 .spec-mode-inline-cursor-name {
   overflow: hidden;
   max-width: 120px;
-  border-radius: 0 4px 4px 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   padding: 2px 5px;
   color: white;
-  font-size: 0.62rem;
+  font-size: 0.6875rem;
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -453,7 +450,7 @@
 
 .spec-mode-section-content p {
   margin: 0;
-  font-size: 0.92rem;
+  font-size: 0.875rem;
   line-height: 1.72;
   text-wrap: pretty;
 }
@@ -462,7 +459,7 @@
 .spec-mode-section-content ol {
   margin: 0;
   padding-left: 1.4em;
-  font-size: 0.92rem;
+  font-size: 0.875rem;
   line-height: 1.72;
 }
 
@@ -476,11 +473,11 @@
 }
 
 .spec-mode-section-content code {
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: color-mix(in oklab, var(--foreground) 7%, transparent);
   padding: 0.08em 0.34em;
   font-family: var(--font-mono);
-  font-size: 0.86em;
+  font-size: 0.875rem;
 }
 
 /* Same reason as the thread: a spec cites file paths, and a path has no break
@@ -491,7 +488,7 @@
 
 .spec-mode-section-content pre {
   overflow-x: auto;
-  border-radius: 6px;
+  border-radius: var(--radius-lg);
   background: color-mix(in oklab, var(--foreground) 5%, transparent);
   padding: 10px 12px;
 }
@@ -529,13 +526,13 @@
   flex-direction: column;
   gap: 10px;
   border: 1px dashed var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-lg);
   padding: 13px 15px;
   background: var(--secondary);
 }
 
 .spec-mode-empty-copy {
-  font-size: 0.87rem;
+  font-size: 0.875rem;
   line-height: 1.65;
   text-wrap: pretty;
 }
@@ -554,9 +551,9 @@
 
 .spec-mode-provenance-chips span {
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   padding: 2px 7px;
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-provenance-mark {
@@ -572,7 +569,7 @@
   gap: 10px;
   margin: 8px 0;
   border: 1px dashed var(--instrument-caution);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-lg);
   padding: 10px 12px;
   background: color-mix(in oklch, var(--instrument-caution) 8%, transparent);
   vertical-align: middle;
@@ -597,7 +594,7 @@
 .spec-mode-open-question-flag {
   color: var(--instrument-caution);
   font-family: var(--font-mono);
-  font-size: 0.78rem;
+  font-size: 0.75rem;
 }
 
 .spec-mode-open-question-copy {
@@ -609,12 +606,12 @@
 }
 
 .spec-mode-open-question-copy > :first-child {
-  font-size: 0.85rem;
+  font-size: 0.875rem;
   line-height: 1.55;
 }
 
 .spec-mode-open-question-copy > :last-child {
-  font-size: 0.66rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-conversation {
@@ -637,7 +634,7 @@
 }
 
 .spec-mode-conversation-header > :last-child {
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-thread {
@@ -657,7 +654,7 @@
   align-items: center;
   gap: 8px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   padding: 5px 9px;
   color: inherit;
   text-align: left;
@@ -677,20 +674,20 @@
   flex: none;
   color: var(--ring);
   font-family: var(--font-mono);
-  font-size: 0.72rem;
+  font-size: 0.75rem;
 }
 
 .spec-mode-activity-copy {
   min-width: 0;
   flex: 1;
-  font-size: 0.76rem;
+  font-size: 0.75rem;
   line-height: 1.45;
 }
 
 .spec-mode-activity time,
 .spec-mode-human-turn time,
 .spec-mode-agent-turn time {
-  font-size: 0.62rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-human-turn,
@@ -720,24 +717,23 @@
   border-bottom-width: 2px;
   border-radius: var(--radius-sm);
   background: var(--secondary);
-  font-family: var(--font-mono);
-  font-size: 0.62rem;
+  font-size: 0.6875rem;
   font-weight: 600;
 }
 
 .spec-mode-human-bubble {
   max-width: 300px;
   margin: 0;
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   padding: 9px 12px;
   background: var(--secondary);
-  font-size: 0.84rem;
+  font-size: 0.875rem;
   line-height: 1.6;
 }
 
 .spec-mode-agent-copy {
   margin: 0;
-  font-size: 0.84rem;
+  font-size: 0.875rem;
   line-height: 1.68;
   text-wrap: pretty;
 }
@@ -780,7 +776,7 @@
   max-width: 100%;
   overflow-x: auto;
   border-collapse: collapse;
-  font-size: 0.78rem;
+  font-size: 0.75rem;
 }
 
 .spec-mode-markdown th,
@@ -791,7 +787,7 @@
 }
 
 .spec-mode-markdown .md-h {
-  font-size: 0.9rem;
+  font-size: 0.875rem;
 }
 
 .spec-mode-pending {
@@ -821,10 +817,13 @@
 /* Named, not positional: the row gained a trailing Stop button, and a
    `:last-child` rule would have restyled that instead of the label. */
 .spec-mode-thinking-label {
-  font-size: 0.78rem;
+  font-size: 0.75rem;
 }
 
 .spec-mode-conversation-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   border-top: 1px solid var(--border);
   padding: 8px 18px;
   font-size: 0.75rem;
@@ -842,7 +841,7 @@
 
 .spec-mode-next-copy {
   margin: 0;
-  font-size: 0.84rem;
+  font-size: 0.875rem;
   line-height: 1.6;
   text-wrap: pretty;
 }
@@ -887,12 +886,12 @@
   flex: 1;
   resize: none;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   outline: none;
   background: transparent;
   color: var(--foreground);
   font: inherit;
-  font-size: 0.84rem;
+  font-size: 0.875rem;
   line-height: 1.55;
 }
 
@@ -906,11 +905,11 @@
 }
 
 .spec-mode-composer-status {
-  font-size: 0.72rem;
+  font-size: 0.75rem;
 }
 
 .spec-mode-published-document {
-  font-size: 0.94rem;
+  font-size: 0.875rem;
   line-height: 1.75;
   text-wrap: pretty;
 }
@@ -982,7 +981,7 @@
   width: 100%;
   align-items: center;
   gap: 10px;
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   padding: 8px 9px;
   text-align: left;
 }
@@ -999,8 +998,7 @@
 
 .spec-mode-checkpoint-list small {
   color: var(--muted-foreground);
-  font-family: var(--font-mono);
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-checkpoint-order {
@@ -1009,10 +1007,10 @@
   height: 20px;
   place-items: center;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   color: var(--muted-foreground);
   font-family: var(--font-mono);
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
 }
 
 /* CheckpointDiff used to inherit these rules from the deleted read page. */
@@ -1028,14 +1026,14 @@
   padding: 16px;
   background: var(--card);
   font-family: var(--font-sans);
-  font-size: 0.9rem;
+  font-size: 0.875rem;
   line-height: 1.65;
   white-space: pre-wrap;
 }
 
 .spec-diff-segment.is-code {
   font-family: var(--font-mono);
-  font-size: 0.8rem;
+  font-size: 0.75rem;
 }
 
 .spec-diff-segment ins,
@@ -1099,12 +1097,12 @@
 }
 
 .spec-mode-ideation-context > :last-child {
-  font-size: 0.7rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-ideation-title {
   margin: 0;
-  font-size: 1.6rem;
+  font-size: 1.625rem;
   line-height: 1.2;
 }
 
@@ -1118,7 +1116,7 @@
 }
 
 .spec-mode-ideation-person > :last-child {
-  font-size: 0.74rem;
+  font-size: 0.75rem;
 }
 
 .spec-mode-ideation-avatar {
@@ -1131,8 +1129,7 @@
   border-bottom-width: 2px;
   border-radius: var(--radius-sm);
   background: var(--secondary);
-  font-family: var(--font-mono);
-  font-size: 0.64rem;
+  font-size: 0.6875rem;
   font-weight: 600;
 }
 
@@ -1144,7 +1141,7 @@
 .spec-mode-ideation .spec-mode-human-bubble {
   max-width: 460px;
   padding: 11px 14px;
-  font-size: 0.9rem;
+  font-size: 0.875rem;
 }
 
 .spec-mode-ideation .spec-mode-agent-turn {
@@ -1152,12 +1149,12 @@
 }
 
 .spec-mode-ideation .spec-mode-agent-copy {
-  font-size: 0.92rem;
+  font-size: 0.875rem;
   line-height: 1.72;
 }
 
 .spec-mode-ideation .spec-mode-citations span {
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-ideation-empty {
@@ -1190,11 +1187,10 @@
   border-radius: var(--radius);
   padding: 12px 14px;
   background: var(--card);
-  box-shadow: var(--shadow-xs);
 }
 
 .spec-mode-ideation-footer .spec-mode-composer textarea {
-  font-size: 0.92rem;
+  font-size: 0.875rem;
   line-height: 1.6;
 }
 
@@ -1210,7 +1206,7 @@
 .spec-mode-ideation-bridge-note,
 .spec-mode-ideation-start-error {
   margin: 0;
-  font-size: 0.78rem;
+  font-size: 0.75rem;
 }
 
 .spec-mode-ideation-start-error {
@@ -1224,7 +1220,7 @@
   }
 
   .spec-mode-ideation-title {
-    font-size: 1.4rem;
+    font-size: 1.25rem;
   }
 
   .spec-mode-ideation-bridge {
@@ -1278,7 +1274,7 @@
 
 .spec-mode-published-title {
   margin: 0;
-  font-size: 2rem;
+  font-size: 1.875rem;
   line-height: 1.12;
   letter-spacing: -0.025em;
   text-wrap: balance;
@@ -1305,7 +1301,6 @@
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--card);
-  box-shadow: var(--shadow-xs);
 }
 
 .spec-mode-decisions > header {
@@ -1340,7 +1335,7 @@
   padding-top: 2px;
   color: var(--muted-foreground);
   font-family: var(--font-mono);
-  font-size: 0.7rem;
+  font-size: 0.6875rem;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1350,13 +1345,13 @@
 }
 
 .spec-mode-decision-copy {
-  font-size: 0.86rem;
+  font-size: 0.875rem;
   line-height: 1.55;
   text-wrap: pretty;
 }
 
 .spec-mode-decisions li span {
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-decisions-loading,
@@ -1372,7 +1367,7 @@
 .spec-mode-published-document {
   display: grid;
   gap: 24px;
-  font-size: 0.94rem;
+  font-size: 0.875rem;
   line-height: 1.75;
   text-wrap: pretty;
 }
@@ -1406,7 +1401,7 @@
 }
 
 .spec-mode-published-questions h2 {
-  font-size: 1.05rem;
+  font-size: 1rem;
 }
 
 .spec-mode-published-questions ul {
@@ -1422,7 +1417,7 @@
   align-items: flex-start;
   gap: 10px;
   border: 1px dashed var(--instrument-caution);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-lg);
   padding: 10px 12px;
   background: color-mix(in oklch, var(--instrument-caution) 8%, transparent);
 }
@@ -1439,11 +1434,11 @@
 
 .spec-mode-published-questions li p {
   margin: 0;
-  font-size: 0.85rem;
+  font-size: 0.875rem;
 }
 
 .spec-mode-published-questions li span span {
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-published-footer {
@@ -1484,7 +1479,6 @@
   z-index: 5;
   right: 408px;
   bottom: 18px;
-  box-shadow: var(--shadow-sm);
 }
 
 .spec-mode-mobile {
@@ -1527,7 +1521,7 @@
 
 .spec-mode-mobile-status {
   padding-top: 4px;
-  font-size: 0.68rem;
+  font-size: 0.6875rem;
   line-height: 1.45;
 }
 
@@ -1539,8 +1533,7 @@
   place-items: center;
   border-radius: 50%;
   color: white;
-  font-family: var(--font-mono);
-  font-size: 0.62rem;
+  font-size: 0.6875rem;
 }
 
 .spec-mode-mobile-back {
@@ -1592,7 +1585,7 @@
 }
 
 .spec-mode-mobile-document .spec-mode-section-content p {
-  font-size: 0.88rem;
+  font-size: 0.875rem;
   line-height: 1.65;
 }
 
@@ -1603,7 +1596,6 @@
   border-top: 1px solid var(--border);
   padding: 0 0 max(10px, env(safe-area-inset-bottom));
   background: var(--card);
-  box-shadow: 0 -8px 24px color-mix(in oklab, var(--foreground) 8%, transparent);
 }
 
 .spec-mode-mobile-next .spec-mode-next {
@@ -1634,7 +1626,7 @@
   }
 
   .spec-mode-published-title {
-    font-size: 1.65rem;
+    font-size: 1.625rem;
   }
 
   .spec-mode-published-byline {

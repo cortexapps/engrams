@@ -1,15 +1,17 @@
 import {
+  Bandage,
   Box,
   Database,
   FileBox,
-  Gauge,
-  KeyRound,
+  GitPullRequestArrow,
+  HardDrive,
   KeySquare,
   Layers,
   Server,
   SquarePlus,
   User,
   Users,
+  Workflow,
 } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import type { LinkProps } from "@tanstack/react-router";
@@ -50,15 +52,17 @@ interface Dest {
 // so "go to fleet" / "hosts" style typing still lands.
 const DESTS: Dest[] = [
   { to: "/sessions", label: "Tasks", icon: Layers, leader: "s" },
+  { to: "/reviews", label: "Reviews", icon: GitPullRequestArrow },
   { to: "/artifacts", label: "Artifacts", icon: FileBox, leader: "a" },
-  { to: "/operator", label: "Operator", icon: Gauge, admin: true, leader: "o" },
-  { to: "/operator/fleet", label: "Fleet", icon: Server, admin: true, leader: "f" },
-  { to: "/operator/storage", label: "Storage", icon: Database, admin: true },
-  { to: "/operator/images", label: "Images", icon: Box, admin: true },
-  { to: "/operator/registries", label: "Registries", icon: KeyRound, admin: true },
+  { to: "/automations", label: "Automations", icon: Workflow, admin: true, leader: "o" },
   { to: "/settings", label: "Settings · Profile", icon: User, leader: "," },
   { to: "/settings/credentials", label: "Settings · Credentials", icon: KeySquare },
   { to: "/settings/members", label: "Settings · Members", icon: Users, admin: true },
+  { to: "/settings/fleet", label: "Settings · Fleet", icon: Server, admin: true, leader: "f" },
+  { to: "/settings/storage", label: "Settings · Storage", icon: HardDrive, admin: true },
+  { to: "/settings/images", label: "Settings · Images", icon: Box, admin: true },
+  { to: "/settings/registries", label: "Settings · Registries", icon: Database, admin: true },
+  { to: "/settings/papercuts", label: "Settings · Papercuts", icon: Bandage },
 ];
 
 export function CommandMenu() {
@@ -129,11 +133,11 @@ export function CommandMenu() {
                       run(() => navigate({ to: "/sessions/$id", params: { id: r.id } }))
                     }
                   >
-                    <span className="text-[0.7rem] leading-none">
+                    <span className="text-2xs leading-none">
                       <StatusGlyph status={r.status} beat={false} />
                     </span>
                     <span className="flex min-w-0 flex-1 items-baseline gap-2">
-                      <span className="truncate font-mono text-[0.8rem]">{shortId(r.id)}</span>
+                      <span className="truncate font-mono text-sm">{shortId(r.id)}</span>
                       <span className="truncate text-xs text-muted-foreground">
                         {stripImageHost(r.image)}
                       </span>

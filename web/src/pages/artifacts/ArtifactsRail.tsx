@@ -4,7 +4,7 @@ import { TriangleAlert } from "lucide-react";
 
 import { useNow } from "../../hooks/useNow";
 import { useArtifacts } from "../../hooks/useArtifacts";
-import { relativeTime } from "../sessions/session-format";
+import { relativeAge } from "@/lib/relative-time";
 import { KIND_GLYPHS, mediaKind } from "../../lib/artifacts";
 import {
   SidebarContent,
@@ -81,8 +81,8 @@ export function ArtifactsRail() {
                         <Link to="/artifacts/$artifactId" params={{ artifactId: a.id }}>
                           <Glyph className="size-4 shrink-0" />
                           <span className="min-w-0 flex-1 truncate">{a.title}</span>
-                          <span className="shrink-0 font-mono text-[0.65rem] tabular-nums opacity-70">
-                            {relativeTime(a.updatedAt, now)}
+                          <span className="shrink-0 font-mono text-2xs tabular-nums opacity-70">
+                            {relativeAge(a.updatedAt, now)}
                           </span>
                         </Link>
                       </SidebarMenuButton>

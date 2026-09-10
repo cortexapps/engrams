@@ -17,7 +17,7 @@ use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engram_core::traits::{Clock, MetadataStore};
+use engram_core::traits::{Clock, GcCandidateBacklog, MetadataStore, GC_CANDIDATE_EXACT_CAP};
 use engram_core::types::capture_job::{
     CaptureJobReport, CaptureJobStage, CaptureTerminalReport, NewCaptureJob,
 };
@@ -2392,6 +2392,114 @@ async fn latest_snapshot_reports_recoverable_flag(ctx: &Ctx) {
     );
 }
 
+/// Shard-scoped expiry: the `content_hash` range selects exactly its
+/// shard, the grace cutoff still applies inside it, and the limit caps
+/// the page. This is what lets the promote pass hold only one shard
+/// group's pin set instead of the whole thing.
+async fn gc_candidates_shard_range(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let mut h00 = [0u8; 32];
+    h00[0] = 0x00;
+    h00[31] = 1;
+    let mut h00b = [0u8; 32];
+    h00b[0] = 0x00;
+    h00b[31] = 2;
+    let mut h7f = [0u8; 32];
+    h7f[0] = 0x7f;
+    let mut hff = [0u8; 32];
+    hff[0] = 0xff;
+
+    meta.upsert_chunk_gc_candidates(&[h00, h00b, h7f, hff])
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(100));
+    let cutoff = ctx.clock.now_utc();
+
+    let bounds = |shard: u8| -> (Vec<u8>, Vec<u8>) {
+        let mut lo = vec![0u8; 32];
+        lo[0] = shard;
+        if shard == u8::MAX {
+            (lo, vec![0xffu8; 33])
+        } else {
+            let mut hi = vec![0u8; 32];
+            hi[0] = shard + 1;
+            (lo, hi)
+        }
+    };
+
+    // Shard 0x00 holds exactly its two hashes.
+    let (lo, hi) = bounds(0x00);
+    let mut got = meta
+        .list_expired_gc_candidates_in_range(cutoff, &lo, &hi, 10)
+        .await
+        .unwrap();
+    got.sort();
+    assert_eq!(got, vec![h00, h00b], "the range selects only shard 0x00");
+
+    // The LAST shard must not be truncated by an unrepresentable upper
+    // bound — 0xff.. is where an off-by-one silently drops a whole shard.
+    let (lo, hi) = bounds(0xff);
+    let got = meta
+        .list_expired_gc_candidates_in_range(cutoff, &lo, &hi, 10)
+        .await
+        .unwrap();
+    assert_eq!(got, vec![hff], "shard 0xff is reachable, not clipped");
+
+    // An empty shard yields nothing.
+    let (lo, hi) = bounds(0x42);
+    assert!(meta
+        .list_expired_gc_candidates_in_range(cutoff, &lo, &hi, 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The grace cutoff still applies inside the range.
+    let early = cutoff - chrono::Duration::seconds(150);
+    let (lo, hi) = bounds(0x00);
+    assert!(
+        meta.list_expired_gc_candidates_in_range(early, &lo, &hi, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a cutoff before first_seen_at excludes the shard's rows"
+    );
+
+    // The limit caps the page.
+    let (lo, hi) = bounds(0x00);
+    assert_eq!(
+        meta.list_expired_gc_candidates_in_range(cutoff, &lo, &hi, 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Past `exact_cap` the backlog stops being an exact count: a 22.7M-row
+/// candidate table made the Storage surface's `count(*)` a 30s scan.
+/// Below the cap the count is exact and says so; at or past it the store
+/// returns an estimate no lower than the rows it counted, and says it is
+/// not exact.
+async fn gc_candidates_backlog_cap(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    meta.upsert_chunk_gc_candidates(&[[1u8; 32], [2u8; 32], [3u8; 32]])
+        .await
+        .unwrap();
+    assert_eq!(
+        meta.count_gc_candidates(10).await.unwrap(),
+        GcCandidateBacklog {
+            count: 3,
+            exact: true
+        }
+    );
+    let capped = meta.count_gc_candidates(2).await.unwrap();
+    assert!(!capped.exact, "at the cap the count is an estimate");
+    assert!(
+        capped.count >= 2,
+        "an estimate never reads below the rows already counted: {capped:?}"
+    );
+}
+
 /// Batched candidate upsert: same sticky-`first_seen_at` semantics as
 /// the singular form, and mixing the two must not double-count.
 async fn gc_candidates_batched(ctx: &Ctx) {
@@ -2402,17 +2510,32 @@ async fn gc_candidates_batched(ctx: &Ctx) {
 
     // Empty input is a no-op, not an error (and skips the round trip).
     meta.upsert_chunk_gc_candidates(&[]).await.unwrap();
-    assert_eq!(meta.count_gc_candidates().await.unwrap(), 0);
+    assert_eq!(
+        meta.count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .unwrap()
+            .count,
+        0
+    );
 
     meta.upsert_chunk_gc_candidates(&[a, b]).await.unwrap();
-    assert_eq!(meta.count_gc_candidates().await.unwrap(), 2);
+    assert_eq!(
+        meta.count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .unwrap()
+            .count,
+        2
+    );
 
     ctx.clock.advance(Duration::from_secs(100));
     // Re-upsert `a` in a batch alongside a new `c`: `a` keeps its
     // original first_seen_at, `c` gets the later one.
     meta.upsert_chunk_gc_candidates(&[a, c]).await.unwrap();
     assert_eq!(
-        meta.count_gc_candidates().await.unwrap(),
+        meta.count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .unwrap()
+            .count,
         3,
         "re-upsert in a batch does not double-count"
     );
@@ -2432,7 +2555,13 @@ async fn gc_candidates_batched(ctx: &Ctx) {
 
     // The singular and batched forms share one table.
     meta.upsert_chunk_gc_candidate(c).await.unwrap();
-    assert_eq!(meta.count_gc_candidates().await.unwrap(), 3);
+    assert_eq!(
+        meta.count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .unwrap()
+            .count,
+        3
+    );
 }
 
 /// The chunk-sweep lease: exclusive while live, stale takeover, guarded
@@ -2488,12 +2617,21 @@ async fn chunk_gc_sweep_lease(ctx: &Ctx) {
 async fn gc_candidates(ctx: &Ctx) {
     let meta = &ctx.meta;
     let h = [7u8; 32];
-    assert_eq!(meta.count_gc_candidates().await.unwrap(), 0);
+    assert_eq!(
+        meta.count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .unwrap()
+            .count,
+        0
+    );
     meta.upsert_chunk_gc_candidate(h).await.unwrap();
     ctx.clock.advance(Duration::from_secs(100));
     meta.upsert_chunk_gc_candidate(h).await.unwrap(); // sticky first_seen
     assert_eq!(
-        meta.count_gc_candidates().await.unwrap(),
+        meta.count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .unwrap()
+            .count,
         1,
         "re-upsert of the same hash does not double-count"
     );
@@ -2518,7 +2656,10 @@ async fn gc_candidates(ctx: &Ctx) {
         .unwrap()
         .is_empty());
     assert_eq!(
-        meta.count_gc_candidates().await.unwrap(),
+        meta.count_gc_candidates(GC_CANDIDATE_EXACT_CAP)
+            .await
+            .unwrap()
+            .count,
         0,
         "delete drops the candidate from the count"
     );
@@ -4031,6 +4172,14 @@ conformance!(t_outbox_flow, super::outbox_flow);
 conformance!(t_snapshot_durable_head, super::snapshot_durable_head);
 conformance!(t_gc_candidates, super::gc_candidates);
 conformance!(t_gc_candidates_batched, super::gc_candidates_batched);
+conformance!(
+    t_gc_candidates_backlog_cap,
+    super::gc_candidates_backlog_cap
+);
+conformance!(
+    t_gc_candidates_shard_range,
+    super::gc_candidates_shard_range
+);
 conformance!(t_chunk_gc_sweep_lease, super::chunk_gc_sweep_lease);
 conformance!(t_host_lifecycle, super::host_lifecycle);
 conformance!(t_bundle_pin_set_union, super::bundle_pin_set_union);

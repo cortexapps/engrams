@@ -62,6 +62,29 @@ use crate::store::ChunkStore;
 /// operator tuning.
 pub const DEFAULT_COLLECT_CONCURRENCY: usize = 16;
 
+/// Hash-prefix shards the chunk space splits into — one per value of a
+/// hash's first byte. Mirrors the coordinator's sweep sharding.
+pub const SHARD_SPACE: usize = 256;
+
+/// Every shard enabled: the unfiltered pin set.
+pub const ALL_SHARDS: [bool; SHARD_SPACE] = [true; SHARD_SPACE];
+
+/// Inclusive-exclusive `content_hash` bounds for one shard, for a PK
+/// range scan on `chunk_gc_candidates`.
+pub fn shard_hash_bounds(shard: u8) -> (Vec<u8>, Vec<u8>) {
+    let mut lo = vec![0u8; 32];
+    lo[0] = shard;
+    let mut hi = vec![0u8; 32];
+    if shard == u8::MAX {
+        // Past the last shard: an all-0xFF..FF+1 bound is unrepresentable
+        // in 32 bytes, so use a 33-byte value that sorts after every hash.
+        hi = vec![0xFFu8; 33];
+    } else {
+        hi[0] = shard + 1;
+    }
+    (lo, hi)
+}
+
 /// Outcome of [`PinSet::collect_converging`].
 #[derive(Debug)]
 pub struct PinSetCollection {
@@ -191,6 +214,34 @@ impl PinSet {
         concurrency: usize,
         max_rounds: usize,
     ) -> Result<PinSetCollection, GcError> {
+        Self::collect_converging_for_shards(meta, chunk_store, concurrency, max_rounds, &ALL_SHARDS)
+            .await
+    }
+
+    /// As [`Self::collect_converging`], but keeping ONLY hashes whose
+    /// first byte is an enabled shard.
+    ///
+    /// This is what stops pin-set memory scaling with the fleet. The set
+    /// was a materialized `HashSet` of EVERY pinned chunk — ~14M hashes,
+    /// 500 MB to 1 GB of coordinator heap — and it grows forever, so any
+    /// memory limit only decides when the OOM lands. It landed on
+    /// 2026-09-03: the sweep was OOMKilled repeatedly, the cursor froze,
+    /// and reclamation stopped for four days after freeing 35 TB.
+    ///
+    /// The key space was already walked in hash-prefix shards; the pin
+    /// set simply was not. A chunk `ab...` can only ever be pinned-or-not
+    /// while walking shard `ab`, so every entry outside the shards this
+    /// tick will touch is dead weight for the entire walk. Filtering
+    /// during the fan-out costs NOTHING extra — same single pass over the
+    /// manifests — and makes memory `pin_set * shards_this_tick / 256`,
+    /// i.e. a tuning knob rather than a function of fleet size.
+    pub async fn collect_converging_for_shards(
+        meta: &dyn MetadataStore,
+        chunk_store: &ChunkStore,
+        concurrency: usize,
+        max_rounds: usize,
+        shards: &[bool; SHARD_SPACE],
+    ) -> Result<PinSetCollection, GcError> {
         let concurrency = concurrency.max(1);
         let max_rounds = max_rounds.max(1);
         let mut fetched: HashSet<ManifestRef> = HashSet::new();
@@ -210,7 +261,7 @@ impl PinSet {
                 });
             }
 
-            Self::fetch_into(chunk_store, &new, concurrency, &mut chunks).await?;
+            Self::fetch_into(chunk_store, &new, concurrency, shards, &mut chunks).await?;
             fetched.extend(new);
             rounds += 1;
 
@@ -233,6 +284,7 @@ impl PinSet {
         chunk_store: &ChunkStore,
         refs: &[ManifestRef],
         concurrency: usize,
+        shards: &[bool; SHARD_SPACE],
         chunks: &mut HashSet<ChunkHash>,
     ) -> Result<(), GcError> {
         let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -250,7 +302,11 @@ impl PinSet {
         }
         while let Some(result) = fetches.next().await {
             for chunk_ref in result?.chunks {
-                chunks.insert(chunk_ref.hash);
+                // The filter that bounds memory: a hash outside this
+                // tick's shards can never be tested against.
+                if shards[chunk_ref.hash.as_bytes()[0] as usize] {
+                    chunks.insert(chunk_ref.hash);
+                }
             }
         }
         Ok(())

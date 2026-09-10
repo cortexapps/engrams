@@ -4,6 +4,8 @@ import { Check } from "lucide-react";
 import { RadioGroup as RadioGroupPrimitive } from "radix-ui";
 
 import { TaskComposer, type TaskComposerState } from "@/components/composer/TaskComposer";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { useProfiles } from "@/hooks/useProfiles";
 import { RadioGroup } from "@/components/ui/radio-group";
 import { Text } from "@/components/ui/text";
@@ -86,16 +88,9 @@ export function NewSpecPage() {
       data-testid="new-spec"
     >
       <div className="mx-auto flex w-full max-w-[680px] flex-col gap-7">
-        <header className="grid gap-3">
-          <Text as="p" variant="label" tone="muted">
-            New spec
-          </Text>
-          <Text as="h1" id="new-spec-title" variant="display" className="text-[2rem]">
+        <header>
+          <Text as="h1" id="new-spec-title" variant="display" className="text-2xl">
             What are we designing?
-          </Text>
-          <Text tone="muted" className="max-w-[60ch] text-[0.92rem]">
-            Rough is fine. I read the code before I ask you anything, so the first thing you see is
-            what I found — not a blank page.
           </Text>
         </header>
 
@@ -104,17 +99,15 @@ export function NewSpecPage() {
             <Text as="legend" variant="label" tone="muted">
               Shape
             </Text>
-            <Text variant="code" tone="muted" className="text-right text-xs">
+            <Text tone="muted" className="text-right text-xs">
               {TEMPLATE_LOCK_REASON}
             </Text>
           </div>
 
           {templates.isPending ? (
-            <Text tone="muted">Loading shapes…</Text>
+            <SkeletonRows rows={1} columns={["minmax(0,1fr)", "minmax(0,1fr)", "minmax(0,1fr)"]} />
           ) : templates.error ? (
-            <Text role="alert" tone="destructive">
-              The shapes did not load. {templates.error.message}
-            </Text>
+            <EmptyState tone="error">The shapes did not load. {templates.error.message}</EmptyState>
           ) : (
             <RadioGroup
               className="grid-cols-1 sm:grid-cols-3"
@@ -133,7 +126,7 @@ export function NewSpecPage() {
                     key={template.id}
                     value={template.id}
                     data-selected={selected || undefined}
-                    className="relative block aspect-auto size-auto min-h-32 rounded-lg border bg-card p-4 text-left shadow-xs transition-[border-color,background-color,box-shadow] outline-none hover:bg-accent/40 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60 data-[selected=true]:border-ring data-[selected=true]:bg-accent/40"
+                    className="relative block aspect-auto size-auto min-h-32 rounded-lg border bg-card p-4 text-left transition-[border-color,background-color] outline-none hover:bg-accent/40 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60 data-[selected=true]:border-ring data-[selected=true]:bg-accent/40"
                   >
                     {selected ? (
                       <Check
@@ -144,7 +137,7 @@ export function NewSpecPage() {
                     <Text as="span" variant="heading" className="block pr-5 text-sm">
                       {template.name}
                     </Text>
-                    <Text as="span" tone="muted" className="mt-2 block text-[0.79rem]">
+                    <Text as="span" tone="muted" className="mt-2 block text-xs">
                       {template.description}
                     </Text>
                     <Text as="span" variant="code" tone="muted" className="mt-3 block text-xs">
@@ -170,13 +163,18 @@ export function NewSpecPage() {
           onSubmit={submit}
         />
 
+        <p className="text-xs text-muted-foreground">
+          Rough is fine. I read the code before I ask you anything, so the first thing you see is
+          what I found — not a blank page.
+        </p>
+
         {create.error ? (
-          <Text role="alert" tone="destructive">
+          <EmptyState inline tone="error">
             The spec did not start. {create.error.message}
-          </Text>
+          </EmptyState>
         ) : null}
 
-        <Text variant="code" tone="muted" className="text-xs">
+        <Text tone="muted" className="text-xs">
           {reconRepos.length > 0
             ? `Reads ${reconRepos.join(", ")} · about 40 seconds`
             : "Recon takes about 40 seconds"}

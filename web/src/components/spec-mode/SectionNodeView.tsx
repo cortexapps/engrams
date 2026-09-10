@@ -89,7 +89,7 @@ export function SectionNodeView({ editor, getPos, node }: NodeViewProps) {
           {section.title}
         </Text>
         {section.state === "settled" && section.credit ? (
-          <Text as="span" variant="code" tone="muted" className="spec-mode-document-credit">
+          <Text as="span" tone="muted" className="spec-mode-document-credit">
             Settled by {section.credit.by.name}
           </Text>
         ) : null}
@@ -162,7 +162,7 @@ export function SectionNodeView({ editor, getPos, node }: NodeViewProps) {
               Drop
             </Button>
           </div>
-          <Text as="span" variant="code" tone="muted">
+          <Text as="span" tone="muted" className="text-xs">
             Proposed — Keep settles it
           </Text>
         </div>
@@ -197,7 +197,6 @@ export function InlineSectionPresence({
           />
           <Text
             as="span"
-            variant="code"
             className="spec-mode-inline-cursor-name"
             style={{ backgroundColor: person.color }}
           >

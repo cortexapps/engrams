@@ -39,7 +39,7 @@ export function StatusGlyph({ status, beat = true, attention = false }: GlyphPro
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: 0.35, ease: "easeOut" }}
-      className={`inline-block leading-none ${isLive ? "animate-pulse motion-reduce:animate-none" : ""}`}
+      className={`inline-block leading-none ${isLive ? "animate-live" : ""}`}
       style={{ color: tone }}
       aria-label={attention ? `${status} — waiting on you` : status}
     >

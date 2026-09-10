@@ -56,6 +56,9 @@ pub struct StorageSummaryResponse {
     pub snapshot_bytes: u64,
     /// Chunks parked in `chunk_gc_candidates` awaiting their grace window.
     pub gc_pending: u64,
+    /// False when `gc_pending` is an estimate: the table passed the
+    /// exact-count cap (`GC_CANDIDATE_EXACT_CAP`).
+    pub gc_pending_exact: bool,
     /// Number of chunk-tracked sandboxes across the fleet (ledger length).
     pub tracked_sandboxes: u64,
     /// Sum of dirty chunks across the ledger.
@@ -138,12 +141,17 @@ pub(crate) async fn storage_summary_core(
     };
 
     let totals = state.services.meta.snapshot_totals().await?;
-    let gc_pending = state.services.meta.count_gc_candidates().await?;
+    let backlog = state
+        .services
+        .meta
+        .count_gc_candidates(engram_core::traits::GC_CANDIDATE_EXACT_CAP)
+        .await?;
 
     Ok(StorageSummaryResponse {
         snapshots: totals.count,
         snapshot_bytes: totals.total_bytes,
-        gc_pending,
+        gc_pending: backlog.count,
+        gc_pending_exact: backlog.exact,
         tracked_sandboxes: rows.len() as u64,
         dirty_chunks,
         unflushed_bytes,

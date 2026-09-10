@@ -26,6 +26,8 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { MintFieldKind } from "@/gen/engram/app/v1/mint_pb";
 import {
   useConnectors,
@@ -59,12 +61,12 @@ export function IntegrationDetail() {
     window.history.replaceState({}, "", window.location.pathname);
   }, []);
 
-  if (isLoading) return <p className="py-6 text-sm text-muted-foreground">Loading…</p>;
+  if (isLoading) return <SkeletonRows rows={3} />;
   if (!view) {
     return (
       <div className="mx-auto max-w-3xl">
         <BackLink />
-        <p className="mt-4 text-sm text-muted-foreground">No connector "{provider}".</p>
+        <EmptyState className="mt-4">No connector "{provider}".</EmptyState>
       </div>
     );
   }
@@ -175,7 +177,7 @@ function DetailBody({ view }: { view: ConnectorView }) {
               )}
             </div>
             <div className="mt-1 flex items-center gap-2.5 text-sm text-muted-foreground">
-              <Text variant="label" tone="muted" className="text-[0.56rem]">
+              <Text variant="label" tone="muted" className="text-2xs">
                 {view.category}
               </Text>
               <span>· {view.builtin ? "built-in" : "custom"}</span>
@@ -288,7 +290,7 @@ function DetailBody({ view }: { view: ConnectorView }) {
 
       {/* powers */}
       <section className="flex flex-col gap-2.5">
-        <Text variant="label">Powers · {view.capabilities.length}</Text>
+        <h2 className="text-sm font-semibold">Powers · {view.capabilities.length}</h2>
         <div className="flex flex-col gap-1.5">
           {view.capabilities.map((cap) => (
             <div
@@ -297,7 +299,7 @@ function DetailBody({ view }: { view: ConnectorView }) {
             >
               <span className="flex-1 text-sm">{humanizeAction(cap.action)}</span>
               {cap.asset && (
-                <span className="inline-flex items-center gap-1 text-[0.7rem] text-muted-foreground">
+                <span className="inline-flex items-center gap-1 text-2xs text-muted-foreground">
                   <LayersIcon className="size-3" />
                   {cap.asset.replace(/_/g, " ")}
                 </span>
@@ -313,7 +315,7 @@ function DetailBody({ view }: { view: ConnectorView }) {
 
       {/* egress */}
       <section className="flex flex-col gap-2.5">
-        <Text variant="label">Egress it can open</Text>
+        <h2 className="text-sm font-semibold">Egress it can open</h2>
         <div className="flex flex-wrap gap-1.5">
           {view.hosts.map((h) => (
             <HostChip key={h} host={h} derived />
@@ -323,8 +325,8 @@ function DetailBody({ view }: { view: ConnectorView }) {
 
       {/* in a session */}
       <section className="flex flex-col gap-2">
-        <Text variant="label">In a session</Text>
-        <p className="text-[0.78rem] leading-relaxed text-muted-foreground">
+        <h2 className="text-sm font-semibold">In a session</h2>
+        <p className="text-xs leading-relaxed text-muted-foreground">
           Every call this integration makes is tagged with its mark — in the run timeline, in audit,
           and on any asset it produces.
         </p>
@@ -339,7 +341,7 @@ function DetailBody({ view }: { view: ConnectorView }) {
               {e.ref && <code className="font-mono text-xs text-muted-foreground">{e.ref}</code>}
               <span className="flex-1" />
               {e.asset && (
-                <span className="inline-flex items-center gap-1 text-[0.68rem] text-muted-foreground">
+                <span className="inline-flex items-center gap-1 text-2xs text-muted-foreground">
                   <LayersIcon className="size-3" />
                   {e.asset.replace(/_/g, " ")}
                 </span>
@@ -358,15 +360,15 @@ function DetailBody({ view }: { view: ConnectorView }) {
 
       {/* used by */}
       <section className="flex flex-col gap-2.5">
-        <Text variant="label">
+        <h2 className="text-sm font-semibold">
           Used by · {view.usedBy} profile{view.usedBy === 1 ? "" : "s"}
-        </Text>
+        </h2>
         {view.usedByProfiles.length === 0 ? (
-          <span className="text-sm text-muted-foreground">No profile grants its powers yet.</span>
+          <EmptyState inline>No profile grants its powers yet.</EmptyState>
         ) : (
           <div className="flex flex-wrap gap-2">
             {view.usedByProfiles.map((p) => (
-              <Button key={p.id} asChild variant="secondary" size="sm" className="rounded-full">
+              <Button key={p.id} asChild variant="secondary" size="sm">
                 <Link to="/settings/profiles/$id" params={{ id: p.id }}>
                   {p.name}
                   <ArrowUpRightIcon className="size-3 opacity-60" />

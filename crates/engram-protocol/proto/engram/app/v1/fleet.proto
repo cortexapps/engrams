@@ -274,6 +274,9 @@ message GetStorageSummaryResponse {
   // chunks. 0 when nothing is tracked yet.
   uint32 avg_locality_pct = 7;
   repeated DurabilityRow rows = 8;
+  // False when `gc_pending` is the stats system's live-tuple estimate:
+  // past 100k rows an exact count is a full scan (30s at 22.7M rows).
+  bool gc_pending_exact = 9;
 }
 
 // One per-sandbox row of the durability ledger.

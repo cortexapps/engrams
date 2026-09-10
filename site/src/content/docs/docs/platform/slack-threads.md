@@ -49,6 +49,6 @@ Slack threads is an ordinary automation with its structure locked. Its trigger i
 app mention event, scoped to the keys of the `channels` map, with thread messages marked as
 continue-only so a reply can join the run that owns the thread but never start a second one.
 Its concurrency key is the thread, with the join policy, which is what keeps one run per
-thread. The Runs tab under the automation lists each thread's run with its step timeline, and
+thread. The Activity tab under the automation lists each thread's run with its step trace, and
 Duplicate gives you an editable copy if you want a different flow. See
 [Automations](../automations/) for the model.

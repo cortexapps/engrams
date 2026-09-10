@@ -5,11 +5,12 @@ import * as z from "zod";
 import { useAddRegistry, useDeleteRegistry, useRegistries } from "../../hooks/useRegistries";
 import type { RegistryAuthKind, RegistryCredentialSummary } from "../../lib/types";
 import { PageHeading } from "../page-heading";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { textVariants } from "@/components/ui/text";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -51,6 +52,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { relativeAge } from "@/lib/relative-time";
 
 // Registries panel — operators register Docker registries with a static
 // credential (sealed under the deployment KEK) or an ambient cloud-IAM
@@ -68,19 +70,18 @@ export function RegistriesPanel() {
         actions={<AddRegistryDialog />}
       />
 
-      {error && (
-        <p className="text-sm text-destructive">Could not load registries — {String(error)}</p>
-      )}
+      {error && <EmptyState tone="error">Could not load registries — {String(error)}</EmptyState>}
 
       {isLoading ? (
-        <p className="py-6 text-sm text-muted-foreground">Loading…</p>
+        <SkeletonRows
+          rows={3}
+          columns={["minmax(12rem,1fr)", "8rem", "minmax(10rem,1fr)", "6rem", "6rem"]}
+        />
       ) : rows.length === 0 ? (
-        <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            No registries yet. Register a Docker registry to enable image pulls from outside your
-            local network.
-          </CardContent>
-        </Card>
+        <EmptyState>
+          No registries yet. Register a Docker registry to enable image pulls from outside your
+          local network.
+        </EmptyState>
       ) : (
         <Table>
           <TableHeader>
@@ -126,7 +127,7 @@ function RegistryRow({ row }: { row: RegistryCredentialSummary }) {
         className="font-mono text-xs text-muted-foreground"
         title={new Date(row.created_at).toLocaleString()}
       >
-        {timeAgo(row.created_at)}
+        {relativeAge(row.created_at)}
       </TableCell>
       <TableCell>
         <div className="flex items-center justify-end">
@@ -154,9 +155,9 @@ function RegistryRow({ row }: { row: RegistryCredentialSummary }) {
           </AlertDialog>
         </div>
         {del.error && (
-          <p className="mt-1 text-right text-xs text-destructive">
+          <EmptyState tone="error" inline className="mt-1 items-end text-right">
             Could not remove — {String(del.error)}
-          </p>
+          </EmptyState>
         )}
       </TableCell>
     </TableRow>
@@ -330,10 +331,7 @@ function AddRegistryDialog() {
                               {card.hint && (
                                 <Badge
                                   variant="secondary"
-                                  className={cn(
-                                    textVariants({ variant: "label" }),
-                                    "text-[0.62rem]",
-                                  )}
+                                  className={cn(textVariants({ variant: "label" }), "text-2xs")}
                                 >
                                   {card.hint}
                                 </Badge>
@@ -472,19 +470,4 @@ function AddRegistryDialog() {
       </DialogContent>
     </Dialog>
   );
-}
-
-function timeAgo(iso: string): string {
-  const then = new Date(iso).getTime();
-  const now = Date.now();
-  if (Number.isNaN(then)) return iso;
-  const seconds = Math.max(0, Math.floor((now - then) / 1000));
-  if (seconds < 60) return "just now";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  return new Date(iso).toLocaleDateString();
 }

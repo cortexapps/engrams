@@ -1,8 +1,11 @@
 import { Fragment } from "react";
-import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot, type StatusTone } from "@/components/status-dot";
 import { useSessionCheckpoints } from "../hooks/useCheckpoints";
-import { fmtAgo, fmtBytes } from "../format";
+import { fmtBytes } from "../format";
+import { relativeTime } from "@/lib/relative-time";
 import type { CheckpointSummary } from "../lib/types";
 
 // ADR 0028 A.log / Fix A: the consolidated durability view for a
@@ -32,36 +35,30 @@ function toneOf(c: CheckpointSummary): Tone {
   return c.recoverable ? "recoverable" : "unverified";
 }
 
-const DOT: Record<Tone, string> = {
-  anchor: "bg-instrument-nominal",
-  recoverable: "bg-muted-foreground/40",
-  unverified: "border border-instrument-caution bg-card",
-};
-
-const BADGE: Record<Tone, string> = {
-  anchor: "border-instrument-nominal/40 text-instrument-nominal",
-  recoverable: "text-muted-foreground",
-  unverified: "border-instrument-caution/40 text-instrument-caution",
-};
-
 const LABEL: Record<Tone, string> = {
-  anchor: "anchor",
-  recoverable: "recoverable",
-  unverified: "unverified",
+  anchor: "Anchor",
+  recoverable: "Recoverable",
+  unverified: "Unverified",
 };
+
+function statusTone(tone: Tone): StatusTone {
+  if (tone === "anchor") return "nominal";
+  if (tone === "unverified") return "caution";
+  return "muted";
+}
 
 export function DurabilityTimeline({ sessionId }: { sessionId: string }) {
   const { data, isLoading } = useSessionCheckpoints(sessionId);
   const checkpoints = data?.checkpoints ?? [];
 
   if (isLoading && checkpoints.length === 0) {
-    return null;
+    return <SkeletonRows rows={2} />;
   }
   if (checkpoints.length === 0) {
     return (
-      <p className="text-xs text-muted-foreground italic">
-        no checkpoints yet — recovery falls back to the latest disk flush.
-      </p>
+      <EmptyState inline className="px-0">
+        No checkpoints yet — recovery falls back to the latest disk flush.
+      </EmptyState>
     );
   }
 
@@ -88,14 +85,10 @@ function TimelineStrip({ ordered }: { ordered: CheckpointSummary[] }) {
           <Fragment key={c.snapshot_id}>
             {i > 0 && <span aria-hidden className="h-px w-2 shrink-0 bg-border" />}
             <span
-              aria-hidden
-              title={`${fmtAgo(c.created_at)} · ${fmtBytes(c.size_bytes)} · ${LABEL[tone]}`}
-              className={cn(
-                "size-2 shrink-0 rounded-full",
-                DOT[tone],
-                c.is_latest && "ring-2 ring-instrument-nominal/25",
-              )}
-            />
+              title={`${relativeTime(c.created_at)} · ${fmtBytes(c.size_bytes)} · ${LABEL[tone]}`}
+            >
+              <StatusDot tone={statusTone(tone)} size={8} />
+            </span>
           </Fragment>
         );
       })}
@@ -114,15 +107,15 @@ function ChainList({ checkpoints }: { checkpoints: CheckpointSummary[] }) {
             className="flex items-center gap-2 border-b border-dashed border-border py-1.5 last:border-0"
             title={`snapshot ${c.snapshot_id} · events cursor ${c.events_cursor ?? "unresolved"}`}
           >
-            <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", DOT[tone])} />
-            <span className="font-mono tabular-nums text-foreground">{fmtAgo(c.created_at)}</span>
+            <StatusDot tone={statusTone(tone)} size={6} />
+            <span className="font-mono tabular-nums text-foreground">
+              {relativeTime(c.created_at)}
+            </span>
             <span className="ml-auto font-mono tabular-nums text-muted-foreground">
               {fmtBytes(c.size_bytes)}
             </span>
-            <Badge
-              variant="outline"
-              className={cn("shrink-0 px-1.5 py-0 text-[0.65rem] font-normal", BADGE[tone])}
-            >
+            <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-2xs font-normal">
+              <StatusDot tone={statusTone(tone)} size={6} />
               {LABEL[tone]}
             </Badge>
           </li>

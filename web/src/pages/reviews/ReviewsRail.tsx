@@ -3,12 +3,18 @@ import { Link, useRouterState } from "@tanstack/react-router";
 import { ListChecks, TriangleAlert } from "lucide-react";
 
 import { useNow } from "../../hooks/useNow";
-import { useReviews } from "../../hooks/useReviews";
-import { relativeTime } from "../sessions/session-format";
+import { useReviewsInfinite } from "../../hooks/useReviews";
+import { useDebouncedValue } from "../../hooks/useDebouncedValue";
+import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
+import { relativeAge } from "@/lib/relative-time";
+import { EngramMark } from "../../components/EngramMark";
 import { LivePulse } from "../../components/LivePulse";
 import { ReviewGlyph } from "./ReviewGlyph";
 import { groupByPr } from "./review-groups";
 import { isActive, prTitleOf, reviewCreatedAt, stageOf } from "./review-format";
+
+/** Pull requests per page of the rail. */
+const PAGE_SIZE = 25;
 import {
   SidebarContent,
   SidebarFooter,
@@ -35,27 +41,23 @@ import {
 
 export function ReviewsRail() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const { data, isPending, error } = useReviews();
   const now = useNow();
   const [search, setSearch] = useState("");
+  const debounced = useDebouncedValue(search, 150).trim();
 
-  const groups = useMemo(() => groupByPr(data?.reviews ?? []), [data?.reviews]);
+  // The search runs on the server, over what the row shows — the repo, the
+  // number, the title and the author — so searching for "quinn" finds the PR a
+  // developer remembers by name, on whichever page it sits. The rail reads a
+  // page of pull requests at a time, like the tasks rail.
+  const { reviews, hasNextPage, isFetchingNextPage, fetchNextPage, isPending, error } =
+    useReviewsInfinite({ search: debounced }, PAGE_SIZE);
+  const loadMoreRef = useLoadMoreSentinel({
+    hasMore: hasNextPage,
+    isFetching: isFetchingNextPage,
+    onLoadMore: fetchNextPage,
+  });
 
-  // Match on what the row actually shows — the repo, the number, and the title
-  // when we have one — so searching for "quinn" finds the PR a developer
-  // remembers by name rather than by coordinate.
-  const rows = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    if (!needle) return groups;
-    return groups.filter((g) => {
-      const title = prTitleOf(g.latest) ?? "";
-      return (
-        g.repo.toLowerCase().includes(needle) ||
-        String(g.prNumber).includes(needle) ||
-        title.toLowerCase().includes(needle)
-      );
-    });
-  }, [groups, search]);
+  const rows = useMemo(() => groupByPr(reviews), [reviews]);
 
   // The dossier route is /reviews/<id>; the ledger index is /reviews itself.
   const openId = pathname.startsWith("/reviews/") ? pathname.split("/")[2] : undefined;
@@ -136,7 +138,7 @@ export function ReviewsRail() {
                               no room for the stage word, so the word goes to
                               assistive tech only — otherwise a rail row announces
                               a PR with no indication of what happened to it. */}
-                          <span className="mt-0.5 shrink-0 text-[0.7rem] leading-none">
+                          <span className="mt-0.5 shrink-0 text-2xs leading-none">
                             <ReviewGlyph status={review.status} />
                             <span className="sr-only">{stageOf(review.status).label}</span>
                           </span>
@@ -147,16 +149,14 @@ export function ReviewsRail() {
                                 recorded before capture landed) keep the number
                                 alone rather than showing a blank. */}
                             <span className="flex min-w-0 items-baseline gap-1.5">
-                              <span className="shrink-0 font-mono text-[0.7rem] leading-tight tabular-nums text-sidebar-foreground/85">
+                              <span className="shrink-0 font-mono text-2xs leading-tight tabular-nums text-sidebar-foreground/85">
                                 #{group.prNumber}
                               </span>
                               {title && (
-                                <span className="truncate text-[0.8rem] leading-tight">
-                                  {title}
-                                </span>
+                                <span className="truncate text-sm leading-tight">{title}</span>
                               )}
                             </span>
-                            <span className="flex min-w-0 items-baseline gap-1.5 text-[0.7rem] leading-tight text-sidebar-foreground/85">
+                            <span className="flex min-w-0 items-baseline gap-1.5 text-2xs leading-tight text-sidebar-foreground/85">
                               <span className="truncate font-mono">{group.repo}</span>
                               {total > 0 && (
                                 <span className="shrink-0 tabular-nums">
@@ -180,9 +180,9 @@ export function ReviewsRail() {
                             {at && (
                               <span
                                 title={at.toLocaleString()}
-                                className="mt-0.5 font-mono text-[0.65rem] tabular-nums text-sidebar-foreground/85"
+                                className="mt-0.5 font-mono text-2xs tabular-nums text-sidebar-foreground/85"
                               >
-                                {relativeTime(at.toISOString(), now)}
+                                {relativeAge(at.toISOString(), now)}
                               </span>
                             )}
                           </span>
@@ -193,6 +193,17 @@ export function ReviewsRail() {
                 })
               )}
             </SidebarMenu>
+            {/* The sentinel is the loader: the trace runs while the next page
+                reads, the same mark the tasks rail shows. */}
+            {hasNextPage && (
+              <div
+                ref={loadMoreRef}
+                aria-hidden
+                className="flex justify-center py-1.5 text-sidebar-foreground/70"
+              >
+                <EngramMark size={16} mode="loader" ground="cover" />
+              </div>
+            )}
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>

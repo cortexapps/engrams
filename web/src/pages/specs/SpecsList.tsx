@@ -1,17 +1,19 @@
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
-import { CircleHelp, FilePenLine } from "lucide-react";
+import { CircleHelp } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import type { SpecListItem } from "../../gen/engram/app/v1/spec_pb";
 import { useNow } from "../../hooks/useNow";
 import { useSpecs, type SpecPhaseFilter } from "../../hooks/useSpecs";
 import { errorMessage } from "../../lib/errors";
-import { relativeTime } from "../sessions/session-format";
+import { relativeAge } from "@/lib/relative-time";
 import { SpecTicketSyncBadge } from "./SpecTicketSyncBadge";
 import { Avatar, AvatarFallback, AvatarGroup, AvatarGroupCount } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/empty-state";
+import { SkeletonRows } from "@/components/skeleton-rows";
+import { StatusDot } from "@/components/status-dot";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Table,
@@ -69,18 +71,11 @@ export function SpecsList() {
       {isPending ? (
         <SpecListSkeleton />
       ) : error ? (
-        <div role="alert" className="rounded-lg border border-dashed py-12 text-center">
-          <p className="text-sm text-destructive">
-            Couldn’t load tech specs. {errorMessage(error)}
-          </p>
-        </div>
+        <EmptyState tone="error">Couldn’t load tech specs. {errorMessage(error)}</EmptyState>
       ) : data.totalCount === 0 ? (
-        <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-16 text-center">
-          <FilePenLine className="size-10 text-muted-foreground" strokeWidth={1} aria-hidden />
-          <p className="max-w-sm text-sm text-muted-foreground">
-            {phase === "all" ? "No tech specs yet." : `No ${phase} tech specs.`}
-          </p>
-        </div>
+        <EmptyState>
+          {phase === "all" ? "No tech specs yet." : `No ${phase} tech specs.`}
+        </EmptyState>
       ) : (
         <>
           <Table className="min-w-[880px]">
@@ -170,6 +165,16 @@ export function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
       </TableCell>
       <TableCell>
         <Badge variant={spec.phase === "published" ? "outline" : "secondary"}>
+          <StatusDot
+            size={6}
+            tone={
+              spec.phase === "published"
+                ? "nominal"
+                : spec.phase === "drafting"
+                  ? "active"
+                  : "caution"
+            }
+          />
           {spec.phase === "published"
             ? "Published"
             : spec.phase === "ideation"
@@ -208,7 +213,7 @@ export function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
         )}
       </TableCell>
       <TableCell className="text-right font-mono text-xs tabular-nums text-muted-foreground">
-        {relativeTime(spec.updatedAt, now)}
+        {relativeAge(spec.updatedAt, now)}
       </TableCell>
     </TableRow>
   );
@@ -263,19 +268,10 @@ function initials(value: string): string {
 
 function SpecListSkeleton() {
   return (
-    <div role="status" aria-label="Loading tech specs" className="space-y-2">
-      {Array.from({ length: 5 }).map((_, index) => (
-        <div key={index} className="flex items-center gap-4 border-b px-2 py-3">
-          <div className="min-w-0 flex-1 space-y-2">
-            <Skeleton className="h-4 w-2/5" />
-            <Skeleton className="h-3 w-1/4" />
-          </div>
-          <Skeleton className="h-5 w-16 rounded-full" />
-          <Skeleton className="h-6 w-20" />
-          <Skeleton className="h-4 w-10" />
-          <Skeleton className="h-4 w-16" />
-        </div>
-      ))}
-    </div>
+    <SkeletonRows
+      rows={5}
+      columns={["minmax(0,1fr)", "72px", "80px", "64px", "64px", "56px"]}
+      className="min-w-[880px]"
+    />
   );
 }

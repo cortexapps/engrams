@@ -8834,6 +8834,36 @@ impl MetadataStore for PostgresStore {
     /// ADR 0016 Phase C: batch-delete candidate rows. Empty input
     /// is a no-op (skip the round-trip). PG handles the array via
     /// `ANY($1::bytea[])`.
+    /// Shard-scoped expiry read. The `content_hash` range rides the PK,
+    /// and there is intentionally no ORDER BY — see the trait doc.
+    async fn list_expired_gc_candidates_in_range(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        lo: &[u8],
+        hi: &[u8],
+        limit: i64,
+    ) -> Result<Vec<[u8; 32]>, MetaError> {
+        let rows = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT content_hash
+               FROM chunk_gc_candidates
+              WHERE content_hash >= $2
+                AND content_hash <  $3
+                AND first_seen_at < $1
+              LIMIT $4",
+        )
+        .bind(cutoff)
+        .bind(lo)
+        .bind(hi)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+            .collect())
+    }
+
     async fn delete_gc_candidates(&self, hashes: &[[u8; 32]]) -> Result<(), MetaError> {
         if hashes.is_empty() {
             return Ok(());
@@ -9239,12 +9269,39 @@ impl MetadataStore for PostgresStore {
 
     /// ADR 0029: count of chunks parked in `chunk_gc_candidates`
     /// awaiting their grace window — the Storage surface's "gc pending".
-    async fn count_gc_candidates(&self) -> Result<u64, MetaError> {
-        let count: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM chunk_gc_candidates")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(count.max(0) as u64)
+    async fn count_gc_candidates(
+        &self,
+        exact_cap: u64,
+    ) -> Result<engram_core::traits::GcCandidateBacklog, MetaError> {
+        use engram_core::traits::GcCandidateBacklog;
+        let cap = i64::try_from(exact_cap).unwrap_or(i64::MAX);
+        // Count at most `cap` rows: a bounded index walk, never a full scan.
+        let counted: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM (SELECT 1 FROM chunk_gc_candidates LIMIT $1) t",
+        )
+        .bind(cap)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if counted < cap {
+            return Ok(GcCandidateBacklog {
+                count: counted.max(0) as u64,
+                exact: true,
+            });
+        }
+        // Past the cap: the stats system's live-tuple estimate, maintained
+        // on every insert and delete, so it costs nothing to read. Never
+        // below what was just counted (the estimate lags a fresh table).
+        let estimate: Option<i64> = sqlx::query_scalar(
+            "SELECT n_live_tup::bigint FROM pg_stat_user_tables WHERE relname = 'chunk_gc_candidates'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(GcCandidateBacklog {
+            count: estimate.unwrap_or(0).max(counted) as u64,
+            exact: false,
+        })
     }
 }
 

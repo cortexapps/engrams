@@ -43,6 +43,7 @@ const storage = (p: Partial<StorageSummaryResponse>): StorageSummaryResponse => 
   snapshots: 0,
   snapshot_bytes: 0,
   gc_pending: 0,
+  gc_pending_exact: true,
   tracked_sandboxes: 0,
   dirty_chunks: 0,
   unflushed_bytes: 0,
@@ -127,22 +128,22 @@ describe("operatorIssues", () => {
 
   test("a host failing capability checks is a caution issue", () => {
     expect(operatorIssues({ ...base, capsFailing: 1 })).toEqual([
-      { tone: "caution", text: "1 host failing capability checks" },
+      { kind: "caps", tone: "caution", text: "1 host failing capability checks" },
     ]);
   });
 
   test("a dead host is critical and named with a count", () => {
     expect(operatorIssues({ ...base, dead: 2 })).toEqual([
-      { tone: "critical", text: "2 hosts offline" },
+      { kind: "offline", tone: "critical", text: "2 hosts offline" },
     ]);
   });
 
   test("capacity crosses caution at 70 and critical at 90, never both", () => {
     expect(operatorIssues({ ...base, capPct: 75 })).toEqual([
-      { tone: "caution", text: "fleet at 75% capacity" },
+      { kind: "capacity", tone: "caution", text: "fleet at 75% capacity" },
     ]);
     expect(operatorIssues({ ...base, capPct: 95 })).toEqual([
-      { tone: "critical", text: "fleet at 95% capacity" },
+      { kind: "capacity", tone: "critical", text: "fleet at 95% capacity" },
     ]);
   });
 

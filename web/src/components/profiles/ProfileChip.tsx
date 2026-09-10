@@ -60,7 +60,7 @@ export function ProfileChip({
       <ProfileIcon name={profile.icon} className="size-3 shrink-0 text-muted-foreground" />
       <span className="min-w-0 truncate">{profile.name}</span>
       {profile.archived && (
-        <Badge variant="secondary" className="px-1 py-0 text-[10px]">
+        <Badge variant="secondary" className="px-1 py-0 text-2xs">
           archived
         </Badge>
       )}
