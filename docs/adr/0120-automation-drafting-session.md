@@ -1,6 +1,16 @@
 # 0120 — The automation drafting session
 
-Status: 2026-08-25 — **Proposed.**
+Status: 2026-08-25 — **Accepted.** Shipped in #1379 (canvas) and #1381
+(backend + composer UI, carrying #1382); prod-verified the same day: a
+`DraftAutomation` call booted a drafting session that renamed its draft
+(`automation_set_meta`), read the event catalog, and proposed two validated
+versions (a correct `pull_request.labeled` → filter → create_session →
+wait_session graph) before parking for the human — the full D1–D5 loop.
+Three review findings hardened the contract en route: the version fence
+moved inside `saveVersion`'s FOR UPDATE (D3 as written was check-then-act);
+a failed session boot clears the binding before archiving so a replay can
+never adopt a dead draft (D5); and the editor adopts an arriving version
+that matches the screen, so a person's own save never false-banners.
 
 ## Context
 
