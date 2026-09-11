@@ -5,6 +5,7 @@ import "@assistant-ui/react-markdown/styles/dot.css";
 import {
   type CodeHeaderProps,
   MarkdownTextPrimitive,
+  type SyntaxHighlighterProps,
   unstable_memoizeMarkdownComponents as memoizeMarkdownComponents,
   useIsMarkdownCodeBlock,
 } from "@assistant-ui/react-markdown";
@@ -12,6 +13,7 @@ import remarkGfm from "remark-gfm";
 import { type FC, memo, useState } from "react";
 import { CheckIcon, CopyIcon } from "lucide-react";
 
+import { SyntaxTokens, useSyntaxTokens } from "@/components/CodeBlock";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { cn } from "@/lib/utils";
 import { UploadPathChildren } from "@/components/session-files/UploadPathText";
@@ -49,6 +51,36 @@ const CodeHeader: FC<CodeHeaderProps> = ({ language, code }) => {
         {isCopied && <CheckIcon />}
       </TooltipIconButton>
     </div>
+  );
+};
+
+// A fenced block in the transcript, highlighted in the app's palette
+// (lib/syntax-theme.ts). The primitive hands us its own `Pre`/`Code` — the
+// themed chrome defined below — so this only decides what goes inside them.
+//
+// Shiki loads lazily from `lib/shiki`, and a block still streaming keeps the
+// tokens it has while its new tail arrives as plain text, so the transcript
+// never flickers between coloured and uncoloured.
+const SyntaxHighlighter: FC<SyntaxHighlighterProps> = ({
+  components: { Pre, Code },
+  language,
+  code,
+}) => {
+  const { lines, tail, complete } = useSyntaxTokens(code, language);
+
+  return (
+    <Pre>
+      <Code data-language={language} data-highlighted={complete ? "true" : "false"}>
+        {lines ? (
+          <>
+            <SyntaxTokens lines={lines} />
+            {tail}
+          </>
+        ) : (
+          code
+        )}
+      </Code>
+    </Pre>
   );
 };
 
@@ -234,4 +266,5 @@ const defaultComponents = memoizeMarkdownComponents({
     );
   },
   CodeHeader,
+  SyntaxHighlighter,
 });
