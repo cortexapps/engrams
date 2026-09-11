@@ -181,6 +181,7 @@ prost = { version = "0.14", default-features = false, features = ["no-recursion-
 rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
@@ -190,6 +191,7 @@ libc = { version = "0.2", features = ["extra_traits", "use_std"] }
 nom = { version = "7" }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
 rustix = { version = "1", features = ["fs"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-musl.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
@@ -201,6 +203,7 @@ prost = { version = "0.14", default-features = false, features = ["no-recursion-
 rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-unknown-linux-musl.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
@@ -210,6 +213,7 @@ libc = { version = "0.2", features = ["extra_traits", "use_std"] }
 nom = { version = "7" }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
 rustix = { version = "1", features = ["fs"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
