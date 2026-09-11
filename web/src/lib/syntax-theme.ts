@@ -27,7 +27,14 @@ import type { ThemeRegistration } from "shiki/types";
 
 type Role = "plain" | "comment" | "keyword" | "string" | "number" | "function" | "type" | "deleted";
 
-type Palette = Record<Role, string> & { background: string };
+// `git` feeds the diff viewer (@pierre/diffs reads `gitDecoration.*` off the
+// theme). They are the app's instrument inks, so an expanded diff agrees with
+// the +N / -N counts in its own header rather than falling back to Pierre's
+// stock green and red.
+type Palette = Record<Role, string> & {
+  background: string;
+  git: { added: string; deleted: string; modified: string };
+};
 
 // oklch(0.301 0.02 206) petrol ink · 0.43/0.026/200 ink-faded (--muted-foreground)
 // · 0.47/0.16/330 violet · 0.46/0.12/150 emerald · 0.5/0.14/68 amber
@@ -43,6 +50,7 @@ const LIGHT: Palette = {
   function: "#0060c1",
   type: "#006d6d",
   deleted: "#c2181d",
+  git: { added: "#0a7e3a", deleted: "#c2181d", modified: "#0060c1" },
 };
 
 // The same seven hues lifted onto the green-black ground: L 0.74–0.82 where the
@@ -58,6 +66,7 @@ const DARK: Palette = {
   function: "#85beff",
   type: "#73d1ca",
   deleted: "#ff716b",
+  git: { added: "#5fd37f", deleted: "#ff716b", modified: "#85beff" },
 };
 
 // One scope table, both themes. Ordered least-to-most specific: TextMate takes
@@ -139,6 +148,9 @@ function build(name: string, type: "light" | "dark", palette: Palette): ThemeReg
     colors: {
       "editor.foreground": palette.plain,
       "editor.background": palette.background,
+      "gitDecoration.addedResourceForeground": palette.git.added,
+      "gitDecoration.deletedResourceForeground": palette.git.deleted,
+      "gitDecoration.modifiedResourceForeground": palette.git.modified,
     },
     fg: palette.plain,
     bg: palette.background,
@@ -155,5 +167,8 @@ function build(name: string, type: "light" | "dark", palette: Palette): ThemeReg
   };
 }
 
-export const ENGRAMS_LIGHT_THEME = build("engrams-light", "light", LIGHT);
-export const ENGRAMS_DARK_THEME = build("engrams-dark", "dark", DARK);
+/** The registered name of each theme — what Shiki and Pierre are told to use. */
+export const SYNTAX_THEME_NAMES = { light: "engrams-light", dark: "engrams-dark" } as const;
+
+export const ENGRAMS_LIGHT_THEME = build(SYNTAX_THEME_NAMES.light, "light", LIGHT);
+export const ENGRAMS_DARK_THEME = build(SYNTAX_THEME_NAMES.dark, "dark", DARK);
