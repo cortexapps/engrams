@@ -1,6 +1,6 @@
 import type { HighlighterCore, ThemedTokenWithVariants } from "shiki/types";
 
-import { ENGRAMS_DARK_THEME, ENGRAMS_LIGHT_THEME } from "./syntax-theme";
+import { ENGRAMS_DARK_THEME, ENGRAMS_LIGHT_THEME, SYNTAX_THEME_NAMES } from "./syntax-theme";
 
 // The app's single Shiki highlighter: a core instance carrying our two themes
 // (syntax-theme.ts) and NO grammars until a fence asks for one.
@@ -18,8 +18,6 @@ import { ENGRAMS_DARK_THEME, ENGRAMS_LIGHT_THEME } from "./syntax-theme";
 // block beats a plain one, and a plain one beats an error.
 
 export type SyntaxLines = ThemedTokenWithVariants[][];
-
-export const SYNTAX_THEMES = { light: "engrams-light", dark: "engrams-dark" } as const;
 
 // Tokenizing is synchronous main-thread work. A fence this long is a dumped log
 // or a vendored file, where colour buys nothing and a dropped frame costs plenty.
@@ -102,7 +100,7 @@ async function tokenize(code: string, lang: string): Promise<SyntaxLines | null>
   try {
     if (!(await ensureLanguage(lang))) return null;
     const highlighter = await getHighlighter();
-    return highlighter.codeToTokensWithThemes(code, { lang, themes: SYNTAX_THEMES });
+    return highlighter.codeToTokensWithThemes(code, { lang, themes: SYNTAX_THEME_NAMES });
   } catch {
     return null;
   }

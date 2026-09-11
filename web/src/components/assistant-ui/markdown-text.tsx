@@ -37,9 +37,11 @@ const CodeHeader: FC<CodeHeaderProps> = ({ language, code }) => {
     copyToClipboard(code);
   };
 
-  // A fence with no info string arrives as the literal "unknown" — don't
-  // surface that. The empty span keeps the copy button right-aligned.
-  const label = language && language !== "unknown" ? language : null;
+  // A fence with no info string arrives as an empty string (the primitive's
+  // `parseLanguageClass` returns "" when the `language-` class is absent), and
+  // an empty label would draw a header with nothing in it. The empty span keeps
+  // the copy button right-aligned.
+  const label = language || null;
 
   return (
     <div className="aui-code-header-root border-border/50 bg-muted/50 mt-5 flex items-center justify-between rounded-t-lg border border-b-0 px-3 py-1.5 text-xs">
@@ -54,23 +56,34 @@ const CodeHeader: FC<CodeHeaderProps> = ({ language, code }) => {
   );
 };
 
+// The fenced-block shell. Shared, because `SyntaxHighlighter` below has to
+// render its own `pre` and cannot borrow the one in `defaultComponents`.
+const PRE_CLASS =
+  "aui-md-pre border-border/50 bg-muted/30 mb-4 overflow-x-auto rounded-t-none rounded-b-lg border border-t-0 p-3 text-xs leading-relaxed";
+
 // A fenced block in the transcript, highlighted in the app's palette
-// (lib/syntax-theme.ts). The primitive hands us its own `Pre`/`Code` — the
-// themed chrome defined below — so this only decides what goes inside them.
+// (lib/syntax-theme.ts). Shiki loads lazily from `lib/shiki`, and a block still
+// streaming keeps the tokens it has while its new tail arrives as plain text,
+// so the transcript never flickers between coloured and uncoloured.
 //
-// Shiki loads lazily from `lib/shiki`, and a block still streaming keeps the
-// tokens it has while its new tail arrives as plain text, so the transcript
-// never flickers between coloured and uncoloured.
-const SyntaxHighlighter: FC<SyntaxHighlighterProps> = ({
-  components: { Pre, Code },
-  language,
-  code,
-}) => {
+// WHY THIS RENDERS ITS OWN `pre`/`code` RATHER THAN THE `Pre`/`Code` THE
+// PRIMITIVE HANDS IT: `memoizeMarkdownComponents` wraps every component it is
+// given — `pre` and `code` included — in `React.memo` with a comparator that
+// compares ONLY the markdown node. A fence's node never changes after it is
+// parsed, so those two never re-render again. Anything that arrives later, and
+// tokens always arrive later, renders into a subtree React has stopped
+// updating: the attributes keep their first-paint values and the text stays
+// plain. The elements here are ours, so they re-render when the tokens land.
+const SyntaxHighlighter: FC<SyntaxHighlighterProps> = ({ language, code }) => {
   const { lines, tail, complete } = useSyntaxTokens(code, language);
 
   return (
-    <Pre>
-      <Code data-language={language} data-highlighted={complete ? "true" : "false"}>
+    <pre className={PRE_CLASS}>
+      <code
+        className={language ? `language-${language}` : undefined}
+        data-language={language}
+        data-highlighted={complete ? "true" : "false"}
+      >
         {lines ? (
           <>
             <SyntaxTokens lines={lines} />
@@ -79,8 +92,8 @@ const SyntaxHighlighter: FC<SyntaxHighlighterProps> = ({
         ) : (
           code
         )}
-      </Code>
-    </Pre>
+      </code>
+    </pre>
   );
 };
 
@@ -243,15 +256,7 @@ const defaultComponents = memoizeMarkdownComponents({
   sup: ({ className, ...props }) => (
     <sup className={cn("aui-md-sup [&>a]:text-xs [&>a]:no-underline", className)} {...props} />
   ),
-  pre: ({ className, ...props }) => (
-    <pre
-      className={cn(
-        "aui-md-pre border-border/50 bg-muted/30 mb-4 overflow-x-auto rounded-t-none rounded-b-lg border border-t-0 p-3 text-xs leading-relaxed",
-        className,
-      )}
-      {...props}
-    />
-  ),
+  pre: ({ className, ...props }) => <pre className={cn(PRE_CLASS, className)} {...props} />,
   code: function Code({ className, ...props }) {
     const isCodeBlock = useIsMarkdownCodeBlock();
     return (
