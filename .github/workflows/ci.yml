@@ -275,7 +275,19 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+        run: |
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
       - name: Build and start the bundle
         run: |
           python3 -m unittest discover \
@@ -316,11 +328,27 @@ jobs:
       # of runs. Ubuntu 24.04's protobuf-compiler ships 3.21.12,
       # well above tonic-build/prost-build's minimum, and `apt`
       # never hits the GH API — deterministic, ~2s.
+      # The Ubuntu 24.04 Azure mirror intermittently stalls (20+ min
+      # before it falls back to archive.ubuntu.com) or serves a stale
+      # package index (protobuf-compiler 3.21.12-8.2ubuntu0.2 was
+      # dropped in favour of .3, so a stale index 404s) — see
+      # actions/runner-images#14594 and #12599. Bound apt's network
+      # retries so a stall fails fast, then retry update+install three
+      # times to ride out the transient index skew.
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
-          protoc --version
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
       # Parallel linker — installs a prebuilt mold release (~1–2s)
       # and (with the action's default `make-default: true`) points
       # /usr/bin/ld at it so cargo's default cc→ld chain picks it up
@@ -438,9 +466,18 @@ jobs:
       # never hits the GH API — deterministic, ~2s.
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
-          protoc --version
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
       - name: Setup mold linker
         uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
@@ -509,7 +546,19 @@ jobs:
       # mke2fs/e2fsprogs setup that used to sit here: ext4 packing is
       # pure Rust (mkext4).
       - name: Install squashfs-tools
-        run: sudo apt-get install -y -qq --no-install-recommends squashfs-tools
+        run: |
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends squashfs-tools; then
+              exit 0
+            fi
+            echo "::warning::squashfs-tools install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install squashfs-tools after 3 attempts"
+          exit 1
+
 
       # Default (non-ignored) tests across the entire workspace. Mirrors
       # `just check`'s nextest pass — same speedup, same coverage. The
@@ -644,16 +693,36 @@ jobs:
       # never hits the GH API — deterministic, ~2s.
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
-          protoc --version
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
       - uses: Swatinem/rust-cache@v2
       - name: Install musl-tools + kernel uapi headers
         # linux-libc-dev: uffd-handler's transitive userfaultfd-sys build
         # script compiles a C shim that #includes <linux/types.h>, absent
         # from the musl cross-gcc sysroot.
         run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools linux-libc-dev
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          installed=0
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends musl-tools linux-libc-dev; then
+              installed=1
+              break
+            fi
+            echo "::warning::musl-tools + linux-libc-dev install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          [ "$installed" = 1 ] || { echo "::error::could not install musl-tools + linux-libc-dev after 3 attempts"; exit 1; }
           # Adversarial finding from the #663 rollout: injecting ALL of
           # /usr/include poisons any real vendored-C build (zstd-sys) with
           # glibc headers under a musl target. The shim only needs the
@@ -761,7 +830,26 @@ jobs:
         run: pnpm test
 
       - name: Install Chromium for renderer policy test
-        run: pnpm exec playwright install chromium --with-deps
+        run: |
+          # `playwright install --with-deps` shells out to apt-get for
+          # Chromium's OS deps; bound apt's network timeouts globally so a
+          # stalled Azure mirror fails fast inside that subprocess instead of
+          # hanging 20+ min, then retry the whole install.
+          printf '%s\n' \
+            'Acquire::Retries 3;' \
+            'Acquire::http::Timeout 30;' \
+            'Acquire::https::Timeout 30;' \
+            'Acquire::ftp::Timeout 30;' \
+            | sudo tee /etc/apt/apt.conf.d/99ci-retries >/dev/null
+          for attempt in 1 2 3; do
+            if pnpm exec playwright install chromium --with-deps; then
+              exit 0
+            fi
+            echo "::warning::chromium install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install chromium after 3 attempts"
+          exit 1
 
       - name: D2 production CSP and renderer browser test
         run: pnpm test:browser
@@ -1423,11 +1511,33 @@ jobs:
 
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
 
       - name: Install musl-tools
-        run: sudo apt-get install -y -qq --no-install-recommends musl-tools
+        run: |
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends musl-tools; then
+              exit 0
+            fi
+            echo "::warning::musl-tools install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install musl-tools after 3 attempts"
+          exit 1
+
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -1707,12 +1817,33 @@ jobs:
       # never hits the GH API — deterministic, ~2s.
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
-          protoc --version
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
 
       - name: Install musl tooling
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
+        run: |
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends musl-tools; then
+              exit 0
+            fi
+            echo "::warning::musl-tools install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install musl-tools after 3 attempts"
+          exit 1
+
 
       - name: Setup mold linker
         uses: rui314/setup-mold@v1
@@ -1890,9 +2021,18 @@ jobs:
       # never hits the GH API — deterministic, ~2s.
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
-          protoc --version
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
 
       - name: Cache cargo build (for the e2e test binary itself)
         uses: Swatinem/rust-cache@v2
@@ -1915,9 +2055,18 @@ jobs:
 
       - name: Install build deps (musl-tools)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-              musl-tools jq bc python3
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends musl-tools jq bc python3; then
+              exit 0
+            fi
+            echo "::warning::musl-tools jq bc python3 install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install musl-tools jq bc python3 after 3 attempts"
+          exit 1
+
 
       - name: Install firecracker (v1.16.0)
         run: |
@@ -2046,7 +2195,19 @@ jobs:
       # `just bundles-squashfs` (the tilt `bundles` resource) packs the RO bundles
       # with mksquashfs, so squashfs-tools must be on PATH before the stack comes up.
       - name: Install squashfs-tools (for bundles-squashfs)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools
+        run: |
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends squashfs-tools; then
+              exit 0
+            fi
+            echo "::warning::squashfs-tools install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install squashfs-tools after 3 attempts"
+          exit 1
+
 
       - name: Bring up prod-shape stack (tilt)
         env:
@@ -2325,8 +2486,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
       - name: Setup mold linker
         uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
@@ -2358,8 +2529,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
       - name: Setup mold linker
         uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
@@ -2396,8 +2577,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
       - name: Setup mold linker
         uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2

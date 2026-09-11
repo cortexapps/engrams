@@ -46,8 +46,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
+
       - name: Setup mold linker
         uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
@@ -138,8 +149,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
+
       - name: Setup mold linker
         uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
@@ -225,8 +247,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+          APT_OPTS=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30)
+          for attempt in 1 2 3; do
+            if sudo apt-get "${APT_OPTS[@]}" update -qq &&
+               sudo apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends protobuf-compiler; then
+              protoc --version
+              exit 0
+            fi
+            echo "::warning::protoc install attempt $attempt failed; retrying"
+            sleep 15
+          done
+          echo "::error::could not install protobuf-compiler after 3 attempts"
+          exit 1
+
       - name: Setup mold linker
         uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
