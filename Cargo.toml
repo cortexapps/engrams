@@ -291,7 +291,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # vendored-C build under a musl target. The lane now stages a scoped
 # UAPI-only dir referenced via `-idirafter` (ci.yml / bake-images.yml),
 # so the musl sysroot's headers always win and zstd-sys compiles clean.
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 # ADR 0093: the streaming packer. Pinned EXACT: mkext4's byte layout is
 # stable per crate version only, and our chunk dedup + cold-base reuse
 # keys hang off byte-identical images — a version bump is a deliberate
