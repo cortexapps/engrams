@@ -1,0 +1,64 @@
+---
+import TraceMark from '../TraceMark.astro';
+import slack from '../../assets/connector-logos/slack.svg';
+import github from '../../assets/connector-logos/github.svg';
+interface Props { kind: 'web' | 'slack' | 'review'; }
+const { kind } = Astro.props;
+---
+<div class:list={['demo', kind]} data-scene data-step="0">
+  <div class="stage">
+    {kind === 'web' && <>
+      <div class="app-pane">
+        <div class="bar"><TraceMark size={25}/><b>engrams</b><span class="muted">/ Release notes</span></div>
+        <div class="conversation"><span class="eyebrow">YOUR TASK</span><h3>Make the release<br/>worth reading.</h3>
+          <div class="message human enter-one">Group these changes<br/>by customer impact.</div>
+          <div class="agent-line web-working enter-two"><TraceMark size={24}/><span>Updating the release page…</span></div>
+          <div class="message answer enter-three">Updated. The biggest improvements come first.</div>
+        </div>
+        <div class="composer">Message your agent <span>↑</span></div>
+      </div>
+      <div class="preview paper"><div class="bar"><span class="live-dot"></span> Live preview <span class="right">↗</span></div><div class="release"><span class="eyebrow">ACME / CHANGELOG</span><h3>A better workday.</h3><span class="release-date">September release</span>
+        <div class="before"><p>Updated search index</p><p>Added batch export endpoint</p><p>Fixed invite link expiry</p></div>
+        <div class="after"><div class="release-item"><b>Find answers faster</b><p>Search across every project.</p></div><div class="release-item"><b>Take your data with you</b><p>Export a whole project at once.</p></div><div class="release-item"><b>Bring everyone along</b><p>Invites work when you need them.</p></div></div>
+      </div><div class="success enter-three">✓ Preview updated</div></div>
+    </>}
+    {kind === 'slack' && <>
+      <div class="slack-window paper"><div class="bar"><img src={slack.src} alt="Slack"/><b># product-eng</b><span class="right">Thread</span></div>
+        <div class="slack-body"><div class="slack-message"><div class="avatar violet">M</div><div><b>Maya <small>10:42</small></b><p>The CSV export drops the last row.</p></div></div>
+          <div class="slack-message enter-one"><div class="avatar blue">J</div><div><b>Jordan <small>10:43</small></b><p><mark>@engrams</mark> investigate this.</p></div></div>
+          <div class="slack-message enter-two"><div class="avatar engram"><TraceMark size={27}/></div><div class="slack-reply"><b>engrams <small class="app-badge">APP</small></b><p class="working">Checking the export loop…</p><div class="enter-three"><p>The loop skips the final row.<br/>Fixed it and added a regression test.</p><div class="pr-link"><span>⑂</span><div><b>Fix ready for review ↗</b><small>#142 · Include the final CSV row</small></div></div></div></div></div>
+        </div><div class="slack-compose">Reply…<span>↵</span></div>
+      </div><div class="surface-note"><TraceMark size={23}/><span>Your agent. Right in the thread.</span></div>
+    </>}
+    {kind === 'review' && <>
+      <div class="review-source paper"><div class="bar"><img src={github.src} alt="GitHub"/><b>Pull request #142</b></div><div class="review-body"><span class="pr-state">OPEN</span><h3>Fix CSV export</h3><div class="review-comment"><div class="review-author"><span class="avatar violet">M</span><b>Maya requested changes</b></div><p>Please cover the<br/>empty-list case.</p></div><div class="review-result enter-three"><b>✓ New commit</b><span>All checks passed</span></div></div></div>
+      <div class="handoff enter-one"><span>→</span><small>Review feedback<br/>automation</small></div>
+      <div class="review-target"><div class="bar"><TraceMark size={25}/><b>engrams</b></div><div class="review-body"><span class="eyebrow">ORIGINAL TASK · PR #142</span><h3>Fix CSV export</h3><div class="received enter-one"><small>FROM GITHUB REVIEW</small><p>Please cover the empty-list case.</p></div><div class="agent-line review-working enter-two"><TraceMark size={23}/><span>Adding the missing test…</span></div><div class="test-result enter-three"><span>✓</span><div><b>Empty-list test added</b><small>Pushed to PR #142</small></div></div></div></div>
+    </>}
+  </div>
+  <div class="transport"><button type="button" data-play aria-label="Pause animation">Pause</button><button type="button" data-replay>Replay</button><div class="timeline" aria-hidden="true"><i></i></div><button type="button" data-result>Show result</button></div>
+</div>
+<script>
+  for (const scene of document.querySelectorAll<HTMLElement>('[data-scene]')) {
+    const play = scene.querySelector<HTMLButtonElement>('[data-play]')!;
+    const progress = scene.querySelector<HTMLElement>('.timeline i')!;
+    let elapsed = 0;
+    let playing = !matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let last = performance.now();
+    const render = () => {
+      scene.dataset.step = String(elapsed < 1400 ? 0 : elapsed < 3200 ? 1 : elapsed < 4700 ? 2 : 3);
+      progress.style.width = `${elapsed / 8500 * 100}%`;
+      play.textContent = playing ? 'Pause' : 'Play';
+      play.setAttribute('aria-label', playing ? 'Pause animation' : 'Play animation');
+    };
+    if (!playing) elapsed = 6500;
+    play.addEventListener('click', () => { playing = !playing; render(); });
+    scene.querySelector('[data-replay]')!.addEventListener('click', () => { elapsed = 0; playing = true; render(); });
+    scene.querySelector('[data-result]')!.addEventListener('click', () => { elapsed = 6500; playing = false; render(); });
+    const frame = (now: number) => {
+      if (playing && !document.hidden) elapsed = (elapsed + Math.min(now - last, 100)) % 8500;
+      last = now; render(); requestAnimationFrame(frame);
+    };
+    render(); requestAnimationFrame(frame);
+  }
+</script>
