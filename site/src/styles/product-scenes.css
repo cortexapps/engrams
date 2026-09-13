@@ -692,3 +692,355 @@ h3 {
     font-size: 7px;
   }
 }
+/* Match the task thread's muted user bubble, plain response, file row, and reply composer. */
+.web .app-pane {
+  background: var(--background);
+  border-color: var(--border);
+}
+.web .bar {
+  border-color: var(--border);
+}
+.task-tabs {
+  display: flex;
+  gap: 22px;
+  padding: 0 18px;
+  height: 35px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--muted-foreground);
+  align-items: center;
+}
+.task-tabs span:first-child {
+  color: var(--foreground);
+  height: 100%;
+  display: flex;
+  align-items: center;
+  border-bottom: 2px solid var(--primary);
+}
+.web .conversation {
+  padding: 18px 20px;
+}
+.prior-answer {
+  font-size: 14px;
+  color: var(--foreground);
+  line-height: 1.5;
+}
+.web .human {
+  max-width: 80%;
+  margin: 18px 0 18px auto;
+  background: var(--muted);
+  border: 0;
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-size: 15px;
+  color: var(--foreground);
+}
+.file-edit {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  margin-bottom: 16px;
+}
+.file-edit code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--foreground);
+}
+.additions {
+  color: #8bc392;
+}
+.deletions {
+  color: #e89c98;
+}
+.web .answer {
+  font-size: 14px;
+  color: var(--foreground);
+}
+.web .composer {
+  background: var(--background);
+  border-color: var(--border);
+  padding: 10px 12px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  border-radius: 8px;
+}
+.composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  height: 24px;
+}
+.web .composer span {
+  float: none;
+  color: var(--muted-foreground);
+}
+.composer-tools > span:first-child {
+  font-size: 20px;
+}
+.plan-mode {
+  font-size: 11px;
+}
+.web .composer .send-key {
+  margin-left: auto;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border-radius: 6px;
+  padding: 4px 11px;
+  font-size: 15px;
+}
+/* GitHub's neutral surfaces and review timeline remain distinct from engrams. */
+.review-source {
+  background: #fff;
+  color: #1f2328;
+  border-color: #d1d9e0;
+}
+.review-source .bar {
+  background: #f6f8fa;
+  border-color: #d1d9e0;
+  height: 43px;
+  font-size: 12px;
+}
+.github-heading {
+  padding: 15px 17px 13px;
+}
+.github-heading h3 {
+  font: 400 21px/1.3 var(--font-sans);
+  margin: 0 0 9px;
+  letter-spacing: -0.4px;
+}
+.github-heading h3 > span {
+  color: #59636e;
+  font-weight: 300;
+}
+.branch-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  color: #59636e;
+}
+.review-source .pr-state {
+  background: #1f883d;
+  color: white;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+.branch-summary code {
+  background: #ddf4ff;
+  color: #0969da;
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-size: 10px;
+}
+.github-tabs {
+  display: flex;
+  gap: 15px;
+  padding: 0 17px;
+  border-bottom: 1px solid #d1d9e0;
+  font-size: 10px;
+  height: 32px;
+  align-items: center;
+}
+.github-tabs > span:first-child {
+  font-weight: 600;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border-bottom: 2px solid #fd8c73;
+}
+.github-tabs i {
+  font-style: normal;
+  background: #eff1f3;
+  border-radius: 12px;
+  padding: 1px 5px;
+}
+.review-source .review-body {
+  padding: 13px 17px;
+}
+.review-event {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 10px;
+  color: #59636e;
+  margin-bottom: 10px;
+}
+.review-event-icon {
+  background: #f6f8fa;
+  color: #cf222e;
+  border: 1px solid #d1d9e0;
+  border-radius: 50%;
+  width: 23px;
+  height: 23px;
+  display: grid;
+  place-items: center;
+  font-size: 16px;
+}
+.review-source .review-comment {
+  border-color: #d1d9e0;
+  border-radius: 6px;
+}
+.review-source .review-author {
+  background: #f6f8fa;
+  border-bottom: 1px solid #d1d9e0;
+  font-size: 10px;
+  padding: 8px;
+  gap: 6px;
+}
+.review-author > span:not(.avatar) {
+  color: #59636e;
+}
+.comment-menu {
+  margin-left: auto;
+  font-weight: 700;
+}
+.review-source .review-comment p {
+  font-size: 15px;
+  line-height: 1.5;
+  margin: 12px;
+}
+.review-source .review-result {
+  display: block;
+  margin-top: 12px;
+  color: #59636e;
+  font-size: 10px;
+}
+.review-result > div {
+  color: #1f2328;
+  display: flex;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+.review-result > div > span {
+  color: #1a7f37;
+}
+.review-result code {
+  color: #0969da;
+  float: right;
+}
+.review-source,
+.review-target {
+  height: 380px;
+}
+@media (max-width: 750px) {
+  .web .stage {
+    height: 440px;
+  }
+  .web .conversation {
+    padding: 13px 10px;
+  }
+  .task-tabs {
+    gap: 10px;
+    padding: 0 10px;
+    font-size: 9px;
+  }
+  .prior-answer,
+  .web .answer {
+    font-size: 11px;
+  }
+  .web .human {
+    font-size: 12px;
+    max-width: 95%;
+    padding: 9px 10px;
+    margin: 15px 0 15px auto;
+  }
+  .file-edit {
+    gap: 4px;
+    padding: 8px 6px;
+  }
+  .file-edit code {
+    font-size: 8px;
+  }
+  .file-edit > span {
+    font-size: 9px;
+  }
+  .web .composer {
+    font-size: 10px;
+  }
+  .review .stage {
+    height: 485px;
+  }
+  .review-source,
+  .review-target {
+    height: 435px;
+  }
+  .github-heading {
+    padding: 12px 9px;
+  }
+  .github-heading h3 {
+    font-size: 18px;
+  }
+  .branch-summary {
+    flex-wrap: wrap;
+    font-size: 9px;
+    gap: 6px;
+  }
+  .branch-summary code {
+    font-size: 8px;
+  }
+  .github-tabs {
+    padding: 0 9px;
+    gap: 8px;
+    font-size: 8px;
+  }
+  .github-tabs i {
+    display: none;
+  }
+  .review-source .review-body {
+    padding: 12px 9px;
+  }
+  .review-event {
+    font-size: 9px;
+    gap: 5px;
+  }
+  .review-event-icon {
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+  }
+  .review-source .review-author {
+    font-size: 9px;
+  }
+  .review-source .review-author > span:not(.avatar) {
+    display: none;
+  }
+  .review-source .review-comment p {
+    font-size: 13px;
+    margin: 10px;
+  }
+  .review-source .review-result {
+    font-size: 9px;
+  }
+  .review-result code {
+    float: none;
+    display: block;
+    margin-top: 5px;
+  }
+  .review-result > div {
+    gap: 5px;
+  }
+}
+.file-edit code {
+  white-space: nowrap;
+}
+@media (max-width: 750px) {
+  .web .stage {
+    height: 510px;
+  }
+  .web .after {
+    top: 185px;
+  }
+}
