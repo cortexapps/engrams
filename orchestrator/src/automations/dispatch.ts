@@ -12,7 +12,8 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
 import { makeCodeBlockRuntime } from "./code/runtime.ts";
-import { evaluateAdmissionPrelude } from "./engine/admission.ts";
+import { resolveAutomationInputs } from "../db/automations.ts";
+import { evaluateAdmissionPrelude, type AdmissionVerdict } from "./engine/admission.ts";
 import type { CodeBlockRuntime } from "./engine/deps.ts";
 
 import {
@@ -125,6 +126,13 @@ export interface AdmitRunInput {
   /** ADR 0120: the bound workstream ('' = unbound). Stamped on the run row
    * and prefixed onto the concurrency key, so claims isolate per instance. */
   instanceId?: string;
+  /** The workstream's input snapshot (layered over the automation's inputs
+   * the way loadSnapshot does), so the admission prelude reads the inputs
+   * the run will see. */
+  instanceInputs?: Record<string, unknown>;
+  /** The admission-prelude verdict dispatch already took for this delivery
+   * (before opening its workstream). Absent = evaluate it here. */
+  admission?: AdmissionVerdict;
   trigger: AutomationRunTrigger;
   scheduledFor: Date | null;
   /** Editor DryRun: the run row is flagged and integration actions stub. */
@@ -242,6 +250,145 @@ export async function admitClaimedCronRun(
   }
 }
 
+/** Evaluate the entrypoint's admission prelude against the inputs the run
+ * would see (the workstream snapshot layered over the automation's). */
+async function preludeVerdict(args: {
+  target: DispatchTarget;
+  entrypoint: { id: string; trigger: TriggerSpec };
+  trigger: AutomationRunTrigger;
+  deliveryKey?: string;
+  instanceInputs?: Record<string, unknown> | undefined;
+  scheduledFor: Date | null;
+  now: () => Date;
+  code?: CodeBlockRuntime | undefined;
+}): Promise<AdmissionVerdict> {
+  const { target, trigger } = args;
+  const receivedAt = trigger.receivedAt ?? args.now().toISOString();
+  return evaluateAdmissionPrelude({
+    definition: target.definition,
+    inputs: resolveAutomationInputs(target.definition.inputsSchema, {
+      ...target.automation.inputs,
+      ...(args.instanceInputs ?? {}),
+    }),
+    automationId: target.automation.id,
+    automationName: target.automation.name,
+    trigger: {
+      kind: trigger.source,
+      receivedAt,
+      ...(trigger.eventKey !== undefined ? { eventKey: trigger.eventKey } : {}),
+      ...(args.deliveryKey !== undefined ? { deliveryKey: args.deliveryKey } : {}),
+      ...(trigger.payload !== undefined ? { payload: trigger.payload } : {}),
+      ...(args.scheduledFor ? { scheduledFor: args.scheduledFor.toISOString() } : {}),
+    },
+    aliases: [],
+    entrypointId: args.entrypoint.id,
+    code: args.code ?? codeRuntime(),
+  });
+}
+
+/** A prelude rejection leaves a `filtered` run row (no workflow, no claim)
+ * so the Activity tab shows the delivery arrived and why nothing happened. */
+async function recordFilteredAdmission(args: {
+  store: AutomationDispatchStore;
+  target: DispatchTarget;
+  entrypointId: string;
+  instanceId: string;
+  runId: string;
+  trigger: AutomationRunTrigger;
+  deliveryKey: string;
+  scheduledFor: Date | null;
+  reason: string;
+  now: () => Date;
+  dryRun?: boolean | undefined;
+}): Promise<void> {
+  await args.store.insertRun({
+    id: args.runId,
+    automationId: args.target.automation.id,
+    version: args.target.automation.currentVersion,
+    entrypointId: args.entrypointId,
+    ...(args.instanceId !== "" ? { instanceId: args.instanceId } : {}),
+    trigger: args.trigger,
+    deliveryKey: args.deliveryKey,
+    concurrencyKey: null,
+    scheduledFor: args.scheduledFor,
+    status: "filtered",
+    error: args.reason,
+    endedAt: args.now(),
+    ...(args.dryRun ? { dryRun: true } : {}),
+  });
+}
+
+/** Decide one matched (target, entrypoint) for a delivery, in the order that
+ * keeps side effects honest: an instance DROP first (no run, audited); then
+ * the admission prelude against the workstream's inputs — BEFORE the
+ * workstream is opened, so a filtered delivery ("LGTM" on a PR nobody asked
+ * to review, a draft PR opening) never creates a workstream; then the
+ * settle (open or join) and the concurrency claim. */
+async function decideAdmission(args: {
+  target: DispatchTarget;
+  entrypoint: { id: string; trigger: TriggerSpec };
+  trigger: AutomationRunTrigger;
+  resolution: InstanceResolution;
+  deliveryKey: string;
+  eventKey: string;
+  instances: AutomationInstanceStore;
+  store: AutomationDispatchStore;
+  now: () => Date;
+  code?: CodeBlockRuntime | undefined;
+}): Promise<
+  | { kind: "dropped" }
+  | { kind: "filtered" }
+  | { kind: "admit"; instanceId: string; inputs?: Record<string, unknown>; verdict: AdmissionVerdict }
+> {
+  const { target, entrypoint, trigger, resolution, deliveryKey } = args;
+  const settleCtx = {
+    automationId: target.automation.id,
+    entrypointId: entrypoint.id,
+    eventKey: args.eventKey,
+    deliveryKey,
+    instances: args.instances,
+  };
+  if (resolution.kind === "drop") {
+    await settleInstanceResolution(resolution, settleCtx);
+    return { kind: "dropped" };
+  }
+  const boundId = resolution.kind === "bound" ? resolution.instance.id : "";
+  const instanceInputs =
+    resolution.kind === "bound"
+      ? resolution.instance.inputs
+      : resolution.kind === "open"
+        ? resolution.inputs
+        : undefined;
+  const verdict = await preludeVerdict({
+    target,
+    entrypoint,
+    trigger,
+    deliveryKey,
+    instanceInputs,
+    scheduledFor: null,
+    now: args.now,
+    code: args.code,
+  });
+  if (verdict.kind === "reject") {
+    await recordFilteredAdmission({
+      store: args.store,
+      target,
+      entrypointId: entrypoint.id,
+      instanceId: boundId,
+      runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id, boundId),
+      trigger,
+      deliveryKey,
+      scheduledFor: null,
+      reason: verdict.reason,
+      now: args.now,
+    });
+    return { kind: "filtered" };
+  }
+  const settled = await settleInstanceResolution(resolution, settleCtx);
+  if (settled === "dropped") return { kind: "dropped" };
+  return { kind: "admit", instanceId: settled.instanceId, inputs: settled.inputs, verdict };
+}
+
 /** Decide admission for one matched occurrence and, unless the policy says
  * otherwise, create the run row and start its workflow. Shared by the webhook
  * dispatcher and the cron scheduler. */
@@ -268,41 +415,33 @@ export async function admitAutomationRun(
 
   // The graph's own admission decides BEFORE the concurrency claim (see
   // engine/admission.ts): a delivery the prelude filters never supersedes
-  // or joins a live run. It leaves a filtered run row so the Activity tab
-  // shows the delivery arrived and why nothing happened.
-  if (instanceId === "") {
-    const receivedAt = trigger.receivedAt ?? deps.now().toISOString();
-    const verdict = await evaluateAdmissionPrelude({
-      definition: target.definition,
-      inputs: target.automation.inputs,
-      automationId,
-      automationName: target.automation.name,
-      trigger: {
-        kind: trigger.source,
-        receivedAt,
-        ...(trigger.eventKey !== undefined ? { eventKey: trigger.eventKey } : {}),
-        deliveryKey,
-        ...(trigger.payload !== undefined ? { payload: trigger.payload } : {}),
-        ...(input.scheduledFor ? { scheduledFor: input.scheduledFor.toISOString() } : {}),
-      },
-      aliases: [],
-      entrypointId: entrypoint.id,
-      code: deps.code ?? codeRuntime(),
-    });
+  // or joins a live run. Dispatch passes the verdict it already took
+  // (before opening any workstream); a direct caller gets it evaluated here.
+  {
+    const verdict =
+      input.admission ??
+      (await preludeVerdict({
+        target,
+        entrypoint,
+        trigger,
+        instanceInputs: input.instanceInputs,
+        scheduledFor: input.scheduledFor,
+        now: deps.now,
+        code: deps.code,
+      }));
     if (verdict.kind === "reject") {
-      await deps.store.insertRun({
-        id: runId,
-        automationId,
-        version: target.automation.currentVersion,
+      await recordFilteredAdmission({
+        store: deps.store,
+        target,
         entrypointId: entrypoint.id,
+        instanceId,
+        runId,
         trigger,
         deliveryKey,
-        concurrencyKey: null,
         scheduledFor: input.scheduledFor,
-        status: "filtered",
-        error: verdict.reason,
-        endedAt: deps.now(),
-        ...(input.dryRun ? { dryRun: true } : {}),
+        reason: verdict.reason,
+        now: deps.now,
+        dryRun: input.dryRun,
       });
       return "filtered";
     }
@@ -484,12 +623,12 @@ async function settleInstanceResolution(
     deliveryKey: string;
     instances: AutomationInstanceStore;
   },
-): Promise<{ instanceId: string } | "dropped"> {
+): Promise<{ instanceId: string; inputs?: Record<string, unknown> } | "dropped"> {
   switch (resolution.kind) {
     case "none":
       return { instanceId: "" };
     case "bound":
-      return { instanceId: resolution.instance.id };
+      return { instanceId: resolution.instance.id, inputs: resolution.instance.inputs };
     case "open": {
       const instance = await ctx.instances.openInstance({
         automationId: ctx.automationId,
@@ -497,7 +636,7 @@ async function settleInstanceResolution(
         inputs: resolution.inputs,
         openedBy: `event:${ctx.deliveryKey}`,
       });
-      return { instanceId: instance.id };
+      return { instanceId: instance.id, inputs: instance.inputs };
     }
     case "drop": {
       try {
@@ -596,23 +735,32 @@ export async function dispatchWebhookOccurrence(
       },
       { instances },
     );
-    const settled = await settleInstanceResolution(resolution, {
-      automationId: target.automation.id,
-      entrypointId: entrypoint.id,
-      eventKey: input.eventKey,
+    const decided = await decideAdmission({
+      target,
+      entrypoint,
+      trigger,
+      resolution,
       deliveryKey,
+      eventKey: input.eventKey,
       instances,
+      store,
+      now,
     });
-    if (settled === "dropped") {
+    if (decided.kind === "dropped") {
       result.dropped += 1;
+      continue;
+    }
+    if (decided.kind === "filtered") {
+      result.filtered += 1;
       continue;
     }
     const outcome = await admitAutomationRun(
       {
         target,
-        runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id, settled.instanceId),
+        runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id, decided.instanceId),
         deliveryKey,
-        ...(settled.instanceId !== "" ? { instanceId: settled.instanceId } : {}),
+        ...(decided.instanceId !== "" ? { instanceId: decided.instanceId, instanceInputs: decided.inputs } : {}),
+        admission: decided.verdict,
         trigger,
         scheduledFor: null,
       },
@@ -915,29 +1063,39 @@ export async function dispatchIntegrationEvent(
     }
     const deliveryKey = `${input.provider}:${input.deliveryId}`;
     try {
-      const settled = await settleInstanceResolution(resolution, {
-        automationId: target.automation.id,
-        entrypointId: entrypoint.id,
-        eventKey: input.eventKey,
+      const decided = await decideAdmission({
+        target,
+        entrypoint,
+        trigger,
+        resolution,
         deliveryKey,
+        eventKey: input.eventKey,
         instances,
+        store,
+        now,
       });
-      if (settled === "dropped") {
+      if (decided.kind === "dropped") {
         result.dropped += 1;
         continue;
       }
-      const outcome = await admitAutomationRun(
-        {
-          target,
-          runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id, settled.instanceId),
-          entrypoint: { id: entrypoint.id, trigger: entrypoint.trigger },
-          ...(settled.instanceId !== "" ? { instanceId: settled.instanceId } : {}),
-          deliveryKey,
-          trigger,
-          scheduledFor: null,
-        },
-        { store, starter, sender, now },
-      );
+      const outcome: AdmitOutcome =
+        decided.kind === "filtered"
+          ? "filtered"
+          : await admitAutomationRun(
+              {
+                target,
+                runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id, decided.instanceId),
+                entrypoint: { id: entrypoint.id, trigger: entrypoint.trigger },
+                ...(decided.instanceId !== ""
+                  ? { instanceId: decided.instanceId, instanceInputs: decided.inputs }
+                  : {}),
+                admission: decided.verdict,
+                deliveryKey,
+                trigger,
+                scheduledFor: null,
+              },
+              { store, starter, sender, now },
+            );
       result[outcome] += 1;
       if (target.automation.builtinKey !== null) {
         result.builtins[target.automation.builtinKey] = outcome;

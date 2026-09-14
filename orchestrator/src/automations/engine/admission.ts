@@ -15,9 +15,9 @@
  * that throws (a code error) admits — the run then fails visibly on the
  * same block instead of a delivery vanishing.
  *
- * Instance-bound runs (ADR 0120) skip the prelude: their admission is the
- * instance policy and the drops ring, and their inputs live on the
- * workstream, which the prelude does not load.
+ * Instance-bound runs (ADR 0120) evaluate it too, against the workstream's
+ * input snapshot layered over the automation's inputs — the same inputs
+ * loadSnapshot hands the run.
  */
 
 import type { RunSnapshot } from "./context.ts";
