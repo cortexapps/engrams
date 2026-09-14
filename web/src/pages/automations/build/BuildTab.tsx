@@ -113,7 +113,7 @@ const KNOWN_OUTPUTS: Record<string, readonly string[]> = {
   state_list: ["entries", "count", "truncated"],
   lookup_pr_session: ["found", "session_id", "task_id", "head_branch", "url", "title"],
   instance_close: ["closed", "not_instanced"],
-  claim_handle: ["claimed", "handle"],
+  claim_handle: ["claimed", "handle", "reclaimed"],
   review_open_pass: [
     "review_id",
     "task_id",
