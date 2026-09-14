@@ -136,6 +136,9 @@ const KNOWN_OUTPUTS: Record<string, readonly string[]> = {
     "ui_only_count",
   ],
   review_close_pass: ["review_id", "outcome"],
+  resolve_user: ["found", "user_id"],
+  relay_session: ["session_id", "installed", "handler_state"],
+  relay_close: ["posted", "rendered_as"],
 };
 
 function sessionSourcesFor(definition: AutomationDefinition, selectedId: string | null): string[] {
