@@ -52,7 +52,7 @@ the default one).
    `enabled: true`). Until the row is enabled, flagged channels stay on
    legacy.
 5. Confirm in the pod log on the next mention in that channel:
-   `slack: app_mention → Slack threads built-in (legacy workflow skipped)`.
+   `slack: app_mention → thread-brain built-in (legacy workflow skipped)`.
    An unflagged channel keeps logging `slack: app_mention → thread workflow`.
 
 To take a channel back off the engine, remove its row from **Channels**
