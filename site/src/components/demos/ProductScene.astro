@@ -10,20 +10,26 @@ const { kind } = Astro.props;
   <div class="stage">
     {kind === 'web' && <>
       <div class="app-pane">
-        <div class="bar"><TraceMark size={25}/><b>engrams</b><span class="muted">/ Release notes</span></div>
+        <div class="bar"><TraceMark size={25}/><b>engrams</b><span class="muted">/ Revenue dashboard</span></div>
         <div class="task-tabs"><span>Conversation</span><span>Files</span><span>Terminal</span></div>
         <div class="conversation">
-          <div class="message prior-answer">The release page is ready.<br/>You can check it in the preview.</div>
-          <div class="message human enter-one">Group these changes by customer impact.</div>
-          <div class="file-edit enter-two"><span>▧</span><code>release-notes.tsx</code><span class="additions">+18</span><span class="deletions">−9</span><span>⌄</span></div>
-          <div class="message answer enter-three">Updated. The biggest improvements come first.</div>
+          <div class="message prior-answer">The dashboard is running.<br/>Try it in the preview.</div>
+          <div class="message human enter-one">The date filter isn’t updating the chart. Fix it.</div>
+          <div class="file-edit enter-two"><span>▧</span><code>revenue-chart.tsx</code><span class="additions">+18</span><span class="deletions">−9</span><span>⌄</span></div>
+          <div class="dashboard-test enter-three">✓ Date filter regression test passed</div><div class="message answer enter-three">Fixed. The chart and totals now use the selected date range.</div>
         </div>
         <div class="composer"><div>Reply to the task…</div><div class="composer-tools"><span>＋</span><span class="plan-mode">Plan</span><span class="send-key">↵</span></div></div>
       </div>
-      <div class="preview paper"><div class="bar"><span class="live-dot"></span> Live preview <span class="right">↗</span></div><div class="release"><span class="eyebrow">ACME / CHANGELOG</span><h3>A better workday.</h3><span class="release-date">September release</span>
-        <div class="before"><p>Updated search index</p><p>Added batch export endpoint</p><p>Fixed invite link expiry</p></div>
-        <div class="after"><div class="release-item"><b>Find answers faster</b><p>Search across every project.</p></div><div class="release-item"><b>Take your data with you</b><p>Export a whole project at once.</p></div><div class="release-item"><b>Bring everyone along</b><p>Invites work when you need them.</p></div></div>
-      </div><div class="success enter-three">✓ Preview updated</div></div>
+      <div class="preview paper analytics"><div class="bar"><span class="live-dot"></span> Live preview <span class="right">↗</span></div>
+        <div class="analytics-nav"><b>◈ Meridian</b><span>Overview</span><span>Customers</span><span class="analytics-avatar">JD</span></div>
+        <div class="analytics-body"><div class="analytics-heading"><h3>Revenue</h3><span>USD</span></div>
+          <div class="date-filters" aria-label="Revenue date range"><button type="button" data-range="365" aria-pressed="false">12 months</button><button type="button" data-range="30" aria-pressed="true">Last 30 days</button><button type="button" data-range="7" aria-pressed="false">Last 7 days</button><span class="demo-pointer" aria-hidden="true">↖</span></div>
+          <div class="analytics-metrics"><div><span>Total revenue</span><strong data-revenue>$0</strong></div><div><span>Transactions</span><strong data-transactions>0</strong></div></div>
+          <div class="chart-heading"><b>Revenue over time</b><span data-chart-period>Sep 2025 – Sep 2026</span></div>
+          <svg class="revenue-chart" viewBox="0 0 360 110" role="img" aria-label="Revenue over the displayed date range"><path class="chart-grid" d="M0 15H360M0 55H360M0 95H360"/><path data-chart-fill class="chart-fill"/><path data-chart-line class="chart-line"/></svg><div class="chart-axis"><span data-axis-start>Sep 2025</span><span data-axis-end>Sep 2026</span></div>
+          <div class="transaction-title">Recent transactions <span>View all ↗</span></div><div class="transaction-row"><span class="customer-icon">N</span><div><b>Northstar Labs</b><small>Pro plan · Sep 13</small></div><span class="paid">Paid</span><b>$249.00</b></div><div class="transaction-row"><span class="customer-icon second">O</span><div><b>Orbit Studio</b><small>Team plan · Sep 12</small></div><span class="paid">Paid</span><b>$99.00</b></div>
+        </div><div class="dashboard-caption"><span class="caption-before">30-day filter selected · chart still shows a year</span><span class="caption-fixed">✓ Filter fixed · try another date range</span><span class="caption-tried">✓ Seven-day view · chart and totals updated</span></div>
+      </div>
     </>}
     {kind === 'slack' && <>
       <div class="slack-window paper"><div class="bar"><img src={slack.src} alt="Slack"/><b># product-eng</b><span class="right">Thread</span></div>
@@ -68,21 +74,57 @@ const { kind } = Astro.props;
   for (const scene of document.querySelectorAll<HTMLElement>('[data-scene]')) {
     const play = scene.querySelector<HTMLButtonElement>('[data-play]')!;
     const progress = scene.querySelector<HTMLElement>('.timeline i')!;
+    const dashboard = scene.classList.contains('web');
+    const duration = dashboard ? 10500 : 8500;
+    let manualRange: number | null = null;
+    let lastChartKey = '';
+    // Fixed daily amounts keep every range and total reproducible.
+    const dailyRevenue = Array.from({length:365}, (_, i) => 180 + ((i * 73 + i * i * 11) % 640));
+    const currency = new Intl.NumberFormat('en-US', {style:'currency',currency:'USD',maximumFractionDigits:0});
+    const drawChart = (days: number, selected: number) => {
+      const key = `${days}:${selected}`;
+      if (!dashboard || key === lastChartKey) return;
+      lastChartKey = key;
+      const values = dailyRevenue.slice(-days);
+      const bins = Math.min(days, 24);
+      const sums = Array.from({length:bins}, (_, i) => values.slice(Math.floor(i*days/bins), Math.floor((i+1)*days/bins)).reduce((a,b)=>a+b,0));
+      const max = Math.max(...sums) * 1.15;
+      const points = sums.map((value,i)=>`${(i/(bins-1)*360).toFixed(1)},${(100-value/max*90).toFixed(1)}`);
+      scene.querySelector('[data-chart-line]')!.setAttribute('d',`M${points.join(' L')}`);
+      scene.querySelector('[data-chart-fill]')!.setAttribute('d',`M0,110 L${points.join(' L')} L360,110 Z`);
+      scene.querySelector('[data-revenue]')!.textContent = currency.format(values.reduce((a,b)=>a+b,0));
+      scene.querySelector('[data-transactions]')!.textContent = String(values.reduce((a,b)=>a+Math.ceil(b/99),0));
+      const start = days === 365 ? 'Sep 2025' : days === 30 ? 'Aug 15' : 'Sep 7';
+      scene.querySelector('[data-axis-start]')!.textContent = start;
+      scene.querySelector('[data-chart-period]')!.textContent = `${start} – Sep 13`;
+      scene.querySelector('[data-axis-end]')!.textContent = 'Sep 13';
+      for (const button of scene.querySelectorAll<HTMLButtonElement>('[data-range]')) button.setAttribute('aria-pressed',String(Number(button.dataset.range)===selected));
+    };
     let elapsed = 0;
     let playing = !matchMedia('(prefers-reduced-motion: reduce)').matches;
     let last = performance.now();
     const render = () => {
       scene.dataset.step = String(elapsed < 1400 ? 0 : elapsed < 3200 ? 1 : elapsed < 4700 ? 2 : 3);
-      progress.style.width = `${elapsed / 8500 * 100}%`;
+      progress.style.width = `${elapsed / duration * 100}%`;
+      if (dashboard) {
+        const fixed = elapsed >= 4700;
+        const tried = elapsed >= 7300;
+        scene.dataset.tried = String(tried);
+        const selected = manualRange ?? (tried ? 7 : 30);
+        drawChart(fixed ? selected : 365, selected);
+      }
       play.textContent = playing ? 'Pause' : 'Play';
       play.setAttribute('aria-label', playing ? 'Pause animation' : 'Play animation');
     };
     if (!playing) elapsed = 6500;
     play.addEventListener('click', () => { playing = !playing; render(); });
-    scene.querySelector('[data-replay]')!.addEventListener('click', () => { elapsed = 0; playing = true; render(); });
+    scene.querySelector('[data-replay]')!.addEventListener('click', () => { elapsed = 0; manualRange = null; playing = true; render(); });
     scene.querySelector('[data-result]')!.addEventListener('click', () => { elapsed = 6500; playing = false; render(); });
+    for (const button of scene.querySelectorAll<HTMLButtonElement>('[data-range]')) {
+      button.addEventListener('click', () => { manualRange = Number(button.dataset.range); elapsed = 6500; playing = false; render(); });
+    }
     const frame = (now: number) => {
-      if (playing && !document.hidden) elapsed = (elapsed + Math.min(now - last, 100)) % 8500;
+      if (playing && !document.hidden) elapsed = (elapsed + Math.min(now - last, 100)) % duration;
       last = now; render(); requestAnimationFrame(frame);
     };
     render(); requestAnimationFrame(frame);
