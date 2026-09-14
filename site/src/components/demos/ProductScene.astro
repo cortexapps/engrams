@@ -2,6 +2,7 @@
 import TraceMark from '../TraceMark.astro';
 import slack from '../../assets/connector-logos/slack.svg';
 import github from '../../assets/connector-logos/github.svg';
+import linear from '../../assets/connector-logos/linear.svg';
 interface Props { kind: 'web' | 'slack' | 'review' | 'automation'; }
 const { kind } = Astro.props;
 ---
@@ -45,19 +46,19 @@ const { kind } = Astro.props;
     {kind === 'automation' && <>
       <div class="automation-window">
         <div class="bar"><TraceMark size={25}/><b>engrams</b><span class="muted">/ Automations</span><span class="enabled">● Enabled</span></div>
-        <div class="automation-title"><div><h3>Keep CI green</h3><p>Find failing tests. Fix them. Open a pull request.</p></div><div class="schedule-pill">◷ Every weekday · 06:00</div></div>
+        <div class="automation-title"><div><h3>Turn bug reports into fixes</h3><p>Pick up a Linear bug. Fix it. Open a pull request.</p></div><div class="schedule-pill">Linear · Issue created · Bug</div></div>
         <div class="factory-flow">
-          <div class="factory-step schedule-step"><span class="step-symbol">◷</span><b>Schedule</b><small class="schedule-wait">Next run · 06:00</small><small class="schedule-fired">Triggered · 06:00</small></div>
+          <div class="factory-step schedule-step"><span class="step-symbol"><img src={linear.src} alt="Linear"/></span><b>Linear bug ticket</b><small class="schedule-wait">Issue created</small><small class="schedule-fired">ENG-214 received</small></div>
           <span class="flow-wire wire-one"></span>
-          <div class="factory-step agent-step"><span class="step-symbol"><TraceMark size={27}/></span><b>Fix failing tests</b><small class="agent-wait">Agent session</small><small class="agent-active">Working on the fix…</small><small class="agent-done">✓ Fix verified</small></div>
+          <div class="factory-step agent-step"><span class="step-symbol"><TraceMark size={27}/></span><b>Fix the bug</b><small class="agent-wait">Agent session</small><small class="agent-active">Working on the fix…</small><small class="agent-done">✓ Fix verified</small></div>
           <span class="flow-wire wire-two"></span>
           <div class="factory-step output-step"><span class="step-symbol"><img src={github.src} alt="GitHub"/></span><b>Open pull request</b><small class="output-wait">After tests pass</small><small class="output-done">✓ Ready for review</small></div>
         </div>
-        <div class="factory-detail"><div class="factory-idle"><span>↻</span><p>Set up once.<br/><b>Ready for the next run.</b></p></div>
-          <div class="factory-work enter-one"><span class="detail-label">Agent session</span><div class="test-before">× CSV export skips the final row</div><div class="test-after enter-two">✓ 148 tests passed <span>Fix verified</span></div></div>
-          <div class="factory-pr enter-three"><div class="pr-open-symbol">⑂</div><div><span class="detail-label">Pull request #143</span><b>Fix the CSV export boundary</b><p>Regression test added. All checks passed.</p></div><span class="ready-pill">Review ↗</span></div>
+        <div class="factory-detail"><div class="factory-idle linear-ticket"><img src={linear.src} alt="Linear"/><div><span class="detail-label">ENG-214 <span class="bug-label">Bug</span></span><b>CSV export skips the final row</b><p>Exporting 10 rows only downloads 9.</p></div></div>
+          <div class="factory-work enter-one"><span class="detail-label">Working on ENG-214</span><div class="test-before">× CSV export skips the final row</div><div class="test-after enter-two">✓ 148 tests passed <span>Fix verified</span></div></div>
+          <div class="factory-pr enter-three"><div class="pr-open-symbol">⑂</div><div><span class="detail-label">ENG-214 → Pull request #143</span><b>Fix the CSV export boundary</b><p>Regression test added. All checks passed.</p></div><span class="ready-pill">Review ↗</span></div>
         </div>
-        <div class="factory-footer"><span class="run-pending">Waiting for schedule</span><span class="run-active">● Run in progress</span><span class="run-done">✓ Run complete</span><span>Next run · tomorrow, 06:00</span></div>
+        <div class="factory-footer"><span class="run-pending">Listening for Linear bugs</span><span class="run-active">● Run in progress</span><span class="run-done">✓ Run complete</span><span>Ready for the next bug ticket</span></div>
       </div>
     </>}
   </div>

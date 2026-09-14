@@ -1359,3 +1359,39 @@ h3 {
     margin: 6px 0 0;
   }
 }
+.linear-ticket {
+  height: 100%;
+  align-items: center;
+}
+.linear-ticket > img {
+  width: 25px;
+  height: 25px;
+}
+.linear-ticket b {
+  font-size: 15px;
+  color: #e4ecdf;
+}
+.linear-ticket p {
+  font-size: 11px;
+  margin: 5px 0 0;
+}
+.bug-label {
+  margin-left: 8px;
+  color: #d6b7bc;
+  border: 1px solid #74535f;
+  border-radius: 12px;
+  padding: 2px 7px;
+  font-size: 9px;
+}
+@media (max-width: 750px) {
+  .linear-ticket b {
+    font-size: 13px;
+  }
+  .linear-ticket > img {
+    width: 21px;
+    height: 21px;
+  }
+  .linear-ticket p {
+    font-size: 10px;
+  }
+}
