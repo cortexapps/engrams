@@ -2,7 +2,7 @@
 import TraceMark from '../TraceMark.astro';
 import slack from '../../assets/connector-logos/slack.svg';
 import github from '../../assets/connector-logos/github.svg';
-interface Props { kind: 'web' | 'slack' | 'review'; }
+interface Props { kind: 'web' | 'slack' | 'review' | 'automation'; }
 const { kind } = Astro.props;
 ---
 <div class:list={['demo', kind]} data-scene data-step="0">
@@ -41,6 +41,24 @@ const { kind } = Astro.props;
       </div>
       <div class="handoff enter-one"><span>→</span><small>Review feedback<br/>automation</small></div>
       <div class="review-target"><div class="bar"><TraceMark size={25}/><b>engrams</b></div><div class="review-body"><span class="eyebrow">ORIGINAL TASK · PR #142</span><h3>Fix CSV export</h3><div class="received enter-one"><small>FROM GITHUB REVIEW</small><p>Please cover the empty-list case.</p></div><div class="agent-line review-working enter-two"><TraceMark size={23}/><span>Adding the missing test…</span></div><div class="test-result enter-three"><span>✓</span><div><b>Empty-list test added</b><small>Pushed to PR #142</small></div></div></div></div>
+    </>}
+    {kind === 'automation' && <>
+      <div class="automation-window">
+        <div class="bar"><TraceMark size={25}/><b>engrams</b><span class="muted">/ Automations</span><span class="enabled">● Enabled</span></div>
+        <div class="automation-title"><div><h3>Keep CI green</h3><p>Find failing tests. Fix them. Open a pull request.</p></div><div class="schedule-pill">◷ Every weekday · 06:00</div></div>
+        <div class="factory-flow">
+          <div class="factory-step schedule-step"><span class="step-symbol">◷</span><b>Schedule</b><small class="schedule-wait">Next run · 06:00</small><small class="schedule-fired">Triggered · 06:00</small></div>
+          <span class="flow-wire wire-one"></span>
+          <div class="factory-step agent-step"><span class="step-symbol"><TraceMark size={27}/></span><b>Fix failing tests</b><small class="agent-wait">Agent session</small><small class="agent-active">Working on the fix…</small><small class="agent-done">✓ Fix verified</small></div>
+          <span class="flow-wire wire-two"></span>
+          <div class="factory-step output-step"><span class="step-symbol"><img src={github.src} alt="GitHub"/></span><b>Open pull request</b><small class="output-wait">After tests pass</small><small class="output-done">✓ Ready for review</small></div>
+        </div>
+        <div class="factory-detail"><div class="factory-idle"><span>↻</span><p>Set up once.<br/><b>Ready for the next run.</b></p></div>
+          <div class="factory-work enter-one"><span class="detail-label">Agent session</span><div class="test-before">× CSV export skips the final row</div><div class="test-after enter-two">✓ 148 tests passed <span>Fix verified</span></div></div>
+          <div class="factory-pr enter-three"><div class="pr-open-symbol">⑂</div><div><span class="detail-label">Pull request #143</span><b>Fix the CSV export boundary</b><p>Regression test added. All checks passed.</p></div><span class="ready-pill">Review ↗</span></div>
+        </div>
+        <div class="factory-footer"><span class="run-pending">Waiting for schedule</span><span class="run-active">● Run in progress</span><span class="run-done">✓ Run complete</span><span>Next run · tomorrow, 06:00</span></div>
+      </div>
     </>}
   </div>
   <div class="transport"><button type="button" data-play aria-label="Pause animation">Pause</button><button type="button" data-replay>Replay</button><div class="timeline" aria-hidden="true"><i></i></div><button type="button" data-result>Show result</button></div>
