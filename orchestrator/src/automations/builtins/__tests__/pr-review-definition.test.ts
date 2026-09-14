@@ -58,9 +58,12 @@ function commentEvent(body: string, assoc = "MEMBER", senderType = "User", repo 
 }
 
 describe("PR_REVIEW_BUILTIN definition", () => {
-  test("validates as a builtin and rejects as a user definition (system blocks)", () => {
+  test("validates as a builtin AND as a user definition: every block is a palette block", () => {
+    // The built-in is an example an ordinary user could have built. A
+    // Duplicate copies it into a user-kind row, so a user-kind validation
+    // failure here means Duplicate produces an unsaveable copy.
     expect(() => validateDefinition(PR_REVIEW_DEFINITION, { kind: "builtin" })).not.toThrow();
-    expect(() => validateDefinition(PR_REVIEW_DEFINITION, { kind: "user" })).toThrow(/reserved/);
+    expect(() => validateDefinition(PR_REVIEW_DEFINITION, { kind: "user" })).not.toThrow();
   });
 
   test("every tunable field exists in its block's config", () => {

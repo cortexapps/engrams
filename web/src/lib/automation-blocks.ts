@@ -619,6 +619,161 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     defaults: () => ({ handle: "" }),
   },
   {
+    kind: "review_open_pass",
+    label: "Open review pass",
+    description:
+      "Start a review pass on a pull request in the engrams review ledger (it shows on the Reviews page). Resolves the heads from GitHub when the trigger carries no SHAs.",
+    icon: GitPullRequest,
+    fields: [
+      {
+        type: "template",
+        key: "repo",
+        label: "Repository",
+        help: "owner/name, e.g. ${{ event.raw.repository.full_name }}",
+      },
+      {
+        type: "number",
+        key: "prNumber",
+        label: "PR number",
+        min: 1,
+        help: 'Usually a run-time reference: {"$ref": "event.raw.pull_request.number"}.',
+      },
+      {
+        type: "select",
+        key: "trigger",
+        label: "Trigger",
+        options: ["opened", "synchronize", "ready_for_review", "command", "retry", "dispatch"],
+        help: "opened and synchronize deduplicate a repeat on the same head; the others are requests.",
+      },
+      {
+        type: "template",
+        key: "headSha",
+        label: "Head SHA",
+        help: "Leave empty to resolve from GitHub.",
+      },
+      {
+        type: "template",
+        key: "baseSha",
+        label: "Base SHA",
+        help: "Leave empty to resolve from GitHub.",
+      },
+      {
+        type: "json",
+        key: "pr",
+        label: "PR context",
+        help: "Optional facts from the webhook payload (title, author, state, url, …).",
+      },
+    ],
+    summary: (c) => {
+      const repo = str(c["repo"]);
+      const trigger = str(c["trigger"], "opened");
+      return repo ? `${trigger} · ${truncate(repo, 40)}` : "No repository";
+    },
+    defaults: () => ({ provider: "github", repo: "", prNumber: 1, trigger: "opened" }),
+  },
+  {
+    kind: "review_stage",
+    label: "Stage review worker",
+    description:
+      "Write the reviewer brief, prior findings, and candidates into a session for one phase, and compose that phase's prompt (the prompt output feeds send_prompt).",
+    icon: FilePlus2,
+    fields: [
+      { type: "select", key: "phase", label: "Phase", options: ["finder", "verifier"] },
+      {
+        type: "template",
+        key: "reviewId",
+        label: "Review id",
+        help: "From the open pass: ${{ steps.open.review_id }}",
+      },
+      {
+        type: "template",
+        key: "sessionId",
+        label: "Session id",
+        help: "The worker session: ${{ steps.finder.session_id }}",
+      },
+      { type: "template", key: "repo", label: "Repository" },
+      { type: "number", key: "prNumber", label: "PR number", min: 1 },
+      { type: "template", key: "headSha", label: "Head SHA" },
+      { type: "template", key: "baseSha", label: "Base SHA" },
+      {
+        type: "json",
+        key: "enabledCategories",
+        label: "Categories",
+        help: "The lenses the reviewer applies; empty = all.",
+      },
+      { type: "template", key: "orgInstructions", label: "Org instructions", multiline: true },
+      {
+        type: "template",
+        key: "focus",
+        label: "Focus",
+        multiline: true,
+        help: "Finder only: a directive appended to the prompt.",
+      },
+    ],
+    summary: (c) => `Stage the ${str(c["phase"], "finder")}`,
+    defaults: () => ({
+      phase: "finder",
+      reviewId: "",
+      sessionId: "",
+      repo: "",
+      prNumber: 1,
+      headSha: "",
+    }),
+  },
+  {
+    kind: "review_settle",
+    label: "Settle review",
+    description:
+      "Apply the category and severity policy to the pass's findings, settle them in the ledger, and emit the parameters for github.post_pr_review.",
+    icon: SquareCheck,
+    fields: [
+      {
+        type: "template",
+        key: "reviewId",
+        label: "Review id",
+        help: "${{ steps.open.review_id }}",
+      },
+      {
+        type: "template",
+        key: "sessionId",
+        label: "Verifier session id",
+        help: "Optional: retired first, best effort.",
+      },
+    ],
+    summary: () => "Decide and settle the findings",
+    defaults: () => ({ reviewId: "" }),
+  },
+  {
+    kind: "review_close_pass",
+    label: "Close review pass",
+    description:
+      "Mark a pass failed or halted (sticky status comment + activity event) or tear a superseded pass down. Meant for settings.onFinalize hooks.",
+    icon: CircleStop,
+    fields: [
+      {
+        type: "template",
+        key: "reviewId",
+        label: "Review id",
+        help: "${{ steps.open.review_id }}",
+      },
+      {
+        type: "select",
+        key: "outcome",
+        label: "Outcome",
+        options: ["failed", "halted", "superseded"],
+      },
+      {
+        type: "template",
+        key: "reason",
+        label: "Reason",
+        multiline: true,
+        help: "Recorded on the review's activity log (failed only), e.g. ${{ run.error }}.",
+      },
+    ],
+    summary: (c) => `Close as ${str(c["outcome"], "failed")}`,
+    defaults: () => ({ reviewId: "", outcome: "failed" }),
+  },
+  {
     kind: "integration_action",
     label: "Integration action",
     description: "Call a catalog action on a connected integration with org credentials.",

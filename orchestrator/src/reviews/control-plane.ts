@@ -212,7 +212,7 @@ export interface ReviewControlPlane {
   composeVerifierPrompt(input: { repo: string; prNumber: number }): { prompt: string };
   /** The status bookkeeping that follows a phase prompt (status transition,
    *  activity event, sticky status comment). send*Prompt call it; the
-   *  built-in's system.review_stage block calls it after the generic
+   *  built-in's review_stage block calls it after the generic
    *  send_prompt delivers the composed text. */
   markPhasePrompted(reviewId: string, role: "finder" | "verifier"): Promise<void>;
   /** ADR 0119 phase 4: the decision + persistence half of `postReviewResults`

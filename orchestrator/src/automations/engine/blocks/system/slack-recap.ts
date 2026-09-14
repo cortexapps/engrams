@@ -48,6 +48,7 @@ export function registerSlackRecapBlock(): void {
   registerBlock<SlackRecapConfig>({
     type: SLACK_RECAP_TYPE,
     system: true,
+    refusesDryRun: true,
     outputs: ["posted", "rendered_as"],
     configSchema: slackRecapConfigSchema,
     async execute(config, ctx) {

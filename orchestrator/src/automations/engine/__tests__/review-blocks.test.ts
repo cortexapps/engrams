@@ -5,12 +5,11 @@ import type { ReviewPostPayload } from "../../../reviews/control-plane.ts";
 import { registerEngineBlocks } from "../blocks/index.ts";
 import { getBlock } from "../blocks/registry.ts";
 import {
-  OPEN_REVIEW_PASS_TYPE,
-  REVIEW_CLEANUP_TYPE,
-  REVIEW_POLICY_GATE_TYPE,
+  REVIEW_OPEN_PASS_TYPE,
+  REVIEW_SETTLE_TYPE,
   setReviewBlockDeps,
   type ReviewBlockControlPlane,
-} from "../blocks/system/review.ts";
+} from "../blocks/review.ts";
 import { buildRunContext, type RunContext } from "../context.ts";
 import type { EngineDeps } from "../deps.ts";
 import { validateDefinition } from "../definition.ts";
@@ -169,10 +168,10 @@ function ctx(): RunContext {
   return context;
 }
 
-describe("system.open_review_pass", () => {
+describe("review_open_pass", () => {
   test("skips the GitHub fetch when the trigger carried complete facts", async () => {
     const f = fake();
-    const block = getBlock(OPEN_REVIEW_PASS_TYPE)!;
+    const block = getBlock(REVIEW_OPEN_PASS_TYPE)!;
     const config = block.configSchema.parse({
       repo: "openai/engrams",
       prNumber: "100",
@@ -209,7 +208,7 @@ describe("system.open_review_pass", () => {
 
   test("resolves heads from GitHub for a comment command and does not dedupe a human trigger", async () => {
     const f = fake();
-    const block = getBlock(OPEN_REVIEW_PASS_TYPE)!;
+    const block = getBlock(REVIEW_OPEN_PASS_TYPE)!;
     const config = block.configSchema.parse({
       repo: "openai/engrams",
       prNumber: 100,
@@ -223,7 +222,7 @@ describe("system.open_review_pass", () => {
 
   test("a same-head redelivery ends the run as filtered, not failed", async () => {
     const f = fake({ deduplicate: true });
-    const block = getBlock(OPEN_REVIEW_PASS_TYPE)!;
+    const block = getBlock(REVIEW_OPEN_PASS_TYPE)!;
     const config = block.configSchema.parse({
       repo: "openai/engrams",
       prNumber: 100,
@@ -244,14 +243,14 @@ describe("system.open_review_pass", () => {
       baseSha: BASE,
       pr: { ...FULL_PR, providerId: null },
     });
-    const block = getBlock(OPEN_REVIEW_PASS_TYPE)!;
+    const block = getBlock(REVIEW_OPEN_PASS_TYPE)!;
     const config = block.configSchema.parse({ repo: "openai/engrams", prNumber: 1, trigger: "retry" });
     const outcome = await block.execute!(config as never, ctx());
     expect(outcome).toMatchObject({ kind: "error", code: "review_no_provider_id", retryable: false });
   });
 
   test("rejects an unsafe repo or SHA at config time", () => {
-    const block = getBlock(OPEN_REVIEW_PASS_TYPE)!;
+    const block = getBlock(REVIEW_OPEN_PASS_TYPE)!;
     expect(() =>
       block.configSchema.parse({ repo: "openai/engrams; rm -rf /", prNumber: 1, trigger: "opened" }),
     ).toThrow();
@@ -261,10 +260,10 @@ describe("system.open_review_pass", () => {
   });
 });
 
-describe("system.review_policy_gate", () => {
+describe("review_settle", () => {
   test("returns the post payload with the crash-safe marker as block outputs", async () => {
     const f = fake();
-    const block = getBlock(REVIEW_POLICY_GATE_TYPE)!;
+    const block = getBlock(REVIEW_SETTLE_TYPE)!;
     const config = block.configSchema.parse({ reviewId: "review-1", sessionId: "verifier-1" });
     const outcome = await block.execute!(config as never, ctx());
     expect(f.calls).toEqual(["decideReviewResults:review-1"]);
@@ -278,34 +277,23 @@ describe("system.review_policy_gate", () => {
   });
 });
 
-describe("system.review_cleanup", () => {
-  test("tears down a superseded pass's worker", async () => {
-    const f = fake();
-    const block = getBlock(REVIEW_CLEANUP_TYPE)!;
-    const config = block.configSchema.parse({ reviewId: "review-9", sessionId: "s-1" });
-    const outcome = await block.execute!(config as never, ctx());
-    expect(f.calls).toEqual(["cleanupSupersededReview:review-9"]);
-    expect(outcome).toMatchObject({ kind: "ok", outputs: { cleaned: true } });
-  });
-});
-
 describe("validator gate", () => {
-  test("a built-in definition may reference the review system blocks; a user one may not", () => {
+  test("the review blocks are palette blocks: a user definition may reference them", () => {
     const raw = {
       engine: 1,
       trigger: { kind: "manual" },
       blocks: [
         {
           id: "open",
-          type: OPEN_REVIEW_PASS_TYPE,
+          type: REVIEW_OPEN_PASS_TYPE,
           config: { repo: "openai/engrams", prNumber: 1, trigger: "opened" },
         },
-        { id: "gate", type: REVIEW_POLICY_GATE_TYPE, config: { reviewId: "${{ steps.open.review_id }}" } },
+        { id: "gate", type: REVIEW_SETTLE_TYPE, config: { reviewId: "${{ steps.open.review_id }}" } },
       ],
       inputsSchema: [],
       settings: { endSessionsOnFinish: false },
     };
     expect(validateDefinition(raw, { kind: "builtin" }).blocks).toHaveLength(2);
-    expect(() => validateDefinition(raw, { kind: "user" })).toThrow(/reserved for built-in/);
+    expect(validateDefinition(raw, { kind: "user" }).blocks).toHaveLength(2);
   });
 });

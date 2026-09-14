@@ -102,6 +102,11 @@ export function draftPatterns(): Record<string, unknown> {
       "Close the lifecycle with the instance_close block (a run closes only its own workstream); later events for it are dropped and audited. Kicking off the same key again starts a FRESH workstream.",
       "RunNow on an instanced automation takes instance_key + instance_inputs_json to open or join a workstream; the automation row's inputs are only defaults for new workstreams.",
     ],
+    reviews: [
+      "A code review that shows on the Reviews page is four blocks around ordinary sessions: review_open_pass (the pass row; outputs review_id, head_sha, base_sha) -> create_session + run_command clone + review_stage phase 'finder' (stages the reviewer brief into the session and outputs the prompt) -> send_prompt with waitFor a signal -> optionally the same for phase 'verifier' -> review_settle (outputs the github.post_pr_review params) -> integration_action github post_pr_review.",
+      "Put review_close_pass in settings.onFinalize hooks (outcome failed on failed|deadline, halted on halted, superseded on superseded) so a crashed or superseded pass leaves the ledger and the PR's status comment consistent. Set concurrency keyTemplate to the PR url with policy supersede: a force-push then supersedes the running pass.",
+      "The PR review built-in is the worked example: Duplicate it for a variant (a security-only review on release branches, say) instead of composing from scratch.",
+    ],
     state: [
       "automation_state is the shared memory across entrypoints and runs: state key = entity (one JSON document per entity, e.g. ticket:ENG-123), and make the automation's concurrency keyTemplate render the SAME entity key with policy queue - then runs touching one entity serialize and get-then-set needs no locks. For per-project workflows prefer settings.instance (see instances) - it scopes state per workstream automatically.",
       "Actors that cannot hold the entity claim (a cron sweep over many entities) write with expectVersion (CAS); an ok:false result is a branchable output, and losing a race to a real per-entity run is usually the correct outcome.",

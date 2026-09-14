@@ -119,7 +119,8 @@ Two rules make this safe:
     and control blocks). This is what lets the PR-review built-in reach the
     legacy graph's failure, halt, and supersede behaviour (the sticky ❌
     status comment, the activity-log reason, worker teardown) through
-    `system.review_finalize`. Any automation run in flight across the
+    `system.review_finalize` (now the catalog block `review_close_pass`).
+    Any automation run in flight across the
     1→2 deploy strands and is failed by the sweep, by design.
   - **3** (phase 4.5): **installed message handlers.** A block executor
     may implement `onMessage(msg, config, ctx) → "consumed" | "pass"`.
@@ -267,6 +268,19 @@ overwritten). Review-specific product logic that is not a generic primitive
 stays in code-registered **system blocks** (`open_review_pass`,
 `review_policy_gate`, `slack_thread_relay`, `slack_thread_recap`) that only built-in definitions
 may reference. If a system block proves generic, it graduates to the catalog.
+
+**Amendment 2026-09-13 — the review blocks graduated.** A built-in must be
+an example an ordinary user could have built from the palette: a Duplicate
+copies the graph into a user-kind row, and a `system.*` block makes that
+copy unsaveable. The four review blocks (`review_open_pass`,
+`review_stage`, `review_settle`, `review_close_pass`; `review_cleanup` was
+unreferenced and is gone) are now catalog blocks — writing the engrams
+review ledger is product surface like `create_session`, and any automation
+may open a pass that shows on the Reviews page. The Slack blocks
+(`slack_thread_relay`, `slack_thread_recap`, `slack_resolve_user`) graduate
+next as provider-neutral `relay_session` / `resolve_user`; the `system.*`
+namespace and its validator gate stay until then. Structure-locking of the
+built-ins (D1) is unchanged.
 
 The old graphs stay live during a parallel window: per-repository
 (`review_enrollment.engine`) and per-channel (membership in the built-in's

@@ -60,6 +60,7 @@ export function registerSlackIdentityBlock(): void {
   registerBlock<SlackIdentityConfig>({
     type: SLACK_IDENTITY_TYPE,
     system: true,
+    refusesDryRun: true,
     outputs: ["user_id", "linked"],
     configSchema: slackIdentityConfigSchema,
     async execute(config, ctx) {

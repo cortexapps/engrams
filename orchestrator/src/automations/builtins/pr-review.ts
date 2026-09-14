@@ -23,7 +23,7 @@
  * "command vs opened" or "repo short name" belongs in code, once.
  *
  * Terminal parity with the legacy graph rides `settings.onFinalize`
- * (ENGINE_STEP_CONTRACT 2) through system.review_finalize:
+ * (ENGINE_STEP_CONTRACT 2) through review_close_pass:
  *   - failed | deadline → the pass is marked failed, the activity log gets
  *     the run's error as the reason, and the sticky status comment flips to
  *     the legacy "failed" text (failReview);
@@ -50,16 +50,17 @@ import { REVIEW_PHASE_SIGNALS } from "../../tools/review.ts";
 import type { AutomationDefinition, BlockDef } from "../engine/definition.ts";
 import type { BuiltinAutomation } from "../engine/builtins.ts";
 import {
-  OPEN_REVIEW_PASS_TYPE,
-  REVIEW_POLICY_GATE_TYPE,
+  REVIEW_CLOSE_PASS_TYPE,
+  REVIEW_OPEN_PASS_TYPE,
+  REVIEW_SETTLE_TYPE,
   REVIEW_STAGE_TYPE,
-} from "../engine/blocks/system/review.ts";
+} from "../engine/blocks/review.ts";
 
 export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 /** Bump on any graph or inputs-schema change (the seeder inserts a new
  * version when the stored content hash differs). */
-export const PR_REVIEW_DEFINITION_VERSION = 3;
+export const PR_REVIEW_DEFINITION_VERSION = 4;
 
 /** Synthetic event key the CI dispatch edge admits a run under (no GitHub
  * delivery carries it). The admission arm accepts it for any mapped repo. */
@@ -252,7 +253,7 @@ const blocks: BlockDef[] = [
   },
   {
     id: "open",
-    type: OPEN_REVIEW_PASS_TYPE,
+    type: REVIEW_OPEN_PASS_TYPE,
     tunable: [],
     config: {
       provider: "github",
@@ -314,7 +315,7 @@ const blocks: BlockDef[] = [
   },
   {
     id: "gate",
-    type: REVIEW_POLICY_GATE_TYPE,
+    type: REVIEW_SETTLE_TYPE,
     tunable: [],
     config: { reviewId: "${{ steps.open.review_id }}" },
   },
@@ -426,7 +427,7 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
         when: ["failed", "deadline"],
         block: {
           id: "report_failure",
-          type: "system.review_finalize",
+          type: REVIEW_CLOSE_PASS_TYPE,
           config: {
             reviewId: { $ref: "steps.open.review_id" },
             outcome: "failed",
@@ -438,7 +439,7 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
         when: ["halted"],
         block: {
           id: "report_halt",
-          type: "system.review_finalize",
+          type: REVIEW_CLOSE_PASS_TYPE,
           config: { reviewId: { $ref: "steps.open.review_id" }, outcome: "halted" },
         },
       },
@@ -446,7 +447,7 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
         when: ["superseded"],
         block: {
           id: "cleanup_superseded",
-          type: "system.review_finalize",
+          type: REVIEW_CLOSE_PASS_TYPE,
           config: { reviewId: { $ref: "steps.open.review_id" }, outcome: "superseded" },
         },
       },

@@ -14,7 +14,7 @@ import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import {
   setReviewBlockDeps,
   type ReviewBlockControlPlane,
-} from "../../engine/blocks/system/review.ts";
+} from "../../engine/blocks/review.ts";
 import type { RunSnapshot } from "../../engine/context.ts";
 import type { EngineDeps, EngineSessionOps, EngineStepRecord } from "../../engine/deps.ts";
 import type { AutomationInbox } from "../../engine/inbox.ts";

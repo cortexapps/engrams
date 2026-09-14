@@ -123,7 +123,10 @@ describe("BlockInspector", () => {
   });
 
   it("renders system blocks read-only", async () => {
-    mount({ id: "gate", type: "system.review_policy_gate", config: { reviewId: "r1" } }, true);
+    mount(
+      { id: "recap", type: "system.slack_thread_recap", config: { status: "completed" } },
+      true,
+    );
     expect(await screen.findByText("built-in logic")).toBeTruthy();
     expect(screen.getByText("Configuration (read-only)")).toBeTruthy();
   });

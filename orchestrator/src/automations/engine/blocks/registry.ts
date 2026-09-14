@@ -50,6 +50,11 @@ export interface BlockExecutor<C = unknown> {
   type: string;
   /** Reserved for built-in definitions ("system.*" types). */
   system?: boolean;
+  /** The block carries product side effects with no dry-run stub (review
+   * rows, Slack posts); a dry run refuses it loudly instead of half-running
+   * the product. Blocks that can stub themselves (`would_execute`,
+   * `dry_run: true` outputs) leave this unset. */
+  refusesDryRun?: boolean;
   /** Documented for the UI/catalog; not enforced at runtime. */
   outputs?: readonly string[];
   configSchema: z.ZodType<C>;
