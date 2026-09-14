@@ -1108,7 +1108,7 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
 
 
 describe("interpretAutomation — installed message handlers (contract 3)", () => {
-  const TYPE = "system.test_relay";
+  const TYPE = "test_relay";
 
   const relayDefinition = (config: Record<string, unknown>): AutomationDefinition => ({
     engine: 1,
@@ -1135,7 +1135,6 @@ describe("interpretAutomation — installed message handlers (contract 3)", () =
     const seen: AutomationInbox[] = [];
     registerBlock<{ consume: string[] }>({
       type: TYPE,
-      system: true,
       configSchema: z.object({ consume: z.array(z.string()) }),
       async execute() {
         return { kind: "ok", outputs: { installed: true } };
@@ -1199,7 +1198,6 @@ describe("interpretAutomation — installed message handlers (contract 3)", () =
     const seenStates: unknown[] = [];
     registerBlock<Record<string, never>>({
       type: TYPE,
-      system: true,
       configSchema: z.object({}),
       async execute() {
         return { kind: "ok", outputs: { handler_state: { n: 0 } } };
@@ -1233,7 +1231,6 @@ describe("interpretAutomation — installed message handlers (contract 3)", () =
   test("a throwing handler is recorded on its relay step and never fails the run", async () => {
     registerBlock<Record<string, never>>({
       type: TYPE,
-      system: true,
       configSchema: z.object({}),
       async execute() {
         return { kind: "ok", outputs: {} };

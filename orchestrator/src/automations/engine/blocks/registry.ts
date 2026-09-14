@@ -2,8 +2,8 @@
  *
  * Executors register at import time (blocks/index.ts); the registry is
  * static, like SWEEP_POLICIES, and `assertBlockRegistryComplete()` runs at
- * boot. `system.*` types are code-registered product logic that only
- * built-in definitions may reference.
+ * boot. Every registered type is a palette type; a block that carries
+ * product side effects with no stub sets `refusesDryRun` (see below).
  */
 
 import type { z } from "zod";
@@ -48,8 +48,6 @@ export interface BlockWaitSpec<C> {
 
 export interface BlockExecutor<C = unknown> {
   type: string;
-  /** Reserved for built-in definitions ("system.*" types). */
-  system?: boolean;
   /** The block carries product side effects with no dry-run stub (review
    * rows, Slack posts); a dry run refuses it loudly instead of half-running
    * the product. Blocks that can stub themselves (`would_execute`,
@@ -87,16 +85,9 @@ export interface BlockExecutor<C = unknown> {
 
 const registry = new Map<string, BlockExecutor<never>>();
 
-export function isSystemBlockType(type: string): boolean {
-  return type.startsWith("system.");
-}
-
 export function registerBlock<C>(executor: BlockExecutor<C>): void {
   if (registry.has(executor.type)) {
     throw new Error(`block type "${executor.type}" registered twice`);
-  }
-  if (isSystemBlockType(executor.type) !== (executor.system === true)) {
-    throw new Error(`block type "${executor.type}" must mark system iff its name is system.*`);
   }
   registry.set(executor.type, executor as BlockExecutor<never>);
 }

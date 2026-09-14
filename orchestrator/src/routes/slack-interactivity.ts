@@ -37,7 +37,7 @@ import {
   assertIdempotencyKey,
   type AutomationInbox,
 } from "../automations/engine/inbox.ts";
-import { SLACK_ANSWER_SIGNAL } from "../automations/engine/blocks/system/slack-relay.ts";
+import { SLACK_ANSWER_SIGNAL } from "../automations/engine/blocks/relay.ts";
 
 /** DBOS statuses a workflow can't re-run from → that epoch is done (Invariant 4). */
 const TERMINAL_WF = new Set(["SUCCESS", "ERROR", "MAX_RECOVERY_ATTEMPTS_EXCEEDED", "CANCELLED"]);

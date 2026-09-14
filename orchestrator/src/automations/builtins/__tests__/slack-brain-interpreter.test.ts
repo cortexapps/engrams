@@ -9,8 +9,8 @@ import type { CuratedEvent } from "../../../control-plane/session-events.ts";
 import { makeCodeBlockRuntime } from "../../code/runtime.ts";
 import { makeReplayRunner, type ReplayRunner, type ReplayScript } from "../../engine/__tests__/replay-step.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
-import { setSlackIdentityDeps } from "../../engine/blocks/system/slack-identity.ts";
-import { setSlackRelayDeps } from "../../engine/blocks/system/slack-relay.ts";
+import { setSlackRelayDeps } from "../../engine/blocks/relay.ts";
+import { setResolveUserDeps } from "../../engine/blocks/resolve-user.ts";
 import { NO_USER_MSG } from "../../../integrations/slack-identity.ts";
 import type { RunSnapshot } from "../../engine/context.ts";
 import type { EngineDeps, EngineSessionOps, EngineStepRecord } from "../../engine/deps.ts";
@@ -70,6 +70,7 @@ interface Harness {
     title: string | null;
     ownerUserId: string | undefined;
   }>;
+  actions: Array<{ actionId: string; params: Record<string, unknown> }>;
   /** Slack user ids the identity gate was asked about. */
   resolved: string[];
   prompts: Array<{ sessionId: string; text: string }>;
@@ -103,6 +104,7 @@ function harness(options: {
   const ended: string[] = [];
   const finalized: Harness["finalized"] = [];
   const resolved: string[] = [];
+  const actions: Array<{ actionId: string; params: Record<string, unknown> }> = [];
   const linked = options.linkedUsers ?? { U1: "user-1", U2: "user-2" };
   const recvQueue = [...(options.recv ?? [])];
   const runSessions: Array<{ sessionId: string; keep: boolean }> = [];
@@ -129,14 +131,13 @@ function harness(options: {
   setSlackRelayDeps({
     policy: () => policy,
     completeToolCall: async () => {},
-    sessionWebUrl: (id) => `https://engrams.test/sessions/${id}`,
+    sessionWebUrl: (id: string) => `https://engrams.test/sessions/${id}`,
   });
-  setSlackIdentityDeps({
-    resolveUser: async (_provider, externalUserId) => {
+  setResolveUserDeps({
+    resolveUser: async (_provider: string, externalUserId: string) => {
       resolved.push(externalUserId);
       return linked[externalUserId] ?? null;
     },
-    policy: () => policy,
   });
 
   const snapshot: RunSnapshot = {
@@ -203,14 +204,20 @@ function harness(options: {
     sessions: sessionOps,
     clock: { nowMs: () => (clock += 1000) },
     code: makeCodeBlockRuntime(),
+    integrationActions: {
+      async execute(input) {
+        actions.push({ actionId: input.actionId, params: input.params });
+        return { ts: "9.0", channel: "C1" };
+      },
+    },
   };
 
-  return { deps, runner, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized, resolved };
+  return { deps, runner, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized, resolved, actions };
 }
 
 afterEach(() => {
   setSlackRelayDeps(null);
-  setSlackIdentityDeps(null);
+  setResolveUserDeps(null);
 });
 
 describe("Slack thread brain through the interpreter", () => {
@@ -320,11 +327,17 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.resolved).toEqual(["U1"]);
     expect(h.sessions).toEqual([]);
     expect(h.relayFlags).toEqual([]);
-    // Posted through the same policy as legacy, as a ❌ on the mention.
-    expect(h.policyCalls).toEqual([`fail:${NO_USER_MSG}`]);
+    // The legacy message, posted into the thread by an ordinary Slack action
+    // (the graph's decision, not the identity block's).
+    expect(h.policyCalls).toEqual([]);
+    expect(h.actions).toEqual([
+      { actionId: "post_message", params: { channel: "C1", threadTs: "100.1", text: NO_USER_MSG } },
+    ]);
     expect(h.names).toContain("step:identity:0");
+    expect(h.names).toContain("step:unlinked.login_notice:0");
     expect(h.names).not.toContain("step:session:0");
-    expect(h.finalized).toEqual([{ status: "filtered", error: expect.stringContaining("not linked") }]);
+    expect(h.finalized).toHaveLength(1);
+    expect(h.finalized[0]).toMatchObject({ status: "filtered" });
   });
 
   test("(a3) recovery still rebuilds the relay state when every ledger write fails", async () => {

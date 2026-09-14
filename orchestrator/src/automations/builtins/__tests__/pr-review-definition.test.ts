@@ -62,8 +62,8 @@ describe("PR_REVIEW_BUILTIN definition", () => {
     // The built-in is an example an ordinary user could have built. A
     // Duplicate copies it into a user-kind row, so a user-kind validation
     // failure here means Duplicate produces an unsaveable copy.
-    expect(() => validateDefinition(PR_REVIEW_DEFINITION, { kind: "builtin" })).not.toThrow();
-    expect(() => validateDefinition(PR_REVIEW_DEFINITION, { kind: "user" })).not.toThrow();
+    expect(() => validateDefinition(PR_REVIEW_DEFINITION)).not.toThrow();
+    expect(() => validateDefinition(PR_REVIEW_DEFINITION)).not.toThrow();
   });
 
   test("every tunable field exists in its block's config", () => {

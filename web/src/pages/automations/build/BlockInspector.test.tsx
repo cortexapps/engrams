@@ -122,13 +122,9 @@ describe("BlockInspector", () => {
     expect(field.textContent).toContain("template is required");
   });
 
-  it("renders system blocks read-only", async () => {
-    mount(
-      { id: "recap", type: "system.slack_thread_recap", config: { status: "completed" } },
-      true,
-    );
-    expect(await screen.findByText("built-in logic")).toBeTruthy();
-    expect(screen.getByText("Configuration (read-only)")).toBeTruthy();
+  it("renders an unknown block kind read-only", async () => {
+    mount({ id: "mystery", type: "not_a_kind_yet", config: { status: "completed" } }, true);
+    expect(await screen.findByText("Configuration (read-only)")).toBeTruthy();
   });
 
   it("integration_action derives param fields from the action's input schema", async () => {

@@ -10,7 +10,7 @@ import { z } from "zod";
 
 import { validateAutomationTemplate } from "../template.ts";
 import { parseFilterGroup, type FilterGroup } from "./conditions.ts";
-import { getBlock, isSystemBlockType } from "./blocks/registry.ts";
+import { getBlock } from "./blocks/registry.ts";
 
 export const ENGINE_VERSION = 1;
 export const MAX_BLOCKS = 64;
@@ -507,10 +507,6 @@ export class DefinitionError extends Error {
   }
 }
 
-export interface ValidateDefinitionOptions {
-  kind: "user" | "builtin";
-}
-
 function* walkBlocks(blocks: BlockDef[]): Generator<BlockDef> {
   for (const block of blocks) {
     yield block;
@@ -581,13 +577,10 @@ function validateTemplatesIn(blockId: string, value: unknown, field: string): vo
 }
 
 /** Authoring-time validation: shape, unique ids, block-type existence and
- * config schemas, system-block gating, nested condition groups, and every
+ * config schemas, nested condition groups, and every
  * embedded Liquid template. Throws `DefinitionError` with a block+field
  * address the editor can route. */
-export function validateDefinition(
-  raw: unknown,
-  options: ValidateDefinitionOptions,
-): AutomationDefinition {
+export function validateDefinition(raw: unknown): AutomationDefinition {
   const parsed = definitionSchema.safeParse(raw);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
@@ -617,13 +610,6 @@ export function validateDefinition(
     }
     seen.add(block.id);
 
-    if (isSystemBlockType(block.type) && options.kind !== "builtin") {
-      throw new DefinitionError(
-        block.id,
-        "type",
-        `block type "${block.type}" is reserved for built-in automations`,
-      );
-    }
     const executor = getBlock(block.type);
     if (!executor) {
       throw new DefinitionError(block.id, "type", `unknown block type "${block.type}"`);

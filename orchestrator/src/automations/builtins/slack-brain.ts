@@ -8,11 +8,12 @@
  * quiet. The session is KEPT when the run ends — a thread's session lives on
  * for a human to pick up.
  *
- * The relay (`system.slack_thread_relay`, phase 4.5) is the product logic
- * that is not a generic primitive: it streams agent messages into the thread
- * as coalesced bubbles, round-trips AskUserQuestion as Block Kit, sets the
- * ⏳/✅ reactions, and answers arrive as the `slack_answer` signal it consumes
- * itself. Everything else is a visible generic block.
+ * The relay (`relay_session`, phase 4.5) streams agent messages into the
+ * thread as coalesced bubbles, round-trips AskUserQuestion as Block Kit,
+ * sets the ⏳/✅ reactions, and answers arrive as the `slack_answer` signal
+ * it consumes itself. Every block here is a catalog block: this built-in is
+ * an example an ordinary user could have built, and Duplicate gives them an
+ * editable copy.
  *
  * The first block is a Code block for the same reason as the review
  * built-in: admission reads a MAP input keyed by a dynamic payload value
@@ -23,7 +24,7 @@
  *   - the initial/turn prompt is the triggering message's text with the bot
  *     mention stripped, NOT the legacy `<thread context>` fold of the whole
  *     thread fetched from the Slack API (that fold needs an I/O block; a
- *     follow-up can add `system.slack_thread_context`);
+ *     follow-up can add a thread-context block);
  *   - the LLM profile picker + the "which profile?" dropdown are retired:
  *     the channel → profile map input decides, with `default_profile` as the
  *     fallback.
@@ -36,12 +37,16 @@ import {
   type BlockDef,
 } from "../engine/definition.ts";
 import type { BuiltinAutomation } from "../engine/builtins.ts";
+import { RELAY_CLOSE_TYPE } from "../engine/blocks/relay-close.ts";
+import { RELAY_SESSION_TYPE } from "../engine/blocks/relay.ts";
+import { RESOLVE_USER_TYPE } from "../engine/blocks/resolve-user.ts";
+import { NO_USER_MSG } from "../../integrations/slack-identity.ts";
 import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 1;
+export const SLACK_BRAIN_DEFINITION_VERSION = 2;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
@@ -140,14 +145,44 @@ const admit: BlockDef[] = [
   // the thread and the run ends `filtered` before any session exists.
   {
     id: "identity",
-    type: "system.slack_resolve_user",
+    type: RESOLVE_USER_TYPE,
+    config: { provider: "slack", externalUserId: `\${{ ${F}.user_id }}` },
+  },
+  {
+    id: "unlinked",
+    type: "branch",
     config: {
-      userId: `\${{ ${F}.user_id }}`,
-      team: `\${{ ${F}.team }}`,
-      channel: `\${{ ${F}.channel }}`,
-      threadTs: `\${{ ${F}.thread_ts }}`,
-      mentionTs: `\${{ ${F}.mention_ts }}`,
-      eventId: `\${{ ${F}.event_id }}`,
+      conditions: {
+        mode: "all",
+        conditions: [{ path: "steps.identity.found", op: "is_false" }],
+      },
+    },
+    then: [
+      {
+        id: "login_notice",
+        type: "integration_action",
+        tunable: ["params"],
+        config: {
+          provider: "slack",
+          actionId: "post_message",
+          params: {
+            channel: `\${{ ${F}.channel }}`,
+            threadTs: `\${{ ${F}.thread_ts }}`,
+            text: NO_USER_MSG,
+          },
+        },
+      },
+    ],
+    else: [],
+  },
+  {
+    id: "linked",
+    type: "filter",
+    config: {
+      conditions: {
+        mode: "all",
+        conditions: [{ path: "steps.identity.found", op: "is_true" }],
+      },
     },
   },
 ];
@@ -171,9 +206,10 @@ const session: BlockDef = {
 
 const relay: BlockDef = {
   id: "relay",
-  type: "system.slack_thread_relay",
+  type: RELAY_SESSION_TYPE,
   config: {
     session: { blockId: "session" },
+    provider: "slack",
     team: `\${{ ${F}.team }}`,
     channel: `\${{ ${F}.channel }}`,
     threadTs: `\${{ ${F}.thread_ts }}`,
@@ -257,9 +293,10 @@ const conversation: BlockDef = {
         // ✅ seals on the reply — the legacy per-turn mention ownership.
         {
           id: "repoint",
-          type: "system.slack_thread_relay",
+          type: RELAY_SESSION_TYPE,
           config: {
             session: { blockId: "session" },
+            provider: "slack",
             team: `\${{ ${F}.team }}`,
             channel: `\${{ ${F}.channel }}`,
             threadTs: `\${{ ${F}.thread_ts }}`,
@@ -357,7 +394,7 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
         when: ["completed", "deadline", "failed", "halted", "superseded", "filtered"],
         block: {
           id: "recap",
-          type: "system.slack_thread_recap",
+          type: RELAY_CLOSE_TYPE,
           config: { status: "${{ run.status }}" },
         },
       },

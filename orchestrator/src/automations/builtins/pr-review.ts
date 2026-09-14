@@ -7,10 +7,10 @@
  * the coarse per-org knobs (which repos, the mention handle, the lenses, the
  * reviewer profile, org instructions).
  *
- * Where product logic is not a generic primitive it stays in code as a
- * `system.*` block: opening the pass (targets, dedupe, the review row),
- * staging the reviewer briefs + prior context + candidates and composing the
- * phase prompts, the policy gate, and the supersede cleanup. Everything else
+ * Where product logic is not a generic primitive it is a first-party
+ * `review_*` catalog block: opening the pass (targets, dedupe, the review
+ * row), staging the reviewer briefs + prior context + candidates and
+ * composing the phase prompts, the policy gate, and the close-out. Everything else
  * — the session, the clone, the prompt delivery, the GitHub comments and
  * review post, the teardown — is a visible generic block.
  *

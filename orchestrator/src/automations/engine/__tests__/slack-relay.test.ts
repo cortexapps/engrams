@@ -6,11 +6,12 @@ import { registerEngineBlocks } from "../blocks/index.ts";
 import { getBlock } from "../blocks/registry.ts";
 import {
   MAX_BUBBLE_CHARS,
+  RELAY_SESSION_TYPE,
   SLACK_ANSWER_SIGNAL,
   setSlackRelayDeps,
   slackRelayClosingSummary,
   type SlackRelayConfig,
-} from "../blocks/system/slack-relay.ts";
+} from "../blocks/relay.ts";
 import { buildRunContext, type RunSnapshot } from "../context.ts";
 import type { EngineDeps, EngineRunStore, EngineSessionOps } from "../deps.ts";
 import type { AutomationInbox } from "../inbox.ts";
@@ -72,6 +73,7 @@ function recordingPolicy() {
 const RUN_ID = "autorun:auto-1:slack:E1";
 const CONFIG: SlackRelayConfig = {
   session: { blockId: "launch" },
+  provider: "slack",
   team: "T1",
   channel: "C1",
   threadTs: "100.0",
@@ -142,7 +144,7 @@ function harness() {
   const ctx = buildRunContext(RUN_ID, snapshot, deps);
   ctx.steps["launch"] = { session_id: "s-launch" };
   ctx.currentBlockId = "relay";
-  const block = getBlock("system.slack_thread_relay")!;
+  const block = getBlock(RELAY_SESSION_TYPE)!;
   // The harness does what the interpreter does with the threaded state
   // (contract 3): the execute step's `handler_state` output seeds it, every
   // handler call sees the previous call's returned state, and the latest
@@ -186,7 +188,7 @@ const sessionEvent = (event: CuratedEvent): AutomationInbox => ({
   event,
 });
 
-describe("system.slack_thread_relay", () => {
+describe("relay_session", () => {
   afterEach(() => setSlackRelayDeps(null));
 
   test("install flips the session's relay flag and returns the session id + initial state", async () => {

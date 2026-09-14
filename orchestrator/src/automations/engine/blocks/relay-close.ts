@@ -1,6 +1,7 @@
-/** `system.slack_thread_recap` — the Slack built-in's finalize hook (ADR 0119
- * phase 4.6). Renders the run's terminal state into the thread exactly the
- * way the legacy loop's terminal arms did, through the same policy:
+/** `relay_close` — the closing message of a relayed session, for a
+ * `settings.onFinalize` hook (ADR 0119 phase 4.6; a catalog block since
+ * 2026-09). Renders the run's terminal state into the relayed place exactly
+ * the way the legacy Slack loop's terminal arms did, through the same policy:
  *
  *   completed          → onComplete (✅, last message, asset recap)
  *   failed | deadline  → onFail (❌ + the run's error)
@@ -14,10 +15,10 @@
 
 import { z } from "zod";
 
-import { registerBlock } from "../registry.ts";
-import { slackRelayFinalFacts, slackRelayPolicy } from "./slack-relay.ts";
+import { registerBlock } from "./registry.ts";
+import { slackRelayFinalFacts, slackRelayPolicy } from "./relay.ts";
 
-export const SLACK_RECAP_TYPE = "system.slack_thread_recap";
+export const RELAY_CLOSE_TYPE = "relay_close";
 
 export const slackRecapConfigSchema = z.object({
   /** The run's terminal status, templated from `${{ run.status }}`. */
@@ -44,10 +45,9 @@ function deps(): SlackRecapDeps {
   return runtimeDeps ?? { facts: slackRelayFinalFacts, policy: slackRelayPolicy };
 }
 
-export function registerSlackRecapBlock(): void {
+export function registerRelayCloseBlock(): void {
   registerBlock<SlackRecapConfig>({
-    type: SLACK_RECAP_TYPE,
-    system: true,
+    type: RELAY_CLOSE_TYPE,
     refusesDryRun: true,
     outputs: ["posted", "rendered_as"],
     configSchema: slackRecapConfigSchema,

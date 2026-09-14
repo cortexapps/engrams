@@ -276,11 +276,16 @@ copy unsaveable. The four review blocks (`review_open_pass`,
 `review_stage`, `review_settle`, `review_close_pass`; `review_cleanup` was
 unreferenced and is gone) are now catalog blocks — writing the engrams
 review ledger is product surface like `create_session`, and any automation
-may open a pass that shows on the Reviews page. The Slack blocks
-(`slack_thread_relay`, `slack_thread_recap`, `slack_resolve_user`) graduate
-next as provider-neutral `relay_session` / `resolve_user`; the `system.*`
-namespace and its validator gate stay until then. Structure-locking of the
-built-ins (D1) is unchanged.
+may open a pass that shows on the Reviews page. The Slack blocks followed
+the same day: `slack_thread_relay` → `relay_session` (Slack is the first
+provider in its `provider` enum), `slack_thread_recap` → `relay_close`,
+`slack_resolve_user` → a pure `resolve_user` lookup (the "log in first"
+post and the `filtered` end are now ordinary blocks in the built-in's
+graph). With no `system.*` kind left, the namespace, the `system` executor
+flag, the validator gate, and the `kind` option of `validateDefinition` are
+gone; the one thing the flag also carried — a dry run refusing a block with
+product side effects — is an explicit `refusesDryRun` on the executor.
+Structure-locking of the built-ins (D1) is unchanged.
 
 The old graphs stay live during a parallel window: per-repository
 (`review_enrollment.engine`) and per-channel (membership in the built-in's

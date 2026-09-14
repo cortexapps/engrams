@@ -4,8 +4,8 @@ The Slack threads automation exists twice during the parity window:
 
 - **Legacy**: the per-thread DBOS workflow `slack-thread.ts` (ADR 0060).
 - **Engine**: the `slack_brain` built-in automation — a definition on the
-  block engine with two system blocks (`system.slack_thread_relay`,
-  `system.slack_thread_recap`).
+  block engine. Every block in it is a palette block (`resolve_user`,
+  `relay_session`, `relay_close` among them).
 
 One channel is served by exactly one of them. The integration dispatcher
 decides per delivery, and the Slack events route
@@ -83,7 +83,8 @@ to use the switch; the flags survive, so lifting it re-opens the same window.
 
 - **Runs**: Settings → Automations → Slack threads → Runs. One run per
   thread (concurrency key `team:channel:thread_ts`, policy `join`). A
-  healthy thread: `facts` → `admit` → `identity` → `session` → `relay` →
+  healthy thread: `facts` → `admit` → `identity` → `unlinked` → `linked` →
+  `session` → `relay` →
   `first_turn` → `thread[n].next` → `thread[n].has_turn.repoint` (the
   relay re-pointed at the follow-up, so ⏳/✅ land on it) →
   `thread[n].has_turn.turn` … and ends `completed` when the idle
@@ -142,12 +143,15 @@ is the message text with the bot mention stripped, not the legacy
 `<thread context>` fold of the whole thread; the LLM profile picker and
 the "which profile?" dropdown are retired in favour of the `channels` map.
 
-Parity that is NOT a divergence: the identity gate. `system.slack_resolve_user`
-is the legacy `resolveUser` — an unlinked author gets the same message and
-no session — and `create_session` carries the resolved user as
-`ownerUserId`, so the thread's session runs with that user's credentials,
-OAuth subject and git attribution (the programmatic org credential is
-reserved for the review workers, which deliberately have no owner).
+Parity that is NOT a divergence: the identity gate. `resolve_user` is the
+legacy `resolveUser` lookup; an unlinked author gets the same "log in first"
+message (posted by the `unlinked.login_notice` Slack action) and no session
+(the `linked` filter ends the run `filtered`). One small divergence: legacy
+also set a ❌ reaction on the mention; the action posts the message only.
+`create_session` carries the resolved user as `ownerUserId`, so the thread's
+session runs with that user's credentials, OAuth subject and git attribution
+(the programmatic org credential is reserved for the review workers, which
+deliberately have no owner).
 
 ## Rollback
 

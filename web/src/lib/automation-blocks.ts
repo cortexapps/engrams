@@ -218,11 +218,9 @@ export interface BlockKindSpec {
     | "filter"
     | "code"
     | "integration_action"
-    | "system";
+    | "readonly";
   /** Whether this kind nests child lists (branch: then/else; loop: body). */
   nests?: "branch" | "loop";
-  /** Kinds only a built-in may reference. */
-  system?: boolean;
   /** Fresh default config when inserted. */
   defaults(): BlockConfig;
 }
@@ -774,6 +772,83 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     defaults: () => ({ reviewId: "", outcome: "failed" }),
   },
   {
+    kind: "resolve_user",
+    label: "Resolve user",
+    description:
+      "Map a provider identity (a Slack user id) to an engrams user. Outputs found + user_id; pass user_id to create_session as the owner.",
+    icon: HeartPulse,
+    fields: [
+      { type: "select", key: "provider", label: "Provider", options: ["slack"] },
+      {
+        type: "template",
+        key: "externalUserId",
+        label: "External user id",
+        help: "e.g. ${{ event.raw.event.user }}",
+      },
+    ],
+    summary: (c) => {
+      const id = str(c["externalUserId"]);
+      return id ? `${str(c["provider"], "slack")} user ${truncate(id, 30)}` : "No user id";
+    },
+    defaults: () => ({ provider: "slack", externalUserId: "" }),
+  },
+  {
+    kind: "relay_session",
+    label: "Relay session",
+    description:
+      "Mirror a session into a Slack thread: streamed replies as bubbles, questions as Block Kit, ⏳/✅ on the message that started the turn. Run it again to re-point at a follow-up.",
+    icon: MailOpen,
+    fields: [
+      { type: "session_ref", key: "session", label: "Session" },
+      { type: "select", key: "provider", label: "Provider", options: ["slack"] },
+      { type: "template", key: "team", label: "Team id", help: "${{ event.raw.team_id }}" },
+      {
+        type: "template",
+        key: "channel",
+        label: "Channel id",
+        help: "${{ event.raw.event.channel }}",
+      },
+      {
+        type: "template",
+        key: "threadTs",
+        label: "Thread ts",
+        help: "The thread root: ${{ event.raw.event.thread_ts | default: event.raw.event.ts }}",
+      },
+      {
+        type: "template",
+        key: "mentionTs",
+        label: "Mention ts",
+        help: "The message this turn reacts on; defaults to the thread root.",
+      },
+      { type: "template", key: "userId", label: "Author id", help: "${{ event.raw.event.user }}" },
+      { type: "template", key: "eventId", label: "Event id", help: "${{ event.raw.event_id }}" },
+    ],
+    summary: (c) => {
+      const channel = str(c["channel"]);
+      return channel ? `Relay to ${truncate(channel, 30)}` : "No channel";
+    },
+    defaults: () => ({ session: {}, provider: "slack", team: "", channel: "", threadTs: "" }),
+  },
+  {
+    kind: "relay_close",
+    label: "Close relay",
+    description:
+      "Post the closing message of a relayed session (✅ with the last reply and assets, ❌ with the error, or a neutral note). Meant for settings.onFinalize hooks.",
+    icon: CircleStop,
+    fields: [
+      { type: "template", key: "status", label: "Run status", help: "Usually ${{ run.status }}." },
+      {
+        type: "template",
+        key: "message",
+        label: "Message",
+        multiline: true,
+        help: "Optional text for the failure or neutral message.",
+      },
+    ],
+    summary: () => "Post the closing message",
+    defaults: () => ({ status: "${{ run.status }}" }),
+  },
+  {
     kind: "integration_action",
     label: "Integration action",
     description: "Call a catalog action on a connected integration with org credentials.",
@@ -792,42 +867,23 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
 
 const BY_KIND = new Map(BLOCK_KINDS.map((spec) => [spec.kind, spec]));
 
-const SYSTEM_SPEC: Omit<BlockKindSpec, "kind" | "label"> = {
-  description: "Product logic shipped with a built-in automation.",
-  icon: Lock,
-  inspector: "system",
-  system: true,
-  summary: () => "Set by the built-in",
-  defaults: () => ({}),
-};
-
-/** Resolve a block kind. `system.*` kinds are synthesized read-only. */
+/** Resolve a block kind. An unknown kind (a definition saved by a newer
+ * server, say) renders read-only. */
 export function blockKind(kind: string): BlockKindSpec {
   const known = BY_KIND.get(kind);
   if (known) return known;
-  if (kind.startsWith("system.")) {
-    return {
-      ...SYSTEM_SPEC,
-      kind,
-      label: kind
-        .slice("system.".length)
-        .split("_")
-        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-        .join(" "),
-    };
-  }
   return {
     kind,
     label: kind,
     description: "Unknown block kind.",
     icon: Lock,
-    inspector: "system",
+    inspector: "readonly",
     summary: () => "Unknown block kind",
     defaults: () => ({}),
   };
 }
 
-/** Kinds a user may insert (system kinds excluded). */
+/** Kinds a user may insert. */
 export function insertableBlockKinds(): readonly BlockKindSpec[] {
   return BLOCK_KINDS;
 }

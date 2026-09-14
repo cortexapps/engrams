@@ -13,12 +13,14 @@ import {
 registerEngineBlocks();
 
 describe("Slack thread brain built-in — definition", () => {
-  test("validates as a built-in (system blocks, $ref loop bound, finalize hook)", () => {
-    const parsed = validateDefinition(SLACK_BRAIN_DEFINITION, { kind: "builtin" });
+  test("validates ($ref loop bound, finalize hook) and every block is a palette block", () => {
+    const parsed = validateDefinition(SLACK_BRAIN_DEFINITION);
     expect(parsed.blocks.map((b) => b.id)).toEqual([
       "facts",
       "admit",
       "identity",
+      "unlinked",
+      "linked",
       "session",
       "relay",
       "first_turn",
@@ -29,13 +31,7 @@ describe("Slack thread brain built-in — definition", () => {
     // admission; it never opens a run of its own.
     expect(parsed.trigger).toMatchObject({ continueOnly: ["message"] });
     expect(parsed.settings.endSessionsOnFinish).toBe(false);
-    expect(parsed.settings.onFinalize?.[0]?.block.type).toBe("system.slack_thread_recap");
-  });
-
-  test("is rejected as a user automation (system blocks are built-in only)", () => {
-    expect(() => validateDefinition(SLACK_BRAIN_DEFINITION, { kind: "user" })).toThrow(
-      /reserved for built-in/,
-    );
+    expect(parsed.settings.onFinalize?.[0]?.block.type).toBe("relay_close");
   });
 
   test("trigger scope: only a channel in the inputs' map matches at dispatch", () => {

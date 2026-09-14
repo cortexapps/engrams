@@ -293,7 +293,7 @@ describe("validator gate", () => {
       inputsSchema: [],
       settings: { endSessionsOnFinish: false },
     };
-    expect(validateDefinition(raw, { kind: "builtin" }).blocks).toHaveLength(2);
-    expect(validateDefinition(raw, { kind: "user" }).blocks).toHaveLength(2);
+    expect(validateDefinition(raw).blocks).toHaveLength(2);
+    expect(validateDefinition(raw).blocks).toHaveLength(2);
   });
 });

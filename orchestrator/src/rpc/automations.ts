@@ -508,12 +508,11 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
    * event keys). */
   async function parseDefinition(
     raw: string,
-    kind: "user" | "builtin",
   ): Promise<{ definition: AutomationDefinition; nextFireAt: Date | null }> {
     const parsed = parseJson(raw, "definition_json", DEFINITION_MAX_CHARS);
     let definition: AutomationDefinition;
     try {
-      definition = validateDefinition(parsed, { kind });
+      definition = validateDefinition(parsed);
     } catch (error) {
       const be = toBlockError(error);
       if (be) throw new BlockValidationError([be]);
@@ -900,7 +899,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     async createAutomation(req, ctx) {
       const userId = (await requireAdmin(ctx, getSession)).id;
       const name = requiredText(req.name, "name");
-      const { definition, nextFireAt } = await parseDefinition(req.definitionJson, "user");
+      const { definition, nextFireAt } = await parseDefinition(req.definitionJson);
       const inputs = req.inputsJson ? parseObjectJson(req.inputsJson, "inputs_json") : {};
       assertInputValues(definition.inputsSchema, inputs);
       const row = await store.create(
@@ -950,7 +949,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const row = await requireAutomation(req.automationId);
       refuseOnBuiltin(row, "saving a new version");
       if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
-      const { definition, nextFireAt } = await parseDefinition(req.definitionJson, "user");
+      const { definition, nextFireAt } = await parseDefinition(req.definitionJson);
       // Existing overrides must still be valid against the new graph; drop
       // the ones that no longer apply rather than refusing the save.
       let overrides: BlockOverrides = row.blockOverrides;
@@ -1010,7 +1009,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         const settings: AutomationSettings = parsed.data;
         const definition: AutomationDefinition = { ...definitionOf(row.version), settings };
         // Re-validate the whole definition (templates inside settings).
-        const { definition: validated } = await parseDefinition(JSON.stringify(definition), "user");
+        const { definition: validated } = await parseDefinition(JSON.stringify(definition));
         const saved = await store.saveVersion(row.id, validated, userId, patch);
         if (!saved) throw new ConnectError("automation not found", Code.NotFound);
         return { automation: toProtoAutomation(saved) };
@@ -1098,7 +1097,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       if (req.draftDefinitionJson !== undefined) {
         const parsed = parseJson(req.draftDefinitionJson, "draft_definition_json", DEFINITION_MAX_CHARS);
         try {
-          definition = validateDefinition(parsed, { kind: row.kind === "builtin" ? "builtin" : "user" });
+          definition = validateDefinition(parsed);
         } catch (error) {
           const be = toBlockError(error);
           if (be) return { blocks: [], errors: [be] };
