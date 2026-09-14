@@ -361,6 +361,24 @@ describe("PR-review built-in on the interpreter", () => {
     expect(h.sessions[0]!.capabilityOverride).toEqual(["engram:pr_review", "github:contents:read@acme/other"]);
   });
 
+  test("(d'') a review.dispatch admits an on_request repo as a dispatch and resolves heads from GitHub", async () => {
+    const h = harness({
+      eventKey: "review.dispatch",
+      payload: { repository: { full_name: "acme/other", name: "other" }, pull_request: { number: 5 } },
+      recv: [finderDone(0)],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe("completed");
+    expect(h.cpCalls.slice(0, 3)).toEqual(["resolvePrHeads", "resolveReviewTarget", "createReviewPass:dispatch"]);
+
+    const stranger = harness({
+      eventKey: "review.dispatch",
+      payload: { repository: { full_name: "stranger/repo", name: "repo" }, pull_request: { number: 5 } },
+    });
+    expect((await interpretAutomation(RUN, stranger.deps)).status).toBe("filtered");
+  });
+
   test("(e) a supersede mid-finder ends the run as superseded and finalize ends the kept=false workers", async () => {
     const h = harness({
       eventKey: "pull_request.opened",

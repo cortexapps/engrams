@@ -208,6 +208,20 @@ never an advisory lock):
   a run (the Slack thread case). This retires the epoch-suffixed thread
   workflow ids of ADR 0060.
 
+**Amendment 2026-09-13 — the admission prelude decides before the claim.**
+The concurrency claim is the engine's first side effect on a delivery
+(`supersede` ends the holder, `join` delivers into it), and it ran before
+the graph's own admission, so a delivery the graph would filter one block
+later had already superseded a live run: any comment on a PR under review
+ended the review, and `@engrams stop` could never end a run `halted`.
+Dispatch now evaluates the entrypoint's admission prelude — its leading
+`code` + `filter` blocks, pure by construction — against the run's scope
+before the claim (`engine/admission.ts`). A rejection records a `filtered`
+run row with no workflow and no claim (`AdmitOutcome: "filtered"`); a
+prelude that throws admits, so the run fails visibly on the same block.
+Instance-bound runs keep the instance policy + drops ring as their
+admission and skip the prelude.
+
 ### D5 — Integration-owned triggers
 
 Verification lives with the integration, not with a user-minted registration.

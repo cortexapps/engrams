@@ -1,9 +1,15 @@
-/** Bearer-authenticated CI dispatch edge for PR reviews (ADR 0100). */
+/** Bearer-authenticated CI dispatch edge for PR reviews (ADR 0100).
+ *
+ * During the ADR 0119 parallel window the edge follows the repo's `engine`
+ * flag like the webhook route does: a repo on the automation engine gets a
+ * built-in run (`review.dispatch`), every other repo the legacy ingress. */
 
 import { Hono } from "hono";
 
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { config } from "../config.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
+import { dispatchAutomationReview, type ReviewCoordinate } from "../reviews/automation-review.ts";
 import {
   startReviewIngress,
   type ReviewIngressStart,
@@ -17,6 +23,10 @@ export interface ReviewsDispatchDeps {
   getSession?: GetSession;
   enrollments?: Pick<EnrollmentStore, "get">;
   startIngress?: (input: ReviewIngressStart) => Promise<void>;
+  /** Admit a built-in run for the coordinate; returns the run id. */
+  dispatchAutomation?: (input: ReviewCoordinate) => Promise<string>;
+  /** ADR 0119 phase 4.4 kill switch; defaults to the config value. */
+  reviewAutomationDisabled?: boolean;
   randomUUID?: () => string;
 }
 
@@ -28,6 +38,8 @@ export function makeReviewsDispatchRoute(
   const enrollments = (): Pick<EnrollmentStore, "get"> =>
     (enrollmentStore ??= makeEnrollmentStore());
   const startIngress = deps.startIngress ?? startReviewIngress;
+  const dispatchAutomation = deps.dispatchAutomation ?? dispatchAutomationReview;
+  const reviewAutomationDisabled = deps.reviewAutomationDisabled ?? config.reviewAutomationDisabled;
   const randomUUID = deps.randomUUID ?? (() => crypto.randomUUID());
   const app = new Hono();
 
@@ -48,9 +60,15 @@ export function makeReviewsDispatchRoute(
       return c.json({ error: "repo and positive pr_number are required" }, 400);
     }
 
-    if (!(await enrollments().get(repo))) {
+    const enrollment = await enrollments().get(repo);
+    if (!enrollment) {
       // A missing enrollment is a stable resource miss, not a transient conflict.
       return c.json({ error: "repo is not enrolled" }, 404);
+    }
+    if (enrollment.engine === "automation" && !reviewAutomationDisabled) {
+      // The run id is the DBOS workflow id, so the response shape holds.
+      const runId = await dispatchAutomation({ repo, prNumber });
+      return c.json({ workflow_id: runId });
     }
     // A CI dispatch carries only a coordinate, so ingress resolves the change
     // before any pass starts (ADR 0100 d11). A GitHub blip now delays the review

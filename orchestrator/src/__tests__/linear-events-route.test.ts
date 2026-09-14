@@ -40,7 +40,7 @@ async function deliver(payload: Record<string, unknown>): Promise<RecordIntegrat
         listObservedScopeValues: async () => [],
       },
       dispatch: async () => ({
-        matched: 0, started: 0, joined: 0, queued: 0, skipped: 0, dropped: 0,
+        matched: 0, started: 0, joined: 0, queued: 0, skipped: 0, filtered: 0, dropped: 0,
         suppressed: [], failed: 0, builtins: {},
       }),
     },

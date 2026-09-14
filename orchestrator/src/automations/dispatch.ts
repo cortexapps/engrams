@@ -11,6 +11,9 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 
 import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
+import { makeCodeBlockRuntime } from "./code/runtime.ts";
+import { evaluateAdmissionPrelude } from "./engine/admission.ts";
+import type { CodeBlockRuntime } from "./engine/deps.ts";
 
 import {
   makeAutomationStore,
@@ -82,6 +85,9 @@ export interface DispatchWebhookResult {
   joined: number;
   queued: number;
   skipped: number;
+  /** The admission prelude rejected the delivery (a filtered run row, no
+   * claim, no workflow). */
+  filtered: number;
   /** ADR 0120: instance-admission drops (no run row; audited in the ring). */
   dropped: number;
 }
@@ -125,7 +131,14 @@ export interface AdmitRunInput {
   dryRun?: boolean;
 }
 
-export type AdmitOutcome = "started" | "joined" | "queued" | "skipped";
+/** `filtered` = the admission prelude rejected the delivery before any
+ * claim: a run row records it, no workflow starts. */
+export type AdmitOutcome = "started" | "joined" | "queued" | "skipped" | "filtered";
+
+let sharedCodeRuntime: CodeBlockRuntime | undefined;
+function codeRuntime(): CodeBlockRuntime {
+  return (sharedCodeRuntime ??= makeCodeBlockRuntime());
+}
 
 /** The concurrency key renders from trigger/event/inputs only — no steps
  * exist before admission. Shared by webhook/integration dispatch and the cron
@@ -167,7 +180,7 @@ export async function admitClaimedCronRun(
     sender: AutomationSender;
     now: () => Date;
   },
-): Promise<AdmitOutcome> {
+): Promise<Exclude<AdmitOutcome, "filtered">> {
   const { target, run, trigger } = input;
   const concurrency = target.definition.settings.concurrency;
   if (!concurrency) return "started";
@@ -239,6 +252,9 @@ export async function admitAutomationRun(
     starter: AutomationWebhookStarter;
     sender: AutomationSender;
     now: () => Date;
+    /** Evaluates the admission prelude's code blocks; the shared QuickJS
+     * runtime by default. */
+    code?: CodeBlockRuntime;
   },
 ): Promise<AdmitOutcome> {
   const { target, runId, deliveryKey, trigger } = input;
@@ -249,6 +265,48 @@ export async function admitAutomationRun(
     id: MAIN_ENTRYPOINT_ID,
     trigger: target.definition.trigger,
   };
+
+  // The graph's own admission decides BEFORE the concurrency claim (see
+  // engine/admission.ts): a delivery the prelude filters never supersedes
+  // or joins a live run. It leaves a filtered run row so the Activity tab
+  // shows the delivery arrived and why nothing happened.
+  if (instanceId === "") {
+    const receivedAt = trigger.receivedAt ?? deps.now().toISOString();
+    const verdict = await evaluateAdmissionPrelude({
+      definition: target.definition,
+      inputs: target.automation.inputs,
+      automationId,
+      automationName: target.automation.name,
+      trigger: {
+        kind: trigger.source,
+        receivedAt,
+        ...(trigger.eventKey !== undefined ? { eventKey: trigger.eventKey } : {}),
+        deliveryKey,
+        ...(trigger.payload !== undefined ? { payload: trigger.payload } : {}),
+        ...(input.scheduledFor ? { scheduledFor: input.scheduledFor.toISOString() } : {}),
+      },
+      aliases: [],
+      entrypointId: entrypoint.id,
+      code: deps.code ?? codeRuntime(),
+    });
+    if (verdict.kind === "reject") {
+      await deps.store.insertRun({
+        id: runId,
+        automationId,
+        version: target.automation.currentVersion,
+        entrypointId: entrypoint.id,
+        trigger,
+        deliveryKey,
+        concurrencyKey: null,
+        scheduledFor: input.scheduledFor,
+        status: "filtered",
+        error: verdict.reason,
+        endedAt: deps.now(),
+        ...(input.dryRun ? { dryRun: true } : {}),
+      });
+      return "filtered";
+    }
+  }
 
   const startRun = async (concurrencyKey: string | null): Promise<void> => {
     await deps.store.insertRun({
@@ -507,6 +565,7 @@ export async function dispatchWebhookOccurrence(
     joined: 0,
     queued: 0,
     skipped: 0,
+    filtered: 0,
     dropped: 0,
   };
 
@@ -614,6 +673,9 @@ export interface DispatchIntegrationResult {
   joined: number;
   queued: number;
   skipped: number;
+  /** The admission prelude rejected the delivery (a filtered run row, no
+   * claim, no workflow). */
+  filtered: number;
   /** ADR 0120: instance-admission drops (no run row; audited in the ring). */
   dropped: number;
   /** Built-in keys suppressed by instance precedence (rung 1): a handle-
@@ -625,7 +687,7 @@ export interface DispatchIntegrationResult {
   /** Admission outcome per matched BUILT-IN (keyed by builtin key). This is
    * what a legacy route consults to decide whether the engine took the
    * delivery: a built-in absent here (not enabled, kill-switched, scope did
-   * not match) or `skipped` leaves the legacy path in charge. The same
+   * not match) `skipped`, or `filtered` leaves the legacy path in charge. The same
    * read the dispatcher made — never a second, possibly stale, lookup. */
   builtins: Record<string, AdmitOutcome>;
 }
@@ -761,6 +823,7 @@ export async function dispatchIntegrationEvent(
     joined: 0,
     queued: 0,
     skipped: 0,
+    filtered: 0,
     dropped: 0,
     suppressed: [],
     failed: 0,

@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { RetryAutomationError, retryAutomationReview } from "../retry-automation.ts";
+import {
+  RetryAutomationError,
+  dispatchAutomationReview,
+  retryAutomationReview,
+  stopAutomationReview,
+} from "../automation-review.ts";
 import type { AutomationRunRow } from "../../db/automations.ts";
 
 const NOW = new Date("2026-08-22T00:00:00Z");
@@ -110,5 +115,77 @@ describe("retryAutomationReview", () => {
   test("throws when the original run no longer exists", async () => {
     const h = harness(null);
     await expect(retryAutomationReview("gone", h.deps)).rejects.toBeInstanceOf(RetryAutomationError);
+  });
+});
+
+describe("dispatchAutomationReview", () => {
+  test("admits a built-in run under review.dispatch with a coordinate-only payload", async () => {
+    const h = harness(null);
+    const runId = await dispatchAutomationReview({ repo: "engrams/engrams", prNumber: 42 }, h.deps);
+    expect(runId).toBe("autorun:b1:dispatch:uuid-1");
+    expect(h.admitted).toHaveLength(1);
+    expect(h.admitted[0]!.deliveryKey).toBe("dispatch:uuid-1");
+    expect(h.admitted[0]!.trigger).toEqual({
+      source: "manual",
+      eventKey: "review.dispatch",
+      receivedAt: NOW.toISOString(),
+      scopeValue: "engrams/engrams",
+      payload: {
+        repository: { full_name: "engrams/engrams", name: "engrams" },
+        pull_request: { number: 42, html_url: "https://github.com/engrams/engrams/pull/42" },
+      },
+    });
+    expect(h.started).toEqual([runId]);
+  });
+});
+
+describe("stopAutomationReview", () => {
+  const coordinate = { repo: "engrams/engrams", prNumber: 7 };
+  function stopHarness(options: { active?: { automationRunId: string | null } | null; runStatus?: string }) {
+    const sent: Array<{ runId: string; message: unknown; key: string }> = [];
+    const deps = {
+      reviews: {
+        getActiveReviewByCoordinate: async () =>
+          options.active === null || options.active === undefined
+            ? null
+            : ({ id: "review-1", automationRunId: options.active.automationRunId } as never),
+      },
+      runs: {
+        getRun: async (id: string) =>
+          options.runStatus === undefined ? null : ({ id, status: options.runStatus } as never),
+      },
+      sender: {
+        send: async (runId: string, message: unknown, key: string) => {
+          sent.push({ runId, message, key });
+        },
+      },
+      randomUUID: () => "req-1",
+    };
+    return { deps, sent };
+  }
+
+  test("sends a stop into the live run behind the PR's active pass", async () => {
+    const h = stopHarness({ active: { automationRunId: "autorun:b1:github:d1" }, runStatus: "running" });
+    expect(await stopAutomationReview(coordinate, h.deps)).toEqual({ stopped: true, runId: "autorun:b1:github:d1" });
+    expect(h.sent).toEqual([
+      {
+        runId: "autorun:b1:github:d1",
+        message: { kind: "stop", reason: "stopped by @mention command" },
+        key: "autorun:autorun:b1:github:d1:stop:req-1",
+      },
+    ]);
+  });
+
+  test("an idle PR, a legacy pass, or a finished run is a quiet result, not an error", async () => {
+    expect(await stopAutomationReview(coordinate, stopHarness({ active: null }).deps)).toEqual({
+      stopped: false,
+      reason: "no_active_review",
+    });
+    expect(
+      await stopAutomationReview(coordinate, stopHarness({ active: { automationRunId: null } }).deps),
+    ).toEqual({ stopped: false, reason: "not_on_engine" });
+    const done = stopHarness({ active: { automationRunId: "autorun:b1:github:d1" }, runStatus: "completed" });
+    expect(await stopAutomationReview(coordinate, done.deps)).toEqual({ stopped: false, reason: "run_not_live" });
+    expect(done.sent).toEqual([]);
   });
 });

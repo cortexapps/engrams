@@ -25,6 +25,11 @@ import {
 import { ownPath } from "../automations/paths.ts";
 import { log as rootLog } from "../log.ts";
 import {
+  stopAutomationReview,
+  type ReviewCoordinate,
+  type StopAutomationReviewResult,
+} from "../reviews/automation-review.ts";
+import {
   dispatchReview,
   type DispatchReviewInput,
   type DispatchReviewResult,
@@ -49,6 +54,10 @@ export interface GithubEventsDeps {
    *  a review (ADR 0100 d11). Separate from `dispatch`, which carries comments
    *  and stops straight to a running pass and needs no resolution. */
   startIngress?: (input: ReviewIngressStart) => Promise<void>;
+  /** `@engrams stop` for a repo on the automation engine: halt the built-in
+   *  run behind the PR's active pass (the built-in's own admission filters
+   *  the stop comment out, so the route must reach the run directly). */
+  stopAutomationReview?: (input: ReviewCoordinate) => Promise<StopAutomationReviewResult>;
   /** Refresh a target only when it already exists. Non-reviewing PR actions
    *  must never create dossiers for pull requests engrams has never reviewed. */
   refreshTarget?: (input: UpsertReviewTargetInput) => Promise<boolean>;
@@ -67,6 +76,7 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
   const webhookSecret = deps.webhookSecret ?? getGithubWebhookSecret;
   const mentionHandle = deps.mentionHandle ?? config.githubAppLogin;
   const reviewAutomationDisabled = deps.reviewAutomationDisabled ?? config.reviewAutomationDisabled;
+  const stopAutomation = deps.stopAutomationReview ?? stopAutomationReview;
   // A repo reviews on the built-in engine when its enrollment says so AND the
   // fleet-wide kill switch is off. The ingress spine has already ledgered the
   // delivery and dispatchIntegrationEvent routes it to the built-in, whose
@@ -291,6 +301,14 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
         ...(command.focus != null ? { focus: command.focus } : {}),
       });
     } else if (command.kind === "stop") {
+      if (onAutomationEngine(enrollment)) {
+        const result = await stopAutomation({ repo: event.repo, prNumber: event.prNumber });
+        log.info(
+          { repo: event.repo, prNumber: event.prNumber, ...result },
+          "github stop command handled on the automation engine",
+        );
+        return c.body(null, 200);
+      }
       await dispatch({
         repo: event.repo,
         prNumber: event.prNumber,
