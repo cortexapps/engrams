@@ -37,6 +37,36 @@ const DEFAULT_BROWSER_LAUNCHER: &str = "engram-browser";
 /// come up than ttyd, so this deadline is more generous than the shell's.
 const READY_DEADLINE: Duration = Duration::from_secs(20);
 
+/// How long to wait for the `engram-browser --ensure` launcher subprocess to
+/// finish before killing it and failing the RPC. MUST stay comfortably under
+/// the host-agent's `start_browser` deadline (30s, in
+/// `crates/engram-sandbox-firecracker/src/lib.rs`): the launcher is internally
+/// bounded (a ~20s x11vnc-ready loop behind an `flock`), but a cold bring-up on
+/// a busy 2-vCPU guest — especially one racing the agent's own
+/// `playwright-cli --ensure` on the same `flock` — can overrun 30s, and an
+/// unbounded wait here then let the whole `StartBrowser` hang past the caller's
+/// deadline. The user saw that as `start_browser: timed out waiting for agentd`
+/// and a VNC tab that closed with "connection closed unexpectedly". Bounding it
+/// here fails fast + clean (and frees `start_lock` promptly, so a retry isn't
+/// stuck behind a wedged predecessor); the next `StartBrowser` takes the fast
+/// path once x11vnc is finally up. 22s over the launcher's own 20s budget
+/// leaves ~2s for a slightly-slow-but-healthy bring-up to still succeed, and
+/// ~5s of headroom under the host-agent's 30s.
+const ENSURE_LAUNCHER_DEADLINE: Duration = Duration::from_secs(22);
+
+/// Resolve [`ENSURE_LAUNCHER_DEADLINE`], with a test-only env override so the
+/// timeout path can be exercised in milliseconds instead of tens of seconds
+/// (the override read is compiled out of non-test builds — no prod knob).
+fn ensure_launcher_deadline() -> Duration {
+    #[cfg(test)]
+    if let Ok(ms) = std::env::var("ENGRAM_BROWSER_ENSURE_DEADLINE_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    ENSURE_LAUNCHER_DEADLINE
+}
+
 /// Initial probe interval after spawn. Doubles up to [`READY_PROBE_MAX`] on
 /// each miss.
 const READY_PROBE_START: Duration = Duration::from_millis(100);
@@ -247,13 +277,22 @@ pub async fn start_browser(
         // does not, so set them explicitly — `wait_with_output` below still
         // needs to capture both to build the same error message on failure.
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Bound the wait below (`ENSURE_LAUNCHER_DEADLINE`) drops the
+        // `wait_with_output` future — and with it the `Child` — on timeout;
+        // `kill_on_drop` turns that into a SIGKILL of the launcher shell so a
+        // wedged/over-budget `--ensure` can't linger holding the `flock`. The
+        // detached stack it may have `setsid`'d off is in its own session and
+        // survives (reaped later via the pidfile), which is what we want: a
+        // slow-but-progressing bring-up is still there for the next call's fast
+        // path.
+        .kill_on_drop(true);
     // Issue #569: this short-lived launcher subprocess went completely
     // unwatched by the reaper's tracked registry (unlike every other spawn
     // site in this crate) — a launcher that raced to exit before this
     // function's `.await` on it resumed was exactly as reapable-out-from-under-us
     // as the /exec or ttyd children. `spawn_tracked` closes that gap;
-    // untrack once `wait_with_output` has consumed the exit status below.
+    // untrack once the wait resolves (any branch) below.
     let child = crate::reaper::spawn_tracked(&mut cmd).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -261,15 +300,33 @@ pub async fn start_browser(
         )
     })?;
     let launcher_pid = child.id();
-    let out = child.wait_with_output().await.map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("run browser launcher ({bin} --ensure): {e}"),
-        )
-    })?;
+    // Bound the wait so a cold bring-up that overruns can't hang `StartBrowser`
+    // past the host-agent's 30s deadline (see `ENSURE_LAUNCHER_DEADLINE`). On
+    // timeout the future is dropped, `kill_on_drop` SIGKILLs the launcher, and
+    // we untrack so the reaper collects the corpse, then fail fast + clean.
+    let waited = tokio::time::timeout(ensure_launcher_deadline(), child.wait_with_output()).await;
     if let Some(pid) = launcher_pid {
         crate::reaper::untrack(pid);
     }
+    let out = match waited {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("run browser launcher ({bin} --ensure): {e}"),
+            ));
+        }
+        Err(_elapsed) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "engram-browser --ensure did not finish within {:?} \
+                     (browser stack slow to come up under load; killed it — retry)",
+                    ensure_launcher_deadline()
+                ),
+            ));
+        }
+    };
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "engram-browser --ensure failed ({}): {}",
@@ -992,6 +1049,101 @@ sys.exit(0)
         assert!(
             banner_ok,
             "fresh connect after start_browser should see the RFB banner"
+        );
+    }
+
+    /// A cold bring-up that overruns must NOT hang `StartBrowser` past the
+    /// host-agent's 30s deadline (which surfaced to the user as
+    /// `start_browser: timed out waiting for agentd` and a VNC tab that closed
+    /// "unexpectedly"). `start_browser` bounds the launcher wait at
+    /// [`ENSURE_LAUNCHER_DEADLINE`] (overridden to a few hundred ms here),
+    /// kills the launcher, and returns a clean `TimedOut` — fast — instead of
+    /// blocking on an unbounded `wait_with_output`.
+    ///
+    /// Linux-only for the same reasons as the sibling launcher tests
+    /// (`terminate_pgid` / `killpg` is a no-op on the macOS cross-build).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn start_browser_bounds_a_slow_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_guard = ENV_LOCK.lock().await;
+
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIP: python3 not available; browser test relies on it for a fake launcher");
+            return;
+        }
+
+        // A port nothing binds, so the initial `probe_ready` misses and the
+        // slow path (force-stop + `--ensure`) is taken.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // Fake launcher that never comes up: on `--ensure` it just sleeps well
+        // past the (overridden) deadline. It binds no port and writes no
+        // pidfile — so the only thing that ends it is agentd's `kill_on_drop`
+        // when the bound below fires.
+        let script = r#"#!/usr/bin/env python3
+import sys, time
+if sys.argv[1:2] == ["--ensure"]:
+    time.sleep(30)
+sys.exit(0)
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("engram-browser");
+        std::fs::write(&launcher, script).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pidfile = dir.path().join("browser.pgid");
+
+        let prev_bin = std::env::var("ENGRAM_BROWSER_BIN").ok();
+        let prev_pid = std::env::var("ENGRAM_BROWSER_PIDFILE").ok();
+        let prev_deadline = std::env::var("ENGRAM_BROWSER_ENSURE_DEADLINE_MS").ok();
+        std::env::set_var("ENGRAM_BROWSER_BIN", &launcher);
+        std::env::set_var("ENGRAM_BROWSER_PIDFILE", &pidfile);
+        // Exercise the bound in ~half a second instead of the real 22s.
+        std::env::set_var("ENGRAM_BROWSER_ENSURE_DEADLINE_MS", "500");
+        let _ = shutdown_for_tests().await;
+
+        let started = Instant::now();
+        // Dead CDP port (nothing bound) — irrelevant here, the launcher wait
+        // times out before any CDP probe.
+        let out = start_browser(port, cdp_env(1)).await;
+        let elapsed = started.elapsed();
+
+        let _ = shutdown_for_tests().await;
+
+        // Restore env before asserting so a panic can't leak into a sibling.
+        match prev_bin {
+            Some(p) => std::env::set_var("ENGRAM_BROWSER_BIN", p),
+            None => std::env::remove_var("ENGRAM_BROWSER_BIN"),
+        }
+        match prev_pid {
+            Some(p) => std::env::set_var("ENGRAM_BROWSER_PIDFILE", p),
+            None => std::env::remove_var("ENGRAM_BROWSER_PIDFILE"),
+        }
+        match prev_deadline {
+            Some(p) => std::env::set_var("ENGRAM_BROWSER_ENSURE_DEADLINE_MS", p),
+            None => std::env::remove_var("ENGRAM_BROWSER_ENSURE_DEADLINE_MS"),
+        }
+
+        let err = out.expect_err("a launcher that never comes up must fail, not hang");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "the bound must surface as a TimedOut error; got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "took {elapsed:?} — the bound didn't fire; the old unbounded wait \
+             would block the full 30s launcher sleep"
         );
     }
 
