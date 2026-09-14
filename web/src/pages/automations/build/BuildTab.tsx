@@ -114,6 +114,28 @@ const KNOWN_OUTPUTS: Record<string, readonly string[]> = {
   lookup_pr_session: ["found", "session_id", "task_id", "head_branch", "url", "title"],
   instance_close: ["closed", "not_instanced"],
   claim_handle: ["claimed", "handle"],
+  review_open_pass: [
+    "review_id",
+    "task_id",
+    "target_id",
+    "head_sha",
+    "base_sha",
+    "pr_url",
+    "superseded_review_id",
+    "deduplicated",
+  ],
+  review_stage: ["phase", "prompt", "merge_base"],
+  review_settle: [
+    "review_id",
+    "repo",
+    "pr_number",
+    "commit_id",
+    "summary_md",
+    "comments",
+    "to_post_count",
+    "ui_only_count",
+  ],
+  review_close_pass: ["review_id", "outcome"],
 };
 
 function sessionSourcesFor(definition: AutomationDefinition, selectedId: string | null): string[] {
