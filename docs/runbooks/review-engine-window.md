@@ -58,8 +58,10 @@ The kill switch sends all four back to legacy together.
 
 1. **Per-repo:** flip the repo's `engine` back to `legacy`. Immediate; the next
    delivery reviews on the legacy path.
-2. **Fleet-wide kill switch:** set `ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED=1`
-   (or `true`) and restart the orchestrator pods. Every repo reviews on legacy
+2. **Fleet-wide kill switch:** set the chart value
+   `orchestrator.killSwitches.reviewAutomation: true` (it emits
+   `ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED=1` into the orchestrator
+   ConfigMap) and roll the orchestrator. Every repo reviews on legacy
    regardless of its flag, without touching any row. The switch gates BOTH
    halves — the GitHub route falls back to the legacy graph, and the
    integration dispatcher refuses to admit runs for the `pr_review` built-in —

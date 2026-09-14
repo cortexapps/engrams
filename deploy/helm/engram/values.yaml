@@ -484,6 +484,17 @@ orchestrator:
   # dispatch API and auto-on-open triggers still work.
   githubAppLogin: ""
 
+  # ADR 0119 parallel-window kill switches (docs/runbooks/review-engine-window.md,
+  # docs/runbooks/slack-engine-window.md). `true` emits
+  # ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED=1 / ORCHESTRATOR_SLACK_AUTOMATION_DISABLED=1
+  # into the orchestrator ConfigMap: every repo / channel reviews or answers on
+  # the legacy path regardless of its flag, and the dispatcher refuses to admit
+  # runs for the matching built-in. Flip, roll the orchestrator, flip back when
+  # done — the per-repo / per-channel flags survive the switch.
+  killSwitches:
+    reviewAutomation: false
+    slackAutomation: false
+
   # The three REQUIRED env vars come from ONE Secret (keys below). The chart
   # never inlines them. `databaseSecret.url` MUST point at a SEPARATE database
   # (`engram_orchestrator`), NOT the coordinator's DB — the orchestrator owns
