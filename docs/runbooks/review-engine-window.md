@@ -33,6 +33,24 @@ Confirm: `select repo, engine from review_enrollment;` shows `automation`, and
 the PR-review automation on the Automations page is **enabled** with
 `engrams/engrams` in its `repos` input.
 
+## The other doors follow the flag
+
+A flagged repo must never reach the legacy graph through a side door, or two
+brains review one PR. Every entry point reads the same `engine` flag:
+
+- **`@engrams review`** — the webhook spine dispatches the comment to the
+  built-in; the route skips legacy ingress.
+- **`@engrams stop`** — the built-in's admission filters the stop comment
+  out, so the route stops the built-in run behind the PR's active pass
+  directly (the run ends `halted`; the `report_halt` finalize hook posts the
+  halt comment). An idle PR is a quiet no-op, as on legacy.
+- **CI dispatch** (`POST /api/v1/reviews/dispatch`) — admits a built-in run
+  under the synthetic `review.dispatch` event key. The response's
+  `workflow_id` is the run id (also the DBOS workflow id).
+- **Retry** from `/reviews` — a fresh built-in run with the original trigger.
+
+The kill switch sends all four back to legacy together.
+
 ## The two brakes
 
 1. **Per-repo:** flip the repo's `engine` back to `legacy`. Immediate; the next

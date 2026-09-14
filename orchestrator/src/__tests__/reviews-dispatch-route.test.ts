@@ -15,18 +15,33 @@ const enrollment: EnrollmentRow = {
   updatedAt: new Date("2026-07-17T00:00:00Z"),
 };
 
-function app(options: { authenticated?: boolean; enrolled?: boolean } = {}) {
+function app(
+  options: {
+    authenticated?: boolean;
+    enrolled?: boolean;
+    engine?: EnrollmentRow["engine"];
+    reviewAutomationDisabled?: boolean;
+  } = {},
+) {
   const ingresses: ReviewIngressStart[] = [];
+  const automationDispatches: Array<{ repo: string; prNumber: number }> = [];
+  const row: EnrollmentRow = { ...enrollment, engine: options.engine ?? "legacy" };
   return {
     ingresses,
+    automationDispatches,
     app: makeReviewsDispatchRoute({
       getSession: async () => options.authenticated === false
         ? null
         : { user: { id: "api-user" } },
-      enrollments: { get: async () => options.enrolled === false ? null : enrollment },
+      enrollments: { get: async () => options.enrolled === false ? null : row },
       randomUUID: () => "dispatch-key-1",
+      reviewAutomationDisabled: options.reviewAutomationDisabled ?? false,
       startIngress: async (input) => {
         ingresses.push(input);
+      },
+      dispatchAutomation: async (input) => {
+        automationDispatches.push(input);
+        return "autorun:b1:dispatch:uuid-1";
       },
     }),
   };
@@ -64,6 +79,22 @@ describe("POST /api/v1/reviews/dispatch", () => {
       trigger: "dispatch",
       idempotencyKey: "dispatch-key-1",
     }]);
+  });
+
+  test("a repo on the automation engine gets a built-in run, not legacy ingress (ADR 0119 phase 4.4)", async () => {
+    const fixture = app({ engine: "automation" });
+    const res = await request(fixture.app);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ workflow_id: "autorun:b1:dispatch:uuid-1" });
+    expect(fixture.automationDispatches).toEqual([{ repo: enrollment.repo, prNumber: 100 }]);
+    expect(fixture.ingresses).toEqual([]);
+  });
+
+  test("the kill switch sends an automation repo back to legacy ingress", async () => {
+    const fixture = app({ engine: "automation", reviewAutomationDisabled: true });
+    expect((await request(fixture.app)).status).toBe(200);
+    expect(fixture.automationDispatches).toEqual([]);
+    expect(fixture.ingresses).toHaveLength(1);
   });
 
   test("returns 404 without dispatch for an un-enrolled repo", async () => {

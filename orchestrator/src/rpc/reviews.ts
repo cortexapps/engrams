@@ -18,7 +18,7 @@ import {
 import { makeProfileStore } from "../db/profiles.ts";
 import { makeAutomationStore } from "../db/automations.ts";
 import { setReviewEngine, EngineFlagError, type EngineFlagStore } from "../reviews/engine-flag.ts";
-import { retryAutomationReview } from "../reviews/retry-automation.ts";
+import { retryAutomationReview } from "../reviews/automation-review.ts";
 import { log as rootLog } from "../log.ts";
 import {
   makeReviewStore,

@@ -59,7 +59,11 @@ export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 /** Bump on any graph or inputs-schema change (the seeder inserts a new
  * version when the stored content hash differs). */
-export const PR_REVIEW_DEFINITION_VERSION = 2;
+export const PR_REVIEW_DEFINITION_VERSION = 3;
+
+/** Synthetic event key the CI dispatch edge admits a run under (no GitHub
+ * delivery carries it). The admission arm accepts it for any mapped repo. */
+export const REVIEW_DISPATCH_EVENT_KEY = "review.dispatch";
 
 /** Placeholder the seeder replaces with the org's default GitHub connection. */
 export const DEFAULT_CONNECTION_PLACEHOLDER = "__default__";
@@ -95,6 +99,11 @@ export default ({ event, inputs, trigger }) => {
     const re = new RegExp("(^|\\\\s)" + handle + "(\\\\[bot\\\\])?\\\\s+review(\\\\s|$)", "im");
     if (!re.test(raw.comment?.body ?? "")) return null;
     mode = "command";
+  } else if (key === "review.dispatch") {
+    // An explicit dispatch (CI, an operator) is a request, like a comment
+    // command: it does not need mode "auto", and it carries no SHAs, so
+    // open_review_pass resolves the heads from GitHub.
+    mode = "dispatch";
   } else {
     return null;
   }

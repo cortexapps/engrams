@@ -147,11 +147,13 @@ function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment, reviewA
   const dispatches: DispatchReviewInput[] = [];
   const ingresses: ReviewIngressStart[] = [];
   const refreshes: UpsertReviewTargetInput[] = [];
+  const stops: Array<{ repo: string; prNumber: number }> = [];
   const ingress = fakeIngress();
   return {
     dispatches,
     ingresses,
     refreshes,
+    stops,
     ledger: ingress.recorded,
     integrationDispatches: ingress.dispatched,
     app: makeGithubEventsRoute({
@@ -171,6 +173,10 @@ function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment, reviewA
       },
       startIngress: async (input) => {
         ingresses.push(input);
+      },
+      stopAutomationReview: async (input) => {
+        stops.push(input);
+        return { stopped: true, runId: "autorun:b1:github:d1" };
       },
       refreshTarget: async (input) => {
         refreshes.push(input);
@@ -234,6 +240,32 @@ describe("the automation-engine route branch (ADR 0119 phase 4.4)", () => {
     expect(res.status).toBe(200);
     expect(fixture.ingresses).toEqual([]);
     expect(fixture.integrationDispatches).toHaveLength(1);
+  });
+
+  test("an @mention stop on an automation repo halts the built-in run, never the legacy mailbox", async () => {
+    const body = commentBody("@acme-reviewer stop", "MEMBER", "User");
+    const fixture = app(true, autoAutomationEnrollment);
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "issue_comment"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.stops).toEqual([{ repo: enrollment.repo, prNumber: 100 }]);
+    expect(fixture.dispatches).toEqual([]);
+  });
+
+  test("the kill switch sends an @mention stop back to the legacy mailbox", async () => {
+    const body = commentBody("@acme-reviewer stop", "MEMBER", "User");
+    const fixture = app(true, autoAutomationEnrollment, /* reviewAutomationDisabled */ true);
+    await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "issue_comment"),
+    });
+    expect(fixture.stops).toEqual([]);
+    expect(fixture.dispatches).toHaveLength(1);
+    expect(fixture.dispatches[0]).toMatchObject({ stop: true });
   });
 
   test("an @mention review on a legacy repo still starts legacy ingress", async () => {
