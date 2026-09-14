@@ -1492,9 +1492,6 @@ h3 {
   z-index: 2;
   filter: drop-shadow(1px 1px 0 white);
 }
-[data-tried="true"] .demo-pointer {
-  opacity: 1;
-}
 .analytics-metrics {
   display: flex;
   gap: 40px;
@@ -1624,13 +1621,6 @@ h3 {
   display: inline;
   color: #49704a;
 }
-.web[data-tried="true"] .caption-fixed {
-  display: none;
-}
-.web[data-tried="true"] .caption-tried {
-  display: inline;
-  color: #49704a;
-}
 @media (max-width: 750px) {
   .web .stage {
     height: auto;
@@ -1725,49 +1715,49 @@ h3 {
   transition: width 0.7s;
   margin-left: auto;
 }
-.web[data-tried="true"] .analytics {
-  width: 48%;
-}
-.analytics-heading button {
-  border: 1px solid #dfe4eb;
-  background: #fff;
-  color: #6f7887;
-  padding: 5px 7px;
-  border-radius: 5px;
-  font: 9px var(--font-sans);
-  cursor: pointer;
-}
-.analytics-heading button:focus-visible {
-  outline: 2px solid #6870cf;
-}
-.analytics-heading button[aria-pressed="true"] {
-  background: #eef0fc;
-  color: #535cb0;
-}
-.web[data-tried="true"] .analytics-nav {
-  gap: 9px;
-}
-.web[data-tried="true"] .analytics-nav > span:not(.analytics-avatar) {
-  display: none;
-}
+
 @media (max-width: 750px) {
-  .web[data-tried="true"] .analytics {
-    width: 88%;
-  }
   .analytics-metrics {
     gap: 24px;
   }
   .date-filters button {
     padding: 6px 8px;
   }
-  .web[data-tried="true"] .date-filters button {
-    font-size: 9px;
-    padding: 6px;
+}
+
+/* Let the broken chart cross the preview boundary before the fix. */
+.web .analytics {
+  width: 50%;
+  margin-left: 0;
+  overflow: visible;
+  border-radius: 8px;
+}
+.analytics > .bar {
+  border-radius: 8px 8px 0 0;
+  background: #fff;
+}
+.analytics .dashboard-caption {
+  border-radius: 0 0 8px 8px;
+}
+.web:not([data-step="3"]) .chart-viewport {
+  overflow: visible;
+}
+.web:not([data-step="3"]) .revenue-chart {
+  width: calc(100% + 80px);
+  height: 100px;
+  transform: none;
+  position: relative;
+  z-index: 3;
+}
+.web:not([data-step="3"]) .chart-axis {
+  width: 100%;
+  transform: none;
+}
+@media (max-width: 750px) {
+  .web .analytics {
+    width: 90%;
   }
-  .web[data-tried="true"] .analytics-body {
-    padding: 12px;
-  }
-  .web[data-tried="true"] .analytics-metrics strong {
-    font-size: 22px;
+  .web:not([data-step="3"]) .revenue-chart {
+    width: calc(100% + 50px);
   }
 }
