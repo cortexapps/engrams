@@ -20,8 +20,10 @@
  *   url, because the built-in's supersede concurrency key is that url: a
  *   dispatch must supersede the same PR's in-flight pass exactly as a
  *   webhook delivery would.
- * - **`@engrams stop`**: the built-in's admission filters the stop comment
- *   out (it is not a review request), so the route stops the PR's live run
+ * - **`@engrams stop`**: the built-in's admission prelude (its `facts` +
+ *   `admit` blocks, evaluated by dispatch BEFORE the concurrency claim —
+ *   see engine/admission.ts) filters the stop comment out, so its own
+ *   delivery never supersedes the live pass. The route then stops that run
  *   directly through the engine inbox — the run ends `halted` and the
  *   `report_halt` finalize hook posts the legacy halt comment.
  */

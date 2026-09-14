@@ -55,6 +55,22 @@ export interface PreviewInput {
   entrypointId?: string;
   /** When present, `code` blocks are evaluated (see the module comment). */
   code?: CodeBlockRuntime;
+  /** Walk only the admission prelude (see `admissionPrelude`). Dispatch
+   * uses this to decide a delivery BEFORE the concurrency claim. */
+  preludeOnly?: boolean;
+}
+
+/** The admission prelude of a block list: its leading run of `code` and
+ * `filter` blocks. Pure and side-effect free, so it can be evaluated before
+ * a run exists; the interpreter re-walks it inside the run (same scope,
+ * same verdict). A built-in's "facts + admit" pair is the canonical case. */
+export function admissionPrelude(blocks: readonly BlockDef[]): BlockDef[] {
+  const prelude: BlockDef[] = [];
+  for (const block of blocks) {
+    if (block.type !== "code" && block.type !== "filter") break;
+    prelude.push(block);
+  }
+  return prelude;
 }
 
 /** Deps the preview needs: only `render` goes through the context, and the
@@ -257,7 +273,7 @@ export async function previewDefinition(input: PreviewInput): Promise<PreviewRes
       message: `entrypoint "${input.entrypointId}" is not in this definition`,
     });
   } else {
-    await walk(entrypoint.blocks);
+    await walk(input.preludeOnly ? admissionPrelude(entrypoint.blocks) : entrypoint.blocks);
   }
   ctx.currentBlockId = undefined;
   return { blocks, errors };

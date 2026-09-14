@@ -40,10 +40,13 @@ brains review one PR. Every entry point reads the same `engine` flag:
 
 - **`@engrams review`** — the webhook spine dispatches the comment to the
   built-in; the route skips legacy ingress.
-- **`@engrams stop`** — the built-in's admission filters the stop comment
-  out, so the route stops the built-in run behind the PR's active pass
+- **`@engrams stop`** — the built-in's admission prelude (`facts` + `admit`)
+  is evaluated by dispatch before the concurrency claim, so the stop
+  comment's own delivery is recorded `filtered` and never supersedes the
+  live pass. The route then stops the run behind the PR's active pass
   directly (the run ends `halted`; the `report_halt` finalize hook posts the
-  halt comment). An idle PR is a quiet no-op, as on legacy.
+  halt comment). An idle PR is a quiet no-op, as on legacy. The same rule
+  keeps an unrelated comment ("LGTM") from ending a running review.
 - **CI dispatch** (`POST /api/v1/reviews/dispatch`) — admits a built-in run
   under the synthetic `review.dispatch` event key. The response's
   `workflow_id` is the run id (also the DBOS workflow id).

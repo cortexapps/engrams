@@ -280,6 +280,7 @@ describe("dispatchIntegrationEvent", () => {
       joined: 0,
       queued: 0,
       skipped: 0,
+      filtered: 0,
       dropped: 0,
       suppressed: [],
       failed: 0,
@@ -376,6 +377,67 @@ describe("dispatchIntegrationEvent", () => {
     const row = h.runs.get("autorun:automation-1:feedback:github:gh-lost-1")!;
     expect(row.status).toBe("filtered");
     expect(row.entrypointId).toBe("feedback");
+  });
+
+  test("the admission prelude decides BEFORE the concurrency claim: a filtered delivery never supersedes the live run", async () => {
+    // A review-shaped graph: facts + admit, supersede on the PR url. A
+    // comment that is not a review command must not end the running pass.
+    const reviewShaped: AutomationDefinition = {
+      ...definition(trigger({ eventKeys: ["issue_comment.created"] })),
+      blocks: [
+        {
+          id: "facts",
+          type: "code",
+          config: {
+            mode: "value",
+            source: "export default ({ event }) => /review/.test(event.raw?.comment?.body ?? \"\") ? { admit: true } : null;",
+          },
+        },
+        {
+          id: "admit",
+          type: "filter",
+          config: { conditions: { mode: "all", conditions: [{ path: "steps.facts.value.admit", op: "is_true" }] } },
+        },
+        { id: "launch", type: "create_session", config: { profileId: "p1", promptTemplate: "go" } },
+      ],
+      settings: {
+        endSessionsOnFinish: false,
+        concurrency: { keyTemplate: "${{ event.raw.issue.html_url }}", policy: "supersede" },
+      },
+    };
+    const h = makeHarness([{ automation: meta(), definition: reviewShaped }]);
+    const live = "autorun:automation-1:github:earlier";
+    h.claims.set("automation-1:https://github.com/engrams/engrams/pull/7", live);
+    const sent: unknown[] = [];
+    const d = { ...deps(h), sender: { async send(_to: string, message: unknown) { sent.push(message); } } };
+    const payload = (body: string) => ({
+      repository: { full_name: "engrams/engrams" },
+      issue: { html_url: "https://github.com/engrams/engrams/pull/7" },
+      comment: { body },
+    });
+
+    // "@engrams stop" (or "LGTM"): filtered at admission — no claim, no supersede, no start.
+    const stop = await dispatchIntegrationEvent(
+      input({ eventKey: "issue_comment.created", deliveryId: "gh-stop", payload: payload("@engrams stop") }),
+      d,
+    );
+    expect(stop).toMatchObject({ matched: 1, filtered: 1, started: 0, skipped: 0 });
+    expect(sent).toEqual([]);
+    expect(h.starts).toEqual([]);
+    expect(h.claims.get("automation-1:https://github.com/engrams/engrams/pull/7")).toBe(live);
+    const row = h.runs.get("autorun:automation-1:github:gh-stop")!;
+    expect(row.status).toBe("filtered");
+    expect(row.error).toContain('block "admit"');
+    expect(row.concurrencyKey).toBeNull();
+
+    // "@engrams review": admitted — supersedes the live run and starts.
+    const review = await dispatchIntegrationEvent(
+      input({ eventKey: "issue_comment.created", deliveryId: "gh-review", payload: payload("@engrams review") }),
+      d,
+    );
+    expect(review).toMatchObject({ matched: 1, started: 1, filtered: 0 });
+    expect(sent).toEqual([{ kind: "supersede", byRunId: "autorun:automation-1:github:gh-review" }]);
+    expect(h.starts.map((s) => s.runId)).toEqual(["autorun:automation-1:github:gh-review"]);
   });
 
   test("a redelivery mints the same run id, so DBOS start and the delivery unique dedupe", async () => {
@@ -532,7 +594,7 @@ describe("dispatchIntegrationEvent", () => {
 
   test("builtinTookDelivery: started/joined/queued = the engine owns it; absent or skipped = legacy", async () => {
     const { builtinTookDelivery } = await import("../dispatch.ts");
-    const base = { matched: 1, started: 0, joined: 0, queued: 0, skipped: 0, dropped: 0, suppressed: [], failed: 0 };
+    const base = { matched: 1, started: 0, joined: 0, queued: 0, skipped: 0, filtered: 0, dropped: 0, suppressed: [], failed: 0 };
     expect(builtinTookDelivery(undefined, "slack_brain")).toBe(false);
     expect(builtinTookDelivery({ ...base, builtins: {} }, "slack_brain")).toBe(false);
     expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "skipped" } }, "slack_brain")).toBe(false);
@@ -1196,6 +1258,7 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
       joined: 0,
       queued: 0,
       skipped: 0,
+      filtered: 0,
       dropped: 0,
       suppressed: ["slack_brain"],
       failed: 0,
