@@ -7,6 +7,7 @@ export const AUTOMATION_OUTPUT_MAX_CHARS = 64 * 1024;
 export const AUTOMATION_RENDER_LIMIT_MS = 100;
 
 const ALLOWED_FILTERS = new Set([
+  "coalesce",
   "default",
   "json",
   "join",
@@ -91,6 +92,30 @@ function makeEngine(): Liquid {
     templates: Object.create(null),
     dynamicPartials: false,
     relativeReference: false,
+  });
+
+  // `coalesce`: the first present value among several PATHS of one object —
+  // `${{ event.raw | coalesce: "pull_request.number", "issue.number" }}`.
+  // `default:` cannot express this: LiquidJS evaluates a filter's ARGUMENT
+  // strictly, so `a | default: b` is a render error whenever `b` is absent,
+  // even with `a` present (the built-ins' PR-url key hit exactly this on
+  // every pull_request event). Paths are strings, so nothing is looked up
+  // strictly; own properties only, like every other lookup here.
+  engine.registerFilter("coalesce", (value: unknown, ...paths: unknown[]) => {
+    for (const path of paths) {
+      if (typeof path !== "string" || !PAYLOAD_PATH_RE.test(path)) continue;
+      let cursor: unknown = value;
+      for (const segment of path.split(".")) {
+        if (UNSAFE_OBJECT_PATH_SEGMENTS.has(segment)) return undefined;
+        if (typeof cursor !== "object" || cursor === null || !Object.hasOwn(cursor, segment)) {
+          cursor = undefined;
+          break;
+        }
+        cursor = (cursor as Record<string, unknown>)[segment];
+      }
+      if (cursor !== undefined && cursor !== null && cursor !== "") return cursor;
+    }
+    return undefined;
   });
 
   // `strictFilters` only rejects unknown names; LiquidJS still installs every

@@ -416,8 +416,9 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
       // Rendered at ADMISSION, before any block runs, so it reads the raw
       // event (not steps.*): the PR url for PR events, the issue url for a
       // review-command comment — both are the pull request's html_url.
-      keyTemplate:
-        "${{ event.raw.pull_request.html_url | default: event.raw.issue.html_url }}",
+      // (`coalesce`, not `default:` — default's fallback argument is strict,
+      // so the old template failed on every PR event, which has no `issue`.)
+      keyTemplate: '${{ event.raw | coalesce: "pull_request.html_url", "issue.html_url" }}',
       policy: "supersede",
     },
     runDeadlineSeconds: 4 * PHASE_DEADLINE_S,
