@@ -99,6 +99,10 @@ function harness(options: {
   payload: Record<string, unknown>;
   recv?: AutomationInbox[];
   deduplicate?: boolean;
+  /** ADR 0120: walk this entrypoint as a run bound to this workstream. */
+  entrypointId?: string;
+  instanceId?: string;
+  closed?: Array<{ instanceId: string; reason?: string }>;
 }): Harness {
   const names: string[] = [];
   const records: Harness["records"] = [];
@@ -182,6 +186,8 @@ function harness(options: {
     automationId: RUN.automationId,
     automationName: "PR review",
     version: 1,
+    ...(options.entrypointId !== undefined ? { entrypointId: options.entrypointId } : {}),
+    ...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
     trigger: {
       kind: "integration",
       receivedAt: "2026-08-21T10:00:01Z",
@@ -242,6 +248,16 @@ function harness(options: {
     sessions: sessionOps,
     clock: { nowMs: () => (clock += 1000) },
     code: makeCodeBlockRuntime(),
+    ...(options.closed
+      ? {
+          instances: {
+            async closeInstance(input: { instanceId: string; reason?: string }) {
+              options.closed!.push(input);
+              return true;
+            },
+          },
+        }
+      : {}),
     integrationActions: {
       async execute(input) {
         actions.push({ actionId: input.actionId, params: input.params });
@@ -377,6 +393,23 @@ describe("PR-review built-in on the interpreter", () => {
       payload: { repository: { full_name: "stranger/repo", name: "repo" }, pull_request: { number: 5 } },
     });
     expect((await interpretAutomation(RUN, stranger.deps)).status).toBe("filtered");
+  });
+
+  test("(d3) the closed entrypoint ends the PR's workstream and touches no review", async () => {
+    const closed: Array<{ instanceId: string; reason?: string }> = [];
+    const h = harness({
+      eventKey: "pull_request.closed",
+      payload: { ...prPayload(), action: "closed" },
+      entrypointId: "closed",
+      instanceId: "ai_pr17",
+      closed,
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(closed).toEqual([{ instanceId: "ai_pr17", reason: "pull request closed" }]);
+    expect(h.cpCalls).toEqual([]);
+    expect(h.sessions).toEqual([]);
+    expect(h.actions).toEqual([]);
   });
 
   test("(e) a supersede mid-finder ends the run as superseded and finalize ends the kept=false workers", async () => {
