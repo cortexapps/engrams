@@ -1,28 +1,30 @@
-/** Review system blocks (ADR 0119 D7, phase 4.2).
+/** Review blocks (ADR 0119 D7, graduated to the catalog 2026-09).
  *
  * The PR-review product logic that is not a generic primitive — the durable
- * review record (targets, passes, findings) and the policy gate — stays in
- * code as `system.*` blocks that only the built-in definition may reference.
- * Each block wraps the extracted review control plane (reviews/control-plane.ts)
+ * review record (targets, passes, findings), the worker staging, and the
+ * policy gate — lives in these four blocks. Writing the engrams review
+ * ledger is legitimate product surface, the same way `create_session` is:
+ * any automation may open a pass, and it shows on the Reviews page. Each
+ * block wraps the extracted review control plane (reviews/control-plane.ts)
  * through an injected seam, so the legacy DBOS graph and the built-in share
  * one library and one set of tables. The Reviews product UI reads those
  * tables unchanged.
  *
- * Three blocks:
- *   - system.open_review_pass   — identity + pass row (+ stamps the run id)
- *   - system.review_policy_gate — decision + finding settlement; returns the
- *                                 payload for the generic github.post_pr_review
- *                                 action
- *   - system.review_cleanup     — worker teardown for a superseded pass
- *   - system.review_finalize    — the finalize-hook arm (contract 2): mark the
- *                                 pass failed/halted with the legacy sticky
- *                                 status comment + activity event, or tear a
- *                                 superseded pass down — byte-for-byte the
- *                                 legacy failReview/haltReview/cleanup path
+ * Four blocks:
+ *   - review_open_pass   — identity + pass row (+ stamps the run id)
+ *   - review_stage       — stage a worker session for a phase and compose
+ *                          its prompt (returned as an output for send_prompt)
+ *   - review_settle      — decision + finding settlement; returns the payload
+ *                          for the generic github.post_pr_review action
+ *   - review_close_pass  — the finalize-hook arm (contract 2): mark the pass
+ *                          failed/halted with the sticky status comment +
+ *                          activity event, or tear a superseded pass down —
+ *                          byte-for-byte the legacy failReview/haltReview/
+ *                          cleanup path
  *
  * Supersession itself is the ENGINE's concurrency policy (supersede keyed on
  * the PR url). The built-in reaches the legacy graph's failure/halt/supersede
- * behaviour through `settings.onFinalize` hooks that run review_finalize.
+ * behaviour through `settings.onFinalize` hooks that run review_close_pass.
  */
 
 import { z } from "zod";
@@ -31,18 +33,17 @@ import {
   makeReviewControlPlane,
   type ReviewControlPlane,
   type ReviewPostPayload,
-} from "../../../../reviews/control-plane.ts";
-import { isCompletePrContext, type PrContext } from "../../../../reviews/pr-context.ts";
-import { REVIEW_CATEGORIES, type ReviewCategory } from "../../../../reviewers/render.ts";
-import { isHumanReviewTrigger } from "../../../../reviews/review-trigger.ts";
-import { makeReviewStore } from "../../../../db/reviews.ts";
-import { registerBlock, type BlockOutcome } from "../registry.ts";
+} from "../../../reviews/control-plane.ts";
+import { isCompletePrContext, type PrContext } from "../../../reviews/pr-context.ts";
+import { REVIEW_CATEGORIES, type ReviewCategory } from "../../../reviewers/render.ts";
+import { isHumanReviewTrigger } from "../../../reviews/review-trigger.ts";
+import { makeReviewStore } from "../../../db/reviews.ts";
+import { registerBlock, type BlockOutcome } from "./registry.ts";
 
-export const OPEN_REVIEW_PASS_TYPE = "system.open_review_pass";
-export const REVIEW_STAGE_TYPE = "system.review_stage";
-export const REVIEW_POLICY_GATE_TYPE = "system.review_policy_gate";
-export const REVIEW_CLEANUP_TYPE = "system.review_cleanup";
-export const REVIEW_FINALIZE_TYPE = "system.review_finalize";
+export const REVIEW_OPEN_PASS_TYPE = "review_open_pass";
+export const REVIEW_STAGE_TYPE = "review_stage";
+export const REVIEW_SETTLE_TYPE = "review_settle";
+export const REVIEW_CLOSE_PASS_TYPE = "review_close_pass";
 
 /** The slice of the control plane the blocks use; injected for tests. */
 export type ReviewBlockControlPlane = Pick<
@@ -85,7 +86,7 @@ function deps(): ReviewBlockDeps {
 }
 
 // ---------------------------------------------------------------------------
-// system.open_review_pass
+// review_open_pass
 // ---------------------------------------------------------------------------
 
 const nullableString = z.string().nullable().optional();
@@ -225,10 +226,10 @@ async function executeOpenReviewPass(
 }
 
 // ---------------------------------------------------------------------------
-// system.review_stage
+// review_stage
 // ---------------------------------------------------------------------------
 //
-// Why a system block and not write_files + Liquid: the staged files are
+// Why a block and not write_files + Liquid: the staged files are
 // product logic, not templates — reviewer markdown rendered from the lens
 // catalog, prior-findings.json assembled from the review record AND the
 // author's GitHub replies, candidates.json from the findings table — and the
@@ -297,7 +298,7 @@ async function executeReviewStage(config: ReviewStageConfig): Promise<BlockOutco
 }
 
 // ---------------------------------------------------------------------------
-// system.review_policy_gate
+// review_settle
 // ---------------------------------------------------------------------------
 
 export const reviewPolicyGateConfigSchema = z.object({
@@ -316,17 +317,7 @@ async function executeReviewPolicyGate(config: ReviewPolicyGateConfig): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// system.review_cleanup
-// ---------------------------------------------------------------------------
-
-export const reviewCleanupConfigSchema = z.object({
-  reviewId: z.string().min(1),
-  sessionId: z.string().min(1).optional(),
-});
-export type ReviewCleanupConfig = z.infer<typeof reviewCleanupConfigSchema>;
-
-// ---------------------------------------------------------------------------
-// system.review_finalize — the finalize-hook arm
+// review_close_pass — the finalize-hook arm
 // ---------------------------------------------------------------------------
 
 export const reviewFinalizeConfigSchema = z.object({
@@ -361,10 +352,9 @@ export async function executeReviewFinalize(config: ReviewFinalizeConfig): Promi
   return { kind: "ok", outputs: { review_id: config.reviewId, outcome: config.outcome } };
 }
 
-export function registerReviewSystemBlocks(): void {
+export function registerReviewBlocks(): void {
   registerBlock<ReviewFinalizeConfig>({
-    type: REVIEW_FINALIZE_TYPE,
-    system: true,
+    type: REVIEW_CLOSE_PASS_TYPE,
     outputs: ["review_id", "outcome"],
     configSchema: reviewFinalizeConfigSchema,
     async execute(config) {
@@ -373,8 +363,7 @@ export function registerReviewSystemBlocks(): void {
   });
 
   registerBlock<OpenReviewPassConfig>({
-    type: OPEN_REVIEW_PASS_TYPE,
-    system: true,
+    type: REVIEW_OPEN_PASS_TYPE,
     outputs: [
       "review_id",
       "task_id",
@@ -393,7 +382,6 @@ export function registerReviewSystemBlocks(): void {
 
   registerBlock<ReviewStageConfig>({
     type: REVIEW_STAGE_TYPE,
-    system: true,
     outputs: ["phase", "prompt", "merge_base"],
     configSchema: reviewStageConfigSchema,
     async execute(config) {
@@ -402,8 +390,7 @@ export function registerReviewSystemBlocks(): void {
   });
 
   registerBlock<ReviewPolicyGateConfig>({
-    type: REVIEW_POLICY_GATE_TYPE,
-    system: true,
+    type: REVIEW_SETTLE_TYPE,
     outputs: [
       "review_id",
       "repo",
@@ -420,15 +407,4 @@ export function registerReviewSystemBlocks(): void {
     },
   });
 
-  registerBlock<ReviewCleanupConfig>({
-    type: REVIEW_CLEANUP_TYPE,
-    system: true,
-    configSchema: reviewCleanupConfigSchema,
-    async execute(config) {
-      await deps()
-        .controlPlane()
-        .cleanupSupersededReview(config.reviewId, config.sessionId ? { sessionId: config.sessionId } : {});
-      return { kind: "ok", outputs: { review_id: config.reviewId, cleaned: true } };
-    },
-  });
 }

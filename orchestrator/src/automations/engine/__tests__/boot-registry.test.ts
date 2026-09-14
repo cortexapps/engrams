@@ -16,9 +16,9 @@ describe("block registry at boot", () => {
     for (const type of V1_BLOCK_TYPES) {
       expect(getBlock(type), type).toBeDefined();
     }
-    // The review system blocks ride the same registration.
-    expect(getBlock("system.open_review_pass")).toBeDefined();
-    expect(getBlock("system.review_policy_gate")).toBeDefined();
+    // The Slack system blocks ride the same registration.
+    expect(getBlock("system.slack_thread_recap")).toBeDefined();
+    expect(getBlock("system.slack_resolve_user")).toBeDefined();
 
     const { validateDefinition } = await import("../definition.ts");
     const parsed = validateDefinition(

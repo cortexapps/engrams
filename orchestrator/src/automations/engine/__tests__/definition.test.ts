@@ -99,16 +99,16 @@ describe("validateDefinition", () => {
 
   test("system block types are builtin-only", () => {
     const raw = def({
-      blocks: [{ id: "x", type: "system.review_policy_gate", config: { reviewId: "r-1" } }],
+      blocks: [{ id: "x", type: "system.slack_thread_recap", config: { status: "completed" } }],
     } as never);
     expect(() => validateDefinition(raw, { kind: "user" })).toThrow(/reserved for built-in/);
-    // A built-in may reference it (phase 4.2 registers the review blocks),
+    // A built-in may reference it (phase 4.6 registers the Slack blocks),
     // and its config schema is enforced like any other block's.
     expect(validateDefinition(raw, { kind: "builtin" }).blocks[0]!.type).toBe(
-      "system.review_policy_gate",
+      "system.slack_thread_recap",
     );
     const badConfig = def({
-      blocks: [{ id: "x", type: "system.review_policy_gate", config: {} }],
+      blocks: [{ id: "x", type: "system.slack_thread_recap", config: {} }],
     } as never);
     expect(() => validateDefinition(badConfig, { kind: "builtin" })).toThrow(DefinitionError);
     // An unregistered system type is still unknown for a built-in.
