@@ -13,9 +13,9 @@ import { registerInstanceCloseBlock } from "./instance-close.ts";
 import { registerClaimHandleBlock } from "./claim-handle.ts";
 import { registerIntegrationActionBlock } from "./integration-action.ts";
 import { registerReviewBlocks } from "./review.ts";
-import { registerSlackRelayBlock } from "./system/slack-relay.ts";
-import { registerSlackRecapBlock } from "./system/slack-recap.ts";
-import { registerSlackIdentityBlock } from "./system/slack-identity.ts";
+import { registerSlackRelayBlock } from "./relay.ts";
+import { registerRelayCloseBlock } from "./relay-close.ts";
+import { registerResolveUserBlock } from "./resolve-user.ts";
 import { getBlock, listBlockTypes } from "./registry.ts";
 
 let registered = false;
@@ -34,10 +34,9 @@ export function registerEngineBlocks(): void {
   registerClaimHandleBlock();
   registerIntegrationActionBlock();
   registerReviewBlocks();
-  // Built-in-only (ADR 0119 D7): the validator rejects these on user graphs.
   registerSlackRelayBlock();
-  registerSlackRecapBlock();
-  registerSlackIdentityBlock();
+  registerRelayCloseBlock();
+  registerResolveUserBlock();
 }
 
 export const V1_BLOCK_TYPES = [
@@ -65,6 +64,9 @@ export const V1_BLOCK_TYPES = [
   "review_stage",
   "review_settle",
   "review_close_pass",
+  "resolve_user",
+  "relay_session",
+  "relay_close",
 ] as const;
 
 /** Boot assertion (next to assertSweepPoliciesExhaustive): every v1 type is

@@ -134,7 +134,6 @@ async function rewriteOntoIntegrationTrigger(
       inputsSchema: version.inputsSchema,
       settings: version.settings,
     },
-    { kind: meta.kind === "builtin" ? "builtin" : "user" },
   );
   await deps.store.replaceCurrentDefinition(meta.id, definition);
   return true;

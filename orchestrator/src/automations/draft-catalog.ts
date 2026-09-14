@@ -19,7 +19,7 @@ import {
   settingsSchema,
   triggerSpecSchema,
 } from "./engine/definition.ts";
-import { getBlock, isSystemBlockType, listBlockTypes } from "./engine/blocks/registry.ts";
+import { getBlock, listBlockTypes } from "./engine/blocks/registry.ts";
 import { registerEngineBlocks } from "./engine/blocks/index.ts";
 import { loadEventSample } from "../connectors/samples.ts";
 import { loadRegistry, type CustomConnectorSource } from "../connectors/registry.ts";
@@ -44,7 +44,6 @@ function jsonSchemaOf(schema: z.ZodType): unknown {
 export function draftBlockCatalog(): Record<string, unknown> {
   registerEngineBlocks();
   const blocks = listBlockTypes()
-    .filter((type) => !isSystemBlockType(type))
     .map((type) => {
       const executor = getBlock(type)!;
       return {

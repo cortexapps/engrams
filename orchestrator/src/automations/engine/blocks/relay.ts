@@ -1,5 +1,8 @@
-/** `system.slack_thread_relay` — the Slack thread ↔ session relay as an
- * installed message handler (ADR 0119 phase 4.5, contract 3).
+/** `relay_session` — mirror a session into a place (a Slack thread) as an
+ * installed message handler (ADR 0119 phase 4.5, contract 3). A catalog
+ * block since 2026-09: any automation may relay a session; Slack is the
+ * first provider, and the config's `provider` enum is where the next one
+ * lands.
  *
  * Ports the drain loop of `workflows/slack-thread.ts` (`dispatchSessionEvent`
  * + the `trigger_answer` arm of `handleInbound`) onto the engine. The
@@ -31,8 +34,8 @@
 
 import { z } from "zod";
 
-import { log as rootLog } from "../../../../log.ts";
-import { makeSlackPolicy } from "../../../../integrations/slack-policy.ts";
+import { log as rootLog } from "../../../log.ts";
+import { makeSlackPolicy } from "../../../integrations/slack-policy.ts";
 import {
   routeSessionEvent,
   summarizeAsset,
@@ -41,14 +44,14 @@ import {
   type CommunicationPolicy,
   type QuestionProtocol,
   type StartedSession,
-} from "../../../../workflows/communication-policy.ts";
-import type { SourceMention } from "../../../../workflows/thread-inbox.ts";
-import { config as appConfig } from "../../../../config.ts";
-import { tools as defaultTools } from "../../../../tools/registry.ts";
-import { sessionRefSchema } from "../../definition.ts";
-import type { RunContext } from "../../context.ts";
-import type { AutomationInbox } from "../../inbox.ts";
-import { registerBlock, type BlockOutcome, type HandlerResult } from "../registry.ts";
+} from "../../../workflows/communication-policy.ts";
+import type { SourceMention } from "../../../workflows/thread-inbox.ts";
+import { config as appConfig } from "../../../config.ts";
+import { tools as defaultTools } from "../../../tools/registry.ts";
+import { sessionRefSchema } from "../definition.ts";
+import type { RunContext } from "../context.ts";
+import type { AutomationInbox } from "../inbox.ts";
+import { registerBlock, type BlockOutcome, type HandlerResult } from "./registry.ts";
 
 const log = rootLog.child({ component: "slack-relay" });
 
@@ -93,8 +96,13 @@ function deps(): SlackRelayDeps {
 // Config + render state
 // ---------------------------------------------------------------------------
 
+export const RELAY_SESSION_TYPE = "relay_session";
+
 export const slackRelayConfigSchema = z.object({
   session: sessionRefSchema,
+  /** The place the session is mirrored into. Slack is the only provider so
+   * far; the thread coordinates below are Slack's. */
+  provider: z.enum(["slack"]).default("slack"),
   team: z.string().min(1),
   channel: z.string().min(1),
   /** The thread root ts (the mention that opened the thread). */
@@ -362,15 +370,14 @@ export function slackRelayFinalFacts(ctx: RunContext): {
   };
 }
 
-/** Production policy access for sibling system blocks (the recap). */
+/** Production policy access for the sibling relay_close block. */
 export function slackRelayPolicy(runId: string): CommunicationPolicy {
   return deps().policy(runId);
 }
 
 export function registerSlackRelayBlock(): void {
   registerBlock<SlackRelayConfig>({
-    type: "system.slack_thread_relay",
-    system: true,
+    type: RELAY_SESSION_TYPE,
     refusesDryRun: true,
     outputs: ["session_id", "installed", "handler_state"],
     configSchema: slackRelayConfigSchema,

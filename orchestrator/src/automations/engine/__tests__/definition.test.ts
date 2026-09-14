@@ -1,6 +1,8 @@
+import { z } from "zod";
 import { describe, expect, test } from "bun:test";
 
 import { registerEngineBlocks } from "../blocks/index.ts";
+import { registerBlock, unregisterBlockForTest } from "../blocks/registry.ts";
 import {
   cronEntrypointOf,
   DefinitionError,
@@ -31,7 +33,7 @@ function def(overrides: Partial<AutomationDefinition> = {}): unknown {
 
 describe("validateDefinition", () => {
   test("accepts a minimal user definition", () => {
-    const parsed = validateDefinition(def(), { kind: "user" });
+    const parsed = validateDefinition(def());
     expect(parsed.blocks[0]!.type).toBe("create_session");
   });
 
@@ -50,16 +52,16 @@ describe("validateDefinition", () => {
           ...(policy ? { concurrency: { keyTemplate: "k", policy } } : {}),
         },
       } as Partial<AutomationDefinition>);
-    expect(validateDefinition(integration(["message"], "join"), { kind: "user" }).trigger).toMatchObject({
+    expect(validateDefinition(integration(["message"], "join")).trigger).toMatchObject({
       continueOnly: ["message"],
     });
-    expect(() => validateDefinition(integration(["reaction_added"], "join"), { kind: "user" })).toThrow(
+    expect(() => validateDefinition(integration(["reaction_added"], "join"))).toThrow(
       /continueOnly event "reaction_added" is not one of the trigger's eventKeys/,
     );
-    expect(() => validateDefinition(integration(["message"], "queue"), { kind: "user" })).toThrow(
+    expect(() => validateDefinition(integration(["message"], "queue"))).toThrow(
       /continueOnly needs settings.concurrency.policy "join"/,
     );
-    expect(() => validateDefinition(integration(["message"]), { kind: "user" })).toThrow(
+    expect(() => validateDefinition(integration(["message"]))).toThrow(
       /continueOnly needs settings.concurrency.policy "join"/,
     );
   });
@@ -76,44 +78,21 @@ describe("validateDefinition", () => {
         },
       ],
     } as Partial<AutomationDefinition>);
-    expect(() => validateDefinition(raw, { kind: "user" })).toThrow(/duplicate block id/);
+    expect(() => validateDefinition(raw)).toThrow(/duplicate block id/);
   });
 
   test("rejects unknown block types and bad configs with a block+field address", () => {
     expect(() =>
-      validateDefinition(def({ blocks: [{ id: "x", type: "teleport", config: {} }] } as never), {
-        kind: "user",
-      }),
+      validateDefinition(def({ blocks: [{ id: "x", type: "teleport", config: {} }] } as never)),
     ).toThrow(/unknown block type/);
     try {
       validateDefinition(
-        def({ blocks: [{ id: "x", type: "create_session", config: {} }] } as never),
-        { kind: "user" },
-      );
+        def({ blocks: [{ id: "x", type: "create_session", config: {} }] } as never));
       throw new Error("expected DefinitionError");
     } catch (error) {
       expect(error).toBeInstanceOf(DefinitionError);
       expect((error as DefinitionError).blockId).toBe("x");
     }
-  });
-
-  test("system block types are builtin-only", () => {
-    const raw = def({
-      blocks: [{ id: "x", type: "system.slack_thread_recap", config: { status: "completed" } }],
-    } as never);
-    expect(() => validateDefinition(raw, { kind: "user" })).toThrow(/reserved for built-in/);
-    // A built-in may reference it (phase 4.6 registers the Slack blocks),
-    // and its config schema is enforced like any other block's.
-    expect(validateDefinition(raw, { kind: "builtin" }).blocks[0]!.type).toBe(
-      "system.slack_thread_recap",
-    );
-    const badConfig = def({
-      blocks: [{ id: "x", type: "system.slack_thread_recap", config: {} }],
-    } as never);
-    expect(() => validateDefinition(badConfig, { kind: "builtin" })).toThrow(DefinitionError);
-    // An unregistered system type is still unknown for a built-in.
-    const unknown = def({ blocks: [{ id: "x", type: "system.not_a_thing", config: {} }] } as never);
-    expect(() => validateDefinition(unknown, { kind: "builtin" })).toThrow(/unknown block type/);
   });
 
   test("rejects invalid Liquid templates with the offending field", () => {
@@ -127,7 +106,7 @@ describe("validateDefinition", () => {
       ],
     } as never);
     try {
-      validateDefinition(raw, { kind: "user" });
+      validateDefinition(raw);
       throw new Error("expected DefinitionError");
     } catch (error) {
       expect(error).toBeInstanceOf(DefinitionError);
@@ -148,9 +127,7 @@ describe("validateDefinition", () => {
         id: "report",
         type: "integration_action",
         config: { provider: "github", actionId: "update_issue_comment", params: { body: "x" } },
-      }),
-      { kind: "user" },
-    );
+      }));
     expect(ok.settings.onFinalize?.[0]?.block.id).toBe("report");
     // send_prompt parks on the mailbox; a hook may never wait.
     expect(() =>
@@ -159,21 +136,15 @@ describe("validateDefinition", () => {
           id: "nudge",
           type: "send_prompt",
           config: { session: { blockId: "launch" }, promptTemplate: "x", waitFor: { kind: "none" } },
-        }),
-        { kind: "user" },
-      ),
+        })),
     ).toThrow(/cannot wait/);
     expect(() =>
       validateDefinition(
-        withHook({ id: "w", type: "wait_event", config: {} }),
-        { kind: "user" },
-      ),
+        withHook({ id: "w", type: "wait_event", config: {} })),
     ).toThrow(/cannot wait/);
     expect(() =>
       validateDefinition(
-        withHook({ id: "b", type: "branch", config: { conditions: { mode: "all", conditions: [] } }, then: [] }),
-        { kind: "user" },
-      ),
+        withHook({ id: "b", type: "branch", config: { conditions: { mode: "all", conditions: [] } }, then: [] })),
     ).toThrow(/not allowed in a finalize hook/);
     // Hook ids share the automation's id space.
     expect(() =>
@@ -182,9 +153,7 @@ describe("validateDefinition", () => {
           id: "launch",
           type: "integration_action",
           config: { provider: "github", actionId: "x", params: {} },
-        }),
-        { kind: "user" },
-      ),
+        })),
     ).toThrow(/duplicate block id/);
   });
 
@@ -193,9 +162,7 @@ describe("validateDefinition", () => {
       validateDefinition(
         def({
           blocks: [{ id: "x", type: "branch", config: { conditions: { mode: "all", conditions: [] } } }],
-        } as never),
-        { kind: "user" },
-      ),
+        } as never)),
     ).toThrow(/then/);
     expect(() =>
       validateDefinition(
@@ -208,9 +175,7 @@ describe("validateDefinition", () => {
               body: [],
             },
           ],
-        } as never),
-        { kind: "user" },
-      ),
+        } as never)),
     ).toThrow(/only loop blocks/);
   });
 });
@@ -224,21 +189,21 @@ describe("entrypoints (ADR 0119 D9)", () => {
   });
 
   test("extra entrypoints validate and round-trip", () => {
-    const parsed = validateDefinition(withEntrypoints([sweep()]), { kind: "user" });
+    const parsed = validateDefinition(withEntrypoints([sweep()]));
     expect(parsed.entrypoints).toHaveLength(1);
     expect(entrypointsOf(parsed).map((e) => e.id)).toEqual(["main", "sweep"]);
     expect(entrypointOf(parsed, "sweep")?.blocks[0]?.id).toBe("sweep_probe");
   });
 
   test('"main" is the implicit top-level entrypoint and cannot be redeclared', () => {
-    expect(() => validateDefinition(withEntrypoints([sweep("main")]), { kind: "user" })).toThrow(
+    expect(() => validateDefinition(withEntrypoints([sweep("main")]))).toThrow(
       DefinitionError,
     );
   });
 
   test("entrypoint ids are unique", () => {
     expect(() =>
-      validateDefinition(withEntrypoints([sweep("a"), sweep("a")]), { kind: "user" }),
+      validateDefinition(withEntrypoints([sweep("a"), sweep("a")])),
     ).toThrow(/duplicate entrypoint id/);
   });
 
@@ -248,7 +213,7 @@ describe("entrypoints (ADR 0119 D9)", () => {
       trigger: { kind: "manual" },
       blocks: [{ id: "launch", type: "session_status", config: { session: { template: "s" } } }],
     };
-    expect(() => validateDefinition(withEntrypoints([clash]), { kind: "user" })).toThrow(
+    expect(() => validateDefinition(withEntrypoints([clash]))).toThrow(
       /duplicate block id "launch"/,
     );
   });
@@ -260,7 +225,7 @@ describe("entrypoints (ADR 0119 D9)", () => {
       blocks: [],
     };
     // The main trigger in def() is already cron.
-    expect(() => validateDefinition(withEntrypoints([cronEp]), { kind: "user" })).toThrow(
+    expect(() => validateDefinition(withEntrypoints([cronEp]))).toThrow(
       /at most one cron trigger/,
     );
     // Cron on the extra entrypoint with a non-cron main is fine.
@@ -268,7 +233,7 @@ describe("entrypoints (ADR 0119 D9)", () => {
       trigger: { kind: "manual" },
       entrypoints: [cronEp],
     } as Partial<AutomationDefinition>);
-    const parsed = validateDefinition(manualMain, { kind: "user" });
+    const parsed = validateDefinition(manualMain);
     expect(cronEntrypointOf(parsed)?.id).toBe("tick");
   });
 
@@ -278,24 +243,43 @@ describe("entrypoints (ADR 0119 D9)", () => {
       trigger: { kind: "webhook", registrationId: "r", events: ["push"] },
       blocks: [],
     };
-    expect(() => validateDefinition(withEntrypoints([webhookEp]), { kind: "user" })).toThrow(
+    expect(() => validateDefinition(withEntrypoints([webhookEp]))).toThrow(
       DefinitionError,
     );
   });
 
   test("a message-handler cap is per entrypoint, not per definition", () => {
     // Two entrypoints may EACH carry a handler type; a run walks only one.
-    // (User graphs cannot register handlers, so assert via the reserved
-    // system gate instead: the validator rejects the system type first,
-    // proving the walk covers entrypoint blocks.)
-    const sysEp = {
-      id: "relay",
-      trigger: { kind: "manual" },
-      blocks: [{ id: "fx", type: "system.slack_thread_relay", config: {} }],
-    };
-    expect(() => validateDefinition(withEntrypoints([sysEp]), { kind: "user" })).toThrow(
-      /reserved for built-in automations/,
-    );
+    const relay = (id: string) => ({
+      id,
+      type: "relay_session",
+      config: { session: { blockId: "launch" }, team: "T1", channel: "C1", threadTs: "1.0" },
+    });
+    const ep = (id: string, blocks: unknown[]) => ({ id, trigger: { kind: "manual" }, blocks });
+    expect(
+      validateDefinition(withEntrypoints([ep("a", [relay("ra")]), ep("b", [relay("rb")])])).entrypoints,
+    ).toHaveLength(2);
+    // The same handler type twice in one entrypoint is a re-point (allowed);
+    // a SECOND handler type in the same entrypoint is refused.
+    expect(validateDefinition(withEntrypoints([ep("a", [relay("ra"), relay("rb")])])).entrypoints).toHaveLength(1);
+    registerBlock({
+      type: "test_other_handler",
+      configSchema: z.object({}),
+      async execute() {
+        return { kind: "ok", outputs: {} };
+      },
+      async onMessage() {
+        return { verdict: "pass" };
+      },
+    });
+    try {
+      const other = { id: "other", type: "test_other_handler", config: {} };
+      expect(() => validateDefinition(withEntrypoints([ep("a", [relay("ra"), other])]))).toThrow(
+        /only one message-handler type/,
+      );
+    } finally {
+      unregisterBlockForTest("test_other_handler");
+    }
   });
 });
 
@@ -319,36 +303,28 @@ describe("settings.instance (ADR 0120)", () => {
         {
           inputsSchema: [{ key: "project_id", label: "Project", type: "string" }],
         },
-      ),
-      { kind: "user" },
-    );
+      ));
     expect(parsed.settings.instance?.keyTemplate).toContain("project-");
   });
 
   test("rejects an instance input that is not an inputsSchema field", () => {
     expect(() =>
       validateDefinition(
-        instanced({ keyTemplate: "k", inputs: { ghost: "${{ event.raw.x }}" } }),
-        { kind: "user" },
-      ),
+        instanced({ keyTemplate: "k", inputs: { ghost: "${{ event.raw.x }}" } })),
     ).toThrow('not an inputsSchema field');
   });
 
   test("rejects admission for an unknown entrypoint", () => {
     expect(() =>
       validateDefinition(
-        instanced({ keyTemplate: "k", entrypoints: { ghost: { admit: "open" } } }),
-        { kind: "user" },
-      ),
+        instanced({ keyTemplate: "k", entrypoints: { ghost: { admit: "open" } } })),
     ).toThrow('unknown entrypoint "ghost"');
   });
 
   test("handle_match needs a delivery-bearing trigger", () => {
     expect(() =>
       validateDefinition(
-        instanced({ keyTemplate: "k", entrypoints: { main: { admit: "handle_match" } } }),
-        { kind: "user" },
-      ),
+        instanced({ keyTemplate: "k", entrypoints: { main: { admit: "handle_match" } } })),
     ).toThrow("delivery-bearing trigger");
     const parsed = validateDefinition(
       instanced(
@@ -361,15 +337,13 @@ describe("settings.instance (ADR 0120)", () => {
             eventKeys: ["message"],
           },
         },
-      ),
-      { kind: "user" },
-    );
+      ));
     expect(parsed.settings.instance?.entrypoints?.main?.admit).toBe("handle_match");
   });
 
   test("a bad key template fails at save time", () => {
     expect(() =>
-      validateDefinition(instanced({ keyTemplate: "${{ unclosed" }), { kind: "user" }),
+      validateDefinition(instanced({ keyTemplate: "${{ unclosed" })),
     ).toThrow();
   });
 });
@@ -386,9 +360,7 @@ describe("the {{ }} delimiter guard", () => {
               config: { profileId: "p1", promptTemplate: "Do {{ inputs.thing }}" },
             },
           ],
-        }),
-        { kind: "user" },
-      ),
+        })),
     ).toThrow(/never rendered/);
   });
 
@@ -407,10 +379,10 @@ describe("the {{ }} delimiter guard", () => {
           },
         ],
       });
-    expect(() => validateDefinition(withSessionRef("{{ steps.x.value }}"), { kind: "user" })).toThrow(
+    expect(() => validateDefinition(withSessionRef("{{ steps.x.value }}"))).toThrow(
       /never rendered/,
     );
-    const parsed = validateDefinition(withSessionRef("${{ steps.x.value }}"), { kind: "user" });
+    const parsed = validateDefinition(withSessionRef("${{ steps.x.value }}"));
     expect(parsed.blocks[0]!.type).toBe("send_prompt");
   });
 
@@ -439,9 +411,7 @@ describe("the {{ }} delimiter guard", () => {
             config: { profileId: "p1", promptTemplate: "brace via ${{ '{{' }} escape" },
           },
         ],
-      }),
-      { kind: "user" },
-    );
+      }));
     expect(parsed.blocks).toHaveLength(3);
   });
 });
