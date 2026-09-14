@@ -135,6 +135,10 @@ describe("seedBuiltinAutomations", () => {
     expect(row.inputs["mention"]).toBe("@engrams");
     const v1 = h.versions.get("auto-pr-review")![0]!;
     expect(v1.trigger).toMatchObject({ kind: "integration", provider: "github", connectionId: "conn-github" });
+    // Extra entrypoints' triggers are materialized too (the `closed` door).
+    for (const ep of v1.entrypoints ?? []) {
+      expect(ep.trigger).toMatchObject({ kind: "integration", connectionId: "conn-github" });
+    }
   });
 
   test("a legacy enrollment row the schema rejects drops just that row and never blocks the seed (phase 4.3b)", async () => {
@@ -234,6 +238,12 @@ describe("seedBuiltinAutomations", () => {
       find: { deadlineSeconds: 900 },
       report_failure: { reason: "custom: ${{ run.error }}" },
     });
+  });
+
+  test("content hash covers the extra entrypoints", () => {
+    const withEp = PR_REVIEW_BUILTIN.definition;
+    const withoutEp = { ...withEp, entrypoints: [] };
+    expect(definitionContentHash(withEp)).not.toBe(definitionContentHash(withoutEp));
   });
 
   test("content hash ignores key order and is stable", () => {

@@ -189,4 +189,7 @@ label the entity by its rendered key; generic chrome says "workstream".
   correlation is fragile — the Temporal-practitioner lesson).
 - No explicit rebind override yet (Devin's `!new` gesture) — follow-up.
 - `continueOnly` and slack-brain stay byte-identical; migrating the brain
-  onto instances is a later campaign.
+  onto instances is a later campaign. (2026-09-14: the PR-review built-in
+  IS instanced — one workstream per `owner/repo#number`, closed by a
+  `pull_request.closed` entrypoint; the retry and CI-dispatch doors bind to
+  the same workstream by the key template.)

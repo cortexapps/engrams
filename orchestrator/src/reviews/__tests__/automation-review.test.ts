@@ -35,7 +35,11 @@ function builtin() {
       blocks: [],
       entrypoints: [],
       inputsSchema: [],
-      settings: { concurrency: { keyTemplate: "${{ event.raw.pull_request.html_url }}", policy: "supersede" }, endSessionsOnFinish: true },
+      settings: {
+        instance: { keyTemplate: "${{ event.raw.repository.full_name }}#${{ event.raw.pull_request.number }}" },
+        concurrency: { keyTemplate: "${{ event.raw.pull_request.html_url }}", policy: "supersede" },
+        endSessionsOnFinish: true,
+      },
       createdByUserId: null,
       createdAt: NOW,
     },
@@ -53,7 +57,7 @@ function originalRun(): AutomationRunRow {
       source: "integration",
       receivedAt: "2026-08-21T00:00:00Z",
       eventKey: "pull_request.opened",
-      payload: { pull_request: { html_url: "https://github.com/engrams/engrams/pull/7" } },
+      payload: { repository: { full_name: "engrams/engrams" }, pull_request: { number: 7, html_url: "https://github.com/engrams/engrams/pull/7" } },
     },
     deliveryKey: "github:d1",
     concurrencyKey: null,
@@ -87,27 +91,40 @@ function harness(run: AutomationRunRow | null) {
     getConcurrencyHolder: async () => null,
     casConcurrency: async () => true,
   };
+  const opened: Array<{ key: string; openedBy: string }> = [];
+  const instances = {
+    resolveHandles: async () => [],
+    getOpenInstanceByKey: async () => null,
+    getInstance: async () => null,
+    openInstance: async (input: { key: string; openedBy: string; inputs: Record<string, unknown> }) => {
+      opened.push({ key: input.key, openedBy: input.openedBy });
+      return { id: "ai_pr", key: input.key, status: "open", inputs: input.inputs } as never;
+    },
+  };
   const deps = {
     store: store as never,
     starter: { start: async (_i: { runId: string; automationId: string }, id: string) => void started.push(id) },
     sender: { send: async () => {} },
+    instances: instances as never,
     now: () => NOW,
     randomUUID: () => "uuid-1",
   };
-  return { deps, admitted, started };
+  return { deps, admitted, started, opened };
 }
 
 describe("retryAutomationReview", () => {
   test("admits a fresh built-in run with a retry: delivery key and the original trigger payload", async () => {
     const h = harness(originalRun());
     const runId = await retryAutomationReview("autorun:b1:github:d1", h.deps);
-    expect(runId).toBe("autorun:b1:retry:uuid-1");
+    // Bound to the PR's workstream (ADR 0120), opened by the key template.
+    expect(runId).toBe("autorun:b1:main:i-ai_pr:retry:uuid-1");
+    expect(h.opened).toEqual([{ key: "engrams/engrams#7", openedBy: "review:retry:uuid-1" }]);
     expect(h.admitted).toHaveLength(1);
     expect(h.admitted[0]!.deliveryKey).toBe("retry:uuid-1");
     // The original PR payload rides the retry so the built-in resolves the same PR.
     expect(h.admitted[0]!.trigger).toMatchObject({
       source: "integration",
-      payload: { pull_request: { html_url: "https://github.com/engrams/engrams/pull/7" } },
+      payload: { repository: { full_name: "engrams/engrams" }, pull_request: { number: 7, html_url: "https://github.com/engrams/engrams/pull/7" } },
     });
     expect(h.started).toEqual([runId]);
   });
@@ -122,7 +139,8 @@ describe("dispatchAutomationReview", () => {
   test("admits a built-in run under review.dispatch with a coordinate-only payload", async () => {
     const h = harness(null);
     const runId = await dispatchAutomationReview({ repo: "engrams/engrams", prNumber: 42 }, h.deps);
-    expect(runId).toBe("autorun:b1:dispatch:uuid-1");
+    expect(runId).toBe("autorun:b1:main:i-ai_pr:dispatch:uuid-1");
+    expect(h.opened).toEqual([{ key: "engrams/engrams#42", openedBy: "review:dispatch:uuid-1" }]);
     expect(h.admitted).toHaveLength(1);
     expect(h.admitted[0]!.deliveryKey).toBe("dispatch:uuid-1");
     expect(h.admitted[0]!.trigger).toEqual({

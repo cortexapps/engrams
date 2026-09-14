@@ -70,6 +70,7 @@ export function definitionContentHash(definition: AutomationDefinition): string 
   const subject = {
     trigger: definition.trigger,
     blocks: definition.blocks,
+    entrypoints: definition.entrypoints ?? [],
     inputsSchema: definition.inputsSchema,
     settings: definition.settings,
   };
@@ -85,22 +86,23 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-/** Resolve seed-time placeholders (the default connection id). */
+/** Resolve seed-time placeholders (the default connection id) on the main
+ * trigger AND on every extra entrypoint's trigger. */
 async function materialize(
   builtin: BuiltinAutomation,
   deps: BuiltinSeedDeps,
 ): Promise<AutomationDefinition> {
   const definition = structuredClone(builtin.definition);
-  if (
-    definition.trigger.kind === "integration" &&
-    definition.trigger.connectionId === DEFAULT_CONNECTION_PLACEHOLDER
-  ) {
-    const provider = definition.trigger.provider;
-    const connection = await deps.connections.ensureDefault(
-      provider,
-      `${provider.charAt(0).toUpperCase()}${provider.slice(1)} (default)`,
-    );
-    definition.trigger.connectionId = connection.id;
+  const triggers = [definition.trigger, ...(definition.entrypoints ?? []).map((ep) => ep.trigger)];
+  for (const trigger of triggers) {
+    if (trigger.kind === "integration" && trigger.connectionId === DEFAULT_CONNECTION_PLACEHOLDER) {
+      const provider = trigger.provider;
+      const connection = await deps.connections.ensureDefault(
+        provider,
+        `${provider.charAt(0).toUpperCase()}${provider.slice(1)} (default)`,
+      );
+      trigger.connectionId = connection.id;
+    }
   }
   return definition;
 }
@@ -211,6 +213,7 @@ async function seedOne(
     engine: 1,
     trigger: current.trigger,
     blocks: current.blocks,
+    ...(current.entrypoints.length > 0 ? { entrypoints: current.entrypoints } : {}),
     inputsSchema: current.inputsSchema,
     settings: current.settings,
   };
