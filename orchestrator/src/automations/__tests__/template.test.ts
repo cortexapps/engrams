@@ -6,6 +6,7 @@ import {
   buildAutomationTemplateContext,
   renderAutomationAction,
   renderAutomationTemplate,
+  renderAutomationTemplateInScope,
   validateAutomationTemplate,
 } from "../template.ts";
 
@@ -38,6 +39,26 @@ describe("automation templates", () => {
     expect(
       await renderAutomationTemplate('${{ missing | default: "fallback" }}', context),
     ).toBe("fallback");
+  });
+
+  test("default's ARGUMENT is strict: an absent fallback path is a render error even when the value is present", async () => {
+    await expect(
+      renderAutomationTemplateInScope("${{ a | default: missing.path }}", { a: "present" }),
+    ).rejects.toThrow(/undefined variable/);
+  });
+
+  test("coalesce returns the first present value among string paths, absent paths included", async () => {
+    const scope = { raw: { repository: { full_name: "acme/repo" }, pull_request: { number: 7 } } };
+    expect(await renderAutomationTemplateInScope('${{ raw | coalesce: "pull_request.number", "issue.number" }}', scope)).toBe("7");
+    expect(await renderAutomationTemplateInScope('${{ raw | coalesce: "issue.number", "pull_request.number" }}', scope)).toBe("7");
+    // Empty strings and nulls are "absent"; nothing present renders empty.
+    expect(
+      await renderAutomationTemplateInScope('${{ raw | coalesce: "title", "pull_request.title" }}', {
+        raw: { title: "", pull_request: { title: null } },
+      }),
+    ).toBe("");
+    // Paths are own-property walks: prototype segments never resolve.
+    expect(await renderAutomationTemplateInScope('${{ raw | coalesce: "__proto__.x", "pull_request.number" }}', scope)).toBe("");
   });
 
   test("raw is the only enabled tag and protects literal output syntax", async () => {
