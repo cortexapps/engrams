@@ -371,6 +371,7 @@ export function registerSlackRelayBlock(): void {
   registerBlock<SlackRelayConfig>({
     type: "system.slack_thread_relay",
     system: true,
+    refusesDryRun: true,
     outputs: ["session_id", "installed", "handler_state"],
     configSchema: slackRelayConfigSchema,
     async execute(config, ctx) {

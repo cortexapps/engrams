@@ -355,6 +355,7 @@ export async function executeReviewFinalize(config: ReviewFinalizeConfig): Promi
 export function registerReviewBlocks(): void {
   registerBlock<ReviewFinalizeConfig>({
     type: REVIEW_CLOSE_PASS_TYPE,
+    refusesDryRun: true,
     outputs: ["review_id", "outcome"],
     configSchema: reviewFinalizeConfigSchema,
     async execute(config) {
@@ -364,6 +365,7 @@ export function registerReviewBlocks(): void {
 
   registerBlock<OpenReviewPassConfig>({
     type: REVIEW_OPEN_PASS_TYPE,
+    refusesDryRun: true,
     outputs: [
       "review_id",
       "task_id",
@@ -382,6 +384,7 @@ export function registerReviewBlocks(): void {
 
   registerBlock<ReviewStageConfig>({
     type: REVIEW_STAGE_TYPE,
+    refusesDryRun: true,
     outputs: ["phase", "prompt", "merge_base"],
     configSchema: reviewStageConfigSchema,
     async execute(config) {
@@ -391,6 +394,7 @@ export function registerReviewBlocks(): void {
 
   registerBlock<ReviewPolicyGateConfig>({
     type: REVIEW_SETTLE_TYPE,
+    refusesDryRun: true,
     outputs: [
       "review_id",
       "repo",

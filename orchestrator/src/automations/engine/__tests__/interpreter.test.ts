@@ -625,24 +625,24 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 4)
     expect(outputs["bye"]).toMatchObject({ ended: false, dry_run: true });
   });
 
-  test("a dry run refuses a system block instead of half-running the product", async () => {
+  test("a dry run refuses a block with product side effects instead of half-running the product", async () => {
     registerBlock({
-      type: "system.test_effect",
-      system: true,
+      type: "test_effect",
+      refusesDryRun: true,
       configSchema: z.object({}),
       async execute() {
         throw new Error("must not run");
       },
     });
     try {
-      const definition = makeDefinition([{ id: "fx", type: "system.test_effect", config: {} }]);
+      const definition = makeDefinition([{ id: "fx", type: "test_effect", config: {} }]);
       const h = makeHarness(definition, { dryRun: true });
       const result = await interpretAutomation(RUN, h.deps);
       expect(result.status).toBe("failed");
       expect(result.error).toContain("dry_run_unsupported");
       expect(h.stepRecords.find((r) => r.framePath === "fx")?.record.status).toBe("failed");
     } finally {
-      unregisterBlockForTest("system.test_effect");
+      unregisterBlockForTest("test_effect");
     }
   });
 
