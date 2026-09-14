@@ -862,6 +862,54 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
     expect(i.rows.size).toBe(1);
   });
 
+  test("the admission prelude runs BEFORE the workstream opens: a filtered delivery creates no workstream", async () => {
+    // Review-shaped: facts + admit, then a session; a workstream per PR.
+    const target = {
+      automation: meta(),
+      definition: {
+        ...instancedDefinition(),
+        trigger: trigger({ eventKeys: ["issue_comment.created"] }),
+        blocks: [
+          {
+            id: "facts",
+            type: "code",
+            config: {
+              mode: "value",
+              source: "export default ({ event }) => /review/.test(event.raw?.comment?.body ?? \"\") ? { admit: true } : null;",
+            },
+          },
+          {
+            id: "admit",
+            type: "filter",
+            config: { conditions: { mode: "all", conditions: [{ path: "steps.facts.value.admit", op: "is_true" }] } },
+          },
+          { id: "launch", type: "create_session", config: { profileId: "p1", promptTemplate: "go" } },
+        ],
+      } as AutomationDefinition,
+    };
+    const h = makeHarness([target]);
+    const i = fakeInstances();
+    const payload = (body: string) => ({ ...prPayload, comment: { body } });
+
+    const lgtm = await dispatchIntegrationEvent(
+      input({ eventKey: "issue_comment.created", payload: payload("LGTM"), deliveryId: "gh-lgtm" }),
+      instanceDeps(h, i),
+    );
+    expect(lgtm).toMatchObject({ matched: 1, filtered: 1, started: 0, dropped: 0 });
+    expect(i.rows.size).toBe(0); // nothing opened for a comment nobody asked to review
+    const row = h.runs.get("autorun:automation-1:github:gh-lgtm")!;
+    expect(row).toMatchObject({ status: "filtered", instanceId: "" });
+
+    const review = await dispatchIntegrationEvent(
+      input({ eventKey: "issue_comment.created", payload: payload("@engrams review"), deliveryId: "gh-review" }),
+      instanceDeps(h, i),
+    );
+    expect(review).toMatchObject({ matched: 1, started: 1, filtered: 0 });
+    expect(i.rows.size).toBe(1);
+    const instance = [...i.rows.values()][0]!;
+    expect(h.runs.get(`autorun:automation-1:main:i-${instance.id}:github:gh-review`)?.instanceId).toBe(instance.id);
+  });
+
   test("admit require: no open workstream drops the event with an audited reason and NO run row", async () => {
     const target = {
       automation: meta(),
