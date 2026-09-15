@@ -937,7 +937,7 @@ code {
   font-family: var(--font-mono);
 }
 
-/* ---- plate (a figure with callout pins) ---- */
+/* ---- plate (a screenshot with its ledger) ---- */
 .figure {
   display: grid;
   grid-template-columns: 1fr 340px;
@@ -952,42 +952,11 @@ code {
   background: color-mix(in oklch, var(--foreground) 3%, transparent);
   clip-path: var(--chamfer-14);
 }
-.plate .shot {
-  position: relative;
-}
 .plate img {
   display: block;
   width: 100%;
   height: auto;
   border: 1px solid var(--hairline);
-}
-.pin {
-  position: absolute;
-  display: flex;
-  align-items: center;
-}
-.pin.rev {
-  flex-direction: row-reverse;
-}
-.pin b {
-  width: 24px;
-  height: 24px;
-  border: 1px solid var(--primary);
-  background: var(--primary);
-  color: var(--primary-foreground);
-  box-shadow: 0 0 14px var(--primary);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 700;
-}
-.pin i {
-  width: 60px;
-  height: 1px;
-  background: var(--primary);
-  box-shadow: 0 0 6px var(--primary);
 }
 .plate figcaption {
   display: flex;
@@ -1012,7 +981,7 @@ code {
 }
 .ledger > div {
   display: grid;
-  grid-template-columns: 32px 1fr;
+  grid-template-columns: 84px 1fr;
   gap: 12px;
   padding: 12px 0;
   border-bottom: 1px solid var(--hairline);
@@ -1020,6 +989,11 @@ code {
 .ledger .n {
   font-family: var(--font-mono);
   font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ring);
+  padding-top: 2px;
 }
 
 /* ---- connector belt ---- */

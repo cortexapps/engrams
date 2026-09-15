@@ -124,17 +124,30 @@ export const how = {
 export const session = {
   badge: "Sec. 3",
   label: "A session",
-  meta: "Fig. 3.1 · overlay",
-  title: "No internet. No image libraries.",
-  body: "A session, asked for a PNG of a pelican on a bicycle. It wrote a PNG encoder in Python and shared the file in the thread.",
+  meta: "Fig. 3.1 · session view",
+  title: "Run any harness in a rich web interface.",
+  body: "Claude Code, Codex, and any harness you register all run the same way: in a microVM, with the dashboard wrapped around it. The transcript streams on the left. On the right, a pane opens onto the same guest the agent is working in: a terminal, the browser it drives, VS Code, the files it changed. Open one in the middle of a run and the agent keeps going.",
   screenshotAlt:
-    "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane shows the session's profile, its changed files, and three published apps.",
+    "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane holds a shell open on the guest.",
   caption: "Fig. 3.1 · session se_9f3ea71c · 212 events",
   live: "● live",
-  callouts: [
-    "The transcript. Every message and tool call, streamed as it happens.",
-    "A shell tool call, with its exit code and output.",
-    "The instrument rail: image, harness, snapshot durability, checkpoints.",
+  panes: [
+    {
+      name: "Shell",
+      body: "A terminal on the guest, holding the same filesystem and the same processes the agent is working in.",
+    },
+    {
+      name: "Browser",
+      body: "The browser the agent drives, streamed over VNC. Watch it work through a page, or take the mouse.",
+    },
+    {
+      name: "IDE",
+      body: "VS Code on the workspace (code-server), with its own integrated terminal.",
+    },
+    {
+      name: "Files",
+      body: "Images and files the agent shares render in the transcript. Attach your own in a reply and they land in the guest.",
+    },
   ],
 };
 
