@@ -5,8 +5,8 @@
 
 export const hero = {
   eyebrow: "Your agents, working in your cloud",
-  title: "Describe it once.",
-  titleAccent: "Run it again.",
+  title: "Automate your",
+  titleAccent: "SDLC.",
   lede: "Turn repeat work into an automation. engrams runs Claude Code, Codex, or your own agent when a schedule fires, a pull request changes, or someone asks in Slack. Inspect the changes and continue the conversation, on infrastructure you control.",
   primary: { label: "Explore automations", href: "platform/automations/" },
   secondary: { label: "Run it locally", href: "getting-started/local-quickstart/" },

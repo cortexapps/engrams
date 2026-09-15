@@ -1,16 +1,10 @@
 ---
-// The layout for the pages outside Starlight: /, /compare/, /architecture/.
-// The header sits on the cover (bottle-green) in every theme; the page below
-// it is paper unless a section says otherwise. The footer is a cover band with
-// the license line and the tri-color stripe. Theme choice is stored under
-// Starlight's localStorage key, so a reader who picks dark in the docs gets
-// dark here too.
+// Shared dark layout for the public marketing pages.
 import "@fontsource-variable/jetbrains-mono";
 import "@fontsource-variable/saira/wdth.css";
 import "../styles/tokens.css";
 import "../styles/marketing.css";
 import TraceMark from "../components/TraceMark.astro";
-import ThemeToggle from "../components/ThemeToggle.astro";
 
 interface Props {
   title: string;
@@ -25,7 +19,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
 ---
 
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -40,18 +34,6 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
     <meta property="og:type" content="website" />
     <meta property="og:url" content={canonical} />
     <meta name="theme-color" content="#081A1B" />
-    <script is:inline>
-      // Same key and same fallback as Starlight's ThemeProvider, run before paint.
-      (() => {
-        let stored = null;
-        try {
-          stored = localStorage.getItem("starlight-theme");
-        } catch {}
-        const theme =
-          stored || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
-        document.documentElement.dataset.theme = theme === "light" ? "light" : "dark";
-      })();
-    </script>
   </head>
   <body>
     <div class:list={["cover", "masthead", { landing }]}>
@@ -66,7 +48,6 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
             <a class="secondary" href={`${base}/compare/`}>Compare</a>
             <a href={`${base}/docs/`}>Docs</a>
             <a href="https://github.com/cortexapps/engrams">GitHub</a>
-            <ThemeToggle />
             <a class="cta-small" href={`${base}/docs/getting-started/local-quickstart/`}>Run it locally</a>
           </nav>
         </header>

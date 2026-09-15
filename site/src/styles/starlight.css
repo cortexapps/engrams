@@ -1,46 +1,5 @@
-/* The docs skin on Starlight. Same paper as the marketing pages, a bottle-green
- * top bar and spine, Saira headings, chamfered code blocks on the cover, the
- * amber NB callout. Lime is never text on paper: text accents use --ring.
- *
- * Starlight's own convention is bare :root = dark and [data-theme='light'] =
- * light. Both blocks are set explicitly here so neither theme inherits a
- * Starlight default hue. Everything below the variable blocks is unlayered, so
- * it wins over Starlight's @layer rules without specificity games. */
-
-:root,
-:root[data-theme="light"] {
-  --sl-color-white: var(--foreground);
-  --sl-color-gray-1: var(--secondary-foreground);
-  --sl-color-gray-2: var(--muted-foreground);
-  --sl-color-gray-3: oklch(0.55 0.025 200);
-  --sl-color-gray-4: oklch(0.75 0.02 128);
-  --sl-color-gray-5: var(--border);
-  --sl-color-gray-6: var(--secondary);
-  --sl-color-gray-7: var(--background);
-  --sl-color-black: var(--card);
-
-  --sl-color-accent-low: oklch(0.95 0.06 121);
-  --sl-color-accent: var(--ring);
-  --sl-color-accent-high: oklch(0.35 0.08 140);
-
-  --sl-color-text: var(--foreground);
-  --sl-color-text-accent: var(--ring);
-  --sl-color-text-invert: var(--primary-foreground);
-  --sl-color-bg: var(--background);
-  --sl-color-bg-nav: var(--bottle-green);
-  --sl-color-bg-sidebar: var(--bottle-green);
-  --sl-color-bg-inline-code: transparent;
-  --sl-color-bg-accent: var(--primary);
-  --sl-color-hairline-light: oklch(0.93 0.012 128);
-  --sl-color-hairline: var(--hairline-soft);
-  --sl-color-hairline-shade: var(--hairline-soft);
-
-  --sl-color-green: var(--instrument-nominal-ink);
-  --sl-color-orange: var(--instrument-caution-ink);
-  --sl-color-red: var(--instrument-critical-ink);
-}
-
-:root[data-theme="dark"] {
+/* Dark docs palette and layout. */
+:root {
   --sl-color-white: oklch(0.96 0.03 125);
   --sl-color-gray-1: var(--foreground);
   --sl-color-gray-2: var(--muted-foreground);
@@ -164,36 +123,6 @@ body {
   display: flex;
   gap: 20px;
 }
-.theme-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  height: 32px;
-  padding: 0 10px;
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  cursor: pointer;
-}
-.theme-toggle .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #e8a04a;
-}
-:root[data-theme="dark"] .theme-toggle .dot {
-  background: var(--primary);
-}
-.theme-toggle .when-dark,
-:root[data-theme="dark"] .theme-toggle .when-light {
-  display: none;
-}
-:root[data-theme="dark"] .theme-toggle .when-dark {
-  display: inline;
-}
 
 /* Search: the chamfered field in the bar; Starlight's dialog is untouched. */
 site-search button[data-open-modal] {
@@ -258,10 +187,6 @@ site-search button[data-open-modal] {
   }
   .hd-right {
     gap: 8px;
-  }
-  .theme-toggle .when-light,
-  .theme-toggle .when-dark {
-    display: none !important;
   }
 }
 /* Starlight 0.42 dropped the <starlight-menu-button> custom element; the
@@ -541,7 +466,9 @@ site-search button[data-open-modal] {
 }
 .hud-card:hover {
   transform: translateY(-3px);
-  box-shadow: 0 0 0 1px var(--lime-50), 0 0 40px var(--lime-18);
+  box-shadow:
+    0 0 0 1px var(--lime-50),
+    0 0 40px var(--lime-18);
 }
 .hud-card .rail {
   position: absolute;
@@ -954,4 +881,26 @@ mobile-starlight-toc nav {
 }
 .sl-link-button {
   border-radius: 0;
+}
+
+@media (max-width: 50rem) {
+  .hd-right {
+    flex: none;
+  }
+  site-search button[data-open-modal] {
+    width: 36px;
+    min-width: 36px;
+    padding: 0;
+    justify-content: center;
+  }
+  .hd-brand {
+    gap: 8px;
+    letter-spacing: 0.1em;
+    font-size: 16px;
+  }
+}
+@media (max-width: 720px) {
+  :root {
+    --sl-content-pad-x: 20px;
+  }
 }
