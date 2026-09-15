@@ -141,7 +141,11 @@ code {
   background-image:
     linear-gradient(transparent, var(--bottle-green) 85%),
     linear-gradient(color-mix(in oklch, var(--primary) 40%, transparent) 1px, transparent 1px),
-    linear-gradient(90deg, color-mix(in oklch, var(--primary) 40%, transparent) 1px, transparent 1px);
+    linear-gradient(
+      90deg,
+      color-mix(in oklch, var(--primary) 40%, transparent) 1px,
+      transparent 1px
+    );
   background-size:
     100% 100%,
     48px 48px,
@@ -208,36 +212,6 @@ code {
   font-size: 12px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-}
-.theme-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  height: 36px;
-  padding: 0 12px;
-  border: 1px solid rgba(255, 255, 255, 0.35);
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  cursor: pointer;
-}
-.theme-toggle .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #e8a04a;
-}
-:root[data-theme="dark"] .theme-toggle .dot {
-  background: var(--primary);
-}
-.theme-toggle .when-dark,
-:root[data-theme="dark"] .theme-toggle .when-light {
-  display: none;
-}
-:root[data-theme="dark"] .theme-toggle .when-dark {
-  display: inline;
 }
 .cta-small {
   display: inline-flex;
@@ -1477,8 +1451,7 @@ code {
   .wordmark {
     font-size: 18px;
   }
-  .site-nav a:not(.cta-small),
-  .site-nav .theme-toggle span:not(.dot) {
+  .site-nav a:not(.cta-small) {
     display: none;
   }
   .hero {
@@ -1512,5 +1485,51 @@ code {
   }
   .hairline-table td:first-child {
     width: 110px;
+  }
+}
+
+/* Let narrow grid tracks shrink around long headings and diagram labels. */
+.how .grid2 > div {
+  min-width: 0;
+}
+@media (max-width: 1024px) {
+  .how .grid2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 720px) {
+  .how h2 {
+    font-size: clamp(30px, 8vw, 36px);
+    overflow-wrap: anywhere;
+  }
+  .chunks .meta,
+  .graph-meta,
+  .plate figcaption,
+  .caption {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .site-nav {
+    gap: 8px;
+  }
+  .site-nav .cta-small {
+    padding: 0 10px;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+  }
+  .wordmark {
+    gap: 7px;
+    font-size: 16px;
+    letter-spacing: 0.1em;
+  }
+  .wordmark svg {
+    width: 23px;
+    height: 23px;
+  }
+  .graph-meta {
+    font-size: 10px;
+  }
+  .sec-head {
+    flex-wrap: wrap;
   }
 }

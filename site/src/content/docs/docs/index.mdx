@@ -1,25 +1,50 @@
 ---
-title: Run the factory.
-description: engrams is a self-hosted software factory for AI coding agents. A session is a plain OCI image plus an agent harness, booted in a microVM on a host you run, snapshotted when the agent goes idle, and restored when the next prompt arrives.
+title: Put your agents to work.
+description: Run coding agents in your cloud, inspect their changes, and turn repeat work into automations. Start with one task or build a workflow that runs on a schedule or an event.
 tableOfContents: false
 ---
 
 import HudCard from "../../../components/docs/HudCard.astro";
 
 <div class="doc-actions">
-  <a class="doc-btn primary" href="getting-started/local-quickstart/">Run it locally →</a>
-  <a class="doc-btn" href="guides/deploy-overview/">Deploy to your cloud</a>
+  <a class="doc-btn primary" href="getting-started/local-quickstart/">
+    Run it locally →
+  </a>
+  <a class="doc-btn" href="guides/deploy-overview/">
+    Deploy to your cloud
+  </a>
 </div>
 
-<div class="doc-sec-head"><span class="badge">Start here</span><span class="rule"></span></div>
+<div class="doc-sec-head">
+  <span class="badge">Start here</span>
+  <span class="rule"></span>
+</div>
 
 <div class="hud-grid">
-  <HudCard section="Getting started" title="Run engrams locally" href="getting-started/local-quickstart/">Start the whole stack on one machine and give an agent its first task.</HudCard>
-  <HudCard section="Guides" title="Deploy to your cloud" href="guides/deploy-overview/">One Terraform apply and two Helm releases on GKE or EKS.</HudCard>
-  <HudCard section="Platform" title="Automations" href="platform/automations/">Runs started by schedules, Slack threads, pull requests, and webhooks, with a durable record of every step.</HudCard>
-  <HudCard section="Concepts" title="Build a session image" href="concepts/images-and-harnesses/">Any Linux image with /bin/sh, plus the settings you enter when you enable it.</HudCard>
-  <HudCard section="Guides" title="Custom harness" href="guides/custom-harness/">Register your own agent runtime. It gets the same models, modes and effort levels as the built-ins.</HudCard>
-  <HudCard section="Reference" title="CLI reference" href="reference/cli/">Every engrams command, its flags, and the JSON output contract.</HudCard>
+  <HudCard
+    section="Getting started"
+    title="Run engrams locally"
+    href="getting-started/local-quickstart/"
+  >
+    Start the whole stack on one machine and give an agent its first task.
+  </HudCard>
+  <HudCard section="Guides" title="Deploy to your cloud" href="guides/deploy-overview/">
+    One Terraform apply and two Helm releases on GKE or EKS.
+  </HudCard>
+  <HudCard section="Platform" title="Automations" href="platform/automations/">
+    Runs started by schedules, Slack threads, pull requests, and webhooks, with a durable record of
+    every step.
+  </HudCard>
+  <HudCard section="Concepts" title="Build a session image" href="concepts/images-and-harnesses/">
+    Any Linux image with /bin/sh, plus the settings you enter when you enable it.
+  </HudCard>
+  <HudCard section="Guides" title="Custom harness" href="guides/custom-harness/">
+    Register your own agent runtime. It gets the same models, modes and effort levels as the
+    built-ins.
+  </HudCard>
+  <HudCard section="Reference" title="CLI reference" href="reference/cli/">
+    Every engrams command, its flags, and the JSON output contract.
+  </HudCard>
 </div>
 
 If you are reading these docs as an agent, every page is Markdown in the repository under

@@ -33,12 +33,13 @@ export default defineConfig({
       head: [
         {
           tag: "link",
-          attrs: { rel: "apple-touch-icon", href: `${base.replace(/\/$/, "")}/apple-touch-icon.png` },
+          attrs: {
+            rel: "apple-touch-icon",
+            href: `${base.replace(/\/$/, "")}/apple-touch-icon.png`,
+          },
         },
       ],
-      social: [
-        { icon: "github", label: "GitHub", href: "https://github.com/cortexapps/engrams" },
-      ],
+      social: [{ icon: "github", label: "GitHub", href: "https://github.com/cortexapps/engrams" }],
       customCss: [
         "@fontsource-variable/jetbrains-mono",
         "@fontsource-variable/saira/wdth.css",
@@ -49,11 +50,13 @@ export default defineConfig({
         baseUrl: "https://github.com/cortexapps/engrams/edit/main/site/",
       },
       components: {
+        ThemeProvider: "./src/components/starlight/ThemeProvider.astro",
+        ThemeSelect: "./src/components/starlight/ThemeSelect.astro",
         Header: "./src/components/starlight/Header.astro",
         Sidebar: "./src/components/starlight/Sidebar.astro",
         PageTitle: "./src/components/starlight/PageTitle.astro",
       },
-      // Code blocks are always on the cover: one dark theme in both modes,
+      // Code blocks use the dark cover palette,
       // the panel colors from tokens.css, a chamfer from starlight.css.
       expressiveCode: {
         themes: ["github-dark"],
@@ -93,12 +96,19 @@ export default defineConfig({
         plugins: [langHeader()],
       },
       sidebar: [
-        { label: "Getting started", items: [{ autogenerate: { directory: "docs/getting-started" } }] },
+        {
+          label: "Getting started",
+          items: [{ autogenerate: { directory: "docs/getting-started" } }],
+        },
         { label: "Platform", items: [{ autogenerate: { directory: "docs/platform" } }] },
         { label: "Concepts", items: [{ autogenerate: { directory: "docs/concepts" } }] },
         { label: "Guides", items: [{ autogenerate: { directory: "docs/guides" } }] },
         { label: "Reference", items: [{ autogenerate: { directory: "docs/reference" } }] },
-        { label: "API reference", collapsed: true, items: [{ autogenerate: { directory: "docs/api" } }] },
+        {
+          label: "API reference",
+          collapsed: true,
+          items: [{ autogenerate: { directory: "docs/api" } }],
+        },
         { label: "Contributing", items: [{ autogenerate: { directory: "docs/contributing" } }] },
       ],
       plugins: [starlightLinksValidator({ errorOnRelativeLinks: false, errorOnLocalLinks: false })],

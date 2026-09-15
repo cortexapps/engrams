@@ -5,7 +5,9 @@
 // at 1440.
 function fit(el: HTMLElement) {
   const width = Number(el.dataset.fit);
-  const spill = Number(el.dataset.fitSpill ?? 0);
+  const spill = window.matchMedia("(max-width: 720px)").matches
+    ? 0
+    : Number(el.dataset.fitSpill ?? 0);
   const parent = el.parentElement;
   if (!width || !parent) return;
   el.style.transform = "";

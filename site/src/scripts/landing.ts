@@ -79,7 +79,7 @@ function render(tick: number, step: number, run: number) {
       }),
     );
   }
-  if (boardCount) boardCount.textContent = `${f.boardCount} runs today`;
+  if (boardCount) boardCount.textContent = "Example runs";
   cells.forEach((c, i) => (c.className = f.chunks[i] ?? ""));
   if (sessions) sessions.textContent = String(f.sessions);
   if (stored) stored.textContent = f.stored;
