@@ -8,9 +8,11 @@ export const hero = {
   eyebrow: "Software factory · Automation running",
   title: "Automate your",
   titleAccent: "SDLC.",
-  lede:
-    "engrams is a self-hosted software factory. It runs Claude Code and Codex in Firecracker microVMs on servers you own. A schedule, a Slack thread, a pull request, or a webhook starts a run. Every run keeps its transcript, its diff, and its snapshot, and a person is one message away.",
-  primary: { label: "Run it locally →", href: "getting-started/local-quickstart/" },
+  lede: "engrams is a self-hosted software factory. It runs Claude Code and Codex in Firecracker microVMs on servers you own. A schedule, a Slack thread, a pull request, or a webhook starts a run. Every run keeps its transcript, its diff, and its snapshot, and a person is one message away.",
+  primary: {
+    label: "Run it locally →",
+    href: "getting-started/local-quickstart/",
+  },
   secondary: { label: "Deploy to your cloud", href: "guides/deploy-overview/" },
   chips: ["AGPL-3.0", "Firecracker · KVM", "GKE · EKS", "Claude Code · Codex"],
   graphTitle: "Automation · nightly-flaky-tests",
@@ -56,8 +58,7 @@ export const automations = {
   label: "Automations",
   meta: "Fig. 1.1 – 1.2",
   title: "The routine work is the point.",
-  lede:
-    "An automation is one trigger, a tree of blocks, and typed inputs: start a session, send it a prompt, wait for it, run a command inside it, post to Slack or GitHub, branch, loop. Runs are durable, so a run survives a restart and can wait hours for a reply without holding anything open.",
+  lede: "An automation is one trigger, a tree of blocks, and typed inputs: start a session, send it a prompt, wait for it, run a command inside it, post to Slack or GitHub, branch, loop. Runs are durable, so a run survives a restart and can wait hours for a reply without holding anything open.",
   screenshotAlt:
     "The New automation page asks what the automation should do; a drafting agent assembles it on the canvas.",
   channel: "CH 01 · Fig. 1.1",
@@ -141,8 +142,7 @@ export const extensible = {
   badge: "Sec. 4",
   label: "Extensible",
   title: "Built to be extended.",
-  lede:
-    "Claude Code, Codex and the 23 connectors are what ships in the box. The box is open: register your own harness, add your own connector, and the factory treats them exactly like the built-ins.",
+  lede: "Claude Code, Codex and the 23 connectors are what ships in the box. The box is open: register your own harness, add your own connector, and the factory treats them exactly like the built-ins.",
   cards: [
     {
       kicker: "Harnesses",
@@ -166,10 +166,13 @@ export const belt = { label: "23 connectors built in · plus yours" };
 export const start = {
   eyebrow: "A few minutes on one machine",
   title: "Start",
-  lede:
-    "The local quickstart runs the whole stack on one machine in a few minutes. The deployment guides take a fresh GCP project or AWS account to a running fleet.",
+  lede: "The local quickstart runs the whole stack on one machine in a few minutes. The deployment guides take a fresh GCP project or AWS account to a running fleet.",
   ctas: [
-    { label: "Run it locally", href: "getting-started/local-quickstart/", primary: true },
+    {
+      label: "Run it locally",
+      href: "getting-started/local-quickstart/",
+      primary: true,
+    },
     { label: "Deploy on GCP", href: "guides/deploy-gcp/", primary: false },
     { label: "Deploy on AWS", href: "guides/deploy-aws/", primary: false },
   ],
