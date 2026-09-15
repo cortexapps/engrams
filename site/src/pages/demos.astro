@@ -1,0 +1,13 @@
+---
+import '@fontsource-variable/saira/wdth.css';
+import '../styles/tokens.css';
+import '../styles/product-scenes.css';
+import ProductScene from '../components/demos/ProductScene.astro';
+const scenes = [
+  { kind: 'automation' as const, number: '01', title: 'Turn a bug ticket into a pull request.', body: 'A Linear bug starts the workflow. The agent fixes it and returns a tested change for review.' },
+  { kind: 'web' as const, number: '02', title: 'Point out the problem. Watch the fix.', body: 'Point out a broken layout. Watch the chart fit back into place.' },
+  { kind: 'slack' as const, number: '03', title: 'Delegate where the conversation happens.', body: 'Mention your agent in Slack. Get the fix back in the thread.' },
+  { kind: 'review' as const, number: '04', title: 'Give feedback once. The agent carries it through.', body: 'Route GitHub reviews back to the agent that wrote the code.' },
+];
+---
+<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width"/><meta name="robots" content="noindex"/><title>engrams · Product scenes</title></head><body><main><header class="gallery-header"><a href="/">engrams</a><span>PRODUCT SCENES</span></header>{scenes.map(scene => <section id={scene.kind}><div class="scene-heading"><span>{scene.number}</span><div><h1>{scene.title}</h1><p>{scene.body}</p></div></div><ProductScene kind={scene.kind}/></section>)}</main></body></html>
