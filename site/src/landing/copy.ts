@@ -8,9 +8,11 @@ export const hero = {
   eyebrow: "Software factory · Automation running",
   title: "Automate your",
   titleAccent: "SDLC.",
-  lede:
-    "engrams is a self-hosted software factory. It runs Claude Code and Codex in Firecracker microVMs on servers you own. A schedule, a Slack thread, a pull request, or a webhook starts a run. Every run keeps its transcript, its diff, and its snapshot, and a person is one message away.",
-  primary: { label: "Run it locally →", href: "getting-started/local-quickstart/" },
+  lede: "engrams is a self-hosted software factory. It runs Claude Code and Codex in Firecracker microVMs on servers you own. A schedule, a Slack thread, a pull request, or a webhook starts a run. Every run keeps its transcript, its diff, and its snapshot, and a person is one message away.",
+  primary: {
+    label: "Run it locally →",
+    href: "getting-started/local-quickstart/",
+  },
   secondary: { label: "Deploy to your cloud", href: "guides/deploy-overview/" },
   chips: ["AGPL-3.0", "Firecracker · KVM", "GKE · EKS", "Claude Code · Codex"],
   graphTitle: "Automation · nightly-flaky-tests",
@@ -56,8 +58,7 @@ export const automations = {
   label: "Automations",
   meta: "Fig. 1.1 – 1.2",
   title: "The routine work is the point.",
-  lede:
-    "An automation is one trigger, a tree of blocks, and typed inputs: start a session, send it a prompt, wait for it, run a command inside it, post to Slack or GitHub, branch, loop. Runs are durable, so a run survives a restart and can wait hours for a reply without holding anything open.",
+  lede: "An automation is one trigger, a tree of blocks, and typed inputs: start a session, send it a prompt, wait for it, run a command inside it, post to Slack or GitHub, branch, loop. Runs are durable, so a run survives a restart and can wait hours for a reply without holding anything open.",
   screenshotAlt:
     "The New automation page asks what the automation should do; a drafting agent assembles it on the canvas.",
   channel: "CH 01 · Fig. 1.1",
@@ -123,17 +124,30 @@ export const how = {
 export const session = {
   badge: "Sec. 3",
   label: "A session",
-  meta: "Fig. 3.1 · overlay",
-  title: "No internet. No image libraries.",
-  body: "A session, asked for a PNG of a pelican on a bicycle. It wrote a PNG encoder in Python and shared the file in the thread.",
+  meta: "Fig. 3.1 · session view",
+  title: "Run any harness in a rich web interface.",
+  body: "Claude Code, Codex, and any harness you register all run the same way: in a microVM, with the dashboard wrapped around it. The transcript streams on the left. On the right, a pane opens onto the same guest the agent is working in: a terminal, the browser it drives, VS Code, the files it changed. Open one in the middle of a run and the agent keeps going.",
   screenshotAlt:
-    "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane shows the session's profile, its changed files, and three published apps.",
+    "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane holds a shell open on the guest.",
   caption: "Fig. 3.1 · session se_9f3ea71c · 212 events",
   live: "● live",
-  callouts: [
-    "The transcript. Every message and tool call, streamed as it happens.",
-    "A shell tool call, with its exit code and output.",
-    "The instrument rail: image, harness, snapshot durability, checkpoints.",
+  panes: [
+    {
+      name: "Shell",
+      body: "A terminal on the guest, holding the same filesystem and the same processes the agent is working in.",
+    },
+    {
+      name: "Browser",
+      body: "The browser the agent drives, streamed over VNC. Watch it work through a page, or take the mouse.",
+    },
+    {
+      name: "IDE",
+      body: "VS Code on the workspace (code-server), with its own integrated terminal.",
+    },
+    {
+      name: "Files",
+      body: "Images and files the agent shares render in the transcript. Attach your own in a reply and they land in the guest.",
+    },
   ],
 };
 
@@ -141,8 +155,7 @@ export const extensible = {
   badge: "Sec. 4",
   label: "Extensible",
   title: "Built to be extended.",
-  lede:
-    "Claude Code, Codex and the 23 connectors are what ships in the box. The box is open: register your own harness, add your own connector, and the factory treats them exactly like the built-ins.",
+  lede: "Claude Code, Codex and the 23 connectors are what ships in the box. The box is open: register your own harness, add your own connector, and the factory treats them exactly like the built-ins.",
   cards: [
     {
       kicker: "Harnesses",
@@ -166,10 +179,13 @@ export const belt = { label: "23 connectors built in · plus yours" };
 export const start = {
   eyebrow: "A few minutes on one machine",
   title: "Start",
-  lede:
-    "The local quickstart runs the whole stack on one machine in a few minutes. The deployment guides take a fresh GCP project or AWS account to a running fleet.",
+  lede: "The local quickstart runs the whole stack on one machine in a few minutes. The deployment guides take a fresh GCP project or AWS account to a running fleet.",
   ctas: [
-    { label: "Run it locally", href: "getting-started/local-quickstart/", primary: true },
+    {
+      label: "Run it locally",
+      href: "getting-started/local-quickstart/",
+      primary: true,
+    },
     { label: "Deploy on GCP", href: "guides/deploy-gcp/", primary: false },
     { label: "Deploy on AWS", href: "guides/deploy-aws/", primary: false },
   ],

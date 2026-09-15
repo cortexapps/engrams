@@ -190,20 +190,15 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
       <div class="sec-head"><span class="sec-badge">{session.badge}</span><span>{session.label}</span><span class="sec-rule"></span><span>{session.meta}</span></div>
       <div class="figure">
         <figure class="plate">
-          <div class="shot">
-            <img src={pelican.src} width={pelican.width} height={pelican.height} alt={session.screenshotAlt} loading="lazy" />
-            <div class="pin" style="left:18%;top:22%"><b>1</b><i></i></div>
-            <div class="pin" style="left:46%;top:58%"><b>2</b><i></i></div>
-            <div class="pin rev" style="right:8%;top:36%"><b>3</b><i></i></div>
-          </div>
+          <img src={pelican.src} width={pelican.width} height={pelican.height} alt={session.screenshotAlt} loading="lazy" />
           <figcaption><span>{session.caption}</span><span class="ring">{session.live}</span></figcaption>
         </figure>
         <div>
           <h2 class="display">{session.title}</h2>
           <p class="body">{session.body}</p>
           <div class="ledger">
-            {session.callouts.map((c, i) => (
-              <div><span class="n">({i + 1})</span><span>{c}</span></div>
+            {session.panes.map((p) => (
+              <div><span class="n">{p.name}</span><span>{p.body}</span></div>
             ))}
           </div>
         </div>
