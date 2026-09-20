@@ -33,6 +33,17 @@ Confirm: `select repo, engine from review_enrollment;` shows `automation`, and
 the PR-review automation on the Automations page is **enabled** with
 `engrams/engrams` in its `repos` input.
 
+## A pull request is a workstream
+
+Every PR the built-in touches is a workstream keyed `owner/repo#number`
+(Automations → PR review → Workstreams, and the Workstreams page). Every
+way in binds to it: PR events, the review comment, Retry, CI dispatch. The
+`closed` entrypoint ends it on `pull_request.closed`, so later events for
+that PR drop (audited under the workstream's automation) instead of opening
+review runs. A PR nobody asked to review never gets a workstream: the
+admission prelude (`facts` + `admit`) decides before one is opened, so a
+"LGTM" comment or a draft opening leaves only a `filtered` run.
+
 ## The other doors follow the flag
 
 A flagged repo must never reach the legacy graph through a side door, or two

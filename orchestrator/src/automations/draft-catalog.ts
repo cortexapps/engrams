@@ -68,6 +68,7 @@ export function draftBlockCatalog(): Record<string, unknown> {
       "Block ids are unique across ALL entrypoints; ids match ^[a-z][a-z0-9_]*$.",
       "branch children live in then/else; loop children in body; nothing else nests.",
       'Prose fields render Liquid with ${{ }}; structured values use {"$ref": "steps.<id>.<output>"}.',
+      'Missing variables are render errors. `x | default: y` tolerates a missing x but NOT a missing y (the argument is strict); to pick the first present of several paths use `${{ event.raw | coalesce: "pull_request.number", "issue.number" }}`.',
       "At most one cron trigger per automation; extra entrypoints take integration, cron, or manual triggers.",
     ],
   };

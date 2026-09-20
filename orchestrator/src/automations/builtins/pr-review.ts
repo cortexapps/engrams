@@ -1,4 +1,5 @@
-/** The PR-review built-in automation (ADR 0119 D7, phase 4.3).
+/** The PR-review built-in automation (ADR 0119 D7; a workstream per pull
+ * request since 2026-09-14, ADR 0120, phase 4.3).
  *
  * The review pipeline ADR 0100 hand-wrote as a DBOS graph, expressed as
  * data on the automation engine. Structure is locked (built-ins are
@@ -60,7 +61,7 @@ export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 /** Bump on any graph or inputs-schema change (the seeder inserts a new
  * version when the stored content hash differs). */
-export const PR_REVIEW_DEFINITION_VERSION = 4;
+export const PR_REVIEW_DEFINITION_VERSION = 5;
 
 /** Synthetic event key the CI dispatch edge admits a run under (no GitHub
  * delivery carries it). The admission arm accepts it for any mapped repo. */
@@ -367,6 +368,29 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
     scope: { fromInput: "repos" },
   },
   blocks,
+  // ADR 0120: a pull request is a WORKSTREAM. The main entrypoint's runs
+  // open it (or join it) by the key below; `pull_request.closed` ends it, so
+  // later events for that PR drop, audited, instead of opening review runs.
+  entrypoints: [
+    {
+      id: "closed",
+      trigger: {
+        kind: "integration",
+        provider: "github",
+        connectionId: DEFAULT_CONNECTION_PLACEHOLDER,
+        eventKeys: ["pull_request.closed"],
+        scope: { fromInput: "repos" },
+      },
+      blocks: [
+        {
+          id: "close",
+          type: "instance_close",
+          tunable: [],
+          config: { reason: "pull request closed" },
+        },
+      ],
+    },
+  ],
   inputsSchema: [
     {
       key: "repos",
@@ -412,12 +436,27 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
     },
   ],
   settings: {
+    instance: {
+      // One workstream per pull request: `owner/repo#number`, the same
+      // identity the GitHub facet declares as the handle every PR event
+      // carries. PR events name the PR; a review-command comment names the
+      // issue (GitHub's payload shape for a PR comment); the CI dispatch and
+      // a retry carry `pull_request.number`.
+      keyTemplate:
+        '${{ event.raw.repository.full_name }}#${{ event.raw | coalesce: "pull_request.number", "issue.number" }}',
+      // A close only ends a workstream that exists: a PR engrams never
+      // reviewed closing is a drop (audited), not an open-and-close.
+      entrypoints: { closed: { admit: "require" } },
+    },
     concurrency: {
       // Rendered at ADMISSION, before any block runs, so it reads the raw
       // event (not steps.*): the PR url for PR events, the issue url for a
       // review-command comment — both are the pull request's html_url.
-      keyTemplate:
-        "${{ event.raw.pull_request.html_url | default: event.raw.issue.html_url }}",
+      // (`coalesce`, not `default:` — default's fallback argument is strict,
+      // so the old template failed on every PR event, which has no `issue`.)
+      // Instance-scoped, so the supersede is per PR (which the url already
+      // was) and a close run supersedes a review still running on that PR.
+      keyTemplate: '${{ event.raw | coalesce: "pull_request.html_url", "issue.html_url" }}',
       policy: "supersede",
     },
     runDeadlineSeconds: 4 * PHASE_DEADLINE_S,

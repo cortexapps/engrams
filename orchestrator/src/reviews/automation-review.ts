@@ -32,9 +32,14 @@ import { PR_REVIEW_BUILTIN_KEY, REVIEW_DISPATCH_EVENT_KEY } from "../automations
 import {
   admitAutomationRun,
   automationRunId,
+  defaultInstanceStoreLazy,
   defaultWorkflowStarter,
   type AutomationWebhookStarter,
 } from "../automations/dispatch.ts";
+import { MAIN_ENTRYPOINT_ID, type AutomationDefinition } from "../automations/engine/definition.ts";
+import { resolveInstance } from "../automations/instances.ts";
+import type { AutomationInstanceStore } from "../db/automation-instances.ts";
+import type { AutomationRunTrigger } from "../db/schema.ts";
 import { defaultAutomationSender, inboxKeys, type AutomationSender } from "../automations/engine/inbox.ts";
 import {
   effectiveDefinition,
@@ -49,10 +54,17 @@ import { log as rootLog } from "../log.ts";
 
 const log = rootLog.child({ component: "automation-review" });
 
+export type AutomationReviewInstanceStore = Pick<
+  AutomationInstanceStore,
+  "resolveHandles" | "getOpenInstanceByKey" | "getInstance" | "openInstance"
+>;
+
 export interface AutomationReviewDeps {
   store?: Pick<AutomationStore, "getByBuiltinKey" | "getRun"> & AutomationDispatchStore;
   starter?: AutomationWebhookStarter;
   sender?: AutomationSender;
+  /** ADR 0120: the PR's workstream (the built-in is instanced per PR). */
+  instances?: AutomationReviewInstanceStore;
   now?: () => Date;
   randomUUID?: () => string;
 }
@@ -69,9 +81,48 @@ function resolveDeps(deps: AutomationReviewDeps) {
     store: deps.store ?? makeAutomationStore(),
     starter: deps.starter ?? defaultWorkflowStarter(),
     sender: deps.sender ?? defaultAutomationSender,
+    instances: deps.instances ?? defaultInstanceStoreLazy(),
     now: deps.now ?? (() => new Date()),
     randomUUID: deps.randomUUID ?? (() => crypto.randomUUID()),
   };
+}
+
+/** Bind an out-of-webhook admission to the PR's workstream the way dispatch
+ * does: resolve by the key template (no facet here, so no handle tier),
+ * join the open workstream or open one. A non-instanced definition binds
+ * to nothing (`''`). */
+async function bindWorkstream(
+  builtin: AutomationRow,
+  definition: AutomationDefinition,
+  trigger: AutomationRunTrigger,
+  deliveryKey: string,
+  instances: AutomationReviewInstanceStore,
+): Promise<{ instanceId: string; inputs?: Record<string, unknown> }> {
+  const resolution = await resolveInstance(
+    {
+      target: { automation: builtin, definition },
+      entrypoint: { id: MAIN_ENTRYPOINT_ID, trigger: definition.trigger },
+      trigger,
+    },
+    { instances },
+  );
+  switch (resolution.kind) {
+    case "none":
+      return { instanceId: "" };
+    case "bound":
+      return { instanceId: resolution.instance.id, inputs: resolution.instance.inputs };
+    case "open": {
+      const opened = await instances.openInstance({
+        automationId: builtin.id,
+        key: resolution.key,
+        inputs: resolution.inputs,
+        openedBy: `review:${deliveryKey}`,
+      });
+      return { instanceId: opened.id, inputs: opened.inputs };
+    }
+    case "drop":
+      throw new RetryAutomationError(`the review does not route to a workstream (${resolution.reason})`);
+  }
 }
 
 async function requireBuiltin(
@@ -91,30 +142,31 @@ export async function retryAutomationReview(
   automationRunId_: string,
   deps: AutomationReviewDeps = {},
 ): Promise<string> {
-  const { store, starter, sender, now, randomUUID } = resolveDeps(deps);
+  const { store, starter, sender, instances, now, randomUUID } = resolveDeps(deps);
 
   const original = await store.getRun(automationRunId_);
   if (!original) {
     throw new RetryAutomationError("the review's automation run no longer exists");
   }
   const builtin = await requireBuiltin(store);
+  const definition = effectiveDefinition(builtin.version, builtin.blockOverrides);
 
   const deliveryKey = `retry:${randomUUID()}`;
-  const runId = automationRunId(builtin.id, deliveryKey);
+  const trigger: AutomationRunTrigger = {
+    ...original.trigger,
+    // A retry is a fresh receipt; keep the original payload/eventKey so the
+    // built-in resolves the same PR.
+    receivedAt: now().toISOString(),
+  };
+  const bound = await bindWorkstream(builtin, definition, trigger, deliveryKey, instances);
+  const runId = automationRunId(builtin.id, deliveryKey, MAIN_ENTRYPOINT_ID, bound.instanceId);
   await admitAutomationRun(
     {
-      target: {
-        automation: builtin,
-        definition: effectiveDefinition(builtin.version, builtin.blockOverrides),
-      },
+      target: { automation: builtin, definition },
       runId,
       deliveryKey,
-      trigger: {
-        ...original.trigger,
-        // A retry is a fresh receipt; keep the original payload/eventKey so the
-        // built-in resolves the same PR.
-        receivedAt: now().toISOString(),
-      },
+      ...(bound.instanceId !== "" ? { instanceId: bound.instanceId, instanceInputs: bound.inputs } : {}),
+      trigger,
       scheduledFor: null,
     },
     { store, starter, sender, now },
@@ -133,32 +185,33 @@ export async function dispatchAutomationReview(
   input: ReviewCoordinate,
   deps: AutomationReviewDeps = {},
 ): Promise<string> {
-  const { store, starter, sender, now, randomUUID } = resolveDeps(deps);
+  const { store, starter, sender, instances, now, randomUUID } = resolveDeps(deps);
   const builtin = await requireBuiltin(store);
+  const definition = effectiveDefinition(builtin.version, builtin.blockOverrides);
 
   const deliveryKey = `dispatch:${randomUUID()}`;
-  const runId = automationRunId(builtin.id, deliveryKey);
+  const trigger: AutomationRunTrigger = {
+    source: "manual",
+    eventKey: REVIEW_DISPATCH_EVENT_KEY,
+    receivedAt: now().toISOString(),
+    scopeValue: input.repo,
+    payload: {
+      repository: { full_name: input.repo, name: input.repo.split("/")[1] ?? "" },
+      pull_request: {
+        number: input.prNumber,
+        html_url: `https://github.com/${input.repo}/pull/${input.prNumber}`,
+      },
+    },
+  };
+  const bound = await bindWorkstream(builtin, definition, trigger, deliveryKey, instances);
+  const runId = automationRunId(builtin.id, deliveryKey, MAIN_ENTRYPOINT_ID, bound.instanceId);
   await admitAutomationRun(
     {
-      target: {
-        automation: builtin,
-        definition: effectiveDefinition(builtin.version, builtin.blockOverrides),
-      },
+      target: { automation: builtin, definition },
       runId,
       deliveryKey,
-      trigger: {
-        source: "manual",
-        eventKey: REVIEW_DISPATCH_EVENT_KEY,
-        receivedAt: now().toISOString(),
-        scopeValue: input.repo,
-        payload: {
-          repository: { full_name: input.repo, name: input.repo.split("/")[1] ?? "" },
-          pull_request: {
-            number: input.prNumber,
-            html_url: `https://github.com/${input.repo}/pull/${input.prNumber}`,
-          },
-        },
-      },
+      ...(bound.instanceId !== "" ? { instanceId: bound.instanceId, instanceInputs: bound.inputs } : {}),
+      trigger,
       scheduledFor: null,
     },
     { store, starter, sender, now },
