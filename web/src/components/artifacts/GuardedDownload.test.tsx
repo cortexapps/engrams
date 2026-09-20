@@ -52,14 +52,14 @@ test("Download anyway forces a save even without a fileName", async () => {
   // omitted attribute would NAVIGATE (renderable types serve inline),
   // replacing the SPA with the raw bytes.
   const clicked: Array<{ download: string | null; href: string }> = [];
-  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(
-    function (this: HTMLAnchorElement) {
-      clicked.push({
-        download: this.getAttribute("download"),
-        href: this.getAttribute("href") ?? "",
-      });
-    },
-  );
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    clicked.push({
+      download: this.getAttribute("download"),
+      href: this.getAttribute("href") ?? "",
+    });
+  });
 
   const user = userEvent.setup();
   render(
