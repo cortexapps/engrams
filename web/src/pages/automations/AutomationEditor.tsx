@@ -444,16 +444,15 @@ export function AutomationEditor({
               <Copy aria-hidden /> Duplicate
             </Button>
           )}
-          {mode === "edit" &&
-            automation && (
-              // A dry run executes the SAVED definition; unsaved edits would
-              // mislead, so it waits for a clean editor.
-              <DryRunButton
-                automationId={automation.id}
-                entrypointId={effectiveEntrypointId}
-                disabled={dirty}
-              />
-            )}
+          {mode === "edit" && automation && (
+            // A dry run executes the SAVED definition; unsaved edits would
+            // mislead, so it waits for a clean editor.
+            <DryRunButton
+              automationId={automation.id}
+              entrypointId={effectiveEntrypointId}
+              disabled={dirty}
+            />
+          )}
           <Button
             type="button"
             size="sm"
