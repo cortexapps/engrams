@@ -42,6 +42,14 @@ data:
   {{- with .Values.orchestrator.githubAppLogin }}
   GITHUB_APP_LOGIN: {{ . | quote }}
   {{- end }}
+  {{- /* ADR 0119 parallel-window kill switches: emitted only when ON, so an
+         unset switch leaves the env var absent (config.ts reads "1"/"true"). */ -}}
+  {{- if .Values.orchestrator.killSwitches.reviewAutomation }}
+  ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED: "1"
+  {{- end }}
+  {{- if .Values.orchestrator.killSwitches.slackAutomation }}
+  ORCHESTRATOR_SLACK_AUTOMATION_DISABLED: "1"
+  {{- end }}
   {{- with .Values.orchestrator.auth.iap.audiences }}
   IAP_AUDIENCES: {{ join "," . | quote }}
   {{- end }}

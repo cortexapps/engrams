@@ -65,11 +65,12 @@ session is kept — and the next mention in that thread goes to legacy.
 - **Per-channel**: remove the channel from `channels`, or disable the
   built-in. Takes effect on the next delivery on every replica (the
   dispatcher reads the row per delivery; there is no cache).
-- **Kill switch**: `ORCHESTRATOR_SLACK_AUTOMATION_DISABLED=1` (or `true`;
-  any other spelling is off). Every channel takes legacy, flags untouched,
-  and the flag is never consulted. This is an orchestrator env var: add it
-  to the orchestrator ConfigMap values and roll the deployment. The flags
-  survive, so lifting the switch re-opens the same window.
+- **Kill switch**: the chart value `orchestrator.killSwitches.slackAutomation:
+  true` emits `ORCHESTRATOR_SLACK_AUTOMATION_DISABLED=1` into the orchestrator
+  ConfigMap (the orchestrator accepts `1` or `true`; any other spelling is
+  off). Every channel takes legacy, flags untouched, and the flag is never
+  consulted. Flip the value and roll the deployment. The flags survive, so
+  lifting the switch re-opens the same window.
 
 The ingress spine keeps ledgering events in `integration_event` either way
 (the ledger is the audit trail, not a brain). The kill switch gates BOTH
