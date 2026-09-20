@@ -886,18 +886,21 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
             requeued
         }
     };
-    // ADR 0079 + ADR 0094: the initial-prompt DELIVER op is deferred
-    // while the session is still booting ("session is pending — not
-    // deliverable") and requeued on a growing backoff. Nothing else makes
-    // it ready when the boot completes, so the prompt would wait out the
-    // accumulated backoff (fresh create: ~36 s — the dominant TTFM cost,
-    // measured on the dev VM; claude answers in ~2 s once it has the
-    // prompt). The op that drives the row to Active wakes the sibling
-    // DELIVER on success, so the loop's next claim forwards the prompt in
-    // <100 ms. Two boot ops enqueue a sibling deliver:
+    // ADR 0079 + ADR 0094: a DELIVER op deferred while the session is
+    // still booting ("session is pending — not deliverable") is requeued
+    // on a growing backoff. Nothing else makes it ready when the boot
+    // completes, so the prompt would wait out the accumulated backoff
+    // (fresh create: ~36 s — measured on the dev VM; claude answers in
+    // ~2 s once it has the prompt). The op that drives the row to Active
+    // wakes the sibling DELIVER on success, so the loop's next claim
+    // forwards the prompt in <100 ms. Two boot ops enqueue a sibling
+    // deliver:
     //   - `Resume{flavor=for_delivery}` — prompt-after-idle (ADR 0079).
-    //   - `CreateBoot` — the fresh-create boot (ADR 0094; the original
-    //     "40 s = guest stampede" reading was wrong — it was this backoff).
+    //   - `CreateBoot` — a prompt typed WHILE a fresh create is still
+    //     booting (ADR 0094). Post-ADR-0108 A6 the create-time prompt
+    //     itself rides the spawn env (`RidesBoot`) and mints no deliver,
+    //     so this arm now serves only that follow-up-during-boot case —
+    //     the guaranteed wake keeps it off the executor's 5 s rescan.
     //
     // Gated on Done-or-session-terminal (re-review): a boot/resume that
     // fails terminally while the session stays RESUMABLE (a deterministic
