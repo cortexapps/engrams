@@ -3,7 +3,7 @@
   "protocol": "http",
   "display": {
     "name": "Cortex",
-    "category": "Internal developer portal",
+    "category": "Engineering Operations",
     "blurb": "Work with your Cortex catalog from a session: entities, scorecards, teams, custom data, deploys, dependencies, and CQL queries. Built by Cortex. Authenticated with a workspace API key brokered at the egress proxy, or with a person's own access token.",
     "icon": { "mono": "CX", "color": "#7458DB" },
     "featured": true

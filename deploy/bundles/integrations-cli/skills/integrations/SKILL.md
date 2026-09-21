@@ -6,7 +6,7 @@ description: Integration CLIs (e.g. cortex for Cortex, gh for GitHub, glab for G
 # Integration CLIs
 
 This session has command-line tools for the services your profile connected —
-for example `cortex` (Cortex, the internal developer portal), `gh` (GitHub),
+for example `cortex` (Cortex), `gh` (GitHub),
 `glab` (GitLab), `stripe` (Stripe), `pup` and `datadog` (Datadog), `linear`
 (Linear), `slack` (Slack), and `gcloud` (Google Cloud). **You never handle real
 credentials**: each tool carries a harmless placeholder token, and the engrams

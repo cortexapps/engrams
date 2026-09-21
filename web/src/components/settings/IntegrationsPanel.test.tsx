@@ -57,7 +57,7 @@ const CATALOG = [
     hosts: ["api.getcortexapp.com"],
     display: {
       name: "Cortex",
-      category: "Internal developer portal",
+      category: "Engineering Operations",
       blurb: "Work with your Cortex catalog.",
       icon: { mono: "CX", color: "#7458DB", logo: "" },
       featured: true,
