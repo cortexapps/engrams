@@ -14,7 +14,13 @@
  * tier that can unseal/mint) executes — mirroring `IntegrationService.testConnector`.
  */
 
-import { loadRegistry, type Connector } from "../connectors/registry.ts";
+import {
+  effectiveHosts,
+  loadRegistry,
+  resolveSettings,
+  storedSettingsOf,
+  type Connector,
+} from "../connectors/registry.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
 import { getDb } from "../db/client.ts";
@@ -35,11 +41,19 @@ export interface RunOpDeps {
   /** Resolve the provider's default connection id (the OAuth credential
    * subject, ADR 0106 addendum). Overridable for tests. */
   connectionIdFor?: (provider: string, displayName: string) => Promise<string>;
+  /** The provider's stored connector settings (its default connection's
+   * `config.settings`), which pick the host. Overridable for tests. */
+  settingsFor?: (provider: string) => Promise<Record<string, string>>;
 }
 
 async function defaultConnectionIdFor(provider: string, displayName: string): Promise<string> {
   const row = await makeIntegrationConnectionStore(getDb()).ensureDefault(provider, displayName);
   return row.id;
+}
+
+async function defaultSettingsFor(provider: string): Promise<Record<string, string>> {
+  const row = await makeIntegrationConnectionStore(getDb()).getDefault(provider);
+  return storedSettingsOf(row?.config);
 }
 
 /** A request to issue against an integration's host (the credential is added
@@ -111,7 +125,11 @@ export async function runIntegrationOp(
 ): Promise<IntegrationOpResult> {
   const client = deps?.integrationOp ?? defaultIntegrationOp;
   const c = await resolveConnector(provider, deps);
-  const host = c.hosts[0];
+  // Only a connector that declares settings has stored values to read; the
+  // rest resolve their static hosts without a connection lookup.
+  const settingsFor = deps?.settingsFor ?? defaultSettingsFor;
+  const stored = (c.settings ?? []).length > 0 ? await settingsFor(provider) : {};
+  const host = effectiveHosts(c, resolveSettings(c, stored))[0];
   if (!host) throw new Error(`connector "${provider}" has no host`);
   const body =
     typeof req.body === "string" ? new TextEncoder().encode(req.body) : (req.body ?? new Uint8Array());

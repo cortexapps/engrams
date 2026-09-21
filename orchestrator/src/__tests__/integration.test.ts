@@ -224,6 +224,13 @@ function fakeConnectionStore(seed: IntegrationConnectionRow[] = []): Integration
       rows.set(id, row);
       return row;
     },
+    async setConfig(id, config) {
+      const current = rows.get(id);
+      if (!current) return null;
+      const row = { ...current, config, updatedAt: new Date("2026-07-31T12:02:00Z") };
+      rows.set(id, row);
+      return row;
+    },
     async ensureDefault(provider) {
       return (await this.getDefault(provider))!;
     },

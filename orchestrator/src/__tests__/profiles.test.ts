@@ -139,6 +139,7 @@ async function spawn(deps: ProfileDeps) {
     delete: async () => { throw new Error("unused"); },
     markTested: async () => { throw new Error("unused"); },
     setEnabled: async () => { throw new Error("unused"); },
+    setConfig: async () => { throw new Error("unused"); },
     ensureDefault: async (provider) => (await connections.get(`default-${provider}`))!,
   };
   const withCatalog: ProfileDeps = {
@@ -504,6 +505,7 @@ describe("ProfileService — auth + field filtering", () => {
       delete: async () => { throw new Error("unused"); },
       markTested: async () => { throw new Error("unused"); },
       setEnabled: async () => { throw new Error("unused"); },
+      setConfig: async () => { throw new Error("unused"); },
       ensureDefault: async () => { throw new Error("unused"); },
     };
     const s = await spawn({
@@ -576,6 +578,7 @@ describe("ProfileService — auth + field filtering", () => {
       delete: async () => { throw new Error("unused"); },
       markTested: async () => { throw new Error("unused"); },
       setEnabled: async () => { throw new Error("unused"); },
+      setConfig: async () => { throw new Error("unused"); },
       ensureDefault: async () => { throw new Error("unused"); },
     };
     const s = await spawn({
@@ -812,6 +815,7 @@ describe("user-scoped grants (ADR 0115)", () => {
       delete: async () => { throw new Error("unused"); },
       markTested: async () => { throw new Error("unused"); },
       setEnabled: async () => { throw new Error("unused"); },
+      setConfig: async () => { throw new Error("unused"); },
       ensureDefault: async () => (await twoAcme.get("default-acme"))!,
     };
     const s = await spawn({ ...deps, connections: twoAcme });

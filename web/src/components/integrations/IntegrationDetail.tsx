@@ -19,6 +19,7 @@ import {
   LockIcon,
   RotateCcwIcon,
   ShieldCheckIcon,
+  SlidersHorizontalIcon,
   Trash2Icon,
   TriangleAlertIcon,
   ZapIcon,
@@ -33,9 +34,16 @@ import {
   useConnectors,
   useDeleteConnector,
   useMintKinds,
+  useSetConnectorSettings,
   useTestConnector,
 } from "@/hooks/useIntegrations";
-import { credentialActions, humanizeAction, parseConnectorConfig } from "@/lib/connectorModel";
+import {
+  credentialActions,
+  humanizeAction,
+  parseConnectorConfig,
+  type ParsedSetting,
+} from "@/lib/connectorModel";
+import { ConnectorSettingsFields, settingValue } from "./ConnectorSettingsFields";
 import { ProviderTile } from "./ProviderTile";
 import { AccessTag, HostChip, StatusDot } from "./chips";
 import { ReplaceCredentialSheet } from "./ReplaceCredentialSheet";
@@ -288,6 +296,15 @@ function DetailBody({ view }: { view: ConnectorView }) {
         </div>
       </div>
 
+      {(cfg?.settings ?? []).length > 0 && (
+        <ConnectorSettingsCard
+          provider={view.provider}
+          name={view.name}
+          settings={cfg?.settings ?? []}
+          stored={row?.settings ?? {}}
+        />
+      )}
+
       {/* powers */}
       <section className="flex flex-col gap-2.5">
         <h2 className="text-sm font-semibold">Powers · {view.capabilities.length}</h2>
@@ -431,6 +448,70 @@ interface SampleEvent {
 }
 
 /** Representative in-session events derived from the connector's powers. */
+/**
+ * The connector's `settings` facet on the manage page: the stored values with
+ * an inline editor. Saving writes the whole map; the change reaches the next
+ * session that starts (the policy and CLI env are compiled at launch).
+ */
+function ConnectorSettingsCard({
+  provider,
+  name,
+  settings,
+  stored,
+}: {
+  provider: string;
+  name: string;
+  settings: ParsedSetting[];
+  stored: Record<string, string>;
+}) {
+  const save = useSetConnectorSettings();
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const values = Object.fromEntries(
+    settings.map((s) => [s.name, settingValue(s, drafts, stored).trim()]),
+  );
+  const dirty = settings.some((s) => values[s.name] !== (stored[s.name] ?? s.default ?? ""));
+  const complete = settings.every((s) => values[s.name] !== "");
+
+  return (
+    <div className="rounded-lg border bg-card p-4">
+      <div className="flex items-start gap-3">
+        <SlidersHorizontalIcon className="mt-0.5 size-4 text-instrument-nominal" />
+        <div className="flex flex-1 flex-col gap-3">
+          <div className="text-sm font-semibold">Instance</div>
+          <ConnectorSettingsFields
+            settings={settings}
+            valueOf={(s) => settingValue(s, drafts, stored)}
+            onChange={(settingName, v) => setDrafts((d) => ({ ...d, [settingName]: v }))}
+          />
+          <div className="flex items-center gap-3">
+            <Button
+              size="sm"
+              disabled={!dirty || !complete || save.isPending}
+              onClick={() =>
+                save.mutate(
+                  { provider, settings: values },
+                  {
+                    onSuccess: () => {
+                      toast.success(`${name} settings saved`);
+                      setDrafts({});
+                    },
+                    onError: (e) => toast.error(e instanceof Error ? e.message : String(e)),
+                  },
+                )
+              }
+            >
+              {save.isPending ? "Saving…" : "Save"}
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              Applies to the next session that starts.
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function sampleEvents(view: ConnectorView): SampleEvent[] {
   const out: SampleEvent[] = [];
   const writeAssets = view.capabilities.filter((c) => c.access === "write" && c.asset).slice(0, 2);

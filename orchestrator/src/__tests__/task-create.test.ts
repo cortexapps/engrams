@@ -190,6 +190,9 @@ const fakeConnections = (): IntegrationConnectionStore => {
     setEnabled: async () => {
       throw new Error("unused");
     },
+    setConfig: async () => {
+      throw new Error("unused");
+    },
     ensureDefault: async (provider) => (await store.get(`default-${provider}`))!,
   };
   return store;
