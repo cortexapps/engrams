@@ -239,29 +239,42 @@ add-dependency)
     ;;
 query)
     cql="${1:?usage: cortex query <cql>}"
-    job=$(request POST "/api/v1/queries" -H "Content-Type: application/json" \
-        --data-binary "$(printf '{"query":%s}' "$(json_str "$cql")")")
+    # Every command substitution below is guarded: under `set -e` a bare
+    # `var=$(cmd)` that fails would end the script before the error paths
+    # and the recovery hint could run.
+    if ! job=$(request POST "/api/v1/queries" -H "Content-Type: application/json" \
+        --data-binary "$(printf '{"query":%s}' "$(json_str "$cql")")"); then
+        echo "cortex: could not submit the query (transport error to $HOST)" >&2
+        exit 1
+    fi
     if ! command -v jq >/dev/null 2>&1; then
         # Without jq we cannot follow the job; hand the caller the id to poll.
         printf '%s\n' "$job"
         echo "cortex: install jq to wait for the result, or poll: cortex get queries/<jobId>" >&2
         exit 0
     fi
-    id=$(printf '%s' "$job" | jq -r '.jobId // empty')
+    id=$(printf '%s' "$job" | jq -r '.jobId // empty' 2>/dev/null) || id=""
     if [ -z "$id" ]; then
-        printf '%s' "$job" | pretty
+        printf '%s\n' "$job"
         exit 1
     fi
     # Queries run as a job; poll until it leaves IN_PROGRESS (about 60 s max).
+    # A transient poll failure (connection reset, non-JSON error page) re-polls:
+    # the job keeps running on Cortex and its id stays in hand for the hint.
     n=0
     while [ "$n" -lt 60 ]; do
-        result=$(request GET "/api/v1/queries/$id")
-        status=$(printf '%s' "$result" | jq -r '.status // empty')
-        case "$status" in
-        IN_PROGRESS | "") sleep 1 ;;
-        *) printf '%s' "$result" | pretty; exit 0 ;;
-        esac
         n=$((n + 1))
+        if result=$(request GET "/api/v1/queries/$id") &&
+            status=$(printf '%s' "$result" | jq -r '.status // empty' 2>/dev/null); then
+            case "$status" in
+            IN_PROGRESS | "") ;;
+            *)
+                printf '%s' "$result" | pretty
+                exit 0
+                ;;
+            esac
+        fi
+        sleep 1
     done
     echo "cortex: query $id still running; poll with: cortex get queries/$id" >&2
     exit 1
