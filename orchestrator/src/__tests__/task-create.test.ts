@@ -2037,3 +2037,34 @@ describe("createSessionForExistingTask", () => {
     expect(sessions.deletedIds).toEqual([]);
   });
 });
+
+describe("connector settings (the administrator-chosen API host)", () => {
+  test("a stored host reaches the CLI env and the egress policy; the default never does", async () => {
+    const connections = fakeConnections();
+    const base = connections.get;
+    connections.get = async (id) =>
+      id === "default-cortex"
+        ? { ...(await base(id))!, config: { settings: { api_host: "api.eu.cortex.io" } } }
+        : base(id);
+    const input = await compileSessionCreateInput(
+      profile({ integrationGrants: [defaultGrant("cortex:catalog:read")] }),
+      { ...deps(), connections },
+    );
+    expect(input.selectedSkills).toContain("integrations-cli");
+    expect(input.harnessEnv?.CORTEX_API_HOST).toBe("api.eu.cortex.io");
+    expect(input.harnessEnv?.CORTEX_API_TOKEN).toBe("x-engrams-managed");
+    expect(input.harnessEnv?.ENGRAM_CLI_INTEGRATIONS).toContain('"provider":"cortex"');
+    const everything = JSON.stringify(input);
+    expect(everything).toContain("api.eu.cortex.io");
+    expect(everything).not.toContain("api.getcortexapp.com");
+  });
+
+  test("with nothing stored, the connector's default host applies", async () => {
+    const input = await compileSessionCreateInput(
+      profile({ integrationGrants: [defaultGrant("cortex:catalog:read")] }),
+      deps(),
+    );
+    expect(input.harnessEnv?.CORTEX_API_HOST).toBe("api.getcortexapp.com");
+    expect(JSON.stringify(input)).toContain("api.getcortexapp.com");
+  });
+});

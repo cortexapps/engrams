@@ -1818,3 +1818,58 @@ describe("display.featured", () => {
     expect("featured" in c.display).toBe(false);
   });
 });
+
+describe("the shipped cortex connector", () => {
+  test("is featured, host-parameterized (US / EU / self-hosted), token user mode, with a CLI", () => {
+    const c = connectorRegistry().get("cortex")!;
+    expect(c.display.featured).toBe(true);
+    expect(c.hosts).toEqual([]);
+    expect(c.settings).toHaveLength(1);
+    const host = c.settings![0]!;
+    expect(host.name).toBe("api_host");
+    expect(host.kind).toBe("host");
+    expect(host.options.map((o) => o.value)).toEqual(["api.getcortexapp.com", "api.eu.cortex.io"]);
+    expect(host.custom).toBeDefined();
+    expect(host.default).toBe("api.getcortexapp.com");
+    expect(host.env).toBe("CORTEX_API_HOST");
+    expect(effectiveHosts(c)).toEqual(["api.getcortexapp.com"]);
+    expect(c.userCredential?.token?.hint).toContain("access token");
+    expect(c.userCredential?.oauth).toBeUndefined();
+    expect(c.cli?.bins).toEqual(["cortex"]);
+    expect(c.cli?.dummyEnv).toEqual({ CORTEX_API_TOKEN: "x-engrams-managed" });
+    expect(c.test?.path).toBe("/api/v1/catalog/definitions");
+  });
+
+  test("keeps destructive and administrative endpoints out of every power", () => {
+    const c = connectorRegistry().get("cortex")!;
+    const paths = c.operations.map((op) => `${op.match && "method" in op.match ? op.match.method : ""} ${op.match && "path" in op.match ? op.match.path : ""}`);
+    for (const p of paths) {
+      expect(p).not.toMatch(/\/auth\/key|\/secrets|\/ip-allowlist|\/scim|configurations?/);
+    }
+    // Entity + team hard deletes stay out; archive is the supported path.
+    expect(paths).not.toContain("DELETE /api/v1/catalog/*");
+    expect(paths).not.toContain("DELETE /api/v1/catalog");
+    expect(paths).not.toContain("DELETE /api/v1/teams/*");
+    expect(paths).toContain("PUT /api/v1/catalog/*/archive");
+  });
+
+  test("the EU host compiles into the policy and the CLI env", () => {
+    const grants = [
+      {
+        connectionId: "default-cortex",
+        provider: "cortex",
+        operation: "catalog:read",
+        resourceConstraints: [],
+        settings: { api_host: "api.eu.cortex.io" },
+      },
+    ];
+    const p = compileConnectionPolicy(grants);
+    expect(p.injects.every((i) => i.hosts.length === 1 && i.hosts[0] === "api.eu.cortex.io")).toBe(true);
+    expect(p.network.allow_hosts).toEqual(["api.eu.cortex.io"]);
+    const plan = compileCliIntegrations(["cortex:catalog:read"], undefined, {
+      cortex: { api_host: "api.eu.cortex.io" },
+    });
+    expect(plan.settingsEnv).toEqual({ CORTEX_API_HOST: "api.eu.cortex.io" });
+    expect(plan.enabled.map((e) => e.provider)).toEqual(["cortex"]);
+  });
+});

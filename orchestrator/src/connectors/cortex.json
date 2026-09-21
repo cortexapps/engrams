@@ -1,0 +1,148 @@
+{
+  "provider": "cortex",
+  "protocol": "http",
+  "display": {
+    "name": "Cortex",
+    "category": "Internal developer portal",
+    "blurb": "Work with your Cortex catalog from a session: entities, scorecards, teams, custom data, deploys, dependencies, and CQL queries. Built by Cortex. Authenticated with a workspace API key brokered at the egress proxy, or with a person's own access token.",
+    "icon": { "mono": "CX", "color": "#7458DB" },
+    "featured": true
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "cortex.api_key" }
+    ]
+  },
+  "userCredential": {
+    "token": {
+      "hint": "Create a personal access token under your avatar → Settings → Preferences → My access tokens. It carries your own Cortex permissions."
+    }
+  },
+  "settings": [
+    {
+      "name": "api_host",
+      "label": "API host",
+      "kind": "host",
+      "options": [
+        { "value": "api.getcortexapp.com", "label": "Cortex Cloud, US (api.getcortexapp.com)" },
+        { "value": "api.eu.cortex.io", "label": "Cortex Cloud, EU (api.eu.cortex.io)" }
+      ],
+      "custom": {
+        "label": "Self-hosted",
+        "hint": "The hostname your Cortex API answers on, for example cortex-api.example.com. No scheme, port, or path."
+      },
+      "default": "api.getcortexapp.com",
+      "env": "CORTEX_API_HOST",
+      "hint": "The Cortex your keys belong to. Sessions reach this host and no other Cortex host."
+    }
+  ],
+  "hosts": [],
+  "test": { "path": "/api/v1/catalog/definitions" },
+  "operations": [
+    { "grants": ["catalog:read"], "match": { "method": "GET", "path": "/api/v1/catalog*" } },
+    { "grants": ["catalog:write"], "match": { "method": "POST", "path": "/api/v1/open-api*" } },
+    { "grants": ["catalog:write"], "match": { "method": "PATCH", "path": "/api/v1/open-api*" } },
+    { "grants": ["catalog:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/*/archive" } },
+    { "grants": ["catalog:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/*/unarchive" } },
+    { "grants": ["catalog:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/*/groups" } },
+    { "grants": ["catalog:write"], "match": { "method": "DELETE", "path": "/api/v1/catalog/*/groups" } },
+    { "grants": ["catalog:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/*/documentation/openapi" } },
+    { "grants": ["catalog:write"], "match": { "method": "DELETE", "path": "/api/v1/catalog/*/documentation/openapi" } },
+    { "grants": ["catalog:write"], "match": { "method": "POST", "path": "/api/v1/catalog/definitions*" } },
+    { "grants": ["catalog:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/definitions/*" } },
+    { "grants": ["catalog:write"], "match": { "method": "DELETE", "path": "/api/v1/catalog/definitions/*" } },
+
+    { "grants": ["custom-data:write"], "match": { "method": "POST", "path": "/api/v1/catalog/*/custom-data*" } },
+    { "grants": ["custom-data:write"], "match": { "method": "DELETE", "path": "/api/v1/catalog/*/custom-data*" } },
+    { "grants": ["custom-data:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/custom-data*" } },
+    { "grants": ["custom-data:write"], "match": { "method": "DELETE", "path": "/api/v1/catalog/custom-data*" } },
+
+    { "grants": ["events:write"], "match": { "method": "POST", "path": "/api/v1/catalog/*/custom-events*" } },
+    { "grants": ["events:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/*/custom-events/*" } },
+    { "grants": ["events:write"], "match": { "method": "DELETE", "path": "/api/v1/catalog/*/custom-events*" } },
+
+    { "grants": ["deploys:read"], "match": { "method": "GET", "path": "/api/v1/deploys/*" } },
+    { "grants": ["deploys:write"], "match": { "method": "POST", "path": "/api/v1/catalog/*/deploys*" } },
+    { "grants": ["deploys:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/*/deploys/*" } },
+    { "grants": ["deploys:write"], "match": { "method": "DELETE", "path": "/api/v1/catalog/*/deploys*" } },
+
+    { "grants": ["dependencies:write"], "match": { "method": "POST", "path": "/api/v1/catalog/*/dependencies/*" } },
+    { "grants": ["dependencies:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/*/dependencies/*" } },
+    { "grants": ["dependencies:write"], "match": { "method": "DELETE", "path": "/api/v1/catalog/*/dependencies*" } },
+    { "grants": ["dependencies:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/dependencies*" } },
+
+    { "grants": ["relationships:read"], "match": { "method": "GET", "path": "/api/v1/relationships/*" } },
+    { "grants": ["relationships:read"], "match": { "method": "GET", "path": "/api/v1/relationship-types*" } },
+    { "grants": ["relationships:write"], "match": { "method": "POST", "path": "/api/v1/catalog/*/relationships/*" } },
+    { "grants": ["relationships:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/*/relationships/*" } },
+    { "grants": ["relationships:write"], "match": { "method": "POST", "path": "/api/v1/relationships/*" } },
+    { "grants": ["relationships:write"], "match": { "method": "PUT", "path": "/api/v1/relationships/*" } },
+    { "grants": ["relationships:write"], "match": { "method": "POST", "path": "/api/v1/relationship-types*" } },
+    { "grants": ["relationships:write"], "match": { "method": "PUT", "path": "/api/v1/relationship-types/*" } },
+    { "grants": ["relationships:write"], "match": { "method": "DELETE", "path": "/api/v1/relationship-types/*" } },
+
+    { "grants": ["scorecards:read"], "match": { "method": "GET", "path": "/api/v1/scorecards*" } },
+    { "grants": ["scorecards:write"], "match": { "method": "POST", "path": "/api/v1/scorecards/descriptor*" } },
+    { "grants": ["scorecards:write"], "match": { "method": "POST", "path": "/api/v1/scorecards/*/entity/*/scores" } },
+    { "grants": ["scorecards:write"], "match": { "method": "POST", "path": "/api/v1/scorecards/*/entity/*/exemption" } },
+    { "grants": ["scorecards:write"], "match": { "method": "PUT", "path": "/api/v1/scorecards/*/entity/*/exemption/*" } },
+
+    { "grants": ["teams:read"], "match": { "method": "GET", "path": "/api/v1/teams*" } },
+    { "grants": ["teams:write"], "match": { "method": "POST", "path": "/api/v1/teams" } },
+    { "grants": ["teams:write"], "match": { "method": "PUT", "path": "/api/v1/teams*" } },
+
+    { "grants": ["queries:read"], "match": { "method": "GET", "path": "/api/v1/queries/*" } },
+    { "grants": ["queries:read"], "match": { "method": "POST", "path": "/api/v1/queries" } },
+
+    { "grants": ["initiatives:read"], "match": { "method": "GET", "path": "/api/v1/initiatives*" } },
+    { "grants": ["initiatives:write"], "match": { "method": "POST", "path": "/api/v1/initiatives*" } },
+    { "grants": ["initiatives:write"], "match": { "method": "PUT", "path": "/api/v1/initiatives/*" } },
+    { "grants": ["initiatives:write"], "match": { "method": "DELETE", "path": "/api/v1/initiatives/*" } },
+
+    { "grants": ["workflows:read"], "match": { "method": "GET", "path": "/api/v1/workflows*" } },
+    { "grants": ["workflows:write"], "match": { "method": "POST", "path": "/api/v1/workflows*" } },
+
+    { "grants": ["plugins:read"], "match": { "method": "GET", "path": "/api/v1/plugins*" } },
+    { "grants": ["plugins:write"], "match": { "method": "POST", "path": "/api/v1/plugins*" } },
+    { "grants": ["plugins:write"], "match": { "method": "PUT", "path": "/api/v1/plugins/*" } },
+    { "grants": ["plugins:write"], "match": { "method": "DELETE", "path": "/api/v1/plugins/*" } },
+
+    { "grants": ["scaffolders:read"], "match": { "method": "GET", "path": "/api/v1/scaffolders*" } },
+    { "grants": ["scaffolders:write"], "match": { "method": "POST", "path": "/api/v1/scaffolders*" } },
+    { "grants": ["scaffolders:write"], "match": { "method": "PUT", "path": "/api/v1/scaffolders/*" } },
+    { "grants": ["scaffolders:write"], "match": { "method": "DELETE", "path": "/api/v1/scaffolders/*" } },
+
+    { "grants": ["verifications:read"], "match": { "method": "GET", "path": "/api/v1/verifications*" } },
+    { "grants": ["verifications:read"], "match": { "method": "GET", "path": "/api/v1/verification-periods*" } },
+    { "grants": ["verifications:write"], "match": { "method": "PUT", "path": "/api/v1/verifications*" } },
+    { "grants": ["verifications:write"], "match": { "method": "PUT", "path": "/api/v1/catalog/*/verifications/*" } },
+    { "grants": ["verifications:write"], "match": { "method": "POST", "path": "/api/v1/verification-periods*" } },
+    { "grants": ["verifications:write"], "match": { "method": "PUT", "path": "/api/v1/verification-periods/*" } },
+    { "grants": ["verifications:write"], "match": { "method": "DELETE", "path": "/api/v1/verification-periods/*" } },
+
+    { "grants": ["packages:write"], "match": { "method": "POST", "path": "/api/v1/catalog/*/packages/*" } },
+    { "grants": ["packages:write"], "match": { "method": "DELETE", "path": "/api/v1/catalog/*/packages/*" } },
+
+    { "grants": ["metrics:read"], "match": { "method": "GET", "path": "/api/v1/eng-intel/*" } },
+    { "grants": ["metrics:read"], "match": { "method": "POST", "path": "/api/v1/eng-intel/metrics/point-in-time" } },
+    { "grants": ["metrics:read"], "match": { "method": "POST", "path": "/api/v1/eng-intel/trace" } },
+    { "grants": ["metrics:write"], "match": { "method": "POST", "path": "/api/v1/eng-intel/custom-metrics/*" } },
+    { "grants": ["metrics:write"], "match": { "method": "DELETE", "path": "/api/v1/eng-intel/custom-metrics/*" } },
+    { "grants": ["metrics:write"], "match": { "method": "POST", "path": "/api/v1/eng-intel/labels/users" } },
+
+    { "grants": ["users:read"], "match": { "method": "GET", "path": "/api/v1/users*" } },
+
+    { "grants": ["audit:read"], "match": { "method": "GET", "path": "/api/v1/audit-logs*" } },
+    { "grants": ["audit:read"], "match": { "method": "GET", "path": "/api/v1/gitops-logs*" } },
+    { "grants": ["audit:read"], "match": { "method": "GET", "path": "/api/v1/notifications/logs*" } },
+    { "grants": ["audit:read"], "match": { "method": "GET", "path": "/api/v1/discovery-audit*" } }
+  ],
+  "cli": {
+    "bins": ["cortex"],
+    "binSource": "bundled",
+    "dummyEnv": { "CORTEX_API_TOKEN": "x-engrams-managed" },
+    "credentialDelivery": "inject",
+    "doc": "Use `cortex` to work with the Cortex internal developer portal from this session: browse and search catalog entities, read scorecards and scores, look up teams and on-call, read and write custom data, record deploys and custom events, manage dependencies, and run CQL queries. Authentication is automatic: the egress proxy injects the workspace API key (or the launching person's own access token) as `Authorization: Bearer` on requests to the configured Cortex API host; `CORTEX_API_TOKEN` is a managed placeholder. Do NOT set a real token or run any login. `CORTEX_API_HOST` names the host the administrator selected (US, EU, or self-hosted); the CLI reads it, so do not override it.\n\nEntities are addressed by tag (for example `payments-api`) or id. Find tags with `cortex entities` or `cortex search`.\n\nCommands and the power each needs:\n  cortex entities [field=value ...]           List entities, paged (catalog:read). Filters: types=service, owners=team-tag, query=text, page=0, pageSize=50\n  cortex search <text> [field=value ...]      Search entities by text (catalog:read)\n  cortex entity <tag>                         One entity, with owners and hierarchy (catalog:read)\n  cortex descriptor <tag>                     The entity's YAML descriptor (catalog:read)\n  cortex scorecards                           List scorecards (scorecards:read)\n  cortex scorecard <tag>                      One scorecard (scorecards:read)\n  cortex scores <scorecard-tag> [entity-tag]  Scores for a scorecard, optionally one entity's (scorecards:read)\n  cortex entity-scorecards <tag>              Every scorecard result for one entity (catalog:read)\n  cortex teams                                List teams (teams:read)\n  cortex team <tag>                           One team (teams:read)\n  cortex oncall <tag>                         Who is on call for an entity now (catalog:read)\n  cortex custom-data <tag> [key]              Custom data on an entity, or one key (catalog:read)\n  cortex set-custom-data <tag> <key> <json>   Add or replace one custom-data key; the value is JSON (custom-data:write)\n  cortex events <tag>                         Custom events on an entity (catalog:read)\n  cortex add-event <tag> <type> <title> [json]   Record a custom event; the optional JSON is its payload (events:write)\n  cortex deploys <tag>                        Deploys recorded for an entity (catalog:read)\n  cortex add-deploy <tag> <environment> <sha> [type]   Record a deploy; type defaults to DEPLOY (deploys:write)\n  cortex dependencies <tag>                   Outbound dependencies of an entity (catalog:read)\n  cortex add-dependency <caller> <callee> [json]   Add a dependency edge (dependencies:write)\n  cortex query <cql>                          Run a CQL query and wait for its result (queries:read)\n  cortex initiatives                          List initiatives (initiatives:read)\n  cortex get <path> [field=value ...]         Raw GET under /api/v1 (the matching *:read power)\n  cortex api <METHOD> <path> [json-body]      Raw call with an explicit method and optional JSON body (the matching power)\n\nPaths that do not start with /api are prefixed with /api/v1/. Responses are JSON; list endpoints page with `page` (0-based) and `pageSize`. A path your profile did not grant is denied at the network boundary, not authenticated. Rate limit: 1000 requests per minute per client; a 429 carries Retry-After."
+  }
+}
