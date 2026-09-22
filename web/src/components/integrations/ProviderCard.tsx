@@ -4,7 +4,7 @@
  */
 
 import { Link } from "@tanstack/react-router";
-import { GlobeIcon, PencilIcon, PlusIcon, ZapIcon } from "lucide-react";
+import { GlobeIcon, PencilIcon, PlusIcon, SparklesIcon, ZapIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
@@ -32,12 +32,22 @@ export function ProviderCard({
     <div
       role="group"
       aria-label={`${view.name} integration`}
-      className="flex min-h-[168px] flex-col gap-3 rounded-lg border bg-card p-4"
+      className={`flex min-h-[168px] flex-col gap-3 rounded-lg border bg-card p-4 ${
+        view.featured ? "border-primary/50" : ""
+      }`}
     >
       <div className="flex items-start gap-3">
         <ProviderTile {...view.icon} name={view.name} size={42} />
         <div className="min-w-0 flex-1">
-          <div className="text-base font-semibold">{view.name}</div>
+          <div className="flex items-center gap-2">
+            <span className="text-base font-semibold">{view.name}</span>
+            {view.featured && (
+              <span className="inline-flex items-center gap-1 rounded-sm bg-primary/15 px-1.5 py-0.5 text-2xs font-medium text-primary">
+                <SparklesIcon className="size-3" />
+                Featured
+              </span>
+            )}
+          </div>
           <Text variant="label" tone="muted" className="text-2xs">
             {view.category}
           </Text>

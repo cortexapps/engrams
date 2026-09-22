@@ -350,3 +350,52 @@ describe("credentialActions", () => {
     ).toEqual({ reconnect: false, replace: false });
   });
 });
+
+describe("parseConnectorConfig — settings facet + featured pin", () => {
+  test("shapes the settings the orchestrator accepted and drops malformed entries", () => {
+    const cfg = parseConnectorConfig(
+      JSON.stringify({
+        credential: { source: "inject", injects: [{ header: "Authorization", secretRef: "k" }] },
+        display: { name: "Cortex", featured: true },
+        settings: [
+          {
+            name: "api_host",
+            label: "API host",
+            kind: "host",
+            options: [
+              { value: "api.getcortexapp.com", label: "US" },
+              { value: 7, label: "bad" },
+            ],
+            custom: { label: "Self-hosted", hint: "h" },
+            default: "api.getcortexapp.com",
+            hint: "which cortex",
+          },
+          { name: "nope" },
+          "junk",
+        ],
+      }),
+      "cortex",
+    );
+    expect(cfg.display.featured).toBe(true);
+    expect(cfg.settings).toEqual([
+      {
+        name: "api_host",
+        label: "API host",
+        kind: "host",
+        options: [{ value: "api.getcortexapp.com", label: "US" }],
+        custom: { label: "Self-hosted", hint: "h" },
+        default: "api.getcortexapp.com",
+        hint: "which cortex",
+      },
+    ]);
+  });
+
+  test("a connector without settings parses to an empty list and no featured key", () => {
+    const cfg = parseConnectorConfig(
+      JSON.stringify({ credential: { source: "mint", mint: { kind: "x" } } }),
+      "p",
+    );
+    expect(cfg.settings).toEqual([]);
+    expect("featured" in cfg.display).toBe(false);
+  });
+});

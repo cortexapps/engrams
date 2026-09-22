@@ -1,0 +1,307 @@
+#!/bin/sh
+# engrams Cortex CLI — a thin wrapper over the Cortex REST API (/api/v1).
+#
+# Auth is brokered (ADR 0056/0057): this carries only the `CORTEX_API_TOKEN`
+# placeholder; the egress proxy injects the real workspace API key (or, for a
+# person-scoped session, that person's own access token) as
+# `Authorization: Bearer` on every request to the Cortex API host, and strips
+# any token you supply. There is NOTHING to log in to — do not set a real
+# token or run any `login`.
+#
+# The host is the administrator's choice (the connector's `api_host` setting:
+# Cortex Cloud US, Cortex Cloud EU, or a self-hosted instance). The platform
+# exports it as CORTEX_API_HOST; sessions can reach that host and no other
+# Cortex host, so do not override it.
+#
+# Each subcommand needs the matching power on your profile (cortex:catalog:read,
+# cortex:scorecards:read, cortex:teams:read, cortex:custom-data:write, ...); a
+# path your profile did not grant is denied at the network boundary, not
+# authenticated.
+set -eu
+
+HOST="${CORTEX_API_HOST:-api.getcortexapp.com}"
+BASE="https://$HOST"
+TOKEN="${CORTEX_API_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<EOF
+engrams Cortex CLI — auth is brokered by the platform (no token to set).
+API host: $HOST (selected by your administrator; not overridable)
+
+Usage:
+  cortex entities [field=value ...]           List entities, paged (types=, owners=, query=, page=, pageSize=)
+  cortex search <text> [field=value ...]      Search entities by text
+  cortex entity <tag>                         One entity, with owners
+  cortex descriptor <tag>                     The entity's YAML descriptor
+  cortex scorecards                           List scorecards
+  cortex scorecard <tag>                      One scorecard
+  cortex scores <scorecard-tag> [entity-tag]  Scores for a scorecard, optionally one entity's
+  cortex entity-scorecards <tag>              Every scorecard result for one entity
+  cortex teams                                List teams
+  cortex team <tag>                           One team
+  cortex oncall <tag>                         Who is on call for an entity now
+  cortex custom-data <tag> [key]              Custom data on an entity, or one key
+  cortex set-custom-data <tag> <key> <json>   Add or replace one custom-data key (value is JSON)
+  cortex events <tag>                         Custom events on an entity
+  cortex add-event <tag> <type> <title> [json]          Record a custom event (JSON = payload)
+  cortex deploys <tag>                        Deploys recorded for an entity
+  cortex add-deploy <tag> <environment> <sha> [type]    Record a deploy (type: DEPLOY|ROLLBACK|RESTART|SCALE)
+  cortex dependencies <tag>                   Outbound dependencies of an entity
+  cortex add-dependency <caller> <callee> [json]        Add a dependency edge
+  cortex query <cql>                          Run a CQL query and wait for its result
+  cortex initiatives                          List initiatives
+  cortex get <path> [field=value ...]         Raw GET under /api/v1
+  cortex api <METHOD> <path> [json-body]      Raw call with an explicit method
+
+Entities are addressed by tag (e.g. payments-api) or id. Paths that do not start
+with /api are prefixed with /api/v1/. Responses are JSON; list endpoints page
+with page (0-based) and pageSize.
+EOF
+}
+
+# Pretty-print JSON when jq is present; otherwise pass through.
+pretty() {
+    if command -v jq >/dev/null 2>&1; then jq .; else cat; fi
+}
+
+# json_str <value> — emit a JSON-escaped string literal (quotes included).
+json_str() {
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$1" | jq -Rs .
+    else
+        esc=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        printf '"%s"' "$esc"
+    fi
+}
+
+# Normalize a path: pass through /api/... unchanged, else prefix /api/v1/.
+norm_path() {
+    case "$1" in
+    /api/*) printf '%s' "$1" ;;
+    /*) printf '/api/v1%s' "$1" ;;
+    *) printf '/api/v1/%s' "$1" ;;
+    esac
+}
+
+# request <METHOD> <path> [curl-args...] — call the API with brokered auth.
+request() {
+    m="$1"
+    p="$2"
+    shift 2
+    curl -sS -X "$m" "$BASE$(norm_path "$p")" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Accept: application/json" \
+        "$@"
+}
+
+# get <path> [field=value ...] — GET, each field=value becomes a query param.
+get() {
+    p="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    # -G folds --data-urlencode pairs into the query string for a GET.
+    request GET "$p" -G "$@" | pretty
+}
+
+# send <METHOD> <path> <json-body> — a write with a JSON body.
+send() {
+    request "$1" "$2" -H "Content-Type: application/json" --data-binary "$3" | pretty
+}
+
+# has_param <name> [field=value ...] — true when one of the pairs sets <name>.
+has_param() {
+    name="$1"
+    shift
+    for kv in "$@"; do
+        case "$kv" in "$name="*) return 0 ;; esac
+    done
+    return 1
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+entities)
+    # Both paging params are required by the API; default them.
+    extra=""
+    has_param page "$@" || extra="page=0"
+    if ! has_param pageSize "$@"; then
+        extra="${extra:+$extra
+}pageSize=50"
+    fi
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- "$@" $extra
+    IFS=$OLD_IFS
+    get "/api/v1/catalog" "$@"
+    ;;
+search)
+    text="${1:?usage: cortex search <text> [field=value ...]}"
+    shift
+    get "/api/v1/catalog/search" "query=$text" "$@"
+    ;;
+entity)
+    tag="${1:?usage: cortex entity <tag>}"
+    get "/api/v1/catalog/$tag" "includeOwners=true"
+    ;;
+descriptor)
+    tag="${1:?usage: cortex descriptor <tag>}"
+    request GET "/api/v1/catalog/$tag/openapi" -G --data-urlencode "yaml=true"
+    echo
+    ;;
+scorecards)
+    get "/api/v1/scorecards"
+    ;;
+scorecard)
+    tag="${1:?usage: cortex scorecard <tag>}"
+    get "/api/v1/scorecards/$tag"
+    ;;
+scores)
+    tag="${1:?usage: cortex scores <scorecard-tag> [entity-tag]}"
+    if [ -n "${2:-}" ]; then
+        get "/api/v1/scorecards/$tag/scores" "entityTag=$2"
+    else
+        get "/api/v1/scorecards/$tag/scores"
+    fi
+    ;;
+entity-scorecards)
+    tag="${1:?usage: cortex entity-scorecards <tag>}"
+    get "/api/v1/catalog/$tag/scorecards"
+    ;;
+teams)
+    get "/api/v1/teams"
+    ;;
+team)
+    tag="${1:?usage: cortex team <tag>}"
+    get "/api/v1/teams/$tag"
+    ;;
+oncall)
+    tag="${1:?usage: cortex oncall <tag>}"
+    get "/api/v1/catalog/$tag/integrations/oncall/current"
+    ;;
+custom-data)
+    tag="${1:?usage: cortex custom-data <tag> [key]}"
+    if [ -n "${2:-}" ]; then
+        get "/api/v1/catalog/$tag/custom-data/$2"
+    else
+        get "/api/v1/catalog/$tag/custom-data"
+    fi
+    ;;
+set-custom-data)
+    tag="${1:?usage: cortex set-custom-data <tag> <key> <json>}"
+    key="${2:?usage: cortex set-custom-data <tag> <key> <json>}"
+    value="${3:?usage: cortex set-custom-data <tag> <key> <json>}"
+    send POST "/api/v1/catalog/$tag/custom-data" \
+        "$(printf '{"key":%s,"value":%s}' "$(json_str "$key")" "$value")"
+    ;;
+events)
+    tag="${1:?usage: cortex events <tag>}"
+    get "/api/v1/catalog/$tag/custom-events"
+    ;;
+add-event)
+    tag="${1:?usage: cortex add-event <tag> <type> <title> [json]}"
+    type="${2:?usage: cortex add-event <tag> <type> <title> [json]}"
+    title="${3:?usage: cortex add-event <tag> <type> <title> [json]}"
+    payload="${4:-{\}}"
+    send POST "/api/v1/catalog/$tag/custom-events" \
+        "$(printf '{"type":%s,"title":%s,"customData":%s}' "$(json_str "$type")" "$(json_str "$title")" "$payload")"
+    ;;
+deploys)
+    tag="${1:?usage: cortex deploys <tag>}"
+    get "/api/v1/catalog/$tag/deploys"
+    ;;
+add-deploy)
+    tag="${1:?usage: cortex add-deploy <tag> <environment> <sha> [type]}"
+    env="${2:?usage: cortex add-deploy <tag> <environment> <sha> [type]}"
+    sha="${3:?usage: cortex add-deploy <tag> <environment> <sha> [type]}"
+    type="${4:-DEPLOY}"
+    send POST "/api/v1/catalog/$tag/deploys" \
+        "$(printf '{"title":%s,"environment":%s,"sha":%s,"type":%s}' \
+            "$(json_str "Deploy $sha to $env")" "$(json_str "$env")" "$(json_str "$sha")" "$(json_str "$type")")"
+    ;;
+dependencies)
+    tag="${1:?usage: cortex dependencies <tag>}"
+    get "/api/v1/catalog/$tag/dependencies"
+    ;;
+add-dependency)
+    caller="${1:?usage: cortex add-dependency <caller> <callee> [json]}"
+    callee="${2:?usage: cortex add-dependency <caller> <callee> [json]}"
+    send POST "/api/v1/catalog/$caller/dependencies/$callee" "${3:-{\}}"
+    ;;
+query)
+    cql="${1:?usage: cortex query <cql>}"
+    # Every command substitution below is guarded: under `set -e` a bare
+    # `var=$(cmd)` that fails would end the script before the error paths
+    # and the recovery hint could run.
+    if ! job=$(request POST "/api/v1/queries" -H "Content-Type: application/json" \
+        --data-binary "$(printf '{"query":%s}' "$(json_str "$cql")")"); then
+        echo "cortex: could not submit the query (transport error to $HOST)" >&2
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        # Without jq we cannot follow the job; hand the caller the id to poll.
+        printf '%s\n' "$job"
+        echo "cortex: install jq to wait for the result, or poll: cortex get queries/<jobId>" >&2
+        exit 0
+    fi
+    id=$(printf '%s' "$job" | jq -r '.jobId // empty' 2>/dev/null) || id=""
+    if [ -z "$id" ]; then
+        printf '%s\n' "$job"
+        exit 1
+    fi
+    # Queries run as a job; poll until it leaves IN_PROGRESS (about 60 s max).
+    # A transient poll failure (connection reset, non-JSON error page) re-polls:
+    # the job keeps running on Cortex and its id stays in hand for the hint.
+    n=0
+    while [ "$n" -lt 60 ]; do
+        n=$((n + 1))
+        if result=$(request GET "/api/v1/queries/$id") &&
+            status=$(printf '%s' "$result" | jq -r '.status // empty' 2>/dev/null); then
+            case "$status" in
+            IN_PROGRESS | "") ;;
+            *)
+                printf '%s' "$result" | pretty
+                exit 0
+                ;;
+            esac
+        fi
+        sleep 1
+    done
+    echo "cortex: query $id still running; poll with: cortex get queries/$id" >&2
+    exit 1
+    ;;
+initiatives)
+    get "/api/v1/initiatives"
+    ;;
+get)
+    p="${1:?usage: cortex get <path> [field=value ...]}"
+    shift
+    get "$p" "$@"
+    ;;
+api)
+    m="${1:?usage: cortex api <METHOD> <path> [json-body]}"
+    p="${2:?usage: cortex api <METHOD> <path> [json-body]}"
+    if [ -n "${3:-}" ]; then
+        send "$m" "$p" "$3"
+    else
+        request "$m" "$p" | pretty
+    fi
+    ;;
+"" | -h | --help | help)
+    usage
+    ;;
+*)
+    echo "cortex: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

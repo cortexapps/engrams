@@ -1,17 +1,17 @@
 ---
 name: integrations
-description: Third-party integration CLIs (e.g. gh for GitHub, glab for GitLab, stripe for Stripe, pup and datadog for Datadog, linear for Linear, slack for Slack, gcloud for Google Cloud) are available in this session, authenticated automatically by the engrams platform. Use when you need to interact with a connected service from the command line. Run `engrams-integrations` to see which are enabled and how to use each.
+description: Integration CLIs (e.g. cortex for Cortex, gh for GitHub, glab for GitLab, stripe for Stripe, pup and datadog for Datadog, linear for Linear, slack for Slack, gcloud for Google Cloud) are available in this session, authenticated automatically by the engrams platform. Use when you need to interact with a connected service from the command line. Run `engrams-integrations` to see which are enabled and how to use each.
 ---
 
 # Integration CLIs
 
-This session has command-line tools for the third-party services your profile
-connected — for example `gh` (GitHub), `glab` (GitLab), `stripe` (Stripe),
-`pup` and `datadog` (Datadog), `linear` (Linear), `slack` (Slack), and
-`gcloud` (Google Cloud). **You never
-handle real credentials**: each tool carries a harmless placeholder token, and the
-engrams egress proxy injects the real, capability-scoped credential on the wire.
-Do not paste, export, or `login` with real API tokens — it's already wired.
+This session has command-line tools for the services your profile connected —
+for example `cortex` (Cortex), `gh` (GitHub),
+`glab` (GitLab), `stripe` (Stripe), `pup` and `datadog` (Datadog), `linear`
+(Linear), `slack` (Slack), and `gcloud` (Google Cloud). **You never handle real
+credentials**: each tool carries a harmless placeholder token, and the engrams
+egress proxy injects the real, capability-scoped credential on the wire. Do not
+paste, export, or `login` with real API tokens — it's already wired.
 
 ## See what's enabled (and how to use it)
 
@@ -33,6 +33,9 @@ calls to anything else are denied at the network boundary.
   is blocked. A tool whose integration you didn't enable will fail at the network
   boundary, not because it's missing.
 - There is nothing to log in to, no token to paste, no `*_API_KEY` to set.
+- Some tools read a non-secret instance setting the administrator chose, such
+  as `CORTEX_API_HOST` (US, EU, or a self-hosted Cortex). It is already set;
+  leave it, because only that host is reachable.
 - `gcloud` reads its credential from a session-local metadata endpoint, the same
   way it would on a Compute Engine instance. Do not run `gcloud auth login`, do
   not create an application-default-credentials file, and do not copy a service

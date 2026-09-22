@@ -28,6 +28,10 @@ interface Caps {
   transport: ReturnType<typeof createRouterTransport>;
   puts: Array<{ name: string; value: string }>;
   upserts: string[];
+  /** TestConnector requests: the provider + the draft settings it probed with. */
+  tests: Array<{ provider: string; draftSettings: Record<string, string> }>;
+  /** SetConnectorSettings writes. */
+  settingsWrites: Array<{ provider: string; settings: Record<string, string> }>;
   mints: Array<{ provider: string; kind: string; values: Record<string, string> }>;
   connectionCreates: Array<{
     alias: string;
@@ -45,6 +49,21 @@ interface Caps {
 }
 
 const CATALOG = [
+  // The first-party connector: featured, reached on an administrator-chosen
+  // host (US / EU / self-hosted), so it heads the Available section.
+  {
+    provider: "cortex",
+    credentialSource: "inject",
+    hosts: ["api.getcortexapp.com"],
+    display: {
+      name: "Cortex",
+      category: "Engineering Operations",
+      blurb: "Work with your Cortex catalog.",
+      icon: { mono: "CX", color: "#7458DB", logo: "" },
+      featured: true,
+    },
+    capabilities: [{ action: "catalog:read", access: "read", asset: "" }],
+  },
   {
     provider: "github",
     credentialSource: "mint",
@@ -97,8 +116,35 @@ const CATALOG = [
   },
 ];
 
-// github available (needs connecting), datadog connected.
+// github + cortex available (need connecting), datadog connected.
 const CONNECTORS: Connector[] = [
+  {
+    provider: "cortex",
+    configJson: JSON.stringify({
+      credential: {
+        source: "inject",
+        injects: [{ header: "Authorization", secretRef: "cortex.api_key", template: "Bearer {}" }],
+      },
+      settings: [
+        {
+          name: "api_host",
+          label: "API host",
+          kind: "host",
+          options: [
+            { value: "api.getcortexapp.com", label: "Cortex Cloud, US (api.getcortexapp.com)" },
+            { value: "api.eu.cortex.io", label: "Cortex Cloud, EU (api.eu.cortex.io)" },
+          ],
+          custom: { label: "Self-hosted", hint: "A bare hostname." },
+          default: "api.getcortexapp.com",
+        },
+      ],
+    }),
+    builtin: true,
+    createdAt: "",
+    updatedAt: "",
+    status: "available",
+    settings: {},
+  },
   {
     provider: "github",
     configJson: JSON.stringify({ credential: { source: "mint", mint: { kind: "github_app" } } }),
@@ -125,6 +171,8 @@ const CONNECTORS: Connector[] = [
 function installTransport(options: { connections?: IntegrationConnection[] } = {}): Caps {
   const puts: Caps["puts"] = [];
   const upserts: string[] = [];
+  const tests: Caps["tests"] = [];
+  const settingsWrites: Caps["settingsWrites"] = [];
   const mints: Caps["mints"] = [];
   const connectionCreates: Caps["connectionCreates"] = [];
   const connectionUpdates: Caps["connectionUpdates"] = [];
@@ -151,10 +199,27 @@ function installTransport(options: { connections?: IntegrationConnection[] } = {
         return { secretNames: Object.keys(req.values).map((k) => `${req.kind}.${k}`) };
       },
       uploadConnectorLogo: () => ({ logoUrl: "" }),
-      testConnector: () => ({
-        ok: true,
-        message: "Reached api.github.com · HTTP 200 · credential accepted",
-      }),
+      testConnector: (req) => {
+        tests.push({ provider: req.provider, draftSettings: { ...req.draftSettings } });
+        return {
+          ok: true,
+          message: "Reached api.github.com · HTTP 200 · credential accepted",
+        };
+      },
+      setConnectorSettings: (req) => {
+        settingsWrites.push({ provider: req.provider, settings: { ...req.settings } });
+        return {
+          connector: {
+            provider: req.provider,
+            configJson: "{}",
+            builtin: true,
+            createdAt: "",
+            updatedAt: "",
+            status: "available",
+            settings: { ...req.settings },
+          },
+        };
+      },
       listConnections: () => ({ connections: options.connections ?? [] }),
       createConnection: (req) => {
         connectionCreates.push({
@@ -243,7 +308,16 @@ function installTransport(options: { connections?: IntegrationConnection[] } = {
       deleteProfile: () => ({}),
     });
   });
-  return { transport, puts, upserts, mints, connectionCreates, connectionUpdates };
+  return {
+    transport,
+    puts,
+    upserts,
+    tests,
+    settingsWrites,
+    mints,
+    connectionCreates,
+    connectionUpdates,
+  };
 }
 
 describe("IntegrationsPanel (marketplace)", () => {
@@ -266,6 +340,73 @@ describe("IntegrationsPanel (marketplace)", () => {
     expect(within(github).getByRole("button", { name: /^connect$/i })).toBeTruthy();
     expect(within(datadog).getByRole("link", { name: /manage/i })).toBeTruthy();
     expect(within(googleCloud).getByRole("button", { name: /^connect$/i })).toBeTruthy();
+  });
+
+  test("a featured provider heads its section and carries the badge", async () => {
+    const { transport } = installTransport();
+    renderWithProviders(<IntegrationsPanel />, { transport });
+
+    await screen.findByText("Cortex");
+    // Connected (Datadog) renders first; Available opens with the featured card.
+    const groups = screen.getAllByRole("group").map((g) => g.getAttribute("aria-label"));
+    expect(groups[0]).toBe("Datadog integration");
+    expect(groups[1]).toBe("Cortex integration");
+    const cortex = screen.getByRole("group", { name: "Cortex integration" });
+    expect(within(cortex).getByText("Featured")).toBeTruthy();
+    expect(
+      within(screen.getByRole("group", { name: "GitHub integration" })).queryByText("Featured"),
+    ).toBeNull();
+  });
+
+  test("Connect (inject + settings) probes and stores the chosen host", async () => {
+    const { transport, tests, settingsWrites, puts } = installTransport();
+    renderWithProviders(<IntegrationsPanel />, { transport });
+    const user = userEvent.setup();
+
+    const cortex = await screen.findByRole("group", { name: "Cortex integration" });
+    await user.click(within(cortex).getByRole("button", { name: /^connect$/i }));
+    // The default (US) is preselected; switch to the EU cloud.
+    await user.click(await screen.findByLabelText(/Cortex Cloud, EU/));
+    await user.type(screen.getByLabelText(/authorization/i), "ck_live_123");
+    await user.click(screen.getByRole("button", { name: /continue/i }));
+    // The test step names the host the probe will reach.
+    expect(await screen.findByText("api.eu.cortex.io")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: /test connection/i }));
+    await screen.findByText(/connection verified/i);
+    expect(tests).toEqual([
+      { provider: "cortex", draftSettings: { api_host: "api.eu.cortex.io" } },
+    ]);
+    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await user.click(await screen.findByRole("button", { name: /add cortex/i }));
+
+    await waitFor(() => expect(settingsWrites.length).toBe(1));
+    expect(settingsWrites[0]).toEqual({
+      provider: "cortex",
+      settings: { api_host: "api.eu.cortex.io" },
+    });
+    expect(puts).toContainEqual({ name: "cortex.api_key", value: "ck_live_123" });
+  });
+
+  test("Connect (inject + settings) accepts a self-hosted host", async () => {
+    const { transport, tests } = installTransport();
+    renderWithProviders(<IntegrationsPanel />, { transport });
+    const user = userEvent.setup();
+
+    const cortex = await screen.findByRole("group", { name: "Cortex integration" });
+    await user.click(within(cortex).getByRole("button", { name: /^connect$/i }));
+    await user.click(await screen.findByLabelText(/self-hosted/i));
+    // Until a host is typed, the credential alone cannot continue.
+    await user.type(screen.getByLabelText(/authorization/i), "ck_live_123");
+    expect((screen.getByRole("button", { name: /continue/i }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    await user.type(screen.getByLabelText("API host: Self-hosted"), "cortex-api.example.com");
+    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await user.click(await screen.findByRole("button", { name: /test connection/i }));
+    await screen.findByText(/connection verified/i);
+    expect(tests).toEqual([
+      { provider: "cortex", draftSettings: { api_host: "cortex-api.example.com" } },
+    ]);
   });
 
   test("Connect (mint) calls SetMintCredential with the kind + field values", async () => {

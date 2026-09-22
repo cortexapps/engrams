@@ -30,6 +30,10 @@ import {
   loadRegistry,
   buildProviderCatalog,
   connectorStatus,
+  effectiveHosts,
+  resolveSettings,
+  storedSettingsOf,
+  validateSettingValue,
   type Connector,
   type OauthCredentialStatus,
 } from "../connectors/registry.ts";
@@ -206,9 +210,25 @@ interface StatusInputs {
 }
 
 /** Derive a connector's status from the prefetched inputs. */
-function statusOf(c: Connector, inputs: StatusInputs): string {
+function statusOf(c: Connector, inputs: StatusInputs, storedSettings?: Record<string, string>): string {
   const required = c.credential.source === "mint" ? (inputs.requiredByKind.get(c.credential.mint.kind) ?? []) : [];
-  return connectorStatus(c, inputs.names, required, inputs.oauthByProvider.get(c.provider));
+  return connectorStatus(c, inputs.names, required, inputs.oauthByProvider.get(c.provider), storedSettings);
+}
+
+/**
+ * Check a settings map against the connector's `settings` facet: every key
+ * must be a declared setting and every value must validate. Returns the
+ * first problem as a sentence, or null.
+ */
+function settingsProblem(c: Connector, values: Readonly<Record<string, string>>): string | null {
+  const declared = new Map((c.settings ?? []).map((setting) => [setting.name, setting]));
+  for (const [name, value] of Object.entries(values)) {
+    const setting = declared.get(name);
+    if (!setting) return `"${name}" is not a setting of connector "${c.provider}"`;
+    const problem = validateSettingValue(setting, value);
+    if (problem) return `${setting.label} ${problem}`;
+  }
+  return null;
 }
 
 /**
@@ -343,6 +363,30 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
   // The credential subject for an oauth-facet connector (ADR 0106 addendum).
   const connectionIdFor = async (provider: string, displayName: string) =>
     (await connections.ensureDefault(provider, displayName)).id;
+  // ONE query for every provider's stored connector settings: the default
+  // connection's `config.settings`. Feeds status, the catalog's effective
+  // hosts, and the admin connector rows.
+  const settingsByProvider = async (): Promise<Record<string, Record<string, string>>> => {
+    const out: Record<string, Record<string, string>> = {};
+    for (const row of await connections.list()) {
+      if (row.isDefault) out[row.provider] = storedSettingsOf(row.config);
+    }
+    return out;
+  };
+  const connectorRow = (
+    c: Connector,
+    statusInputs: StatusInputs,
+    stored: Record<string, string> | undefined,
+    row?: { createdAt: Date; updatedAt: Date },
+  ) => ({
+    provider: c.provider,
+    configJson: JSON.stringify(c),
+    builtin: row === undefined,
+    createdAt: row?.createdAt.toISOString() ?? "",
+    updatedAt: row?.updatedAt.toISOString() ?? "",
+    status: statusOf(c, statusInputs, stored),
+    settings: stored ?? {},
+  });
   const profiles = deps?.profiles ?? makeProfileStore(getDb());
   const now = deps?.now ?? (() => new Date());
   const issuer = deps?.issuer ?? googleOidcIssuer();
@@ -363,14 +407,8 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       // dropping any that collide with a seed (writes reject collisions, so this
       // is the defensive belt — built-in always wins).
       const seeds = builtinProviders();
-      const builtins = [...connectorRegistry().values()].map((c) => ({
-        provider: c.provider,
-        configJson: JSON.stringify(c),
-        builtin: true,
-        createdAt: "",
-        updatedAt: "",
-        status: statusOf(c, statusInputs),
-      }));
+      const stored = await settingsByProvider();
+      const builtins = [...connectorRegistry().values()].map((c) => connectorRow(c, statusInputs, stored[c.provider]));
       const custom = (await connectors.list())
         .filter((r) => !seeds.has(r.provider))
         .map((r) => {
@@ -388,7 +426,8 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
             builtin: false,
             createdAt: r.createdAt.toISOString(),
             updatedAt: r.updatedAt.toISOString(),
-            status: parsed ? statusOf(parsed, statusInputs) : "available",
+            status: parsed ? statusOf(parsed, statusInputs, stored[r.provider]) : "available",
+            settings: stored[r.provider] ?? {},
           };
         });
       return { connectors: [...builtins, ...custom] };
@@ -454,7 +493,8 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       await requireUser(ctx, getSession);
       const registry = await loadRegistry(connectors);
       const withLogo = new Set(await connectorLogos.listProviders());
-      const entries = await Promise.all(buildProviderCatalog(registry, providers).map(async (e) => {
+      const stored = await settingsByProvider();
+      const entries = await Promise.all(buildProviderCatalog(registry, providers, stored).map(async (e) => {
         // A NAMED provider has no singleton credential slot — an administrator
         // creates its connections, and `ListConnections` returns them. Only a
         // singleton provider must have a default.
@@ -473,6 +513,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
             name: e.display.name,
             category: e.display.category,
             blurb: e.display.blurb,
+            featured: e.display.featured === true,
             icon: {
               mono: e.display.icon.mono,
               color: e.display.icon.color,
@@ -572,7 +613,13 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       const registry = await loadRegistry(connectors);
       const c = registry.get(req.provider);
       if (!c) throw new ConnectError(`unknown connector "${req.provider}"`, Code.InvalidArgument);
-      const host = c.hosts[0];
+      // The probe reaches the host the settings select: an about-to-be-saved
+      // draft first, else the stored value, else the connector's default.
+      const draftSettings = req.draftSettings ?? {};
+      const settingsIssue = settingsProblem(c, draftSettings);
+      if (settingsIssue) return { ok: false, message: settingsIssue };
+      const storedSettings = storedSettingsOf((await connections.getDefault(c.provider))?.config);
+      const host = effectiveHosts(c, resolveSettings(c, { ...storedSettings, ...draftSettings }))[0];
       if (!host) throw new ConnectError(`connector "${req.provider}" has no host`, Code.InvalidArgument);
       const draft = req.draftValues ?? {};
       // ADR 0058: an honest probe path (default `/`). Datadog's `/`
@@ -649,6 +696,30 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
         const message = err instanceof ConnectError ? err.rawMessage : String(err);
         return { ok: false, message };
       }
+    },
+
+    async setConnectorSettings(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const registry = await loadRegistry(connectors);
+      const c = registry.get(req.provider);
+      if (!c) throw new ConnectError(`unknown connector "${req.provider}"`, Code.InvalidArgument);
+      if ((c.settings ?? []).length === 0) {
+        throw new ConnectError(`connector "${req.provider}" declares no settings`, Code.InvalidArgument);
+      }
+      const values = req.settings ?? {};
+      const problem = settingsProblem(c, values);
+      if (problem) throw new ConnectError(problem, Code.InvalidArgument);
+      // The values live on the provider's default connection, beside the other
+      // non-secret connection config. An omitted setting is cleared (its
+      // default applies again), so the map is the complete state.
+      const row = await connections.ensureDefault(c.provider, `${c.display.name} (default)`);
+      const updated = await connections.setConfig(row.id, { ...row.config, settings: values });
+      if (!updated) throw new ConnectError("default integration connection vanished", Code.Internal);
+      const statusInputs = await fetchStatusInputs(orgSecret, mint, oauthCredential);
+      const customRow = builtinProviders().has(c.provider) ? undefined : await connectors.get(c.provider);
+      return {
+        connector: connectorRow(c, statusInputs, storedSettingsOf(updated.config), customRow ?? undefined),
+      };
     },
 
     async listConnections(_req, ctx) {

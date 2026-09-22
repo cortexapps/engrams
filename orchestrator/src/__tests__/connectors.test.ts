@@ -25,6 +25,10 @@ import {
   buildProviderCatalog,
   defaultDisplayName,
   defaultIconMono,
+  effectiveHosts,
+  resolveSettings,
+  validateSettingValue,
+  storedSettingsOf,
   type Connector,
   type IntegrationGrantSelection,
   type SessionPolicyInputs,
@@ -1619,5 +1623,253 @@ describe("user-scoped credentials (ADR 0115)", () => {
       });
       expect(policy.injects[0]?.header_name).toBe("");
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The `settings` facet: an administrator-chosen API host (regional cloud or
+// self-hosted) that decides a connector's effective hosts.
+// ---------------------------------------------------------------------------
+describe("settings facet", () => {
+  const acmeRaw = {
+    provider: "acme",
+    protocol: "http",
+    credential: {
+      source: "inject",
+      injects: [{ header: "Authorization", secretRef: "acme.key", template: "Bearer {}" }],
+    },
+    hosts: [],
+    settings: [
+      {
+        name: "api_host",
+        label: "API host",
+        kind: "host",
+        options: [
+          { value: "api.acme.com", label: "US" },
+          { value: "api.eu.acme.com", label: "EU" },
+        ],
+        custom: { label: "Self-hosted", hint: "A bare hostname." },
+        default: "api.acme.com",
+        env: "ACME_API_HOST",
+      },
+    ],
+    operations: [{ grants: ["things:read"], match: { method: "GET", path: "/api/v1/things*" } }],
+    cli: {
+      bins: ["acme"],
+      binSource: "bundled",
+      dummyEnv: { ACME_TOKEN: "x-engrams-managed" },
+      credentialDelivery: "inject",
+      doc: "acme things",
+    },
+  };
+  const acme = () => parseConnector(acmeRaw, "acme");
+  const grant = (settings?: Record<string, string>) => ({
+    connectionId: "default-acme",
+    provider: "acme",
+    operation: "things:read",
+    resourceConstraints: [],
+    ...(settings ? { settings } : {}),
+  });
+
+  test("parses, and a host setting lets `hosts` be empty", () => {
+    const c = acme();
+    expect(c.hosts).toEqual([]);
+    expect(c.settings).toEqual([
+      {
+        name: "api_host",
+        label: "API host",
+        kind: "host",
+        options: [
+          { value: "api.acme.com", label: "US" },
+          { value: "api.eu.acme.com", label: "EU" },
+        ],
+        custom: { label: "Self-hosted", hint: "A bare hostname." },
+        default: "api.acme.com",
+        env: "ACME_API_HOST",
+      },
+    ]);
+  });
+
+  test("without a host setting, empty hosts are still rejected", () => {
+    const { settings: _drop, ...noSettings } = acmeRaw;
+    expect(() => parseConnector(noSettings, "acme")).toThrow(/"hosts" must be a non-empty array/);
+  });
+
+  test("rejects malformed settings", () => {
+    const withSetting = (over: Record<string, unknown>) =>
+      parseConnector({ ...acmeRaw, settings: [{ ...acmeRaw.settings[0], ...over }] }, "acme");
+    expect(() => withSetting({ kind: "string" })).toThrow(/"kind" must be "host"/);
+    expect(() => withSetting({ name: "Api-Host" })).toThrow(/"name" must be an identifier/);
+    expect(() => withSetting({ options: [{ value: "*.acme.com", label: "any" }] })).toThrow(/exact hostname/);
+    expect(() => withSetting({ options: [{ value: "https://api.acme.com", label: "url" }] })).toThrow(/bare hostname/);
+    expect(() => withSetting({ env: "1BAD" })).toThrow(/"env" is not a valid env var name/);
+    expect(() => withSetting({ options: [], custom: undefined })).toThrow(/needs "options", "custom", or both/);
+    // A default outside the presets is only valid when a custom value is allowed.
+    expect(() => withSetting({ custom: undefined, default: "api.other.com" })).toThrow(/"default" must be one of/);
+    expect(withSetting({ default: "cortex.example.com" }).settings![0]!.default).toBe("cortex.example.com");
+    expect(() =>
+      parseConnector({ ...acmeRaw, settings: [acmeRaw.settings[0], acmeRaw.settings[0]] }, "acme"),
+    ).toThrow(/duplicate setting name/);
+  });
+
+  test("validateSettingValue: presets, custom hosts, and the rejects", () => {
+    const setting = acme().settings![0]!;
+    expect(validateSettingValue(setting, "api.eu.acme.com")).toBeNull();
+    expect(validateSettingValue(setting, "cortex-api.example.com")).toBeNull();
+    expect(validateSettingValue(setting, "")).toMatch(/must not be empty/);
+    expect(validateSettingValue(setting, "https://x.example.com")).toMatch(/bare hostname/);
+    expect(validateSettingValue(setting, "*.example.com")).toMatch(/exact hostname/);
+    expect(validateSettingValue(setting, "localhost")).toMatch(/too broad/);
+    const presetOnly = { ...setting, custom: undefined };
+    expect(validateSettingValue(presetOnly, "api.other.com")).toMatch(/must be one of api.acme.com, api.eu.acme.com/);
+  });
+
+  test("resolveSettings: a valid stored value wins, an invalid one falls back to the default", () => {
+    const c = acme();
+    expect(resolveSettings(c, undefined)).toEqual({ api_host: "api.acme.com" });
+    expect(resolveSettings(c, { api_host: "api.eu.acme.com" })).toEqual({ api_host: "api.eu.acme.com" });
+    expect(resolveSettings(c, { api_host: "self.example.com" })).toEqual({ api_host: "self.example.com" });
+    expect(resolveSettings(c, { api_host: "https://bad" })).toEqual({ api_host: "api.acme.com" });
+    expect(resolveSettings(c, { unrelated: "x" })).toEqual({ api_host: "api.acme.com" });
+  });
+
+  test("effectiveHosts unions the static hosts with the resolved host setting", () => {
+    const c = parseConnector({ ...acmeRaw, hosts: ["static.acme.com"] }, "acme");
+    expect(effectiveHosts(c)).toEqual(["static.acme.com", "api.acme.com"]);
+    expect(effectiveHosts(c, { api_host: "api.eu.acme.com" })).toEqual(["static.acme.com", "api.eu.acme.com"]);
+    expect(effectiveHosts(c, { api_host: "static.acme.com" })).toEqual(["static.acme.com"]);
+  });
+
+  test("storedSettingsOf reads config.settings and ignores non-string values", () => {
+    expect(storedSettingsOf(undefined)).toEqual({});
+    expect(storedSettingsOf({})).toEqual({});
+    expect(storedSettingsOf({ settings: { api_host: "api.eu.acme.com", junk: 1 } })).toEqual({
+      api_host: "api.eu.acme.com",
+    });
+  });
+
+  test("the policy opens and injects onto the stored host, not the default", () => {
+    const reg = registryOf(acmeRaw);
+    const p = compileConnectionPolicy([grant({ api_host: "api.eu.acme.com" })], reg);
+    expect(p.injects).toHaveLength(1);
+    expect(p.injects[0]!.hosts).toEqual(["api.eu.acme.com"]);
+    expect(p.network.allow_hosts).toEqual(["api.eu.acme.com"]);
+    expect(JSON.stringify(p)).not.toContain("api.acme.com");
+  });
+
+  test("the policy falls back to the default host when nothing is stored", () => {
+    const p = compileConnectionPolicy([grant()], registryOf(acmeRaw));
+    expect(p.injects[0]!.hosts).toEqual(["api.acme.com"]);
+    expect(p.network.allow_hosts).toEqual(["api.acme.com"]);
+  });
+
+  test("a self-hosted value opens exactly that host", () => {
+    const p = compileConnectionPolicy([grant({ api_host: "cortex-api.example.com" })], registryOf(acmeRaw));
+    expect(p.injects[0]!.hosts).toEqual(["cortex-api.example.com"]);
+    expect(p.network.allow_hosts).toEqual(["cortex-api.example.com"]);
+  });
+
+  test("compileCliIntegrations exports the resolved host as the setting's env", () => {
+    const reg = registryOf(acmeRaw);
+    const eu = compileCliIntegrations(["acme:things:read"], reg, { acme: { api_host: "api.eu.acme.com" } });
+    expect(eu.settingsEnv).toEqual({ ACME_API_HOST: "api.eu.acme.com" });
+    expect(eu.dummyEnv).toEqual({ ACME_TOKEN: "x-engrams-managed" });
+    const dflt = compileCliIntegrations(["acme:things:read"], reg);
+    expect(dflt.settingsEnv).toEqual({ ACME_API_HOST: "api.acme.com" });
+    // An unrelated connector exports nothing.
+    expect(compileCliIntegrations(["datadog:logs:read"], registryOf(datadogRaw)).settingsEnv).toEqual({});
+  });
+
+  test("connectorStatus stays available while a default-less setting is unset", () => {
+    const { default: _drop, ...noDefault } = acmeRaw.settings[0];
+    const c = parseConnector({ ...acmeRaw, settings: [noDefault] }, "acme");
+    const names = new Set(["acme.key"]);
+    expect(connectorStatus(c, names)).toBe("available");
+    expect(connectorStatus(c, names, [], undefined, {})).toBe("available");
+    expect(connectorStatus(c, names, [], undefined, { api_host: "api.eu.acme.com" })).toBe("connected");
+    // With a default the setting is never blocking.
+    expect(connectorStatus(acme(), names)).toBe("connected");
+  });
+
+  test("buildProviderCatalog lists the effective host", () => {
+    const reg = registryOf(acmeRaw);
+    const none = new Map();
+    expect(buildProviderCatalog(reg, none)[0]!.hosts).toEqual(["api.acme.com"]);
+    expect(buildProviderCatalog(reg, none, { acme: { api_host: "api.eu.acme.com" } })[0]!.hosts).toEqual([
+      "api.eu.acme.com",
+    ]);
+  });
+});
+
+describe("display.featured", () => {
+  test("a built-in seed may be featured; a custom connector may not", () => {
+    const seed = parseConnector({ ...datadogRaw, display: { featured: true } }, "datadog", { builtin: true });
+    expect(seed.display.featured).toBe(true);
+    expect(() => parseConnector({ ...datadogRaw, display: { featured: true } }, "datadog")).toThrow(
+      /reserved for built-in connectors/,
+    );
+    expect(() => parseConnector({ ...datadogRaw, display: { featured: "yes" } }, "datadog")).toThrow(
+      /must be a boolean/,
+    );
+  });
+
+  test("an unfeatured display carries no featured key", () => {
+    const c = parseConnector({ ...datadogRaw, display: { featured: false } }, "datadog", { builtin: true });
+    expect("featured" in c.display).toBe(false);
+  });
+});
+
+describe("the shipped cortex connector", () => {
+  test("is featured, host-parameterized (US / EU / self-hosted), token user mode, with a CLI", () => {
+    const c = connectorRegistry().get("cortex")!;
+    expect(c.display.featured).toBe(true);
+    expect(c.hosts).toEqual([]);
+    expect(c.settings).toHaveLength(1);
+    const host = c.settings![0]!;
+    expect(host.name).toBe("api_host");
+    expect(host.kind).toBe("host");
+    expect(host.options.map((o) => o.value)).toEqual(["api.getcortexapp.com", "api.eu.cortex.io"]);
+    expect(host.custom).toBeDefined();
+    expect(host.default).toBe("api.getcortexapp.com");
+    expect(host.env).toBe("CORTEX_API_HOST");
+    expect(effectiveHosts(c)).toEqual(["api.getcortexapp.com"]);
+    expect(c.userCredential?.token?.hint).toContain("access token");
+    expect(c.userCredential?.oauth).toBeUndefined();
+    expect(c.cli?.bins).toEqual(["cortex"]);
+    expect(c.cli?.dummyEnv).toEqual({ CORTEX_API_TOKEN: "x-engrams-managed" });
+    expect(c.test?.path).toBe("/api/v1/catalog/definitions");
+  });
+
+  test("keeps destructive and administrative endpoints out of every power", () => {
+    const c = connectorRegistry().get("cortex")!;
+    const paths = c.operations.map((op) => `${op.match && "method" in op.match ? op.match.method : ""} ${op.match && "path" in op.match ? op.match.path : ""}`);
+    for (const p of paths) {
+      expect(p).not.toMatch(/\/auth\/key|\/secrets|\/ip-allowlist|\/scim|configurations?/);
+    }
+    // Entity + team hard deletes stay out; archive is the supported path.
+    expect(paths).not.toContain("DELETE /api/v1/catalog/*");
+    expect(paths).not.toContain("DELETE /api/v1/catalog");
+    expect(paths).not.toContain("DELETE /api/v1/teams/*");
+    expect(paths).toContain("PUT /api/v1/catalog/*/archive");
+  });
+
+  test("the EU host compiles into the policy and the CLI env", () => {
+    const grants = [
+      {
+        connectionId: "default-cortex",
+        provider: "cortex",
+        operation: "catalog:read",
+        resourceConstraints: [],
+        settings: { api_host: "api.eu.cortex.io" },
+      },
+    ];
+    const p = compileConnectionPolicy(grants);
+    expect(p.injects.every((i) => i.hosts.length === 1 && i.hosts[0] === "api.eu.cortex.io")).toBe(true);
+    expect(p.network.allow_hosts).toEqual(["api.eu.cortex.io"]);
+    const plan = compileCliIntegrations(["cortex:catalog:read"], undefined, {
+      cortex: { api_host: "api.eu.cortex.io" },
+    });
+    expect(plan.settingsEnv).toEqual({ CORTEX_API_HOST: "api.eu.cortex.io" });
+    expect(plan.enabled.map((e) => e.provider)).toEqual(["cortex"]);
   });
 });

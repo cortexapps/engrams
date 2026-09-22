@@ -207,6 +207,7 @@ function snapshotConnectionStore(policy: TaskLaunchPolicy): IntegrationConnectio
     delete: unsupported,
     markTested: unsupported,
     setEnabled: unsupported,
+    setConfig: unsupported,
     ensureDefault: unsupported,
   };
 }

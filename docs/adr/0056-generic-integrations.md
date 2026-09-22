@@ -617,3 +617,34 @@ git-askpass primitive (a future gitlab/gitea integration reuses it unchanged).
     middle `ForgeResponse::PullRequest` shifts `Error`'s bincode index 2→1 (a wire
     break gated on session images re-baking with the new agentd; `Credential` stays at
     index 0 so git push keeps working on not-yet-rebaked images).
+
+## Amendment (2026-09-21): the `settings` facet — an administrator-chosen host
+
+**Trigger.** The first-party Cortex connector has three possible API hosts: Cortex
+Cloud US (`api.getcortexapp.com`), Cortex Cloud EU (`api.eu.cortex.io`), and a
+customer's self-hosted instance. A connector's `hosts` were static JSON, and the
+egress allow-list, the credential-inject targets, the "Test connection" probe, and
+the CLI's target all read them. A per-region seed would triple every connector
+that has regions; a wildcard would open egress the deployment does not use.
+
+**Decision.** A connector may declare `settings`: administrator-set, NON-SECRET
+parameters. The only kind is `host` — a bare hostname picked from preset `options`
+or typed freely when the setting declares `custom` (a self-hosted instance), with
+an optional `default` and an optional `env` name.
+
+- Values live on the provider's default `integration_connection` row, under
+  `config.settings`, written by the admin-only `SetConnectorSettings` RPC. The
+  connector JSON never carries a value, so one seed serves every deployment.
+- `effectiveHosts(connector, settings)` = the static `hosts` ∪ every resolved
+  `host` setting value. It is the ONE derivation the policy compiler (allow-list,
+  inject targets, observe targets), the test probe, the Mode-A op runner, and the
+  member catalog read. A connector with a host setting may declare `hosts: []`.
+- Stored values are re-validated when read (`resolveSettings`); a value the
+  current connector rejects falls back to the default, never into the policy.
+- A setting with `env` reaches the guest as plain env (`CliIntegrationPlan.settingsEnv`),
+  so the CLI targets exactly the host the policy opened.
+- A setting without a `default` keeps the connector `available` until set.
+
+**Not done.** Only `host` exists; an opaque `string` kind is a follow-up if a
+connector needs one. Custom (uploaded) connectors may declare settings too; the
+`display.featured` pin added in the same change is built-in-only.

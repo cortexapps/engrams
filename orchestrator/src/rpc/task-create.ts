@@ -48,6 +48,7 @@ import {
   compileCliIntegrations,
   policyHasContent,
   loadRegistry,
+  storedSettingsOf,
   type CustomConnectorSource,
   type IntegrationSecretJson,
 } from "../connectors/registry.ts";
@@ -524,8 +525,16 @@ export async function compileSessionCreateInput(
             grantAvailable,
           ),
         );
-  const cliPlan = compileCliIntegrations(surfacedCapabilities, registry);
+  // Each granted connection's stored connector settings (e.g. the API host),
+  // keyed by provider: the CLI env and the egress policy below read the same
+  // values, so the CLI reaches exactly the host the policy opens.
+  const settingsByProvider: Record<string, Record<string, string>> = {};
+  for (const { connection } of resolvedEffectiveGrants) {
+    settingsByProvider[connection.provider] ??= storedSettingsOf(connection.config);
+  }
+  const cliPlan = compileCliIntegrations(surfacedCapabilities, registry, settingsByProvider);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
+  for (const [k, v] of Object.entries(cliPlan.settingsEnv)) harness[k] = v;
   // Connector-backed CLIs, then the ones a named connection makes usable. The
   // second list comes from the provider registry, so a new provider surfaces
   // its CLI without a branch here.
@@ -619,6 +628,7 @@ export async function compileSessionCreateInput(
       // ADR 0115: only a human compile stamps the user subject below, so a
       // programmatic session's user-scoped grants fall back to org authority.
       userScoped: grant.credentialScope === "user",
+      settings: storedSettingsOf(connection.config),
     })),
     registry,
     {

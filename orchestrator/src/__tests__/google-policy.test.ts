@@ -106,6 +106,9 @@ describe("Google egress policy", () => {
       async setEnabled() {
         return connection;
       },
+      async setConfig() {
+        return connection;
+      },
       async ensureDefault() {
         return connection;
       },

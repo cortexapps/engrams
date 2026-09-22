@@ -162,6 +162,27 @@ export interface ParsedInject {
   template: string;
 }
 
+/** One preset choice of a connector setting. */
+export interface ParsedSettingOption {
+  value: string;
+  label: string;
+}
+
+/**
+ * One administrator-set, non-secret connector parameter (the `settings`
+ * facet). `host` is the only kind: the API host a regional or self-hosted
+ * provider is reached on, picked from `options` or typed when `custom` is set.
+ */
+export interface ParsedSetting {
+  name: string;
+  label: string;
+  kind: "host";
+  options: ParsedSettingOption[];
+  custom?: { label: string; hint?: string };
+  default?: string;
+  hint?: string;
+}
+
 /** ADR 0058: the optional CLI facet a connector drives (display posture). */
 export interface ParsedCli {
   /** PATH command names this connector contributes. */
@@ -188,7 +209,16 @@ export interface ParsedConnectorConfig {
   provider: string;
   credentialSource: "mint" | "inject";
   hosts: string[];
-  display: { name: string; category: string; blurb: string; icon: { mono: string; color: string } };
+  display: {
+    name: string;
+    category: string;
+    blurb: string;
+    icon: { mono: string; color: string };
+    /** Marketplace pin (built-in seeds only); present only when set. */
+    featured?: true;
+  };
+  /** Administrator-set non-secret parameters (e.g. the API host). */
+  settings: ParsedSetting[];
   /** inject only — one or more headers, each backed by an org secret. */
   injects?: ParsedInject[];
   /** mint only */
@@ -198,6 +228,42 @@ export interface ParsedConnectorConfig {
   capabilities: ParsedCapability[];
   /** ADR 0058: the CLI this connector drives, if any. */
   cli?: ParsedCli;
+}
+
+/** One `settings` entry of the raw connector JSON, or nothing when malformed
+ * (the orchestrator is the validator; this only shapes what it accepted). */
+function parseSetting(raw: unknown): ParsedSetting[] {
+  if (typeof raw !== "object" || raw === null) return [];
+  const o = raw as Record<string, unknown>;
+  if (typeof o.name !== "string" || typeof o.label !== "string" || o.kind !== "host") return [];
+  const options: ParsedSettingOption[] = Array.isArray(o.options)
+    ? (o.options as unknown[]).flatMap((opt) => {
+        if (typeof opt !== "object" || opt === null) return [];
+        const v = opt as Record<string, unknown>;
+        return typeof v.value === "string" && typeof v.label === "string"
+          ? [{ value: v.value, label: v.label }]
+          : [];
+      })
+    : [];
+  const rawCustom = o.custom as Record<string, unknown> | undefined;
+  const custom =
+    rawCustom && typeof rawCustom.label === "string"
+      ? {
+          label: rawCustom.label,
+          ...(typeof rawCustom.hint === "string" ? { hint: rawCustom.hint } : {}),
+        }
+      : undefined;
+  return [
+    {
+      name: o.name,
+      label: o.label,
+      kind: "host",
+      options,
+      ...(custom ? { custom } : {}),
+      ...(typeof o.default === "string" ? { default: o.default } : {}),
+      ...(typeof o.hint === "string" ? { hint: o.hint } : {}),
+    },
+  ];
 }
 
 interface RawOp {
@@ -252,7 +318,11 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     category?: string;
     blurb?: string;
     icon?: { mono?: string; color?: string };
+    featured?: boolean;
   };
+  const settings: ParsedSetting[] = Array.isArray(raw.settings)
+    ? (raw.settings as unknown[]).flatMap(parseSetting)
+    : [];
 
   const capabilities: ParsedCapability[] = [];
   const seen = new Set<string>();
@@ -319,7 +389,9 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
         mono: d.icon?.mono ?? defaultIconMono(provider),
         color: d.icon?.color ?? defaultIconColor(provider),
       },
+      ...(d.featured === true ? { featured: true as const } : {}),
     },
+    settings,
     ...(credentialSource === "inject" ? { injects } : { mintKind: cred.mint?.kind }),
     ...(oauth ? { oauth } : {}),
     capabilities,
