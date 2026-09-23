@@ -14,7 +14,12 @@
 //!   1. **loopback reach** (the regression): an echo server bound to
 //!      `127.0.0.1` round-trips bytes — proving the relay reaches guest
 //!      loopback, which `dial_ip:port` never could.
-//!   2. **no head-of-line blocking**: with one connection backed up (its source
+//!   2. **app close reaches the host**: a server that ends its output by
+//!      closing (a close-delimited HTTP response, e.g. HTTP/1.0 with no
+//!      `Content-Length`) must deliver EOF to the host while the host is still
+//!      open. The FC vsock does not forward a guest half-close, so agentd must
+//!      close the connection fully.
+//!   3. **no head-of-line blocking**: with one connection backed up (its source
 //!      wants to push a lot but its reader parks), the others must each still
 //!      read a small chunk and finish under a tight bound.
 //!
@@ -49,6 +54,11 @@ use common::{fc_preflight, require_bin};
 const ECHO_PORT: u16 = 9090;
 /// Guest loopback port for the backed-up-source (HOL) server.
 const SOURCE_PORT: u16 = 9091;
+/// Guest loopback port for the server that writes a line and closes.
+const CLOSE_PORT: u16 = 9092;
+/// Tight ceiling for the app-close EOF to reach the host. The regression hangs
+/// forever, so a few seconds separates the two cases.
+const CLOSE_EOF_DEADLINE: Duration = Duration::from_secs(10);
 /// Size of the source stream socat offers per connection. Large enough that the
 /// "hog" connection (which reads a little then parks) stays genuinely backed up
 /// — a full credit window in flight — but nobody drains it, so it costs ~nothing.
@@ -186,6 +196,15 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
         ),
     )
     .await;
+    exec_ok(
+        &backend,
+        sandbox_id,
+        &format!(
+            "setsid socat TCP-LISTEN:{CLOSE_PORT},bind=127.0.0.1,fork,reuseaddr \
+             EXEC:'echo close-delimited' </dev/null >/dev/null 2>&1 &"
+        ),
+    )
+    .await;
 
     // ---- 4. Assertion 1: loopback reach (the ADR 0066 regression). ----
     // The relay's own 3 s connection-refused retry absorbs the brief window
@@ -200,7 +219,19 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
     );
     drop(echo);
 
-    // ---- 5. Assertion 2: no head-of-line blocking. ----
+    // ---- 5. Assertion 2: the app's close reaches the host. ----
+    // Keep our write side open, as the orchestrator does while it waits for a
+    // response body. Only a full close from agentd produces EOF here.
+    let mut closer = relay_connect(&backend, sandbox_id, CLOSE_PORT).await;
+    let mut out = Vec::new();
+    tokio::time::timeout(CLOSE_EOF_DEADLINE, closer.read_to_end(&mut out))
+        .await
+        .expect("the app closed but EOF never reached the host (half-close lost in the vsock?)")
+        .expect("read to EOF");
+    assert_eq!(&out[..], b"close-delimited\n");
+    drop(closer);
+
+    // ---- 6. Assertion 3: no head-of-line blocking. ----
     // One "hog" connection: its source wants to push a lot, but the client reads
     // a few KiB then parks — so it stays backed up (a full credit window in
     // flight), the realistic HOL threat. The other connections must each read a
