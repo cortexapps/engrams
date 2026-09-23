@@ -316,3 +316,36 @@ async fn proxy_shell_close_with_code_round_trips() {
         other => panic!("expected Close(Some(1001)), got {other:?}"),
     }
 }
+
+/// ttyd ends while the client is still open: when the host drops its
+/// `inbound_tx`, the client's `tunnel.inbound` must end, even though the client
+/// has not closed its own direction.
+#[tokio::test]
+async fn proxy_shell_host_end_ends_client_inbound_while_client_open() {
+    let host = Arc::new(FakeHost::default());
+    let addr = boot_grpc_server(host.clone()).await;
+    let client = connect_grpc_client(addr).await;
+
+    // Keep `tunnel.outbound` alive: the client direction stays open.
+    let mut tunnel = client
+        .proxy_shell(SandboxId::new())
+        .await
+        .expect("proxy_shell");
+
+    let ShellTunnelEnds {
+        inbound_tx,
+        outbound_rx,
+    } = host
+        .tunnel_ends
+        .lock()
+        .take()
+        .expect("inner proxy_shell not called");
+    drop(inbound_tx);
+
+    let end = tokio::time::timeout(Duration::from_secs(2), tunnel.inbound.recv())
+        .await
+        .expect("host end did not reach the client within 2s");
+    assert!(end.is_none(), "expected end of stream, got {end:?}");
+
+    drop(outbound_rx);
+}

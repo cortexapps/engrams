@@ -1437,7 +1437,11 @@ impl HostService for HostServiceImpl {
         // each frame into the ShellTunnel's outbound channel (which
         // the tunnel pump then writes to ttyd). Open is rejected
         // here too — it's a stream-handshake variant, not data.
-        let out_tx_for_open_reject = out_tx.clone();
+        //
+        // WEAK for the same reason as `proxy_port`: a strong clone would
+        // hold the response stream open after ttyd ends until the client
+        // closes.
+        let out_tx_for_open_reject = out_tx.downgrade();
         tokio::spawn(async move {
             while let Some(next) = inbound.next().await {
                 let msg = match next {
@@ -1455,9 +1459,11 @@ impl HostService for HostServiceImpl {
                         // shape); tear down the stream with a typed
                         // status so the client surfaces a clean
                         // error instead of an opaque close.
-                        let _ = out_tx_for_open_reject
-                            .send(Err(Status::invalid_argument(format!("proxy_shell: {e}"))))
-                            .await;
+                        if let Some(tx) = out_tx_for_open_reject.upgrade() {
+                            let _ = tx
+                                .send(Err(Status::invalid_argument(format!("proxy_shell: {e}"))))
+                                .await;
+                        }
                         break;
                     }
                 };
@@ -1548,7 +1554,13 @@ impl HostService for HostServiceImpl {
         // outbound; Close / client-disconnect tears the tunnel down. An
         // Open after the handshake is a protocol error (typed status, so
         // the client surfaces a clean error rather than an opaque close).
-        let out_tx_for_reject = out_tx.clone();
+        //
+        // WEAK on purpose: the response stream ends only when every sender
+        // is dropped. A strong clone here would hold it open until the
+        // CLIENT closes, so a guest EOF (the end of a close-delimited HTTP
+        // response) never reached the client and the browser waited for the
+        // body forever.
+        let out_tx_for_reject = out_tx.downgrade();
         tokio::spawn(async move {
             while let Some(next) = inbound.next().await {
                 let msg = match next {
@@ -1566,11 +1578,13 @@ impl HostService for HostServiceImpl {
                     }
                     Some(ProxyPortBody::Close(_)) | None => break,
                     Some(ProxyPortBody::Open(_)) => {
-                        let _ = out_tx_for_reject
-                            .send(Err(Status::invalid_argument(
-                                "proxy_port: Open only valid as the first message",
-                            )))
-                            .await;
+                        if let Some(tx) = out_tx_for_reject.upgrade() {
+                            let _ = tx
+                                .send(Err(Status::invalid_argument(
+                                    "proxy_port: Open only valid as the first message",
+                                )))
+                                .await;
+                        }
                         break;
                     }
                 }
