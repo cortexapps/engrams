@@ -286,21 +286,21 @@ describe("Google egress policy", () => {
   test("validates project-scoped observer constraints", () => {
     const monitoring = grant(
       "monitoring.timeseries.list",
-      ["/v3/projects/cortex-internal-tooling/timeSeries"],
+      ["/v3/projects/example-project/timeSeries"],
       ["monitoring.googleapis.com"],
     );
     expect(() => appendGooglePolicy(policy(), [monitoring])).not.toThrow();
 
     const trace = grant(
       "trace.traces.get",
-      ["/v1/projects/cortex-internal-tooling/traces/trace-1"],
+      ["/v1/projects/example-project/traces/trace-1"],
       ["cloudtrace.googleapis.com"],
     );
     expect(() => appendGooglePolicy(policy(), [trace])).not.toThrow();
 
     const invalid = grant(
       "monitoring.timeseries.list",
-      ["/v3/projects/cortex-internal-tooling/timeSeries/credential-producing-action"],
+      ["/v3/projects/example-project/timeSeries/credential-producing-action"],
       ["monitoring.googleapis.com"],
     );
     expect(() => appendGooglePolicy(policy(), [invalid])).toThrow(/not a valid/);

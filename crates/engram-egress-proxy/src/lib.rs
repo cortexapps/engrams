@@ -1,8 +1,7 @@
 //! Host-side TLS-MITM proxy for Engram sandboxes.
 //!
-//! See `docs/known-issues.md` and the FC parity plan
-//! (`/Users/nikhilunni/.claude/plans/...`) for the full design. In one
-//! paragraph: every outbound TCP connection from a sandbox gets
+//! See ADR 0006 (`docs/adr/0006-host-agent-egress-proxy.md`) for the
+//! full design. In one paragraph: every outbound TCP connection from a sandbox gets
 //! REDIRECTed by iptables to this proxy. The proxy peeks the SNI,
 //! looks up the source IP in a session registry, and decides whether
 //! to **bypass** (allowed by `manifest.network.allow_hosts`,

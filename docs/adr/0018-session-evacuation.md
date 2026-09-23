@@ -1230,8 +1230,7 @@ Tests:
 
 ### Dev-vm verification
 
-Validated on `engram-dev` (project `cortex-test-1608327238078`,
-zone `us-west2-a`):
+Validated on the Linux dev VM:
 
 - **Linux clippy** clean.
 - **Postgres-gated suite** (CI-shape): 17/17 pass, including all 4
