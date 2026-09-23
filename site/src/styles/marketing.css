@@ -589,8 +589,13 @@ html {
   font-size: 96px;
   line-height: 0.9;
   margin-top: 24px;
-  -webkit-text-stroke: 1.5px var(--foreground);
-  color: transparent;
+  /* A variable font keeps overlapping contours, so a plain text stroke also
+     outlines the overlaps inside a glyph (a star in the "2"). Paint the stroke
+     first at double width, then fill with the card colour on top: the fill
+     hides the inner half and every overlap, and 1.5px of outline shows. */
+  -webkit-text-stroke: 3px var(--foreground);
+  paint-order: stroke fill;
+  color: color-mix(in oklch, var(--foreground) 4%, var(--background));
 }
 .hud h3 {
   font-size: 28px;
@@ -939,7 +944,6 @@ html {
   color: rgba(255, 255, 255, 0.55);
 }
 .led .v {
-  position: relative;
   margin-top: 8px;
   font-family: var(--font-mono);
   font-size: 30px;
@@ -947,13 +951,7 @@ html {
   line-height: 1;
   letter-spacing: 0.02em;
 }
-.led .ghost {
-  position: absolute;
-  inset: 0;
-  color: rgba(255, 179, 71, 0.09);
-}
 .led .lit {
-  position: relative;
   color: var(--led-amber);
   text-shadow: 0 0 10px var(--led-glow);
 }

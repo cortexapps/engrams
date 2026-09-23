@@ -159,10 +159,10 @@ export const how = {
     { cls: "writing", label: "writing now" },
   ],
   leds: [
-    { k: "cold start", ghost: "888", v: "<1s" },
-    { k: "resume · same host", ghost: "88888", v: "<100ms" },
-    { k: "resume · any host", ghost: "8888", v: "1–2s" },
-    { k: "1000 × 4 GiB", ghost: "888888", v: "≈100GiB" },
+    { k: "cold start", v: "<1s" },
+    { k: "resume · same host", v: "<100ms" },
+    { k: "resume · any host", v: "1–2s" },
+    { k: "1000 × 4 GiB", v: "≈100GiB" },
   ],
   footnote:
     "† Measured on the reference deployment: GKE, C3 nodes, Firecracker with lazy memory paging. Measure your own fleet before you promise them to anyone.",
