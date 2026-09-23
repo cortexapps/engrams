@@ -5,6 +5,7 @@ import "@fontsource-variable/saira/wdth.css";
 import "../styles/tokens.css";
 import "../styles/marketing.css";
 import TraceMark from "../components/TraceMark.astro";
+import CortexWordmark from "../components/CortexWordmark.astro";
 
 interface Props {
   title: string;
@@ -42,7 +43,10 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
       <div class="wrap">
         <div class="stripe"><span class="sage"></span><span class="amber"></span><span class="lime"></span><span></span></div>
         <header class="site-header">
-          <a class="wordmark" href={`${base}/`}><TraceMark />engrams</a>
+          <div class="brand">
+            <a class="wordmark" href={`${base}/`}><TraceMark />engrams</a>
+            <a class="byline" href="https://www.cortex.io">by <CortexWordmark height={15} /></a>
+          </div>
           <nav class="site-nav" aria-label="Site">
             <a class="secondary" href={`${base}/architecture/`}>Architecture</a>
             <a class="secondary" href={`${base}/compare/`}>Compare</a>
