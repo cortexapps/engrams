@@ -90,7 +90,29 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
     </div>
   </section>
 
-  <!-- SEC. 1 — AUTOMATIONS -->
+  <!-- SEC. 1 — A SESSION -->
+  <section class="sec">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-badge">{session.badge}</span><span>{session.label}</span><span class="sec-rule"></span><span>{session.meta}</span></div>
+      <div class="figure">
+        <figure class="plate">
+          <img src={pelican.src} width={pelican.width} height={pelican.height} alt={session.screenshotAlt} loading="lazy" />
+          <figcaption><span>{session.caption}</span><span class="ring">{session.live}</span></figcaption>
+        </figure>
+        <div>
+          <h2 class="display">{session.title}</h2>
+          <p class="body">{session.body}</p>
+          <div class="ledger">
+            {session.panes.map((p) => (
+              <div><span class="n">{p.name}</span><span>{p.body}</span></div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SEC. 2 — AUTOMATIONS -->
   <section class="sec">
     <div class="wrap">
       <div class="sec-head"><span class="sec-badge">{automations.badge}</span><span>{automations.label}</span><span class="sec-rule"></span><span>{automations.meta}</span></div>
@@ -140,7 +162,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
     </div>
   </section>
 
-  <!-- SEC. 2 — HOW IT WORKS -->
+  <!-- SEC. 3 — HOW IT WORKS -->
   <section class="cover how">
     <div class="layer carbon soft bg-carbon-fade"></div>
     <div class="wrap">
@@ -179,28 +201,6 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
             ))}
           </div>
           <p class="footnote">{how.footnote}</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- SEC. 3 — A SESSION -->
-  <section class="sec">
-    <div class="wrap">
-      <div class="sec-head"><span class="sec-badge">{session.badge}</span><span>{session.label}</span><span class="sec-rule"></span><span>{session.meta}</span></div>
-      <div class="figure">
-        <figure class="plate">
-          <img src={pelican.src} width={pelican.width} height={pelican.height} alt={session.screenshotAlt} loading="lazy" />
-          <figcaption><span>{session.caption}</span><span class="ring">{session.live}</span></figcaption>
-        </figure>
-        <div>
-          <h2 class="display">{session.title}</h2>
-          <p class="body">{session.body}</p>
-          <div class="ledger">
-            {session.panes.map((p) => (
-              <div><span class="n">{p.name}</span><span>{p.body}</span></div>
-            ))}
-          </div>
         </div>
       </div>
     </div>

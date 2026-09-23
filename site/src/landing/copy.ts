@@ -49,10 +49,40 @@ export const modules = {
   ],
 };
 
-export const automations = {
+export const session = {
   badge: "Sec. 1",
+  label: "A session",
+  meta: "Fig. 1.1 · session view",
+  title: "Run any harness in a rich web interface.",
+  body: "A session is Claude Code, Codex, or your own harness, working the way it does on your laptop, but in a microVM your team can reach. The transcript streams on the left. On the right, open the same machine the agent is using: a terminal, the browser it drives, VS Code, the files it changed. People start sessions from the dashboard or Slack; an automation starts the same kind of session from a trigger.",
+  screenshotAlt:
+    "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane holds a shell open on the guest.",
+  caption: "Fig. 1.1 · session se_9f3ea71c · 212 events",
+  live: "● live",
+  panes: [
+    {
+      name: "Shell",
+      body: "A terminal on the guest, holding the same filesystem and the same processes the agent is working in.",
+    },
+    {
+      name: "Browser",
+      body: "The browser the agent drives, streamed over VNC. Watch it work through a page, or take the mouse.",
+    },
+    {
+      name: "IDE",
+      body: "VS Code on the workspace (code-server), with its own integrated terminal.",
+    },
+    {
+      name: "Files",
+      body: "Images and files the agent shares render in the transcript. Attach your own in a reply and they land in the guest.",
+    },
+  ],
+};
+
+export const automations = {
+  badge: "Sec. 2",
   label: "Automations",
-  meta: "Fig. 1.1 – 1.2",
+  meta: "Fig. 2.1 – 2.2",
   title: "Build the workflow. Stop repeating the setup.",
   lede: "Describe what should happen. A drafting agent builds an editable workflow: start sessions, run commands, check results, and decide what comes next. Enable it when it is ready. A schedule or event starts each run, and saved progress lets it continue after a server restart.",
   screenshotAlt:
@@ -61,7 +91,7 @@ export const automations = {
   caption: "Start with a request. The agent drafts a workflow you can edit before you enable it.",
   signal: "Product screenshot",
   board: {
-    fig: "Fig. 1.2 · runs board",
+    fig: "Fig. 2.2 · runs board",
     title: "See what happened. Decide what comes next.",
     body: "Open a run to see each step, its inputs and outputs, and the session that did the work. Inspect an error or a changed file without reconstructing the run from separate logs.",
     items: [
@@ -79,9 +109,9 @@ export const automations = {
 };
 
 export const how = {
-  badge: "Sec. 2",
+  badge: "Sec. 3",
   label: "How it works",
-  meta: "Fig. 2.1 · chunk store",
+  meta: "Fig. 3.1 · chunk store",
   title: "Keep the environment.",
   titleAccent: "Continue the work.",
   steps: [
@@ -114,36 +144,6 @@ export const how = {
   ],
   footnote:
     "† Measured on the reference deployment: GKE, C3 nodes, Firecracker with lazy memory paging. Measure your own fleet before you promise them to anyone.",
-};
-
-export const session = {
-  badge: "Sec. 3",
-  label: "A session",
-  meta: "Fig. 3.1 · session view",
-  title: "Run any harness in a rich web interface.",
-  body: "Claude Code, Codex, and any harness you register all run the same way: in a microVM, with the dashboard wrapped around it. The transcript streams on the left. On the right, a pane opens onto the same guest the agent is working in: a terminal, the browser it drives, VS Code, the files it changed. Open one in the middle of a run and the agent keeps going.",
-  screenshotAlt:
-    "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane holds a shell open on the guest.",
-  caption: "Fig. 3.1 · session se_9f3ea71c · 212 events",
-  live: "● live",
-  panes: [
-    {
-      name: "Shell",
-      body: "A terminal on the guest, holding the same filesystem and the same processes the agent is working in.",
-    },
-    {
-      name: "Browser",
-      body: "The browser the agent drives, streamed over VNC. Watch it work through a page, or take the mouse.",
-    },
-    {
-      name: "IDE",
-      body: "VS Code on the workspace (code-server), with its own integrated terminal.",
-    },
-    {
-      name: "Files",
-      body: "Images and files the agent shares render in the transcript. Attach your own in a reply and they land in the guest.",
-    },
-  ],
 };
 
 export const extensible = {
