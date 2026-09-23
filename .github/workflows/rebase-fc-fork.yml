@@ -65,12 +65,10 @@ jobs:
         with:
           repository: ${{ vars.FC_FORK_REPO }}
           ref: ${{ vars.FC_FORK_BRANCH || 'engram/live-migration' }}
-          # The cross-org GH_TOKEN (the same PAT build-firecracker's submodule
-          # checkout + the notify job use) — it can READ the INTERNAL fork AND
-          # PUSH the rebased patch branch back. persist-credentials keeps it
-          # configured for the `git push` below. (Once the fork is public the
-          # read is tokenless, but the push still needs write auth.)
-          token: ${{ secrets.GH_TOKEN }}
+          # The fork is public, so the read needs no token. Keep no credential
+          # in .git/config: the build-verify below compiles upstream code and
+          # its dependencies. Only the push step gets write auth.
+          persist-credentials: false
           # Full history + tags so `git describe` can find the fork's base tag
           # and the rebase has the upstream commits to replay onto.
           fetch-depth: 0
@@ -219,17 +217,34 @@ jobs:
           exit 1
 
       # ── Clean + building rebase: push the fork, open the engrams bump PR ─────
+      # The engrams-automerge App, scoped to the fork repo only, pushes the
+      # rebased branch. The App must be installed on the fork and be a bypass
+      # actor in the fork's branch ruleset (it blocks force-pushes).
+      - name: Generate App token (fork push)
+        if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true' && steps.build.outputs.ok == 'true'
+        id: fork-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.AUTOMERGE_APP_ID }}
+          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: firecracker
+
       - name: Push the rebased fork branch
         if: steps.gate.outputs.configured == 'true' && steps.rebase.outputs.ok == 'true' && steps.build.outputs.ok == 'true'
         working-directory: fc
+        env:
+          FORK_TOKEN: ${{ steps.fork-token.outputs.token }}
         run: |
           set -euo pipefail
-          git push --force-with-lease origin HEAD
+          # The same auth header actions/checkout sets, but for these pushes only.
+          auth="http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$FORK_TOKEN" | base64 -w0)"
+          git -c "$auth" push --force-with-lease origin HEAD
           # Lockstep version tag: `engram-v<upstream>` on the rebased fork HEAD, so
           # "what FC are we on" is one `git describe`. Force-update + push (the tag
           # moves to the new HEAD on a re-rebase of the same upstream version).
           git tag -f "engram-${{ steps.target.outputs.latest }}" HEAD
-          git push --force origin "engram-${{ steps.target.outputs.latest }}"
+          git -c "$auth" push --force origin "engram-${{ steps.target.outputs.latest }}"
           echo "Rebased onto ${{ steps.target.outputs.latest }} and pushed; fork HEAD=$(git rev-parse HEAD), tagged engram-${{ steps.target.outputs.latest }}"
 
       # The engrams-automerge App (contents:write + pull_requests:write, scoped to
@@ -295,7 +310,7 @@ jobs:
           url=$(GH_TOKEN="$APP_TOKEN" gh pr create --base main --head "$BRANCH" \
             --label fc-fork-bump \
             --title "build(deps): bump firecracker fork to upstream ${LATEST}" \
-            --body "Automated Firecracker-fork bump to upstream \`${LATEST}\` (ADR 0045 Phase B M4). The patch branch rebased cleanly onto \`${LATEST}\` and **build-verified (static musl)** in \`rebase-fc-fork\` before this PR opened; this bumps the submodule. On merge, build-firecracker rebuilds the fork and the R2 diff-guard re-checks stock↔fork snapshot wire-compat before node-assets bakes — and the fleet roll stays gated on the engrams-internal nodeAssetsImage bump. Auto-merges on green; review only to hold a major.")
+            --body "Automated Firecracker-fork bump to upstream \`${LATEST}\` (ADR 0045 Phase B M4). The patch branch rebased cleanly onto \`${LATEST}\` and **build-verified (static musl)** in \`rebase-fc-fork\` before this PR opened; this bumps the submodule. On merge, build-firecracker rebuilds the fork and the R2 diff-guard re-checks stock↔fork snapshot wire-compat before node-assets bakes — the fleet roll stays gated on the deployment's own node-assets bump. Auto-merges on green; review only to hold a major.")
           echo "Opened $url"
 
           # Approve from github-actions[bot] (a DIFFERENT identity than the App

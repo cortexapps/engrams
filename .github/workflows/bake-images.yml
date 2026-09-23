@@ -369,12 +369,10 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           # The forked FC source lives in the submodule; fetch it. (Only THIS job
           # checks out submodules — every other job stays on a bare checkout so it
-          # never pays the FC clone.) The default GITHUB_TOKEN is scoped to THIS
-          # repo, so it can't read the INTERNAL cortexapps/firecracker submodule —
-          # use the cross-org GH_TOKEN (same PAT the notify job uses) so the
-          # submodule fetch authenticates.
+          # never pays the FC clone.) The fork is public, so the fetch needs no
+          # token, and no credential stays in .git/config while the fork builds.
           submodules: recursive
-          token: ${{ secrets.GH_TOKEN }}
+          persist-credentials: false
           # Full history (main repo AND the submodule) so the R2 guard's
           # `git describe` can walk the fork HEAD back to its upstream base tag.
           # A shallow (depth-1) submodule has no ancestry, so describe finds no
@@ -397,7 +395,7 @@ jobs:
           # (robust across the M4 auto-rebases, which move the base forward).
           # `git describe` needs full history + the release tags. Deepen the
           # submodule if checkout left it shallow, fetch tags from the
-          # (authenticated) fork origin, then fall back to upstream
+          # fork origin (public), then fall back to upstream
           # firecracker-microvm (public, no auth) if the tags still aren't found.
           git fetch --tags --unshallow --quiet origin 2>/dev/null \
             || git fetch --tags --quiet origin 2>/dev/null || true
