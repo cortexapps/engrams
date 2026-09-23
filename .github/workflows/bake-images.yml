@@ -1,25 +1,11 @@
 name: Bake container images
 
-# Two concerns in one workflow:
-#
-# 1. When an image-affecting path changes, build coord/web/host-agent
-#    container images at this SHA and push to GHCR under
-#    `ghcr.io/cortexapps/engrams/<image>:{<sha>,<short>,main,latest}`.
-#    Anyone forking the repo gets the same images under their own
-#    org's GHCR namespace automatically.
-#
-# 2. After every push to main (image-affecting OR not), fire a
-#    `repository_dispatch: engrams-changed` at cortexapps/engrams-
-#    internal carrying the SHA. The deploy repo's auto-pipeline
-#    decides what needs to happen from there (helm rollout, TF
-#    apply, FC host image rebake). Path-filtered bakes + an
-#    always-fires notify let chart-only or TF-only pushes propagate
-#    to a redeploy without forcing a no-op image rebuild.
-#
-# TEMPORARY: the dispatch to engrams-internal exists while engrams
-# is still private. Remove the `notify` job when engrams goes
-# public — at that point engrams-internal pulls in releases on its
-# own cadence.
+# When an image-affecting path changes, build the container images,
+# bundles, and host artifacts at this SHA and push them to GHCR under
+# `ghcr.io/cortexapps/engrams/<image>:{<sha>,<short>,main,latest}`. Anyone
+# forking the repo gets the same images under their own org's GHCR
+# namespace automatically. Deployments pull from GHCR on their own
+# cadence; this workflow does not notify them.
 
 on:
   push:
@@ -134,8 +120,7 @@ jobs:
   bake:
     needs: detect
     # Run iff at least one image is in scope (per-image detection), or a manual
-    # dispatch (which bakes the full set). An empty matrix → job skipped; the
-    # `notify` job's `always()` still fires the deploy for the host/bundle lanes.
+    # dispatch (which bakes the full set). An empty matrix → job skipped.
     if: needs.detect.outputs.images_matrix != '[]' || github.event_name == 'workflow_dispatch'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
@@ -215,7 +200,7 @@ jobs:
 
   # Compile the FC-host musl binaries ONCE — the exact, CI-tested binaries —
   # and publish them to GHCR as an OCI artifact keyed by SHA. The downstream
-  # FC-host bakes in engrams-internal pull these instead of recompiling from
+  # FC-host bakes in a deployment repo pull these instead of recompiling from
   # a private source checkout (ADR 0013-era split): the bake that ships is
   # now the bake that CI tested, and the bake workflow no longer needs a Rust
   # toolchain. Gated on the host_image UNION so the artifact is present at
@@ -501,7 +486,7 @@ jobs:
 
   # Compile the product CLI ONCE — the exact, CI-tested binary — and publish
   # it to GHCR as an OCI artifact keyed by SHA. Consuming repos (the
-  # engrams-internal engram-cli action, engineering-blog scripts) pull this to
+  # a deployment repo's CLI action, scripts) pull this to
   # drive `engrams` commands instead of compiling from a source checkout —
   # exactly how the FC-host bakes consume publish-host-binaries. The CLI is
   # Bun/TS (cli/ — the orchestrator-native rewrite retired the Rust
@@ -603,7 +588,7 @@ jobs:
   # tag, which the deploy pins into the host-fleet DaemonSet and rolls every FC
   # host for nothing (2026-07-20: four host rolls in 90 min off three coord/web
   # pushes, each re-running the risky survivor-rehydrate path). When node-assets
-  # is NOT rebaked at this SHA, engrams-internal's helm-deploy resolve_ref falls
+  # is NOT rebaked at this SHA, a deploy that resolves tags from GHCR falls
   # back to the last node-assets build's full-SHA tag (auditable, not floating),
   # so the DaemonSet template is unchanged and the fleet does not roll.
   #
@@ -701,7 +686,7 @@ jobs:
 
   # ADR 0027: build the RO session bundles (skills, browser, …) and publish
   # each as an OCI artifact to GHCR, mirroring publish-host-binaries. The
-  # FC-host image bake (engrams-internal) pulls them and stages each at the
+  # FC-host image bake (in a deployment repo) pulls them and stages each at the
   # fleet-canonical /var/lib/engram/shared/<name>.squashfs symlink.
   publish-bundles:
     needs: detect
@@ -854,137 +839,3 @@ jobs:
             fi
             echo "Published bundle-$name -> $REPO:{$SHA,$SHORT}"
           done
-
-  # Fires on EVERY push to main where the `bake` job didn't fail.
-  # Fans path-aware repository_dispatches into engrams-internal so
-  # each downstream workflow only runs when its inputs actually
-  # moved:
-  #
-  #   - `engrams-changed` → helm-deploy. Fires when container
-  #     images got (or could have) rebaked.
-  #   - `engrams-host-changed` → bake-fc-host-image (THIN). Fires
-  #     when only the FC-host binaries moved — re-drop them onto
-  #     the existing base image.
-  #   - `engrams-host-base-changed` → bake-fc-host-base (BASE).
-  #     Fires when the OS layer moved (deploy/packer, deploy/otel).
-  #     The base bake re-triggers a thin bake when it finishes.
-  #   - `engrams-tf-changed` → tf-apply directly. Fires for
-  #     OSS-side TF/helm module changes that don't need a
-  #     container or host-image rebake. Without this dispatch,
-  #     such changes don't propagate at all under the path-aware
-  #     model.
-  #
-  # `if: always() && ...` lets this fire when `bake` was skipped
-  # for path reasons; the `*.result != 'failure'` guards keep it
-  # from firing if a bake actually broke. The host dispatches
-  # additionally require publish-host-binaries to have succeeded —
-  # the downstream FC-host bakes pull that GHCR artifact, so firing
-  # them without it would 404 on the pull.
-  notify:
-    # publish-node-assets is in `needs` purely for ORDERING: the bundles
-    # dispatch below rolls the host fleet onto the node-assets image, and
-    # engrams-internal's deploy resolves node-assets to THIS sha — which only
-    # exists once publish-node-assets has pushed it. It is deliberately NOT in
-    # the failure guards below: a node-assets bake failure must not block
-    # engrams-changed / engrams-tf-changed (those don't roll node-assets content).
-    needs: [detect, bake, publish-host-binaries, publish-bundles, publish-node-assets]
-    if: |
-      always() &&
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/main' &&
-      needs.detect.result == 'success' &&
-      needs.bake.result != 'failure' &&
-      needs.bake.result != 'cancelled' &&
-      needs.publish-host-binaries.result != 'failure' &&
-      needs.publish-host-binaries.result != 'cancelled' &&
-      needs.publish-bundles.result != 'failure' &&
-      needs.publish-bundles.result != 'cancelled'
-    runs-on: ubuntu-latest
-    # Only the latest run's notify should dispatch — a superseded run must
-    # not fire a stale deploy. (The old workflow-wide concurrency group used
-    # to guarantee this by cancelling the whole prior run.)
-    concurrency:
-      group: bake-notify-${{ github.ref }}
-      cancel-in-progress: true
-    steps:
-      - name: Fire path-aware repository_dispatches at engrams-internal
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          SHA: ${{ github.sha }}
-          BAKED: ${{ needs.bake.result == 'success' }}
-          CONTAINERS_CHANGED: ${{ needs.detect.outputs.images }}
-          # The per-lane bake matrix — exactly which container images THIS run
-          # built (JSON array, e.g. ["coordinator","web"]; ["host-agent"] for a
-          # host-agent-only commit). engrams-internal's helm-deploy reads
-          # client_payload.images to resolve each image's tag INDEPENDENTLY
-          # (CHART_REF if baked here, else its last build), so an unchanged image
-          # is never pinned to a sibling's SHA — the #334 break, where a
-          # host-agent-only commit fired engrams-changed (host-agent ∈ images)
-          # and pinned orchestrator to a SHA with no orchestrator image.
-          CONTAINERS_MATRIX: ${{ needs.detect.outputs.images_matrix }}
-          HOST_BINARIES_CHANGED: ${{ needs.detect.outputs.host_binaries }}
-          HOST_BASE_CHANGED: ${{ needs.detect.outputs.host_base }}
-          TF_CHANGED: ${{ needs.detect.outputs.tf_or_helm }}
-          BUNDLES_CHANGED: ${{ needs.detect.outputs.bundles }}
-          # Gate the bundles dispatch on the node-assets bake (see below).
-          NODE_ASSETS_RESULT: ${{ needs.publish-node-assets.result }}
-        run: |
-          set -euo pipefail
-          fire() {
-            local event_type="$1"
-            curl --fail -sS -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              https://api.github.com/repos/cortexapps/engrams-internal/dispatches \
-              -d "{\"event_type\":\"$event_type\",\"client_payload\":{\"engrams_ref\":\"$SHA\",\"baked\":$BAKED,\"images\":$CONTAINERS_MATRIX}}"
-            echo "Dispatched $event_type -> cortexapps/engrams-internal @ $SHA (baked=$BAKED, images=$CONTAINERS_MATRIX)"
-          }
-          if [[ "$CONTAINERS_CHANGED" == "true" ]]; then
-            fire engrams-changed
-          fi
-          # The base bake re-fires engrams-host-changed (thin) when it
-          # finishes, so when the OS layer moved we fire ONLY the base event
-          # and let it drive the thin re-layer. Firing the thin bake directly
-          # too would race the base — the thin bake sources from
-          # engram-fc-host-base, which may not exist yet (cutover) or would be
-          # the stale pre-rebake image. So: host_base => base only; thin fires
-          # directly only when binaries moved WITHOUT an OS-layer change.
-          if [[ "$HOST_BASE_CHANGED" == "true" ]]; then
-            fire engrams-host-base-changed
-          elif [[ "$HOST_BINARIES_CHANGED" == "true" ]]; then
-            fire engrams-host-changed
-          fi
-          if [[ "$TF_CHANGED" == "true" ]]; then
-            fire engrams-tf-changed
-          fi
-          # ADR 0027: a bundle change republished the squashfs artifacts above;
-          # the FC-host image must re-bake to pull them onto every host. The
-          # engrams-internal handler for this re-stages /var/lib/engram/shared.
-          #
-          # This MUST wait for publish-node-assets: that job bakes the node-assets
-          # image (pulling bundle-*:main) that the host fleet rolls onto, and it
-          # finishes AFTER publish-bundles. engrams-internal's deploy resolves
-          # node-assets to THIS sha; firing before the image exists made it
-          # resolve the STALE node-assets, so the fleet silently never picked up
-          # the new bundle (observed: f65f6927, the NSS-softoken bundle fix).
-          # notify now lists publish-node-assets in `needs`, so by here the image
-          # is published — fire only once it actually succeeded.
-          if [[ "$BUNDLES_CHANGED" == "true" ]]; then
-            if [[ "$NODE_ASSETS_RESULT" == "success" ]]; then
-              fire engrams-bundles-changed
-            else
-              echo "::error::bundles changed but publish-node-assets=$NODE_ASSETS_RESULT — the new node-assets image is absent, so a deploy would roll the fleet onto the stale one. Not firing engrams-bundles-changed."
-              exit 1
-            fi
-          fi
-          # (The dev-engrams dogfood image is no longer dispatched from here:
-          # engrams-internal bakes + refreshes it on a workday-hourly schedule
-          # against OSS main — the same model as its dev-brain image.)
-          if [[ "$CONTAINERS_CHANGED" != "true" \
-             && "$HOST_BINARIES_CHANGED" != "true" \
-             && "$HOST_BASE_CHANGED" != "true" \
-             && "$TF_CHANGED" != "true" \
-             && "$BUNDLES_CHANGED" != "true" ]]; then
-            echo "No deploy-relevant paths changed in this push; skipping dispatches."
-          fi
