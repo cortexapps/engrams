@@ -176,6 +176,32 @@ code {
 :root {
   --masthead-h: 81px;
 }
+/* The masthead stays pinned while the page scrolls. Its cover background is
+   opaque, so content passes under it cleanly; once the page leaves the top, a
+   scroll-driven animation adds a hairline and a shadow to lift it off the
+   content (browsers without scroll timelines just skip the shadow). */
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+@supports (animation-timeline: scroll()) {
+  .masthead {
+    animation: masthead-lift linear both;
+    animation-timeline: scroll(root);
+    animation-range: 0 64px;
+  }
+}
+@keyframes masthead-lift {
+  to {
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.12),
+      0 8px 24px rgba(0, 0, 0, 0.35);
+  }
+}
+html {
+  scroll-padding-top: var(--masthead-h);
+}
 /* A cover section right under the masthead continues its grid and scanlines
    as if both started at the top of the page. */
 .layer.cont {
