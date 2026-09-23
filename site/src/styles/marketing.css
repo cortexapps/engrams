@@ -1419,8 +1419,12 @@ html {
 .hairline-table td {
   text-align: left;
   vertical-align: top;
-  padding: 14px 16px 14px 0;
+  padding: 14px 32px 14px 0;
   border-bottom: 1px solid var(--hairline-soft);
+}
+.hairline-table th:last-child,
+.hairline-table td:last-child {
+  padding-right: 0;
 }
 .hairline-table th {
   font-family: var(--font-mono);
