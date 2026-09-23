@@ -28,7 +28,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
   landing
 >
   <!-- COVER -->
-  <section class="cover">
+  <section class="cover cover-hero">
     <div class="layer carbon bg-carbon-fade"></div>
     <div class="layer grid cont"></div>
     <div class="layer scan cont"></div>
@@ -50,7 +50,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
             <span>{hero.graphTitle}</span>
             <span>Illustrative sequence</span>
           </div>
-          <div class="graph-scale" data-fit="720" data-fit-spill="48">
+          <div class="graph-scale" data-fit="720">
             <div class="graph" aria-hidden="true">
               <svg width="720" height="416" viewBox="0 0 720 416" fill="none">
                 {edges.map((d, i) => <path d={d} class:list={["edge", { loop: i === 6 }]} data-edge />)}

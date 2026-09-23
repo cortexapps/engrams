@@ -328,6 +328,11 @@ html {
 }
 
 /* ---- hero ---- */
+/* The cover fills the first screen under the masthead, so the floor grid
+   always meets the bottom of the window, whatever the hero's own height. */
+.cover-hero {
+  min-height: calc(100svh - var(--masthead-h));
+}
 .hero {
   display: grid;
   grid-template-columns: 560px 1fr;

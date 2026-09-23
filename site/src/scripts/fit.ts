@@ -1,18 +1,13 @@
 // Fixed-size canvases (the hero graph, the architecture diagram) scale down
-// to the column they sit in. A wrapper carries data-fit="<design width>" and
-// an optional data-fit-spill="<px>" for how far past its column it may reach
-// before it starts shrinking, the way the hero graph spills into the gutter
-// at 1440.
+// to the column they sit in. A wrapper carries data-fit="<design width>"; the
+// canvas never reaches past its column, so it keeps the page's right margin.
 function fit(el: HTMLElement) {
   const width = Number(el.dataset.fit);
-  const spill = window.matchMedia("(max-width: 720px)").matches
-    ? 0
-    : Number(el.dataset.fitSpill ?? 0);
   const parent = el.parentElement;
   if (!width || !parent) return;
   el.style.transform = "";
   el.style.height = "";
-  const s = Math.min(1, (parent.clientWidth + spill) / width);
+  const s = Math.min(1, parent.clientWidth / width);
   el.style.transformOrigin = "top left";
   el.style.transform = `scale(${s})`;
   el.style.height = `${el.scrollHeight * s}px`;
