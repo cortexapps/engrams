@@ -80,7 +80,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
             <div class="rail"></div>
             <div class="kicker"><span>{m.kicker}</span><i></i></div>
             <div class="num">{m.num}</div>
-            <h2 class="display">{m.title}</h2>
+            <h3 class="display">{m.title}</h3>
             <p>{m.body}</p>
             <div class="foot">{m.foot}</div>
           </div>
@@ -93,13 +93,13 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
   <section class="sec">
     <div class="wrap">
       <div class="sec-head"><span class="sec-badge">{session.badge}</span><span>{session.label}</span><span class="sec-rule"></span><span>{session.meta}</span></div>
+      <h2 class="display sec-title">{session.title}</h2>
       <div class="figure">
         <figure class="plate">
           <img src={pelican.src} width={pelican.width} height={pelican.height} alt={session.screenshotAlt} loading="lazy" />
           <figcaption><span>{session.caption}</span><span class="ring">{session.live}</span></figcaption>
         </figure>
         <div>
-          <h2 class="display">{session.title}</h2>
           <p class="body">{session.body}</p>
           <div class="ledger">
             {session.panes.map((p) => (
@@ -173,7 +173,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
       <div class="sec-head"><span class="sec-badge">{how.badge}</span><span>{how.label}</span><span class="sec-rule"></span><span>{how.meta}</span></div>
       <div class="grid2">
         <div>
-          <h2 class="display">{how.title}<br /><span class="lime">{how.titleAccent}</span></h2>
+          <h2 class="display sec-title">{how.title}<br /><span class="lime">{how.titleAccent}</span></h2>
           <div class="steps">
             {how.steps.map((s) => (
               <div>
@@ -215,7 +215,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
     <div class="wrap">
       <div class="sec-head"><span class="sec-badge">{extensible.badge}</span><span>{extensible.label}</span><span class="sec-rule"></span></div>
       <div class="sec-intro">
-        <h2 class="display md">{extensible.title}</h2>
+        <h2 class="display">{extensible.title}</h2>
         <p class="lede">{extensible.lede}</p>
       </div>
       <div class="pair">

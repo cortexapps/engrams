@@ -526,12 +526,21 @@ html {
   align-items: end;
   margin-top: 40px;
 }
-.sec-intro h2 {
-  font-size: 80px;
+/* One size for every section title (H2); the hero H1 and "Start." are the
+   only larger, one-off display type. Below it: a subsection title (36px), a
+   card title (28px), and an item title (18px). */
+.sec-intro h2,
+.sec-title {
+  font-size: 56px;
   line-height: 0.9;
+  text-wrap: balance;
 }
-.sec-intro h2.md {
-  font-size: 72px;
+.sec-title {
+  margin-top: 40px;
+}
+/* In How it works the title heads the left column, level with the chunk store. */
+.how .sec-title {
+  margin-top: 0;
 }
 
 /* ---- HUD module ---- */
@@ -583,9 +592,8 @@ html {
   -webkit-text-stroke: 1.5px var(--foreground);
   color: transparent;
 }
-.hud h2,
 .hud h3 {
-  font-size: 30px;
+  font-size: 28px;
   line-height: 0.95;
   margin-top: 20px;
 }
@@ -609,7 +617,7 @@ html {
   padding: 32px 30px 28px;
 }
 .hud.wide h3 {
-  font-size: 36px;
+  font-size: 28px;
   margin-top: 16px;
 }
 .hud.wide p {
@@ -714,7 +722,7 @@ html {
   align-items: start;
 }
 .split h3.title {
-  font-size: 44px;
+  font-size: 36px;
   margin-top: 16px;
 }
 .split .body {
@@ -729,7 +737,7 @@ html {
   border-bottom: 1px solid var(--hairline);
 }
 .items h3 {
-  font-size: 16px;
+  font-size: 18px;
 }
 .items p {
   font-size: 14px;
@@ -831,9 +839,6 @@ html {
   gap: 64px;
   align-items: start;
   margin-top: 40px;
-}
-.how h2 {
-  font-size: 64px;
 }
 .steps {
   margin-top: 40px;
@@ -960,6 +965,7 @@ html {
 }
 
 /* ---- plate (a screenshot with its ledger) ---- */
+
 .figure {
   display: grid;
   grid-template-columns: 1fr 340px;
@@ -988,12 +994,6 @@ html {
   font-size: 11px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-}
-.figure h2 {
-  font-size: 44px;
-}
-.figure .body {
-  margin-top: 20px;
 }
 .ledger {
   margin-top: 28px;
@@ -1492,10 +1492,7 @@ html {
     grid-template-columns: 1fr;
   }
   .sec-intro h2,
-  .sec-intro h2.md {
-    font-size: 56px;
-  }
-  .how h2 {
+  .sec-title {
     font-size: 48px;
   }
   .belt .tag {
@@ -1553,9 +1550,6 @@ html {
     padding: 24px 0 28px;
     border-left: 0;
   }
-  .case h3 {
-    font-size: 24px;
-  }
   .btn {
     height: 48px;
     font-size: 14px;
@@ -1568,10 +1562,11 @@ html {
     font-size: 40px;
   }
   .sec-intro h2,
-  .sec-intro h2.md,
-  .figure h2,
-  .split h3.title {
+  .sec-title {
     font-size: 36px;
+  }
+  .split h3.title {
+    font-size: 28px;
   }
   .hairline-table td:first-child {
     width: 110px;
@@ -1588,8 +1583,7 @@ html {
   }
 }
 @media (max-width: 720px) {
-  .how h2 {
-    font-size: clamp(30px, 8vw, 36px);
+  .sec-title {
     overflow-wrap: anywhere;
   }
   .chunks .meta,
