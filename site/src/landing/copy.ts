@@ -82,25 +82,47 @@ export const session = {
 export const automations = {
   badge: "Sec. 2",
   label: "Automations",
-  meta: "Fig. 2.1 – 2.2",
-  title: "Build the workflow. Stop repeating the setup.",
-  lede: "Describe what should happen. A drafting agent builds an editable workflow: start sessions, run commands, check results, and decide what comes next. Enable it when it is ready. A schedule or event starts each run, and saved progress lets it continue after a server restart.",
-  screenshotAlt:
-    "The New automation page asks what the automation should do; a drafting agent assembles it on the canvas.",
-  channel: "Automation composer",
-  caption: "Start with a request. The agent drafts a workflow you can edit before you enable it.",
-  signal: "Product screenshot",
-  board: {
-    fig: "Fig. 2.2 · runs board",
-    title: "See what happened. Decide what comes next.",
-    body: "Open a run to see each step, its inputs and outputs, and the session that did the work. Inspect an error or a changed file without reconstructing the run from separate logs.",
+  meta: "Fig. 2.1",
+  title: "Hand off the work that repeats.",
+  lede: "A schedule, a pull request, a Slack mention, or a webhook can start a session, with no one typing a prompt. When one prompt is not enough, chain steps into a workflow: prompt the agent, run the tests, branch on the result, and post to Slack or GitHub.",
+  cases: {
+    label: "In production at Cortex",
+    note: "Four automations that run in our engineering org today.",
     items: [
       {
-        title: "Keep the conversation together",
+        trigger: "schedule",
+        title: "Dependency upgrades and CVE fixes",
+        body: "Scans for outdated dependencies and open CVEs, opens each upgrade, runs the tests, and fixes what breaks. One pull request per change, reviewed by the pull request bot.",
+      },
+      {
+        trigger: "schedule · Datadog",
+        title: "Memory hot spots",
+        body: "Queries Datadog profiles for the largest allocation frames, opens a task on the service that owns the code, and rewrites the hot path. The pull request carries the before and after numbers.",
+      },
+      {
+        trigger: "Datadog webhook",
+        title: "Bug triage",
+        body: "A new production error opens a run. The agent reproduces and diagnoses it, then pushes a fix or files an issue with the root cause. Duplicate errors join the run already in flight.",
+      },
+      {
+        trigger: "Linear · Slack",
+        title: "A project with an owner",
+        body: "One agent watches a Linear project and its Slack channel. It picks up issues, opens pull requests, answers questions in the thread, and posts a daily status.",
+      },
+    ],
+  },
+  board: {
+    fig: "Fig. 2.1 · runs board",
+    title: "Every run is a session you can open.",
+    body: "Open a run to see each step, its inputs and outputs, and the session that did the work. Read the transcript, reply to the agent, or take over in its shell. Runs survive a server restart and can wait hours for a reply without holding a VM.",
+    itemsLabel: "Ships in the box",
+    items: [
+      {
+        title: "Slack threads",
         body: "Mention the bot in Slack and a session opens for that thread, as the person who asked, with their credentials. Replies join the same run.",
       },
       {
-        title: "Review with evidence",
+        title: "Pull request review",
         body: "A finder and a verifier review each pull request on the repositories you list, and post the confirmed findings as one GitHub review.",
       },
     ],

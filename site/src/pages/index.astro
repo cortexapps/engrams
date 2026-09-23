@@ -1,7 +1,6 @@
 ---
 import Marketing from "../layouts/Marketing.astro";
 import pelican from "../assets/screenshots/session-pelican.png";
-import compose from "../assets/screenshots/automation-compose.png";
 import { hero, modules, automations, how, session, extensible, belt, start } from "../landing/copy";
 import { nodes, edges, glyph, frame } from "../landing/demo";
 
@@ -120,13 +119,17 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
         <h2 class="display">{automations.title}</h2>
         <p class="lede">{automations.lede}</p>
       </div>
-      <div class="holo">
-        <div class="screen">
-          <img src={compose.src} width={compose.width} height={compose.height} alt={automations.screenshotAlt} loading="lazy" />
-
-          <div class="ch">{automations.channel}</div>
+      <div class="cases">
+        <div class="cases-head"><span class="label">{automations.cases.label}</span><span>{automations.cases.note}</span></div>
+        <div class="cases-grid">
+          {automations.cases.items.map((c, i) => (
+            <div class="case">
+              <div class="case-top"><span class="trigger">{c.trigger}</span><span class="idx">{String(i + 1).padStart(2, "0")}</span></div>
+              <h3 class="display">{c.title}</h3>
+              <p>{c.body}</p>
+            </div>
+          ))}
         </div>
-        <div class="caption"><span>{automations.caption}</span><span class="signal">{automations.signal}</span></div>
       </div>
 
       <div class="split">
@@ -134,6 +137,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
           <div class="label">{automations.board.fig}</div>
           <h3 class="display title">{automations.board.title}</h3>
           <p class="body">{automations.board.body}</p>
+          <div class="label sm items-label">{automations.board.itemsLabel}</div>
           <div class="items">
             {automations.board.items.map((it) => (
               <div>

@@ -252,7 +252,8 @@ html {
 }
 .byline svg {
   display: block;
-}.site-nav {
+}
+.site-nav {
   display: flex;
   align-items: center;
   gap: 32px;
@@ -637,72 +638,71 @@ html {
   margin-top: 48px;
 }
 
-/* ---- holo frame (a screenshot on a deep panel) ---- */
-.holo {
-  margin-top: 64px;
-  background: var(--panel-deep);
-  padding: 14px;
-  border: 1px solid var(--lime-50);
-  box-shadow: var(--glow);
-  position: relative;
-  color: var(--sage-on-cover);
-  clip-path: var(--chamfer-14);
+/* ---- automation use cases: a hairline 2×2 grid, trigger chip on top ---- */
+.cases {
+  margin-top: 72px;
 }
-.holo .screen {
-  position: relative;
-  overflow: hidden;
-  background: var(--screen);
-}
-.holo img {
-  display: block;
-  width: 100%;
-  height: auto;
-}
-.holo .rec {
-  position: absolute;
-  top: 14px;
-  left: 18px;
+.cases-head {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.16em;
-  color: var(--rec-red);
-}
-.holo .rec i {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--rec-red);
-  animation: blink 1.2s steps(1) infinite;
-}
-.holo .ch {
-  position: absolute;
-  top: 14px;
-  right: 18px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.16em;
-  opacity: 0.85;
-}
-.holo .caption {
-  display: flex;
+  align-items: baseline;
   justify-content: space-between;
   gap: 24px;
-  align-items: center;
-  margin-top: 16px;
-  padding: 0 6px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
+  flex-wrap: wrap;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 14px;
   opacity: 0.85;
 }
-.holo .signal {
+.cases-head .label {
   color: var(--primary);
-  text-shadow: 0 0 8px var(--primary);
-  white-space: nowrap;
+}
+.cases-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+.case {
+  padding: 28px 32px 32px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.case:nth-child(even) {
+  padding: 28px 0 32px 32px;
+  border-left: 1px solid var(--hairline);
+}
+.case-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.case .trigger {
+  padding: 3px 8px;
+  border: 1px solid var(--lime-45);
+  color: var(--primary);
+}
+.case .idx {
+  opacity: 0.5;
+}
+.case h3 {
+  font-size: 28px;
+  line-height: 1;
+  margin-top: 20px;
+}
+.case p {
+  font-size: 15px;
+  line-height: 1.55;
+  margin-top: 12px;
+  max-width: 560px;
+  opacity: 0.85;
+}
+.items-label {
+  margin-top: 32px;
+  opacity: 0.7;
+}
+.items-label + .items {
+  margin-top: 12px;
 }
 
 /* ---- runs board (HUD table) ---- */
@@ -1544,6 +1544,17 @@ html {
   }
   .modules .hud {
     min-height: 0;
+  }
+  .cases-grid {
+    grid-template-columns: 1fr;
+  }
+  .case,
+  .case:nth-child(even) {
+    padding: 24px 0 28px;
+    border-left: 0;
+  }
+  .case h3 {
+    font-size: 24px;
   }
   .btn {
     height: 48px;
