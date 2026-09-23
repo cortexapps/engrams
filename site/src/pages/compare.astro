@@ -5,16 +5,16 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 const docs = `${base}/docs`;
 
 const rows: [string, string, string, string][] = [
-  ["Who runs it", "You, in your cloud or on your hardware.", "The vendor.", "You."],
-  ["Built for", "Agents. A person can open a shell or IDE into a session, but the session is the agent's.", "Agents and code execution, through an SDK.", "People at their editors."],
-  ["Isolation", "A Firecracker microVM per session, on KVM.", "A microVM or container per sandbox, vendor-managed.", "Whatever the workspace template provisions: a VM, a pod, a container."],
-  ["Pause and resume", "Snapshot to content-addressed chunks on idle; restore in under 100 ms on the same host, one to two seconds elsewhere.", "Pause and resume within the vendor's limits and pricing tiers.", "Stop and start the workspace; state depends on the template."],
-  ["Fork", "A manifest copy of a few kilobytes; the fork shares every chunk until it writes.", "Varies by vendor.", "Not a session concept."],
-  ["Agent runtime", "Claude Code and Codex mounted by the host at boot; never in your image.", "Bring your own, inside the sandbox.", "Agents run as workspace processes."],
-  ["Your image", "Any Linux image with /bin/sh, built with docker build.", "A vendor image format or a Dockerfile, per vendor.", "A Terraform template."],
-  ["Cloud", "GKE or EKS, GCS or S3, with Terraform and Helm in the repository.", "The vendor's.", "Any."],
-  ["Product surface", "Dashboard, tasks and profiles, Slack, pull request review, CLI, API, connectors.", "SDK and dashboard.", "Dashboard, templates, CLI, IDE integrations."],
-  ["License", "AGPL-3.0.", "Proprietary service.", "AGPL-3.0 with a paid tier."],
+  ["Who runs it", "You, in your cloud or on your hardware", "The vendor", "You"],
+  ["Built for", "Agents; a person can open a shell or IDE into a session, but the session is the agent's", "Agents and code execution, through an SDK", "People at their editors"],
+  ["Isolation", "A Firecracker microVM per session, on KVM", "A microVM or container per sandbox, vendor-managed", "Whatever the workspace template provisions: a VM, a pod, a container"],
+  ["Pause and resume", "Snapshot to content-addressed chunks on idle; restore in under 100 ms on the same host, one to two seconds elsewhere", "Pause and resume within the vendor's limits and pricing tiers", "Stop and start the workspace; state depends on the template"],
+  ["Fork", "A manifest copy of a few kilobytes; the fork shares every chunk until it writes", "Varies by vendor", "Not a session concept"],
+  ["Agent runtime", "Claude Code and Codex mounted by the host at boot; never in your image", "Bring your own, inside the sandbox", "Agents run as workspace processes"],
+  ["Your image", "Any Linux image with /bin/sh, built with docker build", "A vendor image format or a Dockerfile, per vendor", "A Terraform template"],
+  ["Cloud", "GKE or EKS, GCS or S3, with Terraform and Helm in the repository", "The vendor's", "Any"],
+  ["Product surface", "Dashboard, tasks and profiles, Slack, pull request review, CLI, API, connectors", "SDK and dashboard", "Dashboard, templates, CLI, IDE integrations"],
+  ["License", "AGPL-3.0", "Proprietary service", "AGPL-3.0 with a paid tier"],
 ];
 ---
 
@@ -55,7 +55,7 @@ const rows: [string, string, string, string][] = [
     <div class="wrap">
       <div class="sec-head"><span class="sec-badge">Sec. 1</span><span>When to pick the others</span><span class="sec-rule"></span></div>
       <div class="sec-intro">
-        <h2 class="display md">Pick the other thing when it fits.</h2>
+        <h2 class="display">Pick the other thing when it fits.</h2>
         <div class="prose">
           <p>
             If you do not want to run infrastructure, a hosted sandbox API is the right call: you

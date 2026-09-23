@@ -1,7 +1,6 @@
 ---
 import Marketing from "../layouts/Marketing.astro";
 import pelican from "../assets/screenshots/session-pelican.png";
-import compose from "../assets/screenshots/automation-compose.png";
 import { hero, modules, automations, how, session, extensible, belt, start } from "../landing/copy";
 import { nodes, edges, glyph, frame } from "../landing/demo";
 
@@ -24,12 +23,12 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
 ---
 
 <Marketing
-  title="engrams"
-  description="Turn repeat work into automations that run your coding agents in your cloud. Inspect their changes, continue the conversation, and control access to your tools."
+  title="engrams · Coding agents in your cloud"
+  description="engrams runs Claude Code, Codex, or your own agent in an isolated microVM on your infrastructure. Start one from a prompt, a schedule, a pull request, or a Slack thread, then inspect its changes."
   landing
 >
   <!-- COVER -->
-  <section class="cover">
+  <section class="cover cover-hero">
     <div class="layer carbon bg-carbon-fade"></div>
     <div class="layer grid cont"></div>
     <div class="layer scan cont"></div>
@@ -51,7 +50,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
             <span>{hero.graphTitle}</span>
             <span>Illustrative sequence</span>
           </div>
-          <div class="graph-scale" data-fit="720" data-fit-spill="48">
+          <div class="graph-scale" data-fit="720">
             <div class="graph" aria-hidden="true">
               <svg width="720" height="416" viewBox="0 0 720 416" fill="none">
                 {edges.map((d, i) => <path d={d} class:list={["edge", { loop: i === 6 }]} data-edge />)}
@@ -81,7 +80,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
             <div class="rail"></div>
             <div class="kicker"><span>{m.kicker}</span><i></i></div>
             <div class="num">{m.num}</div>
-            <h2 class="display">{m.title}</h2>
+            <h3 class="display">{m.title}</h3>
             <p>{m.body}</p>
             <div class="foot">{m.foot}</div>
           </div>
@@ -90,7 +89,29 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
     </div>
   </section>
 
-  <!-- SEC. 1 — AUTOMATIONS -->
+  <!-- SEC. 1 — A SESSION -->
+  <section class="sec">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-badge">{session.badge}</span><span>{session.label}</span><span class="sec-rule"></span><span>{session.meta}</span></div>
+      <h2 class="display sec-title">{session.title}</h2>
+      <div class="figure">
+        <figure class="plate">
+          <img src={pelican.src} width={pelican.width} height={pelican.height} alt={session.screenshotAlt} loading="lazy" />
+          <figcaption><span>{session.caption}</span><span class="ring">{session.live}</span></figcaption>
+        </figure>
+        <div>
+          <p class="body">{session.body}</p>
+          <div class="ledger">
+            {session.panes.map((p) => (
+              <div><span class="n">{p.name}</span><span>{p.body}</span></div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SEC. 2 — AUTOMATIONS -->
   <section class="sec">
     <div class="wrap">
       <div class="sec-head"><span class="sec-badge">{automations.badge}</span><span>{automations.label}</span><span class="sec-rule"></span><span>{automations.meta}</span></div>
@@ -98,13 +119,17 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
         <h2 class="display">{automations.title}</h2>
         <p class="lede">{automations.lede}</p>
       </div>
-      <div class="holo">
-        <div class="screen">
-          <img src={compose.src} width={compose.width} height={compose.height} alt={automations.screenshotAlt} loading="lazy" />
-
-          <div class="ch">{automations.channel}</div>
+      <div class="cases">
+        <div class="cases-head"><span class="label">{automations.cases.label}</span><span>{automations.cases.note}</span></div>
+        <div class="cases-grid">
+          {automations.cases.items.map((c, i) => (
+            <div class="case">
+              <div class="case-top"><span class="trigger">{c.trigger}</span><span class="idx">{String(i + 1).padStart(2, "0")}</span></div>
+              <h3 class="display">{c.title}</h3>
+              <p>{c.body}</p>
+            </div>
+          ))}
         </div>
-        <div class="caption"><span>{automations.caption}</span><span class="signal">{automations.signal}</span></div>
       </div>
 
       <div class="split">
@@ -112,6 +137,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
           <div class="label">{automations.board.fig}</div>
           <h3 class="display title">{automations.board.title}</h3>
           <p class="body">{automations.board.body}</p>
+          <div class="label sm items-label">{automations.board.itemsLabel}</div>
           <div class="items">
             {automations.board.items.map((it) => (
               <div>
@@ -140,14 +166,14 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
     </div>
   </section>
 
-  <!-- SEC. 2 — HOW IT WORKS -->
+  <!-- SEC. 3 — HOW IT WORKS -->
   <section class="cover how">
     <div class="layer carbon soft bg-carbon-fade"></div>
     <div class="wrap">
       <div class="sec-head"><span class="sec-badge">{how.badge}</span><span>{how.label}</span><span class="sec-rule"></span><span>{how.meta}</span></div>
       <div class="grid2">
         <div>
-          <h2 class="display">{how.title}<br /><span class="lime">{how.titleAccent}</span></h2>
+          <h2 class="display sec-title">{how.title}<br /><span class="lime">{how.titleAccent}</span></h2>
           <div class="steps">
             {how.steps.map((s) => (
               <div>
@@ -174,33 +200,11 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
             {how.leds.map((l) => (
               <div class="led">
                 <div class="k">{l.k}</div>
-                <div class="v"><span class="ghost" aria-hidden="true">{l.ghost}</span><span class="lit">{l.v}</span></div>
+                <div class="v"><span class="lit">{l.v}</span></div>
               </div>
             ))}
           </div>
           <p class="footnote">{how.footnote}</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- SEC. 3 — A SESSION -->
-  <section class="sec">
-    <div class="wrap">
-      <div class="sec-head"><span class="sec-badge">{session.badge}</span><span>{session.label}</span><span class="sec-rule"></span><span>{session.meta}</span></div>
-      <div class="figure">
-        <figure class="plate">
-          <img src={pelican.src} width={pelican.width} height={pelican.height} alt={session.screenshotAlt} loading="lazy" />
-          <figcaption><span>{session.caption}</span><span class="ring">{session.live}</span></figcaption>
-        </figure>
-        <div>
-          <h2 class="display">{session.title}</h2>
-          <p class="body">{session.body}</p>
-          <div class="ledger">
-            {session.panes.map((p) => (
-              <div><span class="n">{p.name}</span><span>{p.body}</span></div>
-            ))}
-          </div>
         </div>
       </div>
     </div>
@@ -211,7 +215,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
     <div class="wrap">
       <div class="sec-head"><span class="sec-badge">{extensible.badge}</span><span>{extensible.label}</span><span class="sec-rule"></span></div>
       <div class="sec-intro">
-        <h2 class="display md">{extensible.title}</h2>
+        <h2 class="display">{extensible.title}</h2>
         <p class="lede">{extensible.lede}</p>
       </div>
       <div class="pair">

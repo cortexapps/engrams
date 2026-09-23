@@ -176,6 +176,32 @@ code {
 :root {
   --masthead-h: 81px;
 }
+/* The masthead stays pinned while the page scrolls. Its cover background is
+   opaque, so content passes under it cleanly; once the page leaves the top, a
+   scroll-driven animation adds a hairline and a shadow to lift it off the
+   content (browsers without scroll timelines just skip the shadow). */
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+@supports (animation-timeline: scroll()) {
+  .masthead {
+    animation: masthead-lift linear both;
+    animation-timeline: scroll(root);
+    animation-range: 0 64px;
+  }
+}
+@keyframes masthead-lift {
+  to {
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.12),
+      0 8px 24px rgba(0, 0, 0, 0.35);
+  }
+}
+html {
+  scroll-padding-top: var(--masthead-h);
+}
 /* A cover section right under the masthead continues its grid and scanlines
    as if both started at the top of the page. */
 .layer.cont {
@@ -203,6 +229,29 @@ code {
 .wordmark svg {
   width: 28px;
   height: 28px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.byline {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding-left: 16px;
+  border-left: 1px solid rgba(255, 255, 255, 0.25);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  opacity: 0.75;
+  transition: opacity 0.15s;
+}
+.byline:hover {
+  opacity: 1;
+}
+.byline svg {
+  display: block;
 }
 .site-nav {
   display: flex;
@@ -279,6 +328,11 @@ code {
 }
 
 /* ---- hero ---- */
+/* The cover fills the first screen under the masthead, so the floor grid
+   always meets the bottom of the window, whatever the hero's own height. */
+.cover-hero {
+  min-height: calc(100svh - var(--masthead-h));
+}
 .hero {
   display: grid;
   grid-template-columns: 560px 1fr;
@@ -477,12 +531,21 @@ code {
   align-items: end;
   margin-top: 40px;
 }
-.sec-intro h2 {
-  font-size: 80px;
+/* One size for every section title (H2); the hero H1 and "Start." are the
+   only larger, one-off display type. Below it: a subsection title (36px), a
+   card title (28px), and an item title (18px). */
+.sec-intro h2,
+.sec-title {
+  font-size: 56px;
   line-height: 0.9;
+  text-wrap: balance;
 }
-.sec-intro h2.md {
-  font-size: 72px;
+.sec-title {
+  margin-top: 40px;
+}
+/* In How it works the title heads the left column, level with the chunk store. */
+.how .sec-title {
+  margin-top: 0;
 }
 
 /* ---- HUD module ---- */
@@ -531,12 +594,16 @@ code {
   font-size: 96px;
   line-height: 0.9;
   margin-top: 24px;
-  -webkit-text-stroke: 1.5px var(--foreground);
-  color: transparent;
+  /* A variable font keeps overlapping contours, so a plain text stroke also
+     outlines the overlaps inside a glyph (a star in the "2"). Paint the stroke
+     first at double width, then fill with the card colour on top: the fill
+     hides the inner half and every overlap, and 1.5px of outline shows. */
+  -webkit-text-stroke: 3px var(--foreground);
+  paint-order: stroke fill;
+  color: color-mix(in oklch, var(--foreground) 4%, var(--background));
 }
-.hud h2,
 .hud h3 {
-  font-size: 30px;
+  font-size: 28px;
   line-height: 0.95;
   margin-top: 20px;
 }
@@ -560,7 +627,7 @@ code {
   padding: 32px 30px 28px;
 }
 .hud.wide h3 {
-  font-size: 36px;
+  font-size: 28px;
   margin-top: 16px;
 }
 .hud.wide p {
@@ -589,72 +656,71 @@ code {
   margin-top: 48px;
 }
 
-/* ---- holo frame (a screenshot on a deep panel) ---- */
-.holo {
-  margin-top: 64px;
-  background: var(--panel-deep);
-  padding: 14px;
-  border: 1px solid var(--lime-50);
-  box-shadow: var(--glow);
-  position: relative;
-  color: var(--sage-on-cover);
-  clip-path: var(--chamfer-14);
+/* ---- automation use cases: a hairline 2×2 grid, trigger chip on top ---- */
+.cases {
+  margin-top: 72px;
 }
-.holo .screen {
-  position: relative;
-  overflow: hidden;
-  background: var(--screen);
-}
-.holo img {
-  display: block;
-  width: 100%;
-  height: auto;
-}
-.holo .rec {
-  position: absolute;
-  top: 14px;
-  left: 18px;
+.cases-head {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.16em;
-  color: var(--rec-red);
-}
-.holo .rec i {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--rec-red);
-  animation: blink 1.2s steps(1) infinite;
-}
-.holo .ch {
-  position: absolute;
-  top: 14px;
-  right: 18px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.16em;
-  opacity: 0.85;
-}
-.holo .caption {
-  display: flex;
+  align-items: baseline;
   justify-content: space-between;
   gap: 24px;
-  align-items: center;
-  margin-top: 16px;
-  padding: 0 6px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
+  flex-wrap: wrap;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 14px;
   opacity: 0.85;
 }
-.holo .signal {
+.cases-head .label {
   color: var(--primary);
-  text-shadow: 0 0 8px var(--primary);
-  white-space: nowrap;
+}
+.cases-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+.case {
+  padding: 28px 32px 32px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.case:nth-child(even) {
+  padding: 28px 0 32px 32px;
+  border-left: 1px solid var(--hairline);
+}
+.case-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.case .trigger {
+  padding: 3px 8px;
+  border: 1px solid var(--lime-45);
+  color: var(--primary);
+}
+.case .idx {
+  opacity: 0.5;
+}
+.case h3 {
+  font-size: 28px;
+  line-height: 1;
+  margin-top: 20px;
+}
+.case p {
+  font-size: 15px;
+  line-height: 1.55;
+  margin-top: 12px;
+  max-width: 560px;
+  opacity: 0.85;
+}
+.items-label {
+  margin-top: 32px;
+  opacity: 0.7;
+}
+.items-label + .items {
+  margin-top: 12px;
 }
 
 /* ---- runs board (HUD table) ---- */
@@ -666,7 +732,7 @@ code {
   align-items: start;
 }
 .split h3.title {
-  font-size: 44px;
+  font-size: 36px;
   margin-top: 16px;
 }
 .split .body {
@@ -681,7 +747,7 @@ code {
   border-bottom: 1px solid var(--hairline);
 }
 .items h3 {
-  font-size: 16px;
+  font-size: 18px;
 }
 .items p {
   font-size: 14px;
@@ -784,9 +850,6 @@ code {
   align-items: start;
   margin-top: 40px;
 }
-.how h2 {
-  font-size: 64px;
-}
 .steps {
   margin-top: 40px;
   border-top: 1px solid rgba(255, 255, 255, 0.25);
@@ -886,7 +949,6 @@ code {
   color: rgba(255, 255, 255, 0.55);
 }
 .led .v {
-  position: relative;
   margin-top: 8px;
   font-family: var(--font-mono);
   font-size: 30px;
@@ -894,13 +956,7 @@ code {
   line-height: 1;
   letter-spacing: 0.02em;
 }
-.led .ghost {
-  position: absolute;
-  inset: 0;
-  color: rgba(255, 179, 71, 0.09);
-}
 .led .lit {
-  position: relative;
   color: var(--led-amber);
   text-shadow: 0 0 10px var(--led-glow);
 }
@@ -912,6 +968,7 @@ code {
 }
 
 /* ---- plate (a screenshot with its ledger) ---- */
+
 .figure {
   display: grid;
   grid-template-columns: 1fr 340px;
@@ -940,12 +997,6 @@ code {
   font-size: 11px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-}
-.figure h2 {
-  font-size: 44px;
-}
-.figure .body {
-  margin-top: 20px;
 }
 .ledger {
   margin-top: 28px;
@@ -998,10 +1049,33 @@ code {
   text-transform: uppercase;
   white-space: nowrap;
 }
+/* Logos fade out as they slide under the tag and off the right edge, not a
+   hard cut mid-word. Both fades blend into the belt's own cover colour. */
+.belt .tag::after,
+.belt::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 96px;
+  pointer-events: none;
+}
+.belt .tag::after {
+  left: 100%;
+  background: linear-gradient(90deg, var(--bottle-green), transparent);
+}
+.belt::after {
+  right: 0;
+  z-index: 1;
+  background: linear-gradient(90deg, transparent, var(--bottle-green));
+}
 .belt .track {
   display: flex;
   width: max-content;
   animation: marquee 40s linear infinite;
+}
+.belt:hover .track {
+  animation-play-state: paused;
 }
 .belt .item {
   display: flex;
@@ -1059,6 +1133,37 @@ code {
 .site-footer {
   position: relative;
   padding-top: 80px;
+}
+/* The Cortex strip: kept quieter than the Start band above it (ghost button,
+   not lime) so running engrams stays the page's main action. */
+.cortex-cta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+  padding: 32px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.25);
+}
+.cortex-cta .pitch {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+.cortex-cta .pitch svg {
+  display: block;
+}
+.cortex-cta p {
+  font-family: var(--font-display);
+  font-stretch: 108%;
+  font-weight: 600;
+  font-size: 20px;
+  opacity: 0.85;
+}
+.cortex-cta .btn {
+  height: 44px;
+  font-size: 13px;
 }
 .site-footer .row {
   padding: 20px 0 0;
@@ -1337,8 +1442,12 @@ code {
 .hairline-table td {
   text-align: left;
   vertical-align: top;
-  padding: 14px 16px 14px 0;
+  padding: 14px 32px 14px 0;
   border-bottom: 1px solid var(--hairline-soft);
+}
+.hairline-table th:last-child,
+.hairline-table td:last-child {
+  padding-right: 0;
 }
 .hairline-table th {
   font-family: var(--font-mono);
@@ -1413,10 +1522,7 @@ code {
     grid-template-columns: 1fr;
   }
   .sec-intro h2,
-  .sec-intro h2.md {
-    font-size: 56px;
-  }
-  .how h2 {
+  .sec-title {
     font-size: 48px;
   }
   .belt .tag {
@@ -1466,6 +1572,14 @@ code {
   .modules .hud {
     min-height: 0;
   }
+  .cases-grid {
+    grid-template-columns: 1fr;
+  }
+  .case,
+  .case:nth-child(even) {
+    padding: 24px 0 28px;
+    border-left: 0;
+  }
   .btn {
     height: 48px;
     font-size: 14px;
@@ -1478,10 +1592,11 @@ code {
     font-size: 40px;
   }
   .sec-intro h2,
-  .sec-intro h2.md,
-  .figure h2,
-  .split h3.title {
+  .sec-title {
     font-size: 36px;
+  }
+  .split h3.title {
+    font-size: 28px;
   }
   .hairline-table td:first-child {
     width: 110px;
@@ -1498,8 +1613,7 @@ code {
   }
 }
 @media (max-width: 720px) {
-  .how h2 {
-    font-size: clamp(30px, 8vw, 36px);
+  .sec-title {
     overflow-wrap: anywhere;
   }
   .chunks .meta,
@@ -1525,6 +1639,22 @@ code {
   .wordmark svg {
     width: 23px;
     height: 23px;
+  }
+  /* No room beside the wordmark: the byline drops under it, indented to the
+     text so it reads as a subtitle. */
+  .brand {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+  .byline {
+    padding-left: 30px;
+    border-left: 0;
+    font-size: 10px;
+  }
+  .byline svg {
+    height: 12px;
+    width: auto;
   }
   .graph-meta {
     font-size: 10px;

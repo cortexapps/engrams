@@ -36,13 +36,13 @@ export const logs = [
 
 export type Run = { time: string; name: string; trigger: string; dur: string; status: "done" | "running" | "waiting" | "queued" };
 export const runs: Run[] = [
-  { time: "06:00", name: "nightly-flaky-tests", trigger: "schedule", dur: "4m 16s", status: "done" },
+  { time: "06:00", name: "dependency-upgrades", trigger: "schedule", dur: "12m 02s", status: "done" },
   { time: "06:12", name: "pr-review · #4821", trigger: "pull request", dur: "1m 48s", status: "done" },
+  { time: "06:30", name: "memory-hot-spots", trigger: "schedule", dur: "9m 40s", status: "done" },
   { time: "07:03", name: "slack · #eng-infra", trigger: "thread mention", dur: "waiting", status: "waiting" },
-  { time: "07:41", name: "dependency-bumps", trigger: "schedule", dur: "12m 02s", status: "done" },
   { time: "08:15", name: "pr-review · #4823", trigger: "pull request", dur: "0m 51s", status: "running" },
-  { time: "08:20", name: "incident-triage", trigger: "webhook · pagerduty", dur: "2m 30s", status: "running" },
-  { time: "08:22", name: "changelog-draft", trigger: "schedule", dur: "—", status: "queued" },
+  { time: "08:20", name: "bug-triage", trigger: "webhook · datadog", dur: "2m 30s", status: "running" },
+  { time: "08:22", name: "project-owner", trigger: "linear issue", dur: "—", status: "queued" },
 ];
 
 export const glyph: Record<Run["status"], string> = { done: "●", running: "◐", waiting: "◌", queued: "○" };

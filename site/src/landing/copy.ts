@@ -4,10 +4,10 @@
 // Each section connects an outcome to the product behavior that makes it possible.
 
 export const hero = {
-  eyebrow: "Your agents, working in your cloud",
+  eyebrow: "Coding agents, running in your cloud",
   title: "Automate your",
   titleAccent: "SDLC.",
-  lede: "Turn repeat work into an automation. engrams runs Claude Code, Codex, or your own agent when a schedule fires, a pull request changes, or someone asks in Slack. Inspect the changes and continue the conversation, on infrastructure you control.",
+  lede: "engrams runs Claude Code, Codex, or your own agent in an isolated microVM on your infrastructure. Start one from a prompt, a schedule, a pull request, or a Slack thread. Walk away mid-task, and pick it up days later with its files and history intact.",
   primary: { label: "Explore automations", href: "platform/automations/" },
   secondary: { label: "Run it locally", href: "getting-started/local-quickstart/" },
   chips: ["AGPL-3.0", "Firecracker · KVM", "GKE · EKS", "Claude Code · Codex"],
@@ -19,112 +19,45 @@ export const modules = {
   label: "Work on your terms",
   cards: [
     {
-      kicker: "Human control",
+      kicker: "Real environments",
       num: "01",
+      title: "Run your whole stack.",
+      body: "Each agent gets its own microVM, so it can clone the repo, install dependencies, run the build, and start a dev server.",
+      foot: "Firecracker · full workspace",
+    },
+    {
+      kicker: "Human control",
+      num: "02",
       title: "Stay involved.",
       body: "Delegate a task, inspect its changes, and send a follow-up. The dashboard and Slack keep you in the conversation while agents work in your cloud.",
       foot: "Inspect · reply · steer",
-    },
-    {
-      kicker: "Agent choice",
-      num: "02",
-      title: "Use your agents.",
-      body: "Run Claude Code, Codex, or a custom harness with the same session controls. Upgrade the agent without rebuilding your development image.",
-      foot: "Claude Code · Codex · BYO",
     },
     {
       kicker: "Controlled access",
       num: "03",
       title: "Keep keys out.",
       body: "Give an agent the API operations it needs. For brokered integrations, the proxy inserts the credential outside the VM and blocks requests the policy does not allow.",
-      foot: "Brokered credentials · egress policy",
+      foot: "Brokered keys · egress policy",
     },
     {
-      kicker: "Work that lasts",
+      kicker: "Optimized for cost",
       num: "04",
-      title: "Pick it back up.",
-      body: "Step away without losing the environment. An idle VM is snapshotted and removed; your next prompt restores it. Stored snapshots remain, without a running VM per paused session.",
-      foot: "Snapshot · resume · continue",
+      title: "Pay for work, not idle VMs.",
+      body: "When a session goes idle, engrams snapshots it to object storage and frees the host for other work. The next prompt restores it on any host in seconds. Give every service its own agent without a VM running for each.",
+      foot: "Snapshot · release · resume",
     },
   ],
-};
-
-export const automations = {
-  badge: "Sec. 1",
-  label: "Automations",
-  meta: "Fig. 1.1 – 1.2",
-  title: "Build the workflow. Stop repeating the setup.",
-  lede: "Describe what should happen. A drafting agent builds an editable workflow: start sessions, run commands, check results, and decide what comes next. Enable it when it is ready. A schedule or event starts each run, and saved progress lets it continue after a server restart.",
-  screenshotAlt:
-    "The New automation page asks what the automation should do; a drafting agent assembles it on the canvas.",
-  channel: "Automation composer",
-  caption: "Start with a request. The agent drafts a workflow you can edit before you enable it.",
-  signal: "Product screenshot",
-  board: {
-    fig: "Fig. 1.2 · runs board",
-    title: "See what happened. Decide what comes next.",
-    body: "Open a run to see each step, its inputs and outputs, and the session that did the work. Inspect an error or a changed file without reconstructing the run from separate logs.",
-    items: [
-      {
-        title: "Keep the conversation together",
-        body: "Mention the bot in Slack and a session opens for that thread, as the person who asked, with their credentials. Replies join the same run.",
-      },
-      {
-        title: "Review with evidence",
-        body: "A finder and a verifier review each pull request on the repositories you list, and post the confirmed findings as one GitHub review.",
-      },
-    ],
-    footRight: "durable · survives restart",
-  },
-};
-
-export const how = {
-  badge: "Sec. 2",
-  label: "How it works",
-  meta: "Fig. 2.1 · chunk store",
-  title: "Keep the environment.",
-  titleAccent: "Continue the work.",
-  steps: [
-    {
-      s: "S₀",
-      title: "Enable an image",
-      body: "Push any Linux image with `/bin/sh` to a registry and enable it once. engrams writes it as content-addressed chunks, boots it on the fleet, runs your warm-up command, and freezes a base snapshot.",
-    },
-    {
-      s: "S₁",
-      title: "Start a run",
-      body: "A person types a prompt, or a trigger fires. The host restores the snapshot into a fresh microVM, mounts the harness, and the agent starts with its caches already warm.",
-    },
-    {
-      s: "Sₙ",
-      title: "Snapshot, resume, fork",
-      body: "When the agent goes idle the VM is snapshotted to chunks and destroyed. The next prompt restores it, on any host. Forking a session is a manifest copy of a few kilobytes.",
-    },
-  ],
-  legend: [
-    { cls: "base", label: "base image · stored once" },
-    { cls: "delta", label: "session delta" },
-    { cls: "writing", label: "writing now" },
-  ],
-  leds: [
-    { k: "cold start", ghost: "888", v: "<1s" },
-    { k: "resume · same host", ghost: "88888", v: "<100ms" },
-    { k: "resume · any host", ghost: "8888", v: "1–2s" },
-    { k: "1000 × 4 GiB", ghost: "888888", v: "≈100GiB" },
-  ],
-  footnote:
-    "† Measured on the reference deployment: GKE, C3 nodes, Firecracker with lazy memory paging. Measure your own fleet before you promise them to anyone.",
 };
 
 export const session = {
-  badge: "Sec. 3",
+  badge: "Sec. 1",
   label: "A session",
-  meta: "Fig. 3.1 · session view",
+  meta: "Fig. 1.1 · session view",
   title: "Run any harness in a rich web interface.",
-  body: "Claude Code, Codex, and any harness you register all run the same way: in a microVM, with the dashboard wrapped around it. The transcript streams on the left. On the right, a pane opens onto the same guest the agent is working in: a terminal, the browser it drives, VS Code, the files it changed. Open one in the middle of a run and the agent keeps going.",
+  body: "A session is Claude Code, Codex, or your own harness, working the way it does on your laptop, but in a microVM your team can reach. The transcript streams on the left. On the right, open the same machine the agent is using: a terminal, the browser it drives, VS Code, the files it changed. People start sessions from the dashboard or Slack; an automation starts the same kind of session from a trigger.",
   screenshotAlt:
     "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane holds a shell open on the guest.",
-  caption: "Fig. 3.1 · session se_9f3ea71c · 212 events",
+  caption: "Fig. 1.1 · session se_9f3ea71c · 212 events",
   live: "● live",
   panes: [
     {
@@ -146,6 +79,95 @@ export const session = {
   ],
 };
 
+export const automations = {
+  badge: "Sec. 2",
+  label: "Automations",
+  meta: "Fig. 2.1",
+  title: "Hand off the work that repeats.",
+  lede: "A schedule, a pull request, a Slack mention, or a webhook can start a session, with no one typing a prompt. When one prompt is not enough, chain steps into a workflow: prompt the agent, run the tests, branch on the result, and post to Slack or GitHub.",
+  cases: {
+    label: "In production at Cortex",
+    note: "Four automations that run in our engineering org today.",
+    items: [
+      {
+        trigger: "schedule",
+        title: "Dependency upgrades and CVE fixes",
+        body: "Scans for outdated dependencies and open CVEs, opens each upgrade, runs the tests, and fixes what breaks. One pull request per change, reviewed by the pull request bot.",
+      },
+      {
+        trigger: "schedule · Datadog",
+        title: "Memory hot spots",
+        body: "Queries Datadog profiles for the largest allocation frames, opens a task on the service that owns the code, and rewrites the hot path. The pull request carries the before and after numbers.",
+      },
+      {
+        trigger: "Datadog webhook",
+        title: "Bug triage",
+        body: "A new production error opens a run. The agent reproduces and diagnoses it, then pushes a fix or files an issue with the root cause. Duplicate errors join the run already in flight.",
+      },
+      {
+        trigger: "Linear · Slack",
+        title: "A project with an owner",
+        body: "One agent watches a Linear project and its Slack channel. It picks up issues, opens pull requests, answers questions in the thread, and posts a daily status.",
+      },
+    ],
+  },
+  board: {
+    fig: "Fig. 2.1 · runs board",
+    title: "Every run is a session you can open.",
+    body: "Open a run to see each step, its inputs and outputs, and the session that did the work. Read the transcript, reply to the agent, or take over in its shell. Runs survive a server restart and can wait hours for a reply without holding a VM.",
+    itemsLabel: "Ships in the box",
+    items: [
+      {
+        title: "Slack threads",
+        body: "Mention the bot in Slack and a session opens for that thread, as the person who asked, with their credentials. Replies join the same run.",
+      },
+      {
+        title: "Pull request review",
+        body: "A finder and a verifier review each pull request on the repositories you list, and post the confirmed findings as one GitHub review.",
+      },
+    ],
+    footRight: "durable · survives restart",
+  },
+};
+
+export const how = {
+  badge: "Sec. 3",
+  label: "How it works",
+  meta: "Fig. 3.1 · chunk store",
+  title: "Start in a second.",
+  titleAccent: "Pick up anywhere.",
+  steps: [
+    {
+      s: "01",
+      title: "Bring your image",
+      body: "Push any Linux image with `/bin/sh` and enable it once. engrams boots it, runs your warm-up command, and saves the result, so installs and caches are done before the first session.",
+    },
+    {
+      s: "02",
+      title: "Start warm",
+      body: "A prompt or a trigger starts a session from that saved state in under a second, with dependencies installed and caches already warm.",
+    },
+    {
+      s: "03",
+      title: "Sleep, wake, fork",
+      body: "An idle session is saved to storage and its VM is released. The next prompt wakes it on any host in one to two seconds. Fork a session to try two approaches from the same point.",
+    },
+  ],
+  legend: [
+    { cls: "base", label: "base image · stored once" },
+    { cls: "delta", label: "session delta" },
+    { cls: "writing", label: "writing now" },
+  ],
+  leds: [
+    { k: "cold start", v: "<1s" },
+    { k: "resume · same host", v: "<100ms" },
+    { k: "resume · any host", v: "1–2s" },
+    { k: "1000 × 4 GiB", v: "≈100GiB" },
+  ],
+  footnote:
+    "† Measured on the reference deployment: GKE, C3 nodes, Firecracker with lazy memory paging. Measure your own fleet before you promise them to anyone.",
+};
+
 export const extensible = {
   badge: "Sec. 4",
   label: "Extensible",
@@ -163,13 +185,13 @@ export const extensible = {
       kicker: "Connectors",
       title: "Connect the tools your work needs.",
       body: "Define a service’s hosts, credential headers, and allowed operations. The proxy enforces those rules and inserts the key outside the VM. Profiles choose which connections each session can use.",
-      foot: "23 built in · unlimited custom",
+      foot: "24 built in · unlimited custom",
       href: "concepts/egress-and-brokering/",
     },
   ],
 };
 
-export const belt = { label: "23 connectors built in · plus yours" };
+export const belt = { label: "24 connectors built in · plus yours" };
 
 export const start = {
   eyebrow: "Start with one task",
