@@ -19,25 +19,25 @@ export const modules = {
   label: "Work on your terms",
   cards: [
     {
-      kicker: "Human control",
+      kicker: "Real environments",
       num: "01",
+      title: "Run your whole stack.",
+      body: "Each agent gets its own microVM, so it can clone the repo, install dependencies, run the build, and start a dev server.",
+      foot: "Firecracker · full workspace",
+    },
+    {
+      kicker: "Human control",
+      num: "02",
       title: "Stay involved.",
       body: "Delegate a task, inspect its changes, and send a follow-up. The dashboard and Slack keep you in the conversation while agents work in your cloud.",
       foot: "Inspect · reply · steer",
-    },
-    {
-      kicker: "Agent choice",
-      num: "02",
-      title: "Use your agents.",
-      body: "Run Claude Code, Codex, or a custom harness with the same session controls. Upgrade the agent without rebuilding your development image.",
-      foot: "Claude Code · Codex · BYO",
     },
     {
       kicker: "Controlled access",
       num: "03",
       title: "Keep keys out.",
       body: "Give an agent the API operations it needs. For brokered integrations, the proxy inserts the credential outside the VM and blocks requests the policy does not allow.",
-      foot: "Brokered credentials · egress policy",
+      foot: "Brokered keys · egress policy",
     },
     {
       kicker: "Work that lasts",
