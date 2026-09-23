@@ -91,7 +91,7 @@ spec:
                   name: {{ .Values.orchestrator.kekSecret.existingSecret | default .Values.database.existingSecret }}
                   key: {{ .Values.orchestrator.kekSecret.key }}
             {{- if .Values.orchestrator.telemetry.existingSecret }}
-            # Session-telemetry OTLP sinks (docs/telemetry.md). The whole JSON
+            # Session-telemetry OTLP sinks (site guide: guides/telemetry.md). The whole JSON
             # rides a Secret ref because sink entries carry auth headers
             # (Langfuse Basic auth) — never ConfigMap material. Unset = the
             # exporter consumers are never registered.

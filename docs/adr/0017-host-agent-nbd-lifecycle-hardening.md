@@ -376,7 +376,7 @@ without code changes to the scheduler.
   dev-vm after Phase B.
 - `recovery_is_noop_for_unbound_devices` passes.
 - `recovery_clears_kernel_busy_device` skips on dev-vm because
-  the test user (`nikhil_unni_cortex_io`) isn't in the `disk`
+  the test user isn't in the `disk`
   group; the prod host-agent user is.
 - `just check` (full workspace fmt + clippy + nextest) passes
   locally after Phase C.

@@ -13,7 +13,7 @@ green; new automated interrupt coverage — harness-proto round-trip/kind tests,
 the coord `run_interrupted` `from_harness` mapping test, and host-agent hub
 tests asserting `hub.interrupt()` delivers `HarnessCommand::Interrupt` (these
 run in the **standard** `nextest --workspace` CI job, no FC/root). All three
-surfaces visually verified against the real app (screenshots below).
+surfaces visually verified against the real app.
 
 The one piece outside hermetic testing — the actual `SIGINT`-the-`claude`-child
 + clean `--resume` — is `cfg(target_os="linux")` and claude-runtime specific;
@@ -298,31 +298,6 @@ lands as one PR.
 2. **Conversation a–e + g + tool/process animation fix** — UI-only, existing events.
 3. **Interrupt** — proto + harness + host transport + coord endpoint/event + UI;
    verified against the baked `claude` on the dev-vm.
-
-## Screenshots
-
-Captured against the real Vite app at desktop (1280) with representative
-mocked API data (route-intercepted fixtures, the same approach as 0029).
-
-### Settings — aligned to the nav spine
-The big italic `surface-title` + `surface-sub` header on the `book-wide`
-measure; content left edge lines up with the spine and the other surfaces.
-![Settings — aligned](assets/0030/settings-desktop.png)
-
-### Session transcript — the full redesign
-Right-aligned `§ you` turn; assistant prose with inline code; `[ … ]` tool
-brackets; the `● $ cargo nextest … · exit 0 · 18s ▸` process line; Markdown
-(square bullets, **bold**, a verdigris-ruled fenced code block); the PR card;
-the `↳ read 1 · edited 1 · ran 1` receipt; and the `⌑ snapshotted · 1.2 GiB`
-durability marker.
-![Transcript — full](assets/0030/transcript-desktop.png)
-
-### Operator interrupt — context verb + ✕ stop
-An in-flight run: the `◐ $ cargo nextest run --workspace · running…` process
-line, and the harness-waiting line showing the live context verb
-(`running cargo nextest…`) beside the looping engram mark with the `✕ stop`
-control.
-![In-flight — stop control](assets/0030/interrupt-stop-control.png)
 
 ## Consequences
 

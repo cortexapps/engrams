@@ -1310,45 +1310,6 @@ Suggested order of attack:
    that fix #2's retry actually works. Both cheap to add
    but not load-bearing.
 
-Useful Cloud Logging queries while testing:
-
-```sh
-# host-agent's warm-pool refill failure rate
-gcloud logging read 'resource.type="gce_instance" AND \
-    jsonPayload._SYSTEMD_UNIT="engram-host-agent.service" AND \
-    "warm_pool refill failed"' \
-    --project=cortex-internal-tooling --freshness=1h --order=desc
-
-# idle-evict snapshot creation events (post-fix should be near-zero)
-gcloud logging read 'resource.type="gce_instance" AND \
-    jsonPayload._SYSTEMD_UNIT="engram-host-agent.service" AND \
-    "snapshot dir" AND ("create" OR "remove")' \
-    --project=cortex-internal-tooling --freshness=1h
-
-# coord-side eviction failure rate
-gcloud logging read 'resource.labels.container_name="coordinator" AND \
-    "host-pushed idle eviction failed"' \
-    --project=cortex-internal-tooling --freshness=1h
-```
-
-Production state snapshot at the time of writing (2026-05-20 02:35 UTC):
-
-- **FC hosts**: 2 instances (`engrams-fc-pgs9`, `engrams-fc-tf4j`), both on the post-M1.16 + post-Ops-Agent image (commit `3b6aec3`), MIG converged (`isStable=True`).
-- **Coord image**: `75babf7` (the M1.16 SHA — netns work).
-- **Demo image enabled**: `ghcr.io/cortexapps/engrams-internal/demo:warm-75babf7`.
-- **Claude harness registered**: `ghcr.io/cortexapps/engrams/harness-claude:b9dd2d1` (older, pre-M1.12 wire format — works due to `#[serde(default)]` compat).
-- **Stale `templates` rows in PG**: at least 5 reference snapshot IDs `9c615e34`, `36277885`, `99ea12c7`, `1e133a3d`, `cf798a54` whose blobs are not in BlobStorage. Verify via `bash ~/.claude/skills/engrams-prod-ops/scripts/psql.sh "select template_ref, image_repo, image_tag, snapshot_id from templates where active=true"`.
-- **Sessions investigated** (both confirm #3: cold-create masquerading as warm):
-  - `b511cf9b-7356-44fc-b6b4-be859bf864d4` — 2026-05-19 19:40 UTC, 29.5 s activation, triggered the disk-fill on the (now-gone) `engrams-fc-xngk` host via #1.
-  - `bb3dd147-83c7-4f8b-a2cc-84034ae2a8e7` — 2026-05-20 02:40 UTC, 26.4 s activation, on the new (post-Ops-Agent) hosts. Confirmed #6 (shell tab times out from coord pod) and #7 (NBD version conflict surfaces despite fix #2 retry).
-
-Prod-ops skill scripts to lean on (all under `~/.claude/skills/engrams-prod-ops/scripts/`):
-`psql.sh`, `curl.sh`, `metrics-coord.sh`, `metrics-hosts.sh`,
-`logs-coord.sh`, `logs-host.sh`, `logs-search.sh`. See the skill's
-`SKILL.md` for usage notes — secret-hygiene rules apply
-(never `TOKEN=$(...)` into the shell; always inline at point of
-use).
-
 ## Related
 
 - ADR 0007: chunked immutable storage — provides the chunked-memory
