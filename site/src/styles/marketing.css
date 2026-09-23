@@ -1082,6 +1082,37 @@ code {
   position: relative;
   padding-top: 80px;
 }
+/* The Cortex strip: kept quieter than the Start band above it (ghost button,
+   not lime) so running engrams stays the page's main action. */
+.cortex-cta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+  padding: 32px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.25);
+}
+.cortex-cta .pitch {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+.cortex-cta .pitch svg {
+  display: block;
+}
+.cortex-cta p {
+  font-family: var(--font-display);
+  font-stretch: 108%;
+  font-weight: 600;
+  font-size: 20px;
+  opacity: 0.85;
+}
+.cortex-cta .btn {
+  height: 44px;
+  font-size: 13px;
+}
 .site-footer .row {
   padding: 20px 0 0;
   border-top: 1px solid rgba(255, 255, 255, 0.25);

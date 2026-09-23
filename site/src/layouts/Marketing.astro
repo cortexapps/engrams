@@ -64,6 +64,13 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
       {!landing && <div class="layer carbon bg-carbon-fade"></div>}
       {!landing && <div class="layer scan"></div>}
       <div class="wrap">
+        <div class="cortex-cta">
+          <div class="pitch">
+            <CortexWordmark height={22} />
+            <p>Mission control for your AI software factory</p>
+          </div>
+          <a class="btn ghost" href="https://www.cortex.io">Visit cortex.io <span>→</span></a>
+        </div>
         <div class="row">
           <span>engrams · agpl-3.0</span>
           <nav aria-label="Footer">
