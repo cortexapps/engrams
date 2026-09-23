@@ -1049,10 +1049,33 @@ html {
   text-transform: uppercase;
   white-space: nowrap;
 }
+/* Logos fade out as they slide under the tag and off the right edge, not a
+   hard cut mid-word. Both fades blend into the belt's own cover colour. */
+.belt .tag::after,
+.belt::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 96px;
+  pointer-events: none;
+}
+.belt .tag::after {
+  left: 100%;
+  background: linear-gradient(90deg, var(--bottle-green), transparent);
+}
+.belt::after {
+  right: 0;
+  z-index: 1;
+  background: linear-gradient(90deg, transparent, var(--bottle-green));
+}
 .belt .track {
   display: flex;
   width: max-content;
   animation: marquee 40s linear infinite;
+}
+.belt:hover .track {
+  animation-play-state: paused;
 }
 .belt .item {
   display: flex;

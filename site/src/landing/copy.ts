@@ -185,13 +185,13 @@ export const extensible = {
       kicker: "Connectors",
       title: "Connect the tools your work needs.",
       body: "Define a service’s hosts, credential headers, and allowed operations. The proxy enforces those rules and inserts the key outside the VM. Profiles choose which connections each session can use.",
-      foot: "23 built in · unlimited custom",
+      foot: "24 built in · unlimited custom",
       href: "concepts/egress-and-brokering/",
     },
   ],
 };
 
-export const belt = { label: "23 connectors built in · plus yours" };
+export const belt = { label: "24 connectors built in · plus yours" };
 
 export const start = {
   eyebrow: "Start with one task",
