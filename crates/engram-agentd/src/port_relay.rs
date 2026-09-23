@@ -30,7 +30,7 @@
 use std::time::Duration;
 
 use engram_harness_proto::{read_msg, write_msg, RelayAck, RelayConnect, PROXY_PORT_VSOCK_PORT};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Loopback dial budget. A dev server the agent just launched may open a beat
@@ -226,7 +226,7 @@ where
 {
     let hdr: RelayConnect = read_msg(&mut stream).await?;
     match dial_loopback(hdr.target_port).await {
-        Ok(mut loopback) => {
+        Ok(loopback) => {
             // Loopback still runs Nagle × delayed-ACK; disable it so small
             // interactive writes (WS control frames, chunked boundaries) don't
             // eat ~40 ms stalls.
@@ -239,9 +239,7 @@ where
                 },
             )
             .await?;
-            tokio::io::copy_bidirectional_with_sizes(&mut stream, &mut loopback, COPY_BUF, COPY_BUF)
-                .await
-                .map(|_| ())
+            splice(stream, loopback).await
         }
         Err(e) => {
             // Best-effort NAK so the host returns a clean error rather than hang.
@@ -254,6 +252,65 @@ where
             )
             .await;
             Err(e)
+        }
+    }
+}
+
+/// Splice the host stream and the app's loopback connection until the app
+/// closes.
+///
+/// **An app EOF closes the whole connection, not only one direction.** The
+/// Firecracker vsock does not forward a half-close from the guest to the host:
+/// a guest `shutdown(WR)` becomes a `VSOCK_OP_SHUTDOWN` with only the SEND flag,
+/// which the device records and does not pass on to the host socket. The host
+/// sees EOF only when the guest closes both directions. So when the app is done
+/// sending, we flush and return, which drops the vsock stream. A
+/// `copy_bidirectional` half-closes and then waits for the host, and the host
+/// waits for the EOF that never comes. That is how a close-delimited HTTP
+/// response (HTTP/1.0 with no `Content-Length`, e.g. a minimal Python
+/// `BaseHTTPRequestHandler`) hung in the browser.
+///
+/// The cost: an app that half-closes and continues to read loses the rest of
+/// the host's bytes. HTTP/1.x, WebSocket and gRPC servers do not do this.
+///
+/// **A host EOF keeps the reply path open.** We half-close the app's write
+/// side and continue to copy the app's reply until the app closes, as before.
+///
+/// Known limit: after the close, Firecracker gives the host
+/// `CONN_SHUTDOWN_TIMEOUT_MS` (2 s) to read up to 64 KiB it still buffers,
+/// then resets the connection. A very slow reader can lose the end of a
+/// close-delimited response. Framed responses do not close, so they are not
+/// affected.
+async fn splice<S>(stream: S, loopback: TcpStream) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let (host_rd, mut host_wr) = tokio::io::split(stream);
+    let (app_rd, mut app_wr) = loopback.into_split();
+    let mut host_rd = tokio::io::BufReader::with_capacity(COPY_BUF, host_rd);
+    let mut app_rd = tokio::io::BufReader::with_capacity(COPY_BUF, app_rd);
+
+    let to_host = async {
+        tokio::io::copy_buf(&mut app_rd, &mut host_wr).await?;
+        host_wr.flush().await
+    };
+    let to_app = async {
+        let copied = tokio::io::copy_buf(&mut host_rd, &mut app_wr).await;
+        let _ = app_wr.shutdown().await;
+        copied
+    };
+    tokio::pin!(to_host);
+
+    tokio::select! {
+        // The app is done (or its side failed): return, which closes the
+        // vsock stream in both directions.
+        done = &mut to_host => done,
+        // The host is done or the app stopped reading. Keep the app → host
+        // direction until the app closes, so its reply (e.g. a 413 sent
+        // before it stops reading an upload) still reaches the host.
+        sent = to_app => {
+            let replied = to_host.await;
+            sent.map(|_| ()).and(replied)
         }
     }
 }
@@ -367,6 +424,136 @@ mod tests {
         assert!(!ack.ok, "ack should be a NAK for a refused port");
         assert!(ack.error.is_some());
         let _ = relay.await;
+    }
+
+    /// The guest end of a Firecracker vsock connection, for the EOF tests: a
+    /// `shutdown()` does NOT reach the host, because the device records a
+    /// guest SEND-only shutdown and does not pass it on
+    /// (`third_party/firecracker/.../vsock/csm/connection.rs`). The host sees
+    /// EOF only when this stream is dropped. An in-memory duplex alone would
+    /// pass the half-close on and hide the bug.
+    struct NoHalfClose(tokio::io::DuplexStream);
+
+    impl AsyncRead for NoHalfClose {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for NoHalfClose {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Open a relay to `target` over a [`NoHalfClose`] guest end; return the
+    /// host end after an OK ack, plus the relay task.
+    async fn relay_over_vsock_model(
+        target: u16,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (mut host, guest) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(serve_relay_connection(NoHalfClose(guest)));
+        write_msg(
+            &mut host,
+            &RelayConnect {
+                target_port: target,
+            },
+        )
+        .await
+        .unwrap();
+        let ack: RelayAck = read_msg(&mut host).await.unwrap();
+        assert!(ack.ok, "ack should be ok: {ack:?}");
+        (host, relay)
+    }
+
+    /// Regression: an app that ends its response by closing the connection
+    /// (HTTP/1.0, no `Content-Length`) must deliver EOF to the host while the
+    /// host is still open. The host never half-closes here, as the orchestrator
+    /// does not while it waits for the body. Before the fix the relay
+    /// half-closed the vsock (lost in Firecracker) and waited for the host
+    /// forever, so the browser spun.
+    #[tokio::test]
+    async fn relay_closes_vsock_when_app_closes_while_host_stays_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let _ = s.read(&mut buf).await.unwrap();
+            s.write_all(b"HTTP/1.0 200 OK\r\n\r\nhello").await.unwrap();
+            // Drop: a full close, as Python's http.server does after an
+            // HTTP/1.0 response.
+        });
+
+        let (mut host, relay) = relay_over_vsock_model(target).await;
+        host.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), host.read_to_end(&mut got))
+            .await
+            .expect("app close never reached the host: the relay waited on an open host")
+            .unwrap();
+        assert_eq!(&got[..], b"HTTP/1.0 200 OK\r\n\r\nhello");
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("relay task must end once the app closed")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A host EOF still keeps the reply path open: the app sees EOF on its
+    /// read side, then its reply reaches the host before the connection ends.
+    #[tokio::test]
+    async fn relay_keeps_reply_path_open_after_host_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            s.read_to_end(&mut req).await.unwrap();
+            let mut reply = b"reply:".to_vec();
+            reply.extend_from_slice(&req);
+            s.write_all(&reply).await.unwrap();
+        });
+
+        let (mut host, relay) = relay_over_vsock_model(target).await;
+        host.write_all(b"req").await.unwrap();
+        host.shutdown().await.unwrap();
+
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), host.read_to_end(&mut got))
+            .await
+            .expect("reply never reached the host after the host EOF")
+            .unwrap();
+        assert_eq!(&got[..], b"reply:req");
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("relay task must end once the app closed")
+            .unwrap()
+            .unwrap();
     }
 
     /// Test double for [`engram_transport::Listener`], driven by a queue of
