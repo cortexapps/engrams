@@ -40,11 +40,11 @@ export const modules = {
       foot: "Brokered keys · egress policy",
     },
     {
-      kicker: "Work that lasts",
+      kicker: "Optimized for cost",
       num: "04",
-      title: "Pick it back up.",
-      body: "Step away without losing the environment. An idle VM is snapshotted and removed; your next prompt restores it. Stored snapshots remain, without a running VM per paused session.",
-      foot: "Snapshot · resume · continue",
+      title: "Pay for work, not idle VMs.",
+      body: "When a session goes idle, engrams snapshots it to object storage and frees the host for other work. The next prompt restores it on any host in seconds. Give every service its own agent without a VM running for each.",
+      foot: "Snapshot · release · resume",
     },
   ],
 };
