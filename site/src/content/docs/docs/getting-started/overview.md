@@ -5,9 +5,10 @@ sidebar:
   order: 1
 ---
 
-engrams runs your coding agents in your cloud and gives people one place to direct their
-work. Start a task, inspect its changes, and continue the conversation from the dashboard or
-Slack. Turn repeat work into an automation that starts on a schedule or an event.
+engrams is an open-source system that runs AI coding agents in isolated microVMs on your own
+infrastructure. It gives people one place to direct their work: start a task, inspect its
+changes, and continue the conversation from the dashboard or Slack. Turn repeat work into an
+automation that starts on a schedule or an event.
 
 Each agent runs in its own Firecracker microVM. engrams supplies the environment, controls
 access to connected tools, and snapshots idle sessions so work can continue later. Claude

@@ -4,10 +4,10 @@
 // Each section connects an outcome to the product behavior that makes it possible.
 
 export const hero = {
-  eyebrow: "Your agents, working in your cloud",
+  eyebrow: "Coding agents, running in your cloud",
   title: "Automate your",
   titleAccent: "SDLC.",
-  lede: "Turn repeat work into an automation. engrams runs Claude Code, Codex, or your own agent when a schedule fires, a pull request changes, or someone asks in Slack. Inspect the changes and continue the conversation, on infrastructure you control.",
+  lede: "engrams runs Claude Code, Codex, or your own agent in an isolated microVM on your infrastructure. Start one from a prompt, a schedule, a pull request, or a Slack thread. Walk away mid-task, and pick it up days later with its files and history intact.",
   primary: { label: "Explore automations", href: "platform/automations/" },
   secondary: { label: "Run it locally", href: "getting-started/local-quickstart/" },
   chips: ["AGPL-3.0", "Firecracker · KVM", "GKE · EKS", "Claude Code · Codex"],
