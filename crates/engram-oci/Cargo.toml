@@ -39,7 +39,7 @@ flate2.workspace = true
 # alias, because oci-client was on 0.13 while the workspace was on 0.12
 # and the two majors could not share a feature set. The workspace moved
 # to 0.13, so the alias is gone and there is one reqwest in the tree.
-oci-client = { version = "0.17", default-features = false }
+oci-client = { version = "0.18", default-features = false }
 parking_lot.workspace = true
 reqwest.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
