@@ -254,10 +254,10 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 # ahead of the core it targets (0.33 -> core 0.32). The 0.32 set uses
 # tonic 0.14, matching our gRPC stack since #1024 — which is also what
 # retires the second tonic the 0.28 set was keeping in the graph.
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
-tracing-opentelemetry = "0.33"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.34"
 
 # cli
 clap = { version = "4", features = ["derive", "env"] }
