@@ -8412,7 +8412,6 @@ dependencies = [
  "serde",
  "serde_core",
  "serde_json",
- "signature",
  "simd-adler32",
  "slab",
  "smallvec",
