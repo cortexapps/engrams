@@ -71,6 +71,8 @@ interface Harness {
     ownerUserId: string | undefined;
   }>;
   actions: Array<{ actionId: string; params: Record<string, unknown> }>;
+  /** Workstream closes the finalize hook requested (ADR 0120). */
+  closed: Array<{ instanceId: string; reason?: string }>;
   /** Slack user ids the identity gate was asked about. */
   resolved: string[];
   prompts: Array<{ sessionId: string; text: string }>;
@@ -105,6 +107,7 @@ function harness(options: {
   const finalized: Harness["finalized"] = [];
   const resolved: string[] = [];
   const actions: Array<{ actionId: string; params: Record<string, unknown> }> = [];
+  const closed: Array<{ instanceId: string; reason?: string }> = [];
   const linked = options.linkedUsers ?? { U1: "user-1", U2: "user-2" };
   const recvQueue = [...(options.recv ?? [])];
   const runSessions: Array<{ sessionId: string; keep: boolean }> = [];
@@ -152,6 +155,7 @@ function harness(options: {
     automationId: RUN.automationId,
     automationName: "Slack thread brain",
     version: 1,
+    instanceId: "ai_thread1",
     trigger: {
       kind: "integration",
       receivedAt: "2026-08-22T10:00:00Z",
@@ -204,6 +208,12 @@ function harness(options: {
     sessions: sessionOps,
     clock: { nowMs: () => (clock += 1000) },
     code: makeCodeBlockRuntime(),
+    instances: {
+      async closeInstance(input) {
+        closed.push(input);
+        return true;
+      },
+    },
     integrationActions: {
       async execute(input) {
         actions.push({ actionId: input.actionId, params: input.params });
@@ -212,7 +222,7 @@ function harness(options: {
     },
   };
 
-  return { deps, runner, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized, resolved, actions };
+  return { deps, runner, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized, resolved, actions, closed };
 }
 
 afterEach(() => {
@@ -259,6 +269,8 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.names.filter((n) => /^step:thread\[\d+\]\.__until__:0$/.test(n)).length).toBe(2);
     expect(h.names).toContain("step:thread[1].next:0:wait");
     expect(h.names).not.toContain("step:thread[2].next:0");
+    // The run ending ended the thread's workstream (ADR 0120).
+    expect(h.closed).toEqual([{ instanceId: "ai_thread1", reason: "thread run ended: completed" }]);
     // The recap hook posted the ✅ completion through the same policy as legacy.
     expect(h.policyCalls).toContain("complete:");
     expect(h.finalized).toEqual([{ status: "completed" }]);

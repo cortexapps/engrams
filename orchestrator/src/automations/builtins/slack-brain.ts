@@ -1,4 +1,5 @@
-/** The Slack thread-brain built-in automation (ADR 0119 D7, phase 4.6).
+/** The Slack thread-brain built-in automation (ADR 0119 D7, phase 4.6; a
+ * workstream per thread since 2026-09-29, ADR 0120).
  *
  * ADR 0060's per-thread DBOS workflow (`slack-thread.ts`), expressed as data
  * on the engine. It is the conversation-shaped built-in: one run per Slack
@@ -46,7 +47,7 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 2;
+export const SLACK_BRAIN_DEFINITION_VERSION = 3;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
@@ -67,15 +68,11 @@ export default ({ event, inputs, trigger }) => {
   const key = trigger.event ?? "";
   const channel = String(ev.channel ?? "");
   if (!channel) return null;
-  // Bots (including ourselves) never open or continue a brain thread.
+  // Bots (including ourselves) never open a brain thread.
   if (ev.bot_id || ev.subtype === "bot_message") return null;
-  if (key === "message") {
-    // Only thread replies: a top-level channel message is not ours.
-    if (!ev.thread_ts || ev.thread_ts === ev.ts) return null;
-    if (ev.subtype) return null;
-  } else if (key !== "app_mention") {
-    return null;
-  }
+  // Only a mention opens a thread. A reply reaches the thread's run through
+  // the reply entrypoint (joined into this run's mailbox), never here.
+  if (key !== "app_mention") return null;
   const channels = inputs.channels ?? {};
   const profile = channels[channel] ?? inputs.default_profile ?? "";
   if (!profile) return null;
@@ -328,17 +325,33 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     kind: "integration",
     provider: "slack",
     connectionId: DEFAULT_CONNECTION_PLACEHOLDER,
-    eventKeys: ["app_mention", "message"],
-    // A thread reply continues the thread the bot was mentioned in — it is
-    // delivered into that run's mailbox — and never opens a thread of its
-    // own (legacy parity: only an app_mention engaged the brain). Admission
-    // enforces it; the facts block's message checks are about shape only.
-    continueOnly: ["message"],
+    // A mention opens a thread. Replies come in through the `reply`
+    // entrypoint below.
+    eventKeys: ["app_mention"],
     // The channels map's keys ARE the scope: a channel not in the map never
     // matches, so nothing reaches the run for channels an org never flagged.
     scope: { fromInput: "channels" },
   },
   blocks: [...admit, session, relay, firstTurn, conversation],
+  // ADR 0120: a Slack thread is a WORKSTREAM. The mention opens it; a reply
+  // routes to it by the key template and JOINS the thread's live run (the
+  // entrypoint has no body of its own: `continueOnly` delivers the reply
+  // into the run's mailbox, and `require` drops a reply in a thread no
+  // workstream owns — audited — instead of opening one).
+  entrypoints: [
+    {
+      id: "reply",
+      trigger: {
+        kind: "integration",
+        provider: "slack",
+        connectionId: DEFAULT_CONNECTION_PLACEHOLDER,
+        eventKeys: ["message"],
+        continueOnly: ["message"],
+        scope: { fromInput: "channels" },
+      },
+      blocks: [],
+    },
+  ],
   inputsSchema: [
     {
       key: "channels",
@@ -380,11 +393,19 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     },
   ],
   settings: {
-    concurrency: {
-      // One run per thread. Rendered at admission from the raw event: a
-      // thread reply carries thread_ts; the opening mention only has ts.
+    instance: {
+      // One workstream per thread: team, channel, thread root. A reply
+      // carries thread_ts; the opening mention only has ts. (`coalesce`, not
+      // `default:` — default's fallback argument is strict.)
       keyTemplate:
-        "${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event.thread_ts | default: event.raw.event.ts }}",
+        '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}',
+      entrypoints: { reply: { admit: "require" } },
+    },
+    concurrency: {
+      // One run per thread, instance-scoped: the same template as the
+      // workstream key, so a reply's claim lands on the mention's run.
+      keyTemplate:
+        '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}',
       policy: "join",
     },
     runDeadlineSeconds: RUN_DEADLINE_S,
@@ -396,6 +417,18 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
           id: "recap",
           type: RELAY_CLOSE_TYPE,
           config: { status: "${{ run.status }}" },
+        },
+      },
+      // The thread's run ending ends the workstream: the thread went quiet
+      // (completed), or nothing will answer in it any more. A later mention
+      // in the same thread opens a fresh workstream (and a fresh run); the
+      // kept session is the one thing that outlives it (D8).
+      {
+        when: ["completed", "deadline", "failed", "halted", "superseded", "filtered"],
+        block: {
+          id: "close",
+          type: "instance_close",
+          config: { reason: "thread run ended: ${{ run.status }}" },
         },
       },
     ],

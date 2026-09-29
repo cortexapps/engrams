@@ -1038,6 +1038,38 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       return { automation: toProtoAutomation(updated) };
     },
 
+    async setMapInputEntry(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      const inputKey = requiredText(req.inputKey, "input_key");
+      const entryKey = requiredText(req.entryKey, "entry_key");
+      const spec = row.version.inputsSchema.find((f) => f.key === inputKey);
+      if (!spec) {
+        throw new BlockValidationError([
+          blockError("", `inputs.${inputKey}`, "unknown_input", `input "${inputKey}" is not declared`),
+        ]);
+      }
+      if (spec.type !== "map") {
+        throw new ConnectError(`input "${inputKey}" is not a map`, Code.InvalidArgument);
+      }
+      let value: Record<string, unknown> | string | null = null;
+      if (req.valueJson !== undefined) {
+        const parsed: unknown = JSON.parse(req.valueJson);
+        if (typeof parsed !== "string" && (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))) {
+          throw new ConnectError("value_json must be an object or a string", Code.InvalidArgument);
+        }
+        value = parsed as Record<string, unknown> | string;
+        // Validate the entry the way the whole map is validated on SetInputs:
+        // a one-entry map against the map's own spec (its siblings are not
+        // part of this write, so their required-ness does not apply). The
+        // write touches only this entry, so a stale snapshot never leaks in.
+        assertInputValues([spec], { [inputKey]: { [entryKey]: value } });
+      }
+      const updated = await store.setMapInputEntry(row.id, inputKey, entryKey, value, req.enable);
+      if (!updated) throw new ConnectError("automation not found", Code.NotFound);
+      return { automation: toProtoAutomation(updated) };
+    },
+
     async setBlockOverrides(req, ctx) {
       await requireAdmin(ctx, getSession);
       const row = await requireAutomation(req.automationId);

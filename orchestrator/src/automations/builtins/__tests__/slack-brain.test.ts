@@ -27,11 +27,22 @@ describe("Slack thread brain built-in — definition", () => {
       "thread",
     ]);
     expect(parsed.settings.concurrency?.policy).toBe("join");
-    // A thread reply continues a mention-opened thread or is dropped at
-    // admission; it never opens a run of its own.
-    expect(parsed.trigger).toMatchObject({ continueOnly: ["message"] });
     expect(parsed.settings.endSessionsOnFinish).toBe(false);
-    expect(parsed.settings.onFinalize?.[0]?.block.type).toBe("relay_close");
+    expect(parsed.settings.onFinalize?.map((h) => h.block.type)).toEqual(["relay_close", "instance_close"]);
+  });
+
+  test("is a workstream per thread (ADR 0120): a mention opens it, a reply joins it or drops", () => {
+    const parsed = validateDefinition(SLACK_BRAIN_DEFINITION);
+    // Only a mention opens; the main trigger no longer subscribes to messages.
+    expect(parsed.trigger).toMatchObject({ eventKeys: ["app_mention"] });
+    expect(parsed.settings.instance?.keyTemplate).toBe(parsed.settings.concurrency?.keyTemplate);
+    // A reply continues a mention-opened thread (continueOnly + join deliver
+    // it into the thread's run) or is dropped at admission (`require`): it
+    // never opens a workstream or a run of its own.
+    const reply = parsed.entrypoints?.find((ep) => ep.id === "reply");
+    expect(reply?.trigger).toMatchObject({ kind: "integration", eventKeys: ["message"], continueOnly: ["message"] });
+    expect(reply?.blocks).toEqual([]);
+    expect(parsed.settings.instance?.entrypoints).toEqual({ reply: { admit: "require" } });
   });
 
   test("trigger scope: only a channel in the inputs' map matches at dispatch", () => {
@@ -46,7 +57,12 @@ describe("Slack thread brain built-in — definition", () => {
     });
     const flagged = { channels: { C1: "prof-a" } };
     expect(matchesIntegrationTrigger(bound, event("C1"), (k) => scopeValuesFromInput(flagged, k))).toBe(true);
-    expect(matchesIntegrationTrigger(bound, event("C1", "message"), (k) => scopeValuesFromInput(flagged, k))).toBe(true);
+    // Messages match the reply entrypoint's trigger, not the main one.
+    expect(matchesIntegrationTrigger(bound, event("C1", "message"), (k) => scopeValuesFromInput(flagged, k))).toBe(false);
+    const reply = SLACK_BRAIN_DEFINITION.entrypoints!.find((ep) => ep.id === "reply")!.trigger;
+    if (reply.kind !== "integration") throw new Error("integration trigger expected");
+    expect(matchesIntegrationTrigger({ ...reply, connectionId: "conn-slack" }, event("C1", "message"), (k) => scopeValuesFromInput(flagged, k))).toBe(true);
+    expect(matchesIntegrationTrigger({ ...reply, connectionId: "conn-slack" }, event("C2", "message"), (k) => scopeValuesFromInput(flagged, k))).toBe(false);
     expect(matchesIntegrationTrigger(bound, event("C2"), (k) => scopeValuesFromInput(flagged, k))).toBe(false);
     // The seeded default (empty map): nothing matches anywhere.
     expect(matchesIntegrationTrigger(bound, event("C1"), (k) => scopeValuesFromInput({ channels: {} }, k))).toBe(false);
@@ -104,19 +120,16 @@ describe("Slack thread brain — admission code", () => {
     expect(none.ok && none.value).toBeNull();
   });
 
-  test("a message event admits only as a thread reply; top-level and bot messages are rejected", async () => {
+  test("a message event never opens a thread (replies arrive through the reply entrypoint); bot mentions are rejected", async () => {
     const reply = {
       ...mention,
       event: { type: "message", channel: "C1", user: "U2", ts: "1.5", thread_ts: "1.1", text: "more" },
     };
-    const ok = await run(reply, "message", { channels: { C1: "p" } });
-    expect(ok.ok && (ok.value as { thread_ts: string }).thread_ts).toBe("1.1");
+    const out = await run(reply, "message", { channels: { C1: "p" } });
+    expect(out.ok && out.value).toBeNull();
 
-    const topLevel = { ...mention, event: { type: "message", channel: "C1", user: "U2", ts: "2.0", text: "x" } };
-    expect((await run(topLevel, "message", { channels: { C1: "p" } })).ok && null).toBeNull();
-
-    const bot = { ...reply, event: { ...reply.event, bot_id: "B1" } };
-    const botOut = await run(bot, "message", { channels: { C1: "p" } });
+    const bot = { ...mention, event: { ...mention.event, bot_id: "B1" } };
+    const botOut = await run(bot, "app_mention", { channels: { C1: "p" } });
     expect(botOut.ok && botOut.value).toBeNull();
 
     const edited = { ...reply, event: { ...reply.event, subtype: "message_changed" } };

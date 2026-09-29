@@ -1,3 +1,4 @@
+import { PR_REVIEW_DEFINITION } from "../automations/builtins/pr-review.ts";
 import { beforeEach, describe, expect, test } from "bun:test";
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 
@@ -216,6 +217,15 @@ function fakeStore(seed?: {
       const a = automations.get(id);
       if (!a) return null;
       a.meta = { ...a.meta, inputs };
+      return row(a);
+    },
+    async setMapInputEntry(id, inputKey, entryKey, value, enable) {
+      const a = automations.get(id);
+      if (!a) return null;
+      const map = { ...((a.meta.inputs[inputKey] as Record<string, unknown> | undefined) ?? {}) };
+      if (value === null) delete map[entryKey];
+      else map[entryKey] = value;
+      a.meta = { ...a.meta, inputs: { ...a.meta.inputs, [inputKey]: map }, ...(enable ? { enabled: true } : {}) };
       return row(a);
     },
     async setBlockOverrides(id, overrides: BlockOverrides) {
@@ -602,6 +612,39 @@ describe("AutomationService v2", () => {
     expect(disabled.automation?.enabled).toBe(false);
     const fetched = await automations.getAutomation({ lookup: { case: "builtinKey", value: "pr_review" } });
     expect(fetched.automation?.id).toBe("builtin-1");
+  });
+
+  test("SetMapInputEntry sets one entry, validates it against the map's value shape, enables, and removes", async () => {
+    const deps = adminDeps();
+    // The PR-review built-in's real `repos` map spec (mode enum + autofix
+    // boolean) beside the fixture's `mention` string.
+    const stored = builtinStored();
+    const repos = PR_REVIEW_DEFINITION.inputsSchema.find((f) => f.key === "repos")!;
+    stored.versions.get(1)!.inputsSchema = [...stored.versions.get(1)!.inputsSchema, repos];
+    deps.fake.automations.set("builtin-1", stored);
+    const { automations } = clients(deps);
+    const set = await automations.setMapInputEntry({
+      automationId: "builtin-1",
+      inputKey: "repos",
+      entryKey: "acme/app",
+      valueJson: JSON.stringify({ mode: "auto", autofix: true }),
+      enable: true,
+    });
+    const inputs = JSON.parse(set.automation!.inputsJson) as { repos: Record<string, unknown> };
+    expect(inputs.repos["acme/app"]).toEqual({ mode: "auto", autofix: true });
+    expect(set.automation?.enabled).toBe(true);
+
+    await expectCode(
+      automations.setMapInputEntry({ automationId: "builtin-1", inputKey: "repos", entryKey: "acme/app", valueJson: JSON.stringify({ mode: "sometimes" }) }),
+      Code.InvalidArgument,
+    );
+    await expectCode(
+      automations.setMapInputEntry({ automationId: "builtin-1", inputKey: "mention", entryKey: "x", valueJson: "\"y\"" }),
+      Code.InvalidArgument,
+    );
+
+    const removed = await automations.setMapInputEntry({ automationId: "builtin-1", inputKey: "repos", entryKey: "acme/app" });
+    expect((JSON.parse(removed.automation!.inputsJson) as { repos: Record<string, unknown> }).repos["acme/app"]).toBeUndefined();
   });
 
   test("SetBlockOverrides enforces tunable fields and re-validates the merged config", async () => {

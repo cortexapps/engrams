@@ -910,6 +910,87 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
     expect(h.runs.get(`autorun:automation-1:main:i-${instance.id}:github:gh-review`)?.instanceId).toBe(instance.id);
   });
 
+  test("a conversation workstream: the mention opens it, a reply joins its run, a stray reply drops, a closed thread drops", async () => {
+    // The Slack threads shape: main = app_mention (opens), reply entrypoint =
+    // message with continueOnly + admit require (joins the thread's live run
+    // or drops), one instance-scoped join key for both.
+    const key = "${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: \"thread_ts\", \"ts\" }}";
+    const slack: AutomationDefinition = {
+      ...definition(trigger({ provider: "slack", eventKeys: ["app_mention"] })),
+      entrypoints: [
+        {
+          id: "reply",
+          trigger: trigger({ provider: "slack", eventKeys: ["message"], continueOnly: ["message"] }),
+          blocks: [],
+        },
+      ],
+      settings: {
+        endSessionsOnFinish: false,
+        instance: { keyTemplate: key, entrypoints: { reply: { admit: "require" } } },
+        concurrency: { keyTemplate: key, policy: "join" },
+      },
+    };
+    const h = makeHarness([{ automation: meta(), definition: slack }]);
+    const i = fakeInstances();
+    const sent: Array<{ to: string; eventKey?: string }> = [];
+    const d = {
+      ...deps(h),
+      instances: i.store,
+      facets: async () => undefined,
+      sender: { async send(to: string, message: { kind: string; eventKey?: string }) { sent.push({ to, ...(message.eventKey ? { eventKey: message.eventKey } : {}) }); } },
+    };
+    const slackInput = (eventKey: string, ev: Record<string, unknown>, deliveryId: string) =>
+      input({ provider: "slack", eventKey, deliveryId, payload: { team_id: "T1", event: ev } });
+
+    // 1. A mention opens the thread's workstream and starts its run.
+    const opened = await dispatchIntegrationEvent(
+      slackInput("app_mention", { channel: "C1", ts: "100.1", text: "<@BOT> hi" }, "sl-1"),
+      d,
+    );
+    expect(opened).toMatchObject({ matched: 1, started: 1 });
+    expect(i.rows.size).toBe(1);
+    const thread = [...i.rows.values()][0]!;
+    expect(thread.key).toBe("T1:C1:100.1");
+    const mainRun = `autorun:automation-1:main:i-${thread.id}:slack:sl-1`;
+    expect(h.starts.map((s) => s.runId)).toEqual([mainRun]);
+
+    // 2. A reply in that thread joins the run's mailbox: no new run, no new
+    //    workstream, the event delivered to the holder.
+    const joined = await dispatchIntegrationEvent(
+      slackInput("message", { channel: "C1", ts: "100.2", thread_ts: "100.1", text: "more" }, "sl-2"),
+      d,
+    );
+    expect(joined).toMatchObject({ matched: 1, joined: 1, started: 0, dropped: 0 });
+    expect(sent).toEqual([{ to: mainRun, eventKey: "message" }]);
+    expect(i.rows.size).toBe(1);
+    expect(h.runs.size).toBe(1);
+
+    // 3. A reply in a thread nobody was mentioned in drops (audited): no run,
+    //    no workstream.
+    const stray = await dispatchIntegrationEvent(
+      slackInput("message", { channel: "C1", ts: "200.2", thread_ts: "200.1", text: "psst" }, "sl-3"),
+      d,
+    );
+    expect(stray).toMatchObject({ matched: 1, dropped: 1, started: 0, joined: 0 });
+    expect(i.drops.at(-1)).toMatchObject({ entrypointId: "reply", reason: "no_open_instance", detail: "T1:C1:200.1" });
+    expect(i.rows.size).toBe(1);
+
+    // 4. Once the thread's workstream is closed, a reply there drops too, and
+    //    a NEW mention in the same thread opens a fresh workstream.
+    await i.store.closeInstance({ instanceId: thread.id });
+    const late = await dispatchIntegrationEvent(
+      slackInput("message", { channel: "C1", ts: "100.9", thread_ts: "100.1", text: "still there?" }, "sl-4"),
+      d,
+    );
+    expect(late).toMatchObject({ dropped: 1 });
+    const again = await dispatchIntegrationEvent(
+      slackInput("app_mention", { channel: "C1", ts: "100.10", thread_ts: "100.1", text: "<@BOT> again" }, "sl-5"),
+      d,
+    );
+    expect(again).toMatchObject({ started: 1 });
+    expect([...i.rows.values()].filter((r) => r.status === "open")).toHaveLength(1);
+  });
+
   test("admit require: no open workstream drops the event with an audited reason and NO run row", async () => {
     const target = {
       automation: meta(),

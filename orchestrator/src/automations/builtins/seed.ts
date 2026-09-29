@@ -94,14 +94,22 @@ async function materialize(
 ): Promise<AutomationDefinition> {
   const definition = structuredClone(builtin.definition);
   const triggers = [definition.trigger, ...(definition.entrypoints ?? []).map((ep) => ep.trigger)];
+  // One default connection per provider, resolved once however many
+  // entrypoints share it.
+  const resolved = new Map<string, string>();
   for (const trigger of triggers) {
     if (trigger.kind === "integration" && trigger.connectionId === DEFAULT_CONNECTION_PLACEHOLDER) {
       const provider = trigger.provider;
-      const connection = await deps.connections.ensureDefault(
-        provider,
-        `${provider.charAt(0).toUpperCase()}${provider.slice(1)} (default)`,
-      );
-      trigger.connectionId = connection.id;
+      let id = resolved.get(provider);
+      if (id === undefined) {
+        const connection = await deps.connections.ensureDefault(
+          provider,
+          `${provider.charAt(0).toUpperCase()}${provider.slice(1)} (default)`,
+        );
+        id = connection.id;
+        resolved.set(provider, id);
+      }
+      trigger.connectionId = id;
     }
   }
   return definition;

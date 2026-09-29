@@ -31,6 +31,11 @@ service AutomationService {
   rpc UpdateAutomationMeta(UpdateAutomationMetaRequest) returns (UpdateAutomationMetaResponse);
   // Per-automation input values (allowed on built-ins).
   rpc SetInputs(SetInputsRequest) returns (SetInputsResponse);
+  // Set or remove ONE entry of a map input atomically (a JSONB patch, never
+  // a read-modify-write), optionally enabling the automation in the same
+  // write. The product surfaces (Reviews repositories, Slack channels)
+  // enroll through this so two admins never clobber each other's entry.
+  rpc SetMapInputEntry(SetMapInputEntryRequest) returns (SetMapInputEntryResponse);
   // Per-automation tunable block fields (allowed on built-ins). Every key
   // must be a `tunable` field of that block in the current version, and the
   // merged config must re-validate against the block's schema.
@@ -269,6 +274,23 @@ message SetInputsRequest {
 }
 
 message SetInputsResponse {
+  Automation automation = 1;
+}
+
+message SetMapInputEntryRequest {
+  string automation_id = 1;
+  // The map input's key in the inputs schema.
+  string input_key = 2;
+  // The entry (e.g. a repo "owner/name", a Slack channel id).
+  string entry_key = 3;
+  // The entry's value, validated against the map's value shape. Absent =
+  // remove the entry.
+  optional string value_json = 4;
+  // Also enable the automation (its first enrollment turns it on).
+  bool enable = 5;
+}
+
+message SetMapInputEntryResponse {
   Automation automation = 1;
 }
 
