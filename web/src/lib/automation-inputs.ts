@@ -121,10 +121,32 @@ export function parseInputsSchema(raw: unknown): InputFieldSpec[] {
   return out;
 }
 
+/** A map whose rows are one scalar each (`valueShape: {type: "string"}`),
+ * as the row's field spec; null for an object-shaped map. Mirrors the
+ * server's mapScalarField. */
+export function mapScalarField(spec: InputFieldSpec): ValueFieldSpec | null {
+  const shape = spec.valueShape;
+  const type = shape?.["type"];
+  if (type !== "string" && type !== "number" && type !== "boolean" && type !== "enum") return null;
+  const field: ValueFieldSpec = {
+    key: "value",
+    label:
+      typeof shape?.["label"] === "string" && shape["label"] ? (shape["label"] as string) : "Value",
+    type,
+  };
+  if (Array.isArray(shape?.["values"])) {
+    field.values = (shape!["values"] as unknown[]).filter(
+      (v): v is string => typeof v === "string",
+    );
+  }
+  if (shape && "default" in shape) field.default = shape["default"];
+  return field;
+}
+
 /** The object fields of a map input's value (from `valueShape`). */
 export function mapValueFields(spec: InputFieldSpec): ValueFieldSpec[] {
   const shape = spec.valueShape;
-  if (!shape) return [];
+  if (!shape || mapScalarField(spec) !== null) return [];
   const out: ValueFieldSpec[] = [];
   for (const [key, raw] of Object.entries(shape)) {
     if (!isRecord(raw)) continue;
@@ -169,8 +191,11 @@ function scalarDefault(field: ValueFieldSpec): unknown {
   }
 }
 
-/** A fresh value for one map row (every value field at its default). */
-export function defaultMapRow(spec: InputFieldSpec): Record<string, unknown> {
+/** A fresh value for one map row: the scalar's default for a scalar-valued
+ * map, else every value field at its default. */
+export function defaultMapRow(spec: InputFieldSpec): unknown {
+  const scalar = mapScalarField(spec);
+  if (scalar !== null) return scalarDefault(scalar);
   const row: Record<string, unknown> = {};
   for (const field of mapValueFields(spec)) row[field.key] = scalarDefault(field);
   return row;
@@ -356,6 +381,7 @@ export function validateInputs(schema: InputFieldSpec[], values: InputValues): I
           break;
         }
         const fields = mapValueFields(spec);
+        const scalar = mapScalarField(spec);
         for (const [rowKey, row] of Object.entries(value)) {
           if (!isValidMapKey(spec.keyNoun, rowKey)) {
             errors.push({
@@ -363,6 +389,10 @@ export function validateInputs(schema: InputFieldSpec[], values: InputValues): I
               path: rowKey,
               message: `not a valid ${mapKeyHint(spec.keyNoun)}`,
             });
+            continue;
+          }
+          if (scalar !== null) {
+            validateScalar(scalar, row, spec.key, rowKey, errors);
             continue;
           }
           if (!isRecord(row)) {

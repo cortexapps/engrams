@@ -1,4 +1,5 @@
 import { PR_REVIEW_DEFINITION } from "../automations/builtins/pr-review.ts";
+import { SLACK_BRAIN_DEFINITION } from "../automations/builtins/slack-brain.ts";
 import { beforeEach, describe, expect, test } from "bun:test";
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 
@@ -645,6 +646,29 @@ describe("AutomationService v2", () => {
 
     const removed = await automations.setMapInputEntry({ automationId: "builtin-1", inputKey: "repos", entryKey: "acme/app" });
     expect((JSON.parse(removed.automation!.inputsJson) as { repos: Record<string, unknown> }).repos["acme/app"]).toBeUndefined();
+  });
+
+  test("SetMapInputEntry accepts a scalar-valued map entry (the Slack channels map)", async () => {
+    const deps = adminDeps();
+    const stored = builtinStored();
+    const channels = SLACK_BRAIN_DEFINITION.inputsSchema.find((f) => f.key === "channels")!;
+    stored.versions.get(1)!.inputsSchema = [...stored.versions.get(1)!.inputsSchema, channels];
+    deps.fake.automations.set("builtin-1", stored);
+    const { automations } = clients(deps);
+    const set = await automations.setMapInputEntry({
+      automationId: "builtin-1",
+      inputKey: "channels",
+      entryKey: "C0123456789",
+      valueJson: JSON.stringify("prof-a"),
+      enable: true,
+    });
+    expect((JSON.parse(set.automation!.inputsJson) as { channels: Record<string, unknown> }).channels).toEqual({
+      C0123456789: "prof-a",
+    });
+    await expectCode(
+      automations.setMapInputEntry({ automationId: "builtin-1", inputKey: "channels", entryKey: "C0123456789", valueJson: JSON.stringify({ id: "x" }) }),
+      Code.InvalidArgument,
+    );
   });
 
   test("SetBlockOverrides enforces tunable fields and re-validates the merged config", async () => {

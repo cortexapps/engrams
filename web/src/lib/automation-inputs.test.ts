@@ -12,6 +12,8 @@ import {
   parseInputsSchema,
   resolveInputValues,
   validateInputs,
+  mapScalarField,
+  type InputFieldSpec,
 } from "@/lib/automation-inputs";
 import { REVIEW_INPUTS_SCHEMA } from "@/lib/automation-inputs.fixture";
 
@@ -162,6 +164,32 @@ describe("number bounds (mirrors the orchestrator's rule + wording)", () => {
     ]);
     expect(validateInputs(schema, { cap_only: 11 })).toEqual([
       { key: "cap_only", message: "must be at most 10" },
+    ]);
+  });
+});
+
+describe("scalar-valued maps", () => {
+  const CHANNELS: InputFieldSpec = {
+    key: "channels",
+    label: "Channels",
+    type: "map",
+    keyNoun: "channel",
+    required: true,
+    default: {},
+    valueShape: { type: "string", label: "Profile id" },
+  };
+
+  it("projects the row as one scalar field, defaults to it, and validates it as the row", () => {
+    expect(mapValueFields(CHANNELS)).toEqual([]);
+    expect(mapScalarField(CHANNELS)).toMatchObject({
+      key: "value",
+      label: "Profile id",
+      type: "string",
+    });
+    expect(defaultMapRow(CHANNELS)).toBe("");
+    expect(validateInputs([CHANNELS], { channels: { C0123456789: "prof-a" } })).toEqual([]);
+    expect(validateInputs([CHANNELS], { channels: { C0123456789: { id: "x" } } })).toMatchObject([
+      { key: "channels", path: "C0123456789" },
     ]);
   });
 });

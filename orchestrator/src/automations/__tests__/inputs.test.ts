@@ -199,3 +199,32 @@ describe("validateInputValues — number bounds", () => {
     ]);
   });
 });
+
+describe("validateInputValues — scalar-valued maps", () => {
+  // The Slack threads built-in's channels map: channel id → profile id.
+  const CHANNELS: InputFieldSpec = {
+    key: "channels",
+    label: "Channels",
+    type: "map",
+    keyNoun: "channel",
+    required: true,
+    default: {},
+    valueShape: { type: "string", label: "Profile id" },
+  };
+
+  test("a row IS the scalar: a string validates, an object or number does not", () => {
+    expect(validateInputValues([CHANNELS], { channels: { C0123456789: "prof-a" } })).toEqual([]);
+    expect(validateInputValues([CHANNELS], { channels: { C0123456789: { id: "prof-a" } } })).toMatchObject([
+      { key: "channels", path: "C0123456789" },
+    ]);
+    expect(validateInputValues([CHANNELS], { channels: { C0123456789: 7 } })).toMatchObject([
+      { key: "channels", path: "C0123456789" },
+    ]);
+  });
+
+  test("an enum-valued map checks the value against its list", () => {
+    const spec: InputFieldSpec = { ...CHANNELS, valueShape: { type: "enum", values: ["a", "b"] } };
+    expect(validateInputValues([spec], { channels: { C0123456789: "a" } })).toEqual([]);
+    expect(validateInputValues([spec], { channels: { C0123456789: "z" } })).toMatchObject([{ path: "C0123456789" }]);
+  });
+});

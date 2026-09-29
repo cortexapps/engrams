@@ -23,6 +23,7 @@ import {
   defaultMapRow,
   isValidMapKey,
   mapKeyHint,
+  mapScalarField,
   mapValueFields,
   normalizeMapKey,
   type InputFieldError,
@@ -40,7 +41,10 @@ export interface MapInputEditorProps {
 }
 
 export function MapInputEditor({ spec, value, onChange, errors, disabled }: MapInputEditorProps) {
-  const fields = useMemo(() => mapValueFields(spec), [spec]);
+  // A scalar-valued map (channel → profile id) edits as a one-field row
+  // whose field IS the row; an object-valued map edits its fields.
+  const scalar = useMemo(() => mapScalarField(spec), [spec]);
+  const fields = useMemo(() => (scalar ? [scalar] : mapValueFields(spec)), [spec, scalar]);
   const options = useInputKeyOptions(spec.keyNoun);
   const [draftKey, setDraftKey] = useState("");
   const [keyError, setKeyError] = useState<string | null>(null);
@@ -90,8 +94,9 @@ export function MapInputEditor({ spec, value, onChange, errors, disabled }: MapI
       <ul className="flex flex-col gap-2">
         {rows.map(([rowKey, row]) => {
           const errs = rowErrors.get(rowKey);
-          const rowValue =
-            typeof row === "object" && row !== null && !Array.isArray(row)
+          const rowValue = scalar
+            ? { value: row }
+            : typeof row === "object" && row !== null && !Array.isArray(row)
               ? (row as Record<string, unknown>)
               : {};
           return (
@@ -111,7 +116,9 @@ export function MapInputEditor({ spec, value, onChange, errors, disabled }: MapI
                   rowKey={rowKey}
                   fields={fields}
                   value={rowValue}
-                  onChange={(next) => onChange({ ...value, [rowKey]: next })}
+                  onChange={(next) =>
+                    onChange({ ...value, [rowKey]: scalar ? next["value"] : next })
+                  }
                   errors={errs?.fields}
                   disabled={disabled}
                 />
