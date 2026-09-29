@@ -1114,8 +1114,23 @@ skip_web = env_or('ENGRAM_SKIP_WEB', '') in ('1', 'true', 'yes')
 
 # createdb returns nonzero if the DB already exists (initdb made it on a
 # fresh volume); swallow that and let drizzle-kit migrate carry the schema.
+#
+# The wait comes first because `resource_deps=['postgres']` fires on the
+# container RUNNING, not on its healthcheck, and the postgres image runs a
+# temporary socket-only server while it applies initdb.d on a fresh volume.
+# A `drizzle-kit migrate` that connects in that window is reset when the
+# real server starts, and it does not retry (the e2e stack died on
+# "var/dev-api-key never appeared" four times in September). `pg_isready`
+# over TCP answers 0 only once the real server accepts connections: the
+# temp server listens on no TCP address, and a server still starting up
+# rejects. Bounded, so a broken postgres fails loudly instead of hanging.
 local_resource('orchestrator-migrate',
     cmd=(
+        'for i in $(seq 1 120); do ' +
+        'pg_isready -h 127.0.0.1 -p 5435 -U engram -d engram -q && break; ' +
+        'sleep 1; done; ' +
+        'pg_isready -h 127.0.0.1 -p 5435 -U engram -d engram || ' +
+        '{ echo "postgres never accepted TCP connections on :5435" >&2; exit 1; }; ' +
         'cd orchestrator && bun install --silent && ' +
         '(PGPASSWORD=engram createdb -h localhost -p 5435 -U engram ' +
         'engram_orchestrator 2>/dev/null || true) && ' +
