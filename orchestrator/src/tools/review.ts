@@ -95,12 +95,27 @@ export const REVIEW_PHASE_SIGNALS = {
   verifier: "verifier_done",
 } as const;
 
+/** The pass this session works on. A legacy worker's task IS the review's
+ * task; a built-in worker's task is the automation's, so its pass is found
+ * through the session's run (`review.automation_run_id`). Without the
+ * second path every `submit_finding` from an engine review answered
+ * "no active review" and `finder_done` never signalled the run — the first
+ * live engine review sat parked on its finder until the deadline. */
 async function activeReview(
   ctx: ToolContext,
   reviews: ReviewStore,
+  findAutomationBinding: (sessionId: string) => Promise<{ runId: string } | null>,
 ): Promise<ReviewRow | ToolProtocolError> {
-  if (ctx.taskId == null) return NO_ACTIVE_REVIEW;
-  return (await reviews.getActiveReviewForTask(ctx.taskId)) ?? NO_ACTIVE_REVIEW;
+  if (ctx.taskId != null) {
+    const byTask = await reviews.getActiveReviewForTask(ctx.taskId);
+    if (byTask) return byTask;
+  }
+  const binding = await findAutomationBinding(ctx.sessionId);
+  if (binding !== null) {
+    const byRun = await reviews.getActiveReviewForAutomationRun(binding.runId);
+    if (byRun) return byRun;
+  }
+  return NO_ACTIVE_REVIEW;
 }
 
 function isToolError(
@@ -207,7 +222,7 @@ export function registerReviewTools(
     execution: "sync",
     capability: PR_REVIEW_CAPABILITY,
     handler: async (ctx, args) => {
-      const active = await activeReview(ctx, reviews);
+      const active = await activeReview(ctx, reviews, findAutomationBinding);
       if (isToolError(active)) return active;
       if (active.status !== "queued" && active.status !== "finding") {
         return NOT_FINDING_PHASE;
@@ -249,7 +264,7 @@ export function registerReviewTools(
     execution: "sync",
     capability: PR_REVIEW_CAPABILITY,
     handler: async (ctx, args) => {
-      const active = await activeReview(ctx, reviews);
+      const active = await activeReview(ctx, reviews, findAutomationBinding);
       if (isToolError(active)) return active;
       if (active.status !== "queued" && active.status !== "finding") {
         return NOT_FINDING_PHASE;
@@ -277,7 +292,7 @@ export function registerReviewTools(
     execution: "sync",
     capability: PR_REVIEW_CAPABILITY,
     handler: async (ctx, args) => {
-      const active = await activeReview(ctx, reviews);
+      const active = await activeReview(ctx, reviews, findAutomationBinding);
       if (isToolError(active)) return active;
       if (active.status !== "verifying") return NOT_VERIFYING_PHASE;
 

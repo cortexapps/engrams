@@ -316,6 +316,10 @@ export interface ReviewStore {
   /** Every pass over one pull request, newest first, with finding counts. */
   listPasses(targetId: string): Promise<ReviewListRow[]>;
   getActiveReviewForTask(taskId: string): Promise<ReviewRow | null>;
+  /** The active pass an automation run drives (ADR 0119): a built-in's worker
+   * session belongs to the AUTOMATION's task, not the review's, so the review
+   * tools resolve their pass through the session's run instead. */
+  getActiveReviewForAutomationRun(runId: string): Promise<ReviewRow | null>;
   getActiveReviewForTarget(targetId: string): Promise<ReviewRow | null>;
   getActiveReviewByCoordinate(
     provider: string,
@@ -971,6 +975,22 @@ export function makeReviewStore(
         .where(
           and(
             eq(reviewTable.taskId, taskId),
+            inArray(reviewTable.status, ACTIVE_REVIEW_STATUSES),
+          ),
+        )
+        .orderBy(desc(reviewTable.createdAt))
+        .limit(1);
+      return rows[0] ? toReviewRow(rows[0]) : null;
+    },
+
+    async getActiveReviewForAutomationRun(runId) {
+      const rows = await db
+        .select(reviewSelection)
+        .from(reviewTable)
+        .innerJoin(targetTable, eq(reviewTable.targetId, targetTable.id))
+        .where(
+          and(
+            eq(reviewTable.automationRunId, runId),
             inArray(reviewTable.status, ACTIVE_REVIEW_STATUSES),
           ),
         )
