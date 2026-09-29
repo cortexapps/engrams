@@ -2609,10 +2609,16 @@
                 "line": {
                   "type": "integer"
                 },
+                "start_line": {
+                  "type": "integer"
+                },
                 "side": {
                   "type": "string"
                 },
                 "body": {
+                  "type": "string"
+                },
+                "finding_id": {
                   "type": "string"
                 }
               }

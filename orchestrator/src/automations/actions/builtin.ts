@@ -141,10 +141,16 @@ function readComments(params: Record<string, unknown>): InlineComment[] {
     if (typeof path !== "string" || typeof line !== "number" || typeof body !== "string") {
       throw new IntegrationActionError(`comments[${i}] needs path, line, body`, true);
     }
+    // A caller with a findings ledger (the PR-review built-in's review_settle
+    // output) names each comment's finding so the ledger row and the GitHub
+    // comment stay linked; a caller without one gets a positional id.
+    const findingId = typeof record["finding_id"] === "string" ? record["finding_id"] : `automation:${i}`;
+    const startLine = typeof record["start_line"] === "number" ? record["start_line"] : undefined;
     return {
-      findingId: `automation:${i}`,
+      findingId,
       path,
       line,
+      ...(startLine !== undefined ? { startLine } : {}),
       side: typeof record["side"] === "string" ? (record["side"] as string) : "RIGHT",
       body,
     };
