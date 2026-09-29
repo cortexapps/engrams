@@ -4,15 +4,18 @@ import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
 import { AlertTriangle } from "lucide-react";
 
+import { Link } from "@tanstack/react-router";
+
 import {
   useEnrollments,
   useUpsertEnrollment,
   useDeleteEnrollment,
 } from "../../hooks/useEnrollments";
+import { useBuiltinAutomation } from "../../hooks/useAutomations";
 import { useProfiles } from "../../hooks/useProfiles";
 import type { RepoEnrollment } from "../../gen/engram/app/v1/review_pb";
 import { errorMessage } from "../../lib/errors";
-import { PageHeading } from "../page-heading";
+import { PageHeading } from "../../components/page-heading";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
@@ -55,23 +58,50 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-// PR-review enrollment (ADR 0100). A repo must appear here for engrams to touch
-// its pull requests — the GitHub webhook drops any event whose repo is not
-// enrolled. `trigger_mode` decides whether a PR is reviewed automatically on
-// open (auto) or only when the app is @mentioned / dispatched (manual).
-// `autofix` decides whether posted findings route back for fixes. The profile
-// override picks which session profile the review runs on; left as the default,
-// it uses whichever profile is designated the `pr_reviewer`.
-export function ReviewedReposPanel() {
+// The repositories engrams reviews (ADR 0100), as a page of the Reviews
+// product. Enrolling a repo here is a write to the PR-review automation: the
+// repo lands in its `repos` input and the automation is enabled on the first
+// one — the product is the front of the platform, and the link below opens
+// the back. `trigger_mode` decides whether a PR is reviewed automatically on
+// open (auto) or only when the app is @mentioned / dispatched (manual);
+// `autofix` decides whether posted findings route back for fixes. The review
+// sessions run on the profile designated `pr_reviewer`.
+//
+// A row marked `legacy` predates this page and still reviews on the old
+// graph; saving it moves it over. Those rows retire with the legacy graph.
+export function ReviewRepositories() {
   const { data, isPending, error } = useEnrollments();
   const { data: profileData } = useProfiles();
+  const builtin = useBuiltinAutomation("pr_review");
   const rows = data?.enrollments ?? [];
   const profiles = profileData?.profiles ?? [];
   const hasReviewerProfile = profiles.some((p) => p.designation === "pr_reviewer");
+  const automationId = builtin.data?.automation?.id;
 
   return (
-    <div className="space-y-6">
-      <PageHeading title="Reviewed repos" actions={<EnrollDialog profiles={profiles} />} />
+    <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-auto p-4 md:p-6">
+      <PageHeading
+        title="Repositories"
+        count={rows.length > 0 ? `${rows.length} enrolled` : undefined}
+        actions={<EnrollDialog />}
+      />
+
+      <p className="text-sm text-muted-foreground">
+        Pull requests on these repositories are reviewed by the{" "}
+        {automationId ? (
+          <Link
+            to="/automations/$id"
+            params={{ id: automationId }}
+            search={{ tab: "activity" }}
+            className="underline underline-offset-2"
+          >
+            PR review automation
+          </Link>
+        ) : (
+          "PR review automation"
+        )}
+        . Every pull request it touches is a workstream; every pass is a run.
+      </p>
 
       {!hasReviewerProfile && (
         <div
@@ -107,13 +137,13 @@ export function ReviewedReposPanel() {
               <TableHead>Repository</TableHead>
               <TableHead>Trigger</TableHead>
               <TableHead>Autofix</TableHead>
-              <TableHead>Profile</TableHead>
+              <TableHead>Engine</TableHead>
               <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {rows.map((row) => (
-              <EnrollmentRow key={row.repo} row={row} profiles={profiles} />
+              <EnrollmentRow key={row.repo} row={row} />
             ))}
           </TableBody>
         </Table>
@@ -121,8 +151,6 @@ export function ReviewedReposPanel() {
     </div>
   );
 }
-
-type ProfileLite = { id: string; name: string; designation?: string };
 
 function TriggerBadge({ mode }: { mode: string }) {
   return mode === "auto" ? (
@@ -132,12 +160,17 @@ function TriggerBadge({ mode }: { mode: string }) {
   );
 }
 
-function profileLabel(row: RepoEnrollment, profiles: ProfileLite[]): string {
-  if (!row.profileId) return "Default (pr_reviewer)";
-  return profiles.find((p) => p.id === row.profileId)?.name ?? row.profileId;
+function EngineBadge({ engine }: { engine: string }) {
+  return engine === "automation" ? (
+    <Badge variant="outline">automation</Badge>
+  ) : (
+    <Badge variant="secondary" title="Reviews on the retired graph until saved again">
+      legacy
+    </Badge>
+  );
 }
 
-function EnrollmentRow({ row, profiles }: { row: RepoEnrollment; profiles: ProfileLite[] }) {
+function EnrollmentRow({ row }: { row: RepoEnrollment }) {
   const remove = useDeleteEnrollment();
   return (
     <TableRow>
@@ -146,10 +179,12 @@ function EnrollmentRow({ row, profiles }: { row: RepoEnrollment; profiles: Profi
         <TriggerBadge mode={row.triggerMode} />
       </TableCell>
       <TableCell className="text-xs text-muted-foreground">{row.autofix}</TableCell>
-      <TableCell className="text-xs text-muted-foreground">{profileLabel(row, profiles)}</TableCell>
+      <TableCell>
+        <EngineBadge engine={row.engine} />
+      </TableCell>
       <TableCell>
         <div className="flex items-center justify-end gap-1">
-          <EnrollDialog profiles={profiles} existing={row} />
+          <EnrollDialog existing={row} />
           <AlertDialog>
             <AlertDialogTrigger asChild>
               <Button variant="ghost" size="sm" disabled={remove.isPending}>
@@ -183,11 +218,6 @@ function EnrollmentRow({ row, profiles }: { row: RepoEnrollment; profiles: Profi
   );
 }
 
-// Empty profile override = fall back to the designated pr_reviewer profile. We
-// represent that sentinel with a non-empty token because the shadcn Select
-// disallows an empty-string value.
-const DEFAULT_PROFILE = "__default__";
-
 const enrollSchema = z.object({
   repo: z
     .string()
@@ -195,17 +225,10 @@ const enrollSchema = z.object({
     .regex(/^[^/\s]+\/[^/\s]+$/, "must be owner/name (e.g. cortexapps/engrams)"),
   triggerMode: z.enum(["auto", "manual"]),
   autofix: z.enum(["auto", "manual", "off"]),
-  profileId: z.string(),
 });
 type EnrollValues = z.infer<typeof enrollSchema>;
 
-function EnrollDialog({
-  profiles,
-  existing,
-}: {
-  profiles: ProfileLite[];
-  existing?: RepoEnrollment;
-}) {
+function EnrollDialog({ existing }: { existing?: RepoEnrollment }) {
   const [open, setOpen] = useState(false);
   const upsert = useUpsertEnrollment();
   const isEdit = existing !== undefined;
@@ -214,7 +237,6 @@ function EnrollDialog({
     repo: existing?.repo ?? "",
     triggerMode: (existing?.triggerMode as "auto" | "manual") ?? "manual",
     autofix: (existing?.autofix as "auto" | "manual" | "off") ?? "off",
-    profileId: existing?.profileId ? existing.profileId : DEFAULT_PROFILE,
   };
 
   const form = useForm<EnrollValues>({
@@ -228,7 +250,6 @@ function EnrollDialog({
         repo: data.repo.trim(),
         triggerMode: data.triggerMode,
         autofix: data.autofix,
-        profileId: data.profileId === DEFAULT_PROFILE ? "" : data.profileId,
       });
       setOpen(false);
     } catch (e) {
@@ -327,35 +348,6 @@ function EnrollDialog({
                 </Field>
               )}
             />
-            <Controller
-              name="profileId"
-              control={form.control}
-              render={({ field }) => (
-                <Field>
-                  <FieldLabel htmlFor={field.name}>Profile</FieldLabel>
-                  <Select value={field.value} onValueChange={field.onChange}>
-                    <SelectTrigger id={field.name} aria-label="Profile">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={DEFAULT_PROFILE}>
-                        Default (designated pr_reviewer)
-                      </SelectItem>
-                      {profiles.map((p) => (
-                        <SelectItem key={p.id} value={p.id}>
-                          {p.name}
-                          {p.designation === "pr_reviewer" ? " (pr_reviewer)" : ""}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <FieldDescription>
-                    Which session profile the review runs on. Leave default to use the designated
-                    reviewer profile.
-                  </FieldDescription>
-                </Field>
-              )}
-            />
             {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
           </FieldGroup>
 
@@ -369,7 +361,13 @@ function EnrollDialog({
               Cancel
             </Button>
             <Button type="submit" disabled={upsert.isPending}>
-              {upsert.isPending ? "Saving…" : isEdit ? "Save" : "Enroll"}
+              {upsert.isPending
+                ? "Saving…"
+                : isEdit
+                  ? existing.engine === "legacy"
+                    ? "Save and move to automation"
+                    : "Save"
+                  : "Enroll"}
             </Button>
           </DialogFooter>
         </form>

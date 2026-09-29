@@ -13,7 +13,8 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton-rows";
-import { X } from "lucide-react";
+import { GitFork, X } from "lucide-react";
+import { useAbility } from "../../auth/AuthProvider";
 import { ReviewStage } from "./ReviewGlyph";
 import { Sep } from "./Sep";
 import { groupByPr, type PrGroup } from "./review-groups";
@@ -53,6 +54,7 @@ import { cn } from "@/lib/utils";
 
 export function Reviews() {
   const now = useNow();
+  const canManage = useAbility().can("manage", "Review");
   const [query, setQuery] = useState("");
   const search = useDebouncedValue(query, 150).trim();
   const [filters, setFilters] = useState<Record<string, string[]>>({});
@@ -138,7 +140,20 @@ export function Reviews() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-auto p-4 md:p-6">
-      <PageHeading title="Reviews" count={count} />
+      <PageHeading
+        title="Reviews"
+        count={count}
+        actions={
+          canManage ? (
+            <Button variant="outline" size="sm" asChild>
+              <Link to="/reviews/repositories">
+                <GitFork className="size-3.5" aria-hidden />
+                Repositories
+              </Link>
+            </Button>
+          ) : undefined
+        }
+      />
 
       <div className="flex flex-wrap items-center gap-2">
         <Input

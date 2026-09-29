@@ -37,6 +37,7 @@ import { SessionDetail } from "./pages/SessionDetail";
 import { Reviews } from "./pages/reviews/Reviews";
 import { ReviewsLayout } from "./pages/reviews/ReviewsLayout";
 import { ReviewDossier } from "./pages/reviews/ReviewDossier";
+import { ReviewRepositories } from "./pages/reviews/ReviewRepositories";
 import { ArtifactsLayout } from "./pages/artifacts/ArtifactsLayout";
 import { ArtifactsLibrary } from "./pages/artifacts/ArtifactsLibrary";
 import { ArtifactDetail } from "./pages/artifacts/ArtifactDetail";
@@ -77,7 +78,6 @@ import { ActivityPage } from "./pages/automations/activity/ActivityPage";
 import { WorkstreamsPage } from "./pages/automations/workstreams/WorkstreamsPage";
 import { WorkstreamPage } from "./pages/automations/workstreams/WorkstreamPage";
 import { SettingsTab } from "./pages/automations/settings/SettingsTab";
-import { RedirectToBuiltin } from "./pages/automations/settings/RedirectToBuiltin";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -221,6 +221,14 @@ const reviewDossierRoute = createRoute({
   getParentRoute: () => reviewsLayoutRoute,
   path: "$id",
   component: ReviewDossier,
+});
+// The repositories engrams reviews — enrollment is a write to the PR-review
+// automation (its `repos` input). Static, so it outranks `$id`.
+const reviewRepositoriesRoute = createRoute({
+  getParentRoute: () => reviewsLayoutRoute,
+  path: "repositories",
+  beforeLoad: requireAdmin,
+  component: ReviewRepositories,
 });
 
 // Retired: the Operator section. Its pages live under /settings now (the
@@ -408,14 +416,13 @@ const integrationsRoute = createRoute({
   beforeLoad: requireAdmin,
   component: IntegrationsPanel,
 });
-// Kept for bookmarks: reviewed repos became the PR-review built-in's `repos`
-// input (ADR 0119 phase 3.8). The panel itself retires with the enrollment
-// RPCs in phase 4.7.
+// Kept for bookmarks: reviewed repos live on the Reviews product now.
 const reviewedReposRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "reviewed-repos",
-  beforeLoad: requireAdmin,
-  component: RedirectToBuiltin,
+  beforeLoad: () => {
+    throw redirect({ to: "/reviews/repositories", replace: true });
+  },
 });
 const integrationDetailRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
@@ -635,7 +642,11 @@ export const routeTree = rootRoute.addChildren([
       allSessionsRoute,
       sessionDetailRoute,
     ]),
-    reviewsLayoutRoute.addChildren([reviewsIndexRoute, reviewDossierRoute]),
+    reviewsLayoutRoute.addChildren([
+      reviewsIndexRoute,
+      reviewRepositoriesRoute,
+      reviewDossierRoute,
+    ]),
     artifactsLayoutRoute.addChildren([
       artifactsIndexRoute,
       artifactDetailRoute,

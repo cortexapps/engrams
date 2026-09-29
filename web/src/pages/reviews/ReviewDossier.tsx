@@ -9,10 +9,12 @@ import {
   Loader2,
   MessagesSquare,
   RotateCcw,
+  Workflow,
 } from "lucide-react";
 
 import type { Review } from "../../gen/engram/app/v1/review_pb";
 import { useRetryReview, useReview } from "../../hooks/useReviews";
+import { useBuiltinAutomation } from "../../hooks/useAutomations";
 import { useNow } from "../../hooks/useNow";
 import { useAbility } from "../../auth/AuthProvider";
 import type { SessionSubject } from "../../lib/ability";
@@ -181,6 +183,8 @@ function PrHeader({
   // borrow identity from the newest sibling.
   const title = prTitleOf(pass);
   const retry = useRetryReview();
+  const builtin = useBuiltinAutomation("pr_review");
+  const runAutomationId = builtin.data?.automation?.id;
   const navigate = useNavigate();
   // One GitHub affordance, but never a label that lies about where it lands.
   const reviewUrl = postedReviewUrl(pass);
@@ -204,6 +208,20 @@ function PrHeader({
           {title ?? `Pull request #${pass.prNumber}`}
         </Text>
         <div className="flex shrink-0 items-center gap-1">
+          {pass.automationRunId && runAutomationId && (
+            // The platform behind the product: this pass is one run of the
+            // PR-review automation, and the run's trace is the ground truth.
+            <Button variant="ghost" size="sm" asChild>
+              <Link
+                to="/automations/$id"
+                params={{ id: runAutomationId }}
+                search={{ tab: "activity", run: pass.automationRunId }}
+              >
+                <Workflow className="size-3.5" aria-hidden />
+                Run
+              </Link>
+            </Button>
+          )}
           <Button variant="ghost" size="sm" asChild>
             <a href={reviewUrl ?? prUrl(pass)} target="_blank" rel="noreferrer">
               <ExternalLink className="size-3.5" aria-hidden />
