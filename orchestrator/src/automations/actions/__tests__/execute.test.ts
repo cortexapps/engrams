@@ -252,6 +252,29 @@ describe("executeIntegrationAction — builtins", () => {
     expect(outputs).toMatchObject({ posted: true, inline_posted: false, github_review_id: "99" });
   });
 
+  test("github.post_pr_review carries a caller's finding_id and start_line onto the inline comment", async () => {
+    // The PR-review built-in's review_settle output names each comment's
+    // finding; the ledger row and the GitHub comment must stay linked.
+    const f = fakeRunOp([json(200, []), json(200, { id: 7 })]);
+    await executeIntegrationAction(
+      {
+        provider: "github",
+        actionId: "post_pr_review",
+        params: {
+          repo: "acme/repo",
+          prNumber: 12,
+          commitId: "abc123",
+          summary: "One finding.",
+          comments: [{ finding_id: "f-1", path: "src/a.ts", line: 9, start_line: 4, side: "RIGHT", body: "nit" }],
+        },
+      },
+      CTX,
+      deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
+    );
+    const posted = JSON.parse(f.calls[1]!.req.body as string) as { comments: Array<Record<string, unknown>> };
+    expect(posted.comments[0]).toMatchObject({ path: "src/a.ts", line: 9, start_line: 4, side: "RIGHT" });
+  });
+
   test("github.post_pr_review short-circuits when the marker is already on a review", async () => {
     const marker = `<!-- engrams-automation:${CTX.runId}:${CTX.stepPath} -->`;
     const f = fakeRunOp([json(200, [{ body: `Looks fine.\n\n${marker}` }])]);
@@ -360,6 +383,37 @@ describe("executeIntegrationAction — builtins", () => {
       identifier: "ENG-1",
       url: "https://linear.app/i/ENG-1",
     });
+  });
+});
+
+describe("executeIntegrationAction — templated scalars", () => {
+  test("a numeric string for an integer param is coerced (a Liquid template always renders a string)", async () => {
+    // The PR-review built-in's first live pull request: `number` rendered
+    // as "1539" and the action refused it.
+    const f = fakeRunOp([json(200, []), json(201, { id: 42 })]);
+    const outputs = await executeIntegrationAction(
+      {
+        provider: "github",
+        actionId: "create_issue_comment",
+        params: { repo: "acme/repo", number: "1539", body: "hello" },
+      },
+      CTX,
+      deps(f.runOp),
+    );
+    expect(outputs).toEqual({ commentId: 42 });
+    expect(f.calls[1]!.req.path).toContain("/issues/1539/comments");
+  });
+
+  test("a string that is not a number is still rejected", async () => {
+    const f = fakeRunOp([]);
+    await expectActionError(
+      executeIntegrationAction(
+        { provider: "github", actionId: "create_issue_comment", params: { repo: "acme/repo", number: "abc", body: "x" } },
+        CTX,
+        deps(f.runOp),
+      ),
+      { permanent: true, message: /expected an integer/ },
+    );
   });
 });
 

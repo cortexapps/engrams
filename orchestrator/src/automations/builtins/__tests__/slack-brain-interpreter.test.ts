@@ -6,6 +6,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import type { CuratedEvent } from "../../../control-plane/session-events.ts";
+import { coerceFieldValue, validateFieldValue } from "../../../connectors/field-schema.ts";
+import { findAction } from "../../actions/execute.ts";
 import { makeCodeBlockRuntime } from "../../code/runtime.ts";
 import { makeReplayRunner, type ReplayRunner, type ReplayScript } from "../../engine/__tests__/replay-step.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
@@ -206,7 +208,16 @@ function harness(options: {
     code: makeCodeBlockRuntime(),
     integrationActions: {
       async execute(input) {
-        actions.push({ actionId: input.actionId, params: input.params });
+        // The real contract: the connector's declared input schema, after
+        // the executor's own coercion. A rendered param the catalog would
+        // refuse fails HERE, not on the first live delivery.
+        const { action } = await findAction(input.provider, input.actionId, { list: async () => [] });
+        const params = coerceFieldValue(action.inputSchema, input.params) as Record<string, unknown>;
+        const violations = validateFieldValue(action.inputSchema, params);
+        if (violations.length > 0) {
+          throw new Error(`invalid params for ${input.actionId}: ${violations[0]!.path} ${violations[0]!.message}`);
+        }
+        actions.push({ actionId: input.actionId, params });
         return { ts: "9.0", channel: "C1" };
       },
     },

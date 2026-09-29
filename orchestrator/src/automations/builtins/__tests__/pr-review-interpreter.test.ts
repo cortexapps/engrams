@@ -9,6 +9,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import type { BeginReviewPassResult } from "../../../db/reviews.ts";
 import type { ReviewPostPayload } from "../../../reviews/control-plane.ts";
+import { coerceFieldValue, validateFieldValue } from "../../../connectors/field-schema.ts";
+import { findAction } from "../../actions/execute.ts";
 import { makeCodeBlockRuntime } from "../../code/runtime.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import {
@@ -260,7 +262,16 @@ function harness(options: {
       : {}),
     integrationActions: {
       async execute(input) {
-        actions.push({ actionId: input.actionId, params: input.params });
+        // The real contract: the connector's declared input schema, after
+        // the executor's own coercion. A rendered param the catalog would
+        // refuse fails HERE, not on the first live delivery.
+        const { action } = await findAction(input.provider, input.actionId, { list: async () => [] });
+        const params = coerceFieldValue(action.inputSchema, input.params) as Record<string, unknown>;
+        const violations = validateFieldValue(action.inputSchema, params);
+        if (violations.length > 0) {
+          throw new Error(`invalid params for ${input.actionId}: ${violations[0]!.path} ${violations[0]!.message}`);
+        }
+        actions.push({ actionId: input.actionId, params });
         if (input.actionId === "create_issue_comment") return { commentId: 777, status: 201 };
         if (input.actionId === "post_pr_review") return { reviewId: 9001, status: 200 };
         return { status: 200 };
