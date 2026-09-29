@@ -16,8 +16,8 @@ import {
   type ReviewTriggerMode,
 } from "../db/enrollments.ts";
 import { makeProfileStore } from "../db/profiles.ts";
-import { makeAutomationStore } from "../db/automations.ts";
-import { setReviewEngine, EngineFlagError, type EngineFlagStore } from "../reviews/engine-flag.ts";
+import { setReviewEngine, EngineFlagError } from "../reviews/engine-flag.ts";
+import { makeReviewEngineWriter, type ReviewEngineWriter } from "../db/review-engine.ts";
 import { retryAutomationReview } from "../reviews/automation-review.ts";
 import { log as rootLog } from "../log.ts";
 import {
@@ -62,7 +62,8 @@ export interface ReviewDeps {
   startIngress?: (input: ReviewIngressStart) => Promise<void>;
   randomUUID?: () => string;
   /** ADR 0119 phase 4.4 seams (default to the production stores). */
-  builtins?: EngineFlagStore;
+  /** The one writer of the enrollment flag + built-in repos map (one transaction). */
+  reviewEngine?: ReviewEngineWriter;
   retryAutomation?: (automationRunId: string) => Promise<string>;
 }
 
@@ -212,8 +213,8 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
   const startIngress = deps?.startIngress ?? startReviewIngress;
   const randomUUID = deps?.randomUUID ?? (() => crypto.randomUUID());
   const engineLog = rootLog.child({ component: "review-engine-flag" });
-  const builtins = (): EngineFlagStore =>
-    deps?.builtins ?? makeAutomationStore(deps?.db ?? getDb());
+  const reviewEngine = (): ReviewEngineWriter =>
+    deps?.reviewEngine ?? makeReviewEngineWriter(deps?.db ?? getDb());
   const retryAutomation =
     deps?.retryAutomation ?? ((runId: string) => retryAutomationReview(runId));
 
@@ -342,8 +343,13 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
           Code.InvalidArgument,
         );
       }
-      const profileId = req.profileId?.trim() || null;
-      if (profileId != null && !(await profiles().get(profileId))) {
+      // An omitted profile_id keeps the stored override; an explicit empty
+      // string clears it. The product's dialog no longer carries the field,
+      // and a trigger/autofix edit must never wipe a per-repo profile.
+      const stored = await enrollments().get(repo);
+      const profileId =
+        req.profileId === undefined ? (stored?.profileId ?? null) : req.profileId.trim() || null;
+      if (profileId != null && profileId !== stored?.profileId && !(await profiles().get(profileId))) {
         throw new ConnectError("profile_id does not exist", Code.InvalidArgument);
       }
       // Enrolling through the product IS enrolling on the automation engine:
@@ -358,8 +364,7 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       });
       try {
         const result = await setReviewEngine(repo, "automation", {
-          setEnrollmentEngine: (r, e) => enrollments().setEngine(r, e),
-          builtins: builtins(),
+          writer: reviewEngine(),
           log: engineLog,
         });
         return { enrollment: enrollmentToProto(result.enrollment) };
@@ -384,8 +389,7 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       if (await enrollments().get(repo)) {
         try {
           await setReviewEngine(repo, "legacy", {
-            setEnrollmentEngine: (r, e) => enrollments().setEngine(r, e),
-            builtins: builtins(),
+            writer: reviewEngine(),
             log: engineLog,
           });
         } catch (error) {
