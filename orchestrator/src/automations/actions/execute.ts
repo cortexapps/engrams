@@ -11,7 +11,7 @@
 import { makeConnectorStore } from "../../db/connectors.ts";
 import { getDb } from "../../db/client.ts";
 import { loadRegistry, type ActionSpec, type Connector } from "../../connectors/registry.ts";
-import { validateFieldValue } from "../../connectors/field-schema.ts";
+import { coerceFieldValue, validateFieldValue } from "../../connectors/field-schema.ts";
 import {
   runIntegrationOp as defaultRunIntegrationOp,
   type IntegrationOpResult,
@@ -199,7 +199,10 @@ export async function executeIntegrationAction(
   const runOp: RunIntegrationOp = deps.runOp ?? defaultRunIntegrationOp;
   const { connector, action } = await findAction(config.provider, config.actionId, deps.connectors);
 
-  const violations = validateFieldValue(action.inputSchema, config.params);
+  // Templated scalars render as strings; the schema says what they are.
+  const params = coerceFieldValue(action.inputSchema, config.params) as Record<string, unknown>;
+  config = { ...config, params };
+  const violations = validateFieldValue(action.inputSchema, params);
   if (violations.length > 0) {
     const first = violations[0]!;
     throw new IntegrationActionError(

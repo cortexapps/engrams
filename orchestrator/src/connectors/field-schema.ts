@@ -86,6 +86,43 @@ function walk(
   }
 }
 
+const INTEGER_RE = /^-?\d+$/;
+const NUMBER_RE = /^-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/;
+
+/** Coerce templated scalars to the schema's type. A Liquid template ALWAYS
+ * renders a string, so `number: "${{ event.raw.pull_request.number }}"`
+ * arrives as "1539" for an `integer` param; every author who templates a
+ * numeric or boolean param would otherwise hit "expected an integer" at
+ * run time (the PR-review built-in did, on its first live pull request).
+ * Only an unambiguous string converts: an integer literal for `integer`, a
+ * numeric literal for `number`, `true`/`false` for `boolean`. Anything else
+ * passes through untouched for `validateFieldValue` to reject. Objects and
+ * arrays recurse; unknown properties are left for validation to flag. */
+export function coerceFieldValue(schema: FieldSchema, value: unknown): unknown {
+  switch (schema.type) {
+    case "object": {
+      if (!isRecord(value)) return value;
+      const out: Record<string, unknown> = {};
+      for (const [key, child] of Object.entries(value)) {
+        const childSchema = schema.properties[key];
+        out[key] = childSchema === undefined ? child : coerceFieldValue(childSchema, child);
+      }
+      return out;
+    }
+    case "array":
+      if (!Array.isArray(value) || schema.items === undefined) return value;
+      return value.map((item) => coerceFieldValue(schema.items!, item));
+    case "integer":
+      return typeof value === "string" && INTEGER_RE.test(value.trim()) ? Number(value.trim()) : value;
+    case "number":
+      return typeof value === "string" && NUMBER_RE.test(value.trim()) ? Number(value.trim()) : value;
+    case "boolean":
+      return value === "true" ? true : value === "false" ? false : value;
+    case "string":
+      return value;
+  }
+}
+
 /** Validate a value against a FieldSchema. Unknown object properties are
  * violations — action inputs are a closed contract. */
 export function validateFieldValue(schema: FieldSchema, value: unknown): FieldValueError[] {
