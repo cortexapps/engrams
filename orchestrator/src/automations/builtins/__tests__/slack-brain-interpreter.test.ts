@@ -350,6 +350,9 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.names).not.toContain("step:session:0");
     expect(h.finalized).toHaveLength(1);
     expect(h.finalized[0]).toMatchObject({ status: "filtered" });
+    // The notice bound the thread's handle to this workstream; closing it
+    // would drop every later mention in the thread. It stays open.
+    expect(h.closed).toEqual([]);
   });
 
   test("(a3) recovery still rebuilds the relay state when every ledger write fails", async () => {

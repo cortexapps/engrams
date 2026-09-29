@@ -423,8 +423,16 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       // (completed), or nothing will answer in it any more. A later mention
       // in the same thread opens a fresh workstream (and a fresh run); the
       // kept session is the one thing that outlives it (D8).
+      //
+      // NOT on `filtered`: an unlinked author's mention posts the "log in
+      // first" notice through the Slack post_message action, which binds the
+      // thread's handle to this workstream. A closed workstream's handle
+      // drops every later event in that thread (the v1 closed-handle
+      // policy), so closing here would silence the thread for good, for the
+      // linked colleague who mentions the bot next as well. Left open, the
+      // next mention binds by key and runs afresh.
       {
-        when: ["completed", "deadline", "failed", "halted", "superseded", "filtered"],
+        when: ["completed", "deadline", "failed", "halted", "superseded"],
         block: {
           id: "close",
           type: "instance_close",
