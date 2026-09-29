@@ -2,6 +2,7 @@ import {
   FileBox,
   FilePenLine,
   GitPullRequestArrow,
+  MessageSquare,
   PanelLeftClose,
   PanelLeftOpen,
   SquareTerminal,
@@ -66,6 +67,15 @@ const DESTS: Dest[] = [
     icon: FileBox,
     adminOnly: false,
     match: (p) => p.startsWith("/artifacts"),
+  },
+  {
+    to: "/slack",
+    label: "Slack",
+    icon: MessageSquare,
+    // Admin for now: enrolling a channel is org config, and the thread list
+    // reads the workstream RPCs, which are admin-gated.
+    adminOnly: true,
+    match: (p) => p.startsWith("/slack"),
   },
   {
     to: "/specs",

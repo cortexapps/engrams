@@ -13,6 +13,7 @@ import {
   setAutomationEnabled,
   setBlockOverrides,
   setInputs,
+  setMapInputEntry,
   testRender,
   updateAutomationMeta,
 } from "@/gen/engram/app/v1/automation-AutomationService_connectquery";
@@ -131,6 +132,14 @@ export function useDuplicateAutomation() {
 export function useSetInputs() {
   const invalidate = useInvalidateAutomations();
   return useMutation(setInputs, { onSuccess: invalidate });
+}
+
+/** Set or remove ONE entry of a map input atomically (the product surfaces'
+ * enrollment write: a repo, a Slack channel). `enable` turns the automation
+ * on in the same write. */
+export function useSetMapInputEntry() {
+  const invalidate = useInvalidateAutomations();
+  return useMutation(setMapInputEntry, { onSuccess: invalidate });
 }
 
 export function useSetBlockOverrides() {

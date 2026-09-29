@@ -38,6 +38,7 @@ import { Reviews } from "./pages/reviews/Reviews";
 import { ReviewsLayout } from "./pages/reviews/ReviewsLayout";
 import { ReviewDossier } from "./pages/reviews/ReviewDossier";
 import { ReviewRepositories } from "./pages/reviews/ReviewRepositories";
+import { SlackThreads } from "./pages/slack/SlackThreads";
 import { ArtifactsLayout } from "./pages/artifacts/ArtifactsLayout";
 import { ArtifactsLibrary } from "./pages/artifacts/ArtifactsLibrary";
 import { ArtifactDetail } from "./pages/artifacts/ArtifactDetail";
@@ -249,6 +250,16 @@ const legacyOperatorRoutes = Object.entries(LEGACY_OPERATOR).map(([path, to]) =>
     },
   }),
 );
+
+// /slack — the Slack threads product: enrolled channels and the threads
+// engrams is in. Enrollment is a write to the Slack threads automation (its
+// `channels` input); the threads are its workstreams.
+const slackRoute = createRoute({
+  getParentRoute: () => appLayoutRoute,
+  path: "/slack",
+  beforeLoad: requireAdmin,
+  component: SlackThreads,
+});
 
 // /artifacts — the cross-session document library, with a persistent rail
 // (the Reviews/Sessions content-rail shape). The detail page is a CHILD of
@@ -647,6 +658,7 @@ export const routeTree = rootRoute.addChildren([
       reviewRepositoriesRoute,
       reviewDossierRoute,
     ]),
+    slackRoute,
     artifactsLayoutRoute.addChildren([
       artifactsIndexRoute,
       artifactDetailRoute,

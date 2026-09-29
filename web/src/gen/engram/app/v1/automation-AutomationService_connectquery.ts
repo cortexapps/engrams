@@ -66,6 +66,16 @@ export const updateAutomationMeta = AutomationService.method.updateAutomationMet
 export const setInputs = AutomationService.method.setInputs;
 
 /**
+ * Set or remove ONE entry of a map input atomically (a JSONB patch, never
+ * a read-modify-write), optionally enabling the automation in the same
+ * write. The product surfaces (Reviews repositories, Slack channels)
+ * enroll through this so two admins never clobber each other's entry.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.SetMapInputEntry
+ */
+export const setMapInputEntry = AutomationService.method.setMapInputEntry;
+
+/**
  * Per-automation tunable block fields (allowed on built-ins). Every key
  * must be a `tunable` field of that block in the current version, and the
  * merged config must re-validate against the block's schema.
