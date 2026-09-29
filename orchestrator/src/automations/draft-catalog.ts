@@ -70,6 +70,7 @@ export function draftBlockCatalog(): Record<string, unknown> {
       'Prose fields render Liquid with ${{ }}; structured values use {"$ref": "steps.<id>.<output>"}.',
       'Missing variables are render errors. `x | default: y` tolerates a missing x but NOT a missing y (the argument is strict); to pick the first present of several paths use `${{ event.raw | coalesce: "pull_request.number", "issue.number" }}`.',
       "At most one cron trigger per automation; extra entrypoints take integration, cron, or manual triggers.",
+      'create_session.profileId takes a profile id OR a profile DESIGNATION (e.g. "pr_reviewer"); a designation resolves to whichever profile the org assigned it, so a definition stays portable across orgs.',
     ],
   };
 }
