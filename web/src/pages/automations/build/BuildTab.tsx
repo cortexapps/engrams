@@ -1,5 +1,7 @@
 /** The Build tab: the canvas (one column per way in) with the inspector as a
- * side sheet on the right and the test drawer along the bottom.
+ * side sheet on the right and the test drawer along the bottom. The seam
+ * between the canvas and the inspector is a drag handle, because the inspector
+ * holds the code editor and a fixed 360px is too narrow to read code in.
  *
  * Owns nothing durable — the shell holds the draft definition and passes
  * change callbacks down; this component is layout + selection. Block ids are
@@ -17,6 +19,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import type { AutomationTestState } from "@/hooks/useAutomationTest";
 import {
   addEntrypoint,
@@ -150,6 +153,41 @@ function sessionSourcesFor(definition: AutomationDefinition, selectedId: string 
   return ids;
 }
 
+/**
+ * How wide the inspector opens, as a percentage of the Build tab.
+ *
+ * A pane width is a personal, per-browser layout preference (like the rail
+ * widths and the work pane's split), so it lives in localStorage rather than on
+ * the server. react-resizable-panels reports a layout in percent, so percent is
+ * what we keep; with nothing stored the inspector opens at the designed 360px.
+ */
+const INSPECTOR_WIDTH_KEY = "engram.automation-inspector";
+const INSPECTOR_DEFAULT_WIDTH = "360px";
+/** Floors that keep both halves usable however the seam is dragged: one canvas
+ * column plus its padding on the left, a readable form/code field on the
+ * right. The canvas floor is also what caps the inspector. */
+const CANVAS_MIN_WIDTH = "280px";
+const INSPECTOR_MIN_WIDTH = "320px";
+
+function readInspectorWidth(): number | null {
+  try {
+    const stored = Number(localStorage.getItem(INSPECTOR_WIDTH_KEY));
+    // A missing or garbled value reads as 0/NaN, and a full-width or wider
+    // reading is not a split at all — keep the px default for both.
+    return Number.isFinite(stored) && stored > 0 && stored < 100 ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeInspectorWidth(percent: number) {
+  try {
+    localStorage.setItem(INSPECTOR_WIDTH_KEY, String(percent));
+  } catch {
+    // ignore — persistence is best-effort
+  }
+}
+
 /** Where a block sits: the list holding it, its index, and that list's
  * length — what Move up / Move down need. */
 export function locateBlock(
@@ -188,6 +226,9 @@ export function BuildTab({
   const [zoom, setZoom] = useState<number | "fit">("fit");
   const [adding, setAdding] = useState(false);
   const [draftWay, setDraftWay] = useState("");
+  // Read once: `defaultSize` is only consulted on mount, and every later width
+  // belongs to the library and the store, not to a render.
+  const [storedInspectorWidth] = useState(readInspectorWidth);
 
   const selected = selectedId === TRIGGER_ROW_ID ? null : findBlock(active.blocks, selectedId);
   // A removed block leaves a dangling selection; fall back to the trigger.
@@ -262,239 +303,269 @@ export function BuildTab({
   const draftWayError = draftWay === "" ? null : entrypointIdError(definition, draftWay);
 
   return (
-    <div className="flex min-h-0 flex-1" data-testid="build-tab">
-      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-        {/* The canvas ground: a dot grid in ink at 14%, 20px. */}
-        <div
-          className="relative flex min-h-0 flex-1 flex-col"
-          style={{
-            backgroundImage:
-              "radial-gradient(color-mix(in oklch, var(--color-foreground) 14%, transparent) 1px, transparent 1px)",
-            backgroundSize: "20px 20px",
-          }}
-        >
-          <div className="absolute top-3 right-3 z-30 flex items-center gap-1" aria-label="Zoom">
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 w-7 px-0"
-              aria-label="Zoom out"
-              onClick={() => setZoom((z) => Math.max(MIN_SCALE, (z === "fit" ? 1 : z) - 0.1))}
-            >
-              −
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 w-7 px-0"
-              aria-label="Zoom in"
-              onClick={() => setZoom((z) => Math.min(MAX_SCALE, (z === "fit" ? 1 : z) + 0.1))}
-            >
-              +
-            </Button>
-            <Button variant="outline" size="sm" className="h-7" onClick={() => setZoom("fit")}>
-              Fit
-            </Button>
-          </div>
-          <div className="flex min-h-0 flex-1 gap-6 overflow-x-auto p-6 pt-12">
-            {ways.map((way) => {
-              const projected = way === entrypointId ? active : projectEntrypoint(definition, way);
-              return (
-                <div key={way} className="flex min-h-0 min-w-[240px] flex-1 flex-col">
-                  <Canvas
-                    trigger={projected.trigger}
-                    triggerSummary={triggerSummaryFor(way)}
-                    entrypointId={ways.length > 1 || way !== MAIN_ENTRYPOINT_ID ? way : undefined}
-                    blocks={projected.blocks}
-                    selectedId={way === entrypointId ? effectiveId : null}
-                    onSelect={(id) => select(way, id)}
-                    erroredIds={way === entrypointId ? erroredIds : new Set()}
-                    locked={builtin}
-                    onInsert={(at, index, kind) => onInsert(way, at, index, kind)}
-                    onMove={(at, from, to) => onMove(way, at, from, to)}
-                    onRemove={(id) => onRemove(way, id)}
-                    zoom={zoom}
-                  />
-                </div>
-              );
-            })}
-            {!builtin && (
-              <div className={cn("flex shrink-0 flex-col", adding ? "w-[264px]" : "w-auto")}>
-                {adding ? (
-                  <form
-                    className="flex flex-col gap-2 rounded-lg border border-dashed bg-card/60 p-3"
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      confirmAddWay();
-                    }}
-                  >
-                    <Input
-                      value={draftWay}
-                      onChange={(e) => setDraftWay(e.target.value)}
-                      placeholder="review_feedback"
-                      aria-label="Name for the new way in"
-                      className="font-mono text-xs"
-                      autoFocus
+    <ResizablePanelGroup
+      orientation="horizontal"
+      className="min-h-0 flex-1"
+      data-testid="build-tab"
+      // `onLayoutChanged` (past tense) fires once the pointer is released
+      // rather than on every drag frame — upstream's guidance for writing to a
+      // storage API. Only remember a genuine split; a degenerate reading would
+      // clobber the preferred width.
+      onLayoutChanged={(layout) => {
+        const { "build-canvas": canvas, "build-inspector": inspector } = layout;
+        if (canvas > 1 && inspector > 1) writeInspectorWidth(inspector);
+      }}
+    >
+      <ResizablePanel id="build-canvas" minSize={CANVAS_MIN_WIDTH} className="min-w-0">
+        <div className="relative flex h-full min-h-0 min-w-0 flex-col">
+          {/* The canvas ground: a dot grid in ink at 14%, 20px. */}
+          <div
+            className="relative flex min-h-0 flex-1 flex-col"
+            style={{
+              backgroundImage:
+                "radial-gradient(color-mix(in oklch, var(--color-foreground) 14%, transparent) 1px, transparent 1px)",
+              backgroundSize: "20px 20px",
+            }}
+          >
+            <div className="absolute top-3 right-3 z-30 flex items-center gap-1" aria-label="Zoom">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 w-7 px-0"
+                aria-label="Zoom out"
+                onClick={() => setZoom((z) => Math.max(MIN_SCALE, (z === "fit" ? 1 : z) - 0.1))}
+              >
+                −
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 w-7 px-0"
+                aria-label="Zoom in"
+                onClick={() => setZoom((z) => Math.min(MAX_SCALE, (z === "fit" ? 1 : z) + 0.1))}
+              >
+                +
+              </Button>
+              <Button variant="outline" size="sm" className="h-7" onClick={() => setZoom("fit")}>
+                Fit
+              </Button>
+            </div>
+            <div className="flex min-h-0 flex-1 gap-6 overflow-x-auto p-6 pt-12">
+              {ways.map((way) => {
+                const projected =
+                  way === entrypointId ? active : projectEntrypoint(definition, way);
+                return (
+                  <div key={way} className="flex min-h-0 min-w-[240px] flex-1 flex-col">
+                    <Canvas
+                      trigger={projected.trigger}
+                      triggerSummary={triggerSummaryFor(way)}
+                      entrypointId={ways.length > 1 || way !== MAIN_ENTRYPOINT_ID ? way : undefined}
+                      blocks={projected.blocks}
+                      selectedId={way === entrypointId ? effectiveId : null}
+                      onSelect={(id) => select(way, id)}
+                      erroredIds={way === entrypointId ? erroredIds : new Set()}
+                      locked={builtin}
+                      onInsert={(at, index, kind) => onInsert(way, at, index, kind)}
+                      onMove={(at, from, to) => onMove(way, at, from, to)}
+                      onRemove={(id) => onRemove(way, id)}
+                      zoom={zoom}
                     />
-                    {draftWayError && (
-                      <p className="text-xs text-muted-foreground">{draftWayError}</p>
-                    )}
-                    <div className="flex gap-2">
-                      <Button type="submit" size="sm" disabled={draftWay === "" || !!draftWayError}>
-                        Add
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => setAdding(false)}
-                      >
-                        Cancel
-                      </Button>
-                    </div>
-                  </form>
-                ) : (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="h-9 justify-start border border-dashed text-muted-foreground"
-                    onClick={() => setAdding(true)}
-                    data-testid="add-way-in"
-                  >
-                    <Plus aria-hidden />
-                    Add another way in
-                  </Button>
-                )}
+                  </div>
+                );
+              })}
+              {!builtin && (
+                <div className={cn("flex shrink-0 flex-col", adding ? "w-[264px]" : "w-auto")}>
+                  {adding ? (
+                    <form
+                      className="flex flex-col gap-2 rounded-lg border border-dashed bg-card/60 p-3"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        confirmAddWay();
+                      }}
+                    >
+                      <Input
+                        value={draftWay}
+                        onChange={(e) => setDraftWay(e.target.value)}
+                        placeholder="review_feedback"
+                        aria-label="Name for the new way in"
+                        className="font-mono text-xs"
+                        autoFocus
+                      />
+                      {draftWayError && (
+                        <p className="text-xs text-muted-foreground">{draftWayError}</p>
+                      )}
+                      <div className="flex gap-2">
+                        <Button
+                          type="submit"
+                          size="sm"
+                          disabled={draftWay === "" || !!draftWayError}
+                        >
+                          Add
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => setAdding(false)}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </form>
+                  ) : (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-9 justify-start border border-dashed text-muted-foreground"
+                      onClick={() => setAdding(true)}
+                      data-testid="add-way-in"
+                    >
+                      <Plus aria-hidden />
+                      Add another way in
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+          <TestDrawer test={test} panel={testPanel} />
+        </div>
+      </ResizablePanel>
+
+      {/* The seam the inspector is dragged by. The pill is the handle's own
+          look — the same control as the rail's on the other side of the page. */}
+      <ResizableHandle />
+
+      <ResizablePanel
+        id="build-inspector"
+        defaultSize={storedInspectorWidth ?? INSPECTOR_DEFAULT_WIDTH}
+        minSize={INSPECTOR_MIN_WIDTH}
+        className="min-w-0"
+      >
+        <aside
+          className="flex h-full flex-col border-l bg-card"
+          aria-label="Inspector"
+          data-testid="inspector"
+        >
+          <div className="flex items-start gap-2 px-[18px] pt-5 pb-3.5">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <h3 className="truncate text-sm font-semibold">
+                  {selected ? blockKind(selected.type).label : "Trigger"}
+                </h3>
+                <span className="rounded-sm bg-secondary px-1.5 py-px font-mono text-2xs text-muted-foreground">
+                  {selected ? selected.type : ways.length > 1 ? entrypointId : "way in"}
+                </span>
               </div>
+              <div className="font-mono text-2xs text-muted-foreground">
+                {selected ? selected.id : triggerSummaryFor(entrypointId)}
+              </div>
+            </div>
+            {selected && !builtin && position && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" size="icon-xs" aria-label={`Actions for ${selected.id}`}>
+                    <MoreHorizontal />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem
+                    disabled={position.index === 0}
+                    onSelect={() =>
+                      onMove(entrypointId, position.at, position.index, position.index - 1)
+                    }
+                  >
+                    <ChevronUp aria-hidden /> Move up
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={position.index >= position.length - 1}
+                    onSelect={() =>
+                      onMove(entrypointId, position.at, position.index, position.index + 1)
+                    }
+                  >
+                    <ChevronDown aria-hidden /> Move down
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    variant="destructive"
+                    onSelect={() => onRemove(entrypointId, selected.id)}
+                  >
+                    <Trash2 aria-hidden /> Remove
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             )}
           </div>
-        </div>
-        <TestDrawer test={test} panel={testPanel} />
-      </div>
-
-      <aside
-        className="flex w-[360px] shrink-0 flex-col border-l bg-card"
-        aria-label="Inspector"
-        data-testid="inspector"
-      >
-        <div className="flex items-start gap-2 px-[18px] pt-5 pb-3.5">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <h3 className="truncate text-sm font-semibold">
-                {selected ? blockKind(selected.type).label : "Trigger"}
-              </h3>
-              <span className="rounded-sm bg-secondary px-1.5 py-px font-mono text-2xs text-muted-foreground">
-                {selected ? selected.type : ways.length > 1 ? entrypointId : "way in"}
-              </span>
-            </div>
-            <div className="font-mono text-2xs text-muted-foreground">
-              {selected ? selected.id : triggerSummaryFor(entrypointId)}
-            </div>
+          <div className="min-h-0 flex-1 overflow-y-auto px-[18px] pb-4">
+            {effectiveId === TRIGGER_ROW_ID ? (
+              <TriggerInspector
+                trigger={active.trigger}
+                onChange={updateTrigger}
+                builtin={builtin}
+                errors={triggerErrors}
+              />
+            ) : selected ? (
+              <BlockInspector
+                key={selected.id}
+                block={selected}
+                onChange={updateBlock}
+                builtin={builtin}
+                errors={blockErrors}
+                sessionSources={sessionSources}
+                variablePaths={variablePaths}
+                variableValues={variableValues}
+              />
+            ) : null}
           </div>
-          {selected && !builtin && position && (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon-xs" aria-label={`Actions for ${selected.id}`}>
-                  <MoreHorizontal />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem
-                  disabled={position.index === 0}
-                  onSelect={() =>
-                    onMove(entrypointId, position.at, position.index, position.index - 1)
-                  }
-                >
-                  <ChevronUp aria-hidden /> Move up
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  disabled={position.index >= position.length - 1}
-                  onSelect={() =>
-                    onMove(entrypointId, position.at, position.index, position.index + 1)
-                  }
-                >
-                  <ChevronDown aria-hidden /> Move down
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  variant="destructive"
-                  onSelect={() => onRemove(entrypointId, selected.id)}
-                >
-                  <Trash2 aria-hidden /> Remove
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-[18px] pb-4">
-          {effectiveId === TRIGGER_ROW_ID ? (
-            <TriggerInspector
-              trigger={active.trigger}
-              onChange={updateTrigger}
-              builtin={builtin}
-              errors={triggerErrors}
-            />
-          ) : selected ? (
-            <BlockInspector
-              key={selected.id}
-              block={selected}
-              onChange={updateBlock}
-              builtin={builtin}
-              errors={blockErrors}
-              sessionSources={sessionSources}
-              variablePaths={variablePaths}
-              variableValues={variableValues}
-            />
-          ) : null}
-        </div>
-        {!builtin && (
-          <div className="flex items-center gap-1 border-t px-3 py-2">
-            {selected && position ? (
-              <>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={position.index === 0}
-                  onClick={() =>
-                    onMove(entrypointId, position.at, position.index, position.index - 1)
-                  }
-                >
-                  <ChevronUp aria-hidden /> Move up
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={position.index >= position.length - 1}
-                  onClick={() =>
-                    onMove(entrypointId, position.at, position.index, position.index + 1)
-                  }
-                >
-                  <ChevronDown aria-hidden /> Move down
-                </Button>
+          {!builtin && (
+            <div className="flex items-center gap-1 border-t px-3 py-2">
+              {selected && position ? (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={position.index === 0}
+                    onClick={() =>
+                      onMove(entrypointId, position.at, position.index, position.index - 1)
+                    }
+                  >
+                    <ChevronUp aria-hidden /> Move up
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={position.index >= position.length - 1}
+                    onClick={() =>
+                      onMove(entrypointId, position.at, position.index, position.index + 1)
+                    }
+                  >
+                    <ChevronDown aria-hidden /> Move down
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="ml-auto text-destructive hover:text-destructive"
+                    onClick={() => onRemove(entrypointId, selected.id)}
+                  >
+                    <Trash2 aria-hidden /> Remove
+                  </Button>
+                </>
+              ) : entrypointId !== MAIN_ENTRYPOINT_ID ? (
                 <Button
                   variant="ghost"
                   size="sm"
                   className="ml-auto text-destructive hover:text-destructive"
-                  onClick={() => onRemove(entrypointId, selected.id)}
+                  onClick={removeWay}
+                  aria-label={`Remove way in ${entrypointId}`}
                 >
-                  <Trash2 aria-hidden /> Remove
+                  <X aria-hidden /> Remove this way in
                 </Button>
-              </>
-            ) : entrypointId !== MAIN_ENTRYPOINT_ID ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="ml-auto text-destructive hover:text-destructive"
-                onClick={removeWay}
-                aria-label={`Remove way in ${entrypointId}`}
-              >
-                <X aria-hidden /> Remove this way in
-              </Button>
-            ) : null}
-          </div>
-        )}
-      </aside>
-    </div>
+              ) : null}
+            </div>
+          )}
+        </aside>
+      </ResizablePanel>
+    </ResizablePanelGroup>
   );
 }
 
