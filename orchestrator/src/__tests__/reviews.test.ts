@@ -174,6 +174,9 @@ function makeStore(
     async getActiveReviewForTask() {
       return null;
     },
+    async getActiveReviewForAutomationRun() {
+      return null;
+    },
     async getActiveReviewForTarget() {
       return null;
     },

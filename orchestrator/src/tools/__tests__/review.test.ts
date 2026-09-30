@@ -86,7 +86,12 @@ function fakeReviewStore(options: {
   active?: ReviewRow | null;
   detail?: ReviewDetail | null;
   findingCount?: number;
+  /** Which lookup finds the active pass: by the session's task (legacy
+   * worker), by the session's automation run (built-in worker), or both. */
+  activeVia?: "task" | "run" | "both";
 } = {}) {
+  const byTask = (options.activeVia ?? "task") !== "run";
+  const byRun = (options.activeVia ?? "task") !== "task";
   const findings: ReviewFindingInput[] = [];
   const verdicts: ReviewVerdictInput[] = [];
   const summaries: Array<{ reviewId: string; summaryMd: string }> = [];
@@ -127,7 +132,10 @@ function fakeReviewStore(options: {
       return [];
     },
     async getActiveReviewForTask() {
-      return active;
+      return byTask ? active : null;
+    },
+    async getActiveReviewForAutomationRun() {
+      return byRun ? active : null;
     },
     async getActiveReviewForTarget() {
       return null;
@@ -204,6 +212,18 @@ function reviewRegistry(
   return registry;
 }
 
+function validFinding() {
+  return {
+    path: "src/index.ts",
+    category: "functional-correctness",
+    severity: "high",
+    confidence: "high",
+    title: "A finding",
+    body_md: "Body",
+    evidence: ["src/index.ts"],
+  };
+}
+
 function automationNotifier() {
   const calls: Array<{
     runId: string;
@@ -245,6 +265,34 @@ describe("review tools", () => {
       "finder_done",
       "submit_verdict",
     ]);
+  });
+
+  test("a built-in worker resolves its pass through the automation binding, not the task", async () => {
+    // The worker's task is the AUTOMATION's task, so the task lookup misses;
+    // the session's run owns the pass (review.automation_run_id).
+    const fake = fakeReviewStore({ active: reviewRow({ status: "finding" }), activeVia: "run" });
+    const automation = automationNotifier();
+    const registry = reviewRegistry(fake.store, {
+      findAutomationBinding: async () => ({ runId: "autorun:auto-1:github:d1" }),
+      notifyAutomation: automation.notifyAutomation,
+    });
+    const submit = registry.get("submit_finding");
+    if (!submit || submit.handling !== "handled") throw new Error("submit_finding not registered");
+    const result = await submit.handler(context("submit_finding"), submit.input.parse(validFinding()));
+    expect(result).toMatchObject({ recorded: true });
+    expect(fake.findings).toHaveLength(1);
+
+    const done = registry.get("finder_done");
+    if (!done || done.handling !== "handled") throw new Error("finder_done not registered");
+    await expect(done.handler(context("finder_done"), done.input.parse({ summary_md: "Done." }))).resolves.toEqual({ recorded: true });
+    expect(automation.calls.map((c) => c.message.kind)).toEqual(["signal"]);
+
+    // With no binding either, the tool still answers "no active review".
+    const orphan = reviewRegistry(fakeReviewStore({ activeVia: "run" }).store).get("submit_finding");
+    if (!orphan || orphan.handling !== "handled") throw new Error("submit_finding not registered");
+    expect(await orphan.handler(context("submit_finding"), orphan.input.parse(validFinding()))).toEqual({
+      error: "no active review for this session",
+    });
   });
 
   test("submit_finding schema rejects categories outside the fixed taxonomy", () => {

@@ -231,6 +231,10 @@ describe("ReviewStore", () => {
         reviewIds.push(otherRepoReviewId);
 
         expect((await store.getActiveReviewForTask(taskId))?.id).toBe(activeReviewId);
+        // A built-in worker finds its pass through the run that drives it.
+        await store.setAutomationRunId(activeReviewId, "autorun:auto-1:github:d1");
+        expect((await store.getActiveReviewForAutomationRun("autorun:auto-1:github:d1"))?.id).toBe(activeReviewId);
+        expect(await store.getActiveReviewForAutomationRun("autorun:nobody")).toBeNull();
         const activeTargetId = (await store.getReview(activeReviewId))!.review.targetId;
         const terminalTargetId = (await store.getReview(terminalReviewId))!.review.targetId;
         expect((await store.getActiveReviewForTarget(activeTargetId))?.id).toBe(activeReviewId);
