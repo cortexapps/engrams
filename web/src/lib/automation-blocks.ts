@@ -772,6 +772,29 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     defaults: () => ({ reviewId: "", outcome: "failed" }),
   },
   {
+    kind: "review_record_post",
+    label: "Record posted review",
+    description:
+      "Write the GitHub review id that github.post_pr_review returned onto the pass, so the Reviews page links to the posted review.",
+    icon: SquareCheck,
+    fields: [
+      {
+        type: "template",
+        key: "reviewId",
+        label: "Review id",
+        help: "${{ steps.open.review_id }}",
+      },
+      {
+        type: "template",
+        key: "githubReviewId",
+        label: "GitHub review id",
+        help: "${{ steps.post.github_review_id | default: '' }}",
+      },
+    ],
+    summary: () => "Link the pass to its GitHub review",
+    defaults: () => ({ reviewId: "", githubReviewId: "" }),
+  },
+  {
     kind: "resolve_user",
     label: "Resolve user",
     description:

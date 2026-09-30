@@ -177,6 +177,7 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
       "review_stage",
       "review_settle",
       "review_close_pass",
+      "review_record_post",
       "resolve_user",
       "relay_session",
       "relay_close",
