@@ -53,6 +53,7 @@ import type { BuiltinAutomation } from "../engine/builtins.ts";
 import {
   REVIEW_CLOSE_PASS_TYPE,
   REVIEW_OPEN_PASS_TYPE,
+  REVIEW_RECORD_POST_TYPE,
   REVIEW_SETTLE_TYPE,
   REVIEW_STAGE_TYPE,
 } from "../engine/blocks/review.ts";
@@ -61,7 +62,7 @@ export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 /** Bump on any graph or inputs-schema change (the seeder inserts a new
  * version when the stored content hash differs). */
-export const PR_REVIEW_DEFINITION_VERSION = 5;
+export const PR_REVIEW_DEFINITION_VERSION = 6;
 
 /** Synthetic event key the CI dispatch edge admits a run under (no GitHub
  * delivery carries it). The admission arm accepts it for any mapped repo. */
@@ -334,6 +335,20 @@ const blocks: BlockDef[] = [
         summary: "${{ steps.gate.summary_md }}",
         comments: { $ref: "steps.gate.comments" },
       },
+    },
+  },
+  {
+    // The posted review's id onto the pass, so the dossier links to it. The
+    // settle step marked the pass posted before the post ran, so this is the
+    // one write left after the action (the legacy post step did both).
+    id: "record_post",
+    type: REVIEW_RECORD_POST_TYPE,
+    tunable: [],
+    config: {
+      reviewId: { $ref: "steps.open.review_id" },
+      // Missing on a replayed post (marker already there): `default` makes
+      // the absent output render empty instead of failing the render.
+      githubReviewId: "${{ steps.post.github_review_id | default: '' }}",
     },
   },
   {

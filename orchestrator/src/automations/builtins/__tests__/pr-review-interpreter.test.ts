@@ -93,6 +93,8 @@ interface Harness {
   ended: string[];
   actions: Array<{ actionId: string; params: Record<string, unknown> }>;
   stamped: Array<{ reviewId: string; runId: string }>;
+  /** GitHub review ids written onto passes after the post. */
+  recorded: Array<{ reviewId: string; githubReviewId: string }>;
   finalized: Array<{ status: string; error?: string }>;
 }
 
@@ -115,6 +117,7 @@ function harness(options: {
   const ended: string[] = [];
   const actions: Harness["actions"] = [];
   const stamped: Harness["stamped"] = [];
+  const recorded: Harness["recorded"] = [];
   const finalized: Harness["finalized"] = [];
   const recvQueue = [...(options.recv ?? [])];
   const runSessions: Array<{ sessionId: string; keep: boolean }> = [];
@@ -176,6 +179,9 @@ function harness(options: {
   setReviewBlockDeps({
     controlPlane: () => cp,
     reviews: () => ({
+      async setGithubReviewId(reviewId, githubReviewId) {
+        recorded.push({ reviewId, githubReviewId });
+      },
       async setAutomationRunId(reviewId, runId) {
         stamped.push({ reviewId, runId });
       },
@@ -273,13 +279,15 @@ function harness(options: {
         }
         actions.push({ actionId: input.actionId, params });
         if (input.actionId === "create_issue_comment") return { commentId: 777, status: 201 };
-        if (input.actionId === "post_pr_review") return { reviewId: 9001, status: 200 };
+        if (input.actionId === "post_pr_review") {
+          return { posted: true, inline_posted: true, already_posted: false, github_review_id: "9001" };
+        }
         return { status: 200 };
       },
     },
   };
 
-  return { deps, names, records, cpCalls, sessions, prompts, execs, ended, actions, stamped, finalized };
+  return { deps, names, records, cpCalls, sessions, prompts, execs, ended, actions, stamped, recorded, finalized };
 }
 
 const finderDone = (count: number): AutomationInbox => ({
@@ -327,6 +335,8 @@ describe("PR-review built-in on the interpreter", () => {
       "post_pr_review",
       "update_issue_comment",
     ]);
+    // The posted review's id lands on the pass (the dossier's link).
+    expect(h.recorded).toEqual([{ reviewId: "review-1", githubReviewId: "9001" }]);
     expect(h.actions[1]!.params).toMatchObject({
       repo: "acme/repo",
       prNumber: 17,

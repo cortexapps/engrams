@@ -177,6 +177,7 @@ function makeStore(
     async getActiveReviewForAutomationRun() {
       return null;
     },
+    async setGithubReviewId() {},
     async getActiveReviewForTarget() {
       return null;
     },

@@ -16,6 +16,8 @@
  *                          its prompt (returned as an output for send_prompt)
  *   - review_settle      — decision + finding settlement; returns the payload
  *                          for the generic github.post_pr_review action
+ *   - review_record_post — write the GitHub review id the post action
+ *                          returned onto the pass (the dossier's link)
  *   - review_close_pass  — the finalize-hook arm (contract 2): mark the pass
  *                          failed/halted with the sticky status comment +
  *                          activity event, or tear a superseded pass down —
@@ -44,6 +46,7 @@ export const REVIEW_OPEN_PASS_TYPE = "review_open_pass";
 export const REVIEW_STAGE_TYPE = "review_stage";
 export const REVIEW_SETTLE_TYPE = "review_settle";
 export const REVIEW_CLOSE_PASS_TYPE = "review_close_pass";
+export const REVIEW_RECORD_POST_TYPE = "review_record_post";
 
 /** The slice of the control plane the blocks use; injected for tests. */
 export type ReviewBlockControlPlane = Pick<
@@ -64,7 +67,10 @@ export type ReviewBlockControlPlane = Pick<
 
 export interface ReviewBlockDeps {
   controlPlane(): ReviewBlockControlPlane;
-  reviews(): { setAutomationRunId(reviewId: string, runId: string): Promise<void> };
+  reviews(): {
+    setAutomationRunId(reviewId: string, runId: string): Promise<void>;
+    setGithubReviewId(reviewId: string, githubReviewId: string): Promise<void>;
+  };
 }
 
 let runtimeDeps: ReviewBlockDeps | null = null;
@@ -317,6 +323,25 @@ async function executeReviewPolicyGate(config: ReviewPolicyGateConfig): Promise<
 }
 
 // ---------------------------------------------------------------------------
+// review_record_post
+// ---------------------------------------------------------------------------
+
+export const reviewRecordPostConfigSchema = z.object({
+  reviewId: z.string().min(1),
+  /** The `github_review_id` output of github.post_pr_review. Empty when the
+   * action found its marker already posted (a replay) — nothing to record. */
+  githubReviewId: z.string().optional(),
+});
+export type ReviewRecordPostConfig = z.infer<typeof reviewRecordPostConfigSchema>;
+
+async function executeReviewRecordPost(config: ReviewRecordPostConfig): Promise<BlockOutcome> {
+  const id = config.githubReviewId?.trim();
+  if (!id) return { kind: "ok", outputs: { review_id: config.reviewId, recorded: false } };
+  await deps().reviews().setGithubReviewId(config.reviewId, id);
+  return { kind: "ok", outputs: { review_id: config.reviewId, recorded: true, github_review_id: id } };
+}
+
+// ---------------------------------------------------------------------------
 // review_close_pass — the finalize-hook arm
 // ---------------------------------------------------------------------------
 
@@ -353,6 +378,16 @@ export async function executeReviewFinalize(config: ReviewFinalizeConfig): Promi
 }
 
 export function registerReviewBlocks(): void {
+  registerBlock<ReviewRecordPostConfig>({
+    type: REVIEW_RECORD_POST_TYPE,
+    refusesDryRun: true,
+    outputs: ["review_id", "recorded", "github_review_id"],
+    configSchema: reviewRecordPostConfigSchema,
+    async execute(config) {
+      return executeReviewRecordPost(config);
+    },
+  });
+
   registerBlock<ReviewFinalizeConfig>({
     type: REVIEW_CLOSE_PASS_TYPE,
     refusesDryRun: true,

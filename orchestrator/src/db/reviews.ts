@@ -341,6 +341,12 @@ export interface ReviewStore {
   ): Promise<void>;
   /** ADR 0119 phase 4: stamp the automation run that drives this pass. */
   setAutomationRunId(reviewId: string, runId: string): Promise<void>;
+  /** The GitHub review a pass posted as (the dossier's "Review on GitHub"
+   * link). Written after the post, whatever the pass's status by then: on
+   * the engine path the settle step marks the pass posted BEFORE the post
+   * action runs, so the id arrives on a row `finalizeReview` no longer
+   * touches. */
+  setGithubReviewId(reviewId: string, githubReviewId: string): Promise<void>;
   /** Applies only while the row is active; false exposes a refused late write. */
   updateReviewStatus(reviewId: string, status: string): Promise<boolean>;
   /**
@@ -1147,6 +1153,13 @@ export function makeReviewStore(
       await db
         .update(reviewTable)
         .set({ automationRunId: runId, updatedAt: new Date() })
+        .where(eq(reviewTable.id, reviewId));
+    },
+
+    async setGithubReviewId(reviewId, githubReviewId) {
+      await db
+        .update(reviewTable)
+        .set({ githubReviewId, updatedAt: new Date() })
         .where(eq(reviewTable.id, reviewId));
     },
 

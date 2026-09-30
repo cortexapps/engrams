@@ -137,6 +137,7 @@ function fakeReviewStore(options: {
     async getActiveReviewForAutomationRun() {
       return byRun ? active : null;
     },
+    async setGithubReviewId() {},
     async getActiveReviewForTarget() {
       return null;
     },

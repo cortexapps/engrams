@@ -6,6 +6,7 @@ import { registerEngineBlocks } from "../blocks/index.ts";
 import { getBlock } from "../blocks/registry.ts";
 import {
   REVIEW_OPEN_PASS_TYPE,
+  REVIEW_RECORD_POST_TYPE,
   REVIEW_SETTLE_TYPE,
   setReviewBlockDeps,
   type ReviewBlockControlPlane,
@@ -52,6 +53,7 @@ interface Fake {
   cp: ReviewBlockControlPlane;
   calls: string[];
   stamped: Array<{ reviewId: string; runId: string }>;
+  recorded: Array<{ reviewId: string; githubReviewId: string }>;
   targets: unknown[];
   passes: unknown[];
 }
@@ -119,15 +121,19 @@ function fake(options: { deduplicate?: boolean; payload?: ReviewPostPayload } = 
       calls.push(`haltReview:${reviewId}`);
     },
   };
+  const recorded: Array<{ reviewId: string; githubReviewId: string }> = [];
   setReviewBlockDeps({
     controlPlane: () => cp,
     reviews: () => ({
       async setAutomationRunId(reviewId, runId) {
         stamped.push({ reviewId, runId });
       },
+      async setGithubReviewId(reviewId, githubReviewId) {
+        recorded.push({ reviewId, githubReviewId });
+      },
     }),
   });
-  return { cp, calls, stamped, targets, passes };
+  return { cp, calls, stamped, recorded, targets, passes };
 }
 
 afterEach(() => setReviewBlockDeps(null));
@@ -274,6 +280,20 @@ describe("review_settle", () => {
     if (outcome.kind === "ok") {
       expect(String(outcome.outputs["summary_md"])).toContain("<!-- engrams-review:review-1 -->");
     }
+  });
+});
+
+describe("review_record_post", () => {
+  test("writes the posted review's id onto the pass; an empty id (a replayed post) records nothing", async () => {
+    const f = fake();
+    const block = getBlock(REVIEW_RECORD_POST_TYPE)!;
+    const set = await block.execute!(block.configSchema.parse({ reviewId: "review-9", githubReviewId: "5369378073" }) as never, ctx());
+    expect(set).toMatchObject({ kind: "ok", outputs: { recorded: true, github_review_id: "5369378073" } });
+    expect(f.recorded).toEqual([{ reviewId: "review-9", githubReviewId: "5369378073" }]);
+
+    const skip = await block.execute!(block.configSchema.parse({ reviewId: "review-9", githubReviewId: "" }) as never, ctx());
+    expect(skip).toMatchObject({ kind: "ok", outputs: { recorded: false } });
+    expect(f.recorded).toHaveLength(1);
   });
 });
 

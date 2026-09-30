@@ -64,6 +64,7 @@ export const V1_BLOCK_TYPES = [
   "review_stage",
   "review_settle",
   "review_close_pass",
+  "review_record_post",
   "resolve_user",
   "relay_session",
   "relay_close",
