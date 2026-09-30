@@ -1,9 +1,9 @@
 /** The automation editor shell — the Builder.
  *
  * A fixed-height frame: a masthead (the name as an inline-editable title over
- * the state chips, then the tabs, On/Paused, Dry run, Save) over the tab
- * body. Build fills the remaining height with the canvas; the other tabs
- * scroll. Tabs are driven by the `?tab=` search param.
+ * the description and the state chips, then the tabs, On/Paused, Dry run,
+ * Save) over the tab body. Build fills the remaining height with the canvas;
+ * the other tabs scroll. Tabs are driven by the `?tab=` search param.
  *
  * Saving follows the editing model: a user automation saves a full new
  * version (SaveVersion); a built-in saves only the changed tunable fields
@@ -382,6 +382,24 @@ export function AutomationEditor({
               />
             )}
             {nameError && <FieldError>{nameError}</FieldError>}
+            {/* The description used to live only in Settings, which meant the
+                one line that says what an automation DOES was two clicks away
+                from the graph that does it. It reads as a sub-header here: the
+                same inline edit as the name, at body weight so it stays
+                subordinate to it. */}
+            {builtin ? (
+              description !== "" && (
+                <p className="truncate text-sm text-muted-foreground">{description}</p>
+              )
+            ) : (
+              <input
+                aria-label="Automation description"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="Add a description"
+                className="w-full min-w-0 rounded-sm bg-transparent text-sm text-muted-foreground outline-none placeholder:text-muted-foreground/60 focus-visible:ring-2 focus-visible:ring-ring/60"
+              />
+            )}
             <div className="flex min-w-0 items-center gap-2">
               {builtin && (
                 <Badge
