@@ -39,6 +39,7 @@ import { ReviewsLayout } from "./pages/reviews/ReviewsLayout";
 import { ReviewDossier } from "./pages/reviews/ReviewDossier";
 import { ReviewRepositories } from "./pages/reviews/ReviewRepositories";
 import { SlackThreads } from "./pages/slack/SlackThreads";
+import { SlackLayout } from "./pages/slack/SlackLayout";
 import { ArtifactsLayout } from "./pages/artifacts/ArtifactsLayout";
 import { ArtifactsLibrary } from "./pages/artifacts/ArtifactsLibrary";
 import { ArtifactDetail } from "./pages/artifacts/ArtifactDetail";
@@ -254,10 +255,15 @@ const legacyOperatorRoutes = Object.entries(LEGACY_OPERATOR).map(([path, to]) =>
 // /slack — the Slack threads product: enrolled channels and the threads
 // engrams is in. Enrollment is a write to the Slack threads automation (its
 // `channels` input); the threads are its workstreams.
-const slackRoute = createRoute({
+const slackLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
   path: "/slack",
   beforeLoad: requireAdmin,
+  component: SlackLayout,
+});
+const slackIndexRoute = createRoute({
+  getParentRoute: () => slackLayoutRoute,
+  path: "/",
   component: SlackThreads,
 });
 
@@ -658,7 +664,7 @@ export const routeTree = rootRoute.addChildren([
       reviewRepositoriesRoute,
       reviewDossierRoute,
     ]),
-    slackRoute,
+    slackLayoutRoute.addChildren([slackIndexRoute]),
     artifactsLayoutRoute.addChildren([
       artifactsIndexRoute,
       artifactDetailRoute,

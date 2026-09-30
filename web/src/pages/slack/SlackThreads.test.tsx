@@ -2,16 +2,19 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderWithProviders } from "../../test-utils";
-import { SlackThreads, channelsOf } from "./SlackThreads";
+import { SlackThreads, channelsOf, inputsOf } from "./SlackThreads";
 
 const setEntry = vi.hoisted(() => vi.fn().mockResolvedValue({}));
+const setInputs = vi.hoisted(() => vi.fn().mockResolvedValue({}));
+const setEnabled = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const state = vi.hoisted(() => ({
-  inputs: { channels: {} as Record<string, string> },
+  inputs: { channels: {} as Record<string, string>, default_profile: "" },
   enabled: false,
   profiles: [] as Array<{ id: string; name: string }>,
   instances: [] as Array<Record<string, unknown>>,
 }));
 
+vi.mock("sonner", () => ({ toast: { success: () => {}, error: () => {} } }));
 vi.mock("../../hooks/useAutomations", () => ({
   useBuiltinAutomation: () => ({
     data: {
@@ -24,6 +27,8 @@ vi.mock("../../hooks/useAutomations", () => ({
     isPending: false,
   }),
   useSetMapInputEntry: () => ({ mutateAsync: setEntry, mutate: setEntry, isPending: false }),
+  useSetInputs: () => ({ mutateAsync: setInputs, isPending: false }),
+  useSetAutomationEnabled: () => ({ mutateAsync: setEnabled, isPending: false }),
 }));
 vi.mock("../../hooks/useInstances", () => ({
   useInstanceList: () => ({ data: { instances: state.instances }, isPending: false }),
@@ -36,13 +41,18 @@ vi.mock("../../hooks/useAutomationRuns", () => ({
 vi.mock("../../hooks/useProfiles", () => ({
   useProfiles: () => ({ data: { profiles: state.profiles } }),
 }));
-vi.mock("../../hooks/useNow", () => ({ useNow: () => Date.parse("2026-09-29T12:00:00Z") }));
+vi.mock("../../hooks/useNow", () => ({ useNow: () => Date.parse("2026-09-30T12:00:00Z") }));
 
 beforeEach(() => {
   setEntry.mockClear();
-  state.inputs = { channels: { C0123456789: "prof-a" } };
+  setInputs.mockClear();
+  setEnabled.mockClear();
+  state.inputs = { channels: { C0123456789: "prof-a" }, default_profile: "prof-d" };
   state.enabled = true;
-  state.profiles = [{ id: "prof-a", name: "Helpdesk" }];
+  state.profiles = [
+    { id: "prof-d", name: "Helpdesk" },
+    { id: "prof-a", name: "Alerts" },
+  ];
   state.instances = [
     {
       id: "ai_1",
@@ -51,57 +61,76 @@ beforeEach(() => {
       status: "open",
       inputsJson: "{}",
       openedBy: "event:slack:Ev1",
-      openedAt: "2026-09-29T11:00:00Z",
+      openedAt: "2026-09-30T11:00:00Z",
     },
   ];
 });
 
-describe("channelsOf", () => {
-  it("reads the channels map and tolerates junk", () => {
+describe("channelsOf / inputsOf", () => {
+  it("read the stored inputs and tolerate junk", () => {
     expect(channelsOf(JSON.stringify({ channels: { C2: "p", C1: "q" } }))).toEqual([
       { channel: "C1", profileId: "q" },
       { channel: "C2", profileId: "p" },
     ]);
     expect(channelsOf("nope")).toEqual([]);
-    expect(channelsOf(JSON.stringify({ channels: [] }))).toEqual([]);
+    expect(inputsOf(JSON.stringify({ default_profile: "x" }))).toEqual({ default_profile: "x" });
+    expect(inputsOf("nope")).toEqual({});
   });
 });
 
 describe("SlackThreads", () => {
-  it("lists enrolled channels with their profile, the threads, and the link to the automation", async () => {
+  it("shows the switch on, the default profile, the overrides, the threads, and the automation link", async () => {
     renderWithProviders(<SlackThreads />);
-    expect(await screen.findByText("C0123456789")).toBeTruthy();
-    expect(screen.getByText("Helpdesk")).toBeTruthy();
+    expect(await screen.findByRole("switch", { name: /pause answering/i })).toBeTruthy();
+    expect(screen.getByText("Answering @-mentions")).toBeTruthy();
+    expect(screen.getByText("C0123456789")).toBeTruthy();
+    expect(screen.getByText("Alerts")).toBeTruthy();
     expect(screen.getByRole("link", { name: /Slack threads automation/ })).toBeTruthy();
-    // The key shows twice on a workstream row (humanized name + mono key).
     expect((await screen.findAllByText("T1:C0123456789:1700.1")).length).toBeGreaterThan(0);
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("warns when channels are enrolled but the automation is paused", async () => {
+  it("cannot be turned on with no profile anywhere, and warns when on with none", async () => {
+    state.inputs = { channels: {}, default_profile: "" };
     state.enabled = false;
+    const { unmount } = renderWithProviders(<SlackThreads />);
+    const sw = await screen.findByRole("switch", { name: /answer @-mentions/i });
+    expect((sw as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/Pick a default profile to turn answering on/)).toBeTruthy();
+    unmount();
+
+    state.enabled = true;
     renderWithProviders(<SlackThreads />);
-    expect((await screen.findByRole("alert")).textContent).toMatch(/paused/);
+    expect((await screen.findByRole("alert")).textContent).toMatch(/no profile is set/);
   });
 
-  it("enrolls a channel as one map entry and enables the automation", async () => {
+  it("the switch pauses and resumes the automation", async () => {
     renderWithProviders(<SlackThreads />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: /enroll channel/i }));
+    await user.click(await screen.findByRole("switch", { name: /pause answering/i }));
+    await waitFor(() =>
+      expect(setEnabled).toHaveBeenCalledWith({ id: "auto-slack", enabled: false }),
+    );
+  });
+
+  it("adds a channel override as one map entry without enabling", async () => {
+    renderWithProviders(<SlackThreads />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: /add override/i }));
     await user.type(await screen.findByLabelText("Channel ID"), "C0987654321");
-    await user.click(screen.getByRole("button", { name: /^enroll$/i }));
+    await user.click(screen.getByRole("button", { name: /^add$/i }));
     await waitFor(() =>
       expect(setEntry).toHaveBeenCalledWith({
         automationId: "auto-slack",
         inputKey: "channels",
         entryKey: "C0987654321",
-        valueJson: JSON.stringify("prof-a"),
-        enable: true,
+        valueJson: JSON.stringify("prof-d"),
+        enable: false,
       }),
     );
   });
 
-  it("removes a channel via the confirm dialog", async () => {
+  it("removes an override via the confirm dialog", async () => {
     renderWithProviders(<SlackThreads />);
     const user = userEvent.setup();
     await screen.findByText("C0123456789");

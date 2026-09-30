@@ -5,8 +5,15 @@ import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
 import { AlertTriangle } from "lucide-react";
 
+import { toast } from "sonner";
+
 import { PageHeading } from "../../components/page-heading";
-import { useBuiltinAutomation, useSetMapInputEntry } from "../../hooks/useAutomations";
+import {
+  useBuiltinAutomation,
+  useSetAutomationEnabled,
+  useSetInputs,
+  useSetMapInputEntry,
+} from "../../hooks/useAutomations";
 import { useInstanceList, useRecentDrops } from "../../hooks/useInstances";
 import { useNow } from "../../hooks/useNow";
 import { useProfiles } from "../../hooks/useProfiles";
@@ -25,6 +32,7 @@ import {
 } from "@/components/ui/dialog";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -58,39 +66,78 @@ import { WorkstreamsTable } from "@/pages/automations/workstreams/WorkstreamsTab
 /** The built-in behind this page. */
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
-// The Slack threads product: which channels engrams answers @-mentions in,
-// and the threads it is (and was) in. Enrolling a channel here is a write to
-// the Slack threads automation — its `channels` input, one entry per channel,
-// mapped to the session profile the thread runs on — and the automation is
-// enabled on the first channel. Every thread it answers in is a workstream of
-// that automation, and every mention's run is on its Activity tab; the
-// product is the front of the platform, the links below open the back.
+// The Slack threads product: whether engrams answers @-mentions, on which
+// profile, and the threads it is (and was) in. It answers wherever the Slack
+// app is a member and gets mentioned — the legacy behaviour; per-channel
+// enrollment was the ADR 0119 window's gate and is gone. The switch is the
+// Slack threads automation's own enabled flag; the default profile is its
+// `default_profile` input; a channel override is one entry of its `channels`
+// map. Every thread it answers in is a workstream of that automation, and
+// every mention's run is on its Activity tab; the product is the front of the
+// platform, the links below open the back.
 export function SlackThreads() {
   const builtin = useBuiltinAutomation(SLACK_BRAIN_BUILTIN_KEY);
   const automation = builtin.data?.automation;
   const automationId = automation?.id;
+  const inputs = inputsOf(automation?.inputsJson);
   const channels = channelsOf(automation?.inputsJson);
+  const defaultProfile =
+    typeof inputs["default_profile"] === "string" ? inputs["default_profile"] : "";
   const { data: profileData } = useProfiles();
   const profiles = profileData?.profiles ?? [];
+  const setEnabled = useSetAutomationEnabled();
+  const setInputs = useSetInputs();
+  const enabled = automation?.enabled === true;
+  const answersSomewhere = defaultProfile !== "" || channels.length > 0;
+
+  const onEnabledChange = async (next: boolean) => {
+    if (!automationId) return;
+    try {
+      await setEnabled.mutateAsync({ id: automationId, enabled: next });
+      toast.success(next ? "Answering @-mentions" : "Paused");
+    } catch (error) {
+      toast.error(errorMessage(error));
+    }
+  };
+
+  const onDefaultProfile = async (profileId: string) => {
+    if (!automationId) return;
+    try {
+      await setInputs.mutateAsync({
+        automationId,
+        inputsJson: JSON.stringify({
+          ...inputs,
+          default_profile: profileId === NO_PROFILE ? "" : profileId,
+        }),
+      });
+      toast.success("Default profile saved");
+    } catch (error) {
+      toast.error(errorMessage(error));
+    }
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-8 overflow-auto p-4 md:p-6">
       <PageHeading
         title="Slack"
         count={
-          channels.length > 0
-            ? `${channels.length} ${channels.length === 1 ? "channel" : "channels"}`
-            : undefined
-        }
-        actions={
-          automationId ? (
-            <EnrollChannelDialog automationId={automationId} profiles={profiles} />
+          automation ? (
+            <label className="inline-flex items-center gap-2 text-xs">
+              <Switch
+                aria-label={enabled ? "Pause answering @-mentions" : "Answer @-mentions"}
+                checked={enabled}
+                disabled={setEnabled.isPending || (!enabled && !answersSomewhere)}
+                onCheckedChange={onEnabledChange}
+              />
+              {enabled ? "Answering @-mentions" : "Paused"}
+            </label>
           ) : undefined
         }
       />
 
       <p className="text-sm text-muted-foreground">
-        @-mentions in these channels start a session per thread, relayed both ways, by the{" "}
+        @-mention engrams in any channel the Slack app is in and it answers in the thread, one
+        session per thread, relayed both ways, by the{" "}
         {automationId ? (
           <Link
             to="/automations/$id"
@@ -112,14 +159,65 @@ export function SlackThreads() {
         </EmptyState>
       )}
 
-      <section className="flex flex-col gap-3" aria-label="Channels">
-        <h2 className="text-base font-semibold">Channels</h2>
+      <section className="flex flex-col gap-3" aria-label="Default profile">
+        <h2 className="text-base font-semibold">Default profile</h2>
+        <p className="text-sm text-muted-foreground">
+          The session profile every thread runs on. A channel override below picks a different one
+          for that channel.
+        </p>
+        {builtin.isPending ? (
+          <SkeletonRows rows={1} columns={["minmax(12rem,1fr)"]} />
+        ) : (
+          <Select
+            value={defaultProfile === "" ? NO_PROFILE : defaultProfile}
+            onValueChange={onDefaultProfile}
+            disabled={!automationId || setInputs.isPending}
+          >
+            <SelectTrigger className="w-72" aria-label="Default profile">
+              <SelectValue placeholder="Pick a profile" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={NO_PROFILE}>None — answer nowhere</SelectItem>
+              {profiles.map((p) => (
+                <SelectItem key={p.id} value={p.id}>
+                  {p.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+        {automation && !enabled && !answersSomewhere && (
+          <p className="text-xs text-muted-foreground">
+            Pick a default profile to turn answering on.
+          </p>
+        )}
+        {automation && enabled && !answersSomewhere && (
+          <div
+            role="alert"
+            className="flex items-start gap-2 rounded-lg border border-instrument-caution/40 bg-instrument-caution/10 p-3 text-sm"
+          >
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-instrument-caution" aria-hidden />
+            <span>
+              Answering is on but no profile is set, so every mention is ignored. Pick a default
+              profile.
+            </span>
+          </div>
+        )}
+      </section>
+
+      <section className="flex flex-col gap-3" aria-label="Channel overrides">
+        <div className="flex flex-wrap items-center gap-3">
+          <h2 className="text-base font-semibold">Channel overrides</h2>
+          {automationId && (
+            <div className="ml-auto">
+              <EnrollChannelDialog automationId={automationId} profiles={profiles} />
+            </div>
+          )}
+        </div>
         {builtin.isPending ? (
           <SkeletonRows rows={2} columns={["minmax(12rem,1fr)", "minmax(8rem,1fr)", "6rem"]} />
         ) : channels.length === 0 ? (
-          <EmptyState>
-            No channels enrolled yet. Enroll one to have engrams answer @-mentions there.
-          </EmptyState>
+          <EmptyState>No overrides. Every channel uses the default profile.</EmptyState>
         ) : (
           <Table>
             <TableHeader>
@@ -141,23 +239,26 @@ export function SlackThreads() {
             </TableBody>
           </Table>
         )}
-        {automation && !automation.enabled && channels.length > 0 && (
-          <div
-            role="alert"
-            className="flex items-start gap-2 rounded-lg border border-instrument-caution/40 bg-instrument-caution/10 p-3 text-sm"
-          >
-            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-instrument-caution" aria-hidden />
-            <span>
-              The Slack threads automation is paused, so no channel answers. Turn it on under
-              Automations, or enroll a channel again.
-            </span>
-          </div>
-        )}
       </section>
 
       {automationId && <ThreadsSection automationId={automationId} />}
     </div>
   );
+}
+
+const NO_PROFILE = "__none__";
+
+/** The built-in's inputs, as stored. */
+export function inputsOf(inputsJson: string | undefined): Record<string, unknown> {
+  if (!inputsJson) return {};
+  try {
+    const parsed: unknown = JSON.parse(inputsJson);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 export interface ChannelEntry {
@@ -216,10 +317,10 @@ function ChannelRow({
             </AlertDialogTrigger>
             <AlertDialogContent>
               <AlertDialogHeader>
-                <AlertDialogTitle>Stop answering in {row.channel}?</AlertDialogTitle>
+                <AlertDialogTitle>Remove the override for {row.channel}?</AlertDialogTitle>
                 <AlertDialogDescription>
-                  engrams will ignore @-mentions in this channel from the next message. Threads
-                  already open keep their session. You can enroll it again any time.
+                  Threads in this channel go back to the default profile from the next mention.
+                  Threads already open keep their session.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -282,13 +383,13 @@ function EnrollChannelDialog({
 
   const onSubmit = async (data: EnrollValues) => {
     try {
-      // One entry, atomically; the first channel turns the automation on.
+      // One entry, atomically. An override never turns answering on by itself.
       await enroll.mutateAsync({
         automationId,
         inputKey: "channels",
         entryKey: data.channel.trim(),
         valueJson: JSON.stringify(data.profileId),
-        enable: true,
+        enable: false,
       });
       setOpen(false);
     } catch (e) {
@@ -310,15 +411,18 @@ function EnrollChannelDialog({
             Edit
           </Button>
         ) : (
-          <Button>Enroll channel</Button>
+          <Button variant="outline" size="sm">
+            Add override
+          </Button>
         )}
       </DialogTrigger>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{isEdit ? `Edit ${existing.channel}` : "Enroll a channel"}</DialogTitle>
+          <DialogTitle>
+            {isEdit ? `Edit ${existing.channel}` : "Add a channel override"}
+          </DialogTitle>
           <DialogDescription>
-            engrams answers @-mentions in enrolled channels with one session per thread. The Slack
-            app must be a member of the channel.
+            Threads in this channel run on the profile you pick instead of the default.
           </DialogDescription>
         </DialogHeader>
 
@@ -386,7 +490,7 @@ function EnrollChannelDialog({
               Cancel
             </Button>
             <Button type="submit" disabled={enroll.isPending}>
-              {enroll.isPending ? "Saving…" : isEdit ? "Save" : "Enroll"}
+              {enroll.isPending ? "Saving…" : isEdit ? "Save" : "Add"}
             </Button>
           </DialogFooter>
         </form>
@@ -436,7 +540,7 @@ function ThreadsSection({ automationId }: { automationId: string }) {
       ) : rows.length === 0 ? (
         <EmptyState>
           {status === "open"
-            ? "No open threads. @-mention engrams in an enrolled channel to start one."
+            ? "No open threads. @-mention engrams in a channel the app is in to start one."
             : "No closed threads."}
         </EmptyState>
       ) : (
