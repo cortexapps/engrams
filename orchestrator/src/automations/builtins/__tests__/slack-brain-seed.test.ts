@@ -95,7 +95,6 @@ describe("seedBuiltinAutomations — slack_brain", () => {
       kind: "integration",
       provider: "slack",
       connectionId: "conn-slack",
-      scope: { fromInput: "channels" },
     });
     expect(h.providers).toEqual(["slack"]);
     // A thread's session outlives its run.

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { matchesIntegrationTrigger, scopeValuesFromInput } from "../../dispatch.ts";
+import { matchesIntegrationTrigger } from "../../dispatch.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import { validateDefinition } from "../../engine/definition.ts";
 import { evaluateCode } from "../../code/sandbox.ts";
@@ -45,7 +45,7 @@ describe("Slack thread brain built-in — definition", () => {
     expect(parsed.settings.instance?.entrypoints).toEqual({ reply: { admit: "require" } });
   });
 
-  test("trigger scope: only a channel in the inputs' map matches at dispatch", () => {
+  test("no channel scope: a mention anywhere the app is a member matches; messages match the reply entrypoint", () => {
     const trigger = SLACK_BRAIN_DEFINITION.trigger;
     if (trigger.kind !== "integration") throw new Error("integration trigger expected");
     const bound = { ...trigger, connectionId: "conn-slack" };
@@ -55,22 +55,20 @@ describe("Slack thread brain built-in — definition", () => {
       eventKey,
       scopeValue: channel,
     });
-    const flagged = { channels: { C1: "prof-a" } };
-    expect(matchesIntegrationTrigger(bound, event("C1"), (k) => scopeValuesFromInput(flagged, k))).toBe(true);
+    const none = () => undefined;
+    expect(bound.scope).toBeUndefined();
+    expect(matchesIntegrationTrigger(bound, event("C1"), none)).toBe(true);
+    expect(matchesIntegrationTrigger(bound, event("C-never-seen"), none)).toBe(true);
     // Messages match the reply entrypoint's trigger, not the main one.
-    expect(matchesIntegrationTrigger(bound, event("C1", "message"), (k) => scopeValuesFromInput(flagged, k))).toBe(false);
+    expect(matchesIntegrationTrigger(bound, event("C1", "message"), none)).toBe(false);
     const reply = SLACK_BRAIN_DEFINITION.entrypoints!.find((ep) => ep.id === "reply")!.trigger;
     if (reply.kind !== "integration") throw new Error("integration trigger expected");
-    expect(matchesIntegrationTrigger({ ...reply, connectionId: "conn-slack" }, event("C1", "message"), (k) => scopeValuesFromInput(flagged, k))).toBe(true);
-    expect(matchesIntegrationTrigger({ ...reply, connectionId: "conn-slack" }, event("C2", "message"), (k) => scopeValuesFromInput(flagged, k))).toBe(false);
-    expect(matchesIntegrationTrigger(bound, event("C2"), (k) => scopeValuesFromInput(flagged, k))).toBe(false);
-    // The seeded default (empty map): nothing matches anywhere.
-    expect(matchesIntegrationTrigger(bound, event("C1"), (k) => scopeValuesFromInput({ channels: {} }, k))).toBe(false);
+    expect(matchesIntegrationTrigger({ ...reply, connectionId: "conn-slack" }, event("C-never-seen", "message"), none)).toBe(true);
     // reaction_added is ledgered by the spine but not a brain event.
-    expect(matchesIntegrationTrigger(bound, event("C1", "reaction_added"), (k) => scopeValuesFromInput(flagged, k))).toBe(false);
+    expect(matchesIntegrationTrigger(bound, event("C1", "reaction_added"), none)).toBe(false);
   });
 
-  test("defaultInputs seeds an empty channel map (nothing flagged, nothing fires)", async () => {
+  test("defaultInputs seeds no default profile (the brain answers nowhere until one is set)", async () => {
     const inputs = await SLACK_BRAIN_BUILTIN.defaultInputs();
     expect(inputs).toEqual({
       channels: {},
@@ -113,9 +111,11 @@ describe("Slack thread brain — admission code", () => {
     }
   });
 
-  test("falls back to default_profile; no profile at all → reject", async () => {
+  test("the default profile answers everywhere; a channel override wins; no profile at all → reject", async () => {
     const fb = await run(mention, "app_mention", { channels: {}, default_profile: "prof-d" });
     expect(fb.ok && (fb.value as { profile_id: string }).profile_id).toBe("prof-d");
+    const over = await run(mention, "app_mention", { channels: { C1: "prof-a" }, default_profile: "prof-d" });
+    expect(over.ok && (over.value as { profile_id: string }).profile_id).toBe("prof-a");
     const none = await run(mention, "app_mention", { channels: {} });
     expect(none.ok && none.value).toBeNull();
   });

@@ -47,7 +47,7 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 3;
+export const SLACK_BRAIN_DEFINITION_VERSION = 4;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
@@ -326,11 +326,12 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     provider: "slack",
     connectionId: DEFAULT_CONNECTION_PLACEHOLDER,
     // A mention opens a thread. Replies come in through the `reply`
-    // entrypoint below.
+    // entrypoint below. No channel scope: the brain answers wherever the
+    // Slack app is a member and gets mentioned, as the legacy workflow did.
+    // (The per-channel map was the ADR 0119 parallel-window gate; enabling
+    // the automation is the switch now, and the map only overrides the
+    // profile per channel.)
     eventKeys: ["app_mention"],
-    // The channels map's keys ARE the scope: a channel not in the map never
-    // matches, so nothing reaches the run for channels an org never flagged.
-    scope: { fromInput: "channels" },
   },
   blocks: [...admit, session, relay, firstTurn, conversation],
   // ADR 0120: a Slack thread is a WORKSTREAM. The mention opens it; a reply
@@ -347,7 +348,6 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
         connectionId: DEFAULT_CONNECTION_PLACEHOLDER,
         eventKeys: ["message"],
         continueOnly: ["message"],
-        scope: { fromInput: "channels" },
       },
       blocks: [],
     },
@@ -355,11 +355,10 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
   inputsSchema: [
     {
       key: "channels",
-      label: "Channels",
+      label: "Channel overrides",
       type: "map",
       keyNoun: "channel",
-      help: "Channels the brain answers in, each mapped to the session profile it uses.",
-      required: true,
+      help: "Channels whose threads run on a different profile than the default.",
       default: {},
       valueShape: { type: "string", label: "Profile id" },
     },
@@ -367,7 +366,7 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       key: "default_profile",
       label: "Default profile",
       type: "string",
-      help: "Profile for a flagged channel with no explicit mapping.",
+      help: "The session profile every thread runs on unless a channel override says otherwise. Empty = the brain answers nowhere.",
       default: "",
     },
     {
