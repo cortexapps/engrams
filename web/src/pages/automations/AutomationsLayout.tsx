@@ -11,6 +11,11 @@ import { AutomationsRail } from "./AutomationsRail";
 // whose canvas pans, so the editor routes get the bare sheet.
 // The whole section is admin-gated at the route layer (see router.tsx).
 
+// An automation's name is a sentence more often than a label, and the rail
+// fades it out rather than clipping it with an ellipsis — so the width is worth
+// changing. The rail is drag-resizable and remembers it per browser.
+const RAIL_WIDTH_STORAGE_KEY = "engrams.automationsRailWidth";
+
 const SECTION_PAGES = new Set(["new", "workstreams", "activity"]);
 
 /** `/automations/$id` and `/automations/new/manual` are the Builder. */
@@ -39,7 +44,13 @@ export function AutomationsLayout() {
     },
   ];
   return (
-    <SectionLayout rail={<AutomationsRail />} railLabel="Automations" nav={nav}>
+    <SectionLayout
+      rail={<AutomationsRail />}
+      railLabel="Automations"
+      resizeStorageKey={RAIL_WIDTH_STORAGE_KEY}
+      resizeLabel="Resize automation list"
+      nav={nav}
+    >
       {isBuilderPath(pathname) ? (
         <div className="flex min-h-0 flex-1 flex-col">
           <Outlet />

@@ -731,3 +731,17 @@
     transparent 82%
   );
 }
+
+@utility text-fade-r {
+  /* A label that outruns its box runs out under a fade rather than an
+     ellipsis. Three dots spend the last characters saying "there is more"
+     and read the same at every width; a fade spends them on the name, so
+     widening a rail reveals more of it. Use where the box is resizable.
+
+     The mask only bites when the text actually reaches the edge — a short
+     label leaves that strip empty, and fading empty space shows nothing. */
+  overflow: hidden;
+  white-space: nowrap;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
+}
