@@ -35,5 +35,9 @@ web:
 orchestrator:
   publicUrl: https://${domain}
   auth:
+    oauth:
+      issuer: "${oauth_issuer}"
+      clientId: "${oauth_client_id}"
+      allowedDomains: ${oauth_allowed_domains}
     adminEmails:
       - ${admin_email}

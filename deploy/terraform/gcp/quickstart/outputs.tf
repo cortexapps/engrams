@@ -10,6 +10,10 @@ output "engram_values" {
     static_ip_name       = google_compute_global_address.web.name
     domain               = var.domain
     admin_email          = var.admin_email
+    oauth_issuer         = var.oauth_issuer
+    oauth_client_id      = var.oauth_client_id
+    # A YAML flow sequence is valid JSON, so the list renders inline.
+    oauth_allowed_domains = jsonencode(var.oauth_allowed_domains)
   })
 }
 
