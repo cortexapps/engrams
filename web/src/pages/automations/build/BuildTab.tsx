@@ -92,7 +92,7 @@ function variablePathsFor(definition: AutomationDefinition, selectedId: string |
 }
 
 const KNOWN_OUTPUTS: Record<string, readonly string[]> = {
-  create_session: ["session_id", "task_id"],
+  create_session: ["session_id", "web_url", "task_id"],
   send_prompt: ["outcome", "signal"],
   wait_session: ["outcome"],
   wait_event: ["event", "event_key"],

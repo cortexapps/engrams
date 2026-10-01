@@ -16,6 +16,7 @@ import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import type { AutomationInbox } from "../inbox.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
+import { config as appConfig } from "../../../config.ts";
 
 const overrideFields = {
   harnessMode: z.string().min(1).optional(),
@@ -85,6 +86,11 @@ export type EndSessionConfig = z.infer<typeof endSessionConfigSchema>;
 
 const DEFAULT_WAIT_DEADLINE_S = 7200;
 
+/** The session page a human opens: what a thread or a PR comment links to. */
+function sessionWebUrl(sessionId: string): string {
+  return `${appConfig.baseUrl.replace(/\/$/, "")}/sessions/${sessionId}`;
+}
+
 async function executeCreateSession(
   config: CreateSessionConfig,
   ctx: RunContext,
@@ -127,6 +133,7 @@ async function executeCreateSession(
       kind: "ok",
       outputs: {
         session_id: dryRunSessionId(ctx),
+        web_url: sessionWebUrl(dryRunSessionId(ctx)),
         task_id: "",
         initial_prompt: prompt.length > 0,
         prompt,
@@ -167,6 +174,9 @@ async function executeCreateSession(
     // prompt starts no harness run, so it must not count as turn 1.
     outputs: {
       session_id: created.sessionId,
+      // The session page: a block that announces the session (the Slack
+      // brain's "Started a session" message) links here.
+      web_url: sessionWebUrl(created.sessionId),
       task_id: created.taskId,
       initial_prompt: prompt.length > 0,
       // The rendered initial prompt (after includeEventContext): downstream
@@ -226,7 +236,7 @@ function matchesSessionMessage(
 export function registerSessionBlocks(): void {
   registerBlock<CreateSessionConfig>({
     type: "create_session",
-    outputs: ["session_id", "task_id", "prompt"],
+    outputs: ["session_id", "web_url", "task_id", "prompt"],
     configSchema: createSessionConfigSchema,
     execute: executeCreateSession,
   });

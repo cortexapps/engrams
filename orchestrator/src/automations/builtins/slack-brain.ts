@@ -47,7 +47,7 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 4;
+export const SLACK_BRAIN_DEFINITION_VERSION = 5;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
@@ -201,6 +201,24 @@ const session: BlockDef = {
   },
 };
 
+/** The legacy `onStarted` message: the thread gets the session link as
+ * soon as the session exists, before any agent output arrives. An ordinary
+ * Slack action, so Duplicate lets a user reword or remove it. */
+const started: BlockDef = {
+  id: "started",
+  type: "integration_action",
+  tunable: ["params"],
+  config: {
+    provider: "slack",
+    actionId: "post_message",
+    params: {
+      channel: `\${{ ${F}.channel }}`,
+      threadTs: `\${{ ${F}.thread_ts }}`,
+      text: "Started a session — ${{ steps.session.web_url }}",
+    },
+  },
+};
+
 const relay: BlockDef = {
   id: "relay",
   type: RELAY_SESSION_TYPE,
@@ -333,7 +351,7 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     // profile per channel.)
     eventKeys: ["app_mention"],
   },
-  blocks: [...admit, session, relay, firstTurn, conversation],
+  blocks: [...admit, session, started, relay, firstTurn, conversation],
   // ADR 0120: a Slack thread is a WORKSTREAM. The mention opens it; a reply
   // routes to it by the key template and JOINS the thread's live run (the
   // entrypoint has no body of its own: `continueOnly` delivers the reply

@@ -19,6 +19,7 @@ import type { EngineDeps, EngineSessionOps, EngineStepRecord } from "../../engin
 import type { AutomationInbox } from "../../engine/inbox.ts";
 import { interpretAutomation } from "../../engine/interpreter.ts";
 import type { CommunicationPolicy } from "../../../workflows/communication-policy.ts";
+import { config } from "../../../config.ts";
 import { SLACK_BRAIN_DEFINITION } from "../slack-brain.ts";
 
 registerEngineBlocks();
@@ -269,6 +270,15 @@ describe("Slack thread brain through the interpreter", () => {
     // identity gate resolved U1 and create_session passed the owner through.
     expect(h.resolved).toEqual(["U1"]);
     expect(h.sessions[0]!.ownerUserId).toBe("user-1");
+    // The thread got the session link first (legacy `onStarted`), by an
+    // ordinary Slack action templated on create_session's `web_url`.
+    expect(h.actions).toEqual([
+      {
+        actionId: "post_message",
+        params: { channel: "C1", threadTs: "100.1", text: `Started a session — ${config.baseUrl}/sessions/s-1` },
+      },
+    ]);
+    expect(h.names.indexOf("step:started:0")).toBeLessThan(h.names.indexOf("step:relay:0"));
     // The relay was installed on that session (consumer will forward curated events).
     expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
     // The follow-up became the second prompt, mention stripped.

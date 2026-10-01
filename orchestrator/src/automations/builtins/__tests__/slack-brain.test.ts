@@ -22,6 +22,7 @@ describe("Slack thread brain built-in — definition", () => {
       "unlinked",
       "linked",
       "session",
+      "started",
       "relay",
       "first_turn",
       "thread",
