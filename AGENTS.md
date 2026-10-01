@@ -152,6 +152,25 @@ or merge them in a burst only after a combined local check.
 (`yaml.safe_load` / actionlint) and prefer `run: |` block scalars. Keep the `merge_group`
 trigger in the required workflow.
 
+## Releases
+
+A release is the git tag `v<version>`, a GitHub release, and the tag `<version>` on the GHCR
+images. `.github/workflows/release.yml` makes all three, and it **builds nothing**: it gives
+the version tag to the builds that `bake-images.yml` already published for the release
+commit (`.github/scripts/release-plan.py` selects them and stops if the registry is behind
+that commit). A version tag never moves.
+
+1. Merge a PR that runs `scripts/release-version.sh set <version>`. The version lives in
+   both charts (`version` and `appVersion`) and in the CLI; the script is the only way to
+   change it. The chart `appVersion` is the default image tag and the version the site shows.
+2. Wait for the `Bake container images` run of that merge.
+3. Start the `Release` workflow on `main` with the same version. `dry_run` prints the plan
+   and publishes nothing.
+
+Only members of the organization can release: the workflow's `authorize` job refuses any
+other person, and the `release` environment holds the settings-side controls. Do not add a
+second way to publish a version tag (a tag-push trigger, a version tag in `bake-images.yml`).
+
 ## Conventions
 
 **Writing**
