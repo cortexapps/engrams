@@ -84,6 +84,8 @@ async function fixture(
   const status = makeInMemoryDbosStatusStore(rows, now, {
     isVersionLive: async (applicationVersion, graceMs) =>
       (await heartbeats.liveVersions(graceMs)).includes(applicationVersion),
+    isPodLive: async (podName, graceMs) =>
+      (await heartbeats.livePods(graceMs)).includes(podName),
     recordSweep: (workflowUuid, workflowName) =>
       ledger.recordSweep(workflowUuid, workflowName),
   });
@@ -722,6 +724,12 @@ describe("runSweepTick", () => {
       async listNonTerminalOnVersionsNotIn(): Promise<DbosWorkflowRow[]> {
         throw new Error("status unavailable");
       },
+      async listPendingOnDeadExecutors() {
+        return [];
+      },
+      async requeueStrandedPendingRecording() {
+        return { flipped: false };
+      },
       async adoptPendingRecording() {
         return { flipped: false };
       },
@@ -783,6 +791,116 @@ describe("runSweepTick", () => {
   });
 });
 
+describe("runSweepTick — stranded executors (per-pod recovery)", () => {
+  // Rows on the LIVE version: the version scan never sees them. Their
+  // owner is a pod: "pod-current" beats now, "pod-dead" last beat 30 min
+  // ago (the fixture's dead version), "local" (the SDK default id every
+  // pod once shared) never beats at all.
+  function stranded(workflowUuid: string, executorId: string, overrides: Partial<InMemoryDbosStatusSeed> = {}) {
+    return row(workflowUuid, {
+      applicationVersion: CURRENT_VERSION,
+      name: "AutomationRunWorkflow",
+      executorId,
+      ...overrides,
+    });
+  }
+
+  test("re-enqueues a live-version PENDING workflow whose executor pod stopped beating, keeping its version", async () => {
+    const f = await fixture([stranded("wf-stranded", "pod-dead")]);
+    const result = await runSweepTick(f.deps);
+    expect(result.decisions).toEqual([
+      expect.objectContaining({ workflowUuid: "wf-stranded", action: "requeued" }),
+    ]);
+    const after = f.status.inspect("wf-stranded")!;
+    expect(after.status).toBe("ENQUEUED");
+    expect(after.queueName).toBe("_dbos_internal_queue");
+    expect(after.applicationVersion).toBe(CURRENT_VERSION);
+    expect(after.startedAtEpochMs).toBeNull();
+    expect((await f.deps.ledger.get("wf-stranded"))?.sweepCount).toBe(1);
+  });
+
+  test("the legacy executor id \"local\" is a pod that never beats: its work is re-enqueued once", async () => {
+    const f = await fixture([stranded("wf-local", "local")]);
+    const result = await runSweepTick(f.deps);
+    expect(result.decisions.map((d) => d.action)).toEqual(["requeued"]);
+    // Nothing left to do on the next tick: the row is ENQUEUED now.
+    const again = await runSweepTick(f.deps);
+    expect(again.decisions).toEqual([]);
+  });
+
+  test("a live pod's workflow is never touched", async () => {
+    const f = await fixture([stranded("wf-live", "pod-current")]);
+    const result = await runSweepTick(f.deps);
+    expect(result.decisions).toEqual([]);
+    expect(f.status.inspect("wf-live")!.status).toBe("PENDING");
+  });
+
+  test("a fresh row is left alone: a pod that has just started has not beaten yet", async () => {
+    const f = await fixture([
+      stranded("wf-fresh", "pod-new", { updatedAtEpochMs: NOW.getTime() - 10_000 }),
+    ]);
+    const result = await runSweepTick(f.deps);
+    expect(result.decisions).toEqual([]);
+  });
+
+  test("an alert-only name stranded on a dead pod is reported, not moved", async () => {
+    const f = await fixture([stranded("wf-mystery", "pod-dead", { name: "MysteryWorkflow" })]);
+    const result = await runSweepTick(f.deps);
+    expect(result.decisions).toEqual([
+      expect.objectContaining({ workflowUuid: "wf-mystery", action: "alert_only" }),
+    ]);
+    expect(f.status.inspect("wf-mystery")!.status).toBe("PENDING");
+  });
+
+  test("a suppressed workflow stays where it is", async () => {
+    const f = await fixture([stranded("wf-suppressed", "pod-dead")]);
+    await f.deps.ledger.recordSweep("wf-suppressed", "AutomationRunWorkflow");
+    await f.deps.ledger.setSuppressed("wf-suppressed", true);
+    const result = await runSweepTick(f.deps);
+    expect(result.decisions.map((d) => d.action)).toEqual(["suppressed"]);
+    expect(f.status.inspect("wf-suppressed")!.status).toBe("PENDING");
+  });
+
+  test("requeues count against the batch cap shared with the version scan", async () => {
+    const f = await fixture(
+      [stranded("wf-a", "pod-dead"), stranded("wf-b", "pod-dead"), row("wf-dead-version")],
+      {},
+      { batchCap: 2 },
+    );
+    const result = await runSweepTick(f.deps);
+    expect(result.decisions.map((d) => d.action)).toEqual(["requeued", "requeued"]);
+    expect(f.status.inspect("wf-dead-version")!.status).toBe("PENDING");
+  });
+
+  test("does not requeue when the pod beats again between the listing and the flip", async () => {
+    const f = await fixture([stranded("wf-raced", "pod-dead")]);
+    const listing = f.deps.status.listPendingOnDeadExecutors.bind(f.deps.status);
+    f.deps.status = {
+      ...f.deps.status,
+      async listPendingOnDeadExecutors(liveVersions, podGraceMs, limit) {
+        const rows = await listing(liveVersions, podGraceMs, limit);
+        await f.heartbeats.beat(CURRENT_VERSION, "pod-dead");
+        return rows;
+      },
+    };
+    const result = await runSweepTick(f.deps);
+    expect(result.decisions.map((d) => d.action)).toEqual(["raced"]);
+    expect(f.status.inspect("wf-raced")!.status).toBe("PENDING");
+  });
+
+  test("a failing stranded scan does not abort the version scan", async () => {
+    const f = await fixture([row("wf-dead-version")]);
+    f.deps.status = {
+      ...f.deps.status,
+      async listPendingOnDeadExecutors() {
+        throw new Error("status unavailable");
+      },
+    };
+    const result = await runSweepTick(f.deps);
+    expect(result.decisions.map((d) => d.action)).toEqual(["adopted"]);
+  });
+});
+
 describe("sweep policy exhaustiveness", () => {
   test("accepts the registered production workflow names", () => {
     expect(() =>
@@ -821,6 +939,9 @@ describe("VersionHeartbeat", () => {
           beats.push({ appVersion, podName });
         },
         async liveVersions() {
+          return [];
+        },
+        async livePods() {
           return [];
         },
         async abandonedMsByVersion() {

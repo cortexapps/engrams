@@ -48,6 +48,19 @@ describe("in-memory heartbeat store", () => {
     );
   });
 
+  test("livePods lists the pods with a beat inside the grace window, on any version", async () => {
+    const { makeInMemoryHeartbeatStore } = await sweepModule();
+    let nowMs = 1_000;
+    const store = makeInMemoryHeartbeatStore(() => new Date(nowMs));
+    await store.beat("v-old", "pod-a");
+    nowMs = 1_060;
+    await store.beat("v-live", "pod-b");
+    nowMs = 1_100;
+    expect(await store.livePods(50)).toEqual(["pod-b"]);
+    await store.beat("v-old", "pod-a");
+    expect(await store.livePods(50)).toEqual(["pod-a", "pod-b"]);
+  });
+
   test("prune drops rows past retention and reports the count", async () => {
     const { makeInMemoryHeartbeatStore } = await sweepModule();
     let nowMs = 10_000;
@@ -771,6 +784,95 @@ describe("DBOS sweep stores with live Postgres", () => {
         application_version: applicationVersion,
       });
       expect(Number(result.rows[0]?.sweep_count)).toBe(2147483647);
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "stranded PENDING work on a live version is listed by dead executor and re-enqueued under a fence",
+    async () => {
+      const { makeDbosStatusStore, makeHeartbeatStore } = await sweepModule();
+      const store = makeDbosStatusStore();
+      const heartbeats = makeHeartbeatStore();
+      const liveVersion = `${runId}-stranded-live-version`;
+      const livePod = `${runId}-pod-live`;
+      const deadPod = `${runId}-pod-dead`;
+      const onLive = `${runId}-stranded-on-live`;
+      const onDead = `${runId}-stranded-on-dead`;
+      const onLocal = `${runId}-stranded-on-local`;
+      const fresh = `${runId}-stranded-fresh`;
+      const db = getDb();
+      await heartbeats.beat(liveVersion, livePod);
+      await db.execute(sql`
+        insert into "dbos"."workflow_status"
+          ("workflow_uuid", "status", "name", "application_version",
+           "recovery_attempts", "created_at", "updated_at", "executor_id",
+           "queue_name", "workflow_deadline_epoch_ms", "deduplication_id", "started_at_epoch_ms")
+        values
+          (${onLive}, 'PENDING', 'WorkflowOne', ${liveVersion}, 0, 100, 100, ${livePod},
+           null, null, null, null),
+          (${onDead}, 'PENDING', 'WorkflowOne', ${liveVersion}, 2, 100, 200, ${deadPod},
+           null, 900, ${`${runId}-dedup-dead`}, 500),
+          (${onLocal}, 'PENDING', 'WorkflowOne', ${liveVersion}, 0, 100, 150, 'local',
+           null, null, null, null),
+          (${fresh}, 'PENDING', 'WorkflowOne', ${liveVersion}, 0, 100,
+           (extract(epoch from now()) * 1000)::bigint, ${deadPod},
+           null, null, null, null)
+      `);
+
+      // Oldest updated first; the live pod's row and the fresh row are absent.
+      expect(
+        (await store.listPendingOnDeadExecutors([liveVersion], 60_000, 10)).map((row) => [
+          row.workflowUuid,
+          row.executorId,
+        ]),
+      ).toEqual([
+        [onLocal, "local"],
+        [onDead, deadPod],
+      ]);
+
+      expect(
+        await store.requeueStrandedPendingRecording(
+          { workflowUuid: onDead, executorId: deadPod, workflowName: "WorkflowOne" },
+          60_000,
+        ),
+      ).toEqual({ flipped: true, sweepCount: 1 });
+      const [moved] = (
+        await db.execute(sql`
+          select "status", "queue_name", "application_version", "executor_id",
+                 "workflow_deadline_epoch_ms", "deduplication_id", "started_at_epoch_ms"
+          from "dbos"."workflow_status"
+          where "workflow_uuid" = ${onDead}
+        `)
+      ).rows;
+      expect(moved).toMatchObject({
+        status: "ENQUEUED",
+        queue_name: "_dbos_internal_queue",
+        application_version: liveVersion,
+        executor_id: deadPod,
+        workflow_deadline_epoch_ms: null,
+        deduplication_id: null,
+        started_at_epoch_ms: null,
+      });
+
+      // The fence: the dead pod beats again before the flip → no-op.
+      await heartbeats.beat(liveVersion, deadPod);
+      expect(
+        await store.requeueStrandedPendingRecording(
+          { workflowUuid: onLocal, executorId: "local", workflowName: "WorkflowOne" },
+          60_000,
+        ),
+      ).toEqual({ flipped: true, sweepCount: 1 });
+      expect(
+        (await store.listPendingOnDeadExecutors([liveVersion], 60_000, 10)).map(
+          (row) => row.workflowUuid,
+        ),
+      ).toEqual([]);
+      expect(
+        await store.requeueStrandedPendingRecording(
+          { workflowUuid: onLive, executorId: livePod, workflowName: "WorkflowOne" },
+          60_000,
+        ),
+      ).toEqual({ flipped: false });
     },
   );
 

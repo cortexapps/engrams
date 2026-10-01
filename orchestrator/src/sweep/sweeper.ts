@@ -12,6 +12,11 @@ import { resolvePolicy, type ResolvedPolicy } from "./policy.ts";
 export const HEARTBEAT_INTERVAL_MS = 30_000;
 export const SWEEP_INTERVAL_MS = 60_000;
 export const SWEEP_GRACE_MS = 600_000;
+/** How long a pod may go without a beat before its PENDING workflows are
+ * re-enqueued for a live pod: six beats. Shorter than the version grace —
+ * a pod that is gone is gone, and a thread mid-turn waits this long after
+ * a roll. Double execution is bounded as for a wedged pod (ADR 0104). */
+export const POD_GRACE_MS = 180_000;
 export const SWEEP_BATCH_CAP = 5;
 // An unregistered workflow name means no live binary carries its code, so it
 // can never execute again on any current version. Alerting gives operators
@@ -30,6 +35,7 @@ export interface SweepConfig {
   heartbeatIntervalMs: number;
   sweepIntervalMs: number;
   graceMs: number;
+  podGraceMs: number;
   batchCap: number;
 }
 
@@ -37,6 +43,7 @@ export const DEFAULT_SWEEP_CONFIG = {
   heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
   sweepIntervalMs: SWEEP_INTERVAL_MS,
   graceMs: SWEEP_GRACE_MS,
+  podGraceMs: POD_GRACE_MS,
   batchCap: SWEEP_BATCH_CAP,
 } as const satisfies SweepConfig;
 
@@ -73,6 +80,8 @@ export type SweepDecision = {
   name: string;
   action:
     | "adopted"
+    // Re-enqueued: a live-version workflow whose executor pod is gone.
+    | "requeued"
     | "enqueued_cleared"
     | "cancelled_stale"
     | "alert_only"
@@ -96,6 +105,7 @@ export interface SweepTickResult {
 
 const MUTATING_ACTIONS = new Set<SweepDecision["action"]>([
   "adopted",
+  "requeued",
   "enqueued_cleared",
   "cancelled_stale",
 ]);
@@ -194,11 +204,78 @@ export async function runSweepTick(
     // computed inside Postgres — the same clock that stamps heartbeats and
     // drives liveVersions and the flip fences — so pod↔PG skew can't shift
     // a staleness decision.
+    // Pods, not versions. DBOS recovers PENDING work per executor id at
+    // launch, and a pod's id is its name (dbosExecutorId): a pod that is
+    // gone never recovers what it was running, even though the version is
+    // live. Re-enqueue those on DBOS's internal queue — exactly one live pod
+    // pulls each and replays it from its recorded steps. The fence (no beat
+    // from that pod inside the pod grace AND the row untouched inside it)
+    // also leaves a just-started pod's fresh rows alone before its first
+    // beat. The legacy id "local" (the SDK default every pod once shared) is
+    // simply a pod that never beats.
+    let actions = 0;
+    try {
+      const stranded = await deps.status.listPendingOnDeadExecutors(
+        liveVersions,
+        deps.config.podGraceMs,
+        deps.config.batchCap,
+      );
+      for (const row of stranded) {
+        result.scanned++;
+        let decision: SweepDecision;
+        try {
+          const policy = (deps.resolvePolicy ?? resolvePolicy)(row.name);
+          const prior = await deps.ledger.get(row.workflowUuid);
+          if (prior?.suppressed) {
+            decision = { workflowUuid: row.workflowUuid, name: row.name, action: "suppressed" };
+          } else if (policy.mode === "alert-only") {
+            decision = {
+              workflowUuid: row.workflowUuid,
+              name: row.name,
+              action: "alert_only",
+              reason: `stranded on executor ${row.executorId}`,
+            };
+          } else {
+            const requeued = await deps.status.requeueStrandedPendingRecording(
+              { workflowUuid: row.workflowUuid, executorId: row.executorId, workflowName: row.name },
+              deps.config.podGraceMs,
+            );
+            decision = requeued.flipped
+              ? {
+                  workflowUuid: row.workflowUuid,
+                  name: row.name,
+                  action: "requeued",
+                  reason: `executor ${row.executorId} is gone`,
+                }
+              : {
+                  workflowUuid: row.workflowUuid,
+                  name: row.name,
+                  action: "raced",
+                  reason: "executor beat again or row changed",
+                };
+          }
+        } catch (error) {
+          decision = {
+            workflowUuid: row.workflowUuid,
+            name: row.name,
+            action: "error",
+            reason: errorMessage(error),
+          };
+        }
+        result.decisions.push(decision);
+        if (MUTATING_ACTIONS.has(decision.action)) actions++;
+      }
+    } catch (error) {
+      deps.log.warn(
+        { error },
+        "DBOS stranded-executor scan failed; version scan continues",
+      );
+    }
+
     const abandonedMsByVersion = await deps.heartbeats.abandonedMsByVersion();
 
     const pageSize = deps.config.batchCap * 4;
     const scanBudget = deps.config.batchCap * 40;
-    let actions = 0;
     const cursor = deps.scanCursor;
     let after = cursor?.value;
     let exhausted = false;
