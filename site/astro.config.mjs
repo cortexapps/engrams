@@ -38,6 +38,11 @@ export default defineConfig({
             href: `${base.replace(/\/$/, "")}/apple-touch-icon.png`,
           },
         },
+        // The share card, as on the marketing pages (Starlight writes the other og: tags).
+        { tag: "meta", attrs: { property: "og:image", content: new URL(`${base.replace(/\/$/, "")}/og.png`, site).href } },
+        { tag: "meta", attrs: { property: "og:image:width", content: "1200" } },
+        { tag: "meta", attrs: { property: "og:image:height", content: "630" } },
+        { tag: "meta", attrs: { name: "twitter:card", content: "summary_large_image" } },
       ],
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/cortexapps/engrams" }],
       customCss: [

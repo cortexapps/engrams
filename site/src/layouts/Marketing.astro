@@ -17,6 +17,9 @@ interface Props {
 const { title, description, landing = false } = Astro.props;
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 const canonical = new URL(Astro.url.pathname, Astro.site);
+// The share card for link previews (Slack, X, LinkedIn). Without one, Slack
+// scrapes the first page image, and the full-size screenshot fails to load.
+const ogImage = new URL(`${base}/og.png`, Astro.site);
 ---
 
 <!doctype html>
@@ -34,6 +37,11 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
     <meta property="og:description" content={description} />
     <meta property="og:type" content="website" />
     <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="engrams: the open source alternative to Devin." />
+    <meta name="twitter:card" content="summary_large_image" />
     <meta name="theme-color" content="#081A1B" />
   </head>
   <body>
