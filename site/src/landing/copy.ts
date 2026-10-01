@@ -58,8 +58,7 @@ export const session = {
   body: "A session is Claude Code, Codex, or your own harness, working the way it does on your laptop, but in a microVM your team can reach. The transcript streams on the left. On the right, open the same machine the agent is using: a terminal, the browser it drives, VS Code, the files it changed. People start sessions from the dashboard or Slack; an automation starts the same kind of session from a trigger.",
   screenshotAlt:
     "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane holds a shell open on the guest.",
-  caption: "Fig. 1.1 · session se_9f3ea71c · 212 events",
-  live: "● live",
+  caption: "Fig. 1.1 · The transcript, and a shell on the same VM",
   panes: [
     {
       name: "Shell",

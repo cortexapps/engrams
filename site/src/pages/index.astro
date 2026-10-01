@@ -98,7 +98,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
       <div class="figure">
         <figure class="plate">
           <img src={pelican.src} width={pelican.width} height={pelican.height} alt={session.screenshotAlt} loading="lazy" />
-          <figcaption><span>{session.caption}</span><span class="ring">{session.live}</span></figcaption>
+          <figcaption>{session.caption}</figcaption>
         </figure>
         <div>
           <p class="body">{session.body}</p>
