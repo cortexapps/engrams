@@ -64,9 +64,9 @@ interface ThreadMessage {
 }
 
 /** A curated session event as the automation consumer forwards it. */
-function curated(n: number, kind: string, payload: unknown): AutomationInbox {
+function curated(n: number, kind: string, payload: unknown, sessionId = "s-1"): AutomationInbox {
   const event: CuratedEvent = { idx: BigInt(n), kind, payloadJson: JSON.stringify(payload) };
-  return { kind: "session_event", sessionId: "s-1", event };
+  return { kind: "session_event", sessionId, event };
 }
 
 interface Harness {
@@ -112,6 +112,10 @@ function harness(options: {
    * mention as the root plus every mention the test delivers through `recv`
    * (what a thread of mentions alone looks like). */
   threadReplies?: ThreadMessage[];
+  /** The kept session an earlier run of this workstream left behind (the
+   * thread went quiet and was mentioned again). `alive` = the control plane
+   * still has it; false = swept away since. */
+  previousSession?: { sessionId: string; runId: string; alive: boolean };
 }): Harness {
   const runner = options.replay ? makeReplayRunner(options.replay) : null;
   const names: string[] = runner ? runner.names : [];
@@ -216,7 +220,13 @@ function harness(options: {
     async sendPrompt(sessionId, _promptId, text) { prompts.push({ sessionId, text }); },
     async endSession(sessionId) { ended.push(sessionId); },
     async exec() { return { exitStatus: 0, stdout: "", stderr: "" }; },
-    async getSession() { return { found: false as const }; },
+    async getSession(sessionId) {
+      const prev = options.previousSession;
+      if (prev && prev.alive && prev.sessionId === sessionId) {
+        return { found: true as const, status: "idle", lastActiveAt: "2026-08-22T09:00:00Z", lastEventAt: null };
+      }
+      return { found: false as const };
+    },
     async writeFiles(_s, files) { return files.map((f) => ({ path: f.path, ok: true })); },
   };
 
@@ -232,8 +242,20 @@ function harness(options: {
       },
       async finalizeRun(_r, status, error) { finalized.push({ status, ...(error !== undefined ? { error } : {}) }); },
       async listRunSessions() { return runSessions; },
+      async latestKeptInstanceSession() {
+        return options.previousSession
+          ? { sessionId: options.previousSession.sessionId, runId: options.previousSession.runId }
+          : null;
+      },
       async releaseConcurrency() { return null; },
-      async adoptSession() { return "foreign" as const; },
+      // D11: a session this run created is already ours; the previous run's
+      // kept session (same workstream, terminal owner) adopts; anything
+      // else is foreign.
+      async adoptSession({ sessionId }) {
+        if (runSessions.some((s) => s.sessionId === sessionId)) return "already_ours" as const;
+        if (options.previousSession?.sessionId === sessionId) return "adopted" as const;
+        return "foreign" as const;
+      },
       async getSessionBinding() { return null; },
     },
     sessions: sessionOps,
@@ -320,7 +342,10 @@ describe("Slack thread brain through the interpreter", () => {
       { channel: "C1", threadTs: "100.1" },
       { channel: "C1", threadTs: "100.1", oldest: "100.1" },
     ]);
-    expect(h.names.indexOf("step:started:0")).toBeLessThan(h.names.indexOf("step:relay:0"));
+    expect(h.names.indexOf("step:has_previous.started:0")).toBeLessThan(h.names.indexOf("step:relay:0"));
+    // No earlier run of this workstream kept a session: a fresh one.
+    expect(h.names).toContain("step:previous:0");
+    expect(h.names).not.toContain("step:has_previous.resumed:0");
     // The relay was installed on that session (consumer will forward curated events).
     expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
     // The follow-up became the second prompt, mention stripped.
@@ -332,10 +357,11 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.names.filter((n) => /^step:thread\[\d+\]\.__until__:0$/.test(n)).length).toBe(2);
     expect(h.names).toContain("step:thread[1].next:0:wait");
     expect(h.names).not.toContain("step:thread[2].next:0");
-    // The run ending ended the thread's workstream (ADR 0120).
-    expect(h.closed).toEqual([{ instanceId: "ai_thread1", reason: "thread run ended: completed" }]);
-    // The recap hook posted the ✅ completion through the same policy as legacy.
-    expect(h.policyCalls).toContain("complete:");
+    // The idle exit is a pause, not an end: the workstream stays open (the
+    // next mention binds to it and resumes the kept session) and nothing is
+    // posted — the ✅ on the last mention already says the turn is done.
+    expect(h.closed).toEqual([]);
+    expect(h.policyCalls.filter((c) => c.startsWith("complete:"))).toEqual([]);
     expect(h.finalized).toEqual([{ status: "completed" }]);
   });
 
@@ -378,6 +404,53 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.prompts.map((p) => p.text)).toEqual([
       "<thread context>\nwe rotated the key yesterday\n</thread context>\n\ndoes that matter?",
     ]);
+  });
+
+  test("(a5) a mention in a thread whose run went quiet resumes the kept session in a new run of the same workstream", async () => {
+    // The earlier run (r-old) answered this thread, went idle, and ended with
+    // the workstream open; its session s-old is kept. This mention is a new
+    // run in the same workstream.
+    const h = harness({
+      previousSession: { sessionId: "s-old", runId: "r-old", alive: true },
+      recv: [
+        // The resumed session's run (the opening fold as its prompt) ends.
+        curated(1, "run_started", {}, "s-old"),
+        curated(2, "agent_message", { role: "assistant", text: "picking up where we left off" }, "s-old"),
+        curated(3, "run_completed", { ok: true }, "s-old"),
+        // The resumed session's turn ends (the Nth idle ↔ the Nth prompt,
+        // counted per session within THIS run).
+        { kind: "session_idle", sessionId: "s-old" },
+        null,
+        null,
+      ],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    // No new session; the kept one was prompted (send_prompt adopted it).
+    expect(h.sessions).toEqual([]);
+    expect(h.prompts).toEqual([{ sessionId: "s-old", text: "summarize the incident" }]);
+    expect(h.relayFlags).toEqual([{ sessionId: "s-old", relay: true }]);
+    expect(h.names).toContain("step:has_previous.resumed:0");
+    expect(h.names).toContain("step:opening_turn.resume_turn:0");
+    expect(h.names).not.toContain("step:has_previous.started:0");
+    // The thread was told which session it is talking to.
+    expect(h.actions.filter((a) => a.actionId === "post_message").map((a) => a.params["text"])).toEqual([
+      `Resumed the session — ${config.baseUrl}/sessions/s-old`,
+    ]);
+    expect(h.policyCalls).toContain("msg:picking up where we left off");
+  });
+
+  test("(a6) a kept session that is gone (swept) starts a fresh one", async () => {
+    const h = harness({
+      previousSession: { sessionId: "s-old", runId: "r-old", alive: false },
+      recv: [{ kind: "session_idle", sessionId: "s-1" }, null, null],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.sessions.map((s) => s.id)).toEqual(["s-1"]);
+    expect(h.names).toContain("step:has_previous.started:0");
+    const previous = h.records.filter((r) => r.path === "previous").at(-1);
+    expect(previous?.record.outputs).toMatchObject({ found: false, reason: "gone", session_id: "s-old" });
   });
 
   test("(a') the relay survives a pod restart: its state rides the checkpointed step outputs, not process memory", async () => {
@@ -426,8 +499,8 @@ describe("Slack thread brain through the interpreter", () => {
     // relay's state came back through the checkpointed outputs) …
     expect(h.policyCalls).toContain("msg:one\n\ntwo\n\nthree");
     expect(h.policyCalls).toContain("idle:100.1");
-    // … and the recap read the last message from the recorded step outputs.
-    expect(h.policyCalls.at(-1)).toBe("complete:three");
+    // … and the idle exit posted no recap (a pause, not an end).
+    expect(h.policyCalls.filter((c) => c.startsWith("complete:"))).toEqual([]);
     // The relay's step names are unchanged across passes (contract stays 4).
     const relaySteps = h.names.filter((n) => n.includes(".__relay__:"));
     expect(relaySteps.slice(0, 3)).toEqual(relaySteps.slice(0, 3).map((n, i) => `step:relay.__relay__:${i + 1}`));
@@ -485,7 +558,7 @@ describe("Slack thread brain through the interpreter", () => {
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("completed");
     expect(h.policyCalls).toContain("msg:one\n\ntwo\n\nthree");
-    expect(h.policyCalls.at(-1)).toBe("complete:three");
+    expect(h.policyCalls.filter((c) => c.startsWith("complete:"))).toEqual([]);
     expect(h.records.filter((r) => r.path.endsWith(".__relay__"))).toEqual([]);
   });
 
@@ -525,8 +598,8 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.names.filter((n) => n.includes(".__relay__:"))).toEqual(
       [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `step:relay.__relay__:${n}`),
     );
-    // The recap carries the last message across the re-point.
-    expect(h.policyCalls.at(-1)).toBe("complete:second answer");
+    // The idle exit posts no recap; the last policy call is the turn's ✅.
+    expect(h.policyCalls.at(-1)).toBe("idle:100.2");
   });
 
   test("(b) a top-level channel message (no thread_ts) is filtered, never a session", async () => {
@@ -573,7 +646,7 @@ describe("Slack thread brain through the interpreter", () => {
     ]);
     // Exactly two iterations ran; the third joined message was never consumed.
     expect(h.names.filter((n) => /^step:thread\[\d+\]\.next:0$/.test(n)).length).toBe(2);
-    expect(h.policyCalls.some((c) => c.startsWith("complete:"))).toBe(true);
+    expect(h.finalized).toEqual([{ status: "completed" }]);
   });
 
   test("(d') a bare `@bot` follow-up is not a turn: no prompt, no failure, the thread continues", async () => {
@@ -595,7 +668,9 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.prompts.map((p) => p.text)).toEqual(["now the real question"]);
     expect(h.names).not.toContain("step:thread[0].has_event.has_turn.turn:0");
     expect(h.names).toContain("step:thread[1].has_event.has_turn.turn:0");
-    expect(h.policyCalls.at(-1)).toBe("complete:");
+    // The idle exit posts no recap.
+    expect(h.policyCalls.filter((c) => c.startsWith("complete:"))).toEqual([]);
+    expect(h.finalized).toEqual([{ status: "completed" }]);
   });
 
   test("(d'') a bot-authored app_mention in the thread is ignored by the continuation wait", async () => {

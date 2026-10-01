@@ -23,12 +23,18 @@ describe("Slack thread brain built-in — definition", () => {
       "linked",
       "replies",
       "opening",
-      "session",
-      "started",
+      "previous",
+      "has_previous",
+      "pick",
       "relay",
-      "first_turn",
+      "opening_turn",
       "thread",
     ]);
+    // The idle exit (completed) neither posts nor closes the workstream; only
+    // an explicit end closes it, so the next mention resumes the session.
+    const hooks = parsed.settings.onFinalize!;
+    expect(hooks.find((h) => h.block.type === "relay_close")!.when).not.toContain("completed");
+    expect(hooks.find((h) => h.block.type === "instance_close")!.when).toEqual(["halted", "superseded"]);
     expect(parsed.settings.concurrency?.policy).toBe("join");
     expect(parsed.settings.endSessionsOnFinish).toBe(false);
     expect(parsed.settings.onFinalize?.map((h) => h.block.type)).toEqual(["relay_close", "instance_close"]);

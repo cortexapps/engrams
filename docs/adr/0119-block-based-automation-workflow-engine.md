@@ -324,6 +324,16 @@ brain's OWN workstream from another automation's: the "Started a session"
 post binds the thread handle to the brain's workstream, and the pre-pass had
 read that as a reason for the brain to stand down in its own thread.
 
+**Thread continuity (2026-10-01).** A thread outlives any one run. The
+brain's idle exit (the wait's deadline) now ends the run silently — no
+"Session complete" post — and leaves the workstream OPEN; only `halted` and
+`superseded` close it. The next mention binds to the open workstream, starts
+a new run, and a new palette block, `lookup_instance_session` (the newest
+kept session an earlier run of the same workstream created, verified live),
+feeds a `{template}` session ref that `send_prompt` and the relay adopt
+(D11, same workstream, terminal owner). A fresh session is created only when
+none exists or it is gone.
+
 The reviewer profile seed and the `pr_reviewer` designation retire in the
 same phase (migration 0089). A built-in cannot carry a profile id, and the
 designation was the indirection that let it name one; the product model

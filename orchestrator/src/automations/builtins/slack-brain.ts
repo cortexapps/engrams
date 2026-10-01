@@ -30,6 +30,14 @@
  * run by the workstream key (join), so the automation has one trigger and no
  * reply entrypoint.
  *
+ * The thread outlives any one run (D8 + ADR 0120). A run ends when the
+ * thread goes quiet (the idle wait's deadline), silently — no "Session
+ * complete" post for a pause — and the workstream stays OPEN: the next
+ * mention in the thread binds to it, starts a new run, and
+ * `lookup_instance_session` finds the kept session so the conversation
+ * continues in it (a fresh session only when none exists or it is gone).
+ * Only an explicit end (halted, superseded) closes the workstream.
+ *
  * One divergence from the legacy loop, deliberate: the LLM profile picker +
  * the "which profile?" dropdown are retired — the channel → profile map
  * input decides, with `default_profile` as the fallback.
@@ -43,6 +51,7 @@ import {
 } from "../engine/definition.ts";
 import type { BuiltinAutomation } from "../engine/builtins.ts";
 import { RELAY_CLOSE_TYPE } from "../engine/blocks/relay-close.ts";
+import { LOOKUP_INSTANCE_SESSION_TYPE } from "../engine/blocks/instance-session.ts";
 import { RELAY_SESSION_TYPE } from "../engine/blocks/relay.ts";
 import { RESOLVE_USER_TYPE } from "../engine/blocks/resolve-user.ts";
 import { NO_USER_MSG } from "../../integrations/slack-identity.ts";
@@ -51,7 +60,7 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 6;
+export const SLACK_BRAIN_DEFINITION_VERSION = 7;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
@@ -283,6 +292,10 @@ const opening: BlockDef[] = [
   { id: "opening", type: "code", config: { source: OPENING_TEXT_SOURCE, mode: "value" } },
 ];
 
+/** The thread's kept session from an earlier run of this workstream, if any:
+ * the thread went quiet, its run ended, the next mention is this run. */
+const previous: BlockDef = { id: "previous", type: LOOKUP_INSTANCE_SESSION_TYPE, config: {} };
+
 const session: BlockDef = {
   id: "session",
   type: "create_session",
@@ -318,11 +331,52 @@ const started: BlockDef = {
   },
 };
 
+/** The session this run talks to: the resumed one, else the one it created. */
+const PICK_SOURCE = `
+export default ({ steps }) => ({
+  session_id: steps.previous?.found ? String(steps.previous.session_id ?? "") : String(steps.session?.session_id ?? ""),
+  resumed: Boolean(steps.previous?.found),
+});
+`.trim();
+
+/** Resume the thread's kept session, or create one. Either way the thread
+ * gets a line saying which. */
+const sessionOrResume: BlockDef = {
+  id: "has_previous",
+  type: "branch",
+  config: {
+    conditions: { mode: "all", conditions: [{ path: "steps.previous.found", op: "is_true" }] },
+  },
+  then: [
+    {
+      id: "resumed",
+      type: "integration_action",
+      tunable: ["params"],
+      config: {
+        provider: "slack",
+        actionId: "post_message",
+        params: {
+          channel: `\${{ ${F}.channel }}`,
+          threadTs: `\${{ ${F}.thread_ts }}`,
+          text: "Resumed the session — ${{ steps.previous.web_url }}",
+        },
+      },
+    },
+  ],
+  else: [session, started],
+};
+
+const pick: BlockDef = { id: "pick", type: "code", config: { source: PICK_SOURCE, mode: "value" } };
+
+/** Every later block's session ref: adoption (D11) moves a resumed session's
+ * binding to this run; a created one is already ours. */
+const SESSION_REF = { template: "${{ steps.pick.value.session_id }}" } as const;
+
 const relay: BlockDef = {
   id: "relay",
   type: RELAY_SESSION_TYPE,
   config: {
-    session: { blockId: "session" },
+    session: SESSION_REF,
     provider: "slack",
     team: `\${{ ${F}.team }}`,
     channel: `\${{ ${F}.channel }}`,
@@ -333,13 +387,43 @@ const relay: BlockDef = {
   },
 };
 
-/** The first turn: the mention's text is the session's initial prompt, so
- * the loop only waits for that run to end before listening for more. */
+/** The first turn. A created session got the fold as its initial prompt, so
+ * the run only waits for it to go idle. A resumed session is prompted with
+ * the fold (send_prompt adopts it) and waited on the same way; a resumed
+ * session with nothing to say to (a bare mention) is only waited on. */
 const firstTurn: BlockDef = {
-  id: "first_turn",
-  type: "wait_session",
-  tunable: ["deadlineSeconds"],
-  config: { session: { blockId: "session" }, until: "idle", deadlineSeconds: TURN_DEADLINE_S },
+  id: "opening_turn",
+  type: "branch",
+  config: {
+    conditions: {
+      mode: "all",
+      conditions: [
+        { path: "steps.previous.found", op: "is_true" },
+        { path: "steps.opening.value.has_text", op: "is_true" },
+      ],
+    },
+  },
+  then: [
+    {
+      id: "resume_turn",
+      type: "send_prompt",
+      tunable: ["promptTemplate", "deadlineSeconds"],
+      config: {
+        session: SESSION_REF,
+        promptTemplate: "${{ steps.opening.value.text }}",
+        waitFor: { kind: "run_end" },
+        deadlineSeconds: TURN_DEADLINE_S,
+      },
+    },
+  ],
+  else: [
+    {
+      id: "first_turn",
+      type: "wait_session",
+      tunable: ["deadlineSeconds"],
+      config: { session: SESSION_REF, until: "idle", deadlineSeconds: TURN_DEADLINE_S },
+    },
+  ],
 };
 
 const conversation: BlockDef = {
@@ -420,7 +504,7 @@ const conversation: BlockDef = {
               id: "repoint",
               type: RELAY_SESSION_TYPE,
               config: {
-                session: { blockId: "session" },
+                session: SESSION_REF,
                 provider: "slack",
                 team: `\${{ ${F}.team }}`,
                 channel: `\${{ ${F}.channel }}`,
@@ -435,7 +519,7 @@ const conversation: BlockDef = {
               type: "send_prompt",
               tunable: ["promptTemplate", "deadlineSeconds"],
               config: {
-                session: { blockId: "session" },
+                session: SESSION_REF,
                 promptTemplate: "${{ steps.turn_text.value.text }}",
                 waitFor: { kind: "run_end" },
                 deadlineSeconds: TURN_DEADLINE_S,
@@ -464,7 +548,7 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     // profile per channel.)
     eventKeys: ["app_mention"],
   },
-  blocks: [...admit, ...opening, session, started, relay, firstTurn, conversation],
+  blocks: [...admit, ...opening, previous, sessionOrResume, pick, relay, firstTurn, conversation],
   // ADR 0120: a Slack thread is a WORKSTREAM. The first mention opens it; a
   // later mention in the same thread renders the same key, so it binds to
   // the open workstream and JOINS the thread's live run (the mailbox event
@@ -528,28 +612,28 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     runDeadlineSeconds: RUN_DEADLINE_S,
     endSessionsOnFinish: false,
     onFinalize: [
+      // No post on `completed`: that is the idle exit — a pause, not an
+      // end. The ✅ on the last mention already says the turn is done, and
+      // the next mention continues the same session.
       {
-        when: ["completed", "deadline", "failed", "halted", "superseded", "filtered"],
+        when: ["deadline", "failed", "halted", "superseded", "filtered"],
         block: {
           id: "recap",
           type: RELAY_CLOSE_TYPE,
           config: { status: "${{ run.status }}" },
         },
       },
-      // The thread's run ending ends the workstream: the thread went quiet
-      // (completed), or nothing will answer in it any more. A later mention
-      // in the same thread opens a fresh workstream (and a fresh run); the
-      // kept session is the one thing that outlives it (D8).
+      // Only an explicit end closes the workstream: a quiet thread's run
+      // completes (and a failed or deadline-hit one ends) with the workstream
+      // OPEN, so the next mention binds to it, starts a new run, and resumes
+      // the kept session. Halted (`@stop`) and superseded are the ends.
       //
-      // NOT on `filtered`: an unlinked author's mention posts the "log in
-      // first" notice through the Slack post_message action, which binds the
-      // thread's handle to this workstream. A closed workstream's handle
-      // drops every later event in that thread (the v1 closed-handle
-      // policy), so closing here would silence the thread for good, for the
-      // linked colleague who mentions the bot next as well. Left open, the
-      // next mention binds by key and runs afresh.
+      // NOT on `filtered` either: an unlinked author's mention posts the
+      // "log in first" notice through the Slack post_message action, which
+      // binds the thread's handle to this workstream; closing would silence
+      // the thread for the linked colleague who mentions the bot next.
       {
-        when: ["completed", "deadline", "failed", "halted", "superseded"],
+        when: ["halted", "superseded"],
         block: {
           id: "close",
           type: "instance_close",
