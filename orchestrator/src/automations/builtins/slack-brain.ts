@@ -384,7 +384,7 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       key: "default_profile",
       label: "Default profile",
       type: "string",
-      help: "The session profile every thread runs on unless a channel override says otherwise. Empty = the brain answers nowhere.",
+      help: "The session profile every thread runs on unless a channel override says otherwise. With no default, only channels with an override get answers.",
       default: "",
     },
     {

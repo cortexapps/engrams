@@ -163,7 +163,7 @@ export function SlackThreads() {
         <h2 className="text-base font-semibold">Default profile</h2>
         <p className="text-sm text-muted-foreground">
           The session profile every thread runs on. A channel override below picks a different one
-          for that channel.
+          for that channel. With no default, only channels with an override get answers.
         </p>
         {builtin.isPending ? (
           <SkeletonRows rows={1} columns={["minmax(12rem,1fr)"]} />
@@ -177,7 +177,7 @@ export function SlackThreads() {
               <SelectValue placeholder="Pick a profile" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value={NO_PROFILE}>None — answer nowhere</SelectItem>
+              <SelectItem value={NO_PROFILE}>No default profile</SelectItem>
               {profiles.map((p) => (
                 <SelectItem key={p.id} value={p.id}>
                   {p.name}
