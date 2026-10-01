@@ -32,7 +32,7 @@ const RUN = { runId: "autorun:auto-pr:github:d1", automationId: "auto-pr" };
 
 const INPUTS = {
   repos: { "acme/repo": { mode: "auto", autofix: false }, "acme/other": { mode: "on_request", autofix: false } },
-  profile: "pr_reviewer",
+  profile: "11111111-2222-4333-8444-555555555555",
   mention: "@engrams",
   categories: ["functional-correctness", "security-privacy"],
   instructions: "Be terse.",

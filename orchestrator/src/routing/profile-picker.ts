@@ -282,9 +282,6 @@ export function makeProfilePicker(deps: ProductionPickerDeps = {}): ProfilePicke
       ]);
       const providerById = new Map(conns.map((c) => [c.id, c.provider]));
       return rows
-        // System-designated profiles (e.g. the PR reviewer) serve their own
-        // workflows; a Slack mention never routes to one.
-        .filter((r) => r.designation == null)
         .map((r) => ({
           id: r.id,
           name: r.name,

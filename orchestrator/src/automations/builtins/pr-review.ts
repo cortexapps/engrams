@@ -40,7 +40,6 @@
 
 import { config } from "../../config.ts";
 import { normalizeMentionHandle } from "../../integrations/github-webhook.ts";
-import { PR_REVIEWER_DESIGNATION } from "../../reviewers/seed-profile.ts";
 import { REVIEW_CATEGORIES } from "../../reviewers/render.ts";
 import {
   FINDER_SYSTEM_PROMPT,
@@ -62,7 +61,7 @@ export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 /** Bump on any graph or inputs-schema change (the seeder inserts a new
  * version when the stored content hash differs). */
-export const PR_REVIEW_DEFINITION_VERSION = 6;
+export const PR_REVIEW_DEFINITION_VERSION = 7;
 
 /** Synthetic event key the CI dispatch edge admits a run under (no GitHub
  * delivery carries it). The admission arm accepts it for any mapped repo. */
@@ -87,6 +86,9 @@ export default ({ event, inputs, trigger }) => {
   const repoKey = fullName.toLowerCase();
   const entry = Object.entries(inputs.repos ?? {}).find(([k]) => k.toLowerCase() === repoKey)?.[1];
   if (!entry) return null;
+  // No reviewer profile picked yet (the Reviews page's one setup step):
+  // nothing can run, so the delivery is filtered rather than failed.
+  if (!inputs.profile) return null;
 
   const key = trigger.event ?? "";
   let mode = null;
@@ -423,8 +425,8 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
       key: "profile",
       label: "Reviewer profile",
       type: "string",
-      help: "The session profile the finder and verifier workers run under.",
-      default: PR_REVIEWER_DESIGNATION,
+      help: "The id of the session profile the finder and verifier workers run under. Empty = reviews are off.",
+      default: "",
     },
     {
       key: "mention",
@@ -529,7 +531,7 @@ export const PR_REVIEW_BUILTIN: BuiltinAutomation = {
   async defaultInputs() {
     return {
       repos: {},
-      profile: PR_REVIEWER_DESIGNATION,
+      profile: "",
       mention: defaultMentionHandle(),
       categories: [...REVIEW_CATEGORIES],
       instructions: "",

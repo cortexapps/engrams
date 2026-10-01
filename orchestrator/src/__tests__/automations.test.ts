@@ -60,7 +60,6 @@ const profile = (apps: ProfileApp[] = []): ProfileRow => ({
   secrets: [],
   repos: [],
   apps,
-  designation: null,
   createdAt: NOW,
   updatedAt: NOW,
   deletedAt: null,

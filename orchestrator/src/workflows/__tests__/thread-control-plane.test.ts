@@ -34,7 +34,6 @@ const profileRow = (): ProfileRow => ({
   secrets: [],
   repos: [],
   apps: [],
-  designation: null,
   createdAt: new Date(0),
   updatedAt: new Date(0),
   deletedAt: null,

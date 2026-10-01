@@ -6,13 +6,15 @@ import { ReviewRepositories } from "./ReviewRepositories";
 
 const upsert = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const remove = vi.hoisted(() => vi.fn());
+const setInput = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const state = vi.hoisted(() => ({
   enrollments: [] as Array<{
     repo: string;
     triggerMode: string;
     autofix: string;
   }>,
-  profiles: [] as Array<{ id: string; name: string; designation?: string }>,
+  profiles: [] as Array<{ id: string; name: string }>,
+  inputs: {} as Record<string, unknown>,
 }));
 
 vi.mock("../../hooks/useEnrollments", () => ({
@@ -24,14 +26,20 @@ vi.mock("../../hooks/useProfiles", () => ({
   useProfiles: () => ({ data: { profiles: state.profiles } }),
 }));
 vi.mock("../../hooks/useAutomations", () => ({
-  useBuiltinAutomation: () => ({ data: { automation: { id: "auto-pr" } } }),
+  useBuiltinAutomation: () => ({
+    data: { automation: { id: "auto-pr", inputsJson: JSON.stringify(state.inputs) } },
+    isPending: false,
+  }),
+  useSetInputValue: () => ({ mutateAsync: setInput, isPending: false }),
 }));
 
 beforeEach(() => {
   upsert.mockClear();
   remove.mockClear();
+  setInput.mockClear();
   state.enrollments = [{ repo: "cortexapps/engrams", triggerMode: "manual", autofix: "off" }];
-  state.profiles = [{ id: "p1", name: "Reviewer", designation: "pr_reviewer" }];
+  state.profiles = [{ id: "p1", name: "Reviewer" }];
+  state.inputs = { repos: {}, profile: "p1" };
 });
 
 describe("ReviewRepositories", () => {
@@ -40,15 +48,25 @@ describe("ReviewRepositories", () => {
     expect(await screen.findByText("cortexapps/engrams")).toBeTruthy();
     expect(screen.getByText("@mention")).toBeTruthy();
     expect(screen.getByRole("link", { name: /PR review automation/ })).toBeTruthy();
-    // A pr_reviewer profile exists → no warning banner.
+    // A reviewer profile is picked → no warning banner.
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("warns when no profile is designated pr_reviewer", async () => {
-    state.profiles = [{ id: "p1", name: "Backend" }];
+  it("warns when no reviewer profile is picked, and picking one writes the automation's input", async () => {
+    state.inputs = { repos: {}, profile: "" };
     renderWithProviders(<ReviewRepositories />);
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toMatch(/pr_reviewer/);
+    expect(alert.textContent).toMatch(/No reviewer profile/);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("combobox", { name: /reviewer profile/i }));
+    await user.click(await screen.findByRole("option", { name: "Reviewer" }));
+    await waitFor(() =>
+      expect(setInput).toHaveBeenCalledWith({
+        automationId: "auto-pr",
+        inputKey: "profile",
+        valueJson: JSON.stringify("p1"),
+      }),
+    );
   });
 
   it("enrolls a new repo through the dialog", async () => {

@@ -15,7 +15,7 @@ registerEngineBlocks();
 
 const inputs = {
   repos: { "Acme/Repo": { mode: "auto", autofix: false }, "acme/manual": { mode: "on_request", autofix: false } },
-  profile: "pr_reviewer",
+  profile: "11111111-2222-4333-8444-555555555555",
   mention: "@engrams",
   categories: ["functional-correctness"],
   instructions: "Prefer small diffs.",

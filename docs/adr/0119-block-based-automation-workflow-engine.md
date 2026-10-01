@@ -313,6 +313,16 @@ seed **enabled**: enrolling a repo (reviews) or picking a default profile
 page still writes the row, and `db/review-enrollment-sync.ts` mirrors it into
 the map in one transaction.
 
+The reviewer profile seed and the `pr_reviewer` designation retire in the
+same phase (migration 0089). A built-in cannot carry a profile id, and the
+designation was the indirection that let it name one; the product model
+replaces it: the Reviews page picks the reviewer profile into the built-in's
+`profile` input (as the Slack page picks a default profile), the migration
+copies the designated profile's id into that input, `profile.designation`
+and the Profiles-page toggle are gone, and `create_session` takes an id only
+(an empty render fails the block with the fix named). The seeded "PR
+Reviewer" row stays as an ordinary profile.
+
 `review_enrollment` lifts into the review built-in's `repos` input at first
 seed and is dropped at the end. GitHub `installation_repositories` events
 reach the ledger but never write the input.

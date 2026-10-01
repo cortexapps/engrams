@@ -8,9 +8,11 @@ delivery reaches it through the integration-event spine, the review blocks
 (`review_open_pass`, `review_stage`, `review_settle`, `review_record_post`,
 `review_close_pass`) wrap the same control plane (`reviews/control-plane.ts`),
 and the generic `github.post_pr_review` action posts. The review ledger,
-the Reviews page, the review tools (ADR 0089), the policy gate, and the
-reviewer profile below are unchanged; the diagram and the DBOS version
-notes that follow describe the retired workflow.
+the Reviews page, the review tools (ADR 0089), and the policy gate are
+unchanged. The seeded reviewer profile and its `designation: "pr_reviewer"`
+marker (decision 2 below) are retired too: the Reviews page picks any
+profile as the reviewer, into the built-in's `profile` input. The diagram
+and the DBOS version notes that follow describe the retired workflow.
 
 engrams reviews pull requests in enrolled repos. A review runs as one or more
 sandboxed sessions that investigate the change with real tools (clone, grep,

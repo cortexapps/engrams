@@ -11,8 +11,9 @@ import {
   useUpsertEnrollment,
   useDeleteEnrollment,
 } from "../../hooks/useEnrollments";
-import { useBuiltinAutomation } from "../../hooks/useAutomations";
+import { useBuiltinAutomation, useSetInputValue } from "../../hooks/useAutomations";
 import { useProfiles } from "../../hooks/useProfiles";
+import { toast } from "sonner";
 import type { RepoEnrollment } from "../../gen/engram/app/v1/review_pb";
 import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "../../components/page-heading";
@@ -65,18 +66,33 @@ import {
 // the back. `trigger_mode` decides whether a PR is reviewed automatically on
 // open (auto) or only when the app is @mentioned / dispatched (manual);
 // `autofix` decides whether posted findings route back for fixes. The review
-// sessions run on the profile designated `pr_reviewer`.
-//
-// A row marked `legacy` predates this page and still reviews on the old
-// graph; saving it moves it over. Those rows retire with the legacy graph.
+// sessions run on the reviewer profile picked below: the automation's
+// `profile` input, written one key at a time so a stale page never
+// overwrites another admin's edit.
 export function ReviewRepositories() {
   const { data, isPending, error } = useEnrollments();
   const { data: profileData } = useProfiles();
   const builtin = useBuiltinAutomation("pr_review");
+  const setProfile = useSetInputValue();
   const rows = data?.enrollments ?? [];
   const profiles = profileData?.profiles ?? [];
-  const hasReviewerProfile = profiles.some((p) => p.designation === "pr_reviewer");
-  const automationId = builtin.data?.automation?.id;
+  const automation = builtin.data?.automation;
+  const automationId = automation?.id;
+  const reviewerProfile = profileOf(automation?.inputsJson);
+
+  const onReviewerProfile = async (profileId: string) => {
+    if (!automationId) return;
+    try {
+      await setProfile.mutateAsync({
+        automationId,
+        inputKey: "profile",
+        valueJson: JSON.stringify(profileId === NO_PROFILE ? "" : profileId),
+      });
+      toast.success("Reviewer profile saved");
+    } catch (e) {
+      toast.error(errorMessage(e));
+    }
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-auto p-4 md:p-6">
@@ -103,19 +119,42 @@ export function ReviewRepositories() {
         . Every pull request it touches is a workstream; every pass is a run.
       </p>
 
-      {!hasReviewerProfile && (
-        <div
-          role="alert"
-          className="flex items-start gap-2 rounded-lg border border-instrument-caution/40 bg-instrument-caution/10 p-3 text-sm"
-        >
-          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-instrument-caution" aria-hidden />
-          <span>
-            No profile is designated the <code className="font-mono">pr_reviewer</code>. Reviews on
-            repos without a profile override will fail. Set the “PR reviewer” toggle on a profile
-            under Settings → Profiles.
-          </span>
-        </div>
-      )}
+      <section className="flex flex-col gap-3" aria-label="Reviewer profile">
+        <h2 className="text-base font-semibold">Reviewer profile</h2>
+        <p className="text-sm text-muted-foreground">
+          The session profile the finder and verifier workers run on: its image, model, and skills.
+        </p>
+        {builtin.isPending ? (
+          <SkeletonRows rows={1} columns={["minmax(12rem,1fr)"]} />
+        ) : (
+          <Select
+            value={reviewerProfile === "" ? NO_PROFILE : reviewerProfile}
+            onValueChange={onReviewerProfile}
+            disabled={!automationId || setProfile.isPending}
+          >
+            <SelectTrigger className="w-72" aria-label="Reviewer profile">
+              <SelectValue placeholder="Pick a profile" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={NO_PROFILE}>No reviewer profile</SelectItem>
+              {profiles.map((p) => (
+                <SelectItem key={p.id} value={p.id}>
+                  {p.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+        {automation && reviewerProfile === "" && (
+          <div
+            role="alert"
+            className="flex items-start gap-2 rounded-lg border border-instrument-caution/40 bg-instrument-caution/10 p-3 text-sm"
+          >
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-instrument-caution" aria-hidden />
+            <span>No reviewer profile is picked, so no pull request is reviewed. Pick one.</span>
+          </div>
+        )}
+      </section>
 
       {error && (
         <EmptyState tone="error">Could not load enrollments — {errorMessage(error)}</EmptyState>
@@ -146,6 +185,23 @@ export function ReviewRepositories() {
       )}
     </div>
   );
+}
+
+const NO_PROFILE = "__none__";
+
+/** The automation's `profile` input: a profile id, or "" when nobody picked. */
+function profileOf(inputsJson: string | undefined): string {
+  if (!inputsJson) return "";
+  try {
+    const parsed: unknown = JSON.parse(inputsJson);
+    const value =
+      typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)["profile"]
+        : undefined;
+    return typeof value === "string" ? value : "";
+  } catch {
+    return "";
+  }
 }
 
 function TriggerBadge({ mode }: { mode: string }) {

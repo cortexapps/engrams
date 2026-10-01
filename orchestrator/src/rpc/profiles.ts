@@ -148,7 +148,6 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     modelRouter: row.modelRouter ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
-    designation: row.designation ?? undefined,
     // ADR 0118: the services this profile's sessions host (member-visible —
     // describes config, not a secret, like skills).
     apps: row.apps.map((a) => ({ name: a.name, port: a.port })),
@@ -159,14 +158,6 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
 }
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const ALLOWED_DESIGNATIONS = new Set(["pr_reviewer"]);
-
-function assertDesignationValid(designation: string): void {
-  if (designation && !ALLOWED_DESIGNATIONS.has(designation)) {
-    throw new ConnectError("unknown designation", Code.InvalidArgument);
-  }
-}
-
 /** ADR 0057: map the proto network message (or undefined) to the stored shape. */
 function normalizeNetwork(
   n: { default?: string; allowHosts?: string[]; allowHostPatterns?: string[] } | undefined,
@@ -563,10 +554,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
       assertSecretsValid(secrets);
-      // Validate the designation BEFORE writing the row, so a bad designation
-      // rejects the whole request instead of leaving an orphan profile behind.
-      if (req.designation) assertDesignationValid(req.designation);
-      let row = await store.create({
+      const row = await store.create({
         name: req.name,
         description: req.description,
         icon: req.icon || "Bot",
@@ -584,10 +572,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         effort,
         apps: normalizeAppsChecked(req.apps ?? []),
       });
-      if (req.designation) {
-        await store.setDesignation(row.id, req.designation);
-        row = (await store.get(row.id)) ?? row;
-      }
       return { profile: toProto(row, true) };
     },
 
@@ -613,10 +597,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
       assertSecretsValid(secrets);
-      // Validate the designation BEFORE the update commits, so a bad designation
-      // rejects the request rather than half-saving the ordinary edits.
-      if (req.designation !== undefined) assertDesignationValid(req.designation);
-      let row = await store.update(req.id, {
+      const row = await store.update(req.id, {
         name: req.name,
         description: req.description,
         icon: req.icon || "Bot",
@@ -635,10 +616,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         apps: normalizeAppsChecked(req.apps ?? []),
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
-      if (req.designation !== undefined) {
-        await store.setDesignation(req.id, req.designation || null);
-        row = (await store.get(req.id)) ?? row;
-      }
       return { profile: toProto(row, true) };
     },
 
@@ -677,13 +654,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const user = await requireUser(ctx, getSession);
       const ability = abilityFor(user);
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
-      const row = await store.get(req.id);
-      if (row?.designation != null) {
-        throw new ConnectError(
-          `cannot delete a system profile (designation: ${row.designation})`,
-          Code.FailedPrecondition,
-        );
-      }
       await store.softDelete(req.id);
       return {};
     },

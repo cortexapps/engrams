@@ -45,14 +45,11 @@ export interface ProfileRow {
   repos: ProfileRepo[];
   // ADR 0118: the services every session from this profile hosts.
   apps: ProfileApp[];
-  designation: string | null;
   createdAt: Date;
   updatedAt: Date;
   deletedAt: Date | null;
 }
 
-// `designation` is deliberately absent: update() spreads only ProfileInput into
-// its SET clause, so admin edits cannot clobber a system marker.
 export interface ProfileInput {
   name: string;
   description: string;
@@ -80,13 +77,9 @@ export interface ProfileStore {
   get(id: string): Promise<ProfileRow | null>;
   /** Active (deleted_at IS NULL) only, or null. Used by createTask. */
   getActive(id: string): Promise<ProfileRow | null>;
-  /** The active profile carrying this system designation, or null. */
-  getByDesignation(designation: string): Promise<ProfileRow | null>;
   /** Rows for the given ids (active or archived) — for snapshot enrichment. */
   getByIds(ids: string[]): Promise<ProfileRow[]>;
-  create(input: ProfileInput, designation?: string | null): Promise<ProfileRow>;
-  /** Assign or clear a system designation, keeping each value on at most one profile. */
-  setDesignation(id: string, designation: string | null): Promise<void>;
+  create(input: ProfileInput): Promise<ProfileRow>;
   /** Returns the updated row, or null if the id is absent / archived. */
   update(id: string, input: ProfileInput): Promise<ProfileRow | null>;
   /** Idempotent soft delete (sets deleted_at). */
@@ -112,7 +105,6 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     secrets: (r.secrets ?? []) as ProfileSecret[],
     repos: (r.repos ?? []) as ProfileRepo[],
     apps: (r.apps ?? []) as ProfileApp[],
-    designation: r.designation ?? null,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
     deletedAt: r.deletedAt,
@@ -139,39 +131,16 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
         .limit(1);
       return rows[0] ? toRow(rows[0]) : null;
     },
-    async getByDesignation(designation) {
-      const rows = await db
-        .select()
-        .from(profileTable)
-        .where(and(eq(profileTable.designation, designation), isNull(profileTable.deletedAt)))
-        .limit(1);
-      return rows[0] ? toRow(rows[0]) : null;
-    },
     async getByIds(ids) {
       if (ids.length === 0) return [];
       const rows = await db.select().from(profileTable).where(inArray(profileTable.id, ids));
       return rows.map(toRow);
     },
-    async create(input, designation) {
+    async create(input) {
       const id = crypto.randomUUID();
-      await db.insert(profileTable).values({ id, ...input, designation: designation ?? null });
+      await db.insert(profileTable).values({ id, ...input });
       const row = await this.get(id);
       return row!;
-    },
-    async setDesignation(id, designation) {
-      const updatedAt = new Date();
-      await db.transaction(async (tx) => {
-        if (designation !== null) {
-          await tx
-            .update(profileTable)
-            .set({ designation: null, updatedAt })
-            .where(and(eq(profileTable.designation, designation), ne(profileTable.id, id)));
-        }
-        await tx
-          .update(profileTable)
-          .set({ designation, updatedAt })
-          .where(eq(profileTable.id, id));
-      });
     },
     async update(id, input) {
       const existing = await this.getActive(id);

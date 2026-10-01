@@ -137,7 +137,6 @@ describe("makeProductionSessionOps.createSession", () => {
         launches.push({ ...input });
       },
     });
-    const designations: string[] = [];
     const ops = makeProductionSessionOps({
       store,
       createSessionForExistingTask: async (params) => {
@@ -148,17 +147,6 @@ describe("makeProductionSessionOps.createSession", () => {
       registerListener: async () => {
         calls.push("listener");
       },
-      profiles: {
-        async getByDesignation(designation: string) {
-          designations.push(designation);
-          // "pr_reviewer" is the org's designated reviewer; "nobody" is
-          // unassigned; any other short name resolves to itself so the
-          // existing cases' `profileId: "p1"` reaches the session unchanged.
-          if (designation === "pr_reviewer") return { id: "11111111-2222-4333-8444-555555555555" } as never;
-          if (designation === "nobody") return null;
-          return { id: designation } as never;
-        },
-      },
     });
     return {
       ops,
@@ -167,7 +155,6 @@ describe("makeProductionSessionOps.createSession", () => {
       bindings,
       launches,
       taskOwners,
-      designations,
       setExistingPrimary(id: string) {
         existingPrimary = id;
       },
@@ -185,19 +172,18 @@ describe("makeProductionSessionOps.createSession", () => {
     keep: true,
   };
 
-  test("a profileId that is a designation resolves to the org's profile; an id passes through; an unassigned designation names itself", async () => {
+  test("a profileId passes through as the session's profile; an empty one fails the block before any session", async () => {
     const h = harness();
-    await h.ops.createSession({ ...input, profileId: "pr_reviewer" } as never);
-    expect(h.createdParams.at(-1)!.profileId).toBe("11111111-2222-4333-8444-555555555555");
-    expect(h.designations).toEqual(["pr_reviewer"]);
-
-    await h.ops.createSession({ ...input, profileId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", role: "worker" } as never);
+    await h.ops.createSession({ ...input, profileId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } as never);
     expect(h.createdParams.at(-1)!.profileId).toBe("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
-    expect(h.designations).toEqual(["pr_reviewer"]); // no lookup for an id
 
-    await expect(h.ops.createSession({ ...input, profileId: "nobody", role: "worker" } as never)).rejects.toThrow(
-      /no profile is designated "nobody"/,
+    // A built-in's `profile` input nobody filled renders "": the block names
+    // the fix instead of handing the control plane an unknown profile.
+    const before = h.createdParams.length;
+    await expect(h.ops.createSession({ ...input, profileId: "", role: "worker" } as never)).rejects.toThrow(
+      /profileId is empty/,
     );
+    expect(h.createdParams).toHaveLength(before);
   });
 
   test("binding lands BEFORE listener registration; launch denormalizes", async () => {

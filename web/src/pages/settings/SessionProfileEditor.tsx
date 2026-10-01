@@ -129,7 +129,6 @@ const schema = z.object({
   modelRouter: z.string().nullable(),
   model: z.string().nullable(),
   effort: z.string().nullable(),
-  designation: z.boolean(),
   includeUserTokens: z.boolean(),
   skills: z.array(z.string()),
   integrationGrants: z.array(
@@ -211,7 +210,6 @@ const EMPTY: ProfileFormValues = {
   modelRouter: null,
   model: null,
   effort: null,
-  designation: false,
   includeUserTokens: false,
   skills: [],
   integrationGrants: [],
@@ -294,7 +292,6 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       modelRouter: optionId(p.modelRouter),
       model: optionId(p.model),
       effort: optionId(p.effort),
-      designation: p.designation === "pr_reviewer",
       includeUserTokens: p.includeUserTokens,
       skills: p.skills ?? [],
       integrationGrants: (p.integrationGrants ?? []).map((grant) => ({
@@ -480,24 +477,12 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         .filter((r) => r.path !== ""),
       apps: vals.apps,
     };
-    const designationValue = vals.designation ? "pr_reviewer" : "";
     try {
       if (mode === "edit" && editingId) {
-        // `designation` is admin-only and role-transferring, so send it ONLY when
-        // the toggle actually changed from the loaded snapshot. Otherwise a stale
-        // editor tab would re-assert an out-of-date designation on an unrelated
-        // save and silently steal (or drop) the reviewer role. The field is
-        // optional on the wire; omitting it means the server leaves it untouched.
-        const hydratedDesignation = existing?.profile?.designation === "pr_reviewer";
-        const designationTouched = vals.designation !== hydratedDesignation;
-        await update.mutateAsync({
-          id: editingId,
-          ...payload,
-          ...(designationTouched ? { designation: designationValue } : {}),
-        });
+        await update.mutateAsync({ id: editingId, ...payload });
         toast.success("Saved changes");
       } else {
-        await create.mutateAsync({ ...payload, designation: designationValue });
+        await create.mutateAsync(payload);
         toast.success(`Profile "${vals.name.trim()}" created`);
       }
       navigate({ to: "/settings/profiles" });
@@ -579,26 +564,6 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                       Optional — shown wherever this profile is offered.
                     </FieldDescription>
                   </Field>
-                )}
-              />
-              <Controller
-                control={control}
-                name="designation"
-                render={({ field }) => (
-                  <div className="flex items-center gap-3 rounded-md border bg-background px-3 py-2.5">
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                      aria-label="PR reviewer profile"
-                    />
-                    <div className="flex-1">
-                      <div className="text-sm">Designate as the PR reviewer</div>
-                      <div className="text-xs text-muted-foreground">
-                        Pull-request reviews run on this profile&apos;s image, model, and skills.
-                        Only one profile can be the reviewer.
-                      </div>
-                    </div>
-                  </div>
                 )}
               />
             </FieldGroup>

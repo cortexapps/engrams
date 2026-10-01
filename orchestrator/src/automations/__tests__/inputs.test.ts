@@ -25,7 +25,7 @@ const REVIEW_INPUTS_SCHEMA_JSON = `[
       "autofix": { "type": "boolean", "label": "Autofix", "default": false }
     }
   },
-  { "key": "profile", "label": "Reviewer profile", "type": "string", "default": "pr_reviewer" },
+  { "key": "profile", "label": "Reviewer profile", "type": "string", "default": "" },
   { "key": "mention", "label": "Mention", "type": "string", "default": "@engrams" },
   {
     "key": "categories",
@@ -63,7 +63,7 @@ describe("validateInputValues — the review schema (shared fixture)", () => {
           "engrams/engrams": { mode: "auto", autofix: false },
           "cortex/brain-backend": { mode: "on_request", autofix: true },
         },
-        profile: "pr_reviewer",
+        profile: "",
         mention: "@engrams",
         categories: ["security", "docs"],
         instructions: "Be terse.\nPrefer small diffs.",

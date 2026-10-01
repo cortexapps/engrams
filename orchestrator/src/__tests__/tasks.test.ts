@@ -268,7 +268,6 @@ function makeFakeProfiles(opts?: {
     secrets: [],
     repos: [],
     apps: opts?.apps ?? [],
-    designation: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,
@@ -285,9 +284,6 @@ function makeFakeProfiles(opts?: {
       const r = rows.get(id);
       return r && !r.deletedAt ? r : null;
     },
-    async getByDesignation(designation) {
-      return [...rows.values()].find((r) => r.designation === designation && !r.deletedAt) ?? null;
-    },
     async getByIds(ids) {
       return ids.map((i) => rows.get(i)).filter(Boolean) as ProfileRow[];
     },
@@ -296,7 +292,6 @@ function makeFakeProfiles(opts?: {
       rows.set(r.id, r);
       return r;
     },
-    async setDesignation() {},
     async update() {
       return null;
     },

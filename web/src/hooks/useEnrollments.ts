@@ -4,8 +4,8 @@
  * A repo must be enrolled here for engrams to review its pull requests — the
  * webhook route drops any event whose repo has no enrollment. Enrollment is
  * admin-only org config on the native Connect `ReviewService`. Each row carries
- * the trigger mode (auto vs. @mention-only), the autofix routing, and an
- * optional profile override (empty = the designated `pr_reviewer` profile).
+ * the trigger mode (auto vs. @mention-only) and the autofix routing. The
+ * reviewer profile is the PR-review automation's `profile` input.
  */
 
 import { useMutation, useQuery, createConnectQueryKey } from "@connectrpc/connect-query";

@@ -161,7 +161,7 @@ describe("seedBuiltinAutomations", () => {
     const h = harness({
       existing: {
         definition: stored,
-        inputs: { repos: { "acme/app": { mode: "auto", autofix: false } }, mention: "@reviewbot", profile: "pr_reviewer", categories: [], instructions: "" },
+        inputs: { repos: { "acme/app": { mode: "auto", autofix: false } }, mention: "@reviewbot", profile: "11111111-2222-4333-8444-555555555555", categories: [], instructions: "" },
         overrides: {
           // A real edit (differs from old default) — kept.
           find: { deadlineSeconds: 900 },

@@ -1230,10 +1230,6 @@ export const profile = pgTable(
     // into the guest's env, so a sibling app is configured with an address the
     // user's browser can reach too. Empty = no apps.
     apps: jsonb("apps").$type<ProfileApp[]>().notNull().default([]),
-    // System marker (ADR 0100): at most one profile per value; the review
-    // workflow finds its profile by this marker, and designated profiles cannot
-    // be deleted.
-    designation: text("designation"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at")
       .notNull()
@@ -1241,11 +1237,6 @@ export const profile = pgTable(
       .$onUpdate(() => new Date()),
     deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
   },
-  (t) => [
-    uniqueIndex("profile_designation_unique")
-      .on(t.designation)
-      .where(sql`designation is not null`),
-  ],
 );
 
 // ---------------------------------------------------------------------------

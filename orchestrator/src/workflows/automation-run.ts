@@ -94,30 +94,6 @@ export interface ProductionSessionOpsDeps {
   store?: AutomationEngineStore;
   createSessionForExistingTask?: CreateExistingSession;
   registerListener?: (sessionId: string) => Promise<void>;
-  /** Resolves a profile DESIGNATION (`pr_reviewer`) to the org's profile. */
-  profiles?: Pick<ProfileStore, "getByDesignation">;
-}
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/** A block's `profileId` is an id or a designation. A built-in cannot carry
- * an id — profile ids differ per org — so it names the designation the org
- * assigned (`pr_reviewer`), the way the legacy review graph resolved its
- * reviewer. An id passes through untouched; anything else is looked up by
- * designation, and a designation nobody holds fails the block with a
- * message that says which one to assign. */
-export async function resolveProfileRef(
-  ref: string,
-  profiles: Pick<ProfileStore, "getByDesignation">,
-): Promise<string> {
-  if (UUID_RE.test(ref)) return ref;
-  const row = await profiles.getByDesignation(ref);
-  if (!row) {
-    throw new Error(
-      `no profile is designated "${ref}" — assign the designation to a profile under Settings → Profiles`,
-    );
-  }
-  return row.id;
 }
 
 /** EngineSessionOps over the control plane. The binding row lands BEFORE the
@@ -126,8 +102,6 @@ export async function resolveProfileRef(
 export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): EngineSessionOps {
   let resolvedStore = deps.store;
   const store = () => (resolvedStore ??= makeAutomationEngineStore());
-  let resolvedProfiles = deps.profiles;
-  const profiles = () => (resolvedProfiles ??= makeProfileStore(getDb()));
   let createExistingSession = deps.createSessionForExistingTask;
   const createSession = (): CreateExistingSession => {
     if (createExistingSession) return createExistingSession;
@@ -170,7 +144,13 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
         const existing = await store().getAutomationTaskSession(input.runId);
         if (existing !== null) return { sessionId: existing, taskId };
       }
-      const profileId = await resolveProfileRef(input.profileId, profiles());
+      // A built-in carries no profile id of its own (ids differ per org): its
+      // `profile` input holds the one the org picked, and an empty render
+      // means nobody picked yet.
+      const profileId = input.profileId;
+      if (profileId === "") {
+        throw new Error("create_session: profileId is empty — pick a profile in the automation's inputs");
+      }
       const { sessionId } = await createSession()({
         taskId,
         taskType: "automation",

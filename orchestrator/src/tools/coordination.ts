@@ -269,7 +269,6 @@ async function compileChildInput(
     secrets: structuredClone(policy.secrets),
     repos: structuredClone(policy.repos),
     apps: structuredClone(policy.apps),
-    designation: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,

@@ -14,7 +14,6 @@ import {
   type RunExecRuntime,
 } from "../exec/durable-exec.ts";
 import { stageFiles, type FileStagingClient } from "../exec/stage-files.ts";
-import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import {
   makeReviewStore,
   type BeginReviewPassInput,
@@ -157,7 +156,6 @@ export interface ReviewControlPlaneDeps {
   reviews?: ReviewControlPlaneStore;
   db?: ReturnType<typeof getDb>;
   sessions?: ReviewSessionsClient;
-  profiles?: Pick<ProfileStore, "getActive" | "getByDesignation">;
   githubPoster?: GithubReviewPoster;
   renderReviewer?: RenderReviewer;
   /** Deterministic retry/deadline scheduler for durable-exec tests. */
@@ -385,8 +383,6 @@ export function makeReviewControlPlane(
   const reviews = () => (reviewStore ??= makeReviewStore(db()));
   const sessions = deps.sessions ?? defaultSessions;
   const execRuntime = deps.execRuntime ?? defaultRunExecRuntime;
-  let profileStore = deps.profiles;
-  const profiles = () => (profileStore ??= makeProfileStore(db()));
   const renderReviewer = deps.renderReviewer ?? defaultRenderReviewer;
   const githubPoster = deps.githubPoster ?? makeGithubReviewPoster();
 

@@ -76,8 +76,8 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
 function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
   const rows = new Map<string, ProfileRow>(seed.map((r) => [r.id, r]));
   let n = 0;
-  const mk = (id: string, input: ProfileInput, designation: string | null = null): ProfileRow => ({
-    id, ...input, designation, createdAt: new Date(0), updatedAt: new Date(0), deletedAt: null,
+  const mk = (id: string, input: ProfileInput): ProfileRow => ({
+    id, ...input, createdAt: new Date(0), updatedAt: new Date(0), deletedAt: null,
   });
   return {
     async list({ includeArchived }) {
@@ -87,22 +87,8 @@ function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
     },
     async get(id) { return rows.get(id) ?? null; },
     async getActive(id) { const r = rows.get(id); return r && r.deletedAt == null ? r : null; },
-    async getByDesignation(designation) {
-      return [...rows.values()].find((r) => r.designation === designation && r.deletedAt == null) ?? null;
-    },
     async getByIds(ids) { return ids.map((i) => rows.get(i)).filter(Boolean) as ProfileRow[]; },
-    async create(input, designation) { const id = `p${n++}`; const r = mk(id, input, designation); rows.set(id, r); return r; },
-    async setDesignation(id, designation) {
-      if (designation !== null) {
-        for (const [otherId, row] of rows) {
-          if (otherId !== id && row.designation === designation) {
-            rows.set(otherId, { ...row, designation: null, updatedAt: new Date(0) });
-          }
-        }
-      }
-      const row = rows.get(id);
-      if (row) rows.set(id, { ...row, designation, updatedAt: new Date(0) });
-    },
+    async create(input) { const id = `p${n++}`; const r = mk(id, input); rows.set(id, r); return r; },
     async update(id, input) {
       const ex = rows.get(id); if (!ex || ex.deletedAt != null) return null;
       const r = { ...ex, ...input, updatedAt: new Date(0) }; rows.set(id, r); return r;
@@ -166,7 +152,6 @@ const archived: ProfileRow = {
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
   repos: [],
   apps: [],
-  designation: null,
   deletedAt: new Date(0),
 };
 const active: ProfileRow = { ...archived, id: "act", name: "Active", deletedAt: null };
@@ -289,73 +274,6 @@ describe("ProfileService — auth + field filtering", () => {
     } finally { await s.close(); }
   });
 
-  test("admin CreateProfile sets and returns the PR reviewer designation", async () => {
-    const store = makeFakeStore();
-    const s = await spawn({
-      getSession: makeGetSession("a", "admin"), store, images: fakeImages(["img-1"]),
-    });
-    try {
-      const r = await s.client.createProfile({
-        name: "Reviewer", description: "", icon: "Bot", imageId: "img-1",
-        harness: "claude", includeUserTokens: false, envVars: {},
-        designation: "pr_reviewer",
-      });
-      expect(r.profile!.designation).toBe("pr_reviewer");
-      expect((await store.getByDesignation("pr_reviewer"))?.id).toBe(r.profile!.id);
-    } finally { await s.close(); }
-  });
-
-  test("admin UpdateProfile sets, preserves when omitted, and clears designation", async () => {
-    const store = makeFakeStore([active]);
-    const s = await spawn({
-      getSession: makeGetSession("a", "admin"), store, images: fakeImages(["img-1"]),
-    });
-    const input = {
-      id: active.id, name: active.name, description: "", icon: "Bot", imageId: "img-1",
-      harness: "claude", includeUserTokens: false, envVars: {},
-    };
-    try {
-      const designated = await s.client.updateProfile({ ...input, designation: "pr_reviewer" });
-      expect(designated.profile!.designation).toBe("pr_reviewer");
-
-      const preserved = await s.client.updateProfile({ ...input, name: "Still Reviewer" });
-      expect(preserved.profile!.designation).toBe("pr_reviewer");
-
-      const cleared = await s.client.updateProfile({ ...input, designation: "" });
-      expect(cleared.profile!.designation).toBeUndefined();
-      expect(await store.getByDesignation("pr_reviewer")).toBeNull();
-    } finally { await s.close(); }
-  });
-
-  test("admin UpdateProfile rejects an unknown designation", async () => {
-    const s = await spawn({
-      getSession: makeGetSession("a", "admin"), store: makeFakeStore([active]),
-      images: fakeImages(["img-1"]),
-    });
-    try {
-      await expectErr(s.client.updateProfile({
-        id: active.id, name: active.name, description: "", icon: "Bot", imageId: "img-1",
-        harness: "claude", includeUserTokens: false, envVars: {}, designation: "unknown",
-      }), Code.InvalidArgument);
-    } finally { await s.close(); }
-  });
-
-  test("admin CreateProfile with a bad designation persists no orphan profile", async () => {
-    const store = makeFakeStore();
-    const s = await spawn({
-      getSession: makeGetSession("a", "admin"), store, images: fakeImages(["img-1"]),
-    });
-    try {
-      await expectErr(s.client.createProfile({
-        name: "Reviewer", description: "", icon: "Bot", imageId: "img-1",
-        harness: "claude", includeUserTokens: false, envVars: {}, designation: "unknown",
-      }), Code.InvalidArgument);
-      // The designation is validated before the row is written, so nothing lands.
-      expect(await store.list({ includeArchived: true })).toHaveLength(0);
-    } finally { await s.close(); }
-  });
-
-  // ADR 0055 P2: skills validated against builtins ∪ the upload catalog.
   test("admin CreateProfile with an unknown skill → InvalidArgument", async () => {
     const s = await spawn({
       getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
@@ -671,27 +589,6 @@ describe("ProfileService — auth + field filtering", () => {
       expect(updated.profile!.harness).toBe("claude");
       expect(updated.profile!.model).toBeUndefined();
       expect(updated.profile!.effort).toBeUndefined();
-    } finally { await s.close(); }
-  });
-
-  test("admin DeleteProfile rejects a designated profile without soft-deleting it", async () => {
-    const designated: ProfileRow = { ...active, designation: "pr_reviewer" };
-    const baseStore = makeFakeStore([designated]);
-    let softDeleteCalls = 0;
-    const store: ProfileStore = {
-      ...baseStore,
-      async softDelete(id) {
-        softDeleteCalls += 1;
-        await baseStore.softDelete(id);
-      },
-    };
-    const s = await spawn({
-      getSession: makeGetSession("a", "admin"), store, images: fakeImages(["img-1"]),
-    });
-    try {
-      await expectErr(s.client.deleteProfile({ id: designated.id }), Code.FailedPrecondition);
-      expect(softDeleteCalls).toBe(0);
-      expect((await store.get(designated.id))?.deletedAt).toBeNull();
     } finally { await s.close(); }
   });
 });
