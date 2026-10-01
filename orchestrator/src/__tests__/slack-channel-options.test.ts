@@ -37,6 +37,10 @@ describe("listSlackChannelOptions", () => {
     ]);
     expect(calls.map((c) => c["cursor"])).toEqual([undefined, "c2", "c3"]);
     expect(calls.every((c) => c["types"] === "public_channel,private_channel")).toBe(true);
+    // Full-size pages: the archived filter is applied after a virtual page is
+    // cut, so a small page is mostly archived channels and walks the cursor
+    // for nothing.
+    expect(calls.every((c) => c["limit"] === 1000)).toBe(true);
   });
 
   test("an empty next_cursor ends the walk after one page", async () => {

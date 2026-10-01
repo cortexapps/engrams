@@ -50,6 +50,7 @@ import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
 import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
 import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
+import { log as rootLog } from "../log.ts";
 import type { HarnessCatalogClient } from "./task-create.ts";
 import type { WebhookVerificationScheme } from "../db/schema.ts";
 import {
@@ -437,23 +438,37 @@ export interface SlackChannelPages {
   };
 }
 
-/** Pages of `conversations.list` to walk before giving up: a workspace with
- * more channels than this lists its first few thousand. */
-const SLACK_CHANNEL_PAGE_LIMIT = 25;
+const log = rootLog.child({ component: "automations-rpc" });
+
+/** Slack's ceiling for one `conversations.list` page. */
+const SLACK_CHANNEL_PAGE_SIZE = 1000;
+/** Pages of `conversations.list` to walk before giving up — 100k virtual
+ * rows, archived channels included (see below). A workspace past that
+ * lists its first 100k and the log says so. */
+const SLACK_CHANNEL_PAGE_LIMIT = 100;
 
 /** Every channel the app can see, public and private alike (a thread in a
  * private channel needs a name as much as a public one's), as key options.
- * Slack pages the list by cursor and may answer any page with FEWER than
- * `limit` channels before the end — one page is never the whole workspace,
+ * Slack pages the list by cursor, and `exclude_archived` is applied AFTER
+ * a virtual page of `limit` rows is cut — a workspace with years of
+ * archived channels answers every page with a handful of live ones (the
+ * engrams workspace: ~18 per 200). One page is never the whole workspace,
  * so the walk follows `next_cursor` until it is empty. */
 export async function listSlackChannelOptions(
   client: SlackChannelPages,
 ): Promise<Array<{ key: string; label: string }>> {
   const options: Array<{ key: string; label: string }> = [];
   let cursor: string | undefined;
-  for (let page = 0; page < SLACK_CHANNEL_PAGE_LIMIT; page += 1) {
+  for (let page = 0; ; page += 1) {
+    if (page === SLACK_CHANNEL_PAGE_LIMIT) {
+      log.warn(
+        { pages: page, channels: options.length },
+        "slack channel list: page cap reached; the list is incomplete",
+      );
+      break;
+    }
     const result = await client.conversations.list({
-      limit: 200,
+      limit: SLACK_CHANNEL_PAGE_SIZE,
       exclude_archived: true,
       types: "public_channel,private_channel",
       ...(cursor !== undefined ? { cursor } : {}),
