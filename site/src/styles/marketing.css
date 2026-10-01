@@ -214,6 +214,7 @@ html {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.18);
 }
 .wordmark {
@@ -338,6 +339,7 @@ html.menu-open {
 }
 .cta-small {
   display: inline-flex;
+  white-space: nowrap;
   align-items: center;
   height: 40px;
   padding: 0 18px;
@@ -1634,7 +1636,10 @@ html.menu-open {
 }
 @media (max-width: 1024px) {
   .site-nav {
-    gap: 18px;
+    gap: 12px;
+  }
+  .cta-small {
+    padding: 0 14px;
   }
   .site-nav .page {
     display: none;
@@ -1785,5 +1790,15 @@ html.menu-open {
   }
   .sec-head {
     flex-wrap: wrap;
+  }
+}
+
+/* Below 360px the GitHub button keeps only its mark. */
+@media (max-width: 359px) {
+  .site-nav .gh {
+    padding: 0 10px;
+  }
+  .site-nav .gh span {
+    display: none;
   }
 }
