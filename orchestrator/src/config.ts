@@ -7,6 +7,12 @@
  */
 
 import { parseAdminEmails } from "./auth/admin-allowlist.ts";
+import {
+  allowlistIsEmpty,
+  isGoogleIssuer,
+  parseEmailAllowlist,
+  type EmailAllowlist,
+} from "./auth/oauth-gate.ts";
 import { HEARTBEAT_INTERVAL_MS, SWEEP_GRACE_MS, SWEEP_INTERVAL_MS } from "./sweep/sweeper.ts";
 
 export interface Config {
@@ -101,25 +107,45 @@ export interface Config {
    */
   kekMasterKey: string;
   /**
+   * ORCHESTRATOR_AUTH_MODE — the ONE human sign-in door this deployment has.
+   * The modes are exclusive; exactly one is active:
+   *
+   *   - `oauth`    — "Sign in with your identity provider" (OIDC, through
+   *                  better-auth genericOAuth). The production default in the
+   *                  Helm chart. Requires `oauth`, allowlist included.
+   *   - `iap`      — GCP Identity-Aware Proxy in front of the app host. The
+   *                  IAP bridge mints sessions from the verified assertion.
+   *                  Requires `iapAudiences`.
+   *   - `password` — email + password (the dev default when the env is
+   *                  unset). `passwordSignup` controls open registration.
+   *
+   * The password door is closed in `oauth` and `iap` mode. Config for a mode
+   * that is not active is a hard boot error: a stray IAP_AUDIENCES would
+   * otherwise arm the fail-closed bridge behind a deployment with no IAP.
+   */
+  authMode: AuthMode;
+  /**
+   * ORCHESTRATOR_AUTH_PASSWORD_SIGNUP — open registration in `password` mode.
+   * Default true (dev). "0"/"false" closes it: existing accounts sign in, and
+   * nobody can make a new one. Always false in the other modes.
+   *
+   * An email is NOT verified on password sign-up, so anyone can register any
+   * address, a bootstrap-admin address included (ORCHESTRATOR_ADMIN_EMAILS is
+   * not a security boundary in this mode). Do not expose `password` mode with
+   * sign-up open to the internet.
+   */
+  passwordSignup: boolean;
+  /**
    * IAP_AUDIENCES — the SET of GCP IAP audiences the orchestrator trusts
    * (comma-separated in the env). Each audience is a backend-service / app
    * resource string (e.g. /projects/PROJECT_NUM/global/backendServices/ID). An
-   * assertion verifies if its `aud` matches ANY entry.
+   * assertion verifies if its `aud` matches ANY entry. A set, because a GCP
+   * IAP audience IS the backend service and a deployment can put more than
+   * one IAP-protected backend in front of the orchestrator.
    *
-   * Why a set, not one value: the orchestrator sits behind MORE THAN ONE
-   * IAP-protected GCP backend service, and a GCP IAP audience IS the backend
-   * service resource — there is no way to share one audience across backends.
-   * The app enters via the classic web Ingress backend; live-host port previews
-   * (ADR 0064) enter via a DEDICATED Gateway backend (required for the wildcard
-   * `*.preview` Certificate Manager cert, which the classic Ingress can't hold).
-   * Two IAP front doors → two audiences, both trusted here. Verification stays
-   * uniform (same JWKS / issuer / ES256); only the accepted `aud` set differs —
-   * the auth layer NEVER branches on Host or path.
-   *
-   * Empty (env unset) → the IAP bridge is fully inert (zero overhead, no header
-   * reads). Set in production when the orchestrator sits behind GCP IAP.
-   * This is the production door story: IAP bridge + disabled public sign-up
-   * replace password auth in prod.
+   * Non-empty exactly when `authMode` is `iap` (the loader enforces both
+   * directions). Empty → the IAP bridge is fully inert (zero overhead, no
+   * header reads).
    */
   iapAudiences: string[];
   /**
@@ -130,14 +156,11 @@ export interface Config {
    */
   iapJwksUrl: string;
   /**
-   * Env-driven OIDC ("Sign in with your IdP"), restoring the old coordinator
-   * `--auth-mode=oidc` parity. Present only when ORCHESTRATOR_OIDC_ISSUER +
-   * CLIENT_ID + CLIENT_SECRET are all set; otherwise `undefined` (OIDC off,
-   * email+password / IAP remain). Federated SSO this way also yields real
-   * user names (the ID token's `name`/`given_name` claims via the `profile`
-   * scope, which stock GCP IAP can't supply).
+   * The OIDC provider behind the `oauth` door. Present exactly when `authMode`
+   * is `oauth` (ORCHESTRATOR_OAUTH_ISSUER + CLIENT_ID + CLIENT_SECRET are then
+   * all required); otherwise `undefined`.
    */
-  oidc: OidcConfig | undefined;
+  oauth: OAuthConfig | undefined;
   /**
    * ORCHESTRATOR_PREVIEW_BASE_DOMAIN — the wildcard base under which live-host
    * port previews are served (ADR 0064): a preview URL is
@@ -166,7 +189,7 @@ export interface Config {
   /**
    * ORCHESTRATOR_ADMIN_EMAILS — comma-separated bootstrap-admin allowlist.
    * Restores the pre-ADR-0051 `auth.bootstrapAdmins` Helm value: matching
-   * emails are created with role 'admin' (any JIT path — IAP bridge, OIDC,
+   * emails are created with role 'admin' (any JIT path — IAP bridge, OAuth,
    * email/password) and an existing matching user is promoted to admin on
    * sign-in. Normalised (trim + lowercase) at load. Empty when unset → the
    * promotion hooks are fully inert (dev/local default).
@@ -305,8 +328,13 @@ export function parseTelemetrySinks(raw: string | undefined): TelemetryConfig | 
   return { sinks };
 }
 
-/** A configured generic OIDC provider (better-auth genericOAuth). */
-export interface OidcConfig {
+/** The human sign-in door. See Config.authMode. */
+export type AuthMode = "oauth" | "iap" | "password";
+
+const AUTH_MODES: readonly AuthMode[] = ["oauth", "iap", "password"];
+
+/** The OIDC provider behind the `oauth` door (better-auth genericOAuth). */
+export interface OAuthConfig {
   /** Issuer base URL; discovery doc is `${issuer}/.well-known/openid-configuration`. */
   issuer: string;
   clientId: string;
@@ -315,6 +343,17 @@ export interface OidcConfig {
   providerId: string;
   /** Requested scopes (`profile` pulls the display name). */
   scopes: string[];
+  /** The name on the sign-in button ("Continue with <displayName>"). */
+  displayName: string;
+  /**
+   * ORCHESTRATOR_OAUTH_ALLOWED_DOMAINS / ORCHESTRATOR_OAUTH_ALLOWED_EMAILS —
+   * who may sign in (auth/oauth-gate.ts). Comma-separated; normalised at load.
+   * `emails` also carries every ORCHESTRATOR_ADMIN_EMAILS entry. Never empty:
+   * the boot fails without one, because an OAuth client otherwise admits
+   * every account the provider has. `domains: ["*"]` is the explicit way to
+   * say that.
+   */
+  allowlist: EmailAllowlist;
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -402,40 +441,96 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     return "";
   })();
 
-  // OPTIONAL: IAP bridge config. IAP_AUDIENCES is a comma-separated SET of
-  // trusted audiences (see the Config.iapAudiences doc for why it's a set).
-  // Empty → the bridge is fully inert in dev (no overhead, no header reads).
-  // No test placeholder needed — empty is valid and means "inert".
+  // The sign-in door. Unset = `password` (the dev default: the Tiltfile sets
+  // nothing). The Helm chart always sets it explicitly.
+  const authModeRaw = (env["ORCHESTRATOR_AUTH_MODE"] ?? "").trim() || "password";
+  if (!(AUTH_MODES as readonly string[]).includes(authModeRaw)) {
+    throw new Error(
+      `Orchestrator: ORCHESTRATOR_AUTH_MODE="${authModeRaw}" must be one of ${AUTH_MODES.join(", ")}`,
+    );
+  }
+  const authMode = authModeRaw as AuthMode;
+
+  // Bootstrap-admin allowlist (restores `auth.bootstrapAdmins`). Parsed +
+  // normalised (trim/lowercase/de-dup) here; empty when unset, which makes the
+  // better-auth promotion hooks fully inert.
+  const adminEmails = parseAdminEmails(env["ORCHESTRATOR_ADMIN_EMAILS"]);
+
+  // `password` mode: open registration unless explicitly closed. Narrow
+  // spellings, like the kill switches below.
+  const passwordSignupRaw = env["ORCHESTRATOR_AUTH_PASSWORD_SIGNUP"];
+  const passwordSignup =
+    authMode === "password" && passwordSignupRaw !== "0" && passwordSignupRaw !== "false";
+
+  // `iap` mode: IAP_AUDIENCES is a comma-separated SET of trusted audiences
+  // (see the Config.iapAudiences doc for why it's a set). Both directions are
+  // checked: the bridge fails closed whenever the set is non-empty, so a stray
+  // value in another mode would 401 every anonymous request, the login page
+  // included.
   const iapAudiences = (env["IAP_AUDIENCES"] ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
+  if (authMode === "iap" && iapAudiences.length === 0) {
+    missing.push("IAP_AUDIENCES (required when ORCHESTRATOR_AUTH_MODE=iap)");
+  }
+  if (authMode !== "iap" && iapAudiences.length > 0) {
+    throw new Error(
+      `Orchestrator: IAP_AUDIENCES is set but ORCHESTRATOR_AUTH_MODE is "${authMode}". ` +
+        `Set ORCHESTRATOR_AUTH_MODE=iap, or remove IAP_AUDIENCES`,
+    );
+  }
   const iapJwksUrl = optional("IAP_JWKS_URL", "https://www.gstatic.com/iap/verify/public_key-jwk");
 
-  // OPTIONAL: env-driven OIDC. Opt-in via ORCHESTRATOR_OIDC_ISSUER; when set,
-  // CLIENT_ID + CLIENT_SECRET become required (partial config is a hard error,
-  // mirroring the old `--auth-mode=oidc` validation — you meant to enable OIDC
-  // but under-configured it). Unset = OIDC off.
-  const oidcIssuer = env["ORCHESTRATOR_OIDC_ISSUER"]?.trim() || undefined;
-  let oidc: OidcConfig | undefined;
-  if (oidcIssuer) {
-    const clientId = env["ORCHESTRATOR_OIDC_CLIENT_ID"]?.trim() || "";
-    const clientSecret = env["ORCHESTRATOR_OIDC_CLIENT_SECRET"]?.trim() || "";
+  // `oauth` mode: the OIDC provider. Partial config is a hard error (you meant
+  // to enable OAuth but under-configured it), and so is provider config in a
+  // mode that will never use it.
+  const oauthIssuer = env["ORCHESTRATOR_OAUTH_ISSUER"]?.trim() || undefined;
+  let oauth: OAuthConfig | undefined;
+  if (authMode === "oauth") {
+    const clientId = env["ORCHESTRATOR_OAUTH_CLIENT_ID"]?.trim() || "";
+    const clientSecret = env["ORCHESTRATOR_OAUTH_CLIENT_SECRET"]?.trim() || "";
+    if (!oauthIssuer)
+      missing.push("ORCHESTRATOR_OAUTH_ISSUER (required when ORCHESTRATOR_AUTH_MODE=oauth)");
     if (!clientId)
-      missing.push("ORCHESTRATOR_OIDC_CLIENT_ID (required when ORCHESTRATOR_OIDC_ISSUER is set)");
+      missing.push("ORCHESTRATOR_OAUTH_CLIENT_ID (required when ORCHESTRATOR_AUTH_MODE=oauth)");
     if (!clientSecret)
       missing.push(
-        "ORCHESTRATOR_OIDC_CLIENT_SECRET (required when ORCHESTRATOR_OIDC_ISSUER is set)",
+        "ORCHESTRATOR_OAUTH_CLIENT_SECRET (required when ORCHESTRATOR_AUTH_MODE=oauth)",
       );
-    oidc = {
-      issuer: oidcIssuer.replace(/\/$/, ""),
+    // Who may sign in. An admin email is always allowed — it would otherwise
+    // be possible to name a bootstrap admin that the allowlist then locks out.
+    const allowlist = parseEmailAllowlist(
+      env["ORCHESTRATOR_OAUTH_ALLOWED_DOMAINS"],
+      env["ORCHESTRATOR_OAUTH_ALLOWED_EMAILS"],
+      adminEmails,
+    );
+    if (allowlistIsEmpty(allowlist))
+      missing.push(
+        "ORCHESTRATOR_OAUTH_ALLOWED_DOMAINS or ORCHESTRATOR_OAUTH_ALLOWED_EMAILS " +
+          '(required when ORCHESTRATOR_AUTH_MODE=oauth; "*" as a domain allows every ' +
+          "account the provider authenticates)",
+      );
+    const issuer = (oauthIssuer ?? "").replace(/\/$/, "");
+    oauth = {
+      issuer,
       clientId,
       clientSecret,
-      providerId: optional("ORCHESTRATOR_OIDC_PROVIDER_ID", "sso"),
-      scopes: optional("ORCHESTRATOR_OIDC_SCOPES", "openid email profile")
+      providerId: optional("ORCHESTRATOR_OAUTH_PROVIDER_ID", "sso"),
+      scopes: optional("ORCHESTRATOR_OAUTH_SCOPES", "openid email profile")
         .split(/[\s,]+/)
         .filter(Boolean),
+      displayName: optional(
+        "ORCHESTRATOR_OAUTH_DISPLAY_NAME",
+        isGoogleIssuer(issuer) ? "Google" : "SSO",
+      ),
+      allowlist,
     };
+  } else if (oauthIssuer) {
+    throw new Error(
+      `Orchestrator: ORCHESTRATOR_OAUTH_ISSUER is set but ORCHESTRATOR_AUTH_MODE is "${authMode}". ` +
+        `Set ORCHESTRATOR_AUTH_MODE=oauth, or remove ORCHESTRATOR_OAUTH_ISSUER`,
+    );
   }
 
   // OPTIONAL: preview base domain for live-host port URLs (ADR 0064). Dev
@@ -458,12 +553,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       }
     })(),
   );
-
-  // OPTIONAL: bootstrap-admin allowlist (restores `auth.bootstrapAdmins`).
-  // Parsed + normalised (trim/lowercase/de-dup) here; empty when unset, which
-  // makes the better-auth promotion hooks fully inert. No test placeholder
-  // needed — unset is valid and means "no bootstrap admins".
-  const adminEmails = parseAdminEmails(env["ORCHESTRATOR_ADMIN_EMAILS"]);
 
   // OPTIONAL: DBOS orphan-sweep operations. The boolean is deliberately
   // narrow: only the documented "1" and "true" spellings activate the kill
@@ -530,9 +619,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     deviceVerificationUrl,
     betterAuthSecret,
     kekMasterKey,
+    authMode,
+    passwordSignup,
     iapAudiences,
     iapJwksUrl,
-    oidc,
+    oauth,
     previewBaseDomain,
     sessionCookieDomain,
     cookiePrefix,
