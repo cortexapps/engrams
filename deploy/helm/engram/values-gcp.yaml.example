@@ -31,14 +31,14 @@
 # image:
 #   repository: us-docker.pkg.dev/REPLACE_PROJECT/engram/coordinator
 #
-# Image TAGS must be set (here and in the web/orchestrator blocks
-# below): the chart's empty-tag fallback is the chart appVersion,
-# which the bake pipeline does not publish. `main` tracks the latest
-# build; pin a SHA tag for reproducible rollouts.
-image:
-  tag: main
+# Image TAGS default to the chart appVersion, which is the release
+# that this checkout is (`v<appVersion>`); leave them unset on a
+# release tag. To run an unreleased build, set `image.tag`,
+# `web.image.tag` and `orchestrator.image.tag` to the full SHA of a
+# commit on main. Do not use the floating `main` tag: the pull policy
+# is IfNotPresent, so a node that has `main` never pulls it again.
 
-# While the repository is private, GHCR needs a pull secret in the
+# While the GHCR packages are private, GHCR needs a pull secret in the
 # release namespace (a GitHub PAT with read:packages):
 #
 #   kubectl create secret docker-registry ghcr-pull -n engrams \
@@ -137,8 +137,6 @@ metrics:
 web:
   enabled: true
   replicaCount: 2
-  image:
-    tag: main   # see the tag note above
 
   service:
     type: ClusterIP
@@ -186,8 +184,6 @@ web:
 
 orchestrator:
   enabled: true
-  image:
-    tag: main   # see the tag note above
   # The public URL — same host as the web Ingress above.
   publicUrl: https://engrams.REPLACE_DOMAIN
   databaseSecret:

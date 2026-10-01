@@ -134,7 +134,7 @@ operator:
     maxShedPerWave: 4
     maxConcurrentDrains: 2
 
-image:
-  tag: main
+# The three image tags default to the chart appVersion (the release
+# that this checkout is). See values-gcp.yaml.example for the detail.
 imagePullSecrets:
   - name: ghcr-pull

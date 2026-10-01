@@ -97,8 +97,6 @@ helm install engram ./deploy/helm/engram \
   --set blob.gcs.bucket="" \
   --set kek.provider=env-var \
   --set secrets.backend=env \
-  --set image.repository=ghcr.io/cortexapps/engrams/coordinator \
-  --set image.tag=0.1.0 \
   --set web.enabled=false
 
 kubectl port-forward svc/engram-coordinator 8080:8080
@@ -115,11 +113,13 @@ curl localhost:8080/healthz
 
 # 2. Images: the chart defaults point at the published GHCR images
 #    (`ghcr.io/cortexapps/engrams/<coordinator|web|orchestrator>`,
-#    baked by .github/workflows/bake-images.yml). Nothing to build.
-#    To use your own registry instead, override `image.repository`
-#    (and web/orchestrator equivalents), e.g.:
+#    baked by .github/workflows/bake-images.yml), at the tag that
+#    is the chart appVersion: the release this checkout is. Nothing
+#    to build. To use your own registry instead, override
+#    `image.repository` and `image.tag` (and the web/orchestrator
+#    equivalents), e.g.:
 #    docker buildx build -f docker/coordinator.Dockerfile --push \
-#      -t us-docker.pkg.dev/$PROJECT/engram/coordinator:0.1.0 .
+#      -t us-docker.pkg.dev/$PROJECT/engram/coordinator:$TAG .
 
 # 3. Stash secrets (use Secret Manager + External Secrets Operator
 #    in prod):
@@ -147,10 +147,12 @@ Bump web (e.g. SPA tweaks) without rolling coord: `helm upgrade
 --set web.image.tag=NEW`. Bump coord without rolling web:
 `helm upgrade --set image.tag=NEW`.
 
-WS-protocol changes: the chart's `appVersion` should bump in lockstep
-with `engram_protocol::WIRE_VERSION`. A mixed-version deploy is
-caught by the hello-frame handshake (loud error + connection drop);
-the host-agents reconnect once both sides are at the same version.
+The chart's `appVersion` is the engrams release, and an empty image
+tag falls back to it. The procedure from one release to the next
+(Terraform, both charts, the order) is in
+[`docs/deploy.md`](../../../docs/deploy.md#releases-and-upgrades).
+Upgrade this chart and `engram-host-fleet` together: the coordinator
+and the host agents refuse to talk across a `WIRE_VERSION` mismatch.
 
 ## Values reference
 
