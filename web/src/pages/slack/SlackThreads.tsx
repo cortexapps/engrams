@@ -11,7 +11,7 @@ import { PageHeading } from "../../components/page-heading";
 import {
   useBuiltinAutomation,
   useSetAutomationEnabled,
-  useSetInputs,
+  useSetInputValue,
   useSetMapInputEntry,
 } from "../../hooks/useAutomations";
 import { useInstanceList, useRecentDrops } from "../../hooks/useInstances";
@@ -86,7 +86,7 @@ export function SlackThreads() {
   const { data: profileData } = useProfiles();
   const profiles = profileData?.profiles ?? [];
   const setEnabled = useSetAutomationEnabled();
-  const setInputs = useSetInputs();
+  const setDefault = useSetInputValue();
   const enabled = automation?.enabled === true;
   const answersSomewhere = defaultProfile !== "" || channels.length > 0;
 
@@ -103,12 +103,12 @@ export function SlackThreads() {
   const onDefaultProfile = async (profileId: string) => {
     if (!automationId) return;
     try {
-      await setInputs.mutateAsync({
+      // One key, atomically: a stale snapshot of the overrides map on this
+      // page must never ride along and overwrite another admin's entry.
+      await setDefault.mutateAsync({
         automationId,
-        inputsJson: JSON.stringify({
-          ...inputs,
-          default_profile: profileId === NO_PROFILE ? "" : profileId,
-        }),
+        inputKey: "default_profile",
+        valueJson: JSON.stringify(profileId === NO_PROFILE ? "" : profileId),
       });
       toast.success("Default profile saved");
     } catch (error) {
@@ -171,7 +171,7 @@ export function SlackThreads() {
           <Select
             value={defaultProfile === "" ? NO_PROFILE : defaultProfile}
             onValueChange={onDefaultProfile}
-            disabled={!automationId || setInputs.isPending}
+            disabled={!automationId || setDefault.isPending}
           >
             <SelectTrigger className="w-72" aria-label="Default profile">
               <SelectValue placeholder="Pick a profile" />

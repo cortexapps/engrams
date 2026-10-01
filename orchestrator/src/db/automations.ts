@@ -233,6 +233,9 @@ export interface AutomationStore {
     value: Record<string, unknown> | string | null,
     enable: boolean,
   ): Promise<AutomationRow | null>;
+  /** Set one input key in place — a JSONB merge of that key alone, so a
+   * stale client snapshot of the other inputs never overwrites them. */
+  setInputValue(id: string, inputKey: string, value: unknown): Promise<AutomationRow | null>;
   setBlockOverrides(id: string, overrides: BlockOverrides): Promise<AutomationRow | null>;
   archive(id: string): Promise<AutomationRow | null>;
   setEnabled(
@@ -826,6 +829,18 @@ export function makeAutomationStore(
       const [row] = await db
         .update(automationTable)
         .set({ inputs, updatedAt: new Date() })
+        .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
+        .returning();
+      return row ? fullView(metaRow(row)) : null;
+    },
+
+    async setInputValue(id, inputKey, value) {
+      const [row] = await db
+        .update(automationTable)
+        .set({
+          inputs: sql`${automationTable.inputs} || jsonb_build_object(${inputKey}::text, ${JSON.stringify(value)}::jsonb)`,
+          updatedAt: new Date(),
+        })
         .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
         .returning();
       return row ? fullView(metaRow(row)) : null;

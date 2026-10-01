@@ -5,7 +5,7 @@ import { renderWithProviders } from "../../test-utils";
 import { SlackThreads, channelsOf, inputsOf } from "./SlackThreads";
 
 const setEntry = vi.hoisted(() => vi.fn().mockResolvedValue({}));
-const setInputs = vi.hoisted(() => vi.fn().mockResolvedValue({}));
+const setValue = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const setEnabled = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const state = vi.hoisted(() => ({
   inputs: { channels: {} as Record<string, string>, default_profile: "" },
@@ -27,7 +27,7 @@ vi.mock("../../hooks/useAutomations", () => ({
     isPending: false,
   }),
   useSetMapInputEntry: () => ({ mutateAsync: setEntry, mutate: setEntry, isPending: false }),
-  useSetInputs: () => ({ mutateAsync: setInputs, isPending: false }),
+  useSetInputValue: () => ({ mutateAsync: setValue, isPending: false }),
   useSetAutomationEnabled: () => ({ mutateAsync: setEnabled, isPending: false }),
 }));
 vi.mock("../../hooks/useInstances", () => ({
@@ -45,7 +45,7 @@ vi.mock("../../hooks/useNow", () => ({ useNow: () => Date.parse("2026-09-30T12:0
 
 beforeEach(() => {
   setEntry.mockClear();
-  setInputs.mockClear();
+  setValue.mockClear();
   setEnabled.mockClear();
   state.inputs = { channels: { C0123456789: "prof-a" }, default_profile: "prof-d" };
   state.enabled = true;
@@ -102,6 +102,20 @@ describe("SlackThreads", () => {
     state.enabled = true;
     renderWithProviders(<SlackThreads />);
     expect((await screen.findByRole("alert")).textContent).toMatch(/no profile is set/);
+  });
+
+  it("changing the default profile writes that one key, never the whole inputs blob", async () => {
+    renderWithProviders(<SlackThreads />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("combobox", { name: "Default profile" }));
+    await user.click(await screen.findByRole("option", { name: "Alerts" }));
+    await waitFor(() =>
+      expect(setValue).toHaveBeenCalledWith({
+        automationId: "auto-slack",
+        inputKey: "default_profile",
+        valueJson: JSON.stringify("prof-a"),
+      }),
+    );
   });
 
   it("the switch pauses and resumes the automation", async () => {

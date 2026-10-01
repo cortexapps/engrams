@@ -13,6 +13,7 @@ import {
   setAutomationEnabled,
   setBlockOverrides,
   setInputs,
+  setInputValue,
   setMapInputEntry,
   testRender,
   updateAutomationMeta,
@@ -132,6 +133,13 @@ export function useDuplicateAutomation() {
 export function useSetInputs() {
   const invalidate = useInvalidateAutomations();
   return useMutation(setInputs, { onSuccess: invalidate });
+}
+
+/** Set ONE non-map input atomically (a lone control on a product page). The
+ * all-inputs form keeps useSetInputs. */
+export function useSetInputValue() {
+  const invalidate = useInvalidateAutomations();
+  return useMutation(setInputValue, { onSuccess: invalidate });
 }
 
 /** Set or remove ONE entry of a map input atomically (the product surfaces'

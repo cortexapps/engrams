@@ -1038,6 +1038,33 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       return { automation: toProtoAutomation(updated) };
     },
 
+    async setInputValue(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      const inputKey = requiredText(req.inputKey, "input_key");
+      const spec = row.version.inputsSchema.find((f) => f.key === inputKey);
+      if (!spec) {
+        throw new BlockValidationError([
+          blockError("", `inputs.${inputKey}`, "unknown_input", `input "${inputKey}" is not declared`),
+        ]);
+      }
+      if (spec.type === "map") {
+        throw new ConnectError(`input "${inputKey}" is a map; use SetMapInputEntry`, Code.InvalidArgument);
+      }
+      let value: unknown;
+      try {
+        value = JSON.parse(req.valueJson);
+      } catch {
+        throw new ConnectError("value_json is not valid JSON", Code.InvalidArgument);
+      }
+      // The one key against its own spec; its siblings are not part of this
+      // write, so their required-ness does not apply.
+      assertInputValues([spec], { [inputKey]: value });
+      const updated = await store.setInputValue(row.id, inputKey, value);
+      if (!updated) throw new ConnectError("automation not found", Code.NotFound);
+      return { automation: toProtoAutomation(updated) };
+    },
+
     async setMapInputEntry(req, ctx) {
       await requireAdmin(ctx, getSession);
       const row = await requireAutomation(req.automationId);

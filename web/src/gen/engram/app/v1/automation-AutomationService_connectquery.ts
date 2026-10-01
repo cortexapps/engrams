@@ -76,6 +76,16 @@ export const setInputs = AutomationService.method.setInputs;
 export const setMapInputEntry = AutomationService.method.setMapInputEntry;
 
 /**
+ * Set ONE non-map input atomically (a JSONB merge of that key, never a
+ * whole-blob replace from a client snapshot). A lone control on a product
+ * page writes through this; the all-inputs form, which holds the complete
+ * current state, keeps SetInputs.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.SetInputValue
+ */
+export const setInputValue = AutomationService.method.setInputValue;
+
+/**
  * Per-automation tunable block fields (allowed on built-ins). Every key
  * must be a `tunable` field of that block in the current version, and the
  * merged config must re-validate against the block's schema.

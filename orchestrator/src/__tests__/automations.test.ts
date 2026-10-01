@@ -220,6 +220,12 @@ function fakeStore(seed?: {
       a.meta = { ...a.meta, inputs };
       return row(a);
     },
+    async setInputValue(id, inputKey, value) {
+      const a = automations.get(id);
+      if (!a) return null;
+      a.meta = { ...a.meta, inputs: { ...a.meta.inputs, [inputKey]: value } };
+      return row(a);
+    },
     async setMapInputEntry(id, inputKey, entryKey, value, enable) {
       const a = automations.get(id);
       if (!a) return null;
@@ -646,6 +652,29 @@ describe("AutomationService v2", () => {
 
     const removed = await automations.setMapInputEntry({ automationId: "builtin-1", inputKey: "repos", entryKey: "acme/app" });
     expect((JSON.parse(removed.automation!.inputsJson) as { repos: Record<string, unknown> }).repos["acme/app"]).toBeUndefined();
+  });
+
+  test("SetInputValue sets one non-map input, validated against its spec, leaving the others alone", async () => {
+    const deps = adminDeps();
+    const stored = builtinStored();
+    const defaultProfile = SLACK_BRAIN_DEFINITION.inputsSchema.find((f) => f.key === "default_profile")!;
+    const channels = SLACK_BRAIN_DEFINITION.inputsSchema.find((f) => f.key === "channels")!;
+    stored.versions.get(1)!.inputsSchema = [...stored.versions.get(1)!.inputsSchema, defaultProfile, channels];
+    stored.meta.inputs = { ...stored.meta.inputs, channels: { C0123456789: "prof-a" } };
+    deps.fake.automations.set("builtin-1", stored);
+    const { automations } = clients(deps);
+    const set = await automations.setInputValue({ automationId: "builtin-1", inputKey: "default_profile", valueJson: JSON.stringify("prof-d") });
+    const inputs = JSON.parse(set.automation!.inputsJson) as Record<string, unknown>;
+    expect(inputs["default_profile"]).toBe("prof-d");
+    expect(inputs["channels"]).toEqual({ C0123456789: "prof-a" }); // untouched
+    await expectCode(
+      automations.setInputValue({ automationId: "builtin-1", inputKey: "default_profile", valueJson: JSON.stringify(7) }),
+      Code.InvalidArgument,
+    );
+    await expectCode(
+      automations.setInputValue({ automationId: "builtin-1", inputKey: "channels", valueJson: "{}" }),
+      Code.InvalidArgument,
+    );
   });
 
   test("SetMapInputEntry accepts a scalar-valued map entry (the Slack channels map)", async () => {
