@@ -3,9 +3,9 @@
  * The seed-profile pattern: idempotent, unique-violation tolerant across
  * replicas, fire-and-forget at boot after the default connections exist.
  *
- * A built-in is created DISABLED: the parallel-run window opens per repo or
- * channel through its inputs and the per-surface flags (4.4/4.6), never by
- * a deploy.
+ * A built-in is created ENABLED with empty inputs: enrolling a repo or
+ * picking a Slack profile is the one switch, and an empty map or profile
+ * admits nothing, so a deploy alone never starts a session.
  *
  * On a later boot the shipped definition may have changed. Structural
  * changes are ours alone (built-ins are structure-locked), so a content-hash

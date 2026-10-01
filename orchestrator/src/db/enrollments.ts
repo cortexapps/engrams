@@ -1,4 +1,6 @@
-/** Pull-request review enrollment data-access seam (ADR 0100). */
+/** Pull-request review enrollment reads (ADR 0100). The writes live in
+ * review-enrollment-sync.ts, which keeps the row and the PR-review
+ * built-in's `repos` map in one transaction. */
 
 import { asc, eq } from "drizzle-orm";
 
@@ -23,8 +25,6 @@ export interface EnrollmentRow extends EnrollmentInput {
 export interface EnrollmentStore {
   list(): Promise<EnrollmentRow[]>;
   get(repo: string): Promise<EnrollmentRow | null>;
-  upsert(input: EnrollmentInput): Promise<EnrollmentRow>;
-  delete(repo: string): Promise<void>;
 }
 
 function toRow(row: typeof enrollmentTable.$inferSelect): EnrollmentRow {
@@ -59,27 +59,5 @@ export function makeEnrollmentStore(
       return rows[0] ? toRow(rows[0]) : null;
     },
 
-    async upsert(input) {
-      const rows = await db
-        .insert(enrollmentTable)
-        .values(input)
-        .onConflictDoUpdate({
-          target: enrollmentTable.repo,
-          set: {
-            triggerMode: input.triggerMode,
-            autofix: input.autofix,
-            profileId: input.profileId,
-            updatedAt: new Date(),
-          },
-        })
-        .returning();
-      const row = rows[0];
-      if (!row) throw new Error("review enrollment upsert returned no row");
-      return toRow(row);
-    },
-
-    async delete(repo) {
-      await db.delete(enrollmentTable).where(eq(enrollmentTable.repo, repo));
-    },
   };
 }

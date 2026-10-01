@@ -52,7 +52,8 @@ export interface ReviewDeps {
   enrollments?: EnrollmentStore;
   profiles?: { get(id: string): Promise<{ id: string } | null> };
   db?: ReturnType<typeof getDb>;
-  /** The one writer of the built-in's repos map (one transaction). */
+  /** The one writer of the enrollment row + the built-in's repos map (one
+   *  transaction). */
   enrollmentSync?: ReviewEnrollmentSync;
   /** Admit a fresh built-in run for the review's original trigger. */
   retryAutomation?: (automationRunId: string) => Promise<string>;
@@ -316,20 +317,17 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       if (profileId != null && profileId !== stored?.profileId && !(await profiles().get(profileId))) {
         throw new ConnectError("profile_id does not exist", Code.InvalidArgument);
       }
-      // Enrolling IS a write to the PR-review built-in: the row is written
-      // first (its trigger/autofix feed the built-in's repos map), then the
-      // sync mirrors it into the map and enables the built-in on the first
-      // repo.
-      await enrollments().upsert({
+      // Enrolling IS a write to the PR-review built-in: the row and the
+      // built-in's repos map (+ enabled on the first repo) land in one
+      // transaction, so a crash between them leaves no repo shown enrolled
+      // that nothing reviews.
+      const result = await enrollmentSync().enroll({
         repo,
         triggerMode: req.triggerMode,
         autofix: req.autofix,
         profileId,
       });
-      const result = await enrollmentSync().enrolled(repo);
       switch (result.kind) {
-        case "not_enrolled":
-          throw new Error(`review enrollment ${repo} vanished after its upsert`);
         case "not_seeded":
           // The seeder runs fire-and-forget at boot; an enrollment before it
           // lands is an operator error, not a silent no-op.
@@ -350,11 +348,8 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       }
       const repo = req.repo.trim();
       if (!repo) throw new ConnectError("repo is required", Code.InvalidArgument);
-      // Take the repo out of the built-in's map first (the sync is the one
-      // writer of that map), then drop the row. A built-in that is not
-      // seeded yet has no map entry to remove.
-      await enrollmentSync().removed(repo);
-      await enrollments().delete(repo);
+      // The map entry and the row go in one transaction.
+      await enrollmentSync().unenroll(repo);
       return {};
     },
   });

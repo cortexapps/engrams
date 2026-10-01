@@ -1,7 +1,7 @@
-/** Live-PG proof of the enrollment sync's two guarantees: the enrollment
- * row and the built-in's repos map move together (one transaction), and
- * concurrent enrollments for different repos never lose each other's map
- * entry. Runs when ORCHESTRATOR_DATABASE_URL points at a migrated database
+/** Live-PG proof of the enrollment sync's guarantees: the enrollment row
+ * and the built-in's repos map move together (one transaction, and no row
+ * without a seeded built-in), and concurrent enrollments for different
+ * repos never lose each other's map entry. Runs when ORCHESTRATOR_DATABASE_URL points at a migrated database
  * (CI's orchestrator lane), and skips otherwise. */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -56,9 +56,6 @@ beforeAll(async () => {
       createdByUserId: null,
     });
   }
-  await db
-    .insert(schema.reviewEnrollment)
-    .values(REPOS.map((repo) => ({ repo, triggerMode: "auto", autofix: "off" })));
 });
 
 afterAll(async () => {
@@ -93,14 +90,19 @@ async function reposMap(): Promise<Record<string, unknown>> {
 }
 
 describe("review enrollment sync (live PG)", () => {
+  const enrollment = (repo: string) => ({ repo, triggerMode: "auto" as const, autofix: "off" as const, profileId: null });
+  const rowFor = async (repo: string) =>
+    (await db!.select().from(schema.reviewEnrollment).where(eq(schema.reviewEnrollment.repo, repo)))[0] ?? null;
+
   test.skipIf(!reachable)(
-    "mirrors the row into the map and enables the built-in; removal drops the entry",
+    "writes the row and the map together and enables the built-in; unenroll removes both",
     async () => {
       const sync = makeReviewEnrollmentSync(db!);
-      const result = await sync.enrolled("rw-test/alpha");
+      const result = await sync.enroll(enrollment("rw-test/alpha"));
       expect(result.kind).toBe("applied");
       if (result.kind !== "applied") return;
       expect(result.enrollment.repo).toBe("rw-test/alpha");
+      expect((await rowFor("rw-test/alpha"))?.triggerMode).toBe("auto");
       expect((await reposMap())["rw-test/alpha"]).toEqual({ mode: "auto", autofix: false });
       const [builtin] = await db!
         .select({ enabled: schema.automation.enabled })
@@ -108,7 +110,13 @@ describe("review enrollment sync (live PG)", () => {
         .where(eq(schema.automation.id, builtinId));
       expect(builtin?.enabled).toBe(true);
 
-      expect(await sync.removed("rw-test/alpha")).toEqual({ kind: "applied" });
+      // A second enroll is an update of the same row (no duplicate key).
+      const again = await sync.enroll({ ...enrollment("rw-test/alpha"), triggerMode: "manual" });
+      expect(again.kind).toBe("applied");
+      expect((await reposMap())["rw-test/alpha"]).toEqual({ mode: "on_request", autofix: false });
+
+      await sync.unenroll("rw-test/alpha");
+      expect(await rowFor("rw-test/alpha")).toBeNull();
       expect((await reposMap())["rw-test/alpha"]).toBeUndefined();
     },
   );
@@ -118,7 +126,7 @@ describe("review enrollment sync (live PG)", () => {
     async () => {
       const sync = makeReviewEnrollmentSync(db!);
       await Promise.all(
-        ["rw-test/beta", "rw-test/gamma", "rw-test/delta"].map((r) => sync.enrolled(r)),
+        ["rw-test/beta", "rw-test/gamma", "rw-test/delta"].map((r) => sync.enroll(enrollment(r))),
       );
       const map = await reposMap();
       expect(map["rw-test/beta"]).toEqual({ mode: "auto", autofix: false });
@@ -127,8 +135,8 @@ describe("review enrollment sync (live PG)", () => {
     },
   );
 
-  test.skipIf(!reachable)("an unenrolled repo writes nothing", async () => {
+  test.skipIf(!reachable)("unenroll of a repo that was never enrolled is a no-op", async () => {
     const sync = makeReviewEnrollmentSync(db!);
-    expect(await sync.enrolled("rw-test/nobody")).toEqual({ kind: "not_enrolled" });
+    await expect(sync.unenroll("rw-test/nobody")).resolves.toBeUndefined();
   });
 });

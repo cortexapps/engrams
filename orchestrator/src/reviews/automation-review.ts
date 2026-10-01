@@ -1,10 +1,8 @@
-/** Reviews that run on the automation engine, reached from outside a webhook
- * (ADR 0119 phase 4.4).
+/** Reviews reached from outside a webhook (ADR 0119 phase 4.4).
  *
  * The GitHub webhook spine admits the PR-review built-in on its own. Three
- * other doors into a review exist, and during the parallel window each one
- * must reach the SAME engine the repo's `engine` flag selects, or a flagged
- * repo gets two brains:
+ * other doors into a review exist, and each one admits a built-in run the
+ * same way:
  *
  * - **Retry** (`/reviews` → Retry): admits a fresh run with the SAME trigger
  *   the original run carried (the review row's `automation_run_id` links to

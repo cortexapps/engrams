@@ -204,25 +204,25 @@ function spawn(
   store: ReviewStore,
   authenticated = true,
   role = "user",
-  enrollments?: EnrollmentStore,
+  enrollments?: FakeEnrollmentStore,
   profileExists = true,
   overrides?: {
     enrollmentSync?: ReviewEnrollmentSync;
     retryAutomation?: (automationRunId: string) => Promise<string>;
   },
 ) {
-  // A default sync so the enrollment path resolves offline: it reads the
-  // row back from the enrollment store and reports it mirrored.
-  const defaultSync: ReviewEnrollmentSync = {
-    async enrolled(repo) {
-      const row = enrollments ? await enrollments.get(repo) : null;
-      if (!row) return { kind: "not_enrolled" };
-      return { kind: "applied", enrollment: row };
-    },
-    async removed() {
-      return { kind: "applied" };
-    },
-  };
+  // A default sync so the enrollment path resolves offline: it writes the
+  // fake store the way the production sync writes the row.
+  const defaultSync: ReviewEnrollmentSync = enrollments
+    ? recordingSync(enrollments).sync
+    : {
+        async enroll() {
+          throw new Error("test spawned without an enrollment store");
+        },
+        async unenroll() {
+          throw new Error("test spawned without an enrollment store");
+        },
+      };
   const transport = createRouterTransport((router) =>
     registerReviews(router, {
       getSession: async () =>
@@ -240,35 +240,40 @@ function spawn(
 }
 
 interface FakeEnrollmentStore extends EnrollmentStore {
-  upserts: EnrollmentInput[];
-  deletes: string[];
+  rows: Map<string, EnrollmentRow>;
 }
 
 function makeEnrollmentStore(rows: EnrollmentRow[]): FakeEnrollmentStore {
   const stored = new Map(rows.map((row) => [row.repo, row]));
-  const upserts: EnrollmentInput[] = [];
-  const deletes: string[] = [];
   return {
-    upserts,
-    deletes,
+    rows: stored,
     async list() {
       return [...stored.values()];
     },
     async get(repo) {
       return stored.get(repo) ?? null;
     },
-    async upsert(input) {
-      upserts.push(input);
+  };
+}
+
+/** A sync over the fake store: the one writer, recording what it wrote. */
+function recordingSync(store: FakeEnrollmentStore) {
+  const enrolls: EnrollmentInput[] = [];
+  const unenrolls: string[] = [];
+  const sync: ReviewEnrollmentSync = {
+    async enroll(input) {
+      enrolls.push(input);
       const now = new Date("2026-07-17T12:00:00Z");
       const row = { ...input, createdAt: now, updatedAt: now };
-      stored.set(input.repo, row);
-      return row;
+      store.rows.set(input.repo, row);
+      return { kind: "applied", enrollment: row };
     },
-    async delete(repo) {
-      deletes.push(repo);
-      stored.delete(repo);
+    async unenroll(repo) {
+      unenrolls.push(repo);
+      store.rows.delete(repo);
     },
   };
+  return { sync, enrolls, unenrolls };
 }
 
 async function expectConnectError(
@@ -434,46 +439,34 @@ describe("ReviewService", () => {
     );
   });
 
-  test("UpsertEnrollment mirrors the row into the built-in; Delete removes it from the map before the row goes", async () => {
-    const synced: Array<[string, string]> = [];
+  test("UpsertEnrollment and DeleteEnrollment go through the one-transaction sync", async () => {
     const enrollmentStore = makeEnrollmentStore([]);
-    const enrollmentSync: ReviewEnrollmentSync = {
-      async enrolled(repo) {
-        synced.push(["enrolled", repo]);
-        const row = await enrollmentStore.get(repo);
-        if (!row) return { kind: "not_enrolled" };
-        return { kind: "applied", enrollment: row };
-      },
-      async removed(repo) {
-        synced.push(["removed", repo]);
-        return { kind: "applied" };
-      },
-    };
-    const admin = spawn(makeStore(null), true, "admin", enrollmentStore, true, { enrollmentSync });
+    const recorder = recordingSync(enrollmentStore);
+    const admin = spawn(makeStore(null), true, "admin", enrollmentStore, true, { enrollmentSync: recorder.sync });
     const response = await admin.upsertEnrollment({
       repo: "openai/engrams",
       triggerMode: "auto",
       autofix: "manual",
     });
     expect(response.enrollment?.repo).toBe("openai/engrams");
-    // The row is written BEFORE the sync reads it into the map.
-    expect(enrollmentStore.upserts).toHaveLength(1);
-    expect(synced).toEqual([["enrolled", "openai/engrams"]]);
+    // The RPC never writes the row itself: the sync writes the row and the
+    // built-in's map together.
+    expect(recorder.enrolls).toEqual([
+      { repo: "openai/engrams", triggerMode: "auto", autofix: "manual", profileId: null },
+    ]);
 
     await admin.deleteEnrollment({ repo: "openai/engrams" });
-    expect(synced.at(-1)).toEqual(["removed", "openai/engrams"]);
-    expect(enrollmentStore.deletes).toEqual(["openai/engrams"]);
+    expect(recorder.unenrolls).toEqual(["openai/engrams"]);
+    expect(await enrollmentStore.get("openai/engrams")).toBeNull();
   });
 
   test("UpsertEnrollment before the built-in is seeded is a FailedPrecondition", async () => {
     const enrollmentStore = makeEnrollmentStore([]);
     const enrollmentSync: ReviewEnrollmentSync = {
-      async enrolled() {
+      async enroll() {
         return { kind: "not_seeded" };
       },
-      async removed() {
-        return { kind: "not_seeded" };
-      },
+      async unenroll() {},
     };
     const admin = spawn(makeStore(null), true, "admin", enrollmentStore, true, { enrollmentSync });
     await expectConnectError(
@@ -564,7 +557,8 @@ describe("ReviewService", () => {
     );
 
     const adminStore = makeEnrollmentStore([]);
-    const admin = spawn(makeStore(null), true, "admin", adminStore);
+    const recorder = recordingSync(adminStore);
+    const admin = spawn(makeStore(null), true, "admin", adminStore, true, { enrollmentSync: recorder.sync });
     const response = await admin.upsertEnrollment({
       repo: "openai/engrams",
       triggerMode: "auto",
@@ -578,7 +572,7 @@ describe("ReviewService", () => {
       profileId: "profile-1",
     });
     await admin.deleteEnrollment({ repo: "openai/engrams" });
-    expect(adminStore.deletes).toEqual(["openai/engrams"]);
+    expect(recorder.unenrolls).toEqual(["openai/engrams"]);
   });
 
   test("rejects invalid enrollment enums", async () => {

@@ -1,14 +1,16 @@
-/** The enrollment reconcile, as ONE transaction (ADR 0119 phase 4.4; the
- * engine flag itself retired in phase 4.7).
+/** The enrollment write, as ONE transaction (ADR 0119 phase 4.4; the engine
+ * flag itself retired in phase 4.7).
  *
  * A repo's review enrollment lives in two places that must agree:
  * `review_enrollment` (the Repositories page's row) and the PR-review
  * built-in's `repos` input (the dispatcher admits only mapped repos, and
- * only when the built-in is enabled). This module is the ONE writer of the
- * map, and it writes with the two rows locked, so:
+ * only when the built-in is enabled). This module is the ONE writer of
+ * both, and it writes them inside a single transaction with the automation
+ * row locked, so:
  *
- *   - a failure between the writes rolls back (no enrollment row the map
- *     lacks — a repo nothing reviews);
+ *   - a failure between the writes rolls both back (no enrollment row the
+ *     map lacks — a repo shown "enrolled" that nothing reviews — and no map
+ *     entry without a row);
  *   - two concurrent enrollments for different repos serialize on the
  *     automation row lock, and the map is patched with a JSONB expression
  *     in place, so neither clobbers the other's entry (no lost update).
@@ -22,7 +24,7 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import { PR_REVIEW_BUILTIN_KEY } from "../automations/builtins/pr-review.ts";
 import { getDb } from "./client.ts";
 import { automation as automationTable, reviewEnrollment as enrollmentTable } from "./schema.ts";
-import type { EnrollmentRow } from "./enrollments.ts";
+import type { EnrollmentInput, EnrollmentRow } from "./enrollments.ts";
 
 export interface RepoPolicy {
   mode: "auto" | "on_request";
@@ -37,19 +39,18 @@ export function repoPolicy(row: Pick<EnrollmentRow, "triggerMode" | "autofix">):
   };
 }
 
-export type SyncEnrollmentResult =
-  /** The repo is not enrolled; nothing was written. */
-  | { kind: "not_enrolled" }
-  /** The built-in is not seeded; nothing was written. */
+export type EnrollResult =
+  /** The built-in is not seeded; nothing was written (the row rolled back). */
   | { kind: "not_seeded" }
   | { kind: "applied"; enrollment: EnrollmentRow };
 
 export interface ReviewEnrollmentSync {
-  /** Mirror the enrollment row into the built-in's `repos` map and enable
-   * the built-in (the first repo turns reviewing on). */
-  enrolled(repo: string): Promise<SyncEnrollmentResult>;
-  /** Take the repo out of the map. The enrollment row is the caller's. */
-  removed(repo: string): Promise<{ kind: "not_seeded" | "applied" }>;
+  /** Upsert the enrollment row, mirror it into the built-in's `repos` map,
+   * and enable the built-in (the first repo turns reviewing on). */
+  enroll(input: EnrollmentInput): Promise<EnrollResult>;
+  /** Take the repo out of the map and delete its row. A built-in that is
+   * not seeded yet has no map entry to remove; the row still goes. */
+  unenroll(repo: string): Promise<void>;
 }
 
 function toEnrollmentRow(row: typeof enrollmentTable.$inferSelect): EnrollmentRow {
@@ -67,17 +68,11 @@ export function makeReviewEnrollmentSync(
   db: ReturnType<typeof getDb> = getDb(),
 ): ReviewEnrollmentSync {
   return {
-    async enrolled(repo) {
+    async enroll(input) {
       return db.transaction(async (tx) => {
-        // Lock the enrollment row, and the automation row so concurrent
-        // enrollments for other repos serialize behind this one.
-        const [enrollment] = await tx
-          .select()
-          .from(enrollmentTable)
-          .where(eq(enrollmentTable.repo, repo))
-          .for("update");
-        if (!enrollment) return { kind: "not_enrolled" as const };
-
+        // Lock the automation row first so concurrent enrollments for other
+        // repos serialize behind this one. A missing built-in rolls the row
+        // write back with the transaction.
         const [builtin] = await tx
           .select({ id: automationTable.id, enabled: automationTable.enabled })
           .from(automationTable)
@@ -85,15 +80,30 @@ export function makeReviewEnrollmentSync(
           .for("update");
         if (!builtin) return { kind: "not_seeded" as const };
 
+        const [row] = await tx
+          .insert(enrollmentTable)
+          .values(input)
+          .onConflictDoUpdate({
+            target: enrollmentTable.repo,
+            set: {
+              triggerMode: input.triggerMode,
+              autofix: input.autofix,
+              profileId: input.profileId,
+              updatedAt: new Date(),
+            },
+          })
+          .returning();
+        if (!row) throw new Error("review enrollment upsert returned no row");
+
         // `inputs.repos.<repo> = policy`, in place. The `||` seeds a missing
         // `repos` object first: jsonb_set creates only the LAST path element.
-        const policy = JSON.stringify(repoPolicy(toEnrollmentRow(enrollment)));
+        const policy = JSON.stringify(repoPolicy(toEnrollmentRow(row)));
         await tx
           .update(automationTable)
           .set({
             inputs: sql`jsonb_set(
               ${automationTable.inputs} || jsonb_build_object('repos', coalesce(${automationTable.inputs}->'repos', '{}'::jsonb)),
-              ARRAY['repos', ${repo}::text],
+              ARRAY['repos', ${input.repo}::text],
               ${policy}::jsonb,
               true
             )`,
@@ -102,26 +112,27 @@ export function makeReviewEnrollmentSync(
           })
           .where(eq(automationTable.id, builtin.id));
 
-        return { kind: "applied" as const, enrollment: toEnrollmentRow(enrollment) };
+        return { kind: "applied" as const, enrollment: toEnrollmentRow(row) };
       });
     },
 
-    async removed(repo) {
-      return db.transaction(async (tx) => {
+    async unenroll(repo) {
+      await db.transaction(async (tx) => {
         const [builtin] = await tx
           .select({ id: automationTable.id })
           .from(automationTable)
           .where(and(eq(automationTable.builtinKey, PR_REVIEW_BUILTIN_KEY), isNull(automationTable.archivedAt)))
           .for("update");
-        if (!builtin) return { kind: "not_seeded" as const };
-        await tx
-          .update(automationTable)
-          .set({
-            inputs: sql`${automationTable.inputs} #- ARRAY['repos', ${repo}::text]`,
-            updatedAt: new Date(),
-          })
-          .where(eq(automationTable.id, builtin.id));
-        return { kind: "applied" as const };
+        if (builtin) {
+          await tx
+            .update(automationTable)
+            .set({
+              inputs: sql`${automationTable.inputs} #- ARRAY['repos', ${repo}::text]`,
+              updatedAt: new Date(),
+            })
+            .where(eq(automationTable.id, builtin.id));
+        }
+        await tx.delete(enrollmentTable).where(eq(enrollmentTable.repo, repo));
       });
     },
   };
