@@ -159,6 +159,12 @@ trigger in the required workflow.
   written artifacts (ADRs, commit messages, PR descriptions), code comments, and messages
   with the user. The product ships the same rule to every session
   (`WRITING_STYLE_SYSTEM_PROMPT` in `orchestrator/src/prompts/base.ts`).
+- **This is a public repository: no internal references, anywhere.** Never put a person's
+  name, a Slack channel name or id, a workspace, a deployment's session/run/instance id,
+  an internal hostname, or a private ticket into code, comments, tests, fixtures, docs,
+  ADRs, commit messages, or PR text. Describe the case generically ("a private channel the
+  app is in", "the first resumed thread in production") and invent neutral fixture names
+  (`#ops-private`, `U1`, `s-old`). What a deployment is called belongs in the deploy repo.
 
 **Commits & ADRs**
 - One logical change per commit; don't bundle unrelated changes.

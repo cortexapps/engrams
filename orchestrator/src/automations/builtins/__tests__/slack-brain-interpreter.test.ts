@@ -452,7 +452,7 @@ describe("Slack thread brain through the interpreter", () => {
       payload: mention,
       previousSession: { sessionId: "s-old", runId: "r-old", alive: true },
       threadReplies: [
-        { ts: "90.0", user: "U1", text: "<@UBOT> hi! this message should not auto-close" },
+        { ts: "90.0", user: "U1", text: "<@UBOT> hi! keep this thread open" },
         { ts: "90.5", user: "UBOT", bot_id: "B1", text: "Started a session — https://x/sessions/s-old" },
         { ts: "90.6", user: "UBOT", bot_id: "B1", text: "Hi! Got it — noted." },
         { ts: "95.0", user: "U2", text: "any update?" },
