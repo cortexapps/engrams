@@ -42,7 +42,7 @@
 
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import { APIError, createAuthMiddleware } from "better-auth/api";
+import { APIError, createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
 import { admin } from "better-auth/plugins/admin";
 import { bearer } from "better-auth/plugins/bearer";
 import { deviceAuthorization } from "better-auth/plugins/device-authorization";
@@ -207,9 +207,22 @@ export const auth = betterAuth({
     // (src/rpc/api-key.ts). `ctx.request` is set for HTTP requests only, so
     // server-side auth.api.createApiKey (no request) still works — the same
     // discriminator the plugin itself uses to gate body.userId.
+    //
+    // GET /device (the device flow's verify leg) needs a session. The plugin
+    // itself answers it for anyone: an anonymous caller that guesses a user
+    // code learns that a login is pending. Only the SPA's /device page calls
+    // it, and that page is behind the login wall, so the anonymous case has no
+    // use. In `iap` mode the bridge's fail-closed 401 used to be the only
+    // thing in front of this endpoint; the check is here so it holds in every
+    // mode. The two CLI legs (/device/code, /device/token) are different
+    // paths and stay anonymous — that anonymity is the point of RFC 8628.
     before: createAuthMiddleware(async (ctx) => {
-      if (ctx.request && ctx.path.startsWith("/api-key")) {
+      if (!ctx.request) return;
+      if (ctx.path.startsWith("/api-key")) {
         throw new APIError("NOT_FOUND");
+      }
+      if (ctx.path === "/device" && !(await getSessionFromCtx(ctx))) {
+        throw new APIError("UNAUTHORIZED");
       }
     }),
   },
