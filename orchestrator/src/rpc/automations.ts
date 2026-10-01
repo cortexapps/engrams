@@ -421,6 +421,54 @@ function toProtoRegistration(row: WebhookRegistrationRow): ProtoWebhookRegistrat
 // Production input-key options
 // ---------------------------------------------------------------------------
 
+/** The page shape `conversations.list` answers with (the `WebClient` method,
+ * narrowed to what the walk reads). */
+export interface SlackChannelPages {
+  conversations: {
+    list(args: {
+      limit: number;
+      exclude_archived: boolean;
+      types: string;
+      cursor?: string;
+    }): Promise<{
+      channels?: Array<{ id?: string; name?: string }>;
+      response_metadata?: { next_cursor?: string };
+    }>;
+  };
+}
+
+/** Pages of `conversations.list` to walk before giving up: a workspace with
+ * more channels than this lists its first few thousand. */
+const SLACK_CHANNEL_PAGE_LIMIT = 25;
+
+/** Every channel the app can see, public and private alike (a thread in a
+ * private channel needs a name as much as a public one's), as key options.
+ * Slack pages the list by cursor and may answer any page with FEWER than
+ * `limit` channels before the end — one page is never the whole workspace,
+ * so the walk follows `next_cursor` until it is empty. */
+export async function listSlackChannelOptions(
+  client: SlackChannelPages,
+): Promise<Array<{ key: string; label: string }>> {
+  const options: Array<{ key: string; label: string }> = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < SLACK_CHANNEL_PAGE_LIMIT; page += 1) {
+    const result = await client.conversations.list({
+      limit: 200,
+      exclude_archived: true,
+      types: "public_channel,private_channel",
+      ...(cursor !== undefined ? { cursor } : {}),
+    });
+    for (const c of result.channels ?? []) {
+      if (typeof c.id !== "string") continue;
+      options.push({ key: c.id, label: c.name ? `#${c.name}` : c.id });
+    }
+    const next = result.response_metadata?.next_cursor;
+    if (!next) break;
+    cursor = next;
+  }
+  return options;
+}
+
 function productionInputKeyOptions(
   integrationEvents: () => Pick<IntegrationEventStore, "listObservedScopeValues">,
   connections: () => Pick<IntegrationConnectionStore, "getDefault">,
@@ -438,19 +486,8 @@ function productionInputKeyOptions(
           const repos = await integrationEvents().listObservedScopeValues(connection.id);
           return repos.map((repo) => ({ key: repo, label: repo }));
         }
-        case "channel": {
-          const client = await getSlackClient();
-          // Private channels the app is in count too (a thread there needs
-          // a name as much as a public one's).
-          const result = await client.conversations.list({
-            limit: 200,
-            exclude_archived: true,
-            types: "public_channel,private_channel",
-          });
-          return (result.channels ?? [])
-            .filter((c) => typeof c.id === "string")
-            .map((c) => ({ key: c.id!, label: c.name ? `#${c.name}` : c.id! }));
-        }
+        case "channel":
+          return listSlackChannelOptions(await getSlackClient());
         case "team": {
           const workspace = await makeLinearIssueClient().readWorkspace();
           return workspace.teams.map((team) => ({ key: team.id, label: team.name }));
