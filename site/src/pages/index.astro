@@ -1,5 +1,6 @@
 ---
 import Marketing from "../layouts/Marketing.astro";
+import TraceMark from "../components/TraceMark.astro";
 import pelican from "../assets/screenshots/session-pelican.png";
 import { hero, modules, slack, automations, how, session, extensible, belt, start } from "../landing/copy";
 import { nodes, edges, glyph, frame } from "../landing/demo";
@@ -128,7 +129,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
           <div class="thread-head"><span>{slack.thread.channel}</span><span>thread</span></div>
           {slack.thread.messages.map((m) => (
             <div class:list={["msg", { bot: m.bot }]}>
-              <div class="avatar" aria-hidden="true">{m.who[0]}</div>
+              <div class="avatar" aria-hidden="true">{m.bot ? <TraceMark size={22} /> : m.who[0]}</div>
               <div>
                 <div class="who"><b>{m.who}</b>{m.bot && <span class="app">app</span>}<span class="time">{m.time}</span></div>
                 <p>{m.body}</p>
@@ -283,7 +284,6 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
         <div>
           <div class="label" style="opacity:.8">{start.eyebrow}</div>
           <h2 class="display">{start.title}<span class="lime">.</span></h2>
-          <p class="wink">{start.wink}</p>
           <p class="lede">{start.lede}</p>
         </div>
         <div class="ctas">

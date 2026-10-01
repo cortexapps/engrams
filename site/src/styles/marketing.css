@@ -1109,9 +1109,11 @@ html {
   font-weight: 700;
   text-transform: uppercase;
 }
+/* The bot wears the engrams mark, as in the header. */
 .msg.bot .avatar {
-  background: var(--primary);
-  color: var(--primary-foreground);
+  background: var(--bottle-green);
+  color: var(--sage-on-cover);
+  border: 1px solid var(--hairline);
 }
 .msg .who {
   display: flex;
@@ -1236,16 +1238,8 @@ html {
   line-height: 0.85;
   margin-top: 28px;
 }
-.start .wink {
-  margin-top: 28px;
-  max-width: 600px;
-  font-family: var(--font-mono);
-  font-size: 14px;
-  letter-spacing: 0.04em;
-  color: var(--primary);
-}
 .start .lede {
-  margin-top: 16px;
+  margin-top: 28px;
   max-width: 600px;
   opacity: 0.85;
 }

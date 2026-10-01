@@ -229,7 +229,6 @@ export const belt = { label: "24 connectors built in · plus yours" };
 export const start = {
   eyebrow: "Start with one task",
   title: "Start",
-  wink: "The only confidential roadmap here is the one you're shipping. Clone the repo and start.",
   lede: "Run the stack locally and give an agent its first task. When you are ready for a shared deployment, follow the GCP or AWS guide to run engrams in your own cloud.",
   ctas: [
     { label: "Run it locally", href: "getting-started/local-quickstart/", primary: true },
