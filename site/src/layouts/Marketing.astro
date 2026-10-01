@@ -6,6 +6,7 @@ import "../styles/tokens.css";
 import "../styles/marketing.css";
 import TraceMark from "../components/TraceMark.astro";
 import CortexWordmark from "../components/CortexWordmark.astro";
+import GoogleTagManager from "../components/GoogleTagManager.astro";
 
 interface Props {
   title: string;
@@ -33,6 +34,7 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <GoogleTagManager part="head" />
     <title>{title}</title>
     <meta name="description" content={description} />
     <link rel="canonical" href={canonical} />
@@ -51,6 +53,7 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
     <meta name="theme-color" content="#081A1B" />
   </head>
   <body>
+    <GoogleTagManager part="body" />
     <div class:list={["cover", "masthead", { landing }]}>
       <div class="layer grid"></div>
       <div class="layer scan"></div>
