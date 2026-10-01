@@ -184,3 +184,53 @@ Mitigation is operator-side: don't allow-list DoH endpoints.
 Wire `livenessProbe` → `/healthz` and `readinessProbe` → `/readyz`;
 a coordinator that lost its DB drops out of the LB instead of
 serving 503s.
+
+## Releases and upgrades
+
+A release is a git tag `v<version>` plus the GHCR images tagged
+`<version>`: `coordinator`, `web`, `orchestrator`, `host-agent`,
+`host-operator`, and `node-assets`. A version tag never moves. Both
+charts carry the version as `appVersion`, and an image tag left empty
+falls back to it, so a checkout of `v0.10.0` installs the `0.10.0`
+images with no tag in your values.
+
+Every push to `main` also publishes each image it rebuilds under the
+full commit SHA. To run an unreleased build, set the six tags
+(`image.tag`, `web.image.tag`, `orchestrator.image.tag` on the
+control-plane chart; `image.tag`, `operator.image.tag`,
+`nodeAssets.image.tag` on the fleet chart) to a SHA and use the charts
+of that commit. **Do not** deploy the floating `main` tag: the charts
+pull with `IfNotPresent`, so a node that has `main` keeps the build it
+has while a new node pulls a newer one.
+
+To upgrade from one release to the next:
+
+1. Read the [release notes](https://github.com/cortexapps/engrams/releases).
+   engrams is 0.x: a release can change a wire format, a schema, or a
+   Terraform module.
+2. Back up both databases. Migrations only go forward; a backup is
+   the one way back to the older release.
+3. `git fetch --tags && git checkout v<version>`.
+4. In the quickstart directory, `terraform init && terraform apply`
+   with your variables, then write the two `terraform output -raw`
+   overlays again. Read the plan first: a release should not replace
+   the cluster, the database, or the bucket.
+5. Compare your values files with the `values-<cloud>.yaml.example`
+   of the new checkout and copy over new keys. Remove any image tag
+   your files set, or the upgrade keeps the old images.
+6. `helm upgrade engram deploy/helm/engram -n engrams -f … -f …`. A
+   pre-upgrade job migrates the orchestrator database and stops the
+   upgrade if it fails; the coordinator migrates its own database
+   when its new pods start. Sessions live on the hosts and keep
+   running.
+7. `kubectl apply -f deploy/helm/engram-host-fleet/crds/` (Helm never
+   updates a CRD), then `helm upgrade hf deploy/helm/engram-host-fleet
+   -n engrams-hosts -f … -f …`. The command returns at once. The
+   operator then replaces the host pods one node at a time: cordon,
+   delete the pod, wait for the new pod to be ready. The VMs keep
+   running and the new pod reattaches to them.
+
+Do steps 6 and 7 together. The coordinator and the host agents share
+a wire version and refuse to talk across a mismatch, so after a
+release that changes it, new sessions queue until the first host is
+on the new version.

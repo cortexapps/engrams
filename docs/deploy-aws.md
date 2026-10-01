@@ -51,6 +51,18 @@ Throughout: `REGION`, `DOMAIN`, `ADMIN_EMAIL`, `EMAIL_DOMAIN` (the
 domain whose accounts may sign in, e.g. `example.com`),
 `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET` are yours.
 
+Run every command from a checkout of the newest release. The charts in
+a release install the images of that release; a checkout of `main` can
+name a version that is not released.
+
+```sh
+git clone https://github.com/cortexapps/engrams.git && cd engrams
+git checkout "$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
+```
+
+To move to a later release afterwards, see
+[Releases and upgrades](./deploy.md#releases-and-upgrades).
+
 ## 1. Quota check
 
 ```sh
@@ -208,7 +220,7 @@ cp deploy/helm/engram/values-aws.yaml.example /tmp/engram-values.yaml
 cp deploy/helm/engram-host-fleet/values-aws.yaml.example /tmp/fleet-values.yaml
 # The tfvalues overlays override every REPLACE_* the TF layer knows.
 
-# While the engrams repository is private, its GHCR images need a
+# While the engrams GHCR packages are private, the images need a
 # pull secret in BOTH namespaces (a GitHub PAT with read:packages) —
 # the values examples reference the name `ghcr-pull`:
 kubectl create secret docker-registry ghcr-pull -n engrams \

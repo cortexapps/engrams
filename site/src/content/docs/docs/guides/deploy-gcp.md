@@ -28,6 +28,16 @@ Throughout, `PROJECT`, `REGION`, `DOMAIN` (for example `engrams.example.com`),
 `ADMIN_EMAIL`, `EMAIL_DOMAIN` (the Workspace domain whose accounts may sign in, for example
 `example.com`), `OAUTH_CLIENT_ID`, and `OAUTH_CLIENT_SECRET` are yours.
 
+Run every command from a checkout of the newest release. The charts in a release install
+the images of that release; a checkout of `main` can name a version that is not released.
+
+```sh
+git clone https://github.com/cortexapps/engrams.git && cd engrams
+git checkout "$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
+```
+
+To move to a later release afterwards, see [Upgrade engrams](../upgrade/).
+
 ## 1. Enable the APIs
 
 ```sh

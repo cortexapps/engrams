@@ -102,3 +102,7 @@ Deployment's template changed. Sessions live on the hosts and are untouched by a
 roll; dashboard event streams reconnect with `Last-Event-ID`, and hosts re-register when the
 coordinator comes back. Roll the two charts together when you upgrade engrams: the
 coordinator and the host agents share a wire version and refuse to talk across a mismatch.
+
+An image tag you leave empty falls back to the chart's `appVersion`, which is the release the
+checkout is. [Upgrade engrams](../../guides/upgrade/) is the procedure from one release to
+the next.
