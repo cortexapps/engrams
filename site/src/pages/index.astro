@@ -1,7 +1,7 @@
 ---
 import Marketing from "../layouts/Marketing.astro";
 import pelican from "../assets/screenshots/session-pelican.png";
-import { hero, modules, automations, how, session, extensible, belt, start } from "../landing/copy";
+import { hero, modules, slack, automations, how, session, extensible, belt, start } from "../landing/copy";
 import { nodes, edges, glyph, frame } from "../landing/demo";
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
@@ -23,8 +23,8 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
 ---
 
 <Marketing
-  title="engrams · Coding agents in your cloud"
-  description="engrams runs Claude Code, Codex, or your own agent in an isolated microVM on your infrastructure. Start one from a prompt, a schedule, a pull request, or a Slack thread, then inspect its changes."
+  title="engrams AI software factory: the open source alternative to Devin and Factory.ai"
+  description="engrams is a self-hosted, open source software factory. It runs Claude Code, Codex, or your own agent in an isolated microVM in your cloud. Start one from a prompt, a schedule, a pull request, or a Slack thread, then inspect its changes."
   landing
 >
   <!-- COVER -->
@@ -41,7 +41,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
           <p class="lede">{hero.lede}</p>
           <div class="actions">
             <a class="btn primary" href={docs + hero.primary.href}>{hero.primary.label}</a>
-            <a class="btn outline" href={docs + hero.secondary.href}>{hero.secondary.label}</a>
+            <a class="btn outline" href={`${base}/${hero.secondary.href}`}>{hero.secondary.label}</a>
           </div>
           <div class="chips">{hero.chips.map((c) => <span>{c}</span>)}</div>
         </div>
@@ -111,7 +111,36 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
     </div>
   </section>
 
-  <!-- SEC. 2 — AUTOMATIONS -->
+  <!-- SEC. 2 — IN SLACK -->
+  <section class="sec">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-badge">{slack.badge}</span><span>{slack.label}</span><span class="sec-rule"></span><span>{slack.meta}</span></div>
+      <div class="slack-split">
+        <div>
+          <h2 class="display sec-title">{slack.title}</h2>
+          <p class="body">{slack.body}</p>
+          <ul class="ticks">{slack.points.map((p) => <li>{p}</li>)}</ul>
+          <div class="actions">
+            <a class="btn outline" href={docs + slack.cta.href}>{slack.cta.label} <span>→</span></a>
+          </div>
+        </div>
+        <div class="thread" aria-label="Illustrative Slack thread">
+          <div class="thread-head"><span>{slack.thread.channel}</span><span>thread</span></div>
+          {slack.thread.messages.map((m) => (
+            <div class:list={["msg", { bot: m.bot }]}>
+              <div class="avatar" aria-hidden="true">{m.who[0]}</div>
+              <div>
+                <div class="who"><b>{m.who}</b>{m.bot && <span class="app">app</span>}<span class="time">{m.time}</span></div>
+                <p>{m.body}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SEC. 3 — AUTOMATIONS -->
   <section class="sec">
     <div class="wrap">
       <div class="sec-head"><span class="sec-badge">{automations.badge}</span><span>{automations.label}</span><span class="sec-rule"></span><span>{automations.meta}</span></div>
@@ -163,10 +192,13 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
           <div class="foot"><span data-board-count>Example runs</span><span>{automations.board.footRight}</span></div>
         </div>
       </div>
+      <div class="actions">
+        <a class="btn outline" href={docs + automations.cta.href}>{automations.cta.label} <span>→</span></a>
+      </div>
     </div>
   </section>
 
-  <!-- SEC. 3 — HOW IT WORKS -->
+  <!-- SEC. 4 — HOW IT WORKS -->
   <section class="cover how">
     <div class="layer carbon soft bg-carbon-fade"></div>
     <div class="wrap">
@@ -210,7 +242,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
     </div>
   </section>
 
-  <!-- SEC. 4 — EXTENSIBLE -->
+  <!-- SEC. 5 — EXTENSIBLE -->
   <section class="sec">
     <div class="wrap">
       <div class="sec-head"><span class="sec-badge">{extensible.badge}</span><span>{extensible.label}</span><span class="sec-rule"></span></div>
@@ -251,6 +283,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
         <div>
           <div class="label" style="opacity:.8">{start.eyebrow}</div>
           <h2 class="display">{start.title}<span class="lime">.</span></h2>
+          <p class="wink">{start.wink}</p>
           <p class="lede">{start.lede}</p>
         </div>
         <div class="ctas">

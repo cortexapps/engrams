@@ -4,13 +4,14 @@
 // Each section connects an outcome to the product behavior that makes it possible.
 
 export const hero = {
-  eyebrow: "Coding agents, running in your cloud",
-  title: "Automate your",
-  titleAccent: "SDLC.",
+  eyebrow: "Stand up a software factory of your own",
+  title: "The open source alternative to",
+  titleAccent: "Devin.",
   lede: "engrams runs Claude Code, Codex, or your own agent in an isolated microVM on your infrastructure. Start one from a prompt, a schedule, a pull request, or a Slack thread. Walk away mid-task, and pick it up days later with its files and history intact.",
-  primary: { label: "Explore automations", href: "platform/automations/" },
-  secondary: { label: "Run it locally", href: "getting-started/local-quickstart/" },
-  chips: ["AGPL-3.0", "Firecracker · KVM", "GKE · EKS", "Claude Code · Codex"],
+  primary: { label: "Run it locally", href: "getting-started/local-quickstart/" },
+  // Site-relative, not docs-relative: the compare page sits beside the landing page.
+  secondary: { label: "Compare to Devin", href: "compare/" },
+  chips: ["Open source", "Firecracker · KVM", "GKE · EKS", "Claude Code · Codex"],
   graphTitle: "Example workflow · fix failing tests",
 };
 
@@ -29,7 +30,7 @@ export const modules = {
       kicker: "Human control",
       num: "02",
       title: "Stay involved.",
-      body: "Delegate a task, inspect its changes, and send a follow-up. The dashboard and Slack keep you in the conversation while agents work in your cloud.",
+      body: "Delegate from Slack, inspect the changes, and reply in the thread to steer. You stay in the conversation while agents work in your cloud.",
       foot: "Inspect · reply · steer",
     },
     {
@@ -79,10 +80,45 @@ export const session = {
   ],
 };
 
-export const automations = {
+export const slack = {
   badge: "Sec. 2",
+  label: "In Slack",
+  meta: "Fig. 2.1 · a thread",
+  title: "Delegate from the thread you're already in.",
+  body: "@mention the bot and a session opens for that thread, running as you, with your credentials. Reply to steer it, and your replies join the same run. When an automation has news, it posts to the channel and you answer right there: tell it a pull request is failing CI, and the same agent diagnoses the failure, pushes a fix, and reports back when the build is green.",
+  points: ["Starts from a mention", "Runs as whoever asked", "Replies join the run", "Agents report in"],
+  cta: { label: "Set up Slack threads", href: "platform/slack-threads/" },
+  // An illustrative thread. Names and numbers are examples, not a real workspace.
+  thread: {
+    channel: "#payments-eng",
+    messages: [
+      {
+        who: "engrams",
+        bot: true,
+        time: "09:12",
+        body: "Nightly dependency upgrade: opened 3 pull requests. #4182 (stripe-node 17 → 18) is failing CI.",
+      },
+      { who: "maya", time: "09:20", body: "@engrams #4182 is failing on the webhook tests. Can you fix it?" },
+      {
+        who: "engrams",
+        bot: true,
+        time: "09:21",
+        body: "On it, in the same session that opened #4182.",
+      },
+      {
+        who: "engrams",
+        bot: true,
+        time: "09:34",
+        body: "stripe-node 18 renamed the signature header type. Pushed a fix to #4182. CI is green.",
+      },
+    ],
+  },
+};
+
+export const automations = {
+  badge: "Sec. 3",
   label: "Automations",
-  meta: "Fig. 2.1",
+  meta: "Fig. 3.1",
   title: "Hand off the work that repeats.",
   lede: "A schedule, a pull request, a Slack mention, or a webhook can start a session, with no one typing a prompt. When one prompt is not enough, chain steps into a workflow: prompt the agent, run the tests, branch on the result, and post to Slack or GitHub.",
   cases: {
@@ -112,15 +148,11 @@ export const automations = {
     ],
   },
   board: {
-    fig: "Fig. 2.1 · runs board",
+    fig: "Fig. 3.1 · runs board",
     title: "Every run is a session you can open.",
     body: "Open a run to see each step, its inputs and outputs, and the session that did the work. Read the transcript, reply to the agent, or take over in its shell. Runs survive a server restart and can wait hours for a reply without holding a VM.",
     itemsLabel: "Ships in the box",
     items: [
-      {
-        title: "Slack threads",
-        body: "Mention the bot in Slack and a session opens for that thread, as the person who asked, with their credentials. Replies join the same run.",
-      },
       {
         title: "Pull request review",
         body: "A finder and a verifier review each pull request on the repositories you list, and post the confirmed findings as one GitHub review.",
@@ -128,12 +160,13 @@ export const automations = {
     ],
     footRight: "durable · survives restart",
   },
+  cta: { label: "Explore automations", href: "platform/automations/" },
 };
 
 export const how = {
-  badge: "Sec. 3",
+  badge: "Sec. 4",
   label: "How it works",
-  meta: "Fig. 3.1 · chunk store",
+  meta: "Fig. 4.1 · chunk store",
   title: "Start in a second.",
   titleAccent: "Pick up anywhere.",
   steps: [
@@ -169,7 +202,7 @@ export const how = {
 };
 
 export const extensible = {
-  badge: "Sec. 4",
+  badge: "Sec. 5",
   label: "Extensible",
   title: "Make it work with your stack.",
   lede: "Connect an internal service or run another agent without building a separate control plane. Custom harnesses use the same session UI; custom connectors use the same credential broker and access policies as the built-ins.",
@@ -196,6 +229,7 @@ export const belt = { label: "24 connectors built in · plus yours" };
 export const start = {
   eyebrow: "Start with one task",
   title: "Start",
+  wink: "The only confidential roadmap here is the one you're shipping. Clone the repo and start.",
   lede: "Run the stack locally and give an agent its first task. When you are ready for a shared deployment, follow the GCP or AWS guide to run engrams in your own cloud.",
   ctas: [
     { label: "Run it locally", href: "getting-started/local-quickstart/", primary: true },

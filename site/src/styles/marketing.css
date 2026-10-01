@@ -184,6 +184,7 @@ code {
   position: sticky;
   top: 0;
   z-index: 50;
+  background: var(--panel-deep);
 }
 @supports (animation-timeline: scroll()) {
   .masthead {
@@ -261,6 +262,28 @@ html {
   font-size: 12px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
+}
+/* GitHub is the second call to action in the nav: framed, larger, with the mark. */
+.site-nav .gh {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--sage-on-cover);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  transition: background 0.1s;
+}
+.site-nav .gh:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.08);
+}
+.site-nav .gh svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
 }
 .cta-small {
   display: inline-flex;
@@ -353,8 +376,9 @@ html {
   animation: pulse 2s infinite;
   flex: none;
 }
+/* Sized so the longest word, ALTERNATIVE, fits the 560px column. */
 .hero h1 {
-  font-size: 88px;
+  font-size: 76px;
   margin-top: 28px;
   text-wrap: balance;
 }
@@ -1021,6 +1045,100 @@ html {
   padding-top: 2px;
 }
 
+/* ---- in Slack: copy and an illustrative thread ---- */
+.slack-split {
+  display: grid;
+  grid-template-columns: 1fr 520px;
+  gap: 64px;
+  align-items: start;
+}
+.slack-split .body {
+  margin-top: 24px;
+  max-width: 620px;
+}
+.ticks {
+  list-style: none;
+  margin: 28px 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 24px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.ticks li::before {
+  content: "— ";
+  color: var(--primary);
+}
+.thread {
+  margin-top: 40px;
+  background: var(--panel-table);
+  color: var(--sage-on-cover);
+  border: 1px solid var(--lime-45);
+  box-shadow: var(--glow);
+  clip-path: var(--chamfer-14);
+  padding: 6px 6px 12px;
+  min-width: 0;
+}
+.thread-head {
+  display: flex;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.6);
+}
+.msg {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  gap: 12px;
+  padding: 14px 14px 0;
+}
+.msg .avatar {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  background: var(--accent);
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.msg.bot .avatar {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.msg .who {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 14px;
+}
+.msg .app {
+  padding: 0 4px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+.msg .time {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  opacity: 0.5;
+}
+.msg p {
+  margin-top: 4px;
+  font-size: 14px;
+  line-height: 1.5;
+  opacity: 0.9;
+}
+
 /* ---- connector belt ---- */
 .belt {
   margin-top: 128px;
@@ -1118,8 +1236,16 @@ html {
   line-height: 0.85;
   margin-top: 28px;
 }
-.start .lede {
+.start .wink {
   margin-top: 28px;
+  max-width: 600px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  color: var(--primary);
+}
+.start .lede {
+  margin-top: 16px;
   max-width: 600px;
   opacity: 0.85;
 }
@@ -1516,6 +1642,7 @@ html {
   .sec-intro,
   .pair,
   .split,
+  .slack-split,
   .how .grid2,
   .figure,
   .start .grid2 {
@@ -1557,8 +1684,17 @@ html {
   .wordmark {
     font-size: 18px;
   }
-  .site-nav a:not(.cta-small) {
+  .site-nav a:not(.cta-small, .gh) {
     display: none;
+  }
+  .site-nav .gh {
+    padding: 0 10px;
+  }
+  .site-nav .gh span {
+    display: none;
+  }
+  .ticks {
+    grid-template-columns: 1fr;
   }
   .hero {
     padding: 48px 0 200px;
