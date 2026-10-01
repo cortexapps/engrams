@@ -4,32 +4,35 @@ import Marketing from "../layouts/Marketing.astro";
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 const docs = `${base}/docs`;
 
+// Vendor columns come from the vendors' public product and pricing pages. Keep
+// them to what those pages state, and update the "as of" line when you revise.
+const asOf = "September 2026";
 const rows: [string, string, string, string][] = [
-  ["Who runs it", "You, in your cloud or on your hardware", "The vendor", "You"],
-  ["Built for", "Agents; a person can open a shell or IDE into a session, but the session is the agent's", "Agents and code execution, through an SDK", "People at their editors"],
-  ["Isolation", "A Firecracker microVM per session, on KVM", "A microVM or container per sandbox, vendor-managed", "Whatever the workspace template provisions: a VM, a pod, a container"],
-  ["Pause and resume", "Snapshot to content-addressed chunks on idle; restore in under 100 ms on the same host, one to two seconds elsewhere", "Pause and resume within the vendor's limits and pricing tiers", "Stop and start the workspace; state depends on the template"],
-  ["Fork", "A manifest copy of a few kilobytes; the fork shares every chunk until it writes", "Varies by vendor", "Not a session concept"],
-  ["Agent runtime", "Claude Code and Codex mounted by the host at boot; never in your image", "Bring your own, inside the sandbox", "Agents run as workspace processes"],
-  ["Your image", "Any Linux image with /bin/sh, built with docker build", "A vendor image format or a Dockerfile, per vendor", "A Terraform template"],
-  ["Cloud", "GKE or EKS, GCS or S3, with Terraform and Helm in the repository", "The vendor's", "Any"],
-  ["Product surface", "Dashboard, tasks and profiles, Slack, pull request review, CLI, API, connectors", "SDK and dashboard", "Dashboard, templates, CLI, IDE integrations"],
-  ["License", "AGPL-3.0", "Proprietary service", "AGPL-3.0 with a paid tier"],
+  ["Who runs it", "You, in your own cloud account or on your own hardware", "Cognition; VPC deployment on Enterprise contracts", "Factory; on-premise deployment on Enterprise contracts"],
+  ["Source code", "Open source. Read it, change it, and run every line (AGPL-3.0)", "Proprietary", "Proprietary"],
+  ["The agent", "Claude Code, Codex, or your own harness, mounted by the host at boot; never baked into your image", "Devin, Cognition's agent", "Droids, Factory's agent"],
+  ["Models", "Whatever your harness calls, on your own provider keys or model router", "From Cognition's model list", "From Factory's model list"],
+  ["Where the work runs", "A Firecracker microVM per session, on your KVM nodes", "A vendor-managed cloud machine per session", "Vendor-managed cloud machines, or your machine through the CLI"],
+  ["Your environment", "Any Linux image with /bin/sh, built with docker build; warmed once and snapshotted", "Set up inside the vendor's machine configuration", "Set up inside the vendor's environment configuration"],
+  ["Credentials", "Brokered: the egress proxy inserts each key outside the VM, and the agent never sees it", "Stored on the vendor's platform", "Stored on the vendor's platform"],
+  ["Automations", "Workflows you edit as a graph, started by a schedule, a pull request, Slack, Linear, or a webhook", "Tasks from Slack, Linear, GitHub, and the API", "Tasks from Slack, Linear, the IDE, and the CLI"],
+  ["Where people work", "Dashboard, Slack threads, GitHub pull request review, CLI, API", "Web app, desktop app, CLI, Slack, Linear", "CLI, IDE, web app, Slack, Linear"],
+  ["What you pay", "No license fee. You pay your cloud provider and your model provider", "Per-seat plans with usage quotas", "Per-seat plans with usage limits"],
 ];
 ---
 
 <Marketing
-  title="engrams compared"
-  description="How engrams differs from hosted sandbox APIs and from development environments for people."
+  title="engrams vs Devin and Factory: the open source software factory"
+  description="How engrams, the open source and self-hosted software factory, compares to Devin and Factory.ai."
 >
   <section class="page-hero">
     <div class="wrap">
       <div class="eyebrow label"><span class="pulse"></span>Compare · Fig. C.1</div>
-      <h1 class="display">Where engrams sits.</h1>
+      <h1 class="display">Devin is a factory you rent. engrams is one you own.</h1>
       <p class="lede">
-        Hosted sandbox APIs run the VMs for you. Development-environment products give people a
-        workspace at their editor. engrams is the third thing: sandboxes for agents, on
-        infrastructure you run.
+        Devin and Factory run the agent, the machines, and your credentials on their platform.
+        engrams runs the agent you choose, in microVMs in your cloud, with the source code in
+        your hands.
       </p>
       <div class="table-scroll">
         <table class="hairline-table">
@@ -37,8 +40,8 @@ const rows: [string, string, string, string][] = [
             <tr>
               <th></th>
               <th>engrams</th>
-              <th>Hosted sandbox APIs (E2B, Modal Sandboxes)</th>
-              <th>Development environments (Coder)</th>
+              <th>Devin (Cognition)</th>
+              <th>Factory (Droids)</th>
             </tr>
           </thead>
           <tbody>
@@ -48,6 +51,7 @@ const rows: [string, string, string, string][] = [
           </tbody>
         </table>
       </div>
+      <p class="footnote">Vendor details are from their public product and pricing pages as of {asOf}. Plans change; check with each vendor.</p>
     </div>
   </section>
 
@@ -58,14 +62,15 @@ const rows: [string, string, string, string][] = [
         <h2 class="display">Pick the other thing when it fits.</h2>
         <div class="prose">
           <p>
-            If you do not want to run infrastructure, a hosted sandbox API is the right call: you
-            get sandboxes in a minute, and you pay per second. engrams asks you for a Kubernetes
-            cluster with a KVM node pool, a Postgres, a bucket, and someone to run them.
+            If you do not want to run infrastructure, a hosted product is the right call. Devin and
+            Factory give you an agent in minutes and handle the machines and billing. engrams asks
+            you for a Kubernetes cluster with a KVM node pool, a Postgres, a bucket, and someone to
+            run them.
           </p>
           <p>
-            If the people on your team are the ones who need the environment, at their editors, all
-            day, a development-environment product is built for exactly that. engrams gives a person
-            a shell into an agent's session; it does not give them a workspace.
+            If you want one vendor's agent and models, tuned together and supported by that vendor,
+            buy that vendor's product. engrams runs the agents you bring and does not ship a model
+            of its own.
           </p>
           <p>
             If your hosts cannot run KVM, engrams has no production mode for you. It does not run
@@ -74,7 +79,8 @@ const rows: [string, string, string, string][] = [
         </div>
       </div>
       <div class="actions">
-        <a class="btn primary" href={`${docs}/getting-started/overview/`}>Read what engrams is</a>
+        <a class="btn primary" href={`${docs}/getting-started/local-quickstart/`}>Run it locally</a>
+        <a class="btn ghost" href={`${docs}/getting-started/overview/`}>Read what engrams is</a>
         <a class="btn ghost" href={`${base}/architecture/`}>See the architecture</a>
       </div>
     </div>
