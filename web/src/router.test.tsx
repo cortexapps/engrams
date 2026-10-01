@@ -122,6 +122,23 @@ test("keeps an authenticated /login?next= arrival on the page so it can bounce b
   expect(router.state.location.pathname).toBe("/login");
 });
 
+// A signed-out deep link keeps its destination through sign-in. The case that
+// hurts without it: `engrams auth login` opens /device?user_code=…, the person
+// signs in, lands on the dashboard, and the code they came to approve is gone.
+test("sends a signed-out deep link to /login with the page as next", async () => {
+  const router = makeTestRouter(null, "/device?user_code=ABCD-1234");
+  await router.load();
+  expect(router.state.location.pathname).toBe("/login");
+  expect(router.state.location.search).toEqual({ next: "/device?user_code=ABCD-1234" });
+});
+
+test("sends a signed-out visit to the root to a clean /login", async () => {
+  const router = makeTestRouter(null, "/");
+  await router.load();
+  expect(router.state.location.pathname).toBe("/login");
+  expect(router.state.location.search).toEqual({});
+});
+
 test("still short-circuits an authenticated /login with no next", async () => {
   const router = makeTestRouter(AUTH, "/login");
   await router.load();

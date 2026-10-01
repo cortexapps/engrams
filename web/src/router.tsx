@@ -90,11 +90,27 @@ export interface RouterContext {
 
 /** Auth gate for all authenticated routes (appLayoutRoute and its children).
  * Redirects to /login when no session is present. The /login route is a
- * sibling of appLayoutRoute — it is never covered by this guard. */
-function requireAuth({ context }: { context: RouterContext }) {
-  if (!context.auth) {
-    throw redirect({ to: "/login" });
-  }
+ * sibling of appLayoutRoute — it is never covered by this guard.
+ *
+ * The page the visitor asked for rides along as `?next=`, so a deep link
+ * survives sign-in: the Login page returns the person there (it validates
+ * `next` — lib/next-url.ts — and a same-origin path is the ordinary case). It
+ * matters most for `engrams auth login`, whose approval link is
+ * `/device?user_code=…`: without `next`, a signed-out person signs in, lands
+ * on the dashboard, and the code they came to approve is gone. A deployment
+ * behind an identity proxy never showed this, because nobody reached the app
+ * signed out. */
+function requireAuth({
+  context,
+  location,
+}: {
+  context: RouterContext;
+  location: { href: string };
+}) {
+  if (context.auth) return;
+  // The bare root is where sign-in lands anyway; keep its login URL clean.
+  if (location.href === "/") throw redirect({ to: "/login" });
+  throw redirect({ to: "/login", search: { next: location.href } });
 }
 
 /** Shared UX-only admin guard. Members who deep-link to an admin route get
