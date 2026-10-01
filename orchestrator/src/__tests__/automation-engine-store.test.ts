@@ -473,6 +473,46 @@ describe("automation engine store (live PG)", () => {
     expect((await engine.findSessionBinding(sessionId))?.relay).toBe(true);
   });
 
+  test.skipIf(!dbReachable)("latestKeptInstanceSession: the newest KEPT session of the workstream's other runs", async () => {
+    const id = `${AUTO_ID}-instance-session`;
+    await seedAutomation(id);
+    const store = makeAutomationStore(getDb());
+    const engine = makeAutomationEngineStore();
+    const db = getDb();
+    const instanceId = `ai_${UNIQ}`;
+    const run = (suffix: string, instance: string) => ({
+      id: `autorun:${id}:slack:${suffix}`,
+      automationId: id,
+      version: 1,
+      instanceId: instance,
+      trigger: TRIGGER,
+      deliveryKey: `slack:${suffix}`,
+      concurrencyKey: null,
+      scheduledFor: null,
+      status: "completed" as const,
+    });
+    await store.insertRun(run("r1", instanceId));
+    await store.insertRun(run("r2", instanceId));
+    await store.insertRun(run("me", instanceId));
+    await store.insertRun(run("other", `ai_${UNIQ}_other`));
+    await db.insert(automationSessionTable).values([
+      // r1 kept one (older), r2 kept one (newer) and ended a worker (keep: false).
+      { sessionId: `sess-${UNIQ}-r1`, runId: `autorun:${id}:slack:r1`, blockId: "session", keep: true, createdAt: new Date("2026-10-01T01:00:00Z") },
+      { sessionId: `sess-${UNIQ}-r2`, runId: `autorun:${id}:slack:r2`, blockId: "session", keep: true, createdAt: new Date("2026-10-01T02:00:00Z") },
+      { sessionId: `sess-${UNIQ}-r2w`, runId: `autorun:${id}:slack:r2`, blockId: "worker", keep: false, createdAt: new Date("2026-10-01T03:00:00Z") },
+      // The asking run's own session never counts, nor another workstream's.
+      { sessionId: `sess-${UNIQ}-me`, runId: `autorun:${id}:slack:me`, blockId: "session", keep: true, createdAt: new Date("2026-10-01T04:00:00Z") },
+      { sessionId: `sess-${UNIQ}-other`, runId: `autorun:${id}:slack:other`, blockId: "session", keep: true, createdAt: new Date("2026-10-01T05:00:00Z") },
+    ]);
+    expect(await engine.latestKeptInstanceSession(instanceId, `autorun:${id}:slack:me`)).toEqual({
+      sessionId: `sess-${UNIQ}-r2`,
+      runId: `autorun:${id}:slack:r2`,
+    });
+    // Unbound asks nothing; a workstream with no earlier run has nothing.
+    expect(await engine.latestKeptInstanceSession("", `autorun:${id}:slack:me`)).toBeNull();
+    expect(await engine.latestKeptInstanceSession(`ai_${UNIQ}_none`, `autorun:${id}:slack:me`)).toBeNull();
+  });
+
   test.skipIf(!dbReachable)("delivery-key uniqueness dedupes a redelivery", async () => {
     const id = `${AUTO_ID}-dedupe`;
     await seedAutomation(id);

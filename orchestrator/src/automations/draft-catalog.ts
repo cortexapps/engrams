@@ -126,6 +126,7 @@ export function draftPatterns(): Record<string, unknown> {
     ],
     pr_feedback_loop: [
       "Every session that opens a PR is auto-recorded in the pr_ref ledger. The lookup_pr_session block maps {repo, prNumber} to the authoring session - found:false is a value, so unrelated PRs just filter out.",
+      "lookup_instance_session finds the KEPT session an earlier run of the same workstream created (found:false = none, gone, or unbound). A conversation-shaped automation (one workstream per thread) uses it so a new run in the thread resumes the thread's session: branch on found → send_prompt with session {template: steps.<id>.session_id} adopts it; else create_session.",
       'So: an entrypoint on pull_request_review.submitted / pull_request_review_comment.created / issue_comment.created -> lookup_pr_session -> filter on found -> send_prompt with session {template: "${{ steps.<lookup>.session_id }}"} delivers the feedback to the implementer. Adoption handles the routing.',
     ],
     delegation: [

@@ -1630,6 +1630,24 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
       return rows;
     },
 
+    async latestKeptInstanceSession(instanceId, excludeRunId) {
+      if (instanceId === "") return null;
+      const [row] = await db
+        .select({ sessionId: automationSessionTable.sessionId, runId: automationSessionTable.runId })
+        .from(automationSessionTable)
+        .innerJoin(automationRunTable, eq(automationSessionTable.runId, automationRunTable.id))
+        .where(
+          and(
+            eq(automationRunTable.instanceId, instanceId),
+            ne(automationRunTable.id, excludeRunId),
+            eq(automationSessionTable.keep, true),
+          ),
+        )
+        .orderBy(desc(automationSessionTable.createdAt))
+        .limit(1);
+      return row ?? null;
+    },
+
     getSessionBinding,
 
     async adoptSession({ runId, automationId, sessionId, instanceId }) {

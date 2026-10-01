@@ -40,6 +40,7 @@ function makeDeps(blocks: BlockDef[], payload?: Record<string, unknown>) {
       stepRecords.push({ framePath, record });
     },
     async finalizeRun() {},
+    async latestKeptInstanceSession() { return null; },
     async listRunSessions() {
       return [];
     },

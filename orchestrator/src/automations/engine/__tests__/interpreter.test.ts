@@ -153,6 +153,7 @@ function makeHarness(
     async finalizeRun(_runId, status, error) {
       finalized.push({ status, ...(error !== undefined ? { error } : {}) });
     },
+    async latestKeptInstanceSession() { return null; },
     async listRunSessions() {
       return runSessions;
     },

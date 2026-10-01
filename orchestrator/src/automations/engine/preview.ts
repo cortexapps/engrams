@@ -96,6 +96,7 @@ function inertDeps(): EngineDeps {
       recordStep: unavailable,
       finalizeRun: unavailable,
       listRunSessions: unavailable,
+      latestKeptInstanceSession: unavailable,
       releaseConcurrency: unavailable,
       adoptSession: unavailable,
       getSessionBinding: unavailable,

@@ -46,6 +46,7 @@ function fakeEngineStore(overrides: Partial<AutomationEngineStore> = {}): Automa
     async getSessionBinding() {
       return null;
     },
+    async latestKeptInstanceSession() { return null; },
     async listRunSessions() {
       return [];
     },

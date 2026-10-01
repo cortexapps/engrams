@@ -578,6 +578,16 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     defaults: () => ({ repo: "", prNumber: 1 }),
   },
   {
+    kind: "lookup_instance_session",
+    label: "Look up workstream session",
+    description:
+      "The kept session an earlier run of this workstream created, so a new run continues it (found: false when none, gone, or unbound).",
+    icon: Repeat,
+    fields: [],
+    summary: () => "This workstream's kept session",
+    defaults: () => ({}),
+  },
+  {
     kind: "instance_close",
     label: "Close workstream",
     description: "Close the run's own workstream; later events for it are dropped (audited).",

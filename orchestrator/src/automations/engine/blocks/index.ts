@@ -9,6 +9,7 @@ import { registerExecBlocks } from "./exec.ts";
 import { registerCodeBlock } from "./code.ts";
 import { registerStateBlocks } from "./state.ts";
 import { registerPrLookupBlock } from "./pr-lookup.ts";
+import { registerInstanceSessionLookupBlock } from "./instance-session.ts";
 import { registerInstanceCloseBlock } from "./instance-close.ts";
 import { registerClaimHandleBlock } from "./claim-handle.ts";
 import { registerIntegrationActionBlock } from "./integration-action.ts";
@@ -30,6 +31,7 @@ export function registerEngineBlocks(): void {
   registerCodeBlock();
   registerStateBlocks();
   registerPrLookupBlock();
+  registerInstanceSessionLookupBlock();
   registerInstanceCloseBlock();
   registerClaimHandleBlock();
   registerIntegrationActionBlock();
@@ -58,6 +60,7 @@ export const V1_BLOCK_TYPES = [
   "state_delete",
   "state_list",
   "lookup_pr_session",
+  "lookup_instance_session",
   "instance_close",
   "claim_handle",
   "review_open_pass",

@@ -111,6 +111,7 @@ function harness() {
     markRunning: async () => {},
     recordStep: async () => {},
     finalizeRun: async () => {},
+    latestKeptInstanceSession: async () => null,
     listRunSessions: async () => [],
     releaseConcurrency: async () => null,
     adoptSession: async () => "foreign",

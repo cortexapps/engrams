@@ -252,6 +252,7 @@ function harness(options: {
       async markRunning() {},
       async recordStep(_r, path, attempt, record) { records.push({ path, attempt, record }); },
       async finalizeRun(_r, status, error) { finalized.push({ status, ...(error !== undefined ? { error } : {}) }); },
+      async latestKeptInstanceSession() { return null; },
       async listRunSessions() { return runSessions; },
       async releaseConcurrency() { return null; },
       async adoptSession() { return "foreign" as const; },
