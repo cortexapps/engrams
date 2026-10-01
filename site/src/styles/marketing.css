@@ -1645,8 +1645,14 @@ html {
   .ticks {
     grid-template-columns: 1fr;
   }
+  /* On a phone the graph stacks under the copy and leaves no room for the
+     floor: it ran over the run log and left a bare scanline band at the foot.
+     Drop the floor and the space reserved for it. */
   .hero {
-    padding: 48px 0 200px;
+    padding: 48px 0 72px;
+  }
+  .cover-hero .layer.floor {
+    display: none;
   }
   .hero h1 {
     font-size: 48px;
