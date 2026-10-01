@@ -63,6 +63,9 @@ service AutomationService {
   rpc ListEventSamples(ListEventSamplesRequest) returns (ListEventSamplesResponse);
   // Picker values for a map input keyed by an integration noun.
   rpc ListInputKeyOptions(ListInputKeyOptionsRequest) returns (ListInputKeyOptionsResponse);
+  // Labels for keys already in hand (the channels of the threads a page
+  // shows): a lookup by id, never a walk of the provider's whole list.
+  rpc DescribeInputKeys(DescribeInputKeysRequest) returns (DescribeInputKeysResponse);
   // ADR 0119 D5: the connector-declared event and action catalogs.
   rpc ListEventCatalog(ListEventCatalogRequest) returns (ListEventCatalogResponse);
   rpc ListActionCatalog(ListActionCatalogRequest) returns (ListActionCatalogResponse);
@@ -535,6 +538,19 @@ message InputKeyOption {
 }
 
 message ListInputKeyOptionsResponse {
+  repeated InputKeyOption options = 1;
+}
+
+message DescribeInputKeysRequest {
+  // "repository" | "channel" | "team"
+  string noun = 1;
+  repeated string keys = 2;
+  optional string connection_id = 3;
+}
+
+message DescribeInputKeysResponse {
+  // One per requested key, in request order; a key the provider does not
+  // know (or will not show) comes back labelled with itself.
   repeated InputKeyOption options = 1;
 }
 

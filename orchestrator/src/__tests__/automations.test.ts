@@ -1011,12 +1011,37 @@ describe("AutomationService v2", () => {
 
   test("ListInputKeyOptions goes through the injected source", async () => {
     const { automations } = clients(
-      adminDeps({ inputKeyOptions: { async list(noun) { return [{ key: `${noun}-1`, label: "One" }]; } } }),
+      adminDeps({
+        inputKeyOptions: {
+          async list(noun) { return [{ key: `${noun}-1`, label: "One" }]; },
+          async describe(_noun, keys) { return keys.map((key) => ({ key, label: key })); },
+        },
+      }),
     );
     const res = await automations.listInputKeyOptions({ noun: "repository" });
     expect(res.options.map((o) => ({ key: o.key, label: o.label }))).toEqual([
       { key: "repository-1", label: "One" },
     ]);
+  });
+
+  test("DescribeInputKeys labels the keys it is handed: trimmed, deduplicated, none → no provider call", async () => {
+    const seen: string[][] = [];
+    const { automations } = clients(
+      adminDeps({
+        inputKeyOptions: {
+          async list() { return []; },
+          async describe(noun, keys) {
+            seen.push([...keys]);
+            return keys.map((key) => ({ key, label: `#${noun}-${key}` }));
+          },
+        },
+      }),
+    );
+    const res = await automations.describeInputKeys({ noun: "channel", keys: [" C1", "C2", "C1", ""] });
+    expect(res.options.map((o) => [o.key, o.label])).toEqual([["C1", "#channel-C1"], ["C2", "#channel-C2"]]);
+    const empty = await automations.describeInputKeys({ noun: "channel", keys: [] });
+    expect(empty.options).toEqual([]);
+    expect(seen).toEqual([["C1", "C2"]]);
   });
 });
 

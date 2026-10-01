@@ -3,7 +3,7 @@ import { MessageSquare, TriangleAlert } from "lucide-react";
 
 import { useNow } from "../../hooks/useNow";
 import { useBuiltinAutomation } from "../../hooks/useAutomations";
-import { useInputKeyOptions } from "../../hooks/useAutomationInputs";
+import { useInputKeyLabels } from "../../hooks/useAutomationInputs";
 import { useInstanceList } from "../../hooks/useInstances";
 import { relativeAge } from "@/lib/relative-time";
 import {
@@ -18,7 +18,7 @@ import {
   SidebarMenuSkeleton,
 } from "@/components/ui/sidebar";
 import { SLACK_BRAIN_BUILTIN_KEY } from "./SlackThreads";
-import { channelNames, describeThread } from "./slack-format";
+import { channelNames, describeThread, threadChannelIds } from "./slack-format";
 
 // The persistent Slack rail: a switcher over the OPEN threads engrams is in.
 // Each row is one thread workstream and navigates to its workstream page.
@@ -27,8 +27,10 @@ export function SlackRail() {
   const builtin = useBuiltinAutomation(SLACK_BRAIN_BUILTIN_KEY);
   const automationId = builtin.data?.automation?.id;
   const list = useInstanceList(automationId, { includeClosed: false });
-  const names = channelNames(useInputKeyOptions("channel").data?.options);
   const threads = list.data?.instances ?? [];
+  const names = channelNames(
+    useInputKeyLabels("channel", threadChannelIds(threads.map((t) => t.key))).data?.options,
+  );
 
   return (
     <>

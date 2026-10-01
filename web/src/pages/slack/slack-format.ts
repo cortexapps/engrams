@@ -13,8 +13,18 @@ export function parseThreadKey(key: string): ThreadKey | null {
   return { team: parts[0]!, channel: parts[1]!, threadTs: parts[2]! };
 }
 
-/** Channel id → "#name", from the channel picker's option list. */
+/** Channel id → "#name" (a describe-by-id lookup of the ids a page shows). */
 export type ChannelNames = ReadonlyMap<string, string>;
+
+/** The channel ids a set of thread keys names, each once. */
+export function threadChannelIds(keys: readonly string[]): string[] {
+  const ids = new Set<string>();
+  for (const key of keys) {
+    const parsed = parseThreadKey(key);
+    if (parsed) ids.add(parsed.channel);
+  }
+  return [...ids];
+}
 
 export function channelNames(
   options: readonly { key: string; label: string }[] | undefined,
