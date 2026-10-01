@@ -214,6 +214,7 @@ html {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.18);
 }
 .wordmark {
@@ -1630,7 +1631,9 @@ html {
   .wordmark {
     font-size: 18px;
   }
-  .site-nav a:not(.cta-small, .gh) {
+  /* On a phone the nav keeps its three calls to action: Compare, GitHub, and
+     Run it locally. */
+  .site-nav a:not(.cta-small, .gh, .compare) {
     display: none;
   }
   .site-nav .gh {
@@ -1704,11 +1707,13 @@ html {
   }
   .site-nav {
     gap: 8px;
+    letter-spacing: 0.04em;
   }
   .site-nav .cta-small {
     padding: 0 10px;
     font-size: 11px;
     letter-spacing: 0.04em;
+    white-space: nowrap;
   }
   .wordmark {
     gap: 7px;
@@ -1740,5 +1745,28 @@ html {
   }
   .sec-head {
     flex-wrap: wrap;
+  }
+}
+
+/* Narrow phones: tighten the header so the wordmark and all three nav calls
+   to action fit on one row. */
+@media (max-width: 420px) {
+  .wordmark {
+    font-size: 13px;
+    letter-spacing: 0.06em;
+  }
+  .site-nav {
+    gap: 5px;
+    font-size: 11px;
+  }
+  .site-nav .gh,
+  .site-nav .cta-small {
+    padding: 0 8px;
+  }
+}
+/* Below 360px the three do not fit; Compare stays in the footer. */
+@media (max-width: 359px) {
+  .site-nav .compare {
+    display: none;
   }
 }
