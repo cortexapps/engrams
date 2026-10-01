@@ -3,6 +3,7 @@ import { MessageSquare, TriangleAlert } from "lucide-react";
 
 import { useNow } from "../../hooks/useNow";
 import { useBuiltinAutomation } from "../../hooks/useAutomations";
+import { useInputKeyOptions } from "../../hooks/useAutomationInputs";
 import { useInstanceList } from "../../hooks/useInstances";
 import { relativeAge } from "@/lib/relative-time";
 import {
@@ -17,7 +18,7 @@ import {
   SidebarMenuSkeleton,
 } from "@/components/ui/sidebar";
 import { SLACK_BRAIN_BUILTIN_KEY } from "./SlackThreads";
-import { threadLabel } from "./slack-format";
+import { channelNames, describeThread } from "./slack-format";
 
 // The persistent Slack rail: a switcher over the OPEN threads engrams is in.
 // Each row is one thread workstream and navigates to its workstream page.
@@ -26,6 +27,7 @@ export function SlackRail() {
   const builtin = useBuiltinAutomation(SLACK_BRAIN_BUILTIN_KEY);
   const automationId = builtin.data?.automation?.id;
   const list = useInstanceList(automationId, { includeClosed: false });
+  const names = channelNames(useInputKeyOptions("channel").data?.options);
   const threads = list.data?.instances ?? [];
 
   return (
@@ -56,7 +58,7 @@ export function SlackRail() {
                 <p className="px-2 py-2 text-xs text-sidebar-foreground/85">No open threads.</p>
               ) : (
                 threads.map((thread) => {
-                  const label = threadLabel(thread.key);
+                  const { title, subtitle } = describeThread(thread, names);
                   return (
                     <SidebarMenuItem key={thread.id}>
                       <SidebarMenuButton asChild className="h-auto items-start gap-2.5 py-1.5">
@@ -66,11 +68,9 @@ export function SlackRail() {
                           title={thread.key}
                         >
                           <span className="flex min-w-0 flex-1 flex-col">
-                            <span className="truncate font-mono text-sm leading-tight">
-                              {label.channel}
-                            </span>
+                            <span className="truncate text-sm leading-tight">{title}</span>
                             <span className="truncate font-mono text-2xs leading-tight text-sidebar-foreground/85">
-                              thread {label.thread}
+                              {subtitle}
                             </span>
                           </span>
                           <span

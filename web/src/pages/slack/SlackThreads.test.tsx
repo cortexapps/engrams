@@ -38,6 +38,9 @@ vi.mock("../../hooks/useInstances", () => ({
 vi.mock("../../hooks/useAutomationRuns", () => ({
   useRunList: () => ({ data: { runs: [] } }),
 }));
+vi.mock("../../hooks/useAutomationInputs", () => ({
+  useInputKeyOptions: () => ({ data: { options: [{ key: "C0123456789", label: "#alerts" }] } }),
+}));
 vi.mock("../../hooks/useProfiles", () => ({
   useProfiles: () => ({ data: { profiles: state.profiles } }),
 }));
@@ -58,6 +61,7 @@ beforeEach(() => {
       id: "ai_1",
       automationId: "auto-slack",
       key: "T1:C0123456789:1700.1",
+      label: "can you draw a pelican?",
       status: "open",
       inputsJson: "{}",
       openedBy: "event:slack:Ev1",
@@ -86,7 +90,11 @@ describe("SlackThreads", () => {
     expect(screen.getByText("C0123456789")).toBeTruthy();
     expect(screen.getByText("Alerts")).toBeTruthy();
     expect(screen.getByRole("link", { name: /Slack threads automation/ })).toBeTruthy();
-    expect((await screen.findAllByText("T1:C0123456789:1700.1")).length).toBeGreaterThan(0);
+    // A thread row reads as a human would: the opening mention as the title,
+    // the named channel and thread as the place — never a bare key.
+    expect(await screen.findByText("can you draw a pelican?")).toBeTruthy();
+    expect(screen.getAllByText("#alerts · thread 1700.1").length).toBeGreaterThan(0);
+    expect(screen.queryByText("T1:C0123456789:1700.1")).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
   });
 

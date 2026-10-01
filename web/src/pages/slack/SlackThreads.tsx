@@ -14,6 +14,7 @@ import {
   useSetInputValue,
   useSetMapInputEntry,
 } from "../../hooks/useAutomations";
+import { useInputKeyOptions } from "../../hooks/useAutomationInputs";
 import { useInstanceList, useRecentDrops } from "../../hooks/useInstances";
 import { useNow } from "../../hooks/useNow";
 import { useProfiles } from "../../hooks/useProfiles";
@@ -63,6 +64,15 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { WorkstreamDrops } from "@/pages/automations/workstreams/WorkstreamDrops";
 import { WorkstreamsTable } from "@/pages/automations/workstreams/WorkstreamsTable";
 
+import {
+  channelLabel,
+  channelNames,
+  describeThread,
+  threadHandleLabel,
+  threadLabel,
+  type ChannelNames,
+} from "./slack-format";
+
 /** The built-in behind this page. */
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
@@ -85,6 +95,8 @@ export function SlackThreads() {
     typeof inputs["default_profile"] === "string" ? inputs["default_profile"] : "";
   const { data: profileData } = useProfiles();
   const profiles = profileData?.profiles ?? [];
+  // Channel ids → "#name" (the same list the override picker offers).
+  const names = channelNames(useInputKeyOptions("channel").data?.options);
   const setEnabled = useSetAutomationEnabled();
   const setDefault = useSetInputValue();
   const enabled = automation?.enabled === true;
@@ -234,6 +246,7 @@ export function SlackThreads() {
                   automationId={automationId!}
                   row={row}
                   profiles={profiles}
+                  names={names}
                 />
               ))}
             </TableBody>
@@ -241,7 +254,7 @@ export function SlackThreads() {
         )}
       </section>
 
-      {automationId && <ThreadsSection automationId={automationId} />}
+      {automationId && <ThreadsSection automationId={automationId} names={names} />}
     </div>
   );
 }
@@ -294,15 +307,20 @@ function ChannelRow({
   automationId,
   row,
   profiles,
+  names,
 }: {
   automationId: string;
   row: ChannelEntry;
   profiles: ProfileLite[];
+  names: ChannelNames;
 }) {
   const remove = useSetMapInputEntry();
   return (
     <TableRow>
-      <TableCell className="font-mono text-xs">{row.channel}</TableCell>
+      <TableCell>
+        <span className="block text-sm">{channelLabel(names, row.channel)}</span>
+        <span className="block font-mono text-2xs text-muted-foreground">{row.channel}</span>
+      </TableCell>
       <TableCell className="text-xs text-muted-foreground">
         {profileLabel(row.profileId, profiles)}
       </TableCell>
@@ -502,7 +520,7 @@ function EnrollChannelDialog({
 /** The threads: the automation's workstreams, open first. The table is the
  * platform's own workstream table — the same rows an admin sees under
  * Automations, which is the point. */
-function ThreadsSection({ automationId }: { automationId: string }) {
+function ThreadsSection({ automationId, names }: { automationId: string; names: ChannelNames }) {
   const [status, setStatus] = useState<"open" | "closed">("open");
   const list = useInstanceList(automationId, { includeClosed: true });
   const drops = useRecentDrops(automationId);
@@ -544,9 +562,23 @@ function ThreadsSection({ automationId }: { automationId: string }) {
             : "No closed threads."}
         </EmptyState>
       ) : (
-        <WorkstreamsTable instances={rows} automations={[]} showAutomation={false} now={now} />
+        <WorkstreamsTable
+          instances={rows}
+          automations={[]}
+          showAutomation={false}
+          now={now}
+          describe={(instance) => describeThread(instance, names)}
+          handleLabel={(handle) => threadHandleLabel(handle, names)}
+        />
       )}
-      <WorkstreamDrops drops={drops.data?.drops ?? []} now={now} />
+      <WorkstreamDrops
+        drops={drops.data?.drops ?? []}
+        now={now}
+        describeDetail={(drop) => {
+          const place = threadLabel(drop.detail, names);
+          return place.thread ? `${place.channel} · thread ${place.thread}` : drop.detail;
+        }}
+      />
     </section>
   );
 }
