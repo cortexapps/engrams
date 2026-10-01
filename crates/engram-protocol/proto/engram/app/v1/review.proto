@@ -15,9 +15,9 @@ service ReviewService {
   rpc ListReviews(ListReviewsRequest) returns (ListReviewsResponse);
   rpc GetReview(GetReviewRequest) returns (GetReviewResponse);
   // Re-run a review from scratch. The review record is terminal (failed,
-  // halted, or posted); this dispatches a fresh pass over the PR's current
-  // head, minting a new review row and `review:<review_id>` workflow. The old
-  // row is left intact as history.
+  // halted, or posted); this admits a fresh built-in run with the original
+  // run's trigger, minting a new review row over the PR's current head. The
+  // old row is left intact as history.
   rpc RetryReview(RetryReviewRequest) returns (RetryReviewResponse);
 
   rpc ListEnrollments(ListEnrollmentsRequest) returns (ListEnrollmentsResponse);
@@ -40,11 +40,9 @@ message RepoEnrollment {
   optional string profile_id = 4;
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
-  // legacy | automation. Enrolling through the product always lands on
-  // `automation` (the PR-review built-in); a `legacy` row predates that and
-  // reviews on the old graph until it is saved again. Retires with the legacy
-  // graph (ADR 0119 phase 4.7).
-  string engine = 7;
+  // 7 was `engine` (legacy | automation) during the ADR 0119 parallel window.
+  reserved 7;
+  reserved "engine";
 }
 
 message ListEnrollmentsRequest {}

@@ -2,43 +2,26 @@ import { describe, expect, test } from "bun:test";
 
 import type { EnrollmentRow } from "../db/enrollments.ts";
 import { makeReviewsDispatchRoute } from "../routes/reviews-dispatch.ts";
-import type { ReviewIngressStart } from "../workflows/review-ingress.ts";
 
 const PATH = "/api/v1/reviews/dispatch";
 const enrollment: EnrollmentRow = {
   repo: "openai/engrams",
   triggerMode: "manual",
-  engine: "legacy" as const,
   autofix: "off",
   profileId: null,
   createdAt: new Date("2026-07-17T00:00:00Z"),
   updatedAt: new Date("2026-07-17T00:00:00Z"),
 };
 
-function app(
-  options: {
-    authenticated?: boolean;
-    enrolled?: boolean;
-    engine?: EnrollmentRow["engine"];
-    reviewAutomationDisabled?: boolean;
-  } = {},
-) {
-  const ingresses: ReviewIngressStart[] = [];
+function app(options: { authenticated?: boolean; enrolled?: boolean } = {}) {
   const automationDispatches: Array<{ repo: string; prNumber: number }> = [];
-  const row: EnrollmentRow = { ...enrollment, engine: options.engine ?? "legacy" };
   return {
-    ingresses,
     automationDispatches,
     app: makeReviewsDispatchRoute({
       getSession: async () => options.authenticated === false
         ? null
         : { user: { id: "api-user" } },
-      enrollments: { get: async () => options.enrolled === false ? null : row },
-      randomUUID: () => "dispatch-key-1",
-      reviewAutomationDisabled: options.reviewAutomationDisabled ?? false,
-      startIngress: async (input) => {
-        ingresses.push(input);
-      },
+      enrollments: { get: async () => options.enrolled === false ? null : enrollment },
       dispatchAutomation: async (input) => {
         automationDispatches.push(input);
         return "autorun:b1:dispatch:uuid-1";
@@ -62,44 +45,20 @@ describe("POST /api/v1/reviews/dispatch", () => {
   test("requires authentication", async () => {
     const fixture = app({ authenticated: false });
     expect((await request(fixture.app)).status).toBe(401);
-    expect(fixture.ingresses).toEqual([]);
+    expect(fixture.automationDispatches).toEqual([]);
   });
 
-  test("starts ingress for an enrolled repo and returns its workflow id", async () => {
+  test("an enrolled repo gets a built-in run and its run id back", async () => {
     const fixture = app();
-    const res = await request(fixture.app);
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({
-      workflow_id: "review-ingress:dispatch-key-1",
-    });
-    expect(fixture.ingresses).toEqual([{
-      provider: "github",
-      repo: enrollment.repo,
-      prNumber: 100,
-      trigger: "dispatch",
-      idempotencyKey: "dispatch-key-1",
-    }]);
-  });
-
-  test("a repo on the automation engine gets a built-in run, not legacy ingress (ADR 0119 phase 4.4)", async () => {
-    const fixture = app({ engine: "automation" });
     const res = await request(fixture.app);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ workflow_id: "autorun:b1:dispatch:uuid-1" });
     expect(fixture.automationDispatches).toEqual([{ repo: enrollment.repo, prNumber: 100 }]);
-    expect(fixture.ingresses).toEqual([]);
-  });
-
-  test("the kill switch sends an automation repo back to legacy ingress", async () => {
-    const fixture = app({ engine: "automation", reviewAutomationDisabled: true });
-    expect((await request(fixture.app)).status).toBe(200);
-    expect(fixture.automationDispatches).toEqual([]);
-    expect(fixture.ingresses).toHaveLength(1);
   });
 
   test("returns 404 without dispatch for an un-enrolled repo", async () => {
     const fixture = app({ enrolled: false });
     expect((await request(fixture.app)).status).toBe(404);
-    expect(fixture.ingresses).toEqual([]);
+    expect(fixture.automationDispatches).toEqual([]);
   });
 });

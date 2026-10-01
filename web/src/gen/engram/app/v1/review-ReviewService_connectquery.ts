@@ -16,9 +16,9 @@ export const getReview = ReviewService.method.getReview;
 
 /**
  * Re-run a review from scratch. The review record is terminal (failed,
- * halted, or posted); this dispatches a fresh pass over the PR's current
- * head, minting a new review row and `review:<review_id>` workflow. The old
- * row is left intact as history.
+ * halted, or posted); this admits a fresh built-in run with the original
+ * run's trigger, minting a new review row over the PR's current head. The
+ * old row is left intact as history.
  *
  * @generated from rpc engram.app.v1.ReviewService.RetryReview
  */

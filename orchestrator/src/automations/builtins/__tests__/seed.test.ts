@@ -10,7 +10,6 @@ const NOW = new Date("2026-08-21T00:00:00Z");
 
 function harness(
   options: {
-    enrollments?: Array<{ repo: string; triggerMode: string; autofix: string }>;
     existing?: { definition: AutomationDefinition; inputs: Record<string, unknown>; overrides: Record<string, Record<string, unknown>> };
     raceOnCreate?: boolean;
   } = {},
@@ -108,30 +107,21 @@ function harness(
   const deps = {
     store,
     connections: { async ensureDefault() { return { id: "conn-github" }; } },
-    enrollments: { async list() { return options.enrollments ?? []; } },
     log: { info() {}, warn() {} },
   };
   return { store, rows, versions, calls, deps };
 }
 
 describe("seedBuiltinAutomations", () => {
-  test("fresh: creates the built-in disabled, resolves the default connection, lifts enrollments into repos", async () => {
-    const h = harness({
-      enrollments: [
-        { repo: "acme/app", triggerMode: "auto", autofix: "off" },
-        { repo: "acme/infra", triggerMode: "manual", autofix: "auto" },
-      ],
-    });
+  test("fresh: creates the built-in disabled with an empty repos map and the default connection", async () => {
+    const h = harness();
     const result = await seedBuiltinAutomations({ ...h.deps, builtins: [PR_REVIEW_BUILTIN] });
 
     expect(result.created).toEqual([PR_REVIEW_BUILTIN_KEY]);
     const row = h.rows.get("auto-pr-review")!;
     expect(row.enabled).toBe(false);
     expect(row.kind).toBe("builtin");
-    expect(row.inputs["repos"]).toEqual({
-      "acme/app": { mode: "auto", autofix: false },
-      "acme/infra": { mode: "on_request", autofix: true },
-    });
+    expect(row.inputs["repos"]).toEqual({});
     expect(row.inputs["mention"]).toBe("@engrams");
     const v1 = h.versions.get("auto-pr-review")![0]!;
     expect(v1.trigger).toMatchObject({ kind: "integration", provider: "github", connectionId: "conn-github" });
@@ -139,31 +129,6 @@ describe("seedBuiltinAutomations", () => {
     for (const ep of v1.entrypoints ?? []) {
       expect(ep.trigger).toMatchObject({ kind: "integration", connectionId: "conn-github" });
     }
-  });
-
-  test("a legacy enrollment row the schema rejects drops just that row and never blocks the seed (phase 4.3b)", async () => {
-    // review_enrollment.repo is a free text PK; a malformed legacy value
-    // must not stop the built-in from seeding for every healthy repo.
-    const warnings: Array<Record<string, unknown>> = [];
-    const h = harness({
-      enrollments: [
-        { repo: "acme/app", triggerMode: "auto", autofix: "off" },
-        { repo: "not a repo", triggerMode: "auto", autofix: "off" },
-      ],
-    });
-    const result = await seedBuiltinAutomations({
-      ...h.deps,
-      log: { info() {}, warn: (b: Record<string, unknown>) => void warnings.push(b) },
-      builtins: [PR_REVIEW_BUILTIN],
-    });
-    expect(result.created).toEqual([PR_REVIEW_BUILTIN_KEY]);
-    const row = h.rows.get("auto-pr-review")!;
-    expect(row.inputs["repos"]).toEqual({ "acme/app": { mode: "auto", autofix: false } });
-    expect(warnings).toEqual([
-      expect.objectContaining({ key: "repos", path: "not a repo", builtinKey: PR_REVIEW_BUILTIN_KEY }),
-    ]);
-    // The shipped schema's own defaults are valid: no other key fell back.
-    expect(warnings).toHaveLength(1);
   });
 
   test("re-run with an unchanged shipped definition is a no-op", async () => {

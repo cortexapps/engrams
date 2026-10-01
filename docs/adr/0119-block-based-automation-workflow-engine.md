@@ -294,6 +294,25 @@ the legacy files, tables, and RPCs are deleted — a clean break, with the
 interpreter-driven built-in tests replacing the legacy workflow tests in the
 same PRs.
 
+**Phase 4.7 (2026-10-01, PR-review legacy deleted).** `PrReviewWorkflow`,
+`ReviewIngressWorkflow`, `dispatch-review`, the review consumer, the
+`review_session` table, `review_enrollment.engine`, the
+`ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED` switch, and the control plane's
+eleven legacy-only methods are gone; the GitHub route only refreshes the
+dossier target and halts the built-in on `@engrams stop`. Divergences from
+the plan above: the sticky status comment (`review.status_comment_id`,
+`upsertStatusComment`) went with the legacy graph rather than moving — the
+built-in's visible `ack`/`status` blocks own the PR status comment, and the
+control plane posts nothing to GitHub itself. The migration lifts every
+enrollment row into the built-in's `repos` map (a product-written entry
+wins) and enables the built-in when anything is enrolled, so a repo still on
+the legacy flag keeps getting reviews across the deploy. Both built-ins now
+seed **enabled**: enrolling a repo (reviews) or picking a default profile
+(Slack) is the one switch, and an empty map or profile admits nothing.
+`review_enrollment` itself stays for one more phase (4.7b): the Repositories
+page still writes the row, and `db/review-enrollment-sync.ts` mirrors it into
+the map in one transaction.
+
 `review_enrollment` lifts into the review built-in's `repos` input at first
 seed and is dropped at the end. GitHub `installation_repositories` events
 reach the ledger but never write the input.
@@ -422,8 +441,9 @@ force-failed (`migrated: engine rebuild`) so no old-body DBOS execution is
 adopted by the new body.
 
 Phase 2 adds `integration_event`. Phase 4 adds `review.automation_run_id`
-and the window flag, then drops `review_session`, `review_enrollment`,
-`webhook_sample`, and `review.workflow_id`.
+and the window flag; 4.7 (migration 0088) drops `review_session`,
+`review_enrollment.engine`, and `review.status_comment_id`, and 4.7b drops
+`review_enrollment`.
 
 Phase 5 (D9–D11) adds `automation_state` (migration 0083) and, diverging
 from the first draft, migration 0084: `automation_version.entrypoints`

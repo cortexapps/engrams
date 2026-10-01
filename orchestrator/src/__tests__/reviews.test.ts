@@ -24,7 +24,7 @@ import type {
 } from "../db/reviews.ts";
 import { ReviewService } from "../gen/engram/app/v1/review_pb.ts";
 import { registerReviews } from "../rpc/reviews.ts";
-import type { ReviewIngressStart } from "../workflows/review-ingress.ts";
+import type { ReviewEnrollmentSync } from "../db/review-enrollment-sync.ts";
 
 const REVIEW_ID = "00000000-0000-4000-8000-000000000001";
 const FINDING_ID = "00000000-0000-4000-8000-000000000002";
@@ -44,7 +44,6 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     trigger: "dispatch",
     status: "verifying",
     githubReviewId: null,
-    statusCommentId: null,
     finderSessionId: null,
     verifierSessionId: null,
     automationRunId: null,
@@ -139,9 +138,6 @@ function makeStore(
     async beginReviewPass() {
       throw new Error("unused");
     },
-    async updateReviewPassContext() {
-      return true;
-    },
     async listPriorPasses() {
       return [];
     },
@@ -171,9 +167,6 @@ function makeStore(
       const row = listRow();
       return row ? [row] : [];
     },
-    async getActiveReviewForTask() {
-      return null;
-    },
     async getActiveReviewForAutomationRun() {
       return null;
     },
@@ -195,7 +188,6 @@ function makeStore(
       throw new Error("unused");
     },
     async setFinderSummary() {},
-    async setStatusCommentId() {},
     async setReviewSessionId() {},
     async setAutomationRunId() {},
     async updateReviewStatus() {
@@ -214,20 +206,21 @@ function spawn(
   role = "user",
   enrollments?: EnrollmentStore,
   profileExists = true,
-  startIngress?: (input: ReviewIngressStart) => Promise<void>,
   overrides?: {
-    reviewEngine?: import("../db/review-engine.ts").ReviewEngineWriter;
+    enrollmentSync?: ReviewEnrollmentSync;
     retryAutomation?: (automationRunId: string) => Promise<string>;
   },
 ) {
-  // A default review-engine writer so the enrollment path resolves offline:
-  // it flips the row in the enrollment store and reports a reconciled,
-  // enabled built-in.
-  const defaultReviewEngine: import("../db/review-engine.ts").ReviewEngineWriter = {
-    async apply(repo, engine) {
-      const row = enrollments ? await enrollments.setEngine(repo, engine) : null;
+  // A default sync so the enrollment path resolves offline: it reads the
+  // row back from the enrollment store and reports it mirrored.
+  const defaultSync: ReviewEnrollmentSync = {
+    async enrolled(repo) {
+      const row = enrollments ? await enrollments.get(repo) : null;
       if (!row) return { kind: "not_enrolled" };
-      return { kind: "applied", enrollment: row, builtinUpdated: true, builtinEnabled: true };
+      return { kind: "applied", enrollment: row };
+    },
+    async removed() {
+      return { kind: "applied" };
     },
   };
   const transport = createRouterTransport((router) =>
@@ -239,11 +232,8 @@ function spawn(
       profiles: {
         get: async (id) => profileExists ? { id } : null,
       },
-      reviewEngine: overrides?.reviewEngine ?? defaultReviewEngine,
+      enrollmentSync: overrides?.enrollmentSync ?? defaultSync,
       ...(overrides?.retryAutomation != null ? { retryAutomation: overrides.retryAutomation } : {}),
-      ...(startIngress != null
-        ? { startIngress, randomUUID: () => "idem-1" }
-        : {}),
     }),
   );
   return createClient(ReviewService, transport);
@@ -270,16 +260,9 @@ function makeEnrollmentStore(rows: EnrollmentRow[]): FakeEnrollmentStore {
     async upsert(input) {
       upserts.push(input);
       const now = new Date("2026-07-17T12:00:00Z");
-      const row = { ...input, engine: input.engine ?? ("legacy" as const), createdAt: now, updatedAt: now };
+      const row = { ...input, createdAt: now, updatedAt: now };
       stored.set(input.repo, row);
       return row;
-    },
-    async setEngine(repo, engine) {
-      const row = stored.get(repo);
-      if (!row) return null;
-      const next = { ...row, engine, updatedAt: new Date() };
-      stored.set(repo, next);
-      return next;
     },
     async delete(repo) {
       deletes.push(repo);
@@ -407,48 +390,7 @@ describe("ReviewService", () => {
     );
   });
 
-  test("RetryReview starts ingress with the prior target id", async () => {
-    const calls: ReviewIngressStart[] = [];
-    const startIngress = async (input: ReviewIngressStart): Promise<void> => {
-      calls.push(input);
-    };
-    const store = makeStore({
-      ...detail,
-      review: reviewRow({ status: "failed" }),
-    });
-    const enrollments = makeEnrollmentStore([{
-      repo: "openai/engrams",
-      triggerMode: "manual",
-      autofix: "off",
-      engine: "legacy",
-      profileId: null,
-      createdAt: CREATED_AT,
-      updatedAt: UPDATED_AT,
-    }]);
-    const response = await spawn(
-      store,
-      true,
-      "user",
-      enrollments,
-      true,
-      startIngress,
-    )
-      .retryReview({ id: REVIEW_ID });
-
-    expect(response.workflowId).toBe("review-ingress:idem-1");
-    expect(response.reviewId).toBeUndefined();
-    expect(calls).toEqual([{
-      provider: "github",
-      repo: "openai/engrams",
-      prNumber: 100,
-      targetId: "target-1",
-      trigger: "retry",
-      idempotencyKey: "idem-1",
-    }]);
-  });
-
-  test("RetryReview on an automation-engine repo retries the built-in, not legacy ingress", async () => {
-    const legacyCalls: ReviewIngressStart[] = [];
+  test("RetryReview re-admits the built-in run behind the review", async () => {
     const store = makeStore({
       ...detail,
       review: reviewRow({ status: "failed", automationRunId: "autorun:b1:github:d1" }),
@@ -456,16 +398,13 @@ describe("ReviewService", () => {
     const enrollments = makeEnrollmentStore([{
       repo: "openai/engrams",
       triggerMode: "auto",
-      engine: "automation",
       autofix: "off",
       profileId: null,
       createdAt: CREATED_AT,
       updatedAt: UPDATED_AT,
     }]);
     const retried: string[] = [];
-    const response = await spawn(store, true, "user", enrollments, true, async (i) => {
-      legacyCalls.push(i);
-    }, {
+    const response = await spawn(store, true, "user", enrollments, true, {
       retryAutomation: async (runId) => {
         retried.push(runId);
         return "autorun:b1:retry:x";
@@ -473,11 +412,10 @@ describe("ReviewService", () => {
     }).retryReview({ id: REVIEW_ID });
 
     expect(retried).toEqual(["autorun:b1:github:d1"]);
-    expect(legacyCalls).toEqual([]); // no legacy ingress
     expect(response.workflowId).toBe("autorun:b1:retry:x");
   });
 
-  test("RetryReview on an automation repo with no automation run is a FailedPrecondition", async () => {
+  test("RetryReview on a pass with no automation run is a FailedPrecondition", async () => {
     const store = makeStore({
       ...detail,
       review: reviewRow({ status: "failed", automationRunId: null }),
@@ -485,41 +423,63 @@ describe("ReviewService", () => {
     const enrollments = makeEnrollmentStore([{
       repo: "openai/engrams",
       triggerMode: "auto",
-      engine: "automation",
       autofix: "off",
       profileId: null,
       createdAt: CREATED_AT,
       updatedAt: UPDATED_AT,
     }]);
     await expectConnectError(
-      spawn(store, true, "user", enrollments, true, async () => {}).retryReview({ id: REVIEW_ID }),
+      spawn(store, true, "user", enrollments, true).retryReview({ id: REVIEW_ID }),
       Code.FailedPrecondition,
     );
   });
 
-  test("UpsertEnrollment enrolls on the automation engine; Delete flips it back out before the row goes", async () => {
-    const applied: Array<{ repo: string; engine: string }> = [];
+  test("UpsertEnrollment mirrors the row into the built-in; Delete removes it from the map before the row goes", async () => {
+    const synced: Array<[string, string]> = [];
     const enrollmentStore = makeEnrollmentStore([]);
-    const reviewEngine: import("../db/review-engine.ts").ReviewEngineWriter = {
-      async apply(repo, engine) {
-        applied.push({ repo, engine });
-        const row = await enrollmentStore.setEngine(repo, engine);
+    const enrollmentSync: ReviewEnrollmentSync = {
+      async enrolled(repo) {
+        synced.push(["enrolled", repo]);
+        const row = await enrollmentStore.get(repo);
         if (!row) return { kind: "not_enrolled" };
-        return { kind: "applied", enrollment: row, builtinUpdated: true, builtinEnabled: true };
+        return { kind: "applied", enrollment: row };
+      },
+      async removed(repo) {
+        synced.push(["removed", repo]);
+        return { kind: "applied" };
       },
     };
-    const admin = spawn(makeStore(null), true, "admin", enrollmentStore, true, undefined, { reviewEngine });
+    const admin = spawn(makeStore(null), true, "admin", enrollmentStore, true, { enrollmentSync });
     const response = await admin.upsertEnrollment({
       repo: "openai/engrams",
       triggerMode: "auto",
       autofix: "manual",
     });
-    expect(response.enrollment?.engine).toBe("automation");
-    expect(applied).toEqual([{ repo: "openai/engrams", engine: "automation" }]);
+    expect(response.enrollment?.repo).toBe("openai/engrams");
+    // The row is written BEFORE the sync reads it into the map.
+    expect(enrollmentStore.upserts).toHaveLength(1);
+    expect(synced).toEqual([["enrolled", "openai/engrams"]]);
 
     await admin.deleteEnrollment({ repo: "openai/engrams" });
-    expect(applied.at(-1)).toEqual({ repo: "openai/engrams", engine: "legacy" });
+    expect(synced.at(-1)).toEqual(["removed", "openai/engrams"]);
     expect(enrollmentStore.deletes).toEqual(["openai/engrams"]);
+  });
+
+  test("UpsertEnrollment before the built-in is seeded is a FailedPrecondition", async () => {
+    const enrollmentStore = makeEnrollmentStore([]);
+    const enrollmentSync: ReviewEnrollmentSync = {
+      async enrolled() {
+        return { kind: "not_seeded" };
+      },
+      async removed() {
+        return { kind: "not_seeded" };
+      },
+    };
+    const admin = spawn(makeStore(null), true, "admin", enrollmentStore, true, { enrollmentSync });
+    await expectConnectError(
+      admin.upsertEnrollment({ repo: "openai/engrams", triggerMode: "auto", autofix: "off" }),
+      Code.FailedPrecondition,
+    );
   });
 
   test("UpsertEnrollment without profile_id keeps the stored override; an empty one clears it", async () => {
@@ -527,7 +487,6 @@ describe("ReviewService", () => {
       repo: "openai/engrams",
       triggerMode: "manual",
       autofix: "off",
-      engine: "legacy",
       profileId: "profile-1",
       createdAt: new Date("2026-07-17T10:00:00Z"),
       updatedAt: new Date("2026-07-17T10:00:00Z"),
@@ -547,28 +506,19 @@ describe("ReviewService", () => {
   });
 
   test("RetryReview returns NotFound for an unknown review", async () => {
-    const startIngress = async (): Promise<void> => {};
     await expectConnectError(
-      spawn(makeStore(null), true, "user", undefined, true, startIngress)
-        .retryReview({ id: REVIEW_ID }),
+      spawn(makeStore(null)).retryReview({ id: REVIEW_ID }),
       Code.NotFound,
     );
   });
 
   test("RetryReview fails when the repo is no longer enrolled", async () => {
-    const startIngress = async (): Promise<void> => {
-      throw new Error("must not start ingress");
-    };
     await expectConnectError(
-      spawn(
-        makeStore(detail),
-        true,
-        "user",
-        makeEnrollmentStore([]),
-        true,
-        startIngress,
-      )
-        .retryReview({ id: REVIEW_ID }),
+      spawn(makeStore(detail), true, "user", makeEnrollmentStore([]), true, {
+        retryAutomation: async () => {
+          throw new Error("must not re-admit");
+        },
+      }).retryReview({ id: REVIEW_ID }),
       Code.FailedPrecondition,
     );
   });
@@ -580,7 +530,6 @@ describe("ReviewService", () => {
       repo: "openai/engrams",
       triggerMode: "auto",
       autofix: "manual",
-      engine: "legacy",
       profileId: "profile-1",
       createdAt,
       updatedAt,

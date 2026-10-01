@@ -794,11 +794,9 @@ const SUPPRESSIBLE_CATCH_ALL = "slack_brain";
 /** Built-in keys whose kill switch is ON. Resolved from config by default;
  * tests inject. Each built-in's switch registers its key here — one line per
  * switch, so the dispatcher gate and the route fallback can never disagree.
- * "pr_review" ← ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED (4.4). */
+ * "slack_brain" ← ORCHESTRATOR_SLACK_AUTOMATION_DISABLED (4.6). */
 export function disabledBuiltinsFromConfig(): ReadonlySet<string> {
   const keys: string[] = [];
-  if (config.reviewAutomationDisabled) keys.push("pr_review");
-  // "slack_brain" ← ORCHESTRATOR_SLACK_AUTOMATION_DISABLED (4.6).
   if (config.slackAutomationDisabled) keys.push("slack_brain");
   return new Set(keys);
 }

@@ -20,7 +20,6 @@
 import { createHash } from "node:crypto";
 
 import { makeAutomationStore, type AutomationRow, type AutomationStore } from "../../db/automations.ts";
-import { makeEnrollmentStore } from "../../db/enrollments.ts";
 import { makeIntegrationConnectionStore } from "../../db/integration-connections.ts";
 import { isUniqueViolation } from "../../db/pg-errors.ts";
 import { log as rootLog } from "../../log.ts";
@@ -47,11 +46,6 @@ export interface BuiltinSeedDeps {
   store: BuiltinSeedStore;
   connections: {
     ensureDefault(provider: string, displayName: string): Promise<{ id: string }>;
-  };
-  /** The review enrollment lift (first seed of pr_review only). Legacy table;
-   * deleted in phase 4.7 along with this seam. */
-  enrollments?: {
-    list(): Promise<Array<{ repo: string; triggerMode: string; autofix: string }>>;
   };
   builtins?: BuiltinAutomation[];
   log?: { info(b: Record<string, unknown>, m: string): void; warn(b: Record<string, unknown>, m: string): void };
@@ -115,23 +109,6 @@ async function materialize(
   return definition;
 }
 
-/** The review enrollment lift: each legacy review_enrollment row becomes an
- * entry in the `repos` map input. Only on first seed; the input is the
- * org's afterwards. */
-async function liftEnrollments(
-  deps: BuiltinSeedDeps,
-): Promise<Record<string, { mode: "auto" | "on_request"; autofix: boolean }>> {
-  if (!deps.enrollments) return {};
-  const repos: Record<string, { mode: "auto" | "on_request"; autofix: boolean }> = {};
-  for (const row of await deps.enrollments.list()) {
-    repos[row.repo] = {
-      mode: row.triggerMode === "auto" ? "auto" : "on_request",
-      autofix: row.autofix !== "off",
-    };
-  }
-  return repos;
-}
-
 /** Seed-time guard (ADR 0119 phase 4.3b): a legacy enrollment row (or a
  * default) the schema rejects must not block the built-in from seeding. A
  * bad map ROW drops just that row; any other violation reverts the whole
@@ -182,9 +159,6 @@ async function seedOne(
 
   if (!existing) {
     const assembled = await builtin.defaultInputs();
-    if (builtin.key === PR_REVIEW_BUILTIN_KEY) {
-      assembled["repos"] = await liftEnrollments(deps);
-    }
     const inputs = sanitizeSeedInputs(definition.inputsSchema, assembled, logger, builtin.key);
     try {
       await deps.store.create(
@@ -310,6 +284,5 @@ export function productionBuiltinSeedDeps(): BuiltinSeedDeps {
   return {
     store: makeAutomationStore(),
     connections: makeIntegrationConnectionStore(),
-    enrollments: makeEnrollmentStore(),
   };
 }

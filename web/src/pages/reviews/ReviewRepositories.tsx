@@ -122,10 +122,7 @@ export function ReviewRepositories() {
       )}
 
       {isPending ? (
-        <SkeletonRows
-          rows={3}
-          columns={["minmax(12rem,1fr)", "6rem", "6rem", "minmax(8rem,1fr)", "6rem"]}
-        />
+        <SkeletonRows rows={3} columns={["minmax(12rem,1fr)", "6rem", "6rem", "6rem"]} />
       ) : rows.length === 0 ? (
         <EmptyState>
           No repos enrolled yet. Enroll one to have engrams review its pull requests.
@@ -137,7 +134,6 @@ export function ReviewRepositories() {
               <TableHead>Repository</TableHead>
               <TableHead>Trigger</TableHead>
               <TableHead>Autofix</TableHead>
-              <TableHead>Engine</TableHead>
               <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
@@ -160,16 +156,6 @@ function TriggerBadge({ mode }: { mode: string }) {
   );
 }
 
-function EngineBadge({ engine }: { engine: string }) {
-  return engine === "automation" ? (
-    <Badge variant="outline">automation</Badge>
-  ) : (
-    <Badge variant="secondary" title="Reviews on the retired graph until saved again">
-      legacy
-    </Badge>
-  );
-}
-
 function EnrollmentRow({ row }: { row: RepoEnrollment }) {
   const remove = useDeleteEnrollment();
   return (
@@ -179,9 +165,6 @@ function EnrollmentRow({ row }: { row: RepoEnrollment }) {
         <TriggerBadge mode={row.triggerMode} />
       </TableCell>
       <TableCell className="text-xs text-muted-foreground">{row.autofix}</TableCell>
-      <TableCell>
-        <EngineBadge engine={row.engine} />
-      </TableCell>
       <TableCell>
         <div className="flex items-center justify-end gap-1">
           <EnrollDialog existing={row} />
@@ -361,13 +344,7 @@ function EnrollDialog({ existing }: { existing?: RepoEnrollment }) {
               Cancel
             </Button>
             <Button type="submit" disabled={upsert.isPending}>
-              {upsert.isPending
-                ? "Saving…"
-                : isEdit
-                  ? existing.engine === "legacy"
-                    ? "Save and move to automation"
-                    : "Save"
-                  : "Enroll"}
+              {upsert.isPending ? "Saving…" : isEdit ? "Save" : "Enroll"}
             </Button>
           </DialogFooter>
         </form>

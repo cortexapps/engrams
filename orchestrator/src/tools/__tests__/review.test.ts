@@ -9,7 +9,6 @@ import type {
   ReviewVerdictInput,
 } from "../../db/reviews.ts";
 import type { AutomationInbox } from "../../automations/engine/inbox.ts";
-import { REVIEW_TOPIC, type ReviewInbox } from "../../workflows/review-inbox.ts";
 import { compileToolManifest } from "../manifest.ts";
 import { createToolRegistry, type ToolContext } from "../registry.ts";
 import {
@@ -35,7 +34,6 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     trigger: "dispatch",
     status: "finding",
     githubReviewId: null,
-    statusCommentId: null,
     finderSessionId: null,
     verifierSessionId: null,
     automationRunId: null,
@@ -86,12 +84,7 @@ function fakeReviewStore(options: {
   active?: ReviewRow | null;
   detail?: ReviewDetail | null;
   findingCount?: number;
-  /** Which lookup finds the active pass: by the session's task (legacy
-   * worker), by the session's automation run (built-in worker), or both. */
-  activeVia?: "task" | "run" | "both";
 } = {}) {
-  const byTask = (options.activeVia ?? "task") !== "run";
-  const byRun = (options.activeVia ?? "task") !== "task";
   const findings: ReviewFindingInput[] = [];
   const verdicts: ReviewVerdictInput[] = [];
   const summaries: Array<{ reviewId: string; summaryMd: string }> = [];
@@ -112,9 +105,6 @@ function fakeReviewStore(options: {
     async beginReviewPass() {
       throw new Error("unused");
     },
-    async updateReviewPassContext() {
-      return true;
-    },
     async listPriorPasses() {
       return [];
     },
@@ -131,11 +121,8 @@ function fakeReviewStore(options: {
     async listPasses() {
       return [];
     },
-    async getActiveReviewForTask() {
-      return byTask ? active : null;
-    },
     async getActiveReviewForAutomationRun() {
-      return byRun ? active : null;
+      return active;
     },
     async setGithubReviewId() {},
     async getActiveReviewForTarget() {
@@ -169,7 +156,6 @@ function fakeReviewStore(options: {
     async setFinderSummary(reviewId, summaryMd) {
       summaries.push({ reviewId, summaryMd });
     },
-    async setStatusCommentId() {},
     async setReviewSessionId() {},
     async setAutomationRunId() {},
     async recordEvent() {},
@@ -204,10 +190,9 @@ function reviewRegistry(
   const registry = createToolRegistry();
   registerReviewTools(registry, {
     reviews: store,
-    reviewSessions: deps.reviewSessions ?? { find: async () => null },
-    ...(deps.notify ? { notify: deps.notify } : {}),
-    // Default: not owned by an automation run, so the legacy binding decides.
-    findAutomationBinding: deps.findAutomationBinding ?? (async () => null),
+    // Default: a worker bound to a run, the only shape production has.
+    findAutomationBinding: deps.findAutomationBinding
+      ?? (async () => ({ runId: "autorun:auto-1:github:d1" })),
     ...(deps.notifyAutomation ? { notifyAutomation: deps.notifyAutomation } : {}),
   });
   return registry;
@@ -239,22 +224,6 @@ function automationNotifier() {
   return { notifyAutomation, calls };
 }
 
-function notifier() {
-  const calls: Array<{
-    destinationId: string;
-    message: ReviewInbox;
-    topic: string;
-    idempotencyKey: string;
-  }> = [];
-  const notify: NonNullable<ReviewToolDeps["notify"]> = async (
-    destinationId,
-    message,
-    topic,
-    idempotencyKey,
-  ) => void calls.push({ destinationId, message, topic, idempotencyKey });
-  return { notify, calls };
-}
-
 describe("review tools", () => {
   test("capability gate excludes all review tools from an ungranted manifest", () => {
     const fake = fakeReviewStore();
@@ -268,10 +237,10 @@ describe("review tools", () => {
     ]);
   });
 
-  test("a built-in worker resolves its pass through the automation binding, not the task", async () => {
-    // The worker's task is the AUTOMATION's task, so the task lookup misses;
-    // the session's run owns the pass (review.automation_run_id).
-    const fake = fakeReviewStore({ active: reviewRow({ status: "finding" }), activeVia: "run" });
+  test("a worker resolves its pass through the automation binding", async () => {
+    // The worker's task is the AUTOMATION's task; the session's run owns the
+    // pass (review.automation_run_id).
+    const fake = fakeReviewStore({ active: reviewRow({ status: "finding" }) });
     const automation = automationNotifier();
     const registry = reviewRegistry(fake.store, {
       findAutomationBinding: async () => ({ runId: "autorun:auto-1:github:d1" }),
@@ -288,8 +257,10 @@ describe("review tools", () => {
     await expect(done.handler(context("finder_done"), done.input.parse({ summary_md: "Done." }))).resolves.toEqual({ recorded: true });
     expect(automation.calls.map((c) => c.message.kind)).toEqual(["signal"]);
 
-    // With no binding either, the tool still answers "no active review".
-    const orphan = reviewRegistry(fakeReviewStore({ activeVia: "run" }).store).get("submit_finding");
+    // With no binding, the tool answers "no active review".
+    const orphan = reviewRegistry(fakeReviewStore().store, {
+      findAutomationBinding: async () => null,
+    }).get("submit_finding");
     if (!orphan || orphan.handling !== "handled") throw new Error("submit_finding not registered");
     expect(await orphan.handler(context("submit_finding"), orphan.input.parse(validFinding()))).toEqual({
       error: "no active review for this session",
@@ -447,72 +418,12 @@ describe("review tools", () => {
     expect(fake.summaries).toEqual([{ reviewId: REVIEW_ID, summaryMd: "One candidate." }]);
   });
 
-  test("finder_done signals the bound workflow with a stable key", async () => {
-    const fake = fakeReviewStore();
-    const sent = notifier();
-    const done = reviewRegistry(fake.store, {
-      reviewSessions: {
-        find: async () => ({ reviewWorkflowId: "review-wf-1", role: "finder" }),
-      },
-      notify: sent.notify,
-    }).get("finder_done");
-    if (!done || done.handling !== "handled") throw new Error("finder_done not registered");
-
-    await expect(done.handler(
-      context(done.name),
-      done.input.parse({ summary_md: "Finished." }),
-    )).resolves.toEqual({ recorded: true });
-
-    expect(sent.calls).toEqual([{
-      destinationId: "review-wf-1",
-      message: { kind: "phase_done", role: "finder" },
-      topic: REVIEW_TOPIC,
-      idempotencyKey: "review:session-1:finder-done",
-    }]);
-  });
-
-  test("finder_done skips a missing binding and tolerates notification failure", async () => {
-    const fake = fakeReviewStore();
-    const sent = notifier();
-    const unbound = reviewRegistry(fake.store, { notify: sent.notify }).get("finder_done");
-    if (!unbound || unbound.handling !== "handled") {
-      throw new Error("finder_done not registered");
-    }
-    await expect(unbound.handler(
-      context(unbound.name),
-      unbound.input.parse({ summary_md: "Unbound." }),
-    )).resolves.toEqual({ recorded: true });
-    expect(sent.calls).toEqual([]);
-
-    const failing = reviewRegistry(fake.store, {
-      reviewSessions: {
-        find: async () => ({ reviewWorkflowId: "review-wf-1", role: "finder" }),
-      },
-      notify: async () => {
-        throw new Error("mailbox unavailable");
-      },
-    }).get("finder_done");
-    if (!failing || failing.handling !== "handled") {
-      throw new Error("finder_done not registered");
-    }
-    await expect(failing.handler(
-      context(failing.name),
-      failing.input.parse({ summary_md: "Still recorded." }),
-    )).resolves.toEqual({ recorded: true });
-  });
-
-  test("finder_done on an automation-owned session signals the run, not the legacy workflow", async () => {
+  test("finder_done signals the session's run with a stable key", async () => {
     // Three findings recorded so far: the signal carries them as
     // candidate_count for the built-in's "any candidates?" branch.
     const fake = fakeReviewStore({ findingCount: 3 });
-    const legacy = notifier();
     const automation = automationNotifier();
     const done = reviewRegistry(fake.store, {
-      // Both bindings exist during the parallel window; the automation one wins.
-      reviewSessions: {
-        find: async () => ({ reviewWorkflowId: "review-wf-1", role: "finder" }),
-      },
-      notify: legacy.notify,
       findAutomationBinding: async () => ({ runId: "autorun:auto-1:github:d1" }),
       notifyAutomation: automation.notifyAutomation,
     }).get("finder_done");
@@ -533,10 +444,9 @@ describe("review tools", () => {
       },
       idempotencyKey: "autorun:session-1:signal:finder_done:call-1:autorun:auto-1:github:d1",
     }]);
-    expect(legacy.calls).toEqual([]);
   });
 
-  test("submit_verdict on an automation-owned session signals verifier_done to the run", async () => {
+  test("submit_verdict signals verifier_done to the run", async () => {
     const fake = fakeReviewStore({
       active: reviewRow({ status: "verifying" }),
       detail: {
@@ -545,13 +455,8 @@ describe("review tools", () => {
         verdicts: [],
       },
     });
-    const legacy = notifier();
     const automation = automationNotifier();
     const verdict = reviewRegistry(fake.store, {
-      reviewSessions: {
-        find: async () => ({ reviewWorkflowId: "review-wf-1", role: "verifier" }),
-      },
-      notify: legacy.notify,
       findAutomationBinding: async () => ({ runId: "autorun:auto-1:github:d1" }),
       notifyAutomation: automation.notifyAutomation,
     }).get("submit_verdict");
@@ -570,7 +475,6 @@ describe("review tools", () => {
     expect(automation.calls.map((call) => call.message)).toEqual([
       { kind: "signal", name: "verifier_done", sessionId: "session-1", payload: {} },
     ]);
-    expect(legacy.calls).toEqual([]);
   });
 
   test("an automation notification outage never fails the tool", async () => {
@@ -616,12 +520,10 @@ describe("review tools", () => {
         verdicts: [],
       },
     });
-    const sent = notifier();
+    const automation = automationNotifier();
     const tool = reviewRegistry(fake.store, {
-      reviewSessions: {
-        find: async () => ({ reviewWorkflowId: "review-wf-1", role: "verifier" }),
-      },
-      notify: sent.notify,
+      findAutomationBinding: async () => ({ runId: "autorun:auto-1:github:d1" }),
+      notifyAutomation: automation.notifyAutomation,
     }).get("submit_verdict");
     if (!tool || tool.handling !== "handled") throw new Error("submit_verdict not registered");
 
@@ -631,7 +533,7 @@ describe("review tools", () => {
       confidence: "high",
       reasoning: "Reproduced.",
     }));
-    expect(sent.calls).toEqual([]);
+    expect(automation.calls).toEqual([]);
 
     await tool.handler(
       { ...context(tool.name), toolCallId: "call-2" },
@@ -642,11 +544,8 @@ describe("review tools", () => {
         reasoning: "Not reproducible.",
       }),
     );
-    expect(sent.calls).toEqual([{
-      destinationId: "review-wf-1",
-      message: { kind: "phase_done", role: "verifier" },
-      topic: REVIEW_TOPIC,
-      idempotencyKey: "review:session-1:verifier-done",
-    }]);
+    expect(automation.calls.map((call) => call.message)).toEqual([
+      { kind: "signal", name: "verifier_done", sessionId: "session-1", payload: {} },
+    ]);
   });
 });

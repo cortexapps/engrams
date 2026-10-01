@@ -11,7 +11,6 @@ const state = vi.hoisted(() => ({
     repo: string;
     triggerMode: string;
     autofix: string;
-    engine: string;
   }>,
   profiles: [] as Array<{ id: string; name: string; designation?: string }>,
 }));
@@ -31,18 +30,15 @@ vi.mock("../../hooks/useAutomations", () => ({
 beforeEach(() => {
   upsert.mockClear();
   remove.mockClear();
-  state.enrollments = [
-    { repo: "cortexapps/engrams", triggerMode: "manual", autofix: "off", engine: "automation" },
-  ];
+  state.enrollments = [{ repo: "cortexapps/engrams", triggerMode: "manual", autofix: "off" }];
   state.profiles = [{ id: "p1", name: "Reviewer", designation: "pr_reviewer" }];
 });
 
 describe("ReviewRepositories", () => {
-  it("lists enrolled repos with their trigger mode, engine, and the link to the automation", async () => {
+  it("lists enrolled repos with their trigger mode and the link to the automation", async () => {
     renderWithProviders(<ReviewRepositories />);
     expect(await screen.findByText("cortexapps/engrams")).toBeTruthy();
     expect(screen.getByText("@mention")).toBeTruthy();
-    expect(screen.getByText("automation")).toBeTruthy();
     expect(screen.getByRole("link", { name: /PR review automation/ })).toBeTruthy();
     // A pr_reviewer profile exists → no warning banner.
     expect(screen.queryByRole("alert")).toBeNull();
@@ -68,19 +64,6 @@ describe("ReviewRepositories", () => {
         autofix: "off",
       }),
     );
-  });
-
-  it("marks a legacy row and offers to move it on save", async () => {
-    state.enrollments = [
-      { repo: "cortexapps/brain-backend", triggerMode: "manual", autofix: "off", engine: "legacy" },
-    ];
-    renderWithProviders(<ReviewRepositories />);
-    expect(await screen.findByText("legacy")).toBeTruthy();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: /^edit$/i }));
-    expect(
-      await screen.findByRole("button", { name: /save and move to automation/i }),
-    ).toBeTruthy();
   });
 
   it("un-enrolls a repo via the confirm dialog", async () => {

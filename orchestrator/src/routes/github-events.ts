@@ -3,7 +3,6 @@
 import { Hono } from "hono";
 
 import { config } from "../config.ts";
-import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import {
   makeReviewStore,
   type ReviewStore,
@@ -29,15 +28,6 @@ import {
   type ReviewCoordinate,
   type StopAutomationReviewResult,
 } from "../reviews/automation-review.ts";
-import {
-  dispatchReview,
-  type DispatchReviewInput,
-  type DispatchReviewResult,
-} from "../workflows/dispatch-review.ts";
-import {
-  startReviewIngress,
-  type ReviewIngressStart,
-} from "../workflows/review-ingress.ts";
 
 const log = rootLog.child({ component: "github-webhook" });
 const AUTHORIZED_COMMENT_ASSOCIATIONS: ReadonlySet<string> = new Set([
@@ -48,15 +38,9 @@ const AUTHORIZED_COMMENT_ASSOCIATIONS: ReadonlySet<string> = new Set([
 
 export interface GithubEventsDeps {
   webhookSecret?: () => Promise<string>;
-  enrollments?: Pick<EnrollmentStore, "get">;
-  dispatch?: (input: DispatchReviewInput) => Promise<DispatchReviewResult>;
-  /** Starts the durable ingress workflow that resolves the change and then starts
-   *  a review (ADR 0100 d11). Separate from `dispatch`, which carries comments
-   *  and stops straight to a running pass and needs no resolution. */
-  startIngress?: (input: ReviewIngressStart) => Promise<void>;
-  /** `@engrams stop` for a repo on the automation engine: halt the built-in
-   *  run behind the PR's active pass (the built-in's own admission filters
-   *  the stop comment out, so the route must reach the run directly). */
+  /** `@engrams stop`: halt the built-in run behind the PR's active pass (the
+   *  built-in's own admission filters the stop comment out, so the route
+   *  must reach the run directly). */
   stopAutomationReview?: (input: ReviewCoordinate) => Promise<StopAutomationReviewResult>;
   /** Refresh a target only when it already exists. Non-reviewing PR actions
    *  must never create dossiers for pull requests engrams has never reviewed. */
@@ -67,31 +51,12 @@ export interface GithubEventsDeps {
   /** The review App's @-mention handle (its slug). Defaults to the deployment's
    *  GITHUB_APP_LOGIN; blank disables mention commands. */
   mentionHandle?: string;
-  /** ADR 0119 phase 4.4: the kill switch. When true, every repo reviews on the
-   *  legacy path regardless of its `engine` flag. Defaults to the config value. */
-  reviewAutomationDisabled?: boolean;
 }
 
 export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
   const webhookSecret = deps.webhookSecret ?? getGithubWebhookSecret;
   const mentionHandle = deps.mentionHandle ?? config.githubAppLogin;
-  const reviewAutomationDisabled = deps.reviewAutomationDisabled ?? config.reviewAutomationDisabled;
   const stopAutomation = deps.stopAutomationReview ?? stopAutomationReview;
-  // A repo reviews on the built-in engine when its enrollment says so AND the
-  // fleet-wide kill switch is off. The ingress spine has already ledgered the
-  // delivery and dispatchIntegrationEvent routes it to the built-in, whose
-  // inputs.repos filter admits the repo — so on this path the legacy start is
-  // simply skipped (the target is still refreshed so the dossier stays current).
-  const onAutomationEngine = (
-    enrollment: { engine: "legacy" | "automation" } | null | undefined,
-  ): boolean => enrollment?.engine === "automation" && !reviewAutomationDisabled;
-  let enrollmentStore = deps.enrollments;
-  const enrollments = (): Pick<EnrollmentStore, "get"> =>
-    (enrollmentStore ??= makeEnrollmentStore());
-  const dispatch = deps.dispatch ?? ((input) => dispatchReview({
-    enrollments: enrollments(),
-  }, input));
-  const startIngress = deps.startIngress ?? startReviewIngress;
   let reviewStore: ReviewStore | undefined;
   const reviews = (): ReviewStore => (reviewStore ??= makeReviewStore());
   const refreshTarget = deps.refreshTarget ?? (async (input) => {
@@ -181,83 +146,34 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
     }
 
     if (event.kind === "pull_request") {
-      const enrollment = await enrollments().get(event.repo);
-      const startsReview = (
-        event.action === "opened"
-        || event.action === "synchronize"
-        || event.action === "ready_for_review"
-      ) && enrollment?.triggerMode === "auto" && !event.draft;
-
-      if (!startsReview) {
-        if (event.pr.providerId === null) {
-          log.warn(
-            { repo: event.repo, prNumber: event.prNumber, action: event.action },
-            "github PR target refresh skipped because the payload had no provider id",
-          );
-          return c.body(null, 200);
-        }
-        const refreshed = await refreshTarget({
-          provider: "github",
-          providerId: event.pr.providerId,
-          repo: event.repo,
-          number: event.prNumber,
-          title: event.pr.title,
-          author: event.pr.author,
-          state: event.pr.state,
-          url: event.pr.url,
-          providerUpdatedAt: event.pr.providerUpdatedAt,
-        });
-        log.info(
-          {
-            repo: event.repo,
-            prNumber: event.prNumber,
-            action: event.action,
-            refreshed,
-          },
-          "github PR action refreshed target without starting a review",
-        );
-        return c.body(null, 200);
-      }
-      if (onAutomationEngine(enrollment)) {
-        // The built-in engine reviews this repo: the spine dispatched the
-        // delivery to it already. Keep the dossier target fresh (same as the
-        // non-starting path) and skip the legacy ingress.
-        if (event.pr.providerId !== null) {
-          await refreshTarget({
-            provider: "github",
-            providerId: event.pr.providerId,
-            repo: event.repo,
-            number: event.prNumber,
-            title: event.pr.title,
-            author: event.pr.author,
-            state: event.pr.state,
-            url: event.pr.url,
-            providerUpdatedAt: event.pr.providerUpdatedAt,
-          });
-        }
-        log.info(
+      // The spine dispatched the delivery to the PR-review built-in already;
+      // its admission decides whether this action starts a pass. The route
+      // only keeps the dossier target fresh for a PR engrams has reviewed.
+      if (event.pr.providerId === null) {
+        log.warn(
           { repo: event.repo, prNumber: event.prNumber, action: event.action },
-          "github PR review runs on the automation engine; legacy ingress skipped",
+          "github PR target refresh skipped because the payload had no provider id",
         );
         return c.body(null, 200);
       }
-      // The delivery already describes the change in full, so ingress starts a
-      // review without asking GitHub anything (ADR 0100 decision 11).
-      await startIngress({
+      const refreshed = await refreshTarget({
         provider: "github",
+        providerId: event.pr.providerId,
         repo: event.repo,
-        prNumber: event.prNumber,
-        trigger: event.action === "synchronize" ? "synchronize" : "opened",
-        idempotencyKey,
-        headSha: event.headSha,
-        ...(event.baseSha != null ? { baseSha: event.baseSha } : {}),
-        pr: event.pr,
+        number: event.prNumber,
+        title: event.pr.title,
+        author: event.pr.author,
+        state: event.pr.state,
+        url: event.pr.url,
+        providerUpdatedAt: event.pr.providerUpdatedAt,
       });
+      log.info(
+        { repo: event.repo, prNumber: event.prNumber, action: event.action, refreshed },
+        "github PR action refreshed the review target",
+      );
       return c.body(null, 200);
     }
 
-    const enrollment = await enrollments().get(event.repo);
-    if (!enrollment) return c.body(null, 200);
     const command = parseReviewCommand(event.body, mentionHandle);
     if (!command) return c.body(null, 200);
     if (event.senderType === "Bot") {
@@ -281,41 +197,18 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
     }
 
     if (command.kind === "review") {
-      if (onAutomationEngine(enrollment)) {
-        // The @mention delivery was ledgered and dispatched to the built-in,
-        // whose filter admits the `^@engrams review` comment. Nothing to start.
-        log.info(
-          { repo: event.repo, prNumber: event.prNumber },
-          "github review command runs on the automation engine; legacy ingress skipped",
-        );
-        return c.body(null, 200);
-      }
-      // An issue_comment payload describes the ISSUE, and `issue.id` is the
-      // issue's id, not the pull request's. So ingress must resolve this one.
-      await startIngress({
-        provider: "github",
-        repo: event.repo,
-        prNumber: event.prNumber,
-        trigger: "command",
-        idempotencyKey,
-        ...(command.focus != null ? { focus: command.focus } : {}),
-      });
+      // The @mention delivery was ledgered and dispatched to the built-in,
+      // whose filter admits the `^@engrams review` comment. Nothing to start.
+      log.info(
+        { repo: event.repo, prNumber: event.prNumber },
+        "github review command dispatched to the built-in by the spine",
+      );
     } else if (command.kind === "stop") {
-      if (onAutomationEngine(enrollment)) {
-        const result = await stopAutomation({ repo: event.repo, prNumber: event.prNumber });
-        log.info(
-          { repo: event.repo, prNumber: event.prNumber, ...result },
-          "github stop command handled on the automation engine",
-        );
-        return c.body(null, 200);
-      }
-      await dispatch({
-        repo: event.repo,
-        prNumber: event.prNumber,
-        trigger: "command",
-        idempotencyKey,
-        stop: true,
-      });
+      const result = await stopAutomation({ repo: event.repo, prNumber: event.prNumber });
+      log.info(
+        { repo: event.repo, prNumber: event.prNumber, ...result },
+        "github stop command halted the built-in run",
+      );
     } else if (command.kind === "fix") {
       log.info(
         { repo: event.repo, prNumber: event.prNumber, commentId: event.commentId },

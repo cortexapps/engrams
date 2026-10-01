@@ -180,15 +180,6 @@ export interface Config {
    */
   sweepDisabled: boolean;
   /**
-   * ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED — kill switch for the PR-review
-   * parallel window (ADR 0119 phase 4.4). When set, every repo reviews on the
-   * legacy PrReviewWorkflow regardless of its `review_enrollment.engine` flag,
-   * so a bad built-in review pass can be stopped fleet-wide without editing
-   * rows. "1" or "true" enables it; default false. The built-in's own
-   * `enabled` toggle is the second, independent brake.
-   */
-  reviewAutomationDisabled: boolean;
-  /**
    * ORCHESTRATOR_SLACK_AUTOMATION_DISABLED — kill switch for the Slack
    * thread-brain built-in's per-channel window (ADR 0119 phase 4.6). When
    * set, every Slack channel takes the legacy thread workflow, flagged or
@@ -480,13 +471,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // falling back.
   const sweepDisabled =
     env["ORCHESTRATOR_SWEEP_DISABLED"] === "1" || env["ORCHESTRATOR_SWEEP_DISABLED"] === "true";
-  // Deliberately narrow: only the documented "1"/"true" spellings arm the
-  // review-automation kill switch, matching ORCHESTRATOR_SWEEP_DISABLED.
-  const reviewAutomationDisabled =
-    env["ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED"] === "1" ||
-    env["ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED"] === "true";
-  // OPTIONAL: the Slack automation window's kill switch. Same deliberately
-  // narrow spelling as the sweep switch.
+  // OPTIONAL: the Slack automation window's kill switch. Deliberately
+  // narrow: only the documented "1"/"true" spellings arm it, matching
+  // ORCHESTRATOR_SWEEP_DISABLED.
   const slackAutomationDisabled =
     env["ORCHESTRATOR_SLACK_AUTOMATION_DISABLED"] === "1" ||
     env["ORCHESTRATOR_SLACK_AUTOMATION_DISABLED"] === "true";
@@ -551,7 +538,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     cookiePrefix,
     adminEmails,
     sweepDisabled,
-    reviewAutomationDisabled,
     slackAutomationDisabled,
     sweepIntervalMs,
     sweepGraceMs,

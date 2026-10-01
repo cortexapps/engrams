@@ -784,11 +784,10 @@ describe("runSweepTick", () => {
 });
 
 describe("sweep policy exhaustiveness", () => {
-  test("accepts the four registered production workflow names", () => {
+  test("accepts the registered production workflow names", () => {
     expect(() =>
       assertSweepPoliciesExhaustive([
         "SlackThreadWorkflow",
-        "PrReviewWorkflow",
         "ToolExecWorkflow",
         "AutomationRunWorkflow",
       ]),

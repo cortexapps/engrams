@@ -1,4 +1,6 @@
-/** Durable review-record and worker-session operations: the review product's control plane, importable by the legacy workflow adapter (workflows/review-control-plane.ts) and the ADR 0119 system blocks alike. */
+/** Durable review-record and worker-session operations: the review product's
+ * control plane, behind the ADR 0119 review blocks (automations/engine/blocks/
+ * review.ts). The PR-review built-in is the only driver since phase 4.7. */
 
 import { Code, ConnectError } from "@connectrpc/connect";
 
@@ -12,8 +14,6 @@ import {
   type RunExecRuntime,
 } from "../exec/durable-exec.ts";
 import { stageFiles, type FileStagingClient } from "../exec/stage-files.ts";
-import { makeConnectorStore } from "../db/connectors.ts";
-import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import {
   makeReviewStore,
@@ -21,35 +21,17 @@ import {
   type BeginReviewPassResult,
   type PriorReviewPass,
   type ReviewStore,
-  type UpdateReviewPassContextInput,
 } from "../db/reviews.ts";
-import {
-  makeReviewSessionStore,
-  type ReviewSessionStore,
-} from "../db/review-sessions.ts";
 import { type ProfileNetwork } from "../db/schema.ts";
 import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
-import {
-  harnessCatalog as defaultHarnessCatalog,
-  images as defaultImages,
-  sessions as defaultSessions,
-} from "../control-plane/client.ts";
-import {
-  createSessionForExistingTask,
-  registerSessionListener as registerExistingSessionListener,
-  type CreateSessionForExistingTaskParams,
-  type HarnessCatalogClient,
-  type TaskSessionsClient,
-} from "../rpc/task-create.ts";
-import type { ImagesClient } from "../rpc/profiles.ts";
+import { sessions as defaultSessions } from "../control-plane/client.ts";
+import type { TaskSessionsClient } from "../rpc/task-create.ts";
 import {
   buildInlineCommentBody,
   buildReviewSummary,
-  buildStatusComment,
   makeGithubReviewPoster,
   type GithubReviewPoster,
-  type ReviewStatusPhase,
 } from "./github-review.ts";
 import type { PrContext } from "./pr-context.ts";
 import { buildDecision, type PolicyDecision } from "./policy-gate.ts";
@@ -74,33 +56,9 @@ export interface ResolveReviewTargetInput {
   providerUpdatedAt: Date | null;
 }
 
-export interface StartReviewPassInput {
-  reviewId: string;
-  taskId: string;
-  repo: string;
-  prNumber: number;
-  trigger: string;
-  idempotencyKey: string;
-  headSha: string;
-  baseSha: string;
-  focus?: string;
-}
-
-/** Who asked for a review. Carried whole so the ingress workflow body never has
- *  to assemble a log payload of its own — see `abandonIngress`. */
-export interface ReviewIngressSource {
-  provider: string;
-  repo: string;
-  prNumber: number;
-  trigger: string;
-}
-
 export interface ReviewControlPlane {
-  /** The name stays `resolvePrHeads` even though it now also returns the PR
-   *  context: it appears as a `step(...)` name inside `prReviewWorkflowImpl`,
-   *  and DBOS derives the application version from that function's source, so
-   *  renaming it would rotate the version and strand in-flight reviews for no
-   *  benefit. */
+  /** The heads a pass pins itself to, plus the PR context recorded on the
+   *  review record. */
   resolvePrHeads(repo: string, prNumber: number): Promise<{
     headSha: string;
     baseSha: string;
@@ -112,45 +70,6 @@ export interface ReviewControlPlane {
   /** Atomically decide whether this request deduplicates or creates a pass. The
    *  transaction and nothing else — see the implementation's warning. */
   createReviewPass(input: BeginReviewPassInput): Promise<BeginReviewPassResult>;
-  /** Post the 👀 status comment for a freshly created pass. Split out of
-   *  `createReviewPass` so a slow or failing GitHub ack can never re-run that
-   *  method's non-idempotent transaction. */
-  acknowledgeReviewPass(reviewId: string): Promise<void>;
-  /** Fill an early retry row once GitHub resolves its current pass facts. */
-  updateReviewPassContext(
-    reviewId: string,
-    input: UpdateReviewPassContextInput,
-  ): Promise<boolean>;
-  /** Hand a fully resolved request to the review workflow. */
-  startReviewPass(input: StartReviewPassInput): Promise<void>;
-  /** Tell a committed predecessor to tear down without changing its status. */
-  signalSupersededPass(reviewId: string, idempotencyKey: string): Promise<void>;
-  /**
-   * The single give-up path for ingress: a request that will never become a
-   * review.
-   *
-   * `reviewId` is present only when ingress had already created a pass row (the
-   * retry entry point does). Then this fails that row, so the user who pressed
-   * retry sees a failed review instead of a spinner. With no row there is
-   * nothing to fail, so it only reports.
-   *
-   * Both arms — and their logging — live here rather than in the workflow so
-   * the ingress body stays free of branches and log calls. DBOS hashes that
-   * body to derive the application version, so editing a log message there
-   * would rotate the version and strand in-flight executions (ADR 0104).
-   */
-  abandonIngress(
-    source: ReviewIngressSource,
-    reason: string,
-    reviewId?: string,
-  ): Promise<void>;
-  createFinderSession(input: {
-    reviewId: string;
-    taskId: string;
-    repo: string;
-    prNumber: number;
-    workflowId: string;
-  }): Promise<{ sessionId: string }>;
   bootstrapFinderSession(sessionId: string, input: {
     reviewId: string;
     repo: string;
@@ -161,18 +80,9 @@ export interface ReviewControlPlane {
     /** Stage files only; the caller already cloned (phase 4.3). */
     skipClone?: boolean;
   }): Promise<void>;
-  sendFinderPrompt(sessionId: string, input: {
-    reviewId: string;
-    repo: string;
-    prNumber: number;
-    headSha: string;
-    baseSha: string;
-    focus?: string;
-  }): Promise<void>;
-  /** ADR 0119 phase 4.3: the prompt-composition half of sendFinderPrompt
-   *  (merge-base resolution in the clone + re-review scoping + prior-pass
-   *  context), returned as text for a generic send_prompt block. Byte-identical
-   *  to what the legacy path sends. */
+  /** The finder prompt (merge-base resolution in the clone + re-review
+   *  scoping + prior-pass context), returned as text for a generic
+   *  send_prompt block. */
   composeFinderPrompt(sessionId: string, input: {
     reviewId: string;
     repo: string;
@@ -181,19 +91,6 @@ export interface ReviewControlPlane {
     baseSha: string;
     focus?: string;
   }): Promise<{ prompt: string; mergeBase: string }>;
-  /** Retire the finder worker (best-effort) and report how many candidate
-   *  findings it left, as one durable step. */
-  concludeFinderPhase(
-    reviewId: string,
-    opts?: { sessionId?: string },
-  ): Promise<{ candidateCount: number }>;
-  createVerifierSession(input: {
-    reviewId: string;
-    taskId: string;
-    repo: string;
-    prNumber: number;
-    workflowId: string;
-  }): Promise<{ sessionId: string }>;
   bootstrapVerifierSession(sessionId: string, input: {
     repo: string;
     prNumber: number;
@@ -203,34 +100,20 @@ export interface ReviewControlPlane {
     orgInstructions?: string;
     skipClone?: boolean;
   }): Promise<void>;
-  sendVerifierPrompt(sessionId: string, input: {
-    reviewId: string;
-    repo: string;
-    prNumber: number;
-  }): Promise<void>;
-  /** ADR 0119 phase 4.3: the verifier prompt text, for a generic send_prompt. */
+  /** The verifier prompt text, for a generic send_prompt block. */
   composeVerifierPrompt(input: { repo: string; prNumber: number }): { prompt: string };
-  /** The status bookkeeping that follows a phase prompt (status transition,
-   *  activity event, sticky status comment). send*Prompt call it; the
-   *  built-in's review_stage block calls it after the generic
+  /** The status bookkeeping that follows a phase prompt (status transition
+   *  + activity event). The review_stage block calls it after the generic
    *  send_prompt delivers the composed text. */
   markPhasePrompted(reviewId: string, role: "finder" | "verifier"): Promise<void>;
-  /** ADR 0119 phase 4: the decision + persistence half of `postReviewResults`
-   *  without the GitHub post. Settles every finding into its decided state,
-   *  finalizes the review, and returns the payload the generic
-   *  `github.post_pr_review` action posts. Retires the verifier worker first
-   *  (best-effort) when a session id is given. The legacy workflow keeps
-   *  calling `postReviewResults` end to end. */
+  /** The decision + persistence half of posting: settles every finding into
+   *  its decided state, finalizes the review, and returns the payload the
+   *  generic `github.post_pr_review` action posts. Retires the verifier
+   *  worker first (best-effort) when a session id is given. */
   decideReviewResults(
     reviewId: string,
     opts?: { sessionId?: string },
   ): Promise<ReviewPostPayload>;
-  /** Post the review results. Retires the verifier worker first (best-effort)
-   *  when a session id is given, so a stray worker never blocks the post. */
-  postReviewResults(
-    reviewId: string,
-    opts?: { sessionId?: string },
-  ): Promise<void>;
   /** Tear down the given worker (best-effort) and mark the review failed, as one
    *  durable step. `reason` is recorded on the activity log for the UI. */
   failReview(
@@ -251,13 +134,11 @@ interface ReviewControlPlaneStore extends Pick<
   | "claimTargetId"
   | "upsertTarget"
   | "beginReviewPass"
-  | "updateReviewPassContext"
   | "getReview"
   | "listPriorPasses"
   | "updateReviewStatus"
   | "updateFindingState"
   | "finalizeReview"
-  | "setStatusCommentId"
   | "setReviewSessionId"
   | "recordEvent"
 > {}
@@ -272,52 +153,20 @@ export interface ReviewSessionsClient extends TaskSessionsClient, DurableExecCli
 }
 
 type RenderReviewer = (opts: RenderReviewerOptions) => RenderedReviewerFile[];
-type CreateExistingTaskSession = (
-  params: CreateSessionForExistingTaskParams,
-) => Promise<{ sessionId: string }>;
-
-/** Where a worker session's reverse binding (session → its driver) lives.
- * The legacy DBOS graph records `review_session` (→ review workflow id);
- * the ADR 0119 built-in records `automation_session` (→ run id) through the
- * engine's store. Injected so this library stays driver-agnostic. */
-export interface ReviewSessionBinding {
-  record(sessionId: string, role: "finder" | "verifier", legacyWorkflowId: string): Promise<void>;
-  remove(sessionId: string): Promise<void>;
-}
-
 export interface ReviewControlPlaneDeps {
   reviews?: ReviewControlPlaneStore;
-  /** Defaults to the legacy `review_session` store. */
-  sessionBinding?: ReviewSessionBinding;
   db?: ReturnType<typeof getDb>;
   sessions?: ReviewSessionsClient;
   profiles?: Pick<ProfileStore, "getActive" | "getByDesignation">;
-  enrollments?: Pick<EnrollmentStore, "get">;
-  reviewSessions?: ReviewSessionStore;
   githubPoster?: GithubReviewPoster;
   renderReviewer?: RenderReviewer;
-  /** Focused test seam; production delegates to the shared task-create helper. */
-  createSessionForExistingTask?: CreateExistingTaskSession;
-  /** Focused seam for asserting binding-before-listener publication. */
-  registerSessionListener?: (sessionId: string) => Promise<void>;
   /** Deterministic retry/deadline scheduler for durable-exec tests. */
   execRuntime?: RunExecRuntime;
-  /** Hands a resolved request to the review workflow. Injected, never
-   *  imported: this library is workflow-agnostic (the legacy DBOS graph and
-   *  the ADR 0119 built-in both sit on top of it), and `dispatch-review`
-   *  reaches `pr-review`, which reaches this module — a direct import would
-   *  close a cycle. The workflow adapter (workflows/review-control-plane.ts)
-   *  supplies the production implementations. */
-  dispatchPass?: (input: StartReviewPassInput) => Promise<void>;
-  signalSupersededPass?: (
-    reviewId: string,
-    idempotencyKey: string,
-  ) => Promise<void>;
 }
 
 /** What the built-in's GitHub action posts (ADR 0119 phase 4). The summary
  * carries the `<!-- engrams-review:<id> -->` marker so the action's
- * already-posted scan is crash-safe, exactly like the legacy poster. */
+ * already-posted scan is crash-safe. */
 export interface ReviewPostPayload {
   review_id: string;
   repo: string;
@@ -343,8 +192,7 @@ function postedSummary(count: number): string {
 }
 
 /** Settle every finding into its decided terminal state. Idempotent, so it
- * is safe on a replayed engine step. A module-level twin of the closure
- * inside the legacy `postReviewResults` (left untouched on purpose). */
+ * is safe on a replayed engine step. */
 async function settleFindingStates(
   store: Pick<ReviewControlPlaneStore, "updateFindingState">,
   settled: PolicyDecision,
@@ -528,34 +376,6 @@ async function resolveMergeBase(
   return mergeBase;
 }
 
-function productionImagesClient(): ImagesClient {
-  return {
-    async listEnabledImages(req) {
-      const response = await defaultImages.listEnabledImages(req);
-      return {
-        images: response.images.map((image) => ({
-          id: image.id,
-          imageUri: image.imageUri,
-        })),
-      };
-    },
-  };
-}
-
-function productionHarnessCatalogClient(): HarnessCatalogClient {
-  return {
-    async listHarnesses(req) {
-      const response = await defaultHarnessCatalog.listHarnesses(req);
-      return {
-        harnesses: response.harnesses.map((harness) => ({
-          name: harness.name,
-          ...(harness.descriptor ? { descriptor: harness.descriptor } : {}),
-        })),
-      };
-    },
-  };
-}
-
 export function makeReviewControlPlane(
   deps: ReviewControlPlaneDeps = {},
 ): ReviewControlPlane {
@@ -567,57 +387,15 @@ export function makeReviewControlPlane(
   const execRuntime = deps.execRuntime ?? defaultRunExecRuntime;
   let profileStore = deps.profiles;
   const profiles = () => (profileStore ??= makeProfileStore(db()));
-  let enrollmentStore = deps.enrollments;
-  const enrollments = () => (enrollmentStore ??= makeEnrollmentStore(db()));
-  let reviewSessionStore = deps.reviewSessions;
-  const reviewSessions = () => (
-    reviewSessionStore ??= makeReviewSessionStore(db())
-  );
-  const binding: ReviewSessionBinding = deps.sessionBinding ?? {
-    record: (sessionId, role, legacyWorkflowId) =>
-      reviewSessions().record(sessionId, legacyWorkflowId, role),
-    remove: (sessionId) => reviewSessions().remove(sessionId),
-  };
   const renderReviewer = deps.renderReviewer ?? defaultRenderReviewer;
   const githubPoster = deps.githubPoster ?? makeGithubReviewPoster();
 
-  // The sticky GitHub status comment (👀 → ⏳ → ✅). Best-effort: an ack that
-  // fails must never wedge the review, so every failure is logged and
-  // swallowed. The comment id is persisted on first post so later phases edit
-  // in place rather than stacking new comments.
+  // The Reviews page, linked from the posted summary.
   const reviewsPageUrl = `${config.baseUrl.replace(/\/$/, "")}/reviews`;
-  const ackStatus = async (
-    reviewId: string,
-    phase: ReviewStatusPhase,
-    count?: number,
-  ): Promise<void> => {
-    try {
-      const detail = await reviews().getReview(reviewId);
-      if (!detail) return;
-      const { repo, prNumber, statusCommentId } = detail.review;
-      const body = buildStatusComment({
-        reviewId,
-        phase,
-        ...(count !== undefined ? { count } : {}),
-        ...(phase === "posted" ? { reviewUrl: reviewsPageUrl } : {}),
-      });
-      const { commentId } = await githubPoster.upsertStatusComment({
-        repo,
-        prNumber,
-        ...(statusCommentId ? { commentId: statusCommentId } : {}),
-        body,
-      });
-      if (commentId !== statusCommentId) {
-        await reviews().setStatusCommentId(reviewId, commentId);
-      }
-    } catch (err) {
-      log.error({ reviewId, phase, err }, "review status ack failed (best-effort)");
-    }
-  };
-  // Append one milestone to the review's activity log. Best-effort like
-  // ackStatus: an activity-log write must never wedge a review, so a failure is
-  // logged and swallowed. Recorded inside the existing control-plane steps, so
-  // DBOS memoization keeps a replayed workflow from duplicating entries.
+  // Append one milestone to the review's activity log. Best-effort: an
+  // activity-log write must never wedge a review, so a failure is logged and
+  // swallowed. Recorded inside durable steps, so a replay never duplicates
+  // an entry.
   const recordEvent = async (
     reviewId: string,
     kind: string,
@@ -638,8 +416,10 @@ export function makeReviewControlPlane(
       "refused a late review transition because the row is already terminal",
     );
   };
-  // Delete a worker's coordinator session and forget its binding. Tolerates an
-  // already-absent session (a prior partial teardown) so it is safe to retry.
+  // Delete a worker's coordinator session. Tolerates an already-absent
+  // session (a prior partial teardown) so it is safe to retry. The session's
+  // automation_session binding stays: the run's finalize reads it, and a
+  // stale binding for an ended session routes nothing.
   const removeWorkerSession = async (sessionId: string): Promise<void> => {
     try {
       await sessions.deleteSession({ sessionId });
@@ -652,7 +432,6 @@ export function makeReviewControlPlane(
         "review worker session was already absent during cleanup",
       );
     }
-    await binding.remove(sessionId);
   };
   // Best-effort cleanup for the terminal paths: a worker that will not tear down
   // must never block the review from settling into failed/halted.
@@ -753,39 +532,6 @@ export function makeReviewControlPlane(
       return null;
     }
   };
-  const createExistingSession = deps.createSessionForExistingTask ?? ((params) => {
-    const database = db();
-    return createSessionForExistingTask(
-      {
-        profiles: profiles(),
-        images: productionImagesClient(),
-        connectors: { list: () => makeConnectorStore(database).list() },
-        harnessCatalog: productionHarnessCatalogClient(),
-        sessions,
-        secrets: { get: async () => null, getAll: async () => ({}) },
-        db: database,
-      },
-      params,
-    );
-  });
-  const registerSessionListener = deps.registerSessionListener
-    ?? ((sessionId: string) => registerExistingSessionListener(db(), sessionId));
-  // No workflow-side default here: the library does not know which workflow
-  // drives a pass. A caller that omits these seams gets a loud failure at the
-  // call site, never a silently dropped dispatch.
-  const dispatchPass = deps.dispatchPass ?? (async (input: StartReviewPassInput) => {
-    throw new Error(
-      `review control plane has no dispatchPass seam (review ${input.reviewId})`,
-    );
-  });
-  const signalSupersededPass = deps.signalSupersededPass
-    ?? (async (reviewId: string) => {
-      throw new Error(
-        `review control plane has no signalSupersededPass seam (review ${reviewId})`,
-      );
-    });
-  // Hoisted out of the returned object so `abandonIngress` can reuse it without
-  // reaching back through `this`, which a plain object literal cannot do safely.
   const failReview = async (
     reviewId: string,
     opts: { sessionId?: string; reason?: string } = {},
@@ -796,7 +542,6 @@ export function makeReviewControlPlane(
       return;
     }
     await recordEvent(reviewId, "failed", opts.reason);
-    await ackStatus(reviewId, "failed");
   };
 
   const plane: ReviewControlPlane = {
@@ -831,15 +576,16 @@ export function makeReviewControlPlane(
      * `beginReviewPass` is one transaction and it is NOT idempotent: re-running it
      * either deduplicates onto the row it just created (automation, leaving the
      * pass unstarted) or supersedes that row and creates a second one (a human
-     * trigger, leaving a spurious dossier). Ingress runs this as a step with
-     * retries allowed, and DBOS re-invokes the whole callback on any throw. So a
-     * fallible call placed after the commit would turn its first transient error
-     * into a double-create — no crash required.
+     * trigger, leaving a spurious dossier). The review_open_pass block runs
+     * this as a durable step with retries allowed, and DBOS re-invokes the
+     * whole callback on any throw. So a fallible call placed after the commit
+     * would turn its first transient error into a double-create — no crash
+     * required.
      *
-     * The GitHub status ack used to sit here. It is now its own step
-     * (`acknowledgeReviewPass`), which is why retries are safe: a throw can only
-     * come from the transaction itself, and that means it rolled back and created
-     * nothing. Logging below is a synchronous, infallible write, not an effect.
+     * Nothing else touches GitHub here (the built-in's own `ack` block posts
+     * the status comment), so a throw can only come from the transaction
+     * itself, and that means it rolled back and created nothing. Logging
+     * below is a synchronous, infallible write, not an effect.
      */
     async createReviewPass(input) {
       const result = await reviews().beginReviewPass(input);
@@ -865,89 +611,6 @@ export function makeReviewControlPlane(
         "review pass created",
       );
       return result;
-    },
-
-    async acknowledgeReviewPass(reviewId) {
-      // Best-effort by construction: ackStatus swallows its own failures, so this
-      // never throws. It is still a step so a replay does not re-post the comment.
-      await ackStatus(reviewId, "acknowledged");
-    },
-
-    async updateReviewPassContext(reviewId, input) {
-      const updated = await reviews().updateReviewPassContext(reviewId, input);
-      if (!updated) {
-        log.warn(
-          { reviewId, attemptedStatus: "queued-context" },
-          "refused a late review-pass context write to a terminal row",
-        );
-      }
-      return updated;
-    },
-
-    async startReviewPass(input) {
-      const where = {
-        repo: input.repo,
-        prNumber: input.prNumber,
-        trigger: input.trigger,
-        reviewId: input.reviewId,
-        headSha: input.headSha,
-      };
-      log.info(where, "dispatching a review pass");
-      await dispatchPass(input);
-      log.info(where, "review pass dispatched");
-    },
-
-    async signalSupersededPass(reviewId, idempotencyKey) {
-      log.info({ reviewId }, "signalling a superseded review pass to tear down");
-      await signalSupersededPass(reviewId, idempotencyKey);
-    },
-
-    async abandonIngress(source, reason, reviewId) {
-      if (reviewId === undefined) {
-        // Nothing was created, so there is no row to carry this. The log is the
-        // only record — which is why it is an error, not a warning.
-        log.error(
-          { ...source, reason },
-          "review ingress gave up before it could identify a target",
-        );
-        return;
-      }
-      log.error({ ...source, reviewId, reason }, "review ingress gave up; failing the pass");
-      await failReview(reviewId, { reason });
-    },
-
-    async createFinderSession(input) {
-      assertSafeRepo(input.repo);
-      const enrollment = await enrollments().get(input.repo);
-      const profileId = enrollment?.profileId
-        ?? (await profiles().getByDesignation("pr_reviewer"))?.id;
-      if (!profileId) {
-        throw new ReviewSetupError("no pr_reviewer profile configured");
-      }
-
-      const created = await createExistingSession({
-        taskId: input.taskId,
-        taskType: "pr_review",
-        profileId,
-        integrationPrincipalId: "automation:pr-review",
-        role: "finder",
-        capabilityOverride: REVIEW_CAPABILITIES(input.repo),
-        networkOverride: REVIEW_NETWORK,
-        dropProfileSecretsAndEnv: true,
-        appendSystemPrompt: FINDER_SYSTEM_PROMPT,
-        source: {
-          reviewId: input.reviewId,
-          repo: input.repo,
-          prNumber: input.prNumber,
-        },
-      });
-      await binding.record(created.sessionId, "finder", input.workflowId);
-      // Stamp the session on the review at kickoff so the UI can offer a live
-      // "watch" link the moment the finding phase starts.
-      await reviews().setReviewSessionId(input.reviewId, "finder", created.sessionId);
-      await recordEvent(input.reviewId, "finder_started");
-      await registerSessionListener(created.sessionId);
-      return created;
     },
 
     async bootstrapFinderSession(sessionId, input) {
@@ -1069,23 +732,6 @@ export function makeReviewControlPlane(
       return { prompt, mergeBase };
     },
 
-    async sendFinderPrompt(sessionId, input) {
-      const { prompt } = await plane.composeFinderPrompt(sessionId, input);
-
-      // The prompt id MUST be scoped to the session: the coordinator's
-      // outbox is keyed globally by prompt_id (ON CONFLICT DO NOTHING), so
-      // a retry finder session re-sending `review:<id>:finder` deduped
-      // against the FAILED attempt's consumed row and silently never got
-      // its prompt — the session idled forever and the review wedged in
-      // `finding` (first observed live: review f33ad531).
-      await sessions.sendPrompt({
-        sessionId,
-        promptId: `review:${input.reviewId}:finder:${sessionId}`,
-        text: prompt,
-      });
-      await plane.markPhasePrompted(input.reviewId, "finder");
-    },
-
     async markPhasePrompted(reviewId, role) {
       if (role === "finder") {
         if (!(await reviews().updateReviewStatus(reviewId, "finding"))) {
@@ -1093,7 +739,6 @@ export function makeReviewControlPlane(
           return;
         }
         await recordEvent(reviewId, "reviewing");
-        await ackStatus(reviewId, "finding");
         return;
       }
       if (!(await reviews().updateReviewStatus(reviewId, "verifying"))) {
@@ -1109,49 +754,6 @@ export function makeReviewControlPlane(
         "verifying",
         `${candidateCount} candidate finding${candidateCount === 1 ? "" : "s"}`,
       );
-      await ackStatus(reviewId, "verifying", candidateCount);
-    },
-
-    async concludeFinderPhase(reviewId, opts = {}) {
-      await cleanupWorkerSession(opts.sessionId);
-      const detail = await reviews().getReview(reviewId);
-      if (!detail) throw new Error(`review not found: ${reviewId}`);
-      const candidateCount = detail.findings.filter(
-        (finding) => finding.state === "candidate",
-      ).length;
-      return { candidateCount };
-    },
-
-    async createVerifierSession(input) {
-      assertSafeRepo(input.repo);
-      const enrollment = await enrollments().get(input.repo);
-      const profileId = enrollment?.profileId
-        ?? (await profiles().getByDesignation("pr_reviewer"))?.id;
-      if (!profileId) {
-        throw new ReviewSetupError("no pr_reviewer profile configured");
-      }
-
-      const created = await createExistingSession({
-        taskId: input.taskId,
-        taskType: "pr_review",
-        profileId,
-        integrationPrincipalId: "automation:pr-review",
-        role: "verifier",
-        capabilityOverride: REVIEW_CAPABILITIES(input.repo),
-        networkOverride: REVIEW_NETWORK,
-        dropProfileSecretsAndEnv: true,
-        appendSystemPrompt: VERIFIER_SYSTEM_PROMPT,
-        source: {
-          reviewId: input.reviewId,
-          repo: input.repo,
-          prNumber: input.prNumber,
-        },
-      });
-      await binding.record(created.sessionId, "verifier", input.workflowId);
-      await reviews().setReviewSessionId(input.reviewId, "verifier", created.sessionId);
-      await recordEvent(input.reviewId, "verifier_started");
-      await registerSessionListener(created.sessionId);
-      return created;
     },
 
     async bootstrapVerifierSession(sessionId, input) {
@@ -1227,19 +829,6 @@ export function makeReviewControlPlane(
       return { prompt };
     },
 
-    async sendVerifierPrompt(sessionId, input) {
-      const { prompt } = plane.composeVerifierPrompt(input);
-
-      // Session-scoped for the same reason as the finder prompt id: a
-      // verifier retry must not dedupe against a dead attempt's row.
-      await sessions.sendPrompt({
-        sessionId,
-        promptId: `review:${input.reviewId}:verifier:${sessionId}`,
-        text: prompt,
-      });
-      await plane.markPhasePrompted(input.reviewId, "verifier");
-    },
-
     async decideReviewResults(reviewId, opts = {}) {
       await cleanupWorkerSession(opts.sessionId);
       const detail = await reviews().getReview(reviewId);
@@ -1301,130 +890,6 @@ export function makeReviewControlPlane(
       };
     },
 
-    async postReviewResults(reviewId, opts = {}) {
-      await cleanupWorkerSession(opts.sessionId);
-      const detail = await reviews().getReview(reviewId);
-      if (!detail) throw new Error(`review not found: ${reviewId}`);
-
-      const { repo, prNumber } = detail.review;
-      let { headSha, baseSha } = detail.review;
-      if (headSha === "" || baseSha === "") {
-        const live = await githubPoster.fetchPrContext(repo, prNumber);
-        if (headSha === "") headSha = live.headSha;
-        if (baseSha === "") baseSha = live.baseSha;
-        const updated = await reviews().finalizeReview(reviewId, {
-          status: detail.review.status,
-          summaryMd: detail.review.summaryMd ?? "",
-          headSha,
-          baseSha,
-        });
-        if (!updated) {
-          logRefusedTransition(reviewId, detail.review.status);
-          return;
-        }
-      }
-
-      // Settle every finding into its decided terminal state. Idempotent, so it
-      // is safe on both the live post and the crash-recovery marker path.
-      const applyFindingStates = async (
-        settled: PolicyDecision,
-        inlinePosted: boolean,
-      ): Promise<void> => {
-        for (const item of settled.toPost) {
-          await reviews().updateFindingState(
-            item.finding.id,
-            inlinePosted ? "posted" : "ui_only",
-            item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
-          );
-        }
-        for (const item of settled.uiOnly) {
-          await reviews().updateFindingState(
-            item.finding.id,
-            "ui_only",
-            item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
-          );
-        }
-        for (const item of settled.suppressed) {
-          await reviews().updateFindingState(
-            item.finding.id,
-            item.state,
-            item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
-          );
-        }
-      };
-
-      // The marker check closes the crash window between GitHub accepting the
-      // review and the local transaction recording it. On recovery the review is
-      // already on GitHub, so we cannot know whether it posted inline or fell
-      // back to a summary — assume inline (the common case) and re-run the
-      // idempotent state updates the crashed transaction never committed, so
-      // findings don't stay stuck at `candidate`.
-      if (await githubPoster.alreadyPosted(repo, prNumber, reviewId)) {
-        const decision = buildDecision(detail);
-        await applyFindingStates(decision, true);
-        const finalized = await reviews().finalizeReview(reviewId, {
-          status: "posted",
-          summaryMd: detail.review.summaryMd ?? "",
-        });
-        if (!finalized) {
-          logRefusedTransition(reviewId, "posted");
-          return;
-        }
-        const surfaced = decision.toPost.length + decision.uiOnly.length;
-        await recordEvent(reviewId, "posted", postedSummary(surfaced));
-        await ackStatus(reviewId, "posted", surfaced);
-        return;
-      }
-
-      const decision = buildDecision(detail);
-      const comments = decision.toPost.map((item) => {
-        const line = item.finding.endLine ?? item.finding.startLine;
-        if (line == null) {
-          throw new Error(`finding ${item.finding.id} has no inline anchor`);
-        }
-        const startLine = item.finding.startLine;
-        return {
-          findingId: item.finding.id,
-          path: item.finding.path,
-          line,
-          side: item.finding.side ?? "RIGHT",
-          ...(startLine != null && startLine !== line ? { startLine } : {}),
-          body: buildInlineCommentBody(item.finding),
-        };
-      });
-
-      // The summary is rendered for the actual outcome: concise when the inline
-      // comments land (they carry their own detail), fuller on the 422 fallback
-      // (re-quotes every surviving finding so none is lost). The poster returns
-      // the body it actually posted, which we persist below.
-      const reviewUrl = `${config.baseUrl.replace(/\/$/, "")}/reviews`;
-      const posted = await githubPoster.postReview({
-        repo,
-        prNumber,
-        commitId: headSha,
-        buildSummary: (inlinePosted) =>
-          buildReviewSummary({ reviewId, reviewUrl, decision, inlinePosted }),
-        comments,
-      });
-      if (!posted.posted) throw new Error("GitHub review was not posted");
-
-      await applyFindingStates(decision, posted.inlinePosted);
-      const finalized = await reviews().finalizeReview(reviewId, {
-        status: "posted",
-        summaryMd: posted.summaryMd,
-        ...(posted.githubReviewId !== undefined
-          ? { githubReviewId: posted.githubReviewId }
-          : {}),
-      });
-      if (!finalized) {
-        logRefusedTransition(reviewId, "posted");
-        return;
-      }
-      const surfaced = decision.toPost.length + decision.uiOnly.length;
-      await recordEvent(reviewId, "posted", postedSummary(surfaced));
-      await ackStatus(reviewId, "posted", surfaced);
-    },
-
     failReview,
 
     async haltReview(reviewId, opts = {}) {
@@ -1434,12 +899,11 @@ export function makeReviewControlPlane(
         return;
       }
       await recordEvent(reviewId, "halted");
-      await ackStatus(reviewId, "halted");
     },
 
     async cleanupSupersededReview(_reviewId, opts = {}) {
-      // The ingress transaction already committed `superseded`. This step owns
-      // only teardown; writing status here would reintroduce the race B6 removes.
+      // beginReviewPass already committed `superseded`. This step owns only
+      // teardown; writing status here would reintroduce the race B6 removes.
       await cleanupWorkerSession(opts.sessionId);
     },
   };

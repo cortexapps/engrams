@@ -230,8 +230,7 @@ describe("ReviewStore", () => {
         });
         reviewIds.push(otherRepoReviewId);
 
-        expect((await store.getActiveReviewForTask(taskId))?.id).toBe(activeReviewId);
-        // A built-in worker finds its pass through the run that drives it.
+        // A worker finds its pass through the run that drives it.
         await store.setAutomationRunId(activeReviewId, "autorun:auto-1:github:d1");
         expect((await store.getActiveReviewForAutomationRun("autorun:auto-1:github:d1"))?.id).toBe(activeReviewId);
         expect(await store.getActiveReviewForAutomationRun("autorun:nobody")).toBeNull();

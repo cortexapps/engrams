@@ -70,12 +70,9 @@ import type { ConnectRouter } from "@connectrpc/connect";
 // tool-execution workflows.
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
-import { setReviewControlPlane } from "./workflows/pr-review.ts";
-import { setReviewIngressControlPlane } from "./workflows/review-ingress.ts";
 import { startSpecTicketSyncWorkflow } from "./workflows/spec-ticket-sync.ts";
 import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
-import { makeReviewControlPlane } from "./workflows/review-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
 import {
   makeProductionAutomationScheduler,
@@ -91,7 +88,6 @@ import { resolveDraftingSpec, resolveSpecMembership } from "./authz/resolve.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
 import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts";
-import { makeEnrollmentStore } from "./db/enrollments.ts";
 import {
   PostgresSpecDocumentStore,
   proseMirrorDocument,
@@ -117,7 +113,6 @@ import { registerAutomationDraftTools } from "./tools/automation-draft.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
 import { loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
-import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
@@ -617,16 +612,6 @@ const server = buildServer(
 // bind can start a workflow.
 setThreadPolicy(makeSlackPolicy());
 setThreadControlPlane(makeThreadControlPlane());
-const reviewControlPlane = makeReviewControlPlane({
-  sessions: controlPlaneSessions,
-  profiles: makeProfileStore(getDb()),
-  enrollments: makeEnrollmentStore(getDb()),
-  renderReviewer,
-});
-setReviewControlPlane(reviewControlPlane);
-// Review ingress shares the same control plane: it resolves the change, then
-// starts the pass (ADR 0100 d11).
-setReviewIngressControlPlane(reviewControlPlane);
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });

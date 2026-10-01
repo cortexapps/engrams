@@ -20,7 +20,6 @@ const review: ReviewRow = {
   trigger: "opened",
   status: "verifying",
   githubReviewId: null,
-  statusCommentId: null,
   finderSessionId: null,
   verifierSessionId: null,
   automationRunId: null,

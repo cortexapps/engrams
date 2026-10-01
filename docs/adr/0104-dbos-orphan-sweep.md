@@ -112,8 +112,8 @@ abandoned rows back into the queue and pods pull.
    ```ts
    const SWEEP_POLICIES: Record<string, SweepPolicy> = {
      SlackThreadWorkflow: { mode: "adopt", staleAfterHours: 48 },
-     PrReviewWorkflow:    { mode: "adopt", staleAfterHours: 48 },
      ToolExecWorkflow:    { mode: "adopt", staleAfterHours: 1 },
+     // (PrReviewWorkflow had 48h until ADR 0119 phase 4.7 deleted it.)
    };
    ```
 

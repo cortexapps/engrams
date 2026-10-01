@@ -484,14 +484,12 @@ orchestrator:
   # dispatch API and auto-on-open triggers still work.
   githubAppLogin: ""
 
-  # ADR 0119 parallel-window kill switches. `true` emits
-  # ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED=1 / ORCHESTRATOR_SLACK_AUTOMATION_DISABLED=1
-  # into the orchestrator ConfigMap: every repo / channel reviews or answers on
-  # the legacy path regardless of its flag, and the dispatcher refuses to admit
-  # runs for the matching built-in. Flip, roll the orchestrator, flip back when
-  # done — the per-repo / per-channel flags survive the switch.
+  # ADR 0119 parallel-window kill switch (Slack only: the PR-review legacy
+  # path retired in phase 4.7). `true` emits ORCHESTRATOR_SLACK_AUTOMATION_DISABLED=1
+  # into the orchestrator ConfigMap: every channel answers on the legacy
+  # thread workflow, and the dispatcher refuses to admit runs for the
+  # built-in. Flip, roll the orchestrator, flip back when done.
   killSwitches:
-    reviewAutomation: false
     slackAutomation: false
 
   # The three REQUIRED env vars come from ONE Secret (keys below). The chart

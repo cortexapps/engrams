@@ -16,8 +16,7 @@ import {
   type ReviewTriggerMode,
 } from "../db/enrollments.ts";
 import { makeProfileStore } from "../db/profiles.ts";
-import { setReviewEngine, EngineFlagError } from "../reviews/engine-flag.ts";
-import { makeReviewEngineWriter, type ReviewEngineWriter } from "../db/review-engine.ts";
+import { makeReviewEnrollmentSync, type ReviewEnrollmentSync } from "../db/review-enrollment-sync.ts";
 import { retryAutomationReview } from "../reviews/automation-review.ts";
 import { log as rootLog } from "../log.ts";
 import {
@@ -40,10 +39,6 @@ import {
   type ReviewFinding as ReviewFindingProto,
   type ReviewVerdict as ReviewVerdictProto,
 } from "../gen/engram/app/v1/review_pb.ts";
-import {
-  startReviewIngress,
-  type ReviewIngressStart,
-} from "../workflows/review-ingress.ts";
 
 export type GetSession = (
   headers: Headers,
@@ -57,13 +52,9 @@ export interface ReviewDeps {
   enrollments?: EnrollmentStore;
   profiles?: { get(id: string): Promise<{ id: string } | null> };
   db?: ReturnType<typeof getDb>;
-  /** Starts durable review ingress, which resolves the PR before a pass begins
-   *  (ADR 0100 d11). A re-run goes through it like any other request. */
-  startIngress?: (input: ReviewIngressStart) => Promise<void>;
-  randomUUID?: () => string;
-  /** ADR 0119 phase 4.4 seams (default to the production stores). */
-  /** The one writer of the enrollment flag + built-in repos map (one transaction). */
-  reviewEngine?: ReviewEngineWriter;
+  /** The one writer of the built-in's repos map (one transaction). */
+  enrollmentSync?: ReviewEnrollmentSync;
+  /** Admit a fresh built-in run for the review's original trigger. */
   retryAutomation?: (automationRunId: string) => Promise<string>;
 }
 
@@ -74,7 +65,6 @@ function enrollmentToProto(row: EnrollmentRow): RepoEnrollment {
     triggerMode: row.triggerMode,
     autofix: row.autofix,
     ...(row.profileId != null ? { profileId: row.profileId } : {}),
-    engine: row.engine,
     createdAt: timestampFromDate(row.createdAt),
     updatedAt: timestampFromDate(row.updatedAt),
   } as RepoEnrollment;
@@ -210,11 +200,9 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
   let profileStore = deps?.profiles;
   const profiles = (): { get(id: string): Promise<{ id: string } | null> } =>
     (profileStore ??= makeProfileStore(deps?.db ?? getDb()));
-  const startIngress = deps?.startIngress ?? startReviewIngress;
-  const randomUUID = deps?.randomUUID ?? (() => crypto.randomUUID());
-  const engineLog = rootLog.child({ component: "review-engine-flag" });
-  const reviewEngine = (): ReviewEngineWriter =>
-    deps?.reviewEngine ?? makeReviewEngineWriter(deps?.db ?? getDb());
+  const enrollmentLog = rootLog.child({ component: "review-enrollment" });
+  const enrollmentSync = (): ReviewEnrollmentSync =>
+    deps?.enrollmentSync ?? makeReviewEnrollmentSync(deps?.db ?? getDb());
   const retryAutomation =
     deps?.retryAutomation ?? ((runId: string) => retryAutomationReview(runId));
 
@@ -267,45 +255,21 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       }
       const detail = await reviews().getReview(id);
       if (!detail) throw new ConnectError("not found", Code.NotFound);
-      const { repo, prNumber, provider, targetId } = detail.review;
-      const enrollment = await enrollments().get(repo);
-      if (!enrollment) {
+      const { repo } = detail.review;
+      if (!(await enrollments().get(repo))) {
         throw new ConnectError("repo is not enrolled", Code.FailedPrecondition);
       }
-      // A repo on the automation engine retries the BUILT-IN with the original
-      // run's trigger, not a legacy ingress epoch.
-      if (enrollment.engine === "automation") {
-        if (!detail.review.automationRunId) {
-          throw new ConnectError(
-            "this review has no automation run to retry (it ran on the legacy engine)",
-            Code.FailedPrecondition,
-          );
-        }
-        const runId = await retryAutomation(detail.review.automationRunId);
-        return { workflowId: runId };
+      // A retry admits a fresh built-in run with the ORIGINAL run's trigger
+      // (the review row links to it). A pass from before the automation
+      // engine has no run to re-admit; a new push or @mention starts one.
+      if (!detail.review.automationRunId) {
+        throw new ConnectError(
+          "this review predates the automation engine and cannot be retried; push or @mention to start a new pass",
+          Code.FailedPrecondition,
+        );
       }
-      // Ingress resolves the PR's CURRENT head and identity, then mints a new
-      // review record (a terminal review is not "active") and a successor workflow
-      // epoch. The old record stays as history.
-      //
-      // A fresh uuid per re-run, so each press gets its own ingress execution
-      // rather than deduping onto the previous one.
-      const idempotencyKey = randomUUID();
-      await startIngress({
-        provider,
-        repo,
-        prNumber,
-        targetId,
-        trigger: "retry",
-        idempotencyKey,
-      });
-      return {
-        // Ingress owns the review workflow id now, and it is derived from the PR
-        // inside that workflow — so there is nothing to report back here yet. The
-        // client follows the review list, which is how it already learned about
-        // the new pass; `dispatchReview` never returned a review id either.
-        workflowId: `review-ingress:${idempotencyKey}`,
-      };
+      const runId = await retryAutomation(detail.review.automationRunId);
+      return { workflowId: runId };
     },
 
     async listEnrollments(_req, ctx) {
@@ -352,27 +316,30 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       if (profileId != null && profileId !== stored?.profileId && !(await profiles().get(profileId))) {
         throw new ConnectError("profile_id does not exist", Code.InvalidArgument);
       }
-      // Enrolling through the product IS enrolling on the automation engine:
-      // the row is written first (its trigger/autofix feed the built-in's
-      // repos map), then the flag flip reconciles the built-in and enables it
-      // on the first repo. A legacy-flagged row saved again moves over.
+      // Enrolling IS a write to the PR-review built-in: the row is written
+      // first (its trigger/autofix feed the built-in's repos map), then the
+      // sync mirrors it into the map and enables the built-in on the first
+      // repo.
       await enrollments().upsert({
         repo,
         triggerMode: req.triggerMode,
         autofix: req.autofix,
         profileId,
       });
-      try {
-        const result = await setReviewEngine(repo, "automation", {
-          writer: reviewEngine(),
-          log: engineLog,
-        });
-        return { enrollment: enrollmentToProto(result.enrollment) };
-      } catch (error) {
-        if (error instanceof EngineFlagError) {
-          throw new ConnectError(error.message, Code.FailedPrecondition);
-        }
-        throw error;
+      const result = await enrollmentSync().enrolled(repo);
+      switch (result.kind) {
+        case "not_enrolled":
+          throw new Error(`review enrollment ${repo} vanished after its upsert`);
+        case "not_seeded":
+          // The seeder runs fire-and-forget at boot; an enrollment before it
+          // lands is an operator error, not a silent no-op.
+          throw new ConnectError(
+            "the PR-review built-in is not seeded yet; retry after the orchestrator finishes booting",
+            Code.FailedPrecondition,
+          );
+        case "applied":
+          enrollmentLog.info({ repo }, "review enrollment mirrored into the built-in");
+          return { enrollment: enrollmentToProto(result.enrollment) };
       }
     },
 
@@ -383,19 +350,10 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       }
       const repo = req.repo.trim();
       if (!repo) throw new ConnectError("repo is required", Code.InvalidArgument);
-      // Take the repo out of the built-in's map first (the flip to `legacy`
-      // is the one writer of that map), then drop the row. A built-in that
-      // is not seeded yet has no map entry to remove.
-      if (await enrollments().get(repo)) {
-        try {
-          await setReviewEngine(repo, "legacy", {
-            writer: reviewEngine(),
-            log: engineLog,
-          });
-        } catch (error) {
-          if (!(error instanceof EngineFlagError)) throw error;
-        }
-      }
+      // Take the repo out of the built-in's map first (the sync is the one
+      // writer of that map), then drop the row. A built-in that is not
+      // seeded yet has no map entry to remove.
+      await enrollmentSync().removed(repo);
       await enrollments().delete(repo);
       return {};
     },

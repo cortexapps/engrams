@@ -2,10 +2,6 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import { z } from "zod";
 
 import {
-  makeReviewSessionStore,
-  type ReviewSessionStore,
-} from "../db/review-sessions.ts";
-import {
   makeReviewStore,
   type ReviewRow,
   type ReviewStore,
@@ -18,10 +14,6 @@ import {
   type AutomationInbox,
 } from "../automations/engine/inbox.ts";
 import { log as rootLog } from "../log.ts";
-import {
-  REVIEW_TOPIC,
-  type ReviewInbox,
-} from "../workflows/review-inbox.ts";
 import {
   tools,
   type ToolContext,
@@ -72,15 +64,8 @@ const FINDING_CAP_REACHED: ToolProtocolError = {
 
 export interface ReviewToolDeps {
   reviews: ReviewStore;
-  reviewSessions?: Pick<ReviewSessionStore, "find">;
-  notify?: (
-    destinationId: string,
-    message: ReviewInbox,
-    topic: string,
-    idempotencyKey: string,
-  ) => Promise<void>;
-  /** ADR 0119: a worker session owned by a built-in automation run is bound in
-   *  automation_session; its phase signals go to the run's mailbox instead. */
+  /** A worker session owned by an automation run is bound in
+   *  automation_session; its phase signals go to the run's mailbox. */
   findAutomationBinding?: (sessionId: string) => Promise<{ runId: string } | null>;
   notifyAutomation?: (
     runId: string,
@@ -95,21 +80,14 @@ export const REVIEW_PHASE_SIGNALS = {
   verifier: "verifier_done",
 } as const;
 
-/** The pass this session works on. A legacy worker's task IS the review's
- * task; a built-in worker's task is the automation's, so its pass is found
- * through the session's run (`review.automation_run_id`). Without the
- * second path every `submit_finding` from an engine review answered
- * "no active review" and `finder_done` never signalled the run — the first
- * live engine review sat parked on its finder until the deadline. */
+/** The pass this session works on. A worker's task is the automation's,
+ * not the review's, so its pass is found through the session's run
+ * (`review.automation_run_id`). */
 async function activeReview(
   ctx: ToolContext,
   reviews: ReviewStore,
   findAutomationBinding: (sessionId: string) => Promise<{ runId: string } | null>,
 ): Promise<ReviewRow | ToolProtocolError> {
-  if (ctx.taskId != null) {
-    const byTask = await reviews.getActiveReviewForTask(ctx.taskId);
-    if (byTask) return byTask;
-  }
   const binding = await findAutomationBinding(ctx.sessionId);
   if (binding !== null) {
     const byRun = await reviews.getActiveReviewForAutomationRun(binding.runId);
@@ -130,23 +108,6 @@ export function registerReviewTools(
   deps?: ReviewToolDeps,
 ): void {
   const reviews = deps?.reviews ?? makeReviewStore();
-  let reviewSessionStore = deps?.reviewSessions;
-  const reviewSessions = () => (
-    reviewSessionStore ??= makeReviewSessionStore()
-  );
-  const notify = deps?.notify ?? (async (
-    destinationId: string,
-    message: ReviewInbox,
-    topic: string,
-    idempotencyKey: string,
-  ) => {
-    await DBOS.send<ReviewInbox>(
-      destinationId,
-      message,
-      topic,
-      idempotencyKey,
-    );
-  });
   let engineStore: ReturnType<typeof makeAutomationEngineStore> | undefined;
   const findAutomationBinding = deps?.findAutomationBinding ?? (async (sessionId: string) => {
     engineStore ??= makeAutomationEngineStore();
@@ -167,28 +128,17 @@ export function registerReviewTools(
     payload: Record<string, unknown> = {},
   ): Promise<void> => {
     try {
-      // ADR 0119: a session the built-in review automation owns signals its
-      // run directly; the engine's send_prompt wait parks on this name. The
-      // payload lands in steps.<block>.signal, so the built-in's branch reads
-      // e.g. candidate_count without a store round-trip.
+      // The session signals its run directly; the engine's send_prompt wait
+      // parks on this name. The payload lands in steps.<block>.signal, so the
+      // built-in's branch reads e.g. candidate_count without a store
+      // round-trip. An unbound session (none today) has nothing to signal.
       const automation = await findAutomationBinding(ctx.sessionId);
-      if (automation !== null) {
-        const name = REVIEW_PHASE_SIGNALS[role];
-        await notifyAutomation(
-          automation.runId,
-          { kind: "signal", name, sessionId: ctx.sessionId, payload },
-          inboxKeys.signal(ctx.sessionId, name, ctx.toolCallId, automation.runId),
-        );
-        return;
-      }
-      // legacy path — deleted in phase 4.7
-      const binding = await reviewSessions().find(ctx.sessionId);
-      if (!binding || binding.role !== role) return;
-      await notify(
-        binding.reviewWorkflowId,
-        { kind: "phase_done", role },
-        REVIEW_TOPIC,
-        `review:${ctx.sessionId}:${role}-done`,
+      if (automation === null) return;
+      const name = REVIEW_PHASE_SIGNALS[role];
+      await notifyAutomation(
+        automation.runId,
+        { kind: "signal", name, sessionId: ctx.sessionId, payload },
+        inboxKeys.signal(ctx.sessionId, name, ctx.toolCallId, automation.runId),
       );
     } catch (err) {
       // Persisting the tool result is authoritative. The stream fallback and

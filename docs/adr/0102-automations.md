@@ -18,6 +18,10 @@ describe a provider used by many independently configured triggers.
 
 ## Context
 
+(ADR 0119 phase 4.7, 2026-10-01: the hardcoded PR-review path described
+below is deleted; PR review is the seeded built-in automation on the block
+engine. The Slack path retires in phase 4.8.)
+
 engrams has two externally triggered session paths today: GitHub PR review and
 Slack app mentions. Both are hardcoded end to end. Each has an exact-path Hono
 route, provider-specific request verification, a provider-specific DBOS workflow

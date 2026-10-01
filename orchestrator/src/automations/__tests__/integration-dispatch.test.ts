@@ -548,12 +548,12 @@ describe("dispatchIntegrationEvent", () => {
     expect(h.runs.size).toBe(1);
   });
 
-  test("a kill-switched built-in never admits a run, so a flagged repo is not served by both brains", async () => {
-    // With ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED on, the GitHub route falls
-    // back to the legacy review graph. If the dispatcher still delivered to
-    // the enabled built-in, a flagged repo would get TWO reviews. The switch
+  test("a kill-switched built-in never admits a run; a user automation on the same event is unaffected", async () => {
+    // With ORCHESTRATOR_SLACK_AUTOMATION_DISABLED on, the Slack route falls
+    // back to the legacy thread workflow. If the dispatcher still delivered
+    // to the enabled built-in, a channel would get TWO brains. The switch
     // gates the trigger path too; a user automation on the same event is
-    // unaffected.
+    // unaffected. The keys are generic: any built-in key can be switched.
     const builtin = {
       automation: meta({ id: "builtin-review", kind: "builtin", builtinKey: "pr_review" }),
       definition: definition(trigger()),
@@ -566,8 +566,8 @@ describe("dispatchIntegrationEvent", () => {
       disabledBuiltins: new Set<string>(),
     });
     expect(off.started).toBe(2);
-    // The per-built-in tally is what a legacy route consults (the Slack
-    // window): the built-in's own admission outcome, user automations absent.
+    // The per-built-in tally is what the Slack route consults (its window):
+    // the built-in's own admission outcome, user automations absent.
     expect(off.builtins).toEqual({ pr_review: "started" });
 
     const h2 = makeHarness([builtin, user]);
@@ -606,18 +606,14 @@ describe("dispatchIntegrationEvent", () => {
   test("disabledBuiltinsFromConfig maps each switch to its built-in key", async () => {
     const { disabledBuiltinsFromConfig } = await import("../dispatch.ts");
     const { config } = await import("../../config.ts");
-    const saved = { r: config.reviewAutomationDisabled, s: config.slackAutomationDisabled };
+    const saved = config.slackAutomationDisabled;
     try {
-      config.reviewAutomationDisabled = false;
       config.slackAutomationDisabled = false;
       expect([...disabledBuiltinsFromConfig()]).toEqual([]);
-      config.reviewAutomationDisabled = true;
-      expect([...disabledBuiltinsFromConfig()]).toEqual(["pr_review"]);
       config.slackAutomationDisabled = true;
-      expect([...disabledBuiltinsFromConfig()].sort()).toEqual(["pr_review", "slack_brain"]);
+      expect([...disabledBuiltinsFromConfig()]).toEqual(["slack_brain"]);
     } finally {
-      config.reviewAutomationDisabled = saved.r;
-      config.slackAutomationDisabled = saved.s;
+      config.slackAutomationDisabled = saved;
     }
   });
 

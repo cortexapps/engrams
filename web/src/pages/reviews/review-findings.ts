@@ -54,7 +54,7 @@ function outcomeOf(
   }
   if (!verdict) return "unverified";
   if (!isAnchored(finding)) return "no_anchor";
-  // Only `postReviewResults` advances a finding past `candidate`, so on a pass
+  // Only the settle step (`review_settle`) advances a finding past `candidate`, so on a pass
   // that never reached posting EVERY confirmed anchored finding still looks
   // exactly like an over-cap one. Calling it "over the comment cap" would be a
   // statement about a gate that never ran — and the page would simultaneously say

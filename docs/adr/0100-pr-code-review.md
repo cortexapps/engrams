@@ -1,6 +1,16 @@
 # 0100 — PR code review: engrams as a code reviewer on GitHub pull requests
 
-Status: Proposed (2026-07-15)
+Status: Proposed (2026-07-15). **Amended 2026-10-01 (ADR 0119 phase 4.7):**
+`PrReviewWorkflow` and `ReviewIngressWorkflow` are deleted. The review now
+runs as the seeded PR-review built-in automation on the ADR 0119 block
+engine (`orchestrator/src/automations/builtins/pr-review.ts`): the GitHub
+delivery reaches it through the integration-event spine, the review blocks
+(`review_open_pass`, `review_stage`, `review_settle`, `review_record_post`,
+`review_close_pass`) wrap the same control plane (`reviews/control-plane.ts`),
+and the generic `github.post_pr_review` action posts. The review ledger,
+the Reviews page, the review tools (ADR 0089), the policy gate, and the
+reviewer profile below are unchanged; the diagram and the DBOS version
+notes that follow describe the retired workflow.
 
 engrams reviews pull requests in enrolled repos. A review runs as one or more
 sandboxed sessions that investigate the change with real tools (clone, grep,

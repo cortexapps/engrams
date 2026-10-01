@@ -8,7 +8,6 @@ import type { LeaseStore } from "./lease-store.ts";
 import { SessionListener } from "./session-listener.ts";
 import { makeProductionOtelExporterConsumers } from "./otel-exporter-consumer.ts";
 import { makeProductionPrLinkConsumer } from "./pr-link-consumer.ts";
-import { makeProductionReviewConsumer } from "./review-consumer.ts";
 import { makeProductionAutomationConsumer } from "./automation-consumer.ts";
 import { makeProductionSlackConsumer } from "./slack-consumer.ts";
 import { makeProductionTitleConsumer } from "./title-consumer.ts";
@@ -165,7 +164,6 @@ export function makeProductionListenerManager(): ListenerManager {
           makeProductionToolConsumer(),
           makeProductionPrLinkConsumer(),
           makeProductionSlackConsumer(),
-          makeProductionReviewConsumer(),
           makeProductionAutomationConsumer(),
           makeProductionTitleConsumer(),
           makeSpecProjectionConsumer(productionSpecProjection),

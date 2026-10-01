@@ -917,9 +917,6 @@ export const review = pgTable(
     trigger: text("trigger").notNull(),
     status: text("status").notNull().default("queued"), // queued|finding|verifying|posted|failed|superseded|halted
     githubReviewId: text("github_review_id"),
-    // The sticky GitHub issue-comment we post on pickup and edit in place
-    // through the lifecycle (👀 → ⏳ → ✅). Null until the first ack lands.
-    statusCommentId: text("status_comment_id"),
     // The worker sessions, stamped at kickoff so the UI can offer a live
     // "watch" link while the phase runs. The session is deleted when its phase
     // ends, but the id is kept as the durable record of which session ran.
@@ -1038,10 +1035,6 @@ export const reviewEnrollment = pgTable("review_enrollment", {
   triggerMode: text("trigger_mode").notNull().default("manual"), // auto|manual
   autofix: text("autofix").notNull().default("off"), // auto|manual|off
   profileId: text("profile_id").references(() => profile.id),
-  // ADR 0119 phase 4.4: which engine reviews this repo during the parallel
-  // window. legacy = the hand-written PrReviewWorkflow; automation = the
-  // seeded PR-review built-in. Dropped with this table in phase 4.7.
-  engine: text("engine").notNull().default("legacy"), // legacy|automation
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true })
     .notNull()
@@ -1080,15 +1073,6 @@ export const consumerCursor = pgTable(
 export const slackSession = pgTable("slack_session", {
   sessionId: text("session_id").primaryKey(),
   threadWfId: text("thread_wf_id").notNull(),
-});
-
-/** Review worker sessions route terminal state into their owning review
- * workflow mailbox. Absence means the review consumer does not apply. */
-export const reviewSession = pgTable("review_session", {
-  sessionId: text("session_id").primaryKey(),
-  reviewWorkflowId: text("review_workflow_id").notNull(),
-  role: text("role").notNull(), // finder|verifier
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 // ---------------------------------------------------------------------------

@@ -90,25 +90,6 @@ export type BeginReviewPassResult =
       taskId: string;
     };
 
-export interface UpdateReviewPassContextInput {
-  headSha: string;
-  baseSha: string;
-  headBranch: string | null;
-  baseBranch: string | null;
-  additions: number | null;
-  deletions: number | null;
-  changedFiles: number | null;
-}
-
-/**
- * A pass, flattened with its PR's identity.
- *
- * The two live in separate tables — the PR is a durable entity, the pass is an
- * event about it — but every reader wants them together, so the store joins and
- * presents one row. `repo`, `prNumber`, `prTitle`, `prAuthor` and `prState` come
- * from the target and are therefore CURRENT for the PR, identical across all of
- * its passes; the branch and diff fields belong to this pass alone.
- */
 export interface ReviewRow {
   id: string;
   targetId: string;
@@ -121,7 +102,6 @@ export interface ReviewRow {
   trigger: string;
   status: string;
   githubReviewId: string | null;
-  statusCommentId: string | null;
   finderSessionId: string | null;
   verifierSessionId: string | null;
   /** ADR 0119 phase 4: the automation run that drove this pass, if any. */
@@ -300,10 +280,6 @@ export interface ReviewStore {
    * leave an orphan automation task.
    */
   beginReviewPass(input: BeginReviewPassInput): Promise<BeginReviewPassResult>;
-  updateReviewPassContext(
-    reviewId: string,
-    input: UpdateReviewPassContextInput,
-  ): Promise<boolean>;
   getReview(id: string): Promise<ReviewDetail | null>;
   /** Earlier passes of the same target, newest first, excluding the given
    *  pass. Findings ride along so a re-review knows what was already
@@ -315,7 +291,6 @@ export interface ReviewStore {
   listReviews(query: ReviewListQuery): Promise<ReviewListPage>;
   /** Every pass over one pull request, newest first, with finding counts. */
   listPasses(targetId: string): Promise<ReviewListRow[]>;
-  getActiveReviewForTask(taskId: string): Promise<ReviewRow | null>;
   /** The active pass an automation run drives (ADR 0119): a built-in's worker
    * session belongs to the AUTOMATION's task, not the review's, so the review
    * tools resolve their pass through the session's run instead. */
@@ -333,7 +308,6 @@ export interface ReviewStore {
   recordEvent(reviewId: string, kind: string, detail?: string): Promise<void>;
   listEvents(reviewId: string): Promise<ReviewEventRow[]>;
   setFinderSummary(reviewId: string, summaryMd: string): Promise<void>;
-  setStatusCommentId(reviewId: string, statusCommentId: string): Promise<void>;
   setReviewSessionId(
     reviewId: string,
     role: "finder" | "verifier",
@@ -414,7 +388,6 @@ function toReviewRow(row: JoinedReviewRow): ReviewRow {
     trigger: row.trigger,
     status: row.status,
     githubReviewId: row.githubReviewId ?? null,
-    statusCommentId: row.statusCommentId ?? null,
     finderSessionId: row.finderSessionId ?? null,
     verifierSessionId: row.verifierSessionId ?? null,
     automationRunId: row.automationRunId ?? null,
@@ -786,20 +759,6 @@ export function makeReviewStore(
       });
     },
 
-    async updateReviewPassContext(reviewId, input) {
-      const updated = await db
-        .update(reviewTable)
-        .set({ ...input, updatedAt: new Date() })
-        .where(
-          and(
-            eq(reviewTable.id, reviewId),
-            inArray(reviewTable.status, ACTIVE_REVIEW_STATUSES),
-          ),
-        )
-        .returning({ id: reviewTable.id });
-      return updated.length > 0;
-    },
-
     async getReview(id) {
       const reviews = await db
         .select(reviewSelection)
@@ -973,22 +932,6 @@ export function makeReviewStore(
       return listPassRows(eq(reviewTable.targetId, targetId));
     },
 
-    async getActiveReviewForTask(taskId) {
-      const rows = await db
-        .select(reviewSelection)
-        .from(reviewTable)
-        .innerJoin(targetTable, eq(reviewTable.targetId, targetTable.id))
-        .where(
-          and(
-            eq(reviewTable.taskId, taskId),
-            inArray(reviewTable.status, ACTIVE_REVIEW_STATUSES),
-          ),
-        )
-        .orderBy(desc(reviewTable.createdAt))
-        .limit(1);
-      return rows[0] ? toReviewRow(rows[0]) : null;
-    },
-
     async getActiveReviewForAutomationRun(runId) {
       const rows = await db
         .select(reviewSelection)
@@ -1130,13 +1073,6 @@ export function makeReviewStore(
       await db
         .update(reviewTable)
         .set({ summaryMd, updatedAt: new Date() })
-        .where(eq(reviewTable.id, reviewId));
-    },
-
-    async setStatusCommentId(reviewId, statusCommentId) {
-      await db
-        .update(reviewTable)
-        .set({ statusCommentId, updatedAt: new Date() })
         .where(eq(reviewTable.id, reviewId));
     },
 

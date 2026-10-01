@@ -1,7 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 
-import type { EnrollmentRow } from "../db/enrollments.ts";
 import type { UpsertReviewTargetInput } from "../db/reviews.ts";
 import { dispatchIntegrationEvent, type DispatchWebhookInput } from "../automations/dispatch.ts";
 import type { IntegrationEventDispatchInput } from "../automations/integration-ingress.ts";
@@ -9,21 +8,11 @@ import type {
   IntegrationEventStore,
   RecordIntegrationEventInput,
 } from "../db/integration-events.ts";
-import type { DispatchReviewInput } from "../workflows/dispatch-review.ts";
-import type { ReviewIngressStart } from "../workflows/review-ingress.ts";
 import { makeGithubEventsRoute } from "../routes/github-events.ts";
 
 const SECRET = "github-route-secret";
 const PATH = "/api/v1/integrations/github/events";
-const enrollment: EnrollmentRow = {
-  repo: "openai/engrams",
-  triggerMode: "auto",
-  engine: "legacy" as const,
-  autofix: "off",
-  profileId: null,
-  createdAt: new Date("2026-07-17T00:00:00Z"),
-  updatedAt: new Date("2026-07-17T00:00:00Z"),
-};
+const enrollment = { repo: "openai/engrams" };
 
 function headers(body: string, event: string) {
   return {
@@ -65,19 +54,17 @@ function pullRequestBody(
   });
 }
 
-/** What the route is expected to hand review ingress from that delivery. */
-const FORWARDED_PR = {
+/** What the route is expected to refresh the review target with. */
+const REFRESHED_TARGET = {
+  provider: "github",
   providerId: "2158810101",
-  url: `https://github.com/${enrollment.repo}/pull/100`,
-  providerUpdatedAt: new Date("2026-07-21T12:34:56Z"),
+  repo: enrollment.repo,
+  number: 100,
   title: "Bump quinn-proto from 0.11.14 to 0.11.16",
   author: "dependabot[bot]",
   state: "open",
-  headBranch: "dependabot/cargo/quinn-proto-0.11.16",
-  baseBranch: "main",
-  additions: 12,
-  deletions: 4,
-  changedFiles: 2,
+  url: `https://github.com/${enrollment.repo}/pull/100`,
+  providerUpdatedAt: new Date("2026-07-21T12:34:56Z"),
 };
 
 function commentBody(
@@ -143,15 +130,11 @@ export function fakeIngress() {
   };
 }
 
-function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment, reviewAutomationDisabled = false) {
-  const dispatches: DispatchReviewInput[] = [];
-  const ingresses: ReviewIngressStart[] = [];
+function app() {
   const refreshes: UpsertReviewTargetInput[] = [];
   const stops: Array<{ repo: string; prNumber: number }> = [];
   const ingress = fakeIngress();
   return {
-    dispatches,
-    ingresses,
     refreshes,
     stops,
     ledger: ingress.recorded,
@@ -160,20 +143,6 @@ function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment, reviewA
       ingress: ingress.deps,
       webhookSecret: async () => SECRET,
       mentionHandle: "acme-reviewer",
-      reviewAutomationDisabled,
-      enrollments: { get: async () => enrolled ? enrollmentRow : null },
-      dispatch: async (input) => {
-        dispatches.push(input);
-        return {
-          enrolled: true,
-          activePass: true,
-          workflowId: "review:wf",
-          reviewId: "review-row-1",
-        };
-      },
-      startIngress: async (input) => {
-        ingresses.push(input);
-      },
       stopAutomationReview: async (input) => {
         stops.push(input);
         return { stopped: true, runId: "autorun:b1:github:d1" };
@@ -186,101 +155,6 @@ function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment, reviewA
     }),
   };
 }
-
-const autoAutomationEnrollment: EnrollmentRow = { ...enrollment, engine: "automation" };
-
-describe("the automation-engine route branch (ADR 0119 phase 4.4)", () => {
-  test("an automation-engine repo skips legacy ingress, still refreshes the target, and the spine dispatched", async () => {
-    const body = pullRequestBody("opened", false);
-    const fixture = app(true, autoAutomationEnrollment);
-    const res = await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "pull_request"),
-    });
-    expect(res.status).toBe(200);
-    expect(fixture.ingresses).toEqual([]); // no legacy ingress
-    expect(fixture.dispatches).toEqual([]);
-    expect(fixture.refreshes).toHaveLength(1); // dossier target kept fresh
-    expect(fixture.integrationDispatches).toHaveLength(1); // spine → built-in
-  });
-
-  test("the kill switch forces an automation repo back onto legacy ingress", async () => {
-    const body = pullRequestBody("opened", false);
-    const fixture = app(true, autoAutomationEnrollment, /* reviewAutomationDisabled */ true);
-    const res = await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "pull_request"),
-    });
-    expect(res.status).toBe(200);
-    expect(fixture.ingresses).toHaveLength(1); // legacy ingress ran
-    expect(fixture.integrationDispatches).toHaveLength(1); // spine always ledgers+dispatches
-  });
-
-  test("a legacy repo is unchanged: legacy ingress starts", async () => {
-    const body = pullRequestBody("opened", false);
-    const fixture = app(true, enrollment); // engine "legacy"
-    await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "pull_request"),
-    });
-    expect(fixture.ingresses).toHaveLength(1);
-  });
-
-  test("an @mention review on an automation repo skips legacy ingress", async () => {
-    const body = commentBody("@acme-reviewer review", "MEMBER", "User");
-    const fixture = app(true, autoAutomationEnrollment);
-    const res = await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "issue_comment"),
-    });
-    expect(res.status).toBe(200);
-    expect(fixture.ingresses).toEqual([]);
-    expect(fixture.integrationDispatches).toHaveLength(1);
-  });
-
-  test("an @mention stop on an automation repo halts the built-in run, never the legacy mailbox", async () => {
-    const body = commentBody("@acme-reviewer stop", "MEMBER", "User");
-    const fixture = app(true, autoAutomationEnrollment);
-    const res = await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "issue_comment"),
-    });
-    expect(res.status).toBe(200);
-    expect(fixture.stops).toEqual([{ repo: enrollment.repo, prNumber: 100 }]);
-    expect(fixture.dispatches).toEqual([]);
-  });
-
-  test("the kill switch sends an @mention stop back to the legacy mailbox", async () => {
-    const body = commentBody("@acme-reviewer stop", "MEMBER", "User");
-    const fixture = app(true, autoAutomationEnrollment, /* reviewAutomationDisabled */ true);
-    await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "issue_comment"),
-    });
-    expect(fixture.stops).toEqual([]);
-    expect(fixture.dispatches).toHaveLength(1);
-    expect(fixture.dispatches[0]).toMatchObject({ stop: true });
-  });
-
-  test("an @mention review on a legacy repo still starts legacy ingress", async () => {
-    const body = commentBody("@acme-reviewer review", "MEMBER", "User");
-    const fixture = app(true, enrollment);
-    await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "issue_comment"),
-    });
-    expect(fixture.ingresses).toHaveLength(1);
-  });
-});
-
-const manualEnrollment: EnrollmentRow = { ...enrollment, triggerMode: "manual" };
 
 describe("POST /api/v1/integrations/github/events", () => {
   test("rejects an over-cap content-length before signature verification", async () => {
@@ -335,8 +209,8 @@ describe("POST /api/v1/integrations/github/events", () => {
     });
 
     expect(res.status).toBe(400);
-    expect(fixture.ingresses).toEqual([]);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.refreshes).toEqual([]);
+    expect(fixture.integrationDispatches).toEqual([]);
   });
 
   test("acks ping", async () => {
@@ -348,7 +222,7 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "ping"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.refreshes).toEqual([]);
     // Even a ping is a verified delivery: the spine ledgers it.
     expect(fixture.integrationDispatches).toHaveLength(1);
   });
@@ -367,7 +241,7 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "issues"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.refreshes).toEqual([]);
     // The retired github-app system registration no longer exists; the
     // 2.C integration-trigger seam is the only automation path.
     expect(fixture.integrationDispatches).toEqual([
@@ -428,7 +302,6 @@ describe("POST /api/v1/integrations/github/events", () => {
           throw new Error("dbos unavailable");
         },
       },
-      enrollments: { get: async () => null },
     });
     const res = await route.request(PATH, {
       method: "POST",
@@ -451,94 +324,29 @@ describe("POST /api/v1/integrations/github/events", () => {
     });
     expect(res.status).toBe(200);
     expect(fixture.ledger).toHaveLength(1);
-    expect(fixture.ingresses).toHaveLength(1);
-  });
-
-  test("drops un-enrolled repos", async () => {
-    const body = pullRequestBody();
-    const fixture = app(false);
-    const res = await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "pull_request"),
-    });
-    expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([]);
-    expect(fixture.ingresses).toEqual([]);
-    // The route still offers the delivery to the existing-only refresh seam;
-    // production returns false when this PR has never had a target.
     expect(fixture.refreshes).toHaveLength(1);
   });
 
-  test("dispatches an opened non-draft PR for auto enrollment", async () => {
-    const body = pullRequestBody();
-    const fixture = app();
-    const res = await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "pull_request"),
-    });
-    expect(res.status).toBe(200);
-    expect(fixture.ingresses).toEqual([{
-      provider: "github",
-      repo: enrollment.repo,
-      prNumber: 100,
-      trigger: "opened",
-      idempotencyKey: "delivery-1",
-      headSha: "head-sha",
-      baseSha: "base-sha",
-      pr: FORWARDED_PR,
-    }]);
+  test("every pull_request action refreshes the target; the spine carries the review", async () => {
+    // The built-in's own admission decides whether opened/synchronize starts
+    // a pass (its interpreter tests cover the policy). The route's job is
+    // the dossier target and the spine handoff, the same for every action.
+    for (const action of ["opened", "synchronize", "ready_for_review"]) {
+      const body = pullRequestBody(action);
+      const fixture = app();
+      const res = await fixture.app.request(PATH, {
+        method: "POST",
+        body,
+        headers: headers(body, "pull_request"),
+      });
+      expect(res.status).toBe(200);
+      expect(fixture.refreshes).toEqual([REFRESHED_TARGET]);
+      expect(fixture.integrationDispatches).toHaveLength(1); // spine → built-in
+      expect(fixture.stops).toEqual([]);
+    }
   });
 
-  test("dispatches a synchronize (push) for auto enrollment", async () => {
-    const body = pullRequestBody("synchronize");
-    const fixture = app();
-    const res = await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "pull_request"),
-    });
-    expect(res.status).toBe(200);
-    expect(fixture.ingresses).toEqual([{
-      provider: "github",
-      repo: enrollment.repo,
-      prNumber: 100,
-      trigger: "synchronize",
-      idempotencyKey: "delivery-1",
-      headSha: "head-sha",
-      baseSha: "base-sha",
-      pr: FORWARDED_PR,
-    }]);
-  });
-
-  test("does NOT auto-review a synchronize (push) under manual enrollment (#802)", async () => {
-    const body = pullRequestBody("synchronize");
-    const fixture = app(true, manualEnrollment);
-    const res = await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "pull_request"),
-    });
-    expect(res.status).toBe(200);
-    expect(fixture.ingresses).toEqual([]);
-    expect(fixture.refreshes).toHaveLength(1);
-  });
-
-  test("does NOT auto-review an opened PR under manual enrollment", async () => {
-    const body = pullRequestBody("opened");
-    const fixture = app(true, manualEnrollment);
-    const res = await fixture.app.request(PATH, {
-      method: "POST",
-      body,
-      headers: headers(body, "pull_request"),
-    });
-    expect(res.status).toBe(200);
-    expect(fixture.ingresses).toEqual([]);
-    expect(fixture.refreshes).toHaveLength(1);
-  });
-
-  test("does NOT auto-review a draft PR even under auto enrollment", async () => {
+  test("a draft PR still refreshes the target (the built-in filters the draft)", async () => {
     const body = pullRequestBody("synchronize", true);
     const fixture = app();
     const res = await fixture.app.request(PATH, {
@@ -547,11 +355,11 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "pull_request"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.ingresses).toEqual([]);
     expect(fixture.refreshes).toHaveLength(1);
+    expect(fixture.integrationDispatches).toHaveLength(1);
   });
 
-  test("dispatches a review command (mentioning the configured App handle) with its focus", async () => {
+  test("a review command is left to the spine: the built-in admits the @mention itself", async () => {
     const body = commentBody("@acme-reviewer review focus on auth");
     const fixture = app();
     const res = await fixture.app.request(PATH, {
@@ -560,14 +368,20 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "issue_comment"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.ingresses).toEqual([{
-      provider: "github",
-      repo: enrollment.repo,
-      prNumber: 100,
-      trigger: "command",
-      idempotencyKey: "delivery-1",
-      focus: "focus on auth",
-    }]);
+    expect(fixture.integrationDispatches).toHaveLength(1);
+    expect(fixture.stops).toEqual([]);
+  });
+
+  test("an @mention stop halts the built-in run behind the PR's active pass", async () => {
+    const body = commentBody("@acme-reviewer stop", "MEMBER", "User");
+    const fixture = app();
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "issue_comment"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.stops).toEqual([{ repo: enrollment.repo, prNumber: 100 }]);
   });
 
   test("closed refreshes an existing target without starting a pass", async () => {
@@ -580,8 +394,6 @@ describe("POST /api/v1/integrations/github/events", () => {
     });
 
     expect(res.status).toBe(200);
-    expect(fixture.ingresses).toEqual([]);
-    expect(fixture.dispatches).toEqual([]);
     expect(fixture.refreshes).toEqual([{
       provider: "github",
       providerId: "2158810101",
@@ -596,7 +408,7 @@ describe("POST /api/v1/integrations/github/events", () => {
   });
 
   test("drops commands from unauthorized commenters", async () => {
-    const body = commentBody("@acme-reviewer review", "NONE");
+    const body = commentBody("@acme-reviewer stop", "NONE");
     const fixture = app();
     const res = await fixture.app.request(PATH, {
       method: "POST",
@@ -604,7 +416,7 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "issue_comment"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.stops).toEqual([]);
   });
 
   test("drops commands from bot senders", async () => {
@@ -616,7 +428,7 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "issue_comment"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.stops).toEqual([]);
   });
 
   test("ignores a junk comment", async () => {
@@ -628,7 +440,7 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "issue_comment"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.stops).toEqual([]);
   });
 });
 
@@ -703,14 +515,6 @@ describe("ingress → integration-trigger dispatch (2.C)", () => {
       },
       webhookSecret: async () => SECRET,
       mentionHandle: "acme-reviewer",
-      enrollments: { get: async () => null },
-      dispatch: async () => ({
-        enrolled: false,
-        activePass: false,
-        workflowId: "",
-        reviewId: "",
-      }),
-      startIngress: async () => {},
       refreshTarget: async () => true,
       now: () => new Date("2026-08-21T12:00:00Z"),
     });
