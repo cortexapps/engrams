@@ -132,8 +132,12 @@ code {
 .layer.scan {
   background: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.18) 0 1px, transparent 1px 4px);
 }
+/* The tilt pivots on the top edge and draws the 220px plane 147px tall, so a
+   floor pinned to the bottom left a bare 73px band under its far edge. Sink it
+   by that much so the far edge meets the bottom of the cover; the hero's
+   bottom padding is 73px less to match. */
 .layer.floor {
-  inset: auto 0 0 0;
+  inset: auto 0 -73px 0;
   height: 220px;
   transform: perspective(900px) rotateX(58deg);
   transform-origin: 50% 0;
@@ -361,7 +365,7 @@ html {
   display: grid;
   grid-template-columns: 560px 1fr;
   gap: 64px;
-  padding: 72px 0 260px;
+  padding: 72px 0 187px;
   align-items: start;
 }
 .eyebrow {
@@ -1566,7 +1570,7 @@ html {
   }
   .hero {
     grid-template-columns: 1fr;
-    padding-bottom: 240px;
+    padding-bottom: 167px;
   }
   .hero h1 {
     font-size: 72px;
