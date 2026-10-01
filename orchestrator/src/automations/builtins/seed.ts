@@ -165,7 +165,10 @@ async function seedOne(
         {
           name: builtin.name,
           description: builtin.description,
-          enabled: false,
+          // On from the first boot: a fresh deployment's built-ins answer as
+          // soon as a repo is enrolled or a Slack profile is picked, with no
+          // second switch to find. An empty map or profile admits nothing.
+          enabled: true,
           definition,
           nextFireAt: null,
           kind: "builtin",
@@ -180,7 +183,7 @@ async function seedOne(
       throw error;
     }
     result.created.push(builtin.key);
-    logger.info({ key: builtin.key, repos: Object.keys((inputs["repos"] as object) ?? {}).length }, "built-in automation seeded (disabled)");
+    logger.info({ key: builtin.key, repos: Object.keys((inputs["repos"] as object) ?? {}).length }, "built-in automation seeded");
     return;
   }
 

@@ -36,7 +36,7 @@ function harness(
       id,
       name: "PR review",
       description: "",
-      enabled: false,
+      enabled: true,
       kind: "builtin",
       builtinKey: PR_REVIEW_BUILTIN_KEY,
       currentVersion,
@@ -113,13 +113,15 @@ function harness(
 }
 
 describe("seedBuiltinAutomations", () => {
-  test("fresh: creates the built-in disabled with an empty repos map and the default connection", async () => {
+  test("fresh: creates the built-in enabled with an empty repos map and the default connection", async () => {
     const h = harness();
     const result = await seedBuiltinAutomations({ ...h.deps, builtins: [PR_REVIEW_BUILTIN] });
 
     expect(result.created).toEqual([PR_REVIEW_BUILTIN_KEY]);
     const row = h.rows.get("auto-pr-review")!;
-    expect(row.enabled).toBe(false);
+    // On from the first boot: enrolling a repo is the only switch. An empty
+    // map admits nothing until then.
+    expect(row.enabled).toBe(true);
     expect(row.kind).toBe("builtin");
     expect(row.inputs["repos"]).toEqual({});
     expect(row.inputs["mention"]).toBe("@engrams");

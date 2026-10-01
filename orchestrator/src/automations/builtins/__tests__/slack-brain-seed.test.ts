@@ -83,12 +83,13 @@ function harness() {
 }
 
 describe("seedBuiltinAutomations — slack_brain", () => {
-  test("fresh: disabled, empty channel map, default Slack connection", async () => {
+  test("fresh: enabled, empty channel map, default Slack connection", async () => {
     const h = harness();
     const result = await seedBuiltinAutomations({ ...h.deps, builtins: [SLACK_BRAIN_BUILTIN] });
     expect(result.created).toEqual([SLACK_BRAIN_BUILTIN_KEY]);
     const row = h.rows.get(`auto-${SLACK_BRAIN_BUILTIN_KEY}`)!;
-    expect(row.enabled).toBe(false);
+    // On from the first boot; with no default profile it admits nothing.
+    expect(row.enabled).toBe(true);
     expect(row.kind).toBe("builtin");
     expect(row.inputs).toEqual({ channels: {}, default_profile: "", idle_timeout: 3600, max_turns: 50 });
     expect(row.version.trigger).toMatchObject({
