@@ -443,6 +443,9 @@ message AutomationInstance {
   string opened_at = 7;
   optional string closed_at = 8;
   optional string close_reason = 9;
+  // The human title rendered at open (settings.instance.labelTemplate);
+  // absent = the UI shows the key.
+  optional string label = 10;
 }
 
 // One external identifier the workstream owns (routing history; handles

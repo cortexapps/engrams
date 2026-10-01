@@ -692,6 +692,7 @@ function fakeInstances(): InstanceHarness {
         id: `ai_test${++seq}`,
         automationId: input.automationId,
         key: input.key,
+        label: input.label ?? null,
         status: "open",
         inputs: input.inputs,
         openedBy: input.openedBy,
@@ -773,6 +774,7 @@ function fakeInstances(): InstanceHarness {
         id: `ai_test${++seq}`,
         automationId: input.automationId,
         key: input.key,
+        label: null,
         status: input.status ?? "open",
         inputs: input.inputs ?? {},
         openedBy: "seed",
@@ -1139,6 +1141,43 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
     expect(unbound).toMatchObject({ started: 1, dropped: 1, suppressed: [] });
     expect(unbound.builtins).toEqual({ slack_brain: "started" });
     expect(h2.starts.map((s) => s.automationId)).toEqual(["brain-1"]);
+  });
+
+  test("a workstream's labelTemplate renders its title at open; an empty render leaves the key", async () => {
+    const slackTrigger = trigger({ provider: "slack", eventKeys: ["app_mention"] });
+    const brain = {
+      automation: meta({ id: "brain-1", builtinKey: "slack_brain", kind: "builtin" }),
+      definition: definition(slackTrigger, {
+        settings: {
+          endSessionsOnFinish: false,
+          instance: {
+            keyTemplate: "thread-${{ event.raw.event.ts }}",
+            labelTemplate: "${{ event.raw.event.text | strip_mentions | truncate: 80 }}",
+          },
+        },
+      }),
+    };
+    const i = fakeInstances();
+    await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "app_mention",
+        payload: { event: { channel: "C1", ts: "1.1", text: "<@UBOT> can you draw a pelican?" } },
+      }),
+      { ...deps(makeHarness([brain])), instances: i.store, facets: async () => undefined },
+    );
+    expect((await i.store.getOpenInstanceByKey("brain-1", "thread-1.1"))?.label).toBe("can you draw a pelican?");
+
+    await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "app_mention",
+        deliveryId: "slack-bare",
+        payload: { event: { channel: "C1", ts: "2.2", text: "<@UBOT>" } },
+      }),
+      { ...deps(makeHarness([brain])), instances: i.store, facets: async () => undefined },
+    );
+    expect((await i.store.getOpenInstanceByKey("brain-1", "thread-2.2"))?.label).toBeNull();
   });
 
   test("rung-1 precedence: the brain's OWN workstream owning the thread never stands the brain down (its reply joins by key)", async () => {

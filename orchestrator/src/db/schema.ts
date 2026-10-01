@@ -1590,6 +1590,9 @@ export const automationInstance = pgTable(
       .references(() => automation.id, { onDelete: "cascade" }),
     /** The rendered identity key (human-readable, e.g. project-ENG-42). */
     key: text("key").notNull(),
+    /** The human title rendered at open (settings.instance.labelTemplate);
+     * null = the UI shows the key. */
+    label: text("label"),
     status: text("status").notNull().default("open"),
     inputs: jsonb("inputs").$type<Record<string, unknown>>().notNull().default({}),
     /** user:<id> | run:<runId> | the admitting event's descriptor. */

@@ -1311,6 +1311,7 @@ function fakeInstanceStore() {
         id: `ai_rpc${++seq}`,
         automationId: input.automationId,
         key: input.key,
+        label: null,
         status: "open",
         inputs: input.inputs,
         openedBy: input.openedBy,

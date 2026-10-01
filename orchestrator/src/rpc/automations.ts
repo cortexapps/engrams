@@ -440,7 +440,13 @@ function productionInputKeyOptions(
         }
         case "channel": {
           const client = await getSlackClient();
-          const result = await client.conversations.list({ limit: 200, exclude_archived: true });
+          // Private channels the app is in count too (a thread there needs
+          // a name as much as a public one's).
+          const result = await client.conversations.list({
+            limit: 200,
+            exclude_archived: true,
+            types: "public_channel,private_channel",
+          });
           return (result.channels ?? [])
             .filter((c) => typeof c.id === "string")
             .map((c) => ({ key: c.id!, label: c.name ? `#${c.name}` : c.id! }));
@@ -1434,6 +1440,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       id: row.id,
       automationId: row.automationId,
       key: row.key,
+      ...(row.label !== null ? { label: row.label } : {}),
       status: row.status,
       inputsJson: JSON.stringify(row.inputs),
       openedBy: row.openedBy,

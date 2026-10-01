@@ -633,6 +633,7 @@ async function settleInstanceResolution(
       const instance = await ctx.instances.openInstance({
         automationId: ctx.automationId,
         key: resolution.key,
+        label: resolution.label,
         inputs: resolution.inputs,
         openedBy: `event:${ctx.deliveryKey}`,
       });
