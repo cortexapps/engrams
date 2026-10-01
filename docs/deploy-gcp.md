@@ -12,13 +12,23 @@ Topology background: [`deploy.md`](./deploy.md). Terraform layout:
 - A GCP project with billing, and `Owner` (or equivalent) on it.
 - `gcloud`, `terraform` ≥ 1.5, `helm` ≥ 3.10, `kubectl`, `openssl`.
 - A domain you control (you will create one A record).
+- **An OAuth client for sign-in.** People sign in with Google, and
+  only accounts of your Google Workspace domain get in. In the
+  Google Cloud console: APIs & Services → Credentials → OAuth client
+  ID → "Web application", with the authorized redirect URI
+  `https://$DOMAIN/api/auth/oauth2/callback/sso`. If the console
+  asks for a consent screen first, user type "Internal" limits the
+  client to your organization. Keep the client ID and the client
+  secret.
 - **C3 quota**: the KVM pool is 2 × `c3-standard-22` (44 vCPUs) by
   default. Check `gcloud compute regions describe <region>` for
   `C3_CPUS` headroom, and that your region offers C3 at all, before
   applying — a quota request can take a day.
 
 Throughout: `PROJECT`, `REGION`, `DOMAIN` (e.g.
-`engrams.example.com`), `ADMIN_EMAIL` are yours.
+`engrams.example.com`), `ADMIN_EMAIL`, `EMAIL_DOMAIN` (the Workspace
+domain whose accounts may sign in, e.g. `example.com`),
+`OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET` are yours.
 
 ## 1. Enable the APIs
 
@@ -39,7 +49,9 @@ terraform apply \
   -var project_id=$PROJECT \
   -var region=$REGION \
   -var domain=$DOMAIN \
-  -var admin_email=$ADMIN_EMAIL
+  -var admin_email=$ADMIN_EMAIL \
+  -var oauth_client_id=$OAUTH_CLIENT_ID \
+  -var "oauth_allowed_domains=[\"$EMAIL_DOMAIN\"]"
 ```
 
 (Optional: `-var dns_zone_name=<your Cloud DNS zone>` creates the A
@@ -80,6 +92,10 @@ openssl rand -base64 32 | \
 # The orchestrator's session-signing secret.
 openssl rand -base64 48 | \
   gcloud secrets versions add engram-better-auth-secret --data-file=- --project=$PROJECT
+
+# The OAuth client secret.
+echo -n "$OAUTH_CLIENT_SECRET" | \
+  gcloud secrets versions add engram-oauth-client-secret --data-file=- --project=$PROJECT
 
 # The egress-proxy CA pair (fleet-wide, ten-year cert).
 openssl req -x509 -newkey rsa:4096 -nodes \
@@ -163,14 +179,31 @@ kubectl logs -n engrams deploy/engram-coordinator | grep -i "host registered"
 
 ## 6. First login
 
-Open `https://$DOMAIN` (after the cert is Active). Sign up with
-`$ADMIN_EMAIL` — the bootstrap allow-list promotes it to admin on
-first sign-in. There is no identity proxy in this posture: the
-orchestrator's login wall is the auth door. To add IAP on
-top later, see `deploy/helm/engram/values-iap.yaml.example` — the
-split-host layout: IAP guards the app host while the machine surface
-(RPC, SSE, WebSockets) moves to a second hostname, so plan on one
-extra A record (`api.<domain>`, same IP) and a second managed cert.
+Open `https://$DOMAIN` (after the cert is Active) and choose
+**Continue with Google**. Sign in as `$ADMIN_EMAIL` — the bootstrap
+allow-list promotes it to admin on first sign-in. Every other
+account of `$EMAIL_DOMAIN` can sign in as a member, and no other
+account can. There is no password sign-up.
+
+There is no identity proxy in this posture: the orchestrator's login
+wall is the auth door. Every sign-in setting is in the chart's
+`orchestrator.auth` block (`deploy/helm/engram/values.yaml`):
+
+- **Another identity provider**: any provider with an OIDC discovery
+  document (Okta, Auth0, Keycloak, Cognito). Pass
+  `-var oauth_issuer=<issuer URL>` in step 2. The provider must
+  return a verified email.
+- **Who may sign in**: `oauth.allowedDomains` / `oauth.allowedEmails`.
+  The check runs on every sign-in, so an account that leaves the
+  list loses access at its next sign-in.
+- **IAP instead**: `mode: iap`, with
+  `deploy/helm/engram/values-iap.yaml.example` — the split-host
+  layout: IAP guards the app host while the machine surface (RPC,
+  SSE, WebSockets) moves to a second hostname, so plan on one extra
+  A record (`api.<domain>`, same IP) and a second managed cert.
+- **Email + password**: `mode: password`. An address is not verified
+  at sign-up, so anyone who can reach the page can register any
+  address. **Do not** use it on a deployment the internet can reach.
 
 ## 7. Enable a first image
 
@@ -210,4 +243,7 @@ first if you mean it.
 | Host-agent pods Pending | The KVM pool isn't up (C3 quota?) or the namespace lost its `pod-security.kubernetes.io/enforce=privileged` label. |
 | Host-agent CrashLoops on the egress CA | The CA shells are empty (step 3), or the `engram-host-egress-ca` Secret hasn't synced into `engrams-hosts`. |
 | Cert stuck `Provisioning` | DNS doesn't resolve to the static IP yet; managed certs wait for it. |
+| Google shows `redirect_uri_mismatch` | The OAuth client's authorized redirect URI is not exactly `https://$DOMAIN/api/auth/oauth2/callback/sso`. |
+| The login page says the account does not have access | The account is not of an allowed domain. For Google the domain is the Workspace organization of the account, so a personal Google account with an address at your domain is refused. |
+| Orchestrator `CreateContainerConfigError`: `secret "engram-oauth-client" not found` | The `engram-oauth-client-secret` shell is empty — fill it (step 3) and wait for the relay. |
 | `no capacity` / sessions queued forever | Hosts never registered — check the host-agent logs for the coordinator endpoint + bearer (must be an `engram-auth-tokens` entry). |

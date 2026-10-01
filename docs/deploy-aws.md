@@ -40,8 +40,16 @@ the deliberate per-cloud differences are marked ⚡ below.
   get-caller-identity` works).
 - `aws`, `terraform` ≥ 1.5.7, `helm` ≥ 3.10, `kubectl`, `openssl`, `jq`, `dig`.
 - A domain you control (one validation CNAME + one final CNAME).
+- **An OAuth client for sign-in**, from an identity provider with an
+  OIDC discovery document: Google, Cognito, Okta, Auth0, Keycloak.
+  Register a web client with the redirect URI
+  `https://$DOMAIN/api/auth/oauth2/callback/sso`, and keep the client
+  ID and the client secret. The provider must return a verified
+  email.
 
-Throughout: `REGION`, `DOMAIN`, `ADMIN_EMAIL` are yours.
+Throughout: `REGION`, `DOMAIN`, `ADMIN_EMAIL`, `EMAIL_DOMAIN` (the
+domain whose accounts may sign in, e.g. `example.com`),
+`OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET` are yours.
 
 ## 1. Quota check
 
@@ -68,10 +76,17 @@ cat > terraform.tfvars <<EOF
 region      = "$REGION"
 domain      = "$DOMAIN"
 admin_email = "$ADMIN_EMAIL"
+
+oauth_client_id       = "$OAUTH_CLIENT_ID"
+oauth_allowed_domains = ["$EMAIL_DOMAIN"]
 EOF
 terraform init
 terraform apply
 ```
+
+The sign-in provider defaults to Google. For another one, add its
+issuer URL to the file, e.g. `oauth_issuer =
+"https://cognito-idp.<region>.amazonaws.com/<user-pool-id>"`.
 
 (Optional: `route53_zone_id = "<hosted zone>"` in the file automates
 the ACM validation records; step 4 covers the manual alternative.)
@@ -95,7 +110,7 @@ aws eks update-kubeconfig --region $REGION \
 
 ## 3. Populate the secret shells
 
-⚡ Four shells + the CA pair. The coordinator's KEK is the KMS key,
+⚡ Five shells + the CA pair. The coordinator's KEK is the KMS key,
 so there is no coordinator KEK entry; the orchestrator still needs a
 raw key because it seals its own tables in-process and has no KMS
 path. **Do this before the Helm installs** — the relay leaves the
@@ -117,6 +132,11 @@ aws secretsmanager put-secret-value --region $REGION \
 aws secretsmanager put-secret-value --region $REGION \
   --secret-id engram/kek-master \
   --secret-string "$(openssl rand -base64 32)"
+
+# The OAuth client secret.
+aws secretsmanager put-secret-value --region $REGION \
+  --secret-id engram/oauth-client-secret \
+  --secret-string "$OAUTH_CLIENT_SECRET"
 
 # The egress-proxy CA pair (fleet-wide, ten-year cert). ⚡ The
 # host-agent reads these DIRECTLY from Secrets Manager over IRSA
@@ -234,10 +254,16 @@ leg).
 
 ## 7. First login + first image
 
-Sign up with `$ADMIN_EMAIL` (bootstrap-promoted to admin — the
-login wall; ⚡ do NOT put ALB OIDC/Cognito auth in front of
-the app: it breaks CORS preflights and WebSockets the same way IAP
-does). Then enable a first image — `eclipse-temurin:21-jre` is a
+Open `https://$DOMAIN`, choose the **Continue with** button, and
+sign in as `$ADMIN_EMAIL` (bootstrap-promoted to admin). Every other
+account of `$EMAIL_DOMAIN` can sign in as a member, and no other
+account can; there is no password sign-up. Every sign-in setting,
+the allowlist included, is in the chart's `orchestrator.auth` block.
+⚡ Do NOT put ALB OIDC/Cognito auth in front of the app: it breaks
+CORS preflights and WebSockets the same way IAP does — point
+`orchestrator.auth.oauth` at the Cognito user pool instead.
+
+Then enable a first image — `eclipse-temurin:21-jre` is a
 good first pick; **use a glibc-based image** (Alpine/musl images are
 not yet supported by the built-in harnesses), and add your model
 credentials (Settings → Harness environment, or connect OpenRouter
@@ -272,6 +298,9 @@ The bucket refuses destroy unless emptied
 | ASG instances InService but `kubectl get nodes -l engram.io/kvm=true` is empty and the DaemonSet shows 0 desired | The kubelets can't authenticate: the node role needs an EKS access entry (the kvm-nodegroup module creates it — `aws eks list-access-entries --cluster-name <cluster>` must list `<name>-node`). Nodes join on their own once it exists; no relaunch needed. |
 | `terraform apply` fails on a `helm_release` with `no endpoints available for service "aws-load-balancer-webhook-service"` | The AWS Load Balancer Controller registers a fail-closed webhook on every Service before its pods are ready; the quickstart serializes ESO behind it, so this means the controller itself is unhealthy (`kubectl get pods -n kube-system`). Fix that, then re-run `apply`. |
 | Pods CrashLoop on missing Secrets | Step 3 skipped — `kubectl get externalsecret -A` shows the sync state. |
+| Orchestrator `CreateContainerConfigError`: `secret "engram-oauth-client" not found` | The `engram/oauth-client-secret` shell is empty — fill it (step 3) and wait for the relay. |
+| The provider shows a redirect URI error | The client's redirect URI is not exactly `https://$DOMAIN/api/auth/oauth2/callback/sso`. |
+| The login page says the account does not have access | The account is not of an allowed domain, or the provider did not return a verified email. |
 | Orchestrator `CreateContainerConfigError`: `couldn't find key ENGRAM_KEK_MASTER_KEY` | The `engram/kek-master` shell is empty, or the relay has not re-synced since you filled it (`kubectl annotate externalsecret -n engrams engram-orchestrator-secrets force-sync=$(date +%s)`). |
 | Host-agent CrashLoops on the egress CA | The CA shells are empty, or the fleet IRSA role can't read them (it is scoped to exactly those two ARNs). |
 | Ingress has no ALB hostname | The AWS Load Balancer Controller isn't healthy (`kubectl get pods -n kube-system`), or the ACM cert isn't Issued yet. |

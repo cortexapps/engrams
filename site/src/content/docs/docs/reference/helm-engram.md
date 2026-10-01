@@ -25,8 +25,33 @@ Service the public Ingress targets. The web Ingress is the only public surface o
 deployment.
 
 **The orchestrator.** With `orchestrator.enabled`, the Deployment that owns sign-in, tasks,
-profiles, integrations, and the API. Its settings, including the admin allow-list
-(`orchestrator.auth.adminEmails`), live under the `orchestrator` block.
+profiles, integrations, and the API. Its settings live under the `orchestrator` block.
+
+## Sign-in
+
+Every setting for how a person signs in is in `orchestrator.auth`. `mode` selects one door,
+and only that door is open.
+
+| `auth.mode` | The door | Settings |
+|---|---|---|
+| `oauth` (default) | A "Continue with" button for one OIDC identity provider: Google, Okta, Auth0, Keycloak, Cognito. | `oauth.issuer`, `oauth.clientId`, `oauth.clientSecret`, and the allowlist `oauth.allowedDomains` and `oauth.allowedEmails`. |
+| `iap` | GCP Identity-Aware Proxy in front of the app host. | `iap.audiences`. IAP's IAM binding decides who gets in. |
+| `password` | Email and password. | `password.signup` opens or closes registration. |
+
+`auth.adminEmails` names the accounts that become admins on first sign-in, in every mode.
+
+An OAuth client admits every account its provider has, so `oauth` mode needs an allowlist
+and the chart does not render without one. The orchestrator checks it on every sign-in. For
+Google the domain is the Workspace organization of the account, not the text of the
+address. `allowedDomains: ["*"]` admits every account the provider authenticates, which is
+correct for a provider that holds only your own people.
+
+`password` mode does not verify an address at sign-up. With `password.signup: true`, anyone
+who can reach the login page can register any address, an admin address included. Use it
+for evaluation, or on a network the internet cannot reach.
+
+The chart fails the render when the active mode is missing a setting, and it renders only
+the active mode's settings, so the other two blocks can stay filled in.
 
 ## What it does not deploy
 
@@ -67,8 +92,8 @@ at boot.
 | `hpa`, `pdb`, `networkPolicy`, `resources`, `nodeSelector`, `tolerations`, `affinity` | Scheduling and availability. |
 | `otel` | An OTLP endpoint for the coordinator's own traces. |
 | `probes`, `drainSeconds`, `terminationGracePeriodSeconds` | Liveness on `/healthz`, readiness on `/readyz`, and how long a replica drains before it stops. |
-| `web` | The dashboard: image, Ingress, and the annotations that attach a managed certificate or IAP. |
-| `orchestrator` | The orchestrator: image, its Secret with the session-signing key, `auth.adminEmails`, the public URL, and integration settings. |
+| `web` | The dashboard: image, Ingress, and the annotations that attach a managed certificate. |
+| `orchestrator` | The orchestrator: image, its Secret with the session-signing key, `auth` (see [Sign-in](#sign-in)), the public URL, and integration settings. |
 
 ## Upgrades
 
