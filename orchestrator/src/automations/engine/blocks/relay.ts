@@ -46,7 +46,7 @@ import {
   type StartedSession,
 } from "../../../workflows/communication-policy.ts";
 import type { SourceMention } from "../../../workflows/thread-inbox.ts";
-import { config as appConfig } from "../../../config.ts";
+import { sessionWebUrl } from "../../../links.ts";
 import { tools as defaultTools } from "../../../tools/registry.ts";
 import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
@@ -87,7 +87,7 @@ function deps(): SlackRelayDeps {
     policy: (runId) => makeSlackPolicy({ routeExtras: { runId } }),
     completeToolCall: (sessionId, toolCallId, result) =>
       defaultTools.complete(sessionId, toolCallId, result),
-    sessionWebUrl: (sessionId) => `${appConfig.baseUrl}/sessions/${sessionId}`,
+    sessionWebUrl,
   };
   return runtimeDeps;
 }

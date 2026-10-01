@@ -34,6 +34,7 @@ import { resolveEngramsUser } from "../integrations/slack-identity.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import { config } from "../config.ts";
+import { sessionWebUrl } from "../links.ts";
 import { makeProfilePicker, type ProfilePicker } from "../routing/profile-picker.ts";
 import type { ThreadControlPlane } from "./slack-thread.ts";
 import { tools as defaultToolRegistry, type ToolRegistry } from "../tools/registry.ts";
@@ -107,7 +108,7 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
             : {}),
         },
       );
-      return { id: sessionId, webUrl: `${config.baseUrl}/sessions/${sessionId}` };
+      return { id: sessionId, webUrl: sessionWebUrl(sessionId) };
     },
 
     sendPrompt: async (sessionId, prompt, promptId) => {

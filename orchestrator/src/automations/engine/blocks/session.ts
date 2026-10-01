@@ -16,7 +16,7 @@ import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import type { AutomationInbox } from "../inbox.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
-import { config as appConfig } from "../../../config.ts";
+import { sessionWebUrl } from "../../../links.ts";
 
 const overrideFields = {
   harnessMode: z.string().min(1).optional(),
@@ -85,11 +85,6 @@ export const sessionStatusConfigSchema = z.object({ session: sessionRefSchema })
 export type EndSessionConfig = z.infer<typeof endSessionConfigSchema>;
 
 const DEFAULT_WAIT_DEADLINE_S = 7200;
-
-/** The session page a human opens: what a thread or a PR comment links to. */
-function sessionWebUrl(sessionId: string): string {
-  return `${appConfig.baseUrl.replace(/\/$/, "")}/sessions/${sessionId}`;
-}
 
 async function executeCreateSession(
   config: CreateSessionConfig,
