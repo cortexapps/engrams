@@ -764,6 +764,39 @@
       "idempotency": {
         "kind": "natural"
       }
+    },
+    {
+      "id": "list_replies",
+      "label": "List thread replies",
+      "description": "Read a thread's messages (root and replies), each rendered to text.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "type": "string"
+          },
+          "threadTs": {
+            "type": "string"
+          },
+          "oldest": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel",
+          "threadTs"
+        ]
+      },
+      "execute": {
+        "kind": "builtin",
+        "id": "slack.list_replies"
+      },
+      "output": {
+        "messages": "messages"
+      },
+      "idempotency": {
+        "kind": "natural"
+      }
     }
   ]
 }

@@ -17,6 +17,7 @@ import {
   type RunOpDeps,
 } from "../../integrations/run-op.ts";
 import { getSlackClient } from "../../integrations/slack.ts";
+import { replyText, type SlackReply } from "../../integrations/slack-message-text.ts";
 import {
   makeLinearIssueClient,
   type LinearIssueClient,
@@ -43,6 +44,12 @@ export interface SlackChatClient {
   };
   conversations: {
     join(args: { channel: string }): Promise<{ channel?: { id?: string } }>;
+    replies(args: {
+      channel: string;
+      ts: string;
+      oldest?: string;
+      limit?: number;
+    }): Promise<{ messages?: SlackReply[] }>;
   };
 }
 
@@ -214,6 +221,31 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
       channel: requireString(params, "channel"),
     });
     return { channel: response.channel?.id ?? null };
+  },
+
+  "slack.list_replies": async (params, _ctx, deps) => {
+    // One page of a thread, every content surface of each message rendered
+    // to text (text, blocks, attachments, files — the legacy `replyText`).
+    // The caller folds it into a prompt; this action only reads.
+    const client = await deps.slackClient();
+    const oldest = optionalString(params, "oldest");
+    const response = await client.conversations.replies({
+      channel: requireString(params, "channel"),
+      ts: requireString(params, "threadTs"),
+      ...(oldest !== undefined ? { oldest } : {}),
+      limit: 500,
+    });
+    return {
+      // `subtype` is on every Slack message the API returns but not on the
+      // SDK's reply type; widen the one field honestly.
+      messages: (response.messages ?? []).map((m: SlackReply & { subtype?: string }) => ({
+        ts: m.ts ?? "",
+        user: m.user ?? "",
+        bot_id: m.bot_id ?? "",
+        subtype: m.subtype ?? "",
+        text: replyText(m),
+      })),
+    };
   },
 
   "slack.update_message": async (params, _ctx, deps) => {

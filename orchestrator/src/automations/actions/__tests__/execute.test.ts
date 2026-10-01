@@ -320,6 +320,7 @@ describe("executeIntegrationAction — builtins", () => {
             },
             conversations: {
               join: async () => ({}),
+              replies: async () => ({ messages: [] }),
             },
           }),
         }),
@@ -327,6 +328,52 @@ describe("executeIntegrationAction — builtins", () => {
     );
     expect(sent[0]).toEqual({ channel: "C1", text: "hi", thread_ts: "1.1" });
     expect(outputs).toEqual({ ts: "1.2", channel: "C1" });
+  });
+
+  test("slack.list_replies renders every message surface to text and passes the thread coordinates", async () => {
+    const asked: Array<Record<string, unknown>> = [];
+    const f = fakeRunOp([]);
+    const outputs = await executeIntegrationAction(
+      {
+        provider: "slack",
+        actionId: "list_replies",
+        params: { channel: "C1", threadTs: "1.1", oldest: "1.0" },
+      },
+      CTX,
+      deps(f.runOp, {
+        builtinDeps: builtinDeps(f.runOp, {
+          slackClient: async () => ({
+            chat: { postMessage: async () => ({}), update: async () => ({}) },
+            conversations: {
+              join: async () => ({}),
+              replies: async (args) => {
+                asked.push(args);
+                return {
+                  messages: [
+                    { ts: "1.1", user: "U1", text: "<@UBOT> hi" },
+                    { ts: "1.2", bot_id: "B1", text: "Hi! How can I help?" },
+                    {
+                      ts: "1.3",
+                      user: "U1",
+                      text: "",
+                      attachments: [{ title: "Alert", text: "disk full" }],
+                    },
+                  ],
+                };
+              },
+            },
+          }),
+        }),
+      }),
+    );
+    expect(asked[0]).toEqual({ channel: "C1", ts: "1.1", oldest: "1.0", limit: 500 });
+    expect(outputs).toEqual({
+      messages: [
+        { ts: "1.1", user: "U1", bot_id: "", subtype: "", text: "<@UBOT> hi" },
+        { ts: "1.2", user: "", bot_id: "B1", subtype: "", text: "Hi! How can I help?" },
+        { ts: "1.3", user: "U1", bot_id: "", subtype: "", text: expect.stringContaining("disk full") },
+      ],
+    });
   });
 
   test("slack.join_channel joins by id and maps the joined channel through the output", async () => {
@@ -351,6 +398,7 @@ describe("executeIntegrationAction — builtins", () => {
                 joined.push(args);
                 return { channel: { id: "C0BSPCXJBHA" } };
               },
+              replies: async () => ({ messages: [] }),
             },
           }),
         }),

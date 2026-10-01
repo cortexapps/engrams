@@ -9,6 +9,7 @@ export const BUILTIN_ACTION_IDS: ReadonlySet<string> = new Set([
   "slack.post_message",
   "slack.join_channel",
   "slack.update_message",
+  "slack.list_replies",
   "linear.create_issue",
   "linear.create_comment",
 ]);
