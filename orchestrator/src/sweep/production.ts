@@ -13,6 +13,7 @@ import {
   type SweepLedgerStore,
 } from "../db/dbos-sweep.ts";
 import { log as rootLog } from "../log.ts";
+import { dbosExecutorId } from "../workflows/dbos.ts";
 import { makeSweepAlerter } from "./alerts.ts";
 import {
   DEFAULT_SWEEP_CONFIG,
@@ -89,7 +90,9 @@ export function makeSweepRuntime(deps: SweepRuntimeDeps): {
   });
   const heartbeat = new VersionHeartbeat({
     appVersion,
-    podName: deps.runtime?.podName ?? hostname(),
+    // The heartbeat's pod name IS the DBOS executor id: the sweep decides a
+    // workflow's owner is gone by the absence of this name's beat.
+    podName: deps.runtime?.podName ?? dbosExecutorId(),
     heartbeats,
     intervalMs: config.heartbeatIntervalMs,
     log: log.child({ component: "dbos-sweep-heartbeat" }),

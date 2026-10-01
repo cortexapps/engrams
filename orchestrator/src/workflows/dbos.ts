@@ -17,10 +17,25 @@
  */
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
+import { hostname } from "node:os";
 import { config } from "../config.ts";
 import { dbosLogger } from "./dbos-logger.ts";
 
 let launched = false;
+
+/** This process's DBOS executor id: the pod name (the hostname inside a
+ * pod), or `DBOS__VMID` when set. DBOS stamps it on every workflow the
+ * process runs and, at launch, recovers ONLY the PENDING workflows that
+ * carry it. The SDK's default is the constant "local" for every process,
+ * and with two replicas each new pod then recovered every in-flight
+ * workflow at boot — two copies of one run, colliding at the next step
+ * write ("Conflicting WF ID"). A pod that is gone never comes back under
+ * its name; the orphan sweep re-enqueues what it left (ADR 0104). The
+ * sweep's per-pod heartbeat uses this same id, so liveness and ownership
+ * are one name. */
+export function dbosExecutorId(): string {
+  return process.env["DBOS__VMID"] || hostname();
+}
 
 /** Configure + launch the embedded DBOS engine. Idempotent. */
 export async function initDbos(): Promise<void> {
@@ -32,6 +47,7 @@ export async function initDbos(): Promise<void> {
     // `npx dbos schema`; dev/CI lets launch create it).
     systemDatabaseUrl: config.databaseUrl,
     systemDatabaseSchemaName: "dbos",
+    executorID: dbosExecutorId(),
     runAdminServer: false,
     // Send the engine's logging through our pino logger (replaces DBOS's
     // built-in console + OTLP sinks) so all process output is one format.
