@@ -334,6 +334,19 @@ feeds a `{template}` session ref that `send_prompt` and the relay adopt
 (D11, same workstream, terminal owner). A fresh session is created only when
 none exists or it is gone.
 
+Two pitfalls from the first resumed thread in production (2026-10-01). The
+resume is silent: the thread carries the session link from its first run,
+and a "Resumed the session" line read as a restart, so the brain posts
+nothing. Its prompt folds only what the kept session has not seen — the
+lookup now runs BEFORE the fold, and a resumed thread's `since` is the
+brain's own newest reply (the app's bot user from `authorizations`, so
+another bot's post never moves the floor); the opening of a fresh thread
+still brings the whole thread. And the automation consumer had memoized the
+session's run binding at the listener's first look: adoption moved the
+binding to the new run, but every later session event still went to the
+finished run's mailbox and was dropped there, so the resumed run never saw
+its session speak. The consumer now re-reads the binding per event.
+
 The reviewer profile seed and the `pr_reviewer` designation retire in the
 same phase (migration 0089). A built-in cannot carry a profile id, and the
 designation was the indirection that let it name one; the product model

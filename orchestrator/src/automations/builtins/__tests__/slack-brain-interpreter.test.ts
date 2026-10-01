@@ -345,7 +345,6 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.names.indexOf("step:has_previous.started:0")).toBeLessThan(h.names.indexOf("step:relay:0"));
     // No earlier run of this workstream kept a session: a fresh one.
     expect(h.names).toContain("step:previous:0");
-    expect(h.names).not.toContain("step:has_previous.resumed:0");
     // The relay was installed on that session (consumer will forward curated events).
     expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
     // The follow-up became the second prompt, mention stripped.
@@ -430,14 +429,44 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.sessions).toEqual([]);
     expect(h.prompts).toEqual([{ sessionId: "s-old", text: "summarize the incident" }]);
     expect(h.relayFlags).toEqual([{ sessionId: "s-old", relay: true }]);
-    expect(h.names).toContain("step:has_previous.resumed:0");
     expect(h.names).toContain("step:opening_turn.resume_turn:0");
+    expect(h.names).not.toContain("step:has_previous.session:0");
     expect(h.names).not.toContain("step:has_previous.started:0");
-    // The thread was told which session it is talking to.
-    expect(h.actions.filter((a) => a.actionId === "post_message").map((a) => a.params["text"])).toEqual([
-      `Resumed the session — ${config.baseUrl}/sessions/s-old`,
-    ]);
+    // A resume is silent: the thread carries the session link from its first
+    // run, and the conversation simply continues.
+    expect(h.actions.filter((a) => a.actionId === "post_message")).toEqual([]);
     expect(h.policyCalls).toContain("msg:picking up where we left off");
+  });
+
+  test("(a5') a resumed session is prompted with what it has not seen: the replies after our last answer, never its own earlier turns", async () => {
+    // The thread's first run: the root mention, our "Started a session" line
+    // and our answer. Then a colleague's plain reply, a post by ANOTHER bot
+    // (which never moves the floor), and the mention that resumes the thread.
+    const mention = {
+      team_id: "T1",
+      event_id: "Ev2",
+      authorizations: [{ is_bot: true, user_id: "UBOT" }],
+      event: { type: "app_mention", channel: "C1", user: "U1", ts: "100.1", thread_ts: "90.0", text: "<@UBOT> are you still there?" },
+    };
+    const h = harness({
+      payload: mention,
+      previousSession: { sessionId: "s-old", runId: "r-old", alive: true },
+      threadReplies: [
+        { ts: "90.0", user: "U1", text: "<@UBOT> hi! this message should not auto-close" },
+        { ts: "90.5", user: "UBOT", bot_id: "B1", text: "Started a session — https://x/sessions/s-old" },
+        { ts: "90.6", user: "UBOT", bot_id: "B1", text: "Hi! Got it — noted." },
+        { ts: "95.0", user: "U2", text: "any update?" },
+        { ts: "96.0", user: "UOTHER", bot_id: "B2", text: "CI failed on main" },
+        { ts: "100.1", user: "U1", text: "<@UBOT> are you still there?" },
+      ],
+      recv: [{ kind: "session_idle", sessionId: "s-old" }, null, null],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.sessions).toEqual([]);
+    expect(h.prompts).toEqual([
+      { sessionId: "s-old", text: "<thread context>\nany update?\n</thread context>\n\nare you still there?" },
+    ]);
   });
 
   test("(a6) a kept session that is gone (swept) starts a fresh one", async () => {

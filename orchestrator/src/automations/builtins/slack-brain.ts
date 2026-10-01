@@ -60,7 +60,7 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 8;
+export const SLACK_BRAIN_DEFINITION_VERSION = 9;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
@@ -105,6 +105,8 @@ export default ({ event, inputs, trigger }) => {
     title: text.slice(0, 80) || "Slack thread",
     user_id: str(ev.user),
     event_id: str(raw.event_id),
+    // The app's own bot user: the fold tells our posts from other bots' by it.
+    bot_user_id: str((raw.authorizations ?? [])[0]?.user_id),
   };
 };
 `.trim();
@@ -135,9 +137,22 @@ export default ({ steps }) => {
   const facts = steps.facts?.value ?? {};
   const messages = ${args.replies} ?? [];
   const trigger = String(${args.trigger} ?? "");
-  const since = ${args.since};
   const root = String(facts.thread_ts ?? "");
   const num = (ts) => Number.parseFloat(String(ts ?? "")) || 0;
+  // The newest reply of ours in the page: everything up to it was already
+  // delivered to the session (as a directive or as context) by an earlier
+  // turn. A bot post with no \`user\` counts as ours; a post by a different
+  // bot user does not.
+  const ownBot = String(facts.bot_user_id ?? "");
+  let lastOwn = "";
+  for (const m of messages) {
+    const ts = String(m.ts ?? "");
+    if (ts === root) continue;
+    const isBot = Boolean(m.bot_id || m.subtype === "bot_message");
+    const ours = isBot && (!ownBot || !m.user || m.user === ownBot);
+    if (ours && num(ts) > num(lastOwn)) lastOwn = ts;
+  }
+  const since = ${args.since};
   const strip = (t) => String(t ?? "")
     .replace(/<@[^>]+>/g, " ")
     .replace(/[^\\S\\n]+/g, " ")
@@ -173,11 +188,12 @@ export default ({ steps }) => {
 
 /** The opening turn: the whole thread so far (a mention in the middle of a
  * human conversation brings that conversation along), the mention as the
- * directive. */
+ * directive. When the thread's kept session is resumed, only what arrived
+ * after our last reply is new to it — the earlier turns were its own. */
 const OPENING_TEXT_SOURCE = foldSource({
   replies: "steps.replies.messages",
   trigger: "facts.mention_ts",
-  since: "null",
+  since: "steps.previous?.found ? lastOwn : null",
   eventText: "facts.text",
   eventUser: "facts.user_id",
   fromBot: "false",
@@ -287,14 +303,17 @@ function listReplies(id: string, oldest?: string): BlockDef {
   };
 }
 
+/** The thread's kept session from an earlier run of this workstream, if any:
+ * the thread went quiet, its run ended, the next mention is this run. Looked
+ * up before the fold, which keeps a resumed session's earlier turns out of
+ * its prompt. */
+const previous: BlockDef = { id: "previous", type: LOOKUP_INSTANCE_SESSION_TYPE, config: {} };
+
 const opening: BlockDef[] = [
+  previous,
   listReplies("replies"),
   { id: "opening", type: "code", config: { source: OPENING_TEXT_SOURCE, mode: "value" } },
 ];
-
-/** The thread's kept session from an earlier run of this workstream, if any:
- * the thread went quiet, its run ended, the next mention is this run. */
-const previous: BlockDef = { id: "previous", type: LOOKUP_INSTANCE_SESSION_TYPE, config: {} };
 
 const session: BlockDef = {
   id: "session",
@@ -339,30 +358,19 @@ export default ({ steps }) => ({
 });
 `.trim();
 
-/** Resume the thread's kept session, or create one. Either way the thread
- * gets a line saying which. */
-const sessionOrResume: BlockDef = {
+/** Create the thread's session unless a kept one resumes. A resume is
+ * silent: the thread already carries the session link from its first run,
+ * and to the people in it the conversation simply continues. (`is_true`
+ * with an empty then-arm, not `is_false`: the editor's preview cannot run
+ * the lookup, and a missing value is not false — the preview must still
+ * walk the create arm.) */
+const sessionUnlessResumed: BlockDef = {
   id: "has_previous",
   type: "branch",
   config: {
     conditions: { mode: "all", conditions: [{ path: "steps.previous.found", op: "is_true" }] },
   },
-  then: [
-    {
-      id: "resumed",
-      type: "integration_action",
-      tunable: ["params"],
-      config: {
-        provider: "slack",
-        actionId: "post_message",
-        params: {
-          channel: `\${{ ${F}.channel }}`,
-          threadTs: `\${{ ${F}.thread_ts }}`,
-          text: "Resumed the session — ${{ steps.previous.web_url }}",
-        },
-      },
-    },
-  ],
+  then: [],
   else: [session, started],
 };
 
@@ -548,7 +556,7 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     // profile per channel.)
     eventKeys: ["app_mention"],
   },
-  blocks: [...admit, ...opening, previous, sessionOrResume, pick, relay, firstTurn, conversation],
+  blocks: [...admit, ...opening, sessionUnlessResumed, pick, relay, firstTurn, conversation],
   // ADR 0120: a Slack thread is a WORKSTREAM. The first mention opens it; a
   // later mention in the same thread renders the same key, so it binds to
   // the open workstream and JOINS the thread's live run (the mailbox event
