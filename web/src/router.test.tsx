@@ -84,8 +84,21 @@ function makeTestRouter(auth: AuthState | null, path = "/login") {
 }
 
 test("renders sign-in form for unauthenticated visitor at /login", async () => {
-  render(<RouterProvider router={makeTestRouter(null)} />);
-  await screen.findByLabelText(/email/i);
+  // The Login page renders the door the deployment reports (auth-config). It
+  // no longer guesses a password form when that fetch fails, so serve one.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ mode: "password", passwordAuth: true, signup: true })),
+    ),
+  );
+  try {
+    render(<RouterProvider router={makeTestRouter(null)} />);
+    await screen.findByLabelText(/email/i);
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
 
 test("redirects authenticated user away from /login to /sessions", async () => {
