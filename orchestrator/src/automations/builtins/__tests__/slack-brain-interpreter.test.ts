@@ -38,19 +38,29 @@ function replyPayload(text: string, ts: string): Record<string, unknown> {
   return {
     team_id: "T1",
     event_id: `Ev-${ts}`,
-    event: { type: "message", channel: "C1", user: "U2", ts, thread_ts: "100.1", text },
+    event: { type: "app_mention", channel: "C1", user: "U2", ts, thread_ts: "100.1", text },
   };
 }
 
-/** A joined follow-up delivered into the run's mailbox (policy: join). */
+/** A follow-up MENTION in the thread, delivered into the run's mailbox
+ * (the same workstream key → policy: join). Only a mention is a turn. */
 function joined(text: string, ts: string): AutomationInbox {
   return {
     kind: "event",
-    eventKey: "message",
+    eventKey: "app_mention",
     deliveryKey: `slack:Ev-${ts}`,
     payload: replyPayload(text, ts),
     receivedAt: "2026-08-22T10:00:05Z",
   };
+}
+
+/** One message of the thread page `list_replies` returns. */
+interface ThreadMessage {
+  ts: string;
+  user?: string;
+  bot_id?: string;
+  subtype?: string;
+  text: string;
 }
 
 /** A curated session event as the automation consumer forwards it. */
@@ -98,6 +108,10 @@ function harness(options: {
   linkedUsers?: Record<string, string>;
   /** Make every relay-step ledger write throw (the row is observability). */
   failRelayLedger?: boolean;
+  /** The thread as Slack holds it, for `list_replies`. Default: the opening
+   * mention as the root plus every mention the test delivers through `recv`
+   * (what a thread of mentions alone looks like). */
+  threadReplies?: ThreadMessage[];
 }): Harness {
   const runner = options.replay ? makeReplayRunner(options.replay) : null;
   const names: string[] = runner ? runner.names : [];
@@ -113,6 +127,20 @@ function harness(options: {
   const closed: Array<{ instanceId: string; reason?: string }> = [];
   const linked = options.linkedUsers ?? { U1: "user-1", U2: "user-2" };
   const recvQueue = [...(options.recv ?? [])];
+  const openingEvent = ((options.payload ?? mentionPayload())["event"] ?? {}) as Record<string, unknown>;
+  const threadReplies: ThreadMessage[] = options.threadReplies ?? [
+    { ts: String(openingEvent["ts"] ?? "100.1"), user: String(openingEvent["user"] ?? "U1"), text: String(openingEvent["text"] ?? "") },
+    ...(options.recv ?? []).flatMap((m): ThreadMessage[] => {
+      if (!m || m.kind !== "event") return [];
+      const ev = (m.payload["event"] ?? {}) as Record<string, unknown>;
+      return [{
+        ts: String(ev["ts"] ?? ""),
+        user: String(ev["user"] ?? ""),
+        ...(ev["bot_id"] !== undefined ? { bot_id: String(ev["bot_id"]) } : {}),
+        text: String(ev["text"] ?? ""),
+      }];
+    }),
+  ];
   const runSessions: Array<{ sessionId: string; keep: boolean }> = [];
   let clock = 1_000_000;
 
@@ -229,6 +257,13 @@ function harness(options: {
           throw new Error(`invalid params for ${input.actionId}: ${violations[0]!.path} ${violations[0]!.message}`);
         }
         actions.push({ actionId: input.actionId, params });
+        if (input.actionId === "list_replies") {
+          // Slack's `oldest` is inclusive: the page starts AT that ts.
+          const oldest = typeof params["oldest"] === "string" ? Number.parseFloat(params["oldest"]) : null;
+          return {
+            messages: threadReplies.filter((m) => oldest === null || Number.parseFloat(m.ts) >= oldest),
+          };
+        }
         return { ts: "9.0", channel: "C1" };
       },
     },
@@ -272,11 +307,18 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.sessions[0]!.ownerUserId).toBe("user-1");
     // The thread got the session link first (legacy `onStarted`), by an
     // ordinary Slack action templated on create_session's `web_url`.
-    expect(h.actions).toEqual([
+    expect(h.actions.filter((a) => a.actionId === "post_message")).toEqual([
       {
         actionId: "post_message",
         params: { channel: "C1", threadTs: "100.1", text: `Started a session — ${config.baseUrl}/sessions/s-1` },
       },
+    ]);
+    // The thread page was read once for the opening fold (whole thread) and
+    // once per turn, from the previous mention on (Slack's inclusive
+    // `oldest`), so a long thread costs one small read per turn.
+    expect(h.actions.filter((a) => a.actionId === "list_replies").map((a) => a.params)).toEqual([
+      { channel: "C1", threadTs: "100.1" },
+      { channel: "C1", threadTs: "100.1", oldest: "100.1" },
     ]);
     expect(h.names.indexOf("step:started:0")).toBeLessThan(h.names.indexOf("step:relay:0"));
     // The relay was installed on that session (consumer will forward curated events).
@@ -295,6 +337,47 @@ describe("Slack thread brain through the interpreter", () => {
     // The recap hook posted the ✅ completion through the same policy as legacy.
     expect(h.policyCalls).toContain("complete:");
     expect(h.finalized).toEqual([{ status: "completed" }]);
+  });
+
+  test("(a0) the legacy fold: a mention mid-thread brings the thread; plain replies ride the next mention as <thread context>", async () => {
+    // The opening mention is a reply in a human thread rooted at 90.0; two
+    // colleagues spoke before it. After the first answer a plain reply (never
+    // an event the brain acts on) lands in the thread, then a second mention.
+    const opening = {
+      team_id: "T1",
+      event_id: "Ev1",
+      event: { type: "app_mention", channel: "C1", user: "U1", ts: "100.1", thread_ts: "90.0", text: "<@UBOT> what do you make of this?" },
+    };
+    const h = harness({
+      payload: opening,
+      threadReplies: [
+        { ts: "90.0", user: "U3", text: "deploy is red again" },
+        { ts: "95.0", user: "U2", text: "same error as last week" },
+        { ts: "100.1", user: "U1", text: "<@UBOT> what do you make of this?" },
+        { ts: "100.5", bot_id: "B1", text: "Started a session — https://x/sessions/s-1" },
+        { ts: "100.6", bot_id: "B1", text: "Looks like the cache mount." },
+        { ts: "100.7", user: "U2", text: "we rotated the key yesterday" },
+        { ts: "100.8", user: "U1", text: "<@UBOT> does that matter?" },
+      ],
+      recv: [
+        { kind: "session_idle", sessionId: "s-1" },
+        joined("<@UBOT> does that matter?", "100.8"),
+        { kind: "session_idle", sessionId: "s-1" },
+        null,
+        null,
+      ],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    // Opening: the whole thread so far is context, the mention the directive.
+    expect(h.sessions[0]!.prompt).toBe(
+      "<thread context>\ndeploy is red again\nsame error as last week\n</thread context>\n\nwhat do you make of this?",
+    );
+    // Follow-up: everything since the opening mention — the colleague's plain
+    // reply, not the bot's own posts — then the new directive.
+    expect(h.prompts.map((p) => p.text)).toEqual([
+      "<thread context>\nwe rotated the key yesterday\n</thread context>\n\ndoes that matter?",
+    ]);
   });
 
   test("(a') the relay survives a pod restart: its state rides the checkpointed step outputs, not process memory", async () => {
@@ -431,9 +514,9 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.policyCalls.filter((c) => c.startsWith("msg:"))).toEqual(["msg:first answer", "msg:second answer"]);
     // The re-point ran inside the loop body, before the turn's prompt, and
     // was NOT a second install.
-    const body = h.names.filter((n) => n.startsWith("step:thread[0].has_turn."));
-    expect(body.indexOf("step:thread[0].has_turn.repoint:0")).toBeLessThan(
-      body.indexOf("step:thread[0].has_turn.turn:0"),
+    const body = h.names.filter((n) => n.startsWith("step:thread[0].has_event.has_turn."));
+    expect(body.indexOf("step:thread[0].has_event.has_turn.repoint:0")).toBeLessThan(
+      body.indexOf("step:thread[0].has_event.has_turn.turn:0"),
     );
     expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
     // Relay step names keep the FIRST install's path and a single counter
@@ -481,6 +564,13 @@ describe("Slack thread brain through the interpreter", () => {
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("completed");
     expect(h.prompts.map((p) => p.text)).toEqual(["turn one", "turn two"]);
+    // Each turn's read starts at the previous mention: the cursor advances
+    // with the re-point, no extra state.
+    expect(h.actions.filter((a) => a.actionId === "list_replies").map((a) => a.params["oldest"])).toEqual([
+      undefined,
+      "100.1",
+      "100.2",
+    ]);
     // Exactly two iterations ran; the third joined message was never consumed.
     expect(h.names.filter((n) => /^step:thread\[\d+\]\.next:0$/.test(n)).length).toBe(2);
     expect(h.policyCalls.some((c) => c.startsWith("complete:"))).toBe(true);
@@ -503,8 +593,8 @@ describe("Slack thread brain through the interpreter", () => {
     // The empty turn never reached send_prompt (which refuses an empty prompt);
     // the next real message did.
     expect(h.prompts.map((p) => p.text)).toEqual(["now the real question"]);
-    expect(h.names).not.toContain("step:thread[0].has_turn.turn:0");
-    expect(h.names).toContain("step:thread[1].has_turn.turn:0");
+    expect(h.names).not.toContain("step:thread[0].has_event.has_turn.turn:0");
+    expect(h.names).toContain("step:thread[1].has_event.has_turn.turn:0");
     expect(h.policyCalls.at(-1)).toBe("complete:");
   });
 
@@ -543,7 +633,7 @@ describe("Slack thread brain through the interpreter", () => {
     // The bot's mention never became a turn; the wait kept listening and the
     // human's message did.
     expect(h.prompts.map((p) => p.text)).toEqual(["a human follow-up"]);
-    expect(h.names.filter((n) => /\.has_turn\.turn:0$/.test(n))).toHaveLength(1);
+    expect(h.names.filter((n) => /\.has_event\.has_turn\.turn:0$/.test(n))).toHaveLength(1);
     // The WAIT itself refused the bot event (not only the turn gate): the
     // first iteration's `next` matched the human's message.
     const firstNext = h.records.filter((r) => r.path === "thread[0].next").at(-1);

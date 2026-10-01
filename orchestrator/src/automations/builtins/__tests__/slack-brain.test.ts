@@ -21,6 +21,8 @@ describe("Slack thread brain built-in — definition", () => {
       "identity",
       "unlinked",
       "linked",
+      "replies",
+      "opening",
       "session",
       "started",
       "relay",
@@ -32,21 +34,26 @@ describe("Slack thread brain built-in — definition", () => {
     expect(parsed.settings.onFinalize?.map((h) => h.block.type)).toEqual(["relay_close", "instance_close"]);
   });
 
-  test("is a workstream per thread (ADR 0120): a mention opens it, a reply joins it or drops", () => {
+  test("is a workstream per thread (ADR 0120): a mention opens it, a later mention in the thread joins it", () => {
     const parsed = validateDefinition(SLACK_BRAIN_DEFINITION);
-    // Only a mention opens; the main trigger no longer subscribes to messages.
+    // Only a mention is an event the brain acts on (the legacy model): the
+    // one trigger, no reply entrypoint. A mention in the thread renders the
+    // same workstream key as the opening one, so it binds and joins.
     expect(parsed.trigger).toMatchObject({ eventKeys: ["app_mention"] });
+    expect(parsed.entrypoints ?? []).toEqual([]);
     expect(parsed.settings.instance?.keyTemplate).toBe(parsed.settings.concurrency?.keyTemplate);
-    // A reply continues a mention-opened thread (continueOnly + join deliver
-    // it into the thread's run) or is dropped at admission (`require`): it
-    // never opens a workstream or a run of its own.
-    const reply = parsed.entrypoints?.find((ep) => ep.id === "reply");
-    expect(reply?.trigger).toMatchObject({ kind: "integration", eventKeys: ["message"], continueOnly: ["message"] });
-    expect(reply?.blocks).toEqual([]);
-    expect(parsed.settings.instance?.entrypoints).toEqual({ reply: { admit: "require" } });
+    expect(parsed.settings.instance?.keyTemplate).toContain('coalesce: "thread_ts", "ts"');
+    // The loop's wait consumes mentions only; a plain reply is folded into
+    // the next mention's prompt by the list_replies + code pair.
+    const thread = parsed.blocks.find((b) => b.id === "thread")!;
+    const next = thread.body!.find((b) => b.id === "next")!;
+    expect(next.config["eventKeys"]).toEqual(["app_mention"]);
+    expect(thread.body!.map((b) => b.id)).toEqual(["next", "has_event"]);
+    const onEvent = thread.body!.find((b) => b.id === "has_event")!;
+    expect(onEvent.then!.map((b) => b.id)).toEqual(["thread_replies", "turn_text", "has_turn"]);
   });
 
-  test("no channel scope: a mention anywhere the app is a member matches; messages match the reply entrypoint", () => {
+  test("no channel scope: a mention anywhere the app is a member matches; a plain message matches nothing", () => {
     const trigger = SLACK_BRAIN_DEFINITION.trigger;
     if (trigger.kind !== "integration") throw new Error("integration trigger expected");
     const bound = { ...trigger, connectionId: "conn-slack" };
@@ -60,11 +67,9 @@ describe("Slack thread brain built-in — definition", () => {
     expect(bound.scope).toBeUndefined();
     expect(matchesIntegrationTrigger(bound, event("C1"), none)).toBe(true);
     expect(matchesIntegrationTrigger(bound, event("C-never-seen"), none)).toBe(true);
-    // Messages match the reply entrypoint's trigger, not the main one.
+    // A plain message is never a brain event: it reaches the session only
+    // as thread context on the next mention.
     expect(matchesIntegrationTrigger(bound, event("C1", "message"), none)).toBe(false);
-    const reply = SLACK_BRAIN_DEFINITION.entrypoints!.find((ep) => ep.id === "reply")!.trigger;
-    if (reply.kind !== "integration") throw new Error("integration trigger expected");
-    expect(matchesIntegrationTrigger({ ...reply, connectionId: "conn-slack" }, event("C-never-seen", "message"), none)).toBe(true);
     // reaction_added is ledgered by the spine but not a brain event.
     expect(matchesIntegrationTrigger(bound, event("C1", "reaction_added"), none)).toBe(false);
   });

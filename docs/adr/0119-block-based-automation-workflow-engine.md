@@ -313,6 +313,17 @@ seed **enabled**: enrolling a repo (reviews) or picking a default profile
 page still writes the row, and `db/review-enrollment-sync.ts` mirrors it into
 the map in one transaction.
 
+**Slack turns (2026-10-01).** The brain's v1 divergence (a plain thread
+reply as a turn, no `<thread context>` fold) is reverted to the legacy
+model: only an explicit in-thread `@mention` is a turn, routed to the open
+workstream by key (join) — the automation has one trigger and no reply
+entrypoint — and each turn's prompt is the legacy fold, now a `list_replies`
+Slack action (bounded by `oldest` at the previous turn's mention) plus a
+Code block. The dispatcher's rung-1 precedence also learned to tell the
+brain's OWN workstream from another automation's: the "Started a session"
+post binds the thread handle to the brain's workstream, and the pre-pass had
+read that as a reason for the brain to stand down in its own thread.
+
 The reviewer profile seed and the `pr_reviewer` designation retire in the
 same phase (migration 0089). A built-in cannot carry a profile id, and the
 designation was the indirection that let it name one; the product model

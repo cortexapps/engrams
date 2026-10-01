@@ -21,14 +21,18 @@
  * (`inputs.channels[event.channel]`), and the same block derives the facts
  * every later block templates from (`steps.facts.value.*`).
  *
- * Divergences from the legacy loop, deliberate for v1:
- *   - the initial/turn prompt is the triggering message's text with the bot
- *     mention stripped, NOT the legacy `<thread context>` fold of the whole
- *     thread fetched from the Slack API (that fold needs an I/O block; a
- *     follow-up can add a thread-context block);
- *   - the LLM profile picker + the "which profile?" dropdown are retired:
- *     the channel → profile map input decides, with `default_profile` as the
- *     fallback.
+ * Turns are the legacy model: ONLY an explicit `@bot` mention in the thread
+ * is a turn. A plain reply is not answered on its own; it is folded into the
+ * next mention's prompt as `<thread context>` (every message since the
+ * previous turn, bots skipped, mentions stripped), with the mention's text
+ * as the directive underneath — the legacy `foldReplies`, as a `list_replies`
+ * Slack action plus a Code block. An in-thread mention reaches the thread's
+ * run by the workstream key (join), so the automation has one trigger and no
+ * reply entrypoint.
+ *
+ * One divergence from the legacy loop, deliberate: the LLM profile picker +
+ * the "which profile?" dropdown are retired — the channel → profile map
+ * input decides, with `default_profile` as the fallback.
  */
 
 import {
@@ -47,7 +51,7 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 5;
+export const SLACK_BRAIN_DEFINITION_VERSION = 6;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
@@ -96,30 +100,93 @@ export default ({ event, inputs, trigger }) => {
 };
 `.trim();
 
-/** The joined follow-up message, as wait_event leaves it in steps.next.event.
- * `has_text` is the turn gate: a bare `@bot` (nothing left once the mention
- * is stripped) is not a prompt — send_prompt refuses an empty prompt, and
- * that refusal would fail the whole run. The bot guard is repeated here
- * (the `next` wait already refuses bot-authored events) so the gate stays
- * correct even if the wait's conditions are ever tuned away: the relay's
- * own bubbles arrive as `app_mention`/`message` events with a `bot_id`,
- * and answering them would make the brain talk to itself. */
-const NEXT_TEXT_SOURCE = `
+/** The turn prompt: the legacy `foldReplies` in the QuickJS cage. `messages`
+ * is the thread page the `list_replies` action read; `since` is exclusive
+ * (the previous turn's mention — everything up to and including it was
+ * already delivered); the message whose ts is `trigger` is the directive
+ * and goes at the bottom, every other kept message is prior context in
+ * `<thread context>`. Messages newer than the trigger are left for the NEXT
+ * turn (they arrived after the ask; the next mention's fold carries them).
+ * Bot-authored messages never feed the prompt (the agent must not read its
+ * own posts) EXCEPT the thread root, which is the subject of the thread.
+ * Mentions are stripped. When the page does not carry the trigger yet
+ * (Slack lag), the event's own text is the directive.
+ * `has_text` is the turn gate: a bare `@bot` is not a prompt — send_prompt
+ * refuses an empty prompt, and that refusal would fail the whole run. */
+function foldSource(args: {
+  replies: string;
+  trigger: string;
+  since: string;
+  eventText: string;
+  eventUser: string;
+  fromBot: string;
+}): string {
+  return `
 export default ({ steps }) => {
-  const ev = steps.next?.event?.event ?? {};
-  const fromBot = Boolean(ev.bot_id) || ev.subtype === "bot_message";
-  const text = String(ev.text ?? "")
+  const facts = steps.facts?.value ?? {};
+  const messages = ${args.replies} ?? [];
+  const trigger = String(${args.trigger} ?? "");
+  const since = ${args.since};
+  const root = String(facts.thread_ts ?? "");
+  const num = (ts) => Number.parseFloat(String(ts ?? "")) || 0;
+  const strip = (t) => String(t ?? "")
     .replace(/<@[^>]+>/g, " ")
     .replace(/[^\\S\\n]+/g, " ")
     .trim();
+  const kept = [];
+  for (const m of messages) {
+    const ts = String(m.ts ?? "");
+    if (since && num(ts) <= num(since)) continue;
+    if (trigger && num(ts) > num(trigger)) continue;
+    const isRoot = ts === root;
+    if (!isRoot && (m.bot_id || m.subtype === "bot_message")) continue;
+    const text = strip(m.text);
+    if (text) kept.push({ ts, text });
+  }
+  const idx = kept.findIndex((k) => k.ts === trigger);
+  const directive = idx >= 0 ? kept[idx].text : strip(${args.eventText});
+  const context = kept.filter((_, i) => i !== idx).map((k) => k.text);
+  const text = !directive
+    ? ""
+    : context.length
+      ? "<thread context>\\n" + context.join("\\n") + "\\n</thread context>\\n\\n" + directive
+      : directive;
+  const fromBot = Boolean(${args.fromBot});
   return {
     text,
     has_text: !fromBot && text.length > 0,
-    mention_ts: String(ev.ts ?? ""),
-    user_id: String(ev.user ?? ""),
+    mention_ts: trigger,
+    user_id: String(${args.eventUser} ?? ""),
   };
 };
 `.trim();
+}
+
+/** The opening turn: the whole thread so far (a mention in the middle of a
+ * human conversation brings that conversation along), the mention as the
+ * directive. */
+const OPENING_TEXT_SOURCE = foldSource({
+  replies: "steps.replies.messages",
+  trigger: "facts.mention_ts",
+  since: "null",
+  eventText: "facts.text",
+  eventUser: "facts.user_id",
+  fromBot: "false",
+});
+
+/** A follow-up turn: everything since the previous turn's mention (the last
+ * re-point's mention — block outputs are keyed by id, so `steps.repoint` is
+ * the previous iteration's — or the opening mention before any re-point),
+ * the new mention as the directive. */
+const NEXT_TEXT_SOURCE = foldSource({
+  replies: "steps.thread_replies.messages",
+  trigger: "steps.next?.event?.event?.ts",
+  since: 'String(steps.repoint?.handler_state?.mention?.ts ?? facts.mention_ts ?? "")',
+  eventText: "steps.next?.event?.event?.text",
+  eventUser: "steps.next?.event?.event?.user",
+  fromBot:
+    'steps.next?.event?.event?.bot_id || steps.next?.event?.event?.subtype === "bot_message"',
+});
 
 const admit: BlockDef[] = [
   {
@@ -184,13 +251,45 @@ const admit: BlockDef[] = [
   },
 ];
 
+/** The previous turn's mention ts: the fold's exclusive `since` and the
+ * read's inclusive `oldest`. Block outputs are keyed by id, so
+ * `steps.repoint` is the previous iteration's re-point; before any re-point
+ * it is the opening mention. (`default:` tolerates the missing path; its
+ * argument, the facts, is always present.) */
+const PREVIOUS_MENTION_TS = `\${{ steps.repoint.handler_state.mention.ts | default: ${F}.mention_ts }}`;
+
+/** The thread as Slack holds it, for the fold. `oldest` bounds the read to
+ * the tail since the previous turn (inclusive — the fold drops the boundary
+ * message itself); the opening read is unbounded because a mention in the
+ * middle of a human thread brings the whole thread along. */
+function listReplies(id: string, oldest?: string): BlockDef {
+  return {
+    id,
+    type: "integration_action",
+    config: {
+      provider: "slack",
+      actionId: "list_replies",
+      params: {
+        channel: `\${{ ${F}.channel }}`,
+        threadTs: `\${{ ${F}.thread_ts }}`,
+        ...(oldest !== undefined ? { oldest } : {}),
+      },
+    },
+  };
+}
+
+const opening: BlockDef[] = [
+  listReplies("replies"),
+  { id: "opening", type: "code", config: { source: OPENING_TEXT_SOURCE, mode: "value" } },
+];
+
 const session: BlockDef = {
   id: "session",
   type: "create_session",
   tunable: ["promptTemplate"],
   config: {
     profileId: `\${{ ${F}.profile_id }}`,
-    promptTemplate: `\${{ ${F}.text }}`,
+    promptTemplate: "${{ steps.opening.value.text }}",
     titleTemplate: `\${{ ${F}.title }}`,
     role: "primary",
     // The session is the asking user's: their credentials and attribution
@@ -259,12 +358,14 @@ const conversation: BlockDef = {
       id: "next",
       type: "wait_event",
       config: {
-        eventKeys: ["message", "app_mention"],
+        // Only an explicit mention in the thread is a turn (the legacy
+        // model). A plain reply is never delivered here; the next mention's
+        // fold carries it as thread context.
+        eventKeys: ["app_mention"],
         // Bots never continue a thread either (the opening admission has the
-        // same rule). The ingress route drops bot/subtype `message`s, but an
-        // `app_mention` authored by a bot — including our own bubbles when
-        // they quote the handle — reaches the mailbox, so the wait refuses
-        // it here and keeps listening.
+        // same rule): an `app_mention` authored by a bot — including our own
+        // bubbles when they quote the handle — reaches the mailbox, so the
+        // wait refuses it here and keeps listening.
         conditions: {
           mode: "all",
           conditions: [
@@ -281,55 +382,67 @@ const conversation: BlockDef = {
         onDeadline: "continue",
       },
     },
+    // A quiet thread leaves outcome=deadline and no event: nothing to read
+    // or fold (the loop's `until` exits). Only a mention goes on.
     {
-      id: "turn_text",
-      type: "code",
-      config: { source: NEXT_TEXT_SOURCE, mode: "value" },
-    },
-    // The turn gate: wait_event leaves outcome=deadline and no event on a
-    // quiet thread, and a bare mention leaves no text; send_prompt must not
-    // fire on either (an empty prompt is a render failure that would end the
-    // run), so the branch requires an event WITH text.
-    {
-      id: "has_turn",
+      id: "has_event",
       type: "branch",
       config: {
         conditions: {
           mode: "all",
-          conditions: [
-            { path: "steps.next.outcome", op: "equals", value: "event" },
-            { path: "steps.turn_text.value.has_text", op: "is_true" },
-          ],
+          conditions: [{ path: "steps.next.outcome", op: "equals", value: "event" }],
         },
       },
       then: [
-        // Re-point the relay at the accepted follow-up BEFORE its prompt is
-        // sent: ⏳ lands on the reply, its responses open a fresh bubble and
-        // ✅ seals on the reply — the legacy per-turn mention ownership.
+        listReplies("thread_replies", PREVIOUS_MENTION_TS),
         {
-          id: "repoint",
-          type: RELAY_SESSION_TYPE,
-          config: {
-            session: { blockId: "session" },
-            provider: "slack",
-            team: `\${{ ${F}.team }}`,
-            channel: `\${{ ${F}.channel }}`,
-            threadTs: `\${{ ${F}.thread_ts }}`,
-            mentionTs: "${{ steps.turn_text.value.mention_ts }}",
-            userId: "${{ steps.turn_text.value.user_id }}",
-            eventId: "${{ steps.next.delivery_key }}",
-          },
+          id: "turn_text",
+          type: "code",
+          config: { source: NEXT_TEXT_SOURCE, mode: "value" },
         },
+        // The turn gate: a bare mention leaves no text, and send_prompt must not
+        // fire on it (an empty prompt is a render failure that would end the
+        // run), so the branch requires text.
         {
-          id: "turn",
-          type: "send_prompt",
-          tunable: ["promptTemplate", "deadlineSeconds"],
+          id: "has_turn",
+          type: "branch",
           config: {
-            session: { blockId: "session" },
-            promptTemplate: "${{ steps.turn_text.value.text }}",
-            waitFor: { kind: "run_end" },
-            deadlineSeconds: TURN_DEADLINE_S,
+            conditions: {
+              mode: "all",
+              conditions: [{ path: "steps.turn_text.value.has_text", op: "is_true" }],
+            },
           },
+          then: [
+            // Re-point the relay at the accepted follow-up BEFORE its prompt is
+            // sent: ⏳ lands on the reply, its responses open a fresh bubble and
+            // ✅ seals on the reply — the legacy per-turn mention ownership.
+            {
+              id: "repoint",
+              type: RELAY_SESSION_TYPE,
+              config: {
+                session: { blockId: "session" },
+                provider: "slack",
+                team: `\${{ ${F}.team }}`,
+                channel: `\${{ ${F}.channel }}`,
+                threadTs: `\${{ ${F}.thread_ts }}`,
+                mentionTs: "${{ steps.turn_text.value.mention_ts }}",
+                userId: "${{ steps.turn_text.value.user_id }}",
+                eventId: "${{ steps.next.delivery_key }}",
+              },
+            },
+            {
+              id: "turn",
+              type: "send_prompt",
+              tunable: ["promptTemplate", "deadlineSeconds"],
+              config: {
+                session: { blockId: "session" },
+                promptTemplate: "${{ steps.turn_text.value.text }}",
+                waitFor: { kind: "run_end" },
+                deadlineSeconds: TURN_DEADLINE_S,
+              },
+            },
+          ],
+          else: [],
         },
       ],
       else: [],
@@ -351,25 +464,13 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     // profile per channel.)
     eventKeys: ["app_mention"],
   },
-  blocks: [...admit, session, started, relay, firstTurn, conversation],
-  // ADR 0120: a Slack thread is a WORKSTREAM. The mention opens it; a reply
-  // routes to it by the key template and JOINS the thread's live run (the
-  // entrypoint has no body of its own: `continueOnly` delivers the reply
-  // into the run's mailbox, and `require` drops a reply in a thread no
-  // workstream owns — audited — instead of opening one).
-  entrypoints: [
-    {
-      id: "reply",
-      trigger: {
-        kind: "integration",
-        provider: "slack",
-        connectionId: DEFAULT_CONNECTION_PLACEHOLDER,
-        eventKeys: ["message"],
-        continueOnly: ["message"],
-      },
-      blocks: [],
-    },
-  ],
+  blocks: [...admit, ...opening, session, started, relay, firstTurn, conversation],
+  // ADR 0120: a Slack thread is a WORKSTREAM. The first mention opens it; a
+  // later mention in the same thread renders the same key, so it binds to
+  // the open workstream and JOINS the thread's live run (the mailbox event
+  // the loop's wait consumes). No reply entrypoint: a plain reply is not an
+  // event the brain acts on.
+  entrypoints: [],
   inputsSchema: [
     {
       key: "channels",
@@ -416,7 +517,6 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       // `default:` — default's fallback argument is strict.)
       keyTemplate:
         '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}',
-      entrypoints: { reply: { admit: "require" } },
     },
     concurrency: {
       // One run per thread, instance-scoped: the same template as the
