@@ -17,6 +17,12 @@ interface Props {
 const { title, description, landing = false } = Astro.props;
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 const canonical = new URL(Astro.url.pathname, Astro.site);
+// In the header on wide screens, and in the menu on narrow ones.
+const pages = [
+  { label: "Architecture", href: `${base}/architecture/` },
+  { label: "Compare", href: `${base}/compare/` },
+  { label: "Docs", href: `${base}/docs/` },
+];
 // The share card for link previews (Slack, X, LinkedIn). Without one, Slack
 // scrapes the first page image, and the full-size screenshot fails to load.
 const ogImage = new URL(`${base}/og.png`, Astro.site);
@@ -56,17 +62,25 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
             <a class="byline" href="https://www.cortex.io">by <CortexWordmark height={15} /></a>
           </div>
           <nav class="site-nav" aria-label="Site">
-            <a class="secondary" href={`${base}/architecture/`}>Architecture</a>
-            <a class="compare" href={`${base}/compare/`}>Compare</a>
-            <a class="secondary" href={`${base}/docs/`}>Docs</a>
+            {pages.map((p) => <a class="page" href={p.href}>{p.label}</a>)}
             <a class="gh" href="https://github.com/cortexapps/engrams" aria-label="engrams on GitHub">
               <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
               <span>GitHub</span>
             </a>
             <a class="cta-small" href={`${base}/docs/getting-started/local-quickstart/`}>Run it locally</a>
+            <button class="menu-toggle" type="button" aria-label="Menu" aria-expanded="false" aria-controls="site-menu" data-menu-toggle>
+              <svg class="bars" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" /></svg>
+              <svg class="x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 5l14 14M19 5L5 19" /></svg>
+            </button>
           </nav>
         </header>
       </div>
+    </div>
+    <!-- The narrow-screen menu: the page links the header has no room for. -->
+    <div class="menu-panel" id="site-menu" hidden>
+      <nav class="wrap" aria-label="Menu">
+        {pages.map((p) => <a href={p.href}>{p.label}<span aria-hidden="true">→</span></a>)}
+      </nav>
     </div>
     <main>
       <slot />
@@ -96,3 +110,26 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
     </footer>
   </body>
 </html>
+
+<script>
+  const toggle = document.querySelector<HTMLButtonElement>("[data-menu-toggle]");
+  const panel = document.getElementById("site-menu");
+  if (toggle && panel) {
+    const set = (open: boolean) => {
+      toggle.setAttribute("aria-expanded", String(open));
+      panel.hidden = !open;
+      document.documentElement.classList.toggle("menu-open", open);
+    };
+    toggle.addEventListener("click", () => set(toggle.getAttribute("aria-expanded") !== "true"));
+    panel.addEventListener("click", (e) => {
+      if (e.target instanceof Element && e.target.closest("a")) set(false);
+    });
+    addEventListener("keydown", (e) => {
+      if (e.key === "Escape") set(false);
+    });
+    // The menu exists only below 1025px; a window widened past that closes it.
+    matchMedia("(min-width: 1025px)").addEventListener("change", (e) => {
+      if (e.matches) set(false);
+    });
+  }
+</script>

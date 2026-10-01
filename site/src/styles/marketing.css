@@ -214,7 +214,6 @@ html {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.18);
 }
 .wordmark {
@@ -285,6 +284,57 @@ html {
   width: 18px;
   height: 18px;
   flex: none;
+}
+/* The menu button and its panel show only below 1025px (see the media queries). */
+.menu-toggle {
+  display: none;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+.menu-toggle svg {
+  width: 24px;
+  height: 24px;
+}
+.menu-toggle .x,
+.menu-toggle[aria-expanded="true"] .bars {
+  display: none;
+}
+.menu-toggle[aria-expanded="true"] .x {
+  display: block;
+}
+.menu-panel {
+  position: fixed;
+  inset: var(--masthead-h) 0 0;
+  z-index: 49;
+  overflow-y: auto;
+  background: var(--panel-deep);
+  color: var(--sage-on-cover);
+}
+.menu-panel nav {
+  display: flex;
+  flex-direction: column;
+}
+.menu-panel a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  font-family: var(--font-display);
+  font-stretch: 108%;
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+html.menu-open {
+  overflow: hidden;
 }
 .cta-small {
   display: inline-flex;
@@ -1586,8 +1636,11 @@ html {
   .site-nav {
     gap: 18px;
   }
-  .site-nav .secondary {
+  .site-nav .page {
     display: none;
+  }
+  .menu-toggle {
+    display: grid;
   }
   .sec-intro,
   .pair,
@@ -1631,15 +1684,9 @@ html {
   .wordmark {
     font-size: 18px;
   }
-  /* On a phone the nav keeps its three calls to action: Compare, GitHub, and
-     Run it locally. */
-  .site-nav a:not(.cta-small, .gh, .compare) {
-    display: none;
-  }
-  .site-nav .gh {
-    padding: 0 10px;
-  }
-  .site-nav .gh span {
+  /* A phone gets GitHub and the menu; running the stack locally is a
+     desktop task. */
+  .site-nav .cta-small {
     display: none;
   }
   .ticks {
@@ -1707,13 +1754,6 @@ html {
   }
   .site-nav {
     gap: 8px;
-    letter-spacing: 0.04em;
-  }
-  .site-nav .cta-small {
-    padding: 0 10px;
-    font-size: 11px;
-    letter-spacing: 0.04em;
-    white-space: nowrap;
   }
   .wordmark {
     gap: 7px;
@@ -1745,28 +1785,5 @@ html {
   }
   .sec-head {
     flex-wrap: wrap;
-  }
-}
-
-/* Narrow phones: tighten the header so the wordmark and all three nav calls
-   to action fit on one row. */
-@media (max-width: 420px) {
-  .wordmark {
-    font-size: 13px;
-    letter-spacing: 0.06em;
-  }
-  .site-nav {
-    gap: 5px;
-    font-size: 11px;
-  }
-  .site-nav .gh,
-  .site-nav .cta-small {
-    padding: 0 8px;
-  }
-}
-/* Below 360px the three do not fit; Compare stays in the footer. */
-@media (max-width: 359px) {
-  .site-nav .compare {
-    display: none;
   }
 }
