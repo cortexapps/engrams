@@ -16,11 +16,14 @@
 # - The host fleet runs as the engram-host-fleet chart's DaemonSet on
 #   a self-managed Intel nodegroup (see that chart's
 #   values-aws.yaml.example) — so no internal LB is needed here.
-# - No identity proxy: the orchestrator's login wall (better-auth +
-#   `orchestrator.auth.adminEmails`) is the auth door (ADR 0118).
-#   ALB's native OIDC/Cognito authentication is NOT supported in
-#   front of this app — it breaks the same way IAP does (no cookie
-#   on CORS preflights, no WebSocket carry; ADR 0118).
+# - Sign-in is OAuth against your identity provider (the
+#   `orchestrator.auth` block at the bottom): only accounts on the
+#   allowlist get in. No identity proxy sits in front of the app — the
+#   orchestrator's login wall is the auth door (ADR 0118). ALB's
+#   native OIDC/Cognito authentication is NOT supported in front of
+#   this app — it breaks the same way IAP does (no cookie on CORS
+#   preflights, no WebSocket carry; ADR 0118). Point
+#   `orchestrator.auth.oauth` at the Cognito user pool instead.
 
 # Image TAGS must be set (chart empty-tag fallback = the unpublished
 # chart appVersion). `main` tracks the latest build; pin a SHA for
@@ -172,7 +175,31 @@ orchestrator:
   kekSecret:
     existingSecret: engram-orchestrator-secrets
     key: ENGRAM_KEK_MASTER_KEY
+  # How people sign in. `oauth` is the door for a deployment on the
+  # internet; the chart's values.yaml documents the other two
+  # (`iap`, `password`) in the same block.
   auth:
+    mode: oauth
+    oauth:
+      # Your OIDC provider's issuer URL, for example:
+      #   Google:   https://accounts.google.com
+      #   Cognito:  https://cognito-idp.<region>.amazonaws.com/<user-pool-id>
+      #   Okta:     https://<org>.okta.com
+      issuer: REPLACE_OAUTH_ISSUER
+      # Register a web client with the provider, with the redirect URI
+      #   https://engrams.REPLACE_DOMAIN/api/auth/oauth2/callback/sso
+      clientId: REPLACE_OAUTH_CLIENT_ID
+      # The Terraform quickstart relays the `engram/oauth-client-secret`
+      # Secrets Manager entry into this Secret.
+      clientSecret:
+        existingSecret: engram-oauth-client
+        secretKey: ORCHESTRATOR_OAUTH_CLIENT_SECRET
+      # Who may sign in: every account of this email domain. `"*"`
+      # admits every account the provider authenticates — correct for
+      # a provider that holds only your own people (a Cognito user
+      # pool, an Okta org), wide open for a public one (Google).
+      allowedDomains:
+        - REPLACE_EMAIL_DOMAIN
     # Bootstrap admins: promoted to role 'admin' on first sign-in.
     adminEmails:
       - REPLACE_ADMIN_EMAIL

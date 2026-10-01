@@ -2,8 +2,8 @@
 
 Deploys the engrams coordinator (always) plus an optional nginx web
 frontend (default on) to any K8s cluster. The chart is cloud-agnostic
-— cloud-specific bindings (Workload Identity, KMS, LB annotations,
-IAP) live in the `values-*.yaml.example` overlays.
+— cloud-specific bindings (Workload Identity, KMS, LB annotations)
+live in the `values-*.yaml.example` overlays.
 
 ## What this chart deploys
 
@@ -33,14 +33,14 @@ IAP) live in the `values-*.yaml.example` overlays.
 - A `ClusterIP` `Service` (`<release>-web`) — the target of the
   public Ingress.
 - Optional `Ingress` (`web.ingress.enabled`) — the **only** public
-  surface of the deployment. On GCP, fronted by a Google HTTPS LB
-  with IAP attached via a `BackendConfig` annotation on the web
-  Service.
+  surface of the deployment. The orchestrator's sign-in door
+  (`orchestrator.auth`, see [Sign-in](#sign-in)) is what stands
+  between it and the app.
 - A `ConfigMap` (`<release>-web-config`) carrying the nginx server
   block (SPA routing + coord reverse proxy).
 
 **Public-surface invariant.** The coord has no public IP. Browsers
-reach the SPA via the public IAP'd HTTPS LB → nginx → in-cluster
+reach the SPA via the public HTTPS LB → nginx → in-cluster
 ClusterIP. Host-agents reach the coord at a VPC-only internal LB.
 Set `web.enabled=false` only if you're running a CLI-only deploy and
 have an alternative auth-gated path to the coord; never enable the
@@ -58,8 +58,11 @@ coord `ingress` without an auth proxy in front.
   `deploy/terraform/` for node-pool provisioning.
 - **The KEK** — bring your own KMS key (GCP KMS, AWS KMS) or stash a
   base64 master key in the DATABASE_URL secret (dev only).
-- **The managed cert + IAP brand/client** — provisioned in Terraform;
-  the chart only references them by name via annotations.
+- **The managed cert** — provisioned in Terraform; the chart only
+  references it by name via annotations.
+- **The OAuth client** people sign in through — registered with your
+  identity provider; the chart takes its issuer, client id, and a
+  Secret holding the client secret.
 
 ## Prerequisites
 
@@ -191,7 +194,26 @@ common knobs:
 | `web.containerPort` | 8080 | nginx listens here; lets the pod run as non-root UID 101. |
 | `web.service.type` | `ClusterIP` | Always ClusterIP — public reach is via Ingress only. |
 | `web.service.port` | 80 | Ingress targets this. |
-| `web.service.annotations` | `{}` | IAP BackendConfig annotation lands here (see `values-iap.yaml.example`). |
+| `web.service.annotations` | `{}` | BackendConfig annotation lands here (backend timeout; IAP in `values-iap.yaml.example`). |
 | `web.ingress.enabled` | `false` | Flip on once you have managed cert + DNS. |
 | `web.ingress.annotations` | `{}` | GKE managed-cert + static-IP refs. |
 | `web.resources` | 50m / 64Mi req | nginx is light. |
+
+### Sign-in
+
+Every setting for how a person signs in is in `orchestrator.auth`.
+`mode` selects ONE door; only that door is open, and only its
+settings are rendered. The chart fails the render when the active
+mode is missing a setting.
+
+| Key | Default | Notes |
+|---|---|---|
+| `orchestrator.auth.mode` | `oauth` | `oauth`, `iap`, or `password`. |
+| `orchestrator.auth.oauth.issuer` | `""` | OIDC issuer URL (`https://accounts.google.com`, an Okta org, a Cognito user pool, …). Required for `oauth`. |
+| `orchestrator.auth.oauth.clientId` | `""` | Required for `oauth`. Redirect URI: `<publicUrl>/api/auth/oauth2/callback/sso`. |
+| `orchestrator.auth.oauth.clientSecret.existingSecret` | `""` | Secret holding the client secret. Required for `oauth`. |
+| `orchestrator.auth.oauth.allowedDomains` | `[]` | Who may sign in. `oauth` needs this, `allowedEmails`, or `adminEmails`; `["*"]` admits every account the provider authenticates. |
+| `orchestrator.auth.oauth.allowedEmails` | `[]` | Individual accounts, whatever their domain. |
+| `orchestrator.auth.iap.audiences` | `[]` | Trusted IAP audiences. Required for `iap`. |
+| `orchestrator.auth.password.signup` | `false` | Open registration. Addresses are not verified: evaluation or private networks only. |
+| `orchestrator.auth.adminEmails` | `[]` | Promoted to admin on first sign-in, in every mode. |

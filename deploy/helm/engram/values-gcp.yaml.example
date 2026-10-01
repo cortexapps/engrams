@@ -17,9 +17,11 @@
 #       engram-coordinator@REPLACE_PROJECT.iam.gserviceaccount.com
 # - The host fleet runs as the engram-host-fleet chart's DaemonSet in
 #   the same cluster (see that chart's values-gcp.yaml.example).
-# - No identity proxy by default: the orchestrator's login wall
-#   (better-auth + `orchestrator.auth.adminEmails`) is the auth door
-#   (ADR 0118). IAP is an opt-in layer — values-iap.yaml.example.
+# - Sign-in is OAuth against your identity provider (the
+#   `orchestrator.auth` block at the bottom): only accounts on the
+#   allowlist get in. No identity proxy sits in front of the app — the
+#   orchestrator's login wall is the auth door (ADR 0118). IAP is an
+#   alternative door — values-iap.yaml.example.
 
 # ─── coordinator ──────────────────────────────────────────────────
 
@@ -161,9 +163,9 @@ web:
   ingress:
     # The single public surface: Google HTTPS LB + managed cert. With
     # no identity proxy, one "/" rule is the whole table — the
-    # orchestrator's login wall is the auth door (ADR 0118). The
-    # values-iap.yaml.example overlay replaces this with the
-    # per-backend path table IAP requires.
+    # orchestrator's login wall (`orchestrator.auth` below) is the
+    # auth door (ADR 0118). The values-iap.yaml.example overlay
+    # replaces this with the per-backend path table IAP requires.
     enabled: true
     className: gce
     annotations:
@@ -193,7 +195,29 @@ orchestrator:
     urlKey: ORCHESTRATOR_DATABASE_URL
     bearerKey: CONTROL_PLANE_BEARER
     authSecretKey: BETTER_AUTH_SECRET
+  # How people sign in. `oauth` is the door for a deployment on the
+  # internet; the chart's values.yaml documents the other two
+  # (`iap`, `password`) in the same block.
   auth:
+    mode: oauth
+    oauth:
+      # Google sign-in. Any OIDC provider works — set its issuer URL.
+      issuer: https://accounts.google.com
+      # Create the client in the Google Cloud console (APIs & Services
+      # → Credentials → OAuth client ID → Web application) with the
+      # redirect URI
+      #   https://engrams.REPLACE_DOMAIN/api/auth/oauth2/callback/sso
+      clientId: REPLACE_OAUTH_CLIENT_ID
+      # The Terraform quickstart relays the `engram-oauth-client-secret`
+      # Secret Manager entry into this Secret.
+      clientSecret:
+        existingSecret: engram-oauth-client
+        secretKey: ORCHESTRATOR_OAUTH_CLIENT_SECRET
+      # Who may sign in: every account of your Google Workspace
+      # domain. Without an allowlist a Google client admits every
+      # Google account there is.
+      allowedDomains:
+        - REPLACE_EMAIL_DOMAIN
     # Bootstrap admins: each email is promoted to role 'admin' on
     # first sign-in — how a fresh deploy gets a root account without a
     # manual DB UPDATE.

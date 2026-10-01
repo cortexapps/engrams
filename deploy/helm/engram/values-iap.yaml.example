@@ -1,5 +1,9 @@
 # GKE Identity-Aware Proxy overlay — the SPLIT-HOST layout.
 #
+# This swaps the sign-in door from `oauth` (the values-gcp default)
+# to `iap`: Google's proxy signs people in before a request reaches
+# the app, and IAP's own IAM binding decides who gets in.
+#
 # Layer this on top of `values-gcp.yaml.example`:
 #
 #   helm install engram ./deploy/helm/engram \
@@ -19,6 +23,13 @@
 # exactly `orchestrator.trustedOrigins`, and its own auth seams
 # (session cookie / API key / webhook signatures) gate every route
 # there. Anonymous callers get 401s from the app, not a proxy page.
+#
+# The api host is on the internet with NO proxy in front, so the
+# orchestrator must know it is in `iap` mode (`orchestrator.auth`
+# below). That closes the password door and makes the orchestrator
+# accept a browser only with a verified IAP assertion. An IAP layout
+# with the orchestrator left in another mode has IAP on one hostname
+# and an open sign-in door on the other.
 #
 # (Historical note: before the split-host layout this overlay carved
 # a dozen per-path no-IAP exceptions out of the app host's URL map —
@@ -84,6 +95,18 @@
 #    tighter scoping). Bind this ONLY to the web backend — the api
 #    host's backend needs no accessor.
 #
+# 6. The IAP audience of the web backend service, for
+#    `orchestrator.auth.iap.audiences` below. It exists only after
+#    the first Ingress sync has created the backend service:
+#
+#      gcloud compute backend-services list --global \
+#        --format='table(name,id)'      # the k8s1-…-engram-web-80-… row
+#      # audience = /projects/<PROJECT_NUMBER>/global/backendServices/<id>
+#
+#    So the first install runs with a placeholder audience (every
+#    browser request is refused, which is the safe direction), and a
+#    `helm upgrade` with the real one opens the door.
+#
 # What this overlay sets
 # ----------------------
 
@@ -146,6 +169,13 @@ web:
             service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
 
 orchestrator:
+  auth:
+    # The sign-in door is IAP. Overrides the `oauth` door that
+    # values-gcp.yaml.example sets; its `oauth` block is ignored.
+    mode: iap
+    iap:
+      audiences:
+        - REPLACE_IAP_AUDIENCE    # pre-req #6
   # The SPA's origin, admitted by the orchestrator's credentialed
   # CORS gate and better-auth's CSRF check for the cross-origin
   # calls to the api host.

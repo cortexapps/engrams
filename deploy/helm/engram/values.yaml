@@ -89,7 +89,7 @@ database:
 # dropped its human-auth verifiers (oidc / forward-auth / synthetic / cookie),
 # so it no longer reads any auth-mode env. Human auth + the designated-admin
 # allowlist now live in the Bun/Hono orchestrator
-# (`orchestrator.auth.*`, `orchestrator.auth.adminEmails` → ORCHESTRATOR_ADMIN_EMAILS).
+# (`orchestrator.auth` — the sign-in door and the bootstrap admins).
 auth:
   existingSecret: ""
   secretKey: ENGRAM_AUTH_TOKENS
@@ -365,8 +365,10 @@ web:
 
   ingress:
     # The single public surface of the whole deployment. On GCP this
-    # provisions a Google HTTPS LB; pair with a managed cert + IAP
-    # BackendConfig in the values overlay.
+    # provisions a Google HTTPS LB; pair with a managed cert in the
+    # values overlay. The orchestrator's sign-in door
+    # (`orchestrator.auth`) is what stands between this surface and
+    # the app.
     enabled: false
     className: ""
     annotations: {}
@@ -423,9 +425,10 @@ orchestrator:
   containerPort: 8787
 
   # ORCHESTRATOR_PUBLIC_URL — the externally-reachable base URL. Used by
-  # better-auth as `baseURL` (the session-cookie domain + the OIDC redirect
-  # callback `${publicUrl}/api/auth/oauth2/callback/<provider>`). MUST be the
-  # public https URL in any OIDC deploy, or the IdP redirect lands nowhere.
+  # better-auth as `baseURL` (the session-cookie domain + the OAuth redirect
+  # callback `${publicUrl}/api/auth/oauth2/callback/<providerId>`). MUST be the
+  # public https URL in an `auth.mode: oauth` deploy, or the identity
+  # provider's redirect lands nowhere.
   publicUrl: ""
 
   # ADR 0118 — session apps. The wildcard base domain under which a session's
@@ -538,55 +541,100 @@ orchestrator:
     # Job backoff before it's marked Failed (and the install/upgrade aborts).
     backoffLimit: 3
 
-  # Human auth mode is DEPLOY-SELECTABLE, mirroring the old coordinator
-  # `auth.mode` / `oidc.*` knobs. The orchestrator supports three doors and
-  # the modes COMPOSE (config.ts): email+password is always on unless you put
-  # IAP in front; IAP and OIDC each activate only when their block is set.
-  # Env entries are emitted ONLY when the corresponding value is non-empty, so
-  # an unset block leaves that auth path fully inert.
+  # ─── human sign-in ────────────────────────────────────────────────
   #
-  #   email+password  → set NOTHING here (dev / simple deploys)
-  #   IAP             → set auth.iap.audiences (GCP IAP in front of the Ingress)
-  #   OIDC            → set auth.oidc.{issuer,clientId,clientSecret} ("Sign in
-  #                     with your IdP"; yields real user names via the `profile`
-  #                     scope, which stock GCP IAP can't supply)
+  # Everything about how a PERSON signs in is in this one block. `mode` picks
+  # the ONE sign-in door; the doors are exclusive. Only the active mode's
+  # sub-block is rendered into the orchestrator's env, so the other two can
+  # stay filled in — changing door is a one-key change.
+  #
+  #   oauth     "Continue with <your identity provider>". The default, and the
+  #             right door for a deployment on the internet. Works with any
+  #             OIDC provider: Google, Okta, Auth0, Keycloak, Cognito, GitLab.
+  #   iap       GCP Identity-Aware Proxy in front of the app host. GKE only;
+  #             needs the split-host layout (values-iap.yaml.example).
+  #   password  Email + password. For evaluation and for a deployment that is
+  #             NOT reachable from the internet: an address is not verified at
+  #             sign-up, so with `password.signup: true` anyone who can reach
+  #             the login page can make an account under any address — a
+  #             bootstrap-admin address included.
+  #
+  # The chart fails the render when the active mode is missing a value it
+  # needs; the orchestrator checks the same things again at boot.
   auth:
-    # IAP — GCP Identity-Aware Proxy bridge. Add one or more trusted audiences
-    # to enable; the bridge is fully inert (zero header reads) when empty. A
-    # SET because the orchestrator can sit behind more than one IAP-protected
-    # GCP backend service (e.g. the app's web Ingress AND the ADR 0064 preview
-    # Gateway), and a GCP IAP audience IS the backend-service resource — there
-    # is no single audience shared across backends. Rendered to IAP_AUDIENCES
-    # (comma-joined); verification accepts an assertion matching ANY entry.
-    iap:
-      audiences: []    # e.g. [/projects/<NUM>/global/backendServices/<ID>, …]
-      # Override the IAP JWKS endpoint (default in config.ts points at gstatic).
-      # Leave empty in prod.
-      jwksUrl: ""
-    # OIDC — env-driven generic OIDC provider (better-auth genericOAuth).
-    # Setting `issuer` enables it; clientId + clientSecret then become REQUIRED
-    # (partial config is a hard boot error in config.ts). The client secret
-    # comes from a Secret, never inlined.
-    oidc:
+    mode: oauth
+
+    # mode: oauth — one OIDC identity provider (ORCHESTRATOR_OAUTH_*).
+    #
+    # Register an OAuth client with the provider (type "Web application") and
+    # give it this redirect URI:
+    #
+    #   <orchestrator.publicUrl>/api/auth/oauth2/callback/<providerId>
+    #   e.g. https://engrams.example.com/api/auth/oauth2/callback/sso
+    #
+    # The provider must return a verified email (`email_verified: true`); a
+    # sign-in without one is refused.
+    oauth:
+      # The provider's issuer URL; its discovery document is fetched from
+      # `<issuer>/.well-known/openid-configuration`.
+      #   Google:   https://accounts.google.com
+      #   Okta:     https://<org>.okta.com
+      #   Cognito:  https://cognito-idp.<region>.amazonaws.com/<user-pool-id>
+      #   Keycloak: https://<host>/realms/<realm>
       issuer: ""
       clientId: ""
+      # The client secret comes from a Secret, never inlined.
       clientSecret:
         existingSecret: ""
-        secretKey: ORCHESTRATOR_OIDC_CLIENT_SECRET
-      # Stable provider id used in the sign-in call + the callback path
-      # (`${publicUrl}/api/auth/oauth2/callback/<providerId>`). Default "sso".
+        secretKey: ORCHESTRATOR_OAUTH_CLIENT_SECRET
+      # WHO MAY SIGN IN. An OAuth client is a public door — a Google client
+      # authenticates every Google account there is — so at least one of
+      # `allowedDomains`, `allowedEmails`, `adminEmails` must name someone.
+      # The check runs on every sign-in, not only the first.
+      #
+      # allowedDomains: every account of these domains. For Google this is the
+      # Workspace domain (the `hd` claim), so a personal Google account that
+      # merely carries an address at the domain is not admitted. `"*"` admits
+      # every account the provider authenticates — correct for a single-tenant
+      # provider (your own Okta org, a Google client of user type "Internal"),
+      # wide open for a public one.
+      allowedDomains: []
+      # - example.com
+      # allowedEmails: individual accounts, whatever their domain (a
+      # contractor). `adminEmails` below are always allowed.
+      allowedEmails: []
+      # - contractor@other.example
+      # The name on the sign-in button. Default: "Google" for the Google
+      # issuer, otherwise "SSO".
+      displayName: ""
+      # Stable provider id — the last segment of the redirect URI. Default "sso".
       providerId: ""
-      # Requested scopes; `profile` pulls the display name. Default in config.ts
-      # is "openid email profile". Join with spaces here.
-      scopes: ""    # e.g. "openid email profile"
+      # Requested scopes, space-separated; `profile` supplies the display name.
+      # Default "openid email profile".
+      scopes: ""
 
-    # Bootstrap-admin allowlist — ORCHESTRATOR_ADMIN_EMAILS. Restores the
-    # pre-ADR-0051 `auth.bootstrapAdmins` value: each email here is created
-    # with role 'admin' on first login (any door — IAP / OIDC / email+password)
-    # and an existing matching user is promoted to admin on next sign-in. This
-    # is how a fresh deploy gets a designated root/admin account without manual
-    # SQL. Comma-joined into the env; empty list -> the env is omitted and the
-    # promotion hooks are fully inert.
+    # mode: iap — GCP Identity-Aware Proxy (IAP_AUDIENCES).
+    #
+    # The audiences the orchestrator trusts; a request must carry an IAP
+    # assertion for one of them. A SET because a GCP IAP audience IS a backend
+    # service, and more than one IAP-protected backend can front the
+    # orchestrator. Access is decided by IAP's own IAM binding
+    # (roles/iap.httpsResourceAccessor), not here.
+    iap:
+      audiences: []    # e.g. [/projects/<NUM>/global/backendServices/<ID>, …]
+      # Override the IAP JWKS endpoint (tests). Leave empty in prod.
+      jwksUrl: ""
+
+    # mode: password — email + password (ORCHESTRATOR_AUTH_PASSWORD_SIGNUP).
+    password:
+      # Open registration. false: existing accounts sign in and nobody can
+      # make a new one — turn it on to create accounts, then off again.
+      signup: false
+
+    # Bootstrap admins, in every mode — ORCHESTRATOR_ADMIN_EMAILS. Each email
+    # is created with role 'admin' on first sign-in, and an existing matching
+    # user is promoted on the next one. This is how a fresh deploy gets its
+    # first admin without manual SQL.
     adminEmails: []
     # - root@example.com
     # - ops@example.com

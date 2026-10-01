@@ -3,9 +3,14 @@
 Non-secret orchestrator env (ADR 0051). The three REQUIRED vars
 (ORCHESTRATOR_DATABASE_URL, CONTROL_PLANE_BEARER, BETTER_AUTH_SECRET) come
 from a Secret in the Deployment — never from this ConfigMap. Everything here
-is non-sensitive config the orchestrator reads at boot (config.ts). Optional
-auth knobs (IAP / OIDC) are emitted ONLY when set, so an unset block leaves
-that auth path inert and the env var simply absent.
+is non-sensitive config the orchestrator reads at boot (config.ts).
+
+The sign-in door (`orchestrator.auth.mode`) is validated HERE, at render time:
+an unknown mode, or a mode missing a value it needs, fails the install with a
+message naming the value — the pods never start half-configured. Only the
+ACTIVE mode's values are emitted; the orchestrator refuses to boot on config
+for a mode it is not in (a stray IAP audience would arm the fail-closed IAP
+bridge on a deployment with no IAP in front of it).
 
 CONTROL_PLANE_{GRPC,HTTP}_URL default to the in-cluster coord Service when the
 operator leaves them empty, so a same-chart deploy needs zero wiring.
@@ -17,6 +22,29 @@ operator leaves them empty, so a same-chart deploy needs zero wiring.
 {{- $agPort := 50061 -}}
 {{- if .Values.appGrpc -}}{{- $agPort = .Values.appGrpc.port -}}{{- end -}}
 {{- $coordGrpc := printf "%s:%v" $coordHost $agPort -}}
+{{- $auth := .Values.orchestrator.auth -}}
+{{- $authMode := $auth.mode | default "" -}}
+{{- if not (has $authMode (list "oauth" "iap" "password")) -}}
+  {{- fail (printf "values.orchestrator.auth.mode must be one of oauth, iap, password (got %q)" $authMode) -}}
+{{- end -}}
+{{- if eq $authMode "oauth" -}}
+  {{- if not $auth.oauth.issuer -}}
+    {{- fail "values.orchestrator.auth.oauth.issuer is required when orchestrator.auth.mode=oauth (e.g. https://accounts.google.com). For an evaluation install with no identity provider, set orchestrator.auth.mode=password" -}}
+  {{- end -}}
+  {{- if not $auth.oauth.clientId -}}
+    {{- fail "values.orchestrator.auth.oauth.clientId is required when orchestrator.auth.mode=oauth" -}}
+  {{- end -}}
+  {{- if not $auth.oauth.clientSecret.existingSecret -}}
+    {{- fail "values.orchestrator.auth.oauth.clientSecret.existingSecret is required when orchestrator.auth.mode=oauth" -}}
+  {{- end -}}
+  {{- if not (or $auth.oauth.allowedDomains $auth.oauth.allowedEmails $auth.adminEmails) -}}
+    {{- fail "orchestrator.auth.mode=oauth needs an allowlist: set values.orchestrator.auth.oauth.allowedDomains (\"*\" admits every account the provider authenticates), oauth.allowedEmails, or auth.adminEmails" -}}
+  {{- end -}}
+{{- else if eq $authMode "iap" -}}
+  {{- if not $auth.iap.audiences -}}
+    {{- fail "values.orchestrator.auth.iap.audiences is required when orchestrator.auth.mode=iap" -}}
+  {{- end -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -47,25 +75,34 @@ data:
   {{- if .Values.orchestrator.killSwitches.slackAutomation }}
   ORCHESTRATOR_SLACK_AUTOMATION_DISABLED: "1"
   {{- end }}
-  {{- with .Values.orchestrator.auth.iap.audiences }}
-  IAP_AUDIENCES: {{ join "," . | quote }}
+  ORCHESTRATOR_AUTH_MODE: {{ $authMode | quote }}
+  {{- if eq $authMode "oauth" }}
+  ORCHESTRATOR_OAUTH_ISSUER: {{ $auth.oauth.issuer | quote }}
+  ORCHESTRATOR_OAUTH_CLIENT_ID: {{ $auth.oauth.clientId | quote }}
+  {{- with $auth.oauth.allowedDomains }}
+  ORCHESTRATOR_OAUTH_ALLOWED_DOMAINS: {{ join "," . | quote }}
   {{- end }}
-  {{- with .Values.orchestrator.auth.iap.jwksUrl }}
+  {{- with $auth.oauth.allowedEmails }}
+  ORCHESTRATOR_OAUTH_ALLOWED_EMAILS: {{ join "," . | quote }}
+  {{- end }}
+  {{- with $auth.oauth.displayName }}
+  ORCHESTRATOR_OAUTH_DISPLAY_NAME: {{ . | quote }}
+  {{- end }}
+  {{- with $auth.oauth.providerId }}
+  ORCHESTRATOR_OAUTH_PROVIDER_ID: {{ . | quote }}
+  {{- end }}
+  {{- with $auth.oauth.scopes }}
+  ORCHESTRATOR_OAUTH_SCOPES: {{ . | quote }}
+  {{- end }}
+  {{- else if eq $authMode "iap" }}
+  IAP_AUDIENCES: {{ join "," $auth.iap.audiences | quote }}
+  {{- with $auth.iap.jwksUrl }}
   IAP_JWKS_URL: {{ . | quote }}
   {{- end }}
-  {{- with .Values.orchestrator.auth.oidc.issuer }}
-  ORCHESTRATOR_OIDC_ISSUER: {{ . | quote }}
+  {{- else }}
+  ORCHESTRATOR_AUTH_PASSWORD_SIGNUP: {{ ternary "true" "false" (eq ($auth.password.signup | toString) "true") | quote }}
   {{- end }}
-  {{- with .Values.orchestrator.auth.oidc.clientId }}
-  ORCHESTRATOR_OIDC_CLIENT_ID: {{ . | quote }}
-  {{- end }}
-  {{- with .Values.orchestrator.auth.oidc.providerId }}
-  ORCHESTRATOR_OIDC_PROVIDER_ID: {{ . | quote }}
-  {{- end }}
-  {{- with .Values.orchestrator.auth.oidc.scopes }}
-  ORCHESTRATOR_OIDC_SCOPES: {{ . | quote }}
-  {{- end }}
-  {{- with .Values.orchestrator.auth.adminEmails }}
+  {{- with $auth.adminEmails }}
   ORCHESTRATOR_ADMIN_EMAILS: {{ join "," . | quote }}
   {{- end }}
 {{- end -}}
