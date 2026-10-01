@@ -60,7 +60,7 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 7;
+export const SLACK_BRAIN_DEFINITION_VERSION = 8;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
@@ -601,6 +601,9 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       // `default:` — default's fallback argument is strict.)
       keyTemplate:
         '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}',
+      // The thread's title on the Slack page and the rail: the opening
+      // mention's text, as a human reads it.
+      labelTemplate: "${{ event.raw.event.text | strip_mentions | truncate: 80 }}",
     },
     concurrency: {
       // One run per thread, instance-scoped: the same template as the

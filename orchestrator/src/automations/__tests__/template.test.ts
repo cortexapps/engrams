@@ -47,6 +47,17 @@ describe("automation templates", () => {
     ).rejects.toThrow(/undefined variable/);
   });
 
+  test("strip_mentions renders Slack text as a human reads it (a workstream title)", async () => {
+    const scope = { text: "<@UBOT> can you look at <#C123|alerts> and <https://x.io|the dashboard>?   thanks" };
+    expect(await renderAutomationTemplateInScope("${{ text | strip_mentions }}", scope)).toBe(
+      "can you look at #alerts and the dashboard? thanks",
+    );
+    expect(await renderAutomationTemplateInScope("${{ text | strip_mentions | truncate: 12 }}", scope)).toBe(
+      "can you l...",
+    );
+    expect(await renderAutomationTemplateInScope("${{ bare | strip_mentions }}", { bare: "<@UBOT>" })).toBe("");
+  });
+
   test("coalesce returns the first present value among string paths, absent paths included", async () => {
     const scope = { raw: { repository: { full_name: "acme/repo" }, pull_request: { number: 7 } } };
     expect(await renderAutomationTemplateInScope('${{ raw | coalesce: "pull_request.number", "issue.number" }}', scope)).toBe("7");

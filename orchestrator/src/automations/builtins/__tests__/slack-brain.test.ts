@@ -49,6 +49,8 @@ describe("Slack thread brain built-in — definition", () => {
     expect(parsed.entrypoints ?? []).toEqual([]);
     expect(parsed.settings.instance?.keyTemplate).toBe(parsed.settings.concurrency?.keyTemplate);
     expect(parsed.settings.instance?.keyTemplate).toContain('coalesce: "thread_ts", "ts"');
+    // The Slack page shows the opening mention's text as the thread's title.
+    expect(parsed.settings.instance?.labelTemplate).toBe("${{ event.raw.event.text | strip_mentions | truncate: 80 }}");
     // The loop's wait consumes mentions only; a plain reply is folded into
     // the next mention's prompt by the list_replies + code pair.
     const thread = parsed.blocks.find((b) => b.id === "thread")!;
