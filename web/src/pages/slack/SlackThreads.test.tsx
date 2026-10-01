@@ -39,7 +39,16 @@ vi.mock("../../hooks/useAutomationRuns", () => ({
   useRunList: () => ({ data: { runs: [] } }),
 }));
 vi.mock("../../hooks/useAutomationInputs", () => ({
-  useInputKeyOptions: () => ({ data: { options: [{ key: "C0123456789", label: "#alerts" }] } }),
+  useInputKeyLabels: () => ({ data: { options: [{ key: "C0123456789", label: "#alerts" }] } }),
+  useInputKeyOptions: () => ({
+    isPending: false,
+    data: {
+      options: [
+        { key: "C0123456789", label: "#alerts" },
+        { key: "C0555555555", label: "#ops-private" },
+      ],
+    },
+  }),
 }));
 vi.mock("../../hooks/useProfiles", () => ({
   useProfiles: () => ({ data: { profiles: state.profiles } }),
@@ -139,7 +148,14 @@ describe("SlackThreads", () => {
     renderWithProviders(<SlackThreads />);
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: /add override/i }));
-    await user.type(await screen.findByLabelText("Channel ID"), "C0987654321");
+    // The picker searches the app's channels by name; a channel it does not
+    // list is added by its id.
+    await user.click(await screen.findByRole("combobox", { name: /channel/i }));
+    await user.type(screen.getByPlaceholderText("Search channels…"), "ops");
+    expect(await screen.findByText("#ops-private")).toBeTruthy();
+    await user.clear(screen.getByPlaceholderText("Search channels…"));
+    await user.type(screen.getByPlaceholderText("Search channels…"), "C0987654321");
+    await user.click(await screen.findByText(/use channel id/i));
     await user.click(screen.getByRole("button", { name: /^add$/i }));
     await waitFor(() =>
       expect(setEntry).toHaveBeenCalledWith({

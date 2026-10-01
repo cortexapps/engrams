@@ -14,7 +14,7 @@ import {
   useSetInputValue,
   useSetMapInputEntry,
 } from "../../hooks/useAutomations";
-import { useInputKeyOptions } from "../../hooks/useAutomationInputs";
+import { useInputKeyLabels, useInputKeyOptions } from "../../hooks/useAutomationInputs";
 import { useInstanceList, useRecentDrops } from "../../hooks/useInstances";
 import { useNow } from "../../hooks/useNow";
 import { useProfiles } from "../../hooks/useProfiles";
@@ -32,7 +32,6 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import {
   Select,
@@ -68,10 +67,12 @@ import {
   channelLabel,
   channelNames,
   describeThread,
+  threadChannelIds,
   threadHandleLabel,
   threadLabel,
   type ChannelNames,
 } from "./slack-format";
+import { ChannelCombobox, SLACK_CHANNEL_ID_RE } from "./ChannelCombobox";
 
 /** The built-in behind this page. */
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
@@ -95,8 +96,13 @@ export function SlackThreads() {
     typeof inputs["default_profile"] === "string" ? inputs["default_profile"] : "";
   const { data: profileData } = useProfiles();
   const profiles = profileData?.profiles ?? [];
-  // Channel ids → "#name" (the same list the override picker offers).
-  const names = channelNames(useInputKeyOptions("channel").data?.options);
+  // Channel ids → "#name", looked up by id for the overrides this page shows.
+  const names = channelNames(
+    useInputKeyLabels(
+      "channel",
+      channels.map((row) => row.channel),
+    ).data?.options,
+  );
   const setEnabled = useSetAutomationEnabled();
   const setDefault = useSetInputValue();
   const enabled = automation?.enabled === true;
@@ -254,7 +260,7 @@ export function SlackThreads() {
         )}
       </section>
 
-      {automationId && <ThreadsSection automationId={automationId} names={names} />}
+      {automationId && <ThreadsSection automationId={automationId} />}
     </div>
   );
 }
@@ -370,10 +376,7 @@ function ChannelRow({
 }
 
 const enrollSchema = z.object({
-  channel: z
-    .string()
-    .trim()
-    .regex(/^[CGD][A-Z0-9]{6,}$/, "must be a Slack channel ID (e.g. C0123456789)"),
+  channel: z.string().trim().regex(SLACK_CHANNEL_ID_RE, "pick a channel"),
   profileId: z.string().min(1, "pick a profile"),
 });
 type EnrollValues = z.infer<typeof enrollSchema>;
@@ -390,6 +393,11 @@ function EnrollChannelDialog({
   const [open, setOpen] = useState(false);
   const enroll = useSetMapInputEntry();
   const isEdit = existing !== undefined;
+  // The channels the app can see, for the picker (loaded once the dialog opens).
+  const channelOptions = useInputKeyOptions(open ? "channel" : undefined);
+  const options = channelOptions.data?.options ?? [];
+  const existingLabel =
+    existing && (options.find((o) => o.key === existing.channel)?.label ?? existing.channel);
   const defaults: EnrollValues = {
     channel: existing?.channel ?? "",
     profileId: existing?.profileId ?? profiles[0]?.id ?? "",
@@ -436,9 +444,7 @@ function EnrollChannelDialog({
       </DialogTrigger>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>
-            {isEdit ? `Edit ${existing.channel}` : "Add a channel override"}
-          </DialogTitle>
+          <DialogTitle>{isEdit ? `Edit ${existingLabel}` : "Add a channel override"}</DialogTitle>
           <DialogDescription>
             Threads in this channel run on the profile you pick instead of the default.
           </DialogDescription>
@@ -451,20 +457,18 @@ function EnrollChannelDialog({
               control={form.control}
               render={({ field, fieldState }) => (
                 <Field data-invalid={fieldState.invalid}>
-                  <FieldLabel htmlFor={field.name}>Channel ID</FieldLabel>
-                  <Input
-                    {...field}
+                  <FieldLabel htmlFor={field.name}>Channel</FieldLabel>
+                  <ChannelCombobox
                     id={field.name}
-                    autoFocus={!isEdit}
+                    value={field.value}
+                    onChange={field.onChange}
+                    options={options}
+                    loading={channelOptions.isPending}
                     disabled={isEdit}
-                    placeholder="C0123456789"
-                    spellCheck={false}
-                    autoCapitalize="off"
-                    aria-invalid={fieldState.invalid}
                   />
                   <FieldDescription>
-                    In Slack: open the channel, click its name, and copy the Channel ID at the
-                    bottom of the About tab. Cannot be changed later.
+                    Search by name. A channel the app is not in yet can be added by its ID (in
+                    Slack: the channel name, then About). Cannot be changed later.
                   </FieldDescription>
                   {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
                 </Field>
@@ -520,12 +524,22 @@ function EnrollChannelDialog({
 /** The threads: the automation's workstreams, open first. The table is the
  * platform's own workstream table — the same rows an admin sees under
  * Automations, which is the point. */
-function ThreadsSection({ automationId, names }: { automationId: string; names: ChannelNames }) {
+function ThreadsSection({ automationId }: { automationId: string }) {
   const [status, setStatus] = useState<"open" | "closed">("open");
   const list = useInstanceList(automationId, { includeClosed: true });
   const drops = useRecentDrops(automationId);
   const now = useNow();
   const all = list.data?.instances ?? [];
+  // The channels these threads (and the dropped events) are in, by id.
+  const names = channelNames(
+    useInputKeyLabels(
+      "channel",
+      threadChannelIds([
+        ...all.map((i) => i.key),
+        ...(drops.data?.drops ?? []).map((d) => d.detail),
+      ]),
+    ).data?.options,
+  );
   const open = all.filter((instance) => instance.status === "open");
   const closed = all.filter((instance) => instance.status === "closed");
   const rows = status === "open" ? open : closed;
