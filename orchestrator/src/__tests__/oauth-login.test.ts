@@ -21,6 +21,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { betterAuth } from "better-auth";
 import { memoryAdapter, type MemoryDB } from "better-auth/adapters/memory";
+import { admin } from "better-auth/plugins/admin";
 import type { OAuthConfig } from "../config.ts";
 import {
   oauthProviderConfig,
@@ -39,6 +40,8 @@ const LOGIN_URL = `${BASE_URL}/login`;
 let idp: Server;
 let issuer: string;
 let nextClaims: Record<string, unknown> = {};
+/** When true, the token endpoint answers with no ID token (a non-OIDC provider). */
+let omitIdToken = false;
 /** The form body of the last token request — to assert the code + PKCE verifier arrive. */
 let lastTokenRequest: URLSearchParams | undefined;
 
@@ -80,7 +83,7 @@ beforeAll(async () => {
             access_token: "at",
             token_type: "Bearer",
             expires_in: 3600,
-            id_token: idToken(nextClaims),
+            ...(omitIdToken ? {} : { id_token: idToken(nextClaims) }),
           }),
         );
       });
@@ -102,15 +105,21 @@ afterAll(async () => {
 
 type Row = Record<string, unknown>;
 
-function buildAuth(cfg: SignInDoorConfig) {
-  const db: MemoryDB = { user: [], session: [], account: [], verification: [] };
+/** `db` lets two instances share one database (a deployment that changes its config). */
+function buildAuth(
+  cfg: SignInDoorConfig,
+  db: MemoryDB = { user: [], session: [], account: [], verification: [] },
+) {
   const door = signInDoor(cfg, LOGIN_URL);
   const auth = betterAuth({
     baseURL: BASE_URL,
     secret: "test-only-secret-test-only-secret-test-only",
     database: memoryAdapter(db),
     emailAndPassword: door.emailAndPassword,
-    plugins: door.plugins,
+    // The admin plugin is what gives the user row its `role` and `banned`
+    // columns in production (better-auth.ts). Without it here, a test that a
+    // provider claim cannot set them would pass for the wrong reason.
+    plugins: [admin(), ...door.plugins],
   });
   return { auth, db };
 }
@@ -183,6 +192,7 @@ describe("oauth mode — the browser flow", () => {
     oauth = oauthConfig();
     ({ auth, db } = buildAuth({ authMode: "oauth", passwordSignup: false, oauth }));
     lastTokenRequest = undefined;
+    omitIdToken = false;
   });
 
   test("an allowed account signs in; the user is created on first sign-in", async () => {
@@ -228,6 +238,90 @@ describe("oauth mode — the browser flow", () => {
     });
     expect(callback.headers.get("location")).toBe("/");
     expect((db["user"]![0] as Row)["name"]).toBe("bob");
+  });
+
+  test("a provider with no full name gets given + family name", async () => {
+    await signInWithOAuth(auth, {
+      sub: "idp-2b",
+      email: "bob@corp.com",
+      email_verified: true,
+      name: "bob@corp.com",
+      given_name: "Bob",
+      family_name: "Builder",
+    });
+    expect((db["user"]![0] as Row)["name"]).toBe("Bob Builder");
+  });
+
+  // better-auth copies every field it is handed onto the user row. Its default
+  // hands it the whole ID token, so a provider-side `role: "admin"` claim
+  // created an engrams admin. Only the whitelisted profile may arrive.
+  test("provider claims cannot set role or banned on a NEW user", async () => {
+    const { callback } = await signInWithOAuth(auth, {
+      sub: "idp-role-1",
+      email: "eve@corp.com",
+      email_verified: true,
+      name: "Eve E",
+      role: "admin",
+      banned: true,
+      banReason: "set by the provider",
+    });
+    expect(hasSessionCookie(callback)).toBe(true);
+    const user = db["user"]![0] as Row;
+    expect(user["role"]).not.toBe("admin");
+    expect(user["banned"]).not.toBe(true);
+    expect(user["banReason"] ?? null).toBeNull();
+  });
+
+  test("provider claims cannot change role on a RETURNING user", async () => {
+    const claims = { sub: "idp-role-2", email: "gil@corp.com", email_verified: true, name: "Gil G" };
+    await signInWithOAuth(auth, claims);
+    const before = (db["user"]![0] as Row)["role"];
+    await signInWithOAuth(auth, { ...claims, role: "admin", banned: true });
+    const user = db["user"]![0] as Row;
+    expect(user["role"]).toBe(before);
+    expect(user["role"]).not.toBe("admin");
+    expect(user["banned"]).not.toBe(true);
+  });
+
+  test("the provider is the source of truth for the name: a change follows on the next sign-in", async () => {
+    const claims = { sub: "idp-name", email: "hal@corp.com", email_verified: true };
+    await signInWithOAuth(auth, { ...claims, name: "Hal Nine" });
+    expect((db["user"]![0] as Row)["name"]).toBe("Hal Nine");
+
+    await signInWithOAuth(auth, { ...claims, name: "Hal Nine-Thousand", picture: "https://idp/h.png" });
+    expect(db["user"]).toHaveLength(1);
+    const user = db["user"]![0] as Row;
+    expect(user["name"]).toBe("Hal Nine-Thousand");
+    expect(user["image"]).toBe("https://idp/h.png");
+    expect(user["email"]).toBe("hal@corp.com");
+    expect(user["emailVerified"]).toBe(true);
+  });
+
+  // The claims come from the ID token only. A token response without one
+  // (not an OIDC provider, or no `openid` scope) is refused, not guessed at.
+  test("a token response with no ID token is refused", async () => {
+    omitIdToken = true;
+    const { callback } = await signInWithOAuth(auth, {
+      sub: "idp-noid",
+      email: "ivy@corp.com",
+      email_verified: true,
+      name: "Ivy I",
+    });
+    expect(callback.status).toBe(302);
+    expect(callback.headers.get("location")).toContain("error=user_info_is_missing");
+    expect(hasSessionCookie(callback)).toBe(false);
+    expect(db["user"]).toHaveLength(0);
+  });
+
+  test("an ID token with no subject is refused", async () => {
+    const { callback } = await signInWithOAuth(auth, {
+      email: "jan@corp.com",
+      email_verified: true,
+      name: "Jan J",
+    });
+    expect(callback.headers.get("location")).toContain("error=user_info_is_missing");
+    expect(hasSessionCookie(callback)).toBe(false);
+    expect(db["user"]).toHaveLength(0);
   });
 
   test("an account outside the allowlist is refused: no user, no session, no cookie", async () => {
@@ -314,6 +408,38 @@ describe("oauth mode — the IAP → OAuth migration", () => {
     expect(db["user"]).toHaveLength(1);
     expect((db["session"]![0] as Row)["userId"]).toBe(iapUser.id);
     expect((db["account"]![0] as Row)["userId"]).toBe(iapUser.id);
+
+    // IAP reports no name, so the bridge named the user after the mailbox.
+    // The first OAuth sign-in replaces that with the name the provider has.
+    const user = db["user"]![0] as Row;
+    expect(user["id"]).toBe(iapUser.id);
+    expect(user["name"]).toBe("Erin E");
+  });
+
+  test("an admin the bridge created stays admin, and gets the provider's name", async () => {
+    const { auth, db } = buildAuth({
+      authMode: "oauth",
+      passwordSignup: false,
+      oauth: oauthConfig(),
+    });
+    const ctx = await auth.$context;
+    const iapAdmin = await ctx.internalAdapter.createUser({
+      email: "root@corp.com",
+      name: "root",
+      emailVerified: true,
+      role: "admin",
+    });
+
+    await signInWithOAuth(auth, {
+      sub: "idp-root",
+      email: "root@corp.com",
+      email_verified: true,
+      name: "Rita Root",
+    });
+    const user = db["user"]![0] as Row;
+    expect(user["id"]).toBe(iapAdmin.id);
+    expect(user["name"]).toBe("Rita Root");
+    expect(user["role"]).toBe("admin");
   });
 
   // A password-era account never proved its email. Linking the first OAuth
@@ -447,17 +573,10 @@ describe("the password door", () => {
     const open = buildAuth({ authMode: "password", passwordSignup: true, oauth: undefined });
     expect((await signUp(open.auth, "dev@example.com")).status).toBe(200);
 
-    const closedDoor = signInDoor(
+    const { auth: closed } = buildAuth(
       { authMode: "password", passwordSignup: false, oauth: undefined },
-      LOGIN_URL,
+      open.db,
     );
-    const closed = betterAuth({
-      baseURL: BASE_URL,
-      secret: "test-only-secret-test-only-secret-test-only",
-      database: memoryAdapter(open.db),
-      emailAndPassword: closedDoor.emailAndPassword,
-      plugins: closedDoor.plugins,
-    });
 
     const up = await signUp(closed, "newcomer@example.com");
     expect(up.status).toBe(400);

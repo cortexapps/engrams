@@ -6,7 +6,7 @@
  * provider does the same for every tenant. Authentication alone therefore
  * says "this is some account", not "this is one of ours". This module answers
  * the second question, and it runs on EVERY OAuth sign-in (new and existing
- * users alike — see `mapProfileToUser` in better-auth.ts).
+ * users alike — see `getUserInfo` in sign-in-door.ts).
  *
  * Two checks, in order:
  *
@@ -107,9 +107,8 @@ function vouchedDomain(
 }
 
 /**
- * Decide one OAuth sign-in from the provider's claims (the ID token payload,
- * or the userinfo document when the provider sends no ID token). Returns
- * `null` to admit, or the reason to refuse.
+ * Decide one OAuth sign-in from the provider's claims (the ID token payload).
+ * Returns `null` to admit, or the reason to refuse.
  */
 export function checkOAuthProfile(
   profile: Record<string, unknown>,
@@ -120,9 +119,9 @@ export function checkOAuthProfile(
   if (typeof rawEmail !== "string" || !rawEmail.includes("@")) return "email_missing";
   const email = rawEmail.trim().toLowerCase();
 
-  // Some providers send the claim as the string "true" in the userinfo
-  // document. Anything else — false, absent, a different string — is refused.
-  const verified = profile["email_verified"] ?? profile["emailVerified"];
+  // Some providers send the claim as the string "true". Anything else — false,
+  // absent, a different string — is refused.
+  const verified = profile["email_verified"];
   if (verified !== true && verified !== "true") return "email_not_verified";
 
   if (allowlist.emails.includes(email)) return null;
@@ -131,4 +130,65 @@ export function checkOAuthProfile(
   const domain = vouchedDomain(email, profile, issuer);
   if (domain !== undefined && allowlist.domains.includes(domain)) return null;
   return "account_not_allowed";
+}
+
+/** What the `oauth` door writes onto a user row. Nothing else. */
+export interface OAuthProfile {
+  /** The provider's stable subject (`sub`). The account key, with the provider id. */
+  id: string;
+  email: string;
+  /** Always true: `checkOAuthProfile` admits only a verified email. */
+  emailVerified: true;
+  name: string;
+  image?: string;
+}
+
+function str(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
+
+/**
+ * The display name for a set of claims.
+ *
+ * `name` is the provider's full name and is normally right. Some providers
+ * fill it with the email address, or with one word (a username), when the
+ * directory has no full name. In that case `given_name` + `family_name` are
+ * the better source, when both are present. With nothing usable, the mailbox
+ * name stands in — which is also what the IAP bridge writes, so an account is
+ * never left without a name.
+ */
+export function displayNameFromClaims(claims: Record<string, unknown>): string {
+  const full = str(claims["name"]);
+  if (!full || full.includes("@") || !full.includes(" ")) {
+    const given = str(claims["given_name"]);
+    const family = str(claims["family_name"]);
+    if (given && family) return `${given} ${family}`;
+  }
+  if (full) return full;
+  const email = str(claims["email"]).toLowerCase();
+  return email.split("@")[0] || email;
+}
+
+/**
+ * The profile for claims that `checkOAuthProfile` ADMITTED, or `null` when
+ * the token has no subject. Call it only after the gate.
+ *
+ * This is a whitelist on purpose. An ID token carries whatever the provider
+ * was configured to send (`role`, `groups`, `banned`, …), and the auth library
+ * copies every field it is given onto the user row. A provider-side
+ * `role: "admin"` must not become an admin here, so only these five fields
+ * leave this function.
+ */
+export function profileFromClaims(claims: Record<string, unknown>): OAuthProfile | null {
+  const sub = claims["sub"];
+  const id = typeof sub === "number" ? String(sub) : str(sub);
+  if (!id) return null;
+  const image = str(claims["picture"]);
+  return {
+    id,
+    email: str(claims["email"]).toLowerCase(),
+    emailVerified: true,
+    name: displayNameFromClaims(claims),
+    ...(image ? { image } : {}),
+  };
 }

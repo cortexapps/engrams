@@ -8,8 +8,10 @@ import { expect, test, describe } from "bun:test";
 import {
   allowlistIsEmpty,
   checkOAuthProfile,
+  displayNameFromClaims,
   isGoogleIssuer,
   parseEmailAllowlist,
+  profileFromClaims,
   type EmailAllowlist,
 } from "../auth/oauth-gate.ts";
 
@@ -61,7 +63,7 @@ describe("checkOAuthProfile — the verified-email requirement", () => {
     expect(checkOAuthProfile({ email: "a@corp.com" }, OKTA, allow)).toBe("email_not_verified");
   });
 
-  test('the string "true" (userinfo documents) counts as verified', () => {
+  test('the string "true" counts as verified', () => {
     expect(checkOAuthProfile({ email: "a@corp.com", email_verified: "true" }, OKTA, CORP)).toBeNull();
   });
 });
@@ -163,5 +165,81 @@ describe("checkOAuthProfile — Google vouches by `hd`, not by the address", () 
   test('"*" admits a consumer account with any address', () => {
     const any: EmailAllowlist = { domains: ["*"], emails: [] };
     expect(checkOAuthProfile({ email: "a@corp.com", email_verified: true }, GOOGLE, any)).toBeNull();
+  });
+});
+
+describe("displayNameFromClaims", () => {
+  test("the provider's full name is used as it is", () => {
+    expect(displayNameFromClaims({ name: " Nikhil Unni ", email: "nikhil@corp.com" })).toBe(
+      "Nikhil Unni",
+    );
+  });
+
+  // Some directories fill `name` with the address or a username. The two
+  // structured claims are then the better source.
+  test.each([
+    ["an email address", "nikhil@corp.com"],
+    ["one word", "nunni"],
+    ["nothing", undefined],
+  ])("when name is %s, given + family name are used", (_label, name) => {
+    expect(
+      displayNameFromClaims({ name, given_name: "Nikhil", family_name: "Unni", email: "n@corp.com" }),
+    ).toBe("Nikhil Unni");
+  });
+
+  test("a one-word name stands when there is no given + family pair", () => {
+    expect(displayNameFromClaims({ name: "Cher", email: "cher@corp.com" })).toBe("Cher");
+    expect(displayNameFromClaims({ name: "Cher", given_name: "Cher", email: "c@corp.com" })).toBe(
+      "Cher",
+    );
+  });
+
+  test("with no name at all, the mailbox name stands in", () => {
+    expect(displayNameFromClaims({ email: "Jdoe@Corp.com" })).toBe("jdoe");
+  });
+});
+
+describe("profileFromClaims — a whitelist", () => {
+  test("only id, email, emailVerified, name and image leave", () => {
+    expect(
+      profileFromClaims({
+        iss: "https://idp.example",
+        aud: "cid",
+        sub: "idp-1",
+        email: "Alice@Corp.com",
+        email_verified: true,
+        name: "Alice A",
+        picture: "https://idp.example/a.png",
+        hd: "corp.com",
+        // Claims a provider can be configured to send. None may reach the row.
+        role: "admin",
+        banned: true,
+        banReason: "x",
+        groups: ["admins"],
+        id: "attacker-chosen-row-id",
+        createdAt: "1970-01-01",
+      }),
+    ).toEqual({
+      id: "idp-1",
+      email: "alice@corp.com",
+      emailVerified: true,
+      name: "Alice A",
+      image: "https://idp.example/a.png",
+    });
+  });
+
+  test("no picture → no image key", () => {
+    expect(
+      profileFromClaims({ sub: "1", email: "a@corp.com", email_verified: true, name: "A B" }),
+    ).toEqual({ id: "1", email: "a@corp.com", emailVerified: true, name: "A B" });
+  });
+
+  test("a numeric subject is kept, as a string", () => {
+    expect(profileFromClaims({ sub: 42, email: "a@corp.com", name: "A B" })?.id).toBe("42");
+  });
+
+  test("no subject → no profile", () => {
+    expect(profileFromClaims({ email: "a@corp.com", name: "A B" })).toBeNull();
+    expect(profileFromClaims({ sub: "  ", email: "a@corp.com", name: "A B" })).toBeNull();
   });
 });

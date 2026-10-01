@@ -27,8 +27,9 @@
 import type { BetterAuthOptions } from "better-auth";
 import { APIError } from "better-auth/api";
 import { genericOAuth, type GenericOAuthConfig } from "better-auth/plugins/generic-oauth";
+import { decodeJwt } from "jose";
 import type { Config, OAuthConfig } from "../config.ts";
-import { checkOAuthProfile, isGoogleIssuer } from "./oauth-gate.ts";
+import { checkOAuthProfile, isGoogleIssuer, profileFromClaims } from "./oauth-gate.ts";
 
 /**
  * Build the genericOAuth provider config.
@@ -67,11 +68,35 @@ export function oauthProviderConfig(oauth: OAuthConfig, loginUrl: string): Gener
           ...(onlyDomain ? { authorizationUrlParams: { hd: onlyDomain } } : {}),
         }
       : {}),
-    // Runs on EVERY sign-in, before better-auth looks up or creates the user:
-    // the gate therefore covers a first sign-in, a returning user, and a user
-    // whose address has since left the allowlist.
-    mapProfileToUser(profile) {
-      const rejection = checkOAuthProfile(profile, oauth.issuer, oauth.allowlist);
+    // The provider is the source of truth for a person's profile: every
+    // sign-in writes the name (and picture) it reports onto the user row. A
+    // user the IAP bridge created is named after the mailbox (`jdoe`), because
+    // IAP reports no name; the first OAuth sign-in replaces that with the real
+    // one, and a later change at the provider follows on the next sign-in.
+    // Nothing in the app edits a name, so there is nothing to overwrite.
+    overrideUserInfo: true,
+    // Runs on EVERY sign-in, before better-auth looks up or creates the user.
+    // It does two jobs, and both depend on this function being the ONLY source
+    // of what better-auth sees:
+    //
+    //   1. The gate. It covers a first sign-in, a returning user, and a user
+    //      whose address has since left the allowlist.
+    //   2. The whitelist. better-auth copies EVERY field of the object this
+    //      returns onto the user row — at creation, and again on each sign-in
+    //      with `overrideUserInfo`. Its own default hands it the whole ID token,
+    //      so a provider that sends a `role` or `banned` claim would set those
+    //      columns: a provider-side `role: "admin"` became an engrams admin.
+    //      Only the five profile fields leave here; `role` is set by this
+    //      app alone (the bootstrap-admin hooks and the Members page).
+    //
+    // The claims come from the ID token, which the token endpoint returned on
+    // the back channel in exchange for the code and the client secret. With
+    // the `openid` scope every OIDC provider returns one; a response with none
+    // is refused (better-auth reports `user_info_is_missing`).
+    getUserInfo(tokens) {
+      const claims = idTokenClaims(tokens.idToken);
+      if (!claims) return Promise.resolve(null);
+      const rejection = checkOAuthProfile(claims, oauth.issuer, oauth.allowlist);
       if (rejection) {
         // The same shape better-auth's own `ctx.redirect()` throws: a 302
         // that the router turns into the response.
@@ -81,18 +106,19 @@ export function oauthProviderConfig(oauth: OAuthConfig, loginUrl: string): Gener
           new Headers({ location: `${loginUrl}?error=${rejection}` }),
         );
       }
-      const email = String(profile["email"]).trim().toLowerCase();
-      const name = typeof profile["name"] === "string" ? profile["name"].trim() : "";
-      return {
-        // The gate just required the provider's verified-email assertion.
-        // Written as a boolean because some providers send the string "true".
-        emailVerified: true,
-        // better-auth refuses a sign-in with no name. A provider that omits it
-        // (no `profile` scope) gets the mailbox name, as the IAP bridge does.
-        name: name || (email.split("@")[0] ?? email),
-      };
+      return Promise.resolve(profileFromClaims(claims));
     },
   };
+}
+
+/** The payload of an ID token, or `null` when there is none to read. */
+function idTokenClaims(idToken: string | undefined): Record<string, unknown> | null {
+  if (!idToken) return null;
+  try {
+    return decodeJwt(idToken);
+  } catch {
+    return null;
+  }
 }
 
 /** The slice of Config that selects the door. */
