@@ -28,7 +28,7 @@ export const logs = [
   "06:00:00  trigger fired · schedule",
   "06:00:01  session se_9f3ea71c restored from base snapshot · 0.8s",
   '06:00:01  prompt → "find and fix the flaky tests in ci"',
-  "06:04:13  agent idle · transcript 212 events · 3 files changed",
+  "06:04:13  agent idle · 3 files changed",
   "06:04:15  $ npm test  ·  exit 0  ·  148 passed",
   "06:04:15  branch → yes",
   "06:04:16  PR #4821 opened · run complete · snapshot written (1.2 MiB)",

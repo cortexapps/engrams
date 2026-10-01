@@ -14,7 +14,6 @@ const runNo = $("[data-run-no]");
 const clocks = $$("[data-clock]");
 const log = $("[data-log]");
 const boardRows = $("[data-board-rows]");
-const boardCount = $("[data-board-count]");
 const cells = $$<HTMLElement>("[data-chunk]");
 const sessions = $("[data-sessions]");
 const stored = $("[data-stored]");
@@ -79,7 +78,6 @@ function render(tick: number, step: number, run: number) {
       }),
     );
   }
-  if (boardCount) boardCount.textContent = "Example runs";
   cells.forEach((c, i) => (c.className = f.chunks[i] ?? ""));
   if (sessions) sessions.textContent = String(f.sessions);
   if (stored) stored.textContent = f.stored;

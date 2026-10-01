@@ -20,32 +20,20 @@ export const modules = {
   label: "Work on your terms",
   cards: [
     {
-      kicker: "Real environments",
-      num: "01",
       title: "Run your whole stack.",
       body: "Each agent gets its own microVM, so it can clone the repo, install dependencies, run the build, and start a dev server.",
-      foot: "Firecracker · full workspace",
     },
     {
-      kicker: "Human control",
-      num: "02",
       title: "Stay involved.",
       body: "Delegate from Slack, inspect the changes, and reply in the thread to steer. You stay in the conversation while agents work in your cloud.",
-      foot: "Inspect · reply · steer",
     },
     {
-      kicker: "Controlled access",
-      num: "03",
       title: "Keep keys out.",
       body: "Give an agent the API operations it needs. For brokered integrations, the proxy inserts the credential outside the VM and blocks requests the policy does not allow.",
-      foot: "Brokered keys · egress policy",
     },
     {
-      kicker: "Optimized for cost",
-      num: "04",
       title: "Pay for work, not idle VMs.",
       body: "When a session goes idle, engrams snapshots it to object storage and frees the host for other work. The next prompt restores it on any host in seconds. Give every service its own agent without a VM running for each.",
-      foot: "Snapshot · release · resume",
     },
   ],
 };
@@ -53,12 +41,11 @@ export const modules = {
 export const session = {
   badge: "Sec. 1",
   label: "A session",
-  meta: "Fig. 1.1 · session view",
   title: "Run any harness in a rich web interface.",
   body: "A session is Claude Code, Codex, or your own harness, working the way it does on your laptop, but in a microVM your team can reach. The transcript streams on the left. On the right, open the same machine the agent is using: a terminal, the browser it drives, VS Code, the files it changed. People start sessions from the dashboard or Slack; an automation starts the same kind of session from a trigger.",
   screenshotAlt:
     "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane holds a shell open on the guest.",
-  caption: "Fig. 1.1 · The transcript, and a shell on the same VM",
+  caption: "The transcript, and a shell on the same VM",
   panes: [
     {
       name: "Shell",
@@ -82,7 +69,6 @@ export const session = {
 export const slack = {
   badge: "Sec. 2",
   label: "In Slack",
-  meta: "Fig. 2.1 · a thread",
   title: "Delegate from the thread you're already in.",
   body: "@mention the bot and a session opens for that thread, running as you, with your credentials. Reply to steer it, and your replies join the same run. When an automation has news, it posts to the channel and you answer right there: tell it a pull request is failing CI, and the same agent diagnoses the failure, pushes a fix, and reports back when the build is green.",
   points: ["Starts from a mention", "Runs as whoever asked", "Replies join the run", "Agents report in"],
@@ -117,12 +103,10 @@ export const slack = {
 export const automations = {
   badge: "Sec. 3",
   label: "Automations",
-  meta: "Fig. 3.1",
   title: "Hand off the work that repeats.",
   lede: "A schedule, a pull request, a Slack mention, or a webhook can start a session, with no one typing a prompt. When one prompt is not enough, chain steps into a workflow: prompt the agent, run the tests, branch on the result, and post to Slack or GitHub.",
   cases: {
     label: "In production at Cortex",
-    note: "Four automations that run in our engineering org today.",
     items: [
       {
         trigger: "schedule",
@@ -147,7 +131,6 @@ export const automations = {
     ],
   },
   board: {
-    fig: "Fig. 3.1 · runs board",
     title: "Every run is a session you can open.",
     body: "Open a run to see each step, its inputs and outputs, and the session that did the work. Read the transcript, reply to the agent, or take over in its shell. Runs survive a server restart and can wait hours for a reply without holding a VM.",
     itemsLabel: "Ships in the box",
@@ -157,7 +140,6 @@ export const automations = {
         body: "A finder and a verifier review each pull request on the repositories you list, and post the confirmed findings as one GitHub review.",
       },
     ],
-    footRight: "durable · survives restart",
   },
   cta: { label: "Explore automations", href: "platform/automations/" },
 };
@@ -165,7 +147,6 @@ export const automations = {
 export const how = {
   badge: "Sec. 4",
   label: "How it works",
-  meta: "Fig. 4.1 · chunk store",
   title: "Start in a second.",
   titleAccent: "Pick up anywhere.",
   steps: [
@@ -191,13 +172,14 @@ export const how = {
     { cls: "writing", label: "writing now" },
   ],
   leds: [
-    { k: "cold start", v: "<1s" },
-    { k: "resume · same host", v: "<100ms" },
-    { k: "resume · any host", v: "1–2s" },
-    { k: "1000 × 4 GiB", v: "≈100GiB" },
+    // A no-break space keeps each dagger with the word before it.
+    { k: "cold start\u00a0†", v: "<1s" },
+    { k: "resume · same host\u00a0†", v: "<100ms" },
+    { k: "resume · any host\u00a0†", v: "1–2s" },
+    { k: "1000 paused sessions · 4 GiB each", v: "≈100GiB" },
   ],
   footnote:
-    "† Measured on the reference deployment: GKE, C3 nodes, Firecracker with lazy memory paging. Measure your own fleet before you promise them to anyone.",
+    "† Measured on Cortex's deployment: GKE, C3 nodes, Firecracker with lazy memory paging.",
 };
 
 export const extensible = {
@@ -223,7 +205,6 @@ export const extensible = {
   ],
 };
 
-export const belt = { label: "24 connectors built in · plus yours" };
 
 export const start = {
   eyebrow: "Start with one task",

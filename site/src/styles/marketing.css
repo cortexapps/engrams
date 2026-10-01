@@ -611,21 +611,6 @@ html {
   background: var(--primary);
   box-shadow: 0 0 10px var(--primary);
 }
-.hud .num {
-  font-family: var(--font-display);
-  font-stretch: 108%;
-  font-weight: 700;
-  font-size: 96px;
-  line-height: 0.9;
-  margin-top: 24px;
-  /* A variable font keeps overlapping contours, so a plain text stroke also
-     outlines the overlaps inside a glyph (a star in the "2"). Paint the stroke
-     first at double width, then fill with the card colour on top: the fill
-     hides the inner half and every overlap, and 1.5px of outline shows. */
-  -webkit-text-stroke: 3px var(--foreground);
-  paint-order: stroke fill;
-  color: color-mix(in oklch, var(--foreground) 4%, var(--background));
-}
 .hud h3 {
   font-size: 28px;
   line-height: 0.95;
@@ -669,9 +654,6 @@ html {
   grid-template-columns: repeat(4, 1fr);
   gap: 20px;
   margin-top: 48px;
-}
-.modules .hud {
-  min-height: 340px;
 }
 .pair {
   display: grid;
@@ -850,15 +832,6 @@ html {
 }
 .board .status.queued {
   color: rgba(255, 255, 255, 0.45);
-}
-.board .foot {
-  padding: 12px 14px 8px;
-  font-size: 10px;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: rgba(255, 255, 255, 0.5);
-  display: flex;
-  justify-content: space-between;
 }
 
 /* ---- how it works (cover) ---- */
@@ -1150,28 +1123,9 @@ html {
   box-shadow: 0 0 30px color-mix(in oklch, var(--primary) 20%, transparent);
   overflow: hidden;
 }
-.belt .tag {
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  display: flex;
-  align-items: center;
-  padding: 0 24px 0 max(72px, calc((100% - 1440px) / 2 + 72px));
-  background: var(--bottle-green);
-  z-index: 1;
-  border-right: 1px solid rgba(255, 255, 255, 0.3);
-  font-family: var(--font-display);
-  font-stretch: 108%;
-  font-weight: 700;
-  font-size: 13px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-/* Logos fade out as they slide under the tag and off the right edge, not a
-   hard cut mid-word. Both fades blend into the belt's own cover colour. */
-.belt .tag::after,
+/* Logos fade in at the left edge and out at the right edge, not a hard cut
+   mid-word. Both fades blend into the belt's own cover colour. */
+.belt::before,
 .belt::after {
   content: "";
   position: absolute;
@@ -1180,8 +1134,9 @@ html {
   width: 96px;
   pointer-events: none;
 }
-.belt .tag::after {
-  left: 100%;
+.belt::before {
+  left: 0;
+  z-index: 1;
   background: linear-gradient(90deg, var(--bottle-green), transparent);
 }
 .belt::after {
@@ -1646,9 +1601,6 @@ html {
   .sec-title {
     font-size: 48px;
   }
-  .belt .tag {
-    display: none;
-  }
   .leds {
     grid-template-columns: repeat(2, 1fr);
   }
@@ -1698,9 +1650,6 @@ html {
   }
   .modules {
     grid-template-columns: 1fr;
-  }
-  .modules .hud {
-    min-height: 0;
   }
   .cases-grid {
     grid-template-columns: 1fr;

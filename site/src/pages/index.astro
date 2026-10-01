@@ -2,7 +2,7 @@
 import Marketing from "../layouts/Marketing.astro";
 import TraceMark from "../components/TraceMark.astro";
 import pelican from "../assets/screenshots/session-pelican.png";
-import { hero, modules, slack, automations, how, session, extensible, belt, start } from "../landing/copy";
+import { hero, modules, slack, automations, how, session, extensible, start } from "../landing/copy";
 import { nodes, edges, glyph, frame } from "../landing/demo";
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
@@ -49,7 +49,6 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
         <div class="graph-col" data-graph-col>
           <div class="graph-meta label sm">
             <span>{hero.graphTitle}</span>
-            <span>Illustrative sequence</span>
           </div>
           <div class="graph-scale" data-fit="720">
             <div class="graph" aria-hidden="true">
@@ -79,11 +78,8 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
         {modules.cards.map((m) => (
           <div class="hud">
             <div class="rail"></div>
-            <div class="kicker"><span>{m.kicker}</span><i></i></div>
-            <div class="num">{m.num}</div>
             <h3 class="display">{m.title}</h3>
             <p>{m.body}</p>
-            <div class="foot">{m.foot}</div>
           </div>
         ))}
       </div>
@@ -93,7 +89,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
   <!-- SEC. 1 — A SESSION -->
   <section class="sec">
     <div class="wrap">
-      <div class="sec-head"><span class="sec-badge">{session.badge}</span><span>{session.label}</span><span class="sec-rule"></span><span>{session.meta}</span></div>
+      <div class="sec-head"><span class="sec-badge">{session.badge}</span><span>{session.label}</span><span class="sec-rule"></span></div>
       <h2 class="display sec-title">{session.title}</h2>
       <div class="figure">
         <figure class="plate">
@@ -115,7 +111,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
   <!-- SEC. 2 — IN SLACK -->
   <section class="sec">
     <div class="wrap">
-      <div class="sec-head"><span class="sec-badge">{slack.badge}</span><span>{slack.label}</span><span class="sec-rule"></span><span>{slack.meta}</span></div>
+      <div class="sec-head"><span class="sec-badge">{slack.badge}</span><span>{slack.label}</span><span class="sec-rule"></span></div>
       <div class="slack-split">
         <div>
           <h2 class="display sec-title">{slack.title}</h2>
@@ -126,7 +122,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
           </div>
         </div>
         <div class="thread" aria-label="Illustrative Slack thread">
-          <div class="thread-head"><span>{slack.thread.channel}</span><span>thread</span></div>
+          <div class="thread-head"><span>{slack.thread.channel}</span></div>
           {slack.thread.messages.map((m) => (
             <div class:list={["msg", { bot: m.bot }]}>
               <div class="avatar" aria-hidden="true">{m.bot ? <TraceMark size={22} /> : m.who[0]}</div>
@@ -144,13 +140,13 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
   <!-- SEC. 3 — AUTOMATIONS -->
   <section class="sec">
     <div class="wrap">
-      <div class="sec-head"><span class="sec-badge">{automations.badge}</span><span>{automations.label}</span><span class="sec-rule"></span><span>{automations.meta}</span></div>
+      <div class="sec-head"><span class="sec-badge">{automations.badge}</span><span>{automations.label}</span><span class="sec-rule"></span></div>
       <div class="sec-intro">
         <h2 class="display">{automations.title}</h2>
         <p class="lede">{automations.lede}</p>
       </div>
       <div class="cases">
-        <div class="cases-head"><span class="label">{automations.cases.label}</span><span>{automations.cases.note}</span></div>
+        <div class="cases-head"><span class="label">{automations.cases.label}</span></div>
         <div class="cases-grid">
           {automations.cases.items.map((c, i) => (
             <div class="case">
@@ -164,7 +160,6 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
 
       <div class="split">
         <div>
-          <div class="label">{automations.board.fig}</div>
           <h3 class="display title">{automations.board.title}</h3>
           <p class="body">{automations.board.body}</p>
           <div class="label sm items-label">{automations.board.itemsLabel}</div>
@@ -190,7 +185,6 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
               </div>
             ))}
           </div>
-          <div class="foot"><span data-board-count>Example runs</span><span>{automations.board.footRight}</span></div>
         </div>
       </div>
       <div class="actions">
@@ -203,7 +197,7 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
   <section class="cover how">
     <div class="layer carbon soft bg-carbon-fade"></div>
     <div class="wrap">
-      <div class="sec-head"><span class="sec-badge">{how.badge}</span><span>{how.label}</span><span class="sec-rule"></span><span>{how.meta}</span></div>
+      <div class="sec-head"><span class="sec-badge">{how.badge}</span><span>{how.label}</span><span class="sec-rule"></span></div>
       <div class="grid2">
         <div>
           <h2 class="display sec-title">{how.title}<br /><span class="lime">{how.titleAccent}</span></h2>
@@ -267,7 +261,6 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
 
   <!-- CONNECTOR BELT -->
   <section class="cover belt" aria-label="Built-in connectors">
-    <div class="tag">{belt.label}</div>
     <div class="track">
       {beltItems.map((l) => (
         <div class="item"><i style={`--logo:url(${l.src})`}></i><span>{l.label}</span></div>
