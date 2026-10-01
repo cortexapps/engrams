@@ -738,14 +738,18 @@ function fakeInstances(): InstanceHarness {
         return [{ handle, instanceId, instanceStatus: row?.status ?? "open" }];
       });
     },
-    async anyOpenHandleOwner(candidates) {
-      // Mirrors the PG cross-automation query: any ledger entry for one of
-      // these handles whose owning instance is open.
+    async openHandleOwners(candidates) {
+      // Mirrors the PG cross-automation query: every ledger entry for one
+      // of these handles whose owning instance is open, with its owner.
+      const owners = new Map<string, { instanceId: string; automationId: string }>();
       for (const [key, instanceId] of handles) {
+        const automationId = key.slice(0, key.indexOf(":"));
         const handle = key.slice(key.indexOf(":") + 1);
-        if (candidates.includes(handle) && rows.get(instanceId)?.status !== "closed") return true;
+        if (candidates.includes(handle) && rows.get(instanceId)?.status !== "closed") {
+          owners.set(instanceId, { instanceId, automationId });
+        }
       }
-      return false;
+      return [...owners.values()];
     },
     async recordDrop(input) {
       drops.push(input);
@@ -1135,6 +1139,65 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
     expect(unbound).toMatchObject({ started: 1, dropped: 1, suppressed: [] });
     expect(unbound.builtins).toEqual({ slack_brain: "started" });
     expect(h2.starts.map((s) => s.automationId)).toEqual(["brain-1"]);
+  });
+
+  test("rung-1 precedence: the brain's OWN workstream owning the thread never stands the brain down (its reply joins by key)", async () => {
+    // Prod 2026-10-01: the brain's "Started a session" post binds the thread
+    // handle to the brain's workstream, and the pre-pass read that binding
+    // as "a workstream owns this conversation" — every follow-up in every
+    // brain thread was suppressed by the brain's own binding. The legacy
+    // brain still stands down (the verdict), but the built-in routes the
+    // event to its own workstream.
+    const slackTrigger = trigger({ provider: "slack", eventKeys: ["message"] });
+    const brain = {
+      automation: meta({ id: "brain-1", builtinKey: "slack_brain", kind: "builtin" }),
+      definition: definition(slackTrigger, {
+        settings: {
+          endSessionsOnFinish: false,
+          instance: {
+            keyTemplate: "thread-${{ event.raw.event.thread_ts }}",
+            entrypoints: { main: { admit: "require" as const } },
+          },
+        },
+      }),
+    };
+    const slackFacet = {
+      events: [
+        {
+          key: "message",
+          label: "Message",
+          handleCandidates: [
+            {
+              parts: [
+                { lit: "slack:" },
+                { path: "event.channel" },
+                { lit: ":" },
+                { path: "event.thread_ts" },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const h = makeHarness([brain]);
+    const i = fakeInstances();
+    const own = i.seed({ automationId: "brain-1", key: "thread-1724.100" });
+    i.bindHandle("brain-1", "slack:C1:1724.100", own.id);
+
+    const reply = await dispatchIntegrationEvent(
+      input({
+        provider: "slack",
+        eventKey: "message",
+        payload: { event: { channel: "C1", thread_ts: "1724.100" } },
+      }),
+      { ...deps(h), instances: i.store, facets: async () => slackFacet },
+    );
+    // The legacy brain stands down for an owned conversation …
+    expect(reply.suppressed).toEqual(["slack_brain"]);
+    // … and the built-in still takes the delivery into its own workstream.
+    expect(reply.builtins["slack_brain"]).toBeDefined();
+    expect(reply.builtins["slack_brain"]).not.toBe("skipped");
+    expect(h.starts.map((s) => s.automationId)).toEqual(["brain-1"]);
   });
 
   test("rung 2 channel binding: top-level messages route to the channel's workstream; threads beat the channel; a closed thread never falls through", async () => {

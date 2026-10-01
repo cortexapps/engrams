@@ -54,6 +54,12 @@ export interface AutomationDropRow {
   droppedAt: Date;
 }
 
+/** An open workstream that owns a handle (see `openHandleOwners`). */
+export interface HandleOwner {
+  instanceId: string;
+  automationId: string;
+}
+
 export interface ResolvedHandle {
   handle: string;
   instanceId: string;
@@ -104,12 +110,13 @@ export interface AutomationInstanceStore {
   }): Promise<RecordHandleResult>;
   /** One query over all of an event's candidate handles. */
   resolveHandles(automationId: string, handles: string[]): Promise<ResolvedHandle[]>;
-  /** True when ANY open workstream — in ANY automation — owns one of these
-   * handles. The brain-suppression pre-pass asks this when no MATCHED
-   * target bound the event: ownership is about the CONVERSATION, not the
-   * event subscription (a tagged message arrives as two deliveries, and
-   * the owner may subscribe to only one of them). */
-  anyOpenHandleOwner(handles: string[]): Promise<boolean>;
+  /** Every open workstream — in ANY automation — that owns one of these
+   * handles. The brain-suppression pre-pass asks this: ownership is about
+   * the CONVERSATION, not the event subscription (a tagged message arrives
+   * as two deliveries, and the owner may subscribe to only one of them).
+   * The owners' automation ids let the pre-pass tell another automation's
+   * workstream (the brain stands down) from the brain's own (it answers). */
+  openHandleOwners(handles: string[]): Promise<HandleOwner[]>;
   /** The drops ring: record an admission drop (no run row exists for it) and
    * cap the ring per automation. Callers treat this as best-effort — a
    * failed audit write must never fail the delivery. */
@@ -466,10 +473,13 @@ export function makeAutomationInstanceStore(
       }));
     },
 
-    async anyOpenHandleOwner(handles) {
-      if (handles.length === 0) return false;
-      const [row] = await db
-        .select({ handle: automationInstanceHandle.handle })
+    async openHandleOwners(handles) {
+      if (handles.length === 0) return [];
+      const rows = await db
+        .selectDistinct({
+          instanceId: automationInstance.id,
+          automationId: automationInstance.automationId,
+        })
         .from(automationInstanceHandle)
         .innerJoin(
           automationInstance,
@@ -480,9 +490,8 @@ export function makeAutomationInstanceStore(
             inArray(automationInstanceHandle.handle, handles),
             eq(automationInstance.status, "open"),
           ),
-        )
-        .limit(1);
-      return row !== undefined;
+        );
+      return rows;
     },
   };
 }
