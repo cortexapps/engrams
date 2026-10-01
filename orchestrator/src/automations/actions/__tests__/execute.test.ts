@@ -239,6 +239,7 @@ describe("executeIntegrationAction — builtins", () => {
           prNumber: 12,
           commitId: "abc123",
           summary: "Looks fine.",
+          fallbackSummary: "Looks fine. (every finding re-quoted)",
           comments: [{ path: "src/a.ts", line: 3, body: "nit" }],
         },
       },
@@ -246,8 +247,14 @@ describe("executeIntegrationAction — builtins", () => {
       deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
     );
     expect(f.calls).toHaveLength(3);
+    const inline = JSON.parse(f.calls[1]!.req.body as string) as Record<string, unknown>;
+    expect(String(inline["body"])).toContain("Looks fine.");
+    expect(String(inline["body"])).not.toContain("re-quoted");
     const fallback = JSON.parse(f.calls[2]!.req.body as string) as Record<string, unknown>;
     expect(fallback["comments"]).toBeUndefined();
+    // The fallback body is the caller's fuller summary, so a summary-only
+    // review still shows every finding.
+    expect(String(fallback["body"])).toContain("Looks fine. (every finding re-quoted)");
     expect(String(fallback["body"])).toContain(`<!-- engrams-automation:${CTX.runId}:${CTX.stepPath} -->`);
     expect(outputs).toMatchObject({ posted: true, inline_posted: false, github_review_id: "99" });
   });

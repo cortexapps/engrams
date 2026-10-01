@@ -2598,6 +2598,9 @@
           "summary": {
             "type": "string"
           },
+          "fallbackSummary": {
+            "type": "string"
+          },
           "comments": {
             "type": "array",
             "items": {

@@ -113,6 +113,11 @@ export interface ReviewControlPlane {
     reviewId: string,
     opts?: { sessionId?: string },
   ): Promise<ReviewPostPayload>;
+  /** GitHub refused the inline anchors and the post action fell back to the
+   *  summary-only review. Re-settle the inline findings as `ui_only` (they
+   *  are on the Reviews page, not the diff) and store the fallback summary
+   *  as the pass summary, so the dossier says what the PR shows. */
+  recordSummaryOnlyPost(reviewId: string): Promise<void>;
   /** Tear down the given worker (best-effort) and mark the review failed, as one
    *  durable step. `reason` is recorded on the activity log for the UI. */
   failReview(
@@ -171,6 +176,9 @@ export interface ReviewPostPayload {
   pr_number: number;
   commit_id: string;
   summary_md: string;
+  /** The body to post when GitHub refuses the inline anchors (422): it
+   * re-quotes every finding so none is lost to a summary-only review. */
+  fallback_summary_md: string;
   comments: Array<{
     finding_id: string;
     path: string;
@@ -867,6 +875,12 @@ export function makeReviewControlPlane(
         decision,
         inlinePosted: true,
       });
+      const fallbackSummaryMd = buildReviewSummary({
+        reviewId,
+        reviewUrl: reviewsPageUrl,
+        decision,
+        inlinePosted: false,
+      });
       const finalized = await reviews().finalizeReview(reviewId, {
         status: "posted",
         summaryMd,
@@ -880,10 +894,33 @@ export function makeReviewControlPlane(
         pr_number: prNumber,
         commit_id: headSha,
         summary_md: summaryMd,
+        fallback_summary_md: fallbackSummaryMd,
         comments,
         to_post_count: decision.toPost.length,
         ui_only_count: decision.uiOnly.length,
       };
+    },
+
+    async recordSummaryOnlyPost(reviewId) {
+      const detail = await reviews().getReview(reviewId);
+      if (!detail) throw new Error(`review not found: ${reviewId}`);
+      const decision = buildDecision(detail);
+      await settleFindingStates(reviews(), decision, false);
+      const finalized = await reviews().finalizeReview(reviewId, {
+        status: "posted",
+        summaryMd: buildReviewSummary({
+          reviewId,
+          reviewUrl: reviewsPageUrl,
+          decision,
+          inlinePosted: false,
+        }),
+      });
+      if (!finalized) logRefusedTransition(reviewId, "posted");
+      await recordEvent(
+        reviewId,
+        "inline_fallback",
+        `GitHub refused the inline anchors; ${decision.toPost.length} finding${decision.toPost.length === 1 ? "" : "s"} posted in the summary instead`,
+      );
     },
 
     failReview,

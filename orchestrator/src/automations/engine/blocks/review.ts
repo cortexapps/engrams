@@ -60,6 +60,7 @@ export type ReviewBlockControlPlane = Pick<
   | "composeVerifierPrompt"
   | "markPhasePrompted"
   | "decideReviewResults"
+  | "recordSummaryOnlyPost"
   | "cleanupSupersededReview"
   | "failReview"
   | "haltReview"
@@ -331,14 +332,29 @@ export const reviewRecordPostConfigSchema = z.object({
   /** The `github_review_id` output of github.post_pr_review. Empty when the
    * action found its marker already posted (a replay) — nothing to record. */
   githubReviewId: z.string().optional(),
+  /** The `inline_posted` output of github.post_pr_review, rendered through a
+   * template ("true"/"false"). "false" = GitHub refused the inline anchors
+   * and the action posted the fallback summary: the findings move to
+   * `ui_only` and the pass summary becomes the fallback body. Absent or
+   * anything else = the inline comments landed (or a replay). */
+  inlinePosted: z.union([z.boolean(), z.string()]).optional(),
 });
 export type ReviewRecordPostConfig = z.infer<typeof reviewRecordPostConfigSchema>;
+
+function summaryOnly(value: boolean | string | undefined): boolean {
+  return value === false || (typeof value === "string" && value.trim().toLowerCase() === "false");
+}
 
 async function executeReviewRecordPost(config: ReviewRecordPostConfig): Promise<BlockOutcome> {
   const id = config.githubReviewId?.trim();
   if (!id) return { kind: "ok", outputs: { review_id: config.reviewId, recorded: false } };
   await deps().reviews().setGithubReviewId(config.reviewId, id);
-  return { kind: "ok", outputs: { review_id: config.reviewId, recorded: true, github_review_id: id } };
+  const inlinePosted = !summaryOnly(config.inlinePosted);
+  if (!inlinePosted) await deps().controlPlane().recordSummaryOnlyPost(config.reviewId);
+  return {
+    kind: "ok",
+    outputs: { review_id: config.reviewId, recorded: true, github_review_id: id, inline_posted: inlinePosted },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -381,7 +397,7 @@ export function registerReviewBlocks(): void {
   registerBlock<ReviewRecordPostConfig>({
     type: REVIEW_RECORD_POST_TYPE,
     refusesDryRun: true,
-    outputs: ["review_id", "recorded", "github_review_id"],
+    outputs: ["review_id", "recorded", "github_review_id", "inline_posted"],
     configSchema: reviewRecordPostConfigSchema,
     async execute(config) {
       return executeReviewRecordPost(config);
@@ -436,6 +452,7 @@ export function registerReviewBlocks(): void {
       "pr_number",
       "commit_id",
       "summary_md",
+      "fallback_summary_md",
       "comments",
       "to_post_count",
       "ui_only_count",

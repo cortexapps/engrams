@@ -922,6 +922,24 @@ describe("ReviewControlPlane", () => {
     });
     expect(payload.comments[0]!.body).toContain("```suggestion\nreturn afterVerification;\n```");
     expect(payload.summary_md.endsWith(`<!-- engrams-review:${reviewed.id} -->`)).toBe(true);
+    // The fallback body (GitHub refused an inline anchor → summary-only
+    // review) re-quotes the confirmed finding so the PR still shows it; the
+    // inline summary leaves the detail to the comment.
+    expect(payload.fallback_summary_md).toContain(confirmed.title);
+    expect(payload.fallback_summary_md).toContain(confirmed.bodyMd);
+    expect(payload.summary_md).not.toContain(confirmed.bodyMd);
+    expect(payload.fallback_summary_md.endsWith(`<!-- engrams-review:${reviewed.id} -->`)).toBe(true);
+
+    // The action reported inline_posted=false: the findings move to ui_only,
+    // the pass summary becomes the fallback body, and the dossier logs why.
+    findingUpdates.length = 0;
+    await cp.recordSummaryOnlyPost(reviewed.id);
+    expect(findingUpdates).toEqual([
+      { id: confirmed.id, state: "ui_only" },
+      { id: refuted.id, state: "suppressed_refuted" },
+    ]);
+    expect(finalizations.at(-1)).toMatchObject({ status: "posted", summaryMd: payload.fallback_summary_md });
+    expect(events).toContain("inline_fallback");
   });
 
 });

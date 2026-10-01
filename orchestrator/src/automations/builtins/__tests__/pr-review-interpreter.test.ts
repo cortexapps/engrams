@@ -77,6 +77,7 @@ const PAYLOAD: ReviewPostPayload = {
   pr_number: 17,
   commit_id: HEAD,
   summary_md: "Summary\n\n<!-- engrams-review:review-1 -->",
+  fallback_summary_md: "Summary (full)\n\n<!-- engrams-review:review-1 -->",
   comments: [{ finding_id: "f1", path: "src/a.ts", line: 3, side: "RIGHT", body: "nit" }],
   to_post_count: 1,
   ui_only_count: 0,
@@ -165,6 +166,9 @@ function harness(options: {
     async decideReviewResults() {
       cpCalls.push("decideReviewResults");
       return PAYLOAD;
+    },
+    async recordSummaryOnlyPost(reviewId) {
+      cpCalls.push(`recordSummaryOnlyPost:${reviewId}`);
     },
     async cleanupSupersededReview() {
       cpCalls.push("cleanupSupersededReview");

@@ -165,6 +165,11 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
       throw new IntegrationActionError(`missing required integer "prNumber"`, true);
     }
     const summary = requireString(params, "summary");
+    // The body for the 422 fallback (GitHub refused an inline anchor): a
+    // caller with a findings ledger passes one that re-quotes every finding,
+    // so a summary-only review loses nothing. Without it the summary is the
+    // body either way.
+    const fallbackSummary = optionalString(params, "fallbackSummary") ?? summary;
     const marker = ctx.marker ?? `<!-- engrams-automation:${ctx.runId}:${ctx.stepPath} -->`;
     if (await markerAlreadyPosted(deps.runOp, repo, prNumber, marker)) {
       return { posted: false, already_posted: true };
@@ -176,9 +181,7 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
       repo,
       prNumber,
       commitId,
-      // The generic action has no findings ledger to re-quote on the 422
-      // fallback; the caller-authored summary is the body either way.
-      buildSummary: () => `${summary}\n\n${marker}`,
+      buildSummary: (inlinePosted) => `${inlinePosted ? summary : fallbackSummary}\n\n${marker}`,
       comments: readComments(params),
     });
     return {

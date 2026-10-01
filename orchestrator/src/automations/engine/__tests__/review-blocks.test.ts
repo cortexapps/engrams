@@ -105,11 +105,15 @@ function fake(options: { deduplicate?: boolean; payload?: ReviewPostPayload } = 
           pr_number: 100,
           commit_id: HEAD,
           summary_md: `Summary\n\n<!-- engrams-review:${reviewId} -->`,
+          fallback_summary_md: `Summary (full)\n\n<!-- engrams-review:${reviewId} -->`,
           comments: [],
           to_post_count: 0,
           ui_only_count: 0,
         }
       );
+    },
+    async recordSummaryOnlyPost(reviewId) {
+      calls.push(`recordSummaryOnlyPost:${reviewId}`);
     },
     async cleanupSupersededReview(reviewId) {
       calls.push(`cleanupSupersededReview:${reviewId}`);
@@ -294,6 +298,28 @@ describe("review_record_post", () => {
     const skip = await block.execute!(block.configSchema.parse({ reviewId: "review-9", githubReviewId: "" }) as never, ctx());
     expect(skip).toMatchObject({ kind: "ok", outputs: { recorded: false } });
     expect(f.recorded).toHaveLength(1);
+    expect(f.calls.filter((c) => c.startsWith("recordSummaryOnlyPost"))).toEqual([]);
+  });
+
+  test("a summary-only post (GitHub refused the inline anchors) re-settles the pass", async () => {
+    // The action's `inline_posted` output arrives through a template, so
+    // the block sees the string "false", not a boolean.
+    const f = fake();
+    const block = getBlock(REVIEW_RECORD_POST_TYPE)!;
+    const out = await block.execute!(
+      block.configSchema.parse({ reviewId: "review-9", githubReviewId: "77", inlinePosted: "false" }) as never,
+      ctx(),
+    );
+    expect(out).toMatchObject({ kind: "ok", outputs: { recorded: true, inline_posted: false } });
+    expect(f.calls).toContain("recordSummaryOnlyPost:review-9");
+
+    // "true" (or an absent output on a replay) leaves the settle alone.
+    const f2 = fake();
+    await block.execute!(
+      block.configSchema.parse({ reviewId: "review-9", githubReviewId: "77", inlinePosted: "true" }) as never,
+      ctx(),
+    );
+    expect(f2.calls.filter((c) => c.startsWith("recordSummaryOnlyPost"))).toEqual([]);
   });
 });
 

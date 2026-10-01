@@ -61,7 +61,7 @@ export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 /** Bump on any graph or inputs-schema change (the seeder inserts a new
  * version when the stored content hash differs). */
-export const PR_REVIEW_DEFINITION_VERSION = 7;
+export const PR_REVIEW_DEFINITION_VERSION = 8;
 
 /** Synthetic event key the CI dispatch edge admits a run under (no GitHub
  * delivery carries it). The admission arm accepts it for any mapped repo. */
@@ -335,6 +335,10 @@ const blocks: BlockDef[] = [
         prNumber: { $ref: "steps.gate.pr_number" },
         commitId: "${{ steps.gate.commit_id }}",
         summary: "${{ steps.gate.summary_md }}",
+        // GitHub refuses the whole batch when one anchor is outside the
+        // diff (422); the action then posts this body instead, which
+        // re-quotes every finding so the PR still shows them.
+        fallbackSummary: "${{ steps.gate.fallback_summary_md }}",
         comments: { $ref: "steps.gate.comments" },
       },
     },
@@ -351,6 +355,9 @@ const blocks: BlockDef[] = [
       // Missing on a replayed post (marker already there): `default` makes
       // the absent output render empty instead of failing the render.
       githubReviewId: "${{ steps.post.github_review_id | default: '' }}",
+      // "false" when the action fell back to the summary-only review: the
+      // findings settle as ui_only and the pass summary follows the PR.
+      inlinePosted: "${{ steps.post.inline_posted | default: true }}",
     },
   },
   {
