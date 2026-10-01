@@ -220,14 +220,6 @@ cp deploy/helm/engram/values-aws.yaml.example /tmp/engram-values.yaml
 cp deploy/helm/engram-host-fleet/values-aws.yaml.example /tmp/fleet-values.yaml
 # The tfvalues overlays override every REPLACE_* the TF layer knows.
 
-# While the engrams GHCR packages are private, the images need a
-# pull secret in BOTH namespaces (a GitHub PAT with read:packages) —
-# the values examples reference the name `ghcr-pull`:
-kubectl create secret docker-registry ghcr-pull -n engrams \
-  --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
-kubectl create secret docker-registry ghcr-pull -n engrams-hosts \
-  --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
-
 helm install engram deploy/helm/engram \
   -n engrams -f /tmp/engram-values.yaml -f /tmp/engram.tfvalues.yaml
 

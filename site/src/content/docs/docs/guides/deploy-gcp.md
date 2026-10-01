@@ -155,8 +155,9 @@ helm install hf deploy/helm/engram-host-fleet \
   -n engrams-hosts -f /tmp/fleet-values.yaml -f /tmp/host-fleet.tfvalues.yaml
 ```
 
-If you pull the engrams images from a private registry, create a pull secret named
-`ghcr-pull` in both namespaces first; the values examples reference that name.
+The engrams images are public, so the install needs no pull secret. If you mirror them
+into a private registry, create a pull secret in both namespaces first and name it under
+`imagePullSecrets` in each values file.
 
 The release names matter. The fleet values dial `engram-coordinator.engrams`, and the
 quickstart's Workload Identity bindings expect the `hf-*` ServiceAccount names. If you use

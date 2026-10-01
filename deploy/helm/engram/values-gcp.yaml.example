@@ -37,16 +37,8 @@
 # `web.image.tag` and `orchestrator.image.tag` to the full SHA of a
 # commit on main. Do not use the floating `main` tag: the pull policy
 # is IfNotPresent, so a node that has `main` never pulls it again.
-
-# While the GHCR packages are private, GHCR needs a pull secret in the
-# release namespace (a GitHub PAT with read:packages):
-#
-#   kubectl create secret docker-registry ghcr-pull -n engrams \
-#     --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
-#
-# Delete this once the packages are public.
-imagePullSecrets:
-  - name: ghcr-pull
+# The images are public; a mirror in a private registry needs
+# `imagePullSecrets`.
 
 mode: coordinator
 
