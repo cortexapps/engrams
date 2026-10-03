@@ -34,6 +34,9 @@ describe("Slack thread brain built-in — definition", () => {
     // an explicit end closes it, so the next mention resumes the session.
     const hooks = parsed.settings.onFinalize!;
     expect(hooks.find((h) => h.block.type === "relay_close")!.when).not.toContain("completed");
+    // Nothing time-based fails a thread: the run ceiling is a pause too.
+    expect(hooks.find((h) => h.block.type === "relay_close")!.when).not.toContain("deadline");
+    expect(hooks.find((h) => h.block.type === "instance_close")!.when).not.toContain("deadline");
     expect(hooks.find((h) => h.block.type === "instance_close")!.when).toEqual(["halted", "superseded"]);
     expect(parsed.settings.concurrency?.policy).toBe("join");
     expect(parsed.settings.endSessionsOnFinish).toBe(false);

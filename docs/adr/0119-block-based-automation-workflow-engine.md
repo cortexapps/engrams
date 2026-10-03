@@ -347,6 +347,20 @@ binding to the new run, but every later session event still went to the
 finished run's mailbox and was dropped there, so the resumed run never saw
 its session speak. The consumer now re-reads the binding per event.
 
+**No timeouts (2026-10-03).** A thread must be answerable a year later and a
+turn may run for hours, so nothing time-based fails a thread. A turn (the
+harness working on one prompt) had a 1 h wait deadline, and a 64-minute task
+ended its run with ❌ "wait deadline expired" while the session was still
+working. The wait is now open-ended: `wait_session until: idle` in a loop
+of day-long slices, each slice's deadline a normal outcome
+(`onDeadline: continue`, now accepted by `send_prompt` and `wait_session`
+as by `wait_event`), the loop ending on idle or the session's end;
+`send_prompt` sends with `waitFor: none` and the same loop follows. The run
+ceiling (48 h, the engine's maximum) is the only clock left, and it is a
+pause like the idle exit — no recap, the workstream open — since it can
+only fall under a turn still running. The idle exit (default 1 h quiet)
+stays: it ends the RUN, never the thread.
+
 The reviewer profile seed and the `pr_reviewer` designation retire in the
 same phase (migration 0089). A built-in cannot carry a profile id, and the
 designation was the indirection that let it name one; the product model

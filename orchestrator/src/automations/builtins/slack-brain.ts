@@ -60,14 +60,19 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 9;
+export const SLACK_BRAIN_DEFINITION_VERSION = 10;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
-/** One turn's harness run. */
-const TURN_DEADLINE_S = 3600;
-/** Generous run ceiling; the per-wait idle timeout is the real end-of-thread
- * signal (settings cannot reference inputs). */
+/** A turn — the harness working on one prompt — has NO deadline: a task
+ * may run for hours, and nothing time-based may fail a thread. A wait has
+ * an engine ceiling, so a turn is waited for in slices of that length,
+ * each slice's deadline a normal outcome, until the session goes idle. */
+const TURN_SLICE_S = MAX_WAIT_DEADLINE_S;
+/** The engine's run ceiling. A run ending here is silent, like the idle
+ * exit: the workstream stays open and the next mention resumes the kept
+ * session (its relay re-installs). The per-wait idle timeout is the real
+ * end of a run (settings cannot reference inputs). */
 const RUN_DEADLINE_S = 48 * 3600;
 
 const F = "steps.facts.value";
@@ -395,6 +400,38 @@ const relay: BlockDef = {
   },
 };
 
+/** Wait for the session to go idle, however long its turn takes: one
+ * wait_session slice per iteration, the slice's deadline a normal outcome
+ * (`onDeadline: continue`), the loop ending on anything but a deadline —
+ * idle (the turn is done), or the session ending. A hundred slices of a day
+ * each before the loop's own bound; the run ceiling comes first. */
+function untilIdle(id: string): BlockDef {
+  const slice = `${id}_slice`;
+  return {
+    id,
+    type: "loop",
+    config: {
+      maxIterations: MAX_LOOP_ITERATIONS,
+      until: {
+        mode: "all",
+        conditions: [{ path: `steps.${slice}.outcome`, op: "not_equals", value: "deadline" }],
+      },
+    },
+    body: [
+      {
+        id: slice,
+        type: "wait_session",
+        config: {
+          session: SESSION_REF,
+          until: "idle",
+          deadlineSeconds: TURN_SLICE_S,
+          onDeadline: "continue",
+        },
+      },
+    ],
+  };
+}
+
 /** The first turn. A created session got the fold as its initial prompt, so
  * the run only waits for it to go idle. A resumed session is prompted with
  * the fold (send_prompt adopts it) and waited on the same way; a resumed
@@ -415,23 +452,16 @@ const firstTurn: BlockDef = {
     {
       id: "resume_turn",
       type: "send_prompt",
-      tunable: ["promptTemplate", "deadlineSeconds"],
+      tunable: ["promptTemplate"],
       config: {
         session: SESSION_REF,
         promptTemplate: "${{ steps.opening.value.text }}",
-        waitFor: { kind: "run_end" },
-        deadlineSeconds: TURN_DEADLINE_S,
+        waitFor: { kind: "none" },
       },
     },
+    untilIdle("resume_wait"),
   ],
-  else: [
-    {
-      id: "first_turn",
-      type: "wait_session",
-      tunable: ["deadlineSeconds"],
-      config: { session: SESSION_REF, until: "idle", deadlineSeconds: TURN_DEADLINE_S },
-    },
-  ],
+  else: [untilIdle("first_turn")],
 };
 
 const conversation: BlockDef = {
@@ -525,14 +555,14 @@ const conversation: BlockDef = {
             {
               id: "turn",
               type: "send_prompt",
-              tunable: ["promptTemplate", "deadlineSeconds"],
+              tunable: ["promptTemplate"],
               config: {
                 session: SESSION_REF,
                 promptTemplate: "${{ steps.turn_text.value.text }}",
-                waitFor: { kind: "run_end" },
-                deadlineSeconds: TURN_DEADLINE_S,
+                waitFor: { kind: "none" },
               },
             },
+            untilIdle("turn_wait"),
           ],
           else: [],
         },
@@ -625,9 +655,13 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     onFinalize: [
       // No post on `completed`: that is the idle exit — a pause, not an
       // end. The ✅ on the last mention already says the turn is done, and
-      // the next mention continues the same session.
+      // the next mention continues the same session. No post on `deadline`
+      // either: no wait in this graph fails on time, so `deadline` can only
+      // be the engine's run ceiling under a turn still running — a pause
+      // too, never a thread's fault (the next mention re-installs the
+      // relay on the same session).
       {
-        when: ["deadline", "failed", "halted", "superseded", "filtered"],
+        when: ["failed", "halted", "superseded", "filtered"],
         block: {
           id: "recap",
           type: RELAY_CLOSE_TYPE,
