@@ -63,7 +63,13 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/cortexapps/engrams"
-rust-version = "1.80"
+# The toolchain channel is `stable` (rust-toolchain.toml), so CI always builds
+# with the newest Rust. This field is the declared floor. sqlx 0.9 (the next
+# major of the database layer) requires Rust 1.94; the stale 1.80 declaration
+# below made Dependabot skip that bump entirely (its cargo updater refuses to
+# propose a version whose `rust_version` exceeds the workspace floor). Raise it
+# so the sqlx 0.9 proposal can arrive.
+rust-version = "1.94"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
