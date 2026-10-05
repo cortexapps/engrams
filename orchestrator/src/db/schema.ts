@@ -1030,17 +1030,6 @@ export const reviewEvent = pgTable(
 
 /** Per-repository PR-review enrollment. The text fields are constrained by
  * ReviewService to triggerMode: auto|manual and autofix: auto|manual|off. */
-export const reviewEnrollment = pgTable("review_enrollment", {
-  repo: text("repo").primaryKey(), // "owner/name"
-  triggerMode: text("trigger_mode").notNull().default("manual"), // auto|manual
-  autofix: text("autofix").notNull().default("off"), // auto|manual|off
-  profileId: text("profile_id").references(() => profile.id),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-});
 
 // ---------------------------------------------------------------------------
 // Stream-fed session listeners (ingest v2)

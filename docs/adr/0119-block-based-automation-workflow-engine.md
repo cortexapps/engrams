@@ -309,9 +309,17 @@ wins) and enables the built-in when anything is enrolled, so a repo still on
 the legacy flag keeps getting reviews across the deploy. Both built-ins now
 seed **enabled**: enrolling a repo (reviews) or picking a default profile
 (Slack) is the one switch, and an empty map or profile admits nothing.
-`review_enrollment` itself stays for one more phase (4.7b): the Repositories
-page still writes the row, and `db/review-enrollment-sync.ts` mirrors it into
-the map in one transaction.
+`review_enrollment` itself stayed for one more phase (4.7b, 2026-10-05):
+the Repositories page wrote the row, and `db/review-enrollment-sync.ts`
+mirrored it into the map in one transaction. 4.7b made the map the single
+source: migration 0091 drops the table, the sync and the enrollment store
+are gone with the three `ReviewService` enrollment RPCs, the Repositories
+page writes `SetMapInputEntry` on the built-in (as the Slack page writes a
+channel override), and the retry RPC and the CI dispatch edge read
+`reviews/enrolled-repos.ts` — the built-in's `repos` input, matched
+case-insensitively as its own admission is. A repo's per-row profile id
+and the three-state autofix went with the table: the built-in never read
+them (the reviewer profile is the `profile` input; autofix is a boolean).
 
 **Slack turns (2026-10-01).** The brain's v1 divergence (a plain thread
 reply as a turn, no `<thread context>` fold) is reverted to the legacy
@@ -500,8 +508,8 @@ adopted by the new body.
 
 Phase 2 adds `integration_event`. Phase 4 adds `review.automation_run_id`
 and the window flag; 4.7 (migration 0088) drops `review_session`,
-`review_enrollment.engine`, and `review.status_comment_id`, and 4.7b drops
-`review_enrollment`.
+`review_enrollment.engine`, and `review.status_comment_id`; 4.7b (migration
+0091) drops `review_enrollment`.
 
 Phase 5 (D9–D11) adds `automation_state` (migration 0083) and, diverging
 from the first draft, migration 0084: `automation_version.entrypoints`
