@@ -1,7 +1,9 @@
+import { Code, ConnectError } from "@connectrpc/connect";
+
 import { log as rootLog } from "../log.ts";
 import { hostname } from "node:os";
 import { sessions } from "../control-plane/client.ts";
-import { readSessionEventsBounded } from "../control-plane/session-events.ts";
+import { PARKED_STATUS, readSessionEventsBounded } from "../control-plane/session-events.ts";
 import { makeCursorStore } from "./cursor-store.ts";
 import { makeLeaseStore } from "./lease-store.ts";
 import type { LeaseStore } from "./lease-store.ts";
@@ -17,6 +19,12 @@ import { productionSpecProjection } from "../specs/projection.ts";
 
 const log = rootLog.child({ component: "listener-manager" });
 const SCAN_INTERVAL_MS = 5_000;
+/** How often dormant rows are checked against the coordinator. Every resume
+ * is an orchestrator RPC and wakes its row on the spot; this reconcile is
+ * the safety net for a path that did not (an operator acting on the
+ * coordinator directly), and it retires the rows of sessions that are gone. */
+export const DORMANT_RECONCILE_INTERVAL_MS = 10 * 60_000;
+const PROBE_DEADLINE_MS = 15_000;
 
 export interface ListenerHandle {
   start(): Promise<void>;
@@ -28,6 +36,10 @@ export interface ListenerManagerDeps {
   ttlMs: number;
   leaseStore: LeaseStore;
   createListener(sessionId: string): ListenerHandle;
+  /** Current coordinator status of a session (GetSession); throws a NotFound
+   * ConnectError for a session the coordinator no longer knows. Drives the
+   * dormant reconcile; absent = no reconcile. */
+  probeStatus?: (sessionId: string) => Promise<string>;
   setInterval?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
   clearInterval?: (timer: ReturnType<typeof setInterval>) => void;
 }
@@ -36,7 +48,9 @@ export class ListenerManager {
   readonly #deps: ListenerManagerDeps;
   readonly #listeners = new Map<string, ListenerHandle>();
   #timer: ReturnType<typeof setInterval> | null = null;
+  #reconcileTimer: ReturnType<typeof setInterval> | null = null;
   #scan: Promise<void> | null = null;
+  #reconcile: Promise<void> | null = null;
 
   constructor(deps: ListenerManagerDeps) {
     this.#deps = deps;
@@ -103,20 +117,62 @@ export class ListenerManager {
     }
   }
 
+  /** Check every dormant row against the coordinator once: a session that
+   * is no longer parked is woken (its listener drains the log, and finishes
+   * a terminal session properly); one the coordinator no longer knows is
+   * marked terminal. A parked one stays dormant. */
+  reconcileDormantOnce(): Promise<void> {
+    this.#reconcile ??= this.#reconcileImpl().finally(() => {
+      this.#reconcile = null;
+    });
+    return this.#reconcile;
+  }
+
+  async #reconcileImpl(): Promise<void> {
+    const probe = this.#deps.probeStatus;
+    if (!probe) return;
+    for (const sessionId of await this.#deps.leaseStore.listDormant()) {
+      try {
+        const status = await probe(sessionId);
+        if (status === PARKED_STATUS) continue;
+        await this.#deps.leaseStore.wake(sessionId);
+        log.info({ sessionId, status }, "dormant listener woken: the session is no longer parked");
+      } catch (err) {
+        if (err instanceof ConnectError && err.code === Code.NotFound) {
+          await this.#deps.leaseStore.markTerminal(sessionId);
+          log.info({ sessionId }, "dormant listener retired: the session is gone");
+          continue;
+        }
+        log.warn({ sessionId, err }, "dormant listener reconcile probe failed");
+      }
+    }
+  }
+
   async start(): Promise<void> {
     if (this.#timer !== null) return;
     await this.scanOnce();
     const schedule = this.#deps.setInterval ?? setInterval;
     this.#timer = schedule(() => void this.scanOnce(), SCAN_INTERVAL_MS);
+    if (this.#deps.probeStatus) {
+      this.#reconcileTimer = schedule(
+        () => void this.reconcileDormantOnce(),
+        DORMANT_RECONCILE_INTERVAL_MS,
+      );
+    }
   }
 
   async stop(): Promise<void> {
+    const cancel = this.#deps.clearInterval ?? clearInterval;
     if (this.#timer !== null) {
-      const cancel = this.#deps.clearInterval ?? clearInterval;
       cancel(this.#timer);
       this.#timer = null;
     }
+    if (this.#reconcileTimer !== null) {
+      cancel(this.#reconcileTimer);
+      this.#reconcileTimer = null;
+    }
     await this.#scan;
+    await this.#reconcile;
     for (const [sessionId, listener] of [...this.#listeners]) {
       this.#listeners.delete(sessionId);
       try {
@@ -152,6 +208,13 @@ export function makeProductionListenerManager(): ListenerManager {
     owner,
     ttlMs: PRODUCTION_LEASE_TTL_MS,
     leaseStore,
+    probeStatus: async (sessionId) => {
+      const response = await sessions.getSession(
+        { sessionId },
+        { signal: AbortSignal.timeout(PROBE_DEADLINE_MS) },
+      );
+      return response.session?.status ?? "";
+    },
     createListener(sessionId) {
       const listener = new SessionListener({
         sessionId,
