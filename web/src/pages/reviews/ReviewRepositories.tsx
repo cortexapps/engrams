@@ -331,14 +331,17 @@ function EnrollDialog({ automationId, existing }: { automationId: string; existi
 
   const onSubmit = async (data: EnrollValues) => {
     try {
-      // One entry, atomically, and the automation on: the first repo turns
-      // reviewing on. A stale snapshot of the map never rides along.
+      // One entry, atomically. Enrolling a repo turns the automation on (the
+      // first repo turns reviewing on); editing one never does — an admin
+      // who paused reviews from the automation's page must find them still
+      // paused after changing a repo's trigger. A stale snapshot of the map
+      // never rides along.
       await upsert.mutateAsync({
         automationId,
         inputKey: "repos",
         entryKey: data.repo.trim(),
         valueJson: JSON.stringify({ mode: data.mode, autofix: data.autofix }),
-        enable: true,
+        enable: !isEdit,
       });
       setOpen(false);
     } catch (e) {

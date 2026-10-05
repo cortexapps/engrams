@@ -78,6 +78,25 @@ describe("ReviewRepositories", () => {
     );
   });
 
+  it("editing a repo rewrites its entry without turning a paused automation back on", async () => {
+    renderWithProviders(<ReviewRepositories />);
+    const user = userEvent.setup();
+    await screen.findByText("cortexapps/engrams");
+    await user.click(screen.getByRole("button", { name: /^edit$/i }));
+    await user.click(await screen.findByRole("combobox", { name: /trigger/i }));
+    await user.click(await screen.findByRole("option", { name: /^auto/i }));
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(setEntry).toHaveBeenCalledWith({
+        automationId: "auto-pr",
+        inputKey: "repos",
+        entryKey: "cortexapps/engrams",
+        valueJson: JSON.stringify({ mode: "auto", autofix: false }),
+        enable: false,
+      }),
+    );
+  });
+
   it("un-enrolls a repo by removing its map entry, via the confirm dialog", async () => {
     renderWithProviders(<ReviewRepositories />);
     const user = userEvent.setup();
