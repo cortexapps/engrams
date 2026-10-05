@@ -1441,7 +1441,6 @@ describe("createTaskWithSession", () => {
       profileId: "p1",
       source: { provider: "slack", team: "T1" },
       extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: "be concise" },
-      slackThreadWorkflowId: "thread-wf-1",
     });
 
     expect(out.sessionId).toBe("sess-1");
@@ -1467,8 +1466,7 @@ describe("createTaskWithSession", () => {
       profileId: "p1",
       integrationPrincipalId: "user-1",
     });
-    expect(records[2]).toEqual({ sessionId: "sess-1", threadWfId: "thread-wf-1" });
-    expect(records[3]).toEqual({ sessionId: "sess-1" });
+    expect(records[2]).toEqual({ sessionId: "sess-1" });
   });
 
   test("defaults source to {} and title to null", async () => {
@@ -1566,12 +1564,11 @@ describe("createTaskWithSession", () => {
       }),
     ).rejects.toThrow(/different reserved session ID/);
     expect(sessions.deletedIds).toEqual(["sess-OTHER"]);
-    expect(deletes).toEqual(["slack_session", "task"]);
+    expect(deletes).toEqual(["task"]);
   });
 
-  // O7: slack_session has no FK to the task model, so the compensation must
-  // remove the Slack binding explicitly.
-  test("boot-failure compensation removes the slack_session binding and the task", async () => {
+  // O7: the compensation removes the task row (task_session cascades).
+  test("boot-failure compensation removes the task", async () => {
     const sessions = fakeSessions();
     sessions.createSession = async () => {
       throw new Error("boot boom");
@@ -1582,11 +1579,10 @@ describe("createTaskWithSession", () => {
         type: "slack_thread",
         ownerUserId: "u",
         profileId: "p1",
-        slackThreadWorkflowId: "thread-wf-1",
       }),
     ).rejects.toThrow(/boot boom/);
     expect(sessions.deletedIds).toEqual(["sess-1"]);
-    expect(deletes).toEqual(["slack_session", "task"]);
+    expect(deletes).toEqual(["task"]);
   });
 
   // O7: a DB failure during compensation must not mask the original error.

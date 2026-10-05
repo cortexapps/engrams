@@ -153,10 +153,6 @@ function harness(options: {
   let clock = 1_000_000;
 
   const policy: CommunicationPolicy = {
-    systemPromptAppend: "",
-    async onPickup(m) { policyCalls.push(`pickup:${m.ts}`); },
-    async onProfileChoice() { return "p1"; },
-    async onProfileChosen() {},
     async onStarted() { policyCalls.push("started"); },
     async onWorking(m) { policyCalls.push(`working:${m.ts}`); },
     async onIdle(m) { policyCalls.push(`idle:${m.ts}`); },
@@ -168,7 +164,6 @@ function harness(options: {
     async onFail(_m, message) { policyCalls.push(`fail:${message}`); },
     async onNeutralClose(_m, message) { policyCalls.push(`neutral:${message}`); },
     async onDeliveryError() { policyCalls.push("delivery-error"); },
-    async gatherThreadContext() { return { prompt: "", maxTs: "0" }; },
   };
   setSlackRelayDeps({
     policy: () => policy,

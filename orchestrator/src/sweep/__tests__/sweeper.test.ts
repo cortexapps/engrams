@@ -195,12 +195,13 @@ describe("runSweepTick", () => {
   });
 
   test("adopts a days-old workflow whose version died moments ago", async () => {
-    // The regression: a thread workflow lives for its whole session, so a
-    // long-running active thread has an old created_at. Staleness must key
-    // on version abandonment, or a routine deploy silently cancels it.
+    // The regression: an automation run waits for as long as its thread or
+    // review takes, so a long-running active run has an old created_at.
+    // Staleness must key on version abandonment, or a routine deploy
+    // silently cancels it.
     const f = await fixture([
       row("wf-long-lived-thread", {
-        name: "SlackThreadWorkflow",
+        name: "AutomationRunWorkflow",
         createdAtEpochMs: NOW.getTime() - 72 * HOUR_MS,
       }),
     ]);
@@ -905,7 +906,6 @@ describe("sweep policy exhaustiveness", () => {
   test("accepts the registered production workflow names", () => {
     expect(() =>
       assertSweepPoliciesExhaustive([
-        "SlackThreadWorkflow",
         "ToolExecWorkflow",
         "AutomationRunWorkflow",
       ]),

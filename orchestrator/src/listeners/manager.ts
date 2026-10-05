@@ -9,7 +9,6 @@ import { SessionListener } from "./session-listener.ts";
 import { makeProductionOtelExporterConsumers } from "./otel-exporter-consumer.ts";
 import { makeProductionPrLinkConsumer } from "./pr-link-consumer.ts";
 import { makeProductionAutomationConsumer } from "./automation-consumer.ts";
-import { makeProductionSlackConsumer } from "./slack-consumer.ts";
 import { makeProductionTitleConsumer } from "./title-consumer.ts";
 import { makeProductionToolConsumer } from "./tool-consumer.ts";
 import { config } from "../config.ts";
@@ -163,7 +162,6 @@ export function makeProductionListenerManager(): ListenerManager {
         consumers: [
           makeProductionToolConsumer(),
           makeProductionPrLinkConsumer(),
-          makeProductionSlackConsumer(),
           makeProductionAutomationConsumer(),
           makeProductionTitleConsumer(),
           makeSpecProjectionConsumer(productionSpecProjection),

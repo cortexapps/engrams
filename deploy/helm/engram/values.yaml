@@ -487,14 +487,6 @@ orchestrator:
   # dispatch API and auto-on-open triggers still work.
   githubAppLogin: ""
 
-  # ADR 0119 parallel-window kill switch (Slack only: the PR-review legacy
-  # path retired in phase 4.7). `true` emits ORCHESTRATOR_SLACK_AUTOMATION_DISABLED=1
-  # into the orchestrator ConfigMap: every channel answers on the legacy
-  # thread workflow, and the dispatcher refuses to admit runs for the
-  # built-in. Flip, roll the orchestrator, flip back when done.
-  killSwitches:
-    slackAutomation: false
-
   # The three REQUIRED env vars come from ONE Secret (keys below). The chart
   # never inlines them. `databaseSecret.url` MUST point at a SEPARATE database
   # (`engram_orchestrator`), NOT the coordinator's DB — the orchestrator owns

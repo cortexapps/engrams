@@ -645,6 +645,13 @@
       "when": 1791208931845,
       "tag": "0091_retire_review_enrollment",
       "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1791210158579,
+      "tag": "0092_retire_slack_session",
+      "breakpoints": true
     }
   ]
 }

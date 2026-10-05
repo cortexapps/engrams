@@ -40,12 +40,12 @@ describe("makeDbosLogger()", () => {
     const { logger, calls } = fakeLogger();
     const dl = makeDbosLogger(logger);
     dl.info("running workflow", {
-      span: { attributes: { workflowUUID: "wf-1", operationName: "SlackThreadWorkflow" } },
+      span: { attributes: { workflowUUID: "wf-1", operationName: "AutomationRunWorkflow" } },
     } as unknown as Parameters<typeof dl.info>[1]);
     expect(calls).toHaveLength(1);
     expect(calls[0].level).toBe("info");
     expect(calls[0].msg).toBe("running workflow");
-    expect(calls[0].obj).toEqual({ workflowUUID: "wf-1", operationName: "SlackThreadWorkflow" });
+    expect(calls[0].obj).toEqual({ workflowUUID: "wf-1", operationName: "AutomationRunWorkflow" });
   });
 
   test("stringifies a non-string entry", () => {

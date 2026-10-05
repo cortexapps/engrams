@@ -1,8 +1,8 @@
 /** The Slack thread-brain built-in automation (ADR 0119 D7, phase 4.6; a
  * workstream per thread since 2026-09-29, ADR 0120).
  *
- * ADR 0060's per-thread DBOS workflow (`slack-thread.ts`), expressed as data
- * on the engine. It is the conversation-shaped built-in: one run per Slack
+ * ADR 0060's per-thread DBOS workflow (retired in phase 4.8), expressed as
+ * data on the engine. It is the conversation-shaped built-in: one run per Slack
  * thread, kept alive across turns by `join` concurrency (a later message in
  * the thread is delivered into the active run's mailbox instead of starting
  * a new run) and a loop of wait_event → send_prompt until the thread goes

@@ -548,75 +548,6 @@ describe("dispatchIntegrationEvent", () => {
     expect(h.runs.size).toBe(1);
   });
 
-  test("a kill-switched built-in never admits a run; a user automation on the same event is unaffected", async () => {
-    // With ORCHESTRATOR_SLACK_AUTOMATION_DISABLED on, the Slack route falls
-    // back to the legacy thread workflow. If the dispatcher still delivered
-    // to the enabled built-in, a channel would get TWO brains. The switch
-    // gates the trigger path too; a user automation on the same event is
-    // unaffected. The keys are generic: any built-in key can be switched.
-    const builtin = {
-      automation: meta({ id: "builtin-review", kind: "builtin", builtinKey: "pr_review" }),
-      definition: definition(trigger()),
-    };
-    const user = { automation: meta({ id: "user-auto" }), definition: definition(trigger()) };
-    const h = makeHarness([builtin, user]);
-
-    const off = await dispatchIntegrationEvent(input(), {
-      ...deps(h),
-      disabledBuiltins: new Set<string>(),
-    });
-    expect(off.started).toBe(2);
-    // The per-built-in tally is what the Slack route consults (its window):
-    // the built-in's own admission outcome, user automations absent.
-    expect(off.builtins).toEqual({ pr_review: "started" });
-
-    const h2 = makeHarness([builtin, user]);
-    const on = await dispatchIntegrationEvent(input(), {
-      ...deps(h2),
-      disabledBuiltins: new Set(["pr_review"]),
-    });
-    expect(on).toMatchObject({ matched: 1, started: 1, builtins: {} });
-    expect(h2.starts.map((s) => s.automationId)).toEqual(["user-auto"]);
-
-    // The Slack switch registers its key the same way (4.6).
-    const slack = {
-      automation: meta({ id: "builtin-slack", kind: "builtin", builtinKey: "slack_brain" }),
-      definition: definition(trigger()),
-    };
-    const h3 = makeHarness([slack, user]);
-    const slackOff = await dispatchIntegrationEvent(input(), {
-      ...deps(h3),
-      disabledBuiltins: new Set(["slack_brain"]),
-    });
-    expect(slackOff).toMatchObject({ matched: 1, started: 1, builtins: {} });
-    expect(h3.starts.map((s) => s.automationId)).toEqual(["user-auto"]);
-  });
-
-  test("builtinTookDelivery: started/joined/queued = the engine owns it; absent or skipped = legacy", async () => {
-    const { builtinTookDelivery } = await import("../dispatch.ts");
-    const base = { matched: 1, started: 0, joined: 0, queued: 0, skipped: 0, filtered: 0, dropped: 0, suppressed: [], failed: 0 };
-    expect(builtinTookDelivery(undefined, "slack_brain")).toBe(false);
-    expect(builtinTookDelivery({ ...base, builtins: {} }, "slack_brain")).toBe(false);
-    expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "skipped" } }, "slack_brain")).toBe(false);
-    expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "started" } }, "slack_brain")).toBe(true);
-    expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "joined" } }, "slack_brain")).toBe(true);
-    expect(builtinTookDelivery({ ...base, builtins: { pr_review: "started" } }, "slack_brain")).toBe(false);
-  });
-
-  test("disabledBuiltinsFromConfig maps each switch to its built-in key", async () => {
-    const { disabledBuiltinsFromConfig } = await import("../dispatch.ts");
-    const { config } = await import("../../config.ts");
-    const saved = config.slackAutomationDisabled;
-    try {
-      config.slackAutomationDisabled = false;
-      expect([...disabledBuiltinsFromConfig()]).toEqual([]);
-      config.slackAutomationDisabled = true;
-      expect([...disabledBuiltinsFromConfig()]).toEqual(["slack_brain"]);
-    } finally {
-      config.slackAutomationDisabled = saved;
-    }
-  });
-
   test("one target's admission fault never drops its siblings, and the delivery fails afterwards", async () => {
     const a = { automation: meta({ id: "automation-a" }), definition: definition(trigger()) };
     const b = { automation: meta({ id: "automation-b" }), definition: definition(trigger()) };
@@ -1184,9 +1115,9 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
     // Prod 2026-10-01: the brain's "Started a session" post binds the thread
     // handle to the brain's workstream, and the pre-pass read that binding
     // as "a workstream owns this conversation" — every follow-up in every
-    // brain thread was suppressed by the brain's own binding. The legacy
-    // brain still stands down (the verdict), but the built-in routes the
-    // event to its own workstream.
+    // brain thread was suppressed by the brain's own binding. Its own
+    // ownership is no verdict at all: the built-in routes the event to its
+    // own workstream.
     const slackTrigger = trigger({ provider: "slack", eventKeys: ["message"] });
     const brain = {
       automation: meta({ id: "brain-1", builtinKey: "slack_brain", kind: "builtin" }),
@@ -1231,9 +1162,9 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
       }),
       { ...deps(h), instances: i.store, facets: async () => slackFacet },
     );
-    // The legacy brain stands down for an owned conversation …
-    expect(reply.suppressed).toEqual(["slack_brain"]);
-    // … and the built-in still takes the delivery into its own workstream.
+    // No stand-down: the owner IS the brain …
+    expect(reply.suppressed).toEqual([]);
+    // … and the built-in takes the delivery into its own workstream.
     expect(reply.builtins["slack_brain"]).toBeDefined();
     expect(reply.builtins["slack_brain"]).not.toBe("skipped");
     expect(h.starts.map((s) => s.automationId)).toEqual(["brain-1"]);
@@ -1429,15 +1360,13 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
     expect(afterClose.builtins).toEqual({ slack_brain: "started" });
   });
 
-  test("the verdict is recorded even when NO brain is a matched target (legacy-only deployments)", async () => {
-    // The prod 2026-08-26 second finding: the slack_brain BUILT-IN was
-    // disabled (the workspace runs the LEGACY thread-brain), so the
-    // suppressible built-in was never among the matched targets, the
-    // ownership check was gated out, `suppressed` stayed empty, and the
-    // legacy route — which consumes this delivery's verdict via
-    // builtinSuppressed — spawned a session inside an owned channel. The
-    // verdict is a property of the DELIVERY: it must be recorded whenever
-    // ownership holds, brains or no brains.
+  test("the verdict is recorded even when NO brain is a matched target", async () => {
+    // The prod 2026-08-26 second finding: with the brain not among the
+    // matched targets, the ownership check was gated out and `suppressed`
+    // stayed empty, so a consumer of the verdict spawned a session inside an
+    // owned channel. The verdict is a property of the DELIVERY: it is
+    // recorded whenever another automation's ownership holds, brains or no
+    // brains.
     const custom = {
       automation: meta({ id: "custom-1" }),
       definition: definition(trigger({ provider: "slack", eventKeys: ["message"] }), {
@@ -1477,22 +1406,4 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
     expect(mention).toMatchObject({ matched: 0, started: 0, suppressed: ["slack_brain"] });
   });
 
-  test("builtinSuppressed reads the suppression list", async () => {
-    const { builtinSuppressed } = await import("../dispatch.ts");
-    const base = {
-      matched: 1,
-      started: 0,
-      joined: 0,
-      queued: 0,
-      skipped: 0,
-      filtered: 0,
-      dropped: 0,
-      suppressed: ["slack_brain"],
-      failed: 0,
-      builtins: {},
-    };
-    expect(builtinSuppressed(base, "slack_brain")).toBe(true);
-    expect(builtinSuppressed(base, "pr_review")).toBe(false);
-    expect(builtinSuppressed(undefined, "slack_brain")).toBe(false);
-  });
 });

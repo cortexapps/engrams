@@ -1057,12 +1057,6 @@ export const consumerCursor = pgTable(
   (t) => [primaryKey({ columns: [t.sessionId, t.consumer] })],
 );
 
-/** Slack-backed sessions route listener output into their owning thread
- * workflow mailbox. Absence means the Slack consumer does not apply. */
-export const slackSession = pgTable("slack_session", {
-  sessionId: text("session_id").primaryKey(),
-  threadWfId: text("thread_wf_id").notNull(),
-});
 
 // ---------------------------------------------------------------------------
 // DBOS orphan sweep (ADR 0104)

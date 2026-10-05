@@ -9,7 +9,6 @@
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
-import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
 import { makeCodeBlockRuntime } from "./code/runtime.ts";
 import { resolveAutomationInputs } from "../db/automations.ts";
@@ -786,25 +785,14 @@ export interface IntegrationDispatchStore extends AutomationDispatchStore {
   ): Promise<DispatchTarget[]>;
 }
 
-/** The one catch-all built-in that rung-1 precedence stands down when a
- * handle-bound workstream owns the event (ADR 0120). Deliberately a single
- * constant, not a registry: suppression is a cross-automation behavior
- * change and each addition should be a reviewed decision. */
+/** The one catch-all built-in that rung-1 precedence stands down when
+ * ANOTHER automation's handle-bound workstream owns the event's conversation
+ * (ADR 0120). Deliberately a single constant, not a registry: suppression is
+ * a cross-automation behavior change and each addition should be a reviewed
+ * decision. */
 const SUPPRESSIBLE_CATCH_ALL = "slack_brain";
 
-/** Built-in keys whose kill switch is ON. Resolved from config by default;
- * tests inject. Each built-in's switch registers its key here — one line per
- * switch, so the dispatcher gate and the route fallback can never disagree.
- * "slack_brain" ← ORCHESTRATOR_SLACK_AUTOMATION_DISABLED (4.6). */
-export function disabledBuiltinsFromConfig(): ReadonlySet<string> {
-  const keys: string[] = [];
-  if (config.slackAutomationDisabled) keys.push("slack_brain");
-  return new Set(keys);
-}
-
 export interface DispatchIntegrationDeps {
-  /** Kill-switched built-in keys; their triggers never admit a run. */
-  disabledBuiltins?: ReadonlySet<string>;
   store?: IntegrationDispatchStore;
   workflowStarter?: AutomationWebhookStarter;
   sender?: AutomationSender;
@@ -825,39 +813,16 @@ export interface DispatchIntegrationResult {
   filtered: number;
   /** ADR 0120: instance-admission drops (no run row; audited in the ring). */
   dropped: number;
-  /** Built-in keys suppressed by instance precedence (rung 1): a handle-
-   * bound workstream owns this event's thread, so the catch-all brain
-   * stands down — for the engine AND the legacy route. */
+  /** Built-in keys suppressed by instance precedence (rung 1): another
+   * automation's handle-bound workstream owns this event's conversation, so
+   * the catch-all brain stood down for this delivery. */
   suppressed: string[];
   /** Targets whose admission threw; the dispatcher rethrows after the loop. */
   failed: number;
-  /** Admission outcome per matched BUILT-IN (keyed by builtin key). This is
-   * what a legacy route consults to decide whether the engine took the
-   * delivery: a built-in absent here (not enabled, kill-switched, scope did
-   * not match) `skipped`, or `filtered` leaves the legacy path in charge. The same
-   * read the dispatcher made — never a second, possibly stale, lookup. */
+  /** Admission outcome per matched BUILT-IN (keyed by builtin key): the
+   * delivery's verdict, as the dispatcher made it — a built-in absent here
+   * was not matched (not enabled, scope did not match). */
   builtins: Record<string, AdmitOutcome>;
-}
-
-/** Did the dispatcher hand this delivery to the built-in — a run started,
- * joined, or queued for it? */
-export function builtinTookDelivery(
-  result: DispatchIntegrationResult | undefined,
-  builtinKey: string,
-): boolean {
-  const outcome = result?.builtins[builtinKey];
-  return outcome !== undefined && outcome !== "skipped";
-}
-
-/** Instance precedence (ADR 0120 rung 1): was the built-in stood down for
- * this delivery because an open workstream owns the thread? The legacy
- * route must treat this exactly like "the engine took it" — the instance's
- * automation is answering; a second responder is the bug. */
-export function builtinSuppressed(
-  result: DispatchIntegrationResult | undefined,
-  builtinKey: string,
-): boolean {
-  return result?.suppressed.includes(builtinKey) ?? false;
 }
 
 /** Providers whose scope noun compares case-insensitively (GitHub owner/repo).
@@ -916,7 +881,6 @@ export async function dispatchIntegrationEvent(
   const starter = deps.workflowStarter ?? defaultWorkflowStarter();
   const sender = deps.sender ?? defaultAutomationSender;
   const now = deps.now ?? (() => new Date());
-  const disabledBuiltins = deps.disabledBuiltins ?? disabledBuiltinsFromConfig();
   const instances = deps.instances ?? defaultInstanceStoreLazy();
   const facets = deps.facets ?? defaultWebhookFacetResolver();
 
@@ -934,17 +898,6 @@ export async function dispatchIntegrationEvent(
     (target) => target.definition.settings.instance !== undefined,
   );
   const targets = providerTargets.flatMap((target) => {
-    // A built-in's kill switch must stop its TRIGGER path too, not only the
-    // legacy route's fallback: otherwise a flagged repo/channel is served by
-    // both brains at once (the legacy graph via the route, the built-in via
-    // this dispatcher). The switch is the fleet-wide brake; the built-in's
-    // own `enabled` toggle is the independent second one.
-    if (
-      target.automation.builtinKey !== null &&
-      disabledBuiltins.has(target.automation.builtinKey)
-    ) {
-      return [];
-    }
     // D9: a delivery matches per ENTRYPOINT — the same event may open (or
     // join) one run for each entrypoint whose trigger matches it.
     return entrypointsOf(target.definition).flatMap((entrypoint) => {
@@ -998,7 +951,9 @@ export async function dispatchIntegrationEvent(
   // case for a live thread (its "Started a session" post binds the thread
   // handle to it) and routes the event to that workstream by key; it must
   // never stand the brain down (prod 2026-10-01: every follow-up in every
-  // brain thread was suppressed by the brain's own binding).
+  // brain thread was suppressed by the brain's own binding). The verdict is
+  // computed over the PROVIDER's instanced automations even when no brain is
+  // a matched target, so `suppressed` is always this delivery's truth.
   const resolved: Array<{
     target: DispatchTarget;
     entrypoint: { id: string; trigger: TriggerSpec };
@@ -1023,11 +978,10 @@ export async function dispatchIntegrationEvent(
   // target was instanced, so no handle ever resolved). Ask the ledger
   // which open workstreams — in any automation — own one of the event's
   // candidate handles. Deliberately NOT gated on the suppressible built-in
-  // being a matched target: the LEGACY brain reads this delivery's verdict
-  // via `builtinSuppressed` and answers whether or not the built-in
-  // automation is enabled (prod 2026-08-26, second finding: the built-in
-  // was disabled, the gate skipped the check, and the legacy route spawned
-  // a session in an owned channel with the fix fully deployed).
+  // being a matched target: the verdict is this delivery's, whoever reads
+  // it (prod 2026-08-26, second finding: the built-in was disabled, the
+  // gate skipped the check, and a consumer of the verdict spawned a session
+  // in an owned channel with the fix fully deployed).
   if (anyInstancedForProvider) {
     const suppressFacet = facet ?? (await facets(input.provider));
     if (suppressFacet !== undefined) {
@@ -1056,13 +1010,11 @@ export async function dispatchIntegrationEvent(
       .map(({ target }) => target.automation.id),
   );
   const ownedByOther = [...owners.values()].some((automationId) => !catchAllIds.has(automationId));
-  if (owners.size > 0 && !result.suppressed.includes(SUPPRESSIBLE_CATCH_ALL)) {
+  if (ownedByOther && !result.suppressed.includes(SUPPRESSIBLE_CATCH_ALL)) {
     result.suppressed.push(SUPPRESSIBLE_CATCH_ALL);
     log.info(
-      { provider: input.provider, eventKey: input.eventKey, ownedByOther },
-      ownedByOther
-        ? "instance precedence: another automation's workstream owns this conversation; every brain stands down"
-        : "instance precedence: the brain's own workstream owns this conversation; the legacy brain stands down",
+      { provider: input.provider, eventKey: input.eventKey },
+      "instance precedence: another automation's workstream owns this conversation; the brain stands down",
     );
   }
 

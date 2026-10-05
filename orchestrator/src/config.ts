@@ -202,13 +202,6 @@ export interface Config {
    * "true" enables it; default false.
    */
   sweepDisabled: boolean;
-  /**
-   * ORCHESTRATOR_SLACK_AUTOMATION_DISABLED — kill switch for the Slack
-   * thread-brain built-in's per-channel window (ADR 0119 phase 4.6). When
-   * set, every Slack channel takes the legacy thread workflow, flagged or
-   * not. "1" or "true" enables it; default false.
-   */
-  slackAutomationDisabled: boolean;
   /** ORCHESTRATOR_SWEEP_INTERVAL_MS — default SWEEP_INTERVAL_MS. */
   sweepIntervalMs: number;
   /** ORCHESTRATOR_SWEEP_GRACE_MS — default SWEEP_GRACE_MS. */
@@ -560,12 +553,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // falling back.
   const sweepDisabled =
     env["ORCHESTRATOR_SWEEP_DISABLED"] === "1" || env["ORCHESTRATOR_SWEEP_DISABLED"] === "true";
-  // OPTIONAL: the Slack automation window's kill switch. Deliberately
-  // narrow: only the documented "1"/"true" spellings arm it, matching
-  // ORCHESTRATOR_SWEEP_DISABLED.
-  const slackAutomationDisabled =
-    env["ORCHESTRATOR_SLACK_AUTOMATION_DISABLED"] === "1" ||
-    env["ORCHESTRATOR_SLACK_AUTOMATION_DISABLED"] === "true";
   const sweepIntervalMs = positiveNumber("ORCHESTRATOR_SWEEP_INTERVAL_MS", SWEEP_INTERVAL_MS);
   const sweepGraceMs = positiveNumber("ORCHESTRATOR_SWEEP_GRACE_MS", SWEEP_GRACE_MS);
   const sweepHeartbeatIntervalMs = positiveNumber(
@@ -629,7 +616,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     cookiePrefix,
     adminEmails,
     sweepDisabled,
-    slackAutomationDisabled,
     sweepIntervalMs,
     sweepGraceMs,
     sweepHeartbeatIntervalMs,
