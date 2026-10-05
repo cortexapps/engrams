@@ -622,7 +622,9 @@ resumes only through the orchestrator — it is the coordinator's one client
 — so an interceptor on the control-plane transport wakes the row after any
 unary `SessionService` call that can resume or end a session (SendPrompt,
 Resume, Interrupt, DeleteSession, …), whoever the caller is: the passthrough
-surface, the engine's session blocks, the coordination tools. The scanner
+surface, the engine's session blocks, the coordination tools. The wake is
+issued once the RPC settles and never awaited: a best-effort side effect
+must not hold the caller's response on the orchestrator's database. The scanner
 re-arms the listener on its next pass; the events are durable, so the
 catch-up delivers whatever the resume produced. (3) **A wake grace fences
 the race.** The coordinator may still report `parked` for a session whose

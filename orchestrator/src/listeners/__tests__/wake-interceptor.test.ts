@@ -93,6 +93,20 @@ describe("makeListenerWakeInterceptor", () => {
     expect(await interceptor(async () => res)(req)).toBe(res);
   });
 
+  test("the rpc returns without waiting on the wake", async () => {
+    let settleWake: (() => void) | undefined;
+    const interceptor = makeListenerWakeInterceptor(
+      () => new Promise<void>((resolve) => (settleWake = resolve)),
+      log,
+    );
+    const { req, res } = sendPrompt("s1");
+    // Resolves while the wake is still pending: a stalled database never
+    // holds the caller's response.
+    expect(await interceptor(async () => res)(req)).toBe(res);
+    expect(settleWake).toBeDefined();
+    settleWake!();
+  });
+
   test("a read does not wake", async () => {
     let woken = 0;
     const interceptor = makeListenerWakeInterceptor(async () => {

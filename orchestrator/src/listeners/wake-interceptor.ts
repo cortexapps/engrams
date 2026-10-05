@@ -58,15 +58,15 @@ export function makeListenerWakeInterceptor(
     try {
       return await next(req);
     } finally {
-      // After the RPC, whatever its outcome: a failed resume wakes a row that
-      // the listener then reconciles. A failed wake never fails the RPC —
-      // the dormant reconcile heals it within its interval.
+      // Issued after the RPC settles, whatever its outcome (a failed resume
+      // wakes a row the listener then reconciles) — and never awaited: the
+      // wake is best-effort, so the caller's response must not wait on the
+      // orchestrator's database. A lost or failed wake is healed by the
+      // dormant reconcile within its interval.
       if (sessionId !== undefined) {
-        try {
-          await wake(sessionId);
-        } catch (err) {
+        void wake(sessionId).catch((err: unknown) => {
           log.warn({ sessionId, err }, "listener wake failed after a session rpc");
-        }
+        });
       }
     }
   };
