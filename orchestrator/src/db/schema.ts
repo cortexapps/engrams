@@ -1474,9 +1474,17 @@ export const automationRun = pgTable(
     /** A DryRun from the editor: integration actions are stubbed and record
      * what they would have done instead of calling the provider. */
     dryRun: boolean("dry_run").notNull().default(false),
+    /** Set by the retention collector once the run's step rows are deleted
+     * (ADR 0104 amendment): the run page can say so, and the prune's frontier
+     * (ended before the cutoff, not yet pruned) shrinks as it drains. */
+    detailsPrunedAt: timestamp("details_pruned_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
+    // The retention frontier: ended runs whose details are still kept.
+    index("automation_run_retention_idx")
+      .on(t.endedAt)
+      .where(sql`ended_at is not null and details_pruned_at is null`),
     // ADR 0120 instances — the dedupe split: a cron occurrence fans out one
     // run per open instance (instance_id joins the occurrence identity); an
     // external delivery lands in at most ONE instance (the delivery identity

@@ -3,7 +3,9 @@
  * Two prunes, both batch-capped so a sweep tick stays bounded and a backlog
  * drains over cycles:
  *  - run details: the step ledger (`automation_step_run`) of runs that
- *    ended before the cutoff. The run row stays.
+ *    ended before the cutoff. The run row stays, stamped `details_pruned_at`
+ *    so the frontier (a partial index on ended runs not yet pruned) shrinks
+ *    as it drains instead of being rescanned every cycle.
  *  - DBOS records: the engine's `workflow_status` rows (the SDK schema
  *    cascades their step outputs, notifications, events and streams) for
  *    workflows created before the cutoff that are not PENDING/ENQUEUED/
@@ -32,21 +34,20 @@ export function makeRetentionStore(db: ReturnType<typeof getDb> = getDb()): Rete
     async pruneRunDetails(cutoff, batch) {
       return db.transaction(async (tx) => {
         const doomed = await tx.execute(sql`
-          select "r"."id"
-          from "automation_run" as "r"
-          where "r"."ended_at" is not null
-            and "r"."ended_at" < ${cutoff}
-            and exists (
-              select 1 from "automation_step_run" as "s" where "s"."run_id" = "r"."id"
-            )
-          order by "r"."ended_at" asc
+          select "id"
+          from "automation_run"
+          where "ended_at" is not null
+            and "details_pruned_at" is null
+            and "ended_at" < ${cutoff}
+          order by "ended_at" asc
           limit ${batch}
         `);
         const ids = doomed.rows.map((row) => String(row.id));
         if (ids.length === 0) return 0;
+        const list = textArray(ids);
+        await tx.execute(sql`delete from "automation_step_run" where "run_id" = any(${list})`);
         await tx.execute(sql`
-          delete from "automation_step_run"
-          where "run_id" = any(${textArray(ids)})
+          update "automation_run" set "details_pruned_at" = now() where "id" = any(${list})
         `);
         return ids.length;
       });
@@ -85,13 +86,15 @@ function textArray(values: string[]) {
 /** Deterministic in-memory projection for the sweep unit tests: runs with
  * their end time and step count, DBOS workflows with status and creation. */
 export function makeInMemoryRetentionStore(seed: {
-  runs?: Array<{ id: string; endedAt: Date | null; steps: number }>;
+  runs?: Array<{ id: string; endedAt: Date | null; steps: number; pruned?: boolean }>;
   workflows?: Array<{ id: string; status: string; createdAt: Date; parentId?: string }>;
 } = {}): RetentionStore & {
-  runs: Map<string, { endedAt: Date | null; steps: number }>;
+  runs: Map<string, { endedAt: Date | null; steps: number; pruned: boolean }>;
   workflows: Map<string, { status: string; createdAt: Date; parentId?: string }>;
 } {
-  const runs = new Map((seed.runs ?? []).map((r) => [r.id, { endedAt: r.endedAt, steps: r.steps }]));
+  const runs = new Map(
+    (seed.runs ?? []).map((r) => [r.id, { endedAt: r.endedAt, steps: r.steps, pruned: r.pruned ?? false }]),
+  );
   const workflows = new Map(
     (seed.workflows ?? []).map((w) => [
       w.id,
@@ -108,10 +111,13 @@ export function makeInMemoryRetentionStore(seed: {
     workflows,
     async pruneRunDetails(cutoff, batch) {
       const doomed = [...runs.entries()]
-        .filter(([, r]) => r.endedAt !== null && r.endedAt < cutoff && r.steps > 0)
+        .filter(([, r]) => r.endedAt !== null && r.endedAt < cutoff && !r.pruned)
         .sort((a, b) => a[1].endedAt!.getTime() - b[1].endedAt!.getTime())
         .slice(0, batch);
-      for (const [, r] of doomed) r.steps = 0;
+      for (const [, r] of doomed) {
+        r.steps = 0;
+        r.pruned = true;
+      }
       return doomed.length;
     },
     async pruneDbosWorkflows(cutoff, batch) {

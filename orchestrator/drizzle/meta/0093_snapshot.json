@@ -1,5 +1,5 @@
 {
-  "id": "cbfbe2de-6b24-4ef8-b8c0-8406710cb07c",
+  "id": "c07d3893-51c1-4920-ac68-0aa5ad82ffbd",
   "prevId": "36d21b0a-9aae-4184-8532-d183170d7ddf",
   "version": "7",
   "dialect": "postgresql",
@@ -1232,6 +1232,12 @@
           "notNull": true,
           "default": false
         },
+        "details_pruned_at": {
+          "name": "details_pruned_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",
@@ -1241,6 +1247,22 @@
         }
       },
       "indexes": {
+        "automation_run_retention_idx": {
+          "name": "automation_run_retention_idx",
+          "columns": [
+            {
+              "expression": "ended_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "ended_at is not null and details_pruned_at is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "automation_run_occurrence_unique": {
           "name": "automation_run_occurrence_unique",
           "columns": [

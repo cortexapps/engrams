@@ -48,7 +48,7 @@ describe("runRetentionTick", () => {
         { id: "run-old", endedAt: daysAgo(31), steps: 4 },
         { id: "run-fresh", endedAt: daysAgo(29), steps: 2 },
         { id: "run-open", endedAt: null, steps: 1 },
-        { id: "run-old-empty", endedAt: daysAgo(40), steps: 0 },
+        { id: "run-old-empty", endedAt: daysAgo(40), steps: 0, pruned: true },
       ],
       workflows: [
         { id: "wf-old-success", status: "SUCCESS", createdAt: daysAgo(31) },
@@ -68,7 +68,7 @@ describe("runRetentionTick", () => {
       runsPruned: 1,
       workflowsPruned: 2,
     });
-    expect(store.runs.get("run-old")?.steps).toBe(0);
+    expect(store.runs.get("run-old")).toEqual({ endedAt: daysAgo(31), steps: 0, pruned: true });
     expect(store.runs.get("run-fresh")?.steps).toBe(2);
     expect(store.runs.get("run-open")?.steps).toBe(1);
     expect([...store.workflows.keys()].sort()).toEqual([

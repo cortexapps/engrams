@@ -979,11 +979,17 @@ describe("DBOS sweep stores with live Postgres", () => {
     expect(await store.pruneRunDetails(cutoff, 10)).toBe(1);
     expect(await store.pruneRunDetails(cutoff, 10)).toBe(0);
     expect([await stepsOf(old), await stepsOf(fresh), await stepsOf(open)]).toEqual([0, 2, 2]);
-    // The run rows stay.
+    // The run rows stay, the pruned ones stamped.
     const kept = await getDb().execute(sql`
-      select "id", "status" from "automation_run" where "id" like ${`${runId}-run-%`} order by "id"
+      select "id", "details_pruned_at" is not null as "pruned"
+      from "automation_run" where "id" like ${`${runId}-run-%`} order by "id"
     `);
-    expect(kept.rows.map((row) => row.id)).toEqual([fresh, old, oldest, open]);
+    expect(kept.rows.map((row) => [row.id, row.pruned])).toEqual([
+      [fresh, false],
+      [old, true],
+      [oldest, true],
+      [open, false],
+    ]);
   });
 
   test.skipIf(!dbReachable)("retention deletes terminal DBOS workflows past the cutoff with their records", async () => {

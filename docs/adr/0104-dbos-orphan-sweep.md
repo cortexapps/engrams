@@ -505,7 +505,9 @@ out-of-bounds value reads as the default. Today the policy is one number:
 same page and document. (2) **The sweep leader collects**, once per cycle
 after the scans, under the same lease: it deletes the step rows of runs
 whose `ended_at` is older than the cutoff (the run row — status, timing,
-trigger, bound session — stays), and deletes `workflow_status` rows created
+trigger, bound session — stays, stamped `details_pruned_at`, so the prune's
+frontier is a partial index of ended, not-yet-pruned runs that shrinks as it
+drains), and deletes `workflow_status` rows created
 before the cutoff whose status is not PENDING/ENQUEUED/DELAYED and whose
 parent, if any, is not live either; the SDK schema cascades the step
 outputs, events, notifications and streams. Both prunes take **500 rows per
