@@ -3,6 +3,10 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import { sql } from "drizzle-orm";
 
 import { checkDb, getDb } from "../db/client.ts";
+import { makeAutomationStore } from "../db/automations.ts";
+import { makeOrgSettingStore, RETENTION_KEY } from "../db/org-settings.ts";
+import { makeRetentionStore } from "../db/retention.ts";
+import { automation as automationTable } from "../db/schema.ts";
 
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
 const dbReachable = DB_URL ? await checkDb() : false;
@@ -462,6 +466,11 @@ describe("DBOS sweep stores with live Postgres", () => {
                          where "id" like ${`${runId}-%`}`);
     await db.execute(sql`delete from "dbos"."workflow_status"
                          where "workflow_uuid" like ${`${runId}-%`}`);
+    // Runs and their step rows cascade from the automation.
+    await db.execute(sql`delete from "automation"
+                         where "id" like ${`${runId}-%`}`);
+    await db.execute(sql`delete from "org_setting"
+                         where "key" like ${`${runId}-%`}`);
     await db.execute(sql`delete from "dbos_version_heartbeats"
                          where "pod_name" like ${`${runId}-%`}`);
     await db.execute(sql`delete from "dbos_sweep_ledger"
@@ -906,4 +915,145 @@ describe("DBOS sweep stores with live Postgres", () => {
     expect(rows).toEqual([alertedOnly, fresh]);
   });
 
+  test.skipIf(!dbReachable)("org settings upsert by key and read back the document", async () => {
+    const store = makeOrgSettingStore();
+    const key = `${runId}-${RETENTION_KEY}`;
+    expect(await store.get(key)).toBeNull();
+    await store.set(key, { runDetailDays: 45 }, `${runId}-admin`);
+    expect(await store.get(key)).toEqual({ runDetailDays: 45 });
+    await store.set(key, { runDetailDays: 60 }, null);
+    expect(await store.get(key)).toEqual({ runDetailDays: 60 });
+    const rows = await getDb().execute(sql`
+      select "updated_by_user_id" from "org_setting" where "key" = ${key}
+    `);
+    expect(rows.rows.map((row) => row.updated_by_user_id)).toEqual([null]);
+  });
+
+  test.skipIf(!dbReachable)("retention prunes the step rows of old ended runs, keeping the run", async () => {
+    const automationId = `${runId}-retention-auto`;
+    await getDb().insert(automationTable).values({
+      id: automationId,
+      name: "retention test",
+      description: "",
+      enabled: true,
+      currentVersion: 1,
+    });
+    const runs = makeAutomationStore(getDb());
+    const trigger = { source: "manual", receivedAt: "2026-10-05T10:00:00Z" } as const;
+    const day = 24 * 60 * 60 * 1_000;
+    const now = Date.now();
+    const seed = async (suffix: string, endedAt: Date | undefined) => {
+      const id = `${runId}-run-${suffix}`;
+      await runs.insertRun({
+        id,
+        automationId,
+        version: 1,
+        trigger,
+        deliveryKey: `${runId}-${suffix}`,
+        concurrencyKey: null,
+        scheduledFor: null,
+        ...(endedAt ? { status: "succeeded", endedAt } : {}),
+      });
+      await getDb().execute(sql`
+        insert into "automation_step_run" ("run_id", "block_id", "attempt", "status")
+        values (${id}, 'a', 1, 'succeeded'), (${id}, 'b', 1, 'succeeded')
+      `);
+      return id;
+    };
+    const oldest = await seed("oldest", new Date(now - 50 * day));
+    const old = await seed("old", new Date(now - 40 * day));
+    const fresh = await seed("fresh", new Date(now - 10 * day));
+    const open = await seed("open", undefined);
+    const store = makeRetentionStore();
+    const cutoff = new Date(now - 30 * day);
+
+    // Oldest first, one per call: the batch cap bounds a cycle.
+    expect(await store.pruneRunDetails(cutoff, 1)).toBe(1);
+    const stepsOf = async (id: string) =>
+      Number(
+        (await getDb().execute(sql`select count(*)::int as "n" from "automation_step_run" where "run_id" = ${id}`))
+          .rows[0]!.n,
+      );
+    expect(await stepsOf(oldest)).toBe(0);
+    expect(await stepsOf(old)).toBe(2);
+    expect(await store.pruneRunDetails(cutoff, 10)).toBe(1);
+    expect(await store.pruneRunDetails(cutoff, 10)).toBe(0);
+    expect([await stepsOf(old), await stepsOf(fresh), await stepsOf(open)]).toEqual([0, 2, 2]);
+    // The run rows stay.
+    const kept = await getDb().execute(sql`
+      select "id", "status" from "automation_run" where "id" like ${`${runId}-run-%`} order by "id"
+    `);
+    expect(kept.rows.map((row) => row.id)).toEqual([fresh, old, oldest, open]);
+  });
+
+  test.skipIf(!dbReachable)("retention deletes terminal DBOS workflows past the cutoff with their records", async () => {
+    const oldDone = `${runId}-ret-old-done`;
+    const oldError = `${runId}-ret-old-error`;
+    const oldPending = `${runId}-ret-old-pending`;
+    const oldChild = `${runId}-ret-old-child`;
+    const freshDone = `${runId}-ret-fresh-done`;
+    const day = 24 * 60 * 60 * 1_000;
+    const now = Date.now();
+    await getDb().execute(sql`
+      insert into "dbos"."workflow_status"
+        ("workflow_uuid", "status", "name", "application_version",
+         "recovery_attempts", "created_at", "updated_at", "parent_workflow_id")
+      values
+        (${oldPending}, 'PENDING', 'WorkflowOne', 'v', 0, 1, 1, null),
+        (${oldChild}, 'SUCCESS', 'WorkflowOne', 'v', 0, 2, 2, ${oldPending}),
+        (${oldDone}, 'SUCCESS', 'WorkflowOne', 'v', 0, 3, 3, null),
+        (${oldError}, 'ERROR', 'WorkflowOne', 'v', 1, 4, 4, null),
+        (${freshDone}, 'SUCCESS', 'WorkflowOne', 'v', 0, ${now - 10 * day}, ${now - 10 * day}, null)
+    `);
+    // The records the SDK keeps per workflow; the real schema cascades them.
+    await getDb().execute(sql`
+      insert into "dbos"."operation_outputs" ("workflow_uuid", "function_id", "function_name", "output")
+      values (${oldDone}, 0, 'step', '"x"'), (${freshDone}, 0, 'step', '"y"')
+    `);
+    await getDb().execute(sql`
+      insert into "dbos"."workflow_events" ("workflow_uuid", "key", "value")
+      values (${oldDone}, 'k', '"v"')
+    `);
+    await getDb().execute(sql`
+      insert into "dbos"."notifications" ("destination_uuid", "topic", "message")
+      values (${oldDone}, 't', '"m"')
+    `);
+    await getDb().execute(sql`
+      insert into "dbos"."streams" ("workflow_uuid", "key", "value", "offset")
+      values (${oldDone}, 's', '"v"', 0)
+    `);
+    const store = makeRetentionStore();
+    const cutoff = new Date(now - 30 * day);
+
+    // Oldest first with the cap. These rows are older than any other test's
+    // (created_at 1..4 ms), so the cap of one lands here: the PENDING row
+    // and its child are skipped and the first SUCCESS goes.
+    expect(await store.pruneDbosWorkflows(cutoff, 1)).toBe(1);
+    const remaining = async () =>
+      (
+        await getDb().execute(sql`
+          select "workflow_uuid" from "dbos"."workflow_status"
+          where "workflow_uuid" like ${`${runId}-ret-%`} order by "workflow_uuid"
+        `)
+      ).rows.map((row) => row.workflow_uuid);
+    expect(await remaining()).toEqual([freshDone, oldChild, oldError, oldPending]);
+    // The next sweep takes the ERROR row — and whatever terminal rows the
+    // earlier tests in this file left behind.
+    expect(await store.pruneDbosWorkflows(cutoff, 1_000)).toBeGreaterThanOrEqual(1);
+    expect(await store.pruneDbosWorkflows(cutoff, 1_000)).toBe(0);
+    expect(await remaining()).toEqual([freshDone, oldChild, oldPending]);
+
+    const countIn = async (table: string, column: string) =>
+      Number(
+        (
+          await getDb().execute(
+            sql`select count(*)::int as "n" from "dbos".${sql.identifier(table)} where ${sql.identifier(column)} like ${`${runId}-ret-%`}`,
+          )
+        ).rows[0]!.n,
+      );
+    expect(await countIn("operation_outputs", "workflow_uuid")).toBe(1);
+    expect(await countIn("workflow_events", "workflow_uuid")).toBe(0);
+    expect(await countIn("notifications", "destination_uuid")).toBe(0);
+    expect(await countIn("streams", "workflow_uuid")).toBe(0);
+  });
 });

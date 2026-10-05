@@ -12,6 +12,8 @@ import {
   type SweepLeaseStore,
   type SweepLedgerStore,
 } from "../db/dbos-sweep.ts";
+import { makeOrgSettingStore, type OrgSettingStore } from "../db/org-settings.ts";
+import { makeRetentionStore, type RetentionStore } from "../db/retention.ts";
 import { log as rootLog } from "../log.ts";
 import { dbosExecutorId } from "../workflows/dbos.ts";
 import { makeSweepAlerter } from "./alerts.ts";
@@ -42,6 +44,8 @@ export interface SweepRuntimeOverrides {
   lease: SweepLeaseStore;
   ledger: SweepLedgerStore;
   status: DbosStatusStore;
+  /** The retention collector's seams; omitted = no pruning. */
+  retention?: { settings: Pick<OrgSettingStore, "get">; store: RetentionStore };
 }
 
 export interface SweepRuntimeDeps {
@@ -74,6 +78,12 @@ export function makeSweepRuntime(deps: SweepRuntimeDeps): {
     graceMs: deps.config.sweepGraceMs,
     heartbeatIntervalMs: deps.config.sweepHeartbeatIntervalMs,
   };
+  // Production prunes by the org's retention policy; a test runtime that
+  // passes no retention seams gets no pruning.
+  const retention =
+    deps.runtime === undefined
+      ? { settings: makeOrgSettingStore(), store: makeRetentionStore() }
+      : deps.runtime.retention;
   const sweeper = new Sweeper({
     owner:
       deps.runtime?.owner ??
@@ -86,6 +96,7 @@ export function makeSweepRuntime(deps: SweepRuntimeDeps): {
     status,
     cancelWorkflow,
     alerter,
+    ...(retention !== undefined ? { retention } : {}),
     log,
   });
   const heartbeat = new VersionHeartbeat({

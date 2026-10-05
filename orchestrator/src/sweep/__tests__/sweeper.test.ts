@@ -12,6 +12,8 @@ import {
   type InMemoryDbosStatusSeed,
   type SweepLeaseStore,
 } from "../../db/dbos-sweep.ts";
+import { makeInMemoryOrgSettingStore, RETENTION_KEY } from "../../db/org-settings.ts";
+import { makeInMemoryRetentionStore } from "../../db/retention.ts";
 import { assertSweepPoliciesExhaustive } from "../policy.ts";
 import {
   DEFAULT_SWEEP_CONFIG,
@@ -106,6 +108,62 @@ async function fixture(
   };
   return { deps, status, heartbeats, lease, cancelled };
 }
+
+describe("runSweepTick retention", () => {
+  const DAY_MS = 24 * HOUR_MS;
+
+  test("prunes under the lease after the scans and reports the result", async () => {
+    const settings = makeInMemoryOrgSettingStore({ [RETENTION_KEY]: { runDetailDays: 7 } });
+    const store = makeInMemoryRetentionStore({
+      runs: [{ id: "run-old", endedAt: new Date(NOW.getTime() - 8 * DAY_MS), steps: 3 }],
+      workflows: [{ id: "wf-old", status: "SUCCESS", createdAt: new Date(NOW.getTime() - 8 * DAY_MS) }],
+    });
+    const f = await fixture([], { retention: { settings, store, now: () => new Date(NOW) } });
+
+    const result = await runSweepTick(f.deps);
+    expect(result.leaseHeld).toBe(true);
+    expect(result.retention).toEqual({
+      policy: { runDetailDays: 7 },
+      cutoff: new Date(NOW.getTime() - 7 * DAY_MS).toISOString(),
+      runsPruned: 1,
+      workflowsPruned: 1,
+    });
+    expect(store.runs.get("run-old")?.steps).toBe(0);
+    expect(store.workflows.size).toBe(0);
+    // The lease is released after the prune.
+    expect(await f.lease.tryAcquire("next-owner", 120_000)).toBe(true);
+  });
+
+  test("does not prune when the lease is not held", async () => {
+    const store = makeInMemoryRetentionStore({
+      workflows: [{ id: "wf-old", status: "SUCCESS", createdAt: new Date(NOW.getTime() - 60 * DAY_MS) }],
+    });
+    const f = await fixture([], {
+      retention: { settings: makeInMemoryOrgSettingStore(), store, now: () => new Date(NOW) },
+    });
+    expect(await f.lease.tryAcquire("other-owner", 120_000)).toBe(true);
+
+    const result = await runSweepTick(f.deps);
+    expect(result.leaseHeld).toBe(false);
+    expect(result.retention).toBeUndefined();
+    expect(store.workflows.size).toBe(1);
+  });
+
+  test("a failing prune is contained: the tick still completes and releases the lease", async () => {
+    const store = makeInMemoryRetentionStore();
+    store.pruneRunDetails = async () => {
+      throw new Error("pg down");
+    };
+    const f = await fixture([row("wf-1", { status: "SUCCESS" })], {
+      retention: { settings: makeInMemoryOrgSettingStore(), store, now: () => new Date(NOW) },
+    });
+
+    const result = await runSweepTick(f.deps);
+    expect(result.leaseHeld).toBe(true);
+    expect(result.retention).toBeUndefined();
+    expect(await f.lease.tryAcquire("next-owner", 120_000)).toBe(true);
+  });
+});
 
 describe("runSweepTick", () => {
   test("returns without scanning when the lease is not held", async () => {

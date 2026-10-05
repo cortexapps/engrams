@@ -484,3 +484,39 @@ re-created the double execution for the transition. A leader-election
 only; the queue flip is the same exactly-once primitive the version adopt
 already uses, load-spread by pull.
 
+
+## Amendment (2026-10-05): the retention collector
+
+**What was missing.** DBOS keeps every workflow's `workflow_status` row and
+its step outputs forever — the SDK has no garbage collection — and the
+engine's step ledger (`automation_step_run`) grew with it. Both tables are
+read only while a run is in flight (DBOS replays from its own records; the
+engine's step rows are a projection for the run page), so a finished run's
+records are dead weight after a while. The sweep scans
+`workflow_status` every minute; its cost grows with the table.
+
+**Decision.** (1) **Retention is an org policy, not a deployment knob.** An
+admin chooses it on Settings → Retention; it is stored as one JSON document
+in the new `org_setting` table (`key`, `value`, who changed it, when), read
+through `RetentionService` (get/set, both admin-only) and validated against
+a zod schema on every read, so an older stored shape still parses and an
+out-of-bounds value reads as the default. Today the policy is one number:
+**run detail days** (7–365, default 30). Session retention will join the
+same page and document. (2) **The sweep leader collects**, once per cycle
+after the scans, under the same lease: it deletes the step rows of runs
+whose `ended_at` is older than the cutoff (the run row — status, timing,
+trigger, bound session — stays), and deletes `workflow_status` rows created
+before the cutoff whose status is not PENDING/ENQUEUED/DELAYED and whose
+parent, if any, is not live either; the SDK schema cascades the step
+outputs, events, notifications and streams. Both prunes take **500 rows per
+cycle, oldest first**, so a tick stays bounded and a backlog drains over the
+following cycles. A failed prune logs at warn and never fails the sweep;
+the next cycle retries. (3) The seven-day floor matches the terminal-failure
+scan's lookback, so an alert's workflow row is still there when the operator
+reads it.
+
+**Not chosen.** A helm value — operators would set it once and the admin
+who owns the data would never see it. A hard cap on the table size — the
+admin's question is "how long do I keep run history", not "how many rows".
+Deleting the run rows themselves — the run list and the workstream history
+are product surfaces; only the per-step detail is retention-bound.

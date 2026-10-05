@@ -1075,6 +1075,19 @@ export const dbosVersionHeartbeats = pgTable(
 );
 
 /** Durable per-workflow sweep history and operator-control flags. */
+// ---------------------------------------------------------------------------
+// Org settings: one row per setting key, the value a JSON document the
+// owning module validates (db/org-settings.ts). Policies an admin chooses
+// on the Settings page — retention first.
+// ---------------------------------------------------------------------------
+
+export const orgSetting = pgTable("org_setting", {
+  key: text("key").primaryKey(),
+  value: jsonb("value").$type<unknown>().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedByUserId: text("updated_by_user_id"),
+});
+
 export const dbosSweepLedger = pgTable("dbos_sweep_ledger", {
   workflowUuid: text("workflow_uuid").primaryKey(),
   workflowName: text("workflow_name").notNull(),

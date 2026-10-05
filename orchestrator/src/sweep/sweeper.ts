@@ -8,6 +8,7 @@ import type {
 } from "../db/dbos-sweep.ts";
 import type { FailureScanResult, SweepAlerter } from "./alerts.ts";
 import { resolvePolicy, type ResolvedPolicy } from "./policy.ts";
+import { runRetentionTick, type RetentionDeps, type RetentionResult } from "./retention.ts";
 
 export const HEARTBEAT_INTERVAL_MS = 30_000;
 export const SWEEP_INTERVAL_MS = 60_000;
@@ -72,6 +73,9 @@ export interface SweepTickDeps {
    * once a pass reaches the end. The Sweeper class injects one automatically.
    */
   scanCursor?: { value: ScanCursor | undefined };
+  /** The retention collector's seams; absent = no pruning (tests, dev
+   * without a policy). Runs under the same lease, after the scans. */
+  retention?: Omit<RetentionDeps, "log" | "now"> & { now?: () => Date };
   log: Logger;
 }
 
@@ -101,6 +105,7 @@ export interface SweepTickResult {
   decisions: SweepDecision[];
   alerted?: number;
   failureScan?: FailureScanResult;
+  retention?: RetentionResult;
 }
 
 const MUTATING_ACTIONS = new Set<SweepDecision["action"]>([
@@ -461,6 +466,19 @@ export async function runSweepTick(
           { error },
           "DBOS terminal failure scan failed",
         );
+      }
+    }
+
+    // Contained like the alerts: a failed prune never fails the sweep.
+    if (deps.retention) {
+      try {
+        result.retention = await runRetentionTick({
+          ...deps.retention,
+          now: deps.retention.now ?? (() => new Date()),
+          log: deps.log,
+        });
+      } catch (error) {
+        deps.log.warn({ error }, "retention collector failed; next cycle retries");
       }
     }
 
