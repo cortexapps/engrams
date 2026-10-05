@@ -355,7 +355,10 @@ type MarkerGuardOutcome =
  * comments for the marker; found → short-circuit with the existing comment's
  * mapped outputs; else append the marker to the body param. Actions without
  * comment-shaped params (repo + number + body) just get the marker appended —
- * the pre-scan is a crash-window optimization, not a correctness gate. */
+ * the pre-scan is a crash-window optimization, not a correctness gate. That
+ * second shape is also how a pinned comment survives an EDIT: an update
+ * action carrying the same key marker rewrites the body with the marker
+ * re-appended, so the next run's scan still finds the comment. */
 async function commentMarkerGuard(
   runOp: RunIntegrationOp,
   config: IntegrationActionConfigInput,

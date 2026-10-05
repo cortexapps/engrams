@@ -343,13 +343,15 @@ describe("PR-review built-in on the interpreter", () => {
     // line pointing at it.
     expect(h.actions.map((a) => a.actionId)).toEqual([
       "upsert_issue_comment",
-      "update_issue_comment",
+      "update_pinned_comment",
       "post_pr_review",
-      "update_issue_comment",
+      "update_pinned_comment",
     ]);
     expect(h.actions[0]!.params).toMatchObject({ repo: "acme/repo", number: 17, key: "review-status" });
     expect(String(h.actions[0]!.params["body"])).toContain("reviewing");
-    expect(h.actions[1]!.params).toMatchObject({ commentId: 777 });
+    // Every edit of the pinned comment carries the key, so the marker survives.
+    expect(h.actions[1]!.params).toMatchObject({ commentId: 777, key: "review-status" });
+    expect(h.actions[3]!.params).toMatchObject({ commentId: 777, key: "review-status" });
     // The posted review's id lands on the pass (the dossier's link).
     expect(h.recorded).toEqual([{ reviewId: "review-1", githubReviewId: "9001" }]);
     expect(h.actions[2]!.params).toMatchObject({
@@ -376,10 +378,11 @@ describe("PR-review built-in on the interpreter", () => {
     expect(result.status).toBe("completed");
     expect(h.actions.map((a) => a.actionId)).toEqual([
       "upsert_issue_comment",
-      "update_issue_comment",
-      "update_issue_comment",
+      "update_pinned_comment",
+      "update_pinned_comment",
     ]);
     expect(String(h.actions[2]!.params["body"])).toContain("no findings");
+    expect(h.actions[2]!.params).toMatchObject({ key: "review-status" });
     expect(h.recorded).toEqual([]);
     expect(h.names).toContain("step:has_findings.status_clean:0");
     expect(h.names).not.toContain("step:has_findings.post:0");
@@ -491,7 +494,7 @@ describe("PR-review built-in on the interpreter", () => {
     expect(result.status).toBe("superseded");
     expect(h.prompts).toHaveLength(1);
     expect(h.cpCalls).not.toContain("decideReviewResults");
-    expect(h.actions.map((a) => a.actionId)).toEqual(["upsert_issue_comment", "update_issue_comment"]);
+    expect(h.actions.map((a) => a.actionId)).toEqual(["upsert_issue_comment", "update_pinned_comment"]);
     // No explicit end_session ran (the graph was cut short); finalize ended
     // the finder because the built-in creates workers with keep=false.
     expect(h.ended).toEqual(["s-finder"]);
@@ -517,7 +520,7 @@ describe("PR-review built-in on the interpreter", () => {
     const fail = h.cpCalls.find((c) => c.startsWith("failReview:"));
     expect(fail).toBeDefined();
     expect(fail).toMatch(/deadline/);
-    expect(h.actions.map((a) => a.actionId)).toEqual(["upsert_issue_comment", "update_issue_comment"]);
+    expect(h.actions.map((a) => a.actionId)).toEqual(["upsert_issue_comment", "update_pinned_comment"]);
     expect(h.names).toContain("step:__finalize__.report_failure:0");
     expect(h.names.at(-1)).toBe("step:__finalize__:0");
     // The hook is a step with its own ledger row, succeeded.

@@ -183,6 +183,37 @@ describe("executeIntegrationAction — http", () => {
     expect(later.calls).toHaveLength(1);
     expect(found).toEqual({ commentId: 51 });
 
+    // An EDIT of the pinned comment re-appends the marker (the plain update
+    // action would drop it, and the next run's scan would miss the comment).
+    const edit = fakeRunOp([json(200, { id: 51 })]);
+    await executeIntegrationAction(
+      {
+        provider: "github",
+        actionId: "update_pinned_comment",
+        params: { repo: "acme/repo", commentId: 51, key: "review-status", body: "no findings for def5678" },
+      },
+      { ...CTX, runId: "autorun:auto-1:main:i-2:github:d2" },
+      deps(edit.runOp),
+    );
+    expect(edit.calls).toHaveLength(1);
+    expect(edit.calls[0]!.req.method).toBe("PATCH");
+    const edited = JSON.parse(edit.calls[0]!.req.body as string) as { body: string };
+    expect(edited.body).toBe("no findings for def5678\n\n<!-- engrams-pinned:review-status -->");
+
+    // And a THIRD run scanning the body that edit left behind still finds it.
+    const third = fakeRunOp([json(200, [{ id: 51, body: edited.body }])]);
+    expect(
+      await executeIntegrationAction(
+        {
+          provider: "github",
+          actionId: "upsert_issue_comment",
+          params: { repo: "acme/repo", number: 5, key: "review-status", body: "reviewing 0123abc" },
+        },
+        { ...CTX, runId: "autorun:auto-1:main:i-3:github:d3" },
+        deps(third.runOp),
+      ),
+    ).toEqual({ commentId: 51 });
+
     // The key is part of an HTML comment and of the next scan: a token only.
     await expect(
       executeIntegrationAction(

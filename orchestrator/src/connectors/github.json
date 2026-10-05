@@ -2778,6 +2778,46 @@
       ]
     },
     {
+      "id": "update_pinned_comment",
+      "label": "Rewrite a pinned comment",
+      "description": "Edit a comment posted by upsert_issue_comment, keeping it findable: the key's marker is re-appended to the new body, so a later upsert_issue_comment with the same key still finds this comment.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "repo": {
+            "type": "string"
+          },
+          "commentId": {
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo",
+          "commentId",
+          "key",
+          "body"
+        ]
+      },
+      "execute": {
+        "kind": "http",
+        "method": "PATCH",
+        "pathTemplate": "/repos/{input.repo}/issues/comments/{input.commentId}",
+        "bodyTemplate": {
+          "body": "{input.body}"
+        }
+      },
+      "idempotency": {
+        "kind": "marker_comment",
+        "markerTemplate": "<!-- engrams-pinned:{input.key} -->"
+      }
+    },
+    {
       "id": "update_issue_comment",
       "label": "Update an issue comment",
       "description": "Edit an existing issue or pull request comment.",

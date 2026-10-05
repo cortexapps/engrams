@@ -241,6 +241,12 @@ function prompt(
 const HEAD_SHORT = "${{ steps.open.head_sha | truncate: 7, '' }}";
 /** The status line while a pass runs. */
 const REVIEWING_STATUS = `👀 engrams is reviewing ${HEAD_SHORT}.`;
+/** The pinned status comment's key: `upsert_issue_comment` finds the
+ * comment by it on every pass, and every edit goes through
+ * `update_pinned_comment` with the same key so the marker survives the
+ * rewrite (an edit through the plain update action would drop it, and the
+ * next pass would post a second comment). */
+const STATUS_KEY = "review-status";
 
 const blocks: BlockDef[] = [
   {
@@ -288,7 +294,7 @@ const blocks: BlockDef[] = [
       params: {
         repo: REPO,
         number: PR_NUMBER,
-        key: "review-status",
+        key: STATUS_KEY,
         body: REVIEWING_STATUS,
       },
     },
@@ -300,8 +306,13 @@ const blocks: BlockDef[] = [
     tunable: ["params"],
     config: {
       provider: "github",
-      actionId: "update_issue_comment",
-      params: { repo: REPO, commentId: { $ref: "steps.ack.commentId" }, body: REVIEWING_STATUS },
+      actionId: "update_pinned_comment",
+      params: {
+        repo: REPO,
+        commentId: { $ref: "steps.ack.commentId" },
+        key: STATUS_KEY,
+        body: REVIEWING_STATUS,
+      },
     },
   },
   workerSession("finder", "finder", FINDER_SYSTEM_PROMPT),
@@ -405,10 +416,11 @@ const blocks: BlockDef[] = [
         tunable: ["params"],
         config: {
           provider: "github",
-          actionId: "update_issue_comment",
+          actionId: "update_pinned_comment",
           params: {
             repo: REPO,
             commentId: { $ref: "steps.ack.commentId" },
+            key: STATUS_KEY,
             body: `✅ engrams reviewed ${HEAD_SHORT} — see the review below.`,
           },
         },
@@ -421,10 +433,11 @@ const blocks: BlockDef[] = [
         tunable: ["params"],
         config: {
           provider: "github",
-          actionId: "update_issue_comment",
+          actionId: "update_pinned_comment",
           params: {
             repo: REPO,
             commentId: { $ref: "steps.ack.commentId" },
+            key: STATUS_KEY,
             body: `✅ engrams reviewed ${HEAD_SHORT}: no findings.`,
           },
         },
