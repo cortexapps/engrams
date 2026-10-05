@@ -456,8 +456,6 @@ describe("DBOS sweep stores with live Postgres", () => {
     const db = getDb();
     await db.execute(sql`delete from "review"
                          where "task_id" like ${`${runId}-%`}`);
-    await db.execute(sql`delete from "slack_session"
-                         where "thread_wf_id" like ${`${runId}-%`}`);
     await db.execute(sql`delete from "task_session"
                          where "task_id" like ${`${runId}-%`}`);
     await db.execute(sql`delete from "task"
