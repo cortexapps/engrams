@@ -1572,7 +1572,7 @@ prod-shape bug-fix commits surfaced only on dev-vm verification.
 - **dev-vm SSH via `bash .claude/skills/dev-vm/scripts/ssh.sh`
   was intermittent today.** The `gcloud compute ssh` wrapper hits
   unreliable IAP tunnel hiccups. Falling back to the direct
-  `ssh engram-dev.us-west2-a.cortex-test-1608327238078 ...` alias
+  `ssh <vm>.<zone>.<project> ...` alias
   (populated by `gcloud compute config-ssh`) was consistently
   faster + more reliable. Captured in the new
   `[dev_vm_e2e_verification_workflow]` memory.

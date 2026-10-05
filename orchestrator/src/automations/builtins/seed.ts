@@ -3,9 +3,9 @@
  * The seed-profile pattern: idempotent, unique-violation tolerant across
  * replicas, fire-and-forget at boot after the default connections exist.
  *
- * A built-in is created DISABLED: the parallel-run window opens per repo or
- * channel through its inputs and the per-surface flags (4.4/4.6), never by
- * a deploy.
+ * A built-in is created ENABLED with empty inputs: enrolling a repo or
+ * picking a Slack profile is the one switch, and an empty map or profile
+ * admits nothing, so a deploy alone never starts a session.
  *
  * On a later boot the shipped definition may have changed. Structural
  * changes are ours alone (built-ins are structure-locked), so a content-hash
@@ -20,7 +20,6 @@
 import { createHash } from "node:crypto";
 
 import { makeAutomationStore, type AutomationRow, type AutomationStore } from "../../db/automations.ts";
-import { makeEnrollmentStore } from "../../db/enrollments.ts";
 import { makeIntegrationConnectionStore } from "../../db/integration-connections.ts";
 import { isUniqueViolation } from "../../db/pg-errors.ts";
 import { log as rootLog } from "../../log.ts";
@@ -48,11 +47,6 @@ export interface BuiltinSeedDeps {
   connections: {
     ensureDefault(provider: string, displayName: string): Promise<{ id: string }>;
   };
-  /** The review enrollment lift (first seed of pr_review only). Legacy table;
-   * deleted in phase 4.7 along with this seam. */
-  enrollments?: {
-    list(): Promise<Array<{ repo: string; triggerMode: string; autofix: string }>>;
-  };
   builtins?: BuiltinAutomation[];
   log?: { info(b: Record<string, unknown>, m: string): void; warn(b: Record<string, unknown>, m: string): void };
 }
@@ -70,6 +64,7 @@ export function definitionContentHash(definition: AutomationDefinition): string 
   const subject = {
     trigger: definition.trigger,
     blocks: definition.blocks,
+    entrypoints: definition.entrypoints ?? [],
     inputsSchema: definition.inputsSchema,
     settings: definition.settings,
   };
@@ -85,41 +80,33 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-/** Resolve seed-time placeholders (the default connection id). */
+/** Resolve seed-time placeholders (the default connection id) on the main
+ * trigger AND on every extra entrypoint's trigger. */
 async function materialize(
   builtin: BuiltinAutomation,
   deps: BuiltinSeedDeps,
 ): Promise<AutomationDefinition> {
   const definition = structuredClone(builtin.definition);
-  if (
-    definition.trigger.kind === "integration" &&
-    definition.trigger.connectionId === DEFAULT_CONNECTION_PLACEHOLDER
-  ) {
-    const provider = definition.trigger.provider;
-    const connection = await deps.connections.ensureDefault(
-      provider,
-      `${provider.charAt(0).toUpperCase()}${provider.slice(1)} (default)`,
-    );
-    definition.trigger.connectionId = connection.id;
+  const triggers = [definition.trigger, ...(definition.entrypoints ?? []).map((ep) => ep.trigger)];
+  // One default connection per provider, resolved once however many
+  // entrypoints share it.
+  const resolved = new Map<string, string>();
+  for (const trigger of triggers) {
+    if (trigger.kind === "integration" && trigger.connectionId === DEFAULT_CONNECTION_PLACEHOLDER) {
+      const provider = trigger.provider;
+      let id = resolved.get(provider);
+      if (id === undefined) {
+        const connection = await deps.connections.ensureDefault(
+          provider,
+          `${provider.charAt(0).toUpperCase()}${provider.slice(1)} (default)`,
+        );
+        id = connection.id;
+        resolved.set(provider, id);
+      }
+      trigger.connectionId = id;
+    }
   }
   return definition;
-}
-
-/** The review enrollment lift: each legacy review_enrollment row becomes an
- * entry in the `repos` map input. Only on first seed; the input is the
- * org's afterwards. */
-async function liftEnrollments(
-  deps: BuiltinSeedDeps,
-): Promise<Record<string, { mode: "auto" | "on_request"; autofix: boolean }>> {
-  if (!deps.enrollments) return {};
-  const repos: Record<string, { mode: "auto" | "on_request"; autofix: boolean }> = {};
-  for (const row of await deps.enrollments.list()) {
-    repos[row.repo] = {
-      mode: row.triggerMode === "auto" ? "auto" : "on_request",
-      autofix: row.autofix !== "off",
-    };
-  }
-  return repos;
 }
 
 /** Seed-time guard (ADR 0119 phase 4.3b): a legacy enrollment row (or a
@@ -172,16 +159,16 @@ async function seedOne(
 
   if (!existing) {
     const assembled = await builtin.defaultInputs();
-    if (builtin.key === PR_REVIEW_BUILTIN_KEY) {
-      assembled["repos"] = await liftEnrollments(deps);
-    }
     const inputs = sanitizeSeedInputs(definition.inputsSchema, assembled, logger, builtin.key);
     try {
       await deps.store.create(
         {
           name: builtin.name,
           description: builtin.description,
-          enabled: false,
+          // On from the first boot: a fresh deployment's built-ins answer as
+          // soon as a repo is enrolled or a Slack profile is picked, with no
+          // second switch to find. An empty map or profile admits nothing.
+          enabled: true,
           definition,
           nextFireAt: null,
           kind: "builtin",
@@ -196,7 +183,7 @@ async function seedOne(
       throw error;
     }
     result.created.push(builtin.key);
-    logger.info({ key: builtin.key, repos: Object.keys((inputs["repos"] as object) ?? {}).length }, "built-in automation seeded (disabled)");
+    logger.info({ key: builtin.key, repos: Object.keys((inputs["repos"] as object) ?? {}).length }, "built-in automation seeded");
     return;
   }
 
@@ -211,6 +198,7 @@ async function seedOne(
     engine: 1,
     trigger: current.trigger,
     blocks: current.blocks,
+    ...(current.entrypoints.length > 0 ? { entrypoints: current.entrypoints } : {}),
     inputsSchema: current.inputsSchema,
     settings: current.settings,
   };
@@ -299,6 +287,5 @@ export function productionBuiltinSeedDeps(): BuiltinSeedDeps {
   return {
     store: makeAutomationStore(),
     connections: makeIntegrationConnectionStore(),
-    enrollments: makeEnrollmentStore(),
   };
 }

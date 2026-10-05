@@ -45,6 +45,7 @@ import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
 import { registerPapercuts } from "./rpc/papercuts.ts";
+import { registerRetention } from "./rpc/retention.ts";
 import { registerPrRefs } from "./rpc/pr-refs.ts";
 import { registerReviews } from "./rpc/reviews.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
@@ -69,13 +70,7 @@ import type { ConnectRouter } from "@connectrpc/connect";
 // before DBOS.launch(). Imports below register the finite Slack-thread and
 // tool-execution workflows.
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
-import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
-import { setReviewControlPlane } from "./workflows/pr-review.ts";
-import { setReviewIngressControlPlane } from "./workflows/review-ingress.ts";
 import { startSpecTicketSyncWorkflow } from "./workflows/spec-ticket-sync.ts";
-import { makeSlackPolicy } from "./integrations/slack-policy.ts";
-import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
-import { makeReviewControlPlane } from "./workflows/review-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
 import {
   makeProductionAutomationScheduler,
@@ -91,7 +86,6 @@ import { resolveDraftingSpec, resolveSpecMembership } from "./authz/resolve.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
 import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts";
-import { makeEnrollmentStore } from "./db/enrollments.ts";
 import {
   PostgresSpecDocumentStore,
   proseMirrorDocument,
@@ -117,7 +111,6 @@ import { registerAutomationDraftTools } from "./tools/automation-draft.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
 import { loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
-import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
@@ -157,7 +150,6 @@ import { makeLinearIssueClient } from "./integrations/linear-issues.ts";
 import { SpecTicketSyncService } from "./specs/ticket-sync-service.ts";
 import { PostgresSpecTicketSyncStore } from "./specs/ticket-sync-store.ts";
 import { makeSpecTicketSyncConnector } from "./specs/ticket-sync-connector.ts";
-import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import {
   productionBuiltinSeedDeps,
   registerShippedBuiltins,
@@ -482,6 +474,9 @@ const server = buildServer(
     // Native PapercutService: orchestrator-owned friction inbox.
     registerPapercuts(router);
 
+    // Native RetentionService: the org's retention policy (Settings → Retention).
+    registerRetention(router);
+
     // Native PrRefService: durable task/session links to authored PRs (ADR 0100).
     registerPrRefs(router);
 
@@ -610,23 +605,6 @@ const server = buildServer(
   ],
 );
 
-// ADR 0060: inject the SlackThreadWorkflow's seams (the Slack provider
-// mechanics + the session-lifecycle control plane) before launching the engine,
-// so the first webhook-driven workflow has them. Then launch the embedded DBOS
-// engine before serving any traffic, so a webhook that arrives the instant we
-// bind can start a workflow.
-setThreadPolicy(makeSlackPolicy());
-setThreadControlPlane(makeThreadControlPlane());
-const reviewControlPlane = makeReviewControlPlane({
-  sessions: controlPlaneSessions,
-  profiles: makeProfileStore(getDb()),
-  enrollments: makeEnrollmentStore(getDb()),
-  renderReviewer,
-});
-setReviewControlPlane(reviewControlPlane);
-// Review ingress shares the same control plane: it resolves the change, then
-// starts the pass (ADR 0100 d11).
-setReviewIngressControlPlane(reviewControlPlane);
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
@@ -659,12 +637,9 @@ await Promise.all([
   ),
   integrationConnections.ensureDefault("engram", "Engrams tools"),
 ]);
-void seedReviewerProfile(makeProfileStore(getDb()), integrationConnections, log).catch((err) =>
-  log.error({ err }, "reviewer profile seed failed"),
-);
-// ADR 0119 D7: the shipped built-in automations (PR review). Seeded DISABLED;
-// the per-repo flag (4.4) opens the parallel window. Idempotent; a changed
-// shipped definition bumps the version and preserves org inputs/overrides.
+// ADR 0119 D7: the shipped built-in automations (PR review, Slack brain),
+// seeded enabled with empty inputs. Idempotent; a changed shipped definition
+// bumps the version and preserves org inputs/overrides.
 registerShippedBuiltins();
 void seedBuiltinAutomations(productionBuiltinSeedDeps()).catch((err) =>
   log.error({ err }, "built-in automation seed failed"),

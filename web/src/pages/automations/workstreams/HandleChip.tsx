@@ -1,11 +1,11 @@
 import { parseHandle } from "./handles";
 
-export function HandleChip({ handle }: { handle: string }) {
+export function HandleChip({ handle, label }: { handle: string; label?: string }) {
   const parsed = parseHandle(handle);
   const content = (
     <>
       <span className="font-mono text-2xs text-muted-foreground">{parsed.provider}</span>
-      <span>{parsed.label}</span>
+      <span>{label ?? parsed.label}</span>
       {parsed.href && <span aria-hidden>↗</span>}
     </>
   );

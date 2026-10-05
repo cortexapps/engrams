@@ -51,10 +51,14 @@ export function IntegrationsPanel() {
   };
 
   const shown = views.filter(match);
+  // A featured connector heads its section; the sort is stable, so the
+  // catalog's alphabetical order holds behind it.
+  const featuredFirst = (a: ConnectorView, b: ConnectorView) =>
+    Number(b.featured === true) - Number(a.featured === true);
   // needs_reconnect is a CONFIGURED connector whose refresh was terminally
   // rejected — it belongs with the connected group, flagged for action.
-  const connected = shown.filter((v) => v.status !== "available");
-  const available = shown.filter((v) => v.status === "available");
+  const connected = shown.filter((v) => v.status !== "available").sort(featuredFirst);
+  const available = shown.filter((v) => v.status === "available").sort(featuredFirst);
   const connectView = connect ? views.find((v) => v.provider === connect) : undefined;
 
   return (

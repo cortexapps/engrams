@@ -15,9 +15,15 @@
  * side-effect free, and the built-ins compute admission in a Code block —
  * without its `steps.<id>.value` every filter after it would report a false
  * "fail". Its row shows the value it produced, not its source.
+ *
+ * A filter whose conditions read the outputs of an EXECUTING block (a
+ * `resolve_user` gate, a `session_status` probe) cannot be decided here:
+ * its row carries no `filterPass` and the walk continues, so the blocks
+ * behind the gate still render. Reporting "fail" would hide the rest of the
+ * graph from the editor for a reason the sample cannot settle.
  */
 
-import { evaluateFilter, parseFilterGroup, ConditionParseError } from "./conditions.ts";
+import { ConditionParseError, type FilterCondition, type FilterGroup, evaluateFilter, parseFilterGroup } from "./conditions.ts";
 import { buildRunContext, type RunContext, type RunSnapshot } from "./context.ts";
 import type { AutomationDefinition, BlockDef } from "./definition.ts";
 import { entrypointOf, MAIN_ENTRYPOINT_ID } from "./definition.ts";
@@ -28,6 +34,8 @@ export interface PreviewBlockResult {
   blockId: string;
   blockType: string;
   rendered: Record<string, unknown>;
+  /** Absent on a filter whose conditions read an executing block's outputs
+   * (unknown in a preview): the walk continues past it undecided. */
   filterPass?: boolean;
   scope: Record<string, unknown>;
 }
@@ -55,6 +63,22 @@ export interface PreviewInput {
   entrypointId?: string;
   /** When present, `code` blocks are evaluated (see the module comment). */
   code?: CodeBlockRuntime;
+  /** Walk only the admission prelude (see `admissionPrelude`). Dispatch
+   * uses this to decide a delivery BEFORE the concurrency claim. */
+  preludeOnly?: boolean;
+}
+
+/** The admission prelude of a block list: its leading run of `code` and
+ * `filter` blocks. Pure and side-effect free, so it can be evaluated before
+ * a run exists; the interpreter re-walks it inside the run (same scope,
+ * same verdict). A built-in's "facts + admit" pair is the canonical case. */
+export function admissionPrelude(blocks: readonly BlockDef[]): BlockDef[] {
+  const prelude: BlockDef[] = [];
+  for (const block of blocks) {
+    if (block.type !== "code" && block.type !== "filter") break;
+    prelude.push(block);
+  }
+  return prelude;
 }
 
 /** Deps the preview needs: only `render` goes through the context, and the
@@ -72,6 +96,7 @@ function inertDeps(): EngineDeps {
       recordStep: unavailable,
       finalizeRun: unavailable,
       listRunSessions: unavailable,
+      latestKeptInstanceSession: unavailable,
       releaseConcurrency: unavailable,
       adoptSession: unavailable,
       getSessionBinding: unavailable,
@@ -165,6 +190,22 @@ export async function previewDefinition(input: PreviewInput): Promise<PreviewRes
     }
   };
 
+  /** Ids of blocks that would execute at run time and left no outputs. */
+  const executing = new Set<string>();
+  const readsExecutingOutput = (raw: unknown): boolean => {
+    let group: FilterGroup;
+    try {
+      group = parseFilterGroup(raw);
+    } catch {
+      return false;
+    }
+    const visit = (node: FilterCondition | FilterGroup): boolean =>
+      "conditions" in node
+        ? node.conditions.some(visit)
+        : node.path.startsWith("steps.") && executing.has(node.path.split(".")[1] ?? "");
+    return visit(group);
+  };
+
   const walk = async (list: BlockDef[]): Promise<boolean> => {
     for (const block of list) {
       ctx.currentBlockId = block.id;
@@ -216,6 +257,11 @@ export async function previewDefinition(input: PreviewInput): Promise<PreviewRes
         continue;
       }
       if (block.type === "filter") {
+        if (readsExecutingOutput(block.config["conditions"])) {
+          // Undecidable without running the block it reads; keep walking.
+          blocks.push(result);
+          continue;
+        }
         const pass = evaluate(block.id, block.config["conditions"]);
         result.filterPass = pass === true;
         blocks.push(result);
@@ -244,6 +290,7 @@ export async function previewDefinition(input: PreviewInput): Promise<PreviewRes
       // Executing blocks leave no outputs in a preview; the picker still shows
       // the block exists so downstream references are discoverable.
       ctx.steps[block.id] = ctx.steps[block.id] ?? {};
+      executing.add(block.id);
     }
     return true;
   };
@@ -257,7 +304,7 @@ export async function previewDefinition(input: PreviewInput): Promise<PreviewRes
       message: `entrypoint "${input.entrypointId}" is not in this definition`,
     });
   } else {
-    await walk(entrypoint.blocks);
+    await walk(input.preludeOnly ? admissionPrelude(entrypoint.blocks) : entrypoint.blocks);
   }
   ctx.currentBlockId = undefined;
   return { blocks, errors };

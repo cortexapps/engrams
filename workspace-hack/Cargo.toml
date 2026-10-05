@@ -23,11 +23,12 @@ aws-smithy-async = { version = "1", default-features = false, features = ["rt-to
 aws-smithy-http = { version = "0.64", default-features = false, features = ["event-stream"] }
 aws-smithy-runtime = { version = "1", default-features = false, features = ["client", "rt-tokio"] }
 aws-smithy-runtime-api = { version = "1", features = ["client", "http-02x", "http-auth", "test-util"] }
-aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-0-4-x", "http-body-1-x", "rt-tokio", "test-util"] }
+aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "rt-tokio", "test-util"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+crc32fast = { version = "1" }
 crossbeam-utils = { version = "0.8" }
 crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom"] }
 crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
@@ -82,7 +83,6 @@ rustls = { version = "0.23", default-features = false, features = ["logging", "r
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
-signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }

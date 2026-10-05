@@ -1,4 +1,5 @@
-/** The PR-review built-in automation (ADR 0119 D7, phase 4.3).
+/** The PR-review built-in automation (ADR 0119 D7; a workstream per pull
+ * request since 2026-09-14, ADR 0120, phase 4.3).
  *
  * The review pipeline ADR 0100 hand-wrote as a DBOS graph, expressed as
  * data on the automation engine. Structure is locked (built-ins are
@@ -7,10 +8,10 @@
  * the coarse per-org knobs (which repos, the mention handle, the lenses, the
  * reviewer profile, org instructions).
  *
- * Where product logic is not a generic primitive it stays in code as a
- * `system.*` block: opening the pass (targets, dedupe, the review row),
- * staging the reviewer briefs + prior context + candidates and composing the
- * phase prompts, the policy gate, and the supersede cleanup. Everything else
+ * Where product logic is not a generic primitive it is a first-party
+ * `review_*` catalog block: opening the pass (targets, dedupe, the review
+ * row), staging the reviewer briefs + prior context + candidates and
+ * composing the phase prompts, the policy gate, and the close-out. Everything else
  * — the session, the clone, the prompt delivery, the GitHub comments and
  * review post, the teardown — is a visible generic block.
  *
@@ -23,7 +24,7 @@
  * "command vs opened" or "repo short name" belongs in code, once.
  *
  * Terminal parity with the legacy graph rides `settings.onFinalize`
- * (ENGINE_STEP_CONTRACT 2) through system.review_finalize:
+ * (ENGINE_STEP_CONTRACT 2) through review_close_pass:
  *   - failed | deadline → the pass is marked failed, the activity log gets
  *     the run's error as the reason, and the sticky status comment flips to
  *     the legacy "failed" text (failReview);
@@ -39,7 +40,6 @@
 
 import { config } from "../../config.ts";
 import { normalizeMentionHandle } from "../../integrations/github-webhook.ts";
-import { PR_REVIEWER_DESIGNATION } from "../../reviewers/seed-profile.ts";
 import { REVIEW_CATEGORIES } from "../../reviewers/render.ts";
 import {
   FINDER_SYSTEM_PROMPT,
@@ -50,16 +50,22 @@ import { REVIEW_PHASE_SIGNALS } from "../../tools/review.ts";
 import type { AutomationDefinition, BlockDef } from "../engine/definition.ts";
 import type { BuiltinAutomation } from "../engine/builtins.ts";
 import {
-  OPEN_REVIEW_PASS_TYPE,
-  REVIEW_POLICY_GATE_TYPE,
+  REVIEW_CLOSE_PASS_TYPE,
+  REVIEW_OPEN_PASS_TYPE,
+  REVIEW_RECORD_POST_TYPE,
+  REVIEW_SETTLE_TYPE,
   REVIEW_STAGE_TYPE,
-} from "../engine/blocks/system/review.ts";
+} from "../engine/blocks/review.ts";
 
 export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 /** Bump on any graph or inputs-schema change (the seeder inserts a new
  * version when the stored content hash differs). */
-export const PR_REVIEW_DEFINITION_VERSION = 2;
+export const PR_REVIEW_DEFINITION_VERSION = 9;
+
+/** Synthetic event key the CI dispatch edge admits a run under (no GitHub
+ * delivery carries it). The admission arm accepts it for any mapped repo. */
+export const REVIEW_DISPATCH_EVENT_KEY = "review.dispatch";
 
 /** Placeholder the seeder replaces with the org's default GitHub connection. */
 export const DEFAULT_CONNECTION_PLACEHOLDER = "__default__";
@@ -80,6 +86,9 @@ export default ({ event, inputs, trigger }) => {
   const repoKey = fullName.toLowerCase();
   const entry = Object.entries(inputs.repos ?? {}).find(([k]) => k.toLowerCase() === repoKey)?.[1];
   if (!entry) return null;
+  // No reviewer profile picked yet (the Reviews page's one setup step):
+  // nothing can run, so the delivery is filtered rather than failed.
+  if (!inputs.profile) return null;
 
   const key = trigger.event ?? "";
   let mode = null;
@@ -95,6 +104,11 @@ export default ({ event, inputs, trigger }) => {
     const re = new RegExp("(^|\\\\s)" + handle + "(\\\\[bot\\\\])?\\\\s+review(\\\\s|$)", "im");
     if (!re.test(raw.comment?.body ?? "")) return null;
     mode = "command";
+  } else if (key === "review.dispatch") {
+    // An explicit dispatch (CI, an operator) is a request, like a comment
+    // command: it does not need mode "auto", and it carries no SHAs, so
+    // open_review_pass resolves the heads from GitHub.
+    mode = "dispatch";
   } else {
     return null;
   }
@@ -223,6 +237,17 @@ function prompt(
   };
 }
 
+/** The head, as a human reads a SHA. */
+const HEAD_SHORT = "${{ steps.open.head_sha | truncate: 7, '' }}";
+/** The status line while a pass runs. */
+const REVIEWING_STATUS = `👀 engrams is reviewing ${HEAD_SHORT}.`;
+/** The pinned status comment's key: `upsert_issue_comment` finds the
+ * comment by it on every pass, and every edit goes through
+ * `update_pinned_comment` with the same key so the marker survives the
+ * rewrite (an edit through the plain update action would drop it, and the
+ * next pass would post a second comment). */
+const STATUS_KEY = "review-status";
+
 const blocks: BlockDef[] = [
   {
     id: "facts",
@@ -243,7 +268,7 @@ const blocks: BlockDef[] = [
   },
   {
     id: "open",
-    type: OPEN_REVIEW_PASS_TYPE,
+    type: REVIEW_OPEN_PASS_TYPE,
     tunable: [],
     config: {
       provider: "github",
@@ -255,17 +280,38 @@ const blocks: BlockDef[] = [
       pr: { $ref: `${F}.pr_context` },
     },
   },
+  // ONE status comment per pull request, edited across passes: the pinned
+  // comment is found by its key on every later pass (the connector's
+  // marker scan), so a PR carries a single engrams status line that always
+  // names the latest head, not one new comment per push.
   {
     id: "ack",
     type: "integration_action",
     tunable: ["params"],
     config: {
       provider: "github",
-      actionId: "create_issue_comment",
+      actionId: "upsert_issue_comment",
       params: {
         repo: REPO,
         number: PR_NUMBER,
-        body: "👀 engrams is reviewing ${{ steps.open.head_sha | truncate: 7, '' }}.",
+        key: STATUS_KEY,
+        body: REVIEWING_STATUS,
+      },
+    },
+  },
+  // A found comment still says what the previous pass said: rewrite it.
+  {
+    id: "ack_refresh",
+    type: "integration_action",
+    tunable: ["params"],
+    config: {
+      provider: "github",
+      actionId: "update_pinned_comment",
+      params: {
+        repo: REPO,
+        commentId: { $ref: "steps.ack.commentId" },
+        key: STATUS_KEY,
+        body: REVIEWING_STATUS,
       },
     },
   },
@@ -305,40 +351,98 @@ const blocks: BlockDef[] = [
   },
   {
     id: "gate",
-    type: REVIEW_POLICY_GATE_TYPE,
+    type: REVIEW_SETTLE_TYPE,
     tunable: [],
     config: { reviewId: "${{ steps.open.review_id }}" },
   },
+  // A review object on the PR only when there is something to review: a
+  // pass with findings posts the GitHub review (inline comments + summary)
+  // and points the status line at it; a clean pass says so on the status
+  // line alone — an empty "No findings" review under every push was noise.
   {
-    id: "post",
-    type: "integration_action",
+    id: "has_findings",
+    type: "branch",
     tunable: [],
     config: {
-      provider: "github",
-      actionId: "post_pr_review",
-      params: {
-        repo: "${{ steps.gate.repo }}",
-        prNumber: { $ref: "steps.gate.pr_number" },
-        commitId: "${{ steps.gate.commit_id }}",
-        summary: "${{ steps.gate.summary_md }}",
-        comments: { $ref: "steps.gate.comments" },
+      conditions: {
+        mode: "any",
+        conditions: [
+          { path: "steps.gate.to_post_count", op: "gt", value: 0 },
+          { path: "steps.gate.ui_only_count", op: "gt", value: 0 },
+        ],
       },
     },
-  },
-  {
-    id: "status",
-    type: "integration_action",
-    tunable: ["params"],
-    config: {
-      provider: "github",
-      actionId: "update_issue_comment",
-      params: {
-        repo: REPO,
-        commentId: { $ref: "steps.ack.commentId" },
-        body:
-          "✅ engrams posted ${{ steps.gate.to_post_count }} finding(s) for ${{ steps.open.head_sha | truncate: 7, '' }}.",
+    then: [
+      {
+        id: "post",
+        type: "integration_action",
+        tunable: [],
+        config: {
+          provider: "github",
+          actionId: "post_pr_review",
+          params: {
+            repo: "${{ steps.gate.repo }}",
+            prNumber: { $ref: "steps.gate.pr_number" },
+            commitId: "${{ steps.gate.commit_id }}",
+            summary: "${{ steps.gate.summary_md }}",
+            // GitHub refuses the whole batch when one anchor is outside the
+            // diff (422); the action then posts this body instead, which
+            // re-quotes every finding so the PR still shows them.
+            fallbackSummary: "${{ steps.gate.fallback_summary_md }}",
+            comments: { $ref: "steps.gate.comments" },
+          },
+        },
       },
-    },
+      {
+        // The posted review's id onto the pass, so the dossier links to it.
+        // The settle step marked the pass posted before the post ran, so
+        // this is the one write left after the action.
+        id: "record_post",
+        type: REVIEW_RECORD_POST_TYPE,
+        tunable: [],
+        config: {
+          reviewId: { $ref: "steps.open.review_id" },
+          // Missing on a replayed post (marker already there): `default`
+          // makes the absent output render empty instead of failing.
+          githubReviewId: "${{ steps.post.github_review_id | default: '' }}",
+          // "false" when the action fell back to the summary-only review:
+          // the findings settle as ui_only and the pass summary follows.
+          inlinePosted: "${{ steps.post.inline_posted | default: true }}",
+        },
+      },
+      {
+        id: "status",
+        type: "integration_action",
+        tunable: ["params"],
+        config: {
+          provider: "github",
+          actionId: "update_pinned_comment",
+          params: {
+            repo: REPO,
+            commentId: { $ref: "steps.ack.commentId" },
+            key: STATUS_KEY,
+            body: `✅ engrams reviewed ${HEAD_SHORT} — see the review below.`,
+          },
+        },
+      },
+    ],
+    else: [
+      {
+        id: "status_clean",
+        type: "integration_action",
+        tunable: ["params"],
+        config: {
+          provider: "github",
+          actionId: "update_pinned_comment",
+          params: {
+            repo: REPO,
+            commentId: { $ref: "steps.ack.commentId" },
+            key: STATUS_KEY,
+            body: `✅ engrams reviewed ${HEAD_SHORT}: no findings.`,
+          },
+        },
+      },
+    ],
   },
 ];
 
@@ -357,6 +461,29 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
     scope: { fromInput: "repos" },
   },
   blocks,
+  // ADR 0120: a pull request is a WORKSTREAM. The main entrypoint's runs
+  // open it (or join it) by the key below; `pull_request.closed` ends it, so
+  // later events for that PR drop, audited, instead of opening review runs.
+  entrypoints: [
+    {
+      id: "closed",
+      trigger: {
+        kind: "integration",
+        provider: "github",
+        connectionId: DEFAULT_CONNECTION_PLACEHOLDER,
+        eventKeys: ["pull_request.closed"],
+        scope: { fromInput: "repos" },
+      },
+      blocks: [
+        {
+          id: "close",
+          type: "instance_close",
+          tunable: [],
+          config: { reason: "pull request closed" },
+        },
+      ],
+    },
+  ],
   inputsSchema: [
     {
       key: "repos",
@@ -374,8 +501,8 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
       key: "profile",
       label: "Reviewer profile",
       type: "string",
-      help: "The session profile the finder and verifier workers run under.",
-      default: PR_REVIEWER_DESIGNATION,
+      help: "The id of the session profile the finder and verifier workers run under. Empty = reviews are off.",
+      default: "",
     },
     {
       key: "mention",
@@ -402,12 +529,27 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
     },
   ],
   settings: {
+    instance: {
+      // One workstream per pull request: `owner/repo#number`, the same
+      // identity the GitHub facet declares as the handle every PR event
+      // carries. PR events name the PR; a review-command comment names the
+      // issue (GitHub's payload shape for a PR comment); the CI dispatch and
+      // a retry carry `pull_request.number`.
+      keyTemplate:
+        '${{ event.raw.repository.full_name }}#${{ event.raw | coalesce: "pull_request.number", "issue.number" }}',
+      // A close only ends a workstream that exists: a PR engrams never
+      // reviewed closing is a drop (audited), not an open-and-close.
+      entrypoints: { closed: { admit: "require" } },
+    },
     concurrency: {
       // Rendered at ADMISSION, before any block runs, so it reads the raw
       // event (not steps.*): the PR url for PR events, the issue url for a
       // review-command comment — both are the pull request's html_url.
-      keyTemplate:
-        "${{ event.raw.pull_request.html_url | default: event.raw.issue.html_url }}",
+      // (`coalesce`, not `default:` — default's fallback argument is strict,
+      // so the old template failed on every PR event, which has no `issue`.)
+      // Instance-scoped, so the supersede is per PR (which the url already
+      // was) and a close run supersedes a review still running on that PR.
+      keyTemplate: '${{ event.raw | coalesce: "pull_request.html_url", "issue.html_url" }}',
       policy: "supersede",
     },
     runDeadlineSeconds: 4 * PHASE_DEADLINE_S,
@@ -417,7 +559,7 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
         when: ["failed", "deadline"],
         block: {
           id: "report_failure",
-          type: "system.review_finalize",
+          type: REVIEW_CLOSE_PASS_TYPE,
           config: {
             reviewId: { $ref: "steps.open.review_id" },
             outcome: "failed",
@@ -429,7 +571,7 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
         when: ["halted"],
         block: {
           id: "report_halt",
-          type: "system.review_finalize",
+          type: REVIEW_CLOSE_PASS_TYPE,
           config: { reviewId: { $ref: "steps.open.review_id" }, outcome: "halted" },
         },
       },
@@ -437,7 +579,7 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
         when: ["superseded"],
         block: {
           id: "cleanup_superseded",
-          type: "system.review_finalize",
+          type: REVIEW_CLOSE_PASS_TYPE,
           config: { reviewId: { $ref: "steps.open.review_id" }, outcome: "superseded" },
         },
       },
@@ -465,7 +607,7 @@ export const PR_REVIEW_BUILTIN: BuiltinAutomation = {
   async defaultInputs() {
     return {
       repos: {},
-      profile: PR_REVIEWER_DESIGNATION,
+      profile: "",
       mention: defaultMentionHandle(),
       categories: [...REVIEW_CATEGORIES],
       instructions: "",

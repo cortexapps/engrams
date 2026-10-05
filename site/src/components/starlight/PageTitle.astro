@@ -3,6 +3,8 @@
 // the read time and the edit link. The docs home gets the hero variant instead:
 // an eyebrow, the title, and the description as a lede.
 // Starlight anchors the page title at #_top; the skip link and the TOC rely on it.
+import { VERSION_LABEL } from "../../version";
+
 const PAGE_TITLE_ID = "_top";
 
 const { entry, editUrl, sidebar } = Astro.locals.starlightRoute;
@@ -30,7 +32,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 {
   isHome ? (
     <div class="doc-hero">
-      <div class="doc-eyebrow"><span class="pulse"></span>Documentation · v0.x</div>
+      <div class="doc-eyebrow"><span class="pulse"></span>Documentation · {VERSION_LABEL}</div>
       <h1 id={PAGE_TITLE_ID}>{entry.data.title}</h1>
       {entry.data.description && <p class="doc-lede">{entry.data.description}</p>}
     </div>

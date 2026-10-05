@@ -19,7 +19,7 @@ import {
   settingsSchema,
   triggerSpecSchema,
 } from "./engine/definition.ts";
-import { getBlock, isSystemBlockType, listBlockTypes } from "./engine/blocks/registry.ts";
+import { getBlock, listBlockTypes } from "./engine/blocks/registry.ts";
 import { registerEngineBlocks } from "./engine/blocks/index.ts";
 import { loadEventSample } from "../connectors/samples.ts";
 import { loadRegistry, type CustomConnectorSource } from "../connectors/registry.ts";
@@ -44,7 +44,6 @@ function jsonSchemaOf(schema: z.ZodType): unknown {
 export function draftBlockCatalog(): Record<string, unknown> {
   registerEngineBlocks();
   const blocks = listBlockTypes()
-    .filter((type) => !isSystemBlockType(type))
     .map((type) => {
       const executor = getBlock(type)!;
       return {
@@ -69,7 +68,9 @@ export function draftBlockCatalog(): Record<string, unknown> {
       "Block ids are unique across ALL entrypoints; ids match ^[a-z][a-z0-9_]*$.",
       "branch children live in then/else; loop children in body; nothing else nests.",
       'Prose fields render Liquid with ${{ }}; structured values use {"$ref": "steps.<id>.<output>"}.',
+      'Missing variables are render errors. `x | default: y` tolerates a missing x but NOT a missing y (the argument is strict); to pick the first present of several paths use `${{ event.raw | coalesce: "pull_request.number", "issue.number" }}`.',
       "At most one cron trigger per automation; extra entrypoints take integration, cron, or manual triggers.",
+      'create_session.profileId takes a profile id. Profile ids differ per org, so a portable definition reads it from a string input (`${{ inputs.profile }}`) the org fills in; an empty value fails the block.',
     ],
   };
 }
@@ -85,7 +86,7 @@ export function draftPatterns(): Record<string, unknown> {
       "Runs are SHORT and stateless. Waits inside a run cap at 24h and stuck runs are swept at 48h - never design a run to live for a day.",
       "A workflow that spans days = multiple ENTRYPOINTS (one per way in: an integration event, a cron tick, a manual kick) sharing the automation's inputs, settings, and state. Each run enters through one entrypoint, does one step of the lifecycle, and exits.",
       "A TEMPLATED workflow (the same lifecycle per project/customer/case) declares settings.instance and becomes one automation with many WORKSTREAMS - see the instances section; never duplicate an automation per project.",
-      "Conversations (hours, every event carries the same key) are the ONE long-lived-run shape: concurrency policy join + trigger.continueOnly, like the Slack threads built-in.",
+      "Conversations (hours, every event carries the same key) are the ONE long-lived-run shape: a workstream per conversation (settings.instance keyed on the thread) whose opening event's run holds the conversation, plus a reply entrypoint with continueOnly + admit require that JOINS that run — like the Slack threads built-in.",
       "At most one cron trigger per automation.",
       "ONE template contract everywhere: every rendered string uses ${{ ... }} (Liquid) - session {template} refs included. Plain {{ ... }} NEVER renders (it flows through as a literal) and save refuses it; code block source is JS, not a template.",
     ],
@@ -101,6 +102,11 @@ export function draftPatterns(): Record<string, unknown> {
       "State inside an instance-bound run is automatically scoped to the workstream: write plain keys ('plan', 'tickets') and two projects never collide. Concurrency keys scope the same way.",
       "Close the lifecycle with the instance_close block (a run closes only its own workstream); later events for it are dropped and audited. Kicking off the same key again starts a FRESH workstream.",
       "RunNow on an instanced automation takes instance_key + instance_inputs_json to open or join a workstream; the automation row's inputs are only defaults for new workstreams.",
+    ],
+    reviews: [
+      "A code review that shows on the Reviews page is four blocks around ordinary sessions: review_open_pass (the pass row; outputs review_id, head_sha, base_sha) -> create_session + run_command clone + review_stage phase 'finder' (stages the reviewer brief into the session and outputs the prompt) -> send_prompt with waitFor a signal -> optionally the same for phase 'verifier' -> review_settle (outputs the github.post_pr_review params) -> integration_action github post_pr_review -> review_record_post (writes the posted review's id onto the pass so the Reviews page links to it).",
+      "Put review_close_pass in settings.onFinalize hooks (outcome failed on failed|deadline, halted on halted, superseded on superseded) so a crashed or superseded pass leaves the ledger and the PR's status comment consistent. Set concurrency keyTemplate to the PR url with policy supersede: a force-push then supersedes the running pass.",
+      "The PR review built-in is the worked example: Duplicate it for a variant (a security-only review on release branches, say) instead of composing from scratch.",
     ],
     state: [
       "automation_state is the shared memory across entrypoints and runs: state key = entity (one JSON document per entity, e.g. ticket:ENG-123), and make the automation's concurrency keyTemplate render the SAME entity key with policy queue - then runs touching one entity serialize and get-then-set needs no locks. For per-project workflows prefer settings.instance (see instances) - it scopes state per workstream automatically.",
@@ -120,6 +126,7 @@ export function draftPatterns(): Record<string, unknown> {
     ],
     pr_feedback_loop: [
       "Every session that opens a PR is auto-recorded in the pr_ref ledger. The lookup_pr_session block maps {repo, prNumber} to the authoring session - found:false is a value, so unrelated PRs just filter out.",
+      "lookup_instance_session finds the KEPT session an earlier run of the same workstream created (found:false = none, gone, or unbound). A conversation-shaped automation (one workstream per thread) uses it so a new run in the thread resumes the thread's session: branch on found → send_prompt with session {template: steps.<id>.session_id} adopts it; else create_session.",
       'So: an entrypoint on pull_request_review.submitted / pull_request_review_comment.created / issue_comment.created -> lookup_pr_session -> filter on found -> send_prompt with session {template: "${{ steps.<lookup>.session_id }}"} delivers the feedback to the implementer. Adoption handles the routing.',
     ],
     delegation: [

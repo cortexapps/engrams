@@ -1,108 +1,158 @@
 // Every word on the landing page, in one place. Links are docs-relative; the
 // page prefixes them with the deployment's base path.
 //
-// This copy came out of the design pass and is the placeholder the owner will
-// finalise; edit it here and nothing else has to change.
+// Each section connects an outcome to the product behavior that makes it possible.
 
 export const hero = {
-  eyebrow: "Software factory · Automation running",
-  title: "Automate your",
-  titleAccent: "SDLC.",
-  lede:
-    "engrams is a self-hosted software factory. It runs Claude Code and Codex in Firecracker microVMs on servers you own. A schedule, a Slack thread, a pull request, or a webhook starts a run. Every run keeps its transcript, its diff, and its snapshot, and a person is one message away.",
-  primary: { label: "Run it locally →", href: "getting-started/local-quickstart/" },
-  secondary: { label: "Deploy to your cloud", href: "guides/deploy-overview/" },
-  chips: ["AGPL-3.0", "Firecracker · KVM", "GKE · EKS", "Claude Code · Codex"],
-  graphTitle: "Automation · nightly-flaky-tests",
+  eyebrow: "Stand up a software factory of your own",
+  title: "The open source alternative to",
+  titleAccent: "Devin.",
+  lede: "engrams runs Claude Code, Codex, or your own agent in an isolated microVM on your infrastructure. Start one from a prompt, a schedule, a pull request, or a Slack thread. Walk away mid-task, and pick it up days later with its files and history intact.",
+  primary: { label: "Run it locally", href: "getting-started/local-quickstart/" },
+  // Site-relative, not docs-relative: the compare page sits beside the landing page.
+  secondary: { label: "Compare to Devin", href: "compare/" },
+  chips: ["Open source", "Firecracker · KVM", "GKE · EKS", "Claude Code · Codex"],
+  graphTitle: "Example workflow · fix failing tests",
 };
 
 export const modules = {
   badge: "Sec. 0",
-  label: "Mission parameters",
+  label: "Work on your terms",
   cards: [
     {
-      kicker: "Self-hosted",
-      num: "01",
-      title: "Your cloud.",
-      body: "One Terraform apply and two Helm releases bring it up on GKE or EKS. No transcript, workspace, or key leaves your account.",
-      foot: "GKE · EKS · GCS · S3",
+      title: "Run your whole stack.",
+      body: "Each agent gets its own microVM, so it can clone the repo, install dependencies, run the build, and start a dev server.",
     },
     {
-      kicker: "Any harness",
-      num: "02",
-      title: "Any agent.",
-      body: "A harness is a bundle the host mounts at boot, so your image never contains the agent, and you can register your own.",
-      foot: "Claude Code · Codex · BYO",
+      title: "Stay involved.",
+      body: "Delegate from Slack, inspect the changes, and reply in the thread to steer. You stay in the conversation while agents work in your cloud.",
     },
     {
-      kicker: "Any model",
-      num: "03",
-      title: "Your keys.",
-      body: "You bring an Anthropic or OpenAI key, or point a harness at OpenRouter. Build and Plan modes, effort levels.",
-      foot: "Anthropic · OpenAI · OpenRouter",
+      title: "Keep keys out.",
+      body: "Give an agent the API operations it needs. For brokered integrations, the proxy inserts the credential outside the VM and blocks requests the policy does not allow.",
     },
     {
-      kicker: "Idle = 0",
-      num: "04",
-      title: "Idle is free.",
-      body: "A paused session is chunks in the blob store and a row in Postgres. It holds no host resources until the next prompt.",
-      foot: "Deduplicated · Content-addressed",
+      title: "Pay for work, not idle VMs.",
+      body: "When a session goes idle, engrams snapshots it to object storage and frees the host for other work. The next prompt restores it on any host in seconds. Give every service its own agent without a VM running for each.",
     },
   ],
 };
 
-export const automations = {
+export const session = {
   badge: "Sec. 1",
-  label: "Automations",
-  meta: "Fig. 1.1 – 1.2",
-  title: "The routine work is the point.",
-  lede:
-    "An automation is one trigger, a tree of blocks, and typed inputs: start a session, send it a prompt, wait for it, run a command inside it, post to Slack or GitHub, branch, loop. Runs are durable, so a run survives a restart and can wait hours for a reply without holding anything open.",
+  label: "A session",
+  title: "Run any harness in a rich web interface.",
+  body: "A session is Claude Code, Codex, or your own harness, working the way it does on your laptop, but in a microVM your team can reach. The transcript streams on the left. On the right, open the same machine the agent is using: a terminal, the browser it drives, VS Code, the files it changed. People start sessions from the dashboard or Slack; an automation starts the same kind of session from a trigger.",
   screenshotAlt:
-    "The New automation page asks what the automation should do; a drafting agent assembles it on the canvas.",
-  channel: "CH 01 · Fig. 1.1",
-  caption:
-    "Describe it in a sentence · a drafting agent assembles the automation on the canvas · nothing runs until you enable it",
-  signal: "Signal ● Locked",
-  board: {
-    fig: "Fig. 1.2 · runs board",
-    title: "Every run is a step timeline.",
-    body: "Each step opens to its inputs, its outputs, its output text, and the session it used. Trace spans for every model call and tool call can go to Langfuse or any OpenTelemetry collector.",
-    items: [
+    "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane holds a shell open on the guest.",
+  caption: "The transcript, and a shell on the same VM",
+  panes: [
+    {
+      name: "Shell",
+      body: "A terminal on the guest, holding the same filesystem and the same processes the agent is working in.",
+    },
+    {
+      name: "Browser",
+      body: "The browser the agent drives, streamed over VNC. Watch it work through a page, or take the mouse.",
+    },
+    {
+      name: "IDE",
+      body: "VS Code on the workspace (code-server), with its own integrated terminal.",
+    },
+    {
+      name: "Files",
+      body: "Images and files the agent shares render in the transcript. Attach your own in a reply and they land in the guest.",
+    },
+  ],
+};
+
+export const slack = {
+  badge: "Sec. 2",
+  label: "In Slack",
+  title: "Delegate from the thread you're already in.",
+  body: "@mention the bot and a session opens for that thread, running as you, with your credentials. Reply to steer it, and your replies join the same run. When an automation has news, it posts to the channel and you answer right there: tell it a pull request is failing CI, and the same agent diagnoses the failure, pushes a fix, and reports back when the build is green.",
+  points: ["Starts from a mention", "Runs as whoever asked", "Replies join the run", "Agents report in"],
+  cta: { label: "Set up Slack threads", href: "platform/slack-threads/" },
+  // An illustrative thread. Names and numbers are examples, not a real workspace.
+  thread: {
+    channel: "#payments-eng",
+    messages: [
       {
-        title: "One run per thread",
-        body: "Mention the bot in Slack and a session opens for that thread, as the person who asked, with their credentials. Replies join the same run.",
+        who: "engrams",
+        bot: true,
+        time: "09:12",
+        body: "Nightly dependency upgrade: opened 3 pull requests. #4182 (stripe-node 17 → 18) is failing CI.",
+      },
+      { who: "maya", time: "09:20", body: "@engrams #4182 is failing on the webhook tests. Can you fix it?" },
+      {
+        who: "engrams",
+        bot: true,
+        time: "09:21",
+        body: "On it, in the same session that opened #4182.",
       },
       {
-        title: "Pull request review",
-        body: "A finder and a verifier review each pull request on the repositories you list, and post the confirmed findings as one GitHub review.",
+        who: "engrams",
+        bot: true,
+        time: "09:34",
+        body: "stripe-node 18 renamed the signature header type. Pushed a fix to #4182. CI is green.",
       },
     ],
-    footRight: "durable · survives restart",
   },
 };
 
+export const automations = {
+  badge: "Sec. 3",
+  label: "Automations",
+  title: "Hand off the work that repeats.",
+  lede: "A schedule, a pull request, a Slack mention, or a webhook can start a session, with no one typing a prompt. When one prompt is not enough, chain steps into a workflow: prompt the agent, run the tests, branch on the result, and post to Slack or GitHub.",
+  cases: {
+    label: "In production at Cortex",
+    items: [
+      {
+        trigger: "schedule",
+        title: "Dependency upgrades and CVE fixes",
+        body: "Scans for outdated dependencies and open CVEs, opens each upgrade, runs the tests, and fixes what breaks. One pull request per change, reviewed by the pull request bot.",
+      },
+      {
+        trigger: "schedule · Datadog",
+        title: "Memory hot spots",
+        body: "Queries Datadog profiles for the largest allocation frames, opens a task on the service that owns the code, and rewrites the hot path. The pull request carries the before and after numbers.",
+      },
+      {
+        trigger: "Datadog webhook",
+        title: "Bug triage",
+        body: "A new production error opens a run. The agent reproduces and diagnoses it, then pushes a fix or files an issue with the root cause. Duplicate errors join the run already in flight.",
+      },
+      {
+        trigger: "Linear · Slack",
+        title: "A project with an owner",
+        body: "One agent watches a Linear project and its Slack channel. It picks up issues, opens pull requests, answers questions in the thread, and posts a daily status.",
+      },
+    ],
+  },
+  cta: { label: "Explore automations", href: "platform/automations/" },
+};
+
 export const how = {
-  badge: "Sec. 2",
+  badge: "Sec. 4",
   label: "How it works",
-  meta: "Fig. 2.1 · chunk store",
-  title: "Enable once.",
-  titleAccent: "Restore forever.",
+  title: "Start in a second.",
+  titleAccent: "Pick up anywhere.",
   steps: [
     {
-      s: "S₀",
-      title: "Enable an image",
-      body: "Push any Linux image with `/bin/sh` to a registry and enable it once. engrams writes it as content-addressed chunks, boots it on the fleet, runs your warm-up command, and freezes a base snapshot.",
+      s: "01",
+      title: "Bring your image",
+      body: "Push any Linux image with `/bin/sh` and enable it once. engrams boots it, runs your warm-up command, and saves the result, so installs and caches are done before the first session.",
     },
     {
-      s: "S₁",
-      title: "Start a run",
-      body: "A person types a prompt, or a trigger fires. The host restores the snapshot into a fresh microVM, mounts the harness, and the agent starts with its caches already warm.",
+      s: "02",
+      title: "Start warm",
+      body: "A prompt or a trigger starts a session from that saved state in under a second, with dependencies installed and caches already warm.",
     },
     {
-      s: "Sₙ",
-      title: "Snapshot, resume, fork",
-      body: "When the agent goes idle the VM is snapshotted to chunks and destroyed. The next prompt restores it, on any host. Forking a session is a manifest copy of a few kilobytes.",
+      s: "03",
+      title: "Sleep, wake, fork",
+      body: "An idle session is saved to storage and its VM is released. The next prompt wakes it on any host in one to two seconds. Fork a session to try two approaches from the same point.",
     },
   ],
   legend: [
@@ -111,63 +161,44 @@ export const how = {
     { cls: "writing", label: "writing now" },
   ],
   leds: [
-    { k: "cold start", ghost: "888", v: "<1s" },
-    { k: "resume · same host", ghost: "88888", v: "<100ms" },
-    { k: "resume · any host", ghost: "8888", v: "1–2s" },
-    { k: "1000 × 4 GiB", ghost: "888888", v: "≈100GiB" },
+    // A no-break space keeps each dagger with the word before it.
+    { k: "cold start\u00a0†", v: "<1s" },
+    { k: "resume · same host\u00a0†", v: "<100ms" },
+    { k: "resume · any host\u00a0†", v: "1–2s" },
+    { k: "1000 paused sessions · 4 GiB each", v: "≈100GiB" },
   ],
   footnote:
-    "† Measured on the reference deployment: GKE, C3 nodes, Firecracker with lazy memory paging. Measure your own fleet before you promise them to anyone.",
-};
-
-export const session = {
-  badge: "Sec. 3",
-  label: "A session",
-  meta: "Fig. 3.1 · overlay",
-  title: "No internet. No image libraries.",
-  body: "A session, asked for a PNG of a pelican on a bicycle. It wrote a PNG encoder in Python and shared the file in the thread.",
-  screenshotAlt:
-    "A session in the engrams dashboard: the agent has drawn a pelican riding a bicycle and shared the PNG in the transcript; the right pane shows the session's profile, its changed files, and three published apps.",
-  caption: "Fig. 3.1 · session se_9f3ea71c · 212 events",
-  live: "● live",
-  callouts: [
-    "The transcript. Every message and tool call, streamed as it happens.",
-    "A shell tool call, with its exit code and output.",
-    "The instrument rail: image, harness, snapshot durability, checkpoints.",
-  ],
+    "† Measured on Cortex's deployment: GKE, C3 nodes, Firecracker with lazy memory paging.",
 };
 
 export const extensible = {
-  badge: "Sec. 4",
+  badge: "Sec. 5",
   label: "Extensible",
-  title: "Built to be extended.",
-  lede:
-    "Claude Code, Codex and the 23 connectors are what ships in the box. The box is open: register your own harness, add your own connector, and the factory treats them exactly like the built-ins.",
+  title: "Make it work with your stack.",
+  lede: "Connect an internal service or run another agent without building a separate control plane. Custom harnesses use the same session UI; custom connectors use the same credential broker and access policies as the built-ins.",
   cards: [
     {
       kicker: "Harnesses",
-      title: "Bring your own agent.",
-      body: "A harness is a bundle the host mounts at boot, so your image never contains the agent. Claude Code and Codex ship as harnesses; register yours and it gets the same models, modes and effort levels.",
+      title: "Change agents. Keep your setup.",
+      body: "Register an agent through the harness SDK and descriptor. It appears in the picker with its models, modes, and effort levels. The host mounts it at boot, separately from your image.",
       foot: "claude code · codex · yours",
       href: "guides/custom-harness/",
     },
     {
       kicker: "Connectors",
-      title: "Bring your own connector.",
-      body: "Credentials are held by engrams and brokered at the egress proxy, so an agent can call an API without ever holding the key. Define a connector for any service and it is brokered the same way.",
-      foot: "23 built in · unlimited custom",
+      title: "Connect the tools your work needs.",
+      body: "Define a service’s hosts, credential headers, and allowed operations. The proxy enforces those rules and inserts the key outside the VM. Profiles choose which connections each session can use.",
+      foot: "24 built in · unlimited custom",
       href: "concepts/egress-and-brokering/",
     },
   ],
 };
 
-export const belt = { label: "23 connectors built in · plus yours" };
 
 export const start = {
-  eyebrow: "A few minutes on one machine",
+  eyebrow: "Start with one task",
   title: "Start",
-  lede:
-    "The local quickstart runs the whole stack on one machine in a few minutes. The deployment guides take a fresh GCP project or AWS account to a running fleet.",
+  lede: "Run the stack locally and give an agent its first task. When you are ready for a shared deployment, follow the GCP or AWS guide to run engrams in your own cloud.",
   ctas: [
     { label: "Run it locally", href: "getting-started/local-quickstart/", primary: true },
     { label: "Deploy on GCP", href: "guides/deploy-gcp/", primary: false },

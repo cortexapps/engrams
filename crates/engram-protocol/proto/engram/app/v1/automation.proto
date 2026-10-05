@@ -31,6 +31,16 @@ service AutomationService {
   rpc UpdateAutomationMeta(UpdateAutomationMetaRequest) returns (UpdateAutomationMetaResponse);
   // Per-automation input values (allowed on built-ins).
   rpc SetInputs(SetInputsRequest) returns (SetInputsResponse);
+  // Set or remove ONE entry of a map input atomically (a JSONB patch, never
+  // a read-modify-write), optionally enabling the automation in the same
+  // write. The product surfaces (Reviews repositories, Slack channels)
+  // enroll through this so two admins never clobber each other's entry.
+  rpc SetMapInputEntry(SetMapInputEntryRequest) returns (SetMapInputEntryResponse);
+  // Set ONE non-map input atomically (a JSONB merge of that key, never a
+  // whole-blob replace from a client snapshot). A lone control on a product
+  // page writes through this; the all-inputs form, which holds the complete
+  // current state, keeps SetInputs.
+  rpc SetInputValue(SetInputValueRequest) returns (SetInputValueResponse);
   // Per-automation tunable block fields (allowed on built-ins). Every key
   // must be a `tunable` field of that block in the current version, and the
   // merged config must re-validate against the block's schema.
@@ -53,6 +63,9 @@ service AutomationService {
   rpc ListEventSamples(ListEventSamplesRequest) returns (ListEventSamplesResponse);
   // Picker values for a map input keyed by an integration noun.
   rpc ListInputKeyOptions(ListInputKeyOptionsRequest) returns (ListInputKeyOptionsResponse);
+  // Labels for keys already in hand (the channels of the threads a page
+  // shows): a lookup by id, never a walk of the provider's whole list.
+  rpc DescribeInputKeys(DescribeInputKeysRequest) returns (DescribeInputKeysResponse);
   // ADR 0119 D5: the connector-declared event and action catalogs.
   rpc ListEventCatalog(ListEventCatalogRequest) returns (ListEventCatalogResponse);
   rpc ListActionCatalog(ListActionCatalogRequest) returns (ListActionCatalogResponse);
@@ -272,6 +285,36 @@ message SetInputsResponse {
   Automation automation = 1;
 }
 
+message SetMapInputEntryRequest {
+  string automation_id = 1;
+  // The map input's key in the inputs schema.
+  string input_key = 2;
+  // The entry (e.g. a repo "owner/name", a Slack channel id).
+  string entry_key = 3;
+  // The entry's value, validated against the map's value shape. Absent =
+  // remove the entry.
+  optional string value_json = 4;
+  // Also enable the automation (its first enrollment turns it on).
+  bool enable = 5;
+}
+
+message SetMapInputEntryResponse {
+  Automation automation = 1;
+}
+
+message SetInputValueRequest {
+  string automation_id = 1;
+  // The input's key in the inputs schema (a string / number / boolean / enum
+  // / list / json field — not a map; maps use SetMapInputEntry).
+  string input_key = 2;
+  // The value, validated against that field's spec.
+  string value_json = 3;
+}
+
+message SetInputValueResponse {
+  Automation automation = 1;
+}
+
 message SetBlockOverridesRequest {
   string automation_id = 1;
   string overrides_json = 2;
@@ -403,6 +446,9 @@ message AutomationInstance {
   string opened_at = 7;
   optional string closed_at = 8;
   optional string close_reason = 9;
+  // The human title rendered at open (settings.instance.labelTemplate);
+  // absent = the UI shows the key.
+  optional string label = 10;
 }
 
 // One external identifier the workstream owns (routing history; handles
@@ -492,6 +538,19 @@ message InputKeyOption {
 }
 
 message ListInputKeyOptionsResponse {
+  repeated InputKeyOption options = 1;
+}
+
+message DescribeInputKeysRequest {
+  // "repository" | "channel" | "team"
+  string noun = 1;
+  repeated string keys = 2;
+  optional string connection_id = 3;
+}
+
+message DescribeInputKeysResponse {
+  // One per requested key, in request order; a key the provider does not
+  // know (or will not show) comes back labelled with itself.
   repeated InputKeyOption options = 1;
 }
 

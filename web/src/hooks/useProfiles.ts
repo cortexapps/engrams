@@ -21,7 +21,7 @@ export function useProfile(id: string | undefined) {
 /**
  * Invalidate profile reads after a mutation: every listProfiles variant
  * (archived + active) AND every getProfile(id) — otherwise an open editor keeps
- * a stale snapshot and can silently re-assert an out-of-date designation.
+ * a stale snapshot and can silently re-assert an out-of-date field.
  */
 function useInvalidateProfiles() {
   const qc = useQueryClient();

@@ -47,11 +47,26 @@ export function rangeMessage(value: number, min?: number, max?: number): string 
   return null;
 }
 
+/** A map whose rows are one scalar each (`valueShape: {type: "string"}` —
+ * the Slack threads built-in's channel → profile map), as the row's field
+ * spec; null for an object-shaped map. Same projection as the web's
+ * mapScalarField. */
+export function mapScalarField(spec: InputFieldSpec): ValueFieldSpec | null {
+  const shape = spec.valueShape;
+  const type = shape?.["type"];
+  if (type !== "string" && type !== "number" && type !== "boolean" && type !== "enum") return null;
+  const field: ValueFieldSpec = { key: "value", type };
+  if (Array.isArray(shape?.["values"])) {
+    field.values = (shape!["values"] as unknown[]).filter((v): v is string => typeof v === "string");
+  }
+  return field;
+}
+
 /** The object fields of a map value (from `valueShape`) — same projection as
  * the web's mapValueFields: only scalar-typed entries are modelled. */
 export function mapValueFields(spec: InputFieldSpec): ValueFieldSpec[] {
   const shape = spec.valueShape;
-  if (!shape) return [];
+  if (!shape || mapScalarField(spec) !== null) return [];
   const out: ValueFieldSpec[] = [];
   for (const [key, raw] of Object.entries(shape)) {
     if (!isRecord(raw)) continue;
@@ -210,6 +225,7 @@ export function validateInputValues(
           break;
         }
         const fields = mapValueFields(spec);
+        const scalar = mapScalarField(spec);
         for (const [rowKey, row] of Object.entries(value)) {
           if (!isValidMapKey(spec.keyNoun, rowKey)) {
             errors.push({
@@ -218,6 +234,10 @@ export function validateInputValues(
               code: "map_key",
               message: `not a valid ${mapKeyHint(spec.keyNoun)}`,
             });
+            continue;
+          }
+          if (scalar !== null) {
+            validateScalar(scalar, row, spec.key, rowKey, errors);
             continue;
           }
           if (!isRecord(row)) {

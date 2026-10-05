@@ -13,10 +13,6 @@ real docker bake, real registry):
   zero capture VMs; both rows share one `base_snapshot_id`, and a
   session created against the reused-snapshot tag boots and execs.
 
-![materializing](assets/0036/enable-materializing.png)
-![capturing](assets/0036/enable-capturing.png)
-![both tags enabled](assets/0036/enable-done-both-tags.png)
-
 Remaining prod watch (post-merge, non-blocking): first GHCR delta
 bake + async enable of dev-engrams through the job API.
 

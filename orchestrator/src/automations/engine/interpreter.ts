@@ -617,14 +617,14 @@ export async function interpretAutomation(
         installed !== null && installed.executor === executor ? installed.state : undefined;
       const name = stepName(frames, attempt);
       const outcome: BlockOutcome = await deps.step(async () => {
-        // A system block carries product side effects (review rows, Slack
-        // posts) that have no stub; a dry run refuses it loudly rather than
+        // A block that carries product side effects (review rows, Slack
+        // posts) has no stub; a dry run refuses it loudly rather than
         // half-running the product.
-        if (ctx.dryRun && executor.system) {
+        if (ctx.dryRun && executor.refusesDryRun) {
           const refused: BlockOutcome = {
             kind: "error",
             code: "dry_run_unsupported",
-            message: `system block "${block.type}" cannot run in a dry run`,
+            message: `block "${block.type}" has product side effects and cannot run in a dry run`,
             retryable: false,
           };
           await deps.store.recordStep(input.runId, path, attempt, {

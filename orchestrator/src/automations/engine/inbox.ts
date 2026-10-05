@@ -3,8 +3,7 @@
  * One topic; the DBOS workflow id (= the run id) addresses the mailbox. Every
  * send carries a NON-EMPTY idempotency key: DBOS's notifications table
  * conflicts on the message id alone, so one empty-string key would swallow
- * every later empty-key send system-wide (the ADR 0060 hazard, guarded the
- * same way as `defaultDbos` in workflows/dispatch-review.ts).
+ * every later empty-key send system-wide (the ADR 0060 hazard).
  */
 
 import { DBOS } from "@dbos-inc/dbos-sdk";

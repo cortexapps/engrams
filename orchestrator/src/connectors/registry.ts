@@ -148,6 +148,9 @@ export interface ConnectorDisplay {
   category: string;
   blurb: string;
   icon: ConnectorIcon;
+  /** Marketplace pin: featured connectors list first. Built-in seeds only;
+   * present only when true, so an unfeatured display block is unchanged. */
+  featured?: true;
 }
 
 /**
@@ -341,6 +344,39 @@ export interface UserCredentialFacet {
   inject?: { header: string; template: string };
 }
 
+/**
+ * The `settings` facet: administrator-set, NON-SECRET connector parameters.
+ *
+ * The only kind today is `host`: the value is a bare hostname the provider's
+ * API is reached on, picked from preset `options` (regional clouds) or typed
+ * freely when `custom` is declared (a self-hosted instance). A host setting's
+ * value joins the connector's *effective hosts* — the egress allow-list, the
+ * credential-inject targets, the test probe — and, when `env` names a
+ * variable, reaches the guest CLI as plain env. Values live on the provider's
+ * default connection (`config.settings`), never in the connector JSON, so one
+ * seed serves every deployment. A setting without a `default` must be set
+ * before the connector reads as connected.
+ */
+export interface ConnectorSettingOption {
+  value: string;
+  label: string;
+}
+export interface ConnectorSetting {
+  /** Identifier (`[a-z][a-z0-9_]*`); the key in the stored values map. */
+  name: string;
+  label: string;
+  kind: "host";
+  /** Preset choices. May be empty when `custom` is declared. */
+  options: ConnectorSettingOption[];
+  /** When present, a free-text value is accepted (validated per `kind`). */
+  custom?: { label: string; hint?: string };
+  /** Applies when the administrator has not set a value. */
+  default?: string;
+  /** Guest env var the resolved value is exported as (for the CLI facet). */
+  env?: string;
+  hint?: string;
+}
+
 export type WebhookVerificationScheme =
   | "github_hmac_sha256"
   | "slack_v0"
@@ -492,6 +528,9 @@ export interface Connector {
   oauth?: OauthFacet;
   /** ADR 0115: optional user-scoped credential support (PAT and/or OAuth). */
   userCredential?: UserCredentialFacet;
+  /** Administrator-set non-secret parameters (e.g. the API host). A connector
+   * with a `host` setting may declare `hosts: []`; see {@link effectiveHosts}. */
+  settings?: ConnectorSetting[];
   /** Optional inbound-webhook taxonomy + declarative curated alias mapping. */
   webhook?: WebhookFacet;
   /** ADR 0119 D5: outbound action catalog (built-in seed connectors only). */
@@ -647,6 +686,9 @@ export interface IntegrationGrantSelection {
    * `userSubjectId` (human principals); programmatic sessions compile the
    * org credential regardless. */
   userScoped?: boolean;
+  /** The connection's stored connector settings (`config.settings`), which
+   * decide the connector's effective hosts for this grant. */
+  settings?: Readonly<Record<string, string>>;
 }
 
 /** Whether a compiled policy carries anything worth shipping on CreateSession. */
@@ -748,6 +790,182 @@ function assertHost(where: string, h: string): void {
   }
 }
 
+/** An exact hostname: {@link assertHost} minus the leading-label wildcard. A
+ * setting's value names ONE host the credential is injected onto. */
+function assertExactHost(where: string, h: string): void {
+  assertHost(where, h);
+  if (h.includes("*")) fail(where, `host "${h}" must be an exact hostname (no wildcard)`);
+}
+
+// --- Settings facet (administrator-set, non-secret parameters) --------------
+const MAX_SETTINGS = 8;
+const MAX_SETTING_OPTIONS = 20;
+const MAX_SETTING_LABEL = 80;
+const MAX_SETTING_HINT = 300;
+const SETTING_NAME_RE = /^[a-z][a-z0-9_]*$/;
+
+function parseSettings(where: string, raw: unknown): ConnectorSetting[] {
+  if (!Array.isArray(raw)) fail(where, '"settings" must be an array');
+  if (raw.length === 0) fail(where, '"settings" must not be empty when present');
+  if (raw.length > MAX_SETTINGS) fail(where, `"settings" has ${raw.length} entries (max ${MAX_SETTINGS})`);
+  const seen = new Set<string>();
+  return raw.map((rawSetting, i): ConnectorSetting => {
+    const sw = `${where} settings[${i}]`;
+    if (typeof rawSetting !== "object" || rawSetting === null || Array.isArray(rawSetting)) {
+      fail(sw, "must be an object");
+    }
+    const o = rawSetting as Record<string, unknown>;
+    if (typeof o.name !== "string" || !SETTING_NAME_RE.test(o.name)) {
+      fail(sw, '"name" must be an identifier ([a-z][a-z0-9_]*)');
+    }
+    if (seen.has(o.name)) fail(sw, `duplicate setting name "${o.name}"`);
+    seen.add(o.name);
+    if (typeof o.label !== "string" || o.label.trim().length === 0 || o.label.length > MAX_SETTING_LABEL) {
+      fail(sw, `"label" must be 1..${MAX_SETTING_LABEL} characters`);
+    }
+    if (o.kind !== "host") fail(sw, `"kind" must be "host" (got ${JSON.stringify(o.kind)})`);
+    const options: ConnectorSettingOption[] = [];
+    if (o.options !== undefined) {
+      if (!Array.isArray(o.options)) fail(sw, '"options" must be an array');
+      if (o.options.length > MAX_SETTING_OPTIONS) {
+        fail(sw, `"options" has ${o.options.length} entries (max ${MAX_SETTING_OPTIONS})`);
+      }
+      for (const [j, rawOpt] of o.options.entries()) {
+        const ow = `${sw} options[${j}]`;
+        if (typeof rawOpt !== "object" || rawOpt === null) fail(ow, "must be an object");
+        const opt = rawOpt as Record<string, unknown>;
+        if (typeof opt.value !== "string") fail(ow, '"value" must be a string');
+        assertExactHost(ow, opt.value);
+        if (typeof opt.label !== "string" || opt.label.trim().length === 0 || opt.label.length > MAX_SETTING_LABEL) {
+          fail(ow, `"label" must be 1..${MAX_SETTING_LABEL} characters`);
+        }
+        if (options.some((existing) => existing.value === opt.value)) {
+          fail(ow, `duplicate option value "${opt.value}"`);
+        }
+        options.push({ value: opt.value, label: opt.label.trim() });
+      }
+    }
+    let custom: ConnectorSetting["custom"];
+    if (o.custom !== undefined) {
+      if (typeof o.custom !== "object" || o.custom === null) fail(sw, '"custom" must be an object');
+      const c = o.custom as Record<string, unknown>;
+      if (typeof c.label !== "string" || c.label.trim().length === 0 || c.label.length > MAX_SETTING_LABEL) {
+        fail(sw, `"custom.label" must be 1..${MAX_SETTING_LABEL} characters`);
+      }
+      if (c.hint !== undefined && (typeof c.hint !== "string" || c.hint.length > MAX_SETTING_HINT)) {
+        fail(sw, `"custom.hint" must be a string of at most ${MAX_SETTING_HINT} characters`);
+      }
+      custom = { label: c.label.trim(), ...(typeof c.hint === "string" ? { hint: c.hint } : {}) };
+    }
+    if (options.length === 0 && custom === undefined) {
+      fail(sw, 'a setting needs "options", "custom", or both');
+    }
+    const setting: ConnectorSetting = {
+      name: o.name,
+      label: o.label.trim(),
+      kind: "host",
+      options,
+      ...(custom ? { custom } : {}),
+    };
+    if (o.default !== undefined) {
+      if (typeof o.default !== "string") fail(sw, '"default" must be a string');
+      const problem = validateSettingValue(setting, o.default);
+      if (problem) fail(sw, `"default" ${problem}`);
+      setting.default = o.default;
+    }
+    if (o.env !== undefined) {
+      if (typeof o.env !== "string" || !ENV_NAME_RE.test(o.env)) fail(sw, '"env" is not a valid env var name');
+      setting.env = o.env;
+    }
+    if (o.hint !== undefined) {
+      if (typeof o.hint !== "string" || o.hint.length > MAX_SETTING_HINT) {
+        fail(sw, `"hint" must be a string of at most ${MAX_SETTING_HINT} characters`);
+      }
+      setting.hint = o.hint;
+    }
+    return setting;
+  });
+}
+
+/**
+ * Validate one stored/draft value against its setting. Returns the problem
+ * (a clause, e.g. `must be an exact hostname`) or `null` when acceptable. A
+ * `host` value must be an exact hostname; without `custom` it must also be
+ * one of the options.
+ */
+export function validateSettingValue(setting: ConnectorSetting, value: string): string | null {
+  if (value.length === 0) return "must not be empty";
+  if (setting.custom === undefined && !setting.options.some((o) => o.value === value)) {
+    return `must be one of ${setting.options.map((o) => o.value).join(", ")}`;
+  }
+  try {
+    assertExactHost("setting", value);
+  } catch (e) {
+    return (e as Error).message.replace(/^connector setting: /, "");
+  }
+  return null;
+}
+
+/**
+ * The connector's settings as they apply: a stored value that still
+ * validates wins, else the setting's default, else the setting is absent
+ * (unset — the connector is not connected until it is). Stored values are
+ * re-validated here because they were written against the connector as it
+ * was then; a later seed edit must not smuggle a stale host into the policy.
+ */
+export function resolveSettings(
+  connector: Connector,
+  stored: Readonly<Record<string, string>> | undefined,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const setting of connector.settings ?? []) {
+    const value = stored?.[setting.name];
+    if (typeof value === "string" && validateSettingValue(setting, value) === null) {
+      out[setting.name] = value;
+    } else if (setting.default !== undefined) {
+      out[setting.name] = setting.default;
+    }
+  }
+  return out;
+}
+
+/** True when every declared setting has a value (stored or default). */
+export function settingsComplete(connector: Connector, stored: Readonly<Record<string, string>> | undefined): boolean {
+  const resolved = resolveSettings(connector, stored);
+  return (connector.settings ?? []).every((setting) => resolved[setting.name] !== undefined);
+}
+
+/**
+ * The hosts a connector reaches once its settings apply: the static `hosts`
+ * plus every resolved `host` setting value (deduped, static first). This is
+ * the ONE derivation the egress allow-list, the inject targets, the test
+ * probe, and the catalog all read — a connector's reach is never
+ * `connector.hosts` alone once it declares a host setting.
+ */
+export function effectiveHosts(
+  connector: Connector,
+  settings: Readonly<Record<string, string>> = resolveSettings(connector, undefined),
+): string[] {
+  const hosts = [...connector.hosts];
+  for (const setting of connector.settings ?? []) {
+    if (setting.kind !== "host") continue;
+    const value = settings[setting.name];
+    if (value !== undefined && !hosts.includes(value)) hosts.push(value);
+  }
+  return hosts;
+}
+
+/** The stored settings on a connection row (`config.settings`), or none. */
+export function storedSettingsOf(config: Readonly<Record<string, unknown>> | undefined): Record<string, string> {
+  const raw = config?.settings;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "string") out[k] = v;
+  }
+  return out;
+}
+
 // --- Display identity (validated + defaulted from the provider id) ---------
 const MAX_DISPLAY_NAME = 120;
 const MAX_DISPLAY_CATEGORY = 60;
@@ -797,7 +1015,7 @@ function defaultDisplay(provider: string): ConnectorDisplay {
 
 /** Validate the optional `display` block, filling any missing field from the
  * provider id so the parsed connector always carries a complete identity. */
-function parseDisplay(where: string, raw: unknown, provider: string): ConnectorDisplay {
+function parseDisplay(where: string, raw: unknown, provider: string, builtin: boolean): ConnectorDisplay {
   const base = defaultDisplay(provider);
   if (raw === undefined) return base;
   if (typeof raw !== "object" || raw === null) fail(where, '"display" must be an object');
@@ -840,7 +1058,15 @@ function parseDisplay(where: string, raw: unknown, provider: string): ConnectorD
     }
     icon = next;
   }
-  return { name, category, blurb, icon };
+  let featured = false;
+  if (d.featured !== undefined) {
+    if (typeof d.featured !== "boolean") fail(where, '"display.featured" must be a boolean');
+    // A custom connector cannot pin itself above the seeds: the pin is an
+    // editorial decision the deployment ships, not one an upload can make.
+    if (d.featured && !builtin) fail(where, '"display.featured" is reserved for built-in connectors');
+    featured = d.featured;
+  }
+  return { name, category, blurb, icon, ...(featured ? { featured: true as const } : {}) };
 }
 
 /**
@@ -1750,7 +1976,15 @@ export function parseConnector(
     fail(where, `"credential.source" must be "inject" or "mint" (got ${JSON.stringify(cred.source)})`);
   }
 
-  const hosts = asStringArray(where, "hosts", o.hosts);
+  const settings = o.settings !== undefined ? parseSettings(where, o.settings) : undefined;
+  // A connector reached on an administrator-chosen host (a `host` setting) may
+  // declare no static hosts — its reach comes from {@link effectiveHosts}.
+  // Every other connector needs at least one.
+  const hostSetting = settings?.some((setting) => setting.kind === "host") === true;
+  const hosts =
+    hostSetting && Array.isArray(o.hosts) && o.hosts.length === 0
+      ? []
+      : asStringArray(where, "hosts", o.hosts);
   if (hosts.length > MAX_HOSTS) fail(where, `"hosts" has ${hosts.length} entries (max ${MAX_HOSTS})`);
   for (const h of hosts) assertHost(where, h);
   if (credential.source === "inject") {
@@ -1858,7 +2092,7 @@ export function parseConnector(
     return { grants, ...(match ? { match } : {}), ...(asset ? { asset } : {}) };
   });
 
-  const display = parseDisplay(where, o.display, o.provider);
+  const display = parseDisplay(where, o.display, o.provider, opts.builtin === true);
   const cli = o.cli !== undefined ? parseCli(where, o.cli) : undefined;
 
   let test: ConnectorTest | undefined;
@@ -2120,6 +2354,7 @@ export function parseConnector(
     ...(test ? { test } : {}),
     ...(oauth ? { oauth } : {}),
     ...(userCredential ? { userCredential } : {}),
+    ...(settings ? { settings } : {}),
     ...(webhook ? { webhook } : {}),
     ...(actions ? { actions } : {}),
   };
@@ -2273,9 +2508,13 @@ export function compileIntegrationPolicy(
   for (const grant of grants) {
     const connector = registry.get(grant.provider);
     if (!connector) continue;
+    // The connection's stored settings (e.g. the API host) decide the reach:
+    // a regional or self-hosted host is opened + injected onto, never a
+    // hard-coded default the deployment does not use.
+    const hosts = effectiveHosts(connector, resolveSettings(connector, grant.settings));
     for (const op of connector.operations) {
       if (!op.grants.includes(grant.operation)) continue;
-      for (const h of connector.hosts) grantedHosts.add(h);
+      for (const h of hosts) grantedHosts.add(h);
       // ADR 0059: a GraphQL op gates `POST <graphqlEndpoint>` and is body-matched
       // by (operation, field); a REST op gates by (method, path glob). The path
       // glob is emitted whole (the proxy globs `*` over the full request path —
@@ -2319,7 +2558,7 @@ export function compileIntegrationPolicy(
         // proxy's refresh rail keeps it fresh (ADR 0106 addendum).
         for (const inj of connector.credential.injects) {
           const entry: IntegrationInjectJson = {
-            hosts: inj.hosts ?? connector.hosts,
+            hosts: inj.hosts ?? hosts,
             header_name: inj.header,
             header_template: inj.template ?? "{}",
             secret_ref: userScoped ? "" : (inj.secretRef ?? ""),
@@ -2357,7 +2596,7 @@ export function compileIntegrationPolicy(
         // requires `userCredential.inject` on mint connectors).
         const userInject = userScoped ? connector.userCredential?.inject : undefined;
         const entry: IntegrationInjectJson = {
-          hosts: connector.hosts,
+          hosts,
           header_name: userInject?.header ?? "",
           header_template: userInject?.template ?? "",
           secret_ref: "",
@@ -2386,7 +2625,7 @@ export function compileIntegrationPolicy(
         const statusClass = a.success?.statusClass;
         const fetchableExternal = a.fetchable?.external;
         const entry: IntegrationObserveJson = {
-          hosts: connector.hosts,
+          hosts,
           methods,
           path_globs,
           provider: connector.provider,
@@ -2465,6 +2704,10 @@ export interface CliIntegrationPlan {
   dummyEnv: Record<string, string>;
   /** Stub config files agentd writes for the same purpose. */
   dummyFiles: CliDummyFile[];
+  /** Real (non-secret) configuration the connectors' `settings` export to the
+   * guest — e.g. `CORTEX_API_HOST=api.eu.cortex.io` — so a CLI reaches the
+   * same host the policy opened. Distinct from the placeholders above. */
+  settingsEnv: Record<string, string>;
   /** Enabled CLI providers, sorted by provider (the discovery-skill input). */
   enabled: EnabledCli[];
   /** Dynamic-mount bundle names this plan requires (the shared integrations CLI
@@ -2486,6 +2729,7 @@ export interface CliIntegrationPlan {
 export function compileCliIntegrations(
   capabilities: string[],
   registry: Map<string, Connector> = connectorRegistry(),
+  settingsByProvider: Readonly<Record<string, Readonly<Record<string, string>>>> = {},
 ): CliIntegrationPlan {
   const grantedProviders = new Set<string>();
   for (const capStr of capabilities) {
@@ -2499,6 +2743,7 @@ export function compileCliIntegrations(
   }
 
   const dummyEnv: Record<string, string> = {};
+  const settingsEnv: Record<string, string> = {};
   const dummyFiles: CliDummyFile[] = [];
   const enabled: EnabledCli[] = [];
   // Dedup'd mount bundles (a `dyn_*` slot each): the shared integrations bundle
@@ -2507,16 +2752,22 @@ export function compileCliIntegrations(
   const bundles = new Set<string>();
 
   for (const provider of [...grantedProviders].sort()) {
-    const cli = registry.get(provider)!.cli;
+    const connector = registry.get(provider)!;
+    const cli = connector.cli;
     if (!cli) continue;
-    enabled.push({ provider, displayName: registry.get(provider)!.display.name, bins: cli.bins, doc: cli.doc });
+    enabled.push({ provider, displayName: connector.display.name, bins: cli.bins, doc: cli.doc });
     bundles.add(INTEGRATIONS_CLI_BUNDLE);
     if (cli.binSource === "uploaded" && cli.bundle) bundles.add(cli.bundle);
     for (const [k, v] of Object.entries(cli.dummyEnv ?? {})) dummyEnv[k] = v;
     for (const f of cli.dummyFiles ?? []) dummyFiles.push(f);
+    const resolved = resolveSettings(connector, settingsByProvider[provider]);
+    for (const setting of connector.settings ?? []) {
+      const value = resolved[setting.name];
+      if (setting.env !== undefined && value !== undefined) settingsEnv[setting.env] = value;
+    }
   }
 
-  return { dummyEnv, dummyFiles, enabled, bundles: [...bundles] };
+  return { dummyEnv, settingsEnv, dummyFiles, enabled, bundles: [...bundles] };
 }
 
 // ---------------------------------------------------------------------------
@@ -2551,7 +2802,11 @@ export function connectorStatus(
   orgSecretNames: ReadonlySet<string>,
   requiredMintSecretNames: ReadonlyArray<string> = [],
   oauthStatus?: OauthCredentialStatus,
+  storedSettings?: Readonly<Record<string, string>>,
 ): ConnectorStatus {
+  // A setting without a default (e.g. a self-hosted API host) is part of the
+  // connection: until it is set there is no host to inject onto.
+  if (!settingsComplete(connector, storedSettings)) return "available";
   if (connector.oauth) {
     if (oauthStatus === undefined) return "available";
     return oauthStatus === "connected" ? "connected" : "needs_reconnect";
@@ -2620,6 +2875,7 @@ function accessOf(method: string | undefined): CatalogAccess {
 export function buildProviderCatalog(
   registry: Map<string, Connector>,
   providers: ReadonlyMap<string, ConnectionProvider>,
+  settingsByProvider: Readonly<Record<string, Readonly<Record<string, string>>>> = {},
 ): ProviderCatalogEntry[] {
   const entries: ProviderCatalogEntry[] = [];
   for (const connector of registry.values()) {
@@ -2646,7 +2902,7 @@ export function buildProviderCatalog(
       provider: connector.provider,
       display: connector.display,
       credentialSource: connector.credential.source,
-      hosts: connector.hosts,
+      hosts: effectiveHosts(connector, resolveSettings(connector, settingsByProvider[connector.provider])),
       capabilities: [...byAction.values()],
       connectionModel: "singleton",
       ...(connector.userCredential

@@ -51,6 +51,7 @@ function harness(blocks: BlockDef[], responses: IntegrationOpResult[]) {
       stepRecords.push({ framePath, attempt, record });
     },
     async finalizeRun() {},
+    async latestKeptInstanceSession() { return null; },
     async listRunSessions() {
       return [];
     },

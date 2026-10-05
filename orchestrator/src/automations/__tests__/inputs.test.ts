@@ -25,7 +25,7 @@ const REVIEW_INPUTS_SCHEMA_JSON = `[
       "autofix": { "type": "boolean", "label": "Autofix", "default": false }
     }
   },
-  { "key": "profile", "label": "Reviewer profile", "type": "string", "default": "pr_reviewer" },
+  { "key": "profile", "label": "Reviewer profile", "type": "string", "default": "" },
   { "key": "mention", "label": "Mention", "type": "string", "default": "@engrams" },
   {
     "key": "categories",
@@ -63,7 +63,7 @@ describe("validateInputValues — the review schema (shared fixture)", () => {
           "engrams/engrams": { mode: "auto", autofix: false },
           "cortex/brain-backend": { mode: "on_request", autofix: true },
         },
-        profile: "pr_reviewer",
+        profile: "",
         mention: "@engrams",
         categories: ["security", "docs"],
         instructions: "Be terse.\nPrefer small diffs.",
@@ -197,5 +197,34 @@ describe("validateInputValues — number bounds", () => {
     expect(validateInputValues(schema, { cap_only: 11 })).toEqual([
       { key: "cap_only", code: "range", message: "must be at most 10" },
     ]);
+  });
+});
+
+describe("validateInputValues — scalar-valued maps", () => {
+  // The Slack threads built-in's channels map: channel id → profile id.
+  const CHANNELS: InputFieldSpec = {
+    key: "channels",
+    label: "Channels",
+    type: "map",
+    keyNoun: "channel",
+    required: true,
+    default: {},
+    valueShape: { type: "string", label: "Profile id" },
+  };
+
+  test("a row IS the scalar: a string validates, an object or number does not", () => {
+    expect(validateInputValues([CHANNELS], { channels: { C0123456789: "prof-a" } })).toEqual([]);
+    expect(validateInputValues([CHANNELS], { channels: { C0123456789: { id: "prof-a" } } })).toMatchObject([
+      { key: "channels", path: "C0123456789" },
+    ]);
+    expect(validateInputValues([CHANNELS], { channels: { C0123456789: 7 } })).toMatchObject([
+      { key: "channels", path: "C0123456789" },
+    ]);
+  });
+
+  test("an enum-valued map checks the value against its list", () => {
+    const spec: InputFieldSpec = { ...CHANNELS, valueShape: { type: "enum", values: ["a", "b"] } };
+    expect(validateInputValues([spec], { channels: { C0123456789: "a" } })).toEqual([]);
+    expect(validateInputValues([spec], { channels: { C0123456789: "z" } })).toMatchObject([{ path: "C0123456789" }]);
   });
 });

@@ -37,6 +37,11 @@ service IntegrationService {
   // credential to test before sealing (inject: the single value under any key;
   // mint: the field map); empty tests the stored credential.
   rpc TestConnector(TestConnectorRequest) returns (TestConnectorResponse);
+  // Admin-only: store the values of a connector's declared `settings` (non-
+  // secret parameters such as the API host a regional or self-hosted provider
+  // is reached on). Values live on the provider's default connection and feed
+  // the connector's effective hosts, the test probe, and the CLI env.
+  rpc SetConnectorSettings(SetConnectorSettingsRequest) returns (SetConnectorSettingsResponse);
   // ADR 0109: configured credential instances. Existing providers expose an
   // ordinary default connection; the first provider with user-created named
   // connections is Google Cloud, whose config contains no private key.
@@ -126,6 +131,10 @@ message Connector {
   // inject connector, connected ⇔ its secretRef exists in the org store; for a
   // mint connector, connected ⇔ every required `<kind>.<field>` secret exists.
   string status = 6;
+  // Stored values of the connector's declared `settings` (setting name →
+  // value), read from the provider's default connection. Non-secret; a
+  // setting the administrator has not set is absent (its default applies).
+  map<string, string> settings = 7;
 }
 
 message ListConnectorsRequest {}
@@ -169,6 +178,8 @@ message ConnectorDisplay {
   string category = 2;
   string blurb = 3;
   ConnectorIcon icon = 4;
+  // True for a connector the marketplace lists first (built-in seeds only).
+  bool featured = 5;
 }
 
 // One grantable power, derived for display (the slug stays canonical).
@@ -258,9 +269,25 @@ message TestConnectorRequest {
   // stored one). inject: the single secret value under any key; mint: the
   // field map (e.g. app_id, private_key_pem).
   map<string, string> draft_values = 2;
+  // About-to-be-saved settings values (setting name → value) to probe with,
+  // e.g. the API host; a setting not present here uses the stored value, else
+  // the connector's default.
+  map<string, string> draft_settings = 3;
 }
 
 message TestConnectorResponse {
   bool ok = 1;
   string message = 2;
+}
+
+message SetConnectorSettingsRequest {
+  string provider = 1;
+  // Setting name → value. Every declared setting is validated against its
+  // facet (a `host` setting must be a bare hostname); an unknown name is
+  // rejected. Omitted settings are cleared back to their defaults.
+  map<string, string> settings = 2;
+}
+
+message SetConnectorSettingsResponse {
+  Connector connector = 1;
 }

@@ -138,7 +138,17 @@ if [ "${1:-}" = "--ensure" ]; then
     [ -x "$here/bin/flock" ] && FLOCK="$here/bin/flock"
     [ -z "$FLOCK" ] && command -v flock >/dev/null 2>&1 && FLOCK="$(command -v flock)"
     if [ -n "$FLOCK" ]; then
-        exec "$FLOCK" -w 60 "${BROWSER_PIDFILE}.lock" "$self" --ensure-locked
+        # -w 20, NOT 60: a waiter must never block past the caller's
+        # StartBrowser RPC budget. The holder's own bring-up is ~20s (the
+        # --ensure-locked x11vnc-ready loop below is 200 * 0.1s), so 20s lets a
+        # normal concurrent bring-up complete, then the waiter acquires and
+        # finds the stack already up. The old 60s ceiling outlived agentd's 30s
+        # StartBrowser deadline (and the agent's own unbounded
+        # `playwright-cli --ensure`), so a waiter could hang the caller well
+        # past the point it had already given up — the exact "timed out waiting
+        # for agentd" failure this pairs with agentd's own bounded --ensure
+        # wait (crates/engram-agentd/src/browser.rs).
+        exec "$FLOCK" -w 20 "${BROWSER_PIDFILE}.lock" "$self" --ensure-locked
     fi
     exec "$self" --ensure-locked
 fi

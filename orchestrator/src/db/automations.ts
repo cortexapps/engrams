@@ -222,6 +222,20 @@ export interface AutomationStore {
   ): Promise<AutomationRow | null>;
   updateMeta(id: string, patch: AutomationMetaPatch): Promise<AutomationRow | null>;
   setInputs(id: string, inputs: Record<string, unknown>): Promise<AutomationRow | null>;
+  /** Set (`value` an object) or remove (`value` null) one entry of a map
+   * input in place — a JSONB patch in one statement, so concurrent writers
+   * to different entries never lose each other's. `enable` turns the
+   * automation on in the same write. */
+  setMapInputEntry(
+    id: string,
+    inputKey: string,
+    entryKey: string,
+    value: Record<string, unknown> | string | null,
+    enable: boolean,
+  ): Promise<AutomationRow | null>;
+  /** Set one input key in place — a JSONB merge of that key alone, so a
+   * stale client snapshot of the other inputs never overwrites them. */
+  setInputValue(id: string, inputKey: string, value: unknown): Promise<AutomationRow | null>;
   setBlockOverrides(id: string, overrides: BlockOverrides): Promise<AutomationRow | null>;
   archive(id: string): Promise<AutomationRow | null>;
   setEnabled(
@@ -815,6 +829,38 @@ export function makeAutomationStore(
       const [row] = await db
         .update(automationTable)
         .set({ inputs, updatedAt: new Date() })
+        .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
+        .returning();
+      return row ? fullView(metaRow(row)) : null;
+    },
+
+    async setInputValue(id, inputKey, value) {
+      const [row] = await db
+        .update(automationTable)
+        .set({
+          inputs: sql`${automationTable.inputs} || jsonb_build_object(${inputKey}::text, ${JSON.stringify(value)}::jsonb)`,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
+        .returning();
+      return row ? fullView(metaRow(row)) : null;
+    },
+
+    async setMapInputEntry(id, inputKey, entryKey, value, enable) {
+      // `||` seeds a missing map first: jsonb_set creates only the LAST
+      // path element. Removal with `#-` is a no-op on an absent entry.
+      const patched =
+        value === null
+          ? sql`${automationTable.inputs} #- ARRAY[${inputKey}::text, ${entryKey}::text]`
+          : sql`jsonb_set(
+              ${automationTable.inputs} || jsonb_build_object(${inputKey}::text, coalesce(${automationTable.inputs}->${inputKey}::text, '{}'::jsonb)),
+              ARRAY[${inputKey}::text, ${entryKey}::text],
+              ${JSON.stringify(value)}::jsonb,
+              true
+            )`;
+      const [row] = await db
+        .update(automationTable)
+        .set({ inputs: patched, ...(enable ? { enabled: true } : {}), updatedAt: new Date() })
         .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
         .returning();
       return row ? fullView(metaRow(row)) : null;
@@ -1582,6 +1628,24 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         .from(automationSessionTable)
         .where(eq(automationSessionTable.runId, runId));
       return rows;
+    },
+
+    async latestKeptInstanceSession(instanceId, excludeRunId) {
+      if (instanceId === "") return null;
+      const [row] = await db
+        .select({ sessionId: automationSessionTable.sessionId, runId: automationSessionTable.runId })
+        .from(automationSessionTable)
+        .innerJoin(automationRunTable, eq(automationSessionTable.runId, automationRunTable.id))
+        .where(
+          and(
+            eq(automationRunTable.instanceId, instanceId),
+            ne(automationRunTable.id, excludeRunId),
+            eq(automationSessionTable.keep, true),
+          ),
+        )
+        .orderBy(desc(automationSessionTable.createdAt))
+        .limit(1);
+      return row ?? null;
     },
 
     getSessionBinding,

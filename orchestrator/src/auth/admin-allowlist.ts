@@ -18,7 +18,7 @@
  *
  *   - `databaseHooks.user.create.before`: a NEW user whose email matches the
  *     allowlist is created with role 'admin' directly. This covers every
- *     user-creation path — the IAP bridge's `createUser`, the OIDC callback,
+ *     user-creation path — the IAP bridge's `createUser`, the OAuth callback,
  *     and email/password sign-up.
  *
  *   - `databaseHooks.session.create.after`: when an EXISTING user signs in,

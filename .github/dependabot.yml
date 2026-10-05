@@ -312,6 +312,27 @@ updates:
     groups:
       web-minor-patch:
         update-types: ["minor", "patch"]
+        # react and react-dom are version-locked to the EXACT same minor —
+        # React 19.x throws "Incompatible React versions" at runtime unless
+        # `react` and `react-dom` are bit-for-bit identical. A lone bump of
+        # either half is unbuildable, the rand/rand_chacha shape again:
+        #   #1504 bumps react 19.2.8 -> 19.3.0 alone (react-dom stays 19.2.8)
+        #   #1502 bumps react-dom 19.2.8 -> 19.3.0 alone (react stays 19.2.8)
+        # Both PRs fail every vitest suite with
+        #   "Error: Incompatible React versions: The 'react' and 'react-dom'
+        #    packages must have the exact same version."
+        # There is no landing order that works — the two halves must move in
+        # one PR. The `react` group below owns the whole family at every
+        # update level; exclude it here so it does not split again.
+        exclude-patterns:
+          ["react", "react-dom", "@types/react", "@types/react-dom"]
+      # The React runtime is version-locked to itself (react + react-dom
+      # ship as one monorepo release and must be identical at runtime), so
+      # the pair is the smallest buildable review unit — the tonic/prost and
+      # rand/rand_chacha exception to "majors arrive individually".
+      react:
+        patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
+        update-types: ["major", "minor", "patch"]
 
   # The public docs + landing site (pnpm, Astro + Starlight) --------------
   - package-ecosystem: "npm"

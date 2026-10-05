@@ -20,7 +20,7 @@ describe("SpecBlockTranscriptChip", () => {
         status={{ type: "complete" }}
         addResult={() => {}}
         resume={() => {}}
-        respondToApproval={() => {}}
+        respondToApproval={async () => {}}
       />,
     );
 
@@ -46,7 +46,7 @@ describe("SpecBlockTranscriptChip", () => {
         status={{ type: "complete" }}
         addResult={() => {}}
         resume={() => {}}
-        respondToApproval={() => {}}
+        respondToApproval={async () => {}}
       />,
     );
 
@@ -66,7 +66,7 @@ describe("SpecBlockTranscriptChip", () => {
         status={{ type: "complete" }}
         addResult={() => {}}
         resume={() => {}}
-        respondToApproval={() => {}}
+        respondToApproval={async () => {}}
       />,
     );
 

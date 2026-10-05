@@ -68,6 +68,16 @@ export const uploadConnectorLogo = IntegrationService.method.uploadConnectorLogo
 export const testConnector = IntegrationService.method.testConnector;
 
 /**
+ * Admin-only: store the values of a connector's declared `settings` (non-
+ * secret parameters such as the API host a regional or self-hosted provider
+ * is reached on). Values live on the provider's default connection and feed
+ * the connector's effective hosts, the test probe, and the CLI env.
+ *
+ * @generated from rpc engram.app.v1.IntegrationService.SetConnectorSettings
+ */
+export const setConnectorSettings = IntegrationService.method.setConnectorSettings;
+
+/**
  * ADR 0109: configured credential instances. Existing providers expose an
  * ordinary default connection; the first provider with user-created named
  * connections is Google Cloud, whose config contains no private key.

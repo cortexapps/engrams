@@ -268,7 +268,6 @@ function makeFakeProfiles(opts?: {
     secrets: [],
     repos: [],
     apps: opts?.apps ?? [],
-    designation: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,
@@ -285,9 +284,6 @@ function makeFakeProfiles(opts?: {
       const r = rows.get(id);
       return r && !r.deletedAt ? r : null;
     },
-    async getByDesignation(designation) {
-      return [...rows.values()].find((r) => r.designation === designation && !r.deletedAt) ?? null;
-    },
     async getByIds(ids) {
       return ids.map((i) => rows.get(i)).filter(Boolean) as ProfileRow[];
     },
@@ -296,7 +292,6 @@ function makeFakeProfiles(opts?: {
       rows.set(r.id, r);
       return r;
     },
-    async setDesignation() {},
     async update() {
       return null;
     },
@@ -583,6 +578,7 @@ const fakeConnections: IntegrationConnectionStore = {
   delete: async () => { throw new Error("unused"); },
   markTested: async () => { throw new Error("unused"); },
   setEnabled: async () => { throw new Error("unused"); },
+  setConfig: async () => { throw new Error("unused"); },
   ensureDefault: async (provider) => (await fakeConnections.get(`default-${provider}`))!,
 };
 

@@ -44,6 +44,15 @@ export interface EngineRunStore {
   ): Promise<void>;
   /** Sessions the run created, with their keep flags (automation_session). */
   listRunSessions(runId: string): Promise<Array<{ sessionId: string; keep: boolean }>>;
+  /** ADR 0120 + D8: the newest KEPT session an earlier run of this
+   * workstream created (`automation_session` through `automation_run`),
+   * excluding the asking run — what a new run in the same workstream resumes
+   * (a Slack thread's session outlives the run that went quiet). Null when
+   * no earlier run kept one. */
+  latestKeptInstanceSession(
+    instanceId: string,
+    excludeRunId: string,
+  ): Promise<{ sessionId: string; runId: string } | null>;
   /** Release this run's concurrency claim; returns the promoted successor run
    * id when the policy is queue and a pending run waits, else null. The whole
    * release+promote is one transaction. */

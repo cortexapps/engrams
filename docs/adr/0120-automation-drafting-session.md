@@ -1,6 +1,16 @@
 # 0120 — The automation drafting session
 
-Status: 2026-08-25 — **Proposed.**
+Status: 2026-08-25 — **Accepted.** Shipped in #1379 (canvas) and #1381
+(backend + composer UI, carrying #1382); prod-verified the same day: a
+`DraftAutomation` call booted a drafting session that renamed its draft
+(`automation_set_meta`), read the event catalog, and proposed two validated
+versions (a correct `pull_request.labeled` → filter → create_session →
+wait_session graph) before parking for the human — the full D1–D5 loop.
+Three review findings hardened the contract en route: the version fence
+moved inside `saveVersion`'s FOR UPDATE (D3 as written was check-then-act);
+a failed session boot clears the binding before archiving so a replay can
+never adopt a dead draft (D5); and the editor adopts an arriving version
+that matches the screen, so a person's own save never false-banners.
 
 ## Context
 
@@ -178,5 +188,14 @@ label the entity by its rendered key; generic chrome says "workstream".
   handle's source of truth is the designed follow-up (push-only
   correlation is fragile — the Temporal-practitioner lesson).
 - No explicit rebind override yet (Devin's `!new` gesture) — follow-up.
-- `continueOnly` and slack-brain stay byte-identical; migrating the brain
-  onto instances is a later campaign.
+- (2026-09-14: the PR-review built-in IS instanced — one workstream per
+  `owner/repo#number`, closed by a `pull_request.closed` entrypoint; the
+  retry and CI-dispatch doors bind to the same workstream by the key
+  template. 2026-09-29: the Slack brain too — one workstream per thread,
+  keyed `team:channel:thread_ts`; the mention's run holds the conversation
+  as before, a `reply` entrypoint with `continueOnly` + admit `require`
+  joins it or drops, and the run's end closes the workstream. Replies
+  route by the KEY template, not by handles: the relay posts through the
+  Slack policy, not the `post_message` action, so no handle is written.
+  The catch-all suppression in dispatch (`SUPPRESSIBLE_CATCH_ALL`) stays
+  until the brain's run model is redesigned onto short runs.)

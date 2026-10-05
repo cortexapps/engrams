@@ -32,6 +32,7 @@ import { MintFieldKind } from "@/gen/engram/app/v1/mint_pb";
 import {
   useConnectors,
   useMintKinds,
+  useSetConnectorSettings,
   useSetMintCredential,
   useTestConnector,
 } from "@/hooks/useIntegrations";
@@ -40,6 +41,7 @@ import { humanizeAction, parseConnectorConfig } from "@/lib/connectorModel";
 import { ProviderTile } from "./ProviderTile";
 import { AccessTag, HostChip } from "./chips";
 import { SecretField } from "./SecretField";
+import { ConnectorSettingsFields, settingValue } from "./ConnectorSettingsFields";
 import { GithubSetupPanel } from "./GithubSetupPanel";
 import { OAuthConnectSheet } from "./OAuthConnectSheet";
 import type { ConnectorView } from "./useConnectorViews";
@@ -56,6 +58,7 @@ export function ConnectSheet({
   const conns = useConnectors();
   const mintKinds = useMintKinds();
   const setMint = useSetMintCredential();
+  const setSettings = useSetConnectorSettings();
   const putSecret = usePutOrgSecret();
   const test = useTestConnector();
 
@@ -68,6 +71,30 @@ export function ConnectSheet({
       )
     : undefined;
   const injects = cfg?.injects ?? [];
+  // The connector's `settings` facet (e.g. the API host). Drafts sit over the
+  // stored values, which sit over the connector's defaults.
+  const settings = cfg?.settings ?? [];
+  const [settingDrafts, setSettingDrafts] = useState<Record<string, string>>({});
+  const settingOf = (s: (typeof settings)[number]) =>
+    settingValue(s, settingDrafts, row?.settings).trim();
+  const settingValues = () => Object.fromEntries(settings.map((s) => [s.name, settingOf(s)]));
+  const settingsFilled = settings.every((s) => settingOf(s) !== "");
+  const hostSetting = settings.find((s) => s.kind === "host");
+  // The host the test will reach and the review lists: a host setting decides
+  // it; a static connector reads its first declared host.
+  const probeHost = hostSetting ? settingOf(hostSetting) : view.hosts[0];
+  const reviewHosts = hostSetting
+    ? [
+        ...new Set([
+          probeHost,
+          ...view.hosts.filter(
+            (h) =>
+              !hostSetting.options.some((o) => o.value === h) &&
+              h !== (row?.settings?.[hostSetting.name] ?? hostSetting.default),
+          ),
+        ]),
+      ].filter((h) => h !== "")
+    : view.hosts;
 
   const [step, setStep] = useState(0);
   const [values, setValues] = useState<Record<string, string>>({});
@@ -83,11 +110,12 @@ export function ConnectSheet({
     return <OAuthConnectSheet view={view} oauth={cfg.oauth} onClose={onClose} />;
   }
 
-  const filled = isMint
+  const credentialFilled = isMint
     ? (mintKind?.fields ?? []).filter((f) => f.required).every((f) => (values[f.name] ?? "").trim())
     : injects.length > 0 &&
       injects.every((i) => (injectSecrets[i.secretRef] ?? "").trim().length > 0);
-  const pending = setMint.isPending || putSecret.isPending;
+  const filled = credentialFilled && settingsFilled;
+  const pending = setMint.isPending || putSecret.isPending || setSettings.isPending;
 
   const runTest = async () => {
     setTestState("idle");
@@ -95,7 +123,11 @@ export function ConnectSheet({
     // test probes ALL the connector's headers (the orchestrator maps each by ref).
     const draftValues = isMint ? values : injectSecrets;
     try {
-      const r = await test.mutateAsync({ provider: view.provider, draftValues });
+      const r = await test.mutateAsync({
+        provider: view.provider,
+        draftValues,
+        draftSettings: settingValues(),
+      });
       setTestState(r.ok ? "ok" : "fail");
       setTestMessage(r.message);
     } catch (e) {
@@ -107,6 +139,10 @@ export function ConnectSheet({
   const finish = async () => {
     setError(null);
     try {
+      // Settings first: the credential is only useful on the host they select.
+      if (settings.length > 0) {
+        await setSettings.mutateAsync({ provider: view.provider, settings: settingValues() });
+      }
       if (isMint) {
         if (!mintKind) throw new Error("no mint kind for this provider");
         await setMint.mutateAsync({ provider: view.provider, kind: mintKind.kind, values });
@@ -184,6 +220,14 @@ export function ConnectSheet({
                 </div>
               </div>
 
+              {settings.length > 0 && (
+                <ConnectorSettingsFields
+                  settings={settings}
+                  valueOf={(s) => settingValue(s, settingDrafts, row?.settings)}
+                  onChange={(name, v) => setSettingDrafts((d) => ({ ...d, [name]: v }))}
+                />
+              )}
+
               {isMint
                 ? (mintKind?.fields ?? []).map((f) => (
                     <label key={f.name} className="flex flex-col gap-1.5">
@@ -248,8 +292,8 @@ export function ConnectSheet({
           {step === 1 && (
             <div className="flex flex-col gap-4">
               <p className="text-sm leading-relaxed text-muted-foreground">
-                We'll make one real request to <code className="font-mono">{view.hosts[0]}</code>{" "}
-                with the credential you entered — just an authenticated ping, no scopes exercised.
+                We'll make one real request to <code className="font-mono">{probeHost}</code> with
+                the credential you entered — just an authenticated ping, no scopes exercised.
               </p>
               <div className="flex justify-center py-1">
                 <Button onClick={runTest} disabled={test.isPending}>
@@ -306,7 +350,7 @@ export function ConnectSheet({
               <div className="flex flex-col gap-2">
                 <h3 className="text-sm font-semibold">Egress this can open</h3>
                 <div className="flex flex-wrap gap-1.5">
-                  {view.hosts.map((h) => (
+                  {reviewHosts.map((h) => (
                     <HostChip key={h} host={h} derived />
                   ))}
                 </div>

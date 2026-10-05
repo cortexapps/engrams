@@ -5,10 +5,14 @@ sidebar:
   order: 1
 ---
 
-engrams is a self-hosted orchestrator for AI coding agents. It runs each agent in its own
-Firecracker microVM, snapshots the VM when the agent goes idle, and restores it when the next
-prompt arrives. The pattern is the one behind hosted sandbox products; engrams is the version
-you run in your own cloud.
+engrams is an open-source system that runs AI coding agents in isolated microVMs on your own
+infrastructure. It gives people one place to direct their work: start a task, inspect its
+changes, and continue the conversation from the dashboard or Slack. Turn repeat work into an
+automation that starts on a schedule or an event.
+
+Each agent runs in its own Firecracker microVM. engrams supplies the environment, controls
+access to connected tools, and snapshots idle sessions so work can continue later. Claude
+Code and Codex ship as harnesses; custom harnesses use the same session controls.
 
 ## The objects
 
@@ -73,13 +77,13 @@ recoverable snapshot exists.
 
 ## What survives what
 
-| Event | Disk state | Memory state | Conversation log |
-|---|---|---|---|
-| Resume on the same host, chunks cached | preserved | preserved | preserved |
-| Resume on a different host | rebuilt from chunks | rebuilt from chunks | preserved |
-| Every host lost, blob store intact | preserved | preserved | preserved |
-| Blob store lost | gone | gone | preserved in Postgres |
-| Host crash before the first snapshot | gone | gone | up to the last persisted event |
+| Event                                  | Disk state          | Memory state        | Conversation log               |
+| -------------------------------------- | ------------------- | ------------------- | ------------------------------ |
+| Resume on the same host, chunks cached | preserved           | preserved           | preserved                      |
+| Resume on a different host             | rebuilt from chunks | rebuilt from chunks | preserved                      |
+| Every host lost, blob store intact     | preserved           | preserved           | preserved                      |
+| Blob store lost                        | gone                | gone                | preserved in Postgres          |
+| Host crash before the first snapshot   | gone                | gone                | up to the last persisted event |
 
 The conversation log lives in Postgres, so a session's history outlives its VM in every case.
 
@@ -101,10 +105,10 @@ The conversation log lives in Postgres, so a session's history outlives its VM i
 Production runs on Kubernetes with a dedicated node pool that has nested virtualization
 enabled. That is Intel-only on every managed provider today.
 
-| Cloud | Cluster | KVM nodes |
-|---|---|---|
-| Google Cloud | GKE Standard | C3 family (Sapphire Rapids) |
-| AWS | EKS | m8i (Granite Rapids), or `*.metal` |
+| Cloud        | Cluster      | KVM nodes                          |
+| ------------ | ------------ | ---------------------------------- |
+| Google Cloud | GKE Standard | C3 family (Sapphire Rapids)        |
+| AWS          | EKS          | m8i (Granite Rapids), or `*.metal` |
 
 For development, an Apple Silicon Mac runs sessions under Apple's Virtualization framework,
 and any Linux machine with `/dev/kvm` runs them under Firecracker.

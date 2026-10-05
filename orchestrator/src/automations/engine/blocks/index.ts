@@ -9,13 +9,14 @@ import { registerExecBlocks } from "./exec.ts";
 import { registerCodeBlock } from "./code.ts";
 import { registerStateBlocks } from "./state.ts";
 import { registerPrLookupBlock } from "./pr-lookup.ts";
+import { registerInstanceSessionLookupBlock } from "./instance-session.ts";
 import { registerInstanceCloseBlock } from "./instance-close.ts";
 import { registerClaimHandleBlock } from "./claim-handle.ts";
 import { registerIntegrationActionBlock } from "./integration-action.ts";
-import { registerReviewSystemBlocks } from "./system/review.ts";
-import { registerSlackRelayBlock } from "./system/slack-relay.ts";
-import { registerSlackRecapBlock } from "./system/slack-recap.ts";
-import { registerSlackIdentityBlock } from "./system/slack-identity.ts";
+import { registerReviewBlocks } from "./review.ts";
+import { registerSlackRelayBlock } from "./relay.ts";
+import { registerRelayCloseBlock } from "./relay-close.ts";
+import { registerResolveUserBlock } from "./resolve-user.ts";
 import { getBlock, listBlockTypes } from "./registry.ts";
 
 let registered = false;
@@ -30,14 +31,14 @@ export function registerEngineBlocks(): void {
   registerCodeBlock();
   registerStateBlocks();
   registerPrLookupBlock();
+  registerInstanceSessionLookupBlock();
   registerInstanceCloseBlock();
   registerClaimHandleBlock();
   registerIntegrationActionBlock();
-  // Built-in-only (ADR 0119 D7): the validator rejects these on user graphs.
-  registerReviewSystemBlocks();
+  registerReviewBlocks();
   registerSlackRelayBlock();
-  registerSlackRecapBlock();
-  registerSlackIdentityBlock();
+  registerRelayCloseBlock();
+  registerResolveUserBlock();
 }
 
 export const V1_BLOCK_TYPES = [
@@ -59,8 +60,17 @@ export const V1_BLOCK_TYPES = [
   "state_delete",
   "state_list",
   "lookup_pr_session",
+  "lookup_instance_session",
   "instance_close",
   "claim_handle",
+  "review_open_pass",
+  "review_stage",
+  "review_settle",
+  "review_close_pass",
+  "review_record_post",
+  "resolve_user",
+  "relay_session",
+  "relay_close",
 ] as const;
 
 /** Boot assertion (next to assertSweepPoliciesExhaustive): every v1 type is

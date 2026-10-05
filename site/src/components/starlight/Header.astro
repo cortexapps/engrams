@@ -1,11 +1,11 @@
 ---
 // The docs top bar: bottle-green, the wordmark in a cell as wide as the
-// sidebar, a breadcrumb, then search, the site links, and the theme toggle.
+// sidebar, a breadcrumb, then search and the site links.
 // Replaces Starlight's Header wholesale; the mobile menu button is rendered by
 // the page frame, not here.
 import Search from "@astrojs/starlight/components/Search.astro";
 import TraceMark from "../TraceMark.astro";
-import ThemeToggle from "../ThemeToggle.astro";
+import { VERSION_LABEL } from "../../version";
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 ---
@@ -14,7 +14,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, "");
   <div class="hd-left">
     <a class="hd-brand" href={`${base}/`}><TraceMark size={24} />engrams</a>
     <div class="hd-crumb">
-      <span class="dim">/</span><a href={`${base}/docs/`}>docs</a><span class="dim">/</span><span class="lime">v0.x</span>
+      <span class="dim">/</span><a href={`${base}/docs/`}>docs</a><span class="dim">/</span><span class="lime">{VERSION_LABEL}</span>
     </div>
   </div>
   <div class="hd-right">
@@ -24,6 +24,5 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, "");
       <a href={`${base}/`}>Home</a>
       <a href="https://github.com/cortexapps/engrams">GitHub</a>
     </nav>
-    <ThemeToggle class="sm" />
   </div>
 </div>

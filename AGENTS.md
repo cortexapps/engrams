@@ -145,41 +145,31 @@ bakes only the changed images. A CI-workflow or detector change re-runs everythi
 EVERY lane (Linux, macOS, firecracker, AND the e2e stack), and passes iff each lane
 succeeded-or-skipped. When you add a new lane, add it to the gate's `needs:` (and give it a
 detector flag) — **never add an individual lane as a required check**, or a path-skipped lane
-will wedge the merge queue. **Admin mass-merges skip combined-state validation** —
-each PR was green in isolation, not together (2026-07-16: two PRs adding the same
-workspace dep auto-merged into a duplicate TOML key, and a test PR + an
-invariant PR collided on a contract — main broke twice in one day). Land batches
-through the merge queue, or tight-burst them only after a combined local check.
+will wedge the merge queue. **Admin merges skip combined-state validation** —
+each PR was green in isolation, not together. Land batches through the merge queue,
+or merge them in a burst only after a combined local check.
 `.github/**` is outside `just check`: validate workflow YAML
 (`yaml.safe_load` / actionlint) and prefer `run: |` block scalars. Keep the `merge_group`
 trigger in the required workflow.
 
-## Multi-PR and multi-agent work
+## Releases
 
-One coordinating agent owns the Git graph for a multi-PR effort. Before implementation,
-it records a stack manifest with each issue, branch, base, dependency, migration number or
-`none`, shared file, and required focused gate.
+A release is the git tag `v<version>`, a GitHub release, and the tag `<version>` on the GHCR
+images. `.github/workflows/release.yml` makes all three, and it **builds nothing**: it gives
+the version tag to the builds that `bake-images.yml` already published for the release
+commit (`.github/scripts/release-plan.py` selects them and stops if the registry is behind
+that commit). A version tag never moves.
 
-- Use real stacked bases when several dependent PRs must stay clean at the same time. If
-  every PR targets `main`, keep only the next PR in merge order green. After it merges,
-  rebase its immediate successor. Do not rebase every descendant after every merge.
-- Reserve and record migration numbers before parallel work starts. The coordinating agent
-  verifies the migration chain and is the only agent that changes stack bases or migration
-  order.
-- Before a force-push, verify the latest base SHA, the remote branch lease, and queued
-  predecessor merges. A force-push can dismiss approvals and remove a merge-queue entry;
-  report both effects after the push.
-- Use one implementation session per issue. Reuse that session for review fixes. Do not
-  create separate review, rereview, and final-review sessions when the Engrams review is
-  already active.
-- Treat only the current PR head as live. Ignore superseded CI and stale review findings.
-  Create a fix task only for a valid current-head finding.
-- An implementation session finishes after it opens the PR and its focused local gates
-  pass. One coordinating monitor owns current-head CI, Engrams review, and merge-order
-  updates for the complete stack.
-- Require a concise progress update from a child session at least every 15 minutes. If it
-  has no useful event for 30 minutes, interrupt it and inspect the blocker before retrying
-  or replacing it.
+1. Merge a PR that runs `scripts/release-version.sh set <version>`. The version lives in
+   both charts (`version` and `appVersion`) and in the CLI; the script is the only way to
+   change it. The chart `appVersion` is the default image tag and the version the site shows.
+2. Wait for the `Bake container images` run of that merge.
+3. Start the `Release` workflow on `main` with the same version. `dry_run` prints the plan
+   and publishes nothing.
+
+Only members of the organization can release: the workflow's `authorize` job refuses any
+other person, and the `release` environment holds the settings-side controls. Do not add a
+second way to publish a version tag (a tag-push trigger, a version tag in `bake-images.yml`).
 
 ## Conventions
 
@@ -188,6 +178,12 @@ it records a stack manifest with each issue, branch, base, dependency, migration
   written artifacts (ADRs, commit messages, PR descriptions), code comments, and messages
   with the user. The product ships the same rule to every session
   (`WRITING_STYLE_SYSTEM_PROMPT` in `orchestrator/src/prompts/base.ts`).
+- **This is a public repository: no internal references, anywhere.** Never put a person's
+  name, a Slack channel name or id, a workspace, a deployment's session/run/instance id,
+  an internal hostname, or a private ticket into code, comments, tests, fixtures, docs,
+  ADRs, commit messages, or PR text. Describe the case generically ("a private channel the
+  app is in", "the first resumed thread in production") and invent neutral fixture names
+  (`#ops-private`, `U1`, `s-old`). What a deployment is called belongs in the deploy repo.
 
 **Commits & ADRs**
 - One logical change per commit; don't bundle unrelated changes.

@@ -1,6 +1,27 @@
 # 0100 — PR code review: engrams as a code reviewer on GitHub pull requests
 
-Status: Proposed (2026-07-15)
+Status: Proposed (2026-07-15); superseded in its engine by ADR 0119
+(Accepted 2026-10-05). **Amended 2026-10-05 (status line):** a pull request
+carries ONE engrams status comment, pinned by key (`upsert_issue_comment`,
+a marker the connector scans for) and rewritten on every pass, and a
+GitHub review object is posted only when a pass has findings; a clean pass
+says so on the status line alone. **Amended 2026-10-05 (phase 4.7b):** the
+`review_enrollment` table is gone (migration 0091); which repositories are
+reviewed, and how each triggers, is the built-in's `repos` input, edited on
+the Repositories page through `SetMapInputEntry`. **Amended 2026-10-01 (ADR
+0119 phase 4.7):**
+`PrReviewWorkflow` and `ReviewIngressWorkflow` are deleted. The review now
+runs as the seeded PR-review built-in automation on the ADR 0119 block
+engine (`orchestrator/src/automations/builtins/pr-review.ts`): the GitHub
+delivery reaches it through the integration-event spine, the review blocks
+(`review_open_pass`, `review_stage`, `review_settle`, `review_record_post`,
+`review_close_pass`) wrap the same control plane (`reviews/control-plane.ts`),
+and the generic `github.post_pr_review` action posts. The review ledger,
+the Reviews page, the review tools (ADR 0089), and the policy gate are
+unchanged. The seeded reviewer profile and its `designation: "pr_reviewer"`
+marker (decision 2 below) are retired too: the Reviews page picks any
+profile as the reviewer, into the built-in's `profile` input. The diagram
+and the DBOS version notes that follow describe the retired workflow.
 
 engrams reviews pull requests in enrolled repos. A review runs as one or more
 sandboxed sessions that investigate the change with real tools (clone, grep,

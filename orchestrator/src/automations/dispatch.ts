@@ -9,8 +9,11 @@
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
-import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
+import { makeCodeBlockRuntime } from "./code/runtime.ts";
+import { resolveAutomationInputs } from "../db/automations.ts";
+import { evaluateAdmissionPrelude, type AdmissionVerdict } from "./engine/admission.ts";
+import type { CodeBlockRuntime } from "./engine/deps.ts";
 
 import {
   makeAutomationStore,
@@ -82,6 +85,9 @@ export interface DispatchWebhookResult {
   joined: number;
   queued: number;
   skipped: number;
+  /** The admission prelude rejected the delivery (a filtered run row, no
+   * claim, no workflow). */
+  filtered: number;
   /** ADR 0120: instance-admission drops (no run row; audited in the ring). */
   dropped: number;
 }
@@ -119,13 +125,27 @@ export interface AdmitRunInput {
   /** ADR 0120: the bound workstream ('' = unbound). Stamped on the run row
    * and prefixed onto the concurrency key, so claims isolate per instance. */
   instanceId?: string;
+  /** The workstream's input snapshot (layered over the automation's inputs
+   * the way loadSnapshot does), so the admission prelude reads the inputs
+   * the run will see. */
+  instanceInputs?: Record<string, unknown>;
+  /** The admission-prelude verdict dispatch already took for this delivery
+   * (before opening its workstream). Absent = evaluate it here. */
+  admission?: AdmissionVerdict;
   trigger: AutomationRunTrigger;
   scheduledFor: Date | null;
   /** Editor DryRun: the run row is flagged and integration actions stub. */
   dryRun?: boolean;
 }
 
-export type AdmitOutcome = "started" | "joined" | "queued" | "skipped";
+/** `filtered` = the admission prelude rejected the delivery before any
+ * claim: a run row records it, no workflow starts. */
+export type AdmitOutcome = "started" | "joined" | "queued" | "skipped" | "filtered";
+
+let sharedCodeRuntime: CodeBlockRuntime | undefined;
+function codeRuntime(): CodeBlockRuntime {
+  return (sharedCodeRuntime ??= makeCodeBlockRuntime());
+}
 
 /** The concurrency key renders from trigger/event/inputs only — no steps
  * exist before admission. Shared by webhook/integration dispatch and the cron
@@ -167,7 +187,7 @@ export async function admitClaimedCronRun(
     sender: AutomationSender;
     now: () => Date;
   },
-): Promise<AdmitOutcome> {
+): Promise<Exclude<AdmitOutcome, "filtered">> {
   const { target, run, trigger } = input;
   const concurrency = target.definition.settings.concurrency;
   if (!concurrency) return "started";
@@ -229,6 +249,145 @@ export async function admitClaimedCronRun(
   }
 }
 
+/** Evaluate the entrypoint's admission prelude against the inputs the run
+ * would see (the workstream snapshot layered over the automation's). */
+async function preludeVerdict(args: {
+  target: DispatchTarget;
+  entrypoint: { id: string; trigger: TriggerSpec };
+  trigger: AutomationRunTrigger;
+  deliveryKey?: string;
+  instanceInputs?: Record<string, unknown> | undefined;
+  scheduledFor: Date | null;
+  now: () => Date;
+  code?: CodeBlockRuntime | undefined;
+}): Promise<AdmissionVerdict> {
+  const { target, trigger } = args;
+  const receivedAt = trigger.receivedAt ?? args.now().toISOString();
+  return evaluateAdmissionPrelude({
+    definition: target.definition,
+    inputs: resolveAutomationInputs(target.definition.inputsSchema, {
+      ...target.automation.inputs,
+      ...(args.instanceInputs ?? {}),
+    }),
+    automationId: target.automation.id,
+    automationName: target.automation.name,
+    trigger: {
+      kind: trigger.source,
+      receivedAt,
+      ...(trigger.eventKey !== undefined ? { eventKey: trigger.eventKey } : {}),
+      ...(args.deliveryKey !== undefined ? { deliveryKey: args.deliveryKey } : {}),
+      ...(trigger.payload !== undefined ? { payload: trigger.payload } : {}),
+      ...(args.scheduledFor ? { scheduledFor: args.scheduledFor.toISOString() } : {}),
+    },
+    aliases: [],
+    entrypointId: args.entrypoint.id,
+    code: args.code ?? codeRuntime(),
+  });
+}
+
+/** A prelude rejection leaves a `filtered` run row (no workflow, no claim)
+ * so the Activity tab shows the delivery arrived and why nothing happened. */
+async function recordFilteredAdmission(args: {
+  store: AutomationDispatchStore;
+  target: DispatchTarget;
+  entrypointId: string;
+  instanceId: string;
+  runId: string;
+  trigger: AutomationRunTrigger;
+  deliveryKey: string;
+  scheduledFor: Date | null;
+  reason: string;
+  now: () => Date;
+  dryRun?: boolean | undefined;
+}): Promise<void> {
+  await args.store.insertRun({
+    id: args.runId,
+    automationId: args.target.automation.id,
+    version: args.target.automation.currentVersion,
+    entrypointId: args.entrypointId,
+    ...(args.instanceId !== "" ? { instanceId: args.instanceId } : {}),
+    trigger: args.trigger,
+    deliveryKey: args.deliveryKey,
+    concurrencyKey: null,
+    scheduledFor: args.scheduledFor,
+    status: "filtered",
+    error: args.reason,
+    endedAt: args.now(),
+    ...(args.dryRun ? { dryRun: true } : {}),
+  });
+}
+
+/** Decide one matched (target, entrypoint) for a delivery, in the order that
+ * keeps side effects honest: an instance DROP first (no run, audited); then
+ * the admission prelude against the workstream's inputs — BEFORE the
+ * workstream is opened, so a filtered delivery ("LGTM" on a PR nobody asked
+ * to review, a draft PR opening) never creates a workstream; then the
+ * settle (open or join) and the concurrency claim. */
+async function decideAdmission(args: {
+  target: DispatchTarget;
+  entrypoint: { id: string; trigger: TriggerSpec };
+  trigger: AutomationRunTrigger;
+  resolution: InstanceResolution;
+  deliveryKey: string;
+  eventKey: string;
+  instances: AutomationInstanceStore;
+  store: AutomationDispatchStore;
+  now: () => Date;
+  code?: CodeBlockRuntime | undefined;
+}): Promise<
+  | { kind: "dropped" }
+  | { kind: "filtered" }
+  | { kind: "admit"; instanceId: string; inputs?: Record<string, unknown>; verdict: AdmissionVerdict }
+> {
+  const { target, entrypoint, trigger, resolution, deliveryKey } = args;
+  const settleCtx = {
+    automationId: target.automation.id,
+    entrypointId: entrypoint.id,
+    eventKey: args.eventKey,
+    deliveryKey,
+    instances: args.instances,
+  };
+  if (resolution.kind === "drop") {
+    await settleInstanceResolution(resolution, settleCtx);
+    return { kind: "dropped" };
+  }
+  const boundId = resolution.kind === "bound" ? resolution.instance.id : "";
+  const instanceInputs =
+    resolution.kind === "bound"
+      ? resolution.instance.inputs
+      : resolution.kind === "open"
+        ? resolution.inputs
+        : undefined;
+  const verdict = await preludeVerdict({
+    target,
+    entrypoint,
+    trigger,
+    deliveryKey,
+    instanceInputs,
+    scheduledFor: null,
+    now: args.now,
+    code: args.code,
+  });
+  if (verdict.kind === "reject") {
+    await recordFilteredAdmission({
+      store: args.store,
+      target,
+      entrypointId: entrypoint.id,
+      instanceId: boundId,
+      runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id, boundId),
+      trigger,
+      deliveryKey,
+      scheduledFor: null,
+      reason: verdict.reason,
+      now: args.now,
+    });
+    return { kind: "filtered" };
+  }
+  const settled = await settleInstanceResolution(resolution, settleCtx);
+  if (settled === "dropped") return { kind: "dropped" };
+  return { kind: "admit", instanceId: settled.instanceId, inputs: settled.inputs, verdict };
+}
+
 /** Decide admission for one matched occurrence and, unless the policy says
  * otherwise, create the run row and start its workflow. Shared by the webhook
  * dispatcher and the cron scheduler. */
@@ -239,6 +398,9 @@ export async function admitAutomationRun(
     starter: AutomationWebhookStarter;
     sender: AutomationSender;
     now: () => Date;
+    /** Evaluates the admission prelude's code blocks; the shared QuickJS
+     * runtime by default. */
+    code?: CodeBlockRuntime;
   },
 ): Promise<AdmitOutcome> {
   const { target, runId, deliveryKey, trigger } = input;
@@ -249,6 +411,40 @@ export async function admitAutomationRun(
     id: MAIN_ENTRYPOINT_ID,
     trigger: target.definition.trigger,
   };
+
+  // The graph's own admission decides BEFORE the concurrency claim (see
+  // engine/admission.ts): a delivery the prelude filters never supersedes
+  // or joins a live run. Dispatch passes the verdict it already took
+  // (before opening any workstream); a direct caller gets it evaluated here.
+  {
+    const verdict =
+      input.admission ??
+      (await preludeVerdict({
+        target,
+        entrypoint,
+        trigger,
+        instanceInputs: input.instanceInputs,
+        scheduledFor: input.scheduledFor,
+        now: deps.now,
+        code: deps.code,
+      }));
+    if (verdict.kind === "reject") {
+      await recordFilteredAdmission({
+        store: deps.store,
+        target,
+        entrypointId: entrypoint.id,
+        instanceId,
+        runId,
+        trigger,
+        deliveryKey,
+        scheduledFor: input.scheduledFor,
+        reason: verdict.reason,
+        now: deps.now,
+        dryRun: input.dryRun,
+      });
+      return "filtered";
+    }
+  }
 
   const startRun = async (concurrencyKey: string | null): Promise<void> => {
     await deps.store.insertRun({
@@ -394,7 +590,7 @@ export function defaultInstanceStoreLazy(): AutomationInstanceStore {
     closeInstance: (input) => get().closeInstance(input),
     recordInstanceHandle: (input) => get().recordInstanceHandle(input),
     resolveHandles: (automationId, handles) => get().resolveHandles(automationId, handles),
-    anyOpenHandleOwner: (handles) => get().anyOpenHandleOwner(handles),
+    openHandleOwners: (handles) => get().openHandleOwners(handles),
     recordDrop: (input) => get().recordDrop(input),
     listRecentDrops: (automationId, limit) => get().listRecentDrops(automationId, limit),
     listInstances: (automationId, opts) => get().listInstances(automationId, opts),
@@ -426,20 +622,21 @@ async function settleInstanceResolution(
     deliveryKey: string;
     instances: AutomationInstanceStore;
   },
-): Promise<{ instanceId: string } | "dropped"> {
+): Promise<{ instanceId: string; inputs?: Record<string, unknown> } | "dropped"> {
   switch (resolution.kind) {
     case "none":
       return { instanceId: "" };
     case "bound":
-      return { instanceId: resolution.instance.id };
+      return { instanceId: resolution.instance.id, inputs: resolution.instance.inputs };
     case "open": {
       const instance = await ctx.instances.openInstance({
         automationId: ctx.automationId,
         key: resolution.key,
+        label: resolution.label,
         inputs: resolution.inputs,
         openedBy: `event:${ctx.deliveryKey}`,
       });
-      return { instanceId: instance.id };
+      return { instanceId: instance.id, inputs: instance.inputs };
     }
     case "drop": {
       try {
@@ -507,6 +704,7 @@ export async function dispatchWebhookOccurrence(
     joined: 0,
     queued: 0,
     skipped: 0,
+    filtered: 0,
     dropped: 0,
   };
 
@@ -537,23 +735,32 @@ export async function dispatchWebhookOccurrence(
       },
       { instances },
     );
-    const settled = await settleInstanceResolution(resolution, {
-      automationId: target.automation.id,
-      entrypointId: entrypoint.id,
-      eventKey: input.eventKey,
+    const decided = await decideAdmission({
+      target,
+      entrypoint,
+      trigger,
+      resolution,
       deliveryKey,
+      eventKey: input.eventKey,
       instances,
+      store,
+      now,
     });
-    if (settled === "dropped") {
+    if (decided.kind === "dropped") {
       result.dropped += 1;
+      continue;
+    }
+    if (decided.kind === "filtered") {
+      result.filtered += 1;
       continue;
     }
     const outcome = await admitAutomationRun(
       {
         target,
-        runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id, settled.instanceId),
+        runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id, decided.instanceId),
         deliveryKey,
-        ...(settled.instanceId !== "" ? { instanceId: settled.instanceId } : {}),
+        ...(decided.instanceId !== "" ? { instanceId: decided.instanceId, instanceInputs: decided.inputs } : {}),
+        admission: decided.verdict,
         trigger,
         scheduledFor: null,
       },
@@ -578,27 +785,14 @@ export interface IntegrationDispatchStore extends AutomationDispatchStore {
   ): Promise<DispatchTarget[]>;
 }
 
-/** The one catch-all built-in that rung-1 precedence stands down when a
- * handle-bound workstream owns the event (ADR 0120). Deliberately a single
- * constant, not a registry: suppression is a cross-automation behavior
- * change and each addition should be a reviewed decision. */
+/** The one catch-all built-in that rung-1 precedence stands down when
+ * ANOTHER automation's handle-bound workstream owns the event's conversation
+ * (ADR 0120). Deliberately a single constant, not a registry: suppression is
+ * a cross-automation behavior change and each addition should be a reviewed
+ * decision. */
 const SUPPRESSIBLE_CATCH_ALL = "slack_brain";
 
-/** Built-in keys whose kill switch is ON. Resolved from config by default;
- * tests inject. Each built-in's switch registers its key here — one line per
- * switch, so the dispatcher gate and the route fallback can never disagree.
- * "pr_review" ← ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED (4.4). */
-export function disabledBuiltinsFromConfig(): ReadonlySet<string> {
-  const keys: string[] = [];
-  if (config.reviewAutomationDisabled) keys.push("pr_review");
-  // "slack_brain" ← ORCHESTRATOR_SLACK_AUTOMATION_DISABLED (4.6).
-  if (config.slackAutomationDisabled) keys.push("slack_brain");
-  return new Set(keys);
-}
-
 export interface DispatchIntegrationDeps {
-  /** Kill-switched built-in keys; their triggers never admit a run. */
-  disabledBuiltins?: ReadonlySet<string>;
   store?: IntegrationDispatchStore;
   workflowStarter?: AutomationWebhookStarter;
   sender?: AutomationSender;
@@ -614,41 +808,21 @@ export interface DispatchIntegrationResult {
   joined: number;
   queued: number;
   skipped: number;
+  /** The admission prelude rejected the delivery (a filtered run row, no
+   * claim, no workflow). */
+  filtered: number;
   /** ADR 0120: instance-admission drops (no run row; audited in the ring). */
   dropped: number;
-  /** Built-in keys suppressed by instance precedence (rung 1): a handle-
-   * bound workstream owns this event's thread, so the catch-all brain
-   * stands down — for the engine AND the legacy route. */
+  /** Built-in keys suppressed by instance precedence (rung 1): another
+   * automation's handle-bound workstream owns this event's conversation, so
+   * the catch-all brain stood down for this delivery. */
   suppressed: string[];
   /** Targets whose admission threw; the dispatcher rethrows after the loop. */
   failed: number;
-  /** Admission outcome per matched BUILT-IN (keyed by builtin key). This is
-   * what a legacy route consults to decide whether the engine took the
-   * delivery: a built-in absent here (not enabled, kill-switched, scope did
-   * not match) or `skipped` leaves the legacy path in charge. The same
-   * read the dispatcher made — never a second, possibly stale, lookup. */
+  /** Admission outcome per matched BUILT-IN (keyed by builtin key): the
+   * delivery's verdict, as the dispatcher made it — a built-in absent here
+   * was not matched (not enabled, scope did not match). */
   builtins: Record<string, AdmitOutcome>;
-}
-
-/** Did the dispatcher hand this delivery to the built-in — a run started,
- * joined, or queued for it? */
-export function builtinTookDelivery(
-  result: DispatchIntegrationResult | undefined,
-  builtinKey: string,
-): boolean {
-  const outcome = result?.builtins[builtinKey];
-  return outcome !== undefined && outcome !== "skipped";
-}
-
-/** Instance precedence (ADR 0120 rung 1): was the built-in stood down for
- * this delivery because an open workstream owns the thread? The legacy
- * route must treat this exactly like "the engine took it" — the instance's
- * automation is answering; a second responder is the bug. */
-export function builtinSuppressed(
-  result: DispatchIntegrationResult | undefined,
-  builtinKey: string,
-): boolean {
-  return result?.suppressed.includes(builtinKey) ?? false;
 }
 
 /** Providers whose scope noun compares case-insensitively (GitHub owner/repo).
@@ -707,7 +881,6 @@ export async function dispatchIntegrationEvent(
   const starter = deps.workflowStarter ?? defaultWorkflowStarter();
   const sender = deps.sender ?? defaultAutomationSender;
   const now = deps.now ?? (() => new Date());
-  const disabledBuiltins = deps.disabledBuiltins ?? disabledBuiltinsFromConfig();
   const instances = deps.instances ?? defaultInstanceStoreLazy();
   const facets = deps.facets ?? defaultWebhookFacetResolver();
 
@@ -725,17 +898,6 @@ export async function dispatchIntegrationEvent(
     (target) => target.definition.settings.instance !== undefined,
   );
   const targets = providerTargets.flatMap((target) => {
-    // A built-in's kill switch must stop its TRIGGER path too, not only the
-    // legacy route's fallback: otherwise a flagged repo/channel is served by
-    // both brains at once (the legacy graph via the route, the built-in via
-    // this dispatcher). The switch is the fleet-wide brake; the built-in's
-    // own `enabled` toggle is the independent second one.
-    if (
-      target.automation.builtinKey !== null &&
-      disabledBuiltins.has(target.automation.builtinKey)
-    ) {
-      return [];
-    }
     // D9: a delivery matches per ENTRYPOINT — the same event may open (or
     // join) one run for each entrypoint whose trigger matches it.
     return entrypointsOf(target.definition).flatMap((entrypoint) => {
@@ -761,6 +923,7 @@ export async function dispatchIntegrationEvent(
     joined: 0,
     queued: 0,
     skipped: 0,
+    filtered: 0,
     dropped: 0,
     suppressed: [],
     failed: 0,
@@ -781,21 +944,30 @@ export async function dispatchIntegrationEvent(
   };
 
   // Instance resolution runs BEFORE admission for every matched pair, so
-  // rung-1 precedence can see across targets: when an open workstream owns
-  // the event's thread (a handle bound it), the catch-all slack brain
-  // stands down for this delivery — one thread, one responder.
+  // rung-1 precedence can see across targets: when an open workstream of
+  // ANOTHER automation owns the event's thread (a handle bound it), the
+  // catch-all slack brain stands down for this delivery — one thread, one
+  // responder. The brain's OWN workstream owning the thread is the normal
+  // case for a live thread (its "Started a session" post binds the thread
+  // handle to it) and routes the event to that workstream by key; it must
+  // never stand the brain down (prod 2026-10-01: every follow-up in every
+  // brain thread was suppressed by the brain's own binding). The verdict is
+  // computed over the PROVIDER's instanced automations even when no brain is
+  // a matched target, so `suppressed` is always this delivery's truth.
   const resolved: Array<{
     target: DispatchTarget;
     entrypoint: { id: string; trigger: TriggerSpec };
     resolution: InstanceResolution;
   }> = [];
-  let handleBound = false;
+  const owners = new Map<string, string>(); // instanceId → automationId
   for (const { target, entrypoint } of targets) {
     const resolution = await resolveInstance(
       { target, entrypoint, trigger, provider: input.provider, ...(facet !== undefined ? { facet } : {}) },
       { instances },
     );
-    if (resolution.kind === "bound" && resolution.via === "handle") handleBound = true;
+    if (resolution.kind === "bound" && resolution.via === "handle") {
+      owners.set(resolution.instance.id, resolution.instance.automationId);
+    }
     resolved.push({ target, entrypoint, resolution });
   }
   // Rung 2 completion: ownership is about the CONVERSATION, not the event
@@ -803,16 +975,14 @@ export async function dispatchIntegrationEvent(
   // app_mention), and the owning workstream may subscribe to only one of
   // them — but every brain must stand down for both (prod 2026-08-26: the
   // legacy picker answered a mention in an owned channel because no MATCHED
-  // target was instanced, so no handle ever resolved). When nothing bound,
-  // ask the ledger directly whether any open workstream — in any
-  // automation — owns one of the event's candidate handles. Deliberately
-  // NOT gated on the suppressible built-in being a matched target: the
-  // LEGACY brain reads this delivery's verdict via `builtinSuppressed`
-  // and answers whether or not the built-in automation is enabled
-  // (prod 2026-08-26, second finding: the built-in was disabled, the gate
-  // skipped the check, and the legacy route spawned a session in an owned
-  // channel with the fix fully deployed).
-  if (!handleBound && anyInstancedForProvider) {
+  // target was instanced, so no handle ever resolved). Ask the ledger
+  // which open workstreams — in any automation — own one of the event's
+  // candidate handles. Deliberately NOT gated on the suppressible built-in
+  // being a matched target: the verdict is this delivery's, whoever reads
+  // it (prod 2026-08-26, second finding: the built-in was disabled, the
+  // gate skipped the check, and a consumer of the verdict spawned a session
+  // in an owned channel with the fix fully deployed).
+  if (anyInstancedForProvider) {
     const suppressFacet = facet ?? (await facets(input.provider));
     if (suppressFacet !== undefined) {
       const candidates = extractHandleCandidates({
@@ -821,20 +991,30 @@ export async function dispatchIntegrationEvent(
         eventKey: input.eventKey,
         payload: input.payload ?? {},
       });
-      if (candidates.length > 0 && (await instances.anyOpenHandleOwner(candidates))) {
-        handleBound = true;
+      if (candidates.length > 0) {
+        for (const owner of await instances.openHandleOwners(candidates)) {
+          owners.set(owner.instanceId, owner.automationId);
+        }
       }
     }
   }
   // The suppression VERDICT is a property of the delivery, not of which
   // brains happen to be enabled: record it whenever ownership held, so the
-  // legacy route stands down even when the built-in is not a target. The
-  // per-target loop below still skips any matched built-in.
-  if (handleBound && !result.suppressed.includes(SUPPRESSIBLE_CATCH_ALL)) {
+  // legacy route stands down even when the built-in is not a target (the
+  // owner may be the built-in brain's own thread — the legacy brain still
+  // has no business in it). The per-target loop below skips the matched
+  // built-in only when ANOTHER automation's workstream owns the thread.
+  const catchAllIds = new Set(
+    targets
+      .filter(({ target }) => target.automation.builtinKey === SUPPRESSIBLE_CATCH_ALL)
+      .map(({ target }) => target.automation.id),
+  );
+  const ownedByOther = [...owners.values()].some((automationId) => !catchAllIds.has(automationId));
+  if (ownedByOther && !result.suppressed.includes(SUPPRESSIBLE_CATCH_ALL)) {
     result.suppressed.push(SUPPRESSIBLE_CATCH_ALL);
     log.info(
       { provider: input.provider, eventKey: input.eventKey },
-      "instance precedence: a workstream owns this conversation; every brain stands down",
+      "instance precedence: another automation's workstream owns this conversation; the brain stands down",
     );
   }
 
@@ -845,36 +1025,46 @@ export async function dispatchIntegrationEvent(
   // targets that already succeeded).
   const failures: Array<{ automationId: string; error: unknown }> = [];
   for (const { target, entrypoint, resolution } of resolved) {
-    if (handleBound && target.automation.builtinKey === SUPPRESSIBLE_CATCH_ALL) {
+    if (ownedByOther && target.automation.builtinKey === SUPPRESSIBLE_CATCH_ALL) {
       // The verdict (result.suppressed) and its log were recorded above,
       // once per delivery; here the matched built-in is only skipped.
       continue;
     }
     const deliveryKey = `${input.provider}:${input.deliveryId}`;
     try {
-      const settled = await settleInstanceResolution(resolution, {
-        automationId: target.automation.id,
-        entrypointId: entrypoint.id,
-        eventKey: input.eventKey,
+      const decided = await decideAdmission({
+        target,
+        entrypoint,
+        trigger,
+        resolution,
         deliveryKey,
+        eventKey: input.eventKey,
         instances,
+        store,
+        now,
       });
-      if (settled === "dropped") {
+      if (decided.kind === "dropped") {
         result.dropped += 1;
         continue;
       }
-      const outcome = await admitAutomationRun(
-        {
-          target,
-          runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id, settled.instanceId),
-          entrypoint: { id: entrypoint.id, trigger: entrypoint.trigger },
-          ...(settled.instanceId !== "" ? { instanceId: settled.instanceId } : {}),
-          deliveryKey,
-          trigger,
-          scheduledFor: null,
-        },
-        { store, starter, sender, now },
-      );
+      const outcome: AdmitOutcome =
+        decided.kind === "filtered"
+          ? "filtered"
+          : await admitAutomationRun(
+              {
+                target,
+                runId: automationRunId(target.automation.id, deliveryKey, entrypoint.id, decided.instanceId),
+                entrypoint: { id: entrypoint.id, trigger: entrypoint.trigger },
+                ...(decided.instanceId !== ""
+                  ? { instanceId: decided.instanceId, instanceInputs: decided.inputs }
+                  : {}),
+                admission: decided.verdict,
+                deliveryKey,
+                trigger,
+                scheduledFor: null,
+              },
+              { store, starter, sender, now },
+            );
       result[outcome] += 1;
       if (target.automation.builtinKey !== null) {
         result.builtins[target.automation.builtinKey] = outcome;

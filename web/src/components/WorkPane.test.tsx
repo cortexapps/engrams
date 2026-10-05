@@ -117,16 +117,16 @@ describe("WorkPane", () => {
   // Labeled measurement buttons carry a text span; icon-only measures and the
   // More trigger don't — the mock keys widths off that structural difference.
   function mockNarrowStrip(width: number) {
-    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(
-      function (this: HTMLElement) {
-        return this.querySelector('[aria-hidden="true"]') ? width : 0;
-      },
-    );
-    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
-      function (this: HTMLElement) {
-        return DOMRect.fromRect({ width: this.querySelector("span") ? 60 : 30 });
-      },
-    );
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return this.querySelector('[aria-hidden="true"]') ? width : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return DOMRect.fromRect({ width: this.querySelector("span") ? 60 : 30 });
+    });
   }
 
   test("sheds non-core labeled tabs into More before dropping any label", async () => {

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import { validateDefinition, applyBlockOverrides } from "../../engine/definition.ts";
+import { renderAutomationTemplateInScope } from "../../template.ts";
 import { evaluateCode } from "../../code/sandbox.ts";
 import {
   PR_REVIEW_BUILTIN,
@@ -14,7 +15,7 @@ registerEngineBlocks();
 
 const inputs = {
   repos: { "Acme/Repo": { mode: "auto", autofix: false }, "acme/manual": { mode: "on_request", autofix: false } },
-  profile: "pr_reviewer",
+  profile: "11111111-2222-4333-8444-555555555555",
   mention: "@engrams",
   categories: ["functional-correctness"],
   instructions: "Prefer small diffs.",
@@ -58,9 +59,37 @@ function commentEvent(body: string, assoc = "MEMBER", senderType = "User", repo 
 }
 
 describe("PR_REVIEW_BUILTIN definition", () => {
-  test("validates as a builtin and rejects as a user definition (system blocks)", () => {
-    expect(() => validateDefinition(PR_REVIEW_DEFINITION, { kind: "builtin" })).not.toThrow();
-    expect(() => validateDefinition(PR_REVIEW_DEFINITION, { kind: "user" })).toThrow(/reserved/);
+  test("validates as a builtin AND as a user definition: every block is a palette block", () => {
+    // The built-in is an example an ordinary user could have built. A
+    // Duplicate copies it into a user-kind row, so a user-kind validation
+    // failure here means Duplicate produces an unsaveable copy.
+    expect(() => validateDefinition(PR_REVIEW_DEFINITION)).not.toThrow();
+    expect(() => validateDefinition(PR_REVIEW_DEFINITION)).not.toThrow();
+  });
+
+  test("is a workstream per pull request (ADR 0120): one key for every way in, closed on PR close", async () => {
+    const instance = PR_REVIEW_DEFINITION.settings.instance!;
+    const scope = (raw: Record<string, unknown>, event: string) => ({
+      trigger: { kind: "integration", event },
+      event: { raw },
+      inputs,
+    });
+    // A PR event names the PR; a comment names the issue; the CI dispatch
+    // and a retry carry pull_request.number — all render the same key.
+    expect(await renderAutomationTemplateInScope(instance.keyTemplate, scope(prEvent("opened").raw, "pull_request.opened"))).toBe("acme/repo#7");
+    expect(await renderAutomationTemplateInScope(instance.keyTemplate, scope(commentEvent("@engrams review").raw, "issue_comment.created"))).toBe("acme/manual#9");
+    expect(
+      await renderAutomationTemplateInScope(
+        instance.keyTemplate,
+        scope({ repository: { full_name: "acme/repo" }, pull_request: { number: 7, html_url: "https://github.com/acme/repo/pull/7" } }, "review.dispatch"),
+      ),
+    ).toBe("acme/repo#7");
+
+    const closed = PR_REVIEW_DEFINITION.entrypoints!.find((ep) => ep.id === "closed")!;
+    expect(closed.trigger).toMatchObject({ kind: "integration", provider: "github", eventKeys: ["pull_request.closed"] });
+    expect(closed.blocks.map((b) => b.type)).toEqual(["instance_close"]);
+    // A close only ends a workstream that exists.
+    expect(instance.entrypoints).toEqual({ closed: { admit: "require" } });
   });
 
   test("every tunable field exists in its block's config", () => {

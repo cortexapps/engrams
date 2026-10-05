@@ -1,9 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Code, ConnectError } from "@connectrpc/connect";
 
-import type { ProfileRow } from "../../db/profiles.ts";
 import type { ReviewDetail, ReviewRow } from "../../db/reviews.ts";
-import type { GithubReviewPoster } from "../../reviews/github-review.ts";
 import {
   runExec,
   RunExecError,
@@ -15,9 +13,7 @@ import {
   type ReviewControlPlane,
   type ReviewControlPlaneDeps,
   type ReviewSessionsClient,
-} from "../review-control-plane.ts";
-import { prReviewWorkflowImpl, type StepRunner } from "../pr-review.ts";
-import type { ReviewInbox } from "../review-inbox.ts";
+} from "../../reviews/control-plane.ts";
 
 type ExecRequest = Parameters<ReviewSessionsClient["exec"]>[0];
 type ExecFrame =
@@ -43,7 +39,6 @@ const review: ReviewRow = {
   trigger: "opened",
   status: "queued",
   githubReviewId: null,
-  statusCommentId: null,
   finderSessionId: null,
   verifierSessionId: null,
   automationRunId: null,
@@ -62,32 +57,6 @@ const review: ReviewRow = {
   updatedAt: new Date("2026-07-22T00:00:00Z"),
 };
 
-const reviewerProfile: ProfileRow = {
-  id: "reviewer-profile",
-  name: "Reviewer",
-  description: "",
-  icon: "Bot",
-  imageId: "reviewer-image",
-  harness: "claude",
-  model: null,
-  effort: null,
-  includeUserTokens: false,
-  envVars: {},
-  skills: [],
-  integrationGrants: [{
-    connectionId: "connection-engram",
-    operation: "pr_review",
-    resourceConstraints: [],
-  }],
-  network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
-  secrets: [],
-  repos: [],
-  apps: [],
-  designation: "pr_reviewer",
-  createdAt: new Date(0),
-  updatedAt: new Date(0),
-  deletedAt: null,
-};
 
 function reviewDetail(status: ReviewRow["status"] = review.status): ReviewDetail {
   return { review: { ...review, status }, findings: [], verdicts: [] };
@@ -104,13 +73,11 @@ function reviewStore(
       reviewId: review.id,
       taskId: review.taskId,
     }),
-    updateReviewPassContext: async () => true,
     getReview: async () => reviewDetail(),
     listPriorPasses: async () => [],
     updateReviewStatus: async () => true,
     updateFindingState: async () => {},
     finalizeReview: async () => true,
-    setStatusCommentId: async () => {},
     setReviewSessionId: async () => {},
     recordEvent: async () => {},
     ...overrides,
@@ -286,33 +253,6 @@ function bootstrapControlPlane(
   });
 }
 
-const githubPoster: GithubReviewPoster = {
-  fetchPrContext: async () => ({
-    headSha: HEAD_SHA,
-    baseSha: BASE_SHA,
-    pr: {
-      providerId: null,
-      url: null,
-      title: null,
-      author: null,
-      headBranch: null,
-      baseBranch: null,
-      state: null,
-      additions: null,
-      deletions: null,
-      changedFiles: null,
-      providerUpdatedAt: null,
-    },
-  }),
-  alreadyPosted: async () => false,
-  listReviewComments: async () => [],
-  upsertStatusComment: async () => ({ commentId: "status-comment" }),
-  postReview: async () => ({
-    posted: true,
-    inlinePosted: true,
-    summaryMd: "",
-  }),
-};
 
 describe("durable orchestrator exec caller", () => {
   test("re-attaches from byte offsets without gaps, duplicates, or a second spawn", async () => {
@@ -817,80 +757,6 @@ describe("durable orchestrator exec caller", () => {
         await expect(promise).rejects.toThrow("guest journal unavailable");
         expect(server.writeCalls).toHaveLength(0);
       }
-    }
-  });
-
-  test("stage-1 fallback drives the review workflow to a durable failed record", async () => {
-    for (const terminal of ["missing-exit", "null-exit"] as const) {
-      const server = new JournalExecServer(
-        new Uint8Array(),
-        encoder.encode("stage-1 fallback"),
-        [],
-        terminal,
-      );
-      let persistedStatus: ReviewRow["status"] = "queued";
-      const events: string[] = [];
-      const removedBindings: string[] = [];
-      const sessions = server;
-      const cp = makeReviewControlPlane({
-        sessions,
-        execRuntime: instantRuntime(),
-        reviews: reviewStore({
-          getReview: async () => reviewDetail(persistedStatus),
-          updateReviewStatus: async (_reviewId, status) => {
-            persistedStatus = status;
-            return true;
-          },
-          recordEvent: async (_reviewId, kind) => {
-            events.push(kind);
-          },
-        }),
-        profiles: {
-          getActive: async () => reviewerProfile,
-          getByDesignation: async () => reviewerProfile,
-        },
-        enrollments: { get: async () => null },
-        reviewSessions: {
-          record: async () => {},
-          find: async () => null,
-          remove: async (sessionId) => {
-            removedBindings.push(sessionId);
-          },
-        },
-        githubPoster,
-        createSessionForExistingTask: async () => ({
-          sessionId: "finder-stage-1-flow",
-        }),
-        registerSessionListener: async () => {},
-      });
-      const messages: Array<ReviewInbox | null> = [{
-        kind: "trigger",
-        reviewId: review.id,
-        taskId: review.taskId,
-        repo: review.repo,
-        prNumber: review.prNumber,
-        trigger: review.trigger,
-        headSha: review.headSha,
-        baseSha: review.baseSha,
-      }];
-      const steps: string[] = [];
-      const step: StepRunner = async (fn, name) => {
-        steps.push(name);
-        return fn();
-      };
-
-      await prReviewWorkflowImpl({
-        controlPlane: cp,
-        step,
-        workflowId: `workflow-${terminal}`,
-        recv: async () => messages.shift() ?? null,
-      });
-
-      expect(persistedStatus).toBe("failed");
-      expect(events).toContain("failed");
-      expect(steps.at(-1)).toBe("failReview");
-      expect(steps).not.toContain("sendFinderPrompt");
-      expect(removedBindings).toEqual(["finder-stage-1-flow"]);
     }
   });
 

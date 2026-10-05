@@ -142,7 +142,20 @@ export default defineConfig({
     // tunneled in for local testing never reach the orchestrator. Allow the
     // ngrok domains (leading dot = the domain and all its subdomains) so a
     // rotating tunnel host passes without re-editing this file each run.
-    allowedHosts: [".ngrok-free.dev", ".ngrok-free.app", ".ngrok.app", ".ngrok.io"],
+    //
+    // A dogfooding session publishes this dev server as a session app (ADR
+    // 0118), which reaches it on the session's OWN preview hostname. That is
+    // the only origin `TRUSTED_ORIGINS` names, so it is the one a person in a
+    // session must use — and Vite's host check rejected it with the same 403
+    // before anything else ran. The hostname carries a per-session name, so
+    // allow the domain rather than one host.
+    allowedHosts: [
+      ".ngrok-free.dev",
+      ".ngrok-free.app",
+      ".ngrok.app",
+      ".ngrok.io",
+      ".preview.engrams.cortex.io",
+    ],
     proxy: {
       // ---- Orchestrator: Connect/gRPC bridge ----
       "/rpc": {

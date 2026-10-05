@@ -1,9 +1,9 @@
 /** The automation editor shell — the Builder.
  *
- * A fixed-height frame: a 60px masthead (the name as an inline-editable
- * title, the version chip, the tabs, On/Paused, Dry run, Save) over the tab
- * body. Build fills the remaining height with the canvas; the other tabs
- * scroll. Tabs are driven by the `?tab=` search param.
+ * A fixed-height frame: a masthead (the name as an inline-editable title over
+ * the description and the state chips, then the tabs, On/Paused, Dry run,
+ * Save) over the tab body. Build fills the remaining height with the canvas;
+ * the other tabs scroll. Tabs are driven by the `?tab=` search param.
  *
  * Saving follows the editing model: a user automation saves a full new
  * version (SaveVersion); a built-in saves only the changed tunable fields
@@ -356,47 +356,69 @@ export function AutomationEditor({
         onValueChange={(v) => setTab(v as EditorTab)}
         className="flex min-h-0 flex-1 flex-col gap-0"
       >
-        {/* The masthead: 60px, hairline below. The name IS the title — Saira,
-            editable in place; the rest of the row is the automation's state
-            and its two verbs. */}
-        <header className="@container flex h-[60px] min-w-0 shrink-0 items-center gap-3 border-b px-6">
-          {builtin ? (
-            <h1 className="min-w-0 flex-1 truncate font-display text-lg font-semibold [font-stretch:108%]">
-              {name}
-            </h1>
-          ) : (
-            <input
-              aria-label="Automation name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Name your automation"
-              aria-invalid={nameError ? true : undefined}
-              className={cn(
-                "min-w-[120px] flex-1 bg-transparent font-display text-lg font-semibold [font-stretch:108%] outline-none placeholder:text-muted-foreground/60",
-                "max-w-[360px] rounded-sm focus-visible:ring-2 focus-visible:ring-ring/60",
+        {/* The masthead: an identity block over the tabs and the verbs, hairline
+            below. The name IS the title — Saira, editable in place — and it gets
+            the whole left column, because an automation is named in a sentence
+            and a title clipped at 360px hid which one you had open. The chips
+            say what the automation IS, so they sit under the name instead of
+            taking that width from it. */}
+        <header className="@container flex min-h-[60px] min-w-0 shrink-0 items-center gap-3 border-b px-6 py-2.5">
+          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+            {builtin ? (
+              <h1 className="truncate font-display text-lg font-semibold [font-stretch:108%]">
+                {name}
+              </h1>
+            ) : (
+              <input
+                aria-label="Automation name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="Name your automation"
+                aria-invalid={nameError ? true : undefined}
+                className={cn(
+                  "w-full min-w-0 bg-transparent font-display text-lg font-semibold [font-stretch:108%] outline-none placeholder:text-muted-foreground/60",
+                  "rounded-sm focus-visible:ring-2 focus-visible:ring-ring/60",
+                )}
+              />
+            )}
+            {nameError && <FieldError>{nameError}</FieldError>}
+            {/* The description used to live only in Settings, which meant the
+                one line that says what an automation DOES was two clicks away
+                from the graph that does it. It reads as a sub-header here: the
+                same inline edit as the name, at body weight so it stays
+                subordinate to it. */}
+            {builtin ? (
+              description !== "" && (
+                <p className="truncate text-sm text-muted-foreground">{description}</p>
+              )
+            ) : (
+              <input
+                aria-label="Automation description"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="Add a description"
+                className="w-full min-w-0 rounded-sm bg-transparent text-sm text-muted-foreground outline-none placeholder:text-muted-foreground/60 focus-visible:ring-2 focus-visible:ring-ring/60"
+              />
+            )}
+            <div className="flex min-w-0 items-center gap-2">
+              {builtin && (
+                <Badge
+                  variant="secondary"
+                  className="shrink-0 gap-1 rounded-sm"
+                  data-testid="builtin-banner"
+                  title="Its steps and wiring are fixed. Fields marked as editable, and the Inputs tab, are yours to change; Duplicate makes a fully editable copy."
+                >
+                  <Lock className="size-3" aria-hidden />
+                  built-in
+                </Badge>
               )}
-            />
-          )}
-          {nameError && <FieldError>{nameError}</FieldError>}
-          {builtin && (
-            <Badge
-              variant="secondary"
-              className="shrink-0 gap-1 rounded-sm"
-              data-testid="builtin-banner"
-              title="Its steps and wiring are fixed. Fields marked as editable, and the Inputs tab, are yours to change; Duplicate makes a fully editable copy."
-            >
-              <Lock className="size-3" aria-hidden />
-              built-in
-            </Badge>
-          )}
-          {automation && (
-            // The version chip is the first thing to yield when the row is
-            // tight; the tabs and the verbs never do.
-            <span className="hidden shrink-0 rounded-full bg-secondary px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground @4xl:inline">
-              v{automation.currentVersion} · saved {relativeTime(automation.updatedAt)}
-            </span>
-          )}
-          <div className="min-w-2 flex-1" />
+              {automation && (
+                <span className="truncate rounded-full bg-secondary px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground">
+                  v{automation.currentVersion} · saved {relativeTime(automation.updatedAt)}
+                </span>
+              )}
+            </div>
+          </div>
           <TabsList className="shrink-0">
             <TabsTrigger value="build">Build</TabsTrigger>
             <TabsTrigger value="inputs" disabled={mode === "create"}>
@@ -444,16 +466,15 @@ export function AutomationEditor({
               <Copy aria-hidden /> Duplicate
             </Button>
           )}
-          {mode === "edit" &&
-            automation && (
-              // A dry run executes the SAVED definition; unsaved edits would
-              // mislead, so it waits for a clean editor.
-              <DryRunButton
-                automationId={automation.id}
-                entrypointId={effectiveEntrypointId}
-                disabled={dirty}
-              />
-            )}
+          {mode === "edit" && automation && (
+            // A dry run executes the SAVED definition; unsaved edits would
+            // mislead, so it waits for a clean editor.
+            <DryRunButton
+              automationId={automation.id}
+              entrypointId={effectiveEntrypointId}
+              disabled={dirty}
+            />
+          )}
           <Button
             type="button"
             size="sm"

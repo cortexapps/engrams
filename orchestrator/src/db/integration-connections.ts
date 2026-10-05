@@ -44,6 +44,10 @@ export interface IntegrationConnectionStore {
   delete(id: string): Promise<boolean>;
   markTested(id: string, testedAt: Date): Promise<IntegrationConnectionRow | null>;
   setEnabled(id: string, enabled: boolean): Promise<IntegrationConnectionRow | null>;
+  /** Replace the non-secret config only. Unlike `update` this keeps `enabled`
+   * and `testedAt`: a connector's settings (e.g. its API host) are part of a
+   * singleton default connection that is never disabled. */
+  setConfig(id: string, config: Record<string, unknown>): Promise<IntegrationConnectionRow | null>;
   ensureDefault(provider: string, displayName: string): Promise<IntegrationConnectionRow>;
 }
 
@@ -140,6 +144,15 @@ export function makeIntegrationConnectionStore(
       const rows = await db
         .update(connectionTable)
         .set({ enabled, updatedAt: new Date() })
+        .where(eq(connectionTable.id, id))
+        .returning();
+      return rows[0] ? toRow(rows[0]) : null;
+    },
+
+    async setConfig(id, config) {
+      const rows = await db
+        .update(connectionTable)
+        .set({ config, updatedAt: new Date() })
         .where(eq(connectionTable.id, id))
         .returning();
       return rows[0] ? toRow(rows[0]) : null;

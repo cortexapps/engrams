@@ -184,7 +184,7 @@ function AutomationRow({
           >
             {tone === "muted" ? "○" : "●"}
           </span>
-          <span className="min-w-0 flex-1 truncate">{automation.name}</span>
+          <span className="text-fade-r min-w-0 flex-1">{automation.name}</span>
           <span className="ml-auto shrink-0 font-mono text-2xs tabular-nums text-sidebar-foreground/[0.65]">
             {paused ? "paused" : at ? relativeAge(at, now) : "—"}
           </span>

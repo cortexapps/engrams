@@ -1,5 +1,7 @@
 # engrams
 
+[![Release](https://img.shields.io/github/v/release/cortexapps/engrams?filter=v*&label=release)](https://github.com/cortexapps/engrams/releases/latest)
+
 engrams is a self-hosted orchestrator for AI coding agents. It runs each agent in its own [Firecracker](https://github.com/firecracker-microvm/firecracker) microVM, snapshots the VM when the agent goes idle, and restores it when the next prompt arrives.
 
 A session is a plain OCI image plus an agent harness. You build the image with `docker build`, enable it once, and engrams boots it on a host in your own cloud, streams the transcript and tool calls to the dashboard, Slack, or the CLI, and snapshots the VM away when it goes quiet. Claude Code and Codex ship as harnesses. The pattern is the one behind hosted sandbox products like E2B, Modal Sandboxes, and Ramp's Inspect; engrams is the version you run yourself.
@@ -104,19 +106,19 @@ The **orchestrator** is the product surface. It owns users and API keys, tasks a
 
 Storage is the part that makes the rest cheap. Disk and memory state live as hash-keyed immutable chunks in a blob store, with versioned manifests pointing at them. A base image is materialized into chunks once when you enable it. Sessions read those chunks on demand through an NBD device and page memory in lazily with `userfaultfd`, and a snapshot writes only the chunks that changed. Restoring on a different host is a matter of fetching the delta.
 
-[`DESIGN.md`](DESIGN.md) has the full design and [`docs/architecture.md`](docs/architecture.md) the component and wire detail.
+[`DESIGN.md`](DESIGN.md) has the full design and the [architecture page](site/src/content/docs/docs/concepts/architecture.md) the component and wire detail.
 
 ## Documentation
 
 - [`docs/deploy.md`](docs/deploy.md), [`docs/deploy-gcp.md`](docs/deploy-gcp.md), [`docs/deploy-aws.md`](docs/deploy-aws.md): production deployment.
-- [`docs/images.md`](docs/images.md): building session images and enabling them.
-- [`docs/warm-hooks.md`](docs/warm-hooks.md): running a command once at enable time so sessions start warm.
-- [`docs/telemetry.md`](docs/telemetry.md): OpenTelemetry spans for every model call and tool call.
+- [Images and harnesses](site/src/content/docs/docs/concepts/images-and-harnesses.md): building session images and enabling them.
+- [Warm hooks](site/src/content/docs/docs/guides/warm-hooks.md): running a command once at enable time so sessions start warm.
+- [Telemetry](site/src/content/docs/docs/guides/telemetry.md): OpenTelemetry spans for every model call and tool call.
 - [`cli/README.md`](cli/README.md): the `engrams` CLI.
 
 ## Contributing
 
-[`AGENTS.md`](AGENTS.md) is the guide for working in this repo: the build, the test lanes, and the conventions. `just check` runs the Rust gate before a pull request. The Firecracker fork's daily rebase is tracked at [![rebase-fc-fork](https://github.com/cortexapps/engrams/actions/workflows/rebase-fc-fork.yml/badge.svg)](https://github.com/cortexapps/engrams/actions/workflows/rebase-fc-fork.yml); red means a rebase conflict needs a hand, per [`docs/runbooks/firecracker-fork.md`](docs/runbooks/firecracker-fork.md).
+[`AGENTS.md`](AGENTS.md) is the guide for working in this repo: the build, the test lanes, and the conventions. `just check` runs the Rust gate before a pull request.
 
 ## License
 

@@ -199,7 +199,7 @@ build_tree() {
     # fetched binary): auth is brokered, so each just calls the provider's REST
     # API and the egress proxy injects the real credential host-side (ADR 0056/0057).
     for bin in linear jira sentry pd cloudflare vercel netlify circle newrelic \
-               notion asana twilio sendgrid hubspot airtable figma discord shopify; do
+               notion asana twilio sendgrid hubspot airtable figma discord shopify cortex; do
         cp "$here/bin/$bin" "$dest/bin/$bin"
         chmod 0755 "$dest/bin/$bin"
     done

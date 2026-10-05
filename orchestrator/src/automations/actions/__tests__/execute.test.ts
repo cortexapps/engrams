@@ -147,6 +147,87 @@ describe("executeIntegrationAction — http", () => {
     expect(replayed).toEqual({ commentId: 42 });
   });
 
+  test("marker_comment with an {input.key} marker pins one comment per key across runs", async () => {
+    // First run: no pinned comment yet → create, with the key marker.
+    const first = fakeRunOp([json(200, []), json(201, { id: 51 })]);
+    const created = await executeIntegrationAction(
+      {
+        provider: "github",
+        actionId: "upsert_issue_comment",
+        params: { repo: "acme/repo", number: 5, key: "review-status", body: "reviewing abc1234" },
+      },
+      CTX,
+      deps(first.runOp),
+    );
+    expect(created).toEqual({ commentId: 51 });
+    const posted = JSON.parse(first.calls[1]!.req.body as string) as { body: string };
+    expect(posted.body).toContain("<!-- engrams-pinned:review-status -->");
+    expect(posted.body).not.toContain(CTX.runId);
+
+    // A LATER run (different run id) finds it by the key and gets its id back.
+    const later = fakeRunOp([
+      json(200, [
+        { id: 60, body: "someone else" },
+        { id: 51, body: "reviewing abc1234\n\n<!-- engrams-pinned:review-status -->" },
+      ]),
+    ]);
+    const found = await executeIntegrationAction(
+      {
+        provider: "github",
+        actionId: "upsert_issue_comment",
+        params: { repo: "acme/repo", number: 5, key: "review-status", body: "reviewing def5678" },
+      },
+      { ...CTX, runId: "autorun:auto-1:main:i-2:github:d2" },
+      deps(later.runOp),
+    );
+    expect(later.calls).toHaveLength(1);
+    expect(found).toEqual({ commentId: 51 });
+
+    // An EDIT of the pinned comment re-appends the marker (the plain update
+    // action would drop it, and the next run's scan would miss the comment).
+    const edit = fakeRunOp([json(200, { id: 51 })]);
+    await executeIntegrationAction(
+      {
+        provider: "github",
+        actionId: "update_pinned_comment",
+        params: { repo: "acme/repo", commentId: 51, key: "review-status", body: "no findings for def5678" },
+      },
+      { ...CTX, runId: "autorun:auto-1:main:i-2:github:d2" },
+      deps(edit.runOp),
+    );
+    expect(edit.calls).toHaveLength(1);
+    expect(edit.calls[0]!.req.method).toBe("PATCH");
+    const edited = JSON.parse(edit.calls[0]!.req.body as string) as { body: string };
+    expect(edited.body).toBe("no findings for def5678\n\n<!-- engrams-pinned:review-status -->");
+
+    // And a THIRD run scanning the body that edit left behind still finds it.
+    const third = fakeRunOp([json(200, [{ id: 51, body: edited.body }])]);
+    expect(
+      await executeIntegrationAction(
+        {
+          provider: "github",
+          actionId: "upsert_issue_comment",
+          params: { repo: "acme/repo", number: 5, key: "review-status", body: "reviewing 0123abc" },
+        },
+        { ...CTX, runId: "autorun:auto-1:main:i-3:github:d3" },
+        deps(third.runOp),
+      ),
+    ).toEqual({ commentId: 51 });
+
+    // The key is part of an HTML comment and of the next scan: a token only.
+    await expect(
+      executeIntegrationAction(
+        {
+          provider: "github",
+          actionId: "upsert_issue_comment",
+          params: { repo: "acme/repo", number: 5, key: "-->oops", body: "x" },
+        },
+        CTX,
+        deps(fakeRunOp([]).runOp),
+      ),
+    ).rejects.toThrow(/short token/);
+  });
+
   test("caps oversized mapped outputs with a truncation flag", async () => {
     const huge = "x".repeat(300 * 1024);
     const f = fakeRunOp([json(200, []), json(201, { id: huge })]);
@@ -239,6 +320,7 @@ describe("executeIntegrationAction — builtins", () => {
           prNumber: 12,
           commitId: "abc123",
           summary: "Looks fine.",
+          fallbackSummary: "Looks fine. (every finding re-quoted)",
           comments: [{ path: "src/a.ts", line: 3, body: "nit" }],
         },
       },
@@ -246,10 +328,39 @@ describe("executeIntegrationAction — builtins", () => {
       deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
     );
     expect(f.calls).toHaveLength(3);
+    const inline = JSON.parse(f.calls[1]!.req.body as string) as Record<string, unknown>;
+    expect(String(inline["body"])).toContain("Looks fine.");
+    expect(String(inline["body"])).not.toContain("re-quoted");
     const fallback = JSON.parse(f.calls[2]!.req.body as string) as Record<string, unknown>;
     expect(fallback["comments"]).toBeUndefined();
+    // The fallback body is the caller's fuller summary, so a summary-only
+    // review still shows every finding.
+    expect(String(fallback["body"])).toContain("Looks fine. (every finding re-quoted)");
     expect(String(fallback["body"])).toContain(`<!-- engrams-automation:${CTX.runId}:${CTX.stepPath} -->`);
     expect(outputs).toMatchObject({ posted: true, inline_posted: false, github_review_id: "99" });
+  });
+
+  test("github.post_pr_review carries a caller's finding_id and start_line onto the inline comment", async () => {
+    // The PR-review built-in's review_settle output names each comment's
+    // finding; the ledger row and the GitHub comment must stay linked.
+    const f = fakeRunOp([json(200, []), json(200, { id: 7 })]);
+    await executeIntegrationAction(
+      {
+        provider: "github",
+        actionId: "post_pr_review",
+        params: {
+          repo: "acme/repo",
+          prNumber: 12,
+          commitId: "abc123",
+          summary: "One finding.",
+          comments: [{ finding_id: "f-1", path: "src/a.ts", line: 9, start_line: 4, side: "RIGHT", body: "nit" }],
+        },
+      },
+      CTX,
+      deps(f.runOp, { builtinDeps: builtinDeps(f.runOp) }),
+    );
+    const posted = JSON.parse(f.calls[1]!.req.body as string) as { comments: Array<Record<string, unknown>> };
+    expect(posted.comments[0]).toMatchObject({ path: "src/a.ts", line: 9, start_line: 4, side: "RIGHT" });
   });
 
   test("github.post_pr_review short-circuits when the marker is already on a review", async () => {
@@ -290,6 +401,7 @@ describe("executeIntegrationAction — builtins", () => {
             },
             conversations: {
               join: async () => ({}),
+              replies: async () => ({ messages: [] }),
             },
           }),
         }),
@@ -297,6 +409,52 @@ describe("executeIntegrationAction — builtins", () => {
     );
     expect(sent[0]).toEqual({ channel: "C1", text: "hi", thread_ts: "1.1" });
     expect(outputs).toEqual({ ts: "1.2", channel: "C1" });
+  });
+
+  test("slack.list_replies renders every message surface to text and passes the thread coordinates", async () => {
+    const asked: Array<Record<string, unknown>> = [];
+    const f = fakeRunOp([]);
+    const outputs = await executeIntegrationAction(
+      {
+        provider: "slack",
+        actionId: "list_replies",
+        params: { channel: "C1", threadTs: "1.1", oldest: "1.0" },
+      },
+      CTX,
+      deps(f.runOp, {
+        builtinDeps: builtinDeps(f.runOp, {
+          slackClient: async () => ({
+            chat: { postMessage: async () => ({}), update: async () => ({}) },
+            conversations: {
+              join: async () => ({}),
+              replies: async (args) => {
+                asked.push(args);
+                return {
+                  messages: [
+                    { ts: "1.1", user: "U1", text: "<@UBOT> hi" },
+                    { ts: "1.2", bot_id: "B1", text: "Hi! How can I help?" },
+                    {
+                      ts: "1.3",
+                      user: "U1",
+                      text: "",
+                      attachments: [{ title: "Alert", text: "disk full" }],
+                    },
+                  ],
+                };
+              },
+            },
+          }),
+        }),
+      }),
+    );
+    expect(asked[0]).toEqual({ channel: "C1", ts: "1.1", oldest: "1.0", limit: 500 });
+    expect(outputs).toEqual({
+      messages: [
+        { ts: "1.1", user: "U1", bot_id: "", subtype: "", text: "<@UBOT> hi" },
+        { ts: "1.2", user: "", bot_id: "B1", subtype: "", text: "Hi! How can I help?" },
+        { ts: "1.3", user: "U1", bot_id: "", subtype: "", text: expect.stringContaining("disk full") },
+      ],
+    });
   });
 
   test("slack.join_channel joins by id and maps the joined channel through the output", async () => {
@@ -321,6 +479,7 @@ describe("executeIntegrationAction — builtins", () => {
                 joined.push(args);
                 return { channel: { id: "C0BSPCXJBHA" } };
               },
+              replies: async () => ({ messages: [] }),
             },
           }),
         }),
@@ -360,6 +519,37 @@ describe("executeIntegrationAction — builtins", () => {
       identifier: "ENG-1",
       url: "https://linear.app/i/ENG-1",
     });
+  });
+});
+
+describe("executeIntegrationAction — templated scalars", () => {
+  test("a numeric string for an integer param is coerced (a Liquid template always renders a string)", async () => {
+    // The PR-review built-in's first live pull request: `number` rendered
+    // as "1539" and the action refused it.
+    const f = fakeRunOp([json(200, []), json(201, { id: 42 })]);
+    const outputs = await executeIntegrationAction(
+      {
+        provider: "github",
+        actionId: "create_issue_comment",
+        params: { repo: "acme/repo", number: "1539", body: "hello" },
+      },
+      CTX,
+      deps(f.runOp),
+    );
+    expect(outputs).toEqual({ commentId: 42 });
+    expect(f.calls[1]!.req.path).toContain("/issues/1539/comments");
+  });
+
+  test("a string that is not a number is still rejected", async () => {
+    const f = fakeRunOp([]);
+    await expectActionError(
+      executeIntegrationAction(
+        { provider: "github", actionId: "create_issue_comment", params: { repo: "acme/repo", number: "abc", body: "x" } },
+        CTX,
+        deps(f.runOp),
+      ),
+      { permanent: true, message: /expected an integer/ },
+    );
   });
 });
 

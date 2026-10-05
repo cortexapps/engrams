@@ -10,7 +10,6 @@
 import { Lock } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { Badge } from "@/components/ui/badge";
 import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import {
@@ -81,10 +80,9 @@ export function BlockInspector(props: BlockInspectorProps) {
           <div className="flex items-center gap-2">
             <h3 className="truncate font-medium">{spec.label}</h3>
             <code className="text-muted-foreground text-xs">{block.id}</code>
-            {spec.system && <Badge variant="secondary">built-in logic</Badge>}
           </div>
           <p className="text-muted-foreground text-sm">{spec.description}</p>
-          {builtin && !spec.system && (
+          {builtin && (
             <p className="text-muted-foreground mt-1 flex items-center gap-1 text-xs">
               <Lock className="size-3" aria-hidden />
               {(block.tunable?.length ?? 0) > 0
@@ -97,8 +95,8 @@ export function BlockInspector(props: BlockInspectorProps) {
 
       {formError && <FieldError>{formError}</FieldError>}
 
-      {spec.inspector === "system" ? (
-        <SystemView block={block} />
+      {spec.inspector === "readonly" ? (
+        <ReadOnlyView block={block} />
       ) : spec.inspector === "create_session" ? (
         <CreateSessionInspector {...props} />
       ) : spec.inspector === "filter" ||
@@ -113,13 +111,11 @@ export function BlockInspector(props: BlockInspectorProps) {
         <GenericForm {...props} fields={spec.fields ?? []} />
       )}
 
-      {!spec.system && (
-        <RetryEditor
-          block={block}
-          onChange={props.onChange}
-          disabled={builtin && !isTunable(block, "retry")}
-        />
-      )}
+      <RetryEditor
+        block={block}
+        onChange={props.onChange}
+        disabled={builtin && !isTunable(block, "retry")}
+      />
     </div>
   );
 }
@@ -158,7 +154,7 @@ function GenericForm(props: BlockInspectorProps & { fields: FieldSpec[] }) {
   );
 }
 
-function SystemView({ block }: { block: BlockDef }) {
+function ReadOnlyView({ block }: { block: BlockDef }) {
   return (
     <div className="rounded-md border p-3">
       <p className="text-muted-foreground mb-2 text-xs">Configuration (read-only)</p>

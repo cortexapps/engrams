@@ -88,8 +88,8 @@ pub struct ImageConfig {
 ///
 /// **Fail-loud:** a non-zero exit, a stall, a blown per-stage deadline, or
 /// the global timeout all abort the capture and therefore the whole image
-/// enable (issue #539 — see [`docs/warm-hooks.md`](../../../../docs/warm-hooks.md)
-/// for the full contract: what the hook may assume, deadline semantics, and
+/// enable (see the warm hooks guide,
+/// `site/src/content/docs/docs/guides/warm-hooks.md`, for the full contract: what the hook may assume, deadline semantics, and
 /// the `::engram-warm::` progress-line protocol a hook can emit for
 /// observability). A declared warm hook that can't run is a real defect
 /// (bad command, cold cache, OOM); we never silently ship a "cold" base

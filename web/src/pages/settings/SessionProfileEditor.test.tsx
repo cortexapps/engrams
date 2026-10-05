@@ -255,25 +255,6 @@ describe("SessionProfileEditor (create)", () => {
     expect(screen.queryByText("api.anthropic.com")).toBeNull();
   });
 
-  it("sends an empty designation when the reviewer toggle is untouched", async () => {
-    render(<SessionProfileEditor mode="create" />);
-    fireEvent.change(screen.getByLabelText(/profile name/i), { target: { value: "Plain Agent" } });
-    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
-    await waitFor(() => expect(create).toHaveBeenCalled());
-    expect(create.mock.calls[0][0]).toMatchObject({ designation: "" });
-  });
-
-  it("maps the PR reviewer toggle to the reviewer designation", async () => {
-    render(<SessionProfileEditor mode="create" />);
-    fireEvent.change(screen.getByLabelText(/profile name/i), {
-      target: { value: "Review Agent" },
-    });
-    fireEvent.click(screen.getByLabelText(/pr reviewer profile/i));
-    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
-    await waitFor(() => expect(create).toHaveBeenCalled());
-    expect(create.mock.calls[0][0]).toMatchObject({ designation: "pr_reviewer" });
-  });
-
   it("toggling a skill includes it in the payload (ADR 0055)", async () => {
     render(<SessionProfileEditor mode="create" />);
     fireEvent.change(screen.getByLabelText(/profile name/i), {
@@ -540,7 +521,6 @@ describe("SessionProfileEditor (edit)", () => {
         harness: "claude",
         model: "opus",
         effort: "high",
-        designation: "pr_reviewer",
         includeUserTokens: true,
         envVars: { ANTHROPIC_MODEL: "claude-x" },
         integrationGrants: [
@@ -581,9 +561,6 @@ describe("SessionProfileEditor (edit)", () => {
     });
     expect(screen.getByTestId("icon-picker").textContent).toContain("Server");
     expect(screen.getByTestId("image-select").textContent).toContain("registry/api:latest");
-    expect(screen.getByLabelText(/pr reviewer profile/i).getAttribute("data-state")).toBe(
-      "checked",
-    );
     expect((screen.getByLabelText(/allowed hosts/i) as HTMLTextAreaElement).value).toBe(
       "db.internal",
     );
@@ -645,41 +622,6 @@ describe("SessionProfileEditor (edit)", () => {
         { name: "api", port: 8080 },
       ],
     });
-    // An unchanged save must NOT re-send designation — otherwise a stale tab
-    // could silently steal or drop the reviewer role on an unrelated edit.
-    expect(update.mock.calls[0][0].designation).toBeUndefined();
-  });
-
-  it("sends designation only when the reviewer toggle is changed", async () => {
-    paramsHolder.value = { id: "p1" };
-    profileHolder.value = {
-      profile: {
-        id: "p1",
-        name: "Backend Agent",
-        description: "",
-        icon: "Bot",
-        imageId: "i1",
-        harness: "claude",
-        model: "opus",
-        effort: "high",
-        designation: "pr_reviewer",
-        includeUserTokens: false,
-        envVars: {},
-        integrationGrants: [],
-        skills: [],
-        network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
-        secrets: [],
-        apps: [],
-      },
-    };
-    render(<SessionProfileEditor mode="edit" />);
-    await screen.findByDisplayValue("Backend Agent");
-    // Turn the reviewer toggle OFF, then save.
-    fireEvent.click(screen.getByLabelText(/pr reviewer profile/i));
-    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
-    await waitFor(() => expect(update).toHaveBeenCalledOnce());
-    // The toggle was flipped from on→off, so designation is sent as "" (clear).
-    expect(update.mock.calls[0][0].designation).toBe("");
   });
 
   it("autodiscovers repos and saves an added candidate", async () => {

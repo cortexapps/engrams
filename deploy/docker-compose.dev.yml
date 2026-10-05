@@ -38,7 +38,14 @@ services:
       # the Tilt `orchestrator-migrate` resource handles that case.
       - ./initdb:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U engram -d engram"]
+      # Probe over TCP, never the unix socket: the image's entrypoint runs a
+      # TEMPORARY socket-only server while it applies initdb.d, so a socket
+      # pg_isready reports healthy during that window, the stack starts, and
+      # the real server's start then resets every open connection. The
+      # coordinator retries its connect; `drizzle-kit migrate` in the
+      # orchestrator-migrate one-shot does not, and the e2e stack died on
+      # "var/dev-api-key never appeared". Same trap as ci.yml's test PG.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U engram -d engram"]
       interval: 5s
       timeout: 5s
       retries: 10

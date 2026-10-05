@@ -617,6 +617,55 @@
       "when": 1788600000000,
       "tag": "0087_drops",
       "breakpoints": true
+    },
+    {
+      "idx": 88,
+      "version": "7",
+      "when": 1790828666479,
+      "tag": "0088_retire_legacy_review_engine",
+      "breakpoints": true
+    },
+    {
+      "idx": 89,
+      "version": "7",
+      "when": 1790829589347,
+      "tag": "0089_retire_reviewer_designation",
+      "breakpoints": true
+    },
+    {
+      "idx": 90,
+      "version": "7",
+      "when": 1790861362210,
+      "tag": "0090_instance_label",
+      "breakpoints": true
+    },
+    {
+      "idx": 91,
+      "version": "7",
+      "when": 1791208931845,
+      "tag": "0091_retire_review_enrollment",
+      "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1791210158579,
+      "tag": "0092_retire_slack_session",
+      "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "7",
+      "when": 1791218764945,
+      "tag": "0093_org_settings_and_retention",
+      "breakpoints": true
+    },
+    {
+      "idx": 94,
+      "version": "7",
+      "when": 1791218834318,
+      "tag": "0094_listener_dormancy",
+      "breakpoints": true
     }
   ]
 }

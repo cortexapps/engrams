@@ -21,6 +21,8 @@ on:
     paths:
       - 'site/**'
       - 'crates/engram-protocol/proto/engram/app/**'
+      # The docs show the release version, which the build reads from here.
+      - 'deploy/helm/engram/Chart.yaml'
       - '.github/workflows/site-deploy.yml'
   workflow_dispatch: {}
 

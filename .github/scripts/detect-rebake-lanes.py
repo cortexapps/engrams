@@ -242,6 +242,12 @@ FC_FORK_PATHS = ["third_party/firecracker", ".gitmodules"]
 E2E_PATHS = [
     "deploy/dev/",
     "Tiltfile",
+    # The compose services the Tiltfile boots (postgres, registry, fake-gcs,
+    # jaeger) and postgres's initdb.d scripts: a healthcheck or init change
+    # changes how the stack comes up. (2026-09-14: a healthcheck fix skipped
+    # the very lane it fixed because these were absent.)
+    "deploy/docker-compose.dev.yml",
+    "deploy/initdb/",
     "deploy/demo/",
     "deploy/bundles/",
     "cli/",  # the `engrams` CLI drives enable/registry/session in the lane

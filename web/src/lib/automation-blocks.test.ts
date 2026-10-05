@@ -79,7 +79,7 @@ describe("built-in editing model", () => {
       tunable: ["promptTemplate", "profileId"],
       config: { profileId: "pr_reviewer", promptTemplate: "Review it.", role: "finder" },
     },
-    { id: "gate", type: "system.review_policy_gate", config: { reviewId: "x" } },
+    { id: "recap", type: "relay_close", config: { status: "completed" } },
   ]);
 
   it("isTunable is by top-level key, including dotted paths", () => {
@@ -173,10 +173,17 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
       "state_list",
       "session_status",
       "lookup_pr_session",
+      "review_open_pass",
+      "review_stage",
+      "review_settle",
+      "review_close_pass",
+      "review_record_post",
+      "resolve_user",
+      "relay_session",
+      "relay_close",
     ]) {
       const spec = blockKind(kind);
       expect(spec.description).not.toBe("Unknown block kind.");
-      expect(spec.system).not.toBe(true);
       expect(insertableBlockKinds().some((s) => s.kind === kind)).toBe(true);
     }
   });

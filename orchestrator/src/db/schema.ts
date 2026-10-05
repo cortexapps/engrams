@@ -917,9 +917,6 @@ export const review = pgTable(
     trigger: text("trigger").notNull(),
     status: text("status").notNull().default("queued"), // queued|finding|verifying|posted|failed|superseded|halted
     githubReviewId: text("github_review_id"),
-    // The sticky GitHub issue-comment we post on pickup and edit in place
-    // through the lifecycle (👀 → ⏳ → ✅). Null until the first ack lands.
-    statusCommentId: text("status_comment_id"),
     // The worker sessions, stamped at kickoff so the UI can offer a live
     // "watch" link while the phase runs. The session is deleted when its phase
     // ends, but the id is kept as the durable record of which session ran.
@@ -1033,33 +1030,25 @@ export const reviewEvent = pgTable(
 
 /** Per-repository PR-review enrollment. The text fields are constrained by
  * ReviewService to triggerMode: auto|manual and autofix: auto|manual|off. */
-export const reviewEnrollment = pgTable("review_enrollment", {
-  repo: text("repo").primaryKey(), // "owner/name"
-  triggerMode: text("trigger_mode").notNull().default("manual"), // auto|manual
-  autofix: text("autofix").notNull().default("off"), // auto|manual|off
-  profileId: text("profile_id").references(() => profile.id),
-  // ADR 0119 phase 4.4: which engine reviews this repo during the parallel
-  // window. legacy = the hand-written PrReviewWorkflow; automation = the
-  // seeded PR-review built-in. Dropped with this table in phase 4.7.
-  engine: text("engine").notNull().default("legacy"), // legacy|automation
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-});
 
 // ---------------------------------------------------------------------------
 // Stream-fed session listeners (ingest v2)
 // ---------------------------------------------------------------------------
 
 /** Desired listener rows also serve as cross-process leases. Terminal rows are
- * retained so a completed session is never accidentally listened to again. */
+ * retained so a completed session is never accidentally listened to again.
+ * A dormant row (ADR 0119 amendment, 2026-10-05) is a parked session: it is
+ * not desired until a wake clears it. */
 export const sessionListener = pgTable("session_listeners", {
   sessionId: text("session_id").primaryKey(),
   owner: text("owner"),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
   terminalAt: timestamp("terminal_at", { withTimezone: true }),
+  /** Set when the listener stood down for a parked session; cleared by a wake. */
+  dormantAt: timestamp("dormant_at", { withTimezone: true }),
+  /** The last wake (a resuming session RPC); a stand-down inside its grace
+   * is refused, so a resume under way is never missed. */
+  wokenAt: timestamp("woken_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -1075,21 +1064,6 @@ export const consumerCursor = pgTable(
   (t) => [primaryKey({ columns: [t.sessionId, t.consumer] })],
 );
 
-/** Slack-backed sessions route listener output into their owning thread
- * workflow mailbox. Absence means the Slack consumer does not apply. */
-export const slackSession = pgTable("slack_session", {
-  sessionId: text("session_id").primaryKey(),
-  threadWfId: text("thread_wf_id").notNull(),
-});
-
-/** Review worker sessions route terminal state into their owning review
- * workflow mailbox. Absence means the review consumer does not apply. */
-export const reviewSession = pgTable("review_session", {
-  sessionId: text("session_id").primaryKey(),
-  reviewWorkflowId: text("review_workflow_id").notNull(),
-  role: text("role").notNull(), // finder|verifier
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
 
 // ---------------------------------------------------------------------------
 // DBOS orphan sweep (ADR 0104)
@@ -1108,6 +1082,19 @@ export const dbosVersionHeartbeats = pgTable(
 );
 
 /** Durable per-workflow sweep history and operator-control flags. */
+// ---------------------------------------------------------------------------
+// Org settings: one row per setting key, the value a JSON document the
+// owning module validates (db/org-settings.ts). Policies an admin chooses
+// on the Settings page — retention first.
+// ---------------------------------------------------------------------------
+
+export const orgSetting = pgTable("org_setting", {
+  key: text("key").primaryKey(),
+  value: jsonb("value").$type<unknown>().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedByUserId: text("updated_by_user_id"),
+});
+
 export const dbosSweepLedger = pgTable("dbos_sweep_ledger", {
   workflowUuid: text("workflow_uuid").primaryKey(),
   workflowName: text("workflow_name").notNull(),
@@ -1246,10 +1233,6 @@ export const profile = pgTable(
     // into the guest's env, so a sibling app is configured with an address the
     // user's browser can reach too. Empty = no apps.
     apps: jsonb("apps").$type<ProfileApp[]>().notNull().default([]),
-    // System marker (ADR 0100): at most one profile per value; the review
-    // workflow finds its profile by this marker, and designated profiles cannot
-    // be deleted.
-    designation: text("designation"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at")
       .notNull()
@@ -1257,11 +1240,6 @@ export const profile = pgTable(
       .$onUpdate(() => new Date()),
     deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
   },
-  (t) => [
-    uniqueIndex("profile_designation_unique")
-      .on(t.designation)
-      .where(sql`designation is not null`),
-  ],
 );
 
 // ---------------------------------------------------------------------------
@@ -1503,9 +1481,17 @@ export const automationRun = pgTable(
     /** A DryRun from the editor: integration actions are stubbed and record
      * what they would have done instead of calling the provider. */
     dryRun: boolean("dry_run").notNull().default(false),
+    /** Set by the retention collector once the run's step rows are deleted
+     * (ADR 0104 amendment): the run page can say so, and the prune's frontier
+     * (ended before the cutoff, not yet pruned) shrinks as it drains. */
+    detailsPrunedAt: timestamp("details_pruned_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
+    // The retention frontier: ended runs whose details are still kept.
+    index("automation_run_retention_idx")
+      .on(t.endedAt)
+      .where(sql`ended_at is not null and details_pruned_at is null`),
     // ADR 0120 instances — the dedupe split: a cron occurrence fans out one
     // run per open instance (instance_id joins the occurrence identity); an
     // external delivery lands in at most ONE instance (the delivery identity
@@ -1615,6 +1601,9 @@ export const automationInstance = pgTable(
       .references(() => automation.id, { onDelete: "cascade" }),
     /** The rendered identity key (human-readable, e.g. project-ENG-42). */
     key: text("key").notNull(),
+    /** The human title rendered at open (settings.instance.labelTemplate);
+     * null = the UI shows the key. */
+    label: text("label"),
     status: text("status").notNull().default("open"),
     inputs: jsonb("inputs").$type<Record<string, unknown>>().notNull().default({}),
     /** user:<id> | run:<runId> | the admitting event's descriptor. */

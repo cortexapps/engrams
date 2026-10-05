@@ -83,8 +83,8 @@ refreshed by the proxy itself before they go stale.
 ### Whose credential
 
 A profile grant can name the organization's connection or the launching person's own. With
-the second, a session started by a person who has connected their Slack, GitHub, Linear, or
-Sentry account runs those integrations as them, and a session by someone who has not gets
+the second, a session started by a person who has connected their Slack, GitHub, Linear,
+Sentry, or Cortex account runs those integrations as them, and a session by someone who has not gets
 those integrations switched off, never the org credential. Sessions started by a schedule or
 a webhook always use the organization's. A disconnected personal account stops working in
 live sessions within a day.

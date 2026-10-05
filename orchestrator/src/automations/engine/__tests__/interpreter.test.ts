@@ -153,6 +153,7 @@ function makeHarness(
     async finalizeRun(_runId, status, error) {
       finalized.push({ status, ...(error !== undefined ? { error } : {}) });
     },
+    async latestKeptInstanceSession() { return null; },
     async listRunSessions() {
       return runSessions;
     },
@@ -625,24 +626,24 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 4)
     expect(outputs["bye"]).toMatchObject({ ended: false, dry_run: true });
   });
 
-  test("a dry run refuses a system block instead of half-running the product", async () => {
+  test("a dry run refuses a block with product side effects instead of half-running the product", async () => {
     registerBlock({
-      type: "system.test_effect",
-      system: true,
+      type: "test_effect",
+      refusesDryRun: true,
       configSchema: z.object({}),
       async execute() {
         throw new Error("must not run");
       },
     });
     try {
-      const definition = makeDefinition([{ id: "fx", type: "system.test_effect", config: {} }]);
+      const definition = makeDefinition([{ id: "fx", type: "test_effect", config: {} }]);
       const h = makeHarness(definition, { dryRun: true });
       const result = await interpretAutomation(RUN, h.deps);
       expect(result.status).toBe("failed");
       expect(result.error).toContain("dry_run_unsupported");
       expect(h.stepRecords.find((r) => r.framePath === "fx")?.record.status).toBe("failed");
     } finally {
-      unregisterBlockForTest("system.test_effect");
+      unregisterBlockForTest("test_effect");
     }
   });
 
@@ -1108,7 +1109,7 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
 
 
 describe("interpretAutomation — installed message handlers (contract 3)", () => {
-  const TYPE = "system.test_relay";
+  const TYPE = "test_relay";
 
   const relayDefinition = (config: Record<string, unknown>): AutomationDefinition => ({
     engine: 1,
@@ -1135,7 +1136,6 @@ describe("interpretAutomation — installed message handlers (contract 3)", () =
     const seen: AutomationInbox[] = [];
     registerBlock<{ consume: string[] }>({
       type: TYPE,
-      system: true,
       configSchema: z.object({ consume: z.array(z.string()) }),
       async execute() {
         return { kind: "ok", outputs: { installed: true } };
@@ -1199,7 +1199,6 @@ describe("interpretAutomation — installed message handlers (contract 3)", () =
     const seenStates: unknown[] = [];
     registerBlock<Record<string, never>>({
       type: TYPE,
-      system: true,
       configSchema: z.object({}),
       async execute() {
         return { kind: "ok", outputs: { handler_state: { n: 0 } } };
@@ -1233,7 +1232,6 @@ describe("interpretAutomation — installed message handlers (contract 3)", () =
   test("a throwing handler is recorded on its relay step and never fails the run", async () => {
     registerBlock<Record<string, never>>({
       type: TYPE,
-      system: true,
       configSchema: z.object({}),
       async execute() {
         return { kind: "ok", outputs: {} };

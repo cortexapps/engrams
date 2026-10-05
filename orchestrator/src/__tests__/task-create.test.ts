@@ -69,7 +69,6 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   secrets: [],
   repos: [],
   apps: [],
-  designation: null,
   createdAt: new Date(0),
   updatedAt: new Date(0),
   deletedAt: null,
@@ -188,6 +187,9 @@ const fakeConnections = (): IntegrationConnectionStore => {
       throw new Error("unused");
     },
     setEnabled: async () => {
+      throw new Error("unused");
+    },
+    setConfig: async () => {
       throw new Error("unused");
     },
     ensureDefault: async (provider) => (await store.get(`default-${provider}`))!,
@@ -1439,7 +1441,6 @@ describe("createTaskWithSession", () => {
       profileId: "p1",
       source: { provider: "slack", team: "T1" },
       extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: "be concise" },
-      slackThreadWorkflowId: "thread-wf-1",
     });
 
     expect(out.sessionId).toBe("sess-1");
@@ -1465,8 +1466,7 @@ describe("createTaskWithSession", () => {
       profileId: "p1",
       integrationPrincipalId: "user-1",
     });
-    expect(records[2]).toEqual({ sessionId: "sess-1", threadWfId: "thread-wf-1" });
-    expect(records[3]).toEqual({ sessionId: "sess-1" });
+    expect(records[2]).toEqual({ sessionId: "sess-1" });
   });
 
   test("defaults source to {} and title to null", async () => {
@@ -1564,12 +1564,11 @@ describe("createTaskWithSession", () => {
       }),
     ).rejects.toThrow(/different reserved session ID/);
     expect(sessions.deletedIds).toEqual(["sess-OTHER"]);
-    expect(deletes).toEqual(["slack_session", "task"]);
+    expect(deletes).toEqual(["task"]);
   });
 
-  // O7: slack_session has no FK to the task model, so the compensation must
-  // remove the Slack binding explicitly.
-  test("boot-failure compensation removes the slack_session binding and the task", async () => {
+  // O7: the compensation removes the task row (task_session cascades).
+  test("boot-failure compensation removes the task", async () => {
     const sessions = fakeSessions();
     sessions.createSession = async () => {
       throw new Error("boot boom");
@@ -1580,11 +1579,10 @@ describe("createTaskWithSession", () => {
         type: "slack_thread",
         ownerUserId: "u",
         profileId: "p1",
-        slackThreadWorkflowId: "thread-wf-1",
       }),
     ).rejects.toThrow(/boot boom/);
     expect(sessions.deletedIds).toEqual(["sess-1"]);
-    expect(deletes).toEqual(["slack_session", "task"]);
+    expect(deletes).toEqual(["task"]);
   });
 
   // O7: a DB failure during compensation must not mask the original error.
@@ -2032,5 +2030,36 @@ describe("createSessionForExistingTask", () => {
     ).rejects.toThrow(/db boom/);
     expect(sessions.createReqs).toHaveLength(0);
     expect(sessions.deletedIds).toEqual([]);
+  });
+});
+
+describe("connector settings (the administrator-chosen API host)", () => {
+  test("a stored host reaches the CLI env and the egress policy; the default never does", async () => {
+    const connections = fakeConnections();
+    const base = connections.get;
+    connections.get = async (id) =>
+      id === "default-cortex"
+        ? { ...(await base(id))!, config: { settings: { api_host: "api.eu.cortex.io" } } }
+        : base(id);
+    const input = await compileSessionCreateInput(
+      profile({ integrationGrants: [defaultGrant("cortex:catalog:read")] }),
+      { ...deps(), connections },
+    );
+    expect(input.selectedSkills).toContain("integrations-cli");
+    expect(input.harnessEnv?.CORTEX_API_HOST).toBe("api.eu.cortex.io");
+    expect(input.harnessEnv?.CORTEX_API_TOKEN).toBe("x-engrams-managed");
+    expect(input.harnessEnv?.ENGRAM_CLI_INTEGRATIONS).toContain('"provider":"cortex"');
+    const everything = JSON.stringify(input);
+    expect(everything).toContain("api.eu.cortex.io");
+    expect(everything).not.toContain("api.getcortexapp.com");
+  });
+
+  test("with nothing stored, the connector's default host applies", async () => {
+    const input = await compileSessionCreateInput(
+      profile({ integrationGrants: [defaultGrant("cortex:catalog:read")] }),
+      deps(),
+    );
+    expect(input.harnessEnv?.CORTEX_API_HOST).toBe("api.getcortexapp.com");
+    expect(JSON.stringify(input)).toContain("api.getcortexapp.com");
   });
 });

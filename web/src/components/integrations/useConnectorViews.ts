@@ -58,6 +58,10 @@ export interface ConnectorView {
   /** ADR 0115: user-scoped credential support, when the connector declares
    * it. `tokenHint` is the member-facing setup line for PAT mode. */
   userCredential?: { oauth: boolean; token: boolean; tokenHint?: string };
+  /** Marketplace pin: listed first in its section, with a badge. */
+  featured?: boolean;
+  /** Stored values of the connector's settings (admin surfaces only). */
+  settings?: Record<string, string>;
 }
 
 export interface ConnectorViewsResult {
@@ -138,6 +142,8 @@ export function useConnectorViews(): ConnectorViewsResult {
             ? "needs_reconnect"
             : "available",
       builtin: named ? true : (row?.builtin ?? false),
+      ...(e.display?.featured ? { featured: true } : {}),
+      ...(row ? { settings: { ...row.settings } } : {}),
       usedBy: used.length,
       usedByProfiles: used.map((p) => ({ id: p.id, name: p.name, icon: p.icon })),
       ...(named ? { connectionModel: "named" as const, connectionCount: connections.length } : {}),
@@ -198,6 +204,7 @@ export function catalogToViews(providers: ProviderCatalogEntry[]): ConnectorView
       })),
       status: "available" as const,
       builtin: false,
+      ...(e.display?.featured ? { featured: true } : {}),
       usedBy: 0,
       usedByProfiles: [],
       ...(e.connectionModel === "named" ? { connectionModel: "named" as const } : {}),

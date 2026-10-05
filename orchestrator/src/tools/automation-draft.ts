@@ -280,7 +280,7 @@ export function registerAutomationDraftTools(
       registerEngineBlocks();
       let definition: AutomationDefinition;
       try {
-        definition = validateDefinition(parsed, { kind: "user" });
+        definition = validateDefinition(parsed);
       } catch (error) {
         if (error instanceof DefinitionError) {
           return {

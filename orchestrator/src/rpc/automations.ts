@@ -50,6 +50,7 @@ import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
 import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
 import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
+import { log as rootLog } from "../log.ts";
 import type { HarnessCatalogClient } from "./task-create.ts";
 import type { WebhookVerificationScheme } from "../db/schema.ts";
 import {
@@ -116,6 +117,13 @@ export interface OrgSecretClient {
 
 export interface InputKeyOptionSource {
   list(noun: string, connectionId: string | undefined): Promise<Array<{ key: string; label: string }>>;
+  /** Labels for keys already in hand, in request order; an unknown key is
+   * labelled with itself. */
+  describe(
+    noun: string,
+    keys: readonly string[],
+    connectionId: string | undefined,
+  ): Promise<Array<{ key: string; label: string }>>;
 }
 
 export interface AutomationDeps {
@@ -421,6 +429,119 @@ function toProtoRegistration(row: WebhookRegistrationRow): ProtoWebhookRegistrat
 // Production input-key options
 // ---------------------------------------------------------------------------
 
+/** The page shape `conversations.list` answers with (the `WebClient` method,
+ * narrowed to what the walk reads). */
+export interface SlackChannelPages {
+  conversations: {
+    list(args: {
+      limit: number;
+      exclude_archived: boolean;
+      types: string;
+      cursor?: string;
+    }): Promise<{
+      channels?: Array<{ id?: string; name?: string }>;
+      response_metadata?: { next_cursor?: string };
+    }>;
+  };
+}
+
+const log = rootLog.child({ component: "automations-rpc" });
+
+/** Keys one describe call may carry: a page of threads, not a workspace. */
+const DESCRIBE_INPUT_KEYS_MAX = 200;
+
+/** Slack's ceiling for one `conversations.list` page. */
+const SLACK_CHANNEL_PAGE_SIZE = 1000;
+/** Pages of `conversations.list` to walk before giving up — 100k virtual
+ * rows, archived channels included (see below). A workspace past that
+ * lists its first 100k and the log says so. */
+const SLACK_CHANNEL_PAGE_LIMIT = 100;
+
+/** `conversations.info`, narrowed to what the lookup reads. */
+export interface SlackChannelInfo {
+  conversations: {
+    info(args: { channel: string }): Promise<{ channel?: { id?: string; name?: string } }>;
+  };
+}
+
+/** Channel names change rarely; a page re-render must not be a Slack call
+ * per thread row. */
+const SLACK_CHANNEL_NAME_TTL_MS = 10 * 60_000;
+const SLACK_CHANNEL_LOOKUP_CONCURRENCY = 4;
+const slackChannelNameCache = new Map<string, { label: string; expiresAt: number }>();
+
+/** "#name" for each channel id, by `conversations.info` — a lookup of the
+ * ids a page shows, never a walk of the workspace. A channel the app cannot
+ * see (not a member of a private one, or gone) is labelled with its id.
+ * Request order is kept; duplicates collapse. */
+export async function describeSlackChannels(
+  client: SlackChannelInfo,
+  keys: readonly string[],
+  cache: Map<string, { label: string; expiresAt: number }> = slackChannelNameCache,
+  now: () => number = Date.now,
+): Promise<Array<{ key: string; label: string }>> {
+  const ids = [...new Set(keys)];
+  const labels = new Map<string, string>();
+  const pending: string[] = [];
+  for (const id of ids) {
+    const hit = cache.get(id);
+    if (hit && hit.expiresAt > now()) labels.set(id, hit.label);
+    else pending.push(id);
+  }
+  const lookup = async (id: string) => {
+    let label = id;
+    try {
+      const result = await client.conversations.info({ channel: id });
+      if (result.channel?.name) label = `#${result.channel.name}`;
+    } catch (error) {
+      log.warn({ channel: id, err: error }, "slack channel lookup failed; showing the id");
+    }
+    labels.set(id, label);
+    cache.set(id, { label, expiresAt: now() + SLACK_CHANNEL_NAME_TTL_MS });
+  };
+  for (let i = 0; i < pending.length; i += SLACK_CHANNEL_LOOKUP_CONCURRENCY) {
+    await Promise.all(pending.slice(i, i + SLACK_CHANNEL_LOOKUP_CONCURRENCY).map(lookup));
+  }
+  return ids.map((id) => ({ key: id, label: labels.get(id) ?? id }));
+}
+
+/** Every channel the app can see, public and private alike (a thread in a
+ * private channel needs a name as much as a public one's), as key options.
+ * Slack pages the list by cursor, and `exclude_archived` is applied AFTER
+ * a virtual page of `limit` rows is cut — a workspace with years of
+ * archived channels answers every page with a handful of live ones (one
+ * in ten was seen in practice). One page is never the whole workspace,
+ * so the walk follows `next_cursor` until it is empty. */
+export async function listSlackChannelOptions(
+  client: SlackChannelPages,
+): Promise<Array<{ key: string; label: string }>> {
+  const options: Array<{ key: string; label: string }> = [];
+  let cursor: string | undefined;
+  for (let page = 0; ; page += 1) {
+    if (page === SLACK_CHANNEL_PAGE_LIMIT) {
+      log.warn(
+        { pages: page, channels: options.length },
+        "slack channel list: page cap reached; the list is incomplete",
+      );
+      break;
+    }
+    const result = await client.conversations.list({
+      limit: SLACK_CHANNEL_PAGE_SIZE,
+      exclude_archived: true,
+      types: "public_channel,private_channel",
+      ...(cursor !== undefined ? { cursor } : {}),
+    });
+    for (const c of result.channels ?? []) {
+      if (typeof c.id !== "string") continue;
+      options.push({ key: c.id, label: c.name ? `#${c.name}` : c.id });
+    }
+    const next = result.response_metadata?.next_cursor;
+    if (!next) break;
+    cursor = next;
+  }
+  return options;
+}
+
 function productionInputKeyOptions(
   integrationEvents: () => Pick<IntegrationEventStore, "listObservedScopeValues">,
   connections: () => Pick<IntegrationConnectionStore, "getDefault">,
@@ -438,17 +559,28 @@ function productionInputKeyOptions(
           const repos = await integrationEvents().listObservedScopeValues(connection.id);
           return repos.map((repo) => ({ key: repo, label: repo }));
         }
-        case "channel": {
-          const client = await getSlackClient();
-          const result = await client.conversations.list({ limit: 200, exclude_archived: true });
-          return (result.channels ?? [])
-            .filter((c) => typeof c.id === "string")
-            .map((c) => ({ key: c.id!, label: c.name ? `#${c.name}` : c.id! }));
-        }
+        case "channel":
+          return listSlackChannelOptions(await getSlackClient());
         case "team": {
           const workspace = await makeLinearIssueClient().readWorkspace();
           return workspace.teams.map((team) => ({ key: team.id, label: team.name }));
         }
+        default:
+          throw new ConnectError(`unknown input noun "${noun}"`, Code.InvalidArgument);
+      }
+    },
+    async describe(noun, keys, _connectionId) {
+      switch (noun) {
+        case "channel":
+          return describeSlackChannels(await getSlackClient(), keys);
+        case "team": {
+          const workspace = await makeLinearIssueClient().readWorkspace();
+          const names = new Map(workspace.teams.map((team) => [team.id, team.name]));
+          return keys.map((key) => ({ key, label: names.get(key) ?? key }));
+        }
+        case "repository":
+          // A repository's full name is its own label.
+          return keys.map((key) => ({ key, label: key }));
         default:
           throw new ConnectError(`unknown input noun "${noun}"`, Code.InvalidArgument);
       }
@@ -508,12 +640,11 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
    * event keys). */
   async function parseDefinition(
     raw: string,
-    kind: "user" | "builtin",
   ): Promise<{ definition: AutomationDefinition; nextFireAt: Date | null }> {
     const parsed = parseJson(raw, "definition_json", DEFINITION_MAX_CHARS);
     let definition: AutomationDefinition;
     try {
-      definition = validateDefinition(parsed, { kind });
+      definition = validateDefinition(parsed);
     } catch (error) {
       const be = toBlockError(error);
       if (be) throw new BlockValidationError([be]);
@@ -900,7 +1031,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     async createAutomation(req, ctx) {
       const userId = (await requireAdmin(ctx, getSession)).id;
       const name = requiredText(req.name, "name");
-      const { definition, nextFireAt } = await parseDefinition(req.definitionJson, "user");
+      const { definition, nextFireAt } = await parseDefinition(req.definitionJson);
       const inputs = req.inputsJson ? parseObjectJson(req.inputsJson, "inputs_json") : {};
       assertInputValues(definition.inputsSchema, inputs);
       const row = await store.create(
@@ -950,7 +1081,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const row = await requireAutomation(req.automationId);
       refuseOnBuiltin(row, "saving a new version");
       if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
-      const { definition, nextFireAt } = await parseDefinition(req.definitionJson, "user");
+      const { definition, nextFireAt } = await parseDefinition(req.definitionJson);
       // Existing overrides must still be valid against the new graph; drop
       // the ones that no longer apply rather than refusing the save.
       let overrides: BlockOverrides = row.blockOverrides;
@@ -1010,7 +1141,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         const settings: AutomationSettings = parsed.data;
         const definition: AutomationDefinition = { ...definitionOf(row.version), settings };
         // Re-validate the whole definition (templates inside settings).
-        const { definition: validated } = await parseDefinition(JSON.stringify(definition), "user");
+        const { definition: validated } = await parseDefinition(JSON.stringify(definition));
         const saved = await store.saveVersion(row.id, validated, userId, patch);
         if (!saved) throw new ConnectError("automation not found", Code.NotFound);
         return { automation: toProtoAutomation(saved) };
@@ -1036,6 +1167,65 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const updated = await store.setInputs(row.id, inputs);
       if (!updated) throw new ConnectError("automation not found", Code.NotFound);
       // The Slack route's per-channel window reads this row through a cache.
+      return { automation: toProtoAutomation(updated) };
+    },
+
+    async setInputValue(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      const inputKey = requiredText(req.inputKey, "input_key");
+      const spec = row.version.inputsSchema.find((f) => f.key === inputKey);
+      if (!spec) {
+        throw new BlockValidationError([
+          blockError("", `inputs.${inputKey}`, "unknown_input", `input "${inputKey}" is not declared`),
+        ]);
+      }
+      if (spec.type === "map") {
+        throw new ConnectError(`input "${inputKey}" is a map; use SetMapInputEntry`, Code.InvalidArgument);
+      }
+      let value: unknown;
+      try {
+        value = JSON.parse(req.valueJson);
+      } catch {
+        throw new ConnectError("value_json is not valid JSON", Code.InvalidArgument);
+      }
+      // The one key against its own spec; its siblings are not part of this
+      // write, so their required-ness does not apply.
+      assertInputValues([spec], { [inputKey]: value });
+      const updated = await store.setInputValue(row.id, inputKey, value);
+      if (!updated) throw new ConnectError("automation not found", Code.NotFound);
+      return { automation: toProtoAutomation(updated) };
+    },
+
+    async setMapInputEntry(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      const inputKey = requiredText(req.inputKey, "input_key");
+      const entryKey = requiredText(req.entryKey, "entry_key");
+      const spec = row.version.inputsSchema.find((f) => f.key === inputKey);
+      if (!spec) {
+        throw new BlockValidationError([
+          blockError("", `inputs.${inputKey}`, "unknown_input", `input "${inputKey}" is not declared`),
+        ]);
+      }
+      if (spec.type !== "map") {
+        throw new ConnectError(`input "${inputKey}" is not a map`, Code.InvalidArgument);
+      }
+      let value: Record<string, unknown> | string | null = null;
+      if (req.valueJson !== undefined) {
+        const parsed: unknown = JSON.parse(req.valueJson);
+        if (typeof parsed !== "string" && (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))) {
+          throw new ConnectError("value_json must be an object or a string", Code.InvalidArgument);
+        }
+        value = parsed as Record<string, unknown> | string;
+        // Validate the entry the way the whole map is validated on SetInputs:
+        // a one-entry map against the map's own spec (its siblings are not
+        // part of this write, so their required-ness does not apply). The
+        // write touches only this entry, so a stale snapshot never leaks in.
+        assertInputValues([spec], { [inputKey]: { [entryKey]: value } });
+      }
+      const updated = await store.setMapInputEntry(row.id, inputKey, entryKey, value, req.enable);
+      if (!updated) throw new ConnectError("automation not found", Code.NotFound);
       return { automation: toProtoAutomation(updated) };
     },
 
@@ -1098,7 +1288,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       if (req.draftDefinitionJson !== undefined) {
         const parsed = parseJson(req.draftDefinitionJson, "draft_definition_json", DEFINITION_MAX_CHARS);
         try {
-          definition = validateDefinition(parsed, { kind: row.kind === "builtin" ? "builtin" : "user" });
+          definition = validateDefinition(parsed);
         } catch (error) {
           const be = toBlockError(error);
           if (be) return { blocks: [], errors: [be] };
@@ -1314,6 +1504,23 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       return { options };
     },
 
+    async describeInputKeys(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const noun = requiredText(req.noun, "noun");
+      const keys = [...new Set(req.keys.map((k) => k.trim()).filter((k) => k !== ""))];
+      if (keys.length > DESCRIBE_INPUT_KEYS_MAX) {
+        throw new ConnectError(
+          `at most ${DESCRIBE_INPUT_KEYS_MAX} keys per call`,
+          Code.InvalidArgument,
+        );
+      }
+      const options =
+        keys.length === 0
+          ? []
+          : await inputKeyOptions.describe(noun, keys, req.connectionId?.trim() || undefined);
+      return { options };
+    },
+
     async listEventCatalog(req, ctx) {
       await requireAdmin(ctx, getSession);
       const provider = requiredText(req.provider, "provider");
@@ -1376,6 +1583,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       id: row.id,
       automationId: row.automationId,
       key: row.key,
+      ...(row.label !== null ? { label: row.label } : {}),
       status: row.status,
       inputsJson: JSON.stringify(row.inputs),
       openedBy: row.openedBy,

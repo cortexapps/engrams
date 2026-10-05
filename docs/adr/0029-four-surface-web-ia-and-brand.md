@@ -2,8 +2,8 @@
 
 Status: 2026-06-02 — **Accepted.** Implemented on `redesign/four-surface-ia`;
 web `tsc`/`vitest`/`vite build` green, `cargo nextest`/clippy green for the new
-coordinator endpoint, and all surfaces visually verified at three widths
-(screenshots below). The masthead mark is the **static** canonical logo; the
+coordinator endpoint, and all surfaces visually verified at three widths.
+The masthead mark is the **static** canonical logo; the
 growing-trace animation is reserved for loaders (per review).
 
 ## Context
@@ -127,23 +127,6 @@ can't express, so the ported component classes + the responsive block live in
 The Lab Notebook language is preserved throughout: square corners (radius 0),
 hairline 1px rules, flat surfaces, amber = "now" / verdigris = "archived /
 durable", mono small-caps labels.
-
-## Screenshots
-
-Captured against the real app (Vite) with representative mocked API data, at
-desktop (1280) / tablet (768) / phone (390).
-
-### Sessions
-![Sessions — desktop](assets/0029/sessions-desktop.png)
-![Sessions — phone (wrapped nav spine, two-line rows)](assets/0029/sessions-phone.png)
-
-### Fleet
-![Fleet — desktop (strata, capacity bars, drain, reconciler)](assets/0029/fleet-desktop.png)
-![Fleet — phone (strata stack)](assets/0029/fleet-phone.png)
-
-### Storage
-![Storage — desktop (rollups + durability ledger)](assets/0029/storage-desktop.png)
-![Storage — tablet (ledger flips to label/value records)](assets/0029/storage-tablet.png)
 
 ## Consequences
 

@@ -230,3 +230,51 @@ async fn proxy_port_forwards_host_bytes_to_client() {
         .expect("client-side tunnel closed without delivering");
     assert_eq!(&got[..], b"HTTP/1.1 200 OK\r\n\r\nhi");
 }
+
+/// Guest EOF while the client is still open: when the guest closes its socket
+/// (the host drops `inbound_tx`), the client's `tunnel.inbound` must end, even
+/// though the client has not closed its own direction. A close-delimited HTTP
+/// response (HTTP/1.0, no `Content-Length`) marks its end only this way; if the
+/// EOF does not reach the client, the browser waits for the body forever.
+#[tokio::test]
+async fn proxy_port_guest_eof_ends_client_inbound_while_client_open() {
+    let host = Arc::new(FakeHost::default());
+    let addr = boot_grpc_server(host.clone()).await;
+    let client = connect_grpc_client(addr).await;
+
+    // Keep `tunnel.outbound` alive for the whole test: the client direction
+    // stays open, as it does while the orchestrator waits for the body.
+    let mut tunnel = client
+        .proxy_port(SandboxId::new(), 3000)
+        .await
+        .expect("client proxy_port");
+
+    let PortTunnelEnds {
+        inbound_tx,
+        outbound_rx,
+    } = host
+        .tunnel_ends
+        .lock()
+        .take()
+        .expect("server didn't call inner proxy_port");
+
+    inbound_tx
+        .send(Bytes::from_static(b"HTTP/1.0 200 OK\r\n\r\nhello"))
+        .await
+        .expect("host push bytes");
+    // The guest closes. Hold `outbound_rx` so only the guest direction ends.
+    drop(inbound_tx);
+
+    let got = tokio::time::timeout(Duration::from_secs(2), tunnel.inbound.recv())
+        .await
+        .expect("no bytes reached the client within 2s")
+        .expect("client-side tunnel closed before delivering the body");
+    assert_eq!(&got[..], b"HTTP/1.0 200 OK\r\n\r\nhello");
+
+    let end = tokio::time::timeout(Duration::from_secs(2), tunnel.inbound.recv())
+        .await
+        .expect("guest EOF did not reach the client within 2s");
+    assert!(end.is_none(), "expected EOF, got more bytes: {end:?}");
+
+    drop(outbound_rx);
+}

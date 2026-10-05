@@ -1141,11 +1141,10 @@ mod tests {
             path_globs: vec!["segment-path:/v3/projects/*/metricDescriptors".into()],
             ..RequestPolicy::default()
         };
-        assert!(google.path_matches(
-            "/v3/projects/cortex-internal-tooling/metricDescriptors?alt=json&pageSize=1"
-        ));
-        assert!(!google.path_matches(
-            "/v3/projects/cortex-internal-tooling/metricDescriptors/delete?alt=json"
-        ));
+        assert!(google
+            .path_matches("/v3/projects/example-project/metricDescriptors?alt=json&pageSize=1"));
+        assert!(
+            !google.path_matches("/v3/projects/example-project/metricDescriptors/delete?alt=json")
+        );
     }
 }

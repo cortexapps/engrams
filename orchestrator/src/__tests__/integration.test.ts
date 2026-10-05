@@ -224,6 +224,13 @@ function fakeConnectionStore(seed: IntegrationConnectionRow[] = []): Integration
       rows.set(id, row);
       return row;
     },
+    async setConfig(id, config) {
+      const current = rows.get(id);
+      if (!current) return null;
+      const row = { ...current, config, updatedAt: new Date("2026-07-31T12:02:00Z") };
+      rows.set(id, row);
+      return row;
+    },
     async ensureDefault(provider) {
       return (await this.getDefault(provider))!;
     },
@@ -893,6 +900,125 @@ describe("TestConnector", () => {
     const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: fakeStore().store, mint: fakeMint() });
     try {
       await expectErr(s.client.testConnector({ provider: "nope", draftValues: {} }), Code.InvalidArgument);
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe("SetConnectorSettings + the settings-aware probe (the `settings` facet)", () => {
+  const admin = () => ({
+    getSession: makeGetSession("a", "admin"),
+    connectors: fakeStore().store,
+    mint: fakeMint(),
+    orgSecret: fakeOrgSecret(["cortex.api_key"]).client,
+  });
+
+  test("anon → Unauthenticated; member → PermissionDenied", async () => {
+    const anon = await spawn({ getSession: makeGetSession(null), connectors: fakeStore().store });
+    try {
+      await expectErr(anon.client.setConnectorSettings({ provider: "cortex", settings: {} }), Code.Unauthenticated);
+    } finally {
+      await anon.close();
+    }
+    const mem = await spawn({ getSession: makeGetSession("u"), connectors: fakeStore().store });
+    try {
+      await expectErr(mem.client.setConnectorSettings({ provider: "cortex", settings: {} }), Code.PermissionDenied);
+    } finally {
+      await mem.close();
+    }
+  });
+
+  test("stores validated values on the default connection and serves them back", async () => {
+    const connections = fakeConnectionStore();
+    const s = await spawn({ ...admin(), connections });
+    try {
+      const r = await s.client.setConnectorSettings({
+        provider: "cortex",
+        settings: { api_host: "api.eu.cortex.io" },
+      });
+      expect(r.connector?.settings).toEqual({ api_host: "api.eu.cortex.io" });
+      expect(r.connector?.builtin).toBe(true);
+      expect(r.connector?.status).toBe("connected");
+      const row = await connections.getDefault("cortex");
+      expect(row?.config).toEqual({ settings: { api_host: "api.eu.cortex.io" } });
+      // The admin rows and the member catalog both read the stored host.
+      const list = await s.client.listConnectors({});
+      expect(list.connectors.find((c) => c.provider === "cortex")?.settings).toEqual({
+        api_host: "api.eu.cortex.io",
+      });
+      const cat = await s.client.getIntegrationCatalog({});
+      const cortex = cat.providers.find((p) => p.provider === "cortex")!;
+      expect(cortex.hosts).toEqual(["api.eu.cortex.io"]);
+      expect(cortex.display?.featured).toBe(true);
+      // A self-hosted value is an exact hostname.
+      const self = await s.client.setConnectorSettings({
+        provider: "cortex",
+        settings: { api_host: "cortex-api.example.com" },
+      });
+      expect(self.connector?.settings).toEqual({ api_host: "cortex-api.example.com" });
+      // Clearing the map restores the default.
+      await s.client.setConnectorSettings({ provider: "cortex", settings: {} });
+      const back = await s.client.getIntegrationCatalog({});
+      expect(back.providers.find((p) => p.provider === "cortex")?.hosts).toEqual(["api.getcortexapp.com"]);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("rejects an unknown setting, a bad host, and a connector without settings", async () => {
+    const s = await spawn(admin());
+    try {
+      await expectErr(
+        s.client.setConnectorSettings({ provider: "cortex", settings: { region: "eu" } }),
+        Code.InvalidArgument,
+      );
+      await expectErr(
+        s.client.setConnectorSettings({ provider: "cortex", settings: { api_host: "https://api.eu.cortex.io" } }),
+        Code.InvalidArgument,
+      );
+      await expectErr(
+        s.client.setConnectorSettings({ provider: "cortex", settings: { api_host: "*.cortex.io" } }),
+        Code.InvalidArgument,
+      );
+      await expectErr(
+        s.client.setConnectorSettings({ provider: "datadog", settings: { api_host: "x.y" } }),
+        Code.InvalidArgument,
+      );
+      await expectErr(s.client.setConnectorSettings({ provider: "nope", settings: {} }), Code.InvalidArgument);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("TestConnector probes the draft host, else the stored host, else the default", async () => {
+    const op = fakeIntegrationOp();
+    const connections = fakeConnectionStore();
+    const s = await spawn({ ...admin(), integrationOp: op.client, connections });
+    try {
+      await s.client.testConnector({ provider: "cortex", draftValues: { "cortex.api_key": "k" } });
+      expect(op.calls[0]).toMatchObject({ host: "api.getcortexapp.com", path: "/api/v1/catalog/definitions" });
+
+      await s.client.testConnector({
+        provider: "cortex",
+        draftValues: { "cortex.api_key": "k" },
+        draftSettings: { api_host: "api.eu.cortex.io" },
+      });
+      expect(op.calls[1]).toMatchObject({ host: "api.eu.cortex.io" });
+
+      await s.client.setConnectorSettings({ provider: "cortex", settings: { api_host: "cortex-api.example.com" } });
+      await s.client.testConnector({ provider: "cortex", draftValues: {} });
+      expect(op.calls[2]).toMatchObject({ host: "cortex-api.example.com" });
+
+      // A bad draft never reaches the coordinator: it is reported, not probed.
+      const bad = await s.client.testConnector({
+        provider: "cortex",
+        draftValues: {},
+        draftSettings: { api_host: "https://nope" },
+      });
+      expect(bad.ok).toBe(false);
+      expect(bad.message).toMatch(/API host/);
+      expect(op.calls).toHaveLength(3);
     } finally {
       await s.close();
     }

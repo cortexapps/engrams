@@ -193,8 +193,12 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
 
   const lockedHint = builtin ? <FieldDescription>Set by the built-in.</FieldDescription> : null;
 
-  // The description lives here, not in the Builder masthead: it is a note
-  // about the automation, not part of building it.
+  // The Builder masthead now shows and edits the description too, because a
+  // note about what the automation does belongs next to the graph that does
+  // it. This field stays: Settings is where you come to read the whole record
+  // at once, and it keeps the long-form room the masthead line does not have.
+  // Both write the same field through UpdateMeta, and neither is live while
+  // the other is on screen.
   const descriptionDirty = !builtin && description !== automation.description;
   const saveDescription = async () => {
     try {

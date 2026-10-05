@@ -50,7 +50,7 @@ nodeAssets:
   # Pin to a digest in prod and roll it via the K3 operator's node sequence.
   image:
     repository: ghcr.io/cortexapps/engrams/node-assets
-    tag: main
+    tag: ""         # defaults to .Chart.AppVersion when empty
     pullPolicy: IfNotPresent
 
 firecracker:
@@ -309,7 +309,7 @@ operator:
   enabled: false
   image:
     repository: ghcr.io/cortexapps/engrams/host-operator
-    tag: main
+    tag: ""         # defaults to .Chart.AppVersion when empty
     pullPolicy: IfNotPresent
   logLevel: info
   # ADR 0048: the operator's OWN ServiceAccount annotations — the Workload

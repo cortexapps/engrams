@@ -8,8 +8,8 @@ description: |
   bindings (Workload Identity, secret providers, LB annotations) live
   in `values-*.yaml.example` overlays.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.10.0
+appVersion: "0.10.0"
 keywords:
   - engram
   - firecracker

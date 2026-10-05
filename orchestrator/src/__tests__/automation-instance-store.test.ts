@@ -68,10 +68,14 @@ describe.skipIf(!dbReachable)("automation instance store (live PG)", () => {
     const first = await store.openInstance({
       automationId: autoId,
       key: "project-ENG-1",
+      label: "Fix the deploy",
       inputs: { channel: "#eng-1" },
       openedBy: "user:u-1",
     });
     expect(first.id.startsWith("ai_")).toBe(true);
+    // The title rendered at open rides the row; the key stays the identity.
+    expect(first.label).toBe("Fix the deploy");
+    expect((await store.getInstance(first.id))?.label).toBe("Fix the deploy");
     expect(first.status).toBe("open");
 
     // A concurrent open of the same key must JOIN, never mutate the snapshot.
@@ -225,7 +229,7 @@ describe.skipIf(!dbReachable)("automation instance store (live PG)", () => {
     expect(await store.resolveHandles(otherAuto, [handle])).toEqual([]);
   });
 
-  test("anyOpenHandleOwner is cross-automation and open-only (the brain-suppression pre-pass)", async () => {
+  test("openHandleOwners is cross-automation and open-only (the brain-suppression pre-pass)", async () => {
     const autoId = await seedAutomation("owner-check");
     const store = makeAutomationInstanceStore();
     const owner = await store.openInstance({
@@ -242,16 +246,16 @@ describe.skipIf(!dbReachable)("automation instance store (live PG)", () => {
       writtenBy: "run-1:claim",
     });
 
-    expect(await store.anyOpenHandleOwner([])).toBe(false);
-    expect(await store.anyOpenHandleOwner(["slack:CUNKNOWN"])).toBe(false);
+    expect(await store.openHandleOwners([])).toEqual([]);
+    expect(await store.openHandleOwners(["slack:CUNKNOWN"])).toEqual([]);
     // Deliberately NOT scoped by automation: the check answers "does any
     // workstream anywhere own this conversation", so a channel owner
     // suppresses the brain even for event keys it does not subscribe to.
-    expect(await store.anyOpenHandleOwner(["slack:CUNKNOWN", handle])).toBe(true);
+    expect((await store.openHandleOwners(["slack:CUNKNOWN", handle])).map((o) => o.instanceId)).toHaveLength(1);
 
     // A closed owner no longer suppresses — the brain resumes.
     await store.closeInstance({ instanceId: owner.id });
-    expect(await store.anyOpenHandleOwner([handle])).toBe(false);
+    expect(await store.openHandleOwners([handle])).toEqual([]);
   });
 
   test("explicit claim takes over a CLOSED holder's handle; open holders and auto-writers never rebind", async () => {

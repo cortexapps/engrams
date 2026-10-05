@@ -3,11 +3,8 @@
 A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. engrams orchestrates [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs on Linux production hosts and adds the layer above them: chunked-OCI rootfs + canonical-memory restore (sub-second cold start without pre-warming), FC snapshot lifecycle (UFFD-backed hot resume), multi-host scheduling, chunked-immutable content-addressed durability, and a pluggable cloud abstraction. A subprocess-based dev backend lets the entire orchestration layer run on macOS for fastest-possible iteration; an Apple Silicon backend drives Apple's Virtualization.framework for real microVM isolation locally. Production isolation is always Firecracker.
 
 > This file is the **design** layer — architecture, traits, components,
-> rationale. The chronological "what shipped when" log lives in
-> [`docs/history.md`](./docs/history.md). The live punch list (what's
-> still in flight + what's deferred) lives in
-> [`docs/chunked-storage-rollout.md`](./docs/chunked-storage-rollout.md).
-> The operational guide for GCP/GKE is [`docs/deploy.md`](./docs/deploy.md).
+> rationale. The operational guide for GCP/GKE is
+> [`docs/deploy.md`](./docs/deploy.md).
 >
 > ADRs in `docs/adr/` capture non-obvious decisions. The current
 > trajectory:
@@ -638,22 +635,6 @@ engram/
 
 ---
 
-## Phased implementation plan
-
-> **Moved to [`docs/history.md`](./docs/history.md).** The seven-phase
-> rollout (orchestration layer → Firecracker → multi-host → harness
-> protocol → Apple Silicon → registry → chunked storage + deploy)
-> shipped between Q1 and Q2 2026 and now reads as a milestone log
-> rather than active planning. Cross-reference the ADRs in
-> `docs/adr/` for the design rationale at each pivot.
->
-> The historical phase content below has been removed to keep this
-> file focused on architecture; see the history doc for the
-> chronological "what + when" view and the rollout doc for live
-> punch-list status.
-
----
-
 ## Open questions / risks
 
 ### ~~Risk 1 — VMM snapshot/restore (closed)~~
@@ -884,7 +865,7 @@ Each phase has its own verification, summarized:
 End-to-end smoke test for v1 (Phase 1+2):
 ```bash
 # On a GCE n2d-highmem-32 with nested virt enabled, a Hetzner box, or an Apple Silicon Mac for local dev
-git clone https://github.com/cortex/engram && cd engram
+git clone --recursive https://github.com/cortexapps/engrams && cd engrams
 cp .env.example .env  # fill in Postgres URL, GCS creds
 docker-compose up -d
 sleep 10

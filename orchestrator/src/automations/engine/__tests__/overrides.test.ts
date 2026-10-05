@@ -185,9 +185,13 @@ describe("previewDefinition — code blocks run (the editor's Test with sample)"
     // The walk went on past the filter and rendered the session prompt.
     expect(byId["session"]).toBeDefined();
     expect(JSON.stringify(byId["session"]!.rendered)).toContain("summarize the incident");
-    // The only gap left is an EXECUTING block's output (the identity system
-    // block resolves the user at run time) — reported on the field, as documented.
-    expect(res.errors.map((e) => `${e.blockId}.${e.field}`)).toEqual(["session.ownerUserId"]);
+    // The only gaps left are EXECUTING blocks' outputs (the identity block
+    // resolves the user at run time; the session link exists once the session
+    // does) — reported on the field, as documented.
+    expect(res.errors.map((e) => `${e.blockId}.${e.field}`)).toEqual([
+      "session.ownerUserId",
+      "started.params.text",
+    ]);
   });
 
   test("an unflagged channel is a real fail at the filter, not a missing value", async () => {

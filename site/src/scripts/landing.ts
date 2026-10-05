@@ -1,8 +1,8 @@
 // The landing page's one clock. A 900ms tick advances the hero graph through
-// its eight steps, scrolls the run log, rotates the runs board, and fills the
-// chunk field. Under prefers-reduced-motion everything is drawn once, mid-run,
-// and never moves. The marquee, the dashed edges, and the blinks are CSS.
-import { frame, glyph, logs, RUN_START } from "../landing/demo";
+// its eight steps, scrolls the run log, and fills the chunk field. Under
+// prefers-reduced-motion everything is drawn once, mid-run, and never moves.
+// The marquee, the dashed edges, and the blinks are CSS.
+import { frame, logs, RUN_START } from "../landing/demo";
 import { fitAll } from "./fit";
 
 const $ = <T extends Element>(sel: string) => document.querySelector<T>(sel);
@@ -13,8 +13,6 @@ const edges = $$<SVGPathElement>("[data-edge]");
 const runNo = $("[data-run-no]");
 const clocks = $$("[data-clock]");
 const log = $("[data-log]");
-const boardRows = $("[data-board-rows]");
-const boardCount = $("[data-board-count]");
 const cells = $$<HTMLElement>("[data-chunk]");
 const sessions = $("[data-sessions]");
 const stored = $("[data-stored]");
@@ -57,29 +55,6 @@ function render(tick: number, step: number, run: number) {
       log.append(cursor);
     }
   }
-  if (boardRows) {
-    boardRows.replaceChildren(
-      ...f.board.map((r) => {
-        const row = document.createElement("div");
-        row.className = "row";
-        const cell = (cls: string, text: string) => {
-          const s = document.createElement("span");
-          s.className = cls;
-          s.textContent = text;
-          return s;
-        };
-        row.append(
-          cell("time", r.time),
-          cell("name", r.name),
-          cell("trigger", r.trigger),
-          cell("dur", r.dur),
-          cell(`status ${r.status}`, `${glyph[r.status]} ${r.status}`),
-        );
-        return row;
-      }),
-    );
-  }
-  if (boardCount) boardCount.textContent = `${f.boardCount} runs today`;
   cells.forEach((c, i) => (c.className = f.chunks[i] ?? ""));
   if (sessions) sessions.textContent = String(f.sessions);
   if (stored) stored.textContent = f.stored;

@@ -28,6 +28,8 @@ export interface AutomationInstanceRow {
   id: string;
   automationId: string;
   key: string;
+  /** The human title (settings.instance.labelTemplate at open); null = show the key. */
+  label: string | null;
   status: "open" | "closed";
   inputs: Record<string, unknown>;
   openedBy: string;
@@ -54,6 +56,12 @@ export interface AutomationDropRow {
   droppedAt: Date;
 }
 
+/** An open workstream that owns a handle (see `openHandleOwners`). */
+export interface HandleOwner {
+  instanceId: string;
+  automationId: string;
+}
+
 export interface ResolvedHandle {
   handle: string;
   instanceId: string;
@@ -69,6 +77,7 @@ export interface AutomationInstanceStore {
   openInstance(input: {
     automationId: string;
     key: string;
+    label?: string | null;
     inputs: Record<string, unknown>;
     openedBy: string;
   }): Promise<AutomationInstanceRow>;
@@ -104,12 +113,13 @@ export interface AutomationInstanceStore {
   }): Promise<RecordHandleResult>;
   /** One query over all of an event's candidate handles. */
   resolveHandles(automationId: string, handles: string[]): Promise<ResolvedHandle[]>;
-  /** True when ANY open workstream — in ANY automation — owns one of these
-   * handles. The brain-suppression pre-pass asks this when no MATCHED
-   * target bound the event: ownership is about the CONVERSATION, not the
-   * event subscription (a tagged message arrives as two deliveries, and
-   * the owner may subscribe to only one of them). */
-  anyOpenHandleOwner(handles: string[]): Promise<boolean>;
+  /** Every open workstream — in ANY automation — that owns one of these
+   * handles. The brain-suppression pre-pass asks this: ownership is about
+   * the CONVERSATION, not the event subscription (a tagged message arrives
+   * as two deliveries, and the owner may subscribe to only one of them).
+   * The owners' automation ids let the pre-pass tell another automation's
+   * workstream (the brain stands down) from the brain's own (it answers). */
+  openHandleOwners(handles: string[]): Promise<HandleOwner[]>;
   /** The drops ring: record an admission drop (no run row exists for it) and
    * cap the ring per automation. Callers treat this as best-effort — a
    * failed audit write must never fail the delivery. */
@@ -175,6 +185,7 @@ function instanceRow(row: typeof automationInstance.$inferSelect): AutomationIns
     id: row.id,
     automationId: row.automationId,
     key: row.key,
+    label: row.label ?? null,
     status: row.status === "closed" ? "closed" : "open",
     inputs: row.inputs,
     openedBy: row.openedBy,
@@ -228,6 +239,7 @@ export function makeAutomationInstanceStore(
             id: newId(),
             automationId: input.automationId,
             key: input.key,
+            label: input.label ?? null,
             inputs: input.inputs,
             openedBy: input.openedBy,
             openedAt: now(),
@@ -466,10 +478,13 @@ export function makeAutomationInstanceStore(
       }));
     },
 
-    async anyOpenHandleOwner(handles) {
-      if (handles.length === 0) return false;
-      const [row] = await db
-        .select({ handle: automationInstanceHandle.handle })
+    async openHandleOwners(handles) {
+      if (handles.length === 0) return [];
+      const rows = await db
+        .selectDistinct({
+          instanceId: automationInstance.id,
+          automationId: automationInstance.automationId,
+        })
         .from(automationInstanceHandle)
         .innerJoin(
           automationInstance,
@@ -480,9 +495,8 @@ export function makeAutomationInstanceStore(
             inArray(automationInstanceHandle.handle, handles),
             eq(automationInstance.status, "open"),
           ),
-        )
-        .limit(1);
-      return row !== undefined;
+        );
+      return rows;
     },
   };
 }

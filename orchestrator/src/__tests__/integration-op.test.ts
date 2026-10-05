@@ -157,3 +157,47 @@ describe("the generic SDK seam (clients.ts)", () => {
     ).rejects.toThrow(/no integration client registered/);
   });
 });
+
+describe("runIntegrationOp — the settings facet picks the host", () => {
+  beforeEach(() => invalidateRegistry());
+
+  test("a host-parameterized connector reaches its stored host, else its default", async () => {
+    const { client, calls } = fakeClient();
+    await runIntegrationOp(
+      "cortex",
+      { method: "GET", path: "/api/v1/teams" },
+      {
+        connectors: emptySource,
+        integrationOp: client,
+        settingsFor: async () => ({ api_host: "api.eu.cortex.io" }),
+      },
+    );
+    expect(calls.run[0]!.host).toBe("api.eu.cortex.io");
+
+    await runIntegrationOp(
+      "cortex",
+      { method: "GET", path: "/api/v1/teams" },
+      { connectors: emptySource, integrationOp: client, settingsFor: async () => ({}) },
+    );
+    expect(calls.run[1]!.host).toBe("api.getcortexapp.com");
+  });
+
+  test("a connector without settings never looks a connection up", async () => {
+    const { client, calls } = fakeClient();
+    let asked = 0;
+    await runIntegrationOp(
+      "datadog",
+      { method: "GET", path: "/api/v1/dashboard" },
+      {
+        connectors: emptySource,
+        integrationOp: client,
+        settingsFor: async () => {
+          asked += 1;
+          return {};
+        },
+      },
+    );
+    expect(asked).toBe(0);
+    expect(calls.run[0]!.host).toBe("api.datadoghq.com");
+  });
+});

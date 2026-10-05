@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { Code, ConnectError } from "@connectrpc/connect";
 
 import type { LeaseStore } from "../lease-store.ts";
 import { ListenerManager, type ListenerHandle } from "../manager.ts";
 
-function fixture(initialDesired: string[] = []) {
+function fixture(initialDesired: string[] = [], initialDormant: string[] = []) {
   let desired = new Set(initialDesired);
+  const dormant = new Set(initialDormant);
   const owners = new Map<string, string>();
   const released: string[] = [];
+  const woken: string[] = [];
+  const terminal: string[] = [];
   const leases: LeaseStore = {
     tryAcquire: async (sessionId, owner) => {
       if (owners.has(sessionId)) return false;
@@ -18,9 +22,23 @@ function fixture(initialDesired: string[] = []) {
       if (owners.get(sessionId) === owner) owners.delete(sessionId);
       released.push(sessionId);
     },
-    markTerminal: async (sessionId) => void desired.delete(sessionId),
+    markTerminal: async (sessionId) => {
+      desired.delete(sessionId);
+      dormant.delete(sessionId);
+      terminal.push(sessionId);
+    },
     listDesired: async () => [...desired],
     ensureRow: async (sessionId) => void desired.add(sessionId),
+    markDormant: async (sessionId) => {
+      desired.delete(sessionId);
+      dormant.add(sessionId);
+      return true;
+    },
+    wake: async (sessionId) => {
+      if (dormant.delete(sessionId)) desired.add(sessionId);
+      woken.push(sessionId);
+    },
+    listDormant: async () => [...dormant],
   };
   const started: string[] = [];
   const stopped: string[] = [];
@@ -46,11 +64,50 @@ function fixture(initialDesired: string[] = []) {
     started,
     stopped,
     released,
+    woken,
+    terminal,
     setDesired(values: string[]) {
       desired = new Set(values);
     },
   };
 }
+
+describe("ListenerManager.reconcileDormantOnce", () => {
+  test("wakes a dormant row whose session is no longer parked and retires a gone one", async () => {
+    const f = fixture([], ["parked", "resumed", "gone", "flaky"]);
+    const probed: string[] = [];
+    const manager = new ListenerManager({
+      owner: "manager-1",
+      ttlMs: 30_000,
+      leaseStore: f.leases,
+      createListener: () => ({ start: () => new Promise<void>(() => {}), stop: async () => {} }),
+      probeStatus: async (sessionId) => {
+        probed.push(sessionId);
+        if (sessionId === "parked") return "parked";
+        if (sessionId === "resumed") return "active";
+        if (sessionId === "gone") throw new ConnectError("no such session", Code.NotFound);
+        throw new Error("coordinator unreachable");
+      },
+    });
+
+    await manager.reconcileDormantOnce();
+
+    expect(probed).toEqual(["parked", "resumed", "gone", "flaky"]);
+    expect(f.woken).toEqual(["resumed"]);
+    expect(f.terminal).toEqual(["gone"]);
+    // The resumed session is desired again; the parked and the flaky ones
+    // stay dormant until the next reconcile.
+    expect(await f.leases.listDesired()).toEqual(["resumed"]);
+    expect(await f.leases.listDormant()).toEqual(["parked", "flaky"]);
+  });
+
+  test("without a status probe the reconcile is a no-op", async () => {
+    const f = fixture([], ["parked"]);
+    await f.manager.reconcileDormantOnce();
+    expect(f.woken).toEqual([]);
+    expect(await f.leases.listDormant()).toEqual(["parked"]);
+  });
+});
 
 describe("ListenerManager.scanOnce", () => {
   test("desired {A,B} with B already running starts only A", async () => {

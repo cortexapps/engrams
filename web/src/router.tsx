@@ -37,6 +37,9 @@ import { SessionDetail } from "./pages/SessionDetail";
 import { Reviews } from "./pages/reviews/Reviews";
 import { ReviewsLayout } from "./pages/reviews/ReviewsLayout";
 import { ReviewDossier } from "./pages/reviews/ReviewDossier";
+import { ReviewRepositories } from "./pages/reviews/ReviewRepositories";
+import { SlackThreads } from "./pages/slack/SlackThreads";
+import { SlackLayout } from "./pages/slack/SlackLayout";
 import { ArtifactsLayout } from "./pages/artifacts/ArtifactsLayout";
 import { ArtifactsLibrary } from "./pages/artifacts/ArtifactsLibrary";
 import { ArtifactDetail } from "./pages/artifacts/ArtifactDetail";
@@ -47,6 +50,7 @@ import { SpecTemplates } from "./pages/specs/SpecTemplates";
 import { NewSpecPage } from "./pages/specmode/NewSpecPage";
 import { SpecShellPage } from "./pages/specmode/SpecShellPage";
 import { Papercuts } from "./pages/settings/Papercuts";
+import { Retention } from "./pages/settings/Retention";
 import { Fleet } from "./pages/Fleet";
 import { Storage } from "./pages/Storage";
 import { SettingsLayout } from "./pages/settings/SettingsLayout";
@@ -77,7 +81,6 @@ import { ActivityPage } from "./pages/automations/activity/ActivityPage";
 import { WorkstreamsPage } from "./pages/automations/workstreams/WorkstreamsPage";
 import { WorkstreamPage } from "./pages/automations/workstreams/WorkstreamPage";
 import { SettingsTab } from "./pages/automations/settings/SettingsTab";
-import { RedirectToBuiltin } from "./pages/automations/settings/RedirectToBuiltin";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -88,11 +91,27 @@ export interface RouterContext {
 
 /** Auth gate for all authenticated routes (appLayoutRoute and its children).
  * Redirects to /login when no session is present. The /login route is a
- * sibling of appLayoutRoute — it is never covered by this guard. */
-function requireAuth({ context }: { context: RouterContext }) {
-  if (!context.auth) {
-    throw redirect({ to: "/login" });
-  }
+ * sibling of appLayoutRoute — it is never covered by this guard.
+ *
+ * The page the visitor asked for rides along as `?next=`, so a deep link
+ * survives sign-in: the Login page returns the person there (it validates
+ * `next` — lib/next-url.ts — and a same-origin path is the ordinary case). It
+ * matters most for `engrams auth login`, whose approval link is
+ * `/device?user_code=…`: without `next`, a signed-out person signs in, lands
+ * on the dashboard, and the code they came to approve is gone. A deployment
+ * behind an identity proxy never showed this, because nobody reached the app
+ * signed out. */
+function requireAuth({
+  context,
+  location,
+}: {
+  context: RouterContext;
+  location: { href: string };
+}) {
+  if (context.auth) return;
+  // The bare root is where sign-in lands anyway; keep its login URL clean.
+  if (location.href === "/") throw redirect({ to: "/login" });
+  throw redirect({ to: "/login", search: { next: location.href } });
 }
 
 /** Shared UX-only admin guard. Members who deep-link to an admin route get
@@ -222,6 +241,14 @@ const reviewDossierRoute = createRoute({
   path: "$id",
   component: ReviewDossier,
 });
+// The repositories engrams reviews — enrollment is a write to the PR-review
+// automation (its `repos` input). Static, so it outranks `$id`.
+const reviewRepositoriesRoute = createRoute({
+  getParentRoute: () => reviewsLayoutRoute,
+  path: "repositories",
+  beforeLoad: requireAdmin,
+  component: ReviewRepositories,
+});
 
 // Retired: the Operator section. Its pages live under /settings now (the
 // Overview cockpit folded into Fleet), so the old paths only redirect.
@@ -241,6 +268,21 @@ const legacyOperatorRoutes = Object.entries(LEGACY_OPERATOR).map(([path, to]) =>
     },
   }),
 );
+
+// /slack — the Slack threads product: enrolled channels and the threads
+// engrams is in. Enrollment is a write to the Slack threads automation (its
+// `channels` input); the threads are its workstreams.
+const slackLayoutRoute = createRoute({
+  getParentRoute: () => appLayoutRoute,
+  path: "/slack",
+  beforeLoad: requireAdmin,
+  component: SlackLayout,
+});
+const slackIndexRoute = createRoute({
+  getParentRoute: () => slackLayoutRoute,
+  path: "/",
+  component: SlackThreads,
+});
 
 // /artifacts — the cross-session document library, with a persistent rail
 // (the Reviews/Sessions content-rail shape). The detail page is a CHILD of
@@ -408,14 +450,13 @@ const integrationsRoute = createRoute({
   beforeLoad: requireAdmin,
   component: IntegrationsPanel,
 });
-// Kept for bookmarks: reviewed repos became the PR-review built-in's `repos`
-// input (ADR 0119 phase 3.8). The panel itself retires with the enrollment
-// RPCs in phase 4.7.
+// Kept for bookmarks: reviewed repos live on the Reviews product now.
 const reviewedReposRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "reviewed-repos",
-  beforeLoad: requireAdmin,
-  component: RedirectToBuiltin,
+  beforeLoad: () => {
+    throw redirect({ to: "/reviews/repositories", replace: true });
+  },
 });
 const integrationDetailRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
@@ -475,6 +516,12 @@ const registriesRoute = createRoute({
   path: "registries",
   beforeLoad: requireAdmin,
   component: RegistriesPanel,
+});
+const retentionRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "retention",
+  beforeLoad: requireAdmin,
+  component: Retention,
 });
 const papercutsRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
@@ -635,7 +682,12 @@ export const routeTree = rootRoute.addChildren([
       allSessionsRoute,
       sessionDetailRoute,
     ]),
-    reviewsLayoutRoute.addChildren([reviewsIndexRoute, reviewDossierRoute]),
+    reviewsLayoutRoute.addChildren([
+      reviewsIndexRoute,
+      reviewRepositoriesRoute,
+      reviewDossierRoute,
+    ]),
+    slackLayoutRoute.addChildren([slackIndexRoute]),
     artifactsLayoutRoute.addChildren([
       artifactsIndexRoute,
       artifactDetailRoute,
@@ -662,6 +714,7 @@ export const routeTree = rootRoute.addChildren([
       membersRoute,
       secretsRoute,
       apiKeysRoute,
+      retentionRoute,
       harnessesRoute,
       modelRoutersRoute,
       integrationsRoute,

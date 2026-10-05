@@ -17,6 +17,7 @@ import {
   type RunOpDeps,
 } from "../../integrations/run-op.ts";
 import { getSlackClient } from "../../integrations/slack.ts";
+import { replyText, type SlackReply } from "../../integrations/slack-message-text.ts";
 import {
   makeLinearIssueClient,
   type LinearIssueClient,
@@ -43,6 +44,12 @@ export interface SlackChatClient {
   };
   conversations: {
     join(args: { channel: string }): Promise<{ channel?: { id?: string } }>;
+    replies(args: {
+      channel: string;
+      ts: string;
+      oldest?: string;
+      limit?: number;
+    }): Promise<{ messages?: SlackReply[] }>;
   };
 }
 
@@ -141,10 +148,16 @@ function readComments(params: Record<string, unknown>): InlineComment[] {
     if (typeof path !== "string" || typeof line !== "number" || typeof body !== "string") {
       throw new IntegrationActionError(`comments[${i}] needs path, line, body`, true);
     }
+    // A caller with a findings ledger (the PR-review built-in's review_settle
+    // output) names each comment's finding so the ledger row and the GitHub
+    // comment stay linked; a caller without one gets a positional id.
+    const findingId = typeof record["finding_id"] === "string" ? record["finding_id"] : `automation:${i}`;
+    const startLine = typeof record["start_line"] === "number" ? record["start_line"] : undefined;
     return {
-      findingId: `automation:${i}`,
+      findingId,
       path,
       line,
+      ...(startLine !== undefined ? { startLine } : {}),
       side: typeof record["side"] === "string" ? (record["side"] as string) : "RIGHT",
       body,
     };
@@ -159,6 +172,11 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
       throw new IntegrationActionError(`missing required integer "prNumber"`, true);
     }
     const summary = requireString(params, "summary");
+    // The body for the 422 fallback (GitHub refused an inline anchor): a
+    // caller with a findings ledger passes one that re-quotes every finding,
+    // so a summary-only review loses nothing. Without it the summary is the
+    // body either way.
+    const fallbackSummary = optionalString(params, "fallbackSummary") ?? summary;
     const marker = ctx.marker ?? `<!-- engrams-automation:${ctx.runId}:${ctx.stepPath} -->`;
     if (await markerAlreadyPosted(deps.runOp, repo, prNumber, marker)) {
       return { posted: false, already_posted: true };
@@ -170,9 +188,7 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
       repo,
       prNumber,
       commitId,
-      // The generic action has no findings ledger to re-quote on the 422
-      // fallback; the caller-authored summary is the body either way.
-      buildSummary: () => `${summary}\n\n${marker}`,
+      buildSummary: (inlinePosted) => `${inlinePosted ? summary : fallbackSummary}\n\n${marker}`,
       comments: readComments(params),
     });
     return {
@@ -205,6 +221,31 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
       channel: requireString(params, "channel"),
     });
     return { channel: response.channel?.id ?? null };
+  },
+
+  "slack.list_replies": async (params, _ctx, deps) => {
+    // One page of a thread, every content surface of each message rendered
+    // to text (text, blocks, attachments, files — the legacy `replyText`).
+    // The caller folds it into a prompt; this action only reads.
+    const client = await deps.slackClient();
+    const oldest = optionalString(params, "oldest");
+    const response = await client.conversations.replies({
+      channel: requireString(params, "channel"),
+      ts: requireString(params, "threadTs"),
+      ...(oldest !== undefined ? { oldest } : {}),
+      limit: 500,
+    });
+    return {
+      // `subtype` is on every Slack message the API returns but not on the
+      // SDK's reply type; widen the one field honestly.
+      messages: (response.messages ?? []).map((m: SlackReply & { subtype?: string }) => ({
+        ts: m.ts ?? "",
+        user: m.user ?? "",
+        bot_id: m.bot_id ?? "",
+        subtype: m.subtype ?? "",
+        text: replyText(m),
+      })),
+    };
   },
 
   "slack.update_message": async (params, _ctx, deps) => {

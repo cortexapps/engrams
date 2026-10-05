@@ -16,9 +16,6 @@ describe("block registry at boot", () => {
     for (const type of V1_BLOCK_TYPES) {
       expect(getBlock(type), type).toBeDefined();
     }
-    // The review system blocks ride the same registration.
-    expect(getBlock("system.open_review_pass")).toBeDefined();
-    expect(getBlock("system.review_policy_gate")).toBeDefined();
 
     const { validateDefinition } = await import("../definition.ts");
     const parsed = validateDefinition(
@@ -34,9 +31,7 @@ describe("block registry at boot", () => {
         ],
         inputsSchema: [],
         settings: { endSessionsOnFinish: false },
-      },
-      { kind: "user" },
-    );
+      });
     expect(parsed.blocks[0]!.type).toBe("create_session");
   });
 });

@@ -16,6 +16,7 @@ import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import type { AutomationInbox } from "../inbox.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
+import { sessionWebUrl } from "../../../links.ts";
 
 const overrideFields = {
   harnessMode: z.string().min(1).optional(),
@@ -68,6 +69,9 @@ export const sendPromptConfigSchema = z.object({
     z.object({ kind: z.literal("none") }),
   ]),
   deadlineSeconds: z.number().int().min(1).max(24 * 3600).optional(),
+  /** As on wait_event: `continue` records `outcome: "deadline"` and lets the
+   * graph go on, so a loop can wait for a long turn slice by slice. */
+  onDeadline: z.enum(["fail_run", "continue"]).optional(),
   harnessMode: z.string().min(1).optional(),
 });
 export type SendPromptConfig = z.infer<typeof sendPromptConfigSchema>;
@@ -76,6 +80,7 @@ export const waitSessionConfigSchema = z.object({
   session: sessionRefSchema,
   until: z.enum(["idle", "ended"]),
   deadlineSeconds: z.number().int().min(1).max(24 * 3600).optional(),
+  onDeadline: z.enum(["fail_run", "continue"]).optional(),
 });
 export type WaitSessionConfig = z.infer<typeof waitSessionConfigSchema>;
 
@@ -127,6 +132,7 @@ async function executeCreateSession(
       kind: "ok",
       outputs: {
         session_id: dryRunSessionId(ctx),
+        web_url: sessionWebUrl(dryRunSessionId(ctx)),
         task_id: "",
         initial_prompt: prompt.length > 0,
         prompt,
@@ -167,6 +173,9 @@ async function executeCreateSession(
     // prompt starts no harness run, so it must not count as turn 1.
     outputs: {
       session_id: created.sessionId,
+      // The session page: a block that announces the session (the Slack
+      // brain's "Started a session" message) links here.
+      web_url: sessionWebUrl(created.sessionId),
       task_id: created.taskId,
       initial_prompt: prompt.length > 0,
       // The rendered initial prompt (after includeEventContext): downstream
@@ -226,7 +235,7 @@ function matchesSessionMessage(
 export function registerSessionBlocks(): void {
   registerBlock<CreateSessionConfig>({
     type: "create_session",
-    outputs: ["session_id", "task_id", "prompt"],
+    outputs: ["session_id", "web_url", "task_id", "prompt"],
     configSchema: createSessionConfigSchema,
     execute: executeCreateSession,
   });

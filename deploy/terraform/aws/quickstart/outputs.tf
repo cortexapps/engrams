@@ -10,6 +10,10 @@ output "engram_values" {
     cert_arn             = aws_acm_certificate.web.arn
     domain               = var.domain
     admin_email          = var.admin_email
+    oauth_issuer         = var.oauth_issuer
+    oauth_client_id      = var.oauth_client_id
+    # A YAML flow sequence is valid JSON, so the list renders inline.
+    oauth_allowed_domains = jsonencode(var.oauth_allowed_domains)
   })
 }
 

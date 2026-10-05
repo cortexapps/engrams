@@ -7,19 +7,10 @@ import type { ConnectRouter } from "@connectrpc/connect";
 import { abilityFor } from "../authz/ability.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { requireUser } from "./require.ts";
-import { getDb } from "../db/client.ts";
-import {
-  makeEnrollmentStore,
-  type EnrollmentRow,
-  type EnrollmentStore,
-  type ReviewAutofix,
-  type ReviewTriggerMode,
-} from "../db/enrollments.ts";
-import { makeProfileStore } from "../db/profiles.ts";
 import { makeAutomationStore } from "../db/automations.ts";
-import { setReviewEngine, EngineFlagError, type EngineFlagStore } from "../reviews/engine-flag.ts";
-import { retryAutomationReview } from "../reviews/retry-automation.ts";
-import { log as rootLog } from "../log.ts";
+import { getDb } from "../db/client.ts";
+import { retryAutomationReview } from "../reviews/automation-review.ts";
+import { makeEnrolledRepos, type EnrolledRepos } from "../reviews/enrolled-repos.ts";
 import {
   makeReviewStore,
   type FindingCounts,
@@ -34,16 +25,11 @@ import { isActiveReviewStatus } from "../db/schema.ts";
 import { isHumanReviewTrigger } from "../reviews/review-trigger.ts";
 import {
   ReviewService,
-  type RepoEnrollment,
   type Review as ReviewProto,
   type ReviewEvent as ReviewEventProto,
   type ReviewFinding as ReviewFindingProto,
   type ReviewVerdict as ReviewVerdictProto,
 } from "../gen/engram/app/v1/review_pb.ts";
-import {
-  startReviewIngress,
-  type ReviewIngressStart,
-} from "../workflows/review-ingress.ts";
 
 export type GetSession = (
   headers: Headers,
@@ -54,45 +40,11 @@ export type GetSession = (
 export interface ReviewDeps {
   getSession?: GetSession;
   reviews?: ReviewStore;
-  enrollments?: EnrollmentStore;
-  profiles?: { get(id: string): Promise<{ id: string } | null> };
+  /** The PR-review built-in's `repos` input: which repos get reviews. */
+  enrolledRepos?: Pick<EnrolledRepos, "get">;
   db?: ReturnType<typeof getDb>;
-  /** Starts durable review ingress, which resolves the PR before a pass begins
-   *  (ADR 0100 d11). A re-run goes through it like any other request. */
-  startIngress?: (input: ReviewIngressStart) => Promise<void>;
-  randomUUID?: () => string;
-  /** ADR 0119 phase 4.4 seams (default to the production stores). */
-  builtins?: EngineFlagStore;
+  /** Admit a fresh built-in run for the review's original trigger. */
   retryAutomation?: (automationRunId: string) => Promise<string>;
-}
-
-
-function enrollmentToProto(row: EnrollmentRow): RepoEnrollment {
-  return {
-    repo: row.repo,
-    triggerMode: row.triggerMode,
-    autofix: row.autofix,
-    ...(row.profileId != null ? { profileId: row.profileId } : {}),
-    engine: row.engine,
-    createdAt: timestampFromDate(row.createdAt),
-    updatedAt: timestampFromDate(row.updatedAt),
-  } as RepoEnrollment;
-}
-
-const TRIGGER_MODES: ReadonlySet<string> = new Set(["auto", "manual"]);
-const AUTOFIX_MODES: ReadonlySet<string> = new Set(["auto", "manual", "off"]);
-
-// GitHub owner/repo charset ([A-Za-z0-9._-]). An enrollment whose repo doesn't
-// match a webhook `full_name` (e.g. a trailing slash) is silently dead, so
-// reject it at the door instead of storing an un-triggerable row.
-const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
-
-function isTriggerMode(value: string): value is ReviewTriggerMode {
-  return TRIGGER_MODES.has(value);
-}
-
-function isAutofixMode(value: string): value is ReviewAutofix {
-  return AUTOFIX_MODES.has(value);
 }
 
 function findingCounts(findings: ReviewFindingRow[]): FindingCounts {
@@ -138,6 +90,7 @@ function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
     ...(row.headBranch != null ? { headBranch: row.headBranch } : {}),
     ...(row.baseBranch != null ? { baseBranch: row.baseBranch } : {}),
     ...(row.prState != null ? { prState: row.prState } : {}),
+    ...(row.automationRunId != null ? { automationRunId: row.automationRunId } : {}),
     ...(row.additions != null ? { additions: row.additions } : {}),
     ...(row.deletions != null ? { deletions: row.deletions } : {}),
     ...(row.changedFiles != null ? { changedFiles: row.changedFiles } : {}),
@@ -202,17 +155,9 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
   let store = deps?.reviews;
   const reviews = (): ReviewStore =>
     (store ??= makeReviewStore(deps?.db ?? getDb()));
-  let enrollmentStore = deps?.enrollments;
-  const enrollments = (): EnrollmentStore =>
-    (enrollmentStore ??= makeEnrollmentStore(deps?.db ?? getDb()));
-  let profileStore = deps?.profiles;
-  const profiles = (): { get(id: string): Promise<{ id: string } | null> } =>
-    (profileStore ??= makeProfileStore(deps?.db ?? getDb()));
-  const startIngress = deps?.startIngress ?? startReviewIngress;
-  const randomUUID = deps?.randomUUID ?? (() => crypto.randomUUID());
-  const engineLog = rootLog.child({ component: "review-engine-flag" });
-  const builtins = (): EngineFlagStore =>
-    deps?.builtins ?? makeAutomationStore(deps?.db ?? getDb());
+  let enrolled = deps?.enrolledRepos;
+  const enrolledRepos = (): Pick<EnrolledRepos, "get"> =>
+    (enrolled ??= makeEnrolledRepos(makeAutomationStore(deps?.db ?? getDb())));
   const retryAutomation =
     deps?.retryAutomation ?? ((runId: string) => retryAutomationReview(runId));
 
@@ -265,125 +210,21 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       }
       const detail = await reviews().getReview(id);
       if (!detail) throw new ConnectError("not found", Code.NotFound);
-      const { repo, prNumber, provider, targetId } = detail.review;
-      const enrollment = await enrollments().get(repo);
-      if (!enrollment) {
+      const { repo } = detail.review;
+      if (!(await enrolledRepos().get(repo))) {
         throw new ConnectError("repo is not enrolled", Code.FailedPrecondition);
       }
-      // A repo on the automation engine retries the BUILT-IN with the original
-      // run's trigger, not a legacy ingress epoch.
-      if (enrollment.engine === "automation") {
-        if (!detail.review.automationRunId) {
-          throw new ConnectError(
-            "this review has no automation run to retry (it ran on the legacy engine)",
-            Code.FailedPrecondition,
-          );
-        }
-        const runId = await retryAutomation(detail.review.automationRunId);
-        return { workflowId: runId };
-      }
-      // Ingress resolves the PR's CURRENT head and identity, then mints a new
-      // review record (a terminal review is not "active") and a successor workflow
-      // epoch. The old record stays as history.
-      //
-      // A fresh uuid per re-run, so each press gets its own ingress execution
-      // rather than deduping onto the previous one.
-      const idempotencyKey = randomUUID();
-      await startIngress({
-        provider,
-        repo,
-        prNumber,
-        targetId,
-        trigger: "retry",
-        idempotencyKey,
-      });
-      return {
-        // Ingress owns the review workflow id now, and it is derived from the PR
-        // inside that workflow — so there is nothing to report back here yet. The
-        // client follows the review list, which is how it already learned about
-        // the new pass; `dispatchReview` never returned a review id either.
-        workflowId: `review-ingress:${idempotencyKey}`,
-      };
-    },
-
-    async listEnrollments(_req, ctx) {
-      const user = await requireUser(ctx, getSession);
-      if (!abilityFor(user).can("read", "Review")) {
-        throw new ConnectError("forbidden", Code.PermissionDenied);
-      }
-      return {
-        enrollments: (await enrollments().list()).map(enrollmentToProto),
-      };
-    },
-
-    async upsertEnrollment(req, ctx) {
-      const user = await requireUser(ctx, getSession);
-      if (!abilityFor(user).can("manage", "Review")) {
-        throw new ConnectError("forbidden", Code.PermissionDenied);
-      }
-      const repo = req.repo.trim();
-      if (!repo) throw new ConnectError("repo is required", Code.InvalidArgument);
-      if (!REPO_RE.test(repo)) {
+      // A retry admits a fresh built-in run with the ORIGINAL run's trigger
+      // (the review row links to it). A pass from before the automation
+      // engine has no run to re-admit; a new push or @mention starts one.
+      if (!detail.review.automationRunId) {
         throw new ConnectError(
-          "repo must be in owner/name form",
-          Code.InvalidArgument,
+          "this review predates the automation engine and cannot be retried; push or @mention to start a new pass",
+          Code.FailedPrecondition,
         );
       }
-      if (!isTriggerMode(req.triggerMode)) {
-        throw new ConnectError(
-          "trigger_mode must be auto or manual",
-          Code.InvalidArgument,
-        );
-      }
-      if (!isAutofixMode(req.autofix)) {
-        throw new ConnectError(
-          "autofix must be auto, manual, or off",
-          Code.InvalidArgument,
-        );
-      }
-      const profileId = req.profileId?.trim() || null;
-      if (profileId != null && !(await profiles().get(profileId))) {
-        throw new ConnectError("profile_id does not exist", Code.InvalidArgument);
-      }
-      const engine = req.engine?.trim();
-      if (engine !== undefined && engine !== "" && engine !== "legacy" && engine !== "automation") {
-        throw new ConnectError("engine must be legacy or automation", Code.InvalidArgument);
-      }
-      // Upsert first so the row exists (and its trigger/autofix are current)
-      // before the engine flip reconciles the built-in from them.
-      const enrollment = await enrollments().upsert({
-        repo,
-        triggerMode: req.triggerMode,
-        autofix: req.autofix,
-        profileId,
-      });
-      if (engine === "legacy" || engine === "automation") {
-        try {
-          const result = await setReviewEngine(repo, engine, {
-            setEnrollmentEngine: (r, e) => enrollments().setEngine(r, e),
-            builtins: builtins(),
-            log: engineLog,
-          });
-          return { enrollment: enrollmentToProto(result.enrollment) };
-        } catch (error) {
-          if (error instanceof EngineFlagError) {
-            throw new ConnectError(error.message, Code.FailedPrecondition);
-          }
-          throw error;
-        }
-      }
-      return { enrollment: enrollmentToProto(enrollment) };
-    },
-
-    async deleteEnrollment(req, ctx) {
-      const user = await requireUser(ctx, getSession);
-      if (!abilityFor(user).can("manage", "Review")) {
-        throw new ConnectError("forbidden", Code.PermissionDenied);
-      }
-      const repo = req.repo.trim();
-      if (!repo) throw new ConnectError("repo is required", Code.InvalidArgument);
-      await enrollments().delete(repo);
-      return {};
+      const runId = await retryAutomation(detail.review.automationRunId);
+      return { workflowId: runId };
     },
   });
 }

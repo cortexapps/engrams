@@ -29,6 +29,7 @@
         "bin/figma",
         "bin/discord",
         "bin/shopify",
+        "bin/cortex",
         "bin/gcloud",
         "bin/engram-tunnel"
       ],

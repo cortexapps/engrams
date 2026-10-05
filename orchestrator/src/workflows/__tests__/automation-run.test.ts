@@ -46,6 +46,7 @@ function fakeEngineStore(overrides: Partial<AutomationEngineStore> = {}): Automa
     async getSessionBinding() {
       return null;
     },
+    async latestKeptInstanceSession() { return null; },
     async listRunSessions() {
       return [];
     },
@@ -171,6 +172,20 @@ describe("makeProductionSessionOps.createSession", () => {
     role: "primary",
     keep: true,
   };
+
+  test("a profileId passes through as the session's profile; an empty one fails the block before any session", async () => {
+    const h = harness();
+    await h.ops.createSession({ ...input, profileId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } as never);
+    expect(h.createdParams.at(-1)!.profileId).toBe("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+
+    // A built-in's `profile` input nobody filled renders "": the block names
+    // the fix instead of handing the control plane an unknown profile.
+    const before = h.createdParams.length;
+    await expect(h.ops.createSession({ ...input, profileId: "", role: "worker" } as never)).rejects.toThrow(
+      /profileId is empty/,
+    );
+    expect(h.createdParams).toHaveLength(before);
+  });
 
   test("binding lands BEFORE listener registration; launch denormalizes", async () => {
     const h = harness();

@@ -1,3 +1,5 @@
+import { PR_REVIEW_DEFINITION } from "../automations/builtins/pr-review.ts";
+import { SLACK_BRAIN_DEFINITION } from "../automations/builtins/slack-brain.ts";
 import { beforeEach, describe, expect, test } from "bun:test";
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 
@@ -58,7 +60,6 @@ const profile = (apps: ProfileApp[] = []): ProfileRow => ({
   secrets: [],
   repos: [],
   apps,
-  designation: null,
   createdAt: NOW,
   updatedAt: NOW,
   deletedAt: null,
@@ -216,6 +217,21 @@ function fakeStore(seed?: {
       const a = automations.get(id);
       if (!a) return null;
       a.meta = { ...a.meta, inputs };
+      return row(a);
+    },
+    async setInputValue(id, inputKey, value) {
+      const a = automations.get(id);
+      if (!a) return null;
+      a.meta = { ...a.meta, inputs: { ...a.meta.inputs, [inputKey]: value } };
+      return row(a);
+    },
+    async setMapInputEntry(id, inputKey, entryKey, value, enable) {
+      const a = automations.get(id);
+      if (!a) return null;
+      const map = { ...((a.meta.inputs[inputKey] as Record<string, unknown> | undefined) ?? {}) };
+      if (value === null) delete map[entryKey];
+      else map[entryKey] = value;
+      a.meta = { ...a.meta, inputs: { ...a.meta.inputs, [inputKey]: map }, ...(enable ? { enabled: true } : {}) };
       return row(a);
     },
     async setBlockOverrides(id, overrides: BlockOverrides) {
@@ -604,6 +620,85 @@ describe("AutomationService v2", () => {
     expect(fetched.automation?.id).toBe("builtin-1");
   });
 
+  test("SetMapInputEntry sets one entry, validates it against the map's value shape, enables, and removes", async () => {
+    const deps = adminDeps();
+    // The PR-review built-in's real `repos` map spec (mode enum + autofix
+    // boolean) beside the fixture's `mention` string.
+    const stored = builtinStored();
+    const repos = PR_REVIEW_DEFINITION.inputsSchema.find((f) => f.key === "repos")!;
+    stored.versions.get(1)!.inputsSchema = [...stored.versions.get(1)!.inputsSchema, repos];
+    deps.fake.automations.set("builtin-1", stored);
+    const { automations } = clients(deps);
+    const set = await automations.setMapInputEntry({
+      automationId: "builtin-1",
+      inputKey: "repos",
+      entryKey: "acme/app",
+      valueJson: JSON.stringify({ mode: "auto", autofix: true }),
+      enable: true,
+    });
+    const inputs = JSON.parse(set.automation!.inputsJson) as { repos: Record<string, unknown> };
+    expect(inputs.repos["acme/app"]).toEqual({ mode: "auto", autofix: true });
+    expect(set.automation?.enabled).toBe(true);
+
+    await expectCode(
+      automations.setMapInputEntry({ automationId: "builtin-1", inputKey: "repos", entryKey: "acme/app", valueJson: JSON.stringify({ mode: "sometimes" }) }),
+      Code.InvalidArgument,
+    );
+    await expectCode(
+      automations.setMapInputEntry({ automationId: "builtin-1", inputKey: "mention", entryKey: "x", valueJson: "\"y\"" }),
+      Code.InvalidArgument,
+    );
+
+    const removed = await automations.setMapInputEntry({ automationId: "builtin-1", inputKey: "repos", entryKey: "acme/app" });
+    expect((JSON.parse(removed.automation!.inputsJson) as { repos: Record<string, unknown> }).repos["acme/app"]).toBeUndefined();
+  });
+
+  test("SetInputValue sets one non-map input, validated against its spec, leaving the others alone", async () => {
+    const deps = adminDeps();
+    const stored = builtinStored();
+    const defaultProfile = SLACK_BRAIN_DEFINITION.inputsSchema.find((f) => f.key === "default_profile")!;
+    const channels = SLACK_BRAIN_DEFINITION.inputsSchema.find((f) => f.key === "channels")!;
+    stored.versions.get(1)!.inputsSchema = [...stored.versions.get(1)!.inputsSchema, defaultProfile, channels];
+    stored.meta.inputs = { ...stored.meta.inputs, channels: { C0123456789: "prof-a" } };
+    deps.fake.automations.set("builtin-1", stored);
+    const { automations } = clients(deps);
+    const set = await automations.setInputValue({ automationId: "builtin-1", inputKey: "default_profile", valueJson: JSON.stringify("prof-d") });
+    const inputs = JSON.parse(set.automation!.inputsJson) as Record<string, unknown>;
+    expect(inputs["default_profile"]).toBe("prof-d");
+    expect(inputs["channels"]).toEqual({ C0123456789: "prof-a" }); // untouched
+    await expectCode(
+      automations.setInputValue({ automationId: "builtin-1", inputKey: "default_profile", valueJson: JSON.stringify(7) }),
+      Code.InvalidArgument,
+    );
+    await expectCode(
+      automations.setInputValue({ automationId: "builtin-1", inputKey: "channels", valueJson: "{}" }),
+      Code.InvalidArgument,
+    );
+  });
+
+  test("SetMapInputEntry accepts a scalar-valued map entry (the Slack channels map)", async () => {
+    const deps = adminDeps();
+    const stored = builtinStored();
+    const channels = SLACK_BRAIN_DEFINITION.inputsSchema.find((f) => f.key === "channels")!;
+    stored.versions.get(1)!.inputsSchema = [...stored.versions.get(1)!.inputsSchema, channels];
+    deps.fake.automations.set("builtin-1", stored);
+    const { automations } = clients(deps);
+    const set = await automations.setMapInputEntry({
+      automationId: "builtin-1",
+      inputKey: "channels",
+      entryKey: "C0123456789",
+      valueJson: JSON.stringify("prof-a"),
+      enable: true,
+    });
+    expect((JSON.parse(set.automation!.inputsJson) as { channels: Record<string, unknown> }).channels).toEqual({
+      C0123456789: "prof-a",
+    });
+    await expectCode(
+      automations.setMapInputEntry({ automationId: "builtin-1", inputKey: "channels", entryKey: "C0123456789", valueJson: JSON.stringify({ id: "x" }) }),
+      Code.InvalidArgument,
+    );
+  });
+
   test("SetBlockOverrides enforces tunable fields and re-validates the merged config", async () => {
     const deps = adminDeps();
     deps.fake.automations.set("builtin-1", builtinStored());
@@ -916,12 +1011,37 @@ describe("AutomationService v2", () => {
 
   test("ListInputKeyOptions goes through the injected source", async () => {
     const { automations } = clients(
-      adminDeps({ inputKeyOptions: { async list(noun) { return [{ key: `${noun}-1`, label: "One" }]; } } }),
+      adminDeps({
+        inputKeyOptions: {
+          async list(noun) { return [{ key: `${noun}-1`, label: "One" }]; },
+          async describe(_noun, keys) { return keys.map((key) => ({ key, label: key })); },
+        },
+      }),
     );
     const res = await automations.listInputKeyOptions({ noun: "repository" });
     expect(res.options.map((o) => ({ key: o.key, label: o.label }))).toEqual([
       { key: "repository-1", label: "One" },
     ]);
+  });
+
+  test("DescribeInputKeys labels the keys it is handed: trimmed, deduplicated, none → no provider call", async () => {
+    const seen: string[][] = [];
+    const { automations } = clients(
+      adminDeps({
+        inputKeyOptions: {
+          async list() { return []; },
+          async describe(noun, keys) {
+            seen.push([...keys]);
+            return keys.map((key) => ({ key, label: `#${noun}-${key}` }));
+          },
+        },
+      }),
+    );
+    const res = await automations.describeInputKeys({ noun: "channel", keys: [" C1", "C2", "C1", ""] });
+    expect(res.options.map((o) => [o.key, o.label])).toEqual([["C1", "#channel-C1"], ["C2", "#channel-C2"]]);
+    const empty = await automations.describeInputKeys({ noun: "channel", keys: [] });
+    expect(empty.options).toEqual([]);
+    expect(seen).toEqual([["C1", "C2"]]);
   });
 });
 
@@ -1216,6 +1336,7 @@ function fakeInstanceStore() {
         id: `ai_rpc${++seq}`,
         automationId: input.automationId,
         key: input.key,
+        label: null,
         status: "open",
         inputs: input.inputs,
         openedBy: input.openedBy,
@@ -1268,8 +1389,8 @@ function fakeInstanceStore() {
     async resolveHandles() {
       return [];
     },
-    async anyOpenHandleOwner() {
-      return false;
+    async openHandleOwners() {
+      return [];
     },
     async recordDrop(input) {
       drops.push(input);

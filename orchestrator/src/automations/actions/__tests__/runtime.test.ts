@@ -69,6 +69,7 @@ function slackPostDeps(ledger: ReturnType<typeof fakeLedger>) {
         join: async () => {
           throw new Error("not used");
         },
+        replies: async () => ({ messages: [] }),
       },
     }),
   };

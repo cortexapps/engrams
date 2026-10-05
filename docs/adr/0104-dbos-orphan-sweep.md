@@ -112,8 +112,8 @@ abandoned rows back into the queue and pods pull.
    ```ts
    const SWEEP_POLICIES: Record<string, SweepPolicy> = {
      SlackThreadWorkflow: { mode: "adopt", staleAfterHours: 48 },
-     PrReviewWorkflow:    { mode: "adopt", staleAfterHours: 48 },
      ToolExecWorkflow:    { mode: "adopt", staleAfterHours: 1 },
+     // (PrReviewWorkflow had 48h until ADR 0119 phase 4.7 deleted it.)
    };
    ```
 
@@ -155,8 +155,9 @@ abandoned rows back into the queue and pods pull.
 
 - **Rolling deploys**: old pods heartbeat while alive; grace window must
   exceed heartbeat interval + pod termination grace. Current-version PENDING
-  work is recovered by DBOS's built-in self-recovery — the sweep only ever
-  touches dead versions.
+  work stranded by a pod that is gone is re-enqueued by the sweep's
+  stranded-executor stage (below, 2026-10-01); DBOS's built-in self-recovery
+  covers only a pod that comes back under its own name.
 - **Wedged pod** (alive, not heartbeating): the sweep may steal its
   workflows → bounded double-execution: `(workflow_uuid, function_id)`
   uniqueness in `operation_outputs` kills the loser with
@@ -446,3 +447,79 @@ deploys. Removed entirely, because the loop it guarded barely exists:
 This supersedes the third round's cap-ordering fix — that machinery is gone.
 Deleted: `MAX_SWEEPS`, `SweepConfig.maxSweeps`, the cap branch, the
 `cancelled_capped` action and its alert wiring.
+
+## Amendment (2026-10-01): executor identity and stranded pods
+
+**What broke.** The SDK's executor id defaults to the constant `local` for
+every process, and the orchestrator never set one. DBOS recovers, at launch,
+every PENDING workflow that carries the launching executor's id — so with two
+replicas, every pod roll had BOTH new pods recover ALL in-flight workflows.
+Each run then executed twice; the copies agreed while they replayed recorded
+steps and collided at the first step that was not recorded yet (for a Slack
+thread, the first clock read after its wait's deadline; for a review, its
+`find` wait): `Conflicting WF ID …` from `recordOperationResultInternal`, one
+copy failed, and the failure recap posted ❌ into the thread. The "Safety
+properties" above assumed self-recovery was safe; it was only ever safe with
+one replica.
+
+**Decision.** (1) Each process is its own DBOS executor: `executorID` is the
+pod name (`hostname()` inside a pod), overridable by `DBOS__VMID`
+(`dbosExecutorId()` in `workflows/dbos.ts`). Launch-time recovery therefore
+recovers nothing on a fresh pod and only a restarted process's own work in
+dev. (2) The version heartbeat's `pod_name` is that same id, so liveness and
+ownership are one name. (3) A new sweep stage, before the dead-version scan,
+re-enqueues **PENDING workflows on a live version whose executor has no beat
+inside the pod grace (3 min) and whose row has not changed inside it** onto
+`_dbos_internal_queue`, keeping their version; exactly one live pod of that
+version pulls each and replays it (the dequeue stamps its own executor id).
+The row-age clause leaves a just-started pod's fresh rows alone before its
+first beat. The legacy id `local` is simply a pod that never beats, which is
+how the rows in flight at the first deploy of this change are recovered —
+once, by the sweep leader. Policy, suppression and the batch cap apply as to
+the version scan; the decision is `requeued`, the fence miss `raced`.
+
+**Not chosen.** A boot-time `recoverPendingWorkflows(['local'])` would have
+re-created the double execution for the transition. A leader-election
+"recover the dead pod" call to the SDK would run the orphan in the leader
+only; the queue flip is the same exactly-once primitive the version adopt
+already uses, load-spread by pull.
+
+
+## Amendment (2026-10-05): the retention collector
+
+**What was missing.** DBOS keeps every workflow's `workflow_status` row and
+its step outputs forever — the SDK has no garbage collection — and the
+engine's step ledger (`automation_step_run`) grew with it. Both tables are
+read only while a run is in flight (DBOS replays from its own records; the
+engine's step rows are a projection for the run page), so a finished run's
+records are dead weight after a while. The sweep scans
+`workflow_status` every minute; its cost grows with the table.
+
+**Decision.** (1) **Retention is an org policy, not a deployment knob.** An
+admin chooses it on Settings → Retention; it is stored as one JSON document
+in the new `org_setting` table (`key`, `value`, who changed it, when), read
+through `RetentionService` (get/set, both admin-only) and validated against
+a zod schema on every read, so an older stored shape still parses and an
+out-of-bounds value reads as the default. Today the policy is one number:
+**run detail days** (7–365, default 30). Session retention will join the
+same page and document. (2) **The sweep leader collects**, once per cycle
+after the scans, under the same lease: it deletes the step rows of the
+oldest runs whose `ended_at` is older than the cutoff (the run row — status,
+timing, trigger, bound session — stays, stamped `details_pruned_at` once its
+rows are gone, so the prune's frontier is a partial index of ended,
+not-yet-pruned runs that shrinks as it drains), and deletes `workflow_status` rows created
+before the cutoff whose status is not PENDING/ENQUEUED/DELAYED and whose
+parent, if any, is not live either; the SDK schema cascades the step
+outputs, events, notifications and streams. Both prunes take **500 rows per
+cycle, oldest first** — step rows, not runs: a run with a loop holds a row
+per iteration per attempt, so a run count would not bound the transaction —
+and a tick stays bounded while a backlog drains over the following cycles. A failed prune logs at warn and never fails the sweep;
+the next cycle retries. (3) The seven-day floor matches the terminal-failure
+scan's lookback, so an alert's workflow row is still there when the operator
+reads it.
+
+**Not chosen.** A helm value — operators would set it once and the admin
+who owns the data would never see it. A hard cap on the table size — the
+admin's question is "how long do I keep run history", not "how many rows".
+Deleting the run rows themselves — the run list and the workstream history
+are product surfaces; only the per-step detail is retention-bound.

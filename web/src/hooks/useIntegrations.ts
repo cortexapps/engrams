@@ -17,6 +17,7 @@ import {
   setMintCredential,
   uploadConnectorLogo,
   testConnector,
+  setConnectorSettings,
   listConnections,
   createConnection,
   updateConnection,
@@ -94,6 +95,19 @@ export function useSetMintCredential() {
 export function useUploadConnectorLogo() {
   const invalidateCatalog = useInvalidateCatalog();
   return useMutation(uploadConnectorLogo, { onSuccess: invalidateCatalog });
+}
+
+/** Store a connector's non-secret settings (e.g. its API host). Admin-only.
+ * Refreshes the connector rows AND the catalog: the effective hosts move with it. */
+export function useSetConnectorSettings() {
+  const invalidate = useInvalidateConnectors();
+  const invalidateCatalog = useInvalidateCatalog();
+  return useMutation(setConnectorSettings, {
+    onSuccess: () => {
+      invalidate();
+      invalidateCatalog();
+    },
+  });
 }
 
 /** Test a connector's credential (admin). Draft values test an about-to-be-saved

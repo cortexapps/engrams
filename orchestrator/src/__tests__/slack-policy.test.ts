@@ -2,14 +2,14 @@
  * Slack CommunicationPolicy (ADR 0060 P2.10) — the provider-mechanics impl.
  *
  * The Block Kit shaping is tested in slack-blocks.test.ts; here we pin the
- * policy's own logic: `foldReplies` (the pure thread→prompt cursor fold) and
- * the method wiring, exercised through an injected fake Slack client so no
- * engine or network is needed.
+ * policy's method wiring, exercised through an injected fake Slack client so
+ * no engine or network is needed. (The thread→prompt fold is the Slack
+ * built-in's own Code block, tested with the built-in.)
  */
 
 import { expect, test, describe } from "bun:test";
-import { foldReplies, makeSlackPolicy, type SlackPolicyClient } from "../integrations/slack-policy.ts";
-import type { SourceMention } from "../workflows/thread-inbox.ts";
+import { makeSlackPolicy, type SlackPolicyClient } from "../integrations/slack-policy.ts";
+import type { SourceMention } from "../workflows/communication-policy.ts";
 import type { CuratedEvent } from "../control-plane/session-events.ts";
 
 const M: SourceMention = {
@@ -22,137 +22,6 @@ const M: SourceMention = {
 };
 const ev = (kind: string, payloadJson: string): CuratedEvent => ({ idx: 0n, kind, payloadJson });
 
-describe("foldReplies()", () => {
-  test("wraps prior thread messages in <thread context>, with the @mention as the directive at the bottom", () => {
-    const out = foldReplies(
-      [
-        { ts: "100.0", user: "U1", text: "msg" },
-        { ts: "101.0", user: "U2", text: "hello" },
-        { ts: "102.0", user: "U1", text: "whats up" },
-        { ts: "103.0", user: "U1", text: "<@BOT> could you please handle this" },
-      ],
-      null,
-      "BOT",
-      "103.0", // the triggering @mention's ts
-    );
-    expect(out.prompt).toBe(
-      "<thread context>\nmsg\nhello\nwhats up\n</thread context>\n\ncould you please handle this",
-    );
-    expect(out.maxTs).toBe("103.0");
-  });
-
-  test("no prior context (the mention itself starts the thread) → just the directive, no wrapper", () => {
-    const out = foldReplies(
-      [{ ts: "100.0", user: "U1", text: "<@BOT> do the thing" }],
-      null,
-      "BOT",
-      "100.0",
-    );
-    expect(out.prompt).toBe("do the thing");
-    expect(out.maxTs).toBe("100.0");
-  });
-
-  test("incremental follow-up: new messages before the new mention become the context", () => {
-    const out = foldReplies(
-      [
-        { ts: "200.0", user: "U1", text: "actually wait" },
-        { ts: "201.0", user: "U1", text: "<@BOT> also do X" },
-      ],
-      "100.0",
-      "BOT",
-      "201.0",
-    );
-    expect(out.prompt).toBe("<thread context>\nactually wait\n</thread context>\n\nalso do X");
-    expect(out.maxTs).toBe("201.0");
-  });
-
-  test("the bot's own messages advance the cursor but never feed back into the prompt", () => {
-    const out = foldReplies(
-      [
-        { ts: "150.0", bot_id: "B1", text: "Started a session…" },
-        { ts: "160.0", user: "U1", text: "<@BOT> thanks, now add tests" },
-      ],
-      "100.0",
-      "BOT",
-      "160.0",
-    );
-    expect(out.prompt).toBe("thanks, now add tests");
-    expect(out.maxTs).toBe("160.0");
-  });
-
-  test("no new messages → empty prompt, cursor unchanged", () => {
-    expect(foldReplies([], "100.0", "BOT", undefined)).toEqual({ prompt: "", maxTs: "100.0" });
-  });
-
-  test("a bot-authored ROOT is kept as context; other bot replies are still dropped", () => {
-    const out = foldReplies(
-      [
-        { ts: "100.0", bot_id: "B9", text: "ALERT: p99 latency over budget" },
-        { ts: "101.0", bot_id: "B1", text: "Started a session…" },
-        { ts: "102.0", user: "U1", text: "<@BOT> can you look into this?" },
-      ],
-      null,
-      "BOT",
-      "102.0",
-      "100.0", // the thread root
-    );
-    expect(out.prompt).toBe(
-      "<thread context>\nALERT: p99 latency over budget\n</thread context>\n\ncan you look into this?",
-    );
-    expect(out.maxTs).toBe("102.0");
-  });
-
-  test("an attachments-only root (empty text) folds the attachment content in", () => {
-    const out = foldReplies(
-      [
-        {
-          ts: "100.0",
-          bot_id: "B9",
-          text: "",
-          attachments: [{ title: "Deploy failed", text: "step `build` exited 1" }],
-        },
-        { ts: "101.0", user: "U1", text: "<@BOT> fix it" },
-      ],
-      null,
-      "BOT",
-      "101.0",
-      "100.0",
-    );
-    expect(out.prompt).toBe(
-      "<thread context>\nDeploy failed\nstep `build` exited 1\n</thread context>\n\nfix it",
-    );
-  });
-
-  test("a follow-up gather never re-delivers the root (it is behind the cursor)", () => {
-    const out = foldReplies(
-      [
-        { ts: "100.0", bot_id: "B9", text: "ALERT" },
-        { ts: "200.0", user: "U1", text: "<@BOT> also do X" },
-      ],
-      "150.0",
-      "BOT",
-      "200.0",
-      "100.0",
-    );
-    expect(out.prompt).toBe("also do X");
-    expect(out.maxTs).toBe("200.0");
-  });
-
-  test("directive not among the replies → plain join, no wrapper (graceful fallback)", () => {
-    const out = foldReplies(
-      [
-        { ts: "100.0", user: "U1", text: "<@BOT> please fix the build" },
-        { ts: "101.0", user: "U1", text: "it fails on CI" },
-      ],
-      null,
-      "BOT",
-      "999.0", // no message carries this ts
-    );
-    expect(out.prompt).toBe("please fix the build\n\nit fails on CI");
-    expect(out.maxTs).toBe("101.0");
-  });
-});
-
 describe("makeSlackPolicy()", () => {
   function fakeClient() {
     const calls: {
@@ -160,14 +29,12 @@ describe("makeSlackPolicy()", () => {
       updates: any[];
       reactions: any[];
       unreacts: any[];
-      replies: any[];
       uploads: any[];
     } = {
       posts: [],
       updates: [],
       reactions: [],
       unreacts: [],
-      replies: [],
       uploads: [],
     };
     const client: SlackPolicyClient = {
@@ -182,12 +49,6 @@ describe("makeSlackPolicy()", () => {
         },
         update: async (a) => void calls.updates.push(a),
       },
-      conversations: {
-        replies: async (a) => {
-          calls.replies.push(a);
-          return { messages: [{ ts: "100.0", user: "U1", text: "<@BOT> do the thing" }] };
-        },
-      },
       files: {
         uploadV2: async (a) => {
           calls.uploads.push(a);
@@ -198,21 +59,14 @@ describe("makeSlackPolicy()", () => {
     return { client, calls };
   }
 
-  const policy = (c: SlackPolicyClient) =>
-    makeSlackPolicy({ client: async () => c, botUserId: "BOT" });
+  const policy = (c: SlackPolicyClient) => makeSlackPolicy({ client: async () => c });
 
-  test("systemPromptAppend is a non-empty constant", () => {
-    expect(policy(fakeClient().client).systemPromptAppend.length).toBeGreaterThan(0);
-  });
-
-  test("per-turn lifecycle on the message: 👀 onPickup, ⏳ onWorking, then onIdle clears ⏳ and adds ✅", async () => {
+  test("per-turn lifecycle on the message: ⏳ onWorking, then onIdle clears ⏳ and adds ✅", async () => {
     const { client, calls } = fakeClient();
     const p = policy(client);
-    await p.onPickup(M);
     await p.onWorking(M);
     await p.onIdle(M);
     expect(calls.reactions).toEqual([
-      { channel: "C1", timestamp: "100.0", name: "eyes" },
       { channel: "C1", timestamp: "100.0", name: "hourglass_flowing_sand" },
       { channel: "C1", timestamp: "100.0", name: "white_check_mark" },
     ]);
@@ -339,7 +193,6 @@ describe("makeSlackPolicy()", () => {
     let fetched: { sessionId: string; artifactId: string } | undefined;
     const p = makeSlackPolicy({
       client: async () => client,
-      botUserId: "BOT",
       fetchArtifact: async (sessionId, artifactId) => {
         fetched = { sessionId, artifactId };
         return { bytes: new Uint8Array([1, 2, 3]), mediaType: "image/png", fileName: "shot.png" };
@@ -364,7 +217,6 @@ describe("makeSlackPolicy()", () => {
     const { client, calls } = fakeClient();
     const p = makeSlackPolicy({
       client: async () => client,
-      botUserId: "BOT",
       fetchArtifact: async () => ({ bytes: new Uint8Array([9]), mediaType: "video/mp4", fileName: "" }),
     });
     await p.onAsset(M, fileShared({ artifact_id: "a2", size_bytes: 1, media_type: "video/mp4" }), SESSION);
@@ -376,7 +228,6 @@ describe("makeSlackPolicy()", () => {
     const { client, calls } = fakeClient();
     const p = makeSlackPolicy({
       client: async () => client,
-      botUserId: "BOT",
       fetchArtifact: async () => {
         throw new Error("coordinator unreachable");
       },
@@ -396,7 +247,6 @@ describe("makeSlackPolicy()", () => {
     let fetchCalled = false;
     const p = makeSlackPolicy({
       client: async () => client,
-      botUserId: "BOT",
       fetchArtifact: async () => {
         fetchCalled = true;
         return { bytes: new Uint8Array(), mediaType: "", fileName: "" };
@@ -457,60 +307,5 @@ describe("makeSlackPolicy()", () => {
     // Must resolve, not reject — a Slack blip here must not wedge the workflow.
     await policy(client).onDeliveryError(M, "retry please");
     expect(calls.reactions).toEqual([{ channel: "C1", timestamp: "100.0", name: "warning" }]);
-  });
-
-  test("gatherThreadContext reads replies and folds them into a prompt", async () => {
-    const { client, calls } = fakeClient();
-    const out = await policy(client).gatherThreadContext(M, null);
-    expect(calls.replies[0].channel).toBe("C1");
-    expect(calls.replies[0].ts).toBe("100.0");
-    expect(out.prompt).toBe("do the thing");
-    expect(out.maxTs).toBe("100.0");
-  });
-
-  test("gatherThreadContext keeps a bot-authored root when the mention is a thread reply", async () => {
-    const { client } = fakeClient();
-    client.conversations.replies = async () => ({
-      messages: [
-        { ts: "100.0", bot_id: "B9", text: "ALERT: disk full" },
-        { ts: "101.0", user: "U1", text: "<@BOT> handle this" },
-      ],
-    });
-    const out = await policy(client).gatherThreadContext({ ...M, ts: "101.0" }, null);
-    expect(out.prompt).toBe("<thread context>\nALERT: disk full\n</thread context>\n\nhandle this");
-    expect(out.maxTs).toBe("101.0");
-  });
-
-  // Regression, session 77c65873 (2026-08-07): the root was a Linear app post
-  // whose `text` is a one-line summary and whose ticket sits in an attachment.
-  // The fold read `text` only, so the session was asked "is this true?" about a
-  // ticket it never saw. The whole root must reach the prompt.
-  test("gatherThreadContext keeps an app root's attachment payload, not just its summary line", async () => {
-    const { client } = fakeClient();
-    client.conversations.replies = async () => ({
-      messages: [
-        {
-          ts: "100.0",
-          bot_id: "B9",
-          text: "Madison Unell added an issue to the Product Feedback team",
-          attachments: [
-            {
-              title: "PFR-412 Session loses the ticket body",
-              title_link: "https://linear.app/acme/issue/PFR-412",
-              text: "Starting a session from a Linear unfurl gives the agent no ticket.",
-            },
-          ],
-        },
-        { ts: "101.0", user: "U1", text: "<@BOT> is this true? could you take a look" },
-      ],
-    });
-    const out = await policy(client).gatherThreadContext({ ...M, ts: "101.0" }, null);
-    expect(out.prompt).toBe(
-      "<thread context>\n" +
-        "Madison Unell added an issue to the Product Feedback team\n" +
-        "<https://linear.app/acme/issue/PFR-412|PFR-412 Session loses the ticket body>\n" +
-        "Starting a session from a Linear unfurl gives the agent no ticket.\n" +
-        "</thread context>\n\nis this true? could you take a look",
-    );
   });
 });

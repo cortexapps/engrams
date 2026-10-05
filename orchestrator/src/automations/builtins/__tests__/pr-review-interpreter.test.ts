@@ -9,12 +9,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import type { BeginReviewPassResult } from "../../../db/reviews.ts";
 import type { ReviewPostPayload } from "../../../reviews/control-plane.ts";
+import { coerceFieldValue, validateFieldValue } from "../../../connectors/field-schema.ts";
+import { findAction } from "../../actions/execute.ts";
 import { makeCodeBlockRuntime } from "../../code/runtime.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import {
   setReviewBlockDeps,
   type ReviewBlockControlPlane,
-} from "../../engine/blocks/system/review.ts";
+} from "../../engine/blocks/review.ts";
 import type { RunSnapshot } from "../../engine/context.ts";
 import type { EngineDeps, EngineSessionOps, EngineStepRecord } from "../../engine/deps.ts";
 import type { AutomationInbox } from "../../engine/inbox.ts";
@@ -30,7 +32,7 @@ const RUN = { runId: "autorun:auto-pr:github:d1", automationId: "auto-pr" };
 
 const INPUTS = {
   repos: { "acme/repo": { mode: "auto", autofix: false }, "acme/other": { mode: "on_request", autofix: false } },
-  profile: "pr_reviewer",
+  profile: "11111111-2222-4333-8444-555555555555",
   mention: "@engrams",
   categories: ["functional-correctness", "security-privacy"],
   instructions: "Be terse.",
@@ -75,6 +77,7 @@ const PAYLOAD: ReviewPostPayload = {
   pr_number: 17,
   commit_id: HEAD,
   summary_md: "Summary\n\n<!-- engrams-review:review-1 -->",
+  fallback_summary_md: "Summary (full)\n\n<!-- engrams-review:review-1 -->",
   comments: [{ finding_id: "f1", path: "src/a.ts", line: 3, side: "RIGHT", body: "nit" }],
   to_post_count: 1,
   ui_only_count: 0,
@@ -91,6 +94,8 @@ interface Harness {
   ended: string[];
   actions: Array<{ actionId: string; params: Record<string, unknown> }>;
   stamped: Array<{ reviewId: string; runId: string }>;
+  /** GitHub review ids written onto passes after the post. */
+  recorded: Array<{ reviewId: string; githubReviewId: string }>;
   finalized: Array<{ status: string; error?: string }>;
 }
 
@@ -99,6 +104,12 @@ function harness(options: {
   payload: Record<string, unknown>;
   recv?: AutomationInbox[];
   deduplicate?: boolean;
+  /** ADR 0120: walk this entrypoint as a run bound to this workstream. */
+  entrypointId?: string;
+  instanceId?: string;
+  closed?: Array<{ instanceId: string; reason?: string }>;
+  /** What the settle step decides (default: one inline finding). */
+  decision?: ReviewPostPayload;
 }): Harness {
   const names: string[] = [];
   const records: Harness["records"] = [];
@@ -109,6 +120,7 @@ function harness(options: {
   const ended: string[] = [];
   const actions: Harness["actions"] = [];
   const stamped: Harness["stamped"] = [];
+  const recorded: Harness["recorded"] = [];
   const finalized: Harness["finalized"] = [];
   const recvQueue = [...(options.recv ?? [])];
   const runSessions: Array<{ sessionId: string; keep: boolean }> = [];
@@ -155,7 +167,10 @@ function harness(options: {
     },
     async decideReviewResults() {
       cpCalls.push("decideReviewResults");
-      return PAYLOAD;
+      return options.decision ?? PAYLOAD;
+    },
+    async recordSummaryOnlyPost(reviewId) {
+      cpCalls.push(`recordSummaryOnlyPost:${reviewId}`);
     },
     async cleanupSupersededReview() {
       cpCalls.push("cleanupSupersededReview");
@@ -170,6 +185,9 @@ function harness(options: {
   setReviewBlockDeps({
     controlPlane: () => cp,
     reviews: () => ({
+      async setGithubReviewId(reviewId, githubReviewId) {
+        recorded.push({ reviewId, githubReviewId });
+      },
       async setAutomationRunId(reviewId, runId) {
         stamped.push({ reviewId, runId });
       },
@@ -182,6 +200,8 @@ function harness(options: {
     automationId: RUN.automationId,
     automationName: "PR review",
     version: 1,
+    ...(options.entrypointId !== undefined ? { entrypointId: options.entrypointId } : {}),
+    ...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
     trigger: {
       kind: "integration",
       receivedAt: "2026-08-21T10:00:01Z",
@@ -234,6 +254,7 @@ function harness(options: {
       async markRunning() {},
       async recordStep(_r, path, attempt, record) { records.push({ path, attempt, record }); },
       async finalizeRun(_r, status, error) { finalized.push({ status, ...(error !== undefined ? { error } : {}) }); },
+      async latestKeptInstanceSession() { return null; },
       async listRunSessions() { return runSessions; },
       async releaseConcurrency() { return null; },
       async adoptSession() { return "foreign" as const; },
@@ -242,17 +263,40 @@ function harness(options: {
     sessions: sessionOps,
     clock: { nowMs: () => (clock += 1000) },
     code: makeCodeBlockRuntime(),
+    ...(options.closed
+      ? {
+          instances: {
+            async closeInstance(input: { instanceId: string; reason?: string }) {
+              options.closed!.push(input);
+              return true;
+            },
+          },
+        }
+      : {}),
     integrationActions: {
       async execute(input) {
-        actions.push({ actionId: input.actionId, params: input.params });
+        // The real contract: the connector's declared input schema, after
+        // the executor's own coercion. A rendered param the catalog would
+        // refuse fails HERE, not on the first live delivery.
+        const { action } = await findAction(input.provider, input.actionId, { list: async () => [] });
+        const params = coerceFieldValue(action.inputSchema, input.params) as Record<string, unknown>;
+        const violations = validateFieldValue(action.inputSchema, params);
+        if (violations.length > 0) {
+          throw new Error(`invalid params for ${input.actionId}: ${violations[0]!.path} ${violations[0]!.message}`);
+        }
+        actions.push({ actionId: input.actionId, params });
         if (input.actionId === "create_issue_comment") return { commentId: 777, status: 201 };
-        if (input.actionId === "post_pr_review") return { reviewId: 9001, status: 200 };
+        // The pinned status comment: found or created, its id comes back.
+        if (input.actionId === "upsert_issue_comment") return { commentId: 777 };
+        if (input.actionId === "post_pr_review") {
+          return { posted: true, inline_posted: true, already_posted: false, github_review_id: "9001" };
+        }
         return { status: 200 };
       },
     },
   };
 
-  return { deps, names, records, cpCalls, sessions, prompts, execs, ended, actions, stamped, finalized };
+  return { deps, names, records, cpCalls, sessions, prompts, execs, ended, actions, stamped, recorded, finalized };
 }
 
 const finderDone = (count: number): AutomationInbox => ({
@@ -294,23 +338,67 @@ describe("PR-review built-in on the interpreter", () => {
     expect(h.execs[0]!.command).toContain("fetch origin +refs/pull/");
     expect(h.execs[0]!.command).toContain(`checkout ${HEAD}`);
     expect(h.prompts).toEqual([{ sessionId: "s-finder", text: "FINDER PROMPT" }]);
-    // Ack → post (structured comments passed by $ref) → status update.
+    // The pinned status comment (found or created, then rewritten for this
+    // head) → the review (structured comments passed by $ref) → the status
+    // line pointing at it.
     expect(h.actions.map((a) => a.actionId)).toEqual([
-      "create_issue_comment",
+      "upsert_issue_comment",
+      "update_pinned_comment",
       "post_pr_review",
-      "update_issue_comment",
+      "update_pinned_comment",
     ]);
-    expect(h.actions[1]!.params).toMatchObject({
+    expect(h.actions[0]!.params).toMatchObject({ repo: "acme/repo", number: 17, key: "review-status" });
+    expect(String(h.actions[0]!.params["body"])).toContain("reviewing");
+    // Every edit of the pinned comment carries the key, so the marker survives.
+    expect(h.actions[1]!.params).toMatchObject({ commentId: 777, key: "review-status" });
+    expect(h.actions[3]!.params).toMatchObject({ commentId: 777, key: "review-status" });
+    // The posted review's id lands on the pass (the dossier's link).
+    expect(h.recorded).toEqual([{ reviewId: "review-1", githubReviewId: "9001" }]);
+    expect(h.actions[2]!.params).toMatchObject({
       repo: "acme/repo",
       prNumber: 17,
       commitId: HEAD,
       comments: PAYLOAD.comments,
     });
-    expect(h.actions[2]!.params).toMatchObject({ commentId: 777 });
-    expect(String(h.actions[2]!.params["body"])).toContain("1 finding");
+    expect(h.actions[3]!.params).toMatchObject({ commentId: 777 });
+    expect(String(h.actions[3]!.params["body"])).toContain("see the review");
     // Explicit end_session ran; finalize found nothing left to end.
     expect(h.ended).toEqual(["s-finder"]);
     expect(h.finalized).toEqual([{ status: "completed" }]);
+  });
+
+  test("(a0) a clean pass posts no review object: the status line says no findings", async () => {
+    const h = harness({
+      eventKey: "pull_request.opened",
+      payload: prPayload(),
+      recv: [finderDone(0)],
+      decision: { ...PAYLOAD, comments: [], to_post_count: 0, ui_only_count: 0 },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.actions.map((a) => a.actionId)).toEqual([
+      "upsert_issue_comment",
+      "update_pinned_comment",
+      "update_pinned_comment",
+    ]);
+    expect(String(h.actions[2]!.params["body"])).toContain("no findings");
+    expect(h.actions[2]!.params).toMatchObject({ key: "review-status" });
+    expect(h.recorded).toEqual([]);
+    expect(h.names).toContain("step:has_findings.status_clean:0");
+    expect(h.names).not.toContain("step:has_findings.post:0");
+  });
+
+  test("(a1) findings the review page keeps (none inline) still post the summary review", async () => {
+    const h = harness({
+      eventKey: "pull_request.opened",
+      payload: prPayload(),
+      recv: [finderDone(0)],
+      decision: { ...PAYLOAD, comments: [], to_post_count: 0, ui_only_count: 2 },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.actions.map((a) => a.actionId)).toContain("post_pr_review");
+    expect(h.recorded).toEqual([{ reviewId: "review-1", githubReviewId: "9001" }]);
   });
 
   test("(b) candidates: the verifier pair runs before the gate", async () => {
@@ -361,6 +449,41 @@ describe("PR-review built-in on the interpreter", () => {
     expect(h.sessions[0]!.capabilityOverride).toEqual(["engram:pr_review", "github:contents:read@acme/other"]);
   });
 
+  test("(d'') a review.dispatch admits an on_request repo as a dispatch and resolves heads from GitHub", async () => {
+    const h = harness({
+      eventKey: "review.dispatch",
+      payload: { repository: { full_name: "acme/other", name: "other" }, pull_request: { number: 5 } },
+      recv: [finderDone(0)],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe("completed");
+    expect(h.cpCalls.slice(0, 3)).toEqual(["resolvePrHeads", "resolveReviewTarget", "createReviewPass:dispatch"]);
+
+    const stranger = harness({
+      eventKey: "review.dispatch",
+      payload: { repository: { full_name: "stranger/repo", name: "repo" }, pull_request: { number: 5 } },
+    });
+    expect((await interpretAutomation(RUN, stranger.deps)).status).toBe("filtered");
+  });
+
+  test("(d3) the closed entrypoint ends the PR's workstream and touches no review", async () => {
+    const closed: Array<{ instanceId: string; reason?: string }> = [];
+    const h = harness({
+      eventKey: "pull_request.closed",
+      payload: { ...prPayload(), action: "closed" },
+      entrypointId: "closed",
+      instanceId: "ai_pr17",
+      closed,
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(closed).toEqual([{ instanceId: "ai_pr17", reason: "pull request closed" }]);
+    expect(h.cpCalls).toEqual([]);
+    expect(h.sessions).toEqual([]);
+    expect(h.actions).toEqual([]);
+  });
+
   test("(e) a supersede mid-finder ends the run as superseded and finalize ends the kept=false workers", async () => {
     const h = harness({
       eventKey: "pull_request.opened",
@@ -371,7 +494,7 @@ describe("PR-review built-in on the interpreter", () => {
     expect(result.status).toBe("superseded");
     expect(h.prompts).toHaveLength(1);
     expect(h.cpCalls).not.toContain("decideReviewResults");
-    expect(h.actions.map((a) => a.actionId)).toEqual(["create_issue_comment"]);
+    expect(h.actions.map((a) => a.actionId)).toEqual(["upsert_issue_comment", "update_pinned_comment"]);
     // No explicit end_session ran (the graph was cut short); finalize ended
     // the finder because the built-in creates workers with keep=false.
     expect(h.ended).toEqual(["s-finder"]);
@@ -397,7 +520,7 @@ describe("PR-review built-in on the interpreter", () => {
     const fail = h.cpCalls.find((c) => c.startsWith("failReview:"));
     expect(fail).toBeDefined();
     expect(fail).toMatch(/deadline/);
-    expect(h.actions.map((a) => a.actionId)).toEqual(["create_issue_comment"]);
+    expect(h.actions.map((a) => a.actionId)).toEqual(["upsert_issue_comment", "update_pinned_comment"]);
     expect(h.names).toContain("step:__finalize__.report_failure:0");
     expect(h.names.at(-1)).toBe("step:__finalize__:0");
     // The hook is a step with its own ledger row, succeeded.

@@ -66,10 +66,11 @@ message Profile {
   optional string model = 17;
   optional string effort = 18;
   reserved 19; // was port_exposures (ADR 0064); superseded by `apps` (ADR 0118).
-  // ADR 0100: system-role marker (e.g. "pr_reviewer"). At most one active
-  // profile per designation (the store clears the prior when one is set); a
-  // designated profile cannot be deleted. Empty = an ordinary profile.
-  optional string designation = 20;
+  // 20 was `designation` (ADR 0100's "pr_reviewer" marker); retired with the
+  // reviewer profile seed (ADR 0119 phase 4.7). The PR-review built-in's
+  // `profile` input names the reviewer profile now.
+  reserved 20;
+  reserved "designation";
   // ADR 0109: named connection + operation + resource authority. The
   // connection fixes the provider identity used by the session.
   repeated ProfileIntegrationGrant integration_grants = 21;
@@ -216,8 +217,7 @@ message CreateProfileRequest {
   optional string model = 13;
   optional string effort = 14;
   reserved 15; // was port_exposures (ADR 0064); superseded by `apps` (ADR 0118).
-  // ADR 0100: system-role marker (see Profile.designation). Admin-only.
-  optional string designation = 16;
+  reserved 16; // was designation (ADR 0100); retired in ADR 0119 phase 4.7.
   repeated ProfileIntegrationGrant integration_grants = 17;
   repeated ProfileRepo repos = 18;
   optional string model_router = 19;
@@ -249,8 +249,7 @@ message UpdateProfileRequest {
   optional string model = 14;
   optional string effort = 15;
   reserved 16; // was port_exposures (ADR 0064); superseded by `apps` (ADR 0118).
-  // ADR 0100: system-role marker (see Profile.designation). Admin-only.
-  optional string designation = 17;
+  reserved 17; // was designation (ADR 0100); retired in ADR 0119 phase 4.7.
   repeated ProfileIntegrationGrant integration_grants = 18;
   repeated ProfileRepo repos = 19;
   optional string model_router = 20;

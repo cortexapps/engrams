@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState } from "react";
+import { useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { toast } from "sonner";
 import {
@@ -14,6 +14,7 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 
+import { CodeBlock } from "@/components/CodeBlock";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton-rows";
 import { StatusDot } from "@/components/status-dot";
@@ -27,9 +28,10 @@ import {
   type ConnectionControlResult,
 } from "./ConnectionTestEnableControls";
 import { GoogleCloudEndpointDialog } from "./GoogleCloudConnections";
-import type { SetupCodeLanguage } from "./SyntaxHighlightedCode";
 
-const SyntaxHighlightedCode = lazy(() => import("./SyntaxHighlightedCode"));
+// Shiki loads itself lazily from `lib/shiki`, so CodeBlock costs this page
+// nothing until a generated config renders.
+type SetupCodeLanguage = "terraform" | "shellscript";
 
 export function GoogleCloudSetupPage() {
   const { connectionId } = useParams({ strict: false }) as { connectionId?: string };
@@ -347,15 +349,7 @@ function SetupCode({
         </div>
       </div>
       <pre className="max-h-[min(62vh,44rem)] min-h-72 w-full overflow-auto rounded-md border bg-muted/30 p-4 font-mono text-xs leading-6 whitespace-pre-wrap break-words">
-        <Suspense
-          fallback={
-            <code data-language={language} data-highlighted="false">
-              {value}
-            </code>
-          }
-        >
-          <SyntaxHighlightedCode language={language} value={value} />
-        </Suspense>
+        <CodeBlock code={value} language={language} />
       </pre>
     </div>
   );

@@ -439,6 +439,7 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
           id,
           automationId: "automation-1",
           key: `key-${id}`,
+          label: null,
           status: "open" as const,
           inputs: {},
           openedBy: "",

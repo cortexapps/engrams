@@ -47,6 +47,37 @@ variable "admin_email" {
   }
 }
 
+variable "oauth_issuer" {
+  type        = string
+  description = "Issuer URL of the OIDC identity provider people sign in through (orchestrator.auth.oauth.issuer). Default: Google. A Cognito user pool is https://cognito-idp.<region>.amazonaws.com/<user-pool-id>."
+  default     = "https://accounts.google.com"
+
+  validation {
+    condition     = can(regex("^https://", var.oauth_issuer))
+    error_message = "oauth_issuer must be an https URL."
+  }
+}
+
+variable "oauth_client_id" {
+  type        = string
+  description = "Client id of the OAuth client registered with the provider. Its redirect URI is https://<domain>/api/auth/oauth2/callback/sso. The client SECRET goes in the oauth-client-secret shell, never in Terraform."
+
+  validation {
+    condition     = length(trimspace(var.oauth_client_id)) > 0
+    error_message = "oauth_client_id must not be empty (empty means $OAUTH_CLIENT_ID was unset)."
+  }
+}
+
+variable "oauth_allowed_domains" {
+  type        = list(string)
+  description = "Who may sign in: every account of these email domains (for Google, the Workspace domain). An OAuth client admits every account the provider has, so this must name at least one domain; [\"*\"] admits them all."
+
+  validation {
+    condition     = length(var.oauth_allowed_domains) > 0 && alltrue([for d in var.oauth_allowed_domains : length(trimspace(d)) > 0])
+    error_message = "oauth_allowed_domains must name at least one domain, for example [\"example.com\"]."
+  }
+}
+
 variable "kvm_instance_type" {
   type        = string
   description = "Intel KVM-capable type (see the kvm-nodegroup module). Default is the nested-virt m8i shape nearest above GCP's c3-standard-22; set m7i.metal-24xl for CPUID parity with a GCP C3 fleet (metal quota, ~3× the cost)."

@@ -13,8 +13,8 @@ description: |
   means a metal SKU or explicit nested-virt (Intel-only today — see
   ADR 0044).
 type: application
-version: 0.2.0
-appVersion: "0.1.0"
+version: 0.10.0
+appVersion: "0.10.0"
 keywords:
   - engram
   - firecracker

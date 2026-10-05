@@ -29,7 +29,7 @@ import {
 import { getDb } from "../db/client.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeUserSecretStore } from "../db/user-secrets.ts";
-import { makeProfileStore } from "../db/profiles.ts";
+import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import {
   createSessionForExistingTask,
   registerSessionListener,
@@ -144,10 +144,17 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
         const existing = await store().getAutomationTaskSession(input.runId);
         if (existing !== null) return { sessionId: existing, taskId };
       }
+      // A built-in carries no profile id of its own (ids differ per org): its
+      // `profile` input holds the one the org picked, and an empty render
+      // means nobody picked yet.
+      const profileId = input.profileId;
+      if (profileId === "") {
+        throw new Error("create_session: profileId is empty — pick a profile in the automation's inputs");
+      }
       const { sessionId } = await createSession()({
         taskId,
         taskType: "automation",
-        profileId: input.profileId,
+        profileId,
         integrationPrincipalId: `automation:${input.automationId}`,
         ...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}),
         role: input.role,
