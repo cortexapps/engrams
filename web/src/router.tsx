@@ -50,6 +50,7 @@ import { SpecTemplates } from "./pages/specs/SpecTemplates";
 import { NewSpecPage } from "./pages/specmode/NewSpecPage";
 import { SpecShellPage } from "./pages/specmode/SpecShellPage";
 import { Papercuts } from "./pages/settings/Papercuts";
+import { Retention } from "./pages/settings/Retention";
 import { Fleet } from "./pages/Fleet";
 import { Storage } from "./pages/Storage";
 import { SettingsLayout } from "./pages/settings/SettingsLayout";
@@ -516,6 +517,12 @@ const registriesRoute = createRoute({
   beforeLoad: requireAdmin,
   component: RegistriesPanel,
 });
+const retentionRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "retention",
+  beforeLoad: requireAdmin,
+  component: Retention,
+});
 const papercutsRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "papercuts",
@@ -707,6 +714,7 @@ export const routeTree = rootRoute.addChildren([
       membersRoute,
       secretsRoute,
       apiKeysRoute,
+      retentionRoute,
       harnessesRoute,
       modelRoutersRoute,
       integrationsRoute,
