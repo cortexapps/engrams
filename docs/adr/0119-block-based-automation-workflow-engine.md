@@ -602,3 +602,40 @@ retry). `IntegrationService` gains `ListEventCatalog` and `ListActionCatalog`.
 - A parallel-run window temporarily keeps two paths alive for review and
   Slack; the flags and kill switches bound the risk, and the deletion PRs
   close the window.
+
+## Amendment (2026-10-05): listener stand-down for parked sessions
+
+**What was missing.** A kept session (a Slack thread's, a workstream's)
+stays listened to for as long as it exists: an open coordinator event
+stream, a probe read every thirty seconds, a lease renewal every ten. A
+parked session (ADR 0034) emits nothing until a resume, so most of that
+work was for sessions that could not speak. The cost grew with every thread
+ever opened, not with the work in flight.
+
+**Decision.** (1) **A listener stands down on `parked`.** When the status
+probe at start says `parked`, or a live `status_changed` frame says so, the
+listener drains what the log holds (the park frame reaches the consumers),
+then marks its `session_listeners` row dormant and gives up the lease in
+one statement. A dormant row is not desired: the scanner does not start a
+listener for it. (2) **A resuming RPC wakes the row.** A parked session
+resumes only through the orchestrator — it is the coordinator's one client
+— so an interceptor on the control-plane transport wakes the row after any
+unary `SessionService` call that can resume or end a session (SendPrompt,
+Resume, Interrupt, DeleteSession, …), whoever the caller is: the passthrough
+surface, the engine's session blocks, the coordination tools. The scanner
+re-arms the listener on its next pass; the events are durable, so the
+catch-up delivers whatever the resume produced. (3) **A wake grace fences
+the race.** The coordinator may still report `parked` for a session whose
+resume is under way, so a stand-down is refused while the row's last wake
+is younger than two minutes; the listener keeps streaming and stands down
+on the next park. (4) **A reconcile is the safety net.** Every ten minutes
+the manager probes each dormant row's status: no longer parked → wake (a
+terminal session then drains and finishes through the ordinary path);
+unknown to the coordinator → terminal. A path that resumes a session
+without the orchestrator is healed within the interval.
+
+**Not chosen.** Waking from the engine and the passthrough separately —
+two sites to forget. Peeking into streaming requests (Exec, WriteFile) for
+a session id — the reconcile covers them, and neither carries a prompt.
+Dropping the row on park and re-registering on resume — the row is the
+lease and the terminal marker; dormancy keeps both.

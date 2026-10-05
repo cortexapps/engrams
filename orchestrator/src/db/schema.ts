@@ -1036,12 +1036,19 @@ export const reviewEvent = pgTable(
 // ---------------------------------------------------------------------------
 
 /** Desired listener rows also serve as cross-process leases. Terminal rows are
- * retained so a completed session is never accidentally listened to again. */
+ * retained so a completed session is never accidentally listened to again.
+ * A dormant row (ADR 0119 amendment, 2026-10-05) is a parked session: it is
+ * not desired until a wake clears it. */
 export const sessionListener = pgTable("session_listeners", {
   sessionId: text("session_id").primaryKey(),
   owner: text("owner"),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
   terminalAt: timestamp("terminal_at", { withTimezone: true }),
+  /** Set when the listener stood down for a parked session; cleared by a wake. */
+  dormantAt: timestamp("dormant_at", { withTimezone: true }),
+  /** The last wake (a resuming session RPC); a stand-down inside its grace
+   * is refused, so a resume under way is never missed. */
+  wokenAt: timestamp("woken_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
