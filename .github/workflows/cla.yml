@@ -8,9 +8,12 @@
 # only calls the GitHub API. Do not add an `actions/checkout` of the PR
 # head to this workflow.
 #
-# This check is NOT part of `CI Gate` (AGENTS.md: only the aggregator is
-# a required check). Make "CLA" a required status in the `main` ruleset
-# once the first outside contribution is expected.
+# The `cla` job is a required status in the `main` ruleset, next to
+# `CI Gate`. A required check must also report on the merge queue's
+# temporary branch, or every queue entry waits for it until the queue
+# times out. The `merge_group` trigger makes the job report there. The
+# action step does not run for that event: the pull request already
+# passed the check before it entered the queue.
 name: CLA
 
 on:
@@ -18,6 +21,7 @@ on:
     types: [created]
   pull_request_target:
     types: [opened, closed, synchronize]
+  merge_group:
 
 permissions:
   actions: write
@@ -30,10 +34,12 @@ jobs:
     if: >-
       (github.event.comment.body == 'recheck' ||
        github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') ||
-      github.event_name == 'pull_request_target'
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - name: CLA assistant
+        if: github.event_name != 'merge_group'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
