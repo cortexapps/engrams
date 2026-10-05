@@ -1,6 +1,12 @@
 # ADR 0119: Automations as a block-based durable workflow engine
 
-Status: 2026-08-21 — **Proposed.**
+Status: 2026-08-21 — Proposed. **2026-10-05 — Accepted.** Every phase shipped
+and the two hardcoded graphs it set out to replace are deleted: the legacy
+PR-review engine (phase 4.7, #1551), its enrollment table (4.7b, #1574), and
+the Slack thread workflow with its kill switch (4.8, this change). The
+built-ins run on the block engine in production; the pitfalls each phase
+met are recorded inline below (the parallel-window suppression, thread
+continuity, the no-timeouts rule, the per-pod DBOS executor in ADR 0104).
 
 Builds on ADR 0051 (the TypeScript orchestration tier), ADR 0060 (external
 triggers and durable DBOS workflows), ADR 0100 (PR code review), ADR 0102
@@ -382,6 +388,27 @@ Reviewer" row stays as an ordinary profile.
 `review_enrollment` lifts into the review built-in's `repos` input at first
 seed and is dropped at the end. GitHub `installation_repositories` events
 reach the ledger but never write the input.
+
+**Phase 4.8 (2026-10-05): the legacy Slack engine is gone.** Deleted:
+`workflows/slack-thread.ts`, `thread-control-plane.ts`, `thread-inbox.ts`,
+`thread-workflow-id.ts`, the per-session Slack consumer and its
+`slack_session` table (migration 0092), the Slack webhook classifier the
+legacy route used, the LLM profile picker (`routing/profile-picker.ts` and
+its Block Kit), the `ORCHESTRATOR_SLACK_AUTOMATION_DISABLED` kill switch and
+its chart value, and the dispatcher's legacy-route helpers
+(`builtinTookDelivery`, `builtinSuppressed`, the kill-switch gate). The Slack
+events route is the ingress spine alone; the interactivity route delivers an
+answer only to the run whose relay posted the card (a card with no run id is
+logged and ignored). `SourceMention` and `SourceAnswer` live in
+`communication-policy.ts`, whose interface lost the picker, pickup,
+prompt-append and thread-fold methods nothing called. Rung-1 precedence
+records `suppressed` only when ANOTHER automation's workstream owns the
+conversation — the brain's own ownership was never a verdict, only the
+legacy route's reason to stand down. One parity gap is deliberate: the
+legacy workflow appended a Slack-markdown system prompt at session create
+(`systemPromptAppend`); the built-in never did, so the constant went with
+the interface — wiring it into `create_session` is a follow-up if answers
+read badly in Slack.
 
 ### D8 — Sessions are kept by default
 
