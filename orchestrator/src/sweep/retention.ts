@@ -10,8 +10,8 @@ import type { OrgSettingStore, RetentionPolicy } from "../db/org-settings.ts";
 import { readRetentionPolicy } from "../db/org-settings.ts";
 import type { RetentionStore } from "../db/retention.ts";
 
-/** Runs and workflows pruned per cycle, each. A minute's cycle drains a
- * few thousand rows an hour without a long transaction. */
+/** Rows per prune per cycle (step rows; DBOS workflows). A minute's cycle
+ * drains thousands of rows an hour without a long transaction. */
 export const RETENTION_BATCH = 500;
 
 export interface RetentionDeps {
@@ -25,6 +25,9 @@ export interface RetentionDeps {
 export interface RetentionResult {
   policy: RetentionPolicy;
   cutoff: string;
+  /** Step rows deleted. */
+  runDetailRowsPruned: number;
+  /** Runs stamped as pruned. */
   runsPruned: number;
   workflowsPruned: number;
 }
@@ -33,13 +36,25 @@ export async function runRetentionTick(deps: RetentionDeps): Promise<RetentionRe
   const policy = await readRetentionPolicy(deps.settings);
   const cutoff = new Date(deps.now().getTime() - policy.runDetailDays * 24 * 60 * 60 * 1_000);
   const batch = deps.batch ?? RETENTION_BATCH;
-  const runsPruned = await deps.store.pruneRunDetails(cutoff, batch);
+  const details = await deps.store.pruneRunDetails(cutoff, batch);
   const workflowsPruned = await deps.store.pruneDbosWorkflows(cutoff, batch);
-  if (runsPruned > 0 || workflowsPruned > 0) {
+  if (details.rows > 0 || details.runs > 0 || workflowsPruned > 0) {
     deps.log.info(
-      { component: "dbos-sweep", runDetailDays: policy.runDetailDays, runsPruned, workflowsPruned },
+      {
+        component: "dbos-sweep",
+        runDetailDays: policy.runDetailDays,
+        runDetailRowsPruned: details.rows,
+        runsPruned: details.runs,
+        workflowsPruned,
+      },
       "retention: pruned run details and finished DBOS workflows past the policy",
     );
   }
-  return { policy, cutoff: cutoff.toISOString(), runsPruned, workflowsPruned };
+  return {
+    policy,
+    cutoff: cutoff.toISOString(),
+    runDetailRowsPruned: details.rows,
+    runsPruned: details.runs,
+    workflowsPruned,
+  };
 }

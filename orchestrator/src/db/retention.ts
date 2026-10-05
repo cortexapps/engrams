@@ -3,9 +3,11 @@
  * Two prunes, both batch-capped so a sweep tick stays bounded and a backlog
  * drains over cycles:
  *  - run details: the step ledger (`automation_step_run`) of runs that
- *    ended before the cutoff. The run row stays, stamped `details_pruned_at`
- *    so the frontier (a partial index on ended runs not yet pruned) shrinks
- *    as it drains instead of being rescanned every cycle.
+ *    ended before the cutoff, at most `batch` step ROWS per call (a run with
+ *    a loop holds a row per iteration per attempt, so a run count would not
+ *    bound the transaction). The run row stays, stamped `details_pruned_at`
+ *    once its rows are gone, so the frontier (a partial index on ended runs
+ *    not yet pruned) shrinks as it drains instead of being rescanned.
  *  - DBOS records: the engine's `workflow_status` rows (the SDK schema
  *    cascades their step outputs, notifications, events and streams) for
  *    workflows created before the cutoff that are not PENDING/ENQUEUED/
@@ -18,10 +20,18 @@ import { sql } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 
+export interface RunDetailPrune {
+  /** Step rows deleted this call. */
+  rows: number;
+  /** Runs stamped as pruned this call (their last rows went, or they never
+   * had any). */
+  runs: number;
+}
+
 export interface RetentionStore {
-  /** Delete the step records of runs that ended before `cutoff`; at most
-   * `batch` runs per call. Returns the number of runs pruned. */
-  pruneRunDetails(cutoff: Date, batch: number): Promise<number>;
+  /** Delete the step records of the oldest runs that ended before `cutoff`,
+   * at most `batch` step rows per call, and stamp the runs left empty. */
+  pruneRunDetails(cutoff: Date, batch: number): Promise<RunDetailPrune>;
   /** Delete the DBOS records of terminal workflows created before `cutoff`;
    * at most `batch` workflows per call. Returns the number deleted. */
   pruneDbosWorkflows(cutoff: Date, batch: number): Promise<number>;
@@ -33,7 +43,9 @@ export function makeRetentionStore(db: ReturnType<typeof getDb> = getDb()): Rete
   return {
     async pruneRunDetails(cutoff, batch) {
       return db.transaction(async (tx) => {
-        const doomed = await tx.execute(sql`
+        // The frontier: the oldest ended runs not yet stamped. Walked
+        // through the partial index, bounded by `batch` either way.
+        const frontier = sql`
           select "id"
           from "automation_run"
           where "ended_at" is not null
@@ -41,15 +53,28 @@ export function makeRetentionStore(db: ReturnType<typeof getDb> = getDb()): Rete
             and "ended_at" < ${cutoff}
           order by "ended_at" asc
           limit ${batch}
+        `;
+        const deleted = await tx.execute(sql`
+          delete from "automation_step_run"
+          where "ctid" in (
+            select "s"."ctid"
+            from (${frontier}) as "r"
+            join "automation_step_run" as "s" on "s"."run_id" = "r"."id"
+            limit ${batch}
+          )
         `);
-        const ids = doomed.rows.map((row) => String(row.id));
-        if (ids.length === 0) return 0;
-        const list = textArray(ids);
-        await tx.execute(sql`delete from "automation_step_run" where "run_id" = any(${list})`);
-        await tx.execute(sql`
-          update "automation_run" set "details_pruned_at" = now() where "id" = any(${list})
+        // Stamp the frontier runs left without rows: the ones just emptied,
+        // and the ones that never had any (a dry run, a run that failed
+        // before its first step).
+        const stamped = await tx.execute(sql`
+          update "automation_run"
+          set "details_pruned_at" = now()
+          where "id" in (${frontier})
+            and not exists (
+              select 1 from "automation_step_run" as "s" where "s"."run_id" = "automation_run"."id"
+            )
         `);
-        return ids.length;
+        return { rows: deleted.rowCount ?? 0, runs: stamped.rowCount ?? 0 };
       });
     },
 
@@ -110,15 +135,24 @@ export function makeInMemoryRetentionStore(seed: {
     runs,
     workflows,
     async pruneRunDetails(cutoff, batch) {
-      const doomed = [...runs.entries()]
-        .filter(([, r]) => r.endedAt !== null && r.endedAt < cutoff && !r.pruned)
-        .sort((a, b) => a[1].endedAt!.getTime() - b[1].endedAt!.getTime())
+      const frontier = [...runs.values()]
+        .filter((r) => r.endedAt !== null && r.endedAt < cutoff && !r.pruned)
+        .sort((a, b) => a.endedAt!.getTime() - b.endedAt!.getTime())
         .slice(0, batch);
-      for (const [, r] of doomed) {
-        r.steps = 0;
-        r.pruned = true;
+      let rows = 0;
+      for (const r of frontier) {
+        const take = Math.min(r.steps, batch - rows);
+        r.steps -= take;
+        rows += take;
       }
-      return doomed.length;
+      let stamped = 0;
+      for (const r of frontier) {
+        if (r.steps === 0) {
+          r.pruned = true;
+          stamped++;
+        }
+      }
+      return { rows, runs: stamped };
     },
     async pruneDbosWorkflows(cutoff, batch) {
       const doomed = [...workflows.entries()]

@@ -125,6 +125,7 @@ describe("runSweepTick retention", () => {
     expect(result.retention).toEqual({
       policy: { runDetailDays: 7 },
       cutoff: new Date(NOW.getTime() - 7 * DAY_MS).toISOString(),
+      runDetailRowsPruned: 3,
       runsPruned: 1,
       workflowsPruned: 1,
     });

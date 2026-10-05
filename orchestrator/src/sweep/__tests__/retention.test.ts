@@ -65,6 +65,7 @@ describe("runRetentionTick", () => {
     expect(result).toEqual({
       policy: { runDetailDays: 30 },
       cutoff: daysAgo(30).toISOString(),
+      runDetailRowsPruned: 4,
       runsPruned: 1,
       workflowsPruned: 2,
     });
@@ -79,13 +80,13 @@ describe("runRetentionTick", () => {
     ]);
   });
 
-  test("caps each prune at the batch, oldest first, so a backlog drains over cycles", async () => {
+  test("caps each prune at the batch of rows, oldest first, so a backlog drains over cycles", async () => {
     const settings = makeInMemoryOrgSettingStore();
     const store = makeInMemoryRetentionStore({
       runs: [
-        { id: "run-a", endedAt: daysAgo(50), steps: 1 },
+        { id: "run-a", endedAt: daysAgo(50), steps: 3 },
         { id: "run-b", endedAt: daysAgo(40), steps: 1 },
-        { id: "run-c", endedAt: daysAgo(35), steps: 1 },
+        { id: "run-c", endedAt: daysAgo(35), steps: 0 },
       ],
       workflows: [
         { id: "wf-a", status: "SUCCESS", createdAt: daysAgo(50) },
@@ -94,14 +95,22 @@ describe("runRetentionTick", () => {
       ],
     });
 
+    // Two rows of the oldest run go; nothing is stamped yet (run-a still
+    // holds a row, and run-c is outside this cycle's frontier of two).
     const first = await runRetentionTick({ settings, store, now: () => NOW, batch: 2, log });
-    expect([first.runsPruned, first.workflowsPruned]).toEqual([2, 2]);
-    expect(store.runs.get("run-c")?.steps).toBe(1);
+    expect([first.runDetailRowsPruned, first.runsPruned, first.workflowsPruned]).toEqual([2, 0, 2]);
+    expect(store.runs.get("run-a")?.steps).toBe(1);
     expect([...store.workflows.keys()]).toEqual(["wf-c"]);
 
+    // run-a's last row and run-b's one row: both stamped.
     const second = await runRetentionTick({ settings, store, now: () => NOW, batch: 2, log });
-    expect([second.runsPruned, second.workflowsPruned]).toEqual([1, 1]);
+    expect([second.runDetailRowsPruned, second.runsPruned, second.workflowsPruned]).toEqual([2, 2, 1]);
     expect(store.workflows.size).toBe(0);
+
+    // run-c never had rows: stamped so it leaves the frontier.
+    const third = await runRetentionTick({ settings, store, now: () => NOW, batch: 2, log });
+    expect([third.runDetailRowsPruned, third.runsPruned]).toEqual([0, 1]);
+    expect(store.runs.get("run-c")?.pruned).toBe(true);
   });
 
   test("reads the policy fresh each tick", async () => {

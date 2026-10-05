@@ -967,17 +967,21 @@ describe("DBOS sweep stores with live Postgres", () => {
     const store = makeRetentionStore();
     const cutoff = new Date(now - 30 * day);
 
-    // Oldest first, one per call: the batch cap bounds a cycle.
-    expect(await store.pruneRunDetails(cutoff, 1)).toBe(1);
     const stepsOf = async (id: string) =>
       Number(
         (await getDb().execute(sql`select count(*)::int as "n" from "automation_step_run" where "run_id" = ${id}`))
           .rows[0]!.n,
       );
+    // Oldest first, one ROW per call: the batch bounds the transaction. The
+    // oldest run still holds a row after the first call, so it is not
+    // stamped yet.
+    expect(await store.pruneRunDetails(cutoff, 1)).toEqual({ rows: 1, runs: 0 });
+    expect(await stepsOf(oldest)).toBe(1);
+    expect(await store.pruneRunDetails(cutoff, 1)).toEqual({ rows: 1, runs: 1 });
     expect(await stepsOf(oldest)).toBe(0);
     expect(await stepsOf(old)).toBe(2);
-    expect(await store.pruneRunDetails(cutoff, 10)).toBe(1);
-    expect(await store.pruneRunDetails(cutoff, 10)).toBe(0);
+    expect(await store.pruneRunDetails(cutoff, 10)).toEqual({ rows: 2, runs: 1 });
+    expect(await store.pruneRunDetails(cutoff, 10)).toEqual({ rows: 0, runs: 0 });
     expect([await stepsOf(old), await stepsOf(fresh), await stepsOf(open)]).toEqual([0, 2, 2]);
     // The run rows stay, the pruned ones stamped.
     const kept = await getDb().execute(sql`
