@@ -12,7 +12,8 @@ conventions live in [`AGENTS.md`](AGENTS.md); read it before your first change.
 
 ## The pull request
 
-- One logical change per pull request. Title in the form `scope: lowercase summary`.
+- One logical change per pull request. Title in the form `type(scope): lowercase summary`,
+  for example `fix(web): keep the draft on reload`.
 - Body with `## Problem`, `## Fix`, and `## Test` sections.
 - Run the smallest gate that covers your change (see "Change-scoped validation" in
   `AGENTS.md`). For Rust changes that is `just check` once before you push.

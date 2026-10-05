@@ -18,4 +18,5 @@ highest priority.
 
 ## Supported versions
 
-Only `main` receives security fixes. Deployments run a recent `main` image.
+Security fixes land on `main` and ship in the next release. Only the latest release
+receives fixes; we do not backport to earlier releases.
