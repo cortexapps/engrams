@@ -404,11 +404,11 @@ logged and ignored). `SourceMention` and `SourceAnswer` live in
 prompt-append and thread-fold methods nothing called. Rung-1 precedence
 records `suppressed` only when ANOTHER automation's workstream owns the
 conversation — the brain's own ownership was never a verdict, only the
-legacy route's reason to stand down. One parity gap is deliberate: the
-legacy workflow appended a Slack-markdown system prompt at session create
-(`systemPromptAppend`); the built-in never did, so the constant went with
-the interface — wiring it into `create_session` is a follow-up if answers
-read badly in Slack.
+legacy route's reason to stand down. The one parity gap the deletion opened
+closed the same day: the legacy workflow appended a Slack-markdown system
+prompt at session create (`systemPromptAppend`), which the built-in never
+had; the text now lives with the built-in (`SLACK_SYSTEM_PROMPT_APPEND`)
+and rides `create_session.appendSystemPrompt` (v11).
 
 ### D8 — Sessions are kept by default
 

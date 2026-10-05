@@ -81,8 +81,7 @@ interface Harness {
     prompt: string;
     keep: boolean;
     title: string | null;
-    ownerUserId: string | undefined;
-  }>;
+    ownerUserId: string | undefined; appendSystemPrompt?: string; }>;
   actions: Array<{ actionId: string; params: Record<string, unknown> }>;
   /** Workstream closes the finalize hook requested (ADR 0120). */
   closed: Array<{ instanceId: string; reason?: string }>;
@@ -211,6 +210,7 @@ function harness(options: {
         keep: input.keep,
         title: input.title,
         ownerUserId: input.ownerUserId,
+        appendSystemPrompt: input.appendSystemPrompt,
       });
       runSessions.push({ sessionId: id, keep: input.keep });
       return { sessionId: id, taskId: `t-${id}` };
@@ -326,6 +326,9 @@ describe("Slack thread brain through the interpreter", () => {
     // identity gate resolved U1 and create_session passed the owner through.
     expect(h.resolved).toEqual(["U1"]);
     expect(h.sessions[0]!.ownerUserId).toBe("user-1");
+    // The Slack flavor rides the session's system prompt (ADR 0060 Decision
+    // 8): chat-friendly replies, mrkdwn, questions through the tool.
+    expect(h.sessions[0]!.appendSystemPrompt).toContain("Conform to slack markdown");
     // The thread got the session link first (legacy `onStarted`), by an
     // ordinary Slack action templated on create_session's `web_url`.
     expect(h.actions.filter((a) => a.actionId === "post_message")).toEqual([

@@ -60,7 +60,7 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 10;
+export const SLACK_BRAIN_DEFINITION_VERSION = 11;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
@@ -76,6 +76,22 @@ const TURN_SLICE_S = MAX_WAIT_DEADLINE_S;
 const RUN_DEADLINE_S = 48 * 3600;
 
 const F = "steps.facts.value";
+
+/** Appended to the agent's system prompt when the thread's session is
+ * created (ADR 0060 Decision 8): how to behave in a chat thread, and
+ * Slack's mrkdwn instead of Markdown. The same text ADR 0060's thread
+ * workflow appended; it rides `create_session.appendSystemPrompt` (the
+ * harness's ENGRAM_APPEND_SYSTEM_PROMPT), so a resumed session keeps the
+ * flavor it was created with. */
+export const SLACK_SYSTEM_PROMPT_APPEND = `You are running inside an engrams session triggered from a Slack thread.
+Keep replies concise and chat-friendly.
+
+When you need a decision or clarification from the user, ask via the ask_user_question tool — it renders as interactive buttons in Slack — rather than guessing. The user cannot see your terminal, so surface results, links, and artifacts explicitly. When handling code related tasks, prefer showing your work rather than just saying you're done. Prefer video over images if available.
+
+Conform to slack markdown in your responses. Examples:
+Links are formatted as <url|optional link title>
+Bold is single asterisks surrounding text, like *this*.
+Italics are underlines surrounding text like _this_.`;
 
 /** Admission + fact derivation. Returns null to reject; else the facts. Pure,
  * runs in the QuickJS cage. */
@@ -334,6 +350,7 @@ const session: BlockDef = {
     ownerUserId: "${{ steps.identity.user_id }}",
     // D8 + the thread model: the session outlives the run.
     keepOnFinish: true,
+    appendSystemPrompt: SLACK_SYSTEM_PROMPT_APPEND,
   },
 };
 
