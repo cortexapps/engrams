@@ -45,6 +45,7 @@ import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
 import { registerPapercuts } from "./rpc/papercuts.ts";
+import { registerRetention } from "./rpc/retention.ts";
 import { registerPrRefs } from "./rpc/pr-refs.ts";
 import { registerReviews } from "./rpc/reviews.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
@@ -472,6 +473,9 @@ const server = buildServer(
 
     // Native PapercutService: orchestrator-owned friction inbox.
     registerPapercuts(router);
+
+    // Native RetentionService: the org's retention policy (Settings → Retention).
+    registerRetention(router);
 
     // Native PrRefService: durable task/session links to authored PRs (ADR 0100).
     registerPrRefs(router);
