@@ -422,7 +422,11 @@ impl SandboxBackend for ProcessBackend {
         // ADR 0067: stamp the attach token into the harness child env —
         // the backend is the only party that knows the sandbox id
         // pre-boot; the epoch was minted coordinator-side into the spec.
-        let token_env = agent.attach_token_env(id);
+        let token_env = engram_harness_proto::attach_token::AttachToken {
+            sandbox_id: id,
+            binding_epoch: agent.binding_epoch,
+        }
+        .env();
         let mut agent = agent;
         agent.env.extend(token_env);
         spawn_agent(

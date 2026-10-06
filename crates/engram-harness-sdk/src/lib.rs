@@ -19,14 +19,18 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use engram_harness_proto::attach_token::AttachToken;
 use engram_harness_proto::{
     read_msg, write_msg, AttachReject, HarnessAttach, HarnessAttachAck, HarnessCommand,
     HarnessEvent, HarnessFrame,
 };
-use engram_ids::{SandboxId, SessionId};
+use engram_ids::SessionId;
+use std::future::Future;
+use std::pin::Pin;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, Notify};
 
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send>;
 pub type BoxedWriter = Box<dyn AsyncWrite + Unpin + Send>;
 type HeldEvent = Arc<Mutex<Option<HarnessEvent>>>;
@@ -36,9 +40,18 @@ pub struct ConnectionConfig {
     pub connect: Option<String>,
     pub port: Option<u32>,
     pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    pub binding_epoch: u64,
     pub harness_version: String,
+}
+
+impl ConnectionConfig {
+    fn attach(&self, token: AttachToken) -> HarnessAttach {
+        HarnessAttach {
+            session_id: self.session_id,
+            sandbox_id: token.sandbox_id,
+            binding_epoch: token.binding_epoch,
+            harness_version: self.harness_version.clone(),
+        }
+    }
 }
 
 pub struct Channels {
@@ -115,9 +128,99 @@ pub async fn serve(
     cfg: ConnectionConfig,
     engine: tokio::task::JoinHandle<ExitCode>,
     command_tx: mpsc::Sender<HarnessCommand>,
-    mut event_rx: mpsc::Receiver<HarnessEvent>,
+    event_rx: mpsc::Receiver<HarnessEvent>,
     reattach: Arc<Notify>,
 ) -> ExitCode {
+    let dial_cfg = cfg.clone();
+    serve_with(
+        cfg,
+        move || {
+            let cfg = dial_cfg.clone();
+            Box::pin(async move { dial(&cfg).await })
+        },
+        engine,
+        command_tx,
+        event_rx,
+        reattach,
+    )
+    .await
+}
+
+/// Use an injected transport with the production token loader.
+pub async fn serve_with<D>(
+    cfg: ConnectionConfig,
+    dialer: D,
+    engine: tokio::task::JoinHandle<ExitCode>,
+    command_tx: mpsc::Sender<HarnessCommand>,
+    event_rx: mpsc::Receiver<HarnessEvent>,
+    reattach: Arc<Notify>,
+) -> ExitCode
+where
+    D: FnMut() -> BoxFuture<Option<(BoxedReader, BoxedWriter)>>,
+{
+    serve_loop(
+        cfg,
+        dialer,
+        AttachToken::load,
+        engine,
+        command_tx,
+        event_rx,
+        reattach,
+    )
+    .await
+}
+
+/// In-process fixtures supply a token without changing process-global env.
+pub async fn serve_with_token<D>(
+    cfg: ConnectionConfig,
+    dialer: D,
+    token: AttachToken,
+    engine: tokio::task::JoinHandle<ExitCode>,
+    command_tx: mpsc::Sender<HarnessCommand>,
+    event_rx: mpsc::Receiver<HarnessEvent>,
+    reattach: Arc<Notify>,
+) -> ExitCode
+where
+    D: FnMut() -> BoxFuture<Option<(BoxedReader, BoxedWriter)>>,
+{
+    serve_loop(
+        cfg,
+        dialer,
+        move || Ok(token),
+        engine,
+        command_tx,
+        event_rx,
+        reattach,
+    )
+    .await
+}
+
+pub const SUPERSEDED_TOKEN_GRACE: Duration = Duration::from_secs(15);
+
+async fn serve_loop<D, L>(
+    cfg: ConnectionConfig,
+    mut dialer: D,
+    mut load_token: L,
+    engine: tokio::task::JoinHandle<ExitCode>,
+    command_tx: mpsc::Sender<HarnessCommand>,
+    mut event_rx: mpsc::Receiver<HarnessEvent>,
+    reattach: Arc<Notify>,
+) -> ExitCode
+where
+    D: FnMut() -> BoxFuture<Option<(BoxedReader, BoxedWriter)>>,
+    L: FnMut() -> std::io::Result<AttachToken>,
+{
+    let mut token = match load_token() {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::error!(error = %e, "attach token unavailable");
+            drop(command_tx);
+            event_rx.close();
+            while event_rx.recv().await.is_some() {}
+            let _ = engine.await;
+            return ExitCode::from(2);
+        }
+    };
     let held: HeldEvent = Arc::new(Mutex::new(None));
     // Outlives each connection: a reconnect mid-turn must not lose the
     // turn's stopwatch (that reconnect is often the interesting case).
@@ -128,7 +231,13 @@ pub async fn serve(
     let mut failures = 0u32;
 
     loop {
-        if engine.is_finished() {
+        if let Ok(current) = load_token() {
+            token = current;
+        } else {
+            tracing::warn!("attach token reload failed; retaining last token");
+        }
+        if engine.is_finished() && event_rx.is_empty() && held.lock().expect("held lock").is_none()
+        {
             break;
         }
         // ADR 0108 A1: the dial runs INSIDE the SIGUSR1 select. A dial that
@@ -137,11 +246,11 @@ pub async fn serve(
         // reattach fallback could not break.
         let outcome = tokio::select! {
             o = async {
-                match tokio::time::timeout(DIAL_TIMEOUT, dial(&cfg)).await {
+                match tokio::time::timeout(DIAL_TIMEOUT, dialer()).await {
                     Ok(Some(stream)) => {
                         run_one_connection(
                             stream,
-                            &cfg,
+                            &cfg.attach(token),
                             &command_tx,
                             &mut event_rx,
                             &held,
@@ -160,7 +269,39 @@ pub async fn serve(
             _ = reconnect_nudge.recv() => ConnOutcome::Dropped("SIGUSR1 reconnect nudge"),
         };
         match outcome {
-            ConnOutcome::EngineDone | ConnOutcome::Superseded => break,
+            ConnOutcome::EngineDone => break,
+            ConnOutcome::Superseded => {
+                let deadline = tokio::time::Instant::now() + SUPERSEDED_TOKEN_GRACE;
+                loop {
+                    if let Ok(current) = load_token() {
+                        if current.binding_epoch > token.binding_epoch {
+                            token = current;
+                            break;
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            epoch = token.binding_epoch,
+                            "attach fence remained after token grace"
+                        );
+                        drop(command_tx);
+                        // Drain the close-out events even though this generation cannot send.
+                        let mut undelivered =
+                            usize::from(held.lock().expect("held lock").is_some());
+                        while event_rx.recv().await.is_some() {
+                            undelivered += 1;
+                        }
+                        tracing::warn!(undelivered, "fenced harness exit");
+                        return engine.await.unwrap_or(ExitCode::FAILURE);
+                    }
+                    tokio::select! {
+                        _ = reconnect_nudge.recv() => {},
+                        _ = tokio::time::sleep_until(deadline) => {},
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                    }
+                }
+                failures = 0;
+            }
             ConnOutcome::DialFailed => {
                 failures = failures.saturating_add(1);
                 let backoff = std::cmp::min(10, 1u64 << failures.min(4));
@@ -183,6 +324,11 @@ pub async fn serve(
         }
     }
     drop(command_tx);
+    let mut undelivered = usize::from(held.lock().expect("held lock").is_some());
+    while event_rx.recv().await.is_some() {
+        undelivered += 1;
+    }
+    tracing::info!(undelivered, "harness transport exit");
     engine.await.unwrap_or_else(|e| {
         tracing::error!(error = %e, "harness engine task panicked");
         ExitCode::from(1)
@@ -247,21 +393,15 @@ enum ConnOutcome {
 
 async fn run_one_connection(
     (mut reader, mut writer): (BoxedReader, BoxedWriter),
-    cfg: &ConnectionConfig,
+    attach: &HarnessAttach,
     command_tx: &mpsc::Sender<HarnessCommand>,
     event_rx: &mut mpsc::Receiver<HarnessEvent>,
     held: &HeldEvent,
     reattach: &Notify,
     first_output: &mut first_output::FirstOutput,
 ) -> ConnOutcome {
-    let attach = HarnessAttach {
-        session_id: cfg.session_id,
-        sandbox_id: cfg.sandbox_id,
-        binding_epoch: cfg.binding_epoch,
-        harness_version: cfg.harness_version.clone(),
-    };
     let handshake = async {
-        if write_msg(&mut writer, &attach).await.is_err() {
+        if write_msg(&mut writer, attach).await.is_err() {
             return Err(ConnOutcome::Rejected("attach write failed".into()));
         }
         match read_msg::<_, HarnessAttachAck>(&mut reader).await {
@@ -401,7 +541,6 @@ pub fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engram_harness_proto::HarnessAttachAck;
 
     #[tokio::test]
     async fn emit_places_browser_enrichment_before_generic_tool_start() {
@@ -466,48 +605,6 @@ mod tests {
         assert_eq!(truncate_utf8("éclair", 2), "é…[truncated]");
     }
 
-    #[tokio::test]
-    async fn superseded_attach_is_terminal() {
-        let (client, mut host) = tokio::io::duplex(4096);
-        let (reader, writer) = tokio::io::split(client);
-        let cfg = ConnectionConfig {
-            connect: Some("unused".into()),
-            port: None,
-            session_id: SessionId::new(),
-            sandbox_id: SandboxId::new(),
-            binding_epoch: 7,
-            harness_version: "test".into(),
-        };
-        let host_task = tokio::spawn(async move {
-            let _: HarnessAttach = read_msg(&mut host).await.unwrap();
-            write_msg(
-                &mut host,
-                &HarnessAttachAck {
-                    ok: false,
-                    reject: Some(AttachReject::Superseded),
-                    message: None,
-                },
-            )
-            .await
-            .unwrap();
-        });
-        let (command_tx, _) = mpsc::channel(1);
-        let (_, mut event_rx) = mpsc::channel(1);
-        let held = Arc::new(Mutex::new(None));
-        let outcome = run_one_connection(
-            (Box::new(reader), Box::new(writer)),
-            &cfg,
-            &command_tx,
-            &mut event_rx,
-            &held,
-            &Notify::new(),
-            &mut first_output::FirstOutput::default(),
-        )
-        .await;
-        host_task.await.unwrap();
-        assert!(matches!(outcome, ConnOutcome::Superseded));
-    }
-
     /// ADR 0108 A1: an attach whose ack never arrives (the swallowed-
     /// frame vsock window — the 2026-07-31 41-second zombie) must not
     /// park the SDK forever. The handshake bound turns the hang into a
@@ -521,8 +618,6 @@ mod tests {
             connect: Some("unused".into()),
             port: None,
             session_id: SessionId::new(),
-            sandbox_id: SandboxId::new(),
-            binding_epoch: 1,
             harness_version: "test".into(),
         };
         // The host reads the attach, then goes silent: it never acks
@@ -536,7 +631,10 @@ mod tests {
         let held = Arc::new(Mutex::new(None));
         let outcome = run_one_connection(
             (Box::new(reader), Box::new(writer)),
-            &cfg,
+            &cfg.attach(AttachToken {
+                sandbox_id: engram_ids::SandboxId::new(),
+                binding_epoch: 1,
+            }),
             &command_tx,
             &mut event_rx,
             &held,
@@ -558,5 +656,35 @@ mod tests {
             channels.event_tx.try_send(HarnessEvent::Idle).unwrap();
         }
         assert!(channels.event_tx.try_send(HarnessEvent::Idle).is_err());
+    }
+    #[tokio::test]
+    async fn failed_write_is_replayed_before_new_events() {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(HarnessEvent::Busy).await.unwrap();
+        tx.send(HarnessEvent::Idle).await.unwrap();
+        drop(tx);
+        let held = Arc::new(Mutex::new(None));
+        let mut timing = first_output::FirstOutput::default();
+        let (mut failed, peer) = tokio::io::duplex(1);
+        drop(peer);
+        assert!(matches!(
+            pump_events(&mut failed, &mut rx, &held, &mut timing).await,
+            ConnOutcome::Dropped("write error")
+        ));
+        assert_eq!(*held.lock().unwrap(), Some(HarnessEvent::Busy));
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        assert!(matches!(
+            pump_events(&mut writer, &mut rx, &held, &mut timing).await,
+            ConnOutcome::EngineDone
+        ));
+        assert_eq!(
+            read_msg::<_, HarnessFrame>(&mut reader).await.unwrap(),
+            HarnessFrame::Event(HarnessEvent::Busy)
+        );
+        assert_eq!(
+            read_msg::<_, HarnessFrame>(&mut reader).await.unwrap(),
+            HarnessFrame::Event(HarnessEvent::Idle)
+        );
+        assert!(held.lock().unwrap().is_none());
     }
 }

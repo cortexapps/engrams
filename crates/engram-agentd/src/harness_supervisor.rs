@@ -201,6 +201,16 @@ impl HarnessSupervisor {
             tracing::debug!("SpawnHarness with empty argv — readiness probe; no spawn");
             return Ok(None);
         }
+        use engram_harness_proto::attach_token::{
+            AttachToken, ATTACH_TOKEN_FILE, ATTACH_TOKEN_FILE_ENV,
+        };
+        if let Some(token) = AttachToken::from_env_map(&req.env) {
+            let path =
+                std::env::var_os(ATTACH_TOKEN_FILE_ENV).unwrap_or_else(|| ATTACH_TOKEN_FILE.into());
+            token.write_atomic(std::path::Path::new(&path))?;
+        } else {
+            tracing::debug!("SpawnHarness has no attach token; skipping token write");
+        }
         // Sync the guest clock to the host before spawning the harness, so
         // the agent (and the git/cargo children it drives) start on a
         // correct clock right after a resume. The periodic tick keeps a
@@ -259,19 +269,9 @@ impl HarnessSupervisor {
             // `None` (the handle moves to its `Done` state), so `prev.id()`
             // called after the fact would silently return `None` here.
             let prev_pid = prev.id();
-            // ADR 0045 C1: REATTACH, don't respawn, when the previous
-            // harness is still ALIVE. A live-teleported (or mid-run
-            // resumed) guest arrives with its harness running inside
-            // the moved memory image — the post-move SpawnHarness from
-            // `finish_resume_to_active` used to KILL it here, silently
-            // destroying the in-flight run the teleport had just
-            // preserved losslessly. The harness's event pipe into
-            // agentd is intact (both ends moved together), and the
-            // host re-dials agentd's stream regardless, so the only
-            // correct action for a live child is: return its pid and
-            // leave it alone. An EXITED child (the idle-resume shape:
-            // the run completed before capture) is reaped and a fresh
-            // harness spawns — the pre-existing resume semantics.
+            // Keep the live child and its in-flight run. The token file above
+            // already contains the new binding before the reconnect signal.
+            // An exited child is reaped and replaced.
             match prev.try_wait() {
                 Ok(None) => {
                     let pid = prev_pid;
@@ -287,19 +287,7 @@ impl HarnessSupervisor {
                         pid = ?pid,
                         "harness still running (live move / mid-run resume); reattaching, not respawning",
                     );
-                    // ADR 0045 C1: nudge the live harness to re-dial the
-                    // host NOW. A snapshot restore rebuilds the vsock
-                    // device, but the harness's established connection
-                    // doesn't EOF — its read blocks forever, the
-                    // reconnect loop never wakes, and the destination
-                    // host never sees a harness attach (prompts 500
-                    // "sandbox not found" while exec works — prod
-                    // canaries 1f64052e / 51d51740). This SpawnHarness
-                    // is the one signal that fires exactly at restore
-                    // time, so deliver SIGUSR1 = "drop the connection
-                    // and re-dial" (handled in engram-harness-claude's
-                    // connection loop; harnesses without a handler are
-                    // respawned by the next SpawnHarness anyway).
+                    // SIGUSR1 wakes the SDK so it loads the token and redials.
                     #[cfg(target_os = "linux")]
                     if let Some(pid) = pid {
                         if let Err(e) = nix::sys::signal::kill(
@@ -465,36 +453,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_spawn_kills_first() {
-        let sup = HarnessSupervisor::new();
-        let _first = sup
-            .spawn(SpawnHarnessRequest {
-                argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
-                env: HashMap::new(),
-                session_env: HashMap::new(),
-                host_ca_pem: None,
-            })
-            .await
-            .unwrap();
-        let second = sup
-            .spawn(SpawnHarnessRequest {
-                argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
-                env: HashMap::new(),
-                session_env: HashMap::new(),
-                host_ca_pem: None,
-            })
-            .await
-            .unwrap();
-        assert!(second.is_some());
-        // Clean up.
-        let mut guard = sup.inner.lock().await;
-        if let Some(mut c) = guard.current_child.take() {
-            let _ = c.kill().await;
-            let _ = c.wait().await;
-        }
-    }
-
-    #[tokio::test]
     async fn child_stdio_goes_to_harness_log_not_inherited() {
         // The harness must never inherit agentd's stdio (= /dev/console in
         // the guest, which blocks forever once the restored VM's TTY buffer
@@ -591,5 +549,81 @@ mod tests {
                 .any(|l| l.starts_with(&format!("{}=", engram_harness_proto::HARNESS_CWD_ENV))),
             "the reserved cwd key must be consumed, not leaked into the child env",
         );
+    }
+    static TOKEN_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn token_spawn_case(reuse: bool) {
+        use engram_harness_proto::attach_token::{AttachToken, ATTACH_TOKEN_FILE_ENV};
+        let _guard = TOKEN_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("token");
+        let seen = dir.path().join("seen");
+        let ready = dir.path().join("ready");
+        let old = std::env::var_os(ATTACH_TOKEN_FILE_ENV);
+        std::env::set_var(ATTACH_TOKEN_FILE_ENV, &token_path);
+        let mut token = AttachToken {
+            sandbox_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            binding_epoch: 1,
+        };
+        let sup = HarnessSupervisor::new();
+        let script = if reuse {
+            "trap 'cp \"$ENGRAM_ATTACH_TOKEN_FILE\" \"$SEEN\"' USR1; touch \"$READY\"; while :; do sleep 0.05; done"
+        } else {
+            "cp \"$ENGRAM_ATTACH_TOKEN_FILE\" \"$SEEN\""
+        };
+        let mut env: HashMap<_, _> = token.env().into();
+        env.insert("SEEN".into(), seen.to_string_lossy().into());
+        env.insert("READY".into(), ready.to_string_lossy().into());
+        let mut req = SpawnHarnessRequest {
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            env,
+            session_env: HashMap::new(),
+            host_ca_pem: None,
+        };
+        let first = sup.spawn(req.clone()).await.unwrap();
+        if reuse {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while !ready.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            token.binding_epoch = 2;
+            req.env.extend(token.env());
+            assert_eq!(sup.spawn(req).await.unwrap(), first);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(&seen) {
+                    if let Ok(actual) = serde_json::from_slice::<AttachToken>(&bytes) {
+                        assert_eq!(actual, token);
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if let Some(mut child) = sup.inner.lock().await.current_child.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        match old {
+            Some(value) => std::env::set_var(ATTACH_TOKEN_FILE_ENV, value),
+            None => std::env::remove_var(ATTACH_TOKEN_FILE_ENV),
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_spawn_sees_token_file() {
+        token_spawn_case(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_reuse_writes_new_token_before_signalling() {
+        token_spawn_case(true).await;
     }
 }

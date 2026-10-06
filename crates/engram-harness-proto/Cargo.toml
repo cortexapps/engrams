@@ -19,6 +19,8 @@ bincode.workspace = true
 chrono.workspace = true
 engram-ids.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
 tokio.workspace = true
 uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }

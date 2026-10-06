@@ -4,7 +4,7 @@ use std::process::{ExitCode, Stdio};
 use std::sync::Arc;
 
 use clap::Parser;
-use engram_core::{SandboxId, SessionId};
+use engram_core::SessionId;
 use engram_harness_proto::{
     read_msg, write_msg, AgentRole, FileChange, ForgeOp, ForgeRequest, ForgeResponse,
     HarnessCommand, HarnessEvent, FORGE_VSOCK_PORT,
@@ -144,10 +144,6 @@ struct Cli {
     port: Option<u32>,
     #[arg(long, env = "ENGRAM_SESSION_ID")]
     session_id: SessionId,
-    #[arg(long, env = "ENGRAM_SANDBOX_ID")]
-    sandbox_id: SandboxId,
-    #[arg(long, env = "ENGRAM_BINDING_EPOCH")]
-    binding_epoch: u64,
     #[arg(long, env = "ENGRAM_CODEX_BIN")]
     codex_bin: Option<PathBuf>,
     /// Root of everything this harness keeps per session: `CODEX_HOME`, the
@@ -242,8 +238,6 @@ async fn main() -> ExitCode {
             connect: cli.connect,
             port: cli.port,
             session_id: cli.session_id,
-            sandbox_id: cli.sandbox_id,
-            binding_epoch: cli.binding_epoch,
             harness_version: format!("engram-harness-codex/{}", env!("CARGO_PKG_VERSION")),
         },
         engine,
@@ -1158,7 +1152,12 @@ async fn drive(
                 }
                 Some(HarnessCommand::Shutdown { .. }) => return DriveOutcome::Shutdown,
                 Some(HarnessCommand::Checkpoint { .. }) => {}
-                None => return DriveOutcome::ChannelClosed,
+                None => {
+                    if let Some(run_id) = active.take() {
+                        emit(events, HarnessEvent::RunInterrupted { run_id }).await;
+                    }
+                    return DriveOutcome::ChannelClosed;
+                },
             },
             _ = reattach.notified() => if active.is_none() { emit(events, HarnessEvent::Idle).await; },
             _ = async {
@@ -2744,12 +2743,22 @@ done
         let state_dir =
             std::env::temp_dir().join(format!("engram-codex-state-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&state_dir).expect("test state dir");
+        let token_path = state_dir.join("attach-token");
+        engram_harness_proto::attach_token::AttachToken {
+            sandbox_id: engram_core::SandboxId::new(),
+            binding_epoch: 1,
+        }
+        .write_atomic(&token_path)
+        .unwrap();
+        std::env::set_var(
+            engram_harness_proto::attach_token::ATTACH_TOKEN_FILE_ENV,
+            token_path,
+        );
+
         Cli {
             connect: None,
             port: Some(1),
             session_id: SessionId::new(),
-            sandbox_id: SandboxId::new(),
-            binding_epoch: 1,
             codex_bin: Some(codex_bin),
             state_dir,
             codex_home: None,
@@ -2930,6 +2939,45 @@ done
         assert!(requests.contains("thread/start"));
         assert!(!requests.contains("AUTH_CACHE_LEAKED"));
         assert!(!requests.contains("access-secret"));
+    }
+
+    #[tokio::test]
+    async fn channel_close_interrupts_active_run_without_idle() {
+        let (script, _) = write_fake_codex(&[]).await;
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let engine = tokio::spawn(run_engine(
+            test_cli(script),
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "close".into(),
+                text: "work".into(),
+                mode: None,
+            })
+            .await
+            .unwrap();
+        let run_id = loop {
+            if let Some(HarnessEvent::RunStarted { run_id, .. }) = event_rx.recv().await {
+                break run_id;
+            }
+        };
+        drop(command_tx);
+        assert_eq!(
+            event_rx.recv().await,
+            Some(HarnessEvent::RunInterrupted { run_id })
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), engine)
+                .await
+                .unwrap()
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(event_rx.recv().await, None);
     }
 
     #[tokio::test]

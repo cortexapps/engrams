@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::{SandboxId, SessionId};
-use engram_harness_noop::{run as run_noop, NoopConfig};
+use engram_harness_noop::{serve_duplex, Script};
+use engram_harness_proto::attach_token::AttachToken;
 use engram_harness_proto::HarnessEvent;
 use engram_host_agent::harness::{EventSink, HarnessHub};
 use parking_lot::Mutex;
@@ -41,17 +42,20 @@ async fn noop_harness_events_land_in_event_sink_in_order() {
     let (host_side, harness_side) = tokio::io::duplex(1 << 16);
     hub.accept_connection(sandbox_id, Some(session_id), host_side);
 
-    let mut cfg = NoopConfig::for_session(session_id);
-    cfg.sandbox_id = sandbox_id;
-    cfg.binding_epoch = 1;
+    let mut cfg = Script::default();
+    let token = AttachToken {
+        sandbox_id,
+        binding_epoch: 1,
+    };
     cfg.tool_calls = 3;
     cfg.interval = Duration::from_millis(1);
-    cfg.tool_call_duration_ms = 1;
-    cfg.result_summary_template = "noop tool result".into();
+    cfg.tool_sleep = Duration::from_millis(1);
+    cfg.result_summary = "noop tool result".into();
 
     // Run noop in a task; once it emits Idle it stays connected
     // waiting for shutdown. Send Shutdown to release it.
-    let run_handle = tokio::spawn(async move { run_noop(harness_side, cfg).await });
+    let run_handle =
+        tokio::spawn(async move { serve_duplex(cfg, session_id, token, harness_side).await });
     // Wait for the hub to register the connection so shutdown
     // doesn't race the handshake.
     for _ in 0..100 {
@@ -88,10 +92,10 @@ async fn noop_harness_events_land_in_event_sink_in_order() {
     );
 
     hub.shutdown(sandbox_id, 0).await.expect("shutdown");
-    let outcome = run_handle.await.unwrap().unwrap();
+    let outcome = run_handle.await.unwrap();
     assert_eq!(
         outcome,
-        engram_harness_noop::NoopOutcome::Shutdown,
+        std::process::ExitCode::SUCCESS,
         "noop should exit via Shutdown"
     );
 
@@ -160,13 +164,16 @@ async fn survivor_redial_attaches_against_a_fresh_hub_with_zero_rebuild() {
     let (host_side, harness_side) = tokio::io::duplex(1 << 16);
     hub.accept_via_session_lookup(host_side);
 
-    let mut cfg = NoopConfig::for_session(session_id);
-    cfg.sandbox_id = sandbox_id;
-    cfg.binding_epoch = 1;
+    let mut cfg = Script::default();
+    let token = AttachToken {
+        sandbox_id,
+        binding_epoch: 1,
+    };
     cfg.tool_calls = 1;
     cfg.interval = Duration::from_millis(1);
-    cfg.tool_call_duration_ms = 1;
-    let run_handle = tokio::spawn(async move { run_noop(harness_side, cfg).await });
+    cfg.tool_sleep = Duration::from_millis(1);
+    let run_handle =
+        tokio::spawn(async move { serve_duplex(cfg, session_id, token, harness_side).await });
 
     for _ in 0..200 {
         if hub.attached_count() == 1 {
@@ -193,45 +200,40 @@ async fn survivor_redial_attaches_against_a_fresh_hub_with_zero_rebuild() {
     );
 
     hub.shutdown(sandbox_id, 0).await.expect("shutdown");
-    let outcome = run_handle.await.expect("noop task").expect("noop run");
-    assert!(matches!(
-        outcome,
-        engram_harness_noop::NoopOutcome::Shutdown
-            | engram_harness_noop::NoopOutcome::EmittedAndPeerClosed
-    ));
+    assert_eq!(
+        run_handle.await.expect("noop task"),
+        std::process::ExitCode::SUCCESS
+    );
 }
 
-/// ADR 0073 fencing (the fbd3794c shape): a harness whose session was
-/// re-bound to a NEWER generation presents a stale epoch and is
-/// rejected `Superseded` — deterministically, on the first dial. The
-/// noop harness surfaces that as AttachRejected (the claude harness
-/// exits on the typed variant).
-#[tokio::test]
-async fn stale_epoch_redial_is_rejected_superseded() {
-    let bindings_dir = tempfile::tempdir().expect("tempdir");
+/// Unknown bindings remain retryable and never register with the hub.
+#[tokio::test(start_paused = true)]
+async fn unknown_binding_keeps_retrying_without_registering() {
+    let bindings_dir = tempfile::tempdir().unwrap();
     let session_id = SessionId::new();
     let sink: EventSink = Arc::new(|_, _, _| Box::new(Box::pin(async {})));
     let hub = HarnessHub::new(
         sink,
-        engram_host_agent::bindings::BindingStore::open(bindings_dir.path())
-            .expect("binding store"),
+        engram_host_agent::bindings::BindingStore::open(bindings_dir.path()).unwrap(),
     );
-    // The session moved on: a newer generation owns the record.
-    let new_sandbox = SandboxId::new();
-    hub.bind_session(session_id, new_sandbox, 2)
-        .expect("bind@2");
-
-    let (host_side, harness_side) = tokio::io::duplex(1 << 16);
-    hub.accept_via_session_lookup(host_side);
-
-    // The old generation's harness re-dials with its frozen token.
-    let mut cfg = NoopConfig::for_session(session_id);
-    cfg.sandbox_id = SandboxId::new(); // the OLD sandbox
-    cfg.binding_epoch = 1;
-    let outcome = run_noop(harness_side, cfg).await.expect("noop run");
-    assert!(
-        matches!(outcome, engram_harness_noop::NoopOutcome::AttachRejected),
-        "a stale-epoch dial must be rejected, got {outcome:?}",
-    );
+    let (host, client) = tokio::io::duplex(4096);
+    hub.accept_via_session_lookup(host);
+    let task = tokio::spawn(serve_duplex(
+        Script {
+            autorun: false,
+            ..Script::default()
+        },
+        session_id,
+        AttachToken {
+            sandbox_id: SandboxId::new(),
+            binding_epoch: 1,
+        },
+        client,
+    ));
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(!task.is_finished());
     assert_eq!(hub.attached_count(), 0);
+    task.abort();
 }

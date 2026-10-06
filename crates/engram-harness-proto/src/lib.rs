@@ -32,6 +32,8 @@
 //! length prefix + bincode body. Reusing the shape keeps the agent
 //! image small (one codec).
 
+pub mod attach_token;
+
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

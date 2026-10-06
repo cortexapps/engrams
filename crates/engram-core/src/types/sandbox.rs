@@ -550,32 +550,6 @@ pub struct ExecRusage {
     pub sys_cpu_ms: Option<u64>,
 }
 
-/// ADR 0073: env key carrying the sandbox identity half of the harness
-/// attach token. Stamped by the BACKEND at spawn (the only party that
-/// knows the sandbox id pre-boot); read by the harness; presented in
-/// `HarnessAttach`.
-pub const SANDBOX_ID_ENV: &str = "ENGRAM_SANDBOX_ID";
-
-/// ADR 0073: env key carrying the binding-generation half of the attach
-/// token. Minted coordinator-side into [`AgentSpec::binding_epoch`];
-/// stamped into the harness child env by the backend at spawn.
-pub const BINDING_EPOCH_ENV: &str = "ENGRAM_BINDING_EPOCH";
-
-impl AgentSpec {
-    /// The two attach-token env entries a backend must add to the
-    /// harness child env at spawn (ADR 0073). Kept as a helper so the
-    /// three backends cannot drift on key names or formatting.
-    pub fn attach_token_env(&self, sandbox_id: crate::SandboxId) -> [(String, String); 2] {
-        [
-            (SANDBOX_ID_ENV.to_string(), sandbox_id.to_string()),
-            (
-                BINDING_EPOCH_ENV.to_string(),
-                self.binding_epoch.to_string(),
-            ),
-        ]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

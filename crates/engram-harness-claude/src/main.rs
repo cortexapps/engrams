@@ -43,14 +43,10 @@ mod adapter {
     use std::path::{Path, PathBuf};
     use std::process::{ExitCode, ExitStatus, Stdio};
     use std::sync::Arc;
-    #[cfg(test)]
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use clap::Parser;
     use engram_core::SessionId;
-    #[cfg(test)]
-    use engram_harness_proto::{read_msg, write_msg, HarnessFrame};
     use engram_harness_proto::{
         AgentRole, EditHunk, FileChange, HarnessCommand, HarnessEvent, MAX_FILE_CHANGE_BYTES,
     };
@@ -60,8 +56,6 @@ mod adapter {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     use serde_json::Value;
-    #[cfg(test)]
-    use tokio::io::AsyncWrite;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
     use tokio::sync::{mpsc, Notify};
@@ -313,19 +307,6 @@ mod adapter {
         #[arg(long, env = "ENGRAM_SESSION_ID")]
         pub session_id: SessionId,
 
-        /// ADR 0073: the sandbox half of the attach token (from
-        /// `ENGRAM_SANDBOX_ID`, stamped by the backend at spawn).
-        /// Required — a harness with no token cannot attach, and
-        /// failing at arg-parse is louder and earlier than bouncing
-        /// `UnknownBinding` forever.
-        #[arg(long, env = "ENGRAM_SANDBOX_ID")]
-        pub sandbox_id: engram_core::SandboxId,
-
-        /// ADR 0073: the binding-generation half of the attach token
-        /// (from `ENGRAM_BINDING_EPOCH`, minted coordinator-side).
-        #[arg(long, env = "ENGRAM_BINDING_EPOCH")]
-        pub binding_epoch: u64,
-
         /// Cap on tool calls per run. Adapter logs and stops on
         /// excess; hard cost backstop. Default is intentionally
         /// permissive — the VM is the safety boundary, and a long
@@ -497,8 +478,6 @@ mod adapter {
                 connect: cli.connect,
                 port: cli.vsock_host,
                 session_id: cli.session_id,
-                sandbox_id: cli.sandbox_id,
-                binding_epoch: cli.binding_epoch,
                 harness_version: format!("engram-harness-claude/{}", env!("CARGO_PKG_VERSION")),
             },
             engine,
@@ -507,89 +486,6 @@ mod adapter {
             reattach,
         )
         .await
-    }
-
-    /// The single event a connection pulled from the engine but hadn't
-    /// finished writing when it dropped. Re-sent first on the next
-    /// connection so a transient drop never loses an event. Only ever
-    /// touched by `pump_events` (one connection at a time), under a sync
-    /// lock so there's no await between pulling an event and parking it.
-    #[cfg(test)]
-    type HeldEvent = Arc<Mutex<Option<HarnessEvent>>>;
-
-    /// Outcome of one host connection's life.
-    #[cfg(test)]
-    enum ConnOutcome {
-        /// The engine finished (Shutdown / all command senders gone).
-        /// Stop reconnecting and reap the engine's exit code.
-        EngineDone,
-        /// Host rejected the attach — typically "no sandbox bound to this
-        /// session_id" while the host-agent is mid-reattach after a roll /
-        /// restart and hasn't repopulated its session→sandbox map yet.
-        /// TRANSIENT, not fatal: the binding returns once the host finishes
-        /// reattaching, so the loop backs off and retries. (Regression:
-        /// session b9b28452 — exiting here orphaned the agent across a
-        /// deploy roll; the VM survived but the harness died and the session
-        /// wedged `active` forever.)
-        Rejected { reason: String },
-        /// ADR 0073: host rejected the attach `Superseded` — a newer
-        /// binding generation owns this session. FATAL by design:
-        /// exit 0; retrying can never succeed.
-        Superseded,
-        /// Handshake didn't complete (transport flake at/ before attach).
-        HandshakeFailed { reason: &'static str },
-        /// An established connection later dropped — re-dial.
-        Dropped { reason: &'static str },
-    }
-
-    /// What the reconnect loop does after one connection's outcome.
-    /// Extracted so the retry policy is unit-testable in isolation.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[cfg(test)]
-    enum Reconnect {
-        /// Engine finished — end the loop and reap its exit code.
-        Stop,
-        /// An established link dropped — settle briefly, reset the counter.
-        Settle,
-        /// Couldn't reach/attach the host (transport flake, handshake race,
-        /// OR an attach rejection) — exponential backoff, retry forever.
-        Backoff,
-    }
-
-    #[cfg(test)]
-    impl ConnOutcome {
-        /// The reconnect decision for this outcome. The load-bearing
-        /// invariant: ONLY `EngineDone` stops the loop. An attach `Rejected`
-        /// — e.g. "no sandbox bound to this session_id" during a host roll —
-        /// backs off and retries, because the harness is the session's sole
-        /// event channel and giving up strands it (session b9b28452).
-        fn reconnect(&self) -> Reconnect {
-            match self {
-                ConnOutcome::EngineDone => Reconnect::Stop,
-                // ADR 0073: superseded = a newer generation owns the
-                // session. The ONLY-EngineDone-stops invariant gains its
-                // one deliberate exception: this rejection is typed and
-                // deterministic (never a transient roll window, which
-                // rejects UnknownBinding instead), so exiting cannot
-                // strand a session the way the b9b28452 string-matched
-                // exit did.
-                ConnOutcome::Superseded => Reconnect::Stop,
-                ConnOutcome::Dropped { .. } => Reconnect::Settle,
-                ConnOutcome::HandshakeFailed { .. } | ConnOutcome::Rejected { .. } => {
-                    Reconnect::Backoff
-                }
-            }
-        }
-
-        /// Human-readable cause for the reconnect log line.
-        fn reason(&self) -> &str {
-            match self {
-                ConnOutcome::EngineDone => "engine_done",
-                ConnOutcome::Superseded => "superseded",
-                ConnOutcome::Rejected { reason } => reason,
-                ConnOutcome::HandshakeFailed { reason } | ConnOutcome::Dropped { reason } => reason,
-            }
-        }
     }
 
     /// Push an event to the connection pump. Bounded send: while
@@ -2256,50 +2152,6 @@ mod adapter {
         }
     }
 
-    /// Drain engine events to the current connection's writer. The
-    /// event being written is parked in `held` *before* the await, so
-    /// if this future is cancelled (the read half died) or the write
-    /// fails, the event survives and is re-sent on the next connection
-    /// — at-least-once delivery across a reconnect, no loss.
-    #[cfg(test)]
-    async fn pump_events<W>(
-        writer: &mut W,
-        evt_rx: &mut mpsc::Receiver<HarnessEvent>,
-        held: &HeldEvent,
-    ) -> ConnOutcome
-    where
-        W: AsyncWrite + Unpin,
-    {
-        loop {
-            // Prefer an event parked by a prior dropped connection.
-            let parked = held.lock().expect("held poisoned").clone();
-            let ev = match parked {
-                Some(e) => e,
-                None => match evt_rx.recv().await {
-                    // Park BEFORE the write. The lock is synchronous, so
-                    // there is no await between pulling and parking — a
-                    // cancellation here can't drop the event.
-                    Some(e) => {
-                        *held.lock().expect("held poisoned") = Some(e.clone());
-                        e
-                    }
-                    None => return ConnOutcome::EngineDone,
-                },
-            };
-            match write_msg(writer, &HarnessFrame::Event(ev)).await {
-                Ok(()) => {
-                    *held.lock().expect("held poisoned") = None;
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "event write failed; parked for reconnect");
-                    return ConnOutcome::Dropped {
-                        reason: "write_error",
-                    };
-                }
-            }
-        }
-    }
-
     /// Outcome of one persistent `claude` process's life, as seen by the
     /// outer `run_engine` loop. The terminal `HarnessEvent` for any
     /// in-flight run is emitted by `run_claude_session` itself (so it's
@@ -2635,6 +2487,7 @@ mod adapter {
             engram_harness_sdk::spawn_stderr_tail(stderr, MAX_STDERR_TAIL_LINES, true);
 
         let mut turn: Option<TurnState> = None;
+        let mut channel_closed = false;
         let mut shutting_down = false;
         let mut shutdown_deadline: Option<Instant> = None;
         // Set when an operator Interrupt aborts the current turn; the
@@ -3480,22 +3333,11 @@ mod adapter {
                             // claude flushes its transcript per-message
                             // synchronously; nothing to force here.
                         }
-                        // Track A (ADR 0034): a re-handshake is intercepted
-                        // at the connection layer (`forward_commands` drops
-                        // the link to force a re-dial) and never forwarded
-                        // to the engine. This arm exists only for
-                        // exhaustiveness over `HarnessCommand`.
-                        // All command senders gone = the connection loop
-                        // exited = process teardown (the Superseded exit
-                        // path). SIGINT claude first: this arm skips the
-                        // reap block, and an orphaned twin left running
-                        // would contend with the successor harness's
-                        // `--resume` on the same transcript (claude
-                        // flushes per-message, so SIGINT is
-                        // resume-safe).
+                        // Reap the child and close its run before leaving the engine.
                         None => {
                             sigint_child(&child);
-                            return SessionOutcome::ChannelClosed;
+                            channel_closed = true;
+                            break;
                         }
                     }
                 }
@@ -3598,7 +3440,9 @@ mod adapter {
         if let Some(t) = turn.take() {
             *current_run_id.lock().await = None;
             let run_id = t.run_id;
-            if interrupted_run.as_deref() == Some(run_id.as_str()) {
+            if channel_closed {
+                emit(evt_tx, HarnessEvent::RunInterrupted { run_id }).await;
+            } else if interrupted_run.as_deref() == Some(run_id.as_str()) {
                 // Operator interrupt: the SIGINT tore the process down
                 // mid-turn. Report it as interrupted (not a crash) and let
                 // the engine respawn `--resume` for the next prompt.
@@ -3644,7 +3488,9 @@ mod adapter {
             );
         }
 
-        if shutting_down {
+        if channel_closed {
+            SessionOutcome::ChannelClosed
+        } else if shutting_down {
             SessionOutcome::Shutdown
         } else if condemned {
             // Intentional deferred-delivery resume — checked before the
@@ -4693,8 +4539,6 @@ mod adapter {
     mod engine_tests {
         use super::*;
         use engram_harness_sdk::questions::{Answers, Question, QuestionOption};
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
 
         // These tests start real shell processes. Under the four-way nextest
         // load, process transitions can take longer than their isolated run.
@@ -5297,78 +5141,6 @@ mod adapter {
             let _ = tokio::fs::remove_file(sock).await;
         }
 
-        /// A writer whose every write fails — stands in for a host
-        /// connection that dropped underneath the pump.
-        struct FailingWriter;
-        impl tokio::io::AsyncWrite for FailingWriter {
-            fn poll_write(
-                self: Pin<&mut Self>,
-                _: &mut Context<'_>,
-                _: &[u8],
-            ) -> Poll<std::io::Result<usize>> {
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "connection dropped",
-                )))
-            }
-            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-            fn poll_shutdown(
-                self: Pin<&mut Self>,
-                _: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-        }
-
-        // A connection drop mid-write must PARK the event, not lose it.
-        #[tokio::test]
-        async fn pump_parks_event_when_write_fails() {
-            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(4);
-            let held: HeldEvent = Arc::new(Mutex::new(None));
-            evt_tx.send(HarnessEvent::Idle).await.unwrap();
-
-            let mut w = FailingWriter;
-            let outcome = pump_events(&mut w, &mut evt_rx, &held).await;
-
-            assert!(matches!(outcome, ConnOutcome::Dropped { .. }));
-            assert_eq!(
-                *held.lock().unwrap(),
-                Some(HarnessEvent::Idle),
-                "the un-acked event must be parked for the next connection",
-            );
-        }
-
-        // Regression (session b9b28452): a host-agent roll answers the
-        // harness's re-attach with "no sandbox bound to this session_id"
-        // while it's still reattaching the survivor VM. That rejection is
-        // TRANSIENT — the reconnect loop must back off and retry, never
-        // exit. The old `Rejected => break Some(exit)` arm turned it
-        // terminal: the VM survived the roll but the harness died and the
-        // session wedged `active` forever. Only the engine finishing on its
-        // own may stop the loop.
-        #[test]
-        fn attach_rejection_retries_and_never_ends_the_loop() {
-            let rejected = ConnOutcome::Rejected {
-                reason: "no sandbox bound to this session_id".into(),
-            };
-            assert_eq!(rejected.reconnect(), Reconnect::Backoff);
-            assert_eq!(rejected.reason(), "no sandbox bound to this session_id");
-
-            // The other transport failures retry too; only EngineDone stops.
-            assert_eq!(
-                ConnOutcome::HandshakeFailed { reason: "ack_read" }.reconnect(),
-                Reconnect::Backoff,
-            );
-            assert_eq!(
-                ConnOutcome::Dropped { reason: "eof" }.reconnect(),
-                Reconnect::Settle,
-            );
-            assert_eq!(ConnOutcome::EngineDone.reconnect(), Reconnect::Stop);
-            assert_eq!(ConnOutcome::Superseded.reconnect(), Reconnect::Stop);
-        }
-
         // ADR 0054 Part C: the scrub removes exactly the suppressed
         // narrate-past message(s) by id, keeps the deferred tool_use, and
         // re-links any survivor whose parent it removed.
@@ -5523,32 +5295,6 @@ mod adapter {
                 "survivor re-linked past the removed duplicate"
             );
             let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        // The next connection re-sends the parked event first (at-least-once).
-        #[tokio::test]
-        async fn pump_resends_parked_event() {
-            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(4);
-            // Pre-populate `held` as if a prior connection dropped mid-write,
-            // and close the event channel so the pump finishes after the
-            // re-send.
-            let held: HeldEvent = Arc::new(Mutex::new(Some(HarnessEvent::Idle)));
-            drop(evt_tx);
-
-            let (mut w, mut r) = tokio::io::duplex(4096);
-            let outcome = pump_events(&mut w, &mut evt_rx, &held).await;
-
-            assert!(matches!(outcome, ConnOutcome::EngineDone));
-            assert_eq!(
-                *held.lock().unwrap(),
-                None,
-                "delivered event must be cleared"
-            );
-            let frame: HarnessFrame = read_msg(&mut r).await.unwrap();
-            assert!(
-                matches!(frame, HarnessFrame::Event(HarnessEvent::Idle)),
-                "parked event must be the first thing the new connection sees",
-            );
         }
 
         /// A persistent fake `claude`: emits an `init` banner once, then
@@ -6035,13 +5781,22 @@ mod adapter {
             let state_dir =
                 std::env::temp_dir().join(format!("engram-claude-state-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&state_dir).expect("test state dir");
+            let token_path = state_dir.join("attach-token");
+            engram_harness_proto::attach_token::AttachToken {
+                sandbox_id: engram_core::SandboxId::new(),
+                binding_epoch: 1,
+            }
+            .write_atomic(&token_path)
+            .unwrap();
+            std::env::set_var(
+                engram_harness_proto::attach_token::ATTACH_TOKEN_FILE_ENV,
+                token_path,
+            );
+
             Cli {
                 connect: None,
                 vsock_host: Some(1),
                 session_id: SessionId::new(),
-                // ADR 0073: the test's sole binding generation.
-                sandbox_id: engram_core::SandboxId::new(),
-                binding_epoch: 1,
                 max_tool_calls: 100_000,
                 max_tool_call_secs: 600,
                 max_run_secs: 86_400,
@@ -6268,6 +6023,45 @@ mod adapter {
         // exactly one RunStarted→RunCompleted, no restart. This is the
         // engine-side guarantee behind the no-turn-restart-on-teleport promise
         // (the FC-level pipe survival is proven by the two-host teleport suite).
+        #[tokio::test]
+        async fn channel_close_reaps_child_and_interrupts_active_run_without_idle() {
+            let pidfile = temp_pidfile();
+            let script = write_interrupt_aware_fake_claude(&pidfile, 0).await;
+            let (cmd_tx, cmd_rx) = mpsc::channel(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel(64);
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                Arc::new(Notify::new()),
+                evt_tx,
+            ));
+            assert_eq!(evt_rx.recv().await, Some(HarnessEvent::Idle));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "close".into(),
+                    text: "work".into(),
+                    mode: None,
+                })
+                .await
+                .unwrap();
+            let (run_id, _) = expect_run_started_id(&mut evt_rx).await;
+            drop(cmd_tx);
+            assert_eq!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::RunInterrupted { run_id })
+            );
+            assert_eq!(
+                timeout(Duration::from_secs(8), engine)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                ExitCode::SUCCESS
+            );
+            assert_eq!(evt_rx.recv().await, None);
+            let _ = tokio::fs::remove_file(script).await;
+            let _ = tokio::fs::remove_file(pidfile).await;
+        }
+
         #[tokio::test]
         async fn connection_bounce_mid_turn_preserves_the_run() {
             // One turn: sleep 300ms (stays in flight), then one assistant line

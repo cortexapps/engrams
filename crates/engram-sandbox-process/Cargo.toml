@@ -10,6 +10,7 @@ description = "Local-dev SandboxBackend that runs commands as host subprocesses.
 workspace = true
 
 [dependencies]
+engram-harness-proto.workspace = true
 engram-core.workspace = true
 # ADR 0027: dev parity — activate the same RO skill/browser bundles agentd does.
 engram-session-bundles.workspace = true

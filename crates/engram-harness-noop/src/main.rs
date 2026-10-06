@@ -1,21 +1,12 @@
-//! Standalone binary for the noop harness.
-//!
-//! Auto-spawned by `engram-host-agent` (via the `SandboxSpec::agent`
-//! field) when `ENGRAM_DEV_AUTO_AGENT=noop` is set, so a session created
-//! against `local://hello` immediately starts emitting fake tool
-//! calls. Reads its config from CLI flags (which the host-agent
-//! plumbs through `AgentSpec::argv` — env vars are reserved for
-//! transport secrets like the attach token).
-//!
-//! On startup: dial the harness-hub TCP address, run the cadence,
-//! exit when the peer closes or the host sends `Shutdown`.
+//! Standalone noop engine using the shared harness connection loop.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
 use engram_core::SessionId;
-use engram_harness_noop::{run, NoopConfig, NoopOutcome};
+use engram_harness_noop::{run_engine, Script, HARNESS_VERSION};
+use engram_harness_sdk::{Channels, ConnectionConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "engram-harness-noop", about = "Dev-mode noop harness")]
@@ -68,6 +59,15 @@ struct Cli {
     /// waiting" — the typical input the idle evictor sees.
     #[arg(long)]
     send_run_completed: bool,
+    /// Actual tool delay in seconds; overrides the millisecond option.
+    #[arg(long)]
+    tool_sleep_secs: Option<u64>,
+    /// Wait for a Prompt before starting a run.
+    #[arg(long)]
+    no_autorun: bool,
+    /// Write the harness process id to this file.
+    #[arg(long)]
+    pid_file: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -89,70 +89,44 @@ async fn main() -> ExitCode {
         "noop harness starting",
     );
 
-    let mut cfg = NoopConfig::for_session(cli.session_id);
-    cfg.tool_calls = cli.tool_calls;
-    cfg.interval = Duration::from_secs(cli.interval_secs);
-    cfg.tool_call_duration_ms = cli.tool_call_duration_ms;
-    cfg.send_run_completed = cli.send_run_completed;
-    if let Some(tmpl) = cli.transcript_template {
-        cfg.result_summary_template = tmpl;
-    }
-
-    // Dial the hub. Two flavors:
-    //   --connect host:port  → TCP loopback (ProcessBackend dev)
-    //   --port <port>        → in-VM transport selected by
-    //                          ENGRAM_TRANSPORT (vsock)
-    // clap rejects "neither" / "both" via `conflicts_with`; the
-    // outer match here covers the two valid shapes.
-    let outcome = match (cli.connect.as_deref(), cli.vsock_host) {
-        (Some(addr), None) => match tokio::net::TcpStream::connect(addr).await {
-            Ok(s) => {
-                let _ = s.set_nodelay(true);
-                run(s, cfg).await
-            }
-            Err(e) => {
-                tracing::error!(error = %e, addr = %addr, "noop harness: TCP dial failed");
-                return ExitCode::from(1);
-            }
-        },
-        (None, Some(port)) => dial_transport_and_run(port, cfg).await,
-        _ => {
-            tracing::error!("provide exactly one of --connect or --port");
-            return ExitCode::from(2);
+    if let Some(path) = cli.pid_file {
+        if let Err(e) = std::fs::write(path, std::process::id().to_string()) {
+            tracing::error!(error = %e, "write pid file failed");
+            return ExitCode::FAILURE;
         }
+    }
+    let script = Script {
+        autorun: !cli.no_autorun,
+        tool_calls: cli.tool_calls,
+        interval: Duration::from_secs(cli.interval_secs),
+        tool_sleep: cli
+            .tool_sleep_secs
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_millis(cli.tool_call_duration_ms)),
+        result_summary: cli
+            .transcript_template
+            .unwrap_or_else(|| "ok (noop)".into()),
+        send_run_completed: cli.send_run_completed,
+        ..Script::default()
     };
-
-    // The host-agent splits sandbox creation from agent spawn so
-    // routing (`HarnessHub::bind_session`) is in place by the time
-    // we dial. A rejected attach here means a real misconfiguration,
-    // not a race; bail out instead of retrying.
-    match outcome {
-        Ok(NoopOutcome::AttachRejected) => {
-            tracing::error!("noop harness: attach rejected by host (no session bound?)");
-            ExitCode::from(1)
-        }
-        Ok(outcome) => {
-            tracing::info!(?outcome, "noop harness done");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "noop harness: run failed");
-            ExitCode::from(1)
-        }
-    }
-}
-
-/// Dial the host on `port` via the runtime-selected transport (vsock —
-/// see `engram-transport`). Linux-only; on non-Linux hosts
-/// `engram_transport::from_env` returns `ErrorKind::Unsupported`.
-async fn dial_transport_and_run(
-    port: u32,
-    cfg: NoopConfig,
-) -> Result<NoopOutcome, engram_harness_noop::NoopError> {
-    let transport = engram_transport::from_env().map_err(engram_harness_noop::NoopError::Io)?;
-    let stream = transport.dial(port).await.map_err(|e| {
-        tracing::error!(error = %e, port, "transport dial failed");
-        engram_harness_noop::NoopError::Io(e)
-    })?;
-    run(stream, cfg).await
+    let channels = Channels::new();
+    let engine = tokio::spawn(run_engine(
+        script,
+        channels.command_rx,
+        channels.reattach.clone(),
+        channels.event_tx,
+    ));
+    engram_harness_sdk::serve(
+        ConnectionConfig {
+            connect: cli.connect,
+            port: cli.vsock_host,
+            session_id: cli.session_id,
+            harness_version: HARNESS_VERSION.into(),
+        },
+        engine,
+        channels.command_tx,
+        channels.event_rx,
+        channels.reattach,
+    )
+    .await
 }
