@@ -9,6 +9,7 @@ pub enum HostStatus {
     Ready,
     Draining,
     Dead,
+    Retired,
 }
 
 impl HostStatus {
@@ -17,6 +18,7 @@ impl HostStatus {
             Self::Ready => "ready",
             Self::Draining => "draining",
             Self::Dead => "dead",
+            Self::Retired => "retired",
         }
     }
 
@@ -30,8 +32,10 @@ impl HostStatus {
     /// ```text
     /// Ready    -> Draining (agent preStop / coordinator drive)
     ///           | Dead     (dead-host sweep)
+    ///           | Retired  (retirement grant)
     /// Draining -> Ready    (host came back from a self-reported drain)
     ///           | Dead     (dead-host sweep)
+    ///           | Retired  (retirement grant)
     /// Dead     -> (terminal via heartbeat) — a `dead` row returns ONLY
     ///             via an explicit `POST /api/hosts/register`
     ///             (`upsert_host`, which hardcodes `Ready`), never on the
@@ -39,6 +43,7 @@ impl HostStatus {
     ///             the sweep marked `dead` (and whose sessions it
     ///             orphaned) must NOT silently flip back to `ready` and
     ///             resume taking placements with its sessions unbound.
+    /// Retired  -> terminal; only DeleteHost removes the row.
     /// ```
     ///
     /// Self-transitions return `false`: a no-op status write carries no
@@ -46,9 +51,9 @@ impl HostStatus {
     pub const fn can_transition_to(&self, target: Self) -> bool {
         use HostStatus::*;
         match self {
-            Ready => matches!(target, Draining | Dead),
-            Draining => matches!(target, Ready | Dead),
-            Dead => false,
+            Ready => matches!(target, Draining | Dead | Retired),
+            Draining => matches!(target, Ready | Dead | Retired),
+            Dead | Retired => false,
         }
     }
 }
@@ -362,6 +367,10 @@ pub struct HostRecord {
     /// `status == Ready && !cordoned && fresh`.
     #[serde(default)]
     pub cordoned: bool,
+    pub cordon_owner: Option<CordonOwner>,
+    pub cordon_reason: Option<String>,
+    pub retire_requested_at: Option<DateTime<Utc>>,
+    pub retired_at: Option<DateTime<Utc>>,
     /// ADR 0048: host core count from the heartbeat. The CPU packing
     /// budget is `total_vcpus × overcommit`. 0 = not yet reported.
     #[serde(default)]
@@ -536,11 +545,103 @@ pub struct HostSpec {
     pub labels: Vec<(String, String)>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CordonOwner {
+    Operator,
+    Admin,
+}
+impl CordonOwner {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Admin => "admin",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "operator" => Some(Self::Operator),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "count")]
+pub enum RetirementBlocker {
+    BoundSessions(u64),
+    CaptureJobs(u64),
+    OpenTeleportsAsSource(u64),
+    OpenTeleportsAsDest(u64),
+    PendingTombstones(u64),
+    ResidentSandboxes(u64),
+    EnableWork(u64),
+    NoHeartbeatSinceRequest,
+    NotCordoned,
+}
+impl RetirementBlocker {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::BoundSessions(..) => "bound_sessions",
+            Self::CaptureJobs(..) => "capture_jobs",
+            Self::OpenTeleportsAsSource(..) => "open_teleports_as_source",
+            Self::OpenTeleportsAsDest(..) => "open_teleports_as_dest",
+            Self::PendingTombstones(..) => "pending_tombstones",
+            Self::ResidentSandboxes(..) => "resident_sandboxes",
+            Self::EnableWork(..) => "enable_work",
+            Self::NoHeartbeatSinceRequest => "no_heartbeat_since_request",
+            Self::NotCordoned => "not_cordoned",
+        }
+    }
+    pub const fn count(&self) -> u64 {
+        match self {
+            Self::BoundSessions(n)
+            | Self::CaptureJobs(n)
+            | Self::OpenTeleportsAsSource(n)
+            | Self::OpenTeleportsAsDest(n)
+            | Self::PendingTombstones(n)
+            | Self::ResidentSandboxes(n)
+            | Self::EnableWork(n) => *n,
+            Self::NoHeartbeatSinceRequest | Self::NotCordoned => 0,
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RetirementStatus {
+    pub requested_at: Option<DateTime<Utc>>,
+    pub retired_at: Option<DateTime<Utc>>,
+    pub blockers: Vec<RetirementBlocker>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetirementGrant {
+    Granted,
+    Blocked(Vec<RetirementBlocker>),
+    NotRequested,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeartbeatAck {
+    Accepted,
+    Refused(HostStatus),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteHostOutcome {
+    Deleted,
+    NotRetired(HostStatus),
+}
+
+/// Lease used by enable-work counts and retirement checks.
+pub const ENABLE_MATERIALIZE_LEASE_SECS: u32 = 300;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL: [HostStatus; 3] = [HostStatus::Ready, HostStatus::Draining, HostStatus::Dead];
+    const ALL: [HostStatus; 4] = [
+        HostStatus::Ready,
+        HostStatus::Draining,
+        HostStatus::Dead,
+        HostStatus::Retired,
+    ];
 
     /// Exhaustive `{from} × {to}` table — the host-state mirror of the
     /// session-state transition test. Every pair is asserted explicitly
@@ -552,7 +653,12 @@ mod tests {
         let legal = |from: HostStatus, to: HostStatus| -> bool {
             matches!(
                 (from, to),
-                (Ready, Draining) | (Ready, Dead) | (Draining, Ready) | (Draining, Dead)
+                (Ready, Draining)
+                    | (Ready, Dead)
+                    | (Draining, Ready)
+                    | (Draining, Dead)
+                    | (Ready, Retired)
+                    | (Draining, Retired)
             )
         };
         for &from in &ALL {
@@ -596,6 +702,7 @@ mod tests {
             (HostStatus::Ready, "ready"),
             (HostStatus::Draining, "draining"),
             (HostStatus::Dead, "dead"),
+            (HostStatus::Retired, "retired"),
         ] {
             assert_eq!(
                 serde_json::to_value(variant).unwrap(),
@@ -685,5 +792,48 @@ mod tests {
             broken.failing_capabilities(),
             vec!["grpc_self_connect", "base_shm_tmpfs", "nbd"]
         );
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    #[test]
+    fn blocker_kind_strings() {
+        let cases = [
+            (RetirementBlocker::BoundSessions(1), "bound_sessions", 1),
+            (RetirementBlocker::CaptureJobs(2), "capture_jobs", 2),
+            (
+                RetirementBlocker::OpenTeleportsAsSource(3),
+                "open_teleports_as_source",
+                3,
+            ),
+            (
+                RetirementBlocker::OpenTeleportsAsDest(4),
+                "open_teleports_as_dest",
+                4,
+            ),
+            (
+                RetirementBlocker::PendingTombstones(5),
+                "pending_tombstones",
+                5,
+            ),
+            (
+                RetirementBlocker::ResidentSandboxes(6),
+                "resident_sandboxes",
+                6,
+            ),
+            (RetirementBlocker::EnableWork(7), "enable_work", 7),
+            (
+                RetirementBlocker::NoHeartbeatSinceRequest,
+                "no_heartbeat_since_request",
+                0,
+            ),
+            (RetirementBlocker::NotCordoned, "not_cordoned", 0),
+        ];
+        for (b, kind, count) in cases {
+            assert_eq!(b.kind(), kind);
+            assert_eq!(b.count(), count);
+        }
     }
 }

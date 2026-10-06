@@ -211,11 +211,8 @@ impl SessionState {
     /// Idle        -> Created (resume) | Dead | Completed | Queued (resume
     ///                hit no capacity, ADR 0048)
     /// HostLost    -> Created | Idle | Dead | Completed
-    /// Evacuating  -> Created (scanner resumes on peer)
-    ///              | Queued (RESERVED evac placement found no host that
-    ///                fits the session's budget; queue rather than bind a
-    ///                measured-full survivor — #800, resume-origin so the
-    ///                queue scanner re-homes it once capacity returns)
+    /// Evacuating  -> Active (teleport attach or rollback)
+    ///              | Created (harness start failed on destination)
     ///              | Idle (scanner exhausted retries; user /resume)
     ///              | Dead (terminal; chunks gone)
     ///              | Completed (user delete mid-evac)
@@ -286,12 +283,8 @@ impl SessionState {
             // create path and for the harness-failed resume arm.
             Idle => matches!(target, Active | Created | Dead | Completed | Queued),
             HostLost => matches!(target, Created | Idle | Dead | Completed),
-            // #800: `Queued` is the RESERVED evac placement's honest-overflow
-            // edge — when no survivor fits the session's budget, the evac
-            // resumer queues (resume-origin) instead of binding a
-            // measured-full host, and the queue scanner re-homes it once
-            // capacity returns (the #795 resume precedent, on the evac leg).
-            Evacuating => matches!(target, Created | Queued | Idle | Dead | Completed),
+            // ADR 0123 B8: attach and rollback return to Active.
+            Evacuating => matches!(target, Active | Created | Idle | Dead | Completed),
             // ADR 0074 rung 1: `Active` is the cancel edge — a returning
             // user's prompt un-nominates an eviction whose capture has
             // not begun (lease-guarded CAS; see
@@ -514,15 +507,6 @@ pub struct SandboxAssignment {
     pub status: SessionState,
     pub mem_budget_mib: i64,
     pub cpu_budget_vcpus: i32,
-}
-
-/// ADR 0048: outcome of [`crate::traits::MetadataStore::delete_host`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeleteHostOutcome {
-    /// The host row was deleted (or was already gone — idempotent).
-    Deleted,
-    /// Refused: `n` sessions are still bound to the host.
-    SessionsBound(u64),
 }
 
 /// ADR 0048: the queue's aggregate demand — the autoscaler's scale-up
@@ -902,8 +886,8 @@ mod tests {
             (HostLost, Dead),
             (HostLost, Completed),
             (Evacuating, Created),
-            // #800: RESERVED evac placement queues instead of overcommitting.
-            (Evacuating, Queued),
+            // ADR 0123 B8: attach or rollback.
+            (Evacuating, Active),
             (Evacuating, Idle),
             (Evacuating, Dead),
             (Evacuating, Completed),

@@ -73,6 +73,8 @@ id_newtype!(AgentCommitId);
 // ADR 0084: identifies one durable, host-executed capture job row
 // (`capture_jobs.id`).
 id_newtype!(CaptureJobId);
+// ADR 0123: one durable teleport row (`session_teleports.id`).
+id_newtype!(TeleportId);
 
 impl HostId {
     /// Deterministic `HostId` derived from a Kubernetes node name (ADR 0044
