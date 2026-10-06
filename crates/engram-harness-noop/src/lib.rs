@@ -176,9 +176,8 @@ pub async fn run_engine(
                     }
                     Some(command) => pending.push_back(command),
                 },
-                _ = reattach.notified() => {
-                    let _ = send_event(&event_tx, HarnessEvent::RunContinued { run_id: run_id.clone() }).await;
-                },
+                // The SDK names the continued run on a new generation.
+                _ = reattach.notified() => {},
             }
         }
     }
@@ -404,13 +403,10 @@ mod tests {
             Some(HarnessEvent::ToolCallStarted { .. })
         ));
         tokio::time::advance(Duration::from_secs(4)).await;
+        // A mid-run reattach is silent at the engine; the SDK announces
+        // the continued run on a new generation.
         channels.reattach.notify_one();
-        assert_eq!(
-            events.recv().await,
-            Some(HarnessEvent::RunContinued {
-                run_id: run_id.clone()
-            })
-        );
+        tokio::task::yield_now().await;
         assert!(events.try_recv().is_err());
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(

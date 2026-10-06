@@ -152,6 +152,12 @@ pub enum HarnessFrame {
         binding_epoch: u64,
         seq: u64,
         event: HarnessEvent,
+        /// A per-process value the SDK draws once at start. A process that
+        /// survives a snapshot keeps it (its replays dedup correctly); a
+        /// fresh process at the same binding epoch gets a new one, so its
+        /// sequence numbers never collide with its predecessor's delivery
+        /// keys at the coordinator.
+        incarnation: u64,
     },
     EventAck {
         seq: u64,

@@ -64,6 +64,8 @@ const DRAIN_DETACH_POLL: Duration = Duration::from_millis(50);
 pub struct EventDelivery {
     pub binding_epoch: u64,
     pub seq: u64,
+    /// The sending process (`HarnessFrame::SeqEvent::incarnation`).
+    pub incarnation: u64,
 }
 
 #[derive(Debug)]
@@ -914,6 +916,7 @@ where
                 binding_epoch: frame_epoch,
                 seq,
                 event,
+                incarnation,
             } => {
                 if frame_epoch > binding_epoch {
                     return Err(HarnessError::FrameEpochAboveAttach {
@@ -928,6 +931,7 @@ where
                     Some(EventDelivery {
                         binding_epoch: frame_epoch,
                         seq,
+                        incarnation,
                     }),
                 )
                 .await
@@ -1964,6 +1968,7 @@ mod tests {
                 binding_epoch: 8,
                 seq: 1,
                 event: HarnessEvent::Idle,
+                incarnation: 1,
             },
         )
         .await
@@ -1994,7 +1999,8 @@ mod tests {
                     delivery,
                     Some(EventDelivery {
                         binding_epoch: 6,
-                        seq: 23
+                        seq: 23,
+                        incarnation: 1,
                     })
                 );
                 entered.notify_one();
@@ -2009,6 +2015,7 @@ mod tests {
                 binding_epoch: 6,
                 seq: 23,
                 event: HarnessEvent::Busy,
+                incarnation: 1,
             },
         )
         .await
@@ -2035,7 +2042,8 @@ mod tests {
                     delivery,
                     Some(EventDelivery {
                         binding_epoch: 7,
-                        seq: 1
+                        seq: 1,
+                        incarnation: 1,
                     })
                 );
                 Err(SinkError("store unavailable".into()))
@@ -2048,6 +2056,7 @@ mod tests {
                 binding_epoch: 7,
                 seq: 1,
                 event: HarnessEvent::Idle,
+                incarnation: 1,
             },
         )
         .await

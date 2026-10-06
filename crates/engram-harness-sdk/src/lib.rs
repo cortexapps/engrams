@@ -38,21 +38,72 @@ pub const UNACKED_MAX: usize = 1024;
 struct Outbox {
     next_seq: u64,
     unacked: VecDeque<(u64, u64, HarnessEvent)>,
+    /// The binding epoch the last sequenced event carried. A connection at
+    /// a higher epoch is a new harness generation at the coordinator.
+    last_epoch: Option<u64>,
+    /// Runs this process started and has not finished, in start order,
+    /// tracked from the events it sequences. On a new generation they are
+    /// announced as continued BEFORE any buffered event, so the
+    /// coordinator's settlement never interrupts a run that is still here.
+    open_runs: Vec<String>,
 }
 
 struct EventOutbox {
     state: Mutex<Outbox>,
     acked: Notify,
+    /// Drawn once per process (see `HarnessFrame::SeqEvent::incarnation`).
+    incarnation: u64,
 }
 
 impl EventOutbox {
     fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
         Self {
             state: Mutex::new(Outbox {
                 next_seq: 1,
                 unacked: VecDeque::new(),
+                last_epoch: None,
+                open_runs: Vec::new(),
             }),
             acked: Notify::new(),
+            incarnation: nanos ^ (u64::from(std::process::id()) << 32),
+        }
+    }
+
+    /// Sequence one event under `binding_epoch`: it enters the unacked
+    /// window and the open-run set follows it.
+    fn sequence(&self, binding_epoch: u64, event: HarnessEvent) -> u64 {
+        let mut state = self.state.lock().expect("outbox lock");
+        match &event {
+            HarnessEvent::RunStarted { run_id, .. } if !state.open_runs.contains(run_id) => {
+                state.open_runs.push(run_id.clone());
+            }
+            HarnessEvent::RunCompleted { run_id, .. }
+            | HarnessEvent::RunInterrupted { run_id, .. } => {
+                state.open_runs.retain(|r| r != run_id);
+            }
+            _ => {}
+        }
+        let seq = state.next_seq;
+        state.next_seq = seq
+            .checked_add(1)
+            .expect("harness event sequence exhausted");
+        state.last_epoch = Some(binding_epoch);
+        state.unacked.push_back((binding_epoch, seq, event));
+        seq
+    }
+
+    /// The runs to announce as continued when a connection opens at
+    /// `binding_epoch`: every open run, iff the epoch advanced since the
+    /// last sequenced event. A reconnect at the same epoch announces nothing
+    /// (no settlement happens there); a fresh process has no open runs.
+    fn continued_runs(&self, binding_epoch: u64) -> Vec<String> {
+        let state = self.state.lock().expect("outbox lock");
+        match state.last_epoch {
+            Some(last) if binding_epoch > last => state.open_runs.clone(),
+            _ => Vec::new(),
         }
     }
 
@@ -212,6 +263,27 @@ where
         command_tx,
         event_rx,
         reattach,
+    )
+    .await
+}
+
+/// In-process fixtures that need the token to CHANGE between dials (a new
+/// generation after a snapshot) supply their own loader.
+pub async fn serve_with_loader<D, L>(
+    cfg: ConnectionConfig,
+    dialer: D,
+    load_token: L,
+    engine: tokio::task::JoinHandle<ExitCode>,
+    command_tx: mpsc::Sender<HarnessCommand>,
+    event_rx: mpsc::Receiver<HarnessEvent>,
+    reattach: Arc<Notify>,
+) -> ExitCode
+where
+    D: FnMut() -> BoxFuture<Option<(BoxedReader, BoxedWriter)>>,
+    L: FnMut() -> std::io::Result<AttachToken>,
+{
+    serve_loop(
+        cfg, dialer, load_token, engine, command_tx, event_rx, reattach,
     )
     .await
 }
@@ -477,8 +549,15 @@ async fn forward_commands<R: AsyncRead + Unpin>(
     loop {
         match read_msg::<_, HarnessFrame>(reader).await {
             Ok(HarnessFrame::Command(command)) => {
-                if tx.send(command).await.is_err() {
-                    return "engine gone";
+                // Never await the engine's command channel here: this reader
+                // is also the only consumer of EventAck, and an engine that
+                // is blocked on event backpressure cannot drain commands. A
+                // full channel drops the connection instead; the host
+                // redelivers durable prompts on the redial.
+                match tx.try_send(command) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => return "engine gone",
+                    Err(mpsc::error::TrySendError::Full(_)) => return "command overflow",
                 }
             }
             Ok(HarnessFrame::EventAck { seq }) => outbox.acknowledge(seq),
@@ -496,6 +575,7 @@ async fn pump_events<W: AsyncWrite + Unpin>(
     first_output: &mut first_output::FirstOutput,
     binding_epoch: u64,
 ) -> ConnOutcome {
+    // Replays keep the epoch they were sequenced under.
     let replay = outbox.state.lock().expect("outbox lock").unacked.clone();
     for (binding_epoch, seq, event) in replay {
         if write_msg(
@@ -504,6 +584,28 @@ async fn pump_events<W: AsyncWrite + Unpin>(
                 binding_epoch,
                 seq,
                 event,
+                incarnation: outbox.incarnation,
+            },
+        )
+        .await
+        .is_err()
+        {
+            return ConnOutcome::Dropped("write error");
+        }
+    }
+    // A new generation: the runs still open in this process are announced
+    // before any event the engine buffered across the cut, so the first
+    // event the coordinator sees at this epoch names them.
+    for run_id in outbox.continued_runs(binding_epoch) {
+        let event = HarnessEvent::RunContinued { run_id };
+        let seq = outbox.sequence(binding_epoch, event.clone());
+        if write_msg(
+            writer,
+            &HarnessFrame::SeqEvent {
+                binding_epoch,
+                seq,
+                event,
+                incarnation: outbox.incarnation,
             },
         )
         .await
@@ -524,21 +626,14 @@ async fn pump_events<W: AsyncWrite + Unpin>(
         };
         first_output.observe(&event);
         // Park before the first await. Cancellation cannot lose this event.
-        let seq = {
-            let mut state = outbox.state.lock().expect("outbox lock");
-            let seq = state.next_seq;
-            state.next_seq = seq
-                .checked_add(1)
-                .expect("harness event sequence exhausted");
-            state.unacked.push_back((binding_epoch, seq, event.clone()));
-            seq
-        };
+        let seq = outbox.sequence(binding_epoch, event.clone());
         if write_msg(
             writer,
             &HarnessFrame::SeqEvent {
                 binding_epoch,
                 seq,
                 event,
+                incarnation: outbox.incarnation,
             },
         )
         .await
@@ -762,14 +857,16 @@ mod tests {
                     let received: HarnessAttach = read_msg(&mut reader).await.unwrap();
                     assert_eq!(received.binding_epoch, binding_epoch);
                     write_msg(&mut reader, &HarnessAttachAck { ok: true, reject: None, message: None }).await.unwrap();
-                    assert_eq!(read_msg::<_, HarnessFrame>(&mut reader).await.unwrap(), HarnessFrame::SeqEvent {
-                        binding_epoch: 4, seq: 1, event: HarnessEvent::Busy,
-                    });
+                    assert!(matches!(
+                        read_msg::<_, HarnessFrame>(&mut reader).await.unwrap(),
+                        HarnessFrame::SeqEvent { binding_epoch: 4, seq: 1, event: HarnessEvent::Busy, .. }
+                    ));
                     if binding_epoch == 5 {
                         tx.send(HarnessEvent::Idle).await.unwrap();
-                        assert_eq!(read_msg::<_, HarnessFrame>(&mut reader).await.unwrap(), HarnessFrame::SeqEvent {
-                            binding_epoch: 5, seq: 2, event: HarnessEvent::Idle,
-                        });
+                        assert!(matches!(
+                            read_msg::<_, HarnessFrame>(&mut reader).await.unwrap(),
+                            HarnessFrame::SeqEvent { binding_epoch: 5, seq: 2, event: HarnessEvent::Idle, .. }
+                        ));
                     }
                 } => {}
             }

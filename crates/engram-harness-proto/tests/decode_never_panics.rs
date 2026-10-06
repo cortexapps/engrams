@@ -171,7 +171,7 @@ proptest! {
         flip_val in any::<u8>(),
         garbage in proptest::collection::vec(any::<u8>(), 0..=32),
     ) {
-        for frame in [HarnessFrame::SeqEvent { binding_epoch, seq, event }, HarnessFrame::EventAck { seq }] {
+        for frame in [HarnessFrame::SeqEvent { binding_epoch, seq, event, incarnation: seq ^ 0x5eed }, HarnessFrame::EventAck { seq }] {
             let encoded = bincode::serialize(&frame).expect("encode");
             mutate_and_decode::<HarnessFrame>(&encoded, flip_pos, flip_val, &garbage);
         }

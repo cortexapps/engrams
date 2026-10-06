@@ -1159,12 +1159,12 @@ async fn drive(
                     return DriveOutcome::ChannelClosed;
                 },
             },
+            // The SDK names a continued run on a new generation; the engine
+            // only re-announces its waiting state.
             _ = reattach.notified() => {
-                let event = match &active {
-                    Some(run_id) => HarnessEvent::RunContinued { run_id: run_id.clone() },
-                    None => HarnessEvent::Idle,
-                };
-                emit(events, event).await;
+                if active.is_none() {
+                    emit(events, HarnessEvent::Idle).await;
+                }
             },
             _ = async {
                 match interrupt.deadline {
@@ -2974,13 +2974,9 @@ done
             HarnessEvent::RunStarted { run_id, .. } => run_id,
             other => panic!("expected run start: {other:?}"),
         };
+        // A mid-run reattach announces nothing from the engine (the SDK
+        // names the continued run on a new generation).
         reattach.notify_one();
-        assert_eq!(
-            event_rx.recv().await,
-            Some(HarnessEvent::RunContinued {
-                run_id: run_id.clone()
-            })
-        );
         // The fake responds to turn/interrupt with a completed turn.
         command_tx.send(HarnessCommand::Interrupt).await.unwrap();
         assert_eq!(

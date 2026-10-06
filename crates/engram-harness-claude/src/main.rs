@@ -3348,11 +3348,10 @@ mod adapter {
                 // the turn-end Busy prevented, and announcing NOTHING would
                 // drop the ADR 0108 attach signal that wakes durable prompt
                 // delivery — checkpoint-severed vsock reattaches are routine
-                // mid-subagent). A mid-turn reattach identifies the continued run.
+                // mid-subagent). Mid-turn there is nothing to announce: the
+                // SDK names the continued run itself on a new generation.
                 _ = reattach.notified() => {
-                    if let Some(turn) = &turn {
-                        emit(evt_tx, HarnessEvent::RunContinued { run_id: turn.run_id.clone() }).await;
-                    } else {
+                    if turn.is_none() {
                         emit(
                             evt_tx,
                             if bg_agents > 0 {
@@ -6104,13 +6103,11 @@ mod adapter {
             // Turn 1 is now in flight (the fake sleeps 300ms before its result).
             let r1 = expect_run_started(&mut evt_rx).await;
 
-            // Each reattach identifies the same open run.
+            // A mid-turn reattach announces nothing from the engine: the
+            // SDK names the continued run on a new generation, and an Idle
+            // here would be a false waiting state.
             for _ in 0..2 {
                 reattach.notify_one();
-                assert_eq!(
-                    evt_rx.recv().await,
-                    Some(HarnessEvent::RunContinued { run_id: r1.clone() })
-                );
             }
 
             expect_agent_message(&mut evt_rx, "ok").await;

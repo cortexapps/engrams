@@ -949,11 +949,12 @@ mod harness_event_retry_tests {
             delivery: Some(crate::harness::EventDelivery {
                 binding_epoch: 7,
                 seq: 42,
+                incarnation: 9,
             }),
         };
         assert_eq!(
             serde_json::to_value(request).unwrap()["delivery"],
-            serde_json::json!({"binding_epoch":7,"seq":42})
+            serde_json::json!({"binding_epoch":7,"seq":42,"incarnation":9})
         );
     }
 }

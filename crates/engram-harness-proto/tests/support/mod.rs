@@ -218,13 +218,16 @@ pub fn harness_frame() -> impl Strategy<Value = HarnessFrame> {
     prop_oneof![
         harness_event().prop_map(HarnessFrame::Event),
         harness_command().prop_map(HarnessFrame::Command),
-        (any::<u64>(), any::<u64>(), harness_event()).prop_map(|(binding_epoch, seq, event)| {
-            HarnessFrame::SeqEvent {
-                binding_epoch,
-                seq,
-                event,
+        (any::<u64>(), any::<u64>(), harness_event(), any::<u64>()).prop_map(
+            |(binding_epoch, seq, event, incarnation)| {
+                HarnessFrame::SeqEvent {
+                    binding_epoch,
+                    seq,
+                    event,
+                    incarnation,
+                }
             }
-        }),
+        ),
         any::<u64>().prop_map(|seq| HarnessFrame::EventAck { seq }),
     ]
 }

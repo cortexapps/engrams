@@ -337,6 +337,7 @@ fn harness_frame_golden_and_variant_indices() {
         binding_epoch: 3,
         seq: 42,
         event: ev_run_started(),
+        incarnation: 7,
     };
     let event_ack = HarnessFrame::EventAck { seq: 42 };
     assert_golden("frame_seq_event", &seq_event);
@@ -627,6 +628,7 @@ fn regen_golden() {
             binding_epoch: 3,
             seq: 42,
             event: ev_run_started(),
+            incarnation: 7,
         },
     );
     write("frame_event_ack", &HarnessFrame::EventAck { seq: 42 });
