@@ -1,0 +1,1 @@
+ALTER TABLE "automation_instance" ADD COLUMN "label" text;

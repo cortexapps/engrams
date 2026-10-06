@@ -18,6 +18,9 @@
 import { createGrpcTransport } from "@connectrpc/connect-node";
 import type { Interceptor, Transport } from "@connectrpc/connect";
 import { config } from "../config.ts";
+import { makeLeaseStore } from "../listeners/lease-store.ts";
+import { makeListenerWakeInterceptor } from "../listeners/wake-interceptor.ts";
+import { log } from "../log.ts";
 
 // Machine identity (ADR §5): one trusted caller, one static credential.
 export const bearerInterceptor: Interceptor = (next) => (req) => {
@@ -30,7 +33,11 @@ export const bearerInterceptor: Interceptor = (next) => (req) => {
  * config singleton. The real `controlPlaneTransport` below uses the
  * singleton's URL.
  */
-export function makeTransport(baseUrl: string, bearer?: string): Transport {
+export function makeTransport(
+  baseUrl: string,
+  bearer?: string,
+  extraInterceptors: Interceptor[] = [],
+): Transport {
   // No override → reuse the exported bearerInterceptor (one definition of
   // "attach the machine credential"); an override builds a scoped variant.
   const interceptor: Interceptor =
@@ -43,7 +50,7 @@ export function makeTransport(baseUrl: string, bearer?: string): Transport {
 
   return createGrpcTransport({
     baseUrl,
-    interceptors: [interceptor],
+    interceptors: [interceptor, ...extraInterceptors],
     // ADR §9.4: detect half-open connections so leases don't ghost.
     // These are top-level options from Http2SessionOptions (not under nodeOptions).
     pingIntervalMs: 20_000,
@@ -59,4 +66,12 @@ export function makeTransport(baseUrl: string, bearer?: string): Transport {
 export const controlPlaneTransport: Transport = makeTransport(
   config.controlPlaneGrpcUrl,
   config.controlPlaneBearer,
+  [
+    // Every resuming session RPC wakes the session's listener row (ADR 0119
+    // amendment): this is the one seam all callers share.
+    makeListenerWakeInterceptor(
+      (sessionId) => makeLeaseStore().wake(sessionId),
+      log.child({ component: "listener-wake" }),
+    ),
+  ],
 );

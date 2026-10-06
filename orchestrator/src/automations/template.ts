@@ -8,6 +8,7 @@ export const AUTOMATION_RENDER_LIMIT_MS = 100;
 
 const ALLOWED_FILTERS = new Set([
   "coalesce",
+  "strip_mentions",
   "default",
   "json",
   "join",
@@ -117,6 +118,20 @@ function makeEngine(): Liquid {
     }
     return undefined;
   });
+
+  // `strip_mentions`: Slack message text as a human reads it — `<@U…>` user
+  // mentions removed, `<#C…|name>` channels and `<url|text>` links reduced
+  // to their visible part, whitespace collapsed. A workstream title for a
+  // thread opened by a mention.
+  engine.registerFilter("strip_mentions", (value: unknown) =>
+    String(value ?? "")
+      .replace(/<@[^>|]+(?:\|[^>]*)?>/g, " ")
+      .replace(/<#[^>|]+\|([^>]*)>/g, "#$1")
+      .replace(/<([^>|]+)\|([^>]*)>/g, "$2")
+      .replace(/<([^>]+)>/g, "$1")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
 
   // `strictFilters` only rejects unknown names; LiquidJS still installs every
   // built-in filter. Prune the registries themselves so the authoring surface

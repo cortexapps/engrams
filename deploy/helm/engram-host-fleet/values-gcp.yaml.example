@@ -23,21 +23,14 @@
 #   `engrams` namespace — the endpoints below dial its ClusterIP
 #   Services by DNS name; adjust if your release/namespace differ.
 
-# Images come from the published GHCR defaults. Deploy workflows
-# usually pin image.tag / operator.image.tag / nodeAssets.image.tag to
-# a resolved SHA; a floating tag works but won't auto-roll (the
-# DaemonSet is OnDelete — the operator rolls pods, ADR 0044 K3).
-#
-# The host-agent tag MUST be set: the chart's empty-tag fallback is
-# the unpublished chart appVersion. While the repository is private,
-# also create the ghcr-pull secret in THIS namespace:
-#
-#   kubectl create secret docker-registry ghcr-pull -n engrams-hosts \
-#     --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
-image:
-  tag: main
-imagePullSecrets:
-  - name: ghcr-pull
+# Images come from the published GHCR defaults. The three tags
+# (image.tag, operator.image.tag, nodeAssets.image.tag) default to the
+# chart appVersion, which is the release that this checkout is; leave
+# them unset on a release tag. To run an unreleased build, set each
+# one to a full SHA tag. A floating tag does not roll the fleet (the
+# DaemonSet is OnDelete — the operator rolls pods when the tag
+# CHANGES, ADR 0044 K3). The images are public; a mirror in a private
+# registry needs `imagePullSecrets`.
 
 # Workload Identity: host pods impersonate the fleet GSA (chunks
 # bucket objectAdmin + Secret Manager accessor).

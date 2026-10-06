@@ -26,15 +26,22 @@
  *
  * When `IAP_AUDIENCES` is empty the bridge is fully inert — it returns
  * immediately without touching headers, allocating memory, or reading env.
- * This is the dev-mode default; the Tiltfile does not set IAP_AUDIENCES.
+ * The config loader guarantees the set is non-empty exactly in `iap` mode
+ * (ORCHESTRATOR_AUTH_MODE=iap), so the bridge is inert in `oauth` and
+ * `password` mode, the dev default included.
  *
- * ## Production door story
+ * ## The `iap` door
  *
- * This bridge + disabling public sign-up (Task 22 comment chain) is the prod
- * door story for the orchestrator. Behind IAP every request carries the
- * assertion; the bridge converts it into a better-auth session on first hit
- * so the rest of the app is standard cookie-auth. Public sign-up should be
- * disabled before a prod deploy past Phase 4.
+ * This bridge is the `iap` sign-in door (config.authMode). Behind IAP every
+ * request carries the assertion; the bridge converts it into a better-auth
+ * session on first hit so the rest of the app is standard cookie-auth. The
+ * password door and the OAuth plugin are both off in this mode
+ * (better-auth.ts).
+ *
+ * The bridge is NOT what authorizes the app's routes. Every route has its own
+ * session / API-key / signature guard, and a deployment in `oauth` or
+ * `password` mode runs with this bridge inert and nothing in front of those
+ * guards. A new route must never rely on the bridge's 401.
  *
  * ## Placement (covers all entry paths)
  *

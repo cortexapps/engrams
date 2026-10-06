@@ -1,6 +1,10 @@
 # ADR 0102: Automations — triggers that launch sessions
 
-Status: 2026-07-22 — **Accepted.** Shipped end to end and validated against
+Status: 2026-07-22 — **Accepted.** **Superseded in its workflow model by
+ADR 0119 (Accepted 2026-10-05):** an automation is a block graph on the
+durable engine, not a single `create_task` action; the trigger surface,
+rendering and idempotency decisions here carry over, the single-action model
+does not. Shipped end to end and validated against
 production the same day (see §Implementation record): cron fires, generic
 signed webhooks, GitHub App forwarding, strict rendering with redaction, and
 occurrence-level idempotency were each exercised on the live stack before

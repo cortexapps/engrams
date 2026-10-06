@@ -30,7 +30,7 @@ export type InstanceResolution =
   /** The event belongs to this existing instance. */
   | { kind: "bound"; instance: AutomationInstanceRow; via: "handle" | "key" }
   /** Admission should open (or join, racing) this instance. */
-  | { kind: "open"; key: string; inputs: Record<string, unknown> }
+  | { kind: "open"; key: string; label: string | null; inputs: Record<string, unknown> }
   /** Drop before any run row exists. */
   | { kind: "drop"; reason: InstanceDropReason; detail: string };
 
@@ -164,5 +164,11 @@ export async function resolveInstance(
     input.target.definition.inputsSchema,
     input.target.automation.inputs,
   );
-  return { kind: "open", key, inputs: { ...defaults, ...inputs } };
+  // The title is best-effort: a label template that renders empty (a bare
+  // mention) leaves the UI on the key.
+  const label =
+    settings.labelTemplate !== undefined
+      ? (await renderAutomationTemplateInScope(settings.labelTemplate, scope)).trim() || null
+      : null;
+  return { kind: "open", key, label, inputs: { ...defaults, ...inputs } };
 }

@@ -55,6 +55,8 @@ export default defineConfig({
         baseUrl: "https://github.com/cortexapps/engrams/edit/main/site/",
       },
       components: {
+        Head: "./src/components/starlight/Head.astro",
+        SkipLink: "./src/components/starlight/SkipLink.astro",
         ThemeProvider: "./src/components/starlight/ThemeProvider.astro",
         ThemeSelect: "./src/components/starlight/ThemeSelect.astro",
         Header: "./src/components/starlight/Header.astro",

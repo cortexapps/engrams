@@ -28,6 +28,8 @@ export interface AutomationInstanceRow {
   id: string;
   automationId: string;
   key: string;
+  /** The human title (settings.instance.labelTemplate at open); null = show the key. */
+  label: string | null;
   status: "open" | "closed";
   inputs: Record<string, unknown>;
   openedBy: string;
@@ -75,6 +77,7 @@ export interface AutomationInstanceStore {
   openInstance(input: {
     automationId: string;
     key: string;
+    label?: string | null;
     inputs: Record<string, unknown>;
     openedBy: string;
   }): Promise<AutomationInstanceRow>;
@@ -182,6 +185,7 @@ function instanceRow(row: typeof automationInstance.$inferSelect): AutomationIns
     id: row.id,
     automationId: row.automationId,
     key: row.key,
+    label: row.label ?? null,
     status: row.status === "closed" ? "closed" : "open",
     inputs: row.inputs,
     openedBy: row.openedBy,
@@ -235,6 +239,7 @@ export function makeAutomationInstanceStore(
             id: newId(),
             automationId: input.automationId,
             key: input.key,
+            label: input.label ?? null,
             inputs: input.inputs,
             openedBy: input.openedBy,
             openedAt: now(),

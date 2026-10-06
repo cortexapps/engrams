@@ -1,0 +1,10 @@
+---
+// The skip link is the first element Starlight puts in <body>, and Starlight
+// has no slot before it. The tag manager <noscript> frame must be first in
+// <body>, so it goes here, before the default link.
+import Default from "@astrojs/starlight/components/SkipLink.astro";
+import GoogleTagManager from "../GoogleTagManager.astro";
+---
+
+<GoogleTagManager part="body" />
+<Default />

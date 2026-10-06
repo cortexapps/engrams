@@ -76,9 +76,12 @@ jobs:
           ASSET="${{ matrix.asset_prefix }}-${LINUX_VERSION}-${KERNEL_REV}"
           TAG="fc-kernel-${LINUX_VERSION}-${KERNEL_REV}"
           # Idempotent: create the release if absent, then clobber-upload the
-          # asset + its checksum so a re-run replaces them.
+          # asset + its checksum so a re-run replaces them. `--latest=false`
+          # keeps the "Latest" label on the newest engrams version
+          # (release.yml), which a kernel build is not.
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" \
+              --latest=false \
               --title "FC guest kernel ${LINUX_VERSION} (engram rev ${KERNEL_REV})" \
               --notes "Firecracker guest kernel = stock microvm 6.1 config + deploy/kernel/engram-docker.fragment (ADR 0025). nf_tables + raw table for in-guest Docker."
           gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber

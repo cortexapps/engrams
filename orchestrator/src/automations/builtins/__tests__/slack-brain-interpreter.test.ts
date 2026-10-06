@@ -81,8 +81,7 @@ interface Harness {
     prompt: string;
     keep: boolean;
     title: string | null;
-    ownerUserId: string | undefined;
-  }>;
+    ownerUserId: string | undefined; appendSystemPrompt?: string; }>;
   actions: Array<{ actionId: string; params: Record<string, unknown> }>;
   /** Workstream closes the finalize hook requested (ADR 0120). */
   closed: Array<{ instanceId: string; reason?: string }>;
@@ -116,6 +115,10 @@ function harness(options: {
    * thread went quiet and was mentioned again). `alive` = the control plane
    * still has it; false = swept away since. */
   previousSession?: { sessionId: string; runId: string; alive: boolean };
+  /** How far the engine's clock moves per read (default 1 s). A long turn
+   * is simulated by big steps: a wait's slice deadline then passes in a
+   * couple of empty recvs. */
+  clockStepMs?: number;
 }): Harness {
   const runner = options.replay ? makeReplayRunner(options.replay) : null;
   const names: string[] = runner ? runner.names : [];
@@ -149,10 +152,6 @@ function harness(options: {
   let clock = 1_000_000;
 
   const policy: CommunicationPolicy = {
-    systemPromptAppend: "",
-    async onPickup(m) { policyCalls.push(`pickup:${m.ts}`); },
-    async onProfileChoice() { return "p1"; },
-    async onProfileChosen() {},
     async onStarted() { policyCalls.push("started"); },
     async onWorking(m) { policyCalls.push(`working:${m.ts}`); },
     async onIdle(m) { policyCalls.push(`idle:${m.ts}`); },
@@ -164,7 +163,6 @@ function harness(options: {
     async onFail(_m, message) { policyCalls.push(`fail:${message}`); },
     async onNeutralClose(_m, message) { policyCalls.push(`neutral:${message}`); },
     async onDeliveryError() { policyCalls.push("delivery-error"); },
-    async gatherThreadContext() { return { prompt: "", maxTs: "0" }; },
   };
   setSlackRelayDeps({
     policy: () => policy,
@@ -212,6 +210,7 @@ function harness(options: {
         keep: input.keep,
         title: input.title,
         ownerUserId: input.ownerUserId,
+        appendSystemPrompt: input.appendSystemPrompt,
       });
       runSessions.push({ sessionId: id, keep: input.keep });
       return { sessionId: id, taskId: `t-${id}` };
@@ -259,7 +258,7 @@ function harness(options: {
       async getSessionBinding() { return null; },
     },
     sessions: sessionOps,
-    clock: { nowMs: () => (clock += 1000) },
+    clock: { nowMs: () => (clock += options.clockStepMs ?? 1000) },
     code: makeCodeBlockRuntime(),
     instances: {
       async closeInstance(input) {
@@ -327,6 +326,9 @@ describe("Slack thread brain through the interpreter", () => {
     // identity gate resolved U1 and create_session passed the owner through.
     expect(h.resolved).toEqual(["U1"]);
     expect(h.sessions[0]!.ownerUserId).toBe("user-1");
+    // The Slack flavor rides the session's system prompt (ADR 0060 Decision
+    // 8): chat-friendly replies, mrkdwn, questions through the tool.
+    expect(h.sessions[0]!.appendSystemPrompt).toContain("Conform to slack markdown");
     // The thread got the session link first (legacy `onStarted`), by an
     // ordinary Slack action templated on create_session's `web_url`.
     expect(h.actions.filter((a) => a.actionId === "post_message")).toEqual([
@@ -345,7 +347,6 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.names.indexOf("step:has_previous.started:0")).toBeLessThan(h.names.indexOf("step:relay:0"));
     // No earlier run of this workstream kept a session: a fresh one.
     expect(h.names).toContain("step:previous:0");
-    expect(h.names).not.toContain("step:has_previous.resumed:0");
     // The relay was installed on that session (consumer will forward curated events).
     expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
     // The follow-up became the second prompt, mention stripped.
@@ -430,14 +431,89 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.sessions).toEqual([]);
     expect(h.prompts).toEqual([{ sessionId: "s-old", text: "summarize the incident" }]);
     expect(h.relayFlags).toEqual([{ sessionId: "s-old", relay: true }]);
-    expect(h.names).toContain("step:has_previous.resumed:0");
     expect(h.names).toContain("step:opening_turn.resume_turn:0");
+    expect(h.names).not.toContain("step:has_previous.session:0");
     expect(h.names).not.toContain("step:has_previous.started:0");
-    // The thread was told which session it is talking to.
-    expect(h.actions.filter((a) => a.actionId === "post_message").map((a) => a.params["text"])).toEqual([
-      `Resumed the session — ${config.baseUrl}/sessions/s-old`,
-    ]);
+    // A resume is silent: the thread carries the session link from its first
+    // run, and the conversation simply continues.
+    expect(h.actions.filter((a) => a.actionId === "post_message")).toEqual([]);
     expect(h.policyCalls).toContain("msg:picking up where we left off");
+  });
+
+  test("(a5') a resumed session is prompted with what it has not seen: the replies after our last answer, never its own earlier turns", async () => {
+    // The thread's first run: the root mention, our "Started a session" line
+    // and our answer. Then a colleague's plain reply, a post by ANOTHER bot
+    // (which never moves the floor), and the mention that resumes the thread.
+    const mention = {
+      team_id: "T1",
+      event_id: "Ev2",
+      authorizations: [{ is_bot: true, user_id: "UBOT" }],
+      event: { type: "app_mention", channel: "C1", user: "U1", ts: "100.1", thread_ts: "90.0", text: "<@UBOT> are you still there?" },
+    };
+    const h = harness({
+      payload: mention,
+      previousSession: { sessionId: "s-old", runId: "r-old", alive: true },
+      threadReplies: [
+        { ts: "90.0", user: "U1", text: "<@UBOT> hi! keep this thread open" },
+        { ts: "90.5", user: "UBOT", bot_id: "B1", text: "Started a session — https://x/sessions/s-old" },
+        { ts: "90.6", user: "UBOT", bot_id: "B1", text: "Hi! Got it — noted." },
+        { ts: "95.0", user: "U2", text: "any update?" },
+        { ts: "96.0", user: "UOTHER", bot_id: "B2", text: "CI failed on main" },
+        { ts: "100.1", user: "U1", text: "<@UBOT> are you still there?" },
+      ],
+      recv: [{ kind: "session_idle", sessionId: "s-old" }, null, null],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.sessions).toEqual([]);
+    expect(h.prompts).toEqual([
+      { sessionId: "s-old", text: "<thread context>\nany update?\n</thread context>\n\nare you still there?" },
+    ]);
+  });
+
+  test("(a7) a turn has no deadline: a task longer than one wait slice is waited for slice by slice, then ✅", async () => {
+    // The engine's clock moves 10 h per read. The first slice (24 h) expires
+    // after a few empty recvs; that is a normal outcome, the loop waits
+    // again, and the session's idle arrives in the second slice. No failure,
+    // no second prompt, the relay still installed.
+    const h = harness({
+      clockStepMs: 10 * 3600 * 1000,
+      recv: [null, null, null, { kind: "session_idle", sessionId: "s-1" }, null, null],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.names).toContain("step:opening_turn.first_turn[0].first_turn_slice:0:wait");
+    expect(h.names).toContain("step:opening_turn.first_turn[1].first_turn_slice:0:wait");
+    expect(h.names).not.toContain("step:opening_turn.first_turn[2].first_turn_slice:0");
+    expect(h.prompts).toEqual([]);
+    expect(h.policyCalls.some((c) => c.startsWith("fail:"))).toBe(false);
+    expect(h.finalized).toEqual([{ status: "completed" }]);
+  });
+
+  test("(a8) a resumed session's long turn is waited for the same way, the prompt sent once", async () => {
+    const h = harness({
+      clockStepMs: 10 * 3600 * 1000,
+      previousSession: { sessionId: "s-old", runId: "r-old", alive: true },
+      recv: [null, null, null, { kind: "session_idle", sessionId: "s-old" }, null, null],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.prompts).toEqual([{ sessionId: "s-old", text: "summarize the incident" }]);
+    expect(h.names).toContain("step:opening_turn.resume_wait[1].resume_wait_slice:0:wait");
+    expect(h.policyCalls.some((c) => c.startsWith("fail:"))).toBe(false);
+  });
+
+  test("(a9) the engine's run ceiling under a running turn is a pause, not a failure: nothing is posted, the workstream stays open", async () => {
+    // 48 h run deadline, 20 h per clock read, the session never goes idle.
+    const h = harness({ clockStepMs: 20 * 3600 * 1000, recv: [null, null, null, null, null, null] });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("deadline");
+    expect(h.policyCalls.some((c) => c.startsWith("fail:"))).toBe(false);
+    expect(h.actions.filter((a) => a.actionId === "post_message").map((a) => a.params["text"])).toEqual([
+      `Started a session — ${config.baseUrl}/sessions/s-1`,
+    ]);
+    expect(h.closed).toEqual([]);
+    expect(h.ended).toEqual([]);
   });
 
   test("(a6) a kept session that is gone (swept) starts a fresh one", async () => {

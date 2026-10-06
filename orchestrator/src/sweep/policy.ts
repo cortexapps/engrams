@@ -12,7 +12,6 @@ export interface SweepPolicy {
 }
 
 export const SWEEP_POLICIES: Record<string, SweepPolicy> = {
-  SlackThreadWorkflow: { mode: "adopt", staleAfterHours: 48 },
   ToolExecWorkflow: { mode: "adopt", staleAfterHours: 1 },
   // ADR 0119: interpreter runs park on recv (waits, session phases) for as
   // long as a review or a thread takes, so the launch-scale 1h staleness

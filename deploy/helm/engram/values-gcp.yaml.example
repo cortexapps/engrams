@@ -17,9 +17,11 @@
 #       engram-coordinator@REPLACE_PROJECT.iam.gserviceaccount.com
 # - The host fleet runs as the engram-host-fleet chart's DaemonSet in
 #   the same cluster (see that chart's values-gcp.yaml.example).
-# - No identity proxy by default: the orchestrator's login wall
-#   (better-auth + `orchestrator.auth.adminEmails`) is the auth door
-#   (ADR 0118). IAP is an opt-in layer — values-iap.yaml.example.
+# - Sign-in is OAuth against your identity provider (the
+#   `orchestrator.auth` block at the bottom): only accounts on the
+#   allowlist get in. No identity proxy sits in front of the app — the
+#   orchestrator's login wall is the auth door (ADR 0118). IAP is an
+#   alternative door — values-iap.yaml.example.
 
 # ─── coordinator ──────────────────────────────────────────────────
 
@@ -29,22 +31,14 @@
 # image:
 #   repository: us-docker.pkg.dev/REPLACE_PROJECT/engram/coordinator
 #
-# Image TAGS must be set (here and in the web/orchestrator blocks
-# below): the chart's empty-tag fallback is the chart appVersion,
-# which the bake pipeline does not publish. `main` tracks the latest
-# build; pin a SHA tag for reproducible rollouts.
-image:
-  tag: main
-
-# While the repository is private, GHCR needs a pull secret in the
-# release namespace (a GitHub PAT with read:packages):
-#
-#   kubectl create secret docker-registry ghcr-pull -n engrams \
-#     --docker-server=ghcr.io --docker-username=<gh-user> --docker-password=<PAT>
-#
-# Delete this once the packages are public.
-imagePullSecrets:
-  - name: ghcr-pull
+# Image TAGS default to the chart appVersion, which is the release
+# that this checkout is (`v<appVersion>`); leave them unset on a
+# release tag. To run an unreleased build, set `image.tag`,
+# `web.image.tag` and `orchestrator.image.tag` to the full SHA of a
+# commit on main. Do not use the floating `main` tag: the pull policy
+# is IfNotPresent, so a node that has `main` never pulls it again.
+# The images are public; a mirror in a private registry needs
+# `imagePullSecrets`.
 
 mode: coordinator
 
@@ -135,8 +129,6 @@ metrics:
 web:
   enabled: true
   replicaCount: 2
-  image:
-    tag: main   # see the tag note above
 
   service:
     type: ClusterIP
@@ -161,9 +153,9 @@ web:
   ingress:
     # The single public surface: Google HTTPS LB + managed cert. With
     # no identity proxy, one "/" rule is the whole table — the
-    # orchestrator's login wall is the auth door (ADR 0118). The
-    # values-iap.yaml.example overlay replaces this with the
-    # per-backend path table IAP requires.
+    # orchestrator's login wall (`orchestrator.auth` below) is the
+    # auth door (ADR 0118). The values-iap.yaml.example overlay
+    # replaces this with the per-backend path table IAP requires.
     enabled: true
     className: gce
     annotations:
@@ -184,8 +176,6 @@ web:
 
 orchestrator:
   enabled: true
-  image:
-    tag: main   # see the tag note above
   # The public URL — same host as the web Ingress above.
   publicUrl: https://engrams.REPLACE_DOMAIN
   databaseSecret:
@@ -193,7 +183,29 @@ orchestrator:
     urlKey: ORCHESTRATOR_DATABASE_URL
     bearerKey: CONTROL_PLANE_BEARER
     authSecretKey: BETTER_AUTH_SECRET
+  # How people sign in. `oauth` is the door for a deployment on the
+  # internet; the chart's values.yaml documents the other two
+  # (`iap`, `password`) in the same block.
   auth:
+    mode: oauth
+    oauth:
+      # Google sign-in. Any OIDC provider works — set its issuer URL.
+      issuer: https://accounts.google.com
+      # Create the client in the Google Cloud console (APIs & Services
+      # → Credentials → OAuth client ID → Web application) with the
+      # redirect URI
+      #   https://engrams.REPLACE_DOMAIN/api/auth/oauth2/callback/sso
+      clientId: REPLACE_OAUTH_CLIENT_ID
+      # The Terraform quickstart relays the `engram-oauth-client-secret`
+      # Secret Manager entry into this Secret.
+      clientSecret:
+        existingSecret: engram-oauth-client
+        secretKey: ORCHESTRATOR_OAUTH_CLIENT_SECRET
+      # Who may sign in: every account of your Google Workspace
+      # domain. Without an allowlist a Google client admits every
+      # Google account there is.
+      allowedDomains:
+        - REPLACE_EMAIL_DOMAIN
     # Bootstrap admins: each email is promoted to role 'admin' on
     # first sign-in — how a fresh deploy gets a root account without a
     # manual DB UPDATE.

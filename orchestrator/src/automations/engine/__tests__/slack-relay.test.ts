@@ -37,10 +37,6 @@ function recordingPolicy() {
   let bubbleN = 0;
   let throwOnMessage = false;
   const pol: CommunicationPolicy = {
-    systemPromptAppend: "x",
-    onPickup: async () => {},
-    onProfileChoice: async () => "p",
-    onProfileChosen: async () => {},
     onStarted: async () => {},
     onWorking: async (m) => void calls.onWorking.push([m]),
     onIdle: async (m) => void calls.onIdle.push([m]),
@@ -59,7 +55,6 @@ function recordingPolicy() {
     onFail: async () => {},
     onDeliveryError: async (m, message) => void calls.onDeliveryError.push([m, message]),
     onNeutralClose: async () => {},
-    gatherThreadContext: async () => ({ prompt: "", maxTs: "0" }),
   };
   return {
     pol,

@@ -1,7 +1,7 @@
 /** `resolve_user` — map a provider identity to an engrams user.
  *
- * The Slack thread brain's identity gate (legacy `slack-thread.ts`
- * resolveUser) as a plain lookup: resolve by the provider's profile email
+ * The Slack thread brain's identity gate (ADR 0060's `resolveUser`, retired
+ * with its workflow) as a plain lookup: resolve by the provider's profile email
  * (ADR 0060 D4) and report whether the author is linked. What to do about an
  * unlinked author is the graph's decision — the built-in posts the legacy
  * "log in first" message and ends `filtered` — so the block itself has no

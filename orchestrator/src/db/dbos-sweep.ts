@@ -17,6 +17,9 @@ function textArray(values: string[]): SQL {
 export interface HeartbeatStore {
   beat(appVersion: string, podName: string): Promise<void>;
   liveVersions(graceMs: number): Promise<string[]>;
+  /** Pod names (= DBOS executor ids) with a beat inside the grace window,
+   * on any version: the executors that can still run their workflows. */
+  livePods(graceMs: number): Promise<string[]>;
   /**
    * Milliseconds since each version's freshest heartbeat — how long each
    * version has been abandoned. This is the sweep's abandonment clock:
@@ -85,6 +88,15 @@ export interface DbosSweepTransitionInput {
   expectedVersion: string;
   workflowName: string;
 }
+/** A PENDING workflow on a live version whose executor pod is gone. */
+export interface DbosStrandedWorkflowRow extends DbosWorkflowRow {
+  executorId: string;
+}
+export interface DbosStrandedTransitionInput {
+  workflowUuid: string;
+  executorId: string;
+  workflowName: string;
+}
 
 export type DbosSweepTransitionResult =
   | { flipped: false }
@@ -107,6 +119,28 @@ export interface DbosStatusStore {
   clearVersionOnEnqueuedRecording(
     input: DbosSweepTransitionInput,
     graceMs: number,
+  ): Promise<DbosSweepTransitionResult>;
+  /**
+   * PENDING workflows on a LIVE version whose executor id has no beat
+   * inside the pod grace window and whose row has not changed inside it
+   * either (a pod that has just started owns only fresh rows, so the
+   * second clause covers the moments before its first beat). Oldest
+   * stranded first.
+   */
+  listPendingOnDeadExecutors(
+    liveVersions: string[],
+    podGraceMs: number,
+    limit: number,
+  ): Promise<DbosStrandedWorkflowRow[]>;
+  /**
+   * Re-enqueue a stranded PENDING workflow on DBOS's internal queue so
+   * exactly one live pod pulls it and replays it from its recorded steps.
+   * The version stays: the same code resumes it. Fenced on the same
+   * conditions the listing used, re-checked inside the update.
+   */
+  requeueStrandedPendingRecording(
+    input: DbosStrandedTransitionInput,
+    podGraceMs: number,
   ): Promise<DbosSweepTransitionResult>;
   /**
    * Terminal failures inside the lookback window that have not been logged
@@ -221,6 +255,17 @@ export function makeHeartbeatStore(
         order by "application_version"
       `);
       return result.rows.map((row) => String(row.application_version));
+    },
+
+    async livePods(graceMs) {
+      const result = await db.execute(sql`
+        select "pod_name"
+        from "dbos_version_heartbeats"
+        group by "pod_name"
+        having max("last_seen") > now() - (${graceMs} * interval '1 millisecond')
+        order by "pod_name"
+      `);
+      return result.rows.map((row) => String(row.pod_name));
     },
 
     async abandonedMsByVersion() {
@@ -441,6 +486,76 @@ export function makeDbosStatusStore(
       });
     },
 
+    async listPendingOnDeadExecutors(liveVersions, podGraceMs, limit) {
+      const result = await db.execute(sql`
+        select "ws"."workflow_uuid", "ws"."name", "ws"."status",
+               "ws"."application_version", "ws"."created_at",
+               coalesce("ws"."recovery_attempts", 0) as "recovery_attempts",
+               "ws"."executor_id"
+        from "dbos"."workflow_status" as "ws"
+        where "ws"."status" = 'PENDING'
+          and "ws"."application_version" = any(${textArray(liveVersions)})
+          and "ws"."executor_id" is not null
+          and "ws"."updated_at" <
+              (extract(epoch from now()) * 1000)::bigint - ${podGraceMs}
+          and not exists (
+            select 1
+            from "dbos_version_heartbeats" as "heartbeat"
+            where "heartbeat"."pod_name" = "ws"."executor_id"
+              and "heartbeat"."last_seen" >
+                  now() - (${podGraceMs} * interval '1 millisecond')
+          )
+        order by "ws"."updated_at" asc, "ws"."workflow_uuid" asc
+        limit ${limit}
+      `);
+      return result.rows.map((row) => ({
+        ...dbosWorkflowRow(row),
+        executorId: String(row.executor_id),
+      }));
+    },
+
+    async requeueStrandedPendingRecording(input, podGraceMs) {
+      return db.transaction(async (tx) => {
+        const flipped = await tx.execute(sql`
+          update "dbos"."workflow_status"
+          set "status" = 'ENQUEUED',
+              "queue_name" = '_dbos_internal_queue',
+              "workflow_deadline_epoch_ms" = null,
+              "deduplication_id" = null,
+              "started_at_epoch_ms" = null,
+              "updated_at" = (extract(epoch from now()) * 1000)::bigint
+          where "status" = 'PENDING'
+            and "workflow_uuid" = ${input.workflowUuid}
+            and "executor_id" = ${input.executorId}
+            and "updated_at" <
+                (extract(epoch from now()) * 1000)::bigint - ${podGraceMs}
+            and not exists (
+              select 1
+              from "dbos_version_heartbeats" as "heartbeat"
+              where "heartbeat"."pod_name" = ${input.executorId}
+                and "heartbeat"."last_seen" >
+                    now() - (${podGraceMs} * interval '1 millisecond')
+            )
+          returning "workflow_uuid"
+        `);
+        if (affectedRows(flipped) === 0) return { flipped: false };
+
+        const recorded = await tx.execute(
+          recordSweepQuery(input.workflowUuid, input.workflowName),
+        );
+        const row = recorded.rows[0];
+        if (!row) {
+          throw new Error(
+            `sweep ledger upsert returned no row for ${input.workflowUuid}`,
+          );
+        }
+        return {
+          flipped: true,
+          sweepCount: numberValue(row.sweep_count),
+        };
+      });
+    },
+
     async listUnhandledTerminalFailures(lookbackMs, limit) {
       const result = await db.execute(sql`
         select "workflow_uuid", "name", "status", "application_version",
@@ -472,6 +587,15 @@ export function makeInMemoryHeartbeatStore(
   return {
     async beat(appVersion, podName) {
       rows.set(`${appVersion}\0${podName}`, now().getTime());
+    },
+
+    async livePods(graceMs) {
+      const cutoff = now().getTime() - graceMs;
+      const pods = new Set<string>();
+      for (const [key, lastSeen] of rows) {
+        if (lastSeen > cutoff) pods.add(key.slice(key.indexOf("\0") + 1));
+      }
+      return [...pods].sort();
     },
 
     async liveVersions(graceMs) {
@@ -627,6 +751,7 @@ export interface InMemoryDbosStatusRow extends FailedDbosWorkflowRow {
   workflowDeadlineEpochMs: number | null;
   deduplicationId: string | null;
   startedAtEpochMs: number | null;
+  executorId: string | null;
 }
 
 export type InMemoryDbosStatusSeed = FailedDbosWorkflowRow &
@@ -637,6 +762,7 @@ export type InMemoryDbosStatusSeed = FailedDbosWorkflowRow &
       | "workflowDeadlineEpochMs"
       | "deduplicationId"
       | "startedAtEpochMs"
+      | "executorId"
     >
   >;
 
@@ -649,6 +775,8 @@ export interface InMemoryDbosStatusOptions {
     applicationVersion: string,
     graceMs: number,
   ) => boolean | Promise<boolean>;
+  /** Mirrors the PG heartbeat anti-join on the executor's pod name. */
+  isPodLive?: (podName: string, graceMs: number) => boolean | Promise<boolean>;
   recordSweep?: (
     workflowUuid: string,
     workflowName: string,
@@ -675,6 +803,7 @@ export function makeInMemoryDbosStatusStore(
         workflowDeadlineEpochMs: row.workflowDeadlineEpochMs ?? null,
         deduplicationId: row.deduplicationId ?? null,
         startedAtEpochMs: row.startedAtEpochMs ?? null,
+        executorId: row.executorId ?? null,
       },
     ]),
   );
@@ -783,6 +912,56 @@ export function makeInMemoryDbosStatusStore(
       return recordTransition(row, input, () => {
         row.applicationVersion = null;
       });
+    },
+
+    async listPendingOnDeadExecutors(liveVersions, podGraceMs, limit) {
+      const cutoff = now().getTime() - podGraceMs;
+      const stranded: InMemoryDbosStatusRow[] = [];
+      for (const row of rows.values()) {
+        if (row.status !== "PENDING") continue;
+        if (row.applicationVersion === null || !liveVersions.includes(row.applicationVersion)) continue;
+        if (row.executorId === null || row.updatedAtEpochMs >= cutoff) continue;
+        if ((await options.isPodLive?.(row.executorId, podGraceMs)) === true) continue;
+        stranded.push(row);
+      }
+      return stranded
+        .sort(
+          (left, right) =>
+            left.updatedAtEpochMs - right.updatedAtEpochMs ||
+            (left.workflowUuid < right.workflowUuid ? -1 : left.workflowUuid > right.workflowUuid ? 1 : 0),
+        )
+        .slice(0, limit)
+        .map((row) => ({ ...workflowProjection(row), executorId: row.executorId! }));
+    },
+
+    async requeueStrandedPendingRecording(input, podGraceMs) {
+      const row = rows.get(input.workflowUuid);
+      const cutoff = now().getTime() - podGraceMs;
+      if (
+        !row ||
+        row.status !== "PENDING" ||
+        row.executorId !== input.executorId ||
+        row.updatedAtEpochMs >= cutoff ||
+        (await options.isPodLive?.(input.executorId, podGraceMs)) === true
+      ) {
+        return { flipped: false };
+      }
+      return recordTransition(
+        row,
+        {
+          workflowUuid: input.workflowUuid,
+          expectedVersion: row.applicationVersion ?? "",
+          workflowName: input.workflowName,
+        },
+        () => {
+          row.status = "ENQUEUED";
+          row.queueName = "_dbos_internal_queue";
+          row.workflowDeadlineEpochMs = null;
+          row.deduplicationId = null;
+          row.startedAtEpochMs = null;
+          row.updatedAtEpochMs = now().getTime();
+        },
+      );
     },
 
     async listUnhandledTerminalFailures(lookbackMs, limit) {

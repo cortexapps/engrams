@@ -2,7 +2,6 @@
   "sdkVersion": "4.21.6",
   "workflows": {
     "AutomationRunWorkflow": "fb3f100ceb53032a859e63d1235c08ce",
-    "SlackThreadWorkflow": "066799607907358e675bfb607c6f253c",
     "ToolExecWorkflow": "e66c370bf2411dca14208569ce5562a0"
   }
 }

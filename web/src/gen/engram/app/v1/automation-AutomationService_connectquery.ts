@@ -152,6 +152,14 @@ export const listEventSamples = AutomationService.method.listEventSamples;
 export const listInputKeyOptions = AutomationService.method.listInputKeyOptions;
 
 /**
+ * Labels for keys already in hand (the channels of the threads a page
+ * shows): a lookup by id, never a walk of the provider's whole list.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.DescribeInputKeys
+ */
+export const describeInputKeys = AutomationService.method.describeInputKeys;
+
+/**
  * ADR 0119 D5: the connector-declared event and action catalogs.
  *
  * @generated from rpc engram.app.v1.AutomationService.ListEventCatalog
