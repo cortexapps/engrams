@@ -548,9 +548,13 @@ pub enum HarnessFrame {
   retried. It is now the retirement request with `owner = admin`, which
   the scanner re-plans every tick and grants when the host is empty.
 - 2026-10-06 (C2, review): migration 0122 settles sessions left in
-  `evacuating` by the retired scanner (no `session_teleports` row):
-  tombstone the bound sandbox, then Idle with a recoverable snapshot and
-  Dead without one. Nothing else drives that state from this version.
+  `evacuating` by the retired scanner (no `session_teleports` row) the way
+  the dead-host orphan step does: tombstone the bound sandbox, drop the
+  binding, keep the live disk manifest; Idle with a recoverable memory
+  snapshot or a live disk manifest (the disk-only cold boot), Dead with
+  nothing recoverable. The teleport rollback's lost-source settle uses the
+  same `recovery_target` predicate. Nothing else drives `evacuating` from
+  this version.
 - 2026-10-06 (C2, review): a rollback declares Active only on a resume
   ack. A consumed live export (`migration_abort` answers NotFound) still
   resumes the source; a source sandbox that no longer exists fails the
