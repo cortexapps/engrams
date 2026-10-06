@@ -252,6 +252,10 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
         current_bundles: Vec::new(),
         sandbox_bundles: Vec::new(),
         cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
         total_vcpus: 0,
         wire_version: 0,
         stages_images: false,
@@ -295,6 +299,10 @@ async fn seed_host_with(
         current_bundles: Vec::new(),
         sandbox_bundles: Vec::new(),
         cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
         total_vcpus: 0,
         wire_version: 0,
         stages_images: false,
@@ -790,7 +798,7 @@ async fn missing_strikes_reset_on_sandbox_rekey() {
     );
 }
 
-/// ADR 0047: the durable coordinator cordon. `set_host_cordoned` writes
+/// ADR 0047: the durable coordinator cordon. `set_host_cordon` writes
 /// the PG bit; `placement::pick_for_session` (reading host rows) must
 /// skip the host — from ANY replica (a second registry over the same
 /// store sees the same cordon), and the cordon survives heartbeats
@@ -834,9 +842,13 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
     assert!(first_pick == cordoned || first_pick == healthy);
 
     // Cordon — every replica's picker MUST avoid it.
-    meta.set_host_cordoned(cordoned, true)
-        .await
-        .expect("cordon a rowed host");
+    meta.set_host_cordon(
+        cordoned,
+        Some(engram_core::types::host::CordonOwner::Admin),
+        None,
+    )
+    .await
+    .expect("cordon a rowed host");
     for reg in [&registry, &replica_b] {
         for _ in 0..10 {
             let (picked, _) =
@@ -883,7 +895,7 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
 
     // Uncordon — the previously-cordoned host is eligible again. Use
     // exclude_host to force the pick deterministically.
-    meta.set_host_cordoned(cordoned, false)
+    meta.set_host_cordon(cordoned, None, None)
         .await
         .expect("uncordon");
     let exclude_healthy_ctx = ScheduleContext {
@@ -905,7 +917,12 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
 
     // Unknown host id → NotFound (admin endpoint maps to 404).
     assert!(matches!(
-        meta.set_host_cordoned(HostId::new(), true).await,
+        meta.set_host_cordon(
+            HostId::new(),
+            Some(engram_core::types::host::CordonOwner::Admin),
+            None
+        )
+        .await,
         Err(engram_core::MetaError::NotFound)
     ));
 }
@@ -937,6 +954,10 @@ async fn seed_ready_host(
         current_bundles: Vec::new(),
         sandbox_bundles: Vec::new(),
         cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
         total_vcpus: 0,
         wire_version: 0,
         stages_images: false,
@@ -1059,27 +1080,24 @@ async fn missing_sandbox_strikes_are_consecutive_and_shared() {
     assert_eq!(flipped, vec![sid_b], "grace=1 is the no-grace mode");
 }
 
-/// ADR 0048 C9: `delete_host` is the operator's immediate-deregister
-/// primitive for the scale-down wave. It must REFUSE while any session
-/// is still bound (the operator finishes draining first — deleting the
-/// row out from under a live session orphans its routing), then succeed
-/// once the host is empty, and be idempotent if the row is already gone
-/// (the wave driver may re-issue it after a restart). This pins the
-/// SQL the `DELETE /api/admin/hosts/:id` handler maps onto.
+/// Deletion requires retirement even after the last bound session leaves.
+/// A second deletion succeeds when the row is already absent.
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn delete_host_refuses_bound_then_idempotent() {
-    use engram_core::types::session::DeleteHostOutcome;
+async fn delete_host_refuses_unretired_then_idempotent() {
+    use engram_core::types::host::DeleteHostOutcome;
     let Some(rig) = rig().await else { return };
     let meta = rig.meta.clone();
 
     let host = HostId::new();
     let sid = seed_active_session(&meta, host, SandboxId::new()).await;
 
-    // An Active session is bound → refuse with the bound count.
+    // A ready host cannot be deleted.
     match meta.delete_host(host).await.expect("delete_host") {
-        DeleteHostOutcome::SessionsBound(n) => assert_eq!(n, 1, "one Active session bound"),
-        other => panic!("expected SessionsBound(1) while a session is Active, got {other:?}"),
+        DeleteHostOutcome::NotRetired(status) => {
+            assert_eq!(status, engram_core::types::host::HostStatus::Ready)
+        }
+        other => panic!("expected NotRetired(Ready) while a session is Active, got {other:?}"),
     }
     // Row must survive the refusal.
     assert!(
@@ -1096,6 +1114,21 @@ async fn delete_host_refuses_bound_then_idempotent() {
     meta.transition_session(sid, SessionState::Idle, BindingDisposition::Detach)
         .await
         .expect("Active → Idle");
+
+    meta.request_host_retirement(
+        host,
+        engram_core::types::host::CordonOwner::Admin,
+        "test",
+        chrono::DateTime::UNIX_EPOCH,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        meta.grant_host_retirement(host, chrono::DateTime::UNIX_EPOCH)
+            .await
+            .unwrap(),
+        engram_core::types::host::RetirementGrant::Granted
+    );
 
     match meta.delete_host(host).await.expect("delete_host") {
         DeleteHostOutcome::Deleted => {}

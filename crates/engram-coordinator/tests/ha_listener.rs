@@ -504,6 +504,10 @@ async fn cross_replica_scheduling_pins_and_tokens() {
                 current_bundles: Vec::new(),
                 sandbox_bundles: Vec::new(),
                 cordoned: false,
+                cordon_owner: None,
+                cordon_reason: None,
+                retire_requested_at: None,
+                retired_at: None,
                 total_vcpus: 0,
                 wire_version: 0,
                 stages_images: false,
@@ -572,7 +576,10 @@ async fn cross_replica_scheduling_pins_and_tokens() {
     assert!(picked == h1 || picked == h2);
 
     // --- 2. cordon via A ⇒ B's picker excludes it ---------------------
-    meta_a.set_host_cordoned(h1, true).await.expect("cordon");
+    meta_a
+        .set_host_cordon(h1, Some(engram_core::types::host::CordonOwner::Admin), None)
+        .await
+        .expect("cordon");
     for _ in 0..10 {
         let (picked, _) =
             placement::pick_for_session(meta_b.as_ref(), &registry_b, &ctx, chrono::Utc::now())

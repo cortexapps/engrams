@@ -54,6 +54,10 @@ fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {
         current_bundles: Vec::new(),
         sandbox_bundles: Vec::new(),
         cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
         total_vcpus: 0,
         wire_version: 0,
         stages_images: false,
@@ -191,4 +195,40 @@ async fn heartbeat_still_moves_ready_and_draining() {
         "ready",
         "a host that finished its drain reports ready again — must be honored",
     );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (ENGRAM_TEST_DATABASE_URL)"]
+async fn heartbeat_refuses_retired_host() {
+    use engram_core::types::host::{CordonOwner, HeartbeatAck, RetirementGrant};
+    let Some(store) = connect().await else { return };
+    let id = HostId::new();
+    let mut record = host(id, "retired-heartbeat", "http://127.0.0.1:9101");
+    record.capacity.running_sandboxes = 0;
+    let at = record.last_heartbeat_at;
+    store.upsert_host(record).await.unwrap();
+    store
+        .request_host_retirement(
+            id,
+            CordonOwner::Admin,
+            "test",
+            at - chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.grant_host_retirement(id, at).await.unwrap(),
+        RetirementGrant::Granted
+    );
+    for status in [HostStatus::Ready, HostStatus::Draining] {
+        assert_eq!(
+            store
+                .touch_host_heartbeat(id, heartbeat(status))
+                .await
+                .unwrap(),
+            HeartbeatAck::Refused(HostStatus::Retired)
+        );
+        assert_eq!(read_status(&store, id).await, "retired");
+    }
+    assert!(store.list_lease_expired_hosts().await.unwrap().is_empty());
 }

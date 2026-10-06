@@ -170,6 +170,10 @@ async fn seed_ready_host(
         current_bundles: Vec::new(),
         sandbox_bundles: Vec::new(),
         cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
         total_vcpus: 0,
         wire_version: 0,
         stages_images: false,
@@ -619,7 +623,13 @@ async fn cordon_unmeasured_hosts(meta: &Arc<dyn MetadataStore>) {
     if let Ok(hosts) = meta.list_active_hosts().await {
         for h in hosts {
             if h.utilization.allocatable_mib == 0 && !h.cordoned {
-                let _ = meta.set_host_cordoned(h.id, true).await;
+                let _ = meta
+                    .set_host_cordon(
+                        h.id,
+                        Some(engram_core::types::host::CordonOwner::Admin),
+                        None,
+                    )
+                    .await;
             }
         }
     }
@@ -954,10 +964,18 @@ async fn notify_placement_changed_fires_at_every_site() {
     wait_for_reason(&mut listener, "host_upserted").await;
     wait_for_reason(&mut listener, "host_schedulability_changed").await;
 
-    // 3. set_host_cordoned(false) → "host_uncordoned" (cordon itself does
+    // 3. set_host_cordon(false) → "host_uncordoned" (cordon itself does
     //    NOT notify — only the uncordon direction does).
-    meta.set_host_cordoned(host, true).await.expect("cordon");
-    meta.set_host_cordoned(host, false).await.expect("uncordon");
+    meta.set_host_cordon(
+        host,
+        Some(engram_core::types::host::CordonOwner::Admin),
+        None,
+    )
+    .await
+    .expect("cordon");
+    meta.set_host_cordon(host, None, None)
+        .await
+        .expect("uncordon");
     wait_for_reason(&mut listener, "host_uncordoned").await;
 
     // 4. transition_session leaving a reserving state → "session_freed".

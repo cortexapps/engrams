@@ -587,3 +587,12 @@ describe("Profile subject (ADR 0053)", () => {
     expect(a.can("delete", "Profile")).toBe(true);
   });
 });
+
+test("RetireHost requires fleet management permission", () => {
+  expect(POLICY["FleetService.RetireHost"]).toEqual({
+    action: "manage",
+    subject: "all",
+  });
+  expect(abilityFor({ id: "member", role: "user" }).can("manage", "all")).toBe(false);
+  expect(abilityFor({ id: "admin", role: "admin" }).can("manage", "all")).toBe(true);
+});

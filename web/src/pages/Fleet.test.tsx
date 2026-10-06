@@ -86,7 +86,10 @@ describe("helpers", () => {
 
 describe("Fleet page", () => {
   it("reads every figure from host truth and offers drain / undrain by status", async () => {
-    const uncordon = vi.fn(() => ({ hostId: "host-04", status: "ready" }));
+    const uncordon = vi.fn((_request: { hostId: string; owner: string }) => ({
+      hostId: "host-04",
+      status: "ready",
+    }));
     const transport = createRouterTransport((router) => {
       router.service(FleetService, {
         listHosts: () => ({
@@ -143,5 +146,6 @@ describe("Fleet page", () => {
     expect(screen.getByRole("button", { name: "Drain" })).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: "Undrain" }));
     await waitFor(() => expect(uncordon).toHaveBeenCalled());
+    expect(uncordon.mock.calls[0]?.[0]).toMatchObject({ hostId: "host-04", owner: "admin" });
   });
 });

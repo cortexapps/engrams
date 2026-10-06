@@ -51,6 +51,10 @@ fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {
         current_bundles: Vec::new(),
         sandbox_bundles: Vec::new(),
         cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
         total_vcpus: 0,
         wire_version: 0,
         stages_images: false,
@@ -95,4 +99,34 @@ async fn re_register_same_id_new_pod_name_updates_in_place() {
         1,
         "exactly one row per host id",
     );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (ENGRAM_TEST_DATABASE_URL)"]
+async fn register_keeps_retired_host() {
+    use engram_core::types::host::{CordonOwner, RetirementGrant};
+    let Some(store) = connect().await else { return };
+    let id = HostId::new();
+    let record = host(id, "retired-register", "http://127.0.0.1:9101");
+    let at = record.last_heartbeat_at;
+    store.upsert_host(record.clone()).await.unwrap();
+    store
+        .request_host_retirement(
+            id,
+            CordonOwner::Admin,
+            "test",
+            at - chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.grant_host_retirement(id, at).await.unwrap(),
+        RetirementGrant::Granted
+    );
+    store.upsert_host(record).await.unwrap();
+    assert_eq!(
+        store.get_host(id).await.unwrap().unwrap().status,
+        HostStatus::Retired
+    );
+    assert!(store.list_active_hosts().await.unwrap().is_empty());
 }

@@ -378,16 +378,8 @@ fn issue_790_evict_resume_snapshot_safety_faithful() {
 /// — the drain wave over-reserves host `…0d570000` (32768 MiB > allocatable
 /// 24576) at step 240 under the faithful default.
 ///
-/// The fix is RESERVED evac placement: the evac ctx now carries the
-/// session's reserved 2D budget, `pick_for_session_reserved` drops the soft
-/// fallback (honoring the hard bound), and an evac that fits no survivor
-/// QUEUES (`Evacuating → Queued`, resume-origin) rather than binding a full
-/// host — the queue scanner re-homes it once capacity returns (the #795
-/// resume precedent, on the evac leg). FAIL-WITHOUT / PASS-WITH: forcing the
-/// evac budget to `None` (reverting to the soft pick) FAILS this at step 240
-/// with `placement-accounting`; with the reserved pick it PASSES the full
-/// 1500-step window, drain-evacuated sessions queuing + re-homing through
-/// quiescence.
+/// Reserved evacuation placement must not bind a full host. ADR 0123 B8
+/// keeps the session Evacuating for retry when no survivor fits.
 #[test]
 fn issue_800_reserved_evac_over_reservation_smallest_calm_seed() {
     run_faithful(0, Profile::Calm, 1500);
