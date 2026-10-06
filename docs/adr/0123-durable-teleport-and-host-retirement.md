@@ -124,9 +124,12 @@ rolls back and returns the list.
 returns promptly. It cordons the host with an owner, enqueues a teleport
 for every resident session (B4), evaluates the grant once, and returns
 the retirement status. A caller repeats it until `retired_at` is set.
-`AdminDrainHost` stays as a thin alias with `owner = admin` and no
-grant. `GetHost` reads the row directly, so `dead` and `retired` hosts
-are visible; `NotFound` means "no row".
+`AdminDrainHost` is the same request with `owner = admin`: the scanner
+re-plans it every tick and grants it when the host is empty, so a
+resident that does not fit today is tried again instead of lingering
+behind a one-shot plan. `UncordonHost{owner: admin}` cancels the request
+before the grant. `GetHost` reads the row directly, so `dead` and
+`retired` hosts are visible; `NotFound` means "no row".
 
 **A4. `DeleteHost` requires the grant.** It succeeds on `retired` or
 `dead` rows and is idempotent on a missing row. On any other status it
@@ -540,3 +543,20 @@ pub enum HarnessFrame {
 - 2026-10-05 (O1, C1): the heartbeat's `running_sandboxes` is redefined as
   resident (running plus tearing-down) and the grant reads that column;
   no new wire field or table column.
+- 2026-10-06 (C2, review): `AdminDrainHost` was a cordon plus a one-shot
+  plan, so a resident that did not fit was reported as planned and never
+  retried. It is now the retirement request with `owner = admin`, which
+  the scanner re-plans every tick and grants when the host is empty.
+- 2026-10-06 (C2, review): migration 0122 settles sessions left in
+  `evacuating` by the retired scanner (no `session_teleports` row):
+  tombstone the bound sandbox, then Idle with a recoverable snapshot and
+  Dead without one. Nothing else drives that state from this version.
+- 2026-10-06 (C2, review): a rollback declares Active only on a resume
+  ack. A consumed live export (`migration_abort` answers NotFound) still
+  resumes the source; a source sandbox that no longer exists fails the
+  move with `source_lost_during_rollback`.
+- 2026-10-06 (S1, review): a role clear runs after the unconditional
+  abort, commit, and drain work, and its error is reported last; a
+  finished destination drain is remembered so a failed role persist is
+  retried by the next `migration_drain_wait` rather than reported as a
+  lost drain.
