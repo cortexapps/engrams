@@ -28,6 +28,11 @@ use engram_core::types::sandbox::SandboxSpec;
 use engram_core::SandboxId;
 use serde::{Deserialize, Serialize};
 
+/// Durable role for the frozen source of a post-copy move.
+pub const ROLE_POST_COPY_SOURCE: &str = "post-copy-source";
+/// Durable role for the destination of a post-copy move.
+pub const ROLE_POST_COPY_DEST: &str = "post-copy-dest";
+
 /// Current schema version. Bumped on incompatible changes to the
 /// on-disk JSON shape. The startup reattach pass refuses to read
 /// older or newer versions — a stale manifest is treated as

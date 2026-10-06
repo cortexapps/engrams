@@ -191,6 +191,7 @@ pub struct VzBackend {
     work_dir: PathBuf,
     cfg: VzConfig,
     sandboxes: DashMap<SandboxId, VzSandboxState>,
+    teardowns: engram_core::teardown::TeardownRegistry<SandboxId>,
     /// Latest harness sink (set by `set_harness_sink`). The vsock
     /// bridge passes guest-initiated 1026 connections to this sink
     /// in the same way `engram-sandbox-firecracker` does.
@@ -232,6 +233,7 @@ impl VzBackend {
             work_dir,
             cfg,
             sandboxes: DashMap::new(),
+            teardowns: Default::default(),
             harness_sink: Mutex::new(None),
             forge_sink: Mutex::new(None),
             upload_sink: Mutex::new(None),
@@ -1586,47 +1588,59 @@ impl SandboxBackend for VzBackend {
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
-        let Some((_, state)) = self.sandboxes.remove(&id) else {
-            return Err(SandboxError::NotFound);
-        };
-        // Tear down the bridge first — abort pump tasks, unregister
-        // the guest-side listener, and remove the UDS files. Doing
-        // this before vm.stop avoids a race where pumps see EOF on
-        // their VZ-side fds and try to reach into a dying VM.
-        // Take the bridge out of its mutex before awaiting so we
-        // don't hold a non-Send guard across the await.
-        let bridge = state.bridge.lock().take();
-        if let Some(mut bridge) = bridge {
-            bridge.stop().await;
+        if !self.sandboxes.contains_key(&id) {
+            return match self.teardowns.join(&id) {
+                Some(task) => task
+                    .await
+                    .map_err(|error| SandboxError::Vm(Box::new(error))),
+                None => Ok(()),
+            };
         }
-        // Best-effort stop. If the VM is already stopped or in a
-        // state that can't accept stop (e.g. failed-to-start),
-        // VZ surfaces an NSError; we log and continue, since the
-        // observable goal of `destroy` is "this sandbox is gone."
-        if let Err(e) = state.vm.stop().await {
-            tracing::warn!(error = %e, sandbox_id = %id, "vz stop returned an error; releasing handle anyway");
-        }
-        // Remove the per-sandbox rootfs clone. Best-effort: if
-        // the unlink fails (e.g., file already gone), the next
-        // sandbox with a fresh UUID still gets its own clone, so
-        // we just log and move on. Persistent state lives in
-        // snapshot directories, not here.
-        // ADR 0112: the swap backing is a per-sandbox sibling — remove it
-        // with the rootfs clone (NotFound is benign: no-swap sandboxes).
-        let _ =
-            tokio::fs::remove_file(crate::disk::per_sandbox_swap_path(&self.work_dir, id)).await;
-        if let Err(e) = tokio::fs::remove_file(&state.rootfs_path).await {
-            tracing::debug!(
-                error = %e,
-                path = %state.rootfs_path.display(),
-                sandbox_id = %id,
-                "vz: failed to remove per-sandbox rootfs (likely already gone)"
-            );
-        }
-        // `state` (and the Arc<VzVm> inside) drops here — releases
-        // ObjC retains.
-        drop(state);
-        Ok(())
+        self.teardowns.run_or_join(id, || {
+            let state = self.sandboxes.remove(&id).map(|(_, state)| state);
+            let work_dir = self.work_dir.clone();
+            Box::pin(async move {
+                let Some(state) = state else { return Ok(()); };
+                // Tear down the bridge first — abort pump tasks, unregister
+                // the guest-side listener, and remove the UDS files. Doing
+                // this before vm.stop avoids a race where pumps see EOF on
+                // their VZ-side fds and try to reach into a dying VM.
+                // Take the bridge out of its mutex before awaiting so we
+                // don't hold a non-Send guard across the await.
+                let bridge = state.bridge.lock().take();
+                if let Some(mut bridge) = bridge {
+                    bridge.stop().await;
+                }
+                // Best-effort stop. If the VM is already stopped or in a
+                // state that can't accept stop (e.g. failed-to-start),
+                // VZ surfaces an NSError; we log and continue, since the
+                // observable goal of `destroy` is "this sandbox is gone."
+                if let Err(e) = state.vm.stop().await {
+                    tracing::warn!(error = %e, sandbox_id = %id, "vz stop returned an error; releasing handle anyway");
+                }
+                // Remove the per-sandbox rootfs clone. Best-effort: if
+                // the unlink fails (e.g., file already gone), the next
+                // sandbox with a fresh UUID still gets its own clone, so
+                // we just log and move on. Persistent state lives in
+                // snapshot directories, not here.
+                // ADR 0112: the swap backing is a per-sandbox sibling — remove it
+                // with the rootfs clone (NotFound is benign: no-swap sandboxes).
+                let _ =
+                    tokio::fs::remove_file(crate::disk::per_sandbox_swap_path(&work_dir, id)).await;
+                if let Err(e) = tokio::fs::remove_file(&state.rootfs_path).await {
+                    tracing::debug!(
+                        error = %e,
+                        path = %state.rootfs_path.display(),
+                        sandbox_id = %id,
+                        "vz: failed to remove per-sandbox rootfs (likely already gone)"
+                    );
+                }
+                // `state` (and the Arc<VzVm> inside) drops here — releases
+                // ObjC retains.
+                drop(state);
+                Ok(())
+            })
+        }).await.map_err(|error| SandboxError::Vm(Box::new(error)))
     }
 
     /// ADR 0112: the live spec's swap size — gates the pooled backend's
@@ -1645,12 +1659,14 @@ impl SandboxBackend for VzBackend {
         // the coordinator's ADR 0009 divergence detection can flip a
         // session whose VM died out from under us. The map entry stays
         // (cleanup is coordinator-driven via destroy).
-        Ok(self
+        let mut ids: std::collections::HashSet<_> = self
             .sandboxes
             .iter()
             .filter(|kv| !kv.value().vm.is_dead())
             .map(|kv| *kv.key())
-            .collect())
+            .collect();
+        ids.extend(self.teardowns.keys());
+        Ok(ids.into_iter().collect())
     }
 
     /// ADR 0035 amendment D2: same contract as the FC backend — each live

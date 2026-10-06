@@ -91,8 +91,32 @@ async fn create_list_destroy_round_trip() {
     // before the dir gets removed below.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // destroy clears the sandbox and removes the jail dir
-    backend.destroy(id).await.expect("destroy");
+    // Park the graceful request at an external socket, then release it.
+    // This gives both destroy callers a fixed overlap without a timed sleep.
+    let api_path = jail.join("firecracker.sock");
+    std::fs::rename(&api_path, jail.join("firecracker-real.sock")).unwrap();
+    let listener = tokio::net::UnixListener::bind(&api_path).unwrap();
+    let mut first = Box::pin(backend.destroy(id));
+    assert!(futures::poll!(&mut first).is_pending());
+    let (connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(backend.list().await.unwrap(), vec![id]);
+    let mut second = Box::pin(backend.destroy(id));
+    assert!(futures::poll!(&mut second).is_pending());
+    drop(connection);
+    drop(listener);
+    tokio::join!(
+        async {
+            first.await.expect("first destroy");
+            assert!(backend.list().await.unwrap().is_empty());
+        },
+        async {
+            second.await.expect("second destroy");
+            assert!(backend.list().await.unwrap().is_empty());
+        },
+    );
     assert!(
         backend.list().await.expect("list").is_empty(),
         "list must be empty after destroy",

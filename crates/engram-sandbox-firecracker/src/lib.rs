@@ -1045,6 +1045,7 @@ pub struct FirecrackerBackend {
     /// unexpected exit. The Arc-overhead is one pointer per access
     /// — negligible against the cost of any sandbox operation.
     sandboxes: Arc<DashMap<SandboxId, LiveSandbox>>,
+    teardowns: engram_core::teardown::TeardownRegistry<SandboxId>,
     /// Monotonic CID allocator. Each `create` bumps this. We don't
     /// reuse CIDs of destroyed VMs — a u32 gives us 4 billion before
     /// wrap, which is fine for any single host's lifetime.
@@ -1123,6 +1124,7 @@ impl FirecrackerBackend {
             work_dir,
             config,
             sandboxes: Arc::new(DashMap::new()),
+            teardowns: Default::default(),
             next_cid: AtomicU32::new(FIRST_GUEST_CID + slot * CID_SLOT_STRIDE),
             net_allocator,
             harness_sink: Arc::new(parking_lot::RwLock::new(None)),
@@ -2680,7 +2682,7 @@ impl FirecrackerBackend {
                 &self.work_dir,
                 sandbox_id,
                 &state,
-                pid,
+                (pid, None),
                 net_setup.map(|ns| sandbox_manifest::NetworkRecord {
                     tap_name: ns.tap_name.clone(),
                     vm_cidr_network: ns.vm_cidr.network(),
@@ -2689,7 +2691,7 @@ impl FirecrackerBackend {
                 }),
                 None,
                 None,
-            );
+            )?;
             // ADR 0044 K2: move FC into the node cgroup so a host-agent pod
             // restart doesn't `cgroup.kill` it. Cold create = FC only.
             place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &[pid]);
@@ -3731,28 +3733,17 @@ impl FirecrackerBackend {
         // startup happens). Pre-set the watch to true so start_agent
         // proceeds immediately to SpawnHarness.
         let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
-        // VM is resumed, listeners are up, and (below) its manifest is
-        // written: the restored sandbox is committed. Defuse the
-        // create-window backstops so the VM is fully decoupled from this
-        // host-agent's lifecycle (ADR 0044 K2 detach). Issue #197: the netns
-        // guard hands its `NetnsSetup` over to the live sandbox here — past
-        // this point `destroy()` owns netns teardown, not the guard.
-        fc_guard.disarm();
-        if let Some(g) = uffd_guard.as_mut() {
-            g.disarm();
-        }
-        let netns_setup = netns_guard.into_committed();
-        // ADR 0044 K2: persist the manifest so the successor host-agent
-        // can reattach this still-live restored VM — recording the per-VM
-        // netns (warm restores) and the uffd handler pid (Uffd mode).
+        // Persist the role while all restore guards remain armed. A failed
+        // write must kill the processes and release the network namespace.
         if let Some(fc_pid_u) = fc_pid {
             persist_sandbox_manifest(
                 &self.work_dir,
                 sandbox_id,
                 &state,
-                fc_pid_u,
+                (fc_pid_u, uffd_pid),
                 None, // warm restores run in a per-VM netns, not host-root
-                netns_setup
+                netns_guard
+                    .setup
                     .as_ref()
                     .map(|ns| sandbox_manifest::NetnsRecord {
                         netns_name: ns.netns_name.clone(),
@@ -3762,8 +3753,8 @@ impl FirecrackerBackend {
                         vm_cidr_network: ns.vm_cidr.network(),
                         snat_cidr_network: ns.snat_cidr.network(),
                     }),
-                uffd_pid,
-            );
+                post_copy.then_some(sandbox_manifest::ROLE_POST_COPY_DEST),
+            )?;
             // ADR 0044 K2: move FC AND the uffd handler (Uffd mode) into the
             // node cgroup — both must survive a host-agent pod restart, or a
             // killed handler leaves the restored guest page-faulting forever.
@@ -3771,6 +3762,12 @@ impl FirecrackerBackend {
             pids.extend(uffd_pid);
             place_vm_in_node_cgroup(self.config.vm_cgroup_parent.as_deref(), sandbox_id, &pids);
         }
+        // The manifest is durable. Transfer resource ownership to the live map.
+        fc_guard.disarm();
+        if let Some(g) = uffd_guard.as_mut() {
+            g.disarm();
+        }
+        let netns_setup = netns_guard.into_committed();
         self.sandboxes.insert(
             sandbox_id,
             LiveSandbox {
@@ -4263,18 +4260,17 @@ fn process_record(pid: u32) -> sandbox_manifest::ProcessRecord {
 /// re-adopt this still-live VM after a host-agent restart (ADR 0044 K2).
 /// Called at the end of BOTH `create()` and `restore()` — the only
 /// difference is host-root `network` vs per-VM `netns`, and whether a
-/// uffd handler is present. Best-effort: a write failure means this one
-/// sandbox can't be reattached (it orphan-reaps + the session reconciles
-/// instead), but the running VM itself is unaffected.
+/// uffd handler is present. A write failure aborts the guarded operation.
 fn persist_sandbox_manifest(
     work_dir: &std::path::Path,
     sandbox_id: SandboxId,
     state: &SandboxState,
-    fc_pid: u32,
+    process_ids: (u32, Option<u32>),
     network: Option<sandbox_manifest::NetworkRecord>,
     netns: Option<sandbox_manifest::NetnsRecord>,
-    uffd_pid: Option<u32>,
-) {
+    migration_role: Option<&str>,
+) -> Result<(), SandboxError> {
+    let (fc_pid, uffd_pid) = process_ids;
     let m = sandbox_manifest::SandboxManifest {
         schema_version: sandbox_manifest::SCHEMA_VERSION,
         sandbox_id,
@@ -4291,17 +4287,11 @@ fn persist_sandbox_manifest(
         network,
         netns,
         uffd_handler: uffd_pid.map(process_record),
-        migration_role: None,
+        migration_role: migration_role.map(str::to_owned),
     };
     let path = sandbox_manifest::manifest_path(work_dir, sandbox_id);
-    if let Err(e) = sandbox_manifest::write_manifest(&path, &m) {
-        tracing::warn!(
-            %sandbox_id,
-            error = %e,
-            "sandbox manifest write failed; this sandbox can't be reattached across a \
-             host-agent restart (it'll orphan-reap + the session reconciles). VM is fine."
-        );
-    }
+    sandbox_manifest::write_manifest(&path, &m)
+        .map_err(|e| SandboxError::Vm(format!("write sandbox manifest: {e}").into()))
 }
 
 /// ADR 0044 K2: move the VM's processes (FC + any uffd-handler) into a
@@ -5626,63 +5616,37 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
-        // Idempotent: removing an unknown id is a no-op, matching the
-        // contract ProcessBackend follows.
-        let Some((_, live)) = self.sandboxes.remove(&id) else {
-            return Ok(());
-        };
-
-        // ADR 0050 / issue #196: destroy MUST be cancel-safe. The map
-        // entry is already gone (above), so once we own `live` the only
-        // record of the running FC + uffd handler is on this stack. The
-        // teardown that follows parks in cancellable awaits for several
-        // seconds (graceful-shutdown timeout, uffd SIGTERM wait), and the
-        // host-agent tonic handler runs destroy inline — so a wire-level
-        // cancellation (client disconnect / RPC deadline) drops this
-        // future. If that happened before the kills ran, FC + uffd kept
-        // running (ADR 0044 K2 removed `kill_on_drop`, so dropping `live`
-        // kills nothing) AND a retried destroy hit the idempotent
-        // early-return above, reporting success while the VM lived on —
-        // a leaked microVM, allocator /30 slot, TAP/netns, and a
-        // `sandbox.json` that reattach re-adopts after a host-agent
-        // restart.
-        //
-        // The fix: hand the entire teardown to a detached `tokio::spawn`
-        // and merely *await* its `JoinHandle`. Wire cancellation now only
-        // drops the awaiter; the spawned task runs the full
-        // kill/free/cleanup sequence to completion regardless. We still
-        // return the task's outcome to the caller so a retry that races a
-        // still-running teardown sees a coherent result.
-        let net_allocator = self.net_allocator.clone();
-        let vm_cgroup_parent = self.config.vm_cgroup_parent.clone();
-        let work_dir = self.work_dir.clone();
-        let handle = tokio::spawn(destroy_teardown(
-            id,
-            live,
-            net_allocator,
-            vm_cgroup_parent,
-            work_dir,
-        ));
-        match handle.await {
-            Ok(()) => Ok(()),
-            Err(join_err) => {
-                // The detached task panicked. The map entry is already
-                // gone and the kill/free best-effort steps each swallow
-                // their own errors, so a panic here is unexpected — but
-                // surface it rather than silently claim success.
-                tracing::error!(
-                    sandbox_id = %id,
-                    error = %join_err,
-                    "destroy teardown task panicked",
-                );
-                Err(SandboxError::Vm(
-                    format!("destroy teardown task panicked: {join_err}").into(),
-                ))
-            }
+        if !self.sandboxes.contains_key(&id) {
+            return match self.teardowns.join(&id) {
+                Some(task) => task
+                    .await
+                    .map_err(|error| SandboxError::Vm(Box::new(error))),
+                None => Ok(()),
+            };
         }
+        // Register before removing the live entry. All callers join this task.
+        self.teardowns
+            .run_or_join(id, || {
+                let live = self.sandboxes.remove(&id).map(|(_, live)| live);
+                let net_allocator = self.net_allocator.clone();
+                let vm_cgroup_parent = self.config.vm_cgroup_parent.clone();
+                let work_dir = self.work_dir.clone();
+                Box::pin(async move {
+                    if let Some(live) = live {
+                        destroy_teardown(id, live, net_allocator, vm_cgroup_parent, work_dir).await;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|error| SandboxError::Vm(Box::new(error)))
     }
+
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-        Ok(self.sandboxes.iter().map(|r| *r.key()).collect())
+        let mut ids: std::collections::HashSet<_> =
+            self.sandboxes.iter().map(|r| *r.key()).collect();
+        ids.extend(self.teardowns.keys());
+        Ok(ids.into_iter().collect())
     }
 
     /// ADR 0035 amendment D2: report each live sandbox's attached generations
@@ -5730,7 +5694,7 @@ impl SandboxBackend for FirecrackerBackend {
     /// back to the in-memory signal, since there's nothing else to
     /// check against.
     async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
-        let known_to_backend = self.sandboxes.contains_key(&id);
+        let known_to_backend = self.sandboxes.contains_key(&id) || self.teardowns.contains(&id);
         let manifest_path = sandbox_manifest::manifest_path(&self.work_dir, id);
         let process_alive = match sandbox_manifest::read_manifest(&manifest_path) {
             Ok(manifest) => {
@@ -9542,12 +9506,19 @@ mod tests {
             "destroy must still be parked in the graceful window when we cancel it"
         );
 
+        assert_eq!(be.list().await.unwrap(), vec![id]);
+        let mut second = Box::pin(be.destroy(id));
+        assert!(futures::poll!(&mut second).is_pending());
+
         // The map entry is gone immediately (removed up front) — pre- and
         // post-fix alike.
         assert!(
             !be.sandboxes.contains_key(&id),
             "map entry removed by destroy"
         );
+
+        second.await.expect("join cancelled teardown");
+        assert!(be.list().await.unwrap().is_empty());
 
         // THE invariant: despite the cancellation, the detached teardown
         // task runs to completion. After the graceful window elapses it

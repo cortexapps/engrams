@@ -178,3 +178,49 @@ async fn detached_vm_survives_backend_drop_and_reattaches() {
         "destroy must SIGKILL the FC by recorded pid even with no owned Child"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker; run with --ignored on the dev VM"]
+async fn post_copy_restore_persists_role_before_list() {
+    let Some(env) = common::fc_preflight() else {
+        return;
+    };
+    let work = tempfile::tempdir().unwrap();
+    let rootfs = work.path().join("rootfs.ext4");
+    common::clone_rootfs(&env.rootfs, &rootfs).await.unwrap();
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    cfg.net_pool = None;
+    // File restore isolates the manifest transaction from peer transport.
+    let backend = FirecrackerBackend::new(work.path(), cfg);
+    let source = backend.create(test_spec(rootfs)).await.unwrap();
+    let snapshot = backend.snapshot(source).await.unwrap();
+    backend.destroy(source).await.unwrap();
+    std::fs::write(
+        backend
+            .snapshot_path_for(snapshot.id)
+            .join(engram_sandbox_firecracker::MIGRATION_PEER_FILE),
+        b"{}",
+    )
+    .unwrap();
+    let restore = backend.restore(snapshot);
+    tokio::pin!(restore);
+    let id = loop {
+        tokio::select! {
+            result = &mut restore => break result.unwrap(),
+            () = tokio::task::yield_now() => {
+                for id in backend.list().await.unwrap() {
+                    let manifest = sandbox_manifest::read_manifest(&sandbox_manifest::manifest_path(work.path(), id)).unwrap();
+                    assert_eq!(manifest.migration_role.as_deref(), Some(sandbox_manifest::ROLE_POST_COPY_DEST));
+                }
+            }
+        }
+    };
+    assert!(backend.list().await.unwrap().contains(&id));
+    let manifest =
+        sandbox_manifest::read_manifest(&sandbox_manifest::manifest_path(work.path(), id)).unwrap();
+    assert_eq!(
+        manifest.migration_role.as_deref(),
+        Some(sandbox_manifest::ROLE_POST_COPY_DEST)
+    );
+    backend.destroy(id).await.unwrap();
+}

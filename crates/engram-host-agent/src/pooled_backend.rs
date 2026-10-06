@@ -635,6 +635,7 @@ impl Drop for SwapRearmGuard {
 /// - **VZ**: ~1 s full cold boot. No memory-snapshot primitive
 ///   available on macOS arm64 Linux (Apple-side bug).
 pub struct PooledBackend {
+    teardowns: engram_core::teardown::TeardownRegistry<SandboxId>,
     inner: Arc<dyn SandboxBackend>,
     /// Phase 5+: if `Some`, `create()` resolves `spec.image_uri`
     /// through this cache before delegating to `inner`. The cache
@@ -1867,6 +1868,12 @@ impl PooledBackend {
         // ignored on resume, which keeps the snapshot's pinned mounts).
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
+        let post_copy_dest = self.postcopy_dests.contains_key(&metadata.id)
+            || self
+                .inner
+                .snapshot_path_for(metadata.id)
+                .join(engram_sandbox_firecracker::MIGRATION_PEER_FILE)
+                .exists();
         // ADR 0014 M1.13: eager parallel prefetch of memory chunks
         // into local NVMe BEFORE we hand off to materialize +
         // inner.restore. Without this, materialize_to_file_cached's
@@ -2223,8 +2230,8 @@ impl PooledBackend {
         // normal `destroy()` teardown owns it (kill FC first, THEN disconnect).
         // The handler awaits the JoinHandle only to observe the result for the
         // connected client; a disconnect drops that await, not the work. The
-        // non-NBD path (macOS, no-NBD hosts) has nothing to lose on a dropped
-        // drop chain, so it stays inline.
+        // non-NBD path also detaches restore so the destination role is
+        // recorded if the caller stops waiting.
         #[cfg(target_os = "linux")]
         if let Some(mut state) = pending_nbd_state {
             let inner = self.inner.clone();
@@ -2237,12 +2244,16 @@ impl PooledBackend {
             let dirty_root = self
                 .resolved_dirty_root()
                 .expect("NBD state requires a dirty root");
+            let migration_roles = self.migration_roles.clone();
             let join = tokio::spawn(async move {
                 let new_id = if fresh {
                     inner.restore_fresh(metadata, selected_mounts).await?
                 } else {
                     inner.restore(metadata).await?
                 };
+                if post_copy_dest {
+                    migration_roles.insert(new_id, crate::migration::MigrationRole::PostCopyDest);
+                }
                 state
                     .backend
                     .relocate_dirty_file(&dirty_root.join(format!("{new_id}.cache")))
@@ -2299,12 +2310,21 @@ impl PooledBackend {
                 .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?;
         }
 
-        let new_id = if fresh {
-            self.inner.restore_fresh(metadata, selected_mounts).await?
-        } else {
-            self.inner.restore(metadata).await?
-        };
-        Ok(new_id)
+        let inner = self.inner.clone();
+        let migration_roles = self.migration_roles.clone();
+        tokio::spawn(async move {
+            let new_id = if fresh {
+                inner.restore_fresh(metadata, selected_mounts).await?
+            } else {
+                inner.restore(metadata).await?
+            };
+            if post_copy_dest {
+                migration_roles.insert(new_id, crate::migration::MigrationRole::PostCopyDest);
+            }
+            Ok(new_id)
+        })
+        .await
+        .map_err(|e| SandboxError::Vm(format!("restore task panicked: {e}").into()))?
     }
 
     pub fn new(inner: Arc<dyn SandboxBackend>) -> Self {
@@ -2325,6 +2345,7 @@ impl PooledBackend {
         });
         Self {
             inner,
+            teardowns: Default::default(),
             image_cache: None,
             egress: None,
             session_bindings,
@@ -2432,23 +2453,17 @@ impl PooledBackend {
         }
     }
 
-    /// Set/clear a sandbox's post-copy role, mirroring it into the FC
-    /// sandbox manifest (best-effort) so a host-agent restart's
-    /// reattach pass re-learns it.
+    /// Persist the role before updating the in-memory lifecycle fence.
     pub async fn set_migration_role(
         &self,
         id: SandboxId,
         role: Option<crate::migration::MigrationRole>,
-    ) {
-        self.note_migration_role(id, role);
-        if let Err(e) = self
-            .inner
+    ) -> Result<(), SandboxError> {
+        self.inner
             .set_manifest_migration_role(id, role.map(|r| r.as_str()))
-            .await
-        {
-            tracing::warn!(sandbox_id = %id, error = %e,
-                "persisting migration role to the sandbox manifest failed (reattach blind spot)");
-        }
+            .await?;
+        self.note_migration_role(id, role);
+        Ok(())
     }
 
     /// ADR 0045 C2: the split-brain flag of a sandbox's open export
@@ -8409,7 +8424,10 @@ impl SandboxBackend for PooledBackend {
             // the export insert sit in that window.
             let t_seal = crate::time_source::metrics_now();
             let (disk_seal, disk_seal_info) = if let Some(backend) = &disk_entry {
-                let (sealed, base_manifest, base_ref) = backend.seal_for_postcopy().await;
+                let (sealed, base_manifest, base_ref) = backend
+                    .seal_for_postcopy()
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(e.to_string()))?;
                 let info = serde_json::json!({
                     "sealed_chunk_indices": sealed.indices(),
                     "manifest": base_manifest,
@@ -8484,9 +8502,9 @@ impl SandboxBackend for PooledBackend {
             // dest is about to load — defuse the guard (abort unfences;
             // commit destroys the sandbox). After this point the
             // presetup must NOT be restored (the move is committing).
-            unwind.defuse();
             self.set_migration_role(id, Some(crate::migration::MigrationRole::PostCopySource))
-                .await;
+                .await?;
+            unwind.defuse();
             peer.register(crate::migrate_peer::PeerExport {
                 export_id: export_id.to_string(),
                 token: pending.peer_token,
@@ -8632,7 +8650,7 @@ impl SandboxBackend for PooledBackend {
         } else {
             // Both drains complete: the dest no longer depends on the
             // source.
-            self.set_migration_role(id, None).await;
+            self.set_migration_role(id, None).await?;
         }
         Ok(outcome)
     }
@@ -9085,10 +9103,7 @@ impl SandboxBackend for PooledBackend {
         self.note_migration_role(id, None);
         let snapshot_dir = export.snapshot_dir.clone();
         drop(export); // releases the capture guard (checkpoint fence)
-        if let Err(e) = self.destroy(id).await {
-            tracing::warn!(sandbox_id = %id, error = %e,
-                "migration commit: destroy failed; orphan_reap will clean up");
-        }
+        self.destroy(id).await?;
         let _ = fs::remove_dir_all(&snapshot_dir).await;
         tracing::info!(sandbox_id = %id, "migration committed; source destroyed (ADR 0045 C1)");
         Ok(())
@@ -9114,7 +9129,7 @@ impl SandboxBackend for PooledBackend {
         if let Some(peer) = self.migrate_peer_server() {
             peer.remove(export_id);
         }
-        self.set_migration_role(id, None).await;
+        self.set_migration_role(id, None).await?;
         // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop the
         // guard before the `requeue_*` awaits.
         #[cfg(target_os = "linux")]
@@ -9407,8 +9422,6 @@ impl SandboxBackend for PooledBackend {
                 // coordinator's finalize after the drain). Disk
                 // durability + the publish gate ride the fetch poller.
                 let _ = mig;
-                self.set_migration_role(id, Some(crate::migration::MigrationRole::PostCopyDest))
-                    .await;
             }
             Some(mig) => {
                 self.migration_finish_restore(id, mig, row_template.expect("set above"))
@@ -9453,145 +9466,184 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
-        // Unregister from the local egress proxy first, so any
-        // outstanding traffic from a still-alive guest stops being
-        // rewritten. The destroy below tears down the VM; in the
-        // brief window between the two, a closed-fail-by-default
-        // registry would reject — which is the safe behavior.
-        //
-        // ADR 0016 Phase B 4: the `session_bindings.remove` MUST run
-        // regardless of whether an egress proxy is wired — Phase B's
-        // LiveManifestPublisher resolves sandbox→session via this
-        // map, and leaking a (destroyed) sandbox_id binding would
-        // make the publisher repeat stale publishes for a session
-        // whose sandbox is gone. Sister-bug to the
-        // `notify_session_policy` fix (commit 5163366): both
-        // population AND cleanup must be unconditional now that the
-        // map is shared with the publisher.
-        let removed_session = self.session_bindings.remove(&id).map(|(_, sid)| sid);
-        // ADR 0090: a destroyed survivor stops advertising quarantine —
-        // the evict_local remediation (or any destroy) closes the loop.
-        self.quarantined_survivors.remove(&id);
-        self.unreachable_guests.remove(&id);
-        if let Some(egress) = self.egress.as_ref() {
-            if let Some(session_id) = removed_session {
-                egress.unregister_session(session_id);
-            }
-        }
-        let result = self.inner.destroy(id).await;
-        // Tear down the NBD daemon AFTER the inner backend has
-        // closed the VM (so the kernel doesn't surface "device
-        // busy" on disconnect). Drop on NbdSandboxState handles
-        // disconnect → join → slot release. Done last so even
-        // if inner.destroy errors, the daemon cleanup still runs.
-        #[cfg(target_os = "linux")]
-        {
-            let _ = self.nbd_sandboxes.remove(&id);
-            if let Some(path) = self.dirty_file_path(id) {
-                match fs::remove_file(&path).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => tracing::warn!(
-                        sandbox_id = %id,
-                        path = %path.display(),
-                        %error,
-                        "destroy could not remove the sandbox dirty file",
-                    ),
-                }
-                let _ = fs::remove_file(crate::disk_daemon::backend::ref_sidecar_path(&path)).await;
-            }
-            // A destroyed sandbox's shutdown spool must not outlive it
-            // (the sandbox_id will never rehydrate again; a leftover
-            // spool is dead weight on the hostPath volume).
-            if let Some(root) = self.shutdown_spool_root() {
-                let _ = crate::disk_daemon::spool::discard_spool(self.host_fs.as_ref(), &root, id)
-                    .await;
-            }
-            // engrams#1378: complete an INTERRUPTED PREDECESSOR teardown. A
-            // destroy that died between the FC kill and the NBD disconnect
-            // left this sandbox's device kernel-connected with no in-memory
-            // entry; the startup classification barrier attributed it via
-            // its durable owner record and parked it as residue, and the
-            // coordinator's tombstone (advertised on the heartbeat) re-drives
-            // destroy on THIS generation — this arm is where that teardown
-            // finally lands. On a disconnect error the residue entry is
-            // restored, so the next tombstone advertise retries; the inert
-            // owner record is lazily cleaned at the next startup.
-            if let Some((_, device)) = self.nbd_residue.remove(&id) {
-                use engram_host_core::NbdKernel as _;
-                match crate::disk_daemon::HostNbdKernel.disconnect(&device).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            sandbox_id = %id,
-                            device = %device.display(),
-                            "destroy completed a predecessor's interrupted NBD \
-                             teardown (tombstone-ordered residue disconnect)",
-                        );
-                        ::metrics::counter!(crate::metrics::NBD_RESIDUE_TEARDOWN_TOTAL)
-                            .increment(1);
+        self.teardowns
+            .run_or_join(id, || {
+                let session_bindings = self.session_bindings.clone();
+                let quarantined_survivors = self.quarantined_survivors.clone();
+                let unreachable_guests = self.unreachable_guests.clone();
+                let egress = self.egress.clone();
+                let inner = self.inner.clone();
+                let last_snapshot_unix_ms = self.last_snapshot_unix_ms.clone();
+                let checkpoint_pacing = self.checkpoint_pacing.clone();
+                let dead_probe_inflight = self.dead_probe_inflight.clone();
+                let checkpoint_chains = self.checkpoint_chains.clone();
+                let chain_heads = self.chain_heads.clone();
+                let capture_locks = self.capture_locks.clone();
+                let snapshot_waits = self.snapshot_waits.clone();
+                #[cfg(target_os = "linux")]
+                let nbd_sandboxes = self.nbd_sandboxes.clone();
+                #[cfg(target_os = "linux")]
+                let nbd_residue = self.nbd_residue.clone();
+                #[cfg(target_os = "linux")]
+                let host_fs = self.host_fs.clone();
+                #[cfg(target_os = "linux")]
+                let dirty_file_path = self.dirty_file_path(id);
+                #[cfg(target_os = "linux")]
+                let shutdown_spool_root = self.shutdown_spool_root();
+                Box::pin(async move {
+                    // Unregister from the local egress proxy first, so any
+                    // outstanding traffic from a still-alive guest stops being
+                    // rewritten. The destroy below tears down the VM; in the
+                    // brief window between the two, a closed-fail-by-default
+                    // registry would reject — which is the safe behavior.
+                    //
+                    // ADR 0016 Phase B 4: the `session_bindings.remove` MUST run
+                    // regardless of whether an egress proxy is wired — Phase B's
+                    // LiveManifestPublisher resolves sandbox→session via this
+                    // map, and leaking a (destroyed) sandbox_id binding would
+                    // make the publisher repeat stale publishes for a session
+                    // whose sandbox is gone. Sister-bug to the
+                    // `notify_session_policy` fix (commit 5163366): both
+                    // population AND cleanup must be unconditional now that the
+                    // map is shared with the publisher.
+                    let removed_session = session_bindings.remove(&id).map(|(_, sid)| sid);
+                    // ADR 0090: a destroyed survivor stops advertising quarantine —
+                    // the evict_local remediation (or any destroy) closes the loop.
+                    quarantined_survivors.remove(&id);
+                    unreachable_guests.remove(&id);
+                    if let Some(egress) = egress.as_ref() {
+                        if let Some(session_id) = removed_session {
+                            egress.unregister_session(session_id);
+                        }
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            sandbox_id = %id,
-                            device = %device.display(),
-                            %error,
-                            "residue NBD disconnect failed; kept for the next \
-                             tombstone advertise to retry",
-                        );
-                        self.nbd_residue.insert(id, device);
+                    let result = inner.destroy(id).await;
+                    // Tear down the NBD daemon AFTER the inner backend has
+                    // closed the VM (so the kernel doesn't surface "device
+                    // busy" on disconnect). Drop on NbdSandboxState handles
+                    // disconnect → join → slot release. Done last so even
+                    // if inner.destroy errors, the daemon cleanup still runs.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = nbd_sandboxes.remove(&id);
+                        if let Some(path) = dirty_file_path {
+                            match fs::remove_file(&path).await {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => tracing::warn!(
+                                    sandbox_id = %id,
+                                    path = %path.display(),
+                                    %error,
+                                    "destroy could not remove the sandbox dirty file",
+                                ),
+                            }
+                            let _ = fs::remove_file(crate::disk_daemon::backend::ref_sidecar_path(
+                                &path,
+                            ))
+                            .await;
+                        }
+                        // A destroyed sandbox's shutdown spool must not outlive it
+                        // (the sandbox_id will never rehydrate again; a leftover
+                        // spool is dead weight on the hostPath volume).
+                        if let Some(root) = shutdown_spool_root {
+                            let _ = crate::disk_daemon::spool::discard_spool(
+                                host_fs.as_ref(),
+                                &root,
+                                id,
+                            )
+                            .await;
+                        }
+                        // engrams#1378: complete an INTERRUPTED PREDECESSOR teardown. A
+                        // destroy that died between the FC kill and the NBD disconnect
+                        // left this sandbox's device kernel-connected with no in-memory
+                        // entry; the startup classification barrier attributed it via
+                        // its durable owner record and parked it as residue, and the
+                        // coordinator's tombstone (advertised on the heartbeat) re-drives
+                        // destroy on THIS generation — this arm is where that teardown
+                        // finally lands. On a disconnect error the residue entry is
+                        // restored, so the next tombstone advertise retries; the inert
+                        // owner record is lazily cleaned at the next startup.
+                        if let Some((_, device)) = nbd_residue.remove(&id) {
+                            use engram_host_core::NbdKernel as _;
+                            match crate::disk_daemon::HostNbdKernel.disconnect(&device).await {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        sandbox_id = %id,
+                                        device = %device.display(),
+                                        "destroy completed a predecessor's interrupted NBD \
+                                         teardown (tombstone-ordered residue disconnect)",
+                                    );
+                                    ::metrics::counter!(crate::metrics::NBD_RESIDUE_TEARDOWN_TOTAL)
+                                        .increment(1);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        sandbox_id = %id,
+                                        device = %device.display(),
+                                        %error,
+                                        "residue NBD disconnect failed; kept for the next \
+                                         tombstone advertise to retry",
+                                    );
+                                    nbd_residue.insert(id, device);
+                                }
+                            }
+                            ::metrics::gauge!(crate::metrics::NBD_RESIDUE_DEVICES)
+                                .set(nbd_residue.len() as f64);
+                        }
                     }
-                }
-                ::metrics::gauge!(crate::metrics::NBD_RESIDUE_DEVICES)
-                    .set(self.nbd_residue.len() as f64);
-            }
-        }
-        // ADR 0016 Phase A: drop the COW diagnostic timestamp so
-        // the entry doesn't outlive its sandbox. A subsequent
-        // `cow_state(id)` returns `None` (no NBD entry, no
-        // snapshot timestamp) — same shape as a brand-new
-        // sandbox.
-        let _ = self.last_snapshot_unix_ms.remove(&id);
-        let _ = self.checkpoint_pacing.remove(&id);
-        let _ = self.dead_probe_inflight.remove(&id);
-        // ADR 0028 Fix A: tear down the checkpoint chain. Durable RECORDS
-        // deliberately survive destroy — an eviction's final checkpoint
-        // must stay re-advertisable until the coord acks it (that's the
-        // whole reconciliation point). GCS chunks are the durable truth;
-        // ADR 0039: the chain is manifest-only now (no local rolling
-        // image), so there's nothing on disk to remove here.
-        //
-        // Issue #529: the same invariant covers `eviction_finalize.rs`'s
-        // `EvictionFinalizeRecord`/`CheckpointRecord{kind:EvictionFinal}`
-        // (`<checkpoint_dir>/finalize/`, `.../records/`) and the
-        // `pending_finalizes` idempotency map — none of the three are
-        // touched here. In the normal flow that's moot: `run_terminal`
-        // deletes the `EvictionFinalizeRecord` and clears
-        // `pending_finalizes` itself, strictly BEFORE calling this
-        // `destroy()` (see the ordering in `run_terminal`). Were `destroy`
-        // ever invoked directly on a sandbox with a still-in-flight
-        // finalize (outside that job's own terminal step — not a path any
-        // caller in this repo takes today), the finalize job would keep
-        // running unaffected: it is a pure function of `dest` + the chunk
-        // store, never the live sandbox, and this method deletes neither.
-        let _ = self.checkpoint_chains.remove(&id);
-        if let Some(store) = &self.chain_heads {
-            store.remove_best_effort(id);
-        }
-        let _ = self.capture_locks.remove(&id);
-        // Issue #221: reclaim any unconsumed `snapshot_wait` slot. The
-        // entry is now kept-until-consumed (so a cancelled coordinator
-        // wait can retry), which means the coordinator's give-up path —
-        // `abort_inflight_snapshot` + `destroy` — must clean it up here
-        // or it leaks for the lifetime of the host. Abort the backing
-        // upload task too (the sandbox is gone; the artifacts, if any,
-        // are covered by the durable checkpoint record).
-        if let Some((_, wait)) = self.snapshot_waits.remove(&id) {
-            wait.abort.abort();
-        }
-        result
+                    // ADR 0016 Phase A: drop the COW diagnostic timestamp so
+                    // the entry doesn't outlive its sandbox. A subsequent
+                    // `cow_state(id)` returns `None` (no NBD entry, no
+                    // snapshot timestamp) — same shape as a brand-new
+                    // sandbox.
+                    let _ = last_snapshot_unix_ms.remove(&id);
+                    let _ = checkpoint_pacing.remove(&id);
+                    let _ = dead_probe_inflight.remove(&id);
+                    // ADR 0028 Fix A: tear down the checkpoint chain. Durable RECORDS
+                    // deliberately survive destroy — an eviction's final checkpoint
+                    // must stay re-advertisable until the coord acks it (that's the
+                    // whole reconciliation point). GCS chunks are the durable truth;
+                    // ADR 0039: the chain is manifest-only now (no local rolling
+                    // image), so there's nothing on disk to remove here.
+                    //
+                    // Issue #529: the same invariant covers `eviction_finalize.rs`'s
+                    // `EvictionFinalizeRecord`/`CheckpointRecord{kind:EvictionFinal}`
+                    // (`<checkpoint_dir>/finalize/`, `.../records/`) and the
+                    // `pending_finalizes` idempotency map — none of the three are
+                    // touched here. In the normal flow that's moot: `run_terminal`
+                    // deletes the `EvictionFinalizeRecord` and clears
+                    // `pending_finalizes` itself, strictly BEFORE calling this
+                    // `destroy()` (see the ordering in `run_terminal`). Were `destroy`
+                    // ever invoked directly on a sandbox with a still-in-flight
+                    // finalize (outside that job's own terminal step — not a path any
+                    // caller in this repo takes today), the finalize job would keep
+                    // running unaffected: it is a pure function of `dest` + the chunk
+                    // store, never the live sandbox, and this method deletes neither.
+                    let _ = checkpoint_chains.remove(&id);
+                    if let Some(store) = &chain_heads {
+                        store.remove_best_effort(id);
+                    }
+                    let _ = capture_locks.remove(&id);
+                    // Issue #221: reclaim any unconsumed `snapshot_wait` slot. The
+                    // entry is now kept-until-consumed (so a cancelled coordinator
+                    // wait can retry), which means the coordinator's give-up path —
+                    // `abort_inflight_snapshot` + `destroy` — must clean it up here
+                    // or it leaks for the lifetime of the host. Abort the backing
+                    // upload task too (the sandbox is gone; the artifacts, if any,
+                    // are covered by the durable checkpoint record).
+                    if let Some((_, wait)) = snapshot_waits.remove(&id) {
+                        wait.abort.abort();
+                    }
+                    result.map_err(Arc::new)
+                })
+            })
+            .await
+            .map_err(|error| SandboxError::Vm(Box::new(error)))
     }
 
     async fn start_agent(&self, id: SandboxId, mut agent: AgentSpec) -> Result<(), SandboxError> {
+        let _capture_guard = self.capture_lock(id).lock_owned().await;
+        // This also waits for the checkpoint post phase. Capture and swap
+        // arming must be exclusive; the wait is bounded by the capture.
         // ADR 0021 P1.2: only the host-agent knows the per-host egress-
         // proxy CA, so it stamps the PEM onto the AgentSpec right
         // before the backend sees it. Each backend rides it into the
@@ -10354,7 +10406,9 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-        self.inner.list().await
+        let mut ids: std::collections::HashSet<_> = self.inner.list().await?.into_iter().collect();
+        ids.extend(self.teardowns.keys());
+        Ok(ids.into_iter().collect())
     }
 
     /// ADR 0035 amendment D2: proxy to the wrapped backend — FC and VZ override
@@ -13141,7 +13195,7 @@ mod tests {
         disk.write(0, &vec![0x42u8; chunk_size as usize])
             .await
             .unwrap();
-        let (seal, _m, _r) = disk.seal_for_postcopy().await;
+        let (seal, _m, _r) = disk.seal_for_postcopy().await.unwrap();
         assert_eq!(seal.indices(), vec![0]);
 
         let export_dir = tmp.path().join("export");
@@ -15729,6 +15783,196 @@ mod tests {
         // keep `tmp` alive for the backend's lifetime
         std::mem::forget(tmp);
         PooledBackend::new(inner)
+    }
+
+    struct CustodyBackend {
+        root: PathBuf,
+        id: SandboxId,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        calls: PlMutex<Vec<&'static str>>,
+        fail_destroy: bool,
+    }
+
+    impl CustodyBackend {
+        async fn park(&self, operation: &'static str) {
+            self.calls.lock().push(operation);
+            self.entered.notify_one();
+            let release = self.release.lock().await.take();
+            if let Some(release) = release {
+                release.await.unwrap();
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SandboxBackend for CustodyBackend {
+        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            Ok(self.id)
+        }
+        async fn exec_stream(
+            &self,
+            _: SandboxId,
+            _: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            Err(SandboxError::NotFound)
+        }
+        async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            self.park("snapshot").await;
+            Ok(fake_metadata())
+        }
+        fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+            self.root.join(id.to_string())
+        }
+        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            self.park("restore").await;
+            Ok(self.id)
+        }
+        async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+            self.park("destroy").await;
+            if self.fail_destroy {
+                Err(SandboxError::Vm("destroy failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            Ok(vec![])
+        }
+        async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+            self.calls.lock().push("start_agent");
+            Ok(())
+        }
+    }
+
+    fn custody_backend(
+        root: &Path,
+        fail_destroy: bool,
+    ) -> (Arc<CustodyBackend>, tokio::sync::oneshot::Sender<()>) {
+        let (release, rx) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(CustodyBackend {
+                root: root.to_path_buf(),
+                id: SandboxId::new(),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Mutex::new(Some(rx)),
+                calls: PlMutex::new(Vec::new()),
+                fail_destroy,
+            }),
+            release,
+        )
+    }
+
+    #[tokio::test]
+    async fn cancelled_destroy_keeps_cleanup_and_joiners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (inner, release) = custody_backend(tmp.path(), false);
+        let pooled = PooledBackend::new(inner.clone());
+        let id = inner.id;
+        pooled.bind_session(SessionId::new(), id);
+        pooled.last_snapshot_unix_ms.insert(id, 1);
+        let _lock = pooled.capture_lock(id);
+        let mut first = Box::pin(pooled.destroy(id));
+        assert!(futures::poll!(&mut first).is_pending());
+        inner.entered.notified().await;
+        drop(first);
+        assert_eq!(pooled.list().await.unwrap(), vec![id]);
+        let mut second = Box::pin(pooled.destroy(id));
+        assert!(futures::poll!(&mut second).is_pending());
+        release.send(()).unwrap();
+        second.await.unwrap();
+        assert_eq!(*inner.calls.lock(), vec!["destroy"]);
+        assert!(pooled.list().await.unwrap().is_empty());
+        assert!(!pooled.session_bindings.contains_key(&id));
+        assert!(!pooled.last_snapshot_unix_ms.contains_key(&id));
+        assert!(!pooled.capture_locks.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn cancelled_restore_records_post_copy_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (inner, release) = custody_backend(tmp.path(), false);
+        let pooled = Arc::new(PooledBackend::new(inner.clone()));
+        let metadata = fake_metadata();
+        let dir = inner.snapshot_path_for(metadata.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(engram_sandbox_firecracker::MIGRATION_PEER_FILE),
+            b"{}",
+        )
+        .unwrap();
+        let caller = pooled.clone();
+        let restore =
+            tokio::spawn(async move { caller.restore_with(metadata, false, false, vec![]).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), inner.entered.notified())
+            .await
+            .unwrap();
+        restore.abort();
+        assert!(restore.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !pooled.migration_roles.contains_key(&inner.id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *pooled.migration_roles.get(&inner.id).unwrap(),
+            crate::migration::MigrationRole::PostCopyDest
+        );
+    }
+
+    #[tokio::test]
+    async fn start_agent_waits_for_capture_and_post_phase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (inner, release) = custody_backend(tmp.path(), false);
+        let pooled = PooledBackend::new(inner.clone());
+        let mut capture = Box::pin(pooled.capture_phase(inner.id, SwapDisarmPolicy::Periodic));
+        assert!(futures::poll!(&mut capture).is_pending());
+        let agent = AgentSpec {
+            argv: vec![],
+            env: Default::default(),
+            session_env: Default::default(),
+            binding_epoch: 1,
+            host_ca_pem: None,
+        };
+        let mut start = Box::pin(pooled.start_agent(inner.id, agent));
+        assert!(futures::poll!(&mut start).is_pending());
+        assert_eq!(*inner.calls.lock(), vec!["snapshot"]);
+        release.send(()).unwrap();
+        let (guard, cap) = capture.await.unwrap();
+        assert!(futures::poll!(&mut start).is_pending());
+        drop(cap);
+        drop(guard);
+        start.await.unwrap();
+        assert_eq!(*inner.calls.lock(), vec!["snapshot", "start_agent"]);
+    }
+
+    #[tokio::test]
+    async fn migration_commit_propagates_destroy_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (inner, release) = custody_backend(tmp.path(), true);
+        release.send(()).unwrap();
+        let pooled = PooledBackend::new(inner.clone());
+        let id = inner.id;
+        let export_id = "commit-error".to_string();
+        assert!(pooled.migrations.insert(crate::migration::MigrationExport {
+            export_id: export_id.clone(),
+            sandbox_id: id,
+            snapshot_dir: tmp.path().join("export"),
+            allowed_chunks: Default::default(),
+            disk_pending: None,
+            disk_seal: None,
+            clock: pooled.clock.clone(),
+            created_at: std::time::Duration::ZERO,
+            post_copy: false,
+            state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_activity: Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
+            capture_guard: pooled.capture_lock(id).lock_owned().await,
+        }));
+        let error = pooled.migration_commit(id, &export_id).await.unwrap_err();
+        assert!(error.to_string().contains("destroy failed"));
     }
 
     /// A `SnapshotMetadata` carrying a recognizable id for assertions.

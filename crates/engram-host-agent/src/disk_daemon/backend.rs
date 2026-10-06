@@ -2339,7 +2339,9 @@ impl ChunkedDiskBackend {
     /// land), so the destination rebases to it and resolves non-sealed
     /// chunks via cache/GCS; sealed indices override via the peer.
     /// `guest content == manifest ⊕ seal` at the freeze instant.
-    pub async fn seal_for_postcopy(&self) -> (PostCopyDiskSeal, Manifest, ManifestRef) {
+    pub async fn seal_for_postcopy(
+        &self,
+    ) -> Result<(PostCopyDiskSeal, Manifest, ManifestRef), DiskBackendError> {
         let mut chunks = HashMap::new();
         {
             let tier = self.dirty_tier.lock().await;
@@ -2355,14 +2357,17 @@ impl ChunkedDiskBackend {
                         chunks.insert(chunk_idx, bytes);
                     }
                     Some(Err(error)) => {
-                        tracing::error!(
-                            path = %tier.active.path.display(),
-                            chunk = chunk_idx,
-                            %error,
-                            "post-copy seal could not read an overlay chunk",
-                        );
+                        return Err(dirty_file_error(
+                            "seal overlay chunk",
+                            &tier.active.path,
+                            error,
+                        ));
                     }
-                    None => {}
+                    None => {
+                        return Err(DiskBackendError::InvariantViolation(format!(
+                            "seal read of allocated chunk {chunk_idx} not present in any overlay"
+                        )))
+                    }
                 }
             }
             // ADR 0110 addendum: nothing to clear. The old design
@@ -2396,7 +2401,7 @@ impl ChunkedDiskBackend {
             working_set_trace: None,
             annotations: serde_json::Value::Null,
         };
-        (PostCopyDiskSeal { chunks }, manifest, state.manifest_ref)
+        Ok((PostCopyDiskSeal { chunks }, manifest, state.manifest_ref))
     }
 
     /// ADR 0045 C2 disk post-copy abort path: the move failed before
@@ -6481,7 +6486,7 @@ mod tests {
         for (offset, bytes) in writes_after_flush_starts {
             backend.write(*offset, bytes).await.unwrap();
         }
-        let (seal, manifest, manifest_ref) = backend.seal_for_postcopy().await;
+        let (seal, manifest, manifest_ref) = backend.seal_for_postcopy().await.unwrap();
         drop(interrupted_flush);
         SealedSnapshot {
             seal: Arc::new(seal),
@@ -6493,6 +6498,28 @@ mod tests {
     /// Restore a captured disk after an aborted move.
     async fn restore_sealed_snapshot(backend: &ChunkedDiskBackend, snapshot: &SealedSnapshot) {
         backend.requeue_postcopy_seal(&snapshot.seal).await;
+    }
+
+    #[tokio::test]
+    async fn seal_rejects_truncated_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let manifest = synth_manifest(4096, 4096, vec![]);
+        let cache = ChunkCache::new(ChunkCacheConfig::new(dir.path().join("cache")));
+        let backend =
+            ChunkedDiskBackend::new(ManifestRef::new(), &manifest, cache, store, u64::MAX).unwrap();
+        backend.write(0, &vec![0x42; 4096]).await.unwrap();
+        let (seal, _, _) = backend.seal_for_postcopy().await.unwrap();
+        assert_eq!(seal.get(0).unwrap().as_ref(), &[0x42; 4096]);
+        let path = backend.dirty_tier.lock().await.active.path.clone();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert!(backend.seal_for_postcopy().await.is_err());
     }
 
     /// A source seal preserves the newest guest-visible disk and keeps its

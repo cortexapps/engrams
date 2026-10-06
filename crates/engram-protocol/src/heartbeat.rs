@@ -17,7 +17,8 @@ fn default_true() -> bool {
 /// local NVMe — the scheduler uses the readiness set to gate session
 /// creates onto hosts that can serve them quickly.
 ///
-/// `running_sandboxes` is the load-bearing input to ADR 0009's
+/// `running_sandboxes` includes running and tearing-down residents.
+/// It is the load-bearing input to ADR 0009's
 /// reconciliation pass: the coord intersects this against
 /// `sessions` rows where `host_id = this_host AND status = 'active'`,
 /// and any session whose sandbox is missing for N consecutive
@@ -28,7 +29,7 @@ pub struct Heartbeat {
     pub host_id: HostId,
     pub sent_at: DateTime<Utc>,
     pub capacity: HostCapacityReport,
-    /// Sandbox IDs currently live on this host (per `backend.list()`).
+    /// Resident sandbox IDs: running plus tearing-down (per `backend.list()`).
     /// Empty on hosts that haven't enabled reconciliation yet (Phase 1
     /// observation window). ~12 B per id × ~50 sandboxes ≈ 600 B per
     /// heartbeat — trivial. Ordered for deterministic test fixtures;
@@ -142,6 +143,7 @@ pub struct CheckpointAdvert {
 pub struct HostCapacityReport {
     pub total_mib: u64,
     pub used_mib: u64,
+    /// Resident count: running plus tearing-down sandboxes.
     pub running_sandboxes: u32,
 }
 

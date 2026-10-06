@@ -581,6 +581,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn migration_roles_recover_from_external_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox_id = engram_core::SandboxId::new();
+        let dir = tmp.path().join(sandbox_id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = SandboxManifest {
+            schema_version: SCHEMA_VERSION,
+            sandbox_id,
+            backend: BACKEND_FIRECRACKER.to_string(),
+            spec: engram_core::types::sandbox::SandboxSpec {
+                image: "test".into(),
+                rootfs_source: None,
+                image_uri: None,
+                rootfs_manifest: None,
+                cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
+                memory: engram_core::types::sandbox::MemoryLimit { max_mib: 64 },
+                disk: engram_core::types::sandbox::DiskLimit { max_gib: 1 },
+                ttl: None,
+                env: Default::default(),
+                workdir: None,
+                network: Default::default(),
+                aux_ro_drives: Vec::new(),
+                swap_mib: None,
+            },
+            firecracker: FirecrackerProcessRecord {
+                process: ProcessRecord {
+                    // Guaranteed-dead pid (above kernel default pid_max).
+                    pid: 16_000_001,
+                    start_time_jiffies: 42,
+                    comm: "firecracker".into(),
+                },
+                api_socket: tmp.path().join("nonexistent.sock"),
+                vsock_uds_base: tmp.path().join("nonexistent.vsock"),
+                rootfs_canonical: tmp.path().join("rootfs/nonexistent.dev"),
+                swap_canonical: None,
+                vsock_cid: 3,
+            },
+            network: None,
+            netns: None,
+            uffd_handler: None,
+            migration_role: None,
+        };
+        for (role, expected) in [
+            (
+                Some("post-copy-dest"),
+                Some(crate::migration::MigrationRole::PostCopyDest),
+            ),
+            (None, None),
+            (Some("invalid-role"), None),
+        ] {
+            manifest.migration_role = role.map(str::to_owned);
+            std::fs::write(
+                dir.join("sandbox.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let roles = scan_migration_roles(tmp.path());
+            assert_eq!(
+                roles,
+                expected.map(|r| vec![(sandbox_id, r)]).unwrap_or_default()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dead_pid_is_orphaned_not_reattached() {
         let tmp = tempfile::tempdir().unwrap();

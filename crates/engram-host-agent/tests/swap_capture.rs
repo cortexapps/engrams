@@ -146,10 +146,19 @@ async fn capture_disarms_swap_and_restore_wakes_swapless() {
 
     // ---- 3. Checkpoint (Periodic flavor): disarm → capture → re-arm ----
     let t = Instant::now();
-    let ckpt = pooled
-        .checkpoint_sandbox(sandbox)
-        .await
-        .expect("checkpoint of a swap-armed guest");
+    let agent = engram_core::types::sandbox::AgentSpec {
+        argv: Vec::new(),
+        env: Default::default(),
+        session_env: Default::default(),
+        binding_epoch: 1,
+        host_ca_pem: None,
+    };
+    let (ckpt, start) = tokio::join!(
+        pooled.checkpoint_sandbox(sandbox),
+        pooled.start_agent(sandbox, agent),
+    );
+    let ckpt = ckpt.expect("checkpoint of a swap-armed guest");
+    start.expect("concurrent start_agent");
     eprintln!(
         "SWAP: checkpoint {} ms, memory manifest {:?}",
         t.elapsed().as_millis(),

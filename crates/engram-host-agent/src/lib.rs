@@ -633,7 +633,6 @@ impl HostAgent {
                         let pooled_for_reap = pooled.clone();
                         tokio::spawn(async move {
                             use engram_core::traits::sandbox::SandboxBackend as _;
-                            pooled_for_reap.set_migration_role(sandbox_id, None).await;
                             if let Err(e) = pooled_for_reap.destroy(sandbox_id).await {
                                 tracing::warn!(%sandbox_id, error = %e,
                                     "reattached post-copy dest reap failed");
@@ -687,7 +686,6 @@ impl HostAgent {
                                     migration::ReattachSourceVerdict::Destroy => {
                                         tracing::info!(%sandbox_id,
                                             "ownership moved on; destroying the frozen post-copy source");
-                                        pooled_for_src.set_migration_role(sandbox_id, None).await;
                                         if let Err(e) = pooled_for_src.destroy(sandbox_id).await {
                                             tracing::warn!(%sandbox_id, error = %e,
                                                 "frozen source destroy failed");
@@ -1479,6 +1477,7 @@ impl HostAgent {
                     // explicit `running_sandboxes_known = false` so the
                     // coord skips reconcile for this heartbeat instead of
                     // mistaking the empty set for a real running set.
+                    // Residents include running and tearing-down sandboxes.
                     let (running_sandboxes, running_sandboxes_known) = match pooled_for_heartbeat
                         .list()
                         .await

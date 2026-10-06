@@ -25,6 +25,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use engram_chunk_store::manifest::ChunkHash;
 use engram_core::SandboxId;
+use engram_sandbox_firecracker::sandbox_manifest::{ROLE_POST_COPY_DEST, ROLE_POST_COPY_SOURCE};
 
 /// No commit/abort within this window triggers the coordinator
 /// ownership check (see module docs). The clock runs from the LAST
@@ -50,15 +51,15 @@ pub enum MigrationRole {
 impl MigrationRole {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::PostCopySource => "post-copy-source",
-            Self::PostCopyDest => "post-copy-dest",
+            Self::PostCopySource => ROLE_POST_COPY_SOURCE,
+            Self::PostCopyDest => ROLE_POST_COPY_DEST,
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "post-copy-source" => Some(Self::PostCopySource),
-            "post-copy-dest" => Some(Self::PostCopyDest),
+            ROLE_POST_COPY_SOURCE => Some(Self::PostCopySource),
+            ROLE_POST_COPY_DEST => Some(Self::PostCopyDest),
             _ => None,
         }
     }
@@ -673,5 +674,17 @@ mod tests {
             );
             assert!(!reg.validate_open(id), "export fully consumed");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn migration_role_wire_names_agree() {
+    for (role, name) in [
+        (MigrationRole::PostCopySource, ROLE_POST_COPY_SOURCE),
+        (MigrationRole::PostCopyDest, ROLE_POST_COPY_DEST),
+    ] {
+        assert_eq!(role.as_str(), name);
+        assert_eq!(MigrationRole::parse(name), Some(role));
     }
 }

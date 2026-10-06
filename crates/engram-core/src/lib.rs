@@ -20,3 +20,5 @@ pub use traits::{
     MetadataStore, SandboxBackend, SecretStore,
 };
 pub use types::*;
+
+pub mod teardown;
