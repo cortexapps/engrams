@@ -11,3 +11,14 @@ kek:
   gcpResource: projects/ci/locations/global/keyRings/ci/cryptoKeys/ci
 secrets:
   gcpProjectId: ci-render-stub
+# The chart default sign-in door is `oauth`, which needs a provider and
+# an allowlist.
+orchestrator:
+  auth:
+    oauth:
+      issuer: https://idp.ci-render-stub.example
+      clientId: ci-render-stub
+      clientSecret:
+        existingSecret: ci-render-stub
+      allowedDomains:
+        - ci-render-stub.example

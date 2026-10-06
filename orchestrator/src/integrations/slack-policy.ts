@@ -1,21 +1,19 @@
 /**
- * Slack CommunicationPolicy (ADR 0060 P2.10) — the v1 provider-mechanics impl
- * behind the SlackThreadWorkflow's policy seam. Outbound Block Kit shaping lives
- * in slack-blocks.ts and inbound message rendering in slack-message-text.ts;
- * this module is the thin layer that drives the Slack WebClient (reactions,
- * posts, updates, thread reads). Every method is invoked by the framework as a
- * checkpointed DBOS step, so it runs once per effect.
+ * Slack CommunicationPolicy (ADR 0060 P2.10) — the provider-mechanics impl
+ * behind the relay block's policy seam (ADR 0119). Outbound Block Kit shaping
+ * lives in slack-blocks.ts; this module is the thin layer that drives the
+ * Slack WebClient (reactions, posts, updates, uploads). Every method is
+ * invoked by the framework as a checkpointed DBOS step, so it runs once per
+ * effect.
  *
  * The Slack client is injected (default = the authed WebClient from slack.ts),
- * which keeps the policy — including the thread→prompt fold — unit-testable
- * without a network or the engine.
+ * which keeps the policy unit-testable without a network or the engine.
  */
 
 import type { KnownBlock } from "@slack/types";
 
 import { log as rootLog } from "../log.ts";
 import { getSlackClient } from "./slack.ts";
-import { replyText, type SlackReply } from "./slack-message-text.ts";
 import {
   parseUserQuestion,
   parseQuestionAnswers,
@@ -24,28 +22,17 @@ import {
   buildAssetLine,
   buildClosingBlocks,
   buildMessageBlocks,
-  buildProfilePickerBlocks,
-  buildProfileChosenBlocks,
   type ThreadRoute,
 } from "./slack-blocks.ts";
-import { summarizeAsset, type CommunicationPolicy, type StartedSession } from "../workflows/communication-policy.ts";
-import type { SourceMention } from "../workflows/thread-inbox.ts";
+import {
+  summarizeAsset,
+  type CommunicationPolicy,
+  type SourceMention,
+  type StartedSession,
+} from "../workflows/communication-policy.ts";
 import { fetchArtifactBytes, type FetchedArtifact } from "../control-plane/artifact-fetch.ts";
 
 const log = rootLog.child({ component: "slack" });
-
-/** The flavor appended to a triggered agent's system prompt (ADR 0060 Decision
- *  8) — NOT connector config; a constant this policy provides at session
- *  create so the agent behaves well in a chat thread. */
-const SYSTEM_PROMPT_APPEND = `You are running inside an engrams session triggered from a Slack thread.
-Keep replies concise and chat-friendly.
-
-When you need a decision or clarification from the user, ask via the ask_user_question tool — it renders as interactive buttons in Slack — rather than guessing. The user cannot see your terminal, so surface results, links, and artifacts explicitly. When handling code related tasks, prefer showing your work rather than just saying you're done. Prefer video over images if available.
-
-Conform to slack markdown in your responses. Examples:
-Links are formatted as <url|optional link title>
-Bold is single asterisks surrounding text, like *this*.
-Italics are underlines surrounding text like _this_.`;
 
 /** Inline-upload a shared file to Slack up to this size; a larger artifact posts
  *  a link to the session instead, so the orchestrator never buffers a huge blob
@@ -68,14 +55,6 @@ export interface SlackPolicyClient {
     }): Promise<{ ts?: string }>;
     update(args: { channel: string; ts: string; text?: string; blocks?: KnownBlock[] }): Promise<unknown>;
   };
-  conversations: {
-    replies(args: {
-      channel: string;
-      ts: string;
-      oldest?: string;
-      limit?: number;
-    }): Promise<{ messages?: SlackReply[] }>;
-  };
   files: {
     uploadV2(args: {
       channel_id: string;
@@ -97,70 +76,8 @@ export interface SlackPolicyDeps {
   /** Extra route fields stamped into every Block Kit value this policy posts
    * (the automation relay sets `{runId}` so answers route to its run). */
   routeExtras?: Partial<Pick<ThreadRoute, "runId">>;
-  /** The bot's own user id, so its `<@bot>` mention is stripped from prompts.
-   *  Optional: when unset, all `<@…>` mentions are stripped. */
-  botUserId?: string;
   /** Fetch a shared artifact's bytes (injectable for tests). */
   fetchArtifact?: FetchArtifactFn;
-}
-
-/**
- * Fold a page of thread replies into the session prompt + the new cursor. Pure.
- * The cursor (`maxTs`) advances past EVERY reply seen — including the bot's own
- * — so the next gather never re-reads. Bot-authored replies never feed the
- * prompt (the agent must not be prompted with its own posts) — EXCEPT the
- * thread ROOT (`rootTs`): it is the subject of the thread, so a bot-authored
- * root (an alert, a workflow post, another app) stays in as context. `since`
- * is exclusive: `conversations.replies(oldest=)` is inclusive, so the boundary
- * message is dropped here. Each kept message contributes ALL of its content —
- * `replyText` reads text, blocks, attachments, and files alike.
- *
- * Shape: the triggering @mention (identified by `triggerTs`) is the directive
- * and goes at the BOTTOM; every other kept message is prior thread context,
- * wrapped in `<thread context>…</thread context>` above it. With no other
- * messages the prompt is just the directive (no wrapper). If `triggerTs` matches
- * nothing in this page (the mention wasn't returned), fall back to a plain join.
- */
-export function foldReplies(
-  messages: SlackReply[],
-  since: string | null,
-  botUserId?: string,
-  triggerTs?: string,
-  rootTs?: string,
-): { prompt: string; maxTs: string } {
-  let maxTs = since ?? "0";
-  const kept: { ts: string; text: string }[] = [];
-  for (const msg of messages) {
-    const ts = msg.ts ?? "";
-    if (since && num(ts) <= num(since)) continue; // already delivered
-    if (num(ts) > num(maxTs)) maxTs = ts; // advance past everything seen
-    const isRoot = rootTs !== undefined && ts === rootTs;
-    if (!isRoot && (msg.bot_id || (botUserId && msg.user === botUserId))) continue;
-    const text = stripMentions(replyText(msg), botUserId).trim();
-    if (text) kept.push({ ts, text });
-  }
-
-  const idx = triggerTs ? kept.findIndex((h) => h.ts === triggerTs) : -1;
-  if (idx === -1) {
-    // No identified directive — emit the messages plainly, no wrapper.
-    return { prompt: kept.map((h) => h.text).join("\n\n"), maxTs };
-  }
-  const context = kept.filter((_, i) => i !== idx).map((h) => h.text);
-  const directive = kept[idx].text;
-  const prompt = context.length
-    ? `<thread context>\n${context.join("\n")}\n</thread context>\n\n${directive}`
-    : directive;
-  return { prompt, maxTs };
-}
-
-const num = (ts: string): number => Number.parseFloat(ts) || 0;
-
-/** Strip the bot's `<@id>` mention (or all mentions when the id is unknown).
- *  Collapses runs of spaces/tabs (the hole a removed mention leaves) but keeps
- *  newlines — multi-line messages must reach the prompt intact. */
-function stripMentions(text: string, botUserId?: string): string {
-  const re = botUserId ? new RegExp(`<@${botUserId}(\\|[^>]*)?>`, "g") : /<@[^>]+>/g;
-  return text.replace(re, " ").replace(/[^\S\n]+/g, " ");
 }
 
 /** The slice of a `file_shared` event payload the upload path reads. */
@@ -214,7 +131,6 @@ function synthesizeFilename(mediaType: string): string {
 export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy {
   const getClient =
     deps.client ?? (async () => (await getSlackClient()) as unknown as SlackPolicyClient);
-  const botUserId = deps.botUserId;
   const fetchArtifact: FetchArtifactFn =
     deps.fetchArtifact ??
     ((sessionId, artifactId) => fetchArtifactBytes(sessionId, artifactId, MAX_SLACK_UPLOAD_BYTES));
@@ -260,32 +176,6 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
   }
 
   return {
-    systemPromptAppend: SYSTEM_PROMPT_APPEND,
-
-    onPickup: (m) => react(m, "eyes"),
-
-    async onProfileChoice(m, options) {
-      log.info(
-        { channel: m.channel, thread: m.threadRoot, options: options.length },
-        "slack: asking the user to pick a profile",
-      );
-      // The mentioning user (m.user) is the only one whose pick is accepted;
-      // the mention's eventId dedupes the ask (first selection wins).
-      const blocks = buildProfilePickerBlocks(route(m), m.user, m.eventId, options);
-      return post(m, "Which profile should handle this?", blocks);
-    },
-
-    async onProfileChosen(m, ref, profileName) {
-      const text = `Running with ${profileName}`;
-      const blocks = buildProfileChosenBlocks(profileName);
-      if (ref) {
-        const c = await getClient();
-        await c.chat.update({ channel: m.channel, ts: ref, text, blocks });
-      } else {
-        await post(m, text, blocks);
-      }
-    },
-
     async onStarted(m, session) {
       log.info({ channel: m.channel, thread: m.threadRoot, sessionId: session.id }, "slack: session started");
       await post(m, `Started a session — ${session.webUrl}`);
@@ -408,20 +298,6 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
       } catch {
         /* best-effort — if Slack is down we can't notify, but we must not throw */
       }
-    },
-
-    async gatherThreadContext(m, since) {
-      const c = await getClient();
-      const res = await c.conversations.replies({
-        channel: m.channel,
-        ts: m.threadRoot,
-        ...(since ? { oldest: since } : {}),
-      });
-      // m.ts is the triggering @mention — the directive; everything else in the
-      // thread is context (wrapped), INCLUDING a bot-authored root. For a
-      // follow-up the workflow passes the new mention, so its ts is the
-      // directive for that turn (the root is behind the cursor by then).
-      return foldReplies(res.messages ?? [], since, botUserId, m.ts, m.threadRoot);
     },
   };
 }

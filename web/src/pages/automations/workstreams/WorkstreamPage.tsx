@@ -263,7 +263,7 @@ export function WorkstreamPage() {
         <div className="flex min-w-0 flex-wrap items-center gap-3">
           <StatusDot tone={open ? "nominal" : "muted"} size={10} label={instance.status} />
           <Text as="h1" variant="display" className="truncate">
-            {humanizeWorkstreamName(instance.key)}
+            {instance.label || humanizeWorkstreamName(instance.key)}
           </Text>
           <span className="rounded-full bg-secondary px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground">
             {open ? `open ${relativeAge(instance.openedAt, now)}` : "closed"}

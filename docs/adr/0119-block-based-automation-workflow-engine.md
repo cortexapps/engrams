@@ -1,6 +1,12 @@
 # ADR 0119: Automations as a block-based durable workflow engine
 
-Status: 2026-08-21 — **Proposed.**
+Status: 2026-08-21 — Proposed. **2026-10-05 — Accepted.** Every phase shipped
+and the two hardcoded graphs it set out to replace are deleted: the legacy
+PR-review engine (phase 4.7, #1551), its enrollment table (4.7b, #1574), and
+the Slack thread workflow with its kill switch (4.8, this change). The
+built-ins run on the block engine in production; the pitfalls each phase
+met are recorded inline below (the parallel-window suppression, thread
+continuity, the no-timeouts rule, the per-pod DBOS executor in ADR 0104).
 
 Builds on ADR 0051 (the TypeScript orchestration tier), ADR 0060 (external
 triggers and durable DBOS workflows), ADR 0100 (PR code review), ADR 0102
@@ -309,9 +315,17 @@ wins) and enables the built-in when anything is enrolled, so a repo still on
 the legacy flag keeps getting reviews across the deploy. Both built-ins now
 seed **enabled**: enrolling a repo (reviews) or picking a default profile
 (Slack) is the one switch, and an empty map or profile admits nothing.
-`review_enrollment` itself stays for one more phase (4.7b): the Repositories
-page still writes the row, and `db/review-enrollment-sync.ts` mirrors it into
-the map in one transaction.
+`review_enrollment` itself stayed for one more phase (4.7b, 2026-10-05):
+the Repositories page wrote the row, and `db/review-enrollment-sync.ts`
+mirrored it into the map in one transaction. 4.7b made the map the single
+source: migration 0091 drops the table, the sync and the enrollment store
+are gone with the three `ReviewService` enrollment RPCs, the Repositories
+page writes `SetMapInputEntry` on the built-in (as the Slack page writes a
+channel override), and the retry RPC and the CI dispatch edge read
+`reviews/enrolled-repos.ts` — the built-in's `repos` input, matched
+case-insensitively as its own admission is. A repo's per-row profile id
+and the three-state autofix went with the table: the built-in never read
+them (the reviewer profile is the `profile` input; autofix is a boolean).
 
 **Slack turns (2026-10-01).** The brain's v1 divergence (a plain thread
 reply as a turn, no `<thread context>` fold) is reverted to the legacy
@@ -334,6 +348,33 @@ feeds a `{template}` session ref that `send_prompt` and the relay adopt
 (D11, same workstream, terminal owner). A fresh session is created only when
 none exists or it is gone.
 
+Two pitfalls from the first resumed thread in production (2026-10-01). The
+resume is silent: the thread carries the session link from its first run,
+and a "Resumed the session" line read as a restart, so the brain posts
+nothing. Its prompt folds only what the kept session has not seen — the
+lookup now runs BEFORE the fold, and a resumed thread's `since` is the
+brain's own newest reply (the app's bot user from `authorizations`, so
+another bot's post never moves the floor); the opening of a fresh thread
+still brings the whole thread. And the automation consumer had memoized the
+session's run binding at the listener's first look: adoption moved the
+binding to the new run, but every later session event still went to the
+finished run's mailbox and was dropped there, so the resumed run never saw
+its session speak. The consumer now re-reads the binding per event.
+
+**No timeouts (2026-10-03).** A thread must be answerable a year later and a
+turn may run for hours, so nothing time-based fails a thread. A turn (the
+harness working on one prompt) had a 1 h wait deadline, and a 64-minute task
+ended its run with ❌ "wait deadline expired" while the session was still
+working. The wait is now open-ended: `wait_session until: idle` in a loop
+of day-long slices, each slice's deadline a normal outcome
+(`onDeadline: continue`, now accepted by `send_prompt` and `wait_session`
+as by `wait_event`), the loop ending on idle or the session's end;
+`send_prompt` sends with `waitFor: none` and the same loop follows. The run
+ceiling (48 h, the engine's maximum) is the only clock left, and it is a
+pause like the idle exit — no recap, the workstream open — since it can
+only fall under a turn still running. The idle exit (default 1 h quiet)
+stays: it ends the RUN, never the thread.
+
 The reviewer profile seed and the `pr_reviewer` designation retire in the
 same phase (migration 0089). A built-in cannot carry a profile id, and the
 designation was the indirection that let it name one; the product model
@@ -347,6 +388,27 @@ Reviewer" row stays as an ordinary profile.
 `review_enrollment` lifts into the review built-in's `repos` input at first
 seed and is dropped at the end. GitHub `installation_repositories` events
 reach the ledger but never write the input.
+
+**Phase 4.8 (2026-10-05): the legacy Slack engine is gone.** Deleted:
+`workflows/slack-thread.ts`, `thread-control-plane.ts`, `thread-inbox.ts`,
+`thread-workflow-id.ts`, the per-session Slack consumer and its
+`slack_session` table (migration 0092), the Slack webhook classifier the
+legacy route used, the LLM profile picker (`routing/profile-picker.ts` and
+its Block Kit), the `ORCHESTRATOR_SLACK_AUTOMATION_DISABLED` kill switch and
+its chart value, and the dispatcher's legacy-route helpers
+(`builtinTookDelivery`, `builtinSuppressed`, the kill-switch gate). The Slack
+events route is the ingress spine alone; the interactivity route delivers an
+answer only to the run whose relay posted the card (a card with no run id is
+logged and ignored). `SourceMention` and `SourceAnswer` live in
+`communication-policy.ts`, whose interface lost the picker, pickup,
+prompt-append and thread-fold methods nothing called. Rung-1 precedence
+records `suppressed` only when ANOTHER automation's workstream owns the
+conversation — the brain's own ownership was never a verdict, only the
+legacy route's reason to stand down. The one parity gap the deletion opened
+closed the same day: the legacy workflow appended a Slack-markdown system
+prompt at session create (`systemPromptAppend`), which the built-in never
+had; the text now lives with the built-in (`SLACK_SYSTEM_PROMPT_APPEND`)
+and rides `create_session.appendSystemPrompt` (v11).
 
 ### D8 — Sessions are kept by default
 
@@ -473,8 +535,8 @@ adopted by the new body.
 
 Phase 2 adds `integration_event`. Phase 4 adds `review.automation_run_id`
 and the window flag; 4.7 (migration 0088) drops `review_session`,
-`review_enrollment.engine`, and `review.status_comment_id`, and 4.7b drops
-`review_enrollment`.
+`review_enrollment.engine`, and `review.status_comment_id`; 4.7b (migration
+0091) drops `review_enrollment`.
 
 Phase 5 (D9–D11) adds `automation_state` (migration 0083) and, diverging
 from the first draft, migration 0084: `automation_version.entrypoints`
@@ -540,3 +602,42 @@ retry). `IntegrationService` gains `ListEventCatalog` and `ListActionCatalog`.
 - A parallel-run window temporarily keeps two paths alive for review and
   Slack; the flags and kill switches bound the risk, and the deletion PRs
   close the window.
+
+## Amendment (2026-10-05): listener stand-down for parked sessions
+
+**What was missing.** A kept session (a Slack thread's, a workstream's)
+stays listened to for as long as it exists: an open coordinator event
+stream, a probe read every thirty seconds, a lease renewal every ten. A
+parked session (ADR 0034) emits nothing until a resume, so most of that
+work was for sessions that could not speak. The cost grew with every thread
+ever opened, not with the work in flight.
+
+**Decision.** (1) **A listener stands down on `parked`.** When the status
+probe at start says `parked`, or a live `status_changed` frame says so, the
+listener drains what the log holds (the park frame reaches the consumers),
+then marks its `session_listeners` row dormant and gives up the lease in
+one statement. A dormant row is not desired: the scanner does not start a
+listener for it. (2) **A resuming RPC wakes the row.** A parked session
+resumes only through the orchestrator — it is the coordinator's one client
+— so an interceptor on the control-plane transport wakes the row after any
+unary `SessionService` call that can resume or end a session (SendPrompt,
+Resume, Interrupt, DeleteSession, …), whoever the caller is: the passthrough
+surface, the engine's session blocks, the coordination tools. The wake is
+issued once the RPC settles and never awaited: a best-effort side effect
+must not hold the caller's response on the orchestrator's database. The scanner
+re-arms the listener on its next pass; the events are durable, so the
+catch-up delivers whatever the resume produced. (3) **A wake grace fences
+the race.** The coordinator may still report `parked` for a session whose
+resume is under way, so a stand-down is refused while the row's last wake
+is younger than two minutes; the listener keeps streaming and stands down
+on the next park. (4) **A reconcile is the safety net.** Every ten minutes
+the manager probes each dormant row's status: no longer parked → wake (a
+terminal session then drains and finishes through the ordinary path);
+unknown to the coordinator → terminal. A path that resumes a session
+without the orchestrator is healed within the interval.
+
+**Not chosen.** Waking from the engine and the passthrough separately —
+two sites to forget. Peeking into streaming requests (Exec, WriteFile) for
+a session id — the reconcile covers them, and neither carries a prompt.
+Dropping the row on park and re-registering on resume — the row is the
+lease and the terminal marker; dormancy keeps both.

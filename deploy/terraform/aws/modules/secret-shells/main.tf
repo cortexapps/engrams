@@ -26,6 +26,12 @@
 #     --secret-id <prefix>/better-auth-secret \
 #     --secret-string "$(openssl rand -base64 48)"
 #
+#   # OAuth client secret — from the identity provider's client
+#   # (sign-in door `orchestrator.auth.mode: oauth`, the chart default)
+#   aws secretsmanager put-secret-value \
+#     --secret-id <prefix>/oauth-client-secret \
+#     --secret-string "<client secret>"
+#
 #   # Egress CA pair — generate once, ten-year cert
 #   openssl req -x509 -newkey rsa:4096 -nodes \
 #     -keyout /tmp/ca.key -out /tmp/ca.pem -days 3650 \
@@ -42,11 +48,12 @@
 
 locals {
   shells = {
-    "auth-tokens"        = "Comma-separated coordinator bearer allow-list (the first entry doubles as CONTROL_PLANE_BEARER)."
-    "better-auth-secret" = "The orchestrator's better-auth session-signing secret."
-    "kek-master"         = "Base64 32-byte KEK for the orchestrator's in-process sealing (ADR 0051). The coordinator's KEK is the KMS key; the orchestrator has no KMS path."
-    "egress-ca-cert"     = "Egress proxy CA certificate PEM (fleet-wide — ADR 0006)."
-    "egress-ca-key"      = "Egress proxy CA private key PEM."
+    "auth-tokens"         = "Comma-separated coordinator bearer allow-list (the first entry doubles as CONTROL_PLANE_BEARER)."
+    "better-auth-secret"  = "The orchestrator's better-auth session-signing secret."
+    "oauth-client-secret" = "Client secret of the OAuth client people sign in through (orchestrator.auth.mode=oauth)."
+    "kek-master"          = "Base64 32-byte KEK for the orchestrator's in-process sealing (ADR 0051). The coordinator's KEK is the KMS key; the orchestrator has no KMS path."
+    "egress-ca-cert"      = "Egress proxy CA certificate PEM (fleet-wide — ADR 0006)."
+    "egress-ca-key"       = "Egress proxy CA private key PEM."
   }
 }
 

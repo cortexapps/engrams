@@ -1,0 +1,247 @@
+name: Release
+
+# Publish a version of engrams: version tags on the GHCR images, a git tag,
+# and a GitHub release with the CLI binaries.
+#
+# A release builds nothing. bake-images.yml already published every artifact
+# under the SHA of the main commit it was built from. This workflow selects
+# the build of each artifact that matches the release commit
+# (.github/scripts/release-plan.py), gives that build the tag `<version>`, and
+# creates the git tag `v<version>` on the release commit. The bytes that a
+# release ships are the bytes that CI tested on main.
+#
+# How to release:
+#   1. Merge a PR that runs `scripts/release-version.sh set <version>`.
+#   2. Wait for the 'Bake container images' run of that merge to finish.
+#   3. Start this workflow on main with the same version. Use `dry_run` to see
+#      the plan first.
+#
+# Who can release. GitHub lets only people with write access start a
+# `workflow_dispatch` run. The `authorize` job then makes sure that the run is
+# on main and that the person is a member of the organization that owns the
+# repository, not an outside collaborator. The `release` environment adds the
+# controls that live in the repository settings (the branch that can deploy
+# to it, and required reviewers).
+#
+# A version tag never moves. A second run for the same version stops, and so
+# does a run that finds the tag on a different build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The version to release, for example 0.10.0. It must be the chart appVersion on main.'
+        required: true
+        type: string
+      dry_run:
+        description: 'Do every check and print the plan. Publish nothing.'
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+# One release at a time, never cancelled: a cancelled run can leave some
+# images tagged and no git tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: The run is on main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [[ "$REF" != "refs/heads/main" ]]; then
+            echo "::error::A release runs on main only, not on $REF."
+            exit 1
+          fi
+
+      # The token of a workflow cannot read the organization's member list.
+      # It can read who has access to this repository, and that is enough:
+      # in a repository that an organization owns, a person with write access
+      # is a member of the organization or an outside collaborator. Each API
+      # call that fails stops the job, so the check fails closed.
+      - name: The person is a member of the organization
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          permission="$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission)"
+          case "$permission" in
+            admin|write) ;;
+            *)
+              echo "::error::$ACTOR has '$permission' access. A release needs write access."
+              exit 1
+              ;;
+          esac
+          outside="$(gh api --paginate \
+            "repos/$REPO/collaborators?affiliation=outside&per_page=100" --jq '.[].login')"
+          if grep -qixF "$ACTOR" <<<"$outside"; then
+            echo "::error::$ACTOR is an outside collaborator. Only members of the organization can release."
+            exit 1
+          fi
+          echo "$ACTOR can release ($permission access, organization member)."
+
+  release:
+    name: release ${{ inputs.version }}
+    needs: authorize
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write   # create the git tag and the GitHub release
+      packages: write   # add the version tag to the GHCR packages
+    env:
+      VERSION: ${{ inputs.version }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history: the plan walks main back to the commit that each
+          # artifact was built from.
+          fetch-depth: 0
+
+      - name: Check the version
+        run: |
+          set -euo pipefail
+          scripts/release-version.sh check "$VERSION"
+          if [[ -n "$(git ls-remote --tags origin "refs/tags/v$VERSION")" ]]; then
+            echo "::error::The tag v$VERSION exists. A released version never changes; release a new version."
+            exit 1
+          fi
+
+      # detect-rebake-lanes.py reads the cargo dependency graph.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: oras-project/setup-oras@v2
+
+      - name: Select the build of each artifact
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release-plan.py \
+            --repo "$REPO" --sha "$SHA" --out "$RUNNER_TEMP/plan.tsv"
+
+      # Read every digest before the first write. A version tag that exists
+      # on a different build stops the release here, with nothing changed.
+      - name: Check the version tags
+        run: |
+          set -euo pipefail
+          digest() {
+            oras manifest fetch --descriptor "$1" | jq -r .digest
+          }
+          : > "$RUNNER_TEMP/images.tsv"
+          while IFS=$'\t' read -r name sha; do
+            base="ghcr.io/$REPO/$name"
+            want="$(digest "$base:$sha")"
+            # Only "not found" means that the tag is free. Any other failure
+            # stops the release: a lookup that failed must not let the tag move.
+            if have="$(digest "$base:$VERSION" 2> "$RUNNER_TEMP/lookup.err")"; then
+              if [[ "$have" != "$want" ]]; then
+                echo "::error::$base:$VERSION exists and is a different build ($have, not $want)."
+                exit 1
+              fi
+            elif ! grep -qi "not found" "$RUNNER_TEMP/lookup.err"; then
+              cat "$RUNNER_TEMP/lookup.err" >&2
+              echo "::error::Could not read $base:$VERSION."
+              exit 1
+            fi
+            printf '%s\t%s\t%s\n' "$name" "$sha" "$want" >> "$RUNNER_TEMP/images.tsv"
+          done < "$RUNNER_TEMP/plan.tsv"
+
+          {
+            echo "## Release $VERSION at \`${SHA:0:12}\`"
+            echo
+            echo "| Artifact | Tag | Built from | Digest |"
+            echo "|---|---|---|---|"
+            while IFS=$'\t' read -r name sha want; do
+              echo "| \`$name\` | \`$VERSION\` | \`${sha:0:12}\` | \`$want\` |"
+            done < "$RUNNER_TEMP/images.tsv"
+          } | tee "$RUNNER_TEMP/images.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tag the artifacts
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # GHCR is eventually consistent: a tag request can 404 on a manifest
+          # that the registry served a moment ago. Try again before failing.
+          tag_with_retry() {
+            local ref="$1" tag="$2" attempt
+            for attempt in 1 2 3 4 5; do
+              if oras tag "$ref" "$tag"; then
+                return 0
+              fi
+              echo "oras tag $ref -> $tag failed (attempt $attempt/5); retrying in 3s" >&2
+              sleep 3
+            done
+            echo "oras tag $ref -> $tag failed after 5 attempts" >&2
+            return 1
+          }
+          while IFS=$'\t' read -r name _ want; do
+            tag_with_retry "ghcr.io/$REPO/$name@$want" "$VERSION"
+          done < "$RUNNER_TEMP/images.tsv"
+
+      # The CLI binaries are the ones in the `cli-tools` artifact that got the
+      # version tag above. A release asset is the way to get them with no
+      # registry client.
+      - name: Get the CLI binaries
+        run: |
+          set -euo pipefail
+          sha="$(awk -F'\t' '$1 == "cli-tools" { print $2 }' "$RUNNER_TEMP/plan.tsv")"
+          mkdir -p "$RUNNER_TEMP/cli"
+          cd "$RUNNER_TEMP/cli"
+          oras pull "ghcr.io/$REPO/cli-tools:$sha"
+          mv engrams engrams-linux-x64
+          chmod +x engrams-*
+          got="$(./engrams-linux-x64 --version)"
+          if [[ "$got" != "$VERSION" ]]; then
+            echo "::error::The CLI build reports version '$got', not '$VERSION'."
+            exit 1
+          fi
+          sha256sum engrams-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the GitHub release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          {
+            echo "To install or upgrade, see [Releases and upgrades](https://github.com/$REPO/blob/v$VERSION/docs/deploy.md#releases-and-upgrades)."
+            echo
+            cat "$RUNNER_TEMP/images.md"
+          } > "$RUNNER_TEMP/notes.md"
+          # Generated notes list the pull requests since the last version
+          # tag. The repository also has `fc-kernel-*` releases, so name the
+          # start tag; the first version has no start tag and gets no list.
+          notes_args=()
+          previous="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)"
+          if [[ -n "$previous" ]]; then
+            notes_args=(--generate-notes --notes-start-tag "$previous")
+          fi
+          gh release create "v$VERSION" \
+            --target "$SHA" \
+            --title "v$VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "${notes_args[@]}" \
+            --latest \
+            "$RUNNER_TEMP"/cli/engrams-* "$RUNNER_TEMP/cli/SHA256SUMS"
+          echo "Released https://github.com/$REPO/releases/tag/v$VERSION" >> "$GITHUB_STEP_SUMMARY"

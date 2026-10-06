@@ -68,6 +68,35 @@ function decodeJson(result: IntegrationOpResult, what: string): unknown {
  * (GitHub's `owner/repo`): each sub-segment is validated (no empty, no `.`,
  * no `..`) and encoded separately. A placeholder embedded in a longer segment
  * is fully encoded, so it can never smuggle separators. */
+/** A marker value must survive inside an HTML comment and match itself on
+ * the next scan: a short token, no markup. */
+const MARKER_PARAM_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,80}$/;
+
+/** The idempotency marker: `{runId}` and `{stepPath}` pin a comment to one
+ * step of one run (replay-safe, the default); `{input.<param>}` pins it to
+ * a caller-chosen key instead, so a later run finds the comment an earlier
+ * one posted and gets its id back (a status line edited across passes). */
+function renderMarkerTemplate(
+  template: string,
+  ctx: { runId: string; stepPath: string },
+  params: Record<string, unknown>,
+): string {
+  return template
+    .replaceAll("{runId}", ctx.runId)
+    .replaceAll("{stepPath}", ctx.stepPath)
+    .replace(/\{input\.([A-Za-z0-9_]+)\}/g, (_m, key: string) => {
+      const value = params[key];
+      const text = typeof value === "number" ? String(value) : value;
+      if (typeof text !== "string" || !MARKER_PARAM_RE.test(text)) {
+        throw new IntegrationActionError(
+          `marker needs param "${key}" as a short token ([A-Za-z0-9_.:-], 1-81 chars)`,
+          true,
+        );
+      }
+      return text;
+    });
+}
+
 function renderPathTemplate(template: string, params: Record<string, unknown>): string {
   const read = (key: string): string => {
     const value = params[key];
@@ -214,9 +243,11 @@ export async function executeIntegrationAction(
 
   const marker =
     action.idempotency.kind === "marker_comment"
-      ? (action.idempotency.markerTemplate ?? "<!-- engrams-automation:{runId}:{stepPath} -->")
-          .replaceAll("{runId}", ctx.runId)
-          .replaceAll("{stepPath}", ctx.stepPath)
+      ? renderMarkerTemplate(
+          action.idempotency.markerTemplate ?? "<!-- engrams-automation:{runId}:{stepPath} -->",
+          ctx,
+          config.params,
+        )
       : null;
 
   switch (action.execute.kind) {
@@ -324,7 +355,10 @@ type MarkerGuardOutcome =
  * comments for the marker; found → short-circuit with the existing comment's
  * mapped outputs; else append the marker to the body param. Actions without
  * comment-shaped params (repo + number + body) just get the marker appended —
- * the pre-scan is a crash-window optimization, not a correctness gate. */
+ * the pre-scan is a crash-window optimization, not a correctness gate. That
+ * second shape is also how a pinned comment survives an EDIT: an update
+ * action carrying the same key marker rewrites the body with the marker
+ * re-appended, so the next run's scan still finds the comment. */
 async function commentMarkerGuard(
   runOp: RunIntegrationOp,
   config: IntegrationActionConfigInput,

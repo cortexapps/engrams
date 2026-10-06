@@ -21,6 +21,10 @@ function event(idx: bigint, kind = "run_started"): CuratedEvent {
   return { idx, kind, payloadJson: "{}" };
 }
 
+function parkedFrame(idx: bigint): WireEvent {
+  return { idx, kind: "status_changed", payloadJson: JSON.stringify({ to: "parked" }) };
+}
+
 function terminal(idx: bigint, outcome = "completed"): WireEvent {
   const to = outcome === "completed" ? "completed" : outcome === "failed" ? "failed" : "dead";
   return { idx, kind: "status_changed", payloadJson: JSON.stringify({ to }) };
@@ -827,6 +831,118 @@ describe("SessionListener", () => {
 
     await subject.stop();
     await running;
+  });
+});
+
+describe("SessionListener — stand-down for a parked session", () => {
+  test("a session parked at start drains the backlog, then stands down without a stream", async () => {
+    const rec = recordingConsumer();
+    const base = await acquiredLease();
+    const cursors = makeInMemoryCursorStore();
+    let opens = 0;
+    const subject = await listener({
+      leaseStore: base,
+      fetchStatus: async () => "parked",
+      readPage: async (_sessionId, after) =>
+        after < 1n ? page([event(0n), event(1n)], 1n) : page([], after),
+      openStream: async () => {
+        opens++;
+        throw new Error("a parked session must not be streamed");
+      },
+    }, [rec.consumer], cursors);
+
+    await subject.run();
+
+    expect(opens).toBe(0);
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n]);
+    expect(await cursors.get("session-1", "consumer")).toBe(1n);
+    expect(rec.terminals).toEqual([]);
+    expect(await base.listDesired()).toEqual([]);
+    expect(await base.listDormant()).toEqual(["session-1"]);
+    // The stand-down gave the lease up: nobody can acquire a dormant row.
+    expect(await base.tryAcquire("session-1", "owner-2", 30_000)).toBe(false);
+  });
+
+  test("a live park frame reaches the consumers, then the listener stands down", async () => {
+    const rec = recordingConsumer();
+    const base = await acquiredLease();
+    let closed = 0;
+    const subject = await listener({
+      leaseStore: base,
+      fetchStatus: async () => "active",
+      openStream: async () =>
+        opened([event(0n) as WireEvent, parkedFrame(1n)], {
+          waitAtEnd: true,
+          onClose: () => closed++,
+        }),
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    expect(rec.events.map((ev) => ev.idx)).toContain(0n);
+    expect(closed).toBe(1);
+    expect(rec.terminals).toEqual([]);
+    expect(await base.listDesired()).toEqual([]);
+    expect(await base.listDormant()).toEqual(["session-1"]);
+  });
+
+  test("a wake inside the grace defers the stand-down and the listener keeps going", async () => {
+    const rec = recordingConsumer();
+    const base = await acquiredLease();
+    // A resuming RPC just woke the row: the coordinator may still say parked.
+    await base.wake("session-1");
+    const streams = [
+      opened([parkedFrame(0n)], { waitAtEnd: true }),
+      opened([terminal(1n)], { waitAtEnd: true }),
+    ];
+    let opens = 0;
+    const subject = await listener({
+      leaseStore: base,
+      fetchStatus: async () => "parked",
+      openStream: async () => streams[opens++]!,
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    // Start-time stand-down refused (fresh wake), the live park frame's
+    // stand-down refused too, so the listener reconnected and saw the end.
+    expect(opens).toBe(2);
+    expect(rec.terminals).toEqual(["completed"]);
+    expect(await base.listDormant()).toEqual([]);
+    expect(await base.listDesired()).toEqual([]);
+  });
+});
+
+describe("SessionListener — a deferred stand-down retries", () => {
+  test("once the grace has passed, a quiet probe that still sees parked stands the listener down", async () => {
+    const rec = recordingConsumer();
+    const base = await acquiredLease();
+    await base.wake("session-1");
+    let statusProbes = 0;
+    let opens = 0;
+    const subject = await listener({
+      leaseStore: base,
+      standDownGraceMs: 30,
+      probeIntervalMs: 5,
+      sleep: (ms) => Bun.sleep(ms),
+      fetchStatus: async () => {
+        statusProbes++;
+        return "parked";
+      },
+      openStream: async () => {
+        opens++;
+        return opened([], { waitAtEnd: true });
+      },
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    // The start-time stand-down was refused (fresh wake); the silent stream's
+    // probes re-asked the coordinator until the grace had passed.
+    expect(statusProbes).toBeGreaterThan(1);
+    expect(opens).toBeGreaterThanOrEqual(1);
+    expect(await base.listDormant()).toEqual(["session-1"]);
+    expect(await base.listDesired()).toEqual([]);
   });
 });
 

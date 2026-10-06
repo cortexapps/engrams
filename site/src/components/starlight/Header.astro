@@ -5,6 +5,7 @@
 // the page frame, not here.
 import Search from "@astrojs/starlight/components/Search.astro";
 import TraceMark from "../TraceMark.astro";
+import { VERSION_LABEL } from "../../version";
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 ---
@@ -13,7 +14,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, "");
   <div class="hd-left">
     <a class="hd-brand" href={`${base}/`}><TraceMark size={24} />engrams</a>
     <div class="hd-crumb">
-      <span class="dim">/</span><a href={`${base}/docs/`}>docs</a><span class="dim">/</span><span class="lime">v0.x</span>
+      <span class="dim">/</span><a href={`${base}/docs/`}>docs</a><span class="dim">/</span><span class="lime">{VERSION_LABEL}</span>
     </div>
   </div>
   <div class="hd-right">

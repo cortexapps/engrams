@@ -7,14 +7,12 @@ import { AlertTriangle } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 
 import {
-  useEnrollments,
-  useUpsertEnrollment,
-  useDeleteEnrollment,
-} from "../../hooks/useEnrollments";
-import { useBuiltinAutomation, useSetInputValue } from "../../hooks/useAutomations";
+  useBuiltinAutomation,
+  useSetInputValue,
+  useSetMapInputEntry,
+} from "../../hooks/useAutomations";
 import { useProfiles } from "../../hooks/useProfiles";
 import { toast } from "sonner";
-import type { RepoEnrollment } from "../../gen/engram/app/v1/review_pb";
 import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "../../components/page-heading";
 import { EmptyState } from "@/components/empty-state";
@@ -32,6 +30,7 @@ import {
 } from "@/components/ui/dialog";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -60,24 +59,26 @@ import {
 } from "@/components/ui/table";
 
 // The repositories engrams reviews (ADR 0100), as a page of the Reviews
-// product. Enrolling a repo here is a write to the PR-review automation: the
-// repo lands in its `repos` input and the automation is enabled on the first
-// one — the product is the front of the platform, and the link below opens
-// the back. `trigger_mode` decides whether a PR is reviewed automatically on
-// open (auto) or only when the app is @mentioned / dispatched (manual);
-// `autofix` decides whether posted findings route back for fixes. The review
-// sessions run on the reviewer profile picked below: the automation's
-// `profile` input, written one key at a time so a stale page never
-// overwrites another admin's edit.
+// product. The list IS the PR-review automation's `repos` input (ADR 0119
+// phase 4.7b: the single source — no enrollment table beside it): enrolling
+// a repo writes one entry of that map and enables the automation, the way
+// the Slack page writes a channel override — the product is the front of
+// the platform, and the link below opens the back. `mode` decides whether a
+// PR is reviewed automatically on open (auto) or only when the app is
+// @mentioned / dispatched (on_request); `autofix` whether posted findings
+// route back for fixes. The review sessions run on the reviewer profile
+// picked below: the automation's `profile` input, written one key at a time
+// so a stale page never overwrites another admin's edit.
 export function ReviewRepositories() {
-  const { data, isPending, error } = useEnrollments();
   const { data: profileData } = useProfiles();
   const builtin = useBuiltinAutomation("pr_review");
   const setProfile = useSetInputValue();
-  const rows = data?.enrollments ?? [];
   const profiles = profileData?.profiles ?? [];
   const automation = builtin.data?.automation;
   const automationId = automation?.id;
+  const rows = reposOf(automation?.inputsJson);
+  const isPending = builtin.isPending;
+  const error = builtin.error;
   const reviewerProfile = profileOf(automation?.inputsJson);
 
   const onReviewerProfile = async (profileId: string) => {
@@ -99,7 +100,7 @@ export function ReviewRepositories() {
       <PageHeading
         title="Repositories"
         count={rows.length > 0 ? `${rows.length} enrolled` : undefined}
-        actions={<EnrollDialog />}
+        actions={automationId ? <EnrollDialog automationId={automationId} /> : undefined}
       />
 
       <p className="text-sm text-muted-foreground">
@@ -157,7 +158,7 @@ export function ReviewRepositories() {
       </section>
 
       {error && (
-        <EmptyState tone="error">Could not load enrollments — {errorMessage(error)}</EmptyState>
+        <EmptyState tone="error">Could not load repositories — {errorMessage(error)}</EmptyState>
       )}
 
       {isPending ? (
@@ -178,7 +179,7 @@ export function ReviewRepositories() {
           </TableHeader>
           <TableBody>
             {rows.map((row) => (
-              <EnrollmentRow key={row.repo} row={row} />
+              <EnrollmentRow key={row.repo} row={row} automationId={automationId!} />
             ))}
           </TableBody>
         </Table>
@@ -188,6 +189,42 @@ export function ReviewRepositories() {
 }
 
 const NO_PROFILE = "__none__";
+
+/** One entry of the automation's `repos` map, as the page shows it. */
+export interface RepoRow {
+  repo: string;
+  mode: "auto" | "on_request";
+  autofix: boolean;
+}
+
+/** The automation's `repos` input as rows, sorted by repo. A malformed
+ * entry reads as the declared defaults (on request, no autofix). */
+export function reposOf(inputsJson: string | undefined): RepoRow[] {
+  if (!inputsJson) return [];
+  try {
+    const parsed: unknown = JSON.parse(inputsJson);
+    const repos =
+      typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)["repos"]
+        : undefined;
+    if (typeof repos !== "object" || repos === null || Array.isArray(repos)) return [];
+    return Object.entries(repos as Record<string, unknown>)
+      .map(([repo, value]) => {
+        const entry =
+          typeof value === "object" && value !== null && !Array.isArray(value)
+            ? (value as Record<string, unknown>)
+            : {};
+        return {
+          repo,
+          mode: entry["mode"] === "auto" ? ("auto" as const) : ("on_request" as const),
+          autofix: entry["autofix"] === true,
+        };
+      })
+      .sort((a, b) => a.repo.localeCompare(b.repo));
+  } catch {
+    return [];
+  }
+}
 
 /** The automation's `profile` input: a profile id, or "" when nobody picked. */
 function profileOf(inputsJson: string | undefined): string {
@@ -212,18 +249,18 @@ function TriggerBadge({ mode }: { mode: string }) {
   );
 }
 
-function EnrollmentRow({ row }: { row: RepoEnrollment }) {
-  const remove = useDeleteEnrollment();
+function EnrollmentRow({ row, automationId }: { row: RepoRow; automationId: string }) {
+  const remove = useSetMapInputEntry();
   return (
     <TableRow>
       <TableCell className="font-mono text-xs">{row.repo}</TableCell>
       <TableCell>
-        <TriggerBadge mode={row.triggerMode} />
+        <TriggerBadge mode={row.mode} />
       </TableCell>
-      <TableCell className="text-xs text-muted-foreground">{row.autofix}</TableCell>
+      <TableCell className="text-xs text-muted-foreground">{row.autofix ? "on" : "off"}</TableCell>
       <TableCell>
         <div className="flex items-center justify-end gap-1">
-          <EnrollDialog existing={row} />
+          <EnrollDialog automationId={automationId} existing={row} />
           <AlertDialog>
             <AlertDialogTrigger asChild>
               <Button variant="ghost" size="sm" disabled={remove.isPending}>
@@ -240,7 +277,16 @@ function EnrollmentRow({ row }: { row: RepoEnrollment }) {
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction onClick={() => remove.mutate({ repo: row.repo })}>
+                <AlertDialogAction
+                  onClick={() =>
+                    remove.mutate({
+                      automationId,
+                      inputKey: "repos",
+                      entryKey: row.repo,
+                      enable: false,
+                    })
+                  }
+                >
                   Remove
                 </AlertDialogAction>
               </AlertDialogFooter>
@@ -262,20 +308,20 @@ const enrollSchema = z.object({
     .string()
     .trim()
     .regex(/^[^/\s]+\/[^/\s]+$/, "must be owner/name (e.g. cortexapps/engrams)"),
-  triggerMode: z.enum(["auto", "manual"]),
-  autofix: z.enum(["auto", "manual", "off"]),
+  mode: z.enum(["auto", "on_request"]),
+  autofix: z.boolean(),
 });
 type EnrollValues = z.infer<typeof enrollSchema>;
 
-function EnrollDialog({ existing }: { existing?: RepoEnrollment }) {
+function EnrollDialog({ automationId, existing }: { automationId: string; existing?: RepoRow }) {
   const [open, setOpen] = useState(false);
-  const upsert = useUpsertEnrollment();
+  const upsert = useSetMapInputEntry();
   const isEdit = existing !== undefined;
 
   const defaults: EnrollValues = {
     repo: existing?.repo ?? "",
-    triggerMode: (existing?.triggerMode as "auto" | "manual") ?? "manual",
-    autofix: (existing?.autofix as "auto" | "manual" | "off") ?? "off",
+    mode: existing?.mode ?? "on_request",
+    autofix: existing?.autofix ?? false,
   };
 
   const form = useForm<EnrollValues>({
@@ -285,10 +331,17 @@ function EnrollDialog({ existing }: { existing?: RepoEnrollment }) {
 
   const onSubmit = async (data: EnrollValues) => {
     try {
+      // One entry, atomically. Enrolling a repo turns the automation on (the
+      // first repo turns reviewing on); editing one never does — an admin
+      // who paused reviews from the automation's page must find them still
+      // paused after changing a repo's trigger. A stale snapshot of the map
+      // never rides along.
       await upsert.mutateAsync({
-        repo: data.repo.trim(),
-        triggerMode: data.triggerMode,
-        autofix: data.autofix,
+        automationId,
+        inputKey: "repos",
+        entryKey: data.repo.trim(),
+        valueJson: JSON.stringify({ mode: data.mode, autofix: data.autofix }),
+        enable: !isEdit,
       });
       setOpen(false);
     } catch (e) {
@@ -348,7 +401,7 @@ function EnrollDialog({ existing }: { existing?: RepoEnrollment }) {
               )}
             />
             <Controller
-              name="triggerMode"
+              name="mode"
               control={form.control}
               render={({ field }) => (
                 <Field>
@@ -359,11 +412,11 @@ function EnrollDialog({ existing }: { existing?: RepoEnrollment }) {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="auto">Auto — review every PR when it opens</SelectItem>
-                      <SelectItem value="manual">On @mention — only when asked</SelectItem>
+                      <SelectItem value="on_request">On request — only when asked</SelectItem>
                     </SelectContent>
                   </Select>
                   <FieldDescription>
-                    Manual reviews run when the app is @mentioned on the PR or dispatched.
+                    On-request reviews run when the app is @mentioned on the PR or dispatched.
                   </FieldDescription>
                 </Field>
               )}
@@ -372,18 +425,16 @@ function EnrollDialog({ existing }: { existing?: RepoEnrollment }) {
               name="autofix"
               control={form.control}
               render={({ field }) => (
-                <Field>
-                  <FieldLabel htmlFor={field.name}>Autofix</FieldLabel>
-                  <Select value={field.value} onValueChange={field.onChange}>
-                    <SelectTrigger id={field.name} aria-label="Autofix">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="off">Off — post findings only</SelectItem>
-                      <SelectItem value="manual">Manual — offer fixes on request</SelectItem>
-                      <SelectItem value="auto">Auto — route findings back for fixes</SelectItem>
-                    </SelectContent>
-                  </Select>
+                <Field orientation="horizontal">
+                  <Switch
+                    id={field.name}
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                    aria-label="Autofix"
+                  />
+                  <FieldLabel htmlFor={field.name}>
+                    Autofix — route posted findings back for fixes
+                  </FieldLabel>
                 </Field>
               )}
             />

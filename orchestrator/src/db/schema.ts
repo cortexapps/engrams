@@ -1030,29 +1030,25 @@ export const reviewEvent = pgTable(
 
 /** Per-repository PR-review enrollment. The text fields are constrained by
  * ReviewService to triggerMode: auto|manual and autofix: auto|manual|off. */
-export const reviewEnrollment = pgTable("review_enrollment", {
-  repo: text("repo").primaryKey(), // "owner/name"
-  triggerMode: text("trigger_mode").notNull().default("manual"), // auto|manual
-  autofix: text("autofix").notNull().default("off"), // auto|manual|off
-  profileId: text("profile_id").references(() => profile.id),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-});
 
 // ---------------------------------------------------------------------------
 // Stream-fed session listeners (ingest v2)
 // ---------------------------------------------------------------------------
 
 /** Desired listener rows also serve as cross-process leases. Terminal rows are
- * retained so a completed session is never accidentally listened to again. */
+ * retained so a completed session is never accidentally listened to again.
+ * A dormant row (ADR 0119 amendment, 2026-10-05) is a parked session: it is
+ * not desired until a wake clears it. */
 export const sessionListener = pgTable("session_listeners", {
   sessionId: text("session_id").primaryKey(),
   owner: text("owner"),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
   terminalAt: timestamp("terminal_at", { withTimezone: true }),
+  /** Set when the listener stood down for a parked session; cleared by a wake. */
+  dormantAt: timestamp("dormant_at", { withTimezone: true }),
+  /** The last wake (a resuming session RPC); a stand-down inside its grace
+   * is refused, so a resume under way is never missed. */
+  wokenAt: timestamp("woken_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -1068,12 +1064,6 @@ export const consumerCursor = pgTable(
   (t) => [primaryKey({ columns: [t.sessionId, t.consumer] })],
 );
 
-/** Slack-backed sessions route listener output into their owning thread
- * workflow mailbox. Absence means the Slack consumer does not apply. */
-export const slackSession = pgTable("slack_session", {
-  sessionId: text("session_id").primaryKey(),
-  threadWfId: text("thread_wf_id").notNull(),
-});
 
 // ---------------------------------------------------------------------------
 // DBOS orphan sweep (ADR 0104)
@@ -1092,6 +1082,19 @@ export const dbosVersionHeartbeats = pgTable(
 );
 
 /** Durable per-workflow sweep history and operator-control flags. */
+// ---------------------------------------------------------------------------
+// Org settings: one row per setting key, the value a JSON document the
+// owning module validates (db/org-settings.ts). Policies an admin chooses
+// on the Settings page — retention first.
+// ---------------------------------------------------------------------------
+
+export const orgSetting = pgTable("org_setting", {
+  key: text("key").primaryKey(),
+  value: jsonb("value").$type<unknown>().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedByUserId: text("updated_by_user_id"),
+});
+
 export const dbosSweepLedger = pgTable("dbos_sweep_ledger", {
   workflowUuid: text("workflow_uuid").primaryKey(),
   workflowName: text("workflow_name").notNull(),
@@ -1478,9 +1481,17 @@ export const automationRun = pgTable(
     /** A DryRun from the editor: integration actions are stubbed and record
      * what they would have done instead of calling the provider. */
     dryRun: boolean("dry_run").notNull().default(false),
+    /** Set by the retention collector once the run's step rows are deleted
+     * (ADR 0104 amendment): the run page can say so, and the prune's frontier
+     * (ended before the cutoff, not yet pruned) shrinks as it drains. */
+    detailsPrunedAt: timestamp("details_pruned_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
+    // The retention frontier: ended runs whose details are still kept.
+    index("automation_run_retention_idx")
+      .on(t.endedAt)
+      .where(sql`ended_at is not null and details_pruned_at is null`),
     // ADR 0120 instances — the dedupe split: a cron occurrence fans out one
     // run per open instance (instance_id joins the occurrence identity); an
     // external delivery lands in at most ONE instance (the delivery identity
@@ -1590,6 +1601,9 @@ export const automationInstance = pgTable(
       .references(() => automation.id, { onDelete: "cascade" }),
     /** The rendered identity key (human-readable, e.g. project-ENG-42). */
     key: text("key").notNull(),
+    /** The human title rendered at open (settings.instance.labelTemplate);
+     * null = the UI shows the key. */
+    label: text("label"),
     status: text("status").notNull().default("open"),
     inputs: jsonb("inputs").$type<Record<string, unknown>>().notNull().default({}),
     /** user:<id> | run:<runId> | the admitting event's descriptor. */

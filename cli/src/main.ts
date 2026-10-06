@@ -25,7 +25,7 @@ import * as admin from "./commands/admin.ts";
 
 const program = new Command("engrams")
   .description("engrams product CLI — sessions, tasks, images, fleet")
-  .version("0.1.0")
+  .version("0.10.0")
   .option("--url <url>", "orchestrator base URL (env: ENGRAMS_URL)")
   .option("--json", "print raw JSON instead of the human-readable view", false);
 

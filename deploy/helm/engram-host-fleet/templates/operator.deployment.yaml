@@ -46,7 +46,7 @@ spec:
       serviceAccountName: {{ include "hostfleet.operator.fullname" . }}
       containers:
         - name: operator
-          image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
+          image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
           ports:
             # Autoscaler/wave/roll metrics (ENGRAM_OPERATOR_METRICS_ADDR

@@ -3,7 +3,7 @@ import Marketing from "../layouts/Marketing.astro";
 import TraceMark from "../components/TraceMark.astro";
 import pelican from "../assets/screenshots/session-pelican.png";
 import { hero, modules, slack, automations, how, session, extensible, start } from "../landing/copy";
-import { nodes, edges, glyph, frame } from "../landing/demo";
+import { nodes, edges, frame } from "../landing/demo";
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 const docs = `${base}/docs/`;
@@ -143,7 +143,12 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
       <div class="sec-head"><span class="sec-badge">{automations.badge}</span><span>{automations.label}</span><span class="sec-rule"></span></div>
       <div class="sec-intro">
         <h2 class="display">{automations.title}</h2>
-        <p class="lede">{automations.lede}</p>
+        <div>
+          <p class="lede">{automations.lede}</p>
+          <div class="actions">
+            <a class="btn outline" href={docs + automations.cta.href}>{automations.cta.label} <span>→</span></a>
+          </div>
+        </div>
       </div>
       <div class="cases">
         <div class="cases-head"><span class="label">{automations.cases.label}</span></div>
@@ -156,39 +161,6 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
             </div>
           ))}
         </div>
-      </div>
-
-      <div class="split">
-        <div>
-          <h3 class="display title">{automations.board.title}</h3>
-          <p class="body">{automations.board.body}</p>
-          <div class="label sm items-label">{automations.board.itemsLabel}</div>
-          <div class="items">
-            {automations.board.items.map((it) => (
-              <div>
-                <h3 class="display">{it.title}</h3>
-                <p>{it.body}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-        <div class="board" aria-label="Illustrative automation runs">
-          <div class="head"><span>time</span><span>automation</span><span>trigger</span><span>duration</span><span>status</span></div>
-          <div data-board-rows>
-            {first.board.map((r) => (
-              <div class="row">
-                <span class="time">{r.time}</span>
-                <span class="name">{r.name}</span>
-                <span class="trigger">{r.trigger}</span>
-                <span class="dur">{r.dur}</span>
-                <span class:list={["status", r.status]}>{glyph[r.status]} {r.status}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-      <div class="actions">
-        <a class="btn outline" href={docs + automations.cta.href}>{automations.cta.label} <span>→</span></a>
       </div>
     </div>
   </section>

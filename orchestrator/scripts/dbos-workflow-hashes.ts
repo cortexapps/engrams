@@ -1,4 +1,3 @@
-import "../src/workflows/slack-thread.ts";
 import "../src/workflows/tool-exec.ts";
 import "../src/workflows/automation-run.ts";
 

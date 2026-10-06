@@ -1,6 +1,15 @@
 # ADR 0060: External triggers and durable background-agent workflows (Slack-first)
 
-Status: 2026-06-25 — **Accepted.** Substrate simplified after an adversarial design
+Status: 2026-06-25 — **Accepted.** **Amended 2026-10-05 (ADR 0119 phase
+4.8):** the `SlackThreadWorkflow`, its control plane, the single-topic thread
+mailbox and the per-session Slack consumer are deleted; a Slack thread is a
+workstream of the Slack threads built-in on the ADR 0119 block engine (one
+run per turn burst, the session kept across runs). What survives of this
+record: the `CommunicationPolicy` seam (now driven by the relay block, with
+the picker/pickup/fold methods removed), the Slack events + interactivity
+routes (the events route is the ingress spine; answers route to the run
+whose relay asked), the Block Kit question round-trip, and the closing
+summary. The mailbox and recv-loop design below is history. Substrate simplified after an adversarial design
 review (see §Design review): the reverse channel is DBOS-native (2 workflows, zero
 new tables), not the 5-table pump the exploration note sketched. Shipped Slack-first
 end to end (events + interactivity, full AskUserQuestion round-trip, enriched closing
