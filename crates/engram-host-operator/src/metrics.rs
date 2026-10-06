@@ -52,21 +52,27 @@ pub fn init(addr: SocketAddr) {
     // appears on first increment has no Cloud Monitoring descriptor — which
     // blocks alert/dashboard creation and makes "0 because nothing
     // happened" indistinguishable from "0 because nothing is exported".
-    for action in [
-        "hold",
-        "start_wave",
-        "continue_wave",
-        "abort_and_grow",
-        "abort_only",
-    ] {
-        ::metrics::counter!(AUTOSCALE_STEP_ACTIONS_TOTAL, "action" => action).absolute(0);
-    }
     ::metrics::counter!(AUTOSCALE_GROWS_TOTAL).absolute(0);
-    ::metrics::counter!(AUTOSCALE_VICTIMS_REMOVED_TOTAL).absolute(0);
-    for reason in ["abort", "drain_timeout"] {
+    for kind in ["shed", "repair"] {
+        ::metrics::counter!(AUTOSCALE_VICTIMS_REMOVED_TOTAL, "kind" => kind).absolute(0);
+    }
+    for reason in ["not_in_plan", "deadline", "pressure", "no_row"] {
         ::metrics::counter!(AUTOSCALE_VICTIMS_RELEASED_TOTAL, "reason" => reason).absolute(0);
     }
-    ::metrics::counter!(AUTOSCALE_STUCK_ROLL_REPAIRS_TOTAL).absolute(0);
+    for reason in [
+        "bound_sessions",
+        "capture_jobs",
+        "open_teleports_as_source",
+        "open_teleports_as_dest",
+        "pending_tombstones",
+        "resident_sandboxes",
+        "enable_work",
+        "no_heartbeat_since_request",
+        "not_cordoned",
+    ] {
+        ::metrics::counter!(AUTOSCALE_RETIRE_BLOCKED_TOTAL, "reason" => reason).absolute(0);
+    }
+    ::metrics::counter!(AUTOSCALE_INVALID_VICTIMS_TOTAL).absolute(0);
     ::metrics::counter!(ROLL_NODES_TOTAL).absolute(0);
 }
 
@@ -82,37 +88,22 @@ pub fn init(addr: SocketAddr) {
 /// hysteresis.
 pub const AUTOSCALE_HOSTS: &str = "engram_autoscale_hosts";
 
-/// Gauge, 0/1: victim-annotated nodes exist (a shed wave is in flight).
-/// A wave blocks image rolls; one pinned at 1 without
-/// `victims_removed_total` moving is a wedged wave.
-pub const AUTOSCALE_WAVE_IN_FLIGHT: &str = "engram_autoscale_wave_in_flight";
-
-/// Counter, label `action` ∈ {hold, start_wave, continue_wave,
-/// abort_and_grow, abort_only}: every `plan_step` decision. The
-/// abort_* arms are queue/scale-up pressure pre-empting a wave —
-/// sustained aborts mean the fleet is thrashing between shed and grow.
-pub const AUTOSCALE_STEP_ACTIONS_TOTAL: &str = "engram_autoscale_step_actions_total";
+/// Gauge: durable victim count, with phase retiring or removing.
+pub const AUTOSCALE_VICTIMS: &str = "engram_autoscale_victims";
+/// Counter: pending retirement observations, by coordinator blocker kind.
+pub const AUTOSCALE_RETIRE_BLOCKED_TOTAL: &str = "engram_autoscale_retire_blocked_total";
+/// Counter: invalid victim annotations left unchanged.
+pub const AUTOSCALE_INVALID_VICTIMS_TOTAL: &str = "engram_autoscale_invalid_victims_total";
 
 /// Counter: `set_size` grow calls (scale-up actuations, including
 /// stuck-roll availability-debt surges).
 pub const AUTOSCALE_GROWS_TOTAL: &str = "engram_autoscale_grows_total";
 
-/// Counter: wave victims fully retired (drained → node removed →
-/// coordinator row deleted). The scale-down success meter.
+/// Counter: completed removals, with kind shed or repair.
 pub const AUTOSCALE_VICTIMS_REMOVED_TOTAL: &str = "engram_autoscale_victims_removed_total";
 
-/// Counter, label `reason` ∈ {abort, drain_timeout}: wave victims
-/// released back to the fleet (uncordoned + de-annotated) instead of
-/// removed. `abort` = queue/grow pressure reclaimed the capacity
-/// (by design); `drain_timeout` = a host would not drain inside the
-/// budget — repeated firings for the same fleet mean sessions that
-/// won't teleport (check migration_total outcomes coordinator-side).
+/// Counter: released victims, by not_in_plan, deadline, pressure, or no_row.
 pub const AUTOSCALE_VICTIMS_RELEASED_TOTAL: &str = "engram_autoscale_victims_released_total";
-
-/// Counter: roll-stuck nodes successfully repaired (drained + removed +
-/// deregistered after replacement capacity landed). Each increment is a
-/// timed-out image roll that needed the surge-and-retire path.
-pub const AUTOSCALE_STUCK_ROLL_REPAIRS_TOTAL: &str = "engram_autoscale_stuck_roll_repairs_total";
 
 /// Counter: nodes sent through the ADR 0044 K3 drain-gated image roll
 /// (the deploy path that replaces host-agent pods node-by-node).

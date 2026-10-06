@@ -136,7 +136,6 @@ operator:
     scaleDown: aggressive
     scaleDownHysteresisTicks: 5
     maxShedPerWave: 4
-    maxConcurrentDrains: 2
 
 # Google Managed Prometheus scrape of the host-agent + operator
 # metrics. Needs `managed_prometheus` on the cluster.

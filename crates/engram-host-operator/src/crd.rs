@@ -3,12 +3,12 @@
 //! A `HostFleet` declares the target host-agent + node-assets images and the
 //! rollout guardrails. The operator patches the (chart-owned) host-agent
 //! DaemonSet's images toward this CR, then rolls each node's pod one at a
-//! time — draining the node's coordinator host (snapshot + warm-restore on a
-//! peer) before deleting the pod, never dropping below the capacity floor.
+//! time. Image rolls preserve the node's VMs and respect the capacity floor.
+//! Cloud removal requires a coordinator retirement grant.
 //!
 //! The chart still owns the DaemonSet's full pod spec (init container,
 //! emptyDir, securityContext, …); the operator only drives the *image* and
-//! the *drain-gated roll*, which is the part `OnDelete` deliberately leaves
+//! the *image roll*, which is the part `OnDelete` deliberately leaves
 //! to a controller.
 
 use kube::CustomResource;
@@ -40,9 +40,8 @@ pub struct HostFleetSpec {
     /// (per-pod emptyDir), so there's no swap under a live VM.
     pub node_assets_image: String,
 
-    /// Base URL of the coordinator (e.g. `http://engram-coordinator:8080`).
-    /// The operator drives cordon/drain on `/api/admin/...` and polls the
-    /// drain gate on `/api/hosts/:id`.
+    /// Coordinator gRPC endpoint (e.g. `http://engram-coordinator:50061`).
+    /// The operator calls FleetService over gRPC for image rolls and retirement.
     pub coordinator_url: String,
 
     /// Never drain a node if doing so would drop the fleet below this many
@@ -51,8 +50,8 @@ pub struct HostFleetSpec {
     #[serde(default)]
     pub capacity_floor: u32,
 
-    /// Seconds to wait for a drained host's `running_sandboxes` to reach 0
-    /// before aborting the roll (leaving the pod in place).
+    /// Shed retirement deadline in seconds. Also bounds the image roll
+    /// successor gate and contributes to the handoff TTL.
     #[serde(default = "default_drain_timeout")]
     pub drain_timeout_seconds: u64,
 
@@ -107,8 +106,7 @@ pub struct AutoscalingSpec {
     /// ADR 0045 Phase E: whether the pool may shrink, and how aggressively.
     /// `off` (default) is K4's scale-up-only behavior. `idleOnly` sheds only a
     /// fully-idle host; `aggressive` sheds the least-loaded host (sessions
-    /// evacuate). The scale-down *decision* is computed + logged today; live
-    /// node removal is the follow-up actuator (safe node-specific removal).
+    /// teleport). Node removal requires the coordinator retirement grant.
     #[serde(default)]
     pub scale_down: crate::scaler::ScaleDownMode,
     /// ADR 0045 Phase E: shed only after the scale-down decision holds for
@@ -117,17 +115,9 @@ pub struct AutoscalingSpec {
     /// scale-up reconcile interval changes.
     #[serde(default = "default_scale_down_hysteresis")]
     pub scale_down_hysteresis_ticks: u32,
-    /// ADR 0048: the most victim nodes a single scale-down WAVE may target.
-    /// Small waves are observable + bound the blast radius; the cost-optimal
-    /// target may be much lower, but we approach it a few nodes at a time.
+    /// The most victim nodes retiring at once (ADR 0123 E3).
     #[serde(default = "default_max_shed_per_wave")]
     pub max_shed_per_wave: u32,
-    /// ADR 0048: the most victims to DRAIN concurrently within one reconcile.
-    /// 1 is the safe default — the coordinator's R8 gate already serialises
-    /// per-host live migrations, so concurrent drains mostly help when many
-    /// victims are idle (nothing to teleport).
-    #[serde(default = "default_max_concurrent_drains")]
-    pub max_concurrent_drains: u32,
 }
 
 fn default_scale_down_hysteresis() -> u32 {
@@ -135,10 +125,6 @@ fn default_scale_down_hysteresis() -> u32 {
 }
 
 fn default_max_shed_per_wave() -> u32 {
-    1
-}
-
-fn default_max_concurrent_drains() -> u32 {
     1
 }
 

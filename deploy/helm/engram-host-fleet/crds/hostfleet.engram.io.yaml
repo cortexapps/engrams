@@ -40,13 +40,6 @@
                     "description": "Optional node-pool autoscaling. The operator uses fleet demand to\nkeep `targetFreeMib` of headroom. Explicit `noop` selection computes\nand logs the plan without autoscale mutations. GKE or ASG\ninitialization errors fail operator startup.",
                     "nullable": true,
                     "properties": {
-                      "maxConcurrentDrains": {
-                        "default": 1,
-                        "description": "ADR 0048: the most victims to DRAIN concurrently within one reconcile.\n1 is the safe default — the coordinator's R8 gate already serialises\nper-host live migrations, so concurrent drains mostly help when many\nvictims are idle (nothing to teleport).",
-                        "format": "uint32",
-                        "minimum": 0.0,
-                        "type": "integer"
-                      },
                       "maxHosts": {
                         "format": "uint32",
                         "minimum": 0.0,
@@ -54,7 +47,7 @@
                       },
                       "maxShedPerWave": {
                         "default": 1,
-                        "description": "ADR 0048: the most victim nodes a single scale-down WAVE may target.\nSmall waves are observable + bound the blast radius; the cost-optimal\ntarget may be much lower, but we approach it a few nodes at a time.",
+                        "description": "The most victim nodes retiring at once (ADR 0123 E3).",
                         "format": "uint32",
                         "minimum": 0.0,
                         "type": "integer"
@@ -71,7 +64,7 @@
                       },
                       "scaleDown": {
                         "default": "off",
-                        "description": "ADR 0045 Phase E: whether the pool may shrink, and how aggressively.\n`off` (default) is K4's scale-up-only behavior. `idleOnly` sheds only a\nfully-idle host; `aggressive` sheds the least-loaded host (sessions\nevacuate). The scale-down *decision* is computed + logged today; live\nnode removal is the follow-up actuator (safe node-specific removal).",
+                        "description": "ADR 0045 Phase E: whether the pool may shrink, and how aggressively.\n`off` (default) is K4's scale-up-only behavior. `idleOnly` sheds only a\nfully-idle host; `aggressive` sheds the least-loaded host (sessions\nteleport). Node removal requires the coordinator retirement grant.",
                         "enum": [
                           "off",
                           "idleOnly",
@@ -109,7 +102,7 @@
                     "type": "integer"
                   },
                   "coordinatorUrl": {
-                    "description": "Base URL of the coordinator (e.g. `http://engram-coordinator:8080`).\nThe operator drives cordon/drain on `/api/admin/...` and polls the\ndrain gate on `/api/hosts/:id`.",
+                    "description": "Coordinator gRPC endpoint (e.g. `http://engram-coordinator:50061`).\nThe operator calls FleetService over gRPC for image rolls and retirement.",
                     "type": "string"
                   },
                   "daemonSet": {
@@ -130,7 +123,7 @@
                   },
                   "drainTimeoutSeconds": {
                     "default": 600,
-                    "description": "Seconds to wait for a drained host's `running_sandboxes` to reach 0\nbefore aborting the roll (leaving the pod in place).",
+                    "description": "Shed retirement deadline in seconds. Also bounds the image roll\nsuccessor gate and contributes to the handoff TTL.",
                     "format": "uint64",
                     "minimum": 0.0,
                     "type": "integer"

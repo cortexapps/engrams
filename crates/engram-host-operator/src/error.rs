@@ -20,9 +20,6 @@ pub enum OperatorError {
         // (clippy::result_large_err).
         status: Box<tonic::Status>,
     },
-    /// A drain did not reach `running_sandboxes == 0` within the budget;
-    /// the roll is aborted and the pod left in place.
-    DrainTimeout { host_id: String, remaining: u32 },
     /// After deleting a pod for an image roll, the successor didn't come up
     /// Ready on the target image within the budget; the roll is aborted with
     /// the host still cordoned (the operator retries next reconcile).
@@ -38,10 +35,6 @@ impl fmt::Display for OperatorError {
         match self {
             Self::Kube(e) => write!(f, "kubernetes api error: {e}"),
             Self::Rpc { op, status } => write!(f, "coordinator {op} failed: {status}"),
-            Self::DrainTimeout { host_id, remaining } => write!(
-                f,
-                "drain of host {host_id} timed out with {remaining} sandbox(es) still running"
-            ),
             Self::RollTimeout { node } => write!(
                 f,
                 "image roll of node {node} timed out waiting for the successor pod to be Ready on target"

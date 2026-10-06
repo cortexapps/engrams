@@ -1,6 +1,5 @@
 //! ADR 0044 K3 / ADR 0051: app-gRPC client for the coordinator `FleetService`
-//! the operator drives during a roll — cordon → drain → poll the drain gate
-//! → uncordon — plus the scale-down wave's list/demand/delete.
+//! used for image rolls and durable host retirement (ADR 0123 E).
 //!
 //! This was a REST (`reqwest`) client until the coordinator retired its
 //! HTTP control plane (ADR 0051, gRPC-only). The REST routes the operator
@@ -13,25 +12,24 @@
 //! `Authorization: Bearer <token>` gRPC metadata (the same scheme the cli
 //! uses). In a synthetic-admin dev coord (no accepted tokens) it's omitted.
 
+use std::time::Duration;
+
 use engram_core::HostId;
 use engram_protocol::app;
 use engram_protocol::app::fleet_service_client::FleetServiceClient;
 use tonic::codegen::InterceptedService;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
+use crate::autoscale::Retirement;
 use crate::error::OperatorError;
 use crate::scaler::FleetDemand;
 
-/// The `HostView` fields the drain/roll gates need (from
+pub const CORDON_OWNER: &str = "operator";
+
+/// The `HostView` fields the roll gate needs (from
 /// `FleetService.GetHost`).
 #[derive(Debug)]
 pub struct HostStatus {
-    /// `"ready"` | `"draining"` | `"dead"` — the coordinator's view.
-    #[allow(dead_code)]
-    pub status: String,
-    /// Live sandbox count from the host's latest heartbeat. The drain gate
-    /// waits for this to reach 0.
-    pub running_sandboxes: u32,
     /// ADR 0088: in-flight enable work bound to this host — enable_jobs
     /// live-materializing here, and non-terminal capture_jobs. Both roll
     /// paths wait on these reaching 0 before killing the host-agent pod
@@ -107,8 +105,10 @@ impl CoordClient {
     /// first RPC (which the reconcile loop already requeues on).
     pub fn new(endpoint: String, token: Option<String>) -> Self {
         let endpoint = normalize_endpoint(&endpoint);
-        let channel = Channel::from_shared(endpoint.clone())
+        let channel = Endpoint::from_shared(endpoint.clone())
             .unwrap_or_else(|e| panic!("invalid coordinator gRPC endpoint {endpoint:?}: {e}"))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
             .connect_lazy();
         let fleet = FleetServiceClient::with_interceptor(channel, BearerFn { token });
         Self { fleet }
@@ -116,11 +116,11 @@ impl CoordClient {
 
     /// `FleetService.CordonHost` — stop the picker placing new sessions on
     /// the host.
-    pub async fn cordon(&self, host: HostId) -> Result<(), OperatorError> {
+    pub async fn cordon(&self, host: HostId, owner: &str) -> Result<(), OperatorError> {
         self.fleet
             .clone()
             .cordon_host(app::CordonHostRequest {
-                owner: "operator".into(),
+                owner: owner.into(),
                 host_id: host.to_string(),
             })
             .await
@@ -156,11 +156,11 @@ impl CoordClient {
     }
 
     /// `FleetService.UncordonHost`.
-    pub async fn uncordon(&self, host: HostId) -> Result<(), OperatorError> {
+    pub async fn uncordon(&self, host: HostId, owner: &str) -> Result<(), OperatorError> {
         self.fleet
             .clone()
             .uncordon_host(app::UncordonHostRequest {
-                owner: "operator".into(),
+                owner: owner.into(),
                 host_id: host.to_string(),
             })
             .await
@@ -171,28 +171,33 @@ impl CoordClient {
         Ok(())
     }
 
-    /// `FleetService.AdminDrainHost` — the cordon+evacuate admin drain (the
-    /// old `POST /admin/hosts/:id/drain`), NOT the soft member-facing
-    /// `DrainHost` status flip. Returns the evacuating-session set; the wave
-    /// observes actual progress via [`Self::host_status`], so we ignore it.
-    pub async fn drain(&self, host: HostId) -> Result<(), OperatorError> {
-        self.fleet
+    /// Request or observe the coordinator's durable retirement grant.
+    pub async fn retire_host(
+        &self,
+        host: HostId,
+        owner: &str,
+        reason: &str,
+    ) -> Result<Retirement, OperatorError> {
+        match self
+            .fleet
             .clone()
-            .admin_drain_host(app::AdminDrainHostRequest {
+            .retire_host(app::RetireHostRequest {
                 host_id: host.to_string(),
+                owner: owner.into(),
+                reason: reason.into(),
             })
             .await
-            .map_err(|status| OperatorError::Rpc {
-                op: "drain",
+        {
+            Ok(response) => Ok(retirement_from_response(response.into_inner())),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(Retirement::NoRow),
+            Err(status) => Err(OperatorError::Rpc {
+                op: "retire_host",
                 status: Box::new(status),
-            })?;
-        Ok(())
+            }),
+        }
     }
 
-    /// `FleetService.DeleteHost` (the old `DELETE /admin/hosts/:id`, ADR
-    /// 0048) — deregister a drained host. The coordinator returns
-    /// `FAILED_PRECONDITION` if any session is still bound, so the wave only
-    /// calls this after the drain gate reports 0 sandboxes.
+    /// Delete the coordinator row after granted cloud removal.
     pub async fn delete_host(&self, host: HostId) -> Result<(), OperatorError> {
         self.fleet
             .clone()
@@ -226,9 +231,7 @@ impl CoordClient {
             .collect()
     }
 
-    /// `FleetService.GetHost` — the drain gate. `Ok(None)` means the host is
-    /// no longer registered (already gone — nothing left to drain), faithful
-    /// to the old `GET /hosts/:id` 404 → `None`.
+    /// Read the host for the image roll enable-work gate.
     pub async fn host_status(&self, host: HostId) -> Result<Option<HostStatus>, OperatorError> {
         match self
             .fleet
@@ -239,8 +242,6 @@ impl CoordClient {
             .await
         {
             Ok(resp) => Ok(resp.into_inner().host.map(|v| HostStatus {
-                status: v.status,
-                running_sandboxes: v.running_sandboxes,
                 live_materializes: v.live_materializes,
                 live_capture_jobs: v.live_capture_jobs,
             })),
@@ -291,4 +292,43 @@ fn host_view_to_load(v: app::HostView) -> Result<HostLoad, OperatorError> {
         reserved_vcpus: v.reserved_vcpus,
         free_vcpus: v.free_vcpus,
     })
+}
+
+fn retirement_from_response(response: app::RetireHostResponse) -> Retirement {
+    let retirement = response.retirement.unwrap_or_default();
+    if !retirement.retired_at.is_empty() {
+        Retirement::Granted
+    } else {
+        Retirement::Pending(retirement.blockers.into_iter().map(|b| b.kind).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retirement_response_requires_nonempty_retired_at() {
+        assert_eq!(
+            retirement_from_response(app::RetireHostResponse::default()),
+            Retirement::Pending(vec![])
+        );
+        let mut response = app::RetireHostResponse {
+            retirement: Some(app::HostRetirement {
+                requested_at: "2026-10-05T00:00:00Z".into(),
+                blockers: vec![app::RetirementBlocker {
+                    kind: "bound_sessions".into(),
+                    count: 1,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            retirement_from_response(response.clone()),
+            Retirement::Pending(vec!["bound_sessions".into()])
+        );
+        response.retirement.as_mut().unwrap().retired_at = "2026-10-05T00:01:00Z".into();
+        assert_eq!(retirement_from_response(response), Retirement::Granted);
+    }
 }

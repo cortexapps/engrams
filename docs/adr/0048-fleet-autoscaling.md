@@ -160,6 +160,8 @@ the explicit max-capacity backstop.
 
 ### 5. Scale-down: consolidation waves on the teleport seam
 
+The drain/gate/remove order below is superseded by ADR 0123 E2.
+
 `NodePoolScaler` gains `remove_node(pool, node)` — remove ONE named node,
 atomically decrementing the pool target (GKE: Container API
 `instanceGroupUrls` → the owning zonal MIG → Compute

@@ -176,6 +176,8 @@ The host-agent + node-prep DaemonSets, `OnDelete` update strategy (the operator 
 
 ### K3 — `HostFleet` CRD + drain-gated operator (implemented)
 
+The drain/gate/remove order below is superseded by ADR 0123 E2.
+
 K1's chart uses `updateStrategy: OnDelete` precisely so K8s never rolls a host-agent pod out from under a live microVM. K3 is the controller that *does* drive rollout — declaratively, digest-pinned, drain-gated, node-by-node. It's ADR 0043 Phase 3a (drain-first) + 3d (version-pin) reborn as operator logic instead of MIG `max_surge` mechanics.
 
 **CRD.** A `HostFleet` resource declares: the host-agent **image digest**, the **node-asset digest** (the `firecracker`+kernel bundle, see K5), a **node-pool selector**, a **capacity floor** (never drain below N schedulable hosts), and a **rollout policy** (max-unavailable, surge). Version changes are a digest edit on the CR — rolled intentionally, never on a registry-tag move.

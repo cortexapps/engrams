@@ -10,7 +10,7 @@
 //! K2 keeps the node's microVMs alive across the pod swap and the successor's
 //! `reattach_pass` adopts them, so an image roll is lossless (no
 //! snapshot-rehome rewind). Drain/evac is reserved for actual node removal
-//! (see [`gate_drain`]).
+//! (see [`crate::autoscale::Retirement`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -218,7 +218,7 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
     // marked nodes to autoscaling so it can surge replacement capacity and
     // drain/remove them safely. With autoscaling disabled, the marker still
     // blocks the destructive retry loop and leaves a crisp operator signal.
-    let recovery_key = roll_recovery_key(spec);
+    let recovery_key = crate::autoscale::fleet_key(spec);
     let stuck_rolls = roll_stuck_nodes(&managed_nodes, recovery_key);
 
     // 3. Plan.
@@ -240,14 +240,25 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
     // served BY the roll, so blocking on it deadlocks the fleet. Best-effort —
     // a coord hiccup shouldn't wedge the controller.
     let roll_idle = matches!(decision, RollDecision::UpToDate { .. });
-    let blocks_roll =
-        match run_autoscale(spec, &ctx, &pods, &managed_nodes, roll_idle, &stuck_rolls).await {
-            Ok(status) => status.blocks_roll,
-            Err(e) => {
-                tracing::warn!(error = %e, "autoscale step failed; continuing");
-                false
-            }
-        };
+    let blocks_roll = match run_autoscale(
+        spec,
+        &ctx,
+        &pods,
+        &managed_nodes,
+        roll_idle,
+        &stuck_rolls,
+    )
+    .await
+    {
+        Ok(status) => status.blocks_roll,
+        Err(e) => {
+            tracing::warn!(error = %e, "autoscale step failed; retaining victim roll exclusion");
+            managed_nodes.iter().any(|n| {
+                n.annotations()
+                    .contains_key(crate::autoscale::VICTIM_ANNOTATION)
+            })
+        }
+    };
 
     // 4. Act. An in-flight scale-down wave takes precedence over image rolls
     //    (the wave's drains are consuming receiving capacity) — requeue soon.
@@ -270,6 +281,14 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
             Ok(Action::requeue(Duration::from_secs(30)))
         }
         RollDecision::RollNode { node, pod } => {
+            // An invalid victim record also protects its node from a pod roll.
+            if managed_nodes.iter().any(|n| {
+                n.name_any() == node
+                    && n.annotations()
+                        .contains_key(crate::autoscale::VICTIM_ANNOTATION)
+            }) {
+                return Ok(Action::requeue(Duration::from_secs(10)));
+            }
             roll_node(client, spec, &node, &pod, recovery_key).await?;
             ::metrics::counter!(crate::metrics::ROLL_NODES_TOTAL).increment(1);
             Ok(Action::requeue(Duration::from_secs(5)))
@@ -278,8 +297,7 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
 }
 
 /// One autoscale reconcile: builds the live coordinator + K8s seams and runs
-/// [`crate::autoscale::step`]. No-op (returns "no wave") unless the CR sets
-/// `autoscaling`.
+/// [`crate::autoscale::step`], including victims left after autoscaling is removed.
 async fn run_autoscale(
     spec: &HostFleetSpec,
     ctx: &Ctx,
@@ -288,17 +306,6 @@ async fn run_autoscale(
     roll_idle: bool,
     stuck_rolls: &[String],
 ) -> Result<crate::autoscale::AutoscaleStatus, OperatorError> {
-    if spec.autoscaling.is_none() {
-        if !stuck_rolls.is_empty() {
-            tracing::warn!(
-                nodes = ?stuck_rolls,
-                "image roll is stuck but autoscaling is disabled; blocking further rolls"
-            );
-        }
-        return Ok(crate::autoscale::AutoscaleStatus {
-            blocks_roll: !stuck_rolls.is_empty(),
-        });
-    }
     let coord = CoordClient::new(spec.coordinator_url.clone(), coord_token());
     let nodes = crate::autoscale::K8sNodeOps {
         client: ctx.client.clone(),
@@ -332,7 +339,7 @@ async fn run_autoscale(
 /// back"), losing post-checkpoint work for no reason when the VM never died.
 /// Drain/evac is reserved for actual **node removal** (scale-down, node
 /// maintenance), where the VMs genuinely die with the node — see
-/// [`gate_drain`].
+/// [`crate::autoscale::Retirement`].
 ///
 /// The cordon stays in force across the swap for scheduling only (no new
 /// placements on a mid-swap host). ADR 0116 A6: the shield against the
@@ -356,7 +363,7 @@ async fn roll_node(
     // between the two leaves a marked node the coordinator still schedules,
     // which the planner just re-rolls (the cordon is idempotent).
     set_node_roll_cordon(client, node, true).await?;
-    coord.cordon(host_id).await?;
+    coord.cordon(host_id, crate::coord::CORDON_OWNER).await?;
     // ADR 0116 A-D2: declare the handoff BEFORE anything can kill the
     // pod, so the coordinator's binding-lease deadline covers the whole
     // replacement (enable-work gate + pod delete + successor gate, plus
@@ -418,7 +425,7 @@ async fn roll_node(
     // Ready; resume scheduling. Coordinator first — it's the load-bearing
     // cordon, and a crash between the two leaves a marked node convergence
     // re-releases (both calls are idempotent).
-    coord.uncordon(host_id).await?;
+    coord.uncordon(host_id, crate::coord::CORDON_OWNER).await?;
     clear_node_roll_markers(client, node).await?;
     tracing::info!(%node, %host_id, "successor Ready + reattached; uncordoned");
     Ok(())
@@ -736,13 +743,6 @@ async fn set_node_roll_cordon(client: &Client, node: &str, on: bool) -> Result<(
     Ok(())
 }
 
-fn roll_recovery_key(spec: &HostFleetSpec) -> &str {
-    spec.autoscaling
-        .as_ref()
-        .map(|a| a.node_pool.as_str())
-        .unwrap_or(spec.daemon_set.name.as_str())
-}
-
 async fn set_node_roll_stuck(
     client: &Client,
     node: &str,
@@ -827,7 +827,12 @@ async fn converge_roll_cordons(
 ) -> Result<(), OperatorError> {
     let marked: Vec<String> = nodes
         .iter()
-        .filter(|n| n.annotations().contains_key(ROLL_CORDON_ANNOTATION))
+        .filter(|n| {
+            n.annotations().contains_key(ROLL_CORDON_ANNOTATION)
+                && !n
+                    .annotations()
+                    .contains_key(crate::autoscale::VICTIM_ANNOTATION)
+        })
         .map(|n| n.name_any())
         .collect();
     if marked.is_empty() {
@@ -841,7 +846,7 @@ async fn converge_roll_cordons(
             %host_id,
             "releasing leaked roll-cordon: roll completed but its owner never uncordoned"
         );
-        coord.uncordon(host_id).await?;
+        coord.uncordon(host_id, crate::coord::CORDON_OWNER).await?;
         clear_node_roll_markers(client, node).await?;
     }
     Ok(())
@@ -950,8 +955,6 @@ mod tests {
     impl GateMock {
         fn status(mats: u32, caps: u32) -> Result<Option<crate::coord::HostStatus>, ()> {
             Ok(Some(crate::coord::HostStatus {
-                status: "ready".into(),
-                running_sandboxes: 0,
                 live_materializes: mats,
                 live_capture_jobs: caps,
             }))
@@ -975,21 +978,21 @@ mod tests {
                 Some(Ok(v)) => Ok(v),
                 Some(Err(())) => Err(OperatorError::Invalid("scripted error".into())),
                 None => Ok(Some(crate::coord::HostStatus {
-                    status: "ready".into(),
-                    running_sandboxes: 0,
                     live_materializes: 0,
                     live_capture_jobs: 0,
                 })),
             }
         }
-        async fn cordon(&self, _host: HostId) -> Result<(), OperatorError> {
-            unreachable!("gate_enable_work never cordons")
-        }
-        async fn uncordon(&self, _host: HostId) -> Result<(), OperatorError> {
+        async fn uncordon(&self, _host: HostId, _owner: &str) -> Result<(), OperatorError> {
             unreachable!("gate_enable_work never uncordons")
         }
-        async fn drain(&self, _host: HostId) -> Result<(), OperatorError> {
-            unreachable!("gate_enable_work never drains")
+        async fn retire_host(
+            &self,
+            _host: HostId,
+            _owner: &str,
+            _reason: &str,
+        ) -> Result<crate::autoscale::Retirement, OperatorError> {
+            unreachable!("gate_enable_work never retires hosts")
         }
         async fn delete_host(&self, _host: HostId) -> Result<(), OperatorError> {
             unreachable!("gate_enable_work never deletes hosts")
@@ -1209,5 +1212,20 @@ mod tests {
         // A Ready on-target pod, but on a DIFFERENT node → doesn't open this
         // node's gate.
         assert!(!successor_ready(&[pod("b", NEW, NA, true)], "a", NEW, NA));
+    }
+    #[test]
+    fn roll_stuck_marker_uses_shared_fleet_key() {
+        let spec = HostFleetSpec {
+            autoscaling: Some(crate::crd::AutoscalingSpec {
+                node_pool: "pool".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let key = crate::autoscale::fleet_key(&spec);
+        let mut node = Node::default();
+        node.metadata.name = Some("stuck".into());
+        node.metadata.annotations = Some([(ROLL_STUCK_ANNOTATION.into(), key.into())].into());
+        assert_eq!(roll_stuck_nodes(&[node], key), ["stuck"]);
     }
 }

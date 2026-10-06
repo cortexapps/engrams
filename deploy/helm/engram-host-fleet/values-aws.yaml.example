@@ -129,4 +129,3 @@ operator:
     scaleDown: aggressive
     scaleDownHysteresisTicks: 5
     maxShedPerWave: 4
-    maxConcurrentDrains: 2

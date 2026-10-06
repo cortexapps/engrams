@@ -1,41 +1,8 @@
-//! ADR 0048: the STATELESS scale-down wave executor.
-//!
-//! The wave is recomputed from scratch every reconcile — no in-memory wave
-//! object. Its only durable state is a Node annotation,
-//! `fleet.engram.io/scaledown-victim: <fleet>`, written when a victim is
-//! cordoned. That annotation (a) distinguishes a wave-cordon from a manual
-//! one, (b) survives an operator restart so a half-finished wave resumes, and
-//! (c) is the set the executor reads to know what's in flight.
-//!
-//! Each reconcile, [`step`] reads coordinator demand + the per-host load and
-//! decides one [`StepAction`] ([`plan_step`], pure + unit-tested):
-//!
-//! - **Queue pressure or scale-up** ⇒ ABORT the wave: uncordon + de-annotate
-//!   every not-yet-removed victim (instant capacity return), then grow the
-//!   pool if needed. A burst mid-wave reclaims the cordoned nodes immediately.
-//! - **Scale-down** (queue empty, hysteresis met, image roll quiescent) ⇒
-//!   START a wave: [`plan_wave`](crate::wave::plan_wave) picks victims, each is
-//!   cordoned + annotated, then up to `maxConcurrentDrains` are driven
-//!   `drain → gate(running→0) → remove_node → delete_host`. A drain that
-//!   times out uncordons + de-annotates that victim and the others continue.
-//! - An **in-flight** wave (annotated victims present) is CONTINUED every tick
-//!   regardless of hysteresis, and blocks new image rolls until it finishes.
-//! - Otherwise **hold**.
-//!
-//! A timed-out image roll is a separate, durable availability-debt state
-//! (`fleet.engram.io/roll-stuck`, ADR 0044/0048 amendments). Its node still
-//! exists physically but cannot accept placement, so queued demand targets
-//! `desired_schedulable + stuck_rolls`. Once replacement capacity is Ready
-//! and the queue is empty, the same drain-gated named-node removal used by a
-//! scale-down wave retires the stuck node. A transiently joining node carries
-//! no marker and therefore never compounds scale-up.
-//!
-//! The actuation rides two seams — [`CoordApi`] (coordinator admin calls) and
-//! [`NodeOps`] (K8s node cordon + annotation) — so the executor is exercised
-//! against recording mocks without a cluster or a coordinator.
+//! ADR 0123 E: durable host retirement before cloud removal.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use engram_core::traits::cloud::NodePoolScaler;
@@ -44,7 +11,7 @@ use k8s_openapi::api::core::v1::Node;
 use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
 
-use crate::coord::{CoordClient, HostLoad, HostStatus};
+use crate::coord::{CoordClient, HostLoad, HostStatus, CORDON_OWNER};
 use crate::crd::HostFleetSpec;
 use crate::error::OperatorError;
 use crate::reconcile::PodInfo;
@@ -52,10 +19,131 @@ use crate::reconcile::ROLL_STUCK_ANNOTATION;
 use crate::scaler::{desired_hosts, AutoscalePolicy};
 use crate::wave::{plan_wave, WaveHost, WavePolicy};
 
-/// Node annotation marking a host as the victim of an in-flight scale-down
-/// wave for fleet `<value>`. Written at cordon time; removed on abort or once
-/// the node is gone. Its presence == "this cordon is a wave-cordon".
-pub const VICTIM_ANNOTATION: &str = "fleet.engram.io/scaledown-victim";
+// Upgrade only with no old scale-down wave in flight. Do not read the old key.
+pub const VICTIM_ANNOTATION: &str = "fleet.engram.io/victim";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VictimRecord {
+    pub fleet: String,
+    pub kind: VictimKind,
+    pub phase: VictimPhase,
+    #[serde(with = "deadline")]
+    pub deadline: Option<SystemTime>,
+}
+
+mod deadline {
+    use super::*;
+    use k8s_openapi::jiff::Timestamp;
+    pub fn serialize<S: serde::Serializer>(
+        value: &Option<SystemTime>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value
+            .map(Timestamp::try_from)
+            .transpose()
+            .map_err(serde::ser::Error::custom)?
+            .map(|t| t.to_string())
+            .serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<SystemTime>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|s| {
+                s.parse::<Timestamp>()
+                    .map(SystemTime::from)
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VictimKind {
+    Shed,
+    Repair,
+}
+impl VictimKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shed => "shed",
+            Self::Repair => "repair",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VictimPhase {
+    Retiring,
+    Removing,
+}
+#[derive(Clone, Debug)]
+pub struct Victim {
+    pub node: String,
+    pub record: VictimRecord,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Retirement {
+    Pending(Vec<String>),
+    Granted,
+    NoRow,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseReason {
+    NotInPlan,
+    Deadline,
+    Pressure,
+    NoRow,
+}
+impl ReleaseReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotInPlan => "not_in_plan",
+            Self::Deadline => "deadline",
+            Self::Pressure => "pressure",
+            Self::NoRow => "no_row",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    CallRetire,
+    Remove,
+    Release(ReleaseReason),
+    Hold,
+}
+pub fn plan_victim(v: &VictimRecord, in_plan: bool) -> Next {
+    match (v.phase, v.kind, in_plan) {
+        (VictimPhase::Removing, _, _) => Next::Remove,
+        (_, VictimKind::Shed, false) => Next::Release(ReleaseReason::NotInPlan),
+        _ => Next::CallRetire,
+    }
+}
+pub fn after_retire(v: &VictimRecord, r: Retirement, pressure_now: bool, now: SystemTime) -> Next {
+    match r {
+        Retirement::Granted => Next::Remove,
+        Retirement::NoRow if v.kind == VictimKind::Shed => Next::Release(ReleaseReason::NoRow),
+        Retirement::Pending(_) if v.kind == VictimKind::Shed && pressure_now => {
+            Next::Release(ReleaseReason::Pressure)
+        }
+        Retirement::Pending(_)
+            if v.kind == VictimKind::Shed && v.deadline.is_some_and(|d| now >= d) =>
+        {
+            Next::Release(ReleaseReason::Deadline)
+        }
+        _ => Next::Hold,
+    }
+}
+
+/// Shared durable identity for roll recovery and victim records.
+pub fn fleet_key(spec: &HostFleetSpec) -> &str {
+    spec.autoscaling
+        .as_ref()
+        .map(|a| a.node_pool.as_str())
+        .unwrap_or(&spec.daemon_set.name)
+}
 
 /// Coordinator admin calls the wave drives. A trait so the executor runs
 /// against a recording mock in tests (the live impl is [`CoordClient`]).
@@ -64,9 +152,13 @@ pub trait CoordApi: Send + Sync {
     async fn fleet_demand(&self) -> Result<crate::scaler::FleetDemand, OperatorError>;
     async fn list_hosts(&self) -> Result<Vec<HostLoad>, OperatorError>;
     async fn host_status(&self, host: HostId) -> Result<Option<HostStatus>, OperatorError>;
-    async fn cordon(&self, host: HostId) -> Result<(), OperatorError>;
-    async fn uncordon(&self, host: HostId) -> Result<(), OperatorError>;
-    async fn drain(&self, host: HostId) -> Result<(), OperatorError>;
+    async fn uncordon(&self, host: HostId, owner: &str) -> Result<(), OperatorError>;
+    async fn retire_host(
+        &self,
+        host: HostId,
+        owner: &str,
+        reason: &str,
+    ) -> Result<Retirement, OperatorError>;
     async fn delete_host(&self, host: HostId) -> Result<(), OperatorError>;
 }
 
@@ -81,14 +173,16 @@ impl CoordApi for CoordClient {
     async fn host_status(&self, host: HostId) -> Result<Option<HostStatus>, OperatorError> {
         CoordClient::host_status(self, host).await
     }
-    async fn cordon(&self, host: HostId) -> Result<(), OperatorError> {
-        CoordClient::cordon(self, host).await
+    async fn uncordon(&self, host: HostId, owner: &str) -> Result<(), OperatorError> {
+        CoordClient::uncordon(self, host, owner).await
     }
-    async fn uncordon(&self, host: HostId) -> Result<(), OperatorError> {
-        CoordClient::uncordon(self, host).await
-    }
-    async fn drain(&self, host: HostId) -> Result<(), OperatorError> {
-        CoordClient::drain(self, host).await
+    async fn retire_host(
+        &self,
+        host: HostId,
+        owner: &str,
+        reason: &str,
+    ) -> Result<Retirement, OperatorError> {
+        CoordClient::retire_host(self, host, owner, reason).await
     }
     async fn delete_host(&self, host: HostId) -> Result<(), OperatorError> {
         CoordClient::delete_host(self, host).await
@@ -99,14 +193,10 @@ impl CoordApi for CoordClient {
 /// annotation. A trait for the same test-seam reason as [`CoordApi`].
 #[async_trait]
 pub trait NodeOps: Send + Sync {
-    async fn set_unschedulable(&self, node: &str, val: bool) -> Result<(), OperatorError>;
-    /// Set (Some) or clear (None) the victim annotation on `node`.
-    async fn set_victim(&self, node: &str, fleet: Option<&str>) -> Result<(), OperatorError>;
-    /// Every node currently annotated as a victim of `fleet`.
-    async fn annotated_victims(&self, fleet: &str) -> Result<Vec<String>, OperatorError>;
-    /// Clear the durable timed-out-image-roll marker on `node` after the
-    /// named node has been safely removed.
-    async fn clear_roll_stuck(&self, node: &str) -> Result<(), OperatorError>;
+    /// Empty fleet selects all records in this DaemonSet's node snapshot after autoscaling is removed.
+    async fn victims(&self, fleet: &str) -> Result<Vec<Victim>, OperatorError>;
+    async fn mark_victim(&self, node: &str, record: &VictimRecord) -> Result<(), OperatorError>;
+    async fn clear_victim(&self, node: &str) -> Result<(), OperatorError>;
 
     /// The K8s Node object's `creationTimestamp`, for the node-ready
     /// bring-up histogram. Defaulted to `None` so the recording test
@@ -139,55 +229,74 @@ pub struct K8sNodeOps<'a> {
 
 #[async_trait]
 impl NodeOps for K8sNodeOps<'_> {
-    async fn set_unschedulable(&self, node: &str, val: bool) -> Result<(), OperatorError> {
-        let nodes: Api<Node> = Api::all(self.client.clone());
-        let patch = serde_json::json!({ "spec": { "unschedulable": val } });
-        nodes
-            .patch(node, &PatchParams::default(), &Patch::Merge(patch))
-            .await?;
-        Ok(())
-    }
-
-    async fn set_victim(&self, node: &str, fleet: Option<&str>) -> Result<(), OperatorError> {
-        let nodes: Api<Node> = Api::all(self.client.clone());
-        // A `null` annotation value deletes the key under a merge patch.
-        let val = match fleet {
-            Some(f) => serde_json::Value::String(f.to_string()),
-            None => serde_json::Value::Null,
-        };
-        let patch = serde_json::json!({
-            "metadata": { "annotations": { VICTIM_ANNOTATION: val } }
-        });
-        nodes
-            .patch(node, &PatchParams::default(), &Patch::Merge(patch))
-            .await?;
-        Ok(())
-    }
-
-    async fn annotated_victims(&self, fleet: &str) -> Result<Vec<String>, OperatorError> {
+    async fn victims(&self, fleet: &str) -> Result<Vec<Victim>, OperatorError> {
         use kube::ResourceExt;
-        Ok(self
+        let mut victims = Vec::new();
+        for node in self.managed_nodes {
+            let Some(raw) = node.annotations().get(VICTIM_ANNOTATION) else {
+                continue;
+            };
+            match serde_json::from_str::<VictimRecord>(raw) {
+                Ok(record) if fleet.is_empty() || record.fleet == fleet => {
+                    victims.push(Victim {
+                        node: node.name_any(),
+                        record,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(node = %node.name_any(), %error,
+                        "invalid victim annotation; leaving node unchanged");
+                    ::metrics::counter!(crate::metrics::AUTOSCALE_INVALID_VICTIMS_TOTAL)
+                        .increment(1);
+                }
+            }
+        }
+        Ok(victims)
+    }
+
+    async fn mark_victim(&self, node: &str, record: &VictimRecord) -> Result<(), OperatorError> {
+        // Never overwrite an invalid or foreign record from the snapshot.
+        if let Some(raw) = self
             .managed_nodes
             .iter()
-            .filter(|n| {
-                n.annotations()
-                    .get(VICTIM_ANNOTATION)
-                    .map(|v| v == fleet)
-                    .unwrap_or(false)
-            })
-            .map(|n| n.name_any())
-            .collect())
-    }
-
-    async fn clear_roll_stuck(&self, node: &str) -> Result<(), OperatorError> {
+            .find(|n| n.metadata.name.as_deref() == Some(node))
+            .and_then(|n| n.metadata.annotations.as_ref())
+            .and_then(|a| a.get(VICTIM_ANNOTATION))
+        {
+            let old: VictimRecord =
+                serde_json::from_str(raw).map_err(|e| OperatorError::Invalid(e.to_string()))?;
+            if old.fleet != record.fleet {
+                return Err(OperatorError::Invalid("foreign victim record".into()));
+            }
+        }
         let nodes: Api<Node> = Api::all(self.client.clone());
-        let patch = serde_json::json!({
-            "metadata": { "annotations": { ROLL_STUCK_ANNOTATION: serde_json::Value::Null } }
-        });
         nodes
-            .patch(node, &PatchParams::default(), &Patch::Merge(patch))
+            .patch(
+                node,
+                &PatchParams::default(),
+                &Patch::Merge(mark_victim_patch(record)?),
+            )
             .await?;
         Ok(())
+    }
+    async fn clear_victim(&self, node: &str) -> Result<(), OperatorError> {
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        match nodes
+            .patch(
+                node,
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({
+                    "metadata": { "annotations": { VICTIM_ANNOTATION: null } },
+                    "spec": { "unschedulable": false }
+                })),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn node_created_at(
@@ -220,6 +329,14 @@ impl NodeOps for K8sNodeOps<'_> {
             .and_then(|c| c.last_transition_time.clone())
             .map(|t| t.0.into()))
     }
+}
+
+fn mark_victim_patch(record: &VictimRecord) -> Result<serde_json::Value, OperatorError> {
+    let value = serde_json::to_string(record).map_err(|e| OperatorError::Invalid(e.to_string()))?;
+    Ok(serde_json::json!({
+        "metadata": { "annotations": { VICTIM_ANNOTATION: value, ROLL_STUCK_ANNOTATION: null } },
+        "spec": { "unschedulable": true }
+    }))
 }
 
 /// Cross-tick memory for the node-ready histogram: the set of host ids
@@ -363,7 +480,7 @@ async fn track_node_ready(
         else {
             continue;
         };
-        let registered_at = crate::time_source::metrics_wall_now();
+        let registered_at = crate::time_source::wall_now();
         let scale_requested_at = tracker.take_scale_request(&pod.node);
         let created_at = match nodes.node_created_at(&pod.node).await {
             Ok(value) => value,
@@ -442,64 +559,6 @@ async fn track_node_ready(
     }
 }
 
-/// What [`step`] decided to do this reconcile. Pure output of [`plan_step`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StepAction {
-    /// Queue/scale-up pressure: return any cordoned wave capacity, then grow
-    /// (the caller grows only above both the pod count and the cloud target).
-    AbortAndGrow,
-    /// Queue pressure with no grow needed: just return cordoned capacity.
-    AbortOnly,
-    /// Begin a fresh scale-down wave (hysteresis met + image roll quiescent).
-    StartWave,
-    /// Continue an in-flight wave (finish what's started — ignores hysteresis
-    /// and the roll gate; an in-flight wave already blocks rolls).
-    ContinueWave,
-    /// Nothing to do.
-    Hold,
-}
-
-/// Inputs to the pure step decision.
-#[derive(Clone, Copy, Debug)]
-pub struct StepInputs {
-    pub desired: u32,
-    /// Grow-only cloud target after adding durable unavailable-capacity debt.
-    pub grow_target: u32,
-    pub current: u32,
-    pub physical: u32,
-    pub queued_sessions: u64,
-    pub scale_down_enabled: bool,
-    pub hysteresis_ready: bool,
-    pub roll_idle: bool,
-    pub wave_in_flight: bool,
-}
-
-/// The pure wave-step decision — see [`StepAction`]. Precedence: queue/scale-up
-/// pressure aborts everything; otherwise an in-flight wave continues; a fresh
-/// wave needs hysteresis + a quiescent roll; else hold.
-pub fn plan_step(i: StepInputs) -> StepAction {
-    let scale_up = i.grow_target > i.physical;
-    if i.queued_sessions > 0 || scale_up {
-        return if scale_up {
-            StepAction::AbortAndGrow
-        } else {
-            StepAction::AbortOnly
-        };
-    }
-    if !i.scale_down_enabled {
-        return StepAction::Hold;
-    }
-    // An in-flight wave is finished regardless of the scale-down target — once
-    // victims are cordoned + draining, see them through.
-    if i.wave_in_flight {
-        return StepAction::ContinueWave;
-    }
-    if i.desired < i.current && i.hysteresis_ready && i.roll_idle {
-        return StepAction::StartWave;
-    }
-    StepAction::Hold
-}
-
 /// Result of one autoscale step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AutoscaleStatus {
@@ -521,17 +580,6 @@ pub struct FleetObservation<'a> {
     pub pods: &'a [PodInfo],
     pub roll_idle: bool,
     pub stuck_rolls: &'a [String],
-}
-
-/// Bundle of the actuation seams + wave knobs, passed to the drive helpers.
-pub struct WaveActuator<'a> {
-    pub coord: &'a dyn CoordApi,
-    pub nodes: &'a dyn NodeOps,
-    pub scaler: &'a dyn NodePoolScaler,
-    pub fleet: &'a str,
-    pub node_pool: &'a str,
-    pub max_concurrent_drains: u32,
-    pub drain_timeout: Duration,
 }
 
 /// Map each pod's node name → its coordinator [`HostLoad`] (joined by the
@@ -570,223 +618,31 @@ pub fn assemble_wave_hosts(
         .collect()
 }
 
-/// Uncordon + de-annotate every in-flight victim — the wave abort path.
-/// Best-effort per node (a single failure is logged, the rest proceed) so a
-/// transient error can't strand capacity cordoned.
-async fn abort_wave(act: &WaveActuator<'_>, victims: &[String]) {
-    for node in victims {
-        let host = HostId::from_node_name(node);
-        let r = async {
-            act.coord.uncordon(host).await?;
-            act.nodes.set_unschedulable(node, false).await?;
-            act.nodes.set_victim(node, None).await?;
-            Ok::<(), OperatorError>(())
-        }
-        .await;
-        match r {
-            Ok(()) => {
-                ::metrics::counter!(
-                    crate::metrics::AUTOSCALE_VICTIMS_RELEASED_TOTAL, "reason" => "abort"
-                )
-                .increment(1);
-                tracing::info!(%node, %host, "wave abort: uncordoned + de-annotated victim")
-            }
-            Err(e) => {
-                tracing::warn!(%node, %host, error=%e, "wave abort: failed to release victim")
-            }
-        }
-    }
-}
-
-/// Drive the planned victims. Cordons + annotates every victim first (stops new
-/// placement on doomed nodes), then drives up to `max_concurrent_drains`
-/// through `drain → gate → remove_node → delete_host`. Returns how many victims
-/// remain in flight (cordoned, not yet removed) — non-zero means "wave still
-/// running".
-async fn drive_victims(act: &WaveActuator<'_>, victims: &[String]) -> u32 {
-    // 1. Cordon + annotate all victims (idempotent — a re-driven in-flight
-    //    victim is already cordoned).
-    for node in victims {
-        let host = HostId::from_node_name(node);
-        if let Err(e) = ensure_cordoned(act, node, host).await {
-            tracing::warn!(%node, error=%e, "wave: failed to cordon victim; will retry next tick");
-        }
-    }
-
-    // 2. Drive up to max_concurrent_drains victims to full removal this tick.
-    let mut in_flight = victims.len() as u32;
-    let budget = act.max_concurrent_drains.max(1);
-    for node in victims.iter().take(budget as usize) {
-        let host = HostId::from_node_name(node);
-        match drive_one(act, node, host).await {
-            DriveOutcome::Removed => in_flight = in_flight.saturating_sub(1),
-            DriveOutcome::Released => in_flight = in_flight.saturating_sub(1),
-            DriveOutcome::StillDraining => {}
-        }
-    }
-    in_flight
-}
-
-enum DriveOutcome {
-    /// Drained + removed + deregistered.
-    Removed,
-    /// Drain timed out → uncordoned + de-annotated (capacity returned).
-    Released,
-    /// Transient error mid-pipeline — left cordoned for the next tick.
-    StillDraining,
-}
-
-/// Cordon a victim on both the coordinator (durable, stops placement) and the
-/// K8s node (stops stray scheduling), and annotate it as a wave victim.
-async fn ensure_cordoned(
-    act: &WaveActuator<'_>,
-    node: &str,
-    host: HostId,
+/// Release only our durable intent. A transient error preserves the record.
+async fn release(
+    coord: &dyn CoordApi,
+    nodes: &dyn NodeOps,
+    v: &Victim,
+    reason: ReleaseReason,
 ) -> Result<(), OperatorError> {
-    act.coord.cordon(host).await?;
-    act.nodes.set_unschedulable(node, true).await?;
-    act.nodes.set_victim(node, Some(act.fleet)).await?;
+    match coord
+        .uncordon(HostId::from_node_name(&v.node), CORDON_OWNER)
+        .await
+    {
+        Ok(()) => {}
+        Err(OperatorError::Rpc { status, .. })
+            if matches!(
+                status.code(),
+                tonic::Code::NotFound | tonic::Code::FailedPrecondition
+            ) => {}
+        Err(e) => return Err(e),
+    }
+    nodes.clear_victim(&v.node).await?;
+    ::metrics::counter!(crate::metrics::AUTOSCALE_VICTIMS_RELEASED_TOTAL, "reason" => reason.label()).increment(1);
     Ok(())
 }
 
-/// One victim through `drain → gate → remove_node → delete_host`. A drain
-/// timeout releases the victim (uncordon + de-annotate) so it rejoins the
-/// fleet — never strand a session because one host wouldn't drain.
-async fn drive_one(act: &WaveActuator<'_>, node: &str, host: HostId) -> DriveOutcome {
-    if let Err(e) = act.coord.drain(host).await {
-        tracing::warn!(%node, %host, error=%e, "wave: drain call failed; retry next tick");
-        return DriveOutcome::StillDraining;
-    }
-    match gate_drain(act.coord, host, act.drain_timeout).await {
-        Ok(()) => {}
-        Err(OperatorError::DrainTimeout { remaining, .. }) => {
-            tracing::warn!(
-                %node, %host, remaining,
-                "wave: drain timed out — releasing victim (uncordon + de-annotate)"
-            );
-            let _ = act.coord.uncordon(host).await;
-            let _ = act.nodes.set_unschedulable(node, false).await;
-            let _ = act.nodes.set_victim(node, None).await;
-            ::metrics::counter!(
-                crate::metrics::AUTOSCALE_VICTIMS_RELEASED_TOTAL, "reason" => "drain_timeout"
-            )
-            .increment(1);
-            return DriveOutcome::Released;
-        }
-        Err(e) => {
-            tracing::warn!(%node, %host, error=%e, "wave: drain gate errored; retry next tick");
-            return DriveOutcome::StillDraining;
-        }
-    }
-    // Drained to 0 sandboxes. Remove the node (decrements MIG target) then
-    // deregister the coord row so it doesn't linger to the dead-host TTL.
-    if let Err(e) = act.scaler.remove_node(act.node_pool, node).await {
-        tracing::warn!(%node, error=%e, "wave: remove_node failed; retry next tick");
-        return DriveOutcome::StillDraining;
-    }
-    if let Err(e) = act.coord.delete_host(host).await {
-        // The node is already gone from the cloud; the coord row will fall to
-        // the dead-host TTL. Log + move on (don't re-add the node).
-        tracing::warn!(%node, %host, error=%e, "wave: delete_host failed; row will TTL out");
-    }
-    // Clear the annotation defensively (the Node object usually vanishes with
-    // the instance, but a slow kubelet deregistration could leave it).
-    let _ = act.nodes.set_victim(node, None).await;
-    ::metrics::counter!(crate::metrics::AUTOSCALE_VICTIMS_REMOVED_TOTAL).increment(1);
-    tracing::info!(%node, %host, "wave: victim drained + removed + deregistered");
-    DriveOutcome::Removed
-}
-
-/// Retire durable image-roll failures after surge capacity is schedulable.
-/// This deliberately does NOT share the scale-down wave's timeout-release
-/// arm: a roll-stuck node has no viable host-agent successor, so uncordoning
-/// it would advertise broken capacity. Any drain/RPC failure leaves it
-/// cordoned + marked for a later retry.
-async fn repair_stuck_rolls(act: &WaveActuator<'_>, stuck: &[String]) -> u32 {
-    let mut remaining = stuck.len() as u32;
-    for node in stuck.iter().take(act.max_concurrent_drains as usize) {
-        if repair_stuck_roll(act, node).await {
-            remaining = remaining.saturating_sub(1);
-        }
-    }
-    remaining
-}
-
-async fn repair_stuck_roll(act: &WaveActuator<'_>, node: &str) -> bool {
-    let host = HostId::from_node_name(node);
-    if let Err(e) = act.coord.cordon(host).await {
-        tracing::warn!(%node, %host, error=%e, "stuck-roll repair: coordinator cordon failed");
-        return false;
-    }
-    if let Err(e) = act.nodes.set_unschedulable(node, true).await {
-        tracing::warn!(%node, %host, error=%e, "stuck-roll repair: K8s cordon failed");
-        return false;
-    }
-    if let Err(e) = act.coord.drain(host).await {
-        tracing::warn!(%node, %host, error=%e, "stuck-roll repair: drain call failed");
-        return false;
-    }
-    if let Err(e) = gate_drain(act.coord, host, act.drain_timeout).await {
-        tracing::warn!(
-            %node,
-            %host,
-            error=%e,
-            "stuck-roll repair: drain gate did not complete; keeping node cordoned"
-        );
-        return false;
-    }
-    if let Err(e) = act.scaler.remove_node(act.node_pool, node).await {
-        tracing::warn!(%node, %host, error=%e, "stuck-roll repair: remove_node failed");
-        return false;
-    }
-    if let Err(e) = act.coord.delete_host(host).await {
-        tracing::warn!(%node, %host, error=%e, "stuck-roll repair: delete_host failed; row will TTL out");
-    }
-    // The cloud removal normally deletes the Node object. Clear the marker
-    // best-effort for a slow kubelet deregistration; a NotFound is harmless.
-    let _ = act.nodes.clear_roll_stuck(node).await;
-    ::metrics::counter!(crate::metrics::AUTOSCALE_STUCK_ROLL_REPAIRS_TOTAL).increment(1);
-    tracing::info!(%node, %host, "stuck-roll repair: drained + removed + deregistered");
-    true
-}
-
-/// Poll the coordinator's drain gate until the host reports
-/// `running_sandboxes == 0` AND no in-flight enable work (or it's
-/// deregistered), or the budget elapses.
-///
-/// ADR 0088: the sandbox count *incidentally* covers a capture VM (it is
-/// registered in the backend and counted) but a materialize boots no VM —
-/// without the `has_enable_work` leg, a scale-down could remove the node
-/// under a live materialize. Node removal genuinely destroys the work, so
-/// unlike the image roll's proceed-on-timeout gate, this stays inside the
-/// wave's existing release-the-victim-on-timeout semantics.
-async fn gate_drain(
-    coord: &dyn CoordApi,
-    host: HostId,
-    budget: Duration,
-) -> Result<(), OperatorError> {
-    let deadline = crate::time_source::metrics_now_tokio() + budget;
-    loop {
-        match coord.host_status(host).await? {
-            None => return Ok(()), // already deregistered
-            Some(st) if st.running_sandboxes == 0 && !st.has_enable_work() => return Ok(()),
-            Some(st) => {
-                if crate::time_source::metrics_now_tokio() >= deadline {
-                    return Err(OperatorError::DrainTimeout {
-                        host_id: host.to_string(),
-                        remaining: st.running_sandboxes,
-                    });
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    }
-}
-
-/// One autoscale step for the reconcile loop. `roll_idle` is true iff the image
-/// roll is `UpToDate` (a fresh wave only starts when no roll is in flight).
-/// Returns whether a wave is in flight (the caller blocks rolls + requeues
-/// soon while one is).
+/// One bounded step per victim. The annotation is the restart cursor.
 pub async fn step(
     spec: &HostFleetSpec,
     scaler: Option<&dyn NodePoolScaler>,
@@ -796,212 +652,221 @@ pub async fn step(
     nodes: &dyn NodeOps,
     observation: FleetObservation<'_>,
 ) -> Result<AutoscaleStatus, OperatorError> {
-    let Some(a) = &spec.autoscaling else {
-        return Ok(AutoscaleStatus::default());
-    };
-    let policy = AutoscalePolicy {
+    let demand = coord.fleet_demand().await?;
+    let hosts = coord.list_hosts().await?;
+    let key = fleet_key(spec);
+    let mut victims = nodes
+        .victims(if spec.autoscaling.is_some() { key } else { "" })
+        .await?;
+    let policy = spec.autoscaling.as_ref().map(|a| AutoscalePolicy {
         min_hosts: a.min_hosts,
         max_hosts: a.max_hosts,
         target_free_mib: a.target_free_mib,
         scale_down: a.scale_down,
-    };
-    let demand = coord.fleet_demand().await?;
-    let desired = desired_hosts(demand, policy);
-    let current = demand.schedulable_hosts;
-    let pods = observation.pods;
-    let stuck_rolls = observation.stuck_rolls;
-    let physical = pods.len() as u32;
-    // ADR 0044/0048 amendment: a timed-out image roll still exists in the
-    // managed pool and in the DaemonSet list, but cannot become schedulable.
-    // Add that durable debt to the schedulable target. A normal joining node
-    // has no marker, so repeated reconciles keep reasserting one idempotent
-    // target instead of ratcheting the pool upward.
-    let unavailable = stuck_rolls.len() as u32;
-    let grow_target = desired
-        .saturating_add(unavailable)
-        .min(a.max_hosts.max(a.min_hosts));
-    for (kind, value) in [
-        ("desired", desired),
-        ("schedulable", current),
-        ("physical", physical),
-        ("grow_target", grow_target),
-    ] {
-        ::metrics::gauge!(crate::metrics::AUTOSCALE_HOSTS, "kind" => kind).set(value as f64);
-    }
-    let hosts = coord.list_hosts().await?;
+    });
+    let desired = policy
+        .map(|p| desired_hosts(demand, p))
+        .unwrap_or(demand.schedulable_hosts);
     let Some(scaler) = scaler else {
-        let wave_hosts = assemble_wave_hosts(pods, &hosts, &[]);
-        let decision = plan_wave(
-            &wave_hosts,
-            desired,
-            WavePolicy {
-                mode: a.scale_down,
-                max_shed_per_wave: a.max_shed_per_wave.max(1),
-                floor: a.min_hosts.max(spec.capacity_floor),
-                headroom_mib: a.target_free_mib,
-            },
-        );
-        tracing::info!(node_pool = %a.node_pool, current, physical, desired, grow_target,
-            victims = ?decision.victims, note = %decision.note, "autoscale observe-only plan");
-        return Ok(AutoscaleStatus::default());
-    };
-    // The annotation value keys wave-victims to THIS node pool (distinguishing
-    // them from a manual cordon, and from another fleet's wave).
-    let fleet_key = a.node_pool.as_str();
-    let annotated = nodes.annotated_victims(fleet_key).await?;
-    let wave_in_flight = !annotated.is_empty();
-
-    track_node_ready(node_ready, nodes, pods, &hosts).await;
-
-    ::metrics::gauge!(crate::metrics::AUTOSCALE_WAVE_IN_FLIGHT).set(if wave_in_flight {
-        1.0
-    } else {
-        0.0
-    });
-
-    // Hysteresis: accumulate only while a fresh scale-down target persists.
-    let scale_down_target = a.scale_down.enabled()
-        && desired < current
-        && demand.queued_sessions == 0
-        && stuck_rolls.is_empty()
-        && desired <= physical;
-    let hysteresis_ticks = scaledown_hysteresis.observe(scale_down_target && !wave_in_flight);
-    let hysteresis_ready = hysteresis_ticks >= a.scale_down_hysteresis_ticks.max(1);
-
-    let action = plan_step(StepInputs {
-        desired,
-        grow_target,
-        current,
-        physical,
-        queued_sessions: demand.queued_sessions,
-        scale_down_enabled: a.scale_down.enabled(),
-        hysteresis_ready,
-        roll_idle: observation.roll_idle,
-        wave_in_flight,
-    });
-    tracing::info!(
-        node_pool = %a.node_pool, current, physical, desired, grow_target,
-        unavailable, queued = demand.queued_sessions, wave_in_flight, ?action,
-        "autoscale step"
-    );
-    let action_label = match action {
-        StepAction::Hold => "hold",
-        StepAction::StartWave => "start_wave",
-        StepAction::ContinueWave => "continue_wave",
-        StepAction::AbortAndGrow => "abort_and_grow",
-        StepAction::AbortOnly => "abort_only",
-    };
-    ::metrics::counter!(crate::metrics::AUTOSCALE_STEP_ACTIONS_TOTAL, "action" => action_label)
-        .increment(1);
-
-    let act = WaveActuator {
-        coord,
-        nodes,
-        scaler,
-        fleet: fleet_key,
-        node_pool: &a.node_pool,
-        max_concurrent_drains: a.max_concurrent_drains.max(1),
-        drain_timeout: Duration::from_secs(spec.drain_timeout_seconds),
-    };
-
-    let pressure = matches!(action, StepAction::AbortAndGrow | StepAction::AbortOnly);
-    if (pressure || !stuck_rolls.is_empty()) && wave_in_flight {
-        abort_wave(&act, &annotated).await;
-    }
-    if grow_target > physical && grow_target > scaler.current_target(&a.node_pool).await? {
-        let requested_at = crate::time_source::metrics_wall_now();
-        scaler.set_size(&a.node_pool, grow_target).await?;
-        node_ready.record_grow(physical, grow_target, requested_at);
-        ::metrics::counter!(crate::metrics::AUTOSCALE_GROWS_TOTAL).increment(1);
-        tracing::info!(
-            node_pool=%a.node_pool,
-            desired,
-            grow_target,
-            physical,
-            unavailable,
-            "autoscale: grew pool (including unavailable-capacity debt)"
-        );
-    }
-
-    if !stuck_rolls.is_empty() {
-        // Do not compete with queued creates for the replacement capacity.
-        // Once the queue drains and the schedulable target is actually met,
-        // safely drain + remove the named broken node.
-        if demand.queued_sessions == 0 && current >= desired {
-            let remaining = repair_stuck_rolls(&act, stuck_rolls).await;
-            tracing::info!(
-                node_pool=%a.node_pool,
-                stuck = stuck_rolls.len(),
-                remaining,
-                "stuck-roll repair step"
+        if let Some(a) = &spec.autoscaling {
+            let pinned: Vec<_> = victims.iter().map(|v| v.node.clone()).collect();
+            let decision = plan_wave(
+                &assemble_wave_hosts(observation.pods, &hosts, &pinned),
+                desired,
+                WavePolicy {
+                    mode: a.scale_down,
+                    max_shed_per_wave: a.max_shed_per_wave.max(1),
+                    floor: a.min_hosts.max(spec.capacity_floor),
+                    headroom_mib: a.target_free_mib,
+                },
             );
-            // Repair may have removed a named node this tick — block the
-            // precomputed image-roll decision; the next reconcile must
-            // observe the new fleet first.
-            return Ok(AutoscaleStatus { blocks_roll: true });
+            tracing::info!(desired, victims = ?decision.victims, note = %decision.note, "autoscale observe-only plan");
         }
-        // Durable debt alone never blocks a roll (issue #1012): the stuck
-        // node's successor is not Ready, so `plan_roll` already yields
-        // WaitForReady, and when the queue is starved by wire skew the roll
-        // is the only thing that can serve it.
         return Ok(AutoscaleStatus::default());
-    }
-
-    match action {
-        StepAction::AbortAndGrow | StepAction::AbortOnly => {
-            // Queue/scale-up pressure aborts waves and grows the pool, but
-            // never suppresses image rolls (issue #1012): a roll removes no
-            // capacity (reattach pod swap, floor-gated), and a queue starved
-            // by wire skew is served BY the roll — blocking here deadlocks
-            // (queue waits for roll, roll waits for queue).
-            Ok(AutoscaleStatus::default())
+    };
+    track_node_ready(node_ready, nodes, observation.pods, &hosts).await;
+    let mut planned = Vec::new();
+    let mut repaired = false;
+    if let Some(a) = &spec.autoscaling {
+        let physical = observation.pods.len() as u32;
+        let unavailable = observation.stuck_rolls.len() as u32
+            + victims
+                .iter()
+                .filter(|v| {
+                    v.record.kind == VictimKind::Repair
+                        && !observation.stuck_rolls.contains(&v.node)
+                })
+                .count() as u32;
+        let grow_target = desired
+            .saturating_add(unavailable)
+            .min(a.max_hosts.max(a.min_hosts));
+        for (kind, value) in [
+            ("desired", desired),
+            ("schedulable", demand.schedulable_hosts),
+            ("physical", physical),
+            ("grow_target", grow_target),
+        ] {
+            ::metrics::gauge!(crate::metrics::AUTOSCALE_HOSTS, "kind" => kind).set(value as f64);
         }
-        StepAction::Hold => Ok(AutoscaleStatus::default()),
-        StepAction::StartWave | StepAction::ContinueWave => {
-            let wave_hosts = assemble_wave_hosts(pods, &hosts, &annotated);
-            let wpolicy = WavePolicy {
-                mode: a.scale_down,
-                max_shed_per_wave: a.max_shed_per_wave.max(1),
-                floor: a.min_hosts.max(spec.capacity_floor),
-                headroom_mib: a.target_free_mib,
-            };
-            let decision = plan_wave(&wave_hosts, desired, wpolicy);
-            tracing::info!(node_pool=%a.node_pool, victims=?decision.victims, note=%decision.note, "wave plan");
-            if decision.victims.is_empty() {
-                // Nothing safe to shed this tick; clear any leftover in-flight
-                // annotations so a stuck wave doesn't block rolls forever.
-                if wave_in_flight {
-                    abort_wave(&act, &annotated).await;
+        if grow_target > physical && grow_target > scaler.current_target(&a.node_pool).await? {
+            scaler.set_size(&a.node_pool, grow_target).await?;
+            node_ready.record_grow(physical, grow_target, crate::time_source::wall_now());
+            ::metrics::counter!(crate::metrics::AUTOSCALE_GROWS_TOTAL).increment(1);
+        }
+        let budget = a.max_shed_per_wave.max(1) as usize;
+        if demand.queued_sessions == 0 && demand.schedulable_hosts >= desired {
+            for node in observation.stuck_rolls {
+                if victims.len() >= budget {
+                    break;
                 }
-                return Ok(AutoscaleStatus::default());
+                if victims.iter().any(|v| &v.node == node) {
+                    continue;
+                }
+                let record = VictimRecord {
+                    fleet: key.into(),
+                    kind: VictimKind::Repair,
+                    phase: VictimPhase::Retiring,
+                    deadline: None,
+                };
+                if let Err(error) = nodes.mark_victim(node, &record).await {
+                    tracing::warn!(%node, %error, "could not mark repair victim; retry next tick");
+                    continue;
+                }
+                victims.push(Victim {
+                    node: node.clone(),
+                    record,
+                });
+                repaired = true;
             }
-            let in_flight = drive_victims(&act, &decision.victims).await;
-            Ok(AutoscaleStatus {
-                blocks_roll: in_flight > 0,
+        }
+        let pinned: Vec<_> = victims
+            .iter()
+            .filter(|v| {
+                v.record.kind == VictimKind::Shed && v.record.phase == VictimPhase::Retiring
             })
+            .map(|v| v.node.clone())
+            .collect();
+        let reserved = victims
+            .iter()
+            .filter(|v| {
+                v.record.kind == VictimKind::Repair || v.record.phase == VictimPhase::Removing
+            })
+            .count();
+        let mut wave_hosts = assemble_wave_hosts(observation.pods, &hosts, &pinned);
+        wave_hosts.retain(|h| {
+            !victims.iter().any(|v| {
+                v.node == h.node
+                    && (v.record.kind == VictimKind::Repair
+                        || v.record.phase == VictimPhase::Removing)
+            })
+        });
+        if a.scale_down.enabled() {
+            planned = plan_wave(
+                &wave_hosts,
+                desired,
+                WavePolicy {
+                    mode: a.scale_down,
+                    max_shed_per_wave: budget.saturating_sub(reserved) as u32,
+                    floor: a.min_hosts.max(spec.capacity_floor),
+                    headroom_mib: a.target_free_mib,
+                },
+            )
+            .victims;
+        }
+        let target = a.scale_down.enabled()
+            && desired < demand.schedulable_hosts
+            && demand.queued_sessions == 0
+            && unavailable == 0;
+        let ticks = scaledown_hysteresis.observe(target && victims.is_empty());
+        let can_start =
+            target && observation.roll_idle && ticks >= a.scale_down_hysteresis_ticks.max(1);
+        planned.retain(|node| pinned.contains(node) || can_start);
+        for node in &planned {
+            if victims.iter().any(|v| &v.node == node) {
+                continue;
+            }
+            let record = VictimRecord {
+                fleet: key.into(),
+                kind: VictimKind::Shed,
+                phase: VictimPhase::Retiring,
+                deadline: Some(
+                    crate::time_source::wall_now()
+                        + Duration::from_secs(spec.drain_timeout_seconds),
+                ),
+            };
+            if let Err(error) = nodes.mark_victim(node, &record).await {
+                tracing::warn!(%node, %error, "could not mark shed victim; retry next tick");
+                continue;
+            }
+            victims.push(Victim {
+                node: node.clone(),
+                record,
+            });
         }
     }
+    victims.sort_by_key(|v| v.record.kind != VictimKind::Repair);
+    let mut remaining = Vec::new();
+    for mut v in victims {
+        let result: Result<bool, OperatorError> = async {
+            let host = HostId::from_node_name(&v.node);
+            let mut next = plan_victim(&v.record, planned.contains(&v.node));
+            if next == Next::CallRetire {
+                let retirement = coord.retire_host(host, CORDON_OWNER, v.record.kind.label()).await?;
+                let pressure = if let Retirement::Pending(blockers) = &retirement {
+                    for reason in blockers {
+                        ::metrics::counter!(crate::metrics::AUTOSCALE_RETIRE_BLOCKED_TOTAL, "reason" => reason.clone()).increment(1);
+                    }
+                    let fresh = coord.fleet_demand().await?;
+                    fresh.queued_sessions > 0 || policy.is_some_and(|p| desired_hosts(fresh, p) > fresh.schedulable_hosts)
+                } else { false };
+                next = after_retire(&v.record, retirement, pressure, crate::time_source::wall_now());
+            }
+            match next {
+                Next::Remove => {
+                    v.record.phase = VictimPhase::Removing;
+                    nodes.mark_victim(&v.node, &v.record).await?;
+                    // The record retains the pool even if autoscaling was removed from the CR.
+                    scaler.remove_node(&v.record.fleet, &v.node).await?;
+                    coord.delete_host(host).await?;
+                    nodes.clear_victim(&v.node).await?;
+                    ::metrics::counter!(crate::metrics::AUTOSCALE_VICTIMS_REMOVED_TOTAL, "kind" => v.record.kind.label()).increment(1);
+                    Ok(true)
+                }
+                Next::Release(reason) => { release(coord, nodes, &v, reason).await?; Ok(true) }
+                Next::Hold => Ok(false),
+                Next::CallRetire => unreachable!("retirement was evaluated"),
+            }
+        }.await;
+        match result {
+            Ok(true) => {}
+            Ok(false) => remaining.push(v),
+            Err(e) => {
+                tracing::warn!(node = %v.node, error = %e, "victim step failed; retaining intent for retry");
+                remaining.push(v);
+            }
+        }
+    }
+    for (phase, label) in [
+        (VictimPhase::Retiring, "retiring"),
+        (VictimPhase::Removing, "removing"),
+    ] {
+        ::metrics::gauge!(crate::metrics::AUTOSCALE_VICTIMS, "phase" => label)
+            .set(remaining.iter().filter(|v| v.record.phase == phase).count() as f64);
+    }
+    // A stuck roll with autoscaling disabled has no repair path; it still
+    // blocks further rolls so the fleet does not lose more capacity.
+    let stuck_without_repair = spec.autoscaling.is_none() && !observation.stuck_rolls.is_empty();
+    Ok(AutoscaleStatus {
+        blocks_roll: repaired || !remaining.is_empty() || stuck_without_repair,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scaler::FleetDemand;
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
-
-    fn inputs() -> StepInputs {
-        StepInputs {
-            desired: 5,
-            grow_target: 5,
-            current: 5,
-            physical: 5,
-            queued_sessions: 0,
-            scale_down_enabled: true,
-            hysteresis_ready: true,
-            roll_idle: true,
-            wave_in_flight: false,
-        }
-    }
-
     #[test]
     fn node_ready_tracker_seeds_silently_then_reports_fresh() {
         let t = NodeReadyTracker::default();
@@ -1073,132 +938,20 @@ mod tests {
         assert_eq!(h.observe_at(true, start + Duration::from_secs(182)), 1);
     }
 
-    #[test]
-    fn queue_pressure_aborts_even_mid_wave() {
-        let i = StepInputs {
-            queued_sessions: 3,
-            wave_in_flight: true,
-            desired: 5,
-            grow_target: 5,
-            physical: 5,
-            ..inputs()
-        };
-        assert_eq!(plan_step(i), StepAction::AbortOnly);
-    }
-
-    #[test]
-    fn scale_up_aborts_and_grows() {
-        let i = StepInputs {
-            desired: 8,
-            grow_target: 8,
-            physical: 5,
-            wave_in_flight: true,
-            ..inputs()
-        };
-        assert_eq!(plan_step(i), StepAction::AbortAndGrow);
-    }
-
-    #[test]
-    fn in_flight_wave_continues_regardless_of_hysteresis_and_roll() {
-        let i = StepInputs {
-            desired: 3,
-            grow_target: 3,
-            current: 5,
-            wave_in_flight: true,
-            hysteresis_ready: false,
-            roll_idle: false,
-            ..inputs()
-        };
-        assert_eq!(plan_step(i), StepAction::ContinueWave);
-    }
-
-    #[test]
-    fn fresh_wave_needs_hysteresis_and_a_quiescent_roll() {
-        let base = StepInputs {
-            desired: 3,
-            grow_target: 3,
-            current: 5,
-            wave_in_flight: false,
-            ..inputs()
-        };
-        assert_eq!(plan_step(base), StepAction::StartWave);
-        assert_eq!(
-            plan_step(StepInputs {
-                hysteresis_ready: false,
-                ..base
-            }),
-            StepAction::Hold
-        );
-        assert_eq!(
-            plan_step(StepInputs {
-                roll_idle: false,
-                ..base
-            }),
-            StepAction::Hold
-        );
-    }
-
-    #[test]
-    fn scale_down_off_holds() {
-        let i = StepInputs {
-            desired: 3,
-            grow_target: 3,
-            current: 5,
-            scale_down_enabled: false,
-            ..inputs()
-        };
-        assert_eq!(plan_step(i), StepAction::Hold);
-    }
-
-    #[test]
-    fn at_target_holds() {
-        assert_eq!(plan_step(inputs()), StepAction::Hold);
-    }
-
-    #[test]
-    fn unavailable_debt_grows_past_a_phantom_physical_host() {
-        let i = StepInputs {
-            desired: 3,
-            grow_target: 4,
-            current: 2,
-            physical: 3,
-            queued_sessions: 1,
-            ..inputs()
-        };
-        assert_eq!(plan_step(i), StepAction::AbortAndGrow);
-    }
-
-    #[test]
-    fn ordinary_joining_capacity_does_not_compound_growth() {
-        let i = StepInputs {
-            desired: 3,
-            grow_target: 3,
-            current: 2,
-            physical: 3,
-            queued_sessions: 0,
-            ..inputs()
-        };
-        assert_eq!(plan_step(i), StepAction::Hold);
-    }
-
-    // ---- Recording-mock actuation tests ----
-
     #[derive(Default)]
     struct Rec {
         log: Mutex<Vec<String>>,
         record_reads: bool,
-        demand: Mutex<crate::scaler::FleetDemand>,
-        /// host_id → running_sandboxes returned by host_status (one entry per
-        /// call, popped front; empty → 0).
-        drain_progress: Mutex<HashMap<HostId, std::collections::VecDeque<u32>>>,
-        /// ADR 0088: host_id → (live_materializes, live_capture_jobs) per
-        /// host_status call (popped front; empty → (0, 0)).
-        enable_work: Mutex<HashMap<HostId, std::collections::VecDeque<(u32, u32)>>>,
-        annotated: Mutex<Vec<String>>,
-        /// Returned by `list_hosts` (the wave planner's join input).
+        demand: Mutex<FleetDemand>,
+        demands: Mutex<VecDeque<FleetDemand>>,
+        retirements: Mutex<HashMap<HostId, VecDeque<Retirement>>>,
+        victims: Mutex<Vec<Victim>>,
         hosts: Mutex<Vec<HostLoad>>,
-        /// When set, `remove_node` fails — keeps a wave victim in flight.
         fail_remove: Mutex<bool>,
+        fail_delete: Mutex<bool>,
+        uncordon_result: Mutex<Option<tonic::Code>>,
+        clear_victim_fails: Mutex<bool>,
+        mark_victim_fails: Mutex<bool>,
     }
     impl Rec {
         fn push(&self, s: impl Into<String>) {
@@ -1208,14 +961,24 @@ mod tests {
             self.log.lock().unwrap().clone()
         }
     }
-
+    fn rpc_error(op: &'static str, code: tonic::Code) -> OperatorError {
+        OperatorError::Rpc {
+            op,
+            status: Box::new(tonic::Status::new(code, "injected failure")),
+        }
+    }
     #[async_trait]
     impl CoordApi for Arc<Rec> {
-        async fn fleet_demand(&self) -> Result<crate::scaler::FleetDemand, OperatorError> {
+        async fn fleet_demand(&self) -> Result<FleetDemand, OperatorError> {
             if self.record_reads {
                 self.push("fleet_demand");
             }
-            Ok(*self.demand.lock().unwrap())
+            Ok(self
+                .demands
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(*self.demand.lock().unwrap()))
         }
         async fn list_hosts(&self) -> Result<Vec<HostLoad>, OperatorError> {
             if self.record_reads {
@@ -1223,74 +986,87 @@ mod tests {
             }
             Ok(self.hosts.lock().unwrap().clone())
         }
-        async fn host_status(&self, host: HostId) -> Result<Option<HostStatus>, OperatorError> {
-            let running = self
-                .drain_progress
+        async fn host_status(&self, _: HostId) -> Result<Option<HostStatus>, OperatorError> {
+            panic!("retirement must not inspect heartbeat counts")
+        }
+        async fn retire_host(
+            &self,
+            host: HostId,
+            owner: &str,
+            reason: &str,
+        ) -> Result<Retirement, OperatorError> {
+            assert_eq!(owner, CORDON_OWNER);
+            self.push(format!("retire_host {host} {reason}"));
+            Ok(self
+                .retirements
                 .lock()
                 .unwrap()
                 .get_mut(&host)
                 .and_then(|q| q.pop_front())
-                .unwrap_or(0);
-            let (mats, caps) = self
-                .enable_work
-                .lock()
-                .unwrap()
-                .get_mut(&host)
-                .and_then(|q| q.pop_front())
-                .unwrap_or((0, 0));
-            Ok(Some(HostStatus {
-                status: "draining".into(),
-                running_sandboxes: running,
-                live_materializes: mats,
-                live_capture_jobs: caps,
-            }))
+                .unwrap_or(Retirement::Pending(vec!["bound_sessions".into()])))
         }
-        async fn cordon(&self, host: HostId) -> Result<(), OperatorError> {
-            self.push(format!("cordon {host}"));
-            Ok(())
-        }
-        async fn uncordon(&self, host: HostId) -> Result<(), OperatorError> {
+        async fn uncordon(&self, host: HostId, owner: &str) -> Result<(), OperatorError> {
+            assert_eq!(owner, CORDON_OWNER);
             self.push(format!("uncordon {host}"));
-            Ok(())
-        }
-        async fn drain(&self, host: HostId) -> Result<(), OperatorError> {
-            self.push(format!("drain {host}"));
-            Ok(())
+            match *self.uncordon_result.lock().unwrap() {
+                None => Ok(()),
+                Some(code) => Err(rpc_error("uncordon", code)),
+            }
         }
         async fn delete_host(&self, host: HostId) -> Result<(), OperatorError> {
             self.push(format!("delete_host {host}"));
-            Ok(())
+            if *self.fail_delete.lock().unwrap() {
+                Err(rpc_error("delete_host", tonic::Code::Unavailable))
+            } else {
+                Ok(())
+            }
         }
     }
-
     #[async_trait]
     impl NodeOps for Arc<Rec> {
-        async fn set_unschedulable(&self, node: &str, val: bool) -> Result<(), OperatorError> {
-            self.push(format!("unschedulable {node}={val}"));
-            Ok(())
+        async fn victims(&self, fleet: &str) -> Result<Vec<Victim>, OperatorError> {
+            Ok(self
+                .victims
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|v| fleet.is_empty() || v.record.fleet == fleet)
+                .cloned()
+                .collect())
         }
-        async fn set_victim(&self, node: &str, fleet: Option<&str>) -> Result<(), OperatorError> {
-            self.push(format!("victim {node}={fleet:?}"));
-            let mut a = self.annotated.lock().unwrap();
-            match fleet {
-                Some(_) => {
-                    if !a.iter().any(|n| n == node) {
-                        a.push(node.to_string());
-                    }
-                }
-                None => a.retain(|n| n != node),
+        async fn mark_victim(
+            &self,
+            node: &str,
+            record: &VictimRecord,
+        ) -> Result<(), OperatorError> {
+            if *self.mark_victim_fails.lock().unwrap() {
+                return Err(OperatorError::Invalid("patch failed".into()));
             }
+            let patch = mark_victim_patch(record)?;
+            assert_eq!(patch["spec"]["unschedulable"], true);
+            assert!(patch["metadata"]["annotations"]
+                .as_object()
+                .unwrap()
+                .contains_key(ROLL_STUCK_ANNOTATION));
+            assert!(patch["metadata"]["annotations"][ROLL_STUCK_ANNOTATION].is_null());
+            self.push(format!("mark_victim {node} {:?}", record.phase));
+            let mut victims = self.victims.lock().unwrap();
+            victims.retain(|v| v.node != node);
+            victims.push(Victim {
+                node: node.into(),
+                record: record.clone(),
+            });
             Ok(())
         }
-        async fn annotated_victims(&self, _fleet: &str) -> Result<Vec<String>, OperatorError> {
-            Ok(self.annotated.lock().unwrap().clone())
-        }
-        async fn clear_roll_stuck(&self, node: &str) -> Result<(), OperatorError> {
-            self.push(format!("roll_stuck {node}=None"));
+        async fn clear_victim(&self, node: &str) -> Result<(), OperatorError> {
+            self.push(format!("clear_victim {node}"));
+            if *self.clear_victim_fails.lock().unwrap() {
+                return Err(OperatorError::Invalid("clear failed".into()));
+            }
+            self.victims.lock().unwrap().retain(|v| v.node != node);
             Ok(())
         }
     }
-
     struct RecScaler {
         rec: Arc<Rec>,
         cloud_target: Mutex<u32>,
@@ -1336,18 +1112,6 @@ mod tests {
         }
     }
 
-    fn actuator<'a>(rec: &'a Arc<Rec>, scaler: &'a RecScaler, drains: u32) -> WaveActuator<'a> {
-        WaveActuator {
-            coord: rec,
-            nodes: rec,
-            scaler,
-            fleet: "f",
-            node_pool: "kvm",
-            max_concurrent_drains: drains,
-            drain_timeout: Duration::from_millis(50),
-        }
-    }
-
     fn autoscale_spec() -> HostFleetSpec {
         HostFleetSpec {
             daemon_set: crate::crd::DaemonSetRef {
@@ -1368,7 +1132,6 @@ mod tests {
                 scale_down: crate::scaler::ScaleDownMode::Off,
                 scale_down_hysteresis_ticks: 3,
                 max_shed_per_wave: 1,
-                max_concurrent_drains: 1,
             }),
         }
     }
@@ -1543,14 +1306,14 @@ mod tests {
             "desired 3 schedulable + 1 stuck debt must surge to 4: {log:?}"
         );
         assert!(
-            !log.iter().any(|line| line.starts_with("drain ")),
+            !log.iter().any(|line| line.starts_with("retire_host ")),
             "queued creates own replacement capacity before repair: {log:?}"
         );
     }
 
     /// Issue #1012 regression: after a coord-first wire bump every host is
     /// skew-excluded from placement, sessions queue, and the roll is the only
-    /// cure for the skew. Queue pressure (`AbortOnly` — nothing to grow) must
+    /// cure for the skew. Queue pressure with nothing to grow must
     /// not block the roll, or the fleet deadlocks: the queue waits for the
     /// roll, the roll waits for the queue.
     #[tokio::test]
@@ -1597,189 +1360,6 @@ mod tests {
         assert!(
             !status.blocks_roll,
             "a skew-starved queue must be served BY the roll, never block it"
-        );
-    }
-
-    /// The one thing that still blocks rolls: an in-flight scale-down wave
-    /// (its drains consume the receiving capacity a roll would also need).
-    #[tokio::test]
-    async fn in_flight_wave_still_blocks_the_roll() {
-        let rec = Arc::new(Rec::default());
-        // Fleet of 3 with enough free RAM that the cost-optimal target is 2 —
-        // the annotated victim's wave continues this tick.
-        *rec.demand.lock().unwrap() = crate::scaler::FleetDemand {
-            schedulable_hosts: 3,
-            free_mib: 180_000,
-            total_mib: 196_608,
-            free_vcpus: 100,
-            total_vcpus: 120,
-            ..crate::scaler::FleetDemand::default()
-        };
-        let load = |node: &str, cordoned: bool| HostLoad {
-            id: HostId::from_node_name(node),
-            cordoned,
-            running_sandboxes: 0,
-            reserved_mib: 0,
-            free_mib: 60_000,
-            reserved_vcpus: 0,
-            free_vcpus: 30,
-        };
-        *rec.hosts.lock().unwrap() = vec![
-            load("a", false),
-            load("b", false),
-            load("victim", true), // cordoned by the wave, pinned via annotation
-        ];
-        rec.annotated.lock().unwrap().push("victim".into());
-        // Transient removal failure keeps the victim in flight this tick.
-        *rec.fail_remove.lock().unwrap() = true;
-        let mut spec = autoscale_spec();
-        spec.autoscaling.as_mut().unwrap().scale_down = crate::scaler::ScaleDownMode::IdleOnly;
-        let scaler = RecScaler::new(rec.clone(), 3);
-        let hysteresis = ScaleDownHysteresis::default();
-        let pods = vec![ready_pod("a"), ready_pod("b"), ready_pod("victim")];
-
-        let status = step(
-            &spec,
-            Some(&scaler),
-            &hysteresis,
-            &NodeReadyTracker::default(),
-            &rec,
-            &rec,
-            FleetObservation {
-                pods: &pods,
-                roll_idle: true,
-                stuck_rolls: &[],
-            },
-        )
-        .await
-        .expect("autoscale step");
-
-        assert!(
-            status.blocks_roll,
-            "an in-flight wave's drains must still block image rolls"
-        );
-    }
-
-    #[tokio::test]
-    async fn roll_stuck_node_is_drain_removed_after_capacity_recovers() {
-        let rec = Arc::new(Rec::default());
-        *rec.demand.lock().unwrap() = crate::scaler::FleetDemand {
-            schedulable_hosts: 3,
-            free_mib: 24_576,
-            total_mib: 196_608,
-            free_vcpus: 80,
-            total_vcpus: 120,
-            ..crate::scaler::FleetDemand::default()
-        };
-        let scaler = RecScaler::new(rec.clone(), 3);
-        let hysteresis = ScaleDownHysteresis::default();
-        let pods = vec![
-            ready_pod("a"),
-            ready_pod("b"),
-            ready_pod("replacement"),
-            ready_pod("stuck"),
-        ];
-
-        let status = step(
-            &autoscale_spec(),
-            Some(&scaler),
-            &hysteresis,
-            &NodeReadyTracker::default(),
-            &rec,
-            &rec,
-            FleetObservation {
-                pods: &pods,
-                roll_idle: false,
-                stuck_rolls: &["stuck".into()],
-            },
-        )
-        .await
-        .expect("autoscale step");
-
-        assert!(status.blocks_roll, "must re-observe after named removal");
-        let log = rec.log();
-        let position = |prefix: &str| {
-            log.iter()
-                .position(|line| line.starts_with(prefix))
-                .unwrap_or_else(|| panic!("missing {prefix:?} in {log:?}"))
-        };
-        assert!(position("drain ") < position("remove_node stuck"));
-        assert!(position("remove_node stuck") < position("delete_host "));
-        assert!(log.iter().any(|line| line == "roll_stuck stuck=None"));
-    }
-
-    #[tokio::test]
-    async fn drive_one_happy_path_drains_removes_deletes() {
-        let rec = Arc::new(Rec::default());
-        let scaler = RecScaler::new(rec.clone(), 3);
-        let act = actuator(&rec, &scaler, 1);
-        // host_status reports 0 immediately → drains in one poll.
-        let out = drive_victims(&act, &["node-a".to_string()]).await;
-        assert_eq!(out, 0, "fully removed → nothing in flight");
-        let log = rec.log();
-        // cordon + annotate happen first, then drain → remove_node → delete_host.
-        let pos = |needle: &str| {
-            log.iter()
-                .position(|l| l.starts_with(needle))
-                .unwrap_or_else(|| panic!("missing {needle:?} in {log:?}"))
-        };
-        assert!(pos("cordon ") < pos("drain "), "cordon before drain");
-        assert!(pos("drain ") < pos("remove_node "), "drain before remove");
-        assert!(
-            pos("remove_node ") < pos("delete_host "),
-            "remove before delete"
-        );
-    }
-
-    #[tokio::test]
-    async fn drive_one_drain_timeout_releases_victim() {
-        let rec = Arc::new(Rec::default());
-        let scaler = RecScaler::new(rec.clone(), 3);
-        // host_status always reports 2 running → never drains → times out.
-        let host = HostId::from_node_name("node-b");
-        rec.drain_progress
-            .lock()
-            .unwrap()
-            .insert(host, std::iter::repeat_n(2u32, 100).collect());
-        let act = actuator(&rec, &scaler, 1);
-        let out = drive_victims(&act, &["node-b".to_string()]).await;
-        assert_eq!(out, 0, "released → not counted as in flight");
-        let log = rec.log();
-        assert!(
-            log.iter().any(|l| l.starts_with("uncordon ")),
-            "a drain timeout uncordons the victim: {log:?}"
-        );
-        assert!(
-            !log.iter().any(|l| l.starts_with("remove_node ")),
-            "a timed-out victim is NEVER removed: {log:?}"
-        );
-    }
-
-    /// ADR 0088: zero sandboxes is no longer sufficient — in-flight enable
-    /// work (here a live capture job) holds the drain gate, and the wave
-    /// releases the victim on timeout instead of removing the node under it.
-    #[tokio::test(start_paused = true)]
-    async fn drive_one_blocks_on_live_enable_work() {
-        let rec = Arc::new(Rec::default());
-        let scaler = RecScaler::new(rec.clone(), 3);
-        let host = HostId::from_node_name("node-c");
-        // 0 running sandboxes throughout (materialize boots no VM), but a
-        // capture job stays live past the drain budget.
-        rec.enable_work
-            .lock()
-            .unwrap()
-            .insert(host, std::iter::repeat_n((0u32, 1u32), 100).collect());
-        let act = actuator(&rec, &scaler, 1);
-        let out = drive_victims(&act, &["node-c".to_string()]).await;
-        assert_eq!(out, 0, "released → not counted as in flight");
-        let log = rec.log();
-        assert!(
-            !log.iter().any(|l| l.starts_with("remove_node ")),
-            "a node with live enable work is NEVER removed: {log:?}"
-        );
-        assert!(
-            log.iter().any(|l| l.starts_with("uncordon ")),
-            "the enable-work timeout releases the victim: {log:?}"
         );
     }
 
@@ -1837,19 +1417,555 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn abort_wave_uncordons_and_deannotates() {
-        let rec = Arc::new(Rec::default());
-        let scaler = RecScaler::new(rec.clone(), 3);
-        let act = actuator(&rec, &scaler, 1);
-        abort_wave(&act, &["node-x".to_string(), "node-y".to_string()]).await;
-        let log = rec.log();
-        assert!(log.iter().filter(|l| l.starts_with("uncordon ")).count() == 2);
-        assert!(log.iter().any(|l| l == "victim node-x=None"));
-        assert!(log.iter().any(|l| l == "victim node-y=None"));
-        assert!(
-            !log.iter().any(|l| l.starts_with("remove_node ")),
-            "abort never removes a node"
+    fn record(kind: VictimKind, phase: VictimPhase) -> VictimRecord {
+        VictimRecord {
+            fleet: "kvm".into(),
+            kind,
+            phase,
+            deadline: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(500)),
+        }
+    }
+    fn retiring() -> VictimRecord {
+        record(VictimKind::Shed, VictimPhase::Retiring)
+    }
+    #[test]
+    fn plan_victim_removing_is_never_released() {
+        for kind in [VictimKind::Shed, VictimKind::Repair] {
+            for in_plan in [false, true] {
+                assert_eq!(
+                    plan_victim(&record(kind, VictimPhase::Removing), in_plan),
+                    Next::Remove
+                );
+            }
+        }
+    }
+    #[test]
+    fn plan_victim_shed_not_in_plan_is_released() {
+        assert_eq!(
+            plan_victim(&retiring(), false),
+            Next::Release(ReleaseReason::NotInPlan)
         );
+        assert_eq!(plan_victim(&retiring(), true), Next::CallRetire);
+    }
+    #[test]
+    fn plan_victim_repair_is_always_advanced() {
+        assert_eq!(
+            plan_victim(&record(VictimKind::Repair, VictimPhase::Retiring), false),
+            Next::CallRetire
+        );
+    }
+    #[test]
+    fn after_retire_only_granted_reaches_remove() {
+        for kind in [VictimKind::Shed, VictimKind::Repair] {
+            for pressure in [true, false] {
+                let v = record(kind, VictimPhase::Retiring);
+                assert_eq!(
+                    after_retire(&v, Retirement::Granted, pressure, SystemTime::UNIX_EPOCH),
+                    Next::Remove
+                );
+                for result in [
+                    Retirement::Pending(vec![]),
+                    Retirement::Pending(vec!["bound_sessions".into()]),
+                    Retirement::NoRow,
+                ] {
+                    assert_ne!(
+                        after_retire(&v, result, pressure, SystemTime::UNIX_EPOCH),
+                        Next::Remove
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn after_retire_pending_under_pressure_releases_shed_not_repair() {
+        assert_eq!(
+            after_retire(
+                &retiring(),
+                Retirement::Pending(vec![]),
+                true,
+                SystemTime::UNIX_EPOCH
+            ),
+            Next::Release(ReleaseReason::Pressure)
+        );
+        assert_eq!(
+            after_retire(
+                &record(VictimKind::Repair, VictimPhase::Retiring),
+                Retirement::Pending(vec![]),
+                true,
+                SystemTime::UNIX_EPOCH
+            ),
+            Next::Hold
+        );
+    }
+    #[test]
+    fn after_retire_shed_deadline_releases_pending() {
+        let v = retiring();
+        assert_eq!(
+            after_retire(&v, Retirement::Pending(vec![]), false, v.deadline.unwrap()),
+            Next::Release(ReleaseReason::Deadline)
+        );
+        assert_eq!(
+            after_retire(&v, Retirement::Granted, true, v.deadline.unwrap()),
+            Next::Remove
+        );
+    }
+    #[test]
+    fn after_retire_repair_never_times_out() {
+        let v = record(VictimKind::Repair, VictimPhase::Retiring);
+        assert_eq!(
+            after_retire(
+                &v,
+                Retirement::Pending(vec![]),
+                false,
+                v.deadline.unwrap() + Duration::from_secs(10)
+            ),
+            Next::Hold
+        );
+        assert_eq!(
+            after_retire(&v, Retirement::NoRow, true, v.deadline.unwrap()),
+            Next::Hold
+        );
+    }
+    #[test]
+    fn victim_record_round_trips_json_and_rejects_garbage() {
+        for kind in [VictimKind::Shed, VictimKind::Repair] {
+            for phase in [VictimPhase::Retiring, VictimPhase::Removing] {
+                let mut v = record(kind, phase);
+                for deadline in [v.deadline, None] {
+                    v.deadline = deadline;
+                    let json = serde_json::to_string(&v).unwrap();
+                    assert_eq!(serde_json::from_str::<VictimRecord>(&json).unwrap(), v);
+                    if deadline.is_some() {
+                        assert!(json.contains("1970-01-01T00:08:20Z"));
+                    }
+                }
+            }
+        }
+        for raw in [
+            "kvm",
+            "{}",
+            r#"{"fleet":"kvm","kind":"shed","phase":"oops","deadline":null}"#,
+            r#"{"fleet":"kvm","kind":"shed","phase":"retiring","deadline":"bad"}"#,
+        ] {
+            assert!(serde_json::from_str::<VictimRecord>(raw).is_err());
+        }
+    }
+    #[test]
+    fn fleet_key_is_shared_by_roll_stuck_and_victim_markers() {
+        let mut spec = autoscale_spec();
+        assert_eq!(fleet_key(&spec), "kvm");
+        let v = VictimRecord {
+            fleet: fleet_key(&spec).into(),
+            ..retiring()
+        };
+        let patch = mark_victim_patch(&v).unwrap();
+        let parsed: VictimRecord = serde_json::from_value(
+            serde_json::from_str(
+                patch["metadata"]["annotations"][VICTIM_ANNOTATION]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed.fleet, fleet_key(&spec));
+        spec.autoscaling = None;
+        assert_eq!(fleet_key(&spec), "hf-host-agent");
+    }
+
+    fn fixture() -> (Arc<Rec>, HostFleetSpec, Vec<PodInfo>) {
+        let rec = Arc::new(Rec::default());
+        let mut spec = autoscale_spec();
+        let a = spec.autoscaling.as_mut().unwrap();
+        a.scale_down = crate::scaler::ScaleDownMode::IdleOnly;
+        a.scale_down_hysteresis_ticks = 1;
+        spec.drain_timeout_seconds = 600;
+        *rec.demand.lock().unwrap() = FleetDemand {
+            schedulable_hosts: 3,
+            total_mib: 180_000,
+            free_mib: 180_000,
+            ..Default::default()
+        };
+        let pods: Vec<_> = ["a", "b", "c"].into_iter().map(ready_pod).collect();
+        *rec.hosts.lock().unwrap() = pods
+            .iter()
+            .map(|p| HostLoad {
+                id: HostId::from_node_name(&p.node),
+                cordoned: false,
+                running_sandboxes: 0,
+                reserved_mib: 0,
+                free_mib: 60_000,
+                reserved_vcpus: 0,
+                free_vcpus: 30,
+            })
+            .collect();
+        (rec, spec, pods)
+    }
+    fn seed(rec: &Rec, node: &str, kind: VictimKind, phase: VictimPhase) {
+        let mut record = record(kind, phase);
+        record.deadline = if kind == VictimKind::Repair {
+            None
+        } else {
+            Some(crate::time_source::wall_now() + Duration::from_secs(600))
+        };
+        rec.victims.lock().unwrap().push(Victim {
+            node: node.into(),
+            record,
+        });
+    }
+    fn script(rec: &Rec, node: &str, results: Vec<Retirement>) {
+        rec.retirements
+            .lock()
+            .unwrap()
+            .insert(HostId::from_node_name(node), results.into());
+    }
+    async fn tick(
+        rec: &Arc<Rec>,
+        spec: &HostFleetSpec,
+        pods: &[PodInfo],
+        stuck: &[String],
+    ) -> AutoscaleStatus {
+        step(
+            spec,
+            Some(&RecScaler::new(rec.clone(), 3)),
+            &ScaleDownHysteresis::default(),
+            &NodeReadyTracker::default(),
+            rec,
+            rec,
+            FleetObservation {
+                pods,
+                roll_idle: true,
+                stuck_rolls: stuck,
+            },
+        )
+        .await
+        .unwrap()
+    }
+    fn count(rec: &Rec, prefix: &str) -> usize {
+        rec.log().iter().filter(|l| l.starts_with(prefix)).count()
+    }
+    fn no_remove(rec: &Rec) {
+        assert_eq!(count(rec, "remove_node"), 0);
+        assert_eq!(count(rec, "delete_host"), 0);
+    }
+
+    #[tokio::test]
+    async fn mark_victim_is_one_patch_before_retire_host() {
+        let (rec, spec, pods) = fixture();
+        tick(&rec, &spec, &pods, &[]).await;
+        let log = rec.log();
+        assert_eq!(log[0], "mark_victim a Retiring");
+        assert!(log[1].starts_with("retire_host"));
+        assert_eq!(count(&rec, "mark_victim"), 1);
+        assert_eq!(count(&rec, "retire_host"), 1);
+    }
+    #[tokio::test]
+    async fn retire_pending_holds_without_remove_or_delete() {
+        for result in [
+            Retirement::Pending(vec!["bound_sessions".into()]),
+            Retirement::Pending(vec![]),
+            Retirement::NoRow,
+        ] {
+            let (rec, spec, pods) = fixture();
+            script(&rec, "a", vec![result.clone()]);
+            let status = tick(&rec, &spec, &pods, &[]).await;
+            assert_eq!(status.blocks_roll, result != Retirement::NoRow);
+            no_remove(&rec);
+        }
+    }
+    #[tokio::test]
+    async fn granted_writes_removing_before_remove_node_then_deletes() {
+        let (rec, spec, pods) = fixture();
+        script(&rec, "a", vec![Retirement::Granted]);
+        tick(&rec, &spec, &pods, &[]).await;
+        let log = rec.log();
+        let pos = |p: &str| log.iter().position(|l| l.starts_with(p)).unwrap();
+        assert!(pos("retire_host") < pos("mark_victim a Removing"));
+        assert!(pos("mark_victim a Removing") < pos("remove_node"));
+        assert!(pos("remove_node") < pos("delete_host"));
+        assert!(rec.victims.lock().unwrap().is_empty());
+        assert_eq!(count(&rec, "uncordon"), 0);
+    }
+    #[tokio::test]
+    async fn delete_host_error_keeps_victim_in_flight() {
+        let (rec, spec, pods) = fixture();
+        script(&rec, "a", vec![Retirement::Granted]);
+        *rec.fail_delete.lock().unwrap() = true;
+        assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(
+            rec.victims.lock().unwrap()[0].record.phase,
+            VictimPhase::Removing
+        );
+        assert_eq!(count(&rec, "clear_victim"), 0);
+        *rec.fail_delete.lock().unwrap() = false;
+        tick(&rec, &spec, &pods, &[]).await;
+        assert_eq!(count(&rec, "retire_host"), 1);
+        assert_eq!(count(&rec, "remove_node"), 2);
+        assert!(rec.victims.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn demand_burst_while_pending_releases_without_remove() {
+        let (rec, spec, pods) = fixture();
+        let initial = *rec.demand.lock().unwrap();
+        *rec.demands.lock().unwrap() = [
+            initial,
+            FleetDemand {
+                queued_sessions: 1,
+                ..initial
+            },
+        ]
+        .into();
+        assert!(!tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(count(&rec, "uncordon"), 1);
+        no_remove(&rec);
+        assert!(rec.demands.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn restart_mid_removing_resumes_remove_and_delete() {
+        let (rec, spec, pods) = fixture();
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Removing);
+        tick(&rec, &spec, &pods, &[]).await;
+        assert_eq!(count(&rec, "retire_host"), 0);
+        assert_eq!(count(&rec, "uncordon"), 0);
+        assert_eq!(count(&rec, "remove_node"), 1);
+        assert_eq!(count(&rec, "delete_host"), 1);
+    }
+    #[tokio::test]
+    async fn restart_mid_retiring_reissues_retire_host() {
+        let (rec, spec, pods) = fixture();
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+        tick(&rec, &spec, &pods, &[]).await;
+        tick(&rec, &spec, &pods, &[]).await;
+        assert_eq!(count(&rec, "retire_host"), 2);
+        assert_eq!(count(&rec, "mark_victim"), 0);
+        no_remove(&rec);
+    }
+    #[tokio::test]
+    async fn partial_release_retains_intent() {
+        for fail_uncordon in [false, true] {
+            let (rec, mut spec, pods) = fixture();
+            spec.autoscaling = None;
+            seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+            if fail_uncordon {
+                *rec.uncordon_result.lock().unwrap() = Some(tonic::Code::Unavailable);
+            } else {
+                *rec.clear_victim_fails.lock().unwrap() = true;
+            }
+            assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+            assert_eq!(rec.victims.lock().unwrap().len(), 1);
+            if fail_uncordon {
+                assert_eq!(count(&rec, "clear_victim"), 0);
+            }
+            *rec.uncordon_result.lock().unwrap() = None;
+            *rec.clear_victim_fails.lock().unwrap() = false;
+            assert!(!tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+            assert!(rec.victims.lock().unwrap().is_empty());
+            no_remove(&rec);
+        }
+    }
+    #[tokio::test]
+    async fn uncordon_owner_mismatch_clears_only_our_annotation() {
+        for code in [tonic::Code::FailedPrecondition, tonic::Code::NotFound] {
+            let (rec, mut spec, pods) = fixture();
+            spec.autoscaling = None;
+            seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+            *rec.uncordon_result.lock().unwrap() = Some(code);
+            assert!(!tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+            assert_eq!(count(&rec, "clear_victim"), 1);
+            no_remove(&rec);
+        }
+    }
+    #[tokio::test]
+    async fn manual_coordinator_cordon_is_never_released_or_picked() {
+        let (rec, spec, pods) = fixture();
+        rec.hosts.lock().unwrap()[0].cordoned = true;
+        tick(&rec, &spec, &pods, &[]).await;
+        assert!(rec.log().is_empty());
+    }
+    #[tokio::test]
+    async fn pinned_victim_beyond_budget_is_released_not_stranded() {
+        let (rec, spec, pods) = fixture();
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+        seed(&rec, "b", VictimKind::Shed, VictimPhase::Retiring);
+        assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        let victims = rec.victims.lock().unwrap();
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].node, "a");
+        assert_eq!(count(&rec, "uncordon"), 1);
+        no_remove(&rec);
+    }
+    #[tokio::test]
+    async fn scale_down_off_mid_wave_releases_victims() {
+        let (rec, mut spec, pods) = fixture();
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+        spec.autoscaling.as_mut().unwrap().scale_down = crate::scaler::ScaleDownMode::Off;
+        assert!(!tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(count(&rec, "uncordon"), 1);
+        no_remove(&rec);
+    }
+    #[tokio::test]
+    async fn autoscaling_removed_mid_wave_releases_victims() {
+        let (rec, mut spec, pods) = fixture();
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+        seed(&rec, "b", VictimKind::Shed, VictimPhase::Removing);
+        spec.autoscaling = None;
+        assert!(!tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(count(&rec, "uncordon"), 1);
+        assert_eq!(count(&rec, "remove_node b"), 1);
+        assert!(rec.victims.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn stuck_roll_without_autoscaling_still_blocks_rolls() {
+        let (rec, mut spec, pods) = fixture();
+        spec.autoscaling = None;
+        assert!(tick(&rec, &spec, &pods, &["c".into()]).await.blocks_roll);
+        no_remove(&rec);
+        assert_eq!(count(&rec, "mark_victim"), 0);
+    }
+    #[tokio::test]
+    async fn roll_stuck_node_becomes_repair_victim_after_capacity_recovers() {
+        let (rec, spec, pods) = fixture();
+        script(&rec, "c", vec![Retirement::Granted]);
+        assert!(tick(&rec, &spec, &pods, &["c".into()]).await.blocks_roll);
+        let log = rec.log();
+        assert_eq!(log[0], "mark_victim c Retiring");
+        assert!(log[1].ends_with("repair"));
+        assert_eq!(log[2], "mark_victim c Removing");
+        assert_eq!(log[3], "remove_node c");
+        assert!(log[4].starts_with("delete_host"));
+    }
+    #[tokio::test]
+    async fn roll_stuck_repair_holds_under_pressure_but_is_not_released() {
+        let (rec, spec, pods) = fixture();
+        seed(&rec, "c", VictimKind::Repair, VictimPhase::Retiring);
+        rec.demand.lock().unwrap().queued_sessions = 1;
+        assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(count(&rec, "retire_host"), 1);
+        assert_eq!(count(&rec, "uncordon"), 0);
+        no_remove(&rec);
+    }
+    #[tokio::test]
+    async fn in_flight_victim_blocks_the_roll() {
+        let (rec, spec, pods) = fixture();
+        script(&rec, "a", vec![Retirement::Granted]);
+        *rec.fail_remove.lock().unwrap() = true;
+        assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(
+            rec.victims.lock().unwrap()[0].record.phase,
+            VictimPhase::Removing
+        );
+        assert_eq!(count(&rec, "delete_host"), 0);
+    }
+    #[tokio::test]
+    async fn granted_does_not_read_demand_again_or_release() {
+        let (rec, spec, pods) = fixture();
+        let initial = *rec.demand.lock().unwrap();
+        *rec.demands.lock().unwrap() = [
+            initial,
+            FleetDemand {
+                queued_sessions: 10,
+                ..initial
+            },
+        ]
+        .into();
+        script(&rec, "a", vec![Retirement::Granted]);
+        tick(&rec, &spec, &pods, &[]).await;
+        assert_eq!(rec.demands.lock().unwrap().len(), 1);
+        assert_eq!(count(&rec, "uncordon"), 0);
+        assert_eq!(count(&rec, "remove_node"), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_removing_patch_never_reaches_cloud() {
+        let (rec, spec, pods) = fixture();
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+        script(&rec, "a", vec![Retirement::Granted]);
+        *rec.mark_victim_fails.lock().unwrap() = true;
+        assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        no_remove(&rec);
+        assert_eq!(
+            rec.victims.lock().unwrap()[0].record.phase,
+            VictimPhase::Retiring
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_only_keeps_leftover_victims_unchanged() {
+        let (rec, mut spec, pods) = fixture();
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Removing);
+        seed(&rec, "b", VictimKind::Repair, VictimPhase::Retiring);
+        spec.autoscaling = None;
+        step(
+            &spec,
+            None,
+            &ScaleDownHysteresis::default(),
+            &NodeReadyTracker::default(),
+            &rec,
+            &rec,
+            FleetObservation {
+                pods: &pods,
+                roll_idle: true,
+                stuck_rolls: &[],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(rec.log().is_empty());
+        assert_eq!(rec.victims.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn every_pending_victim_gets_one_retire_and_one_demand_read_per_tick() {
+        let (mut rec, mut spec, mut pods) = fixture();
+        Arc::get_mut(&mut rec).unwrap().record_reads = true;
+        spec.autoscaling.as_mut().unwrap().max_shed_per_wave = 2;
+        pods.push(ready_pod("d"));
+        let mut extra = rec.hosts.lock().unwrap()[0].clone();
+        extra.id = HostId::from_node_name("d");
+        rec.hosts.lock().unwrap().push(extra);
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+        seed(&rec, "b", VictimKind::Shed, VictimPhase::Retiring);
+        assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(count(&rec, "retire_host"), 2);
+        assert_eq!(count(&rec, "fleet_demand"), 3);
+        assert_eq!(count(&rec, "list_hosts"), 1);
+        no_remove(&rec);
+    }
+    #[tokio::test]
+    async fn invalid_victim_annotation_is_read_only() {
+        let mut node = Node::default();
+        node.metadata.name = Some("invalid".into());
+        node.metadata.annotations = Some([(VICTIM_ANNOTATION.into(), "garbage".into())].into());
+        let snapshot = [node];
+        // Build the lazy HTTP client only. These operations must not send a request.
+        let client =
+            Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap())).unwrap();
+        let nodes = K8sNodeOps {
+            client,
+            managed_nodes: &snapshot,
+        };
+        assert!(nodes.victims("kvm").await.unwrap().is_empty());
+        assert!(nodes.mark_victim("invalid", &retiring()).await.is_err());
+        assert_eq!(
+            snapshot[0].metadata.annotations.as_ref().unwrap()[VICTIM_ANNOTATION],
+            "garbage"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_victims_run_first_and_share_the_in_flight_bound() {
+        let (rec, mut spec, mut pods) = fixture();
+        spec.autoscaling.as_mut().unwrap().max_shed_per_wave = 2;
+        pods.push(ready_pod("d"));
+        let mut extra = rec.hosts.lock().unwrap()[0].clone();
+        extra.id = HostId::from_node_name("d");
+        rec.hosts.lock().unwrap().push(extra);
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+        seed(&rec, "b", VictimKind::Repair, VictimPhase::Retiring);
+        assert!(tick(&rec, &spec, &pods, &["c".into()]).await.blocks_roll);
+        assert_eq!(rec.victims.lock().unwrap().len(), 2);
+        assert!(rec.log()[0].ends_with("repair"));
+        assert_eq!(count(&rec, "mark_victim"), 0);
+        assert_eq!(count(&rec, "retire_host"), 2);
     }
 }
