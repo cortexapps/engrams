@@ -618,31 +618,13 @@ pub(crate) async fn boot_on_reserved_host(
     // session is first created (the same path every follow-up uses), so the
     // boot finalize records nothing prompt-related here.
     //
-    // ADR 0094: wake the sibling DELIVER op now that the boot is done. The
-    // create-time DELIVER was enqueued while the session was still `pending`,
-    // so it deferred ("not deliverable yet") on the 1 s known-wait cadence
-    // (ADR 0108 A5). The boot runs longer than that cadence, so by this
-    // point the op is usually ALREADY due — just unclaimed, because op
-    // requeues never NOTIFY. The wake must therefore count already-due ops
-    // too: this lane is out-of-op (no completion re-drive claims the
-    // queue), so its NOTIFY is the ONLY wake, and the pre-widening
-    // `not_before > now` guard skipped it here for the common case —
-    // stranding every fresh create's prompt on the executor's 5 s rescan
-    // (prod: run_started pinned at prompt+5.3 s while the harness idled
-    // from ~2.3 s). This is the SAME wake ADR 0079 established for resumes
-    // and PR #676 wired onto the `CreateBoot` op. Idempotent: harmless if
-    // the executor already claimed the DELIVER or there is no create-time
-    // prompt (0 rows matched → no NOTIFY). The 5 s fallback poll still
-    // backstops a missed NOTIFY.
-    if let Err(e) = state
-        .services
-        .meta
-        .op_wake_queued_kind(session_id, engram_core::types::session_op::OpKind::Deliver)
-        .await
-    {
-        tracing::debug!(%session_id, error = %e, "sibling deliver wake after boot failed (5s poll backstops)");
-    }
-
+    // ADR 0108 A6: the create-time prompt now rides the spawn env
+    // (`PromptDelivery::RidesBoot`, stamped above), so it mints no sibling
+    // DELIVER op for this boot to wake. A follow-up prompt typed while the
+    // session was still `pending` DOES enqueue a deferred DELIVER, but that
+    // is woken by the `CreateBoot`-kind arm in `drive_one` when this op
+    // finishes `Done` — which also stamps `attach_grace` BEFORE the wake
+    // (ADR 0108 A4), so this boot no longer wakes the deliver itself.
     Ok(())
 }
 
