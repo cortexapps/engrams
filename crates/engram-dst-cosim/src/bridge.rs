@@ -220,8 +220,9 @@ impl HostClient for CosimHostClient {
         session_id: SessionId,
         sandbox_id: SandboxId,
         _binding_epoch: u64,
-    ) {
+    ) -> Result<(), engram_core::SandboxError> {
         self.host.lock().await.bind(session_id, sandbox_id);
+        Ok(())
     }
 
     async fn unbind_session(&self, session_id: SessionId) {

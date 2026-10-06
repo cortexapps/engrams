@@ -15,6 +15,7 @@
 //! callers that want both should snapshot then evict in two requests, or
 //! evict then resume across the lifecycle of a session.
 
+use crate::boot_materializer::{materialize_snapshot_resume, HarnessPlan};
 use std::time::Duration;
 
 use engram_core::traits::storage::BlobStorage;
@@ -117,15 +118,29 @@ pub(crate) async fn reattach_harness_in_place(
     if session.sandbox_id != Some(sandbox_id) {
         return Ok(false);
     }
-    let Some(crate::boot_materializer::ResumeMaterials { agent, policy }) =
-        crate::boot_materializer::materialize_snapshot_resume(state, &session, sandbox_id).await
+    let epoch = state
+        .services
+        .meta
+        .rebind_session_guarded(
+            session_id,
+            session
+                .host_id
+                .ok_or_else(|| ApiError::Conflict("session has no host".into()))?,
+            sandbox_id,
+            Some(Some(sandbox_id)),
+            &[session.status],
+        )
+        .await?;
+    bind_harness_generation(state, session_id, sandbox_id, epoch).await?;
+    let HarnessPlan::Spawn { agent, policy } =
+        materialize_snapshot_resume(state, &session, sandbox_id, epoch).await?
     else {
         return Ok(false);
     };
     state
         .services
         .host
-        .start_agent(sandbox_id, agent, policy, fence)
+        .start_agent(sandbox_id, agent, *policy, fence)
         .await?;
     Ok(true)
 }
@@ -938,7 +953,20 @@ pub(crate) async fn resume_from_created(
     if !ctx.step("finish").await {
         return Err(fenced_error());
     }
-    let outcome = finish_resume_to_active(state, &session, sandbox_id, true, ctx.fence()).await?;
+    let epoch = state
+        .services
+        .meta
+        .rebind_session_guarded(
+            id,
+            session.host_id.unwrap(),
+            sandbox_id,
+            Some(Some(sandbox_id)),
+            &[SessionState::Created],
+        )
+        .await?;
+    bind_harness_generation(state, id, sandbox_id, epoch).await?;
+    let plan = materialize_snapshot_resume(state, &session, sandbox_id, epoch).await?;
+    let outcome = finish_resume_to_active(state, &session, sandbox_id, plan, ctx.fence()).await?;
     let note = match outcome {
         FinishResumeOutcome::Active => "resumed from Created (auto-evac completion)",
         // ADR 0090: retryable, not a 200 — the resume op's backoff +
@@ -1047,11 +1075,11 @@ pub(crate) async fn resume_from_idle(
             .fenced_assign_sandbox(id, ctx.fence().epoch as i64, None, Some(source_host))
             .await
         {
-            Ok(true) => {
+            Ok(_) => {
                 state.host_registry.invalidate_sandbox(source_sandbox);
                 session.sandbox_id = None;
             }
-            Ok(false) => {
+            Err(engram_core::MetaError::Conflict(_)) => {
                 crate::metrics::note_fenced_write();
                 return Err(ApiError::Conflict(
                     "resume: fenced by a newer op while clearing the stale source binding".into(),
@@ -1210,14 +1238,25 @@ async fn resume_disk_only_cold_boot(
     if !ctx.step("bind").await {
         return Err(fenced_error());
     }
-    bind_session_routing_minted(state, id, receipt.new_sandbox_id).await;
+    bind_harness_generation(state, id, receipt.new_sandbox_id, receipt.binding_epoch).await?;
     if !ctx.step("finish").await {
         return Err(fenced_error());
     }
     let refreshed = state.services.meta.get_session(id).await?;
-    let outcome =
-        finish_resume_to_active(state, &refreshed, receipt.new_sandbox_id, true, ctx.fence())
-            .await?;
+    let outcome = finish_resume_to_active(
+        state,
+        &refreshed,
+        receipt.new_sandbox_id,
+        materialize_snapshot_resume(
+            state,
+            &refreshed,
+            receipt.new_sandbox_id,
+            receipt.binding_epoch,
+        )
+        .await?,
+        ctx.fence(),
+    )
+    .await?;
     let note = match outcome {
         FinishResumeOutcome::Active => {
             "resumed via disk-only cold boot (fresh kernel on latest disk; in-RAM context lost)"
@@ -1483,16 +1522,8 @@ pub async fn apply_rung1_rewind(
 /// Preconditions: the session row is at `Created` state, `host_id` +
 /// `sandbox_id` are bound to the target (caller's responsibility).
 ///
-/// Steps:
-/// 1. Load the image's manifest bundle + per-request secrets to
-///    rebuild the launch env.
-/// 2. Resolve the harness AgentSpec. `harness=None` skips
-///    `start_agent` entirely.
-/// 3. Rebuild the SessionEgressPolicy for the new sandbox (fresh
-///    guest_ip from the restored VM).
-/// 4. Call `start_agent` — re-attaches the in-VM agentd's harness
-///    supervisor to the post-restore sandbox.
-/// 5. Transition `Created → Active` + emit `Resumed` + `StatusChanged`.
+/// Apply the resolved plan, then transition to Active and emit StatusChanged.
+/// An explicit no-harness plan skips start_agent.
 ///
 /// Failure modes are honest per ADR 0015 M2:
 /// - `start_agent` fails → session stays at `Created`, returns
@@ -1500,15 +1531,11 @@ pub async fn apply_rung1_rewind(
 ///   409 against this state until a follow-up `/resume` succeeds.
 /// - PG transition fails → returns `Err(ApiError)`.
 #[tracing::instrument(name = "coord.finish_resume_to_active", skip_all, fields(session_id = %session.id))]
-pub async fn finish_resume_to_active(
+pub(crate) async fn finish_resume_to_active(
     state: &SharedState,
     session: &Session,
     new_sandbox_id: SandboxId,
-    // Emit the terminal StatusChanged here? The live-migration verb
-    // suppresses it and emits a single `evacuating -> active` itself —
-    // the `created -> active` hop is an internal FSM step there, not a
-    // user-meaningful state (the session can't take messages yet).
-    emit_status: bool,
+    plan: HarnessPlan,
     // ADR 0079: the caller's op fence — the resume verb / evac claim /
     // teleport claim thread their epoch so the session-row transitions
     // below are fenced against a successor re-claim. Epoch 0 (no op)
@@ -1516,27 +1543,12 @@ pub async fn finish_resume_to_active(
     fence: SessionFence,
 ) -> Result<FinishResumeOutcome, ApiError> {
     let id = session.id;
-    // ADR 0016 §A.1.7: load the full bundle (manifest + SecretBundle
-    // + env-with-placeholders) once and reuse it both for the launch
-    // env below AND for the post-resume egress policy rebuild. Avoids
-    // a second SecretStore round-trip on the resume hot path.
-    // `resolve_session_env` folds the manifest env + secrets + the
-    // per-request overrides identically to the `/exec` path.
-    // Build the resume-shape AgentSpec + egress policy and (re)attach the
-    // harness to the restored sandbox. `resolve_resume_agent_and_policy`
-    // (shared with the ADR 0034 Track A in-place reattach) returns `None`
-    // when the manifest bundle can't load (dev-VM / process backend) — we
-    // skip the agent re-attach then, same as before.
     let mut start_agent_failed: Option<(String, bool)> = None;
-    if let Some((agent, policy)) =
-        crate::boot_materializer::materialize_snapshot_resume(state, session, new_sandbox_id)
-            .await
-            .map(|m| (m.agent, m.policy))
-    {
+    if let HarnessPlan::Spawn { agent, policy } = plan {
         if let Err(e) = state
             .services
             .host
-            .start_agent(new_sandbox_id, agent, policy, fence)
+            .start_agent(new_sandbox_id, agent, *policy, fence)
             .await
         {
             // ADR 0116 B-D3: classify BEFORE the type is lost — B3
@@ -1607,7 +1619,7 @@ pub async fn finish_resume_to_active(
         BindingDisposition::Retain,
     )
     .await?;
-    if emit_status {
+    {
         let now = state.services.clock.now_utc();
         // Review finding #6: fenced. Ok(None) (a successor re-claimed) is
         // not an error — the transition above committed under our epoch.
@@ -2016,7 +2028,8 @@ async fn resume_from_fc_snapshot(
         // from a fenced executor (the successor may be mid-work).
         return Err(fenced_error());
     }
-    bind_resumed_session(state, id, host_id, new_sandbox_id, op_ctx.fence()).await?;
+    let binding_epoch =
+        bind_resumed_session(state, id, host_id, new_sandbox_id, op_ctx.fence()).await?;
     // ADR 0077 phase 4 (Revive): NO `Idle → Created` pre-transition.
     // The session stays Idle across the restore + harness rebuild and
     // flips STRAIGHT to Active (Idle → Active) in finish_resume_to_active
@@ -2055,7 +2068,8 @@ async fn resume_from_fc_snapshot(
         state,
         &session_refreshed,
         new_sandbox_id,
-        true,
+        materialize_snapshot_resume(state, &session_refreshed, new_sandbox_id, binding_epoch)
+            .await?,
         op_ctx.fence(),
     )
     .await?;
@@ -2090,7 +2104,7 @@ async fn bind_resumed_session(
     host_id: engram_core::HostId,
     sandbox_id: SandboxId,
     fence: SessionFence,
-) -> Result<(), ApiError> {
+) -> Result<u64, ApiError> {
     // ADR 0047: these are the AUTHORITATIVE routing writes. The
     // coordinator keeps no in-memory session→sandbox binding anymore,
     // so `sessions.{host_id,sandbox_id}` IS the routing — a failed
@@ -2122,13 +2136,13 @@ async fn bind_resumed_session(
     // predicate alone would bind the fresh VM onto that Dead row —
     // #211's leak, reborn. The state guard collapses into the fence once
     // the detectors' session writes become fenced enqueues.
-    match state
+    let epoch = match state
         .services
         .meta
         .rebind_session_guarded(id, host_id, sandbox_id, Some(None), &[SessionState::Idle])
         .await
     {
-        Ok(()) => {}
+        Ok(epoch) => epoch,
         Err(MetaError::Conflict(msg)) => {
             // The row went terminal (or a competitor bound it) while we
             // were restoring. Destroy the VM we just created so it does
@@ -2168,9 +2182,9 @@ async fn bind_resumed_session(
             }
             return Err(ApiError::Internal(format!("rebind_session on resume: {e}")));
         }
-    }
-    bind_session_routing_minted(state, id, sandbox_id).await;
-    Ok(())
+    };
+    bind_harness_generation(state, id, sandbox_id, epoch).await?;
+    Ok(epoch)
 }
 
 /// ADR 0018 commit 10 / ADR 0047: register the post-relocate
@@ -2188,41 +2202,18 @@ async fn bind_resumed_session(
 /// Shared with `bind_resumed_session` (the /resume path); exposed
 /// `pub(crate)` so the admin evac endpoint and the `evac_resumer`
 /// scanner (driving operator-drained sessions) can fire the same shape.
-pub(crate) async fn bind_session_routing(
+pub(crate) async fn bind_harness_generation(
     state: &SharedState,
     id: SessionId,
     sandbox_id: SandboxId,
     binding_epoch: u64,
-) {
+) -> Result<(), ApiError> {
     state
         .services
         .host
         .bind_session(id, sandbox_id, binding_epoch)
-        .await;
-}
-
-/// ADR 0073: mint-then-bind for the NEW-sandbox fresh-spawn flows
-/// (idle resume, disk-only cold recovery, evac restore). Live moves
-/// must NOT come through here — a teleported harness survives with
-/// its generation unchanged; they bind at `current_binding_epoch`.
-pub(crate) async fn bind_session_routing_minted(
-    state: &SharedState,
-    id: SessionId,
-    sandbox_id: SandboxId,
-) -> u64 {
-    let epoch = match state.services.meta.mint_binding_epoch(id).await {
-        Ok(e) => e,
-        Err(e) => {
-            // Loud but non-fatal: with no mint, the spawn-path bind
-            // (LocalHostClient::start_agent) still writes a record at
-            // the spec's epoch; a 0 here means that attach will bounce
-            // UnknownBinding until a later reattach mints properly.
-            tracing::error!(session_id = %id, error = %e, "mint binding epoch failed");
-            0
-        }
-    };
-    bind_session_routing(state, id, sandbox_id, epoch).await;
-    epoch
+        .await?;
+    Ok(())
 }
 
 /// ADR 0051: transport-agnostic evict core (gRPC `EvictLocal` + axum
@@ -3210,18 +3201,17 @@ mod evicting_gate_tests {
     #[tokio::test]
     async fn resume_op_resumes_at_finish_step_with_bound_sandbox() {
         let id = SessionId::new();
-        let host = engram_core::HostId::new();
-        let residual = SandboxId::new();
         let session = Session {
             id,
             // Idle but still carrying a binding — a prior attempt of THIS
             // op restored + bound and crashed before the finish leg
             // (ADR 0077: the bind happens while the row is still Idle).
             status: SessionState::Idle,
-            host_id: Some(host),
-            sandbox_id: Some(residual),
+            host_id: None,
+            sandbox_id: None,
             image: "test/repo:step-resume".into(),
-            mode: SessionMode::Agent,
+            // No harness and no image bundle in this fixture: dev-VM shape.
+            mode: SessionMode::DevVm,
             created_at: Utc::now(),
             last_active_at: Utc::now(),
             last_event_at: None,
@@ -3231,6 +3221,9 @@ mod evicting_gate_tests {
             suggested_title: None,
         };
         let (state, mini, _local) = crate::state::tests::build_state_for_session(session);
+        // The retry must bind a reachable host before it can become Active.
+        let residual = crate::state::tests::bind_live_sandbox(&state, &mini).await;
+        mini.session.lock().host_id = Some(state.host_registry.host_ids()[0]);
 
         // Claim the resume op and durably record the `bind` step, as the
         // crashed attempt would have.

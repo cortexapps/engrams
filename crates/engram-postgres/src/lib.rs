@@ -1146,7 +1146,7 @@ impl MetadataStore for PostgresStore {
         &self,
         session_id: SessionId,
         sandbox_id: SandboxId,
-    ) -> Result<(), MetaError> {
+    ) -> Result<u64, MetaError> {
         // Issue #535 (c): the row is GUARANTEED to already exist (`pending`,
         // committed by `reserve_and_persist_create` before any host RPC ran)
         // — a slim UPDATE replaces the old `create_session_created` upsert.
@@ -1160,20 +1160,18 @@ impl MetadataStore for PostgresStore {
         let res = sqlx::query(
             r#"
             UPDATE sessions
-               SET status = 'created', sandbox_id = $2, last_active_at = $3
-             WHERE id = $1 AND status = 'pending'
+               SET status = 'created', sandbox_id = $2, last_active_at = $3, binding_epoch = binding_epoch + 1
+             WHERE id = $1 AND status = 'pending' RETURNING binding_epoch
             "#,
         )
         .bind(session_id.as_uuid())
         .bind(sandbox_id.as_uuid())
         .bind(self.clock.now_utc())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
-        if res.rows_affected() == 0 {
-            return Err(MetaError::NotFound);
-        }
-        Ok(())
+        let row = res.ok_or(MetaError::NotFound)?;
+        Ok(row.try_get::<i64, _>(0).map_err(db_err)? as u64)
     }
 
     async fn reserve_and_persist_create(
@@ -3316,39 +3314,6 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
-    async fn rebind_session(
-        &self,
-        id: SessionId,
-        host_id: HostId,
-        sandbox_id: SandboxId,
-    ) -> Result<(), MetaError> {
-        // ADR 0045 C2: ONE UPDATE — the ownership oracle
-        // (`session.sandbox_id == sandbox`) flips atomically with the
-        // host rebind (the post-copy `Committing` persist).
-        //
-        // Issue #215: reset `missing_strikes = 0` — this re-keys the
-        // session onto a fresh sandbox (and host), so any in-flight
-        // reconcile strike streak against the old sandbox is no longer
-        // consecutive and must not bleed into the new binding's grace.
-        let n = sqlx::query(
-            r#"
-            UPDATE sessions SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = $4 WHERE id = $1
-            "#,
-        )
-        .bind(id.as_uuid())
-        .bind(host_id.as_uuid())
-        .bind(sandbox_id.as_uuid())
-        .bind(self.clock.now_utc())
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        if n == 0 {
-            return Err(MetaError::NotFound);
-        }
-        Ok(())
-    }
-
     async fn assign_session_host(
         &self,
         id: SessionId,
@@ -3796,37 +3761,11 @@ impl MetadataStore for PostgresStore {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn mint_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
-        // ADR 0067: one atomic bump; the RETURNING value is the epoch
-        // the caller stamps into the AgentSpec + bind RPC. Monotonic
-        // per session by construction (single row, single counter).
-        let row =
-            sqlx::query("UPDATE sessions SET binding_epoch = binding_epoch + 1 WHERE id = $1 RETURNING binding_epoch")
-                .bind(id.as_uuid())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
-        let row = row.ok_or(MetaError::NotFound)?;
-        let epoch: i64 = row.try_get(0).map_err(db_err)?;
-        Ok(epoch as u64)
-    }
-
-    async fn current_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
-        let row = sqlx::query("SELECT binding_epoch FROM sessions WHERE id = $1")
-            .bind(id.as_uuid())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?;
-        let row = row.ok_or(MetaError::NotFound)?;
-        let epoch: i64 = row.try_get(0).map_err(db_err)?;
-        Ok(epoch as u64)
-    }
-
     async fn assign_session_sandbox(
         &self,
         id: SessionId,
         sandbox_id: Option<SandboxId>,
-    ) -> Result<(), MetaError> {
+    ) -> Result<Option<u64>, MetaError> {
         // ADR 0016 Phase B: the `live_disk_manifest_*` invariant is
         // "set IFF the session is bound to a running sandbox the
         // host-side FlushScheduler is publishing for." Unbinding
@@ -3864,18 +3803,18 @@ impl MetadataStore for PostgresStore {
         // column is keyed by session id alone, so re-keying the
         // sandbox must explicitly clear it here.
         let now = self.clock.now_utc();
-        let n = if sandbox_id.is_some() {
-            sqlx::query(
-                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = $3 \
-                 WHERE id = $1",
+        if sandbox_id.is_some() {
+            let row = sqlx::query(
+                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = $3, binding_epoch = binding_epoch + 1 \
+                 WHERE id = $1 RETURNING binding_epoch",
             )
             .bind(id.as_uuid())
             .bind(sandbox_id.map(|s| s.as_uuid()))
             .bind(now)
-            .execute(&self.pool)
+            .fetch_optional(&self.pool)
             .await
-            .map_err(db_err)?
-            .rows_affected()
+            .map_err(db_err)?.ok_or(MetaError::NotFound)?;
+            return Ok(Some(row.try_get::<i64, _>(0).map_err(db_err)? as u64));
         } else {
             // Single TX: clear sandbox + live manifest, AND bump
             // chunk_generation in the same step so Phase C's mid-
@@ -3911,12 +3850,11 @@ impl MetadataStore for PostgresStore {
                 .map_err(db_err)?;
             }
             tx.commit().await.map_err(db_err)?;
-            n
-        };
-        if n == 0 {
-            return Err(MetaError::NotFound);
+            if n == 0 {
+                return Err(MetaError::NotFound);
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     // ---- Issue #211: guarded CAS overrides ----
@@ -3937,7 +3875,7 @@ impl MetadataStore for PostgresStore {
         sandbox_id: Option<SandboxId>,
         expected_current: Option<Option<SandboxId>>,
         allowed_states: &[SessionState],
-    ) -> Result<(), MetaError> {
+    ) -> Result<Option<u64>, MetaError> {
         // The `None` clear path additionally tears down the live disk
         // manifest + bumps chunk_generation; reuse the existing blind
         // setter inside a guarded TX rather than duplicating that logic.
@@ -3978,17 +3916,18 @@ impl MetadataStore for PostgresStore {
         // Issue #215: clear `missing_strikes` on both bind and unbind —
         // see the comment in `assign_session_sandbox`. A re-key / unbind
         // breaks the reconcile strike streak's consecutiveness.
-        if sandbox_id.is_some() {
-            sqlx::query(
-                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = $3 \
-                 WHERE id = $1",
+        let epoch = if sandbox_id.is_some() {
+            let row = sqlx::query(
+                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = $3, binding_epoch = binding_epoch + 1 \
+                 WHERE id = $1 RETURNING binding_epoch",
             )
             .bind(id.as_uuid())
             .bind(sandbox_id.map(|s| s.as_uuid()))
             .bind(now)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
             .map_err(db_err)?;
+            Some(row.try_get::<i64, _>(0).map_err(db_err)? as u64)
         } else {
             let n = sqlx::query(
                 "UPDATE sessions
@@ -4014,9 +3953,10 @@ impl MetadataStore for PostgresStore {
                 .await
                 .map_err(db_err)?;
             }
-        }
+            None
+        };
         tx.commit().await.map_err(db_err)?;
-        Ok(())
+        Ok(epoch)
     }
 
     async fn assign_session_host_guarded(
@@ -4066,7 +4006,7 @@ impl MetadataStore for PostgresStore {
         sandbox_id: SandboxId,
         expected_current: Option<Option<SandboxId>>,
         allowed_states: &[SessionState],
-    ) -> Result<(), MetaError> {
+    ) -> Result<u64, MetaError> {
         let states: Vec<String> = allowed_states
             .iter()
             .map(|s| s.as_str().to_string())
@@ -4099,9 +4039,9 @@ impl MetadataStore for PostgresStore {
                 ON CONFLICT (host_id, sandbox_id) DO NOTHING
             )
             UPDATE sessions s
-               SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = $7
+               SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = $7, binding_epoch = s.binding_epoch + 1
               FROM prior p
-             WHERE s.id = p.id
+             WHERE s.id = p.id RETURNING s.binding_epoch
             "#,
         )
         .bind(id.as_uuid())
@@ -4115,14 +4055,13 @@ impl MetadataStore for PostgresStore {
         .bind(expected_uuid.is_some())
         .bind(expected_uuid.flatten())
         .bind(self.clock.now_utc())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(db_err)?
-        .rows_affected();
-        if n == 0 {
+        .map_err(db_err)?;
+        let Some(row) = n else {
             return Err(self.conflict_or_not_found(id).await);
-        }
-        Ok(())
+        };
+        Ok(row.try_get::<i64, _>(0).map_err(db_err)? as u64)
     }
 
     async fn host_for_sandbox(
@@ -5319,6 +5258,82 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         Ok(max.unwrap_or(0).max(0) as u64)
+    }
+
+    async fn settle_harness_generation(
+        &self,
+        session: SessionId,
+        epoch: u64,
+        continued: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<engram_core::types::session::SettledRun>, MetaError> {
+        let epoch = i64::try_from(epoch).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let changed = sqlx::query(
+            "UPDATE sessions SET attached_binding_epoch = $2
+             WHERE id = $1 AND attached_binding_epoch < $2",
+        )
+        .bind(session.as_uuid())
+        .bind(epoch)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if changed.rows_affected() == 0 {
+            return Ok(Vec::new());
+        }
+        let runs: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT started.payload->>'run_id'
+             FROM session_events started
+             WHERE started.session_id = $1 AND started.kind = 'run_started'
+               AND started.payload->>'run_id' IS NOT NULL
+               AND NOT (started.payload->>'run_id' = ANY($2))
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_events ended
+                   WHERE ended.session_id = started.session_id
+                     AND ended.kind IN ('run_completed', 'run_interrupted')
+                     AND ended.payload->>'run_id' = started.payload->>'run_id'
+                     AND ended.idx > started.idx)
+             ORDER BY 1",
+        )
+        .bind(session.as_uuid())
+        .bind(continued)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let mut settled = Vec::new();
+        for run in runs {
+            let payload = serde_json::json!({"type": "harness_run_interrupted", "run_id": run,
+                "cause": "harness_replaced", "at": now});
+            if let Some(idx) = append_event_idempotent_tx(
+                &mut tx,
+                session,
+                &format!("run_interrupted:{run}"),
+                "run_interrupted",
+                payload,
+                now,
+            )
+            .await?
+            {
+                settled.push(engram_core::types::session::SettledRun { run_id: run, idx });
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(settled)
+    }
+
+    async fn append_session_event_idempotent(
+        &self,
+        session: SessionId,
+        key: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<i64>, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let idx =
+            append_event_idempotent_tx(&mut tx, session, key, kind, payload, self.clock.now_utc())
+                .await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(idx)
     }
 
     async fn append_session_event(
@@ -8498,21 +8513,24 @@ impl MetadataStore for PostgresStore {
         epoch: i64,
         sandbox_id: Option<SandboxId>,
         host_id: Option<HostId>,
-    ) -> Result<bool, MetaError> {
+    ) -> Result<Option<u64>, MetaError> {
         let res = sqlx::query(
             "UPDATE sessions
-                SET sandbox_id = $2, host_id = $3, last_active_at = $5, updated_at = $5
-              WHERE id = $1 AND current_epoch = $4",
+                SET sandbox_id = $2, host_id = $3, last_active_at = $5, updated_at = $5,
+                    binding_epoch = binding_epoch + CASE WHEN $2::uuid IS NULL THEN 0 ELSE 1 END
+              WHERE id = $1 AND current_epoch = $4 RETURNING binding_epoch",
         )
         .bind(session_id.as_uuid())
         .bind(sandbox_id.map(|s| s.as_uuid()))
         .bind(host_id.map(|h| h.as_uuid()))
         .bind(epoch)
         .bind(self.clock.now_utc())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(res.rows_affected() > 0)
+        let row = res.ok_or_else(|| MetaError::Conflict("stale session fence".into()))?;
+        let epoch = row.try_get::<i64, _>(0).map_err(db_err)? as u64;
+        Ok(sandbox_id.map(|_| epoch))
     }
 
     /// ADR 0016 Phase B: publish the host's freshly-flushed disk
@@ -9501,4 +9519,46 @@ fn oauth_flow_from_pg(
         created_at: row.try_get("created_at").map_err(db_err)?,
         updated_at: row.try_get("updated_at").map_err(db_err)?,
     })
+}
+
+/// The session lock serializes key lookup with index allocation and insertion.
+async fn append_event_idempotent_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session: SessionId,
+    key: &str,
+    kind: &str,
+    mut payload: serde_json::Value,
+    now: DateTime<Utc>,
+) -> Result<Option<i64>, MetaError> {
+    sqlx::query("SELECT id FROM sessions WHERE id = $1 FOR UPDATE")
+        .bind(session.as_uuid())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM session_events WHERE session_id = $1 AND payload->>'idempotency_key' = $2)",
+    ).bind(session.as_uuid()).bind(key).fetch_one(&mut **tx).await.map_err(db_err)?;
+    if exists {
+        return Ok(None);
+    }
+    payload
+        .as_object_mut()
+        .ok_or_else(|| MetaError::Serialization("event payload must be an object".into()))?
+        .insert(
+            "idempotency_key".into(),
+            serde_json::Value::String(key.into()),
+        );
+    let row = sqlx::query(
+        "WITH next AS (
+            UPDATE sessions SET next_event_idx = next_event_idx + 1, updated_at = $4, last_event_at = $4
+            WHERE id = $1 RETURNING next_event_idx - 1 AS idx, recovery_epoch
+         ), inserted AS (
+            INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch, created_at)
+            SELECT $1, idx, $2, $3, recovery_epoch, $4 FROM next RETURNING idx
+         ) SELECT idx, pg_notify('session_events', json_build_object('session_id', $1::text, 'idx', idx)::text)
+           FROM inserted",
+    ).bind(session.as_uuid()).bind(kind).bind(payload).bind(now)
+        .fetch_one(&mut **tx).await.map_err(db_err)?;
+    Ok(Some(row.try_get("idx").map_err(db_err)?))
 }

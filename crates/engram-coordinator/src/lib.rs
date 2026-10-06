@@ -294,12 +294,6 @@ pub async fn run_with_registry_and_local(
     let _idle_detector =
         idle_detector::spawn(idle_detector::IdleDetectorConfig::from_env(), state.clone());
 
-    // Track A: harness-desync watchdog. Catches the wedge class the
-    // silence-only backstop misses — a harness whose event stream desynced
-    // from the run state machine (a run-scoped event with no open run, or a
-    // stuck-open run) — and recovers it with a non-destructive harness
-    // re-handshake, escalating to the eviction lane if the nudges don't take.
-
     // ADR 0009 §1-§3: in-process reconcile driver. In `--mode=all`
     // (single-process coord+host) and `--mode=host` test fixtures
     // there's no WS heartbeat path — the reconcile hook in

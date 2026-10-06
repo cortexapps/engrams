@@ -770,12 +770,16 @@ impl HostClient for HostRegistry {
         backend.guest_ip(id).await
     }
 
-    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId, binding_epoch: u64) {
-        if let Ok((_, backend)) = self.resolve_owner(sandbox_id).await {
-            backend
-                .bind_session(session_id, sandbox_id, binding_epoch)
-                .await;
-        }
+    async fn bind_session(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        binding_epoch: u64,
+    ) -> Result<(), engram_core::SandboxError> {
+        let (_, backend) = self.resolve_owner(sandbox_id).await?;
+        backend
+            .bind_session(session_id, sandbox_id, binding_epoch)
+            .await
     }
 
     async fn unbind_session(&self, session_id: SessionId) {
@@ -956,7 +960,7 @@ mod tests {
             &self,
             _: engram_core::SessionId,
             _: SandboxId,
-        ) -> Result<(), engram_core::MetaError> {
+        ) -> Result<u64, engram_core::MetaError> {
             unreachable!()
         }
         async fn reserve_and_persist_create(
@@ -997,8 +1001,8 @@ mod tests {
             &self,
             _: engram_core::SessionId,
             _: Option<SandboxId>,
-        ) -> Result<(), engram_core::MetaError> {
-            Ok(())
+        ) -> Result<Option<u64>, engram_core::MetaError> {
+            Ok(None)
         }
         async fn host_for_sandbox(
             &self,

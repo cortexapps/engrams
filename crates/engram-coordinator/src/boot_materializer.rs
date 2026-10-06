@@ -336,88 +336,56 @@ pub(crate) async fn materialize_cold_boot(
 /// create. Making those absences STRUCTURAL is the point: the pre-B2
 /// shape expressed them by positionally dropping tuple fields, which is
 /// how the cold-boot harness wedge survived review.
-pub(crate) struct ResumeMaterials {
-    pub agent: engram_core::types::sandbox::AgentSpec,
-    pub policy: engram_core::types::egress::SessionEgressPolicy,
+pub(crate) enum HarnessPlan {
+    Spawn {
+        agent: engram_core::types::sandbox::AgentSpec,
+        policy: Box<engram_core::types::egress::SessionEgressPolicy>,
+    },
+    None,
 }
 
-/// ADR 0016 §A.1.7 / ADR 0116 B2: derive the resume-shape agent spec +
-/// egress policy for a session (moved verbatim from
-/// `api/snapshot.rs::resolve_resume_agent_and_policy`; the manifest +
-/// SecretBundle + env load once, reused for both).
-///
-/// The spec is **resume-shaped**: no `ENGRAM_INITIAL_PROMPT*` env.
-/// Prompt-less is load-bearing — ADR 0108 A6 stamps the create-time
-/// prompt into the spawn env in `boot_on_reserved_host` (the CREATE
-/// lanes only, never here), so a boot-shape respawn of an *exited*
-/// harness would re-inject it mid-conversation; the resume shape just
-/// `--resume`s the existing claude session and goes `Idle`. This
-/// structural split is the A6 no-reinject guarantee.
-///
-/// Shared by `finish_resume_to_active` (a fresh post-restore sandbox)
-/// and the ADR 0034 Track A desync watchdog's in-place reattach (the
-/// session's existing LIVE sandbox). `None` when the manifest bundle
-/// can't load (dev-VM / process backend) — callers skip the agent
-/// attach, exactly as resume did before.
+/// Resolve a prompt-free harness plan. Only an explicit no-harness selection
+/// can skip spawn. Resolution failures must not make the session Active.
 pub(crate) async fn materialize_snapshot_resume(
     state: &SharedState,
     session: &Session,
     sandbox_id: engram_core::SandboxId,
-) -> Option<ResumeMaterials> {
+    binding_epoch: u64,
+) -> Result<HarnessPlan, ApiError> {
     let id = session.id;
-    let (resume_bundle, resume_base_env) =
-        crate::api::sessions::resolve_session_env(state, session).await;
-    let b = resume_bundle.as_ref()?;
-    // Same split as create: agentd holds the durable session env (image env +
-    // secrets + session id); the harness gets the forge broker token as a
-    // per-spawn extra, from the PG-sealed row (ADR 0047) — same token across
-    // coord restarts and replicas.
-    let mut session_env = resume_base_env.clone();
+    // Only a dev-VM session has no harness. An agent-mode session with no
+    // persisted selection is an error from `resolve_harness`, never a
+    // silent "no harness".
+    if session.mode.is_dev_vm() {
+        return Ok(HarnessPlan::None);
+    }
+    let selected = state.services.meta.get_session_harness(id).await?;
+    let (b, mut session_env) = crate::api::sessions::resolve_session_env(state, session).await?;
     session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
-    // ADR 0062: the harness comes from the session's persisted selection
-    // (not the baked manifest).
-    let selected_harness = state
-        .services
-        .meta
-        .get_session_harness(id)
-        .await
-        .ok()
-        .flatten();
-    let resolved = crate::api::sessions::resolve_harness(
+    let Some(resolved) = crate::api::sessions::resolve_harness(
         state,
-        selected_harness.as_deref(),
+        selected.as_deref(),
         session.mode,
         id,
         session_env,
         b.config.workdir.clone(),
-        // Resume: the mode was validated when its prompt was accepted.
         None,
     )
-    .await
-    .ok()
-    .flatten()?;
-    // Consumed BY NAME: only the agent spec. `resolved.mount` re-anchors
-    // host-side from the snapshot's aux_bundles; `resolved.egress` is
-    // already merged into the persisted policy (see [`ResumeMaterials`]).
+    .await?
+    else {
+        return Ok(HarnessPlan::None);
+    };
     let mut agent = resolved.agent;
-    crate::api::sessions::inject_harness_env(state, id, &mut agent.env).await;
-    // ADR 0073: stamp the CURRENT epoch (this runs after the flow's
-    // bind — minted for fresh-spawn resumes, unminted for live moves,
-    // where the surviving harness must keep validating).
-    agent.binding_epoch = state
-        .services
-        .meta
-        .current_binding_epoch(id)
-        .await
-        .unwrap_or(0);
-    // Rebuild the SessionEgressPolicy for `sandbox_id`. Falls back to the
-    // legacy placeholder when the host has no guest IP (process backend, VZ in
-    // some configs) or the IP is unparseable — same as the create path.
+    crate::api::sessions::inject_harness_env(state, id, &mut agent.env).await?;
+    agent.binding_epoch = binding_epoch;
     let policy =
         crate::api::sessions::build_resume_egress_policy(state, id, sandbox_id, &session.image)
-            .await
+            .await?
             .unwrap_or_else(|| crate::api::snapshot::placeholder_egress_policy(id, sandbox_id));
-    Some(ResumeMaterials { agent, policy })
+    Ok(HarnessPlan::Spawn {
+        agent,
+        policy: Box::new(policy),
+    })
 }
 
 /// The placement-budget slice of the cold-boot shape, for callers that
@@ -553,5 +521,414 @@ mod tests {
                 AuxRoDrive::slot_drive_id(AuxRoDrive::HARNESS_SLOT_INDEX),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use crate::api::snapshot::{finish_resume_to_active, FinishResumeOutcome};
+    use async_trait::async_trait;
+    use engram_core::traits::SessionFence;
+    use engram_core::traits::{Entropy, HostClient, MetadataStore};
+    use engram_core::types::egress::SessionEgressPolicy;
+    use engram_core::types::sandbox::{
+        AgentSpec, ExecRequest as HostExecRequest, ExecStream, SandboxProbe,
+    };
+    use engram_core::types::snapshot::SnapshotMetadata;
+    use engram_core::types::{SessionSpec, SessionState};
+    use engram_core::{SandboxError, SandboxId, SessionId};
+    use engram_sim::{ManualClock, MemBlobStorage, SimEntropy, SimMetadataStore};
+    use std::sync::Arc;
+
+    struct ReadinessHost {
+        meta: Arc<SimMetadataStore>,
+        session: SessionId,
+        starts: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl HostClient for ReadinessHost {
+        async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            unreachable!("exec-core tests never create sandboxes")
+        }
+
+        async fn destroy(&self, _id: SandboxId, _fence: SessionFence) -> Result<(), SandboxError> {
+            unreachable!("exec-core tests never destroy sandboxes")
+        }
+
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            unreachable!("exec-core tests never list sandboxes")
+        }
+
+        async fn probe_sandbox(&self, _id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+            unreachable!("exec-core tests never probe sandboxes")
+        }
+
+        async fn exec_stream(
+            &self,
+            id: SandboxId,
+            cmd: HostExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            let _ = (id, cmd);
+            unreachable!("readiness never executes commands")
+        }
+
+        async fn snapshot(
+            &self,
+            _id: SandboxId,
+            _fence: SessionFence,
+        ) -> Result<SnapshotMetadata, SandboxError> {
+            unreachable!("exec-core tests never snapshot sandboxes")
+        }
+
+        async fn restore(
+            &self,
+            _metadata: SnapshotMetadata,
+            _fence: SessionFence,
+        ) -> Result<SandboxId, SandboxError> {
+            unreachable!("exec-core tests never restore sandboxes")
+        }
+
+        async fn start_agent(
+            &self,
+            _id: SandboxId,
+            _agent: AgentSpec,
+            _policy: SessionEgressPolicy,
+            _fence: SessionFence,
+        ) -> Result<(), SandboxError> {
+            assert_eq!(
+                self.meta.get_session(self.session).await.unwrap().status,
+                SessionState::Created
+            );
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
+            None
+        }
+
+        async fn bind_session(
+            &self,
+            _session_id: SessionId,
+            _sandbox_id: SandboxId,
+            _binding_epoch: u64,
+        ) -> Result<(), engram_core::SandboxError> {
+            Err(SandboxError::Vm("bind rejected".into()))
+        }
+
+        async fn unbind_session(&self, _session_id: SessionId) {}
+
+        async fn send_prompt(
+            &self,
+            _sandbox_id: SandboxId,
+            _prompt_id: String,
+            _text: String,
+            _mode: Option<String>,
+        ) -> Result<(), SandboxError> {
+            unreachable!("exec-core tests never send prompts")
+        }
+    }
+
+    async fn fixture() -> (
+        SharedState,
+        Arc<SimMetadataStore>,
+        Arc<ReadinessHost>,
+        Session,
+        SandboxId,
+    ) {
+        let clock = ManualClock::new();
+        let entropy = Arc::new(SimEntropy::seeded(123));
+        let meta = SimMetadataStore::new(clock.clone(), entropy.clone());
+        let sid = meta
+            .create_session(SessionSpec {
+                image: "test.invalid/readiness:latest".into(),
+                mode: Default::default(),
+            })
+            .await
+            .unwrap();
+        let sandbox = SandboxId::from(entropy.uuid());
+        assert_eq!(
+            meta.transition_session_created(sid, sandbox).await.unwrap(),
+            1
+        );
+        let session = meta.get_session(sid).await.unwrap();
+        let host = Arc::new(ReadinessHost {
+            meta: meta.clone(),
+            session: sid,
+            starts: Default::default(),
+        });
+        let blob = Arc::new(MemBlobStorage::new());
+        let services = crate::Services {
+            meta: meta.clone(),
+            host: host.clone(),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: blob.clone(),
+            chunk_store: engram_chunk_store::ChunkStore::new(blob),
+            materialize_dir: None,
+            clock: clock.clone(),
+            entropy,
+        };
+        let state = Arc::new(crate::AppState::new(
+            crate::CoordinatorConfig::default(),
+            services,
+        ));
+        (state, meta, host, session, sandbox)
+    }
+
+    #[tokio::test]
+    async fn resolution_error_never_becomes_active() {
+        let (state, meta, host, session, sandbox) = fixture().await;
+        meta.with_db_mut(|db| {
+            db.runtime_specs.insert(
+                session.id,
+                serde_json::from_value(serde_json::json!({"v": 1, "selected_harness": "claude"}))
+                    .unwrap(),
+            );
+        });
+        let result = materialize_snapshot_resume(&state, &session, sandbox, 1).await;
+        assert!(result.is_err(), "a missing image bundle must fail");
+        assert_eq!(
+            meta.get_session(session.id).await.unwrap().status,
+            SessionState::Created
+        );
+        assert_eq!(host.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_session_without_a_selection_is_an_error_not_a_skip() {
+        let (state, meta, host, session, sandbox) = fixture().await;
+        let result = materialize_snapshot_resume(&state, &session, sandbox, 1).await;
+        assert!(
+            result.is_err(),
+            "no selection on an agent session is an error"
+        );
+        assert_eq!(
+            meta.get_session(session.id).await.unwrap().status,
+            SessionState::Created
+        );
+        assert_eq!(host.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_no_harness_reaches_active_without_spawn() {
+        let (state, meta, host, mut session, sandbox) = fixture().await;
+        session.mode = engram_core::types::session::SessionMode::DevVm;
+        let plan = materialize_snapshot_resume(&state, &session, sandbox, 1)
+            .await
+            .unwrap();
+        assert!(matches!(plan, HarnessPlan::None));
+        assert!(matches!(
+            finish_resume_to_active(&state, &session, sandbox, plan, SessionFence::unfenced())
+                .await
+                .unwrap(),
+            FinishResumeOutcome::Active
+        ));
+        assert_eq!(
+            meta.get_session(session.id).await.unwrap().status,
+            SessionState::Active
+        );
+        assert_eq!(host.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_precedes_active() {
+        let (state, meta, host, session, sandbox) = fixture().await;
+        let plan = HarnessPlan::Spawn {
+            agent: AgentSpec {
+                argv: vec!["harness".into()],
+                env: Default::default(),
+                session_env: Default::default(),
+                binding_epoch: 1,
+                host_ca_pem: None,
+            },
+            policy: Box::new(crate::api::snapshot::placeholder_egress_policy(
+                session.id, sandbox,
+            )),
+        };
+        assert!(matches!(
+            finish_resume_to_active(&state, &session, sandbox, plan, SessionFence::unfenced())
+                .await
+                .unwrap(),
+            FinishResumeOutcome::Active
+        ));
+        assert_eq!(
+            meta.get_session(session.id).await.unwrap().status,
+            SessionState::Active
+        );
+        assert_eq!(host.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bind_error_propagates_without_spawn() {
+        let (state, meta, host, session, sandbox) = fixture().await;
+        assert!(
+            crate::api::snapshot::bind_harness_generation(&state, session.id, sandbox, 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            meta.get_session(session.id).await.unwrap().status,
+            SessionState::Created
+        );
+        assert_eq!(host.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    /// ADR 0123 C5: a snapshot teleport keeps the harness process, and that
+    /// process keeps running the same run under the new generation. Its own
+    /// RunContinued advances the generation and must not settle the run.
+    #[tokio::test]
+    async fn continued_run_survives_the_generation_advance() {
+        use crate::state::{emit_harness_event, EventDelivery, RunInterruptCause, SessionEvent};
+        let (state, meta, _, session, sandbox) = fixture().await;
+        for run in ["kept", "stale"] {
+            meta.append_session_event(
+                session.id,
+                "run_started",
+                serde_json::json!({"run_id": run}),
+            )
+            .await
+            .unwrap();
+        }
+        let mut events = state.events.subscribe(session.id);
+        emit_harness_event(
+            &state,
+            session.id,
+            sandbox,
+            engram_harness_proto::HarnessEvent::RunContinued {
+                run_id: "kept".into(),
+            },
+            state.services.clock.now_utc(),
+            Some(EventDelivery {
+                binding_epoch: 2,
+                seq: 1,
+                incarnation: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        // Only the run the new generation did not continue is settled.
+        match events.try_recv().unwrap().event {
+            SessionEvent::HarnessRunInterrupted { run_id, cause, .. } => {
+                assert_eq!(run_id, "stale");
+                assert_eq!(cause, Some(RunInterruptCause::HarnessReplaced));
+            }
+            other => panic!("expected the stale run settled, got {other:?}"),
+        }
+        assert!(matches!(
+            events.try_recv().unwrap().event,
+            SessionEvent::HarnessRunContinued { .. }
+        ));
+        assert!(
+            events.try_recv().is_err(),
+            "the continued run is not settled"
+        );
+        // A later generation that continues nothing settles it.
+        emit_harness_event(
+            &state,
+            session.id,
+            sandbox,
+            engram_harness_proto::HarnessEvent::Idle,
+            state.services.clock.now_utc(),
+            Some(EventDelivery {
+                binding_epoch: 3,
+                seq: 1,
+                incarnation: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        match events.try_recv().unwrap().event {
+            SessionEvent::HarnessRunInterrupted { run_id, .. } => assert_eq!(run_id, "kept"),
+            other => panic!("expected the kept run settled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_settles_publishes_and_deduplicates() {
+        use crate::state::{emit_harness_event, EventDelivery, RunInterruptCause, SessionEvent};
+        let (state, meta, _, session, sandbox) = fixture().await;
+        meta.append_session_event(
+            session.id,
+            "run_started",
+            serde_json::json!({"run_id": "old"}),
+        )
+        .await
+        .unwrap();
+        let mut events = state.events.subscribe(session.id);
+        let delivery = Some(EventDelivery {
+            binding_epoch: 2,
+            seq: 1,
+            incarnation: 1,
+        });
+        emit_harness_event(
+            &state,
+            session.id,
+            sandbox,
+            engram_harness_proto::HarnessEvent::Idle,
+            state.services.clock.now_utc(),
+            delivery,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap().event,
+            SessionEvent::HarnessRunInterrupted {
+                cause: Some(RunInterruptCause::HarnessReplaced),
+                ..
+            }
+        ));
+        assert!(matches!(
+            events.try_recv().unwrap().event,
+            SessionEvent::HarnessIdle { .. }
+        ));
+        emit_harness_event(
+            &state,
+            session.id,
+            sandbox,
+            engram_harness_proto::HarnessEvent::Idle,
+            state.services.clock.now_utc(),
+            delivery,
+        )
+        .await
+        .unwrap();
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            meta.list_session_events_window(
+                session.id,
+                engram_core::types::EventCursor::After(-1),
+                100,
+                &[],
+                &[]
+            )
+            .await
+            .unwrap()
+            .len(),
+            3
+        );
+        let old: SessionEvent = serde_json::from_value(serde_json::json!({"type": "harness_run_interrupted", "run_id": "old", "at": state.services.clock.now_utc()})).unwrap();
+        assert!(matches!(
+            old,
+            SessionEvent::HarnessRunInterrupted { cause: None, .. }
+        ));
+        meta.set_outage(true);
+        assert!(emit_harness_event(
+            &state,
+            session.id,
+            sandbox,
+            engram_harness_proto::HarnessEvent::Idle,
+            state.services.clock.now_utc(),
+            delivery
+        )
+        .await
+        .is_err());
     }
 }

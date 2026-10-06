@@ -1745,13 +1745,14 @@ impl HostClient for GrpcHostClient {
         Self::guest_ip(self, id).await
     }
 
-    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId, binding_epoch: u64) {
-        if let Err(e) = self
-            .bind_harness_session(session_id, sandbox_id, binding_epoch)
+    async fn bind_session(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        binding_epoch: u64,
+    ) -> Result<(), engram_core::SandboxError> {
+        self.bind_harness_session(session_id, sandbox_id, binding_epoch)
             .await
-        {
-            tracing::warn!(%session_id, %sandbox_id, binding_epoch, error = %e, "gRPC bind_harness_session failed");
-        }
     }
 
     async fn unbind_session(&self, session_id: SessionId) {

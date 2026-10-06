@@ -488,6 +488,34 @@ impl HarnessEvent {
     /// Discriminant string used as the `kind` column in `session_events`.
     /// Stable across coordinator restarts — clients that subscribe by
     /// kind (Slackbot, Web UI) match on these strings.
+    /// The run this event belongs to, when it carries one. Exhaustive on
+    /// purpose: a new variant must say whether it names a run.
+    pub fn run_id(&self) -> Option<&str> {
+        match self {
+            Self::RunStarted { run_id, .. }
+            | Self::AgentMessage { run_id, .. }
+            | Self::ToolCallStarted { run_id, .. }
+            | Self::ToolCallCompleted { run_id, .. }
+            | Self::RunCompleted { run_id, .. }
+            | Self::RunInterrupted { run_id }
+            | Self::AgentMessageChunk { run_id, .. }
+            | Self::FileChanged { run_id, .. }
+            | Self::ToolCallRequested { run_id, .. }
+            | Self::BrowserActivity { run_id, .. }
+            | Self::Generation { run_id, .. }
+            | Self::RunCost { run_id, .. }
+            | Self::RunContinued { run_id } => Some(run_id),
+            Self::Idle
+            | Self::Busy
+            | Self::Parked
+            | Self::PromptQueued { .. }
+            | Self::PromptEdited { .. }
+            | Self::PromptDequeued { .. }
+            | Self::TitleSuggested { .. }
+            | Self::PromptSteered { .. } => None,
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::RunStarted { .. } => "run_started",

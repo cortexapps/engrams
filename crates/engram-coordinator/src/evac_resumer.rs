@@ -18,7 +18,7 @@
 //!      restores from the session's `live_disk_manifest` and/or latest
 //!      snapshot, rebinds PG `(host_id, sandbox_id)`, transitions
 //!      `Evacuating → Created`.
-//!    - [`crate::api::snapshot::bind_session_routing`] registers the
+//!    - [`crate::api::snapshot::bind_harness_generation`] registers the
 //!      session→sandbox map on the target host-agent (the coordinator
 //!      keeps no in-memory binding — `sessions.sandbox_id` is the
 //!      authority, ADR 0047).
@@ -29,7 +29,7 @@
 //!    tick re-picks it up via the operator-/exec-driven `/resume`
 //!    path). The pre-bump idempotency lives in
 //!    `evacuate_dead_source` (PG rebind is `assign_*` which tolerates
-//!    re-runs) and in `bind_session_routing` (an idempotent host RPC).
+//!    re-runs) and in `bind_harness_generation` (an idempotent host RPC).
 //!
 //! ## Why this pattern
 //!
@@ -336,11 +336,11 @@ async fn advance_one_claimed(
                 )
                 .await
             {
-                Ok(true) => {
+                Ok(_) => {
                     state.host_registry.invalidate_sandbox(source_sandbox);
                     session.sandbox_id = None;
                 }
-                Ok(false) => {
+                Err(engram_core::MetaError::Conflict(_)) => {
                     crate::metrics::note_fenced_write();
                     return Ok(());
                 }
@@ -615,8 +615,13 @@ async fn run_resume_pipeline(
         .await;
 
     // ADR 0073: evac restore is a fresh-spawn generation — mint.
-    crate::api::snapshot::bind_session_routing_minted(state, session_id, receipt.new_sandbox_id)
-        .await;
+    crate::api::snapshot::bind_harness_generation(
+        state,
+        session_id,
+        receipt.new_sandbox_id,
+        receipt.binding_epoch,
+    )
+    .await?;
 
     // ADR 0028 A.log: warm rung-1 recovery — rewind the transcript to
     // the checkpoint's cursor + emit the recovery boundary. Gated on
@@ -643,7 +648,13 @@ async fn run_resume_pipeline(
         state,
         &session_refreshed,
         receipt.new_sandbox_id,
-        true,
+        crate::boot_materializer::materialize_snapshot_resume(
+            state,
+            &session_refreshed,
+            receipt.new_sandbox_id,
+            receipt.binding_epoch,
+        )
+        .await?,
         fence,
     )
     .await

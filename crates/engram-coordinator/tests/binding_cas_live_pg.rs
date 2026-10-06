@@ -162,9 +162,11 @@ async fn guarded_rebind_admits_the_idle_unbound_row() {
     let new_sandbox = SandboxId::new();
     let host = HostId::new();
     ensure_host(&meta, host).await;
-    meta.rebind_session_guarded(id, host, new_sandbox, Some(None), &[SessionState::Idle])
+    let epoch = meta
+        .rebind_session_guarded(id, host, new_sandbox, Some(None), &[SessionState::Idle])
         .await
         .expect("rebind onto the Idle/unbound row must succeed");
+    assert_eq!(epoch, 2);
 
     let row = meta.get_session(id).await.expect("get_session");
     assert_eq!(row.sandbox_id, Some(new_sandbox), "sandbox bound");

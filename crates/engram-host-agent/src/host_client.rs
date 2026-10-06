@@ -352,16 +352,15 @@ impl HostClient for LocalHostClient {
             .map(|ep| ep.egress_identity)
     }
 
-    async fn bind_session(&self, session_id: SessionId, sandbox_id: SandboxId, binding_epoch: u64) {
-        if let Err(e) = self
-            .harness_hub
+    async fn bind_session(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        binding_epoch: u64,
+    ) -> Result<(), engram_core::SandboxError> {
+        self.harness_hub
             .bind_session(session_id, sandbox_id, binding_epoch)
-        {
-            // A refused bind means a NEWER generation already owns the
-            // record (monotonicity) — the caller is stale, and the
-            // correct outcome is exactly "this bind does not take".
-            tracing::warn!(%session_id, %sandbox_id, binding_epoch, error = %e, "bind_session refused");
-        }
+            .map_err(|e| engram_core::SandboxError::Vm(format!("bind session: {e}").into()))
     }
 
     async fn unbind_session(&self, session_id: SessionId) {

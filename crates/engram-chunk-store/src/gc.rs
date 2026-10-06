@@ -440,7 +440,7 @@ mod tests {
             &self,
             _session_id: SessionId,
             _sandbox_id: SandboxId,
-        ) -> Result<(), MetaError> {
+        ) -> Result<u64, MetaError> {
             Err(MetaError::NotFound)
         }
         async fn reserve_and_persist_create(
@@ -476,8 +476,8 @@ mod tests {
             &self,
             _id: SessionId,
             _sandbox_id: Option<SandboxId>,
-        ) -> Result<(), MetaError> {
-            Ok(())
+        ) -> Result<Option<u64>, MetaError> {
+            Ok(None)
         }
         async fn upsert_host(
             &self,

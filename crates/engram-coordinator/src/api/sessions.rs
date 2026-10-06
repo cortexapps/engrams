@@ -41,27 +41,23 @@ pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
 /// via `join_all` instead of one-at-a-time — the result folds back into the
 /// SAME order-insensitive (env map + entries vec) shape a serial loop would
 /// have produced.
-/// The third tuple element counts TRANSIENT resolution failures (secret
-/// STORE errors — not `Ok(None)`, which is the persistent "ref doesn't
-/// resolve" config state). Boot/resume callers deliberately ignore it
-/// (lossy-by-design: the session must come up, degraded beats dead); the
-/// survivor egress re-push treats any failure as retryable, because
-/// silently applying an incomplete policy would permanently downgrade a
-/// HEALTHY running session's egress (adversarial-review finding on the
-/// 2026-07-13 incident fix).
+/// Missing secrets and store errors block launch and resume.
 pub(crate) async fn resolve_policy_secrets(
     state: &SharedState,
     policy: Option<&engram_core::types::IntegrationPolicy>,
     ctx: &SecretContext<'_>,
     session: SessionId,
-) -> (
-    HashMap<String, String>,
-    Vec<engram_core::types::egress::EgressSecretEntry>,
-) {
+) -> Result<
+    (
+        HashMap<String, String>,
+        Vec<engram_core::types::egress::EgressSecretEntry>,
+    ),
+    ApiError,
+> {
     let mut env: HashMap<String, String> = HashMap::new();
     let mut entries: Vec<engram_core::types::egress::EgressSecretEntry> = Vec::new();
     let Some(policy) = policy else {
-        return (env, entries);
+        return Ok((env, entries));
     };
     let resolved = futures::future::join_all(policy.secrets.iter().map(|s| async move {
         let result =
@@ -71,22 +67,14 @@ pub(crate) async fn resolve_policy_secrets(
     }))
     .await;
     for (s, result) in resolved {
-        let value = match result {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                tracing::warn!(secret_ref = %s.secret_ref, env_var = %s.env_var,
-                    "policy secret ref not resolvable; skipping");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(secret_ref = %s.secret_ref, error = %e,
-                    "policy secret resolution failed; skipping");
-                continue;
-            }
-        };
+        let value = result
+            .map_err(|e| ApiError::Internal(format!("policy secret resolution: {e}")))?
+            .ok_or_else(|| {
+                ApiError::Internal(format!("policy secret {} is not configured", s.env_var))
+            })?;
         install_policy_secret(&mut env, &mut entries, s, value, session);
     }
-    (env, entries)
+    Ok((env, entries))
 }
 
 /// Resolve a persisted policy/capture ref through both supported lookup shapes:
@@ -250,101 +238,43 @@ pub(crate) async fn resume_manifest_bundle(
     // (re-read from PG, like the egress rebuild), not the manifest. Deterministic
     // placeholders (env var + session id) match the egress entries the proxy
     // gets, so broker substitution authenticates after resume.
-    let policy = load_session_policy(state, session.id).await;
+    let policy = load_session_policy(state, session.id).await?;
     let (policy_secret_env, _egress) =
-        resolve_policy_secrets(state, policy.as_ref(), &secret_ctx, session.id).await;
+        resolve_policy_secrets(state, policy.as_ref(), &secret_ctx, session.id).await?;
     let mut env: HashMap<String, String> = config.env.clone();
     env.extend(policy_secret_env);
     Ok(ResumeManifestBundle { config, env })
 }
 
-/// ADR 0057: re-read + parse the persisted per-session integration policy.
-/// Shared by the resume env + egress rebuilds. A parse/lookup failure is
-/// warn-logged and treated as "no policy" (deny-all network, no secrets) — the
-/// session still resumes, just without its policy-derived access.
+/// Load the persisted session policy. Lookup and parse errors block resume.
 pub(crate) async fn load_session_policy(
     state: &SharedState,
     session_id: SessionId,
-) -> Option<engram_core::types::IntegrationPolicy> {
+) -> Result<Option<engram_core::types::IntegrationPolicy>, ApiError> {
     match state
         .services
         .meta
         .get_session_integration_policy(session_id)
-        .await
+        .await?
     {
-        Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json).unwrap_or_else(|e| {
-            tracing::warn!(%session_id, error = %e,
-                "persisted session policy failed to parse on resume; no network/secrets/injection");
-            None
-        }),
-        Ok(None) => None,
-        Err(e) => {
-            tracing::warn!(%session_id, error = %e,
-                "session policy lookup failed on resume; no network/secrets/injection");
-            None
-        }
+        Some(json) => engram_core::types::IntegrationPolicy::parse(&json)
+            .map_err(|e| ApiError::Internal(format!("session policy: {e}"))),
+        None => Ok(None),
     }
 }
 
-/// The full launch environment for an existing session: the image
-/// manifest's `[env]` + resolved `[secrets]` (via
-/// [`resume_manifest_bundle`]) with the per-request secret overrides
-/// from [`load_session_secrets`] layered on top — exactly the env the
-/// harness is (re)spawned with on resume.
-///
-/// Shared by two callers that both need this assembled identically:
-/// the resume path (which also wants the [`ResumeManifestBundle`] for
-/// the egress-policy rebuild + harness resolution) and `/exec` (which
-/// wants the env + the manifest `workdir`). Returning the bundle as
-/// well as the folded env lets `/exec` read `manifest.workdir` without
-/// a second load.
-///
-/// Best-effort by design: a manifest-load failure (warn-logged in
-/// [`resume_manifest_bundle`]) yields `(None, request-or-default env)`,
-/// and a secrets-load failure is warn-logged and skipped — neither
-/// blocks the caller. This keeps `/exec` working (request-only env, the
-/// pre-injection behaviour) even if the image lineage is degraded.
+/// Resolve the persisted environment. A failed load blocks harness spawn.
 pub(crate) async fn resolve_session_env(
     state: &SharedState,
     session: &Session,
-) -> (Option<ResumeManifestBundle>, HashMap<String, String>) {
-    let bundle = match resume_manifest_bundle(state, session).await {
-        Ok(b) => Some(b),
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session.id,
-                error = %e,
-                "resolve_session_env: manifest bundle load failed; launch env falls back to overrides-only",
-            );
-            None
-        }
-    };
-    let mut env = bundle.as_ref().map(|b| b.env.clone()).unwrap_or_default();
-    match load_session_secrets(state, session.id).await {
-        Ok(Some(overrides)) => {
-            for (k, v) in overrides {
-                env.insert(k, v);
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session.id,
-                error = %e,
-                "resolve_session_env: per-request secret overrides unavailable; continuing without them",
-            );
-        }
+) -> Result<(ResumeManifestBundle, HashMap<String, String>), ApiError> {
+    let bundle = resume_manifest_bundle(state, session).await?;
+    let mut env = bundle.env.clone();
+    if let Some(overrides) = load_session_secrets(state, session.id).await? {
+        env.extend(overrides);
     }
-
-    // ADR 0051: the coordinator no longer resolves human identity. Per-user git
-    // attribution (`ENGRAM_USER_EMAIL`/`ENGRAM_USER_NAME`) rides the
-    // orchestrator-resolved `identity_env` at create time, sealed into
-    // `session_secrets` and replayed by the overrides fold above. The app
-    // committer identity is deployment config, so it's re-stamped from
-    // `state.cfg` on every launch instead of being sealed.
     stamp_committer_env(&state.cfg, &mut env);
-
-    (bundle, env)
+    Ok((bundle, env))
 }
 
 /// Stamp the deployment's app committer identity (`--git-committer-email`)
@@ -388,19 +318,21 @@ pub(crate) async fn build_resume_egress_policy(
     session_id: SessionId,
     sandbox_id: engram_core::SandboxId,
     image: &str,
-) -> Option<engram_core::types::egress::SessionEgressPolicy> {
-    let guest_ip = state.services.host.guest_ip(sandbox_id).await?;
+) -> Result<Option<engram_core::types::egress::SessionEgressPolicy>, ApiError> {
+    let Some(guest_ip) = state.services.host.guest_ip(sandbox_id).await else {
+        return Ok(None);
+    };
     // ADR 0057: re-read the persisted session policy once → network + secrets +
     // injects (resolved host-side) + observes (pure), so a resumed session
     // re-derives its whole egress policy on the new host (same as create).
-    let policy = load_session_policy(state, session_id).await;
+    let policy = load_session_policy(state, session_id).await?;
     let (repo, tag) = split_image_ref(image);
     let secret_ctx = SecretContext {
         repo,
         image_tag: tag,
     };
     let (_policy_env, egress_secrets) =
-        resolve_policy_secrets(state, policy.as_ref(), &secret_ctx, session_id).await;
+        resolve_policy_secrets(state, policy.as_ref(), &secret_ctx, session_id).await?;
     let network = policy
         .as_ref()
         .map(|p| p.network.clone())
@@ -413,17 +345,14 @@ pub(crate) async fn build_resume_egress_policy(
     // resume that dropped them would silently kill the app-to-app short circuit
     // for the rest of the session's life; one that re-minted them would publish
     // addresses the guest's env — fixed at its first bind — knows nothing about.
-    // A read failure degrades like every other input on this lossy-by-design
-    // path: the session still comes up, without the short circuit.
     let apps = state
         .services
         .meta
         .get_session_runtime_spec(session_id)
-        .await
-        .unwrap_or_default()
+        .await?
         .map(|rs| rs.apps)
         .unwrap_or_default();
-    Some(assemble_resume_egress_policy(
+    Ok(Some(assemble_resume_egress_policy(
         session_id,
         sandbox_id,
         guest_ip,
@@ -440,7 +369,7 @@ pub(crate) async fn build_resume_egress_policy(
             .map(|policy| policy.tunnels.clone())
             .unwrap_or_default(),
         apps,
-    ))
+    )))
 }
 
 /// Pure synchronous assembly path for the resume egress policy.
@@ -1431,7 +1360,7 @@ async fn prepare_inner(
         image_tag: &image_tag,
     };
     let (policy_secret_env, egress_secrets) =
-        resolve_policy_secrets(state, integration_policy.as_ref(), &secret_ctx, session_id).await;
+        resolve_policy_secrets(state, integration_policy.as_ref(), &secret_ctx, session_id).await?;
 
     let spec = SessionSpec {
         image: image_uri.to_string(),
@@ -1870,18 +1799,19 @@ pub(crate) async fn inject_harness_env(
     state: &SharedState,
     session_id: SessionId,
     env: &mut HashMap<String, String>,
-) {
-    inject_forge_env(state, session_id, env).await;
+) -> Result<(), ApiError> {
+    inject_forge_env(state, session_id, env).await?;
     // ADR 0026: artifact-upload token, injected for every image
     // (not git-gated) so the baked `engram-share` skill always works.
-    inject_upload_env(state, session_id, env).await;
+    inject_upload_env(state, session_id, env).await?;
+    Ok(())
 }
 
 pub(crate) async fn inject_forge_env(
     state: &SharedState,
     session_id: SessionId,
     env: &mut HashMap<String, String>,
-) {
+) -> Result<(), ApiError> {
     // ADR 0056 P2: forge env is injected when the session holds a capability for a
     // provider that (a) resolves a mint engine AND (b) declares a git-forge host
     // (`Integration::git_forge_host`). De-hardcodes the old `"github"` literal — any
@@ -1891,8 +1821,7 @@ pub(crate) async fn inject_forge_env(
         .services
         .meta
         .get_session_capabilities(session_id)
-        .await
-        .unwrap_or_default();
+        .await?;
     // The session's bound caps that belong to a git-forge provider.
     let mut git_caps: Vec<&engram_core::types::Capability> = Vec::new();
     let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -1911,19 +1840,11 @@ pub(crate) async fn inject_forge_env(
         }
     }
     if git_caps.is_empty() {
-        return;
+        return Ok(());
     }
-    let Some(token) = get_or_mint_broker_token(state, session_id).await else {
-        // A git-forge-capable session with no broker token means the in-guest
-        // gitconfig gets no credential helper and every git op fails with
-        // "could not read Username". This used to be silent (the mint FK-failed
-        // before the session row existed); it must never be quiet again.
-        tracing::error!(
-            %session_id,
-            "git-forge-capable session got no broker token; git credentials will be UNAVAILABLE in-guest",
-        );
-        return;
-    };
+    let token = get_or_mint_broker_token(state, session_id)
+        .await
+        .ok_or_else(|| ApiError::Internal("session broker token resolution failed".into()))?;
     env.insert("ENGRAM_FORGE_TOKEN".into(), token);
     // Owner hint: the org segment of the first git-forge capability that scopes a
     // resource (`github:contents:write@owner/repo` → `owner`). Omitted otherwise —
@@ -1944,6 +1865,7 @@ pub(crate) async fn inject_forge_env(
     if let Some(ep) = loopback_endpoint(state) {
         env.insert("ENGRAM_FORGE_ENDPOINT".into(), ep);
     }
+    Ok(())
 }
 
 /// ADR 0026: inject the artifact-upload env so the in-guest
@@ -1957,16 +1879,17 @@ pub(crate) async fn inject_upload_env(
     state: &SharedState,
     session_id: SessionId,
     env: &mut HashMap<String, String>,
-) {
-    let Some(token) = get_or_mint_broker_token(state, session_id).await else {
-        return;
-    };
+) -> Result<(), ApiError> {
+    let token = get_or_mint_broker_token(state, session_id)
+        .await
+        .ok_or_else(|| ApiError::Internal("session broker token resolution failed".into()))?;
     env.insert("ENGRAM_UPLOAD_TOKEN".into(), token.clone());
     env.insert("ENGRAM_CREDENTIAL_BROKER_TOKEN".into(), token);
     if let Some(ep) = loopback_endpoint(state) {
         env.insert("ENGRAM_UPLOAD_ENDPOINT".into(), ep.clone());
         env.insert("ENGRAM_CREDENTIAL_ENDPOINT".into(), ep);
     }
+    Ok(())
 }
 
 /// ADR 0062: resolve the session's **selected** harness into the [`AgentSpec`]

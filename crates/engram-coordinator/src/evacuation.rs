@@ -515,9 +515,15 @@ where
     meta.assign_session_host(session_id, Some(target_host))
         .await
         .map_err(EvacError::Rebind)?;
-    meta.assign_session_sandbox(session_id, Some(new_sandbox_id))
+    let binding_epoch = meta
+        .assign_session_sandbox(session_id, Some(new_sandbox_id))
         .await
-        .map_err(EvacError::Rebind)?;
+        .map_err(EvacError::Rebind)?
+        .ok_or_else(|| {
+            EvacError::Rebind(engram_core::MetaError::Serialization(
+                "binding write returned no epoch".into(),
+            ))
+        })?;
     meta.transition_session(
         session_id,
         SessionState::Created,
@@ -527,6 +533,7 @@ where
     .map_err(EvacError::Rebind)?;
 
     Ok(EvacReceipt {
+        binding_epoch,
         new_host_id: target_host,
         new_sandbox_id,
         loss,
@@ -691,7 +698,8 @@ mod tests {
             _session_id: SessionId,
             _sandbox_id: SandboxId,
             _binding_epoch: u64,
-        ) {
+        ) -> Result<(), engram_core::SandboxError> {
+            Ok(())
         }
         async fn unbind_session(&self, _session_id: SessionId) {}
         async fn send_prompt(

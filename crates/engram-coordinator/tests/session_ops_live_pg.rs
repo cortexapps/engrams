@@ -87,18 +87,15 @@ async fn enqueue_and_claim_is_one_round_trip_when_idle() {
 
     // `sessions.current_epoch` really moved: a fenced write with the
     // claimed epoch lands, one with any other epoch is 0-row.
-    assert!(
-        !meta
-            .fenced_assign_sandbox(sid, 99, None, None)
-            .await
-            .expect("fenced write, wrong epoch"),
-        "stale epoch must fence",
-    );
-    assert!(
+    assert!(matches!(
+        meta.fenced_assign_sandbox(sid, 99, None, None).await,
+        Err(engram_core::MetaError::Conflict(_))
+    ));
+    assert_eq!(
         meta.fenced_assign_sandbox(sid, 1, None, None)
             .await
-            .expect("fenced write, claimed epoch"),
-        "current_epoch must be 1 after the claim",
+            .unwrap(),
+        None
     );
 }
 

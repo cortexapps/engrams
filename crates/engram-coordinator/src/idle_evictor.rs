@@ -390,8 +390,8 @@ async fn quarantine_reap_unevictable(
                 .fenced_assign_sandbox(session_id, ctx.epoch, None, session.host_id)
                 .await
             {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(_) => {}
+                Err(engram_core::MetaError::Conflict(_)) => {
                     crate::metrics::note_fenced_write();
                     tracing::warn!(
                         session_id = %session_id,
@@ -2470,7 +2470,7 @@ mod tests {
                 session_id: engram_core::SessionId,
                 sandbox_id: engram_core::SandboxId,
                 binding_epoch: u64,
-            ) {
+            ) -> Result<(), engram_core::SandboxError> {
                 self.inner
                     .bind_session(session_id, sandbox_id, binding_epoch)
                     .await
@@ -2699,7 +2699,7 @@ mod tests {
                 session_id: engram_core::SessionId,
                 sandbox_id: engram_core::SandboxId,
                 binding_epoch: u64,
-            ) {
+            ) -> Result<(), engram_core::SandboxError> {
                 self.inner
                     .bind_session(session_id, sandbox_id, binding_epoch)
                     .await
@@ -2921,7 +2921,7 @@ mod tests {
                 session_id: engram_core::SessionId,
                 sandbox_id: engram_core::SandboxId,
                 binding_epoch: u64,
-            ) {
+            ) -> Result<(), engram_core::SandboxError> {
                 self.inner
                     .bind_session(session_id, sandbox_id, binding_epoch)
                     .await
@@ -3247,7 +3247,7 @@ mod tests {
                 session_id: engram_core::SessionId,
                 sandbox_id: engram_core::SandboxId,
                 binding_epoch: u64,
-            ) {
+            ) -> Result<(), engram_core::SandboxError> {
                 self.inner
                     .bind_session(session_id, sandbox_id, binding_epoch)
                     .await
@@ -4372,7 +4372,7 @@ mod tests {
                 session_id: engram_core::SessionId,
                 sandbox_id: engram_core::SandboxId,
                 binding_epoch: u64,
-            ) {
+            ) -> Result<(), engram_core::SandboxError> {
                 self.inner
                     .bind_session(session_id, sandbox_id, binding_epoch)
                     .await
@@ -4639,7 +4639,7 @@ mod tests {
                 session_id: engram_core::SessionId,
                 sandbox_id: engram_core::SandboxId,
                 binding_epoch: u64,
-            ) {
+            ) -> Result<(), engram_core::SandboxError> {
                 self.inner
                     .bind_session(session_id, sandbox_id, binding_epoch)
                     .await

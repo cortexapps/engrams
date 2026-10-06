@@ -215,7 +215,7 @@ pub trait MetadataStore: Send + Sync {
         &self,
         session_id: SessionId,
         sandbox_id: SandboxId,
-    ) -> Result<(), MetaError>;
+    ) -> Result<u64, MetaError>;
 
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError>;
 
@@ -863,43 +863,15 @@ pub trait MetadataStore: Send + Sync {
 
     /// Persist the in-memory `SandboxId` of the live sandbox serving
     /// this session. Set to `Some` after `host_registry.create_for_session`
-    /// returns, cleared to `None` on evict/migrate. The coordinator
+    /// returns, cleared to `None` on evict/migrate. A set mints and returns
+    /// the binding epoch; a clear returns None without a mint. The coordinator
     /// uses these rows to rebuild its in-memory routing maps after
     /// a restart.
     async fn assign_session_sandbox(
         &self,
         id: SessionId,
         sandbox_id: Option<SandboxId>,
-    ) -> Result<(), MetaError>;
-
-    /// ADR 0073: mint the next binding epoch for `id` — one atomic
-    /// `UPDATE … SET binding_epoch = binding_epoch + 1 … RETURNING`.
-    /// Called by the coordinator at the moment it commits to binding
-    /// the session to a NEW sandbox for a fresh-spawn flow (create,
-    /// idle resume, cold recovery, evac). Live moves do NOT mint — the
-    /// harness process survives a teleport and its generation is
-    /// unchanged (see `current_binding_epoch`).
-    ///
-    /// Default (mock stores): a constant `1` — mocks get "no fencing",
-    /// which is the pre-0067 behavior; the Postgres store overrides
-    /// with the real per-session counter. Same degradation pattern as
-    /// the guarded-CAS defaults above.
-    async fn mint_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
-        let _ = id;
-        Ok(1)
-    }
-
-    /// ADR 0073: the session's current binding epoch, without minting.
-    /// Read by flows where the harness process may SURVIVE the
-    /// transition (live migration; in-place reattach on the same
-    /// sandbox) so the spec they build matches the standing record.
-    ///
-    /// Default (mock stores): constant `1`, paired with
-    /// [`Self::mint_binding_epoch`]'s default.
-    async fn current_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
-        let _ = id;
-        Ok(1)
-    }
+    ) -> Result<Option<u64>, MetaError>;
 
     /// ADR 0073 phase 4: one row per Active+bound session for the idle
     /// scan — newest event (kind + time), host, and the shell pin. The
@@ -1313,6 +1285,8 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// A set returns the new binding epoch; a clear returns None.
+    /// A stale fence returns Conflict.
     /// Fenced sandbox (re)bind — subsumes `rebind_session_guarded`'s
     /// bespoke expected-state list with the one epoch predicate.
     async fn fenced_assign_sandbox(
@@ -1321,7 +1295,7 @@ pub trait MetadataStore: Send + Sync {
         epoch: i64,
         sandbox_id: Option<SandboxId>,
         host_id: Option<crate::types::HostId>,
-    ) -> Result<bool, MetaError> {
+    ) -> Result<Option<u64>, MetaError> {
         let _ = (session_id, epoch, sandbox_id, host_id);
         Err(MetaError::Serialization(
             "fenced writes not supported by this store".into(),
@@ -1498,21 +1472,16 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
-    /// ADR 0045 C2: the `Committing` persist — rebind a session's host
-    /// AND sandbox in one step. The ownership oracle
-    /// (`sandbox_ownership`: `session.sandbox_id == sandbox`) must flip
-    /// atomically with the rebind, which is the entire semantic content
-    /// of post-copy ownership transfer. The default is the sequential
-    /// two-step (mock/test stores); the Postgres store overrides with a
-    /// single UPDATE.
+    /// Bind host and sandbox in one guarded write and return the new epoch.
+    /// This is the unguarded entry point for fixture callers.
     async fn rebind_session(
         &self,
         id: SessionId,
         host_id: HostId,
         sandbox_id: SandboxId,
-    ) -> Result<(), MetaError> {
-        self.assign_session_host(id, Some(host_id)).await?;
-        self.assign_session_sandbox(id, Some(sandbox_id)).await
+    ) -> Result<u64, MetaError> {
+        self.rebind_session_guarded(id, host_id, sandbox_id, None, &[])
+            .await
     }
 
     /// Issue #211: guarded compare-and-swap variant of
@@ -1546,7 +1515,7 @@ pub trait MetadataStore: Send + Sync {
         sandbox_id: Option<SandboxId>,
         expected_current: Option<Option<SandboxId>>,
         allowed_states: &[SessionState],
-    ) -> Result<(), MetaError> {
+    ) -> Result<Option<u64>, MetaError> {
         let session = self.get_session(id).await?;
         if let Some(expected) = expected_current {
             if session.sandbox_id != expected {
@@ -1610,7 +1579,7 @@ pub trait MetadataStore: Send + Sync {
         sandbox_id: SandboxId,
         expected_current: Option<Option<SandboxId>>,
         allowed_states: &[SessionState],
-    ) -> Result<(), MetaError> {
+    ) -> Result<u64, MetaError> {
         let session = self.get_session(id).await?;
         if let Some(expected) = expected_current {
             if session.sandbox_id != expected {
@@ -1627,7 +1596,10 @@ pub trait MetadataStore: Send + Sync {
                 allowed_states
             )));
         }
-        self.rebind_session(id, host_id, sandbox_id).await
+        self.assign_session_host(id, Some(host_id)).await?;
+        self.assign_session_sandbox(id, Some(sandbox_id))
+            .await?
+            .ok_or_else(|| MetaError::Serialization("binding write returned no epoch".into()))
     }
 
     /// ADR 0015 M3: PG-authoritative lookup for "which host owns this
@@ -2249,6 +2221,39 @@ pub trait MetadataStore: Send + Sync {
         _stream: ExecOutputStream,
     ) -> Result<u64, MetaError> {
         Ok(0)
+    }
+
+    /// ADR 0123 C5: advance `attached_binding_epoch` to `epoch` and, if it
+    /// moved, close every open run of an older generation with
+    /// `run_interrupted { cause: harness_replaced }`, once per run. The runs
+    /// in `continued` are the ones the advancing event itself references
+    /// (a re-attached harness that keeps running them); they are never
+    /// settled. Returns the runs it closed with the appended event index.
+    async fn settle_harness_generation(
+        &self,
+        session: SessionId,
+        epoch: u64,
+        continued: &[String],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::types::session::SettledRun>, MetaError> {
+        let _ = (session, epoch, continued, now);
+        Err(MetaError::Serialization(
+            "harness settlement is not implemented".into(),
+        ))
+    }
+
+    /// Append once per session and key. A replay returns no index.
+    async fn append_session_event_idempotent(
+        &self,
+        session: SessionId,
+        key: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<i64>, MetaError> {
+        let _ = (session, key, kind, payload);
+        Err(MetaError::Serialization(
+            "idempotent event append is not implemented".into(),
+        ))
     }
 
     /// Append an event to a session's persistent log. Returns the

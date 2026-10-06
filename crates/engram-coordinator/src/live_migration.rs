@@ -543,7 +543,7 @@ pub async fn migrate_session_live(
         // epoch predicate alone cannot see their flips. The state guard
         // collapses into the fence once the detectors' writes become
         // fenced enqueues (the ADR's "NOT deleted" list).
-        state
+        let epoch = state
             .services
             .meta
             .rebind_session_guarded(
@@ -565,28 +565,24 @@ pub async fn migrate_session_live(
             )
             .await
             .map_err(|e| format!("to Created: {e}"))?;
-        Ok::<(), String>(())
+        Ok::<u64, String>(epoch)
     }
     .await;
-    if let Err(e) = rebind {
-        let _ = dest_backend.destroy(new_sandbox_id, claim.fence()).await;
-        let _ = state
-            .services
-            .meta
-            .set_teleport_target(session_id, None)
+    let epoch = match rebind {
+        Ok(epoch) => epoch,
+        Err(e) => {
+            let _ = dest_backend.destroy(new_sandbox_id, claim.fence()).await;
+            let _ = state
+                .services
+                .meta
+                .set_teleport_target(session_id, None)
+                .await;
+            return Err(parachute_or_kill(state, session_id, durable_row.is_some(), e).await);
+        }
+    };
+    let bind_result =
+        crate::api::snapshot::bind_harness_generation(state, session_id, new_sandbox_id, epoch)
             .await;
-        return Err(parachute_or_kill(state, session_id, durable_row.is_some(), e).await);
-    }
-    // ADR 0073: live move — the harness process SURVIVES the teleport
-    // (agentd C1 reattach), so its generation is unchanged: bind the
-    // target host's record at the CURRENT epoch (re-point, no mint).
-    let epoch = state
-        .services
-        .meta
-        .current_binding_epoch(session_id)
-        .await
-        .unwrap_or(0);
-    crate::api::snapshot::bind_session_routing(state, session_id, new_sandbox_id, epoch).await;
     // CASE 1 (issue #209): the teleport_target pin's ONLY job is to aim
     // the parachute at the dest while the move is in flight. The rebind
     // above committed the ownership flip — the dest is now the durable
@@ -603,48 +599,28 @@ pub async fn migrate_session_live(
         .meta
         .set_teleport_target(session_id, None)
         .await;
-    // D12: `evacuating → active` emits POST-BLACKOUT (the guest is
-    // executing on the dest). The prompt-hold (session lease) keeps
-    // "messages deliver" honest through the harness rebuild below.
-    let _ = state
-        .emit(
-            session_id,
-            SessionEvent::StatusChanged {
-                from: SessionState::Evacuating,
-                to: SessionState::Active,
-                at: clock.now_utc(),
-            },
+    // Always schedule source finalization after the ownership transfer.
+    // Return the attach error after that task owns the drain.
+    let attach_result = async {
+        bind_result?;
+        let session_refreshed = state.services.meta.get_session(session_id).await?;
+        let plan = crate::boot_materializer::materialize_snapshot_resume(
+            state,
+            &session_refreshed,
+            new_sandbox_id,
+            epoch,
         )
-        .await;
-    // A failed refresh / finish_resume_to_active here must NOT abandon
-    // the move with the source still alive: the session is already
-    // rebound + Active on the dest, the finalize (drain + source commit)
-    // still has to run. Fall back to a best-effort log instead of an
-    // early `?` return (which historically skipped both the pin removal
-    // above AND the finalize spawn below — the pre-spawn gap). The
-    // harness rebuild is recoverable post-hoc; abandoning the source
-    // page server is not.
-    match state.services.meta.get_session(session_id).await {
-        Ok(session_refreshed) => {
-            if let Err(e) = crate::api::snapshot::finish_resume_to_active(
-                state,
-                &session_refreshed,
-                new_sandbox_id,
-                false,
-                claim.fence(),
-            )
-            .await
-            {
-                tracing::warn!(%session_id, error = %e,
-                    "post-copy migration: finish_resume_to_active failed; session left at Created");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(%session_id, error = %e,
-                "post-copy migration: session refresh failed; skipping harness rebuild \
-                 but proceeding to the finalize (drain + source release)");
-        }
+        .await?;
+        crate::api::snapshot::finish_resume_to_active(
+            state,
+            &session_refreshed,
+            new_sandbox_id,
+            plan,
+            claim.fence(),
+        )
+        .await
     }
+    .await;
 
     metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "presetup")
         .record(presetup_ms as f64 / 1000.0);
@@ -905,6 +881,12 @@ pub async fn migrate_session_live(
     }
     .instrument(finalize_span),
     );
+    match attach_result.map_err(|e| MigrateError::Fatal(e.to_string()))? {
+        crate::api::snapshot::FinishResumeOutcome::Active => {}
+        crate::api::snapshot::FinishResumeOutcome::CreatedHarnessFailed { message, .. } => {
+            return Err(MigrateError::Fatal(message));
+        }
+    }
     Ok(())
 }
 
@@ -1010,7 +992,8 @@ mod tests {
             host_id: Some(HostId::new()),
             sandbox_id: Some(SandboxId::new()),
             image: "test/repo:live-migrate".into(),
-            mode: SessionMode::Agent,
+            // No harness and no image bundle in this fixture: dev-VM shape.
+            mode: SessionMode::DevVm,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
             last_event_at: None,

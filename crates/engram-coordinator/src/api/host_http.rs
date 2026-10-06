@@ -1534,6 +1534,8 @@ pub async fn claim_capture_job(
 
 #[derive(Deserialize)]
 pub struct HarnessEventRequest {
+    #[serde(default)]
+    pub delivery: Option<crate::state::EventDelivery>,
     pub sandbox_id: SandboxId,
     pub event: HarnessEvent,
     /// Host's wall-clock at observation time. Forwarded for future
@@ -1552,7 +1554,15 @@ pub async fn harness_event_ingest(
     // de-dupe back-to-back duplicate harness-idle events; out-of-
     // order arrival across coord pods is safe because session_event
     // rows carry a monotonic `idx` from Postgres.
-    crate::state::emit_harness_event(&state, session_id, req.sandbox_id, req.event, req.at).await?;
+    crate::state::emit_harness_event(
+        &state,
+        session_id,
+        req.sandbox_id,
+        req.event,
+        req.at,
+        req.delivery,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

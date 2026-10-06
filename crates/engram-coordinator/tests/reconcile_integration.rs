@@ -571,7 +571,14 @@ impl engram_core::traits::HostClient for ProbeBackend {
     async fn guest_ip(&self, _: SandboxId) -> Option<std::net::Ipv4Addr> {
         unreachable!()
     }
-    async fn bind_session(&self, _: SessionId, _: SandboxId, _binding_epoch: u64) {}
+    async fn bind_session(
+        &self,
+        _: SessionId,
+        _: SandboxId,
+        _binding_epoch: u64,
+    ) -> Result<(), engram_core::SandboxError> {
+        Ok(())
+    }
     async fn unbind_session(&self, _: SessionId) {}
     async fn send_prompt(
         &self,

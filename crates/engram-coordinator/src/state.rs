@@ -196,15 +196,19 @@ pub enum SessionEvent {
         ok: bool,
         at: DateTime<Utc>,
     },
-    HarnessRunContinued {
-        run_id: String,
-        at: DateTime<Utc>,
-    },
     /// ADR 0030: the in-flight run was stopped by an operator interrupt
     /// (`POST /sessions/:id/interrupt` → the harness SIGINT'd its child).
     /// Distinct from `HarnessRunCompleted` so the transcript shows an
     /// "interrupted" marker; the session stays alive and resumable.
     HarnessRunInterrupted {
+        run_id: String,
+        #[serde(default)]
+        cause: Option<RunInterruptCause>,
+        at: DateTime<Utc>,
+    },
+    /// ADR 0123 C5: a re-attached harness keeps running this run under a
+    /// new generation. Settlement exempts it.
+    HarnessRunContinued {
         run_id: String,
         at: DateTime<Utc>,
     },
@@ -518,8 +522,8 @@ impl SessionEvent {
             Self::HarnessBrowserActivity { .. } => "browser_activity",
             Self::HarnessToolCallRequested { .. } => "tool_call_requested",
             Self::HarnessRunCompleted { .. } => "run_completed",
-            Self::HarnessRunContinued { .. } => "run_continued",
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
+            Self::HarnessRunContinued { .. } => "run_continued",
             Self::HarnessIdle { .. } => "harness_idle",
             Self::HarnessParked { .. } => "harness_parked",
             Self::HarnessBusy { .. } => "harness_busy",
@@ -623,7 +627,11 @@ impl SessionEvent {
                 Self::HarnessRunCompleted { run_id, ok, at }
             }
             HarnessEvent::RunContinued { run_id } => Self::HarnessRunContinued { run_id, at },
-            HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted { run_id, at },
+            HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted {
+                run_id,
+                cause: None,
+                at,
+            },
             HarnessEvent::Idle => Self::HarnessIdle { at },
             HarnessEvent::Parked => Self::HarnessParked { at },
             HarnessEvent::Busy => Self::HarnessBusy { at },
@@ -840,6 +848,16 @@ impl Drop for PreviewPermit {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunInterruptCause {
+    HarnessReplaced,
+}
+
+/// The delivery identity the host hub forwards with a sequenced harness
+/// event (ADR 0123 C4): one type on both sides of the wire.
+pub use engram_host_agent::harness::EventDelivery;
+
 pub struct AppState {
     pub cfg: CoordinatorConfig,
     pub services: Services,
@@ -848,6 +866,7 @@ pub struct AppState {
     /// to clone (`Arc` clone), so handlers freely take a reference and
     /// the listener task takes its own.
     pub events: Arc<SessionEventBus>,
+    harness_event_writer: Arc<HarnessEventWriter>,
     /// Multi-host routing layer. In `--mode=all` this has exactly one
     /// entry registered at startup (the local backend, wrapped in
     /// `engram_host_agent::pooled_backend::PooledBackend` so the
@@ -974,13 +993,15 @@ impl AppState {
         // Created before the hub: the harness event sink wakes the
         // outbox shim on attach signals (ADR 0108 A3).
         let outbox_wake = Arc::new(tokio::sync::Notify::new());
+        let harness_event_writer = Arc::new(HarnessEventWriter {
+            events: events.clone(),
+            meta: services.meta.clone(),
+            clock: services.clock.clone(),
+            outbox_wake: outbox_wake.clone(),
+            last_kind: DashMap::new(),
+        });
         let harness_hub = Arc::new(HarnessHub::new(
-            harness_event_sink(
-                events.clone(),
-                services.meta.clone(),
-                services.clock.clone(),
-                outbox_wake.clone(),
-            ),
+            harness_event_writer.clone().sink(),
             bindings,
         ));
         let reconciler =
@@ -1001,6 +1022,7 @@ impl AppState {
             events,
             host_registry,
             harness_hub,
+            harness_event_writer,
             boot_bundles,
             // ADR 0073: local fast-path wake for the outbox delivery
             // driver (the PG NOTIFY covers cross-pod).
@@ -1289,32 +1311,20 @@ pub(crate) fn outbox_ack_id(session_id: SessionId, event: &SessionEvent) -> Opti
 
 pub type SharedState = Arc<AppState>;
 
-/// Replay a harness event that arrived from a remote host (via
-/// `NotifyKind::HarnessEvent`) through the coord's local hub. The
-/// hub's `EventSink` — built by `harness_event_sink` below — does
-/// the session_events append + SSE publish, dedup, etc. From the
-/// perspective of subscribers this is indistinguishable from a
-/// mode=all event flowing through the in-proc EventSink.
-///
-/// `at` is the host's wall-clock at observation time, captured at
-/// the source and round-tripped through the WS. We forward it for
-/// future use (per-event timestamps on the persisted row); today the
-/// sink's `SessionEvent::from_harness` stamps its own coordinator
-/// clock read (ADR 0098 D1: the injected `Clock`, not `Utc::now()`)
-/// because the persisted event row already has a `created_at`.
+/// Persist a remote harness event and publish it. Delivery metadata advances
+/// readiness and supplies the durable replay key. Errors reach the HTTP caller.
 pub async fn emit_harness_event(
     state: &SharedState,
     session_id: SessionId,
-    sandbox_id: engram_core::SandboxId,
+    _sandbox_id: engram_core::SandboxId,
     event: engram_harness_proto::HarnessEvent,
     _at: chrono::DateTime<chrono::Utc>,
+    delivery: Option<EventDelivery>,
 ) -> Result<(), crate::error::ApiError> {
     state
-        .harness_hub
-        .emit_external(session_id, sandbox_id, event, None)
+        .harness_event_writer
+        .emit(session_id, event, delivery)
         .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    Ok(())
 }
 
 /// Build the [`EventSink`] that forwards harness events into
@@ -1322,303 +1332,370 @@ pub async fn emit_harness_event(
 /// `Idle` / `RunCompleted` for Git sessions. Captures clones of
 /// the bus + meta service + sandbox backend so the closure has no
 /// cycles back into AppState.
+#[cfg(test)]
 fn harness_event_sink(
     events: Arc<SessionEventBus>,
     meta: Arc<dyn engram_core::traits::MetadataStore>,
     clock: Arc<dyn engram_core::traits::Clock>,
     outbox_wake: Arc<tokio::sync::Notify>,
 ) -> EventSink {
-    // Per-session cache of the most-recent forwarded event kind. Used
-    // to drop a `harness_idle` / `harness_parked` / `harness_busy` that
-    // would land back-to-back with the same kind: harnesses re-announce
-    // their waiting state on reconnect, so an evict/resume cycle (or a
-    // checkpoint-severed vsock reattach mid-subagent) would otherwise
-    // append a redundant marker to the log on every cycle.
-    let last_kind: Arc<DashMap<SessionId, &'static str>> = Arc::new(DashMap::new());
-    Arc::new(move |session_id, _sandbox_id, ev, _delivery| {
-        let events = events.clone();
-        let meta = meta.clone();
-        let clock = clock.clone();
-        let last_kind = last_kind.clone();
-        let outbox_wake = outbox_wake.clone();
-        Box::pin(async move {
-            // Forward every harness event into session_events for live
-            // SSE / Web UI / Slackbot timeline. ADR 0005 retired the
-            // auto-checkpoint branch this used to trigger on Idle /
-            // RunCompleted; durability moved to hot+cold snapshots,
-            // not git checkpoints.
-            let session_event = SessionEvent::from_harness(ev, clock.now_utc());
-            let kind = session_event.kind();
+    Arc::new(HarnessEventWriter {
+        events,
+        meta,
+        clock,
+        outbox_wake,
+        last_kind: DashMap::new(),
+    })
+    .sink()
+}
 
-            // Issue #527 Phase 1: a run-started with a client prompt_id is
-            // the consuming end of the `prompt_received` receipt — captured
-            // here (before `session_event` moves into the published
-            // `IndexedEvent` below) so the post-append lookup below can join
-            // it against the receipt row and record prompt→run-start
-            // latency. `None` for the env-seeded initial prompt, which
-            // never gets a receipt.
-            let run_started_prompt_id = if let SessionEvent::HarnessRunStarted {
-                prompt_id: Some(pid),
-                ..
-            } = &session_event
-            {
-                Some(pid.clone())
+struct HarnessEventWriter {
+    events: Arc<SessionEventBus>,
+    meta: Arc<dyn engram_core::traits::MetadataStore>,
+    clock: Arc<dyn engram_core::traits::Clock>,
+    outbox_wake: Arc<tokio::sync::Notify>,
+    last_kind: DashMap<SessionId, &'static str>,
+}
+
+impl HarnessEventWriter {
+    /// The hub's sink. An append failure is returned, not logged: the hub
+    /// withholds the acknowledgement and drops the connection, so the
+    /// harness replays the event (ADR 0123 C4).
+    fn sink(self: Arc<Self>) -> EventSink {
+        Arc::new(move |session, _sandbox, event, delivery| {
+            let writer = self.clone();
+            Box::pin(async move {
+                writer
+                    .emit(session, event, delivery)
+                    .await
+                    .map_err(|e| engram_host_agent::harness::SinkError(e.to_string()))
+            })
+        })
+    }
+
+    async fn emit(
+        &self,
+        session_id: SessionId,
+        ev: engram_harness_proto::HarnessEvent,
+        delivery: Option<EventDelivery>,
+    ) -> Result<(), crate::error::ApiError> {
+        let Self {
+            events,
+            meta,
+            clock,
+            outbox_wake,
+            last_kind,
+        } = self;
+        if let Some(delivery) = delivery {
+            // ADR 0123 C5: the first event of a new generation settles the
+            // open runs of older generations, except the run this event
+            // itself continues (a re-attached harness keeps running it).
+            let continued: Vec<String> = ev.run_id().map(str::to_owned).into_iter().collect();
+            let settled_at = clock.now_utc();
+            let settled = meta
+                .settle_harness_generation(
+                    session_id,
+                    delivery.binding_epoch,
+                    &continued,
+                    settled_at,
+                )
+                .await?;
+            for run in settled {
+                events.publish(
+                    session_id,
+                    IndexedEvent {
+                        idx: run.idx,
+                        event: SessionEvent::HarnessRunInterrupted {
+                            run_id: run.run_id,
+                            at: settled_at,
+                            cause: Some(RunInterruptCause::HarnessReplaced),
+                        },
+                        ephemeral: false,
+                    },
+                );
+            }
+        }
+        // Forward every harness event into session_events for live
+        // SSE / Web UI / Slackbot timeline. ADR 0005 retired the
+        // auto-checkpoint branch this used to trigger on Idle /
+        // RunCompleted; durability moved to hot+cold snapshots,
+        // not git checkpoints.
+        let session_event = SessionEvent::from_harness(ev, clock.now_utc());
+        let kind = session_event.kind();
+
+        // Issue #527 Phase 1: a run-started with a client prompt_id is
+        // the consuming end of the `prompt_received` receipt — captured
+        // here (before `session_event` moves into the published
+        // `IndexedEvent` below) so the post-append lookup below can join
+        // it against the receipt row and record prompt→run-start
+        // latency. `None` for the env-seeded initial prompt, which
+        // never gets a receipt.
+        let run_started_prompt_id = if let SessionEvent::HarnessRunStarted {
+            prompt_id: Some(pid),
+            ..
+        } = &session_event
+        {
+            Some(pid.clone())
+        } else {
+            None
+        };
+
+        // ADR 0073 fix: harness events are the CONFIRMING events that retire
+        // the durable outbox row (`run_started{prompt_id}` /
+        // `prompt_queued{prompt_id}` / `tool_call_completed{tool_call_id}`),
+        // but they ingest through THIS sink — NOT `AppState::emit`, where the
+        // ack lived — so the ack never fired. An un-acked row is redelivered
+        // forever: the delivery driver re-resumes the session and re-runs the
+        // prompt on every idle cycle (acked_at NULL, attempts climbing;
+        // phantom re-runs + resume/evict churn + a duplicate-turn transcript
+        // the web can't render). Capture the ack id here (before
+        // `session_event` moves into the published frame) and retire the row
+        // after the append. Unknown / already-acked ids are no-ops.
+        let ack_id = outbox_ack_id(session_id, &session_event);
+
+        // Session titles: a harness-suggested title is materialized onto
+        // `sessions.suggested_title` (in real time, at ingestion) so the
+        // orchestrator can read it as the session's display title without
+        // walking the log. Captured before `session_event` moves into the
+        // published frame; the write happens after `publish` (below) so it
+        // never sits in front of the live SSE frame.
+        let suggested_title =
+            if let SessionEvent::HarnessTitleSuggested { title, .. } = &session_event {
+                Some(title.clone())
             } else {
                 None
             };
 
-            // ADR 0073 fix: harness events are the CONFIRMING events that retire
-            // the durable outbox row (`run_started{prompt_id}` /
-            // `prompt_queued{prompt_id}` / `tool_call_completed{tool_call_id}`),
-            // but they ingest through THIS sink — NOT `AppState::emit`, where the
-            // ack lived — so the ack never fired. An un-acked row is redelivered
-            // forever: the delivery driver re-resumes the session and re-runs the
-            // prompt on every idle cycle (acked_at NULL, attempts climbing;
-            // phantom re-runs + resume/evict churn + a duplicate-turn transcript
-            // the web can't render). Capture the ack id here (before
-            // `session_event` moves into the published frame) and retire the row
-            // after the append. Unknown / already-acked ids are no-ops.
-            let ack_id = outbox_ack_id(session_id, &session_event);
-
-            // Session titles: a harness-suggested title is materialized onto
-            // `sessions.suggested_title` (in real time, at ingestion) so the
-            // orchestrator can read it as the session's display title without
-            // walking the log. Captured before `session_event` moves into the
-            // published frame; the write happens after `publish` (below) so it
-            // never sits in front of the live SSE frame.
-            let suggested_title =
-                if let SessionEvent::HarnessTitleSuggested { title, .. } = &session_event {
-                    Some(title.clone())
-                } else {
-                    None
-                };
-
-            // ADR 0108 A3: an Idle/Parked/Busy announcement is the ATTACH
-            // signal — the harness (re)announced its waiting state on a
-            // live connection. Wake any backed-off Deliver op now:
-            // delivery keys on the attach, never on a boot milestone or
-            // a poll cadence (the 2026-07-31 50 s gap was a Deliver op
-            // racing the attach and then waiting out an inflated
-            // backoff). This MUST run before the back-to-back dedupe
-            // below: a re-announce after a reattach is exactly the
-            // signal the incident waited 41 s for, and it is exactly
-            // the shape the dedupe drops from the log.
-            if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy") {
-                // ADR 0108 A8: a harness that just announced Idle can
-                // take a prompt NOW — a row waiting out ACK_TIMEOUT
-                // from a forward into a dead link has no reason to
-                // keep waiting. Without this recall the wake below
-                // finds nothing due and no-ops; the row then sits out
-                // the full timeout (prod 7eddce62: 35.5 s after a
-                // 120 ms un-park).
-                if let Err(e) = meta.outbox_make_due(session_id).await {
-                    tracing::debug!(
-                        session_id = %session_id,
-                        error = %e,
-                        "outbox make-due on attach signal failed (ack timeout backstops)",
-                    );
-                }
-                if let Err(e) = meta
-                    .op_wake_queued_kind(
-                        session_id,
-                        engram_core::types::session_op::OpKind::Deliver,
-                    )
-                    .await
-                {
-                    tracing::debug!(
-                        session_id = %session_id,
-                        error = %e,
-                        "deliver wake on attach signal failed (poll backstops)",
-                    );
-                }
-                // The shim scan enqueues a Deliver op when rows are due
-                // and none is queued; a wake with nothing due is a
-                // no-op.
-                outbox_wake.notify_one();
-            }
-
-            // Drop a back-to-back duplicate waiting-state marker. The
-            // upstream TTL bookkeeping in HarnessHub::reader_loop
-            // already saw the event, so suppressing it here only
-            // affects the persisted log + SSE bus.
-            if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy")
-                && last_kind
-                    .get(&session_id)
-                    .map(|v| *v == kind)
-                    .unwrap_or(false)
-            {
-                return Ok(());
-            }
-
-            let mut payload = match serde_json::to_value(&session_event) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "harness event serialize failed");
-                    return Ok(());
-                }
-            };
-            // Postgres `jsonb` cannot represent U+0000 anywhere in a
-            // string (SQLSTATE 22P05), and this payload carries raw guest
-            // tool output — an `xxd` of a binary file puts literal NULs
-            // into `result_summary`, the insert fails, and the event
-            // vanishes from the session log (incident 2026-07-10: exactly
-            // the two hexdumps of the corrupted files were the events
-            // that dropped). Replace NUL with U+FFFD before PG sees it,
-            // and rebuild the in-memory event from the sanitized payload
-            // so the SSE surface serves the same bytes as the durable log.
-            let mut session_event = session_event;
-            if strip_jsonb_nul(&mut payload) {
+        // ADR 0108 A3: an Idle/Parked/Busy announcement is the ATTACH
+        // signal — the harness (re)announced its waiting state on a
+        // live connection. Wake any backed-off Deliver op now:
+        // delivery keys on the attach, never on a boot milestone or
+        // a poll cadence (the 2026-07-31 50 s gap was a Deliver op
+        // racing the attach and then waiting out an inflated
+        // backoff). This MUST run before the back-to-back dedupe
+        // below: a re-announce after a reattach is exactly the
+        // signal the incident waited 41 s for, and it is exactly
+        // the shape the dedupe drops from the log.
+        if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy") {
+            // ADR 0108 A8: a harness that just announced Idle can
+            // take a prompt NOW — a row waiting out ACK_TIMEOUT
+            // from a forward into a dead link has no reason to
+            // keep waiting. Without this recall the wake below
+            // finds nothing due and no-ops; the row then sits out
+            // the full timeout (prod 7eddce62: 35.5 s after a
+            // 120 ms un-park).
+            if let Err(e) = meta.outbox_make_due(session_id).await {
                 tracing::debug!(
                     session_id = %session_id,
-                    kind,
-                    "harness event contained U+0000; sanitized for jsonb",
+                    error = %e,
+                    "outbox make-due on attach signal failed (ack timeout backstops)",
                 );
-                match serde_json::from_value::<SessionEvent>(payload.clone()) {
-                    Ok(ev) => session_event = ev,
-                    // Persisted payload is the authority; a rebuild
-                    // failure only leaves the live SSE copy with the
-                    // original NULs (legal JSON), never drops the event.
-                    Err(e) => {
-                        tracing::warn!(error = %e, "sanitized event rebuild failed; SSE keeps original")
-                    }
-                }
             }
-
-            // Phase 1c: token chunks are EPHEMERAL — they are NEVER appended
-            // to `session_events`. Fan them out cross-replica on the dedicated
-            // `session_event_deltas` NOTIFY channel; every replica's
-            // pg_listener re-broadcasts to its local bus, so a client on a
-            // replica WITHOUT the harness connection still streams. The
-            // producing replica also LISTENs that channel, so the NOTIFY echo
-            // is the single delivery path — we do NOT publish locally here
-            // (that would double-emit to this replica's own subscribers).
-            // Best-effort: a dropped NOTIFY costs only animation, never
-            // correctness — the durable `agent_message` (same message_id) is
-            // the authoritative record and supersedes every chunk.
-            if kind == "agent_message_chunk" {
-                if let Err(e) = meta.notify_session_delta(session_id, &payload).await {
-                    tracing::debug!(
-                        session_id = %session_id,
-                        error = %e,
-                        "notify_session_delta failed; dropping ephemeral chunk",
-                    );
-                }
-                return Ok(());
+            if let Err(e) = meta
+                .op_wake_queued_kind(session_id, engram_core::types::session_op::OpKind::Deliver)
+                .await
+            {
+                tracing::debug!(
+                    session_id = %session_id,
+                    error = %e,
+                    "deliver wake on attach signal failed (poll backstops)",
+                );
             }
+            // The shim scan enqueues a Deliver op when rows are due
+            // and none is queued; a wake with nothing due is a
+            // no-op.
+            outbox_wake.notify_one();
+        }
 
-            match meta.append_session_event(session_id, kind, payload).await {
-                Ok(idx) => {
-                    last_kind.insert(session_id, kind);
+        // Drop a back-to-back duplicate waiting-state marker. The
+        // upstream TTL bookkeeping in HarnessHub::reader_loop
+        // already saw the event, so suppressing it here only
+        // affects the persisted log + SSE bus.
+        if delivery.is_none()
+            && matches!(kind, "harness_idle" | "harness_parked" | "harness_busy")
+            && last_kind
+                .get(&session_id)
+                .map(|v| *v == kind)
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
 
-                    // PR #556 review finding #2: publish FIRST. This is the
-                    // live SSE frame the ADR-0052 held user-echo waits on to
-                    // un-hold and render — the metric join below is a
-                    // synchronous PG round-trip that must never sit in front
-                    // of it (worst case: the query's full timeout delays
-                    // every run_started delivery, precisely when a
-                    // contended Postgres makes that delay most costly).
-                    events.publish(
-                        session_id,
-                        IndexedEvent {
-                            idx,
-                            event: session_event,
-                            ephemeral: false,
-                        },
-                    );
-
-                    // ADR 0073 fix: retire the durable outbox row this harness
-                    // event confirms. Placed AFTER `publish` so the ack's PG
-                    // write never sits in front of the live SSE frame (same
-                    // rationale as the metric join below). Without this, the
-                    // delivery driver never learns the prompt was consumed and
-                    // redelivers it on every resume forever.
-                    if let Some(ack_id) = &ack_id {
-                        match meta.outbox_ack(ack_id).await {
-                            Ok(true) => {
-                                metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
-                            }
-                            Ok(false) => {}
-                            Err(e) => tracing::warn!(
-                                session_id = %session_id,
-                                ack_id = %ack_id,
-                                error = %e,
-                                "outbox ack from harness event failed",
-                            ),
-                        }
-                    }
-
-                    // Session titles: materialize the latest harness-suggested
-                    // title onto the session row (idempotent). Best-effort — a
-                    // failure only means the display title lags the log; the
-                    // event itself is already durably appended above.
-                    if let Some(title) = &suggested_title {
-                        if let Err(e) = meta.set_session_suggested_title(session_id, title).await {
-                            tracing::warn!(
-                                session_id = %session_id,
-                                error = %e,
-                                "set_session_suggested_title failed",
-                            );
-                        }
-                    }
-
-                    // Issue #527 Phase 1: join this run-start against its
-                    // `prompt_received` receipt (one PG lookup per run-start —
-                    // runs are low-rate, acceptable per-event cost) and
-                    // record the true prompt→run-start latency. Skip
-                    // silently when there's no receipt (env-seeded initial
-                    // prompt) rather than treating it as an error.
-                    //
-                    // PR #556 review finding #1: the elapsed seconds come
-                    // back already computed PG-side (`NOW() - created_at`,
-                    // one clock) — no coordinator-process `Utc::now()` is
-                    // mixed in, so there's no coordinator/Postgres (or
-                    // cross-replica) clock skew to bias or drop samples.
-                    if let Some(pid) = &run_started_prompt_id {
-                        match meta.prompt_received_seconds_ago(session_id, pid).await {
-                            Ok(Some(secs)) if secs >= 0.0 => {
-                                metrics::histogram!(crate::metrics::PROMPT_TO_RUN_STARTED_SECONDS)
-                                    .record(secs);
-                            }
-                            Ok(Some(secs)) => {
-                                // PG-side computation makes this all but
-                                // unreachable in practice (would require
-                                // Postgres's own clock to step backward
-                                // between the two reads in one query) — kept
-                                // as a defensive guard, not a routine branch.
-                                tracing::warn!(
-                                    session_id = %session_id,
-                                    prompt_id = %pid,
-                                    secs,
-                                    "prompt_received_seconds_ago went negative; \
-                                     skipping implausible sample",
-                                );
-                            }
-                            Ok(None) => {}
-                            Err(e) => tracing::warn!(
-                                session_id = %session_id,
-                                prompt_id = %pid,
-                                error = %e,
-                                "prompt_received_seconds_ago lookup failed",
-                            ),
-                        }
-                    }
-                }
+        let mut payload = serde_json::to_value(&session_event).map_err(|e| {
+            crate::error::ApiError::Internal(format!("harness event serialize: {e}"))
+        })?;
+        // Postgres `jsonb` cannot represent U+0000 anywhere in a
+        // string (SQLSTATE 22P05), and this payload carries raw guest
+        // tool output — an `xxd` of a binary file puts literal NULs
+        // into `result_summary`, the insert fails, and the event
+        // vanishes from the session log (incident 2026-07-10: exactly
+        // the two hexdumps of the corrupted files were the events
+        // that dropped). Replace NUL with U+FFFD before PG sees it,
+        // and rebuild the in-memory event from the sanitized payload
+        // so the SSE surface serves the same bytes as the durable log.
+        let mut session_event = session_event;
+        if strip_jsonb_nul(&mut payload) {
+            tracing::debug!(
+                session_id = %session_id,
+                kind,
+                "harness event contained U+0000; sanitized for jsonb",
+            );
+            match serde_json::from_value::<SessionEvent>(payload.clone()) {
+                Ok(ev) => session_event = ev,
+                // Persisted payload is the authority; a rebuild
+                // failure only leaves the live SSE copy with the
+                // original NULs (legal JSON), never drops the event.
                 Err(e) => {
-                    // No ack for an event that was not stored: the hub
-                    // closes the connection and the harness replays it.
+                    tracing::warn!(error = %e, "sanitized event rebuild failed; SSE keeps original")
+                }
+            }
+        }
+
+        // Legacy token chunks are ephemeral and are not appended
+        // to `session_events`. Fan them out cross-replica on the dedicated
+        // `session_event_deltas` NOTIFY channel; every replica's
+        // pg_listener re-broadcasts to its local bus, so a client on a
+        // replica WITHOUT the harness connection still streams. The
+        // producing replica also LISTENs that channel, so the NOTIFY echo
+        // is the single delivery path — we do NOT publish locally here
+        // (that would double-emit to this replica's own subscribers).
+        // Best-effort: a dropped NOTIFY costs only animation, never
+        // correctness — the durable `agent_message` (same message_id) is
+        // the authoritative record and supersedes every chunk.
+        if delivery.is_none() && kind == "agent_message_chunk" {
+            if let Err(e) = meta.notify_session_delta(session_id, &payload).await {
+                tracing::debug!(
+                    session_id = %session_id,
+                    error = %e,
+                    "notify_session_delta failed; dropping ephemeral chunk",
+                );
+            }
+            return Ok(());
+        }
+
+        let idx = if let Some(delivery) = delivery {
+            meta.append_session_event_idempotent(
+                session_id,
+                &format!(
+                    "harness:{}:{}:{}",
+                    delivery.binding_epoch, delivery.incarnation, delivery.seq
+                ),
+                kind,
+                payload,
+            )
+            .await?
+        } else {
+            Some(meta.append_session_event(session_id, kind, payload).await?)
+        };
+        if let Some(idx) = idx {
+            last_kind.insert(session_id, kind);
+
+            // PR #556 review finding #2: publish FIRST. This is the
+            // live SSE frame the ADR-0052 held user-echo waits on to
+            // un-hold and render — the metric join below is a
+            // synchronous PG round-trip that must never sit in front
+            // of it (worst case: the query's full timeout delays
+            // every run_started delivery, precisely when a
+            // contended Postgres makes that delay most costly).
+            events.publish(
+                session_id,
+                IndexedEvent {
+                    idx,
+                    event: session_event,
+                    ephemeral: false,
+                },
+            );
+        }
+
+        // ADR 0073 fix: retire the durable outbox row this harness
+        // event confirms. Placed AFTER `publish` so the ack's PG
+        // write never sits in front of the live SSE frame (same
+        // rationale as the metric join below). Without this, the
+        // delivery driver never learns the prompt was consumed and
+        // redelivers it on every resume forever. The ack runs for a
+        // replayed duplicate too (idx None): the first delivery may
+        // have stored the event and died before this ack, and the
+        // replay is the only retry there is. A failed ack withholds the
+        // harness ack so the event is replayed again.
+        if let Some(ack_id) = &ack_id {
+            match meta.outbox_ack(ack_id).await {
+                Ok(true) => {
+                    metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        ack_id = %ack_id,
+                        error = %e,
+                        "outbox ack from harness event failed",
+                    );
+                    return Err(e.into());
+                }
+            }
+        }
+
+        if let Some(idx) = idx {
+            let _ = idx;
+
+            // Session titles: materialize the latest harness-suggested
+            // title onto the session row (idempotent). Best-effort — a
+            // failure only means the display title lags the log; the
+            // event itself is already durably appended above.
+            if let Some(title) = &suggested_title {
+                if let Err(e) = meta.set_session_suggested_title(session_id, title).await {
                     tracing::warn!(
                         session_id = %session_id,
                         error = %e,
-                        "append_session_event for harness event failed",
+                        "set_session_suggested_title failed",
                     );
-                    return Err(engram_host_agent::harness::SinkError(format!(
-                        "append_session_event: {e}"
-                    )));
                 }
             }
-            Ok(())
-        })
-    })
+
+            // Issue #527 Phase 1: join this run-start against its
+            // `prompt_received` receipt (one PG lookup per run-start —
+            // runs are low-rate, acceptable per-event cost) and
+            // record the true prompt→run-start latency. Skip
+            // silently when there's no receipt (env-seeded initial
+            // prompt) rather than treating it as an error.
+            //
+            // PR #556 review finding #1: the elapsed seconds come
+            // back already computed PG-side (`NOW() - created_at`,
+            // one clock) — no coordinator-process `Utc::now()` is
+            // mixed in, so there's no coordinator/Postgres (or
+            // cross-replica) clock skew to bias or drop samples.
+            if let Some(pid) = &run_started_prompt_id {
+                match meta.prompt_received_seconds_ago(session_id, pid).await {
+                    Ok(Some(secs)) if secs >= 0.0 => {
+                        metrics::histogram!(crate::metrics::PROMPT_TO_RUN_STARTED_SECONDS)
+                            .record(secs);
+                    }
+                    Ok(Some(secs)) => {
+                        // PG-side computation makes this all but
+                        // unreachable in practice (would require
+                        // Postgres's own clock to step backward
+                        // between the two reads in one query) — kept
+                        // as a defensive guard, not a routine branch.
+                        tracing::warn!(
+                            session_id = %session_id,
+                            prompt_id = %pid,
+                            secs,
+                            "prompt_received_seconds_ago went negative; \
+                             skipping implausible sample",
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        session_id = %session_id,
+                        prompt_id = %pid,
+                        error = %e,
+                        "prompt_received_seconds_ago lookup failed",
+                    ),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Replace every U+0000 in the JSON tree's strings (values AND object
@@ -1729,23 +1806,6 @@ pub(crate) mod tests {
             !lim.per_session.contains_key(&s),
             "idle session entry should be pruned",
         );
-    }
-
-    #[test]
-    fn run_continued_maps_from_harness_with_stable_kind() {
-        let at = DateTime::<Utc>::UNIX_EPOCH;
-        let event = SessionEvent::from_harness(
-            HarnessEvent::RunContinued {
-                run_id: "r1".into(),
-            },
-            at,
-        );
-        assert!(
-            matches!(&event, SessionEvent::HarnessRunContinued { run_id, at: timestamp } if run_id == "r1" && *timestamp == at)
-        );
-        assert_eq!(event.kind(), "run_continued");
-        let json = serde_json::to_value(event).unwrap();
-        assert_eq!(json["run_id"], "r1");
     }
 
     #[test]
@@ -2190,6 +2250,7 @@ pub(crate) mod tests {
     pub(crate) struct MiniMeta {
         pub(crate) session: PlMutex<Session>,
         pub(crate) events: PlMutex<Vec<PersistedEvent>>,
+        binding_epoch: PlMutex<u64>,
         next_idx: PlMutex<i64>,
         pub(crate) snapshots: PlMutex<Vec<SnapshotRecord>>,
         /// ADR 0045 C1 tests: host rows for `list_active_hosts` (the
@@ -2329,6 +2390,7 @@ pub(crate) mod tests {
             Self {
                 session: PlMutex::new(session),
                 events: PlMutex::new(Vec::new()),
+                binding_epoch: PlMutex::new(0),
                 next_idx: PlMutex::new(0),
                 snapshots: PlMutex::new(Vec::new()),
                 hosts: PlMutex::new(Vec::new()),
@@ -2479,7 +2541,7 @@ pub(crate) mod tests {
             &self,
             _: engram_core::SessionId,
             _: engram_core::SandboxId,
-        ) -> Result<(), MetaError> {
+        ) -> Result<u64, MetaError> {
             unreachable!("transition_session_created not used in state tests")
         }
         async fn reserve_and_persist_create(
@@ -2629,7 +2691,7 @@ pub(crate) mod tests {
             &self,
             id: engram_core::SessionId,
             sandbox_id: Option<engram_core::SandboxId>,
-        ) -> Result<(), MetaError> {
+        ) -> Result<Option<u64>, MetaError> {
             let mut s = self.session.lock();
             if id != s.id {
                 return Err(MetaError::NotFound);
@@ -2642,7 +2704,11 @@ pub(crate) mod tests {
             if sandbox_id.is_none() && self.live_disk_manifests.lock().remove(&id).is_some() {
                 *self.chunk_generation.lock() += 1;
             }
-            Ok(())
+            Ok(sandbox_id.map(|_| {
+                let mut epoch = self.binding_epoch.lock();
+                *epoch += 1;
+                *epoch
+            }))
         }
         async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
             let mut hosts = self.hosts.lock();
@@ -3368,13 +3434,13 @@ pub(crate) mod tests {
             epoch: i64,
             sandbox_id: Option<engram_core::SandboxId>,
             host_id: Option<HostId>,
-        ) -> Result<bool, MetaError> {
+        ) -> Result<Option<u64>, MetaError> {
             if self.ops.current_epoch(session_id) != epoch {
-                return Ok(false);
+                return Err(MetaError::Conflict("stale fence".into()));
             }
-            self.assign_session_sandbox(session_id, sandbox_id).await?;
+            let epoch = self.assign_session_sandbox(session_id, sandbox_id).await?;
             self.assign_session_host(session_id, host_id).await?;
-            Ok(true)
+            Ok(epoch)
         }
 
         // ADR 0016 Phase B: in-memory mirror of
@@ -3543,7 +3609,7 @@ pub(crate) mod tests {
         )
         .await
         .expect_err("a failed append is not acked");
-        assert!(error.to_string().contains("append_session_event"));
+        assert!(error.to_string().contains("injected failure"));
         assert!(mini.events.lock().is_empty());
 
         // The replay lands once storage is back.

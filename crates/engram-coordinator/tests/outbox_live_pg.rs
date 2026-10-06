@@ -328,15 +328,24 @@ async fn unacked_rows_are_editable_and_dequeueable_acked_are_immutable() {
 async fn binding_epoch_mints_monotonically_per_session() {
     let Some(meta) = connect().await else { return };
     let sid = seed_session(&meta).await;
+    // ADR 0123 C1: every binding write mints. The create transition is the
+    // first binding (a pending row may not carry a sandbox before it).
+    let e1 = meta
+        .transition_session_created(sid, engram_core::SandboxId::new())
+        .await
+        .expect("bind 1");
+    let e2 = meta
+        .assign_session_sandbox(sid, Some(engram_core::SandboxId::new()))
+        .await
+        .expect("bind 2");
+    assert_eq!((e1, e2), (1, Some(2)));
+    // A clear is not a binding write: no mint.
     assert_eq!(
-        meta.current_binding_epoch(sid).await.expect("current"),
-        0,
-        "fresh session starts at 0 (never minted)",
+        meta.assign_session_sandbox(sid, None).await.expect("clear"),
+        None
     );
-    let e1 = meta.mint_binding_epoch(sid).await.expect("mint 1");
-    let e2 = meta.mint_binding_epoch(sid).await.expect("mint 2");
-    assert_eq!((e1, e2), (1, 2));
-    assert_eq!(meta.current_binding_epoch(sid).await.expect("current"), 2);
-    // Unknown session: NotFound, never a silent 0.
-    assert!(meta.mint_binding_epoch(SessionId::new()).await.is_err());
+    assert!(meta
+        .assign_session_sandbox(SessionId::new(), Some(engram_core::SandboxId::new()))
+        .await
+        .is_err());
 }

@@ -296,7 +296,7 @@ impl MetadataStore for SimMetadataStore {
         &self,
         id: SessionId,
         sandbox_id: engram_core::SandboxId,
-    ) -> Result<(), MetaError> {
+    ) -> Result<u64, MetaError> {
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
@@ -307,13 +307,15 @@ impl MetadataStore for SimMetadataStore {
         row.session.status = SessionState::Created;
         row.session.sandbox_id = Some(sandbox_id);
         row.session.last_active_at = now;
+        row.binding_epoch += 1;
+        let epoch = row.binding_epoch as u64;
         db.transition_log.push(super::TransitionLogEntry {
             session: id,
             from: SessionState::Pending,
             to: SessionState::Created,
             exempt: false,
         });
-        Ok(())
+        Ok(epoch)
     }
 
     async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
@@ -554,7 +556,7 @@ impl MetadataStore for SimMetadataStore {
         &self,
         id: SessionId,
         sandbox_id: Option<engram_core::SandboxId>,
-    ) -> Result<(), MetaError> {
+    ) -> Result<Option<u64>, MetaError> {
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
@@ -562,30 +564,15 @@ impl MetadataStore for SimMetadataStore {
         row.session.sandbox_id = sandbox_id;
         row.missing_strikes = 0;
         row.updated_at = now;
+        let epoch = sandbox_id.map(|_| {
+            row.binding_epoch += 1;
+            row.binding_epoch as u64
+        });
         if sandbox_id.is_none() {
             row.session.live_disk_manifest = None;
             db.chunk_generation += 1;
         }
-        Ok(())
-    }
-
-    /// `UPDATE sessions SET binding_epoch = binding_epoch + 1 ...
-    /// RETURNING binding_epoch`.
-    async fn mint_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
-        self.gate()?;
-        let mut db = self.db.lock();
-        let row = db.sessions.get_mut(&id).ok_or(MetaError::NotFound)?;
-        row.binding_epoch += 1;
-        Ok(row.binding_epoch as u64)
-    }
-
-    async fn current_binding_epoch(&self, id: SessionId) -> Result<u64, MetaError> {
-        self.gate()?;
-        let db = self.db.lock();
-        db.sessions
-            .get(&id)
-            .map(|r| r.binding_epoch as u64)
-            .ok_or(MetaError::NotFound)
+        Ok(epoch)
     }
 
     /// Fenced on status='idle' AND current_epoch=$2; true iff the flip
@@ -1469,6 +1456,92 @@ impl MetadataStore for SimMetadataStore {
     /// CTE mirror: atomically allocate next_event_idx from the session
     /// row (missing session -> NotFound), stamp recovery_epoch, insert,
     /// pg_notify('session_events', {session_id, idx}).
+    async fn settle_harness_generation(
+        &self,
+        session: SessionId,
+        epoch: u64,
+        continued: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<engram_core::types::session::SettledRun>, MetaError> {
+        self.gate()?;
+        let epoch = i64::try_from(epoch).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let mut db = self.db.lock();
+        let Some(row) = db.sessions.get_mut(&session) else {
+            return Ok(Vec::new());
+        };
+        if row.attached_binding_epoch >= epoch {
+            return Ok(Vec::new());
+        }
+        row.attached_binding_epoch = epoch;
+        let events = db.session_events.get(&session).cloned().unwrap_or_default();
+        let runs: std::collections::BTreeSet<String> = events
+            .iter()
+            .filter(|event| event.kind == "run_started")
+            .filter_map(|started| {
+                let run = started.payload.get("run_id")?.as_str()?;
+                if continued.iter().any(|c| c == run) {
+                    return None;
+                }
+                (!events.iter().any(|ended| {
+                    ended.idx > started.idx
+                        && matches!(ended.kind.as_str(), "run_completed" | "run_interrupted")
+                        && ended.payload.get("run_id").and_then(|v| v.as_str()) == Some(run)
+                }))
+                .then(|| run.to_string())
+            })
+            .collect();
+        let mut settled = Vec::new();
+        let mut indices = Vec::new();
+        for run in runs {
+            let payload = serde_json::json!({"type": "harness_run_interrupted", "run_id": run,
+                "cause": "harness_replaced", "at": now});
+            if let Some(idx) = append_event_idempotent_locked(
+                &mut db,
+                session,
+                &format!("run_interrupted:{run}"),
+                "run_interrupted",
+                payload,
+                now,
+            )? {
+                settled.push(engram_core::types::session::SettledRun { run_id: run, idx });
+                indices.push(idx);
+            }
+        }
+        drop(db);
+        for idx in indices {
+            self.notify(
+                "session_events",
+                serde_json::json!({"session_id": session, "idx": idx}).to_string(),
+            );
+        }
+        Ok(settled)
+    }
+
+    async fn append_session_event_idempotent(
+        &self,
+        session: SessionId,
+        key: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<i64>, MetaError> {
+        self.gate()?;
+        let idx = append_event_idempotent_locked(
+            &mut self.db.lock(),
+            session,
+            key,
+            kind,
+            payload,
+            self.now(),
+        )?;
+        if let Some(idx) = idx {
+            self.notify(
+                "session_events",
+                serde_json::json!({"session_id": session, "idx": idx}).to_string(),
+            );
+        }
+        Ok(idx)
+    }
+
     async fn append_session_event(
         &self,
         session_id: SessionId,
@@ -2088,28 +2161,31 @@ impl MetadataStore for SimMetadataStore {
         Ok(Some((current, indices)))
     }
 
-    /// `WHERE id=$1 AND current_epoch=$4`; bool = landed.
+    /// A stale fence conflicts; a set mints, and a clear returns None.
     async fn fenced_assign_sandbox(
         &self,
         session_id: SessionId,
         epoch: i64,
         sandbox_id: Option<engram_core::SandboxId>,
         host_id: Option<HostId>,
-    ) -> Result<bool, MetaError> {
+    ) -> Result<Option<u64>, MetaError> {
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
         let Some(r) = db.sessions.get_mut(&session_id) else {
-            return Ok(false);
+            return Err(MetaError::Conflict("stale session fence".into()));
         };
         if r.current_epoch != epoch {
-            return Ok(false);
+            return Err(MetaError::Conflict("stale session fence".into()));
         }
         r.session.sandbox_id = sandbox_id;
         r.session.host_id = host_id;
         r.session.last_active_at = now;
         r.updated_at = now;
-        Ok(true)
+        Ok(sandbox_id.map(|_| {
+            r.binding_epoch += 1;
+            r.binding_epoch as u64
+        }))
     }
 
     /// CAS on expected sandbox + allowed states; distinct Conflict
@@ -2120,7 +2196,7 @@ impl MetadataStore for SimMetadataStore {
         sandbox_id: Option<engram_core::SandboxId>,
         expected_current: Option<Option<engram_core::SandboxId>>,
         allowed_states: &[SessionState],
-    ) -> Result<(), MetaError> {
+    ) -> Result<Option<u64>, MetaError> {
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
@@ -2145,11 +2221,15 @@ impl MetadataStore for SimMetadataStore {
         r.session.sandbox_id = sandbox_id;
         r.missing_strikes = 0;
         r.updated_at = now;
+        let epoch = sandbox_id.map(|_| {
+            r.binding_epoch += 1;
+            r.binding_epoch as u64
+        });
         if sandbox_id.is_none() {
             r.session.live_disk_manifest = None;
             db.chunk_generation += 1;
         }
-        Ok(())
+        Ok(epoch)
     }
 
     // ================= session ops (ADR 0079) =================
@@ -3237,24 +3317,6 @@ impl MetadataStore for SimMetadataStore {
             .values()
             .find(|r| r.session.sandbox_id == Some(sandbox_id) && r.session.host_id.is_some())
             .map(|r| (r.session.host_id.expect("filtered"), r.session.status)))
-    }
-
-    /// Blind rebind: host+sandbox set, strikes reset. NotFound on 0 rows.
-    async fn rebind_session(
-        &self,
-        id: SessionId,
-        host_id: HostId,
-        sandbox_id: engram_core::SandboxId,
-    ) -> Result<(), MetaError> {
-        self.gate()?;
-        let now = self.now();
-        let mut db = self.db.lock();
-        let r = db.sessions.get_mut(&id).ok_or(MetaError::NotFound)?;
-        r.session.host_id = Some(host_id);
-        r.session.sandbox_id = Some(sandbox_id);
-        r.missing_strikes = 0;
-        r.updated_at = now;
-        Ok(())
     }
 
     /// Same CAS predicates as the sandbox-guarded sibling.
@@ -4515,7 +4577,7 @@ impl MetadataStore for SimMetadataStore {
         sandbox_id: SandboxId,
         expected_current: Option<Option<SandboxId>>,
         allowed_states: &[SessionState],
-    ) -> Result<(), MetaError> {
+    ) -> Result<u64, MetaError> {
         // PG twin (rebind onto a fresh host+sandbox under the same CAS as
         // assign_session_sandbox_guarded, also stamping host_id and — issue
         // #215 — clearing the reconcile strike streak). A guard miss is a
@@ -4556,10 +4618,12 @@ impl MetadataStore for SimMetadataStore {
         r.session.sandbox_id = Some(sandbox_id);
         r.missing_strikes = 0;
         r.updated_at = now;
+        r.binding_epoch += 1;
+        let epoch = r.binding_epoch as u64;
         if let Some((key, value)) = db_tombstone_insert {
             db.sandbox_tombstones.entry(key).or_insert(value);
         }
-        Ok(())
+        Ok(epoch)
     }
 
     async fn record_capture_job_report(
@@ -5257,4 +5321,45 @@ fn op_row_to_domain(row: &super::OpRow) -> engram_core::types::session_op::Sessi
         created_at: row.created_at,
         finished_at: row.finished_at,
     }
+}
+
+fn append_event_idempotent_locked(
+    db: &mut super::SimDb,
+    session: SessionId,
+    key: &str,
+    kind: &str,
+    mut payload: serde_json::Value,
+    now: DateTime<Utc>,
+) -> Result<Option<i64>, MetaError> {
+    let row = db.sessions.get_mut(&session).ok_or(MetaError::NotFound)?;
+    let events = db.session_events.entry(session).or_default();
+    if events.iter().any(|event| {
+        event
+            .payload
+            .get("idempotency_key")
+            .and_then(|v| v.as_str())
+            == Some(key)
+    }) {
+        return Ok(None);
+    }
+    payload
+        .as_object_mut()
+        .ok_or_else(|| MetaError::Serialization("event payload must be an object".into()))?
+        .insert(
+            "idempotency_key".into(),
+            serde_json::Value::String(key.into()),
+        );
+    let idx = row.next_event_idx;
+    row.next_event_idx += 1;
+    row.updated_at = now;
+    row.session.last_event_at = Some(now);
+    events.push(PersistedEvent {
+        idx,
+        kind: kind.into(),
+        payload,
+        created_at: now,
+        recovery_epoch: row.recovery_epoch,
+        rewound_at: None,
+    });
+    Ok(Some(idx))
 }

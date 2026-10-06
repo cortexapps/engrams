@@ -56,13 +56,13 @@ impl MetadataStore for MiniMeta {
         &self,
         session_id: SessionId,
         sandbox_id: engram_core::SandboxId,
-    ) -> Result<(), MetaError> {
+    ) -> Result<u64, MetaError> {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&session_id).ok_or(MetaError::NotFound)?;
         s.status = SessionState::Created;
         s.sandbox_id = Some(sandbox_id);
         s.last_active_at = Utc::now();
-        Ok(())
+        Ok(1)
     }
     async fn reserve_and_persist_create(
         &self,
@@ -110,11 +110,11 @@ impl MetadataStore for MiniMeta {
         &self,
         id: SessionId,
         sandbox_id: Option<engram_core::SandboxId>,
-    ) -> Result<(), MetaError> {
+    ) -> Result<Option<u64>, MetaError> {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
         s.sandbox_id = sandbox_id;
-        Ok(())
+        Ok(None)
     }
     async fn upsert_host(&self, _h: HostRecord) -> Result<(), MetaError> {
         Ok(())

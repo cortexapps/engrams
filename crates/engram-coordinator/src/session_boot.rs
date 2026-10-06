@@ -280,9 +280,12 @@ pub(crate) async fn boot_on_reserved_host(
     );
     let env_egress_leg = async {
         if let Some(a) = agent.as_mut() {
-            crate::api::sessions::inject_harness_env(state, session_id, &mut a.env).await;
+            crate::api::sessions::inject_harness_env(state, session_id, &mut a.env).await?;
         }
-        resolve_inject_entries(state, session_id, integration_policy.as_ref(), &image_ref).await
+        Ok::<_, ApiError>(
+            resolve_inject_entries(state, session_id, integration_policy.as_ref(), &image_ref)
+                .await,
+        )
     };
     // Issue #535 correction: neither `coord_prepare` nor `coord_finalize`
     // covers this join itself — `coord_finalize` only starts once it
@@ -314,28 +317,41 @@ pub(crate) async fn boot_on_reserved_host(
         }
     };
 
+    let injects = match injects {
+        Ok(injects) => injects,
+        Err(e) => {
+            if let Err(teardown) = state.services.host.destroy(sandbox_id, fence).await {
+                tracing::warn!(%session_id, error = %teardown, "teardown after environment failure failed");
+            }
+            return Err(BootError::NotStarted(e));
+        }
+    };
+
     // ---- flip the (already-committed) row to Created + bind sandbox_id ----
     // Issue #535 (c): the row itself, and every satellite, are already
     // committed (by `reserve_and_persist_create`, before this function ever
     // ran) — this is a single slim UPDATE, not an upsert.
-    if let Err(e) = state
+    let binding_epoch = match state
         .services
         .meta
         .transition_session_created(session_id, sandbox_id)
         .await
     {
-        tracing::error!(
-            %session_id, %sandbox_id, %host_id, error = %e,
-            "session row transition-to-created failed after sandbox create; tearing sandbox down",
-        );
-        if let Err(de) = state.services.host.destroy(sandbox_id, fence).await {
+        Ok(epoch) => epoch,
+        Err(e) => {
             tracing::error!(
-                %session_id, %sandbox_id, error = %de,
-                "sandbox teardown after transition failure also failed — host reconcile will GC",
+                %session_id, %sandbox_id, %host_id, error = %e,
+                "session row transition-to-created failed after sandbox create; tearing sandbox down",
             );
+            if let Err(de) = state.services.host.destroy(sandbox_id, fence).await {
+                tracing::error!(
+                    %session_id, %sandbox_id, error = %de,
+                    "sandbox teardown after transition failure also failed — host reconcile will GC",
+                );
+            }
+            return Err(BootError::NotStarted(e.into()));
         }
-        return Err(BootError::NotStarted(e.into()));
-    }
+    };
 
     // Egress policy from the resolved guest IP (None on backends without
     // one) + the injects/observes already resolved by the overlapped leg.
@@ -361,22 +377,10 @@ pub(crate) async fn boot_on_reserved_host(
     let egress_policy =
         assemble_egress_policy(state, session_id, sandbox_id, &network, resolved_policy).await;
 
-    // ADR 0073: mint the binding generation for this fresh-spawn bind.
-    // The epoch fences out any surviving older-generation harness for
-    // this session (Superseded at attach) and rides both the durable
-    // host record (bind below) and the harness spawn env (spec stamp).
-    let binding_epoch = match state.services.meta.mint_binding_epoch(session_id).await {
-        Ok(e) => e,
-        Err(e) => {
-            return Err(BootError::Started(ApiError::Internal(format!(
-                "mint binding epoch: {e}"
-            ))));
-        }
-    };
     // ADR 0099 H6 (site 1): a freshly minted epoch is threaded into BOTH
     // the AgentSpec stamp and the durable bind RPC below, and every fence
     // downstream compares against it. It must clear the floor: the column
-    // defaults to 0 and `mint_binding_epoch` is an atomic `+1 RETURNING`,
+    // defaults to 0 and the binding write is an atomic `+1 RETURNING`,
     // so a mint yields >= 1 by construction. A 0 here would mean the
     // counter never advanced — the spawned harness would lose every
     // fence and never validate. (Strict pairwise monotonicity is enforced
@@ -389,11 +393,9 @@ pub(crate) async fn boot_on_reserved_host(
         binding_epoch >= 1,
         "minted binding epoch must be positive for session {session_id}, got {binding_epoch}",
     );
-    state
-        .services
-        .host
-        .bind_session(session_id, sandbox_id, binding_epoch)
-        .await;
+    crate::api::snapshot::bind_harness_generation(state, session_id, sandbox_id, binding_epoch)
+        .await
+        .map_err(BootError::Started)?;
 
     // ---- start the agent ----
     let mut agent = agent.unwrap_or_else(|| AgentSpec {

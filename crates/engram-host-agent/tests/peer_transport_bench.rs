@@ -94,7 +94,14 @@ mod peer_bench_support {
         async fn guest_ip(&self, _: SandboxId) -> Option<std::net::Ipv4Addr> {
             None
         }
-        async fn bind_session(&self, _: SessionId, _: SandboxId, _: u64) {}
+        async fn bind_session(
+            &self,
+            _: SessionId,
+            _: SandboxId,
+            _: u64,
+        ) -> Result<(), engram_core::SandboxError> {
+            Ok(())
+        }
         async fn unbind_session(&self, _: SessionId) {}
         async fn send_prompt(
             &self,

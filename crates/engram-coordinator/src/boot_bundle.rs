@@ -296,7 +296,7 @@ mod tests {
             &self,
             _: engram_core::SessionId,
             _: engram_core::SandboxId,
-        ) -> Result<(), MetaError> {
+        ) -> Result<u64, MetaError> {
             unimplemented!()
         }
         async fn reserve_and_persist_create(
@@ -326,7 +326,7 @@ mod tests {
             &self,
             _: engram_core::SessionId,
             _: Option<engram_core::SandboxId>,
-        ) -> Result<(), MetaError> {
+        ) -> Result<Option<u64>, MetaError> {
             unimplemented!()
         }
         async fn upsert_host(&self, _: HostRecord) -> Result<(), MetaError> {

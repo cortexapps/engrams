@@ -5972,3 +5972,223 @@ conformance!(
     t_retirement_capture_and_enable_work,
     super::retirement_capture_and_enable_work
 );
+
+async fn binding_epoch_minted_by_binding_writes(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta
+        .create_session(spec("conf:binding-epochs"))
+        .await
+        .unwrap();
+    let host = HostId::new();
+    meta.upsert_host(host_record(host, "epochs", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    let first = engram_core::SandboxId::new();
+    assert_eq!(
+        meta.transition_session_created(sid, first).await.unwrap(),
+        1
+    );
+    let second = engram_core::SandboxId::new();
+    assert_eq!(
+        meta.rebind_session_guarded(
+            sid,
+            host,
+            second,
+            Some(Some(first)),
+            &[SessionState::Created]
+        )
+        .await
+        .unwrap(),
+        2
+    );
+    assert!(meta
+        .rebind_session_guarded(
+            sid,
+            host,
+            first,
+            Some(Some(first)),
+            &[SessionState::Created]
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        meta.fenced_assign_sandbox(sid, 0, Some(first), Some(host))
+            .await
+            .unwrap(),
+        Some(3)
+    );
+    assert_eq!(
+        meta.fenced_assign_sandbox(sid, 0, None, Some(host))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(meta.assign_session_sandbox(sid, None).await.unwrap(), None);
+    assert!(matches!(
+        meta.fenced_assign_sandbox(sid, 99, Some(second), Some(host))
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert_eq!(
+        meta.assign_session_sandbox(sid, Some(second))
+            .await
+            .unwrap(),
+        Some(4)
+    );
+    assert_eq!(
+        meta.assign_session_sandbox_guarded(
+            sid,
+            Some(first),
+            Some(Some(second)),
+            &[SessionState::Created]
+        )
+        .await
+        .unwrap(),
+        Some(5)
+    );
+    assert_eq!(
+        meta.assign_session_sandbox_guarded(sid, None, Some(Some(first)), &[SessionState::Created])
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(meta.rebind_session(sid, host, second).await.unwrap(), 6);
+}
+conformance!(
+    t_binding_epoch_minted_by_binding_writes,
+    super::binding_epoch_minted_by_binding_writes
+);
+
+async fn settle_harness_generation_exactly_once(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:settlement")).await.unwrap();
+    for (kind, run) in [
+        ("run_started", "open"),
+        ("run_started", "kept"),
+        ("run_started", "done"),
+        ("run_completed", "done"),
+    ] {
+        meta.append_session_event(sid, kind, serde_json::json!({"run_id": run}))
+            .await
+            .unwrap();
+    }
+    // Generation 2 continues "kept" (ADR 0123 C5): only "open" settles.
+    let settled = meta
+        .settle_harness_generation(sid, 2, &["kept".into()], ctx.clock.now_utc())
+        .await
+        .unwrap();
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0].run_id, "open");
+    let no_continued: [String; 0] = [];
+    assert!(meta
+        .settle_harness_generation(sid, 2, &no_continued, ctx.clock.now_utc())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(meta
+        .settle_harness_generation(sid, 1, &no_continued, ctx.clock.now_utc())
+        .await
+        .unwrap()
+        .is_empty());
+    let rows = meta
+        .list_session_events_window(
+            sid,
+            EventCursor::After(-1),
+            100,
+            &["run_interrupted".into()],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].idx, settled[0].idx);
+    assert_eq!(rows[0].payload["run_id"], "open");
+    assert_eq!(rows[0].payload["cause"], "harness_replaced");
+    assert_eq!(rows[0].payload["idempotency_key"], "run_interrupted:open");
+    assert_eq!(rows[0].created_at, ctx.clock.now_utc());
+    // A later generation that continues nothing settles "kept" too.
+    let settled = meta
+        .settle_harness_generation(sid, 3, &no_continued, ctx.clock.now_utc())
+        .await
+        .unwrap();
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0].run_id, "kept");
+    assert!(meta
+        .settle_harness_generation(sid, 3, &no_continued, ctx.clock.now_utc())
+        .await
+        .unwrap()
+        .is_empty());
+}
+conformance!(
+    t_settle_harness_generation_exactly_once,
+    super::settle_harness_generation_exactly_once
+);
+
+async fn harness_event_delivery_dedups(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:event-dedup")).await.unwrap();
+    let other = meta
+        .create_session(spec("conf:event-dedup-other"))
+        .await
+        .unwrap();
+    let payload = serde_json::json!({"type": "harness_idle", "at": ctx.clock.now_utc()});
+    let first = meta
+        .append_session_event_idempotent(sid, "harness:1:1", "harness_idle", payload.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        meta.append_session_event_idempotent(sid, "harness:1:1", "harness_idle", payload.clone())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        meta.append_session_event_idempotent(sid, "harness:1:2", "harness_idle", payload.clone())
+            .await
+            .unwrap(),
+        Some(first + 1)
+    );
+    assert_eq!(
+        meta.append_session_event_idempotent(sid, "harness:2:1", "harness_idle", payload.clone())
+            .await
+            .unwrap(),
+        Some(first + 2)
+    );
+    assert!(meta
+        .append_session_event_idempotent(other, "harness:1:1", "harness_idle", payload)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        meta.list_session_events_window(sid, EventCursor::After(-1), 100, &[], &[])
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    let payload = serde_json::json!({"type": "harness_idle", "at": ctx.clock.now_utc()});
+    let (left, right) = tokio::join!(
+        meta.append_session_event_idempotent(sid, "harness:2:2", "harness_idle", payload.clone()),
+        meta.append_session_event_idempotent(sid, "harness:2:2", "harness_idle", payload),
+    );
+    assert_eq!(
+        usize::from(left.unwrap().is_some()) + usize::from(right.unwrap().is_some()),
+        1
+    );
+    assert!(meta
+        .append_session_event_idempotent(sid, "invalid", "harness_idle", serde_json::Value::Null)
+        .await
+        .is_err());
+    assert_eq!(
+        meta.list_session_events_window(sid, EventCursor::After(-1), 100, &[], &[])
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+}
+conformance!(
+    t_harness_event_delivery_dedups,
+    super::harness_event_delivery_dedups
+);

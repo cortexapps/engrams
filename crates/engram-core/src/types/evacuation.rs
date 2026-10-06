@@ -25,6 +25,7 @@ use super::ids::{HostId, SandboxId};
 /// it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EvacReceipt {
+    pub binding_epoch: u64,
     pub new_host_id: HostId,
     pub new_sandbox_id: SandboxId,
     pub loss: EvacLoss,
@@ -100,6 +101,7 @@ mod tests {
     #[test]
     fn evac_receipt_round_trips_through_json() {
         let receipt = EvacReceipt {
+            binding_epoch: 1,
             new_host_id: HostId::new(),
             new_sandbox_id: SandboxId::new(),
             loss: EvacLoss::Memory {

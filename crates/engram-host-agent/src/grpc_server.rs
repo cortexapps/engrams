@@ -932,7 +932,8 @@ impl HostService for HostServiceImpl {
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         self.inner
             .bind_session(session_id, sandbox_id, r.binding_epoch)
-            .await;
+            .await
+            .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
     }
 

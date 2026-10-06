@@ -203,7 +203,8 @@ impl HostClient for FakeBackend {
         _session_id: SessionId,
         _sandbox_id: SandboxId,
         _binding_epoch: u64,
-    ) {
+    ) -> Result<(), engram_core::SandboxError> {
+        Ok(())
     }
     async fn unbind_session(&self, _session_id: SessionId) {}
     async fn send_prompt(

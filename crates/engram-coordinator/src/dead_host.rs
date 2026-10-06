@@ -854,7 +854,7 @@ mod tests {
             _session_id: SessionId,
             _sandbox_id: SandboxId,
             _binding_epoch: u64,
-        ) {
+        ) -> Result<(), engram_core::SandboxError> {
             unimplemented!()
         }
         async fn unbind_session(&self, _session_id: SessionId) {

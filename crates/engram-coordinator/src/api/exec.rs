@@ -85,12 +85,16 @@ async fn session_exec_env(
     };
     let mut env = HashMap::new();
     if bundle.is_some() {
-        crate::api::sessions::inject_forge_env(state, id, &mut env).await;
+        if let Err(e) = crate::api::sessions::inject_forge_env(state, id, &mut env).await {
+            tracing::warn!(session_id = %id, error = %e, "exec forge environment unavailable");
+        }
     }
     // ADR 0026: upload token is not git-gated and doesn't need the
     // manifest bundle — inject it unconditionally so `engram-share`
     // works from `/exec` even when the bundle load above failed.
-    crate::api::sessions::inject_upload_env(state, id, &mut env).await;
+    if let Err(e) = crate::api::sessions::inject_upload_env(state, id, &mut env).await {
+        tracing::warn!(session_id = %id, error = %e, "exec upload environment unavailable");
+    }
     (env, bundle.and_then(|b| b.config.workdir))
 }
 
@@ -553,7 +557,8 @@ mod tests {
             _session_id: SessionId,
             _sandbox_id: SandboxId,
             _binding_epoch: u64,
-        ) {
+        ) -> Result<(), engram_core::SandboxError> {
+            Ok(())
         }
 
         async fn unbind_session(&self, _session_id: SessionId) {}

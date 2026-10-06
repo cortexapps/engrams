@@ -232,7 +232,7 @@ mod tests {
             &self,
             _: SessionId,
             _: engram_core::SandboxId,
-        ) -> Result<(), MetaError> {
+        ) -> Result<u64, MetaError> {
             unreachable!()
         }
         async fn reserve_and_persist_create(
@@ -268,8 +268,8 @@ mod tests {
             &self,
             _: SessionId,
             _: Option<SandboxId>,
-        ) -> Result<(), MetaError> {
-            Ok(())
+        ) -> Result<Option<u64>, MetaError> {
+            Ok(None)
         }
         async fn upsert_host(&self, _: HostRecord) -> Result<(), MetaError> {
             Ok(())

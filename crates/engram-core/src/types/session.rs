@@ -495,6 +495,14 @@ pub struct QueuedSession {
     pub queued_at: DateTime<Utc>,
 }
 
+/// One open run that `settle_harness_generation` closed, with the index of
+/// the `run_interrupted` event it appended (ADR 0123 C5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettledRun {
+    pub run_id: String,
+    pub idx: i64,
+}
+
 /// ADR 0048 C8: an Active session bound to a host, with its reservation
 /// budgets — the drain don't-strand guard needs the budgets to ask
 /// "does some survivor fit this session?".
