@@ -1,6 +1,6 @@
 # ADR 0123: Durable session teleport and the host retirement grant
 
-Status: Proposed (2026-10-05)
+Status: Accepted (2026-10-05); phases S1-S6, C1-C4, O1-O2, X1 implemented in the PR chain listed under Phases.
 
 Terms used in this document:
 
@@ -487,21 +487,19 @@ pub enum HarnessFrame {
 
 ## Phases
 
-| PR | Content |
-|---|---|
-| S1 | D1, D2 |
-| S2 | D3 |
-| S3 | D4 |
-| S4 | C2, C3; the noop harness becomes an SDK-driven deterministic fixture |
-| S5 | C4 wire, SDK outbox, hub acknowledgement, sink retry |
-| S6 | orchestrator: `run_interrupted` is a failed run end |
-| C1 | migration 0120, A1-A6, store and sim, conformance, `RetireHost`/`GetHost`/`DeleteHost` |
-| C3 | C1, C5, C6 (uniform mint, settlement, honest readiness) |
-| C2 | B: `teleport.rs`, `TeleportSession`, migration 0121, deletions, DST, live-PG, e2e |
-| C4 | fixture cleanup (`assign_session_sandbox` retired) |
-| O1 | E5, E6 |
-| O2 | E1-E4, E7 |
-| X1, X2 | composed acceptance: a real SDK harness mid-run survives a snapshot teleport; retirement grants only after the move |
+| PR | Content | Pull request |
+|---|---|---|
+| ADR | this document | #1582 |
+| S1-S3 | D1-D4: seal is a Result, roles inside the restore and capture transactions, TeardownRegistry and the resident count, start_agent on the capture lock | #1584 |
+| S4 | C2, C3: attach token file, SDK reload and fence grace, noop harness on the SDK | #1586 |
+| S5-S6 | C4: SeqEvent with the sequencing epoch, EventAck, outbox replay, hub ack after the sink, sink retry, RunContinued; orchestrator run_interrupted | #1587 |
+| C1 | A1-A6, B3, B8: migration 0120, Retired, the grant, RetireHost/GetHost/DeleteHost, cordon owner, the reservation arm | #1585 |
+| C3 | C1, C5, C6: uniform mint, honest readiness, run settlement with the continued-run exemption, delivery dedup (migration 0121) | #1590 |
+| C2 | B: teleport.rs, TeleportSession, snapshot_hold, live payload (migration 0122), deletions, scenarios, e2e | #1591 |
+| O1 | E5, E6 | #1583 |
+| O2 | E1-E4, E7 | #1588 |
+| X1 | the KVM acceptance test: a real SDK harness survives a non-drained snapshot and finishes its run | #1589 |
+| C4 | fixture cleanup: assign_session_sandbox retired | (follows #1591) |
 
 ## Divergence log
 
@@ -511,3 +509,34 @@ pub enum HarnessFrame {
   the new generation, so the run's own first event would have settled
   it: #1549 by policy. C4 and C5 now stamp the epoch at sequencing time,
   add `RunContinued`, and exempt the runs the advancing event references.
+- 2026-10-05 (C2): the snapshot kind cannot use the eviction capture
+  (`snapshot_begin` runs a finalizer that destroys the source) and cannot
+  pre-pause the guest (the capture disarms swap over exec). The host gains
+  `snapshot_hold`: the ordinary capture that leaves the VM paused and does
+  not re-arm swap; `resume` re-arms once and `destroy` clears the hold. A
+  post-capture execution window is not acceptable: events the source emits
+  after the capture point carry epoch N and the same sequence numbers the
+  destination replays, so dedup would drop the destination's real events.
+- 2026-10-05 (C2): a live move persists its full presetup result in
+  `session_teleports.live_payload` in the same CAS that records
+  `export_id`, so a successor never calls presetup twice; an export the
+  host no longer holds rolls the move back with `live_export_lost`. The
+  export lifetime on the host is still TTL-driven; making it
+  teleport-driven (B10) is the remaining host follow-up.
+- 2026-10-05 (C2): a live rollback releases the source through
+  `migration_abort` (the export fenced it); only a held snapshot source is
+  released through `resume`.
+- 2026-10-05 (C3): `HarnessPlan::None` means a dev-VM session. An
+  agent-mode session with no persisted harness selection is an error,
+  never a silent "no harness"; the previous code swallowed that error.
+- 2026-10-05 (C1): `session_teleports.dest_host_id` has no foreign key
+  (like `source_host_id`), so a retired host that served as a destination
+  stays deletable. Pre-existing cordons are backfilled to the admin owner.
+  `EnableWork` counts live materializes only; `CaptureJobs` already
+  reports the capture jobs.
+- 2026-10-05 (O2): a granted host is removed unconditionally; pressure
+  releases only a shed victim that is still pending. A stuck image roll
+  with autoscaling disabled still blocks further rolls.
+- 2026-10-05 (O1, C1): the heartbeat's `running_sandboxes` is redefined as
+  resident (running plus tearing-down) and the grant reads that column;
+  no new wire field or table column.
