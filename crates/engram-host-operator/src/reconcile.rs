@@ -55,8 +55,8 @@ pub const ROLL_STUCK_ANNOTATION: &str = "fleet.engram.io/roll-stuck";
 /// Context shared across reconciles.
 pub struct Ctx {
     pub client: Client,
-    /// ADR 0044 K4: actuates node-pool size changes. `NoopScaler` by default.
-    pub scaler: Arc<dyn NodePoolScaler>,
+    /// Actuates node-pool changes. None selects observe-only autoscaling.
+    pub scaler: Option<Arc<dyn NodePoolScaler>>,
     /// ADR 0045 Phase E: minute-based scale-down hysteresis. This is
     /// deliberately independent of the faster scale-up reconcile interval.
     pub scaledown_hysteresis: crate::autoscale::ScaleDownHysteresis,
@@ -306,7 +306,7 @@ async fn run_autoscale(
     };
     crate::autoscale::step(
         spec,
-        ctx.scaler.as_ref(),
+        ctx.scaler.as_deref(),
         &ctx.scaledown_hysteresis,
         &ctx.node_ready,
         &coord,

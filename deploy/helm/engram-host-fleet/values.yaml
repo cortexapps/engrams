@@ -319,13 +319,15 @@ operator:
   serviceAccount:
     annotations: {}
     # e.g.: iam.gke.io/gcp-service-account: engram-host-operator@<project>.iam.gserviceaccount.com
-  # ADR 0044 K4 / ADR 0122: node-pool scaler. `noop` logs the desired size
-  # only; `gke` resizes a GKE pool via the Container API + Workload Identity
-  # (the operator GSA needs container.nodePools.update +
-  # compute.instanceGroupManagers.update); `asg` resizes an EC2 Auto Scaling
+  # ADR 0044 K4 / ADR 0122: node-pool scaler. `noop` is observe-only;
+  # autoscale computes and logs plans without mutations. `gke` resizes a GKE
+  # pool via the Container API + Workload Identity (the operator GSA needs
+  # container.clusters.{get,update} + compute.instanceGroupManagers.{get,update}).
+  # `asg` resizes an EC2 Auto Scaling
   # group via IRSA (autoscaling:{DescribeAutoScalingGroups,SetDesiredCapacity,
   # TerminateInstanceInAutoScalingGroup} + ec2:DescribeInstances) —
   # `autoscaling.nodePool` is then the ASG NAME.
+  # GKE or ASG initialization errors fail startup. Unset/unknown values fail too.
   scaler: noop          # noop | gke | asg
   # Render a HostFleet CR for this release's host-agent DaemonSet (the common
   # case). Set false to manage the CR out-of-band.
@@ -352,7 +354,7 @@ operator:
   # coordinator demand and sizes the host node pool — scale-UP via set_size
   # (2D + queue-aware, one-shot), scale-DOWN via the teleport-packed wave
   # (drain the least-loaded nodes onto peers, then remove them). The default
-  # scaler (ENGRAM_NODE_POOL_SCALER unset) is a NOOP that only LOGS decisions;
+  # chart selection is explicit `noop`: observe-only, with no autoscale mutations;
   # set it to "gke" or "asg" (operator.scaler above) to actuate a real pool.
   autoscaling:
     enabled: false

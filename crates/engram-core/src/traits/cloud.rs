@@ -29,15 +29,15 @@ pub trait CloudBackend: Send + Sync {
 /// the operator beyond selecting the impl.
 #[async_trait]
 pub trait NodePoolScaler: Send + Sync {
-    /// Set the node pool's desired size. Idempotent — re-asserted every
-    /// reconcile. `node_pool` is an actuator-specific identifier.
+    /// Read the pool's desired size as the cloud holds it now: the number
+    /// that `set_size` would overwrite.
+    async fn current_target(&self, node_pool: &str) -> Result<u32, BackendError>;
+
+    /// Set the node pool's desired size. `node_pool` is actuator-specific.
     ///
-    /// ADR 0048 invariant: `set_size` is **GROW-ONLY**. The caller must never
-    /// pass a `desired` below the pool's current physical size — a count-only
-    /// shrink lets the managed instance group pick an arbitrary (possibly
-    /// loaded) victim. Shrinking goes through [`Self::remove_node`], which
-    /// names the node. (A failed roll that leaves a host cordoned must not let
-    /// a later `set_size(N-1)` on a physically-N pool delete a live node.)
+    /// This is GROW-ONLY. Callers compare desired with `current_target` and
+    /// call this only when desired is greater. A count-only shrink can remove
+    /// a loaded node. Shrinking must use `remove_node` to name the victim.
     async fn set_size(&self, node_pool: &str, desired: u32) -> Result<(), BackendError>;
 
     /// ADR 0048: remove ONE specific node from the pool, atomically

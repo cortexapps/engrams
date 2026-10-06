@@ -30,6 +30,24 @@ use crate::crd::HostFleet;
 use crate::error::OperatorError;
 use crate::reconcile::{reconcile, Ctx};
 
+#[derive(Debug, PartialEq, Eq)]
+enum ScalerKind {
+    Observe,
+    Gke,
+    Asg,
+}
+
+fn parse_scaler_kind(v: Option<&str>) -> Result<ScalerKind, OperatorError> {
+    match v {
+        Some("noop") => Ok(ScalerKind::Observe),
+        Some("gke") => Ok(ScalerKind::Gke),
+        Some("asg") => Ok(ScalerKind::Asg),
+        _ => Err(OperatorError::Invalid(
+            "ENGRAM_NODE_POOL_SCALER must be explicit: noop, gke, or asg".into(),
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), OperatorError> {
     // `engram-host-operator crd` prints the CRD manifest (JSON — valid YAML,
@@ -48,38 +66,21 @@ async fn main() -> Result<(), OperatorError> {
         )
         .init();
 
+    let scaler_kind = parse_scaler_kind(std::env::var("ENGRAM_NODE_POOL_SCALER").ok().as_deref())?;
+    tracing::info!(?scaler_kind, "node-pool actuator selection");
     let client = Client::try_default().await?;
     let fleets: Api<HostFleet> = Api::all(client.clone());
 
-    // ADR 0044 K4 / ADR 0122: select the node-pool scaler. Default noop (logs
-    // the desired size); `gke` actuates a GKE pool via the Container API;
-    // `asg` actuates an EC2 Auto Scaling group (the pool identifier in the
-    // HostFleet spec is then the ASG name). Off-cloud detection fails fast →
-    // fall back to noop so a misconfig never wedges the operator.
-    let node_scaler: Arc<dyn engram_core::traits::cloud::NodePoolScaler> =
-        match std::env::var("ENGRAM_NODE_POOL_SCALER").as_deref() {
-            Ok("gke") => match engram_cloud_gcp::gke::GkeNodePoolScaler::detect().await {
-                Ok(s) => {
-                    tracing::info!("node-pool scaler: gke");
-                    Arc::new(s)
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "gke scaler init failed (not on GKE?); using noop");
-                    Arc::new(scaler::NoopScaler)
-                }
-            },
-            Ok("asg") => match engram_cloud_aws::asg::AsgNodePoolScaler::detect().await {
-                Ok(s) => {
-                    tracing::info!("node-pool scaler: asg");
-                    Arc::new(s)
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "asg scaler init failed (not on AWS?); using noop");
-                    Arc::new(scaler::NoopScaler)
-                }
-            },
-            _ => Arc::new(scaler::NoopScaler),
-        };
+    let node_scaler: Option<Arc<dyn engram_core::traits::cloud::NodePoolScaler>> = match scaler_kind
+    {
+        ScalerKind::Observe => None,
+        ScalerKind::Gke => Some(Arc::new(
+            engram_cloud_gcp::gke::GkeNodePoolScaler::detect().await?,
+        )),
+        ScalerKind::Asg => Some(Arc::new(
+            engram_cloud_aws::asg::AsgNodePoolScaler::detect().await?,
+        )),
+    };
     let metrics_addr = std::env::var("ENGRAM_OPERATOR_METRICS_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:9102".to_string())
         .parse()
@@ -117,6 +118,23 @@ fn error_policy(_obj: Arc<HostFleet>, err: &OperatorError, _ctx: Arc<Ctx>) -> Ac
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_scaler_kind_requires_an_explicit_value() {
+        for value in [None, Some(""), Some("unknown")] {
+            assert!(matches!(
+                parse_scaler_kind(value),
+                Err(OperatorError::Invalid(_))
+            ));
+        }
+        for (value, expected) in [
+            ("noop", ScalerKind::Observe),
+            ("gke", ScalerKind::Gke),
+            ("asg", ScalerKind::Asg),
+        ] {
+            assert_eq!(parse_scaler_kind(Some(value)).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn checked_in_crd_matches_generated_schema() {

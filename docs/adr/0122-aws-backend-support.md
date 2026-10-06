@@ -153,6 +153,7 @@ constraint: EKS-default node naming only (Karpenter or
 Selection string: `ENGRAM_NODE_POOL_SCALER=asg` (chart value
 `operator.autoscaling.scaler: asg`), with the detect-or-noop fallback
 the GKE arm uses.
+ADR 0123 E6 replaces this fallback: selection is explicit; init errors fail startup.
 
 Terraform-side coupling (the AWS `host-operator-iam` module must
 match): the ASG suspends `AZRebalance` (it would pick its own

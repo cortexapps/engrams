@@ -446,7 +446,7 @@ async fn track_node_ready(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepAction {
     /// Queue/scale-up pressure: return any cordoned wave capacity, then grow
-    /// (the caller actuates `set_size` only if `desired > physical`).
+    /// (the caller grows only above both the pod count and the cloud target).
     AbortAndGrow,
     /// Queue pressure with no grow needed: just return cordoned capacity.
     AbortOnly,
@@ -789,7 +789,7 @@ async fn gate_drain(
 /// soon while one is).
 pub async fn step(
     spec: &HostFleetSpec,
-    scaler: &dyn NodePoolScaler,
+    scaler: Option<&dyn NodePoolScaler>,
     scaledown_hysteresis: &ScaleDownHysteresis,
     node_ready: &NodeReadyTracker,
     coord: &dyn CoordApi,
@@ -820,25 +820,39 @@ pub async fn step(
     let grow_target = desired
         .saturating_add(unavailable)
         .min(a.max_hosts.max(a.min_hosts));
+    for (kind, value) in [
+        ("desired", desired),
+        ("schedulable", current),
+        ("physical", physical),
+        ("grow_target", grow_target),
+    ] {
+        ::metrics::gauge!(crate::metrics::AUTOSCALE_HOSTS, "kind" => kind).set(value as f64);
+    }
+    let hosts = coord.list_hosts().await?;
+    let Some(scaler) = scaler else {
+        let wave_hosts = assemble_wave_hosts(pods, &hosts, &[]);
+        let decision = plan_wave(
+            &wave_hosts,
+            desired,
+            WavePolicy {
+                mode: a.scale_down,
+                max_shed_per_wave: a.max_shed_per_wave.max(1),
+                floor: a.min_hosts.max(spec.capacity_floor),
+                headroom_mib: a.target_free_mib,
+            },
+        );
+        tracing::info!(node_pool = %a.node_pool, current, physical, desired, grow_target,
+            victims = ?decision.victims, note = %decision.note, "autoscale observe-only plan");
+        return Ok(AutoscaleStatus::default());
+    };
     // The annotation value keys wave-victims to THIS node pool (distinguishing
     // them from a manual cordon, and from another fleet's wave).
     let fleet_key = a.node_pool.as_str();
     let annotated = nodes.annotated_victims(fleet_key).await?;
     let wave_in_flight = !annotated.is_empty();
 
-    // Fetched once per tick: the node-ready tracker consumes it here and
-    // the wave arm below reuses it (it used to fetch its own copy).
-    let hosts = coord.list_hosts().await?;
     track_node_ready(node_ready, nodes, pods, &hosts).await;
 
-    for (kind, v) in [
-        ("desired", desired),
-        ("schedulable", current),
-        ("physical", physical),
-        ("grow_target", grow_target),
-    ] {
-        ::metrics::gauge!(crate::metrics::AUTOSCALE_HOSTS, "kind" => kind).set(v as f64);
-    }
     ::metrics::gauge!(crate::metrics::AUTOSCALE_WAVE_IN_FLIGHT).set(if wave_in_flight {
         1.0
     } else {
@@ -894,7 +908,7 @@ pub async fn step(
     if (pressure || !stuck_rolls.is_empty()) && wave_in_flight {
         abort_wave(&act, &annotated).await;
     }
-    if grow_target > physical {
+    if grow_target > physical && grow_target > scaler.current_target(&a.node_pool).await? {
         let requested_at = crate::time_source::metrics_wall_now();
         scaler.set_size(&a.node_pool, grow_target).await?;
         node_ready.record_grow(physical, grow_target, requested_at);
@@ -1172,6 +1186,7 @@ mod tests {
     #[derive(Default)]
     struct Rec {
         log: Mutex<Vec<String>>,
+        record_reads: bool,
         demand: Mutex<crate::scaler::FleetDemand>,
         /// host_id → running_sandboxes returned by host_status (one entry per
         /// call, popped front; empty → 0).
@@ -1197,9 +1212,15 @@ mod tests {
     #[async_trait]
     impl CoordApi for Arc<Rec> {
         async fn fleet_demand(&self) -> Result<crate::scaler::FleetDemand, OperatorError> {
+            if self.record_reads {
+                self.push("fleet_demand");
+            }
             Ok(*self.demand.lock().unwrap())
         }
         async fn list_hosts(&self) -> Result<Vec<HostLoad>, OperatorError> {
+            if self.record_reads {
+                self.push("list_hosts");
+            }
             Ok(self.hosts.lock().unwrap().clone())
         }
         async fn host_status(&self, host: HostId) -> Result<Option<HostStatus>, OperatorError> {
@@ -1272,9 +1293,26 @@ mod tests {
 
     struct RecScaler {
         rec: Arc<Rec>,
+        cloud_target: Mutex<u32>,
+        target_reads: Mutex<Vec<String>>,
+    }
+    impl RecScaler {
+        /// A scaler whose cloud already holds `cloud_target` nodes.
+        fn new(rec: Arc<Rec>, cloud_target: u32) -> Self {
+            Self {
+                rec,
+                cloud_target: Mutex::new(cloud_target),
+                target_reads: Mutex::new(Vec::new()),
+            }
+        }
     }
     #[async_trait]
     impl NodePoolScaler for RecScaler {
+        async fn current_target(&self, pool: &str) -> Result<u32, engram_core::BackendError> {
+            self.target_reads.lock().unwrap().push(pool.into());
+            Ok(*self.cloud_target.lock().unwrap())
+        }
+
         async fn set_size(
             &self,
             _pool: &str,
@@ -1346,6 +1384,122 @@ mod tests {
         }
     }
 
+    async fn check_grow(cloud_target: u32, pod_count: usize) -> (Vec<String>, Vec<String>) {
+        let rec = Arc::new(Rec::default());
+        *rec.demand.lock().unwrap() = crate::scaler::FleetDemand {
+            schedulable_hosts: 3,
+            total_mib: 48_000,
+            free_mib: 0,
+            ..Default::default()
+        };
+        let mut spec = autoscale_spec();
+        spec.autoscaling.as_mut().unwrap().target_free_mib = 16_000;
+        let scaler = RecScaler::new(rec.clone(), cloud_target);
+        let pods: Vec<_> = (0..pod_count).map(|n| ready_pod(&n.to_string())).collect();
+        step(
+            &spec,
+            Some(&scaler),
+            &ScaleDownHysteresis::default(),
+            &NodeReadyTracker::default(),
+            &rec,
+            &rec,
+            FleetObservation {
+                pods: &pods,
+                roll_idle: true,
+                stuck_rolls: &[],
+            },
+        )
+        .await
+        .unwrap();
+        let reads = scaler.target_reads.lock().unwrap().clone();
+        (rec.log(), reads)
+    }
+
+    #[tokio::test]
+    async fn grow_never_lowers_cloud_target() {
+        let (log, reads) = check_grow(5, 3).await;
+        assert!(log.is_empty(), "{log:?}");
+        assert_eq!(reads, ["kvm"]);
+    }
+
+    #[tokio::test]
+    async fn grow_raises_when_cloud_target_is_below() {
+        let (log, reads) = check_grow(3, 3).await;
+        assert_eq!(log, ["set_size 4"]);
+        assert_eq!(reads, ["kvm"]);
+    }
+
+    #[tokio::test]
+    async fn grow_skips_cloud_read_when_pods_already_meet_target() {
+        let (log, reads) = check_grow(3, 4).await;
+        assert!(log.is_empty(), "{log:?}");
+        assert!(reads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn observe_only_performs_no_mutations() {
+        let rec = Arc::new(Rec {
+            record_reads: true,
+            ..Default::default()
+        });
+        *rec.demand.lock().unwrap() = crate::scaler::FleetDemand {
+            schedulable_hosts: 5,
+            total_mib: 80_000,
+            free_mib: 80_000,
+            ..Default::default()
+        };
+        let mut spec = autoscale_spec();
+        let policy = spec.autoscaling.as_mut().unwrap();
+        policy.scale_down = crate::scaler::ScaleDownMode::Aggressive;
+        policy.scale_down_hysteresis_ticks = 1;
+        let pods: Vec<_> = (0..5).map(|n| ready_pod(&n.to_string())).collect();
+        *rec.hosts.lock().unwrap() = pods
+            .iter()
+            .map(|pod| HostLoad {
+                id: HostId::from_node_name(&pod.node),
+                cordoned: false,
+                running_sandboxes: 0,
+                reserved_mib: 0,
+                free_mib: 16_000,
+                reserved_vcpus: 0,
+                free_vcpus: 8,
+            })
+            .collect();
+        let wave_hosts = assemble_wave_hosts(&pods, &rec.hosts.lock().unwrap(), &[]);
+        assert!(
+            !plan_wave(
+                &wave_hosts,
+                2,
+                WavePolicy {
+                    mode: crate::scaler::ScaleDownMode::Aggressive,
+                    max_shed_per_wave: 1,
+                    floor: 2,
+                    headroom_mib: 24_576,
+                }
+            )
+            .victims
+            .is_empty(),
+            "the surplus fleet must have a removable victim"
+        );
+        let status = step(
+            &spec,
+            None,
+            &ScaleDownHysteresis::default(),
+            &NodeReadyTracker::default(),
+            &rec,
+            &rec,
+            FleetObservation {
+                pods: &pods,
+                roll_idle: true,
+                stuck_rolls: &[],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!status.blocks_roll);
+        assert_eq!(rec.log(), ["fleet_demand", "list_hosts"]);
+    }
+
     #[tokio::test]
     async fn queued_demand_surges_past_a_roll_stuck_physical_node() {
         let rec = Arc::new(Rec::default());
@@ -1359,13 +1513,13 @@ mod tests {
             queued_mib: 24_576,
             queued_vcpus: 8,
         };
-        let scaler = RecScaler { rec: rec.clone() };
+        let scaler = RecScaler::new(rec.clone(), 3);
         let hysteresis = ScaleDownHysteresis::default();
         let pods = vec![ready_pod("a"), ready_pod("b"), ready_pod("stuck")];
 
         let status = step(
             &autoscale_spec(),
-            &scaler,
+            Some(&scaler),
             &hysteresis,
             &NodeReadyTracker::default(),
             &rec,
@@ -1414,7 +1568,7 @@ mod tests {
             queued_mib: 49_152,
             queued_vcpus: 16,
         };
-        let scaler = RecScaler { rec: rec.clone() };
+        let scaler = RecScaler::new(rec.clone(), 3);
         let hysteresis = ScaleDownHysteresis::default();
         // Both pods Ready but running stale images (they need the roll).
         let stale = |node: &str| PodInfo {
@@ -1426,7 +1580,7 @@ mod tests {
 
         let status = step(
             &autoscale_spec(),
-            &scaler,
+            Some(&scaler),
             &hysteresis,
             &NodeReadyTracker::default(),
             &rec,
@@ -1480,13 +1634,13 @@ mod tests {
         *rec.fail_remove.lock().unwrap() = true;
         let mut spec = autoscale_spec();
         spec.autoscaling.as_mut().unwrap().scale_down = crate::scaler::ScaleDownMode::IdleOnly;
-        let scaler = RecScaler { rec: rec.clone() };
+        let scaler = RecScaler::new(rec.clone(), 3);
         let hysteresis = ScaleDownHysteresis::default();
         let pods = vec![ready_pod("a"), ready_pod("b"), ready_pod("victim")];
 
         let status = step(
             &spec,
-            &scaler,
+            Some(&scaler),
             &hysteresis,
             &NodeReadyTracker::default(),
             &rec,
@@ -1517,7 +1671,7 @@ mod tests {
             total_vcpus: 120,
             ..crate::scaler::FleetDemand::default()
         };
-        let scaler = RecScaler { rec: rec.clone() };
+        let scaler = RecScaler::new(rec.clone(), 3);
         let hysteresis = ScaleDownHysteresis::default();
         let pods = vec![
             ready_pod("a"),
@@ -1528,7 +1682,7 @@ mod tests {
 
         let status = step(
             &autoscale_spec(),
-            &scaler,
+            Some(&scaler),
             &hysteresis,
             &NodeReadyTracker::default(),
             &rec,
@@ -1557,7 +1711,7 @@ mod tests {
     #[tokio::test]
     async fn drive_one_happy_path_drains_removes_deletes() {
         let rec = Arc::new(Rec::default());
-        let scaler = RecScaler { rec: rec.clone() };
+        let scaler = RecScaler::new(rec.clone(), 3);
         let act = actuator(&rec, &scaler, 1);
         // host_status reports 0 immediately → drains in one poll.
         let out = drive_victims(&act, &["node-a".to_string()]).await;
@@ -1580,7 +1734,7 @@ mod tests {
     #[tokio::test]
     async fn drive_one_drain_timeout_releases_victim() {
         let rec = Arc::new(Rec::default());
-        let scaler = RecScaler { rec: rec.clone() };
+        let scaler = RecScaler::new(rec.clone(), 3);
         // host_status always reports 2 running → never drains → times out.
         let host = HostId::from_node_name("node-b");
         rec.drain_progress
@@ -1607,7 +1761,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn drive_one_blocks_on_live_enable_work() {
         let rec = Arc::new(Rec::default());
-        let scaler = RecScaler { rec: rec.clone() };
+        let scaler = RecScaler::new(rec.clone(), 3);
         let host = HostId::from_node_name("node-c");
         // 0 running sandboxes throughout (materialize boots no VM), but a
         // capture job stays live past the drain budget.
@@ -1686,7 +1840,7 @@ mod tests {
     #[tokio::test]
     async fn abort_wave_uncordons_and_deannotates() {
         let rec = Arc::new(Rec::default());
-        let scaler = RecScaler { rec: rec.clone() };
+        let scaler = RecScaler::new(rec.clone(), 3);
         let act = actuator(&rec, &scaler, 1);
         abort_wave(&act, &["node-x".to_string(), "node-y".to_string()]).await;
         let log = rec.log();

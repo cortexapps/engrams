@@ -46,6 +46,12 @@ struct NodePoolResp {
     instance_group_urls: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct InstanceGroupResp {
+    #[serde(rename = "targetSize")]
+    target_size: u32,
+}
+
 /// Parse a GKE `instanceGroupUrls` entry into `(zone, igm_name)`. The URL
 /// is `.../projects/<proj>/zones/<zone>/instanceGroupManagers/<name>`
 /// (GKE's per-zone managed instance groups). Returns `None` on a shape we
@@ -74,8 +80,7 @@ fn igm_owns_node(igm_name: &str, node_name: &str) -> bool {
 
 impl GkeNodePoolScaler {
     /// Detect project/cluster/location from the GKE metadata server (the
-    /// operator runs in-cluster). Fails fast off-GKE so the caller can fall
-    /// back to the noop scaler.
+    /// operator runs in-cluster). Detection errors fail operator startup.
     pub async fn detect() -> Result<Self, BackendError> {
         let http = engram_tls::client_builder()
             .timeout(Duration::from_secs(10))
@@ -91,6 +96,37 @@ impl GkeNodePoolScaler {
             location,
             cluster,
         })
+    }
+
+    async fn node_pool(&self, node_pool: &str, token: &str) -> Result<NodePoolResp, BackendError> {
+        let np_url = format!(
+            "{CONTAINER_API}/projects/{}/locations/{}/clusters/{}/nodePools/{}",
+            self.project, self.location, self.cluster, node_pool
+        );
+        let resp = self
+            .http
+            .get(&np_url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| BackendError::Sdk(Box::new(e)))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(BackendError::Protocol(format!(
+                "gke nodePools.get returned {status}: {body}"
+            )));
+        }
+        let np: NodePoolResp = resp
+            .json()
+            .await
+            .map_err(|e| BackendError::Sdk(Box::new(e)))?;
+
+        if np.instance_group_urls.len() > 1 {
+            tracing::warn!(node_pool, groups = np.instance_group_urls.len(),
+                "multiple MIGs: setSize nodeCount is per-zone; the operator targets single-zone pools");
+        }
+        Ok(np)
     }
 
     async fn token(&self) -> Result<String, BackendError> {
@@ -138,6 +174,41 @@ async fn fetch_meta(http: &reqwest::Client, path: &str) -> Result<String, Backen
 
 #[async_trait]
 impl NodePoolScaler for GkeNodePoolScaler {
+    async fn current_target(&self, node_pool: &str) -> Result<u32, BackendError> {
+        let token = self.token().await?;
+        let pool = self.node_pool(node_pool, &token).await?;
+        let mut total = 0u32;
+        for url in pool.instance_group_urls {
+            let (zone, igm) = parse_igm_url(&url).ok_or_else(|| {
+                BackendError::Protocol(format!("invalid instance group URL: {url}"))
+            })?;
+            let resp = self
+                .http
+                .get(format!(
+                    "{COMPUTE_API}/projects/{}/zones/{zone}/instanceGroupManagers/{igm}",
+                    self.project
+                ))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .map_err(|e| BackendError::Sdk(Box::new(e)))?;
+            if !resp.status().is_success() {
+                return Err(BackendError::Protocol(format!(
+                    "compute instanceGroupManagers.get returned {}",
+                    resp.status()
+                )));
+            }
+            let group: InstanceGroupResp = resp
+                .json()
+                .await
+                .map_err(|e| BackendError::Sdk(Box::new(e)))?;
+            total = total
+                .checked_add(group.target_size)
+                .ok_or_else(|| BackendError::Protocol("node pool target exceeds u32".into()))?;
+        }
+        Ok(total)
+    }
+
     async fn set_size(&self, node_pool: &str, desired: u32) -> Result<(), BackendError> {
         let token = self.token().await?;
         let url = format!(
@@ -177,29 +248,7 @@ impl NodePoolScaler for GkeNodePoolScaler {
     /// `set_size`; the next reconcile re-observes the fleet.
     async fn remove_node(&self, node_pool: &str, node_name: &str) -> Result<(), BackendError> {
         let token = self.token().await?;
-        // 1. Fetch the pool's managed instance groups.
-        let np_url = format!(
-            "{CONTAINER_API}/projects/{}/locations/{}/clusters/{}/nodePools/{}",
-            self.project, self.location, self.cluster, node_pool
-        );
-        let resp = self
-            .http
-            .get(&np_url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| BackendError::Sdk(Box::new(e)))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(BackendError::Protocol(format!(
-                "gke nodePools.get returned {status}: {body}"
-            )));
-        }
-        let np: NodePoolResp = resp
-            .json()
-            .await
-            .map_err(|e| BackendError::Sdk(Box::new(e)))?;
+        let np = self.node_pool(node_pool, &token).await?;
 
         // 2. Find the MIG that owns this node (by hash-prefix match).
         let owner = np

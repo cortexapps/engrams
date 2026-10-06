@@ -67,11 +67,10 @@ pub struct HostFleetSpec {
     #[serde(default = "default_enable_work_timeout")]
     pub enable_work_timeout_seconds: u64,
 
-    /// ADR 0044 K4: optional node-pool autoscaling. When set, the operator
-    /// polls the coordinator's fleet demand and resizes the host node pool to
-    /// hold `targetFreeMib` of headroom (scale-up only in v1; drain-gated
-    /// scale-down is a follow-up). With the default noop scaler the operator
-    /// only *logs* the desired size.
+    /// Optional node-pool autoscaling. The operator uses fleet demand to
+    /// keep `targetFreeMib` of headroom. Explicit `noop` selection computes
+    /// and logs the plan without autoscale mutations. GKE or ASG
+    /// initialization errors fail operator startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoscaling: Option<AutoscalingSpec>,
 }

@@ -47,8 +47,8 @@ pub struct AsgNodePoolScaler {
 
 impl AsgNodePoolScaler {
     /// Build against the SDK default chains. Fails fast when no region
-    /// resolves (off-AWS, or a pod without `AWS_REGION`/IRSA env) so
-    /// the operator falls back to the noop scaler instead of wedging.
+    /// resolves (off-AWS, or a pod without `AWS_REGION`/IRSA env).
+    /// Detection errors fail operator startup.
     pub async fn detect() -> Result<Self, BackendError> {
         let cfg = engram_aws::sdk_config(engram_aws::AwsOverrides::default()).await;
         let Some(region) = cfg.region().cloned() else {
@@ -129,6 +129,31 @@ impl AsgNodePoolScaler {
 
 #[async_trait]
 impl NodePoolScaler for AsgNodePoolScaler {
+    async fn current_target(&self, node_pool: &str) -> Result<u32, BackendError> {
+        let resp = self
+            .asg
+            .describe_auto_scaling_groups()
+            .auto_scaling_group_names(node_pool)
+            .send()
+            .await
+            .map_err(|e| BackendError::Sdk(Box::new(e)))?;
+        let capacity = resp
+            .auto_scaling_groups()
+            .iter()
+            .find(|g| g.auto_scaling_group_name() == Some(node_pool))
+            .and_then(|g| g.desired_capacity())
+            .ok_or_else(|| {
+                BackendError::Protocol(format!(
+                    "ASG {node_pool} or its desired capacity is missing"
+                ))
+            })?;
+        u32::try_from(capacity).map_err(|_| {
+            BackendError::Protocol(format!(
+                "ASG {node_pool} has negative desired capacity: {capacity}"
+            ))
+        })
+    }
+
     async fn set_size(&self, node_pool: &str, desired: u32) -> Result<(), BackendError> {
         self.asg
             .set_desired_capacity()
@@ -259,6 +284,44 @@ mod tests {
 
     fn xml(body: &str) -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_raw(body.to_string(), "text/xml")
+    }
+
+    const ASG_GROUP: &str = r#"<DescribeAutoScalingGroupsResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">
+      <DescribeAutoScalingGroupsResult><AutoScalingGroups><member>
+        <AutoScalingGroupName>engram-kvm</AutoScalingGroupName>
+        <DesiredCapacity>5</DesiredCapacity>
+      </member></AutoScalingGroups></DescribeAutoScalingGroupsResult>
+    </DescribeAutoScalingGroupsResponse>"#;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_target_reads_desired_capacity() {
+        let server = MockServer::start().await;
+        Mock::given(body_string_contains("Action=DescribeAutoScalingGroups"))
+            .and(body_string_contains(
+                "AutoScalingGroupNames.member.1=engram-kvm",
+            ))
+            .respond_with(xml(ASG_GROUP))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let scaler = AsgNodePoolScaler::for_tests(server.uri()).await;
+        assert_eq!(scaler.current_target("engram-kvm").await.unwrap(), 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_target_missing_group_is_err() {
+        let server = MockServer::start().await;
+        Mock::given(body_string_contains("Action=DescribeAutoScalingGroups"))
+            .and(body_string_contains("AutoScalingGroupNames.member.1=missing"))
+            .respond_with(xml(r#"<DescribeAutoScalingGroupsResponse xmlns="http://autoscaling.amazonaws.com/doc/2011-01-01/">
+              <DescribeAutoScalingGroupsResult><AutoScalingGroups/></DescribeAutoScalingGroupsResult>
+            </DescribeAutoScalingGroupsResponse>"#))
+            .expect(1).mount(&server).await;
+        let scaler = AsgNodePoolScaler::for_tests(server.uri()).await;
+        assert!(matches!(
+            scaler.current_target("missing").await,
+            Err(BackendError::Protocol(_))
+        ));
     }
 
     const EC2_NO_INSTANCES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>

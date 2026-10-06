@@ -1,14 +1,10 @@
 //! ADR 0044 K4: node-pool autoscaling — the operator's *policy* half.
 //!
 //! The operator reads the coordinator's fleet demand and computes a desired
-//! host node-pool size ([`desired_hosts`]); a [`NodePoolScaler`]
-//! (`engram_core::traits::cloud`) actuates it. The actuator is per-cloud and
-//! lives in its own crate (`engram_cloud_gcp::gke` does GKE); [`NoopScaler`]
-//! here is the default that only *logs* the decision, so you can observe what
-//! the autoscaler would do without an actuator wired.
+//! host node-pool size ([`desired_hosts`]). Cloud actuators implement
+//! `engram_core::traits::cloud::NodePoolScaler`. Explicit `noop` selection
+//! computes and logs the autoscale plan without mutations.
 
-use engram_core::traits::cloud::NodePoolScaler;
-use engram_core::BackendError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -18,10 +14,7 @@ use serde::{Deserialize, Serialize};
 /// node, and `NodePoolScaler::set_size` is count-only (it can't pick *which*
 /// node the cloud removes), so a blind shrink could delete a node with live
 /// microVMs. Safe scale-down therefore drains a *specific* least-loaded node
-/// first and then removes *that* node — which needs node-specific cloud
-/// removal (a follow-up actuator). Until that lands the operator computes +
-/// **logs** the decision but does not actuate, mirroring how K4 scale-up
-/// shipped behind the logging `NoopScaler`.
+/// first and then removes that node through the cloud actuator.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum ScaleDownMode {
@@ -40,32 +33,6 @@ pub enum ScaleDownMode {
 impl ScaleDownMode {
     pub(crate) fn enabled(self) -> bool {
         !matches!(self, ScaleDownMode::Off)
-    }
-}
-
-/// Logs the decision without touching any cloud — the operator's default +
-/// dev/test fallback. Real actuators (e.g. `engram_cloud_gcp::gke`) implement
-/// [`NodePoolScaler`] in their own crates and are selected in `main`.
-pub struct NoopScaler;
-
-#[async_trait::async_trait]
-impl NodePoolScaler for NoopScaler {
-    async fn set_size(&self, node_pool: &str, desired: u32) -> Result<(), BackendError> {
-        tracing::info!(
-            node_pool,
-            desired,
-            "noop scaler: would set host node-pool size (no cloud actuator configured)"
-        );
-        Ok(())
-    }
-
-    async fn remove_node(&self, node_pool: &str, node_name: &str) -> Result<(), BackendError> {
-        tracing::info!(
-            node_pool,
-            node_name,
-            "noop scaler: would remove node (no cloud actuator configured)"
-        );
-        Ok(())
     }
 }
 

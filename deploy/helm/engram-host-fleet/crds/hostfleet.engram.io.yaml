@@ -37,7 +37,7 @@
               "spec": {
                 "properties": {
                   "autoscaling": {
-                    "description": "ADR 0044 K4: optional node-pool autoscaling. When set, the operator\npolls the coordinator's fleet demand and resizes the host node pool to\nhold `targetFreeMib` of headroom (scale-up only in v1; drain-gated\nscale-down is a follow-up). With the default noop scaler the operator\nonly *logs* the desired size.",
+                    "description": "Optional node-pool autoscaling. The operator uses fleet demand to\nkeep `targetFreeMib` of headroom. Explicit `noop` selection computes\nand logs the plan without autoscale mutations. GKE or ASG\ninitialization errors fail operator startup.",
                     "nullable": true,
                     "properties": {
                       "maxConcurrentDrains": {
