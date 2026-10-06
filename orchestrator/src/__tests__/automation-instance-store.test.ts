@@ -68,10 +68,14 @@ describe.skipIf(!dbReachable)("automation instance store (live PG)", () => {
     const first = await store.openInstance({
       automationId: autoId,
       key: "project-ENG-1",
+      label: "Fix the deploy",
       inputs: { channel: "#eng-1" },
       openedBy: "user:u-1",
     });
     expect(first.id.startsWith("ai_")).toBe(true);
+    // The title rendered at open rides the row; the key stays the identity.
+    expect(first.label).toBe("Fix the deploy");
+    expect((await store.getInstance(first.id))?.label).toBe("Fix the deploy");
     expect(first.status).toBe("open");
 
     // A concurrent open of the same key must JOIN, never mutate the snapshot.

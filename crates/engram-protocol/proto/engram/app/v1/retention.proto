@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// Retention policies an admin chooses (Settings → Retention). Run detail
+// retention is the first; session retention joins here.
+service RetentionService {
+  rpc GetRetentionPolicy(GetRetentionPolicyRequest) returns (GetRetentionPolicyResponse);
+  rpc SetRetentionPolicy(SetRetentionPolicyRequest) returns (SetRetentionPolicyResponse);
+}
+
+message RetentionPolicy {
+  // Days a finished automation run keeps its step details (block inputs and
+  // outputs, the relay's per-event records) and its engine records. The run
+  // itself stays. 7..365; the collector reads this every cycle.
+  int32 run_detail_days = 1;
+}
+
+message GetRetentionPolicyRequest {}
+
+message GetRetentionPolicyResponse {
+  RetentionPolicy policy = 1;
+}
+
+message SetRetentionPolicyRequest {
+  RetentionPolicy policy = 1;
+}
+
+message SetRetentionPolicyResponse {
+  RetentionPolicy policy = 1;
+}

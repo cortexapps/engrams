@@ -43,7 +43,8 @@ modules/
   cloudsql/           Postgres 16 on a private IP, both databases, connection
                       strings in Secret Manager
   secret-shells/      empty Secret Manager shells for the operator-populated secrets:
-                      master key, auth tokens, session signing, egress CA.
+                      master key, auth tokens, session signing, OAuth client secret,
+                      egress CA.
                       Material never enters Terraform state.
   host-operator-iam/  the autoscaling operator's least-privilege role and account
 quickstart/           ONE apply from a fresh project to an engrams-ready cluster:

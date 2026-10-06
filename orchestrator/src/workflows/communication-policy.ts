@@ -1,22 +1,45 @@
 /**
- * The per-source communication seam (ADR 0060 §Communication policy, P1.4).
+ * The per-source communication seam (ADR 0060 §Communication policy, P1.4;
+ * since ADR 0119 phase 4.8 the relay block is its only driver).
  *
- * "Where does this go" is CODE, not config. The thread workflow (the
- * framework) owns event classification, identity, session create/resume, the
- * recv/drain loop, and outbound replay-dedupe (DBOS step checkpoints). A
- * `CommunicationPolicy` owns ONLY the provider mechanics — how an ack, a
- * question, an asset, a summary, or a failure is rendered on the source, and
- * how a thread's new messages are gathered into a prompt. Slack is the only
- * impl for v1 (P2); Linear/Jira/cron are designed-for (§Future).
+ * "Where does this go" is CODE, not config. The relay block (the framework)
+ * owns event classification, the per-turn ⏳/✅ ledger, and outbound
+ * replay-dedupe (DBOS step checkpoints). A `CommunicationPolicy` owns ONLY
+ * the provider mechanics — how an ack, a question, an asset, a summary, or a
+ * failure is rendered on the source. Slack is the only impl; Linear/Jira are
+ * designed-for. The thread's prompt (the fold of its new messages) is the
+ * built-in's own `list_replies` + Code block, not a policy method.
  *
  * This module is framework-side and DBOS-free: the interface, the pure
- * event-routing decision the workflow makes per event, and a fake for tests.
+ * event-routing decision the relay makes per event, and the source types.
  */
 
 import type { CuratedEvent } from "../control-plane/session-events.ts";
-import type { ProfileOption } from "../routing/profile-picker.ts";
 import { AnswersSchema, QuestionsSchema } from "../tools/builtin.ts";
-import type { SourceMention } from "./thread-inbox.ts";
+
+/**
+ * An `@mention` — the turn's anchor on the source. The provider-shaped
+ * fields are opaque to the framework; only the source's `CommunicationPolicy`
+ * interprets them. Shape matches the Slack events handler (ADR 0060 §handler).
+ */
+export interface SourceMention {
+  team: string;
+  channel: string;
+  threadRoot: string;
+  user: string;
+  ts: string;
+  eventId: string;
+}
+
+/**
+ * A human answer to a deferred `AskUserQuestion`, arriving via the source's
+ * interactivity surface (P2). `answers` is keyed by question text → selected
+ * labels, matching the canonical question tool result (ADR 0089).
+ */
+export interface SourceAnswer {
+  toolCallId: string;
+  answers: Record<string, string[]>;
+}
 
 /** A started session, as the thread workflow needs to reference it. */
 export interface StartedSession {
@@ -46,18 +69,6 @@ export interface ClosingSummary {
  * workflow-local state to later update via `onAnswered`.
  */
 export interface CommunicationPolicy {
-  /** Constant flavor appended to the agent's system prompt at session create
-   *  (ADR 0060 Decision 8) — NOT connector config. */
-  readonly systemPromptAppend: string;
-
-  /** The trigger was picked up (Slack: 👀 on the mention). */
-  onPickup(m: SourceMention): Promise<void>;
-  /** Routing needs the user: render the profile dropdown (Slack: a
-   *  static_select message in the thread); return the provider message ref. */
-  onProfileChoice(m: SourceMention, options: ProfileOption[]): Promise<string>;
-  /** A profile was chosen (by the user or a re-evaluation); `ref` is the value
-   *  `onProfileChoice` returned — update that message to the resolved state. */
-  onProfileChosen(m: SourceMention, ref: string, profileName: string): Promise<void>;
   /** The session started (Slack: a link message into the thread). */
   onStarted(m: SourceMention, session: StartedSession): Promise<void>;
   /** A run began on `m`'s turn — the agent is working (Slack: ⏳ on the message). */
@@ -82,7 +93,7 @@ export interface CommunicationPolicy {
    *  the session's last assistant message + a recap of the assets it produced. */
   onComplete(m: SourceMention, session: StartedSession, summary: ClosingSummary): Promise<void>;
   /** A failure (identity, create, or terminal-failure) — ❌ + actionable text.
-   *  TERMINAL: the thread workflow exits after this. */
+   *  TERMINAL: the run's relay closes after this. */
   onFail(m: SourceMention, message: string): Promise<void>;
   /** A neutral terminal close — the session's sandbox was reclaimed (host roll,
    *  `host_lost`, dev-stack churn), not a success or a failure. Informational,
@@ -91,16 +102,13 @@ export interface CommunicationPolicy {
   /** A NON-FATAL, retryable delivery failure on an otherwise-healthy thread — a
    *  follow-up prompt or an answer that couldn't reach the live session right
    *  now (e.g. the session was mid-resume). ⚠️ + an actionable "try again" note;
-   *  the thread workflow stays alive so the next mention retries. Distinct from
-   *  `onFail`, whose ❌ signals the thread is over. */
+   *  the run stays alive so the next mention retries. Distinct from `onFail`,
+   *  whose ❌ signals the thread's run is over. */
   onDeliveryError(m: SourceMention, message: string): Promise<void>;
-  /** Gather thread messages after `since` (null = the whole thread) into a
-   *  prompt; `maxTs` is the newest message seen, the next `since`. */
-  gatherThreadContext(m: SourceMention, since: string | null): Promise<{ prompt: string; maxTs: string }>;
 }
 
 /** The effect a curated session event maps to — the framework's per-event
- *  classification, consumed by the thread workflow's dispatch. */
+ *  classification, consumed by the relay block's dispatch. */
 export type SessionEffect =
   | { kind: "question"; toolCallId: string | undefined; via: QuestionProtocol }
   | { kind: "answered"; toolCallId: string | undefined; via: QuestionProtocol }

@@ -51,11 +51,20 @@ function runCompletedFailed(payloadJson: string): boolean {
 const log = rootLog.child({ component: "automation-consumer" });
 
 export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionConsumer {
-  let binding: AutomationSessionBindingRef | null | undefined;
+  // The applies-to answer is memoized (a session with no binding never gets
+  // one later). The DESTINATION is not: a kept session's binding moves to
+  // the next run of its workstream when that run adopts it (D11), and the
+  // listener outlives both runs — an address taken once would keep sending
+  // every later event to the finished run's mailbox, where it is dropped as
+  // "run finished", and the resumed run would never see its session speak.
+  let applies: boolean | undefined;
 
-  const destination = (): AutomationSessionBindingRef => {
-    if (!binding) throw new Error("Automation consumer has no run binding");
-    return binding;
+  const destination = async (sessionId: string): Promise<AutomationSessionBindingRef | null> => {
+    const live = await deps.findSessionBinding(sessionId);
+    if (live === null) {
+      log.debug({ sessionId }, "automation session binding gone; session event dropped");
+    }
+    return live;
   };
 
   // A session is KEPT by default (D8), so it outlives its run. Every later
@@ -80,22 +89,23 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
     name: "automation",
     interestedIn: () => true,
     async appliesTo(sessionId) {
-      if (binding === undefined) {
-        binding = await deps.findSessionBinding(sessionId);
+      if (applies === undefined) {
+        applies = (await deps.findSessionBinding(sessionId)) !== null;
       }
-      return binding !== null;
+      return applies;
     },
     async handle(event, ctx) {
+      // Re-read per event: the run that owns the session (adoption moves it)
+      // and the relay flag (it flips AFTER the session exists, when the
+      // relay block installs).
+      const live = await destination(ctx.sessionId);
+      if (live === null) return;
       // Contract 3: a relay-bound session forwards EVERY curated event so an
       // installed handler can render the conversation (idle still rides the
-      // dedicated arm below, so wait matchers keep working unchanged). The
-      // relay flag flips AFTER the session exists (when the relay block
-      // installs), so it is re-read per event rather than taken from the
-      // memoized applies-to binding.
-      const live = await deps.findSessionBinding(ctx.sessionId);
-      if (live?.relay === true) {
+      // dedicated arm below, so wait matchers keep working unchanged).
+      if (live.relay === true) {
         await deliver(
-          destination().runId,
+          live.runId,
           { kind: "session_event", sessionId: ctx.sessionId, event },
           AUTOMATION_TOPIC,
           inboxKeys.sessionEvent(ctx.sessionId, event.idx),
@@ -107,7 +117,7 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
       if (event.kind !== "run_completed") return;
       const runFailed = runCompletedFailed(event.payloadJson);
       await deliver(
-        destination().runId,
+        live.runId,
         {
           kind: "session_idle",
           sessionId: ctx.sessionId,
@@ -118,8 +128,10 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
       );
     },
     async onTerminal(outcome, ctx) {
+      const live = await destination(ctx.sessionId);
+      if (live === null) return;
       await deliver(
-        destination().runId,
+        live.runId,
         { kind: "session_ended", sessionId: ctx.sessionId, outcome },
         AUTOMATION_TOPIC,
         inboxKeys.sessionEnded(ctx.sessionId),

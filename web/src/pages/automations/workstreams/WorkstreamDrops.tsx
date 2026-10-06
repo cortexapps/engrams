@@ -5,7 +5,16 @@ import { relativeAge } from "@/lib/relative-time";
 
 export type WorkstreamDrop = AutomationDropBrief & { automationId?: string };
 
-export function WorkstreamDrops({ drops, now }: { drops: readonly WorkstreamDrop[]; now: number }) {
+export function WorkstreamDrops({
+  drops,
+  now,
+  describeDetail = (drop) => drop.detail,
+}: {
+  drops: readonly WorkstreamDrop[];
+  now: number;
+  /** The drop's detail (a key or a handle) as the page's reader knows it. */
+  describeDetail?: (drop: WorkstreamDrop) => string;
+}) {
   const [expanded, setExpanded] = useState(false);
   const recent = drops.filter((drop) => {
     const droppedAt = Date.parse(drop.droppedAt);
@@ -48,7 +57,7 @@ export function WorkstreamDrops({ drops, now }: { drops: readonly WorkstreamDrop
             >
               <span className="min-w-0 truncate">
                 <span className="font-mono">{drop.eventKey || "unknown event"}</span>
-                {drop.detail && ` · ${drop.detail}`}
+                {drop.detail && ` · ${describeDetail(drop)}`}
               </span>
               <span className="font-mono tabular-nums">{relativeAge(drop.droppedAt, now)}</span>
             </li>

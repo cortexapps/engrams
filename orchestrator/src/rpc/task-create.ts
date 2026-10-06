@@ -36,7 +36,6 @@ import type { ImagesClient } from "./profiles.ts";
 import { evictOwnerCacheEntry } from "../authz/resolve.ts";
 import {
   sessionListener as sessionListenerTable,
-  slackSession as slackSessionTable,
   task as taskTable,
   taskSession as taskSessionTable,
   type ProfileNetwork,
@@ -797,8 +796,6 @@ export interface CreateTaskParams {
   /** Extra harness env merged LAST — e.g. the trigger's
    *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). */
   extraHarnessEnv?: Record<string, string>;
-  /** Slack workflow mailbox to bind before the listener becomes discoverable. */
-  slackThreadWorkflowId?: string;
 }
 
 export interface CreateSessionForExistingTaskParams {
@@ -1187,12 +1184,6 @@ export async function createTaskWithSession(
       }),
       integrationPrincipalId: params.ownerUserId,
     });
-    if (params.slackThreadWorkflowId !== undefined) {
-      await tx.insert(slackSessionTable).values({
-        sessionId,
-        threadWfId: params.slackThreadWorkflowId,
-      });
-    }
     // ADR 0118: reserve every app's hostname HERE — one batched insert inside a
     // transaction that already runs, before the session exists. That is what
     // makes the addresses available as env vars below, and it costs no extra
@@ -1251,9 +1242,7 @@ export async function createTaskWithSession(
     }
     try {
       await deps.db.transaction(async (tx) => {
-        // slack_session has no FK to the task model; the task delete cascades
-        // task_session only, so remove the Slack binding explicitly.
-        await tx.delete(slackSessionTable).where(eq(slackSessionTable.sessionId, sessionId));
+        // The task delete cascades task_session.
         await tx.delete(taskTable).where(eq(taskTable.id, taskId));
       });
     } catch (dbErr) {

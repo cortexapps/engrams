@@ -4,8 +4,10 @@
 import { Hono } from "hono";
 
 import { getSessionFromHeaders } from "../auth/session.ts";
-import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
+import { makeAutomationStore } from "../db/automations.ts";
+import { getDb } from "../db/client.ts";
 import { dispatchAutomationReview, type ReviewCoordinate } from "../reviews/automation-review.ts";
+import { makeEnrolledRepos, type EnrolledRepos } from "../reviews/enrolled-repos.ts";
 
 type GetSession = (
   headers: Headers,
@@ -13,7 +15,8 @@ type GetSession = (
 
 export interface ReviewsDispatchDeps {
   getSession?: GetSession;
-  enrollments?: Pick<EnrollmentStore, "get">;
+  /** The PR-review built-in's `repos` input: which repos get reviews. */
+  enrolledRepos?: Pick<EnrolledRepos, "get">;
   /** Admit a built-in run for the coordinate; returns the run id. */
   dispatchAutomation?: (input: ReviewCoordinate) => Promise<string>;
 }
@@ -22,9 +25,9 @@ export function makeReviewsDispatchRoute(
   deps: ReviewsDispatchDeps = {},
 ): Hono {
   const getSession: GetSession = deps.getSession ?? getSessionFromHeaders;
-  let enrollmentStore = deps.enrollments;
-  const enrollments = (): Pick<EnrollmentStore, "get"> =>
-    (enrollmentStore ??= makeEnrollmentStore());
+  let enrolled = deps.enrolledRepos;
+  const enrolledRepos = (): Pick<EnrolledRepos, "get"> =>
+    (enrolled ??= makeEnrolledRepos(makeAutomationStore(getDb())));
   const dispatchAutomation = deps.dispatchAutomation ?? dispatchAutomationReview;
   const app = new Hono();
 
@@ -45,8 +48,9 @@ export function makeReviewsDispatchRoute(
       return c.json({ error: "repo and positive pr_number are required" }, 400);
     }
 
-    if (!(await enrollments().get(repo))) {
-      // A missing enrollment is a stable resource miss, not a transient conflict.
+    if (!(await enrolledRepos().get(repo))) {
+      // A repo the built-in does not list is a stable resource miss, not a
+      // transient conflict.
       return c.json({ error: "repo is not enrolled" }, 404);
     }
     // The run id is the DBOS workflow id, so the response shape holds.

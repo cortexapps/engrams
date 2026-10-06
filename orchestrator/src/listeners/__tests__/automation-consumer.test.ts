@@ -192,6 +192,46 @@ describe("Automation consumer — relay gate (ADR 0119 phase 4.5)", () => {
     expect(sent.calls.map((c) => c.message.kind)).toEqual(["session_event", "session_idle"]);
   });
 
+  test("the destination is re-read per event: a kept session adopted by a later run of its workstream routes there", async () => {
+    // r-old answered the thread and ended; the session was kept. A later
+    // mention opened r-new, which adopted the session (D11). The listener
+    // outlived both runs — it must not keep sending to r-old's mailbox.
+    let runId = "autorun:auto-1:main:i-1:slack:Ev-old";
+    const sent = sender();
+    const consumer = makeAutomationConsumer({
+      findSessionBinding: async () => ({ runId, relay: true }),
+      send: sent.send,
+    });
+    expect(await consumer.appliesTo("session-1")).toBe(true);
+    await consumer.handle({ idx: 1n, kind: "run_completed", payloadJson: "{}" }, { sessionId: "session-1" });
+    runId = "autorun:auto-1:main:i-1:slack:Ev-new"; // the resumed run adopted the session
+    await consumer.handle({ idx: 2n, kind: "agent_message", payloadJson: "{}" }, { sessionId: "session-1" });
+    await consumer.handle({ idx: 3n, kind: "run_completed", payloadJson: "{}" }, { sessionId: "session-1" });
+    await consumer.onTerminal!("completed", { sessionId: "session-1" });
+    expect(sent.calls.map((c) => [c.destinationId.slice(-6), c.message.kind])).toEqual([
+      ["Ev-old", "session_event"],
+      ["Ev-old", "session_idle"],
+      ["Ev-new", "session_event"],
+      ["Ev-new", "session_event"],
+      ["Ev-new", "session_idle"],
+      ["Ev-new", "session_ended"],
+    ]);
+  });
+
+  test("a binding that is gone drops the event instead of throwing", async () => {
+    let bound = true;
+    const sent = sender();
+    const consumer = makeAutomationConsumer({
+      findSessionBinding: async () => (bound ? { runId: RUN_ID, relay: true } : null),
+      send: sent.send,
+    });
+    expect(await consumer.appliesTo("session-1")).toBe(true);
+    bound = false;
+    await consumer.handle({ idx: 1n, kind: "run_completed", payloadJson: "{}" }, { sessionId: "session-1" });
+    await consumer.onTerminal!("completed", { sessionId: "session-1" });
+    expect(sent.calls).toEqual([]);
+  });
+
   test("the relay flag is re-read per event, so a flip after install takes effect", async () => {
     let relay = false;
     const sent = sender();

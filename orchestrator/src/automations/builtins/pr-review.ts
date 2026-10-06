@@ -61,7 +61,7 @@ export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
 /** Bump on any graph or inputs-schema change (the seeder inserts a new
  * version when the stored content hash differs). */
-export const PR_REVIEW_DEFINITION_VERSION = 8;
+export const PR_REVIEW_DEFINITION_VERSION = 9;
 
 /** Synthetic event key the CI dispatch edge admits a run under (no GitHub
  * delivery carries it). The admission arm accepts it for any mapped repo. */
@@ -237,6 +237,17 @@ function prompt(
   };
 }
 
+/** The head, as a human reads a SHA. */
+const HEAD_SHORT = "${{ steps.open.head_sha | truncate: 7, '' }}";
+/** The status line while a pass runs. */
+const REVIEWING_STATUS = `👀 engrams is reviewing ${HEAD_SHORT}.`;
+/** The pinned status comment's key: `upsert_issue_comment` finds the
+ * comment by it on every pass, and every edit goes through
+ * `update_pinned_comment` with the same key so the marker survives the
+ * rewrite (an edit through the plain update action would drop it, and the
+ * next pass would post a second comment). */
+const STATUS_KEY = "review-status";
+
 const blocks: BlockDef[] = [
   {
     id: "facts",
@@ -269,17 +280,38 @@ const blocks: BlockDef[] = [
       pr: { $ref: `${F}.pr_context` },
     },
   },
+  // ONE status comment per pull request, edited across passes: the pinned
+  // comment is found by its key on every later pass (the connector's
+  // marker scan), so a PR carries a single engrams status line that always
+  // names the latest head, not one new comment per push.
   {
     id: "ack",
     type: "integration_action",
     tunable: ["params"],
     config: {
       provider: "github",
-      actionId: "create_issue_comment",
+      actionId: "upsert_issue_comment",
       params: {
         repo: REPO,
         number: PR_NUMBER,
-        body: "👀 engrams is reviewing ${{ steps.open.head_sha | truncate: 7, '' }}.",
+        key: STATUS_KEY,
+        body: REVIEWING_STATUS,
+      },
+    },
+  },
+  // A found comment still says what the previous pass said: rewrite it.
+  {
+    id: "ack_refresh",
+    type: "integration_action",
+    tunable: ["params"],
+    config: {
+      provider: "github",
+      actionId: "update_pinned_comment",
+      params: {
+        repo: REPO,
+        commentId: { $ref: "steps.ack.commentId" },
+        key: STATUS_KEY,
+        body: REVIEWING_STATUS,
       },
     },
   },
@@ -323,57 +355,94 @@ const blocks: BlockDef[] = [
     tunable: [],
     config: { reviewId: "${{ steps.open.review_id }}" },
   },
+  // A review object on the PR only when there is something to review: a
+  // pass with findings posts the GitHub review (inline comments + summary)
+  // and points the status line at it; a clean pass says so on the status
+  // line alone — an empty "No findings" review under every push was noise.
   {
-    id: "post",
-    type: "integration_action",
+    id: "has_findings",
+    type: "branch",
     tunable: [],
     config: {
-      provider: "github",
-      actionId: "post_pr_review",
-      params: {
-        repo: "${{ steps.gate.repo }}",
-        prNumber: { $ref: "steps.gate.pr_number" },
-        commitId: "${{ steps.gate.commit_id }}",
-        summary: "${{ steps.gate.summary_md }}",
-        // GitHub refuses the whole batch when one anchor is outside the
-        // diff (422); the action then posts this body instead, which
-        // re-quotes every finding so the PR still shows them.
-        fallbackSummary: "${{ steps.gate.fallback_summary_md }}",
-        comments: { $ref: "steps.gate.comments" },
+      conditions: {
+        mode: "any",
+        conditions: [
+          { path: "steps.gate.to_post_count", op: "gt", value: 0 },
+          { path: "steps.gate.ui_only_count", op: "gt", value: 0 },
+        ],
       },
     },
-  },
-  {
-    // The posted review's id onto the pass, so the dossier links to it. The
-    // settle step marked the pass posted before the post ran, so this is the
-    // one write left after the action (the legacy post step did both).
-    id: "record_post",
-    type: REVIEW_RECORD_POST_TYPE,
-    tunable: [],
-    config: {
-      reviewId: { $ref: "steps.open.review_id" },
-      // Missing on a replayed post (marker already there): `default` makes
-      // the absent output render empty instead of failing the render.
-      githubReviewId: "${{ steps.post.github_review_id | default: '' }}",
-      // "false" when the action fell back to the summary-only review: the
-      // findings settle as ui_only and the pass summary follows the PR.
-      inlinePosted: "${{ steps.post.inline_posted | default: true }}",
-    },
-  },
-  {
-    id: "status",
-    type: "integration_action",
-    tunable: ["params"],
-    config: {
-      provider: "github",
-      actionId: "update_issue_comment",
-      params: {
-        repo: REPO,
-        commentId: { $ref: "steps.ack.commentId" },
-        body:
-          "✅ engrams posted ${{ steps.gate.to_post_count }} finding(s) for ${{ steps.open.head_sha | truncate: 7, '' }}.",
+    then: [
+      {
+        id: "post",
+        type: "integration_action",
+        tunable: [],
+        config: {
+          provider: "github",
+          actionId: "post_pr_review",
+          params: {
+            repo: "${{ steps.gate.repo }}",
+            prNumber: { $ref: "steps.gate.pr_number" },
+            commitId: "${{ steps.gate.commit_id }}",
+            summary: "${{ steps.gate.summary_md }}",
+            // GitHub refuses the whole batch when one anchor is outside the
+            // diff (422); the action then posts this body instead, which
+            // re-quotes every finding so the PR still shows them.
+            fallbackSummary: "${{ steps.gate.fallback_summary_md }}",
+            comments: { $ref: "steps.gate.comments" },
+          },
+        },
       },
-    },
+      {
+        // The posted review's id onto the pass, so the dossier links to it.
+        // The settle step marked the pass posted before the post ran, so
+        // this is the one write left after the action.
+        id: "record_post",
+        type: REVIEW_RECORD_POST_TYPE,
+        tunable: [],
+        config: {
+          reviewId: { $ref: "steps.open.review_id" },
+          // Missing on a replayed post (marker already there): `default`
+          // makes the absent output render empty instead of failing.
+          githubReviewId: "${{ steps.post.github_review_id | default: '' }}",
+          // "false" when the action fell back to the summary-only review:
+          // the findings settle as ui_only and the pass summary follows.
+          inlinePosted: "${{ steps.post.inline_posted | default: true }}",
+        },
+      },
+      {
+        id: "status",
+        type: "integration_action",
+        tunable: ["params"],
+        config: {
+          provider: "github",
+          actionId: "update_pinned_comment",
+          params: {
+            repo: REPO,
+            commentId: { $ref: "steps.ack.commentId" },
+            key: STATUS_KEY,
+            body: `✅ engrams reviewed ${HEAD_SHORT} — see the review below.`,
+          },
+        },
+      },
+    ],
+    else: [
+      {
+        id: "status_clean",
+        type: "integration_action",
+        tunable: ["params"],
+        config: {
+          provider: "github",
+          actionId: "update_pinned_comment",
+          params: {
+            repo: REPO,
+            commentId: { $ref: "steps.ack.commentId" },
+            key: STATUS_KEY,
+            body: `✅ engrams reviewed ${HEAD_SHORT}: no findings.`,
+          },
+        },
+      },
+    ],
   },
 ];
 

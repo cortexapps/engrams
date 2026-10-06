@@ -84,8 +84,21 @@ function makeTestRouter(auth: AuthState | null, path = "/login") {
 }
 
 test("renders sign-in form for unauthenticated visitor at /login", async () => {
-  render(<RouterProvider router={makeTestRouter(null)} />);
-  await screen.findByLabelText(/email/i);
+  // The Login page renders the door the deployment reports (auth-config). It
+  // no longer guesses a password form when that fetch fails, so serve one.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ mode: "password", passwordAuth: true, signup: true })),
+    ),
+  );
+  try {
+    render(<RouterProvider router={makeTestRouter(null)} />);
+    await screen.findByLabelText(/email/i);
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
 
 test("redirects authenticated user away from /login to /sessions", async () => {
@@ -107,6 +120,23 @@ test("keeps an authenticated /login?next= arrival on the page so it can bounce b
   );
   await router.load();
   expect(router.state.location.pathname).toBe("/login");
+});
+
+// A signed-out deep link keeps its destination through sign-in. The case that
+// hurts without it: `engrams auth login` opens /device?user_code=…, the person
+// signs in, lands on the dashboard, and the code they came to approve is gone.
+test("sends a signed-out deep link to /login with the page as next", async () => {
+  const router = makeTestRouter(null, "/device?user_code=ABCD-1234");
+  await router.load();
+  expect(router.state.location.pathname).toBe("/login");
+  expect(router.state.location.search).toEqual({ next: "/device?user_code=ABCD-1234" });
+});
+
+test("sends a signed-out visit to the root to a clean /login", async () => {
+  const router = makeTestRouter(null, "/");
+  await router.load();
+  expect(router.state.location.pathname).toBe("/login");
+  expect(router.state.location.search).toEqual({});
 });
 
 test("still short-circuits an authenticated /login with no next", async () => {

@@ -119,6 +119,11 @@ const instanceSettingsSchema = z.object({
    * rendered in the concurrency-key scope ({trigger, event.raw, inputs}) —
    * one template contract for authors. */
   keyTemplate: z.string().min(1),
+  /** The human title, rendered once at instance open in the same scope as
+   * the key (e.g. the Slack mention's text, `| strip_mentions | truncate:
+   * 80`). The key stays the identity; this is what the UI shows. Empty =
+   * the UI falls back to the key. */
+  labelTemplate: z.string().min(1).optional(),
   /** Input-snapshot templates rendered at instance open: field key →
    * template over the admitting event. Unlisted fields snapshot the
    * automation row's value (which demotes to "defaults for new
@@ -713,6 +718,9 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
   const instance = definition.settings.instance;
   if (instance) {
     validateTemplatesIn("__settings__", instance.keyTemplate, "instance.keyTemplate");
+    if (instance.labelTemplate !== undefined) {
+      validateTemplatesIn("__settings__", instance.labelTemplate, "instance.labelTemplate");
+    }
     const inputKeys = new Set(definition.inputsSchema.map((field) => field.key));
     for (const [key, template] of Object.entries(instance.inputs ?? {})) {
       if (!inputKeys.has(key)) {

@@ -2,6 +2,8 @@ import { Code, ConnectError } from "@connectrpc/connect";
 
 import {
   curateWireEvent,
+  PARKED_STATUS,
+  parseStatusChangeTo,
   parseTerminalOutcome,
   terminalOutcomeForStatus,
   type BoundedRead,
@@ -42,6 +44,11 @@ const STREAM_PROBE_INTERVAL_MS = 30_000;
  * replacement — possibly on another pod (issue #704: a wedged listener must
  * never keep renewing). */
 const STALE_GRACE_TTL_FACTOR = 3;
+/** A stand-down is refused while a wake (a resuming session RPC) is younger
+ * than this: the coordinator may still report `parked` for a session whose
+ * resume is under way, and the events of that resume must not be missed. A
+ * resume takes seconds; the grace is generous. */
+const STAND_DOWN_GRACE_MS = 2 * 60_000;
 
 export interface OpenedSessionStream {
   events: AsyncIterable<WireEvent>;
@@ -77,6 +84,8 @@ export interface SessionListenerDeps {
   staleGraceMs?: number;
   /** Clock for staleness accounting; default Date.now. */
   now?: () => number;
+  /** Wake grace inside which a stand-down is refused; default STAND_DOWN_GRACE_MS. */
+  standDownGraceMs?: number;
 }
 
 interface ConsumerState {
@@ -110,6 +119,7 @@ export class SessionListener {
   readonly #rpcDeadlineMs: number;
   readonly #probeIntervalMs: number;
   readonly #staleGraceMs: number;
+  readonly #standDownGraceMs: number;
   readonly #now: () => number;
   #stopRequested = false;
   #stream: OpenedSessionStream | null = null;
@@ -126,6 +136,7 @@ export class SessionListener {
     this.#rpcDeadlineMs = deps.rpcDeadlineMs ?? RPC_DEADLINE_MS;
     this.#probeIntervalMs = deps.probeIntervalMs ?? STREAM_PROBE_INTERVAL_MS;
     this.#staleGraceMs = deps.staleGraceMs ?? STALE_GRACE_TTL_FACTOR * deps.ttlMs;
+    this.#standDownGraceMs = deps.standDownGraceMs ?? STAND_DOWN_GRACE_MS;
     this.#now = deps.now ?? Date.now;
     this.#lastLiveAt = this.#now();
   }
@@ -232,6 +243,9 @@ export class SessionListener {
     let lastSeen = this.#minimumCursor();
     let reconnectAttempt = 0;
     let statusProbed = false;
+    // A stand-down refused inside the wake grace is retried at the next
+    // quiet probe: if the session is still parked by then, stand down.
+    let standDownPending = false;
     while (!this.#stopRequested) {
       // Per-connection, read in the catch to decide whether to reset the
       // backoff: only a connection that delivered a frame and stayed open a
@@ -266,6 +280,20 @@ export class SessionListener {
             await this.#finishTerminal(outcome);
             return;
           }
+          if (status === PARKED_STATUS) {
+            // A parked session emits nothing until a resume. Drain what the
+            // log holds, then stand down instead of holding a stream open —
+            // unless a wake is fresh (a resume may be under way), in which
+            // case listen as usual.
+            const drained = await this.#catchUp();
+            if (drained.lastSeen > lastSeen) lastSeen = drained.lastSeen;
+            if (drained.terminal) {
+              await this.#finishTerminal(drained.terminal);
+              return;
+            }
+            if (await this.#standDown()) return;
+            standDownPending = true;
+          }
         }
         const caughtUp = await this.#catchUp();
         if (caughtUp.lastSeen > lastSeen) lastSeen = caughtUp.lastSeen;
@@ -297,6 +325,7 @@ export class SessionListener {
         );
 
         let lagged = false;
+        let parked = false;
         let terminalOutcome: TerminalOutcome | undefined;
         // Pull frames manually so a silent stream can be probed: the dial is
         // lazy (it happens on the first pull) and can park forever (issue
@@ -372,6 +401,17 @@ export class SessionListener {
                 frameSinceProbe = false;
                 continue; // delivered this interval — no probe read needed
               }
+              if (standDownPending && this.#deps.fetchStatus) {
+                const fetchStatus = this.#deps.fetchStatus;
+                const status = await this.#guarded("status probe", (signal) =>
+                  fetchStatus(this.#deps.sessionId, signal));
+                this.#touchLive();
+                if (status === PARKED_STATUS) {
+                  parked = true;
+                  break;
+                }
+                standDownPending = false; // the resume took: listen as usual
+              }
               sawLogAhead = await this.#probeQuietStream(lastSeen, sawLogAhead);
               continue;
             }
@@ -402,6 +442,7 @@ export class SessionListener {
             if (frame.kind === "status_changed") {
               terminalOutcome = parseTerminalOutcome(frame.payloadJson);
               if (terminalOutcome) break;
+              parked = parseStatusChangeTo(frame.payloadJson) === PARKED_STATUS;
             }
             // Per-consumer curation happens in #offer (raw consumers get the
             // frame as-is, curated consumers get exactly the pre-raw stream).
@@ -410,6 +451,9 @@ export class SessionListener {
               kind: frame.kind,
               payloadJson: frame.payloadJson,
             });
+            // The park frame reaches consumers first; then the stream closes
+            // and the listener stands down.
+            if (parked) break;
             issuePull(); // request the next frame
           }
         } finally {
@@ -427,6 +471,14 @@ export class SessionListener {
           return;
         }
         if (this.#stopRequested) return;
+        if (parked) {
+          if (await this.#standDown()) return;
+          // A fresh wake: the session may be resuming. Reconnect, keep going,
+          // and retry the stand-down at the next quiet probe.
+          standDownPending = true;
+          if (this.#streamWasHealthy(connectedAt, deliveredFrame)) reconnectAttempt = 0;
+          continue;
+        }
         if (lagged) {
           // Falling behind the buffer is flow control, not a coordinator
           // failure: catch up immediately. Only clear the drop backoff if the
@@ -785,6 +837,35 @@ export class SessionListener {
     await this.#deps.leaseStore.markTerminal(this.#deps.sessionId);
     await this.#release();
     this.#requestStop();
+  }
+
+  /** Stand down for a parked session: drain the consumers, then mark the row
+   * dormant and give up the lease in one statement. Refused — and false —
+   * when a wake landed inside the grace: a resume may be under way, so the
+   * caller keeps listening. The manager drops a dormant row from its desired
+   * set; a later wake makes it desired again. */
+  async #standDown(): Promise<boolean> {
+    await this.#waitForDrains();
+    if (this.#stopRequested) return true;
+    const dormant = await this.#deps.leaseStore.markDormant(
+      this.#deps.sessionId,
+      this.#deps.owner,
+      this.#standDownGraceMs,
+    );
+    if (!dormant) {
+      log.info(
+        { sessionId: this.#deps.sessionId },
+        "listener stand-down deferred: the session was woken inside the grace",
+      );
+      return false;
+    }
+    this.#released = true;
+    log.info(
+      { sessionId: this.#deps.sessionId },
+      "listener stood down for a parked session",
+    );
+    this.#requestStop();
+    return true;
   }
 
   async #waitForDrains(): Promise<void> {

@@ -45,6 +45,7 @@ import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
 import { registerPapercuts } from "./rpc/papercuts.ts";
+import { registerRetention } from "./rpc/retention.ts";
 import { registerPrRefs } from "./rpc/pr-refs.ts";
 import { registerReviews } from "./rpc/reviews.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
@@ -69,10 +70,7 @@ import type { ConnectRouter } from "@connectrpc/connect";
 // before DBOS.launch(). Imports below register the finite Slack-thread and
 // tool-execution workflows.
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
-import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
 import { startSpecTicketSyncWorkflow } from "./workflows/spec-ticket-sync.ts";
-import { makeSlackPolicy } from "./integrations/slack-policy.ts";
-import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
 import {
   makeProductionAutomationScheduler,
@@ -476,6 +474,9 @@ const server = buildServer(
     // Native PapercutService: orchestrator-owned friction inbox.
     registerPapercuts(router);
 
+    // Native RetentionService: the org's retention policy (Settings → Retention).
+    registerRetention(router);
+
     // Native PrRefService: durable task/session links to authored PRs (ADR 0100).
     registerPrRefs(router);
 
@@ -604,13 +605,6 @@ const server = buildServer(
   ],
 );
 
-// ADR 0060: inject the SlackThreadWorkflow's seams (the Slack provider
-// mechanics + the session-lifecycle control plane) before launching the engine,
-// so the first webhook-driven workflow has them. Then launch the embedded DBOS
-// engine before serving any traffic, so a webhook that arrives the instant we
-// bind can start a workflow.
-setThreadPolicy(makeSlackPolicy());
-setThreadControlPlane(makeThreadControlPlane());
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });

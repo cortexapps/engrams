@@ -24,6 +24,12 @@
 #     gcloud secrets versions add <prefix>-better-auth-secret --data-file=- \
 #       --project=<project>
 #
+#   # OAuth client secret — from the identity provider's client
+#   # (sign-in door `orchestrator.auth.mode: oauth`, the chart default)
+#   echo -n "<client secret>" | \
+#     gcloud secrets versions add <prefix>-oauth-client-secret --data-file=- \
+#       --project=<project>
+#
 #   # Egress CA pair — generate once, ten-year cert
 #   openssl req -x509 -newkey rsa:4096 -nodes \
 #     -keyout /tmp/ca.key -out /tmp/ca.pem -days 3650 \
@@ -39,11 +45,12 @@
 locals {
   # name => description. One shell each.
   shells = {
-    "kek-master"         = "32-byte base64 master key (env-var KEK provider)."
-    "auth-tokens"        = "Comma-separated coordinator bearer allow-list (machine path; the first entry doubles as CONTROL_PLANE_BEARER)."
-    "better-auth-secret" = "The orchestrator's better-auth session-signing secret."
-    "egress-ca-cert"     = "Egress proxy CA certificate PEM (fleet-wide — ADR 0006)."
-    "egress-ca-key"      = "Egress proxy CA private key PEM."
+    "kek-master"          = "32-byte base64 master key (env-var KEK provider)."
+    "auth-tokens"         = "Comma-separated coordinator bearer allow-list (machine path; the first entry doubles as CONTROL_PLANE_BEARER)."
+    "better-auth-secret"  = "The orchestrator's better-auth session-signing secret."
+    "oauth-client-secret" = "Client secret of the OAuth client people sign in through (orchestrator.auth.mode=oauth)."
+    "egress-ca-cert"      = "Egress proxy CA certificate PEM (fleet-wide — ADR 0006)."
+    "egress-ca-key"       = "Egress proxy CA private key PEM."
   }
 
   # (shell, member) grant pairs, flattened for for_each.

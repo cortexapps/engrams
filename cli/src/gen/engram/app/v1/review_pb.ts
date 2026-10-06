@@ -12,176 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/review.proto.
  */
 export const file_engram_app_v1_review: GenFile = /*@__PURE__*/
-  fileDesc("ChplbmdyYW0vYXBwL3YxL3Jldmlldy5wcm90bxINZW5ncmFtLmFwcC52MSLbAQoOUmVwb0Vucm9sbG1lbnQSDAoEcmVwbxgBIAEoCRIUCgx0cmlnZ2VyX21vZGUYAiABKAkSDwoHYXV0b2ZpeBgDIAEoCRIXCgpwcm9maWxlX2lkGAQgASgJSACIAQESLgoKY3JlYXRlZF9hdBgFIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBCDQoLX3Byb2ZpbGVfaWRKBAgHEAhSBmVuZ2luZSIYChZMaXN0RW5yb2xsbWVudHNSZXF1ZXN0Ik0KF0xpc3RFbnJvbGxtZW50c1Jlc3BvbnNlEjIKC2Vucm9sbG1lbnRzGAEgAygLMh0uZW5ncmFtLmFwcC52MS5SZXBvRW5yb2xsbWVudCJ2ChdVcHNlcnRFbnJvbGxtZW50UmVxdWVzdBIMCgRyZXBvGAEgASgJEhQKDHRyaWdnZXJfbW9kZRgCIAEoCRIPCgdhdXRvZml4GAMgASgJEhcKCnByb2ZpbGVfaWQYBCABKAlIAIgBAUINCgtfcHJvZmlsZV9pZCJNChhVcHNlcnRFbnJvbGxtZW50UmVzcG9uc2USMQoKZW5yb2xsbWVudBgBIAEoCzIdLmVuZ3JhbS5hcHAudjEuUmVwb0Vucm9sbG1lbnQiJwoXRGVsZXRlRW5yb2xsbWVudFJlcXVlc3QSDAoEcmVwbxgBIAEoCSIaChhEZWxldGVFbnJvbGxtZW50UmVzcG9uc2Ui9QcKBlJldmlldxIKCgJpZBgBIAEoCRIMCgRyZXBvGAIgASgJEhEKCXByX251bWJlchgDIAEoBRIPCgd0YXNrX2lkGAQgASgJEhAKCGhlYWRfc2hhGAUgASgJEhAKCGJhc2Vfc2hhGAYgASgJEg8KB3RyaWdnZXIYByABKAkSDgoGc3RhdHVzGAggASgJEh0KEGdpdGh1Yl9yZXZpZXdfaWQYCSABKAlIAIgBARIXCgpzdW1tYXJ5X21kGAogASgJSAGIAQESLgoKY3JlYXRlZF9hdBgLIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgMIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASNAoOZmluZGluZ19jb3VudHMYDSABKAsyHC5lbmdyYW0uYXBwLnYxLkZpbmRpbmdDb3VudHMSHgoRZmluZGVyX3Nlc3Npb25faWQYDiABKAlIAogBARIgChN2ZXJpZmllcl9zZXNzaW9uX2lkGA8gASgJSAOIAQESFQoIcHJfdGl0bGUYECABKAlIBIgBARIWCglwcl9hdXRob3IYESABKAlIBYgBARIYCgtoZWFkX2JyYW5jaBgSIAEoCUgGiAEBEhgKC2Jhc2VfYnJhbmNoGBMgASgJSAeIAQESFQoIcHJfc3RhdGUYFCABKAlICIgBARIWCglhZGRpdGlvbnMYFSABKAVICYgBARIWCglkZWxldGlvbnMYFiABKAVICogBARIaCg1jaGFuZ2VkX2ZpbGVzGBcgASgFSAuIAQESEQoJdGFyZ2V0X2lkGBggASgJEhAKCHByb3ZpZGVyGBkgASgJEhgKC3Byb3ZpZGVyX2lkGBogASgJSAyIAQESEwoGcHJfdXJsGBsgASgJSA2IAQESDgoGYWN0aXZlGBwgASgIEhUKDWh1bWFuX3RyaWdnZXIYHSABKAgSHgoRYXV0b21hdGlvbl9ydW5faWQYHiABKAlIDogBAUITChFfZ2l0aHViX3Jldmlld19pZEINCgtfc3VtbWFyeV9tZEIUChJfZmluZGVyX3Nlc3Npb25faWRCFgoUX3ZlcmlmaWVyX3Nlc3Npb25faWRCCwoJX3ByX3RpdGxlQgwKCl9wcl9hdXRob3JCDgoMX2hlYWRfYnJhbmNoQg4KDF9iYXNlX2JyYW5jaEILCglfcHJfc3RhdGVCDAoKX2FkZGl0aW9uc0IMCgpfZGVsZXRpb25zQhAKDl9jaGFuZ2VkX2ZpbGVzQg4KDF9wcm92aWRlcl9pZEIJCgdfcHJfdXJsQhQKEl9hdXRvbWF0aW9uX3J1bl9pZCJbCg1GaW5kaW5nQ291bnRzEhAKCGNyaXRpY2FsGAEgASgFEgwKBGhpZ2gYAiABKAUSDgoGbWVkaXVtGAMgASgFEgsKA2xvdxgEIAEoBRINCgV0b3RhbBgFIAEoBSKbBAoNUmV2aWV3RmluZGluZxIKCgJpZBgBIAEoCRIRCglyZXZpZXdfaWQYAiABKAkSDAoEcGF0aBgDIAEoCRIXCgpzdGFydF9saW5lGAQgASgFSACIAQESFQoIZW5kX2xpbmUYBSABKAVIAYgBARIRCgRzaWRlGAYgASgJSAKIAQESEAoIY2F0ZWdvcnkYByABKAkSEAoIc2V2ZXJpdHkYCCABKAkSEgoKY29uZmlkZW5jZRgJIAEoCRINCgV0aXRsZRgKIAEoCRIPCgdib2R5X21kGAsgASgJEhoKDXN1Z2dlc3RlZF9maXgYDCABKAlIA4gBARIQCghldmlkZW5jZRgNIAMoCRINCgVzdGF0ZRgOIAEoCRIbCg52ZXJkaWN0X3JlYXNvbhgPIAEoCUgEiAEBEh0KEGdpdGh1Yl90aHJlYWRfaWQYECABKAlIBYgBARIXCgpyZXNvbHV0aW9uGBEgASgJSAaIAQESEgoKc2Vzc2lvbl9pZBgSIAEoCRIuCgpjcmVhdGVkX2F0GBMgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcEINCgtfc3RhcnRfbGluZUILCglfZW5kX2xpbmVCBwoFX3NpZGVCEAoOX3N1Z2dlc3RlZF9maXhCEQoPX3ZlcmRpY3RfcmVhc29uQhMKEV9naXRodWJfdGhyZWFkX2lkQg0KC19yZXNvbHV0aW9uIm8KDVJldmlld1ZlcmRpY3QSEgoKZmluZGluZ19pZBgBIAEoCRIPCgd2ZXJkaWN0GAIgASgJEhIKCmNvbmZpZGVuY2UYAyABKAkSEQoJcmVhc29uaW5nGAQgASgJEhIKCnNlc3Npb25faWQYBSABKAkingEKEkxpc3RSZXZpZXdzUmVxdWVzdBINCgVyZXBvcxgBIAMoCRIOCgZzZWFyY2gYAiABKAkSDwoHYXV0aG9ycxgDIAMoCRIRCglwcl9zdGF0ZXMYBCADKAkSEAoIc3RhdHVzZXMYBSADKAkSEgoKc2V2ZXJpdGllcxgGIAMoCRIMCgRwYWdlGAcgASgFEhEKCXBhZ2Vfc2l6ZRgIIAEoBSJ/ChNMaXN0UmV2aWV3c1Jlc3BvbnNlEiYKB3Jldmlld3MYASADKAsyFS5lbmdyYW0uYXBwLnYxLlJldmlldxITCgt0b3RhbF9jb3VudBgCIAEoBRIrCgZmYWNldHMYAyABKAsyGy5lbmdyYW0uYXBwLnYxLlJldmlld0ZhY2V0cyJTCgxSZXZpZXdGYWNldHMSDQoFcmVwb3MYASADKAkSDwoHYXV0aG9ycxgCIAMoCRIRCglwcl9zdGF0ZXMYAyADKAkSEAoIc3RhdHVzZXMYBCADKAkiHgoQR2V0UmV2aWV3UmVxdWVzdBIKCgJpZBgBIAEoCSIgChJSZXRyeVJldmlld1JlcXVlc3QSCgoCaWQYASABKAkiUAoTUmV0cnlSZXZpZXdSZXNwb25zZRITCgt3b3JrZmxvd19pZBgBIAEoCRIWCglyZXZpZXdfaWQYAiABKAlIAIgBAUIMCgpfcmV2aWV3X2lkIu0BChFHZXRSZXZpZXdSZXNwb25zZRIlCgZyZXZpZXcYASABKAsyFS5lbmdyYW0uYXBwLnYxLlJldmlldxIuCghmaW5kaW5ncxgCIAMoCzIcLmVuZ3JhbS5hcHAudjEuUmV2aWV3RmluZGluZxIuCgh2ZXJkaWN0cxgDIAMoCzIcLmVuZ3JhbS5hcHAudjEuUmV2aWV3VmVyZGljdBIlCgZwYXNzZXMYBSADKAsyFS5lbmdyYW0uYXBwLnYxLlJldmlldxIqCgZldmVudHMYBCADKAsyGi5lbmdyYW0uYXBwLnYxLlJldmlld0V2ZW50IooBCgtSZXZpZXdFdmVudBIKCgJpZBgBIAEoCRIRCglyZXZpZXdfaWQYAiABKAkSDAoEa2luZBgDIAEoCRITCgZkZXRhaWwYBCABKAlIAIgBARIuCgpjcmVhdGVkX2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcEIJCgdfZGV0YWlsMrcECg1SZXZpZXdTZXJ2aWNlElQKC0xpc3RSZXZpZXdzEiEuZW5ncmFtLmFwcC52MS5MaXN0UmV2aWV3c1JlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLkxpc3RSZXZpZXdzUmVzcG9uc2USTgoJR2V0UmV2aWV3Eh8uZW5ncmFtLmFwcC52MS5HZXRSZXZpZXdSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5HZXRSZXZpZXdSZXNwb25zZRJUCgtSZXRyeVJldmlldxIhLmVuZ3JhbS5hcHAudjEuUmV0cnlSZXZpZXdSZXF1ZXN0GiIuZW5ncmFtLmFwcC52MS5SZXRyeVJldmlld1Jlc3BvbnNlEmAKD0xpc3RFbnJvbGxtZW50cxIlLmVuZ3JhbS5hcHAudjEuTGlzdEVucm9sbG1lbnRzUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuTGlzdEVucm9sbG1lbnRzUmVzcG9uc2USYwoQVXBzZXJ0RW5yb2xsbWVudBImLmVuZ3JhbS5hcHAudjEuVXBzZXJ0RW5yb2xsbWVudFJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLlVwc2VydEVucm9sbG1lbnRSZXNwb25zZRJjChBEZWxldGVFbnJvbGxtZW50EiYuZW5ncmFtLmFwcC52MS5EZWxldGVFbnJvbGxtZW50UmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuRGVsZXRlRW5yb2xsbWVudFJlc3BvbnNlYgZwcm90bzM", [file_google_protobuf_timestamp]);
-
-/**
- * A repo enrolled for PR review.
- *
- * @generated from message engram.app.v1.RepoEnrollment
- */
-export type RepoEnrollment = Message<"engram.app.v1.RepoEnrollment"> & {
-  /**
-   * "owner/name".
-   *
-   * @generated from field: string repo = 1;
-   */
-  repo: string;
-
-  /**
-   * auto | manual — whether pull_request.opened auto-triggers a review, or a
-   * review must be asked for (@engrams review / dispatch).
-   *
-   * @generated from field: string trigger_mode = 2;
-   */
-  triggerMode: string;
-
-  /**
-   * auto | manual | off — whether posted findings route back to the authoring
-   * session for fixes.
-   *
-   * @generated from field: string autofix = 3;
-   */
-  autofix: string;
-
-  /**
-   * Profile the review sessions run on; empty = the designated pr_reviewer
-   * profile.
-   *
-   * @generated from field: optional string profile_id = 4;
-   */
-  profileId?: string;
-
-  /**
-   * @generated from field: google.protobuf.Timestamp created_at = 5;
-   */
-  createdAt?: Timestamp;
-
-  /**
-   * @generated from field: google.protobuf.Timestamp updated_at = 6;
-   */
-  updatedAt?: Timestamp;
-};
-
-/**
- * Describes the message engram.app.v1.RepoEnrollment.
- * Use `create(RepoEnrollmentSchema)` to create a new message.
- */
-export const RepoEnrollmentSchema: GenMessage<RepoEnrollment> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 0);
-
-/**
- * @generated from message engram.app.v1.ListEnrollmentsRequest
- */
-export type ListEnrollmentsRequest = Message<"engram.app.v1.ListEnrollmentsRequest"> & {
-};
-
-/**
- * Describes the message engram.app.v1.ListEnrollmentsRequest.
- * Use `create(ListEnrollmentsRequestSchema)` to create a new message.
- */
-export const ListEnrollmentsRequestSchema: GenMessage<ListEnrollmentsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 1);
-
-/**
- * @generated from message engram.app.v1.ListEnrollmentsResponse
- */
-export type ListEnrollmentsResponse = Message<"engram.app.v1.ListEnrollmentsResponse"> & {
-  /**
-   * @generated from field: repeated engram.app.v1.RepoEnrollment enrollments = 1;
-   */
-  enrollments: RepoEnrollment[];
-};
-
-/**
- * Describes the message engram.app.v1.ListEnrollmentsResponse.
- * Use `create(ListEnrollmentsResponseSchema)` to create a new message.
- */
-export const ListEnrollmentsResponseSchema: GenMessage<ListEnrollmentsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 2);
-
-/**
- * Enrolling a repo is a write to the PR-review built-in automation: the repo
- * lands in its `repos` input (mode from trigger_mode, autofix from autofix)
- * and the built-in is enabled on its first repo. Reviews on that repo run on
- * the engine from the next delivery.
- *
- * @generated from message engram.app.v1.UpsertEnrollmentRequest
- */
-export type UpsertEnrollmentRequest = Message<"engram.app.v1.UpsertEnrollmentRequest"> & {
-  /**
-   * @generated from field: string repo = 1;
-   */
-  repo: string;
-
-  /**
-   * @generated from field: string trigger_mode = 2;
-   */
-  triggerMode: string;
-
-  /**
-   * @generated from field: string autofix = 3;
-   */
-  autofix: string;
-
-  /**
-   * @generated from field: optional string profile_id = 4;
-   */
-  profileId?: string;
-};
-
-/**
- * Describes the message engram.app.v1.UpsertEnrollmentRequest.
- * Use `create(UpsertEnrollmentRequestSchema)` to create a new message.
- */
-export const UpsertEnrollmentRequestSchema: GenMessage<UpsertEnrollmentRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 3);
-
-/**
- * @generated from message engram.app.v1.UpsertEnrollmentResponse
- */
-export type UpsertEnrollmentResponse = Message<"engram.app.v1.UpsertEnrollmentResponse"> & {
-  /**
-   * @generated from field: engram.app.v1.RepoEnrollment enrollment = 1;
-   */
-  enrollment?: RepoEnrollment;
-};
-
-/**
- * Describes the message engram.app.v1.UpsertEnrollmentResponse.
- * Use `create(UpsertEnrollmentResponseSchema)` to create a new message.
- */
-export const UpsertEnrollmentResponseSchema: GenMessage<UpsertEnrollmentResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 4);
-
-/**
- * @generated from message engram.app.v1.DeleteEnrollmentRequest
- */
-export type DeleteEnrollmentRequest = Message<"engram.app.v1.DeleteEnrollmentRequest"> & {
-  /**
-   * @generated from field: string repo = 1;
-   */
-  repo: string;
-};
-
-/**
- * Describes the message engram.app.v1.DeleteEnrollmentRequest.
- * Use `create(DeleteEnrollmentRequestSchema)` to create a new message.
- */
-export const DeleteEnrollmentRequestSchema: GenMessage<DeleteEnrollmentRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 5);
-
-/**
- * @generated from message engram.app.v1.DeleteEnrollmentResponse
- */
-export type DeleteEnrollmentResponse = Message<"engram.app.v1.DeleteEnrollmentResponse"> & {
-};
-
-/**
- * Describes the message engram.app.v1.DeleteEnrollmentResponse.
- * Use `create(DeleteEnrollmentResponseSchema)` to create a new message.
- */
-export const DeleteEnrollmentResponseSchema: GenMessage<DeleteEnrollmentResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 6);
+  fileDesc("ChplbmdyYW0vYXBwL3YxL3Jldmlldy5wcm90bxINZW5ncmFtLmFwcC52MSL1BwoGUmV2aWV3EgoKAmlkGAEgASgJEgwKBHJlcG8YAiABKAkSEQoJcHJfbnVtYmVyGAMgASgFEg8KB3Rhc2tfaWQYBCABKAkSEAoIaGVhZF9zaGEYBSABKAkSEAoIYmFzZV9zaGEYBiABKAkSDwoHdHJpZ2dlchgHIAEoCRIOCgZzdGF0dXMYCCABKAkSHQoQZ2l0aHViX3Jldmlld19pZBgJIAEoCUgAiAEBEhcKCnN1bW1hcnlfbWQYCiABKAlIAYgBARIuCgpjcmVhdGVkX2F0GAsgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgp1cGRhdGVkX2F0GAwgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBI0Cg5maW5kaW5nX2NvdW50cxgNIAEoCzIcLmVuZ3JhbS5hcHAudjEuRmluZGluZ0NvdW50cxIeChFmaW5kZXJfc2Vzc2lvbl9pZBgOIAEoCUgCiAEBEiAKE3ZlcmlmaWVyX3Nlc3Npb25faWQYDyABKAlIA4gBARIVCghwcl90aXRsZRgQIAEoCUgEiAEBEhYKCXByX2F1dGhvchgRIAEoCUgFiAEBEhgKC2hlYWRfYnJhbmNoGBIgASgJSAaIAQESGAoLYmFzZV9icmFuY2gYEyABKAlIB4gBARIVCghwcl9zdGF0ZRgUIAEoCUgIiAEBEhYKCWFkZGl0aW9ucxgVIAEoBUgJiAEBEhYKCWRlbGV0aW9ucxgWIAEoBUgKiAEBEhoKDWNoYW5nZWRfZmlsZXMYFyABKAVIC4gBARIRCgl0YXJnZXRfaWQYGCABKAkSEAoIcHJvdmlkZXIYGSABKAkSGAoLcHJvdmlkZXJfaWQYGiABKAlIDIgBARITCgZwcl91cmwYGyABKAlIDYgBARIOCgZhY3RpdmUYHCABKAgSFQoNaHVtYW5fdHJpZ2dlchgdIAEoCBIeChFhdXRvbWF0aW9uX3J1bl9pZBgeIAEoCUgOiAEBQhMKEV9naXRodWJfcmV2aWV3X2lkQg0KC19zdW1tYXJ5X21kQhQKEl9maW5kZXJfc2Vzc2lvbl9pZEIWChRfdmVyaWZpZXJfc2Vzc2lvbl9pZEILCglfcHJfdGl0bGVCDAoKX3ByX2F1dGhvckIOCgxfaGVhZF9icmFuY2hCDgoMX2Jhc2VfYnJhbmNoQgsKCV9wcl9zdGF0ZUIMCgpfYWRkaXRpb25zQgwKCl9kZWxldGlvbnNCEAoOX2NoYW5nZWRfZmlsZXNCDgoMX3Byb3ZpZGVyX2lkQgkKB19wcl91cmxCFAoSX2F1dG9tYXRpb25fcnVuX2lkIlsKDUZpbmRpbmdDb3VudHMSEAoIY3JpdGljYWwYASABKAUSDAoEaGlnaBgCIAEoBRIOCgZtZWRpdW0YAyABKAUSCwoDbG93GAQgASgFEg0KBXRvdGFsGAUgASgFIpsECg1SZXZpZXdGaW5kaW5nEgoKAmlkGAEgASgJEhEKCXJldmlld19pZBgCIAEoCRIMCgRwYXRoGAMgASgJEhcKCnN0YXJ0X2xpbmUYBCABKAVIAIgBARIVCghlbmRfbGluZRgFIAEoBUgBiAEBEhEKBHNpZGUYBiABKAlIAogBARIQCghjYXRlZ29yeRgHIAEoCRIQCghzZXZlcml0eRgIIAEoCRISCgpjb25maWRlbmNlGAkgASgJEg0KBXRpdGxlGAogASgJEg8KB2JvZHlfbWQYCyABKAkSGgoNc3VnZ2VzdGVkX2ZpeBgMIAEoCUgDiAEBEhAKCGV2aWRlbmNlGA0gAygJEg0KBXN0YXRlGA4gASgJEhsKDnZlcmRpY3RfcmVhc29uGA8gASgJSASIAQESHQoQZ2l0aHViX3RocmVhZF9pZBgQIAEoCUgFiAEBEhcKCnJlc29sdXRpb24YESABKAlIBogBARISCgpzZXNzaW9uX2lkGBIgASgJEi4KCmNyZWF0ZWRfYXQYEyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wQg0KC19zdGFydF9saW5lQgsKCV9lbmRfbGluZUIHCgVfc2lkZUIQCg5fc3VnZ2VzdGVkX2ZpeEIRCg9fdmVyZGljdF9yZWFzb25CEwoRX2dpdGh1Yl90aHJlYWRfaWRCDQoLX3Jlc29sdXRpb24ibwoNUmV2aWV3VmVyZGljdBISCgpmaW5kaW5nX2lkGAEgASgJEg8KB3ZlcmRpY3QYAiABKAkSEgoKY29uZmlkZW5jZRgDIAEoCRIRCglyZWFzb25pbmcYBCABKAkSEgoKc2Vzc2lvbl9pZBgFIAEoCSKeAQoSTGlzdFJldmlld3NSZXF1ZXN0Eg0KBXJlcG9zGAEgAygJEg4KBnNlYXJjaBgCIAEoCRIPCgdhdXRob3JzGAMgAygJEhEKCXByX3N0YXRlcxgEIAMoCRIQCghzdGF0dXNlcxgFIAMoCRISCgpzZXZlcml0aWVzGAYgAygJEgwKBHBhZ2UYByABKAUSEQoJcGFnZV9zaXplGAggASgFIn8KE0xpc3RSZXZpZXdzUmVzcG9uc2USJgoHcmV2aWV3cxgBIAMoCzIVLmVuZ3JhbS5hcHAudjEuUmV2aWV3EhMKC3RvdGFsX2NvdW50GAIgASgFEisKBmZhY2V0cxgDIAEoCzIbLmVuZ3JhbS5hcHAudjEuUmV2aWV3RmFjZXRzIlMKDFJldmlld0ZhY2V0cxINCgVyZXBvcxgBIAMoCRIPCgdhdXRob3JzGAIgAygJEhEKCXByX3N0YXRlcxgDIAMoCRIQCghzdGF0dXNlcxgEIAMoCSIeChBHZXRSZXZpZXdSZXF1ZXN0EgoKAmlkGAEgASgJIiAKElJldHJ5UmV2aWV3UmVxdWVzdBIKCgJpZBgBIAEoCSJQChNSZXRyeVJldmlld1Jlc3BvbnNlEhMKC3dvcmtmbG93X2lkGAEgASgJEhYKCXJldmlld19pZBgCIAEoCUgAiAEBQgwKCl9yZXZpZXdfaWQi7QEKEUdldFJldmlld1Jlc3BvbnNlEiUKBnJldmlldxgBIAEoCzIVLmVuZ3JhbS5hcHAudjEuUmV2aWV3Ei4KCGZpbmRpbmdzGAIgAygLMhwuZW5ncmFtLmFwcC52MS5SZXZpZXdGaW5kaW5nEi4KCHZlcmRpY3RzGAMgAygLMhwuZW5ncmFtLmFwcC52MS5SZXZpZXdWZXJkaWN0EiUKBnBhc3NlcxgFIAMoCzIVLmVuZ3JhbS5hcHAudjEuUmV2aWV3EioKBmV2ZW50cxgEIAMoCzIaLmVuZ3JhbS5hcHAudjEuUmV2aWV3RXZlbnQiigEKC1Jldmlld0V2ZW50EgoKAmlkGAEgASgJEhEKCXJldmlld19pZBgCIAEoCRIMCgRraW5kGAMgASgJEhMKBmRldGFpbBgEIAEoCUgAiAEBEi4KCmNyZWF0ZWRfYXQYBSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wQgkKB19kZXRhaWwyiwIKDVJldmlld1NlcnZpY2USVAoLTGlzdFJldmlld3MSIS5lbmdyYW0uYXBwLnYxLkxpc3RSZXZpZXdzUmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuTGlzdFJldmlld3NSZXNwb25zZRJOCglHZXRSZXZpZXcSHy5lbmdyYW0uYXBwLnYxLkdldFJldmlld1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkdldFJldmlld1Jlc3BvbnNlElQKC1JldHJ5UmV2aWV3EiEuZW5ncmFtLmFwcC52MS5SZXRyeVJldmlld1JlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLlJldHJ5UmV2aWV3UmVzcG9uc2ViBnByb3RvMw", [file_google_protobuf_timestamp]);
 
 /**
  * One review pass over a PR at a pinned head_sha, flattened with the PR it is
@@ -404,7 +235,7 @@ export type Review = Message<"engram.app.v1.Review"> & {
  * Use `create(ReviewSchema)` to create a new message.
  */
 export const ReviewSchema: GenMessage<Review> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 7);
+  messageDesc(file_engram_app_v1_review, 0);
 
 /**
  * Per-severity finding counts for the list page.
@@ -443,7 +274,7 @@ export type FindingCounts = Message<"engram.app.v1.FindingCounts"> & {
  * Use `create(FindingCountsSchema)` to create a new message.
  */
 export const FindingCountsSchema: GenMessage<FindingCounts> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 8);
+  messageDesc(file_engram_app_v1_review, 1);
 
 /**
  * @generated from message engram.app.v1.ReviewFinding
@@ -566,7 +397,7 @@ export type ReviewFinding = Message<"engram.app.v1.ReviewFinding"> & {
  * Use `create(ReviewFindingSchema)` to create a new message.
  */
 export const ReviewFindingSchema: GenMessage<ReviewFinding> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 9);
+  messageDesc(file_engram_app_v1_review, 2);
 
 /**
  * The verifier's judgment on one finding.
@@ -611,7 +442,7 @@ export type ReviewVerdict = Message<"engram.app.v1.ReviewVerdict"> & {
  * Use `create(ReviewVerdictSchema)` to create a new message.
  */
 export const ReviewVerdictSchema: GenMessage<ReviewVerdict> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 10);
+  messageDesc(file_engram_app_v1_review, 3);
 
 /**
  * The list is of PULL REQUESTS, not passes: a page holds N pull requests and
@@ -685,7 +516,7 @@ export type ListReviewsRequest = Message<"engram.app.v1.ListReviewsRequest"> & {
  * Use `create(ListReviewsRequestSchema)` to create a new message.
  */
 export const ListReviewsRequestSchema: GenMessage<ListReviewsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 11);
+  messageDesc(file_engram_app_v1_review, 4);
 
 /**
  * @generated from message engram.app.v1.ListReviewsResponse
@@ -722,7 +553,7 @@ export type ListReviewsResponse = Message<"engram.app.v1.ListReviewsResponse"> &
  * Use `create(ListReviewsResponseSchema)` to create a new message.
  */
 export const ListReviewsResponseSchema: GenMessage<ListReviewsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 12);
+  messageDesc(file_engram_app_v1_review, 5);
 
 /**
  * @generated from message engram.app.v1.ReviewFacets
@@ -754,7 +585,7 @@ export type ReviewFacets = Message<"engram.app.v1.ReviewFacets"> & {
  * Use `create(ReviewFacetsSchema)` to create a new message.
  */
 export const ReviewFacetsSchema: GenMessage<ReviewFacets> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 13);
+  messageDesc(file_engram_app_v1_review, 6);
 
 /**
  * @generated from message engram.app.v1.GetReviewRequest
@@ -771,7 +602,7 @@ export type GetReviewRequest = Message<"engram.app.v1.GetReviewRequest"> & {
  * Use `create(GetReviewRequestSchema)` to create a new message.
  */
 export const GetReviewRequestSchema: GenMessage<GetReviewRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 14);
+  messageDesc(file_engram_app_v1_review, 7);
 
 /**
  * Re-run the review with the given id.
@@ -790,7 +621,7 @@ export type RetryReviewRequest = Message<"engram.app.v1.RetryReviewRequest"> & {
  * Use `create(RetryReviewRequestSchema)` to create a new message.
  */
 export const RetryReviewRequestSchema: GenMessage<RetryReviewRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 15);
+  messageDesc(file_engram_app_v1_review, 8);
 
 /**
  * @generated from message engram.app.v1.RetryReviewResponse
@@ -816,7 +647,7 @@ export type RetryReviewResponse = Message<"engram.app.v1.RetryReviewResponse"> &
  * Use `create(RetryReviewResponseSchema)` to create a new message.
  */
 export const RetryReviewResponseSchema: GenMessage<RetryReviewResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 16);
+  messageDesc(file_engram_app_v1_review, 9);
 
 /**
  * @generated from message engram.app.v1.GetReviewResponse
@@ -862,7 +693,7 @@ export type GetReviewResponse = Message<"engram.app.v1.GetReviewResponse"> & {
  * Use `create(GetReviewResponseSchema)` to create a new message.
  */
 export const GetReviewResponseSchema: GenMessage<GetReviewResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 17);
+  messageDesc(file_engram_app_v1_review, 10);
 
 /**
  * One entry in a review's activity log.
@@ -907,16 +738,16 @@ export type ReviewEvent = Message<"engram.app.v1.ReviewEvent"> & {
  * Use `create(ReviewEventSchema)` to create a new message.
  */
 export const ReviewEventSchema: GenMessage<ReviewEvent> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_review, 18);
+  messageDesc(file_engram_app_v1_review, 11);
 
 /**
  * PR code review record (ADR 0100). Reviews are org-visible: a team
  * dashboard, not a personal list. Writes happen through review tool calls
  * and the review workflow, never through this service.
  *
- * Repo enrollment is org configuration: which repos engrams reviews, how
- * reviews trigger, and the autofix posture. Enrollment mutations are
- * admin-only; listing is org-visible like the reviews themselves.
+ * Which repos engrams reviews, and how each triggers, is the PR-review
+ * built-in's `repos` input (AutomationService: SetMapInputEntry), not a
+ * surface here: this service is the review records.
  *
  * @generated from service engram.app.v1.ReviewService
  */
@@ -949,30 +780,6 @@ export const ReviewService: GenService<{
     methodKind: "unary";
     input: typeof RetryReviewRequestSchema;
     output: typeof RetryReviewResponseSchema;
-  },
-  /**
-   * @generated from rpc engram.app.v1.ReviewService.ListEnrollments
-   */
-  listEnrollments: {
-    methodKind: "unary";
-    input: typeof ListEnrollmentsRequestSchema;
-    output: typeof ListEnrollmentsResponseSchema;
-  },
-  /**
-   * @generated from rpc engram.app.v1.ReviewService.UpsertEnrollment
-   */
-  upsertEnrollment: {
-    methodKind: "unary";
-    input: typeof UpsertEnrollmentRequestSchema;
-    output: typeof UpsertEnrollmentResponseSchema;
-  },
-  /**
-   * @generated from rpc engram.app.v1.ReviewService.DeleteEnrollment
-   */
-  deleteEnrollment: {
-    methodKind: "unary";
-    input: typeof DeleteEnrollmentRequestSchema;
-    output: typeof DeleteEnrollmentResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_review, 0);

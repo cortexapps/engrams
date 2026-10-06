@@ -14,7 +14,7 @@ spec:
     namespace: {{ .Release.Namespace }}
     name: {{ include "hostfleet.hostAgent.fullname" . }}
   image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-  nodeAssetsImage: "{{ .Values.nodeAssets.image.repository }}:{{ .Values.nodeAssets.image.tag }}"
+  nodeAssetsImage: "{{ .Values.nodeAssets.image.repository }}:{{ .Values.nodeAssets.image.tag | default .Chart.AppVersion }}"
   coordinatorUrl: {{ required "operator.coordinatorUrl is required when the operator is enabled" .Values.operator.coordinatorUrl | quote }}
   capacityFloor: {{ .Values.operator.capacityFloor }}
   drainTimeoutSeconds: {{ .Values.operator.drainTimeoutSeconds }}
