@@ -1362,6 +1362,10 @@ mod tests {
             current_bundles: Vec::new(),
             sandbox_bundles: Vec::new(),
             cordoned: false,
+            cordon_owner: None,
+            cordon_reason: None,
+            retire_requested_at: None,
+            retired_at: None,
             total_vcpus: 0,
             // Issue #229: 0 = "not yet reported" → tolerated by the
             // placement filter. Tests that exercise the skew gate set this

@@ -416,6 +416,8 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         // follow-up contract change this totality guard flagged). The
         // host-operator's scale-down wave reads them over gRPC ListHosts.
         cordoned,
+        cordon_owner,
+        retirement,
         allocatable_mib,
         reserved_mib,
         free_mib,
@@ -454,6 +456,10 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         util_cpu_pct: *util_cpu_pct,
         last_heartbeat_at: last_heartbeat_at.to_rfc3339(),
         cordoned: *cordoned,
+        cordon_owner: cordon_owner
+            .map(|o| o.as_str().to_owned())
+            .unwrap_or_default(),
+        retirement: retirement.as_ref().map(retirement_to_proto),
         allocatable_mib: *allocatable_mib,
         reserved_mib: *reserved_mib,
         free_mib: *free_mib,
@@ -933,6 +939,29 @@ pub(crate) fn artifact_meta_to_proto(m: crate::api::upload::ArtifactMeta) -> app
         // 0 = corrupt row, which is better than a huge wrapping value.
         size_bytes: size_bytes.try_into().unwrap_or(0),
         file_name,
+    }
+}
+
+pub(super) fn retirement_to_proto(
+    status: &engram_core::types::host::RetirementStatus,
+) -> app::HostRetirement {
+    app::HostRetirement {
+        requested_at: status
+            .requested_at
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default(),
+        retired_at: status
+            .retired_at
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default(),
+        blockers: status
+            .blockers
+            .iter()
+            .map(|b| app::RetirementBlocker {
+                kind: b.kind().into(),
+                count: b.count(),
+            })
+            .collect(),
     }
 }
 

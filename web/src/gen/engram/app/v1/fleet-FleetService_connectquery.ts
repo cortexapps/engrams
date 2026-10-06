@@ -15,6 +15,13 @@ export const listHosts = FleetService.method.listHosts;
 export const getHost = FleetService.method.getHost;
 
 /**
+ * ADR 0123 A3: the retirement grant entry point (see RetireHostRequest).
+ *
+ * @generated from rpc engram.app.v1.FleetService.RetireHost
+ */
+export const retireHost = FleetService.method.retireHost;
+
+/**
  * ADR 0016 Phase A per-host COW diagnostic
  * (GET /api/hosts/:id/cow-state).
  *

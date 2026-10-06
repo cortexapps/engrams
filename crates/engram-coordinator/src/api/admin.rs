@@ -406,15 +406,21 @@ pub struct CordonResponse {
 pub(crate) async fn cordon_host_core(
     state: &SharedState,
     host_id: engram_core::HostId,
+    owner: engram_core::types::host::CordonOwner,
 ) -> Result<CordonResponse, ApiError> {
-    match state.services.meta.set_host_cordoned(host_id, true).await {
+    match state
+        .services
+        .meta
+        .set_host_cordon(host_id, Some(owner), None)
+        .await
+    {
         Ok(()) => {}
         Err(engram_core::MetaError::NotFound) => {
             return Err(ApiError::NotFound(format!("host {host_id} has no row")));
         }
         Err(e) => {
             return Err(ApiError::Internal(format!(
-                "cordon: set_host_cordoned failed: {e}"
+                "cordon: set_host_cordon failed: {e}"
             )));
         }
     }
@@ -479,15 +485,26 @@ pub(crate) async fn begin_host_handoff_core(
 pub(crate) async fn uncordon_host_core(
     state: &SharedState,
     host_id: engram_core::HostId,
+    owner: engram_core::types::host::CordonOwner,
 ) -> Result<CordonResponse, ApiError> {
-    match state.services.meta.set_host_cordoned(host_id, false).await {
-        Ok(()) => {}
+    match state
+        .services
+        .meta
+        .cancel_host_retirement(host_id, owner)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(ApiError::Conflict(
+                "cordon owner differs or host is retired".into(),
+            ))
+        }
         Err(engram_core::MetaError::NotFound) => {
             return Err(ApiError::NotFound(format!("host {host_id} has no row")));
         }
         Err(e) => {
             return Err(ApiError::Internal(format!(
-                "uncordon: set_host_cordoned failed: {e}"
+                "uncordon: set_host_cordon failed: {e}"
             )));
         }
     }
@@ -543,14 +560,23 @@ pub(crate) async fn admin_drain_host_core(
     // ADR 0047: the durable cordon — heartbeats can't clobber it, every
     // replica's picker reads it. A PG failure fails the drain (no
     // in-memory fallback to half-drain behind).
-    match state.services.meta.set_host_cordoned(host_id, true).await {
+    match state
+        .services
+        .meta
+        .set_host_cordon(
+            host_id,
+            Some(engram_core::types::host::CordonOwner::Admin),
+            None,
+        )
+        .await
+    {
         Ok(()) => {}
         Err(engram_core::MetaError::NotFound) => {
             return Err(ApiError::NotFound(format!("host {host_id} has no row")));
         }
         Err(e) => {
             return Err(ApiError::Internal(format!(
-                "drain: set_host_cordoned failed: {e}"
+                "drain: set_host_cordon failed: {e}"
             )));
         }
     }

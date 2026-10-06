@@ -2279,6 +2279,10 @@ pub(crate) mod tests {
                 current_bundles: Vec::new(),
                 sandbox_bundles: Vec::new(),
                 cordoned: false,
+                cordon_owner: None,
+                cordon_reason: None,
+                retire_requested_at: None,
+                retired_at: None,
                 total_vcpus: 0,
                 wire_version: 0,
                 stages_images: false,
@@ -2626,7 +2630,7 @@ pub(crate) mod tests {
             &self,
             id: HostId,
             hb: engram_core::types::host::HostHeartbeat,
-        ) -> Result<(), MetaError> {
+        ) -> Result<engram_core::types::host::HeartbeatAck, MetaError> {
             {
                 let mut fail = self.fail_next_heartbeat_persist.lock();
                 if *fail {
@@ -2638,6 +2642,9 @@ pub(crate) mod tests {
             }
             let mut hosts = self.hosts.lock();
             if let Some(h) = hosts.iter_mut().find(|h| h.id == id) {
+                if matches!(h.status, HostStatus::Dead | HostStatus::Retired) {
+                    return Ok(engram_core::types::host::HeartbeatAck::Refused(h.status));
+                }
                 h.status = hb.status;
                 h.capacity = hb.capacity;
                 h.utilization = hb.utilization;
@@ -2646,7 +2653,7 @@ pub(crate) mod tests {
                 h.total_vcpus = hb.total_vcpus;
                 h.last_heartbeat_at = chrono::Utc::now();
             }
-            Ok(())
+            Ok(engram_core::types::host::HeartbeatAck::Accepted)
         }
         /// Issue #531: overrides the trait's default (which scans
         /// `list_active_sessions`) purely to count invocations — this
@@ -2674,11 +2681,18 @@ pub(crate) mod tests {
                 _ => Vec::new(),
             })
         }
-        async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
+        async fn set_host_cordon(
+            &self,
+            id: HostId,
+            owner: Option<engram_core::types::host::CordonOwner>,
+            reason: Option<&str>,
+        ) -> Result<(), MetaError> {
             let mut hosts = self.hosts.lock();
             match hosts.iter_mut().find(|h| h.id == id) {
                 Some(h) => {
-                    h.cordoned = cordoned;
+                    h.cordoned = owner.is_some();
+                    h.cordon_owner = owner;
+                    h.cordon_reason = reason.map(str::to_owned);
                     Ok(())
                 }
                 None => Err(MetaError::NotFound),

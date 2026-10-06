@@ -1200,7 +1200,15 @@ impl Sim {
                 // fallback) SEQUENTIALLY in deterministic BTreeMap order. The
                 // full gRPC handler (JoinSet, live-teleport preview, the
                 // don't-strand guard) is exercised in tests/api_surface.rs.
-                let _ = state.services.meta.set_host_cordoned(host_id, true).await;
+                let _ = state
+                    .services
+                    .meta
+                    .set_host_cordon(
+                        host_id,
+                        Some(engram_core::types::host::CordonOwner::Admin),
+                        None,
+                    )
+                    .await;
                 let bound = state
                     .services
                     .meta
@@ -1404,7 +1412,7 @@ impl Sim {
             let _ = self
                 .world
                 .meta
-                .set_host_cordoned(self.world.host_ids[i], false)
+                .set_host_cordon(self.world.host_ids[i], None, None)
                 .await;
         }
         for i in 0..self.world.replicas.len() {
@@ -1652,6 +1660,10 @@ fn sim_host_record(
         current_bundles: Vec::new(),
         sandbox_bundles: Vec::new(),
         cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
         total_vcpus: 16,
         wire_version: if faithful {
             engram_protocol::WIRE_VERSION

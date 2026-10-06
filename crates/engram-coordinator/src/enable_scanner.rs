@@ -145,7 +145,8 @@ const DEFAULT_CAPTURE_CAPACITY_WAIT: Duration = Duration::from_secs(1800);
 /// live-materialize freshness window (`live_enable_work_by_host`) so
 /// "the gate stops counting a dead stream" and "a peer may re-claim"
 /// happen on the same clock.
-pub(crate) const DEFAULT_ENABLE_JOB_LEASE_SECS: u32 = 300;
+pub(crate) const DEFAULT_ENABLE_JOB_LEASE_SECS: u32 =
+    engram_core::types::host::ENABLE_MATERIALIZE_LEASE_SECS;
 
 impl EnableScannerConfig {
     /// Resolves `ENGRAM_ENABLE_PRESTAGE_TIMEOUT_SECS` on top of the pure
@@ -1505,6 +1506,10 @@ mod tests {
             current_bundles: Vec::new(),
             sandbox_bundles: Vec::new(),
             cordoned: false,
+            cordon_owner: None,
+            cordon_reason: None,
+            retire_requested_at: None,
+            retired_at: None,
             total_vcpus: 0,
             wire_version: 0,
             stages_images: true,

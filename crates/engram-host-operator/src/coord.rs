@@ -120,6 +120,7 @@ impl CoordClient {
         self.fleet
             .clone()
             .cordon_host(app::CordonHostRequest {
+                owner: "operator".into(),
                 host_id: host.to_string(),
             })
             .await
@@ -159,6 +160,7 @@ impl CoordClient {
         self.fleet
             .clone()
             .uncordon_host(app::UncordonHostRequest {
+                owner: "operator".into(),
                 host_id: host.to_string(),
             })
             .await

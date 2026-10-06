@@ -1028,13 +1028,14 @@ mod tests {
             &self,
             _: HostId,
             _: engram_core::types::host::HostHeartbeat,
-        ) -> Result<(), engram_core::MetaError> {
+        ) -> Result<engram_core::types::host::HeartbeatAck, engram_core::MetaError> {
             unreachable!()
         }
-        async fn set_host_cordoned(
+        async fn set_host_cordon(
             &self,
             _: HostId,
-            _: bool,
+            _: Option<engram_core::types::host::CordonOwner>,
+            _: Option<&str>,
         ) -> Result<(), engram_core::MetaError> {
             unreachable!()
         }

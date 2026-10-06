@@ -56,16 +56,79 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             ))
             .await
             .unwrap_or_default();
-        let hosts = rows
-            .into_iter()
-            .map(|row| {
-                let r = reserved.get(&row.id).copied().unwrap_or_default();
-                let w = enable_work.get(&row.id).copied().unwrap_or_default();
-                let view = crate::api::hosts::HostView::from_row(row, r, w);
-                convert::host_view_to_proto(&view)
-            })
-            .collect();
+        let mut hosts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.id;
+            let r = reserved.get(&id).copied().unwrap_or_default();
+            let w = enable_work.get(&id).copied().unwrap_or_default();
+            // The blocker query is one round trip per host; only a host
+            // with a retirement request has anything to report.
+            let retiring = row.retire_requested_at.is_some();
+            let mut view = crate::api::hosts::HostView::from_row(row, r, w);
+            if retiring {
+                view.retirement = self
+                    .state
+                    .services
+                    .meta
+                    .host_retirement_status(id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            }
+            hosts.push(convert::host_view_to_proto(&view));
+        }
         Ok(Response::new(app::ListHostsResponse { hosts }))
+    }
+
+    async fn retire_host(
+        &self,
+        req: Request<app::RetireHostRequest>,
+    ) -> Result<Response<app::RetireHostResponse>, Status> {
+        self.auth.check(&req)?;
+        let input = req.get_ref();
+        let host_id: engram_core::HostId = input
+            .host_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("malformed host_id"))?;
+        let owner = parse_owner(&input.owner)?;
+        let meta = &self.state.services.meta;
+        let now = self.state.services.clock.now_utc();
+        let requested = meta
+            .request_host_retirement(host_id, owner, &input.reason, now)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !requested {
+            // Idempotent on a host that is already retired; honest on the
+            // rest (unknown, dead, or cordoned by another owner).
+            let row = meta
+                .get_host(host_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("host not found"))?;
+            if row.status != engram_core::types::host::HostStatus::Retired {
+                let why = match row.cordon_owner {
+                    Some(other) if other != owner => {
+                        format!("host is cordoned by {}", other.as_str())
+                    }
+                    _ => format!("host is {}", row.status.as_str()),
+                };
+                return Err(Status::failed_precondition(why));
+            }
+        }
+        // TODO(ADR 0123 B4): C2 plans durable teleports here.
+        let teleports_planned = 0;
+        meta.grant_host_retirement(host_id, now)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let status = meta
+            .host_retirement_status(host_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("host not found"))?;
+        Ok(Response::new(app::RetireHostResponse {
+            host_id: host_id.to_string(),
+            retirement: Some(convert::retirement_to_proto(&status)),
+            teleports_planned,
+        }))
     }
 
     async fn get_host(
@@ -78,16 +141,14 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .host_id
             .parse()
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
-        let rows = self
+        let row = self
             .state
             .services
             .meta
-            .list_active_hosts()
+            .get_host(host_id)
             .await
-            .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
-        let row = rows.into_iter().find(|r| r.id == host_id).ok_or_else(|| {
-            into_status(crate::error::ApiError::NotFound("host not found".into()))
-        })?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("host not found"))?;
         let reserved = self
             .state
             .services
@@ -111,7 +172,14 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .await
             .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
         let w = enable_work.get(&host_id).copied().unwrap_or_default();
-        let view = crate::api::hosts::HostView::from_row(row, r, w);
+        let mut view = crate::api::hosts::HostView::from_row(row, r, w);
+        view.retirement = self
+            .state
+            .services
+            .meta
+            .host_retirement_status(host_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(app::GetHostResponse {
             host: Some(convert::host_view_to_proto(&view)),
         }))
@@ -195,7 +263,11 @@ impl app::fleet_service_server::FleetService for AppFleetService {
         self.state
             .services
             .meta
-            .set_host_cordoned(host_id, true)
+            .set_host_cordon(
+                host_id,
+                Some(engram_core::types::host::CordonOwner::Admin),
+                None,
+            )
             .await
             .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
         Ok(Response::new(app::DrainHostResponse {}))
@@ -244,9 +316,13 @@ impl app::fleet_service_server::FleetService for AppFleetService {
         // api/admin.rs, which writes the durable `hosts.cordoned` bit. The
         // removed in-memory `host_registry.cordon` is no longer the source
         // of truth.
-        let resp = crate::api::admin::cordon_host_core(&self.state, host_id)
-            .await
-            .map_err(into_status)?;
+        let resp = crate::api::admin::cordon_host_core(
+            &self.state,
+            host_id,
+            parse_owner(&req.get_ref().owner)?,
+        )
+        .await
+        .map_err(into_status)?;
         Ok(Response::new(app::CordonHostResponse {
             host_id: resp.host_id.to_string(),
             status: resp.status.to_string(),
@@ -290,20 +366,20 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
         // ADR 0047 (PG-authoritative): delegate to the shared core in
         // api/admin.rs, which clears the durable `hosts.cordoned` bit.
-        let resp = crate::api::admin::uncordon_host_core(&self.state, host_id)
-            .await
-            .map_err(into_status)?;
+        let resp = crate::api::admin::uncordon_host_core(
+            &self.state,
+            host_id,
+            parse_owner(&req.get_ref().owner)?,
+        )
+        .await
+        .map_err(into_status)?;
         Ok(Response::new(app::UncordonHostResponse {
             host_id: resp.host_id.to_string(),
             status: resp.status.to_string(),
         }))
     }
 
-    // Faithful gRPC port of the old `DELETE /api/admin/hosts/:id` handler
-    // (ADR 0048; dropped in the ADR 0051 gRPC-only migration but never
-    // re-added, which stranded the operator's scale-down wave). 204 →
-    // empty Ok; the "still bound" 409 → FAILED_PRECONDITION; other errors
-    // → INTERNAL.
+    // ADR 0123 A4: only retired or dead hosts can be deleted.
     async fn delete_host(
         &self,
         req: Request<app::DeleteHostRequest>,
@@ -314,7 +390,7 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .host_id
             .parse()
             .map_err(|_| Status::invalid_argument("malformed host_id"))?;
-        use engram_core::types::session::DeleteHostOutcome;
+        use engram_core::types::host::DeleteHostOutcome;
         match self.state.services.meta.delete_host(host_id).await {
             Ok(DeleteHostOutcome::Deleted) => {
                 // Drop the in-memory routing entry (best-effort; a sibling
@@ -323,8 +399,9 @@ impl app::fleet_service_server::FleetService for AppFleetService {
                 tracing::info!(%host_id, "admin: host deregistered (row deleted)");
                 Ok(Response::new(app::DeleteHostResponse {}))
             }
-            Ok(DeleteHostOutcome::SessionsBound(n)) => Err(Status::failed_precondition(format!(
-                "host {host_id} still has {n} bound session(s); drain it before deleting"
+            Ok(DeleteHostOutcome::NotRetired(status)) => Err(Status::failed_precondition(format!(
+                "host is {}; retire it first",
+                status.as_str()
             ))),
             Err(e) => Err(Status::internal(format!("delete_host: {e}"))),
         }
@@ -426,4 +503,9 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             queued_vcpus: d.queued_vcpus,
         }))
     }
+}
+
+fn parse_owner(owner: &str) -> Result<engram_core::types::host::CordonOwner, Status> {
+    engram_core::types::host::CordonOwner::parse(owner)
+        .ok_or_else(|| Status::invalid_argument("owner must be operator or admin"))
 }

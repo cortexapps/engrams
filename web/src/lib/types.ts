@@ -204,7 +204,7 @@ export interface AdminUser {
   active: boolean;
 }
 
-export type HostStatus = "ready" | "draining" | "dead";
+export type HostStatus = "ready" | "draining" | "dead" | "retired";
 
 export interface HostView {
   id: string;

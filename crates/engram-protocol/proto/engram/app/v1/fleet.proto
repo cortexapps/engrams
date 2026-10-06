@@ -14,6 +14,8 @@ import "engram/app/v1/session.proto";
 service FleetService {
   rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
   rpc GetHost(GetHostRequest) returns (GetHostResponse);
+  // ADR 0123 A3: the retirement grant entry point (see RetireHostRequest).
+  rpc RetireHost(RetireHostRequest) returns (RetireHostResponse);
   // ADR 0016 Phase A per-host COW diagnostic
   // (GET /api/hosts/:id/cow-state).
   rpc GetHostCowState(GetHostCowStateRequest) returns (GetHostCowStateResponse);
@@ -67,7 +69,7 @@ message ListHostsResponse {
 message HostView {
   string id = 1;
   string hostname = 2;
-  // engram_core HostStatus, as_str: "ready" | "draining" | "dead".
+  // engram_core HostStatus, as_str: "ready" | "draining" | "dead" | "retired".
   string status = 3;
   uint64 capacity_total_mib = 4;
   uint64 capacity_used_mib = 5;
@@ -145,6 +147,12 @@ message HostView {
   // before the floor test (the backing files are sparse anonymous
   // inodes, so statvfs `used` alone under-counts what is spoken for).
   uint64 util_committed_swap_mib = 32;
+  // ADR 0123 A5: who holds the durable cordon — "operator" | "admin";
+  // empty when the host is not cordoned.
+  string cordon_owner = 33;
+  // ADR 0123 A2: retirement status. Unset when no retirement was
+  // requested; `retired_at` set means the grant landed.
+  HostRetirement retirement = 34;
 }
 
 message GetHostRequest {
@@ -203,6 +211,9 @@ message DrainFailure {
 
 message CordonHostRequest {
   string host_id = 1;
+  // ADR 0123 A5: cordon owner, "operator" | "admin". The same owner is
+  // required to uncordon.
+  string owner = 2;
 }
 
 // ADR 0116 A-D2: declare a planned handoff — extend the host's
@@ -232,6 +243,8 @@ message CordonHostResponse {
 
 message UncordonHostRequest {
   string host_id = 1;
+  // Must match the owner that cordoned (ADR 0123 A5).
+  string owner = 2;
 }
 
 // Same Rust type as CordonHostResponse (CordonResponse); a distinct
@@ -459,4 +472,38 @@ message SnapshotBlobGcResponse {
   uint64 promote_repinned_skips = 6;
   uint64 promote_delete_errors = 7;
   uint32 restart_count = 8;
+}
+
+// ADR 0123 A3: the idempotent retirement request. Cordons the host with
+// `owner`, plans teleports for its residents, evaluates the grant once,
+// and returns promptly. The caller repeats it until `retired_at` is set.
+message RetireHostRequest {
+  string host_id = 1;
+  // "operator" | "admin". FAILED_PRECONDITION when another owner holds
+  // the cordon.
+  string owner = 2;
+  // Free-text reason, stored on the host row for operators.
+  string reason = 3;
+}
+
+message RetireHostResponse {
+  string host_id = 1;
+  HostRetirement retirement = 2;
+  // Teleports enqueued by this call.
+  uint32 teleports_planned = 3;
+}
+
+message HostRetirement {
+  // ISO-8601; empty when no retirement was requested.
+  string requested_at = 1;
+  // ISO-8601; set exactly when the grant landed (`status = "retired"`).
+  string retired_at = 2;
+  // Empty once granted. Stable snake_case kinds (ADR 0123 A2), with the
+  // count where one applies.
+  repeated RetirementBlocker blockers = 3;
+}
+
+message RetirementBlocker {
+  string kind = 1;
+  uint64 count = 2;
 }

@@ -56,6 +56,8 @@ const STATUS_TONE: Record<HostStatus, StatusTone> = {
   ready: "nominal",
   draining: "caution",
   dead: "critical",
+  // ADR 0123: retired hosts are empty and wait for DeleteHost; not an alert.
+  retired: "muted",
 };
 
 const HOST_COLUMNS = ["130px", "96px", "minmax(0, 1fr)", "140px", "140px", "88px", "70px"];
@@ -243,7 +245,7 @@ function HostTable({ hosts }: { hosts: HostView[] }) {
   const undrain = useUndrainHost();
   const onUndrain = async (hostId: string) => {
     try {
-      await undrain.mutateAsync({ hostId });
+      await undrain.mutateAsync({ hostId, owner: "admin" });
       toast.success(`${hostId} takes new sandboxes again`);
     } catch (error) {
       toast.error(errorMessage(error));

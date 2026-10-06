@@ -339,10 +339,15 @@ mod tests {
             &self,
             _: HostId,
             _: engram_core::types::host::HostHeartbeat,
-        ) -> Result<(), MetaError> {
+        ) -> Result<engram_core::types::host::HeartbeatAck, MetaError> {
             unimplemented!()
         }
-        async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
+        async fn set_host_cordon(
+            &self,
+            _: HostId,
+            _: Option<engram_core::types::host::CordonOwner>,
+            _: Option<&str>,
+        ) -> Result<(), MetaError> {
             unimplemented!()
         }
         async fn mark_host_dead_if_lease_expired(
@@ -498,6 +503,10 @@ mod tests {
                 }],
                 sandbox_bundles: Vec::new(),
                 cordoned: false,
+                cordon_owner: None,
+                cordon_reason: None,
+                retire_requested_at: None,
+                retired_at: None,
                 total_vcpus: 4,
                 wire_version: 1,
                 stages_images: false,

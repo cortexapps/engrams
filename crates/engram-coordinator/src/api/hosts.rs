@@ -58,6 +58,8 @@ pub struct HostView {
     /// ADR 0047: the coordinator-owned cordon bit — non-schedulable
     /// regardless of the host-reported `status`.
     pub cordoned: bool,
+    pub cordon_owner: Option<engram_core::types::host::CordonOwner>,
+    pub retirement: Option<engram_core::types::host::RetirementStatus>,
     pub capacity_total_mib: u64,
     pub capacity_used_mib: u64,
     pub running_sandboxes: u32,
@@ -149,6 +151,8 @@ impl HostView {
             hostname: row.hostname,
             status: row.status.as_str(),
             cordoned: row.cordoned,
+            cordon_owner: row.cordon_owner,
+            retirement: None,
             capacity_total_mib: row.capacity.total_mib,
             capacity_used_mib: row.capacity.used_mib,
             running_sandboxes: row.capacity.running_sandboxes,

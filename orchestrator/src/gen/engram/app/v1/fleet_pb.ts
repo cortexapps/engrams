@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/fleet.proto.
  */
 export const file_engram_app_v1_fleet: GenFile = /*@__PURE__*/
-  fileDesc("ChllbmdyYW0vYXBwL3YxL2ZsZWV0LnByb3RvEg1lbmdyYW0uYXBwLnYxIhIKEExpc3RIb3N0c1JlcXVlc3QiOwoRTGlzdEhvc3RzUmVzcG9uc2USJgoFaG9zdHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IqgGCghIb3N0VmlldxIKCgJpZBgBIAEoCRIQCghob3N0bmFtZRgCIAEoCRIOCgZzdGF0dXMYAyABKAkSGgoSY2FwYWNpdHlfdG90YWxfbWliGAQgASgEEhkKEWNhcGFjaXR5X3VzZWRfbWliGAUgASgEEhkKEXJ1bm5pbmdfc2FuZGJveGVzGAYgASgNEhQKDHJlYWR5X2ltYWdlcxgIIAEoBBIbChNyZWFkeV9pbWFnZV9kaWdlc3RzGAkgAygJEhsKE3V0aWxfZGlza190b3RhbF9taWIYCiABKAQSGgoSdXRpbF9kaXNrX3VzZWRfbWliGAsgASgEEhoKEnV0aWxfbWVtX3RvdGFsX21pYhgMIAEoBBIZChF1dGlsX21lbV91c2VkX21pYhgNIAEoBBIUCgx1dGlsX2NwdV9wY3QYDiABKAISGQoRbGFzdF9oZWFydGJlYXRfYXQYDyABKAkSEAoIY29yZG9uZWQYECABKAgSFwoPYWxsb2NhdGFibGVfbWliGBEgASgEEhQKDHJlc2VydmVkX21pYhgSIAEoBBIQCghmcmVlX21pYhgTIAEoBBITCgt0b3RhbF92Y3B1cxgUIAEoDRIYChBjcHVfYnVkZ2V0X3ZjcHVzGBUgASgEEhYKDnJlc2VydmVkX3ZjcHVzGBYgASgEEhIKCmZyZWVfdmNwdXMYFyABKAQSGQoRdXRpbF9iYXNlX3NobV9taWIYGCABKAQSGwoTdXRpbF9wYXJrZWRfcHNzX21pYhgZIAEoBBIcChR1dGlsX3J1bm5pbmdfcHNzX21pYhgaIAEoBBIcChRmYWlsaW5nX2NhcGFiaWxpdGllcxgbIAMoCRIbChNmY19zbmFwc2hvdF92ZXJzaW9uGBwgASgJEhsKE2NhcGFiaWxpdGllc19zY2hlbWEYHSABKA0SGQoRbGl2ZV9tYXRlcmlhbGl6ZXMYHiABKA0SGQoRbGl2ZV9jYXB0dXJlX2pvYnMYHyABKA0SHwoXdXRpbF9jb21taXR0ZWRfc3dhcF9taWIYICABKARKBAgHEAhSD2xvY2FsX3NuYXBzaG90cyIhCg5HZXRIb3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIjgKD0dldEhvc3RSZXNwb25zZRIlCgRob3N0GAEgASgLMhcuZW5ncmFtLmFwcC52MS5Ib3N0VmlldyIpChZHZXRIb3N0Q293U3RhdGVSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiWQoXR2V0SG9zdENvd1N0YXRlUmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRItCghzZXNzaW9ucxgCIAMoCzIbLmVuZ3JhbS5hcHAudjEuQ293U3RhdGVWaWV3IiMKEERyYWluSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSITChFEcmFpbkhvc3RSZXNwb25zZSIoChVBZG1pbkRyYWluSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSJsChZBZG1pbkRyYWluSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSEgoKZXZhY3VhdGluZxgCIAMoCRItCghmYWlsdXJlcxgDIAMoCzIbLmVuZ3JhbS5hcHAudjEuRHJhaW5GYWlsdXJlIjEKDERyYWluRmFpbHVyZRISCgpzZXNzaW9uX2lkGAEgASgJEg0KBWVycm9yGAIgASgJIiQKEUNvcmRvbkhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiPAoXQmVnaW5Ib3N0SGFuZG9mZlJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCRIQCgh0dGxfc2VjcxgCIAEoBCI9ChhCZWdpbkhvc3RIYW5kb2ZmUmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIQCghhY2NlcHRlZBgCIAEoCCI1ChJDb3Jkb25Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkiJgoTVW5jb3Jkb25Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIjcKFFVuY29yZG9uSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSDgoGc3RhdHVzGAIgASgJIiQKEURlbGV0ZUhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiFAoSRGVsZXRlSG9zdFJlc3BvbnNlIhoKGEdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdCKEAgoZR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRIRCglzbmFwc2hvdHMYASABKAQSFgoOc25hcHNob3RfYnl0ZXMYAiABKAQSEgoKZ2NfcGVuZGluZxgDIAEoBBIZChF0cmFja2VkX3NhbmRib3hlcxgEIAEoBBIUCgxkaXJ0eV9jaHVua3MYBSABKAQSFwoPdW5mbHVzaGVkX2J5dGVzGAYgASgEEhgKEGF2Z19sb2NhbGl0eV9wY3QYByABKA0SKgoEcm93cxgIIAMoCzIcLmVuZ3JhbS5hcHAudjEuRHVyYWJpbGl0eVJvdxIYChBnY19wZW5kaW5nX2V4YWN0GAkgASgIIuUBCg1EdXJhYmlsaXR5Um93EhIKCnNhbmRib3hfaWQYASABKAkSFwoKc2Vzc2lvbl9pZBgCIAEoCUgAiAEBEg8KB2hvc3RfaWQYAyABKAkSFAoMZGlydHlfY2h1bmtzGAQgASgNEhMKC2RpcnR5X2J5dGVzGAUgASgEEhMKC2Jhc2VfY2h1bmtzGAYgASgNEhkKEWJhc2VfY2h1bmtzX2xvY2FsGAcgASgNEhoKDWxhc3RfZmx1c2hfYXQYCCABKAlIAYgBAUINCgtfc2Vzc2lvbl9pZEIQCg5fbGFzdF9mbHVzaF9hdCIpChNGbHVzaFNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiWwoURmx1c2hTZXNzaW9uUmVzcG9uc2USDwoHb3V0Y29tZRgBIAEoCRIdChBtYW5pZmVzdF92ZXJzaW9uGAIgASgESACIAQFCEwoRX21hbmlmZXN0X3ZlcnNpb24iVgoWRXZhY3VhdGVTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhgKC3RhcmdldF9ob3N0GAIgASgJSACIAQFCDgoMX3RhcmdldF9ob3N0Ij0KF0V2YWN1YXRlU2Vzc2lvblJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDgoGc3RhdHVzGAIgASgJIhcKFUdldEZsZWV0RGVtYW5kUmVxdWVzdCLxAQoWR2V0RmxlZXREZW1hbmRSZXNwb25zZRITCgtyZWFkeV9ob3N0cxgBIAEoDRIZChFzY2hlZHVsYWJsZV9ob3N0cxgCIAEoDRIQCghmcmVlX21pYhgDIAEoBBIRCgl0b3RhbF9taWIYBCABKAQSEgoKZnJlZV92Y3B1cxgFIAEoBBITCgt0b3RhbF92Y3B1cxgGIAEoBBIWCg5jb3Jkb25lZF9ob3N0cxgHIAEoDRIXCg9xdWV1ZWRfc2Vzc2lvbnMYCCABKAQSEgoKcXVldWVkX21pYhgJIAEoBBIUCgxxdWV1ZWRfdmNwdXMYCiABKAQiSQoOQ2h1bmtHY1JlcXVlc3QSDwoHZHJ5X3J1bhgBIAEoCBIXCgpncmFjZV9zZWNzGAIgASgESACIAQFCDQoLX2dyYWNlX3NlY3MijAIKD0NodW5rR2NSZXNwb25zZRIVCg1saXN0ZWRfY2h1bmtzGAEgASgEEhYKDm1hbGZvcm1lZF9rZXlzGAIgASgEEhQKDHBpbl9zZXRfc2l6ZRgDIAEoBBIZChFjYW5kaWRhdGVzX21hcmtlZBgEIAEoBBIYChBwcm9tb3RlZF9kZWxldGVzGAcgASgEEh0KFXByb21vdGVfZGVsZXRlX2Vycm9ycxgIIAEoBBISCgpncmFjZV9zZWNzGAkgASgEEhgKEGdlbmVyYXRpb25fbW92ZWQYCiABKAgSFwoKbWFya19lcnJvchgLIAEoCUgAiAEBQg0KC19tYXJrX2Vycm9ySgQIBRAGSgQIBhAHIkoKD0J1bmRsZUdjUmVxdWVzdBIPCgdkcnlfcnVuGAEgASgIEhcKCmdyYWNlX3NlY3MYAiABKARIAIgBAUINCgtfZ3JhY2Vfc2VjcyLDAQoQQnVuZGxlR2NSZXNwb25zZRIOCgZsaXN0ZWQYASABKAQSFAoMcGluX3NldF9zaXplGAIgASgEEhkKEWNhbmRpZGF0ZXNfbWFya2VkGAMgASgEEhgKEHByb21vdGVkX2RlbGV0ZXMYBCABKAQSHQoVcHJvbW90ZV9kZWxldGVfZXJyb3JzGAUgASgEEhUKDXJlc3RhcnRfY291bnQYBiABKA0SHgoWcHJvbW90ZV9yZXBpbm5lZF9za2lwcxgHIAEoBCJQChVTbmFwc2hvdEJsb2JHY1JlcXVlc3QSDwoHZHJ5X3J1bhgBIAEoCBIXCgpncmFjZV9zZWNzGAIgASgESACIAQFCDQoLX2dyYWNlX3NlY3Mi3AEKFlNuYXBzaG90QmxvYkdjUmVzcG9uc2USDgoGbGlzdGVkGAEgASgEEhEKCW1hbGZvcm1lZBgCIAEoBBIUCgxwaW5fc2V0X3NpemUYAyABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYBCABKAQSGAoQcHJvbW90ZWRfZGVsZXRlcxgFIAEoBBIeChZwcm9tb3RlX3JlcGlubmVkX3NraXBzGAYgASgEEh0KFXByb21vdGVfZGVsZXRlX2Vycm9ycxgHIAEoBBIVCg1yZXN0YXJ0X2NvdW50GAggASgNMpULCgxGbGVldFNlcnZpY2USTgoJTGlzdEhvc3RzEh8uZW5ncmFtLmFwcC52MS5MaXN0SG9zdHNSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5MaXN0SG9zdHNSZXNwb25zZRJICgdHZXRIb3N0Eh0uZW5ncmFtLmFwcC52MS5HZXRIb3N0UmVxdWVzdBoeLmVuZ3JhbS5hcHAudjEuR2V0SG9zdFJlc3BvbnNlEmAKD0dldEhvc3RDb3dTdGF0ZRIlLmVuZ3JhbS5hcHAudjEuR2V0SG9zdENvd1N0YXRlUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuR2V0SG9zdENvd1N0YXRlUmVzcG9uc2USTgoJRHJhaW5Ib3N0Eh8uZW5ncmFtLmFwcC52MS5EcmFpbkhvc3RSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5EcmFpbkhvc3RSZXNwb25zZRJdCg5BZG1pbkRyYWluSG9zdBIkLmVuZ3JhbS5hcHAudjEuQWRtaW5EcmFpbkhvc3RSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5BZG1pbkRyYWluSG9zdFJlc3BvbnNlElEKCkNvcmRvbkhvc3QSIC5lbmdyYW0uYXBwLnYxLkNvcmRvbkhvc3RSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5Db3Jkb25Ib3N0UmVzcG9uc2USYwoQQmVnaW5Ib3N0SGFuZG9mZhImLmVuZ3JhbS5hcHAudjEuQmVnaW5Ib3N0SGFuZG9mZlJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkJlZ2luSG9zdEhhbmRvZmZSZXNwb25zZRJXCgxVbmNvcmRvbkhvc3QSIi5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlc3BvbnNlElEKCkRlbGV0ZUhvc3QSIC5lbmdyYW0uYXBwLnYxLkRlbGV0ZUhvc3RSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5EZWxldGVIb3N0UmVzcG9uc2USZgoRR2V0U3RvcmFnZVN1bW1hcnkSJy5lbmdyYW0uYXBwLnYxLkdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRJXCgxGbHVzaFNlc3Npb24SIi5lbmdyYW0uYXBwLnYxLkZsdXNoU2Vzc2lvblJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkZsdXNoU2Vzc2lvblJlc3BvbnNlEmAKD0V2YWN1YXRlU2Vzc2lvbhIlLmVuZ3JhbS5hcHAudjEuRXZhY3VhdGVTZXNzaW9uUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuRXZhY3VhdGVTZXNzaW9uUmVzcG9uc2USSAoHQ2h1bmtHYxIdLmVuZ3JhbS5hcHAudjEuQ2h1bmtHY1JlcXVlc3QaHi5lbmdyYW0uYXBwLnYxLkNodW5rR2NSZXNwb25zZRJLCghCdW5kbGVHYxIeLmVuZ3JhbS5hcHAudjEuQnVuZGxlR2NSZXF1ZXN0Gh8uZW5ncmFtLmFwcC52MS5CdW5kbGVHY1Jlc3BvbnNlEl0KDlNuYXBzaG90QmxvYkdjEiQuZW5ncmFtLmFwcC52MS5TbmFwc2hvdEJsb2JHY1JlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLlNuYXBzaG90QmxvYkdjUmVzcG9uc2USXQoOR2V0RmxlZXREZW1hbmQSJC5lbmdyYW0uYXBwLnYxLkdldEZsZWV0RGVtYW5kUmVxdWVzdBolLmVuZ3JhbS5hcHAudjEuR2V0RmxlZXREZW1hbmRSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session]);
+  fileDesc("ChllbmdyYW0vYXBwL3YxL2ZsZWV0LnByb3RvEg1lbmdyYW0uYXBwLnYxIhIKEExpc3RIb3N0c1JlcXVlc3QiOwoRTGlzdEhvc3RzUmVzcG9uc2USJgoFaG9zdHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IvEGCghIb3N0VmlldxIKCgJpZBgBIAEoCRIQCghob3N0bmFtZRgCIAEoCRIOCgZzdGF0dXMYAyABKAkSGgoSY2FwYWNpdHlfdG90YWxfbWliGAQgASgEEhkKEWNhcGFjaXR5X3VzZWRfbWliGAUgASgEEhkKEXJ1bm5pbmdfc2FuZGJveGVzGAYgASgNEhQKDHJlYWR5X2ltYWdlcxgIIAEoBBIbChNyZWFkeV9pbWFnZV9kaWdlc3RzGAkgAygJEhsKE3V0aWxfZGlza190b3RhbF9taWIYCiABKAQSGgoSdXRpbF9kaXNrX3VzZWRfbWliGAsgASgEEhoKEnV0aWxfbWVtX3RvdGFsX21pYhgMIAEoBBIZChF1dGlsX21lbV91c2VkX21pYhgNIAEoBBIUCgx1dGlsX2NwdV9wY3QYDiABKAISGQoRbGFzdF9oZWFydGJlYXRfYXQYDyABKAkSEAoIY29yZG9uZWQYECABKAgSFwoPYWxsb2NhdGFibGVfbWliGBEgASgEEhQKDHJlc2VydmVkX21pYhgSIAEoBBIQCghmcmVlX21pYhgTIAEoBBITCgt0b3RhbF92Y3B1cxgUIAEoDRIYChBjcHVfYnVkZ2V0X3ZjcHVzGBUgASgEEhYKDnJlc2VydmVkX3ZjcHVzGBYgASgEEhIKCmZyZWVfdmNwdXMYFyABKAQSGQoRdXRpbF9iYXNlX3NobV9taWIYGCABKAQSGwoTdXRpbF9wYXJrZWRfcHNzX21pYhgZIAEoBBIcChR1dGlsX3J1bm5pbmdfcHNzX21pYhgaIAEoBBIcChRmYWlsaW5nX2NhcGFiaWxpdGllcxgbIAMoCRIbChNmY19zbmFwc2hvdF92ZXJzaW9uGBwgASgJEhsKE2NhcGFiaWxpdGllc19zY2hlbWEYHSABKA0SGQoRbGl2ZV9tYXRlcmlhbGl6ZXMYHiABKA0SGQoRbGl2ZV9jYXB0dXJlX2pvYnMYHyABKA0SHwoXdXRpbF9jb21taXR0ZWRfc3dhcF9taWIYICABKAQSFAoMY29yZG9uX293bmVyGCEgASgJEjEKCnJldGlyZW1lbnQYIiABKAsyHS5lbmdyYW0uYXBwLnYxLkhvc3RSZXRpcmVtZW50SgQIBxAIUg9sb2NhbF9zbmFwc2hvdHMiIQoOR2V0SG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSI4Cg9HZXRIb3N0UmVzcG9uc2USJQoEaG9zdBgBIAEoCzIXLmVuZ3JhbS5hcHAudjEuSG9zdFZpZXciKQoWR2V0SG9zdENvd1N0YXRlUmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIlkKF0dldEhvc3RDb3dTdGF0ZVJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSLQoIc2Vzc2lvbnMYAiADKAsyGy5lbmdyYW0uYXBwLnYxLkNvd1N0YXRlVmlldyIjChBEcmFpbkhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiEwoRRHJhaW5Ib3N0UmVzcG9uc2UiKAoVQWRtaW5EcmFpbkhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkibAoWQWRtaW5EcmFpbkhvc3RSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEhIKCmV2YWN1YXRpbmcYAiADKAkSLQoIZmFpbHVyZXMYAyADKAsyGy5lbmdyYW0uYXBwLnYxLkRyYWluRmFpbHVyZSIxCgxEcmFpbkZhaWx1cmUSEgoKc2Vzc2lvbl9pZBgBIAEoCRINCgVlcnJvchgCIAEoCSIzChFDb3Jkb25Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJEg0KBW93bmVyGAIgASgJIjwKF0JlZ2luSG9zdEhhbmRvZmZSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkSEAoIdHRsX3NlY3MYAiABKAQiPQoYQmVnaW5Ib3N0SGFuZG9mZlJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSEAoIYWNjZXB0ZWQYAiABKAgiNQoSQ29yZG9uSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSDgoGc3RhdHVzGAIgASgJIjUKE1VuY29yZG9uSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCRINCgVvd25lchgCIAEoCSI3ChRVbmNvcmRvbkhvc3RSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSIkChFEZWxldGVIb3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIhQKEkRlbGV0ZUhvc3RSZXNwb25zZSIaChhHZXRTdG9yYWdlU3VtbWFyeVJlcXVlc3QihAIKGUdldFN0b3JhZ2VTdW1tYXJ5UmVzcG9uc2USEQoJc25hcHNob3RzGAEgASgEEhYKDnNuYXBzaG90X2J5dGVzGAIgASgEEhIKCmdjX3BlbmRpbmcYAyABKAQSGQoRdHJhY2tlZF9zYW5kYm94ZXMYBCABKAQSFAoMZGlydHlfY2h1bmtzGAUgASgEEhcKD3VuZmx1c2hlZF9ieXRlcxgGIAEoBBIYChBhdmdfbG9jYWxpdHlfcGN0GAcgASgNEioKBHJvd3MYCCADKAsyHC5lbmdyYW0uYXBwLnYxLkR1cmFiaWxpdHlSb3cSGAoQZ2NfcGVuZGluZ19leGFjdBgJIAEoCCLlAQoNRHVyYWJpbGl0eVJvdxISCgpzYW5kYm94X2lkGAEgASgJEhcKCnNlc3Npb25faWQYAiABKAlIAIgBARIPCgdob3N0X2lkGAMgASgJEhQKDGRpcnR5X2NodW5rcxgEIAEoDRITCgtkaXJ0eV9ieXRlcxgFIAEoBBITCgtiYXNlX2NodW5rcxgGIAEoDRIZChFiYXNlX2NodW5rc19sb2NhbBgHIAEoDRIaCg1sYXN0X2ZsdXNoX2F0GAggASgJSAGIAQFCDQoLX3Nlc3Npb25faWRCEAoOX2xhc3RfZmx1c2hfYXQiKQoTRmx1c2hTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIlsKFEZsdXNoU2Vzc2lvblJlc3BvbnNlEg8KB291dGNvbWUYASABKAkSHQoQbWFuaWZlc3RfdmVyc2lvbhgCIAEoBEgAiAEBQhMKEV9tYW5pZmVzdF92ZXJzaW9uIlYKFkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIYCgt0YXJnZXRfaG9zdBgCIAEoCUgAiAEBQg4KDF90YXJnZXRfaG9zdCI9ChdFdmFjdWF0ZVNlc3Npb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSIXChVHZXRGbGVldERlbWFuZFJlcXVlc3Qi8QEKFkdldEZsZWV0RGVtYW5kUmVzcG9uc2USEwoLcmVhZHlfaG9zdHMYASABKA0SGQoRc2NoZWR1bGFibGVfaG9zdHMYAiABKA0SEAoIZnJlZV9taWIYAyABKAQSEQoJdG90YWxfbWliGAQgASgEEhIKCmZyZWVfdmNwdXMYBSABKAQSEwoLdG90YWxfdmNwdXMYBiABKAQSFgoOY29yZG9uZWRfaG9zdHMYByABKA0SFwoPcXVldWVkX3Nlc3Npb25zGAggASgEEhIKCnF1ZXVlZF9taWIYCSABKAQSFAoMcXVldWVkX3ZjcHVzGAogASgEIkkKDkNodW5rR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzIowCCg9DaHVua0djUmVzcG9uc2USFQoNbGlzdGVkX2NodW5rcxgBIAEoBBIWCg5tYWxmb3JtZWRfa2V5cxgCIAEoBBIUCgxwaW5fc2V0X3NpemUYAyABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYBCABKAQSGAoQcHJvbW90ZWRfZGVsZXRlcxgHIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYCCABKAQSEgoKZ3JhY2Vfc2VjcxgJIAEoBBIYChBnZW5lcmF0aW9uX21vdmVkGAogASgIEhcKCm1hcmtfZXJyb3IYCyABKAlIAIgBAUINCgtfbWFya19lcnJvckoECAUQBkoECAYQByJKCg9CdW5kbGVHY1JlcXVlc3QSDwoHZHJ5X3J1bhgBIAEoCBIXCgpncmFjZV9zZWNzGAIgASgESACIAQFCDQoLX2dyYWNlX3NlY3MiwwEKEEJ1bmRsZUdjUmVzcG9uc2USDgoGbGlzdGVkGAEgASgEEhQKDHBpbl9zZXRfc2l6ZRgCIAEoBBIZChFjYW5kaWRhdGVzX21hcmtlZBgDIAEoBBIYChBwcm9tb3RlZF9kZWxldGVzGAQgASgEEh0KFXByb21vdGVfZGVsZXRlX2Vycm9ycxgFIAEoBBIVCg1yZXN0YXJ0X2NvdW50GAYgASgNEh4KFnByb21vdGVfcmVwaW5uZWRfc2tpcHMYByABKAQiUAoVU25hcHNob3RCbG9iR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzItwBChZTbmFwc2hvdEJsb2JHY1Jlc3BvbnNlEg4KBmxpc3RlZBgBIAEoBBIRCgltYWxmb3JtZWQYAiABKAQSFAoMcGluX3NldF9zaXplGAMgASgEEhkKEWNhbmRpZGF0ZXNfbWFya2VkGAQgASgEEhgKEHByb21vdGVkX2RlbGV0ZXMYBSABKAQSHgoWcHJvbW90ZV9yZXBpbm5lZF9za2lwcxgGIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYByABKAQSFQoNcmVzdGFydF9jb3VudBgIIAEoDSJDChFSZXRpcmVIb3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJEg0KBW93bmVyGAIgASgJEg4KBnJlYXNvbhgDIAEoCSJzChJSZXRpcmVIb3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIxCgpyZXRpcmVtZW50GAIgASgLMh0uZW5ncmFtLmFwcC52MS5Ib3N0UmV0aXJlbWVudBIZChF0ZWxlcG9ydHNfcGxhbm5lZBgDIAEoDSJuCg5Ib3N0UmV0aXJlbWVudBIUCgxyZXF1ZXN0ZWRfYXQYASABKAkSEgoKcmV0aXJlZF9hdBgCIAEoCRIyCghibG9ja2VycxgDIAMoCzIgLmVuZ3JhbS5hcHAudjEuUmV0aXJlbWVudEJsb2NrZXIiMAoRUmV0aXJlbWVudEJsb2NrZXISDAoEa2luZBgBIAEoCRINCgVjb3VudBgCIAEoBDLoCwoMRmxlZXRTZXJ2aWNlEk4KCUxpc3RIb3N0cxIfLmVuZ3JhbS5hcHAudjEuTGlzdEhvc3RzUmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuTGlzdEhvc3RzUmVzcG9uc2USSAoHR2V0SG9zdBIdLmVuZ3JhbS5hcHAudjEuR2V0SG9zdFJlcXVlc3QaHi5lbmdyYW0uYXBwLnYxLkdldEhvc3RSZXNwb25zZRJRCgpSZXRpcmVIb3N0EiAuZW5ncmFtLmFwcC52MS5SZXRpcmVIb3N0UmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuUmV0aXJlSG9zdFJlc3BvbnNlEmAKD0dldEhvc3RDb3dTdGF0ZRIlLmVuZ3JhbS5hcHAudjEuR2V0SG9zdENvd1N0YXRlUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuR2V0SG9zdENvd1N0YXRlUmVzcG9uc2USTgoJRHJhaW5Ib3N0Eh8uZW5ncmFtLmFwcC52MS5EcmFpbkhvc3RSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5EcmFpbkhvc3RSZXNwb25zZRJdCg5BZG1pbkRyYWluSG9zdBIkLmVuZ3JhbS5hcHAudjEuQWRtaW5EcmFpbkhvc3RSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5BZG1pbkRyYWluSG9zdFJlc3BvbnNlElEKCkNvcmRvbkhvc3QSIC5lbmdyYW0uYXBwLnYxLkNvcmRvbkhvc3RSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5Db3Jkb25Ib3N0UmVzcG9uc2USYwoQQmVnaW5Ib3N0SGFuZG9mZhImLmVuZ3JhbS5hcHAudjEuQmVnaW5Ib3N0SGFuZG9mZlJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkJlZ2luSG9zdEhhbmRvZmZSZXNwb25zZRJXCgxVbmNvcmRvbkhvc3QSIi5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlc3BvbnNlElEKCkRlbGV0ZUhvc3QSIC5lbmdyYW0uYXBwLnYxLkRlbGV0ZUhvc3RSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5EZWxldGVIb3N0UmVzcG9uc2USZgoRR2V0U3RvcmFnZVN1bW1hcnkSJy5lbmdyYW0uYXBwLnYxLkdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRJXCgxGbHVzaFNlc3Npb24SIi5lbmdyYW0uYXBwLnYxLkZsdXNoU2Vzc2lvblJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkZsdXNoU2Vzc2lvblJlc3BvbnNlEmAKD0V2YWN1YXRlU2Vzc2lvbhIlLmVuZ3JhbS5hcHAudjEuRXZhY3VhdGVTZXNzaW9uUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuRXZhY3VhdGVTZXNzaW9uUmVzcG9uc2USSAoHQ2h1bmtHYxIdLmVuZ3JhbS5hcHAudjEuQ2h1bmtHY1JlcXVlc3QaHi5lbmdyYW0uYXBwLnYxLkNodW5rR2NSZXNwb25zZRJLCghCdW5kbGVHYxIeLmVuZ3JhbS5hcHAudjEuQnVuZGxlR2NSZXF1ZXN0Gh8uZW5ncmFtLmFwcC52MS5CdW5kbGVHY1Jlc3BvbnNlEl0KDlNuYXBzaG90QmxvYkdjEiQuZW5ncmFtLmFwcC52MS5TbmFwc2hvdEJsb2JHY1JlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLlNuYXBzaG90QmxvYkdjUmVzcG9uc2USXQoOR2V0RmxlZXREZW1hbmQSJC5lbmdyYW0uYXBwLnYxLkdldEZsZWV0RGVtYW5kUmVxdWVzdBolLmVuZ3JhbS5hcHAudjEuR2V0RmxlZXREZW1hbmRSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session]);
 
 /**
  * @generated from message engram.app.v1.ListHostsRequest
@@ -63,7 +63,7 @@ export type HostView = Message<"engram.app.v1.HostView"> & {
   hostname: string;
 
   /**
-   * engram_core HostStatus, as_str: "ready" | "draining" | "dead".
+   * engram_core HostStatus, as_str: "ready" | "draining" | "dead" | "retired".
    *
    * @generated from field: string status = 3;
    */
@@ -262,6 +262,22 @@ export type HostView = Message<"engram.app.v1.HostView"> & {
    * @generated from field: uint64 util_committed_swap_mib = 32;
    */
   utilCommittedSwapMib: bigint;
+
+  /**
+   * ADR 0123 A5: who holds the durable cordon — "operator" | "admin";
+   * empty when the host is not cordoned.
+   *
+   * @generated from field: string cordon_owner = 33;
+   */
+  cordonOwner: string;
+
+  /**
+   * ADR 0123 A2: retirement status. Unset when no retirement was
+   * requested; `retired_at` set means the grant landed.
+   *
+   * @generated from field: engram.app.v1.HostRetirement retirement = 34;
+   */
+  retirement?: HostRetirement;
 };
 
 /**
@@ -471,6 +487,14 @@ export type CordonHostRequest = Message<"engram.app.v1.CordonHostRequest"> & {
    * @generated from field: string host_id = 1;
    */
   hostId: string;
+
+  /**
+   * ADR 0123 A5: cordon owner, "operator" | "admin". The same owner is
+   * required to uncordon.
+   *
+   * @generated from field: string owner = 2;
+   */
+  owner: string;
 };
 
 /**
@@ -568,6 +592,13 @@ export type UncordonHostRequest = Message<"engram.app.v1.UncordonHostRequest"> &
    * @generated from field: string host_id = 1;
    */
   hostId: string;
+
+  /**
+   * Must match the owner that cordoned (ADR 0123 A5).
+   *
+   * @generated from field: string owner = 2;
+   */
+  owner: string;
 };
 
 /**
@@ -1286,6 +1317,127 @@ export const SnapshotBlobGcResponseSchema: GenMessage<SnapshotBlobGcResponse> = 
   messageDesc(file_engram_app_v1_fleet, 34);
 
 /**
+ * ADR 0123 A3: the idempotent retirement request. Cordons the host with
+ * `owner`, plans teleports for its residents, evaluates the grant once,
+ * and returns promptly. The caller repeats it until `retired_at` is set.
+ *
+ * @generated from message engram.app.v1.RetireHostRequest
+ */
+export type RetireHostRequest = Message<"engram.app.v1.RetireHostRequest"> & {
+  /**
+   * @generated from field: string host_id = 1;
+   */
+  hostId: string;
+
+  /**
+   * "operator" | "admin". FAILED_PRECONDITION when another owner holds
+   * the cordon.
+   *
+   * @generated from field: string owner = 2;
+   */
+  owner: string;
+
+  /**
+   * Free-text reason, stored on the host row for operators.
+   *
+   * @generated from field: string reason = 3;
+   */
+  reason: string;
+};
+
+/**
+ * Describes the message engram.app.v1.RetireHostRequest.
+ * Use `create(RetireHostRequestSchema)` to create a new message.
+ */
+export const RetireHostRequestSchema: GenMessage<RetireHostRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 35);
+
+/**
+ * @generated from message engram.app.v1.RetireHostResponse
+ */
+export type RetireHostResponse = Message<"engram.app.v1.RetireHostResponse"> & {
+  /**
+   * @generated from field: string host_id = 1;
+   */
+  hostId: string;
+
+  /**
+   * @generated from field: engram.app.v1.HostRetirement retirement = 2;
+   */
+  retirement?: HostRetirement;
+
+  /**
+   * Teleports enqueued by this call.
+   *
+   * @generated from field: uint32 teleports_planned = 3;
+   */
+  teleportsPlanned: number;
+};
+
+/**
+ * Describes the message engram.app.v1.RetireHostResponse.
+ * Use `create(RetireHostResponseSchema)` to create a new message.
+ */
+export const RetireHostResponseSchema: GenMessage<RetireHostResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 36);
+
+/**
+ * @generated from message engram.app.v1.HostRetirement
+ */
+export type HostRetirement = Message<"engram.app.v1.HostRetirement"> & {
+  /**
+   * ISO-8601; empty when no retirement was requested.
+   *
+   * @generated from field: string requested_at = 1;
+   */
+  requestedAt: string;
+
+  /**
+   * ISO-8601; set exactly when the grant landed (`status = "retired"`).
+   *
+   * @generated from field: string retired_at = 2;
+   */
+  retiredAt: string;
+
+  /**
+   * Empty once granted. Stable snake_case kinds (ADR 0123 A2), with the
+   * count where one applies.
+   *
+   * @generated from field: repeated engram.app.v1.RetirementBlocker blockers = 3;
+   */
+  blockers: RetirementBlocker[];
+};
+
+/**
+ * Describes the message engram.app.v1.HostRetirement.
+ * Use `create(HostRetirementSchema)` to create a new message.
+ */
+export const HostRetirementSchema: GenMessage<HostRetirement> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 37);
+
+/**
+ * @generated from message engram.app.v1.RetirementBlocker
+ */
+export type RetirementBlocker = Message<"engram.app.v1.RetirementBlocker"> & {
+  /**
+   * @generated from field: string kind = 1;
+   */
+  kind: string;
+
+  /**
+   * @generated from field: uint64 count = 2;
+   */
+  count: bigint;
+};
+
+/**
+ * Describes the message engram.app.v1.RetirementBlocker.
+ * Use `create(RetirementBlockerSchema)` to create a new message.
+ */
+export const RetirementBlockerSchema: GenMessage<RetirementBlocker> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 38);
+
+/**
  * Fleet, storage, and GC operations (ADR 0051 §2.3, rev 2026-06-10).
  * The caller is a single trusted service (bearer-authed); there is no
  * per-user anything here. Attribution and authz live in the orchestrator.
@@ -1312,6 +1464,16 @@ export const FleetService: GenService<{
     methodKind: "unary";
     input: typeof GetHostRequestSchema;
     output: typeof GetHostResponseSchema;
+  },
+  /**
+   * ADR 0123 A3: the retirement grant entry point (see RetireHostRequest).
+   *
+   * @generated from rpc engram.app.v1.FleetService.RetireHost
+   */
+  retireHost: {
+    methodKind: "unary";
+    input: typeof RetireHostRequestSchema;
+    output: typeof RetireHostResponseSchema;
   },
   /**
    * ADR 0016 Phase A per-host COW diagnostic

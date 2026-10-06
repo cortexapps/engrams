@@ -209,6 +209,10 @@ pub async fn register(
         current_bundles: Vec::new(),
         sandbox_bundles: Vec::new(),
         cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
         total_vcpus: 0,
         // Issue #229: register carries the host's wire version, but the
         // scheduling-state columns (this among them) are owned by the
@@ -634,17 +638,23 @@ pub async fn heartbeat(
         // so a racing predecessor can never shrink a handoff deadline).
         lease_renew_until: Some(state.services.clock.now_utc() + crate::config::host_lease_ttl()),
     };
-    if let Err(e) = state
+    match state
         .services
         .meta
         .touch_host_heartbeat(host_id, row_heartbeat)
         .await
     {
-        ::metrics::counter!(crate::metrics::HEARTBEAT_PERSIST_FAILURES_TOTAL).increment(1);
-        tracing::warn!(host_id = %host_id, error = %e, "heartbeat persistence failed; returning 5xx so the host backs off — its last_heartbeat_at did NOT advance and the dead-host detector keys on it (issue #231)");
-        return Err(ApiError::Internal(format!(
-            "heartbeat persistence failed; ack withheld so the host retries: {e}"
-        )));
+        Ok(engram_core::types::host::HeartbeatAck::Accepted) => {}
+        Ok(engram_core::types::host::HeartbeatAck::Refused(status)) => {
+            return Err(ApiError::Gone(format!("host is {}", status.as_str())));
+        }
+        Err(e) => {
+            ::metrics::counter!(crate::metrics::HEARTBEAT_PERSIST_FAILURES_TOTAL).increment(1);
+            tracing::warn!(host_id = %host_id, error = %e, "heartbeat persistence failed; returning 5xx so the host backs off — its last_heartbeat_at did NOT advance and the dead-host detector keys on it (issue #231)");
+            return Err(ApiError::Internal(format!(
+                "heartbeat persistence failed; ack withheld so the host retries: {e}"
+            )));
+        }
     }
 
     // ADR 0009 §1-§3: reconcile AFTER the persist above lands — a
@@ -2215,6 +2225,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn heartbeat_refused_host_returns_gone_without_reconcile() {
+        for status in [HostStatus::Dead, HostStatus::Retired] {
+            let host_id = HostId::new();
+            let sandbox_id = SandboxId::new();
+            let mut session = session_with_status(
+                engram_core::SessionId::new(),
+                sandbox_id,
+                SessionState::Active,
+            );
+            session.host_id = Some(host_id);
+            let (state, meta, _local) = build_state_for_session(session);
+            meta.add_ready_host(host_id);
+            meta.hosts.lock()[0].status = status;
+            let hb = serde_json::from_value(serde_json::json!({
+                "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 0 },
+                "running_sandboxes": [],
+            }))
+            .unwrap();
+            let result = heartbeat(State(state), Path(host_id), Json(hb)).await;
+            assert!(matches!(result, Err(ApiError::Gone(_))));
+            assert_eq!(*meta.reconcile_probe_calls.lock(), 0);
+            assert_eq!(meta.hosts.lock()[0].status, status);
+        }
+    }
+
     /// 2026-07-13 incident regression: the ADR 0090 quarantined-survivor
     /// arm fires on EVERY 5s heartbeat, and `session_ops` dedup keys
     /// ONLY on the idempotency key — a key-less enqueue inserts a fresh
@@ -2430,6 +2466,10 @@ mod tests {
                 current_bundles: Vec::new(),
                 sandbox_bundles: Vec::new(),
                 cordoned: false,
+                cordon_owner: None,
+                cordon_reason: None,
+                retire_requested_at: None,
+                retired_at: None,
                 total_vcpus: 0,
                 wire_version: 0, // 0 = not-yet-reported, tolerated
                 stages_images: true,

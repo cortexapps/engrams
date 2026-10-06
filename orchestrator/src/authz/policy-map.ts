@@ -186,6 +186,7 @@ export const POLICY: Record<string, PolicyEntry> = {
   "FleetService.GetHostCowState": { action: "manage", subject: "all" },
   "FleetService.DrainHost": { action: "manage", subject: "all" },
   "FleetService.AdminDrainHost": { action: "manage", subject: "all" },
+  "FleetService.RetireHost": { action: "manage", subject: "all" },
   "FleetService.CordonHost": { action: "manage", subject: "all" },
   // ADR 0116 A-D2: planned-handoff declaration. Admin-only like cordon —
   // it extends the host's binding-lease deadline, the shield a planned

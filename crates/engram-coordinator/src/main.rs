@@ -317,8 +317,15 @@ async fn touch_in_process_host<M: MetadataStore + ?Sized>(
     ready_images: Vec<String>,
     current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
 ) -> Result<(), engram_core::MetaError> {
-    meta.touch_host_heartbeat(host_id, in_process_heartbeat(ready_images, current_bundles))
-        .await
+    match meta
+        .touch_host_heartbeat(host_id, in_process_heartbeat(ready_images, current_bundles))
+        .await?
+    {
+        engram_core::types::host::HeartbeatAck::Accepted => Ok(()),
+        engram_core::types::host::HeartbeatAck::Refused(status) => Err(
+            engram_core::MetaError::Conflict(format!("host is {}", status.as_str())),
+        ),
+    }
 }
 
 #[tokio::main]
@@ -602,6 +609,10 @@ async fn main() -> Result<(), CoordinatorError> {
             current_bundles: Vec::new(),
             sandbox_bundles: Vec::new(),
             cordoned: false,
+            cordon_owner: None,
+            cordon_reason: None,
+            retire_requested_at: None,
+            retired_at: None,
             total_vcpus: 0,
             // Issue #229: the in-process host runs this very binary, so it
             // is trivially on the coordinator's wire version.
@@ -830,6 +841,10 @@ mod tests {
             current_bundles: current_bundles.clone(),
             sandbox_bundles: Vec::new(),
             cordoned: false,
+            cordon_owner: None,
+            cordon_reason: None,
+            retire_requested_at: None,
+            retired_at: None,
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: false,

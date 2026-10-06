@@ -115,7 +115,7 @@ export async function remove(c: Clients, id: string): Promise<void> {
 }
 
 export async function uncordon(c: Clients, id: string, json: boolean): Promise<void> {
-  const resp = await c.fleet.uncordonHost({ hostId: id }).catch(failWith);
+  const resp = await c.fleet.uncordonHost({ hostId: id, owner: "admin" }).catch(failWith);
   if (json) printJson({ host_id: resp.hostId, status: resp.status });
   else console.log(`${resp.hostId}: ${resp.status}`);
 }
