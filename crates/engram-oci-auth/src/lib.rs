@@ -288,10 +288,15 @@ mod tests {
             &self,
             _: HostId,
             _: engram_core::types::host::HostHeartbeat,
-        ) -> Result<(), MetaError> {
-            Ok(())
+        ) -> Result<engram_core::types::host::HeartbeatAck, MetaError> {
+            Ok(engram_core::types::host::HeartbeatAck::Accepted)
         }
-        async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
+        async fn set_host_cordon(
+            &self,
+            _: HostId,
+            _: Option<engram_core::types::host::CordonOwner>,
+            _: Option<&str>,
+        ) -> Result<(), MetaError> {
             Ok(())
         }
 

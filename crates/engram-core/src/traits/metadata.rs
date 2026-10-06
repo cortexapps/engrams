@@ -1,3 +1,4 @@
+use crate::types::host::DeleteHostOutcome;
 use async_trait::async_trait;
 
 use crate::error::MetaError;
@@ -14,8 +15,8 @@ use crate::types::registry::{
     EnableJob, EnableJobState, EnabledImage, RegistryCredential, SessionSecrets,
 };
 use crate::types::session::{
-    BindingDisposition, DeleteHostOutcome, QueuedDemand, QueuedSession, SandboxAssignment, Session,
-    SessionSpec, SessionState,
+    BindingDisposition, QueuedDemand, QueuedSession, SandboxAssignment, Session, SessionSpec,
+    SessionState,
 };
 use crate::types::snapshot::SnapshotRecord;
 
@@ -348,28 +349,6 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
-    /// #800 (RESERVED evac placement): the `Evacuating` twin of
-    /// [`Self::enqueue_session_resume`]. When the evac resumer's reserved
-    /// placement finds NO survivor that fits the session's budget, it
-    /// queues the session (`evacuating → queued`, resume-origin) instead of
-    /// binding a measured-full host — the queue scanner then re-homes it
-    /// once capacity returns, honoring the hard reserved bound (the #795
-    /// resume precedent, on the evac leg). Gated on `status='evacuating'`
-    /// AND the evac op's fencing epoch (ADR 0079), same shape as the resume
-    /// enqueue: a reclaimed-away zombie evac executor must not fork the
-    /// state machine. Returns whether the flip landed: `false` = the row was
-    /// no longer `evacuating` (a peer relocated it) OR the epoch moved (a
-    /// successor re-claimed). Default no-op: `false`.
-    async fn enqueue_evacuating_session_resume(
-        &self,
-        _id: SessionId,
-        _epoch: i64,
-    ) -> Result<bool, MetaError> {
-        Ok(false)
-    }
-
-    /// Every `queued` session, oldest-first (FIFO). The scanner walks
-    /// this each tick. Default impl (mocks): empty.
     async fn list_queued_sessions_fifo(&self) -> Result<Vec<QueuedSession>, MetaError> {
         Ok(Vec::new())
     }
@@ -751,11 +730,8 @@ pub trait MetadataStore: Send + Sync {
             .collect())
     }
 
-    /// ADR 0048: deregister a drained host immediately — its `hosts` row
-    /// is deleted so the operator's scale-down doesn't wait ~30-40s for
-    /// the dead-host detector. REFUSES (returns the bound count) if any
-    /// session is still bound (`pending`/`created`/`active`/`evacuating`/
-    /// `evicting`); idempotent (a missing row = `Ok(Deleted)`).
+    /// Delete a retired or dead host. A missing row is already deleted.
+    /// Other statuses return `NotRetired` without changing the row.
     /// Default impl (mocks): `Deleted`.
     async fn delete_host(&self, _id: HostId) -> Result<DeleteHostOutcome, MetaError> {
         Ok(DeleteHostOutcome::Deleted)
@@ -1687,6 +1663,42 @@ pub trait MetadataStore: Send + Sync {
 
     // ---- hosts ----
     async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError>;
+    async fn get_host(&self, _id: HostId) -> Result<Option<HostRecord>, MetaError> {
+        unimplemented!("get_host")
+    }
+    async fn request_host_retirement(
+        &self,
+        _id: HostId,
+        _owner: crate::types::host::CordonOwner,
+        _reason: &str,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("request_host_retirement")
+    }
+    async fn cancel_host_retirement(
+        &self,
+        _id: HostId,
+        _owner: crate::types::host::CordonOwner,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("cancel_host_retirement")
+    }
+    async fn list_retiring_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
+        unimplemented!("list_retiring_hosts")
+    }
+    async fn host_retirement_status(
+        &self,
+        _id: HostId,
+    ) -> Result<Option<crate::types::host::RetirementStatus>, MetaError> {
+        unimplemented!("host_retirement_status")
+    }
+    async fn grant_host_retirement(
+        &self,
+        _id: HostId,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::types::host::RetirementGrant, MetaError> {
+        unimplemented!("grant_host_retirement")
+    }
+
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError>;
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError>;
 
@@ -1718,11 +1730,15 @@ pub trait MetadataStore: Send + Sync {
     /// `current_bundles`, `total_vcpus`. This is the single
     /// per-heartbeat `hosts` UPDATE; every coordinator replica
     /// schedules from these columns. Deliberately does NOT touch
-    /// `cordoned` (coordinator-owned; see `set_host_cordoned`).
+    /// `cordoned` (coordinator-owned; see `set_host_cordon`).
     /// Distinct from `set_host_status` because drain/dead transitions
     /// imply nothing about liveness and must not refresh the
     /// dead-host detector's timestamp.
-    async fn touch_host_heartbeat(&self, id: HostId, hb: HostHeartbeat) -> Result<(), MetaError>;
+    async fn touch_host_heartbeat(
+        &self,
+        id: HostId,
+        hb: HostHeartbeat,
+    ) -> Result<crate::types::host::HeartbeatAck, MetaError>;
 
     /// ADR 0047: flip the coordinator-owned `hosts.cordoned` bit.
     /// Written only by the admin cordon/uncordon endpoints and the
@@ -1731,7 +1747,12 @@ pub trait MetadataStore: Send + Sync {
     /// `MetaError::NotFound` when no row exists — but succeeds for a
     /// host that has a row yet no live connection (wave-cordon during
     /// pod churn must stick).
-    async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError>;
+    async fn set_host_cordon(
+        &self,
+        id: HostId,
+        owner: Option<crate::types::host::CordonOwner>,
+        reason: Option<&str>,
+    ) -> Result<(), MetaError>;
 
     /// ADR 0116 A-D2: declare a planned handoff for `id` — extend the
     /// binding-lease deadline to at least `until` and flip

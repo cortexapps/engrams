@@ -200,6 +200,17 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         current_bundles,
         sandbox_bundles,
         cordoned,
+        cordon_owner: row
+            .try_get::<Option<String>, _>("cordon_owner")
+            .map_err(col_err)?
+            .map(|v| {
+                engram_core::types::host::CordonOwner::parse(&v)
+                    .ok_or_else(|| MetaError::Serialization(format!("invalid cordon owner: {v}")))
+            })
+            .transpose()?,
+        cordon_reason: row.try_get("cordon_reason").map_err(col_err)?,
+        retire_requested_at: row.try_get("retire_requested_at").map_err(col_err)?,
+        retired_at: row.try_get("retired_at").map_err(col_err)?,
         total_vcpus: total_vcpus.max(0) as u32,
         wire_version: wire_version.max(0) as u32,
         stages_images,
@@ -699,6 +710,7 @@ pub(crate) fn parse_host_status(s: &str) -> Result<HostStatus, MetaError> {
         "ready" => HostStatus::Ready,
         "draining" => HostStatus::Draining,
         "dead" => HostStatus::Dead,
+        "retired" => HostStatus::Retired,
         other => {
             return Err(MetaError::Serialization(format!(
                 "unknown host status: {other}"

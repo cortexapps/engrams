@@ -40,12 +40,14 @@ struct Ctx {
     clock: Arc<ManualClock>,
     /// Keeps the per-test PG database handle alive for the pg variant.
     _pg: Option<engram_testkit::pg::TestDb>,
+    sim: Option<Arc<SimMetadataStore>>,
 }
 
 fn sim_ctx() -> Ctx {
     let clock = ManualClock::new();
     let meta = SimMetadataStore::new(clock.clone(), Arc::new(SimEntropy::seeded(0xD4)));
     Ctx {
+        sim: Some(meta.clone()),
         meta,
         clock,
         _pg: None,
@@ -66,6 +68,7 @@ async fn pg_ctx() -> Option<Ctx> {
         meta: Arc::new(store),
         clock,
         _pg: Some(db),
+        sim: None,
     })
 }
 
@@ -494,6 +497,10 @@ fn host_record(id: HostId, name: &str, now: chrono::DateTime<chrono::Utc>) -> Ho
         current_bundles: Vec::new(),
         sandbox_bundles: Vec::new(),
         cordoned: false,
+        cordon_owner: None,
+        cordon_reason: None,
+        retire_requested_at: None,
+        retired_at: None,
         total_vcpus: 16,
         wire_version: 1,
         stages_images: false,
@@ -1170,7 +1177,13 @@ async fn host_binding_lease(ctx: &Ctx) {
     meta.upsert_host(host_record(unleased, "unleased-host", t2))
         .await
         .unwrap();
-    meta.set_host_cordoned(unleased, true).await.unwrap();
+    meta.set_host_cordon(
+        unleased,
+        Some(engram_core::types::host::CordonOwner::Admin),
+        None,
+    )
+    .await
+    .unwrap();
     let expired: Vec<HostId> = meta
         .list_lease_expired_hosts()
         .await
@@ -2028,99 +2041,31 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
     assert_eq!(landed[1].payload, serde_json::json!({"to": "failed"}));
 }
 
-/// #800: `enqueue_evacuating_session_resume` — the RESERVED evac-placement
-/// overflow CAS. Fenced `evacuating → queued` (resume-origin): matches only
-/// on `status='evacuating'` AND the op's epoch; a wrong epoch, a wrong
-/// status, and a second call are all clean no-ops. Both stores must agree.
-async fn enqueue_evacuating_resume(ctx: &Ctx) {
-    let meta = &ctx.meta;
-    let sid = meta.create_session(spec("conf:evacq")).await.unwrap();
-    // Claim an op to establish the fencing epoch (as the evac resumer does).
-    let EnqueueOutcome::Claimed(op) = meta
-        .op_enqueue_and_claim(sid, OpKind::Resume, serde_json::json!({}), None, "pod-a")
+async fn evacuating_edges(ctx: &Ctx) {
+    let sid = ctx
+        .meta
+        .create_session(spec("conf:evac-edge"))
         .await
-        .unwrap()
-    else {
-        panic!("claimed")
-    };
-    let epoch = op.epoch.unwrap();
-
-    // Walk Pending → Created → Active → Evacuating (the resumer's input).
-    for target in [
+        .unwrap();
+    for state in [
         SessionState::Created,
         SessionState::Active,
         SessionState::Evacuating,
     ] {
-        meta.transition_session(sid, target, BindingDisposition::Retain)
+        ctx.meta
+            .transition_session(sid, state, BindingDisposition::Retain)
             .await
             .unwrap();
     }
-
-    // Wrong epoch: no-op (a reclaimed-away zombie can't fork the machine).
-    assert!(
-        !meta
-            .enqueue_evacuating_session_resume(sid, epoch + 1)
-            .await
-            .unwrap(),
-        "epoch mismatch must not flip the row",
-    );
-    let still = meta.get_session(sid).await.unwrap();
-    assert_eq!(still.status, SessionState::Evacuating);
-
-    // Correct epoch + status: flips to queued (resume-origin), FIFO-visible.
-    assert!(meta
-        .enqueue_evacuating_session_resume(sid, epoch)
+    assert!(ctx
+        .meta
+        .transition_session(sid, SessionState::Queued, BindingDisposition::Retain)
         .await
-        .unwrap());
-    let q = meta.list_queued_sessions_fifo().await.unwrap();
-    let row = q
-        .iter()
-        .find(|r| r.session.id == sid)
-        .expect("queued after evac overflow");
-    assert!(matches!(
-        row.origin,
-        engram_core::types::session::QueueOrigin::Resume
-    ));
-
-    // Second call is a clean no-op — the row already left `evacuating`.
-    assert!(
-        !meta
-            .enqueue_evacuating_session_resume(sid, epoch)
-            .await
-            .unwrap(),
-        "a session no longer Evacuating must not re-queue",
-    );
-
-    // Wrong status guard: an Idle session is never eligible for this CAS.
-    let other = meta.create_session(spec("conf:evacq2")).await.unwrap();
-    let EnqueueOutcome::Claimed(op2) = meta
-        .op_enqueue_and_claim(other, OpKind::Resume, serde_json::json!({}), None, "pod-a")
+        .is_err());
+    ctx.meta
+        .transition_session(sid, SessionState::Active, BindingDisposition::Retain)
         .await
-        .unwrap()
-    else {
-        panic!("claimed")
-    };
-    let epoch2 = op2.epoch.unwrap();
-    for target in [
-        SessionState::Created,
-        SessionState::Active,
-        SessionState::Idle,
-    ] {
-        meta.transition_session(other, target, BindingDisposition::Retain)
-            .await
-            .unwrap();
-    }
-    assert!(
-        !meta
-            .enqueue_evacuating_session_resume(other, epoch2)
-            .await
-            .unwrap(),
-        "an Idle session must not be evac-queued",
-    );
-    assert_eq!(
-        meta.get_session(other).await.unwrap().status,
-        SessionState::Idle,
-    );
+        .unwrap();
 }
 
 /// Outbox: due-ness rides not_before on the shared clock; ack is
@@ -2864,7 +2809,13 @@ async fn placement_no_fit(ctx: &Ctx) {
     meta.upsert_host(host_record(cordoned, "conf-fit-cord", now))
         .await
         .unwrap();
-    meta.set_host_cordoned(cordoned, true).await.unwrap();
+    meta.set_host_cordon(
+        cordoned,
+        Some(engram_core::types::host::CordonOwner::Admin),
+        None,
+    )
+    .await
+    .unwrap();
 
     let details = meta
         .placement_no_fit_details(&[ready, cordoned, unknown], 4096, 2)
@@ -3210,7 +3161,7 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     assert!(
         matches!(
             meta.delete_host(host).await.unwrap(),
-            engram_core::types::session::DeleteHostOutcome::SessionsBound(1)
+            engram_core::types::host::DeleteHostOutcome::NotRetired(HostStatus::Ready)
         ),
         "a parked session blocks host deletion"
     );
@@ -4164,10 +4115,7 @@ conformance!(
     t_fenced_transition_with_events,
     super::fenced_transition_with_events
 );
-conformance!(
-    t_enqueue_evacuating_resume,
-    super::enqueue_evacuating_resume
-);
+conformance!(t_evacuating_edges, super::evacuating_edges);
 conformance!(t_outbox_flow, super::outbox_flow);
 conformance!(t_snapshot_durable_head, super::snapshot_durable_head);
 conformance!(t_gc_candidates, super::gc_candidates);
@@ -5527,4 +5475,500 @@ conformance!(
 conformance!(
     t_artifact_outlives_sessions,
     super::artifact_outlives_sessions
+);
+
+async fn seed_teleport(ctx: &Ctx, row: engram_core::types::teleport::TeleportRow) {
+    if let Some(sim) = &ctx.sim {
+        sim.with_db_mut(|db| {
+            db.teleports.insert(row.id, row);
+        });
+    } else {
+        sqlx::query("INSERT INTO session_teleports (id, session_id, kind, reason, phase, source_host_id, source_sandbox_id, dest_host_id, mem_budget_mib, cpu_budget_vcpus, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) ON CONFLICT (id) DO UPDATE SET phase = EXCLUDED.phase")
+            .bind(row.id.as_uuid()).bind(row.session_id.as_uuid()).bind(row.kind.as_str()).bind(row.reason.as_str()).bind(row.phase.as_str())
+            .bind(row.source_host_id.as_uuid()).bind(row.source_sandbox_id.as_uuid()).bind(row.dest_host_id.as_uuid())
+            .bind(row.mem_budget_mib).bind(row.cpu_budget_vcpus).bind(row.created_at)
+            .execute(ctx._pg.as_ref().unwrap().store.pool()).await.unwrap();
+    }
+}
+
+async fn teleport_fixture(
+    ctx: &Ctx,
+    source: HostId,
+    dest: HostId,
+) -> engram_core::types::teleport::TeleportRow {
+    use engram_core::types::teleport::*;
+    TeleportRow {
+        id: engram_core::TeleportId::new(),
+        session_id: ctx
+            .meta
+            .create_session(spec("conf:teleport"))
+            .await
+            .unwrap(),
+        kind: TeleportKind::Snapshot,
+        reason: TeleportReason::RetireHost,
+        phase: TeleportPhase::Admitted,
+        source_host_id: source,
+        source_sandbox_id: engram_core::SandboxId::new(),
+        dest_host_id: dest,
+        dest_sandbox_id: None,
+        pinned_dest: false,
+        mem_budget_mib: 4096,
+        cpu_budget_vcpus: 2,
+        snapshot_id: None,
+        export_id: None,
+        attempts: 0,
+        error: None,
+        created_at: ctx.clock.now_utc(),
+        updated_at: ctx.clock.now_utc(),
+        finished_at: None,
+    }
+}
+
+async fn host_retirement_grant_blockers(ctx: &Ctx) {
+    use engram_core::types::host::{
+        CordonOwner, DeleteHostOutcome, RetirementBlocker as B, RetirementGrant as G,
+    };
+    let m = &ctx.meta;
+    let h = HostId::new();
+    let other = HostId::new();
+    for id in [h, other] {
+        m.upsert_host(host_record(id, "retirement", ctx.clock.now_utc()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        m.delete_host(h).await.unwrap(),
+        DeleteHostOutcome::NotRetired(HostStatus::Ready)
+    );
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::NotRequested
+    );
+    assert!(m
+        .request_host_retirement(h, CordonOwner::Operator, "shed", ctx.clock.now_utc())
+        .await
+        .unwrap());
+    assert_eq!(m.list_retiring_hosts().await.unwrap().len(), 1);
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::Blocked(vec![B::NoHeartbeatSinceRequest])
+    );
+    ctx.clock.advance(Duration::from_secs(1));
+    m.touch_host_heartbeat(h, heartbeat_fixture())
+        .await
+        .unwrap();
+    let sid = m.create_session(spec("conf:bound")).await.unwrap();
+    m.assign_session_host(sid, Some(h)).await.unwrap();
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::Blocked(vec![B::BoundSessions(1)])
+    );
+    m.transition_session(sid, SessionState::Failed, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    // Detach can create a tombstone. Clear it before the next isolated blocker.
+    if let Some(sim) = &ctx.sim {
+        sim.with_db_mut(|db| db.sandbox_tombstones.clear());
+    } else {
+        sqlx::query("DELETE FROM sandbox_tombstones")
+            .execute(ctx._pg.as_ref().unwrap().store.pool())
+            .await
+            .unwrap();
+    }
+    for source in [true, false] {
+        let mut t = teleport_fixture(
+            ctx,
+            if source { h } else { other },
+            if source { other } else { h },
+        )
+        .await;
+        seed_teleport(ctx, t.clone()).await;
+        assert_eq!(
+            m.grant_host_retirement(h, ctx.clock.now_utc())
+                .await
+                .unwrap(),
+            G::Blocked(vec![if source {
+                B::OpenTeleportsAsSource(1)
+            } else {
+                B::OpenTeleportsAsDest(1)
+            }])
+        );
+        t.phase = engram_core::types::teleport::TeleportPhase::Done;
+        seed_teleport(ctx, t).await;
+    }
+    let sb = engram_core::SandboxId::new();
+    if let Some(sim) = &ctx.sim {
+        sim.with_db_mut(|db| {
+            db.sandbox_tombstones
+                .insert((h, sb), (None, ctx.clock.now_utc()));
+        });
+    } else {
+        sqlx::query(
+            "INSERT INTO sandbox_tombstones(host_id,sandbox_id,created_at) VALUES ($1,$2,$3)",
+        )
+        .bind(h.as_uuid())
+        .bind(sb.as_uuid())
+        .bind(ctx.clock.now_utc())
+        .execute(ctx._pg.as_ref().unwrap().store.pool())
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::Blocked(vec![B::PendingTombstones(1)])
+    );
+    if let Some(sim) = &ctx.sim {
+        sim.with_db_mut(|db| db.sandbox_tombstones.clear());
+    } else {
+        sqlx::query("DELETE FROM sandbox_tombstones")
+            .execute(ctx._pg.as_ref().unwrap().store.pool())
+            .await
+            .unwrap();
+    }
+    let mut hb = heartbeat_fixture();
+    hb.capacity.running_sandboxes = 1;
+    m.touch_host_heartbeat(h, hb).await.unwrap();
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::Blocked(vec![B::ResidentSandboxes(1)])
+    );
+    m.touch_host_heartbeat(h, heartbeat_fixture())
+        .await
+        .unwrap();
+    if let Some(sim) = &ctx.sim {
+        sim.with_db_mut(|db| db.hosts.get_mut(&h).unwrap().cordoned = false);
+    } else {
+        sqlx::query("UPDATE hosts SET cordoned = false WHERE id = $1")
+            .bind(h.as_uuid())
+            .execute(ctx._pg.as_ref().unwrap().store.pool())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::Blocked(vec![B::NotCordoned])
+    );
+    m.set_host_cordon(h, Some(CordonOwner::Operator), Some("shed"))
+        .await
+        .unwrap();
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::Granted
+    );
+    assert_eq!(
+        m.get_host(h).await.unwrap().unwrap().status,
+        HostStatus::Retired
+    );
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::Granted
+    );
+    assert_eq!(m.delete_host(h).await.unwrap(), DeleteHostOutcome::Deleted);
+    assert_eq!(m.delete_host(h).await.unwrap(), DeleteHostOutcome::Deleted);
+    assert!(m.get_host(h).await.unwrap().is_none());
+    assert!(m.host_retirement_status(h).await.unwrap().is_none());
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::NotRequested
+    );
+    let history = if let Some(sim) = &ctx.sim {
+        sim.with_db(|db| db.teleports.len() as i64)
+    } else {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM session_teleports")
+            .fetch_one(ctx._pg.as_ref().unwrap().store.pool())
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        history, 2,
+        "host deletion retains terminal teleport history"
+    );
+}
+
+async fn retired_host_pins_through_heartbeat_and_register(ctx: &Ctx) {
+    use engram_core::types::host::{CordonOwner, HeartbeatAck, RetirementGrant};
+    let h = HostId::new();
+    let m = &ctx.meta;
+    m.upsert_host(host_record(h, "retired", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    m.request_host_retirement(h, CordonOwner::Admin, "test", ctx.clock.now_utc())
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(1));
+    m.touch_host_heartbeat(h, heartbeat_fixture())
+        .await
+        .unwrap();
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        RetirementGrant::Granted
+    );
+    for status in [HostStatus::Ready, HostStatus::Draining] {
+        let mut hb = heartbeat_fixture();
+        hb.status = status;
+        hb.lease_renew_until = Some(ctx.clock.now_utc() + chrono::Duration::seconds(900));
+        assert_eq!(
+            m.touch_host_heartbeat(h, hb).await.unwrap(),
+            HeartbeatAck::Refused(HostStatus::Retired)
+        );
+    }
+    let mut register = host_record(h, "retired", ctx.clock.now_utc());
+    register.lease_expires_at = Some(ctx.clock.now_utc() + chrono::Duration::seconds(600));
+    m.upsert_host(register).await.unwrap();
+    let row = m.get_host(h).await.unwrap().unwrap();
+    assert_eq!(row.status, HostStatus::Retired);
+    assert_eq!(row.lease_state, HostLeaseState::None);
+    assert_eq!(row.lease_epoch, 2);
+    assert_eq!(
+        row.lease_expires_at,
+        Some(ctx.clock.now_utc() + chrono::Duration::seconds(600))
+    );
+    assert!(m.list_active_hosts().await.unwrap().is_empty());
+    assert!(m.list_lease_expired_hosts().await.unwrap().is_empty());
+    assert!(m.set_host_status(h, HostStatus::Ready).await.is_err());
+    assert!(m
+        .mark_host_dead_if_lease_expired(h)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!m.renew_host_lease(h, ctx.clock.now_utc()).await.unwrap());
+    assert!(!m.begin_host_handoff(h, ctx.clock.now_utc()).await.unwrap());
+    assert_eq!(
+        m.get_host(h).await.unwrap().unwrap().status,
+        HostStatus::Retired
+    );
+    assert!(m.list_retiring_hosts().await.unwrap().is_empty());
+    assert!(!m
+        .cancel_host_retirement(h, CordonOwner::Admin)
+        .await
+        .unwrap());
+    assert!(!m
+        .request_host_retirement(h, CordonOwner::Admin, "again", ctx.clock.now_utc())
+        .await
+        .unwrap());
+}
+
+async fn cordon_owner_round_trip(ctx: &Ctx) {
+    use engram_core::types::host::CordonOwner::{Admin, Operator};
+    let m = &ctx.meta;
+    let h = HostId::new();
+    m.upsert_host(host_record(h, "owner", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    m.set_host_cordon(h, Some(Operator), Some("scale down"))
+        .await
+        .unwrap();
+    assert!(!m.cancel_host_retirement(h, Admin).await.unwrap());
+    let row = m.get_host(h).await.unwrap().unwrap();
+    assert_eq!(row.cordon_owner, Some(Operator));
+    assert_eq!(row.cordon_reason.as_deref(), Some("scale down"));
+    let request_time = ctx.clock.now_utc();
+    m.request_host_retirement(h, Operator, "shed", request_time)
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(2));
+    m.request_host_retirement(h, Operator, "shed again", ctx.clock.now_utc())
+        .await
+        .unwrap();
+    assert_eq!(
+        m.host_retirement_status(h)
+            .await
+            .unwrap()
+            .unwrap()
+            .requested_at,
+        Some(request_time)
+    );
+    assert!(m.cancel_host_retirement(h, Operator).await.unwrap());
+    let row = m.get_host(h).await.unwrap().unwrap();
+    assert!(!row.cordoned);
+    assert!(row.cordon_owner.is_none());
+    assert!(row.cordon_reason.is_none());
+    assert!(row.retire_requested_at.is_none());
+    m.set_host_cordon(h, Some(Admin), None).await.unwrap();
+    assert!(!m.cancel_host_retirement(h, Operator).await.unwrap());
+    assert!(m.cancel_host_retirement(h, Admin).await.unwrap());
+}
+
+async fn teleport_reservation_arm_counts_open_rows(ctx: &Ctx) {
+    use engram_core::types::teleport::TeleportPhase;
+    let h = HostId::new();
+    let source = HostId::new();
+    let m = &ctx.meta;
+    for id in [h, source] {
+        m.upsert_host(host_record(id, "budget", ctx.clock.now_utc()))
+            .await
+            .unwrap();
+    }
+    let mut hb = heartbeat_fixture();
+    hb.utilization.allocatable_mib = 4096;
+    m.touch_host_heartbeat(h, hb).await.unwrap();
+    let mut t = teleport_fixture(ctx, source, h).await;
+    let pending = SessionId::new();
+    let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        session_id: pending,
+        spec: spec("conf:placement"),
+        mem_budget_mib: 1,
+        cpu_budget_vcpus: 1,
+        sealed_secrets: None,
+        capabilities: Vec::new(),
+        integration_policy_json: None,
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        ),
+        oauth_binding: None,
+    };
+    m.reserve_and_persist_create(ws, &[], 0).await.unwrap();
+    for phase in [
+        TeleportPhase::Admitted,
+        TeleportPhase::Captured,
+        TeleportPhase::Restored,
+        TeleportPhase::RollingBack,
+    ] {
+        t.phase = phase;
+        seed_teleport(ctx, t.clone()).await;
+        let reserved = m.per_host_reserved().await.unwrap();
+        assert_eq!(reserved[&h].mem_mib, 4096);
+        assert_eq!(reserved[&h].vcpus, 2);
+        let detail = m.placement_no_fit_details(&[h], 1, 1).await.unwrap();
+        assert_eq!(detail[0].reason, "ram_full");
+        assert!(m
+            .place_queued_session(pending, 1, 1, &[h], 0)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    t.phase = TeleportPhase::Done;
+    seed_teleport(ctx, t).await;
+    assert!(!m.per_host_reserved().await.unwrap().contains_key(&h));
+    assert_eq!(
+        m.place_queued_session(pending, 1, 1, &[h], 0)
+            .await
+            .unwrap(),
+        Some(h)
+    );
+}
+
+conformance!(
+    t_host_retirement_grant_blockers,
+    super::host_retirement_grant_blockers
+);
+conformance!(
+    t_retired_host_pins_through_heartbeat_and_register,
+    super::retired_host_pins_through_heartbeat_and_register
+);
+conformance!(t_cordon_owner_round_trip, super::cordon_owner_round_trip);
+conformance!(
+    t_teleport_reservation_arm_counts_open_rows,
+    super::teleport_reservation_arm_counts_open_rows
+);
+
+async fn retirement_capture_and_enable_work(ctx: &Ctx) {
+    use engram_core::types::host::{CordonOwner, RetirementBlocker as B, RetirementGrant as G};
+    let m = &ctx.meta;
+    let h = HostId::new();
+    m.upsert_host(host_record(h, "work", ctx.clock.now_utc()))
+        .await
+        .unwrap();
+    let parent = m
+        .create_or_get_enable_job("conf:retire-capture", None, &ImageConfig::default())
+        .await
+        .unwrap()
+        .id;
+    let job = m.insert_capture_job(new_capture(parent)).await.unwrap();
+    let job = m.place_capture_job(job.id, &[h]).await.unwrap().unwrap();
+    m.request_host_retirement(h, CordonOwner::Admin, "test", ctx.clock.now_utc())
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(1));
+    m.touch_host_heartbeat(h, heartbeat_fixture())
+        .await
+        .unwrap();
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::Blocked(vec![B::CaptureJobs(1)])
+    );
+    let reserved = m.per_host_reserved().await.unwrap();
+    assert_eq!(reserved[&h].mem_mib, job.mem_budget_mib);
+    assert_eq!(
+        m.live_enable_work_by_host(Duration::from_secs(300))
+            .await
+            .unwrap()[&h]
+            .captures,
+        1
+    );
+    m.record_capture_job_report(&CaptureJobReport {
+        job_id: job.id,
+        epoch: job.epoch,
+        stage: CaptureJobStage::Done,
+        progress: None,
+        fc_snapshot_version: None,
+        terminal: Some(CaptureTerminalReport::Done {
+            result_bincode: Vec::new(),
+        }),
+    })
+    .await
+    .unwrap();
+    let now = ctx.clock.now_utc();
+    if let Some(sim) = &ctx.sim {
+        sim.with_db_mut(|db| {
+            let row = db.enable_jobs.get_mut(&parent).unwrap();
+            row.job.state = engram_core::types::registry::EnableJobState::Materializing;
+            row.job.materialize_host_id = Some(h);
+            row.claimed_at = Some(now);
+        });
+    } else {
+        sqlx::query("UPDATE enable_jobs SET state = 'materializing', materialize_host_id = $2, claimed_at = $3 WHERE id = $1").bind(parent).bind(h.as_uuid()).bind(now).execute(ctx._pg.as_ref().unwrap().store.pool()).await.unwrap();
+    }
+    assert_eq!(
+        m.grant_host_retirement(h, now).await.unwrap(),
+        G::Blocked(vec![B::EnableWork(1)])
+    );
+    assert_eq!(
+        m.live_enable_work_by_host(Duration::from_secs(300))
+            .await
+            .unwrap()[&h]
+            .materializes,
+        1
+    );
+    ctx.clock.advance(Duration::from_secs(300));
+    assert!(m
+        .live_enable_work_by_host(Duration::from_secs(300))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        m.grant_host_retirement(h, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        G::Granted
+    );
+}
+conformance!(
+    t_retirement_capture_and_enable_work,
+    super::retirement_capture_and_enable_work
 );

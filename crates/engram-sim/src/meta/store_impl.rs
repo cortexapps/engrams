@@ -3,6 +3,11 @@
 //! replicates). Grouped by table family; unimplemented PG-semantic
 //! methods panic via `sim_unimplemented!` at the bottom.
 
+use engram_core::types::host::DeleteHostOutcome;
+use engram_core::types::host::{
+    CordonOwner, HeartbeatAck, HostLeaseState, RetirementBlocker, RetirementGrant,
+    RetirementStatus, ENABLE_MATERIALIZE_LEASE_SECS,
+};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,8 +29,7 @@ use engram_core::types::registry::{EnableJob, EnableJobState};
 use engram_core::types::registry::{EnabledImage, RegistryCredential, SessionSecrets};
 use engram_core::types::session::SandboxAssignment;
 use engram_core::types::session::{
-    BindingDisposition, DeleteHostOutcome, QueueOrigin, QueuedSession, Session, SessionSpec,
-    SessionState,
+    BindingDisposition, QueueOrigin, QueuedSession, Session, SessionSpec, SessionState,
 };
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::SandboxId;
@@ -48,6 +52,125 @@ use super::{EnableJobRow, SessRow, SimDb, SimMetadataStore};
 /// placement-accounting oracle by construction.
 fn reserves(state: SessionState) -> bool {
     state.reserves_host_memory()
+}
+
+fn reserved_budgets(db: &SimDb) -> std::collections::BTreeMap<HostId, (i64, i64)> {
+    let mut out = std::collections::BTreeMap::<HostId, (i64, i64)>::new();
+    let sessions = db
+        .sessions
+        .values()
+        .filter(|r| reserves(r.session.status))
+        .filter_map(|r| {
+            r.session
+                .host_id
+                .map(|h| (h, r.mem_budget_mib, r.cpu_budget_vcpus))
+        });
+    let captures = db
+        .capture_jobs
+        .values()
+        .filter(|r| !r.stage.is_terminal())
+        .filter_map(|r| r.host_id.map(|h| (h, r.mem_budget_mib, r.cpu_budget_vcpus)));
+    let teleports = db
+        .teleports
+        .values()
+        .filter(|r| {
+            engram_core::types::teleport::TeleportPhase::dest_reserving_phases()
+                .contains(&r.phase.as_str())
+        })
+        .map(|r| (r.dest_host_id, r.mem_budget_mib, r.cpu_budget_vcpus));
+    for (h, mem, cpu) in sessions.chain(captures).chain(teleports) {
+        let e = out.entry(h).or_default();
+        e.0 += mem;
+        e.1 += i64::from(cpu);
+    }
+    out
+}
+
+fn enable_work(
+    db: &SimDb,
+    now: DateTime<Utc>,
+    lease: Duration,
+) -> std::collections::BTreeMap<HostId, engram_core::types::LiveEnableWork> {
+    let mut out = std::collections::BTreeMap::<HostId, engram_core::types::LiveEnableWork>::new();
+    for j in db.enable_jobs.values().filter(|j| {
+        j.job.state == EnableJobState::Materializing
+            && j.claimed_at.is_some_and(|t| {
+                t > now - chrono::Duration::from_std(lease).expect("lease fits chrono")
+            })
+    }) {
+        if let Some(h) = j.job.materialize_host_id {
+            out.entry(h).or_default().materializes += 1;
+        }
+    }
+    for j in db.capture_jobs.values().filter(|j| !j.stage.is_terminal()) {
+        if let Some(h) = j.host_id {
+            out.entry(h).or_default().captures += 1;
+        }
+    }
+    out
+}
+
+fn retirement_status(db: &SimDb, id: HostId, now: DateTime<Utc>) -> Option<RetirementStatus> {
+    let h = db.hosts.get(&id)?;
+    let mut blockers = Vec::new();
+    if h.retired_at.is_none() {
+        let captures = db
+            .capture_jobs
+            .values()
+            .filter(|j| j.host_id == Some(id) && !j.stage.is_terminal())
+            .count() as u64;
+        let work = enable_work(
+            db,
+            now,
+            Duration::from_secs(u64::from(ENABLE_MATERIALIZE_LEASE_SECS)),
+        )
+        .get(&id)
+        .copied()
+        .unwrap_or_default();
+        let counts = [
+            RetirementBlocker::BoundSessions(
+                db.sessions
+                    .values()
+                    .filter(|s| s.session.host_id == Some(id) && reserves(s.session.status))
+                    .count() as u64,
+            ),
+            RetirementBlocker::CaptureJobs(captures),
+            RetirementBlocker::OpenTeleportsAsSource(
+                db.teleports
+                    .values()
+                    .filter(|t| t.source_host_id == id && !t.phase.is_terminal())
+                    .count() as u64,
+            ),
+            RetirementBlocker::OpenTeleportsAsDest(
+                db.teleports
+                    .values()
+                    .filter(|t| t.dest_host_id == id && !t.phase.is_terminal())
+                    .count() as u64,
+            ),
+            RetirementBlocker::PendingTombstones(
+                db.sandbox_tombstones
+                    .keys()
+                    .filter(|(host, _)| *host == id)
+                    .count() as u64,
+            ),
+            RetirementBlocker::ResidentSandboxes(u64::from(h.capacity.running_sandboxes)),
+            RetirementBlocker::EnableWork(u64::from(work.materializes)),
+        ];
+        blockers.extend(counts.into_iter().filter(|b| b.count() > 0));
+        if h.retire_requested_at
+            .is_some_and(|t| h.last_heartbeat_at <= t)
+        {
+            blockers.push(RetirementBlocker::NoHeartbeatSinceRequest);
+        }
+        if !h.cordoned {
+            blockers.push(RetirementBlocker::NotCordoned);
+        }
+    }
+    Some(RetirementStatus {
+        requested_at: h.retire_requested_at,
+        retired_at: h.retired_at,
+        blockers,
+    })
 }
 
 impl SimMetadataStore {
@@ -87,29 +210,7 @@ impl SimMetadataStore {
         if eligible.is_empty() {
             return None;
         }
-        let mut reserved: std::collections::BTreeMap<HostId, (i64, i64)> =
-            std::collections::BTreeMap::new();
-        for row in db.sessions.values() {
-            let Some(host) = row.session.host_id else {
-                continue;
-            };
-            let st = row.session.status;
-            let counts = reserves(st);
-            if counts {
-                let e = reserved.entry(host).or_default();
-                e.0 += row.mem_budget_mib;
-                e.1 += i64::from(row.cpu_budget_vcpus);
-            }
-        }
-        for row in db.capture_jobs.values() {
-            if !row.stage.is_terminal() {
-                if let Some(host) = row.host_id {
-                    let e = reserved.entry(host).or_default();
-                    e.0 += row.mem_budget_mib;
-                    e.1 += i64::from(row.cpu_budget_vcpus);
-                }
-            }
-        }
+        let reserved = reserved_budgets(db);
         let fits = |h: &&HostRecord| -> Option<i64> {
             let alloc = h.utilization.allocatable_mib as i64;
             if alloc <= 0 {
@@ -176,6 +277,7 @@ impl MetadataStore for SimMetadataStore {
                 missing_strikes: 0,
                 current_epoch: 0,
                 binding_epoch: 0,
+                attached_binding_epoch: 0,
                 next_event_idx: 0,
                 recovery_epoch: 0,
                 shell_pinned_until: None,
@@ -302,6 +404,7 @@ impl MetadataStore for SimMetadataStore {
                 missing_strikes: 0,
                 current_epoch: 0,
                 binding_epoch: 0,
+                attached_binding_epoch: 0,
                 next_event_idx: 0,
                 recovery_epoch: 0,
                 shell_pinned_until: None,
@@ -512,38 +615,6 @@ impl MetadataStore for SimMetadataStore {
         Ok(true)
     }
 
-    async fn enqueue_evacuating_session_resume(
-        &self,
-        id: SessionId,
-        epoch: i64,
-    ) -> Result<bool, MetaError> {
-        // #800: fenced `evacuating → queued` (resume origin) — the sim twin
-        // of the PG CAS, gated on `status='evacuating'` + epoch.
-        self.gate()?;
-        let now = self.now();
-        let mut db = self.db.lock();
-        let Some(row) = db.sessions.get_mut(&id) else {
-            return Ok(false);
-        };
-        if row.session.status != SessionState::Evacuating || row.current_epoch != epoch {
-            return Ok(false);
-        }
-        row.session.status = SessionState::Queued;
-        row.queue_origin = Some(QueueOrigin::Resume);
-        row.queued_at = Some(now);
-        row.session.last_active_at = now;
-        db.transition_log.push(super::TransitionLogEntry {
-            session: id,
-            from: SessionState::Evacuating,
-            to: SessionState::Queued,
-            exempt: false,
-        });
-        drop(db);
-        self.notify("placement_changed", "enqueued");
-        Ok(true)
-    }
-
-    /// `WHERE status='queued' ORDER BY queued_at ASC` (serial-stable).
     async fn list_queued_sessions_fifo(&self) -> Result<Vec<QueuedSession>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
@@ -615,21 +686,10 @@ impl MetadataStore for SimMetadataStore {
     ) -> Result<std::collections::HashMap<HostId, ReservedBudget>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
-        let mut out: std::collections::HashMap<HostId, ReservedBudget> =
-            std::collections::HashMap::new();
-        for row in db.sessions.values() {
-            let Some(host) = row.session.host_id else {
-                continue;
-            };
-            let st = row.session.status;
-            let counts = reserves(st);
-            if counts {
-                let e = out.entry(host).or_default();
-                e.mem_mib += row.mem_budget_mib;
-                e.vcpus += i64::from(row.cpu_budget_vcpus);
-            }
-        }
-        Ok(out)
+        Ok(reserved_budgets(&db)
+            .into_iter()
+            .map(|(h, (mem_mib, vcpus))| (h, ReservedBudget { mem_mib, vcpus }))
+            .collect())
     }
 
     // ================= hosts =================
@@ -651,7 +711,9 @@ impl MetadataStore for SimMetadataStore {
                 prev.cloud_metadata = host.cloud_metadata;
                 prev.capacity = host.capacity;
                 prev.last_heartbeat_at = host.last_heartbeat_at;
-                prev.status = host.status;
+                if prev.status != HostStatus::Retired {
+                    prev.status = host.status;
+                }
                 if host.host_addr.is_some() {
                     prev.host_addr = host.host_addr;
                 }
@@ -663,7 +725,11 @@ impl MetadataStore for SimMetadataStore {
                 // fence. A None target leaves the lease untouched.
                 if let Some(until) = host.lease_expires_at {
                     prev.lease_expires_at = Some(until);
-                    prev.lease_state = engram_core::types::host::HostLeaseState::Active;
+                    prev.lease_state = if prev.status == HostStatus::Retired {
+                        HostLeaseState::None
+                    } else {
+                        HostLeaseState::Active
+                    };
                     prev.lease_epoch += 1;
                 }
             }
@@ -675,6 +741,10 @@ impl MetadataStore for SimMetadataStore {
                 fresh.current_bundles = Vec::new();
                 fresh.sandbox_bundles = Vec::new();
                 fresh.cordoned = false;
+                fresh.cordon_owner = None;
+                fresh.cordon_reason = None;
+                fresh.retire_requested_at = None;
+                fresh.retired_at = None;
                 fresh.total_vcpus = 0;
                 fresh.wire_version = 0;
                 fresh.stages_images = false;
@@ -694,6 +764,104 @@ impl MetadataStore for SimMetadataStore {
     }
 
     /// `WHERE status IN ('ready','draining') ORDER BY id`.
+    async fn get_host(&self, id: HostId) -> Result<Option<HostRecord>, MetaError> {
+        self.gate()?;
+        Ok(self.db.lock().hosts.get(&id).cloned())
+    }
+    async fn request_host_retirement(
+        &self,
+        id: HostId,
+        owner: CordonOwner,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let Some(h) = db.hosts.get_mut(&id) else {
+            return Ok(false);
+        };
+        if !matches!(h.status, HostStatus::Ready | HostStatus::Draining) {
+            return Ok(false);
+        }
+        if h.cordon_owner.is_some_and(|o| o != owner) {
+            return Ok(false);
+        }
+        h.cordoned = true;
+        h.cordon_owner = Some(owner);
+        h.cordon_reason = Some(reason.into());
+        h.retire_requested_at.get_or_insert(now);
+        Ok(true)
+    }
+    async fn cancel_host_retirement(
+        &self,
+        id: HostId,
+        owner: CordonOwner,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let Some(h) = db.hosts.get_mut(&id) else {
+            return Ok(false);
+        };
+        if h.cordon_owner != Some(owner) || h.status == HostStatus::Retired {
+            return Ok(false);
+        }
+        h.cordoned = false;
+        h.cordon_owner = None;
+        h.cordon_reason = None;
+        h.retire_requested_at = None;
+        drop(db);
+        self.notify("placement_changed", "host_uncordoned");
+        Ok(true)
+    }
+    async fn list_retiring_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
+        self.gate()?;
+        Ok(self
+            .db
+            .lock()
+            .hosts
+            .values()
+            .filter(|h| {
+                h.retire_requested_at.is_some()
+                    && matches!(h.status, HostStatus::Ready | HostStatus::Draining)
+            })
+            .cloned()
+            .collect())
+    }
+    async fn host_retirement_status(
+        &self,
+        id: HostId,
+    ) -> Result<Option<RetirementStatus>, MetaError> {
+        self.gate()?;
+        Ok(retirement_status(&self.db.lock(), id, self.now()))
+    }
+    async fn grant_host_retirement(
+        &self,
+        id: HostId,
+        now: DateTime<Utc>,
+    ) -> Result<RetirementGrant, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let Some(status) = retirement_status(&db, id, now) else {
+            return Ok(RetirementGrant::NotRequested);
+        };
+        if status.retired_at.is_some() {
+            return Ok(RetirementGrant::Granted);
+        }
+        if status.requested_at.is_none() {
+            return Ok(RetirementGrant::NotRequested);
+        }
+        if !status.blockers.is_empty() {
+            return Ok(RetirementGrant::Blocked(status.blockers));
+        }
+        let h = db.hosts.get_mut(&id).ok_or(MetaError::NotFound)?;
+        h.status = HostStatus::Retired;
+        h.retired_at = Some(now);
+        h.lease_state = HostLeaseState::None;
+        drop(db);
+        self.notify("placement_changed", "host_retired");
+        Ok(RetirementGrant::Granted)
+    }
+
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
@@ -727,6 +895,9 @@ impl MetadataStore for SimMetadataStore {
         self.gate()?;
         let mut db = self.db.lock();
         let host = db.hosts.get_mut(&id).ok_or(MetaError::NotFound)?;
+        if host.status == HostStatus::Retired || status == HostStatus::Retired {
+            return Err(MetaError::NotFound);
+        }
         host.status = status;
         Ok(())
     }
@@ -736,12 +907,13 @@ impl MetadataStore for SimMetadataStore {
         &self,
         id: HostId,
         hb: engram_core::types::host::HostHeartbeat,
-    ) -> Result<(), MetaError> {
+    ) -> Result<engram_core::types::host::HeartbeatAck, MetaError> {
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
         let host = db.hosts.get_mut(&id).ok_or(MetaError::NotFound)?;
-        if host.status != HostStatus::Dead {
+        let previous = host.status;
+        if !matches!(previous, HostStatus::Dead | HostStatus::Retired) {
             host.status = hb.status;
         }
         host.capacity = hb.capacity;
@@ -762,11 +934,19 @@ impl MetadataStore for SimMetadataStore {
                 Some(existing) => existing.max(renew),
                 None => renew,
             });
-            if host.lease_state != engram_core::types::host::HostLeaseState::Handoff {
+            if previous == HostStatus::Retired {
+                host.lease_state = HostLeaseState::None;
+            } else if host.lease_state != engram_core::types::host::HostLeaseState::Handoff {
                 host.lease_state = engram_core::types::host::HostLeaseState::Active;
             }
         }
-        Ok(())
+        Ok(
+            if matches!(previous, HostStatus::Dead | HostStatus::Retired) {
+                HeartbeatAck::Refused(previous)
+            } else {
+                HeartbeatAck::Accepted
+            },
+        )
     }
 
     /// ADR 0116 A-D2: exactly the 0115 `begin_host_handoff` UPDATE.
@@ -780,7 +960,7 @@ impl MetadataStore for SimMetadataStore {
         let Some(host) = db.hosts.get_mut(&id) else {
             return Ok(false);
         };
-        if host.status == HostStatus::Dead {
+        if matches!(host.status, HostStatus::Dead | HostStatus::Retired) {
             return Ok(false);
         }
         host.lease_state = engram_core::types::host::HostLeaseState::Handoff;
@@ -819,7 +999,7 @@ impl MetadataStore for SimMetadataStore {
         let Some(host) = db.hosts.get_mut(&id) else {
             return Ok(false);
         };
-        if host.status == HostStatus::Dead {
+        if matches!(host.status, HostStatus::Dead | HostStatus::Retired) {
             return Ok(false);
         }
         host.lease_expires_at = Some(match host.lease_expires_at {
@@ -832,13 +1012,26 @@ impl MetadataStore for SimMetadataStore {
         Ok(true)
     }
 
-    async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
+    async fn set_host_cordon(
+        &self,
+        id: HostId,
+        owner: Option<engram_core::types::host::CordonOwner>,
+        reason: Option<&str>,
+    ) -> Result<(), MetaError> {
         self.gate()?;
         let mut db = self.db.lock();
         let host = db.hosts.get_mut(&id).ok_or(MetaError::NotFound)?;
-        host.cordoned = cordoned;
+        if host.status == HostStatus::Retired {
+            return Err(MetaError::NotFound);
+        }
+        host.cordoned = owner.is_some();
+        host.cordon_owner = owner;
+        host.cordon_reason = reason.map(str::to_owned);
+        if owner.is_none() {
+            host.retire_requested_at = None;
+        }
         drop(db);
-        if !cordoned {
+        if owner.is_none() {
             self.notify("placement_changed", "host_uncordoned");
         }
         Ok(())
@@ -856,7 +1049,9 @@ impl MetadataStore for SimMetadataStore {
         let mut db = self.db.lock();
         match db.hosts.get_mut(&host_id) {
             None => return Ok(Vec::new()),
-            Some(h) if h.status == HostStatus::Dead => return Ok(Vec::new()),
+            Some(h) if matches!(h.status, HostStatus::Dead | HostStatus::Retired) => {
+                return Ok(Vec::new())
+            }
             Some(h) => {
                 if h.lease_expires_at.is_some_and(|expires| expires >= now) {
                     return Err(MetaError::Conflict(format!(
@@ -3761,23 +3956,13 @@ impl MetadataStore for SimMetadataStore {
     }
 
     async fn delete_host(&self, id: HostId) -> Result<DeleteHostOutcome, MetaError> {
-        // PG twin: refuse while any RESIDENT session (the reserving set —
-        // a `parked` paused-in-place VM included) or non-terminal capture
-        // job is bound; otherwise detach stragglers and delete,
-        // idempotently.
+        // The grant or dead-host transition permits deletion.
         self.gate()?;
         let mut db = self.db.lock();
-        let bound = db
-            .sessions
-            .values()
-            .filter(|r| r.session.host_id == Some(id) && reserves(r.session.status))
-            .count()
-            + db.capture_jobs
-                .values()
-                .filter(|j| j.host_id == Some(id) && !j.stage.is_terminal())
-                .count();
-        if bound > 0 {
-            return Ok(DeleteHostOutcome::SessionsBound(bound as u64));
+        if let Some(host) = db.hosts.get(&id) {
+            if !matches!(host.status, HostStatus::Retired | HostStatus::Dead) {
+                return Ok(DeleteHostOutcome::NotRetired(host.status));
+            }
         }
         for r in db.sessions.values_mut() {
             if r.session.host_id == Some(id) {
@@ -4194,17 +4379,15 @@ impl MetadataStore for SimMetadataStore {
     /// (fresh-claimed `materializing`) and `capture_jobs` (non-terminal
     /// stages) by host.
     ///
-    /// DIVERGENCE (documented, same family as `pick_host_2d`): the sim
-    /// models neither table, so this is always the empty map — a store
-    /// with no enable/capture jobs. Conformance covers only that empty
-    /// case; scenarios must not create enable/capture jobs.
     async fn live_enable_work_by_host(
         &self,
-        _materialize_lease: std::time::Duration,
+        materialize_lease: Duration,
     ) -> Result<std::collections::HashMap<HostId, engram_core::types::LiveEnableWork>, MetaError>
     {
         self.gate()?;
-        Ok(std::collections::HashMap::new())
+        Ok(enable_work(&self.db.lock(), self.now(), materialize_lease)
+            .into_iter()
+            .collect())
     }
 
     async fn mirror_capture_progress_to_enable_job(
@@ -4273,19 +4456,7 @@ impl MetadataStore for SimMetadataStore {
             return Ok(Vec::new());
         }
         let db = self.db.lock();
-        let mut reserved: std::collections::BTreeMap<HostId, (i64, i64)> = Default::default();
-        for row in db.sessions.values() {
-            let Some(host) = row.session.host_id else {
-                continue;
-            };
-            let st = row.session.status;
-            let counts = st.reserves_host_memory();
-            if counts {
-                let e = reserved.entry(host).or_default();
-                e.0 += row.mem_budget_mib;
-                e.1 += i64::from(row.cpu_budget_vcpus);
-            }
-        }
+        let reserved = reserved_budgets(&db);
         Ok(candidates
             .iter()
             .map(|id| {

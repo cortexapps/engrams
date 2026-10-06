@@ -7,6 +7,9 @@
 //! `query!`/`query_as!` once CI provisions a Postgres service and we
 //! ship a `.sqlx/` cache.
 
+use engram_core::types::host::{
+    CordonOwner, HeartbeatAck, RetirementBlocker, RetirementGrant, RetirementStatus,
+};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -288,6 +291,85 @@ impl PostgresStore {
 
 fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
     MetaError::Db(Box::new(e))
+}
+
+fn live_materialize_predicate(now: &str, lease: &str) -> String {
+    format!("state = 'materializing' AND claimed_at IS NOT NULL AND claimed_at > {now} - make_interval(secs => {lease})")
+}
+
+async fn retirement_status(
+    conn: &mut sqlx::PgConnection,
+    id: HostId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<RetirementStatus>, MetaError> {
+    let sql = format!(
+        r#"SELECT retire_requested_at, retired_at, cordoned, last_heartbeat_at,
+        running_sandboxes_count,
+        (SELECT COUNT(*) FROM sessions WHERE host_id = h.id AND status IN ({reserving})) AS bound,
+        (SELECT COUNT(*) FROM capture_jobs WHERE host_id = h.id AND stage NOT IN ('done','failed')) AS captures,
+        (SELECT COUNT(*) FROM session_teleports WHERE source_host_id = h.id AND phase NOT IN ('done','aborted','failed')) AS sources,
+        (SELECT COUNT(*) FROM session_teleports WHERE dest_host_id = h.id AND phase NOT IN ('done','aborted','failed')) AS dests,
+        (SELECT COUNT(*) FROM sandbox_tombstones WHERE host_id = h.id) AS tombstones,
+        (SELECT COUNT(*) FROM enable_jobs WHERE materialize_host_id = h.id AND {materializes}) AS materializes
+        FROM hosts h WHERE id = $1"#,
+        reserving = reserving_states_sql(),
+        materializes = live_materialize_predicate("$2", "$3"),
+    );
+    let Some(r) = sqlx::query(&sql)
+        .bind(id.as_uuid())
+        .bind(now)
+        .bind(f64::from(
+            engram_core::types::host::ENABLE_MATERIALIZE_LEASE_SECS,
+        ))
+        .fetch_optional(conn)
+        .await
+        .map_err(db_err)?
+    else {
+        return Ok(None);
+    };
+    let requested_at: Option<chrono::DateTime<chrono::Utc>> =
+        r.try_get("retire_requested_at").map_err(db_err)?;
+    let retired_at: Option<chrono::DateTime<chrono::Utc>> =
+        r.try_get("retired_at").map_err(db_err)?;
+    let mut blockers = Vec::new();
+    if retired_at.is_none() {
+        let captures: i64 = r.try_get("captures").map_err(db_err)?;
+        let counts = [
+            RetirementBlocker::BoundSessions(r.try_get::<i64, _>("bound").map_err(db_err)? as u64),
+            RetirementBlocker::CaptureJobs(captures as u64),
+            RetirementBlocker::OpenTeleportsAsSource(
+                r.try_get::<i64, _>("sources").map_err(db_err)? as u64,
+            ),
+            RetirementBlocker::OpenTeleportsAsDest(
+                r.try_get::<i64, _>("dests").map_err(db_err)? as u64
+            ),
+            RetirementBlocker::PendingTombstones(
+                r.try_get::<i64, _>("tombstones").map_err(db_err)? as u64,
+            ),
+            RetirementBlocker::ResidentSandboxes(
+                r.try_get::<i32, _>("running_sandboxes_count")
+                    .map_err(db_err)?
+                    .max(0) as u64,
+            ),
+            RetirementBlocker::EnableWork(
+                r.try_get::<i64, _>("materializes").map_err(db_err)? as u64
+            ),
+        ];
+        blockers.extend(counts.into_iter().filter(|b| b.count() > 0));
+        let heartbeat: chrono::DateTime<chrono::Utc> =
+            r.try_get("last_heartbeat_at").map_err(db_err)?;
+        if requested_at.is_some_and(|t| heartbeat <= t) {
+            blockers.push(RetirementBlocker::NoHeartbeatSinceRequest);
+        }
+        if !r.try_get::<bool, _>("cordoned").map_err(db_err)? {
+            blockers.push(RetirementBlocker::NotCordoned);
+        }
+    }
+    Ok(Some(RetirementStatus {
+        requested_at,
+        retired_at,
+        blockers,
+    }))
 }
 
 /// The `status IN (…)` body for the host-memory-reserving states, built
@@ -628,10 +710,14 @@ async fn pick_host_2d(
             FROM capture_jobs
             WHERE host_id = ANY($1)
               AND stage NOT IN ('done','failed')
+            UNION ALL
+            SELECT dest_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+            FROM session_teleports WHERE phase IN ({teleport_reserving})
         ) reserved
         GROUP BY host_id
         "#,
         reserving = reserving_states_sql(),
+        teleport_reserving = engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
     );
     let res_rows = sqlx::query(&res_sql)
         .bind(cand)
@@ -2106,41 +2192,6 @@ impl MetadataStore for PostgresStore {
         Ok(n > 0)
     }
 
-    async fn enqueue_evacuating_session_resume(
-        &self,
-        id: SessionId,
-        epoch: i64,
-    ) -> Result<bool, MetaError> {
-        // #800: Evacuating → queued (resume origin), the RESERVED
-        // evac-placement overflow path. Same fenced-CAS shape as
-        // `enqueue_session_resume` above, but gated on `status='evacuating'`
-        // (the evac resumer's input state) instead of `'idle'`. The row
-        // keeps its `mem_budget_mib` / `cpu_budget_vcpus` from create, so
-        // the queue scanner's resume precheck fits it against the SAME hard
-        // 2D bound. A no-op (0 rows) means a peer already relocated the
-        // session or the epoch moved — the caller stops without emitting the
-        // Queued event.
-        let n = sqlx::query(
-            r#"
-            UPDATE sessions
-               SET status = 'queued', queued_at = $3, queue_origin = 'resume',
-                   last_active_at = $3
-             WHERE id = $1 AND status = 'evacuating' AND current_epoch = $2
-            "#,
-        )
-        .bind(id.as_uuid())
-        .bind(epoch)
-        .bind(self.clock.now_utc())
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        if n > 0 {
-            self.notify_placement_changed("enqueued").await;
-        }
-        Ok(n > 0)
-    }
-
     async fn list_queued_sessions_fifo(
         &self,
     ) -> Result<Vec<engram_core::types::session::QueuedSession>, MetaError> {
@@ -2278,10 +2329,15 @@ impl MetadataStore for PostgresStore {
                 FROM capture_jobs
                 WHERE host_id IS NOT NULL
                   AND stage NOT IN ('done','failed')
+                UNION ALL
+                SELECT dest_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+                FROM session_teleports WHERE phase IN ({teleport_reserving})
             ) reserved
             GROUP BY host_id
             "#,
             reserving = reserving_states_sql(),
+            teleport_reserving =
+                engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
         );
         let rows: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(&sql)
             .fetch_all(&self.pool)
@@ -2427,10 +2483,15 @@ impl MetadataStore for PostgresStore {
                 FROM capture_jobs
                 WHERE host_id = ANY($1)
                   AND stage NOT IN ('done','failed')
+                UNION ALL
+                SELECT dest_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+                FROM session_teleports WHERE phase IN ({teleport_reserving})
             ) reserved
             GROUP BY host_id
             "#,
             reserving = reserving_states_sql(),
+            teleport_reserving =
+                engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
         );
         let res_rows = sqlx::query(&res_sql)
             .bind(&cand)
@@ -2700,35 +2761,20 @@ impl MetadataStore for PostgresStore {
     async fn delete_host(
         &self,
         id: HostId,
-    ) -> Result<engram_core::types::session::DeleteHostOutcome, MetaError> {
-        use engram_core::types::session::DeleteHostOutcome;
+    ) -> Result<engram_core::types::host::DeleteHostOutcome, MetaError> {
+        use engram_core::types::host::DeleteHostOutcome;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        // Refuse while any session is still bound — deleting the row out
-        // from under a live session would orphan its routing (ADR 0116
-        // A6 audit: this refusal IS the release discipline — a bound
-        // host row is never removed on inference). ADR 0084 (c):
-        // an in-flight base-snapshot capture binds the host the same way
-        // (its VM is running there); count non-terminal `capture_jobs`
-        // rows bound to this host in the same guard.
-        let bound_sql = format!(
-            r#"
-            SELECT (SELECT COUNT(*) FROM sessions
-                     WHERE host_id = $1
-                       AND status IN ({reserving}))::BIGINT
-                 + (SELECT COUNT(*) FROM capture_jobs
-                     WHERE host_id = $1
-                       AND stage NOT IN ('done','failed'))::BIGINT
-            "#,
-            reserving = reserving_states_sql(),
-        );
-        let bound: i64 = sqlx::query_scalar(&bound_sql)
-            .bind(id.as_uuid())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        if bound > 0 {
-            tx.rollback().await.map_err(db_err)?;
-            return Ok(DeleteHostOutcome::SessionsBound(bound as u64));
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM hosts WHERE id = $1 FOR UPDATE")
+                .bind(id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        if let Some(status) = status {
+            let status = row::parse_host_status(&status)?;
+            if !matches!(status, HostStatus::Retired | HostStatus::Dead) {
+                return Ok(DeleteHostOutcome::NotRetired(status));
+            }
         }
         // Detach terminal/idle stragglers (defensive against an FK), then
         // delete. 0 rows deleted = already gone → idempotent Deleted.
@@ -4137,7 +4183,7 @@ impl MetadataStore for PostgresStore {
                 capacity_used_mib       = EXCLUDED.capacity_used_mib,
                 running_sandboxes_count = EXCLUDED.running_sandboxes_count,
                 last_heartbeat_at       = EXCLUDED.last_heartbeat_at,
-                status                  = EXCLUDED.status,
+                status                  = CASE WHEN hosts.status = 'retired' THEN 'retired' ELSE EXCLUDED.status END,
                 host_addr               = COALESCE(EXCLUDED.host_addr, hosts.host_addr),
                 capabilities            = EXCLUDED.capabilities,
                 updated_at              = $13,
@@ -4149,7 +4195,7 @@ impl MetadataStore for PostgresStore {
                 -- renewal target (legacy caller) leaves the lease columns
                 -- untouched.
                 lease_expires_at = COALESCE($14, hosts.lease_expires_at),
-                lease_state      = CASE WHEN $14::timestamptz IS NULL
+                lease_state      = CASE WHEN hosts.status = 'retired' THEN 'none' WHEN $14::timestamptz IS NULL
                                         THEN hosts.lease_state
                                         ELSE 'active' END,
                 lease_epoch      = hosts.lease_epoch
@@ -4180,6 +4226,89 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn get_host(&self, id: HostId) -> Result<Option<HostRecord>, MetaError> {
+        sqlx::query("SELECT * FROM hosts WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?
+            .as_ref()
+            .map(row::host_from_row)
+            .transpose()
+    }
+
+    async fn request_host_retirement(
+        &self,
+        id: HostId,
+        owner: CordonOwner,
+        reason: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        // A cordon that another owner holds is refused: the operator must
+        // never take over a manual cordon (ADR 0123 A5).
+        Ok(sqlx::query("UPDATE hosts SET cordoned = true, cordon_owner = $2, cordon_reason = $3, retire_requested_at = COALESCE(retire_requested_at, $4) WHERE id = $1 AND status IN ('ready','draining') AND (cordon_owner IS NULL OR cordon_owner = $2)")
+            .bind(id.as_uuid()).bind(owner.as_str()).bind(reason).bind(now)
+            .execute(&self.pool).await.map_err(db_err)?.rows_affected() > 0)
+    }
+
+    async fn cancel_host_retirement(
+        &self,
+        id: HostId,
+        owner: CordonOwner,
+    ) -> Result<bool, MetaError> {
+        let changed = sqlx::query("UPDATE hosts SET cordoned = false, cordon_owner = NULL, cordon_reason = NULL, retire_requested_at = NULL WHERE id = $1 AND cordon_owner = $2 AND status <> 'retired'")
+            .bind(id.as_uuid()).bind(owner.as_str()).execute(&self.pool).await.map_err(db_err)?.rows_affected() > 0;
+        if changed {
+            self.notify_placement_changed("host_uncordoned").await;
+        }
+        Ok(changed)
+    }
+
+    async fn list_retiring_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
+        sqlx::query("SELECT * FROM hosts WHERE retire_requested_at IS NOT NULL AND status IN ('ready','draining') ORDER BY id")
+            .fetch_all(&self.pool).await.map_err(db_err)?.iter().map(row::host_from_row).collect()
+    }
+
+    async fn host_retirement_status(
+        &self,
+        id: HostId,
+    ) -> Result<Option<RetirementStatus>, MetaError> {
+        let mut conn = self.pool.acquire().await.map_err(db_err)?;
+        retirement_status(&mut conn, id, self.clock.now_utc()).await
+    }
+
+    async fn grant_host_retirement(
+        &self,
+        id: HostId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<RetirementGrant, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM hosts WHERE id = $1 FOR UPDATE")
+                .bind(id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        if status.as_deref() == Some("retired") {
+            return Ok(RetirementGrant::Granted);
+        }
+        let Some(status) = retirement_status(&mut tx, id, now).await? else {
+            return Ok(RetirementGrant::NotRequested);
+        };
+        if status.requested_at.is_none() {
+            return Ok(RetirementGrant::NotRequested);
+        }
+        if !status.blockers.is_empty() {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(RetirementGrant::Blocked(status.blockers));
+        }
+        sqlx::query("UPDATE hosts SET status = 'retired', retired_at = $2, lease_state = 'none' WHERE id = $1")
+            .bind(id.as_uuid()).bind(now).execute(&mut *tx).await.map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        self.notify_placement_changed("host_retired").await;
+        Ok(RetirementGrant::Granted)
+    }
+
     async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
         // `ORDER BY id` is the cheapest stable sort: id is the PK, so
         // the index walk is free, and UUIDs give a deterministic order
@@ -4198,7 +4327,7 @@ impl MetadataStore for PostgresStore {
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
                    util_committed_swap_mib,
                    ready_images, current_bundles, sandbox_bundles,
-                   cordoned, total_vcpus, wire_version, stages_images, capabilities,
+                   cordoned, cordon_owner, cordon_reason, retire_requested_at, retired_at, total_vcpus, wire_version, stages_images, capabilities,
                    lease_expires_at, lease_state, lease_epoch,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
@@ -4212,7 +4341,7 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError> {
-        let n = sqlx::query(r#"UPDATE hosts SET status = $2, updated_at = $3 WHERE id = $1"#)
+        let n = sqlx::query(r#"UPDATE hosts SET status = $2, updated_at = $3 WHERE id = $1 AND status <> 'retired' AND $2 <> 'retired'"#)
             .bind(id.as_uuid())
             .bind(status.as_str())
             .bind(self.clock.now_utc())
@@ -4230,12 +4359,12 @@ impl MetadataStore for PostgresStore {
         &self,
         id: HostId,
         hb: engram_core::types::host::HostHeartbeat,
-    ) -> Result<(), MetaError> {
+    ) -> Result<engram_core::types::host::HeartbeatAck, MetaError> {
         // ADR 0047: the single per-heartbeat UPDATE — capacity +
         // utilization + the scheduling state every replica reads
         // (ready_images / current_bundles / total_vcpus). `cordoned` is
         // deliberately absent: it is coordinator-owned and only
-        // `set_host_cordoned` writes it. (ADR 0078 retired the dead
+        // `set_host_cordon` writes it. (ADR 0078 retired the dead
         // `local_snapshots` mirror.)
         let ready_images = serde_json::to_value(&hb.ready_images)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
@@ -4247,7 +4376,7 @@ impl MetadataStore for PostgresStore {
         // ADR 0068: this tick's re-probed capability vector.
         let capabilities = serde_json::to_value(&hb.capabilities)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
-        let placement_changed = sqlx::query_scalar::<_, bool>(
+        let outcome = sqlx::query_as::<_, (String, bool)>(
             // Issue #230: `dead` is terminal w.r.t. heartbeats — see
             // `HostStatus::can_transition_to`. The dead-host sweep
             // (`mark_host_dead_if_lease_expired`) marks a partitioned
@@ -4270,7 +4399,7 @@ impl MetadataStore for PostgresStore {
                      FOR UPDATE
                 )
                 UPDATE hosts
-                  SET status = CASE WHEN hosts.status = 'dead' THEN 'dead' ELSE $2 END,
+                  SET status = CASE WHEN hosts.status IN ('dead','retired') THEN hosts.status ELSE $2 END,
                       capacity_total_mib = $3,
                       capacity_used_mib = $4,
                       running_sandboxes_count = $5,
@@ -4304,7 +4433,7 @@ impl MetadataStore for PostgresStore {
                                               THEN hosts.lease_expires_at
                                               ELSE GREATEST(COALESCE(hosts.lease_expires_at, $24), $24)
                                          END,
-                      lease_state = CASE WHEN $24::timestamptz IS NULL
+                      lease_state = CASE WHEN hosts.status = 'retired' THEN 'none' WHEN $24::timestamptz IS NULL
                                               OR hosts.lease_state = 'handoff'
                                          THEN hosts.lease_state
                                          ELSE 'active'
@@ -4312,9 +4441,9 @@ impl MetadataStore for PostgresStore {
                       updated_at = $21
                  FROM previous
                 WHERE hosts.id = $1
-                RETURNING previous.status <> 'dead' AND (
+                RETURNING previous.status, previous.status NOT IN ('dead','retired') AND (
                     previous.status IS DISTINCT FROM
-                        CASE WHEN previous.status = 'dead' THEN 'dead' ELSE $2 END
+                        CASE WHEN previous.status IN ('dead','retired') THEN previous.status ELSE $2 END
                     OR (COALESCE(previous.allocatable_mib, 0) = 0 AND $11::bigint > 0)
                     OR previous.ready_images IS DISTINCT FROM $12::jsonb
                     OR previous.total_vcpus IS DISTINCT FROM $14::int
@@ -4351,9 +4480,13 @@ impl MetadataStore for PostgresStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
-        let Some(placement_changed) = placement_changed else {
+        let Some((previous, placement_changed)) = outcome else {
             return Err(MetaError::NotFound);
         };
+        let previous = row::parse_host_status(&previous)?;
+        if matches!(previous, HostStatus::Dead | HostStatus::Retired) {
+            return Ok(HeartbeatAck::Refused(previous));
+        }
         if placement_changed {
             // Registration wakes the queue before the host has its real
             // scheduling vector. Wake again when the first heartbeat supplies
@@ -4362,25 +4495,22 @@ impl MetadataStore for PostgresStore {
             self.notify_placement_changed("host_schedulability_changed")
                 .await;
         }
-        Ok(())
+        Ok(HeartbeatAck::Accepted)
     }
 
-    async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
-        // ADR 0047: the coordinator-owned cordon bit. Heartbeats never
-        // write this column, so the flip sticks until explicit uncordon.
-        let n = sqlx::query(r#"UPDATE hosts SET cordoned = $2, updated_at = $3 WHERE id = $1"#)
-            .bind(id.as_uuid())
-            .bind(cordoned)
-            .bind(self.clock.now_utc())
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?
-            .rows_affected();
+    async fn set_host_cordon(
+        &self,
+        id: HostId,
+        owner: Option<CordonOwner>,
+        reason: Option<&str>,
+    ) -> Result<(), MetaError> {
+        let n = sqlx::query("UPDATE hosts SET cordoned = $2, cordon_owner = $3, cordon_reason = $4, retire_requested_at = CASE WHEN $2 THEN retire_requested_at ELSE NULL END, updated_at = $5 WHERE id = $1 AND status <> 'retired'")
+            .bind(id.as_uuid()).bind(owner.is_some()).bind(owner.map(CordonOwner::as_str)).bind(reason).bind(self.clock.now_utc())
+            .execute(&self.pool).await.map_err(db_err)?.rows_affected();
         if n == 0 {
             return Err(MetaError::NotFound);
         }
-        if !cordoned {
-            // Uncordoning makes the host schedulable again.
+        if owner.is_none() {
             self.notify_placement_changed("host_uncordoned").await;
         }
         Ok(())
@@ -4400,7 +4530,7 @@ impl MetadataStore for PostgresStore {
                   SET lease_state = 'handoff',
                       lease_expires_at = GREATEST(COALESCE(lease_expires_at, $2), $2),
                       updated_at = $3
-                WHERE id = $1 AND status <> 'dead'"#,
+                WHERE id = $1 AND status NOT IN ('dead','retired')"#,
         )
         .bind(id.as_uuid())
         .bind(until)
@@ -4433,7 +4563,7 @@ impl MetadataStore for PostgresStore {
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
                    util_committed_swap_mib,
                    ready_images, current_bundles, sandbox_bundles,
-                   cordoned, total_vcpus, wire_version, stages_images, capabilities,
+                   cordoned, cordon_owner, cordon_reason, retire_requested_at, retired_at, total_vcpus, wire_version, stages_images, capabilities,
                    lease_expires_at, lease_state, lease_epoch,
                    last_heartbeat_at, status, host_addr
               FROM hosts
@@ -4463,7 +4593,7 @@ impl MetadataStore for PostgresStore {
                       lease_state = CASE WHEN lease_state = 'none' THEN 'active'
                                          ELSE lease_state END,
                       updated_at = $3
-                WHERE id = $1 AND status <> 'dead'"#,
+                WHERE id = $1 AND status NOT IN ('dead','retired')"#,
         )
         .bind(id.as_uuid())
         .bind(until)
@@ -4635,7 +4765,7 @@ impl MetadataStore for PostgresStore {
             return Ok(Vec::new());
         };
         let status: String = sqlx::Row::try_get(&host_row, "status").map_err(db_err)?;
-        if status == "dead" {
+        if matches!(status.as_str(), "dead" | "retired") {
             // Idempotent: another replica already settled this host.
             return Ok(Vec::new());
         }
@@ -6438,22 +6568,13 @@ impl MetadataStore for PostgresStore {
         // Live materializes: fresh-claimed `materializing` rows bound to a
         // host. The keepalive frames renew `claimed_at` (~every <=30 s), so a
         // dead stream ages out of this set within the lease window.
-        let mat_rows: Vec<(Uuid, i64)> = sqlx::query_as(
-            r#"
-            SELECT materialize_host_id, COUNT(*)
-              FROM enable_jobs
-             WHERE state = 'materializing'
-               AND materialize_host_id IS NOT NULL
-               AND claimed_at IS NOT NULL
-               AND claimed_at > $2 - make_interval(secs => $1)
-             GROUP BY materialize_host_id
-            "#,
-        )
-        .bind(materialize_lease.as_secs_f64())
-        .bind(self.clock.now_utc())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let mat_sql = format!("SELECT materialize_host_id, COUNT(*) FROM enable_jobs WHERE materialize_host_id IS NOT NULL AND {} GROUP BY materialize_host_id", live_materialize_predicate("$2", "$1"));
+        let mat_rows: Vec<(Uuid, i64)> = sqlx::query_as(&mat_sql)
+            .bind(materialize_lease.as_secs_f64())
+            .bind(self.clock.now_utc())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         for (host, n) in mat_rows {
             out.entry(HostId::from(host)).or_default().materializes = n.max(0) as u32;
         }

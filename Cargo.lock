@@ -2898,6 +2898,7 @@ dependencies = [
  "futures",
  "parking_lot",
  "serde_json",
+ "sqlx",
  "tokio",
  "uuid",
  "workspace-hack",

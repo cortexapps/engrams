@@ -146,6 +146,7 @@ pub struct SessRow {
     pub missing_strikes: i32,
     pub current_epoch: i64,
     pub binding_epoch: i64,
+    pub attached_binding_epoch: i64,
     pub next_event_idx: i64,
     pub recovery_epoch: i64,
     pub shell_pinned_until: Option<DateTime<Utc>>,
@@ -202,6 +203,10 @@ pub struct EnableJobRow {
 #[derive(Default)]
 pub struct SimDb {
     pub serial: u64,
+    pub teleports: std::collections::BTreeMap<
+        engram_core::TeleportId,
+        engram_core::types::teleport::TeleportRow,
+    >,
     pub sessions: std::collections::BTreeMap<SessionId, SessRow>,
     pub hosts: std::collections::BTreeMap<HostId, HostRecord>,
     pub snapshots: std::collections::BTreeMap<SnapshotId, SnapshotRecord>,
