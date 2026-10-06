@@ -59,7 +59,7 @@
 //! Mitigation lives in commit 3: `transition_session(Idle)` clears
 //! `live_disk_manifest_*` in the same transaction it flips
 //! `status = Idle`, so any racing publish that landed between
-//! `host.snapshot()` and `assign_session_sandbox(None)` is wiped.
+//! `host.snapshot()` and the detach is wiped.
 //! The `sessions.sandbox_id == publish.sandbox_id` guard ALSO
 //! drops post-step-4 publishes. Two defences in series; the Idle-
 //! clear is the load-bearing one for the pre-step-4 window.

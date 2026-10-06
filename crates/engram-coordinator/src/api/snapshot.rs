@@ -1819,8 +1819,7 @@ async fn resume_from_fc_snapshot(
     // `session.live_disk_manifest` is `None` when:
     // - The session never went through Phase B (non-NBD host /
     //   never had a publish land).
-    // - The session is mid-eviction and `assign_session_sandbox(None)`
-    //   cleared the column (commit 3's load-bearing race fix).
+    // - The session is mid-eviction and the detach cleared the column.
     //
     // In both `None` cases the resolver falls back to the
     // snapshot's manifest, preserving the pre-Phase-B behaviour.
@@ -2148,7 +2147,7 @@ async fn bind_resumed_session(
 /// FlushScheduler's live-manifest publisher uses to attach session_id
 /// to the publish RPC. The coordinator-side binding is NOT updated
 /// here — it lives only in `sessions.sandbox_id` (Postgres), written by
-/// the caller via `assign_session_sandbox` BEFORE this call, so every
+/// the caller through a guarded binding write BEFORE this call, so every
 /// replica's `/exec` / `/shell` / `/prompt` resolves the new sandbox by
 /// reading that row ([`AppState::resolve_sandbox`]).
 ///

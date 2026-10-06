@@ -307,7 +307,7 @@ async fn seed_active_session(
 /// SB1 via `apply_missing_sandbox_strikes`, then rebind to SB2 via the
 /// production binding writers and assert the column is back at 0 — so a
 /// single subsequent missing tick does NOT cross the threshold. Before
-/// the fix, `assign_session_sandbox` / `rebind_session` left the column
+/// the fix, sandbox binding writes left the column
 /// untouched and the very next missing tick flipped a healthy session.
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
@@ -331,9 +331,9 @@ async fn missing_strikes_reset_on_sandbox_rekey() {
         assert!(flipped.is_empty(), "below threshold → no flip");
     }
 
-    // --- Path 1: assign_session_sandbox(Some) rebind resets strikes.
+    // --- Path 1: fenced_assign_sandbox(Some) rebind resets strikes.
     let sb2 = SandboxId::new();
-    meta.assign_session_sandbox(session_id, Some(sb2))
+    meta.fenced_assign_sandbox(session_id, 0, Some(sb2), Some(host_a))
         .await
         .expect("rebind to SB2");
     let flipped = meta
@@ -370,19 +370,19 @@ async fn missing_strikes_reset_on_sandbox_rekey() {
         "rebind_session must also reset the strike streak"
     );
 
-    // --- Path 3: unbind (assign_session_sandbox(None)) clears strikes.
+    // --- Path 3: unbind (fenced_assign_sandbox(None)) clears strikes.
     // Re-accrue to grace-1, unbind, rebind, then a single miss must not flip.
     for _ in 0..(grace - 2) {
         meta.apply_missing_sandbox_strikes(&[], &[session_id], grace)
             .await
             .expect("re-accrue before unbind");
     }
-    meta.assign_session_sandbox(session_id, None)
+    meta.fenced_assign_sandbox(session_id, 0, None, Some(host_b))
         .await
         .expect("unbind");
     // Rebind to a fresh sandbox so the row is bound again for the tick.
     let sb4 = SandboxId::new();
-    meta.assign_session_sandbox(session_id, Some(sb4))
+    meta.fenced_assign_sandbox(session_id, 0, Some(sb4), Some(host_b))
         .await
         .expect("rebind after unbind");
     let flipped = meta

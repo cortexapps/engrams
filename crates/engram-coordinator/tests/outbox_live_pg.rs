@@ -335,17 +335,24 @@ async fn binding_epoch_mints_monotonically_per_session() {
         .await
         .expect("bind 1");
     let e2 = meta
-        .assign_session_sandbox(sid, Some(engram_core::SandboxId::new()))
+        .fenced_assign_sandbox(sid, 0, Some(engram_core::SandboxId::new()), None)
         .await
         .expect("bind 2");
     assert_eq!((e1, e2), (1, Some(2)));
     // A clear is not a binding write: no mint.
     assert_eq!(
-        meta.assign_session_sandbox(sid, None).await.expect("clear"),
+        meta.fenced_assign_sandbox(sid, 0, None, None)
+            .await
+            .expect("clear"),
         None
     );
     assert!(meta
-        .assign_session_sandbox(SessionId::new(), Some(engram_core::SandboxId::new()))
+        .fenced_assign_sandbox(
+            SessionId::new(),
+            0,
+            Some(engram_core::SandboxId::new()),
+            None
+        )
         .await
         .is_err());
 }

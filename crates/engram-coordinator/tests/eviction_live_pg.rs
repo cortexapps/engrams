@@ -183,7 +183,9 @@ async fn backstop_query_filters_on_ttl_and_sandbox() {
 
     // Unbinding the sandbox removes it from the backstop's view
     // (nothing to evict; other lifecycle paths own bare rows).
-    meta.assign_session_sandbox(id, None).await.expect("unbind");
+    meta.fenced_assign_sandbox(id, 0, None, meta.get_session(id).await.unwrap().host_id)
+        .await
+        .expect("unbind");
     assert!(
         !meta
             .list_active_sessions_idle_past(0)

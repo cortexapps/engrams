@@ -1,8 +1,8 @@
 //! Issue #211: live-Postgres regression tests for the guarded binding
 //! writers.
 //!
-//! Before this fix, `assign_session_host`, `assign_session_sandbox`, and
-//! `rebind_session` were blind `WHERE id = $1` UPDATEs with no state or
+//! Before the guarded writers, binding updates used blind
+//! `WHERE id = $1` UPDATEs with no state or
 //! expected-value guard. A racing actor could bind a live sandbox onto a
 //! row that had concurrently gone terminal (the terminate-races-resume
 //! interleaving) — the ownership oracle matches `sandbox_id` only and
@@ -99,7 +99,7 @@ async fn seed_idle_unbound(meta: &Arc<dyn MetadataStore>) -> SessionId {
     meta.transition_session(id, SessionState::Idle, BindingDisposition::Detach)
         .await
         .expect("active->idle");
-    meta.assign_session_sandbox(id, None)
+    meta.fenced_assign_sandbox(id, 0, None, None)
         .await
         .expect("clear sandbox (evict_local / resume-dispatch shape)");
     id
@@ -197,7 +197,7 @@ async fn guarded_clear_does_not_null_a_fresh_rebind() {
 
     // A migration rebinds A -> B (the fresh, healthy binding).
     let sandbox_b = SandboxId::new();
-    meta.assign_session_sandbox(id, Some(sandbox_b))
+    meta.fenced_assign_sandbox(id, 0, Some(sandbox_b), None)
         .await
         .expect("rebind to B");
 

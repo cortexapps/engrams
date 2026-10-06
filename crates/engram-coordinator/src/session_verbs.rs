@@ -2409,7 +2409,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(id, Some(sandbox_id))
+            .fenced_assign_sandbox(id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         state

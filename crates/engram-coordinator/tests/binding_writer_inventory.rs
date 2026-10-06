@@ -24,7 +24,6 @@ use std::path::Path;
 /// its call sites are ownership writes too.
 const METHODS: &[&str] = &[
     "transition_session_created",
-    "assign_session_sandbox",
     "assign_session_sandbox_guarded",
     "rebind_session_guarded",
     "teleport_commit",
@@ -62,7 +61,6 @@ const DECLARED: &[(&str, &str, usize, &str)] = &[
     ("teleport", "transition_with_fence", 1, "post-attach peer loss enters failed recovery"),
     ("api/snapshot", "transition_with_fence_emitting", 1, "disk-only cold boot retains the fenced binding"),
     ("queue_scanner", "transition_session", 4, "Queued→Idle/Failed settles (RequireUnbound: queued rows are unbound)"),
-    ("reconcile", "assign_session_sandbox", 1, "strike-out unbind fallback"),
     ("reconcile", "assign_session_sandbox_guarded", 1, "strike-out guarded unbind"),
     ("reconcile", "transition_session", 1, "→HostLost after the clears (stage-2 now via dead_host::settle_host_lost, ADR 0116 A4)"),
     ("session_boot", "transition_session", 1, "Created→Active (Retain: the freshly-bound sandbox)"),

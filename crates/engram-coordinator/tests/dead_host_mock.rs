@@ -106,16 +106,6 @@ impl MetadataStore for MiniMeta {
         s.host_id = host_id;
         Ok(())
     }
-    async fn assign_session_sandbox(
-        &self,
-        id: SessionId,
-        sandbox_id: Option<engram_core::SandboxId>,
-    ) -> Result<Option<u64>, MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        s.sandbox_id = sandbox_id;
-        Ok(None)
-    }
     async fn upsert_host(&self, _h: HostRecord) -> Result<(), MetaError> {
         Ok(())
     }

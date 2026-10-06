@@ -358,26 +358,10 @@ async fn flip_missing(
         }
     }
 
-    // Clear sandbox_id so coord routing and a future restart's
-    // `repopulate_routing` don't try to talk to the dead sandbox.
-    //
-    // Issue #211: this MUST be a compare-and-swap on the EXACT sandbox
-    // that struck out, not a blind `WHERE id = $1` clear. A live
-    // migration's `rebind_session` can land a FRESH sandbox onto this
-    // row between our strike-out decision and this clear; a blind null
-    // would wipe that healthy binding and drive a just-migrated session
-    // to HostLost→Idle/Dead. With the CAS, if the row no longer points
-    // at the struck-out sandbox we abort the whole flip (the binding
-    // moved on — the session is not orphaned). When `sandbox_id` is
-    // None (the row already had no binding) we fall back to the blind
-    // clear: there is nothing for a rebind to have replaced.
-    let clear_result = match sandbox_id {
-        Some(struck) => {
-            meta.assign_session_sandbox_guarded(session_id, None, Some(Some(struck)), &[])
-                .await
-        }
-        None => meta.assign_session_sandbox(session_id, None).await,
-    };
+    // Clear only if the current binding still matches, including an absent binding.
+    let clear_result = meta
+        .assign_session_sandbox_guarded(session_id, None, Some(sandbox_id), &[])
+        .await;
     if let Err(e) = clear_result {
         if matches!(e, engram_core::MetaError::Conflict(_)) {
             tracing::info!(

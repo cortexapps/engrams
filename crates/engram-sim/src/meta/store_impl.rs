@@ -942,31 +942,6 @@ impl MetadataStore for SimMetadataStore {
         Ok(())
     }
 
-    /// Bind: set sandbox + reset strikes. Unbind (None): also clears the
-    /// live disk manifest and bumps chunk_generation (same tx).
-    async fn assign_session_sandbox(
-        &self,
-        id: SessionId,
-        sandbox_id: Option<engram_core::SandboxId>,
-    ) -> Result<Option<u64>, MetaError> {
-        self.gate()?;
-        let now = self.now();
-        let mut db = self.db.lock();
-        let row = db.sessions.get_mut(&id).ok_or(MetaError::NotFound)?;
-        row.session.sandbox_id = sandbox_id;
-        row.missing_strikes = 0;
-        row.updated_at = now;
-        let epoch = sandbox_id.map(|_| {
-            row.binding_epoch += 1;
-            row.binding_epoch as u64
-        });
-        if sandbox_id.is_none() {
-            row.session.live_disk_manifest = None;
-            db.chunk_generation += 1;
-        }
-        Ok(epoch)
-    }
-
     /// Fenced on status='idle' AND current_epoch=$2; true iff the flip
     /// landed. Fires the enqueued placement notify on success.
     async fn enqueue_session_resume(&self, id: SessionId, epoch: i64) -> Result<bool, MetaError> {
@@ -2581,13 +2556,19 @@ impl MetadataStore for SimMetadataStore {
             return Err(MetaError::Conflict("stale session fence".into()));
         }
         r.session.sandbox_id = sandbox_id;
+        r.missing_strikes = 0;
         r.session.host_id = host_id;
         r.session.last_active_at = now;
         r.updated_at = now;
-        Ok(sandbox_id.map(|_| {
+        let binding_epoch = sandbox_id.map(|_| {
             r.binding_epoch += 1;
             r.binding_epoch as u64
-        }))
+        });
+        if sandbox_id.is_none() {
+            r.session.live_disk_manifest = None;
+            db.chunk_generation += 1;
+        }
+        Ok(binding_epoch)
     }
 
     /// CAS on expected sandbox + allowed states; distinct Conflict
@@ -2608,14 +2589,14 @@ impl MetadataStore for SimMetadataStore {
         if let Some(expected) = expected_current {
             if r.session.sandbox_id != expected {
                 return Err(MetaError::Conflict(format!(
-                    "assign_session_sandbox CAS: sandbox_id is {:?}, expected {:?}",
+                    "assign_session_sandbox_guarded CAS: sandbox_id is {:?}, expected {:?}",
                     r.session.sandbox_id, expected
                 )));
             }
         }
         if !allowed_states.is_empty() && !allowed_states.contains(&r.session.status) {
             return Err(MetaError::Conflict(format!(
-                "assign_session_sandbox CAS: status is {}, not in {:?}",
+                "assign_session_sandbox_guarded CAS: status is {}, not in {:?}",
                 r.session.status.as_str(),
                 allowed_states
             )));

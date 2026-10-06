@@ -207,11 +207,16 @@ async fn list_live_session_disk_manifest_ids_picks_up_live_writes() {
         "version must round-trip via the live-set query",
     );
 
-    // Clear the live manifest via assign_session_sandbox(None) —
+    // Clear the live manifest via fenced_assign_sandbox(None) —
     // the trait method already cascades the cleanup per its docs.
-    meta.assign_session_sandbox(session_id, None)
-        .await
-        .expect("unbind sandbox");
+    meta.fenced_assign_sandbox(
+        session_id,
+        0,
+        None,
+        meta.get_session(session_id).await.unwrap().host_id,
+    )
+    .await
+    .expect("unbind sandbox");
 
     // Allow PG a tick to fully commit the cascade then re-poll.
     tokio::time::sleep(Duration::from_millis(50)).await;

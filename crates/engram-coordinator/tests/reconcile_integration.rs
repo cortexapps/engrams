@@ -310,7 +310,7 @@ async fn re_appearing_sandbox_within_grace_does_not_flip() {
 /// (evac/resume/migration). The strike counter encodes "N CONSECUTIVE
 /// heartbeats THIS binding's sandbox was missing"; rebinding to a fresh
 /// sandbox breaks consecutiveness, so the new binding is owed a full
-/// `grace_ticks` window. Before the fix, `assign_session_sandbox` left
+/// `grace_ticks` window. Before the fix, sandbox binding writes left
 /// the counter untouched, so a freshly-resumed session carrying 2 stale
 /// strikes was dismantled on its first transient under-report (strike 3
 /// of a contract-promised 3-tick grace collapsed to 1).
@@ -342,7 +342,7 @@ async fn stale_strikes_do_not_carry_across_sandbox_rekey() {
     meta.assign_session_host(session, Some(host_b))
         .await
         .unwrap();
-    meta.assign_session_sandbox(session, Some(sb2))
+    meta.fenced_assign_sandbox(session, 0, Some(sb2), Some(host_b))
         .await
         .unwrap();
 

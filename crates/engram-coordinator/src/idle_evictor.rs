@@ -1952,7 +1952,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         assert_eq!(
@@ -1965,7 +1965,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, None)
+            .fenced_assign_sandbox(session_id, 0, None, None)
             .await
             .unwrap();
         assert_eq!(state.resolve_sandbox(session_id).await, None);
@@ -2160,7 +2160,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -2290,7 +2290,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -2551,7 +2551,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -2776,7 +2776,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -2996,7 +2996,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -3061,7 +3061,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -3327,7 +3327,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -3425,7 +3425,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -3469,7 +3469,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -3519,7 +3519,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         *mini.fail_next_record_snapshot.lock() = true;
@@ -3674,7 +3674,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -3734,7 +3734,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -3787,7 +3787,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         let host_id = state
@@ -3859,7 +3859,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         let host_id = state
@@ -3921,7 +3921,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         let host_id = state
@@ -3975,7 +3975,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         let host_id = state
@@ -4051,7 +4051,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         let host_id = state
@@ -4137,7 +4137,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         let host_id = state
@@ -4204,7 +4204,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         let host_id = state.host_registry.host_of(sandbox_id).expect("routed");
@@ -4443,7 +4443,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -4697,7 +4697,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
         {
@@ -4891,7 +4891,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -4949,7 +4949,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -5002,7 +5002,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -5054,7 +5054,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -5127,7 +5127,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -5227,7 +5227,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 
@@ -5293,7 +5293,7 @@ mod tests {
         state
             .services
             .meta
-            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .fenced_assign_sandbox(session_id, 0, Some(sandbox_id), None)
             .await
             .unwrap();
 

@@ -619,7 +619,7 @@ pub struct Session {
     /// ADR 0016 Phase B: the host's last-published live disk
     /// manifest from the FlushScheduler. Updated by
     /// `MetadataStore::update_live_disk_manifest`; cleared by
-    /// `assign_session_sandbox(None)`. Coord's
+    /// `fenced_assign_sandbox(None)`. Coord's
     /// `effective_resume_disk_manifest` picks the newer of this
     /// and `snapshots.disk_manifest` so the first resume after
     /// continuous flush is enabled doesn't silently roll back to

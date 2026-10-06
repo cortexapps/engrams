@@ -686,14 +686,20 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
     assert_eq!(resp.status(), StatusCode::OK);
     let gen_after_publish = meta.chunk_generation().await.unwrap();
 
-    // Direct trait call (no API endpoint for assign_session_sandbox).
+    // Direct trait call (no API endpoint for fenced_assign_sandbox).
     // ADR 0016 Phase B: this is the load-bearing eviction-race
-    // mitigation — assign_session_sandbox(None) clears the live
+    // mitigation — fenced_assign_sandbox(None) clears the live
     // manifest + bumps chunk_generation in the same logical step
     // the sandbox_id NULLs out.
-    engram_core::traits::MetadataStore::assign_session_sandbox(meta.as_ref(), session_id, None)
-        .await
-        .unwrap();
+    engram_core::traits::MetadataStore::fenced_assign_sandbox(
+        meta.as_ref(),
+        session_id,
+        0,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(meta
         .get_session(session_id)
         .await

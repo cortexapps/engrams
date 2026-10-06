@@ -897,23 +897,12 @@ pub trait MetadataStore: Send + Sync {
         Ok(Some((prev, target)))
     }
 
+    /// Retained because dead_host.rs still uses it to clear host ownership.
     async fn assign_session_host(
         &self,
         id: SessionId,
         host_id: Option<HostId>,
     ) -> Result<(), MetaError>;
-
-    /// Persist the in-memory `SandboxId` of the live sandbox serving
-    /// this session. Set to `Some` after `host_registry.create_for_session`
-    /// returns, cleared to `None` on evict/migrate. A set mints and returns
-    /// the binding epoch; a clear returns None without a mint. The coordinator
-    /// uses these rows to rebuild its in-memory routing maps after
-    /// a restart.
-    async fn assign_session_sandbox(
-        &self,
-        id: SessionId,
-        sandbox_id: Option<SandboxId>,
-    ) -> Result<Option<u64>, MetaError>;
 
     /// ADR 0073 phase 4: one row per Active+bound session for the idle
     /// scan — newest event (kind + time), host, and the shell pin. The
@@ -1328,7 +1317,8 @@ pub trait MetadataStore: Send + Sync {
     }
 
     /// A set returns the new binding epoch; a clear returns None.
-    /// A stale fence returns Conflict.
+    /// A stale fence returns Conflict. Both writes reset missing-sandbox strikes;
+    /// a clear also removes the live manifest and bumps chunk_generation.
     /// Fenced sandbox (re)bind — subsumes `rebind_session_guarded`'s
     /// bespoke expected-state list with the one epoch predicate.
     async fn fenced_assign_sandbox(
@@ -1526,14 +1516,7 @@ pub trait MetadataStore: Send + Sync {
             .await
     }
 
-    /// Issue #211: guarded compare-and-swap variant of
-    /// [`Self::assign_session_sandbox`]. The three binding writers
-    /// (`assign_session_{host,sandbox}`, `rebind_session`) are otherwise
-    /// blind `WHERE id = $1` UPDATEs: a racing actor can bind a live
-    /// sandbox onto a row that has *concurrently* gone terminal (the
-    /// terminate-races-resume interleaving), defeating the orphan reap —
-    /// the ownership oracle matches `sandbox_id` only and never re-checks
-    /// status, so a live VM pinned to a `Completed` row leaks forever.
+    /// Compare-and-swap sandbox binding write.
     ///
     /// This method conditions the write on:
     ///   * `expected_current` — `Some(prev)` requires the row's current
@@ -1548,33 +1531,16 @@ pub trait MetadataStore: Send + Sync {
     /// row with this id exists at all. Callers that just created a sandbox
     /// MUST destroy it on `Conflict` rather than leaking it.
     ///
-    /// The default impl composes a `get_session` legality check with the
-    /// blind setter — atomic enough for single-threaded mock stores; the
-    /// Postgres store overrides it with a true single-statement CAS.
     async fn assign_session_sandbox_guarded(
         &self,
-        id: SessionId,
-        sandbox_id: Option<SandboxId>,
-        expected_current: Option<Option<SandboxId>>,
-        allowed_states: &[SessionState],
+        _id: SessionId,
+        _sandbox_id: Option<SandboxId>,
+        _expected_current: Option<Option<SandboxId>>,
+        _allowed_states: &[SessionState],
     ) -> Result<Option<u64>, MetaError> {
-        let session = self.get_session(id).await?;
-        if let Some(expected) = expected_current {
-            if session.sandbox_id != expected {
-                return Err(MetaError::Conflict(format!(
-                    "assign_session_sandbox guard: sandbox_id is {:?}, expected {:?}",
-                    session.sandbox_id, expected
-                )));
-            }
-        }
-        if !allowed_states.is_empty() && !allowed_states.contains(&session.status) {
-            return Err(MetaError::Conflict(format!(
-                "assign_session_sandbox guard: status is {}, not in {:?}",
-                session.status.as_str(),
-                allowed_states
-            )));
-        }
-        self.assign_session_sandbox(id, sandbox_id).await
+        unimplemented!(
+            "assign_session_sandbox_guarded: PostgresStore and SimMetadataStore implement it"
+        )
     }
 
     /// Issue #211: guarded CAS variant of [`Self::assign_session_host`].
@@ -1616,32 +1582,13 @@ pub trait MetadataStore: Send + Sync {
     /// landing on a row that went terminal mid-migration.
     async fn rebind_session_guarded(
         &self,
-        id: SessionId,
-        host_id: HostId,
-        sandbox_id: SandboxId,
-        expected_current: Option<Option<SandboxId>>,
-        allowed_states: &[SessionState],
+        _id: SessionId,
+        _host_id: HostId,
+        _sandbox_id: SandboxId,
+        _expected_current: Option<Option<SandboxId>>,
+        _allowed_states: &[SessionState],
     ) -> Result<u64, MetaError> {
-        let session = self.get_session(id).await?;
-        if let Some(expected) = expected_current {
-            if session.sandbox_id != expected {
-                return Err(MetaError::Conflict(format!(
-                    "rebind_session guard: sandbox_id is {:?}, expected {:?}",
-                    session.sandbox_id, expected
-                )));
-            }
-        }
-        if !allowed_states.is_empty() && !allowed_states.contains(&session.status) {
-            return Err(MetaError::Conflict(format!(
-                "rebind_session guard: status is {}, not in {:?}",
-                session.status.as_str(),
-                allowed_states
-            )));
-        }
-        self.assign_session_host(id, Some(host_id)).await?;
-        self.assign_session_sandbox(id, Some(sandbox_id))
-            .await?
-            .ok_or_else(|| MetaError::Serialization("binding write returned no epoch".into()))
+        unimplemented!("rebind_session_guarded: PostgresStore and SimMetadataStore implement it")
     }
 
     /// ADR 0015 M3: PG-authoritative lookup for "which host owns this

@@ -472,13 +472,6 @@ mod tests {
         ) -> Result<(), MetaError> {
             Ok(())
         }
-        async fn assign_session_sandbox(
-            &self,
-            _id: SessionId,
-            _sandbox_id: Option<SandboxId>,
-        ) -> Result<Option<u64>, MetaError> {
-            Ok(None)
-        }
         async fn upsert_host(
             &self,
             _host: engram_core::types::HostRecord,

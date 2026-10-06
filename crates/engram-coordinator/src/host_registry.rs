@@ -1006,13 +1006,6 @@ mod tests {
         ) -> Result<(), engram_core::MetaError> {
             Ok(())
         }
-        async fn assign_session_sandbox(
-            &self,
-            _: engram_core::SessionId,
-            _: Option<SandboxId>,
-        ) -> Result<Option<u64>, engram_core::MetaError> {
-            Ok(None)
-        }
         async fn host_for_sandbox(
             &self,
             sandbox_id: SandboxId,

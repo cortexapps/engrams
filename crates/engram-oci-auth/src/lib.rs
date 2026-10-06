@@ -204,7 +204,7 @@ mod tests {
     use engram_core::types::{
         HostRecord, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
     };
-    use engram_core::{HostId, MetaError, SandboxId, SessionId};
+    use engram_core::{HostId, MetaError, SessionId};
 
     /// MetadataStore stub that holds at most one registry credential.
     /// All other methods unreachable / empty — we never call them in
@@ -263,13 +263,6 @@ mod tests {
             _: Option<HostId>,
         ) -> Result<(), MetaError> {
             Ok(())
-        }
-        async fn assign_session_sandbox(
-            &self,
-            _: SessionId,
-            _: Option<SandboxId>,
-        ) -> Result<Option<u64>, MetaError> {
-            Ok(None)
         }
         async fn upsert_host(&self, _: HostRecord) -> Result<(), MetaError> {
             Ok(())

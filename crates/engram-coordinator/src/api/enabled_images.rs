@@ -1390,13 +1390,6 @@ mod tests {
             ) -> Result<(), MetaError> {
                 unreachable!()
             }
-            async fn assign_session_sandbox(
-                &self,
-                _: engram_core::SessionId,
-                _: Option<engram_core::SandboxId>,
-            ) -> Result<Option<u64>, MetaError> {
-                unreachable!()
-            }
             async fn upsert_host(
                 &self,
                 _: engram_core::types::host::HostRecord,

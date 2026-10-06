@@ -1067,8 +1067,8 @@ impl AppState {
     ///
     /// ADR 0047: the coordinator holds NO in-memory session→sandbox
     /// authority. `session_boot` persists the binding via
-    /// `create_session_created`; every rebind/resume path persists it via
-    /// `assign_session_sandbox`; eviction/teardown clears it to `None`.
+    /// `transition_session_created`; rebind/resume paths use guarded binding
+    /// writes; eviction/teardown clears it to `None`.
     /// Any replica answers `/exec` / `/prompt` / `/shell` / `/snapshot`
     /// identically by reading this row — one indexed PK select, sub-ms,
     /// dwarfed by the downstream host exec RPC. A `None` here means the
@@ -2287,7 +2287,7 @@ pub(crate) mod tests {
         /// ADR 0016 Phase C: in-memory mirror of the `chunk_generation`
         /// counter. Bumped in the same critical section that writes
         /// `live_disk_manifests` (or clears it via
-        /// `assign_session_sandbox(None)`) so tests can verify the
+        /// `fenced_assign_sandbox(None)`) so tests can verify the
         /// barrier behaviour Phase C will rely on.
         pub(crate) chunk_generation: PlMutex<u64>,
         /// ADR 0034: in-memory mirror of the eviction retry count.
@@ -2645,29 +2645,6 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        async fn assign_session_sandbox(
-            &self,
-            id: engram_core::SessionId,
-            sandbox_id: Option<engram_core::SandboxId>,
-        ) -> Result<Option<u64>, MetaError> {
-            let mut s = self.session.lock();
-            if id != s.id {
-                return Err(MetaError::NotFound);
-            }
-            s.sandbox_id = sandbox_id;
-            // ADR 0016 Phase B: unbind clears the live manifest +
-            // bumps chunk_generation so Phase C's mid-sweep barrier
-            // observes the pin-set shrink atomically. Mirrors the
-            // PG path in engram-postgres::assign_session_sandbox.
-            if sandbox_id.is_none() && self.live_disk_manifests.lock().remove(&id).is_some() {
-                *self.chunk_generation.lock() += 1;
-            }
-            Ok(sandbox_id.map(|_| {
-                let mut epoch = self.binding_epoch.lock();
-                *epoch += 1;
-                *epoch
-            }))
-        }
         async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
             let mut hosts = self.hosts.lock();
             if let Some(existing) = hosts.iter_mut().find(|h| h.id == host.id) {
@@ -3418,6 +3395,31 @@ pub(crate) mod tests {
             Ok(Some((prev, indices)))
         }
 
+        async fn rebind_session_guarded(
+            &self,
+            id: SessionId,
+            host_id: HostId,
+            sandbox_id: engram_core::SandboxId,
+            expected_current: Option<Option<engram_core::SandboxId>>,
+            allowed_states: &[SessionState],
+        ) -> Result<u64, MetaError> {
+            let mut session = self.session.lock();
+            if session.id != id {
+                return Err(MetaError::NotFound);
+            }
+            if expected_current.is_some_and(|expected| session.sandbox_id != expected) {
+                return Err(MetaError::Conflict("sandbox binding changed".into()));
+            }
+            if !allowed_states.is_empty() && !allowed_states.contains(&session.status) {
+                return Err(MetaError::Conflict("session state changed".into()));
+            }
+            session.host_id = Some(host_id);
+            session.sandbox_id = Some(sandbox_id);
+            let mut epoch = self.binding_epoch.lock();
+            *epoch += 1;
+            Ok(*epoch)
+        }
+
         async fn fenced_assign_sandbox(
             &self,
             session_id: SessionId,
@@ -3425,12 +3427,25 @@ pub(crate) mod tests {
             sandbox_id: Option<engram_core::SandboxId>,
             host_id: Option<HostId>,
         ) -> Result<Option<u64>, MetaError> {
-            if self.ops.current_epoch(session_id) != epoch {
+            let mut s = self.session.lock();
+            if session_id != s.id || self.ops.current_epoch(session_id) != epoch {
                 return Err(MetaError::Conflict("stale fence".into()));
             }
-            let epoch = self.assign_session_sandbox(session_id, sandbox_id).await?;
-            self.assign_session_host(session_id, host_id).await?;
-            Ok(epoch)
+            s.sandbox_id = sandbox_id;
+            s.host_id = host_id;
+            // ADR 0016 Phase B: unbind clears the live manifest +
+            // bumps chunk_generation so Phase C's mid-sweep barrier
+            // observes the pin-set shrink atomically. Mirrors the
+            // PG path in engram-postgres::fenced_assign_sandbox.
+            if sandbox_id.is_none() {
+                self.live_disk_manifests.lock().remove(&session_id);
+                *self.chunk_generation.lock() += 1;
+            }
+            Ok(sandbox_id.map(|_| {
+                let mut epoch = self.binding_epoch.lock();
+                *epoch += 1;
+                *epoch
+            }))
         }
 
         // ADR 0016 Phase B: in-memory mirror of
@@ -3956,7 +3971,7 @@ pub(crate) mod tests {
     /// commit 6's effective_resume_disk_manifest resolver would
     /// then prefer it and restore disk-state AHEAD of memory.
     #[tokio::test]
-    async fn assign_session_sandbox_none_clears_live_manifest_and_bumps_generation() {
+    async fn fenced_assign_sandbox_none_clears_live_manifest_and_bumps_generation() {
         let sandbox_id = engram_core::SandboxId::new();
         let (session_id, mini) = build_phase_b_meta(Some(sandbox_id));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -3972,7 +3987,9 @@ pub(crate) mod tests {
 
         // Unbind. Live manifest disappears; generation bumps because
         // the pin set shrunk.
-        meta.assign_session_sandbox(session_id, None).await.unwrap();
+        meta.fenced_assign_sandbox(session_id, 0, None, None)
+            .await
+            .unwrap();
         assert!(!mini.live_disk_manifests.lock().contains_key(&session_id));
         assert_eq!(
             meta.chunk_generation().await.unwrap(),
@@ -3986,7 +4003,7 @@ pub(crate) mod tests {
     /// as stale if rebinding raced). This is the symmetric case to
     /// the unbind-clears test.
     #[tokio::test]
-    async fn assign_session_sandbox_some_does_not_clear_or_bump() {
+    async fn fenced_assign_sandbox_some_does_not_clear_or_bump() {
         let sandbox_id = engram_core::SandboxId::new();
         let (session_id, mini) = build_phase_b_meta(Some(sandbox_id));
         let meta: Arc<dyn MetadataStore> = mini.clone();
@@ -3999,7 +4016,7 @@ pub(crate) mod tests {
 
         // Rebind to a new sandbox id (the eventual resume path).
         let new_sandbox = engram_core::SandboxId::new();
-        meta.assign_session_sandbox(session_id, Some(new_sandbox))
+        meta.fenced_assign_sandbox(session_id, 0, Some(new_sandbox), None)
             .await
             .unwrap();
         // Generation does NOT bump on a Some(_) rebind — the live

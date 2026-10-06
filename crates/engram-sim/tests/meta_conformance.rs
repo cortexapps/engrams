@@ -3002,7 +3002,9 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
     meta.transition_session(s_idle, SessionState::Idle, BindingDisposition::Detach)
         .await
         .unwrap();
-    meta.assign_session_sandbox(s_idle, None).await.unwrap();
+    meta.fenced_assign_sandbox(s_idle, 0, None, Some(host))
+        .await
+        .unwrap();
 
     // Active on ANOTHER host → excluded from this host's list.
     let s_elsewhere = meta
@@ -6008,14 +6010,19 @@ async fn binding_epoch_minted_by_binding_writes(ctx: &Ctx) {
             .unwrap(),
         None
     );
-    assert_eq!(meta.assign_session_sandbox(sid, None).await.unwrap(), None);
+    assert_eq!(
+        meta.assign_session_sandbox_guarded(sid, None, Some(None), &[])
+            .await
+            .unwrap(),
+        None
+    );
     assert!(matches!(
         meta.fenced_assign_sandbox(sid, 99, Some(second), Some(host))
             .await,
         Err(MetaError::Conflict(_))
     ));
     assert_eq!(
-        meta.assign_session_sandbox(sid, Some(second))
+        meta.fenced_assign_sandbox(sid, 0, Some(second), Some(host))
             .await
             .unwrap(),
         Some(4)
@@ -6038,10 +6045,104 @@ async fn binding_epoch_minted_by_binding_writes(ctx: &Ctx) {
         None
     );
     assert_eq!(meta.rebind_session(sid, host, second).await.unwrap(), 6);
+    // Reconcile's absent-binding CAS must not clear a newly bound sandbox.
+    assert!(matches!(
+        meta.assign_session_sandbox_guarded(sid, None, Some(None), &[])
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert_eq!(
+        meta.get_session(sid).await.unwrap().sandbox_id,
+        Some(second)
+    );
+    assert_eq!(meta.session_binding_generations(sid).await.unwrap().0, 6);
 }
 conformance!(
     t_binding_epoch_minted_by_binding_writes,
     super::binding_epoch_minted_by_binding_writes
+);
+
+async fn fenced_binding_preserves_cleanup_and_strike_reset(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta
+        .create_session(spec("conf:fenced-binding-cleanup"))
+        .await
+        .unwrap();
+    let first = engram_core::SandboxId::new();
+    meta.transition_session_created(sid, first).await.unwrap();
+    let manifest = engram_core::types::manifest::ManifestRef::new();
+    meta.update_live_disk_manifest(sid, first, manifest)
+        .await
+        .unwrap();
+    let generation = meta.chunk_generation().await.unwrap();
+    assert!(meta
+        .apply_missing_sandbox_strikes(&[], &[sid], 2)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // A rejected clear must retain both the live pin and the strike streak.
+    assert!(matches!(
+        meta.fenced_assign_sandbox(sid, 1, None, None).await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert_eq!(
+        meta.get_session(sid).await.unwrap().live_disk_manifest,
+        Some(manifest)
+    );
+    assert_eq!(meta.chunk_generation().await.unwrap(), generation);
+    assert_eq!(
+        meta.apply_missing_sandbox_strikes(&[], &[sid], 2)
+            .await
+            .unwrap(),
+        vec![sid]
+    );
+
+    // A bind resets strikes, retains the manifest, and mints one epoch.
+    assert!(meta
+        .apply_missing_sandbox_strikes(&[], &[sid], 2)
+        .await
+        .unwrap()
+        .is_empty());
+    let second = engram_core::SandboxId::new();
+    assert_eq!(
+        meta.fenced_assign_sandbox(sid, 0, Some(second), None)
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert!(meta
+        .apply_missing_sandbox_strikes(&[], &[sid], 2)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        meta.get_session(sid).await.unwrap().live_disk_manifest,
+        Some(manifest)
+    );
+    assert_eq!(meta.chunk_generation().await.unwrap(), generation);
+
+    // A clear resets strikes and removes the live pin without minting an epoch.
+    assert_eq!(
+        meta.fenced_assign_sandbox(sid, 0, None, None)
+            .await
+            .unwrap(),
+        None
+    );
+    let session = meta.get_session(sid).await.unwrap();
+    assert_eq!(session.sandbox_id, None);
+    assert_eq!(session.live_disk_manifest, None);
+    assert_eq!(meta.chunk_generation().await.unwrap(), generation + 1);
+    assert_eq!(meta.session_binding_generations(sid).await.unwrap().0, 2);
+    assert!(meta
+        .apply_missing_sandbox_strikes(&[], &[sid], 2)
+        .await
+        .unwrap()
+        .is_empty());
+}
+conformance!(
+    t_fenced_binding_preserves_cleanup_and_strike_reset,
+    super::fenced_binding_preserves_cleanup_and_strike_reset
 );
 
 async fn settle_harness_generation_exactly_once(ctx: &Ctx) {
@@ -6510,7 +6611,12 @@ async fn teleport_commit_is_one_statement(ctx: &Ctx) {
     );
     let mismatch = restored_teleport(ctx).await;
     ctx.meta
-        .assign_session_sandbox(mismatch.session_id, Some(engram_core::SandboxId::new()))
+        .fenced_assign_sandbox(
+            mismatch.session_id,
+            0,
+            Some(engram_core::SandboxId::new()),
+            Some(mismatch.source_host_id),
+        )
         .await
         .unwrap();
     assert_eq!(

@@ -3935,113 +3935,8 @@ impl MetadataStore for PostgresStore {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn assign_session_sandbox(
-        &self,
-        id: SessionId,
-        sandbox_id: Option<SandboxId>,
-    ) -> Result<Option<u64>, MetaError> {
-        // ADR 0016 Phase B: the `live_disk_manifest_*` invariant is
-        // "set IFF the session is bound to a running sandbox the
-        // host-side FlushScheduler is publishing for." Unbinding
-        // (sandbox_id = NULL) means the live manifest is no longer
-        // authoritative — the snapshot row (if any) is. Clear in the
-        // same UPDATE so:
-        //   1. Resume's `effective_resume_disk_manifest` resolver
-        //      (commit 6) sees NULL and falls back to the snapshot's
-        //      `disk_manifest`. Without this, an eviction race
-        //      (scheduler publishes between `host.snapshot()` and
-        //      `assign_session_sandbox(None)`) would leave a live
-        //      manifest AHEAD of the snapshot, producing an
-        //      incoherent (memory at T-from-snapshot, disk at T+delta)
-        //      resume.
-        //   2. Phase C's pin set (which keys on `live_disk_manifest_id`
-        //      WHERE NOT NULL) drops the post-eviction lineage from
-        //      its live set so its chunks become GC-eligible after
-        //      the snapshot's chunks supersede them.
-        //
-        // Rebinding (sandbox_id = Some) does NOT clear — the next
-        // scheduler flush of the new sandbox populates the columns;
-        // any leftover value from a prior binding is overwritten by
-        // that publish (or the sandbox_id guard drops it as stale).
-        //
-        // Issue #215: BOTH branches reset `missing_strikes = 0`. The
-        // reconcile strike counter (`apply_missing_sandbox_strikes`)
-        // means "N CONSECUTIVE heartbeats in which THIS session's
-        // bound sandbox was missing from its host's running set". A
-        // rebind points the row at a brand-new sandbox and an unbind
-        // detaches it entirely — either way the previous streak is no
-        // longer consecutive against the current binding, so carrying
-        // it forward would collapse the 3-tick grace for a freshly
-        // resumed/migrated session (one transient under-report on the
-        // new host is strike 3, dismantling a healthy VM). The strike
-        // column is keyed by session id alone, so re-keying the
-        // sandbox must explicitly clear it here.
-        let now = self.clock.now_utc();
-        if sandbox_id.is_some() {
-            let row = sqlx::query(
-                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = $3, binding_epoch = binding_epoch + 1 \
-                 WHERE id = $1 RETURNING binding_epoch",
-            )
-            .bind(id.as_uuid())
-            .bind(sandbox_id.map(|s| s.as_uuid()))
-            .bind(now)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?.ok_or(MetaError::NotFound)?;
-            return Ok(Some(row.try_get::<i64, _>(0).map_err(db_err)? as u64));
-        } else {
-            // Single TX: clear sandbox + live manifest, AND bump
-            // chunk_generation in the same step so Phase C's mid-
-            // sweep barrier observes the pin-set shrink atomically.
-            let mut tx = self.pool.begin().await.map_err(db_err)?;
-            let n = sqlx::query(
-                "UPDATE sessions
-                    SET sandbox_id                 = NULL,
-                        missing_strikes            = 0,
-                        live_disk_manifest_id      = NULL,
-                        live_disk_manifest_version = NULL,
-                        live_disk_manifest_at      = NULL,
-                        updated_at                 = $2
-                  WHERE id = $1",
-            )
-            .bind(id.as_uuid())
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?
-            .rows_affected();
-            // Only bump generation when we actually cleared a row
-            // that had a live manifest. A NULL→NULL clear is a no-op
-            // for the pin set; bumping anyway is harmless (a wasted
-            // sweep restart) but the conditional keeps generation
-            // bumps tied to real pin-set deltas.
-            if n > 0 {
-                sqlx::query(
-                    "UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE",
-                )
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            }
-            tx.commit().await.map_err(db_err)?;
-            if n == 0 {
-                return Err(MetaError::NotFound);
-            }
-        }
-        Ok(None)
-    }
-
-    // ---- Issue #211: guarded CAS overrides ----
-    //
-    // The three writers above are blind `WHERE id = $1` UPDATEs. These
-    // overrides condition the same write on the row's current
-    // `sandbox_id` and `status`, so a racing actor can't bind a live
-    // sandbox onto a row that concurrently went terminal (defeating the
-    // orphan reap), and reconcile can't null a freshly-landed rebind.
-    //
-    // `0 rows` is disambiguated into `Conflict` (row exists but the guard
-    // rejected it) vs `NotFound` (no such id) with a cheap follow-up
-    // existence probe — the same shape `transition_session` uses.
+    // Guarded binding writes lock the row before checking sandbox and status.
+    // A concurrent binding change must not be overwritten by a stale writer.
 
     async fn assign_session_sandbox_guarded(
         &self,
@@ -4050,9 +3945,8 @@ impl MetadataStore for PostgresStore {
         expected_current: Option<Option<SandboxId>>,
         allowed_states: &[SessionState],
     ) -> Result<Option<u64>, MetaError> {
-        // The `None` clear path additionally tears down the live disk
-        // manifest + bumps chunk_generation; reuse the existing blind
-        // setter inside a guarded TX rather than duplicating that logic.
+        // Clear the live manifest and bump chunk_generation on unbind in
+        // the same transaction, so resume cannot use a post-snapshot publish.
         let states: Vec<String> = allowed_states
             .iter()
             .map(|s| s.as_str().to_string())
@@ -4077,19 +3971,17 @@ impl MetadataStore for PostgresStore {
             if cur_sandbox != expected {
                 tx.rollback().await.map_err(db_err)?;
                 return Err(MetaError::Conflict(format!(
-                    "assign_session_sandbox CAS: sandbox_id is {cur_sandbox:?}, expected {expected:?}"
+                    "assign_session_sandbox_guarded CAS: sandbox_id is {cur_sandbox:?}, expected {expected:?}"
                 )));
             }
         }
         if !states.is_empty() && !states.contains(&status) {
             tx.rollback().await.map_err(db_err)?;
             return Err(MetaError::Conflict(format!(
-                "assign_session_sandbox CAS: status is {status}, not in {states:?}"
+                "assign_session_sandbox_guarded CAS: status is {status}, not in {states:?}"
             )));
         }
-        // Issue #215: clear `missing_strikes` on both bind and unbind —
-        // see the comment in `assign_session_sandbox`. A re-key / unbind
-        // breaks the reconcile strike streak's consecutiveness.
+        // A bind or unbind breaks the consecutive missing-sandbox streak.
         let epoch = if sandbox_id.is_some() {
             let row = sqlx::query(
                 "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = $3, binding_epoch = binding_epoch + 1 \
@@ -4187,7 +4079,7 @@ impl MetadataStore for PostgresStore {
             .collect();
         let expected_uuid = expected_current.map(|o| o.map(|s| s.as_uuid()));
         // Issue #215: re-keying onto a fresh sandbox clears the stale
-        // reconcile strike streak (see `assign_session_sandbox`).
+        // reconcile strike streak.
         // ADR 0116 A5: a rebind SUPERSEDES the old binding without
         // host-affirmed absence — the superseded sandbox gets its
         // tombstone in the SAME statement (the A4 discipline; without it
@@ -8700,10 +8592,20 @@ impl MetadataStore for PostgresStore {
         host_id: Option<HostId>,
     ) -> Result<Option<u64>, MetaError> {
         let res = sqlx::query(
-            "UPDATE sessions
+            "WITH binding AS (
+              UPDATE sessions
                 SET sandbox_id = $2, host_id = $3, last_active_at = $5, updated_at = $5,
+                    missing_strikes = 0,
+                    live_disk_manifest_id = CASE WHEN $2::uuid IS NULL THEN NULL ELSE live_disk_manifest_id END,
+                    live_disk_manifest_version = CASE WHEN $2::uuid IS NULL THEN NULL ELSE live_disk_manifest_version END,
+                    live_disk_manifest_at = CASE WHEN $2::uuid IS NULL THEN NULL ELSE live_disk_manifest_at END,
                     binding_epoch = binding_epoch + CASE WHEN $2::uuid IS NULL THEN 0 ELSE 1 END
-              WHERE id = $1 AND current_epoch = $4 RETURNING binding_epoch",
+              WHERE id = $1 AND current_epoch = $4 RETURNING binding_epoch
+             ), generation AS (
+              UPDATE chunk_generation SET generation = generation + 1
+              WHERE id = TRUE AND $2::uuid IS NULL AND EXISTS (SELECT 1 FROM binding)
+             )
+             SELECT binding_epoch FROM binding",
         )
         .bind(session_id.as_uuid())
         .bind(sandbox_id.map(|s| s.as_uuid()))
