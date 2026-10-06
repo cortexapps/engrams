@@ -1145,6 +1145,7 @@ jobs:
             --test chain_rehydrate \
             --test egress_survives_roll \
             --test swap_capture \
+            --test rehome_retained_harness \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
