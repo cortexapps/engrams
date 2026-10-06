@@ -34,6 +34,7 @@ pub struct ScriptedHost {
     pub aborts: AtomicUsize,
     pub destroys: AtomicUsize,
     pub spawns: AtomicUsize,
+    pub binds: AtomicUsize,
     pub presetups: AtomicUsize,
     pub live_refused: AtomicBool,
     pub live_lost: AtomicBool,
@@ -60,8 +61,9 @@ impl ScriptedHost {
             aborts: AtomicUsize::new(0),
             destroys: AtomicUsize::new(0),
             spawns: AtomicUsize::new(0),
+            binds: AtomicUsize::new(0),
             presetups: AtomicUsize::new(0),
-            live_refused: AtomicBool::new(false),
+            live_refused: AtomicBool::new(true),
             live_lost: AtomicBool::new(false),
             peer_lost: AtomicBool::new(false),
             block_capture: AtomicBool::new(false),
@@ -185,6 +187,7 @@ impl HostClient for ScriptedHost {
         _sandbox_id: SandboxId,
         _binding_epoch: u64,
     ) -> Result<(), engram_core::SandboxError> {
+        self.binds.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn unbind_session(&self, _session_id: SessionId) {}
@@ -407,7 +410,6 @@ impl Rig {
                 mem_budget_mib: 128,
                 cpu_budget_vcpus: 1,
                 max_open_per_dest: 1,
-                live_capable: false,
             })
             .await
             .unwrap()
@@ -475,22 +477,7 @@ impl Rig {
         .await
     }
     pub async fn make_live(&self) {
-        assert!(self
-            .state
-            .services
-            .meta
-            .teleport_advance(
-                self.row.id,
-                TeleportPhase::Admitted,
-                TeleportPhase::Admitted,
-                TeleportPatch {
-                    kind: Some(TeleportKind::Live),
-                    ..Default::default()
-                },
-                self.op.epoch.unwrap()
-            )
-            .await
-            .unwrap());
+        self.source.live_refused.store(false, Ordering::SeqCst);
     }
     pub async fn reclaim(&mut self) {
         self.clock.advance(std::time::Duration::from_secs(1));

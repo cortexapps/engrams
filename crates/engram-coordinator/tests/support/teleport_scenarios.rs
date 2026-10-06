@@ -224,6 +224,8 @@ async fn crash_at_every_phase_is_resumed_by_successor(mut rig: Rig, phase: Telep
             TeleportPhase::Admitted,
             TeleportPhase::Captured,
             TeleportPatch {
+                // Rebuild the captured row after the source refused live presetup.
+                kind: Some(engram_core::types::teleport::TeleportKind::Snapshot),
                 snapshot_id: Some(snapshot.id),
                 ..Default::default()
             },
@@ -370,7 +372,10 @@ async fn crash_after_presetup_reuses_live_payload(mut rig: Rig) {
 scenario!(crash_after_presetup_reuses_live_payload);
 
 async fn live_refusal_downgrades_to_snapshot_in_row(rig: Rig) {
-    rig.make_live().await;
+    assert_eq!(
+        rig.row.kind,
+        engram_core::types::teleport::TeleportKind::Live
+    );
     rig.source.live_refused.store(true, Ordering::SeqCst);
     rig.source.destroy_fails.store(true, Ordering::SeqCst);
     assert!(matches!(rig.drive().await, OpOutcome::RetryAfter(_, _)));
@@ -387,6 +392,7 @@ async fn live_refusal_downgrades_to_snapshot_in_row(rig: Rig) {
         engram_core::types::teleport::TeleportKind::Snapshot
     );
     assert_eq!(row.phase, TeleportPhase::Attached);
+    assert_eq!(rig.source.presetups.load(Ordering::SeqCst), 1);
     assert_eq!(rig.source.captures.load(Ordering::SeqCst), 1);
 }
 scenario!(live_refusal_downgrades_to_snapshot_in_row);
@@ -539,7 +545,6 @@ async fn another_admission(rig: &Rig) -> engram_core::types::teleport::TeleportA
         mem_budget_mib: 128,
         cpu_budget_vcpus: 1,
         max_open_per_dest: 1,
-        live_capable: false,
     }
 }
 async fn admit_no_fit_leaves_session_active_and_no_row(rig: Rig) {

@@ -204,7 +204,6 @@ pub struct TeleportAdmitRequest {
     pub mem_budget_mib: i64,
     pub cpu_budget_vcpus: i64,
     pub max_open_per_dest: u32,
-    pub live_capable: bool,
 }
 #[derive(Clone, Debug)]
 pub enum TeleportAdmitOutcome {

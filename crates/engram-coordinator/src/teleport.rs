@@ -706,29 +706,6 @@ mod steps {
         if target.is_some_and(|h| !candidates.contains(&h)) {
             return Ok(TeleportAdmitOutcome::NoFit);
         }
-        let live_host = |h: &engram_core::types::host::HostRecord| {
-            h.capabilities.backend == "firecracker"
-                && matches!(
-                    h.capabilities.base_shm_tmpfs,
-                    engram_core::types::host::CapStatus::Ok(_)
-                )
-                && matches!(
-                    h.capabilities.uffd_minor_shmem,
-                    engram_core::types::host::CapStatus::Ok(_)
-                )
-                && matches!(
-                    h.capabilities.nbd,
-                    engram_core::types::host::CapStatus::Ok(_)
-                )
-        };
-        let hosts = state.services.meta.list_active_hosts().await?;
-        let live_capable = session
-            .host_id
-            .is_some_and(|source| hosts.iter().any(|h| h.id == source && live_host(h)))
-            && candidates
-                .iter()
-                .filter(|id| target.is_none_or(|t| t == **id))
-                .all(|id| hosts.iter().any(|h| h.id == *id && live_host(h)));
         state
             .services
             .meta
@@ -748,7 +725,6 @@ mod steps {
                     .and_then(|n| n.as_u64())
                     .and_then(|n| u32::try_from(n).ok())
                     .unwrap_or(TeleportConfig::default().max_open_per_dest),
-                live_capable,
             })
             .await
             .map_err(Into::into)
@@ -952,19 +928,21 @@ mod steps {
             .meta
             .session_binding_generations(row.session_id)
             .await?;
+        if attached >= epoch {
+            return finish_attach(ctx, row).await;
+        }
         crate::api::snapshot::bind_harness_generation(state, row.session_id, sandbox, epoch)
             .await?;
         let plan =
             crate::boot_materializer::materialize_snapshot_resume(state, &session, sandbox, epoch)
                 .await?;
-        attach_plan(ctx, row, plan, epoch, attached).await
+        attach_plan(ctx, row, plan, epoch).await
     }
     pub(super) async fn attach_plan(
         ctx: &OpCtx<'_>,
         row: &TeleportRow,
         plan: crate::boot_materializer::HarnessPlan,
         epoch: u64,
-        attached: u64,
     ) -> Result<Option<OpOutcome>, ApiError> {
         let state = ctx.state;
         let sandbox = row.dest_sandbox_id.expect("committed destination");
@@ -1007,13 +985,50 @@ mod steps {
                 }
                 Err(e) => return Err(e.into()),
             }
+            // The executor heartbeat stays active here. This 5 s wait is
+            // below its 180 s stale-claim reclaim threshold.
+            let started = state.services.clock.now_mono();
+            for _ in 0..50 {
+                let (_, attached) = state
+                    .services
+                    .meta
+                    .session_binding_generations(row.session_id)
+                    .await?;
+                if attached >= epoch {
+                    return finish_attach(ctx, row).await;
+                }
+                let remaining = Duration::from_secs(5)
+                    .saturating_sub(state.services.clock.now_mono().saturating_sub(started));
+                if remaining.is_zero() {
+                    break;
+                }
+                state
+                    .services
+                    .clock
+                    .sleep(Duration::from_millis(100).min(remaining))
+                    .await;
+            }
+            // Read again after the final sleep before we yield the claim.
+            let (_, attached) = state
+                .services
+                .meta
+                .session_binding_generations(row.session_id)
+                .await?;
             if attached < epoch {
                 return Ok(Some(OpOutcome::RetryAfter(
-                    Duration::from_secs(2),
+                    Duration::from_millis(500),
                     "waiting for harness generation".into(),
                 )));
             }
         }
+        finish_attach(ctx, row).await
+    }
+
+    async fn finish_attach(
+        ctx: &OpCtx<'_>,
+        row: &TeleportRow,
+    ) -> Result<Option<OpOutcome>, ApiError> {
+        let state = ctx.state;
         let mut events = vec![SessionEvent::StatusChanged {
             from: SessionState::Evacuating,
             to: SessionState::Active,
@@ -1225,7 +1240,10 @@ mod attach_tests {
             rig.row.id,
             TeleportPhase::Admitted,
             TeleportPhase::Captured,
-            TeleportPatch::default(),
+            TeleportPatch {
+                export_id: Some("export-one".into()),
+                ..Default::default()
+            },
             epoch,
         )
         .await
@@ -1266,7 +1284,7 @@ mod attach_tests {
             )),
         }
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn attach_waits_for_the_new_generation_before_active() {
         let rig = committed().await;
         let meta = &rig.state.services.meta;
@@ -1275,7 +1293,7 @@ mod attach_tests {
             .await
             .unwrap()
             .unwrap();
-        let (generation, attached) = meta
+        let (generation, _) = meta
             .session_binding_generations(row.session_id)
             .await
             .unwrap();
@@ -1285,10 +1303,10 @@ mod attach_tests {
             epoch: rig.op.epoch.unwrap(),
         };
         assert!(matches!(
-            steps::attach_plan(&ctx, &row, plan(&rig, generation), generation, attached)
+            steps::attach_plan(&ctx, &row, plan(&rig, generation), generation)
                 .await
                 .unwrap(),
-            Some(OpOutcome::RetryAfter(_, _))
+            Some(OpOutcome::RetryAfter(delay, _)) if delay == Duration::from_millis(500)
         ));
         assert_eq!(
             meta.get_session(row.session_id).await.unwrap().status,
@@ -1302,21 +1320,107 @@ mod attach_tests {
         )
         .await
         .unwrap();
-        let (_, attached) = meta
-            .session_binding_generations(row.session_id)
-            .await
-            .unwrap();
-        assert!(
-            steps::attach_plan(&ctx, &row, plan(&rig, generation), generation, attached)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(steps::attach(&ctx, &row).await.unwrap().is_none());
+        assert_eq!(rig.dest.spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(rig.dest.binds.load(Ordering::SeqCst), 0);
         assert_eq!(
             meta.get_session(row.session_id).await.unwrap().status,
             SessionState::Active
         );
     }
+    #[tokio::test(start_paused = true)]
+    async fn attach_observes_generation_during_wait_without_respawn() {
+        let rig = committed().await;
+        let meta = &rig.state.services.meta;
+        let row = meta
+            .open_teleport_for_session(rig.row.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (generation, _) = meta
+            .session_binding_generations(row.session_id)
+            .await
+            .unwrap();
+        let ctx = OpCtx {
+            state: &rig.state,
+            op: &rig.op,
+            epoch: rig.op.epoch.unwrap(),
+        };
+        let settle = async {
+            rig.state
+                .services
+                .clock
+                .sleep(Duration::from_millis(250))
+                .await;
+            assert_eq!(rig.dest.spawns.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                meta.get_session(row.session_id).await.unwrap().status,
+                SessionState::Evacuating
+            );
+            meta.settle_harness_generation(
+                row.session_id,
+                generation,
+                &[],
+                rig.state.services.clock.now_utc(),
+            )
+            .await
+            .unwrap();
+        };
+        let (outcome, ()) = tokio::join!(
+            steps::attach_plan(&ctx, &row, plan(&rig, generation), generation),
+            settle
+        );
+        assert!(outcome.unwrap().is_none());
+        assert_eq!(
+            meta.get_session(row.session_id).await.unwrap().status,
+            SessionState::Active
+        );
+        assert_eq!(rig.dest.spawns.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn harness_generation_settle_wakes_queued_teleport() {
+        let rig = committed().await;
+        let meta = &rig.state.services.meta;
+        let sid = rig.row.session_id;
+        let (generation, _) = meta.session_binding_generations(sid).await.unwrap();
+        assert!(meta
+            .op_requeue_with_backoff(
+                rig.op.id,
+                rig.op.epoch.unwrap(),
+                Duration::from_secs(44),
+                "waiting for harness generation"
+            )
+            .await
+            .unwrap());
+        let queued = meta.op_get(rig.op.id).await.unwrap().unwrap();
+        assert!(queued
+            .not_before
+            .is_some_and(|at| at > rig.state.services.clock.now_utc()));
+        crate::state::emit_harness_event(
+            &rig.state,
+            sid,
+            rig.dest.sandbox,
+            engram_harness_proto::HarnessEvent::Idle,
+            rig.state.services.clock.now_utc(),
+            Some(crate::state::EventDelivery {
+                binding_epoch: generation,
+                seq: 1,
+                incarnation: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        let woken = meta.op_get(rig.op.id).await.unwrap().unwrap();
+        assert!(woken
+            .not_before
+            .is_none_or(|at| at <= rig.state.services.clock.now_utc()));
+        assert_eq!(
+            meta.session_binding_generations(sid).await.unwrap(),
+            (generation, generation)
+        );
+    }
+
     #[tokio::test]
     async fn attach_deterministic_failure_rests_at_created_and_still_releases_source() {
         let rig = committed().await;
@@ -1327,7 +1431,7 @@ mod attach_tests {
             .await
             .unwrap()
             .unwrap();
-        let (generation, attached) = meta
+        let (generation, _) = meta
             .session_binding_generations(row.session_id)
             .await
             .unwrap();
@@ -1337,7 +1441,7 @@ mod attach_tests {
             epoch: rig.op.epoch.unwrap(),
         };
         assert!(
-            steps::attach_plan(&ctx, &row, plan(&rig, generation), generation, attached)
+            steps::attach_plan(&ctx, &row, plan(&rig, generation), generation)
                 .await
                 .unwrap()
                 .is_none()

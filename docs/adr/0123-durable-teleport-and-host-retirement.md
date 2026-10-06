@@ -614,3 +614,13 @@ pub enum HarnessFrame {
   records the guest's memory backing, presetup checks it pause-free, and
   a File-mode fresh session is a valid post-copy source (ADR 0045 and
   ADR 0092 addenda, same date). `ENGRAM_FC_FRESH_RESTORE_MODE` retired.
+||||||| parent of 88b4b23e4 (fix(teleport): live is the admitted kind; the attach step wakes on the harness event)
+- 2026-10-07 (coordinator): admission always records `Live`. The source
+  host's pause-free `migration_presetup` answer decides whether the sandbox
+  supports post-copy; only `InvalidSpec` changes the row to `Snapshot`.
+  Host capability probes no longer choose the kind. The first event of a
+  new harness generation wakes the queued teleport. Attach reads readiness
+  after spawn, waits up to 5 s at a 100 ms cadence, then requests a 500 ms
+  retry. A retry skips bind, materialization, and spawn when the generation
+  is already attached. A check after requeue closes the event/requeue race.
+  This removes the measured 44 s pacing wait after harness attach.

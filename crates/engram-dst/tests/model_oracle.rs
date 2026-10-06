@@ -112,7 +112,6 @@ fn capacity_oracle_counts_an_open_teleport_destination() {
                 mem_budget_mib: 1,
                 cpu_budget_vcpus: 1,
                 max_open_per_dest: 1,
-                live_capable: false,
             })
             .await
             .unwrap();

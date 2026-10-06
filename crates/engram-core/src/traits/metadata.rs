@@ -2217,14 +2217,15 @@ pub trait MetadataStore: Send + Sync {
     /// `run_interrupted { cause: harness_replaced }`, once per run. The runs
     /// in `continued` are the ones the advancing event itself references
     /// (a re-attached harness that keeps running them); they are never
-    /// settled. Returns the runs it closed with the appended event index.
+    /// settled. Returns `Some` with the closed runs when the generation advances,
+    /// including an empty list if no runs close; otherwise returns `None`.
     async fn settle_harness_generation(
         &self,
         session: SessionId,
         epoch: u64,
         continued: &[String],
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<crate::types::session::SettledRun>, MetaError> {
+    ) -> Result<Option<Vec<crate::types::session::SettledRun>>, MetaError> {
         let _ = (session, epoch, continued, now);
         Err(MetaError::Serialization(
             "harness settlement is not implemented".into(),
