@@ -159,6 +159,37 @@ resource "kubectl_manifest" "orchestrator_external_secret" {
   depends_on = [kubectl_manifest.gcp_secret_store]
 }
 
+# ─── engram-oauth-client ──────────────────────────────────────────
+# The client secret of the OAuth client people sign in through
+# (`orchestrator.auth.mode: oauth`, the chart default). Its OWN Secret,
+# not a key of engram-orchestrator-secrets: an ExternalSecret syncs all
+# of its keys or none, so an unpopulated shell here — a deployment that
+# chose another sign-in door — must not hold back the three secrets
+# the orchestrator cannot boot without.
+resource "kubectl_manifest" "oauth_client_external_secret" {
+  yaml_body = <<-YAML
+    apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: engram-oauth-client
+      namespace: ${kubernetes_namespace_v1.app.metadata[0].name}
+    spec:
+      refreshInterval: 1h
+      secretStoreRef:
+        name: gcp-secret-manager
+        kind: ClusterSecretStore
+      target:
+        name: engram-oauth-client
+        creationPolicy: Owner
+      data:
+        - secretKey: ORCHESTRATOR_OAUTH_CLIENT_SECRET
+          remoteRef:
+            key: ${module.secret_shells.secret_ids["oauth-client-secret"]}
+  YAML
+
+  depends_on = [kubectl_manifest.gcp_secret_store]
+}
+
 # ─── the egress CA, into the FLEET namespace only ─────────────────
 # The host fleet is the only CA consumer (caSource=env on the
 # host-agent). The private key stays out of the app namespace — the

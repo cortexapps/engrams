@@ -69,6 +69,9 @@ export const sendPromptConfigSchema = z.object({
     z.object({ kind: z.literal("none") }),
   ]),
   deadlineSeconds: z.number().int().min(1).max(24 * 3600).optional(),
+  /** As on wait_event: `continue` records `outcome: "deadline"` and lets the
+   * graph go on, so a loop can wait for a long turn slice by slice. */
+  onDeadline: z.enum(["fail_run", "continue"]).optional(),
   harnessMode: z.string().min(1).optional(),
 });
 export type SendPromptConfig = z.infer<typeof sendPromptConfigSchema>;
@@ -77,6 +80,7 @@ export const waitSessionConfigSchema = z.object({
   session: sessionRefSchema,
   until: z.enum(["idle", "ended"]),
   deadlineSeconds: z.number().int().min(1).max(24 * 3600).optional(),
+  onDeadline: z.enum(["fail_run", "continue"]).optional(),
 });
 export type WaitSessionConfig = z.infer<typeof waitSessionConfigSchema>;
 

@@ -50,6 +50,7 @@ export const SETTINGS_GROUPS: SettingsGroup[] = [
       { to: "/settings/integrations", label: "Integrations" },
       { to: "/settings/secrets", label: "Secrets" },
       { to: "/settings/api-keys", label: "API keys" },
+      { to: "/settings/retention", label: "Retention" },
     ],
   },
   {

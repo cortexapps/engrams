@@ -2717,6 +2717,107 @@
       ]
     },
     {
+      "id": "upsert_issue_comment",
+      "label": "Create or reuse a pinned comment",
+      "description": "Post a comment on an issue or pull request once per key. A later call with the same key finds the comment an earlier call posted and returns its id instead of posting again; edit it with update_issue_comment. One status line per pull request, across runs.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "repo": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo",
+          "number",
+          "key",
+          "body"
+        ]
+      },
+      "execute": {
+        "kind": "http",
+        "method": "POST",
+        "pathTemplate": "/repos/{input.repo}/issues/{input.number}/comments",
+        "bodyTemplate": {
+          "body": "{input.body}"
+        }
+      },
+      "output": {
+        "commentId": "id"
+      },
+      "idempotency": {
+        "kind": "marker_comment",
+        "markerTemplate": "<!-- engrams-pinned:{input.key} -->"
+      },
+      "handles": [
+        {
+          "parts": [
+            {
+              "lit": "github:"
+            },
+            {
+              "path": "input.repo"
+            },
+            {
+              "lit": "#"
+            },
+            {
+              "path": "input.number"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "update_pinned_comment",
+      "label": "Rewrite a pinned comment",
+      "description": "Edit a comment posted by upsert_issue_comment, keeping it findable: the key's marker is re-appended to the new body, so a later upsert_issue_comment with the same key still finds this comment.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "repo": {
+            "type": "string"
+          },
+          "commentId": {
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo",
+          "commentId",
+          "key",
+          "body"
+        ]
+      },
+      "execute": {
+        "kind": "http",
+        "method": "PATCH",
+        "pathTemplate": "/repos/{input.repo}/issues/comments/{input.commentId}",
+        "bodyTemplate": {
+          "body": "{input.body}"
+        }
+      },
+      "idempotency": {
+        "kind": "marker_comment",
+        "markerTemplate": "<!-- engrams-pinned:{input.key} -->"
+      }
+    },
+    {
       "id": "update_issue_comment",
       "label": "Update an issue comment",
       "description": "Edit an existing issue or pull request comment.",

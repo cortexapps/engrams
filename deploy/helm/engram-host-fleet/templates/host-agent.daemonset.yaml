@@ -185,7 +185,7 @@ spec:
         # host-agent and before the emptyDir is read, so there's no
         # fail-before-init race a `type: File` hostPath mount would have.
         - name: stage-node-assets
-          image: "{{ .Values.nodeAssets.image.repository }}:{{ .Values.nodeAssets.image.tag }}"
+          image: "{{ .Values.nodeAssets.image.repository }}:{{ .Values.nodeAssets.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.nodeAssets.image.pullPolicy }}
           command: ["/bin/sh", "-c"]
           args:

@@ -5,6 +5,7 @@ import { createConnectQueryKey, useMutation, useQuery } from "@connectrpc/connec
 import { useQueryClient } from "@tanstack/react-query";
 
 import {
+  describeInputKeys,
   getAutomation,
   listAutomations,
   listInputKeyOptions,
@@ -20,6 +21,18 @@ export function useInputKeyOptions(noun: KeyNoun | undefined, connectionId?: str
     listInputKeyOptions,
     { noun: noun ?? "", ...(connectionId ? { connectionId } : {}) },
     { enabled: !!noun, staleTime: 60_000 },
+  );
+}
+
+/** Labels for keys a page already shows (the channels of its threads): a
+ * lookup by id, never the provider's whole list. The key set is sorted and
+ * deduplicated so the same page asks once. */
+export function useInputKeyLabels(noun: KeyNoun, keys: readonly string[], connectionId?: string) {
+  const sorted = [...new Set(keys)].sort();
+  return useQuery(
+    describeInputKeys,
+    { noun, keys: sorted, ...(connectionId ? { connectionId } : {}) },
+    { enabled: sorted.length > 0, staleTime: 10 * 60_000 },
   );
 }
 

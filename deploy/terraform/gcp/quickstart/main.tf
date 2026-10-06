@@ -149,11 +149,12 @@ module "secret_shells" {
 
   accessors = {
     # ESO relays everything the charts read as K8s Secrets.
-    "kek-master"         = ["serviceAccount:${google_service_account.eso.email}"]
-    "better-auth-secret" = ["serviceAccount:${google_service_account.eso.email}"]
-    "auth-tokens"        = ["serviceAccount:${google_service_account.eso.email}"]
-    "egress-ca-cert"     = ["serviceAccount:${google_service_account.eso.email}"]
-    "egress-ca-key"      = ["serviceAccount:${google_service_account.eso.email}"]
+    "kek-master"          = ["serviceAccount:${google_service_account.eso.email}"]
+    "better-auth-secret"  = ["serviceAccount:${google_service_account.eso.email}"]
+    "oauth-client-secret" = ["serviceAccount:${google_service_account.eso.email}"]
+    "auth-tokens"         = ["serviceAccount:${google_service_account.eso.email}"]
+    "egress-ca-cert"      = ["serviceAccount:${google_service_account.eso.email}"]
+    "egress-ca-key"       = ["serviceAccount:${google_service_account.eso.email}"]
   }
 }
 

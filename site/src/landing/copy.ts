@@ -130,17 +130,6 @@ export const automations = {
       },
     ],
   },
-  board: {
-    title: "Every run is a session you can open.",
-    body: "Open a run to see each step, its inputs and outputs, and the session that did the work. Read the transcript, reply to the agent, or take over in its shell. Runs survive a server restart and can wait hours for a reply without holding a VM.",
-    itemsLabel: "Ships in the box",
-    items: [
-      {
-        title: "Pull request review",
-        body: "A finder and a verifier review each pull request on the repositories you list, and post the confirmed findings as one GitHub review.",
-      },
-    ],
-  },
   cta: { label: "Explore automations", href: "platform/automations/" },
 };
 

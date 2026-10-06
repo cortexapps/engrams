@@ -208,13 +208,24 @@ export function terminalOutcomeForStatus(status: string): TerminalOutcome | unde
   return TERMINAL_OUTCOME[status];
 }
 
-/** Map a `status_changed` payload's `to` state to its terminal outcome, or
- *  undefined if `to` is not a terminal state. */
-export function parseTerminalOutcome(payloadJson: string): TerminalOutcome | undefined {
+/** The `to` state of a `status_changed` payload, or undefined. */
+export function parseStatusChangeTo(payloadJson: string): string | undefined {
   try {
     const to: unknown = (JSON.parse(payloadJson) as { to?: unknown })?.to;
-    return typeof to === "string" ? TERMINAL_OUTCOME[to] : undefined;
+    return typeof to === "string" ? to : undefined;
   } catch {
     return undefined;
   }
 }
+
+/** Map a `status_changed` payload's `to` state to its terminal outcome, or
+ *  undefined if `to` is not a terminal state. */
+export function parseTerminalOutcome(payloadJson: string): TerminalOutcome | undefined {
+  const to = parseStatusChangeTo(payloadJson);
+  return to === undefined ? undefined : TERMINAL_OUTCOME[to];
+}
+
+/** The one stable session state that produces no events on its own: a parked
+ * session (ADR 0034) emits nothing until a resume, and every resume is an
+ * orchestrator RPC. A listener stands down on it (ADR 0119 amendment). */
+export const PARKED_STATUS = "parked";

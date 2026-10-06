@@ -27,7 +27,7 @@ modules/
                       orchestrator databases, DSNs in Secret Manager
                       (with the load-bearing sslmode split)
   secret-shells/      Empty Secret Manager shells for the operator-
-                      populated secrets (KEK, auth tokens, better-auth,
+                      populated secrets (KEK, auth tokens, better-auth, OAuth client,
                       egress CA) — material never enters tfstate
   host-operator-iam/  The autoscaling operator's least-privilege
                       custom role + GSA (ADR 0048)

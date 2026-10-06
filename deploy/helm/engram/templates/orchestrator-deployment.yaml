@@ -57,8 +57,9 @@ spec:
               containerPort: {{ .Values.orchestrator.containerPort }}
               protocol: TCP
           # Non-secret config (port, public URL, control-plane URLs, trusted
-          # origins, IAP/OIDC knobs) from the ConfigMap; the three REQUIRED
-          # secrets (+ optional OIDC client secret) from Secret refs below.
+          # origins, the sign-in door) from the ConfigMap; the three REQUIRED
+          # secrets (+ the OAuth client secret in `auth.mode: oauth`) from
+          # Secret refs below.
           # The orchestrator FAILS CLOSED without the three required vars
           # (orchestrator/src/config.ts).
           envFrom:
@@ -101,15 +102,14 @@ spec:
                   name: {{ .Values.orchestrator.telemetry.existingSecret }}
                   key: {{ .Values.orchestrator.telemetry.sinksKey }}
             {{- end }}
-            {{- if .Values.orchestrator.auth.oidc.clientSecret.existingSecret }}
-            # OIDC client secret (only when OIDC is configured). config.ts makes
-            # CLIENT_ID + CLIENT_SECRET required once ORCHESTRATOR_OIDC_ISSUER is
-            # set — supply the secret here so the boot-time check passes.
-            - name: ORCHESTRATOR_OIDC_CLIENT_SECRET
+            {{- if eq .Values.orchestrator.auth.mode "oauth" }}
+            # The OAuth client secret (`auth.mode: oauth` only). The ConfigMap
+            # template fails the render when the Secret name is unset.
+            - name: ORCHESTRATOR_OAUTH_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.orchestrator.auth.oidc.clientSecret.existingSecret }}
-                  key: {{ .Values.orchestrator.auth.oidc.clientSecret.secretKey }}
+                  name: {{ .Values.orchestrator.auth.oauth.clientSecret.existingSecret }}
+                  key: {{ .Values.orchestrator.auth.oauth.clientSecret.secretKey }}
             {{- end }}
           # /healthz returns 503 when the DB is unreachable (orchestrator still
           # alive). So it's a READINESS signal, not liveness — a DB blip must

@@ -18,17 +18,57 @@ export function humanizeWorkstreamName(key: string): string {
   return key.replace(/[-_]+/g, " ");
 }
 
+/** What a row says about a workstream: its title (the label rendered at open,
+ * else the key made readable) and a subtitle. A product page passes its own
+ * (the Slack page names the channel). */
+export type DescribeWorkstream = (instance: AutomationInstance) => {
+  title: string;
+  subtitle: string;
+};
+
+export function describeWorkstream(instance: AutomationInstance): {
+  title: string;
+  subtitle: string;
+} {
+  return {
+    title: instance.label || humanizeWorkstreamName(instance.key),
+    subtitle: instance.key,
+  };
+}
+
+/** A place's chip text; undefined = the generic parse. Chips with the same
+ * text collapse into one (a thread's root and a reply in it are one place). */
+export type HandleLabel = (handle: string) => string | undefined;
+
 /** How many places a row shows before it folds the rest behind "+N more". */
 export const VISIBLE_HANDLES = 3;
 
-function HandleCell({ handles, pending }: { handles: string[]; pending: boolean }) {
+function HandleCell({
+  handles: raw,
+  pending,
+  handleLabel,
+}: {
+  handles: string[];
+  pending: boolean;
+  handleLabel?: HandleLabel;
+}) {
   const [showAll, setShowAll] = useState(false);
+  // One chip per distinct text: the brain's "Started a session" post binds
+  // both the thread and its own reply, which are one place to a reader.
+  const seen = new Set<string>();
+  const handles = raw.flatMap((handle) => {
+    const label = handleLabel?.(handle);
+    const text = label ?? handle;
+    if (seen.has(text)) return [];
+    seen.add(text);
+    return [{ handle, label }];
+  });
   const shown = showAll ? handles : handles.slice(0, VISIBLE_HANDLES);
   const hidden = handles.length - shown.length;
   return (
     <div role="cell" className="flex min-w-0 flex-wrap items-center gap-1.5">
-      {shown.map((handle) => (
-        <HandleChip key={handle} handle={handle} />
+      {shown.map(({ handle, label }) => (
+        <HandleChip key={handle} handle={handle} {...(label !== undefined ? { label } : {})} />
       ))}
       {(hidden > 0 || showAll) && handles.length > VISIBLE_HANDLES && (
         <button
@@ -61,11 +101,15 @@ export function WorkstreamsTable({
   automations,
   showAutomation,
   now,
+  describe = describeWorkstream,
+  handleLabel,
 }: {
   instances: readonly AutomationInstance[];
   automations: readonly AutomationSummary[];
   showAutomation: boolean;
   now: number;
+  describe?: DescribeWorkstream;
+  handleLabel?: HandleLabel;
 }) {
   const columns = showAutomation ? WITH_AUTOMATION : WITHOUT_AUTOMATION;
   return (
@@ -93,6 +137,8 @@ export function WorkstreamsTable({
               showAutomation={showAutomation}
               columns={columns}
               now={now}
+              describe={describe}
+              {...(handleLabel ? { handleLabel } : {})}
             />
           ))}
         </div>
@@ -107,17 +153,22 @@ function WorkstreamRow({
   showAutomation,
   columns,
   now,
+  describe,
+  handleLabel,
 }: {
   instance: AutomationInstance;
   automationName?: string;
   showAutomation: boolean;
   columns: string;
   now: number;
+  describe: DescribeWorkstream;
+  handleLabel?: HandleLabel;
 }) {
   const detail = useInstance(instance.id);
   const runs = useRunList(instance.automationId, { instanceId: instance.id, limit: 1 });
   const latest = runs.data?.runs[0];
   const tone = workstreamTone(instance, latest);
+  const { title, subtitle } = describe(instance);
 
   return (
     <div
@@ -132,11 +183,12 @@ function WorkstreamRow({
             to="/automations/workstreams/$id"
             params={{ id: instance.id }}
             className="block truncate font-semibold underline-offset-4 hover:underline"
+            title={instance.key}
           >
-            {humanizeWorkstreamName(instance.key)}
+            {title}
           </Link>
           <span className="block truncate font-mono text-2xs text-muted-foreground">
-            {instance.key}
+            {subtitle}
           </span>
         </div>
       </div>
@@ -148,6 +200,7 @@ function WorkstreamRow({
       <HandleCell
         handles={detail.data?.handles.map((h) => h.handle) ?? []}
         pending={detail.isPending}
+        {...(handleLabel ? { handleLabel } : {})}
       />
       <div role="cell" className="min-w-0 text-xs">
         {latest ? (

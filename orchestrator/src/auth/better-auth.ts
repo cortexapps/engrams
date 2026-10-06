@@ -2,10 +2,15 @@
  * better-auth configuration — ADR 0051 §5 / Task 16.
  *
  * Auth stack:
- *   - emailAndPassword: the single dev-accessible sign-up/sign-in door.
- *     Public sign-up = open registration. This is intentional in dev only;
- *     production posture (disable sign-up / allowlist) is decided in Task 22.
- *     Do NOT deploy past Phase 4 without it.
+ *   - ONE human sign-in door, chosen by config.authMode (ORCHESTRATOR_AUTH_MODE):
+ *       `oauth`    — genericOAuth against the deployment's OIDC provider, behind
+ *                    the allowlist gate (sign-in-door.ts / oauth-gate.ts).
+ *       `iap`      — the IAP bridge (iap-bridge.ts) mints sessions; nothing in
+ *                    this file opens a door.
+ *       `password` — emailAndPassword. Sign-up is open registration unless
+ *                    config.passwordSignup is false. The dev default.
+ *     The doors are exclusive: emailAndPassword is OFF outside `password` mode,
+ *     and the OAuth plugin is absent outside `oauth` mode.
  *   - admin plugin: owns the `role` field ('admin'|'user'), plus setRole /
  *     ban / list APIs used by the Members UI (Task 25). We read 'user' as
  *     "member". There is no JWT plugin and no JWKS — nothing downstream
@@ -37,11 +42,10 @@
 
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import { APIError, createAuthMiddleware } from "better-auth/api";
+import { APIError, createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
 import { admin } from "better-auth/plugins/admin";
 import { bearer } from "better-auth/plugins/bearer";
 import { deviceAuthorization } from "better-auth/plugins/device-authorization";
-import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { apiKey } from "@better-auth/api-key";
 import { getDb } from "../db/client.ts";
 import { config } from "../config.ts";
@@ -51,6 +55,7 @@ import {
   promotedRoleOnLogin,
 } from "./admin-allowlist.ts";
 import { API_KEY_PREFIX, extractApiKey } from "./api-key-header.ts";
+import { signInDoor } from "./sign-in-door.ts";
 
 /** The one OAuth client_id the device-authorization flow accepts (the
  *  `engrams` CLI). Exported for tests; the CLI hardcodes the same string. */
@@ -65,7 +70,7 @@ const adminEmails = config.adminEmails;
 // `databaseHooks` promote allowlisted emails to admin. Defined only when the
 // allowlist is non-empty:
 //   - user.create.before: a NEW user with an allowlisted email is created with
-//     role 'admin' directly (covers IAP bridge createUser, OIDC callback, and
+//     role 'admin' directly (covers IAP bridge createUser, OAuth callback, and
 //     email/password sign-up — every JIT path runs through this hook).
 //   - session.create.after: an EXISTING user signing in is promoted to admin if
 //     allowlisted and not already admin. This means adding someone to the
@@ -108,30 +113,17 @@ const databaseHooks: BetterAuthOptions["databaseHooks"] | undefined =
         },
       };
 
-// Env-driven OIDC ("Sign in with your IdP"), restoring the old coordinator
-// `--auth-mode=oidc` parity. Added only when config.oidc is present (issuer +
-// client id/secret all set). Federated SSO also yields real display names via
-// the `profile` scope's ID-token claims — something stock GCP IAP can't supply.
-const oidcPlugins = config.oidc
-  ? [
-      genericOAuth({
-        config: [
-          {
-            providerId: config.oidc.providerId,
-            clientId: config.oidc.clientId,
-            clientSecret: config.oidc.clientSecret,
-            discoveryUrl: `${config.oidc.issuer}/.well-known/openid-configuration`,
-            scopes: config.oidc.scopes,
-          },
-        ],
-      }),
-    ]
-  : [];
+/** The SPA login page. A refused OAuth sign-in lands here with `?error=`. */
+const LOGIN_URL = `${config.baseUrl.replace(/\/$/, "")}/login`;
+
+// The ONE sign-in door (config.authMode): the password options, plus the OAuth
+// plugin in `oauth` mode. See sign-in-door.ts.
+const door = signInDoor(config, LOGIN_URL);
 
 export const auth = betterAuth({
   // Public base URL (ORCHESTRATOR_PUBLIC_URL); dev defaults to loopback. Drives
-  // the cookie domain + the OIDC redirect callback, so it MUST be the
-  // externally-reachable URL in an OIDC prod deploy.
+  // the cookie domain + the OAuth redirect callback, so it MUST be the
+  // externally-reachable URL in an `oauth` deploy.
   baseURL: config.baseUrl,
   // The browser reaches this through the vite proxy with
   // Origin: http://localhost:5173 — without trustedOrigins, better-auth
@@ -189,15 +181,10 @@ export const auth = betterAuth({
     }),
     { provider: "pg" },
   ),
-  // Email/password is the dev/self-hosted door. It is DISABLED whenever the
-  // orchestrator runs behind GCP IAP (IAP_AUDIENCES set): IAP is then the sole
-  // identity source and the bridge mints sessions from the verified assertion,
-  // so a parallel password door (open registration + a credential to phish or
-  // brute-force) is pure attack surface. When IAP is off (dev / self-hosted)
-  // this stays enabled, and public sign-up = open registration — acceptable in
-  // dev only. The web Login page reads the same posture via /api/v1/auth-config
-  // so it doesn't render a password form that the server would reject.
-  emailAndPassword: { enabled: config.iapAudiences.length === 0 },
+  // The password door: on only in `password` mode (sign-in-door.ts). The web
+  // Login page reads the same posture from /api/v1/auth-config, so it never
+  // renders a form the server rejects.
+  emailAndPassword: door.emailAndPassword,
   // Encrypt better-auth's stored OAuth access/refresh/id tokens at rest
   // (the `account` table columns). NOTE: this uses the BETTER_AUTH_SECRET
   // (the framework's own encryption mechanism) — NOT the shared engrams KEK.
@@ -220,15 +207,28 @@ export const auth = betterAuth({
     // (src/rpc/api-key.ts). `ctx.request` is set for HTTP requests only, so
     // server-side auth.api.createApiKey (no request) still works — the same
     // discriminator the plugin itself uses to gate body.userId.
+    //
+    // GET /device (the device flow's verify leg) needs a session. The plugin
+    // itself answers it for anyone: an anonymous caller that guesses a user
+    // code learns that a login is pending. Only the SPA's /device page calls
+    // it, and that page is behind the login wall, so the anonymous case has no
+    // use. In `iap` mode the bridge's fail-closed 401 used to be the only
+    // thing in front of this endpoint; the check is here so it holds in every
+    // mode. The two CLI legs (/device/code, /device/token) are different
+    // paths and stay anonymous — that anonymity is the point of RFC 8628.
     before: createAuthMiddleware(async (ctx) => {
-      if (ctx.request && ctx.path.startsWith("/api-key")) {
+      if (!ctx.request) return;
+      if (ctx.path.startsWith("/api-key")) {
         throw new APIError("NOT_FOUND");
+      }
+      if (ctx.path === "/device" && !(await getSessionFromCtx(ctx))) {
+        throw new APIError("UNAUTHORIZED");
       }
     }),
   },
   plugins: [
     admin(), // role field ('admin'|'user'), setRole/ban/list APIs → Members UI
-    ...oidcPlugins, // env-driven OIDC provider (genericOAuth) when configured
+    ...door.plugins, // the `oauth` door (genericOAuth), present only in that mode
     // The `engrams auth login` rail (RFC 8628 device flow): the CLI POSTs
     // /api/auth/device/code, the user approves on the SPA's /device page
     // (cookie-authed), and the CLI's /api/auth/device/token poll returns a

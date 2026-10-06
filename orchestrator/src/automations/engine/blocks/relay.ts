@@ -4,9 +4,10 @@
  * first provider, and the config's `provider` enum is where the next one
  * lands.
  *
- * Ports the drain loop of `workflows/slack-thread.ts` (`dispatchSessionEvent`
- * + the `trigger_answer` arm of `handleInbound`) onto the engine. The
- * rendering itself is the unchanged Slack `CommunicationPolicy`
+ * Ports the drain loop of ADR 0060's thread workflow (`dispatchSessionEvent`
+ * + the `trigger_answer` arm of `handleInbound`; the workflow retired in ADR
+ * 0119 phase 4.8) onto the engine. The rendering itself is the Slack
+ * `CommunicationPolicy`
  * (`integrations/slack-policy.ts`) and the pure routing is the unchanged
  * `routeSessionEvent` (`workflows/communication-policy.ts`) — only the loop
  * that drives them moved. Per-turn mention ownership (⏳/✅ on the message
@@ -28,8 +29,8 @@
  * makes a restarted pod continue the bubble / answer the question exactly
  * where the old one stopped.
  *
- * Delivery failures never fail the run — the legacy loop's "log and drop it,
- * keep the thread alive" posture (slack-thread.ts handleInbound).
+ * Delivery failures never fail the run — the retired loop's "log and drop
+ * it, keep the thread alive" posture.
  */
 
 import { z } from "zod";
@@ -44,8 +45,8 @@ import {
   type CommunicationPolicy,
   type QuestionProtocol,
   type StartedSession,
+  type SourceMention,
 } from "../../../workflows/communication-policy.ts";
-import type { SourceMention } from "../../../workflows/thread-inbox.ts";
 import { sessionWebUrl } from "../../../links.ts";
 import { tools as defaultTools } from "../../../tools/registry.ts";
 import { sessionRefSchema } from "../definition.ts";
@@ -60,7 +61,7 @@ export const SLACK_ANSWER_SIGNAL = "slack_answer";
 
 const ANSWER_FAIL_MSG = "I couldn't record that answer — the session may have ended.";
 const LEGACY_QUESTION_MSG = "This question predates an upgrade and can no longer be answered.";
-/** Cap an assistant bubble's accumulated text (slack-thread.ts MAX_BUBBLE_CHARS). */
+/** Cap an assistant bubble's accumulated text (the retired workflow's cap). */
 export const MAX_BUBBLE_CHARS = 8000;
 
 // ---------------------------------------------------------------------------

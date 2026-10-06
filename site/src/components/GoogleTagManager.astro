@@ -1,0 +1,37 @@
+---
+// The Google Tag Manager container, in the two parts Google gives: the loader
+// for <head>, and the <noscript> frame that goes first in <body>. The marketing
+// layout and the Starlight overrides (Head, SkipLink) render one part each, so
+// every page has both. `astro dev` renders neither, to keep local page views
+// out of the container.
+interface Props {
+  part: "head" | "body";
+}
+const { part } = Astro.props;
+const id = "GTM-W2X9JDTK";
+const enabled = import.meta.env.PROD;
+---
+
+{
+  enabled && part === "head" && (
+    <script is:inline define:vars={{ id }}>
+      (function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+      new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+      j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+      'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+      })(window,document,'script','dataLayer',id);
+    </script>
+  )
+}
+{
+  enabled && part === "body" && (
+    <noscript>
+      <iframe
+        src={`https://www.googletagmanager.com/ns.html?id=${id}`}
+        height="0"
+        width="0"
+        style="display:none;visibility:hidden"
+      />
+    </noscript>
+  )
+}

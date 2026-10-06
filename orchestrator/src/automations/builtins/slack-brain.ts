@@ -1,8 +1,8 @@
 /** The Slack thread-brain built-in automation (ADR 0119 D7, phase 4.6; a
  * workstream per thread since 2026-09-29, ADR 0120).
  *
- * ADR 0060's per-thread DBOS workflow (`slack-thread.ts`), expressed as data
- * on the engine. It is the conversation-shaped built-in: one run per Slack
+ * ADR 0060's per-thread DBOS workflow (retired in phase 4.8), expressed as
+ * data on the engine. It is the conversation-shaped built-in: one run per Slack
  * thread, kept alive across turns by `join` concurrency (a later message in
  * the thread is delivered into the active run's mailbox instead of starting
  * a new run) and a loop of wait_event → send_prompt until the thread goes
@@ -60,17 +60,38 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 7;
+export const SLACK_BRAIN_DEFINITION_VERSION = 11;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
-/** One turn's harness run. */
-const TURN_DEADLINE_S = 3600;
-/** Generous run ceiling; the per-wait idle timeout is the real end-of-thread
- * signal (settings cannot reference inputs). */
+/** A turn — the harness working on one prompt — has NO deadline: a task
+ * may run for hours, and nothing time-based may fail a thread. A wait has
+ * an engine ceiling, so a turn is waited for in slices of that length,
+ * each slice's deadline a normal outcome, until the session goes idle. */
+const TURN_SLICE_S = MAX_WAIT_DEADLINE_S;
+/** The engine's run ceiling. A run ending here is silent, like the idle
+ * exit: the workstream stays open and the next mention resumes the kept
+ * session (its relay re-installs). The per-wait idle timeout is the real
+ * end of a run (settings cannot reference inputs). */
 const RUN_DEADLINE_S = 48 * 3600;
 
 const F = "steps.facts.value";
+
+/** Appended to the agent's system prompt when the thread's session is
+ * created (ADR 0060 Decision 8): how to behave in a chat thread, and
+ * Slack's mrkdwn instead of Markdown. The same text ADR 0060's thread
+ * workflow appended; it rides `create_session.appendSystemPrompt` (the
+ * harness's ENGRAM_APPEND_SYSTEM_PROMPT), so a resumed session keeps the
+ * flavor it was created with. */
+export const SLACK_SYSTEM_PROMPT_APPEND = `You are running inside an engrams session triggered from a Slack thread.
+Keep replies concise and chat-friendly.
+
+When you need a decision or clarification from the user, ask via the ask_user_question tool — it renders as interactive buttons in Slack — rather than guessing. The user cannot see your terminal, so surface results, links, and artifacts explicitly. When handling code related tasks, prefer showing your work rather than just saying you're done. Prefer video over images if available.
+
+Conform to slack markdown in your responses. Examples:
+Links are formatted as <url|optional link title>
+Bold is single asterisks surrounding text, like *this*.
+Italics are underlines surrounding text like _this_.`;
 
 /** Admission + fact derivation. Returns null to reject; else the facts. Pure,
  * runs in the QuickJS cage. */
@@ -105,6 +126,8 @@ export default ({ event, inputs, trigger }) => {
     title: text.slice(0, 80) || "Slack thread",
     user_id: str(ev.user),
     event_id: str(raw.event_id),
+    // The app's own bot user: the fold tells our posts from other bots' by it.
+    bot_user_id: str((raw.authorizations ?? [])[0]?.user_id),
   };
 };
 `.trim();
@@ -135,9 +158,22 @@ export default ({ steps }) => {
   const facts = steps.facts?.value ?? {};
   const messages = ${args.replies} ?? [];
   const trigger = String(${args.trigger} ?? "");
-  const since = ${args.since};
   const root = String(facts.thread_ts ?? "");
   const num = (ts) => Number.parseFloat(String(ts ?? "")) || 0;
+  // The newest reply of ours in the page: everything up to it was already
+  // delivered to the session (as a directive or as context) by an earlier
+  // turn. A bot post with no \`user\` counts as ours; a post by a different
+  // bot user does not.
+  const ownBot = String(facts.bot_user_id ?? "");
+  let lastOwn = "";
+  for (const m of messages) {
+    const ts = String(m.ts ?? "");
+    if (ts === root) continue;
+    const isBot = Boolean(m.bot_id || m.subtype === "bot_message");
+    const ours = isBot && (!ownBot || !m.user || m.user === ownBot);
+    if (ours && num(ts) > num(lastOwn)) lastOwn = ts;
+  }
+  const since = ${args.since};
   const strip = (t) => String(t ?? "")
     .replace(/<@[^>]+>/g, " ")
     .replace(/[^\\S\\n]+/g, " ")
@@ -173,11 +209,12 @@ export default ({ steps }) => {
 
 /** The opening turn: the whole thread so far (a mention in the middle of a
  * human conversation brings that conversation along), the mention as the
- * directive. */
+ * directive. When the thread's kept session is resumed, only what arrived
+ * after our last reply is new to it — the earlier turns were its own. */
 const OPENING_TEXT_SOURCE = foldSource({
   replies: "steps.replies.messages",
   trigger: "facts.mention_ts",
-  since: "null",
+  since: "steps.previous?.found ? lastOwn : null",
   eventText: "facts.text",
   eventUser: "facts.user_id",
   fromBot: "false",
@@ -287,14 +324,17 @@ function listReplies(id: string, oldest?: string): BlockDef {
   };
 }
 
+/** The thread's kept session from an earlier run of this workstream, if any:
+ * the thread went quiet, its run ended, the next mention is this run. Looked
+ * up before the fold, which keeps a resumed session's earlier turns out of
+ * its prompt. */
+const previous: BlockDef = { id: "previous", type: LOOKUP_INSTANCE_SESSION_TYPE, config: {} };
+
 const opening: BlockDef[] = [
+  previous,
   listReplies("replies"),
   { id: "opening", type: "code", config: { source: OPENING_TEXT_SOURCE, mode: "value" } },
 ];
-
-/** The thread's kept session from an earlier run of this workstream, if any:
- * the thread went quiet, its run ended, the next mention is this run. */
-const previous: BlockDef = { id: "previous", type: LOOKUP_INSTANCE_SESSION_TYPE, config: {} };
 
 const session: BlockDef = {
   id: "session",
@@ -310,6 +350,7 @@ const session: BlockDef = {
     ownerUserId: "${{ steps.identity.user_id }}",
     // D8 + the thread model: the session outlives the run.
     keepOnFinish: true,
+    appendSystemPrompt: SLACK_SYSTEM_PROMPT_APPEND,
   },
 };
 
@@ -339,30 +380,19 @@ export default ({ steps }) => ({
 });
 `.trim();
 
-/** Resume the thread's kept session, or create one. Either way the thread
- * gets a line saying which. */
-const sessionOrResume: BlockDef = {
+/** Create the thread's session unless a kept one resumes. A resume is
+ * silent: the thread already carries the session link from its first run,
+ * and to the people in it the conversation simply continues. (`is_true`
+ * with an empty then-arm, not `is_false`: the editor's preview cannot run
+ * the lookup, and a missing value is not false — the preview must still
+ * walk the create arm.) */
+const sessionUnlessResumed: BlockDef = {
   id: "has_previous",
   type: "branch",
   config: {
     conditions: { mode: "all", conditions: [{ path: "steps.previous.found", op: "is_true" }] },
   },
-  then: [
-    {
-      id: "resumed",
-      type: "integration_action",
-      tunable: ["params"],
-      config: {
-        provider: "slack",
-        actionId: "post_message",
-        params: {
-          channel: `\${{ ${F}.channel }}`,
-          threadTs: `\${{ ${F}.thread_ts }}`,
-          text: "Resumed the session — ${{ steps.previous.web_url }}",
-        },
-      },
-    },
-  ],
+  then: [],
   else: [session, started],
 };
 
@@ -387,6 +417,38 @@ const relay: BlockDef = {
   },
 };
 
+/** Wait for the session to go idle, however long its turn takes: one
+ * wait_session slice per iteration, the slice's deadline a normal outcome
+ * (`onDeadline: continue`), the loop ending on anything but a deadline —
+ * idle (the turn is done), or the session ending. A hundred slices of a day
+ * each before the loop's own bound; the run ceiling comes first. */
+function untilIdle(id: string): BlockDef {
+  const slice = `${id}_slice`;
+  return {
+    id,
+    type: "loop",
+    config: {
+      maxIterations: MAX_LOOP_ITERATIONS,
+      until: {
+        mode: "all",
+        conditions: [{ path: `steps.${slice}.outcome`, op: "not_equals", value: "deadline" }],
+      },
+    },
+    body: [
+      {
+        id: slice,
+        type: "wait_session",
+        config: {
+          session: SESSION_REF,
+          until: "idle",
+          deadlineSeconds: TURN_SLICE_S,
+          onDeadline: "continue",
+        },
+      },
+    ],
+  };
+}
+
 /** The first turn. A created session got the fold as its initial prompt, so
  * the run only waits for it to go idle. A resumed session is prompted with
  * the fold (send_prompt adopts it) and waited on the same way; a resumed
@@ -407,23 +469,16 @@ const firstTurn: BlockDef = {
     {
       id: "resume_turn",
       type: "send_prompt",
-      tunable: ["promptTemplate", "deadlineSeconds"],
+      tunable: ["promptTemplate"],
       config: {
         session: SESSION_REF,
         promptTemplate: "${{ steps.opening.value.text }}",
-        waitFor: { kind: "run_end" },
-        deadlineSeconds: TURN_DEADLINE_S,
+        waitFor: { kind: "none" },
       },
     },
+    untilIdle("resume_wait"),
   ],
-  else: [
-    {
-      id: "first_turn",
-      type: "wait_session",
-      tunable: ["deadlineSeconds"],
-      config: { session: SESSION_REF, until: "idle", deadlineSeconds: TURN_DEADLINE_S },
-    },
-  ],
+  else: [untilIdle("first_turn")],
 };
 
 const conversation: BlockDef = {
@@ -517,14 +572,14 @@ const conversation: BlockDef = {
             {
               id: "turn",
               type: "send_prompt",
-              tunable: ["promptTemplate", "deadlineSeconds"],
+              tunable: ["promptTemplate"],
               config: {
                 session: SESSION_REF,
                 promptTemplate: "${{ steps.turn_text.value.text }}",
-                waitFor: { kind: "run_end" },
-                deadlineSeconds: TURN_DEADLINE_S,
+                waitFor: { kind: "none" },
               },
             },
+            untilIdle("turn_wait"),
           ],
           else: [],
         },
@@ -548,7 +603,7 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     // profile per channel.)
     eventKeys: ["app_mention"],
   },
-  blocks: [...admit, ...opening, previous, sessionOrResume, pick, relay, firstTurn, conversation],
+  blocks: [...admit, ...opening, sessionUnlessResumed, pick, relay, firstTurn, conversation],
   // ADR 0120: a Slack thread is a WORKSTREAM. The first mention opens it; a
   // later mention in the same thread renders the same key, so it binds to
   // the open workstream and JOINS the thread's live run (the mailbox event
@@ -601,6 +656,9 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       // `default:` — default's fallback argument is strict.)
       keyTemplate:
         '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}',
+      // The thread's title on the Slack page and the rail: the opening
+      // mention's text, as a human reads it.
+      labelTemplate: "${{ event.raw.event.text | strip_mentions | truncate: 80 }}",
     },
     concurrency: {
       // One run per thread, instance-scoped: the same template as the
@@ -614,9 +672,13 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     onFinalize: [
       // No post on `completed`: that is the idle exit — a pause, not an
       // end. The ✅ on the last mention already says the turn is done, and
-      // the next mention continues the same session.
+      // the next mention continues the same session. No post on `deadline`
+      // either: no wait in this graph fails on time, so `deadline` can only
+      // be the engine's run ceiling under a turn still running — a pause
+      // too, never a thread's fault (the next mention re-installs the
+      // relay on the same session).
       {
-        when: ["deadline", "failed", "halted", "superseded", "filtered"],
+        when: ["failed", "halted", "superseded", "filtered"],
         block: {
           id: "recap",
           type: RELAY_CLOSE_TYPE,

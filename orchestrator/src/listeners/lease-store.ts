@@ -7,8 +7,19 @@ export interface LeaseStore {
   renew(sessionId: string, owner: string, ttlMs: number): Promise<boolean>;
   release(sessionId: string, owner: string): Promise<void>;
   markTerminal(sessionId: string): Promise<void>;
+  /** Rows a listener should run for: not terminal, not dormant. */
   listDesired(): Promise<string[]>;
   ensureRow(sessionId: string): Promise<void>;
+  /** Stand the listener down for a parked session: clear the lease and mark
+   * the row dormant — only while `owner` still holds the lease and no wake
+   * landed inside `graceMs` (a resume may be under way; keep listening).
+   * Returns whether the row went dormant. */
+  markDormant(sessionId: string, owner: string, graceMs: number): Promise<boolean>;
+  /** A resuming session RPC happened: clear dormancy and stamp the wake, so a
+   * stand-down inside the grace is refused. A no-op for a terminal row. */
+  wake(sessionId: string): Promise<void>;
+  /** Dormant rows, for the periodic reconcile against the coordinator. */
+  listDormant(): Promise<string[]>;
 }
 
 export interface LeaseQueryResult {
@@ -39,6 +50,7 @@ export function makeLeaseStore(executor: LeaseExecutor = productionExecutor()): 
             "lease_expires_at" = now() + (${ttlMs} * interval '1 millisecond')
         where "session_id" = ${sessionId}
           and "terminal_at" is null
+          and "dormant_at" is null
           and ("owner" is null or "lease_expires_at" < now())
         returning "session_id"
       `);
@@ -78,11 +90,10 @@ export function makeLeaseStore(executor: LeaseExecutor = productionExecutor()): 
         select "session_id"
         from "session_listeners"
         where "terminal_at" is null
+          and "dormant_at" is null
         order by "session_id"
       `);
-      return result.rows.flatMap((row) =>
-        typeof row.session_id === "string" ? [row.session_id] : []
-      );
+      return sessionIds(result);
     },
 
     async ensureRow(sessionId) {
@@ -92,13 +103,54 @@ export function makeLeaseStore(executor: LeaseExecutor = productionExecutor()): 
         on conflict ("session_id") do nothing
       `);
     },
+
+    async markDormant(sessionId, owner, graceMs) {
+      const result = await executor.execute(sql`
+        update "session_listeners"
+        set "dormant_at" = now(), "owner" = null, "lease_expires_at" = null
+        where "session_id" = ${sessionId}
+          and "owner" = ${owner}
+          and "terminal_at" is null
+          and ("woken_at" is null
+               or "woken_at" < now() - (${graceMs} * interval '1 millisecond'))
+        returning "session_id"
+      `);
+      return (result.rowCount ?? result.rows.length) > 0;
+    },
+
+    async wake(sessionId) {
+      await executor.execute(sql`
+        update "session_listeners"
+        set "dormant_at" = null, "woken_at" = now()
+        where "session_id" = ${sessionId} and "terminal_at" is null
+      `);
+    },
+
+    async listDormant() {
+      const result = await executor.execute(sql`
+        select "session_id"
+        from "session_listeners"
+        where "terminal_at" is null
+          and "dormant_at" is not null
+        order by "session_id"
+      `);
+      return sessionIds(result);
+    },
   };
+}
+
+function sessionIds(result: LeaseQueryResult): string[] {
+  return result.rows.flatMap((row) =>
+    typeof row.session_id === "string" ? [row.session_id] : []
+  );
 }
 
 interface MemoryLease {
   owner: string | null;
   leaseExpiresAt: Date | null;
   terminalAt: Date | null;
+  dormantAt: Date | null;
+  wokenAt: Date | null;
 }
 
 /** Deterministic in-memory implementation shared by unit tests. */
@@ -109,7 +161,7 @@ export function makeInMemoryLeaseStore(
   return {
     async tryAcquire(sessionId, owner, ttlMs) {
       const row = rows.get(sessionId);
-      if (!row || row.terminalAt !== null) return false;
+      if (!row || row.terminalAt !== null || row.dormantAt !== null) return false;
       const current = now();
       if (
         row.owner !== null &&
@@ -143,15 +195,48 @@ export function makeInMemoryLeaseStore(
 
     async listDesired() {
       return [...rows.entries()]
-        .filter(([, row]) => row.terminalAt === null)
+        .filter(([, row]) => row.terminalAt === null && row.dormantAt === null)
         .map(([sessionId]) => sessionId)
         .sort();
     },
 
     async ensureRow(sessionId) {
       if (!rows.has(sessionId)) {
-        rows.set(sessionId, { owner: null, leaseExpiresAt: null, terminalAt: null });
+        rows.set(sessionId, {
+          owner: null,
+          leaseExpiresAt: null,
+          terminalAt: null,
+          dormantAt: null,
+          wokenAt: null,
+        });
       }
+    },
+
+    async markDormant(sessionId, owner, graceMs) {
+      const row = rows.get(sessionId);
+      if (!row || row.terminalAt !== null || row.owner !== owner) return false;
+      const current = now();
+      if (row.wokenAt !== null && current.getTime() - row.wokenAt.getTime() < graceMs) {
+        return false;
+      }
+      row.dormantAt = current;
+      row.owner = null;
+      row.leaseExpiresAt = null;
+      return true;
+    },
+
+    async wake(sessionId) {
+      const row = rows.get(sessionId);
+      if (!row || row.terminalAt !== null) return;
+      row.dormantAt = null;
+      row.wokenAt = now();
+    },
+
+    async listDormant() {
+      return [...rows.entries()]
+        .filter(([, row]) => row.terminalAt === null && row.dormantAt !== null)
+        .map(([sessionId]) => sessionId)
+        .sort();
     },
   };
 }

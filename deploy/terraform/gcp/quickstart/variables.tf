@@ -30,6 +30,32 @@ variable "admin_email" {
   description = "Bootstrap admin: promoted to role 'admin' on first sign-in (the values output wires it to orchestrator.auth.adminEmails)."
 }
 
+variable "oauth_issuer" {
+  type        = string
+  description = "Issuer URL of the OIDC identity provider people sign in through (orchestrator.auth.oauth.issuer). Default: Google."
+  default     = "https://accounts.google.com"
+}
+
+variable "oauth_client_id" {
+  type        = string
+  description = "Client id of the OAuth client registered with the provider. Its redirect URI is https://<domain>/api/auth/oauth2/callback/sso. The client SECRET goes in the oauth-client-secret shell, never in Terraform."
+
+  validation {
+    condition     = length(trimspace(var.oauth_client_id)) > 0
+    error_message = "oauth_client_id must not be empty (empty means $OAUTH_CLIENT_ID was unset)."
+  }
+}
+
+variable "oauth_allowed_domains" {
+  type        = list(string)
+  description = "Who may sign in: every account of these email domains (for Google, the Workspace domain). An OAuth client admits every account the provider has, so this must name at least one domain; [\"*\"] admits them all."
+
+  validation {
+    condition     = length(var.oauth_allowed_domains) > 0 && alltrue([for d in var.oauth_allowed_domains : length(trimspace(d)) > 0])
+    error_message = "oauth_allowed_domains must name at least one domain, for example [\"example.com\"]."
+  }
+}
+
 variable "kvm_machine_type" {
   type        = string
   description = "Intel nested-virt machine type for the host pool (see the gke-kvm-pool module)."
