@@ -929,6 +929,11 @@ pub struct PooledBackend {
     /// guard + migration fence). Mirrored into the FC sandbox manifest
     /// for reattach (ADR 0044 K2).
     migration_roles: Arc<DashMap<SandboxId, crate::migration::MigrationRole>>,
+    /// Destinations whose post-copy drain finished. `migration_drain_wait`
+    /// records the outcome here before it clears the persisted role, so a
+    /// failed manifest write is retried by the next call and never turns a
+    /// complete drain into a rewind.
+    drained_dests: Arc<DashMap<SandboxId, engram_core::types::snapshot::DrainOutcome>>,
     /// ADR 0044 K2 (issue #224): terminal-mode flag for graceful
     /// shutdown. `abandon_nbd_data_planes_for_shutdown` sets this
     /// `true` (SeqCst) BEFORE draining `nbd_sandboxes`, turning
@@ -2396,6 +2401,7 @@ impl PooledBackend {
             pending_presetups: Arc::new(DashMap::new()),
             postcopy_dests: Arc::new(DashMap::new()),
             migration_roles: Arc::new(DashMap::new()),
+            drained_dests: Arc::new(DashMap::new()),
             #[cfg(target_os = "linux")]
             abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             captures_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2453,17 +2459,21 @@ impl PooledBackend {
         }
     }
 
-    /// Persist the role before updating the in-memory lifecycle fence.
+    /// Note the role in memory, then persist it to the manifest. The note
+    /// is the lifecycle fence this process reads; the manifest is the hint
+    /// a restart reads. A caller that SETS a role fails its operation when
+    /// the persist fails (a restart must never resume a shipped source). A
+    /// caller that CLEARS a role finishes its unconditional work first and
+    /// reports the persist error last.
     pub async fn set_migration_role(
         &self,
         id: SandboxId,
         role: Option<crate::migration::MigrationRole>,
     ) -> Result<(), SandboxError> {
+        self.note_migration_role(id, role);
         self.inner
             .set_manifest_migration_role(id, role.map(|r| r.as_str()))
-            .await?;
-        self.note_migration_role(id, role);
-        Ok(())
+            .await
     }
 
     /// ADR 0045 C2: the split-brain flag of a sandbox's open export
@@ -8502,8 +8512,17 @@ impl SandboxBackend for PooledBackend {
             // dest is about to load — defuse the guard (abort unfences;
             // commit destroys the sandbox). After this point the
             // presetup must NOT be restored (the move is committing).
-            self.set_migration_role(id, Some(crate::migration::MigrationRole::PostCopySource))
-                .await?;
+            if let Err(error) = self
+                .set_migration_role(id, Some(crate::migration::MigrationRole::PostCopySource))
+                .await
+            {
+                // The export must not outlive a role the manifest does not
+                // carry: take it back so the unwind guard resumes a guest
+                // no export holds, and a restart sees no source role.
+                drop(self.migrations.remove_validated(id, export_id));
+                self.note_migration_role(id, None);
+                return Err(error);
+            }
             unwind.defuse();
             peer.register(crate::migrate_peer::PeerExport {
                 export_id: export_id.to_string(),
@@ -8558,6 +8577,11 @@ impl SandboxBackend for PooledBackend {
         id: SandboxId,
     ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
         use engram_core::types::snapshot::DrainOutcome;
+        if let Some(done) = self.drained_dests.get(&id).map(|d| d.clone()) {
+            // The drain already finished; only the role clear is pending.
+            self.set_migration_role(id, None).await?;
+            return Ok(done);
+        }
         let Some(sock) = self.inner.post_copy_control_sock(id) else {
             return Err(SandboxError::InvalidSpec(
                 "no post-copy control socket for this sandbox".into(),
@@ -8649,7 +8673,9 @@ impl SandboxBackend for PooledBackend {
             }
         } else {
             // Both drains complete: the dest no longer depends on the
-            // source.
+            // source. Record that first, so a failed role persist is
+            // retried by the next call rather than reported as a lost drain.
+            self.drained_dests.insert(id, outcome.clone());
             self.set_migration_role(id, None).await?;
         }
         Ok(outcome)
@@ -9102,9 +9128,12 @@ impl SandboxBackend for PooledBackend {
         }
         self.note_migration_role(id, None);
         let snapshot_dir = export.snapshot_dir.clone();
+        // The export is consumed, so a retry cannot reach its directory:
+        // remove it whether or not the destroy succeeds.
         drop(export); // releases the capture guard (checkpoint fence)
-        self.destroy(id).await?;
+        let destroyed = self.destroy(id).await;
         let _ = fs::remove_dir_all(&snapshot_dir).await;
+        destroyed?;
         tracing::info!(sandbox_id = %id, "migration committed; source destroyed (ADR 0045 C1)");
         Ok(())
     }
@@ -9129,7 +9158,6 @@ impl SandboxBackend for PooledBackend {
         if let Some(peer) = self.migrate_peer_server() {
             peer.remove(export_id);
         }
-        self.set_migration_role(id, None).await?;
         // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop the
         // guard before the `requeue_*` awaits.
         #[cfg(target_os = "linux")]
@@ -9153,6 +9181,9 @@ impl SandboxBackend for PooledBackend {
             .resume(id)
             .await
             .map_err(|e| SandboxError::Snapshot(format!("migration abort resume: {e}")))?;
+        // Last: the drained bytes are back, the fence is down, and the
+        // guest runs again whether or not this manifest write succeeds.
+        self.set_migration_role(id, None).await?;
         tracing::info!(sandbox_id = %id, "migration aborted; guest resumed in place (ADR 0045 C1)");
         Ok(())
     }
@@ -9480,6 +9511,8 @@ impl SandboxBackend for PooledBackend {
                 let chain_heads = self.chain_heads.clone();
                 let capture_locks = self.capture_locks.clone();
                 let snapshot_waits = self.snapshot_waits.clone();
+                let migration_roles = self.migration_roles.clone();
+                let drained_dests = self.drained_dests.clone();
                 #[cfg(target_os = "linux")]
                 let nbd_sandboxes = self.nbd_sandboxes.clone();
                 #[cfg(target_os = "linux")]
@@ -9511,6 +9544,8 @@ impl SandboxBackend for PooledBackend {
                     // the evict_local remediation (or any destroy) closes the loop.
                     quarantined_survivors.remove(&id);
                     unreachable_guests.remove(&id);
+                    migration_roles.remove(&id);
+                    drained_dests.remove(&id);
                     if let Some(egress) = egress.as_ref() {
                         if let Some(session_id) = removed_session {
                             egress.unregister_session(session_id);
@@ -15792,6 +15827,7 @@ mod tests {
         release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         calls: PlMutex<Vec<&'static str>>,
         fail_destroy: bool,
+        fail_role_write: std::sync::atomic::AtomicBool,
     }
 
     impl CustodyBackend {
@@ -15843,6 +15879,25 @@ mod tests {
             self.calls.lock().push("start_agent");
             Ok(())
         }
+        async fn resume(&self, _: SandboxId) -> Result<(), SandboxError> {
+            self.calls.lock().push("resume");
+            Ok(())
+        }
+        async fn set_manifest_migration_role(
+            &self,
+            _: SandboxId,
+            _: Option<&str>,
+        ) -> Result<(), SandboxError> {
+            self.calls.lock().push("role");
+            if self
+                .fail_role_write
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(SandboxError::Snapshot("manifest write failed".into()))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     fn custody_backend(
@@ -15858,6 +15913,7 @@ mod tests {
                 release: tokio::sync::Mutex::new(Some(rx)),
                 calls: PlMutex::new(Vec::new()),
                 fail_destroy,
+                fail_role_write: std::sync::atomic::AtomicBool::new(false),
             }),
             release,
         )
@@ -15949,18 +16005,14 @@ mod tests {
         assert_eq!(*inner.calls.lock(), vec!["snapshot", "start_agent"]);
     }
 
-    #[tokio::test]
-    async fn migration_commit_propagates_destroy_failure() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (inner, release) = custody_backend(tmp.path(), true);
-        release.send(()).unwrap();
-        let pooled = PooledBackend::new(inner.clone());
-        let id = inner.id;
-        let export_id = "commit-error".to_string();
+    /// An open export for `id` whose local directory exists on disk.
+    async fn open_export(pooled: &PooledBackend, id: SandboxId, dir: PathBuf) -> String {
+        std::fs::create_dir_all(&dir).unwrap();
+        let export_id = format!("export-{id}");
         assert!(pooled.migrations.insert(crate::migration::MigrationExport {
             export_id: export_id.clone(),
             sandbox_id: id,
-            snapshot_dir: tmp.path().join("export"),
+            snapshot_dir: dir,
             allowed_chunks: Default::default(),
             disk_pending: None,
             disk_seal: None,
@@ -15971,8 +16023,95 @@ mod tests {
             last_activity: Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
             capture_guard: pooled.capture_lock(id).lock_owned().await,
         }));
+        export_id
+    }
+
+    #[tokio::test]
+    async fn migration_commit_propagates_destroy_failure_and_removes_the_export_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (inner, release) = custody_backend(tmp.path(), true);
+        release.send(()).unwrap();
+        let pooled = PooledBackend::new(inner.clone());
+        let id = inner.id;
+        let dir = tmp.path().join("export");
+        let export_id = open_export(&pooled, id, dir.clone()).await;
         let error = pooled.migration_commit(id, &export_id).await.unwrap_err();
         assert!(error.to_string().contains("destroy failed"));
+        // The export is consumed, so nothing else can reach the directory.
+        assert!(!dir.exists(), "export dir must go even when destroy fails");
+        assert!(pooled.migrations.export_id_of(id).is_none());
+    }
+
+    /// The abort's unconditional work (requeue, unfence, resume) runs
+    /// before the role clear, so a failed manifest write never strands a
+    /// paused guest; the error still reaches the caller.
+    #[tokio::test]
+    async fn migration_abort_resumes_the_guest_before_reporting_the_role_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (inner, release) = custody_backend(tmp.path(), false);
+        release.send(()).unwrap();
+        let pooled = PooledBackend::new(inner.clone());
+        let id = inner.id;
+        pooled.note_migration_role(id, Some(crate::migration::MigrationRole::PostCopySource));
+        let dir = tmp.path().join("export");
+        let export_id = open_export(&pooled, id, dir.clone()).await;
+        inner
+            .fail_role_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = pooled.migration_abort(id, &export_id).await.unwrap_err();
+        assert!(error.to_string().contains("manifest write failed"));
+        assert_eq!(*inner.calls.lock(), vec!["resume", "role"]);
+        assert!(!dir.exists());
+        assert!(pooled.migrations.export_id_of(id).is_none());
+        assert!(
+            !pooled.capture_locks.contains_key(&id) || pooled.capture_lock(id).try_lock().is_ok()
+        );
+        // The in-memory fence is down: this process no longer treats the
+        // guest as a frozen source.
+        assert_eq!(pooled.migration_role(id), None);
+    }
+
+    /// A finished drain is remembered: when the role clear fails, the next
+    /// call retries only the clear and reports the same outcome, instead of
+    /// turning a complete drain into a lost peer.
+    #[tokio::test]
+    async fn migration_drain_wait_retries_the_role_clear_after_the_drain_finished() {
+        use engram_core::types::snapshot::DrainOutcome;
+        let tmp = tempfile::tempdir().unwrap();
+        let (inner, release) = custody_backend(tmp.path(), false);
+        release.send(()).unwrap();
+        let pooled = PooledBackend::new(inner.clone());
+        let id = inner.id;
+        pooled.note_migration_role(id, Some(crate::migration::MigrationRole::PostCopyDest));
+        let done = DrainOutcome::Done {
+            pulled: 7,
+            alt_sourced: 1,
+            zero_chunks: 2,
+            ms: 30,
+        };
+        pooled.drained_dests.insert(id, done.clone());
+        inner
+            .fail_role_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        pooled.migration_drain_wait(id).await.unwrap_err();
+        inner
+            .fail_role_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let again = pooled.migration_drain_wait(id).await.unwrap();
+        assert!(matches!(
+            again,
+            DrainOutcome::Done {
+                pulled: 7,
+                ms: 30,
+                ..
+            }
+        ));
+        assert_eq!(*inner.calls.lock(), vec!["role", "role"]);
+        assert_eq!(pooled.migration_role(id), None);
+        // Destroy forgets both the role and the drain memo.
+        pooled.destroy(id).await.unwrap();
+        assert!(!pooled.drained_dests.contains_key(&id));
+        assert!(!pooled.migration_roles.contains_key(&id));
     }
 
     /// A `SnapshotMetadata` carrying a recognizable id for assertions.
