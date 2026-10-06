@@ -318,29 +318,45 @@ a fatal fence. Swap re-arming on agentd reuse stays: a restored guest
 has a fresh zero swap file and needs it (ADR 0112 D2).
 
 **C4. Sequenced, acknowledged events.** `HarnessFrame` gains two
-trailing variants: `SeqEvent { seq, event }` (harness to host) and
-`EventAck { seq }` (host to harness, cumulative). `seq` is per harness
-process and strictly increasing from 1. The SDK keeps unacknowledged
+trailing variants: `SeqEvent { binding_epoch, seq, event }` (harness to
+host) and `EventAck { seq }` (host to harness, cumulative). `seq` is per
+harness process and strictly increasing from 1. `binding_epoch` is the
+generation the SDK held when it **sequenced** the event, not when it
+sent it: a replayed event produced under generation N still carries N
+after the harness re-attached under N+1. The SDK keeps unacknowledged
 events in a bounded outbox (1024) and replays them on reconnect; a full
-outbox blocks the engine. The hub acknowledges only after the sink
-returned `Ok`, and the production sink retries the coordinator POST
-with a bounded backoff, so an acknowledgement means the coordinator
-stored the event. `HarnessEventRequest.delivery { binding_epoch, seq }`
-rides to the coordinator, which deduplicates by `(session_id,
-binding_epoch, seq)`. `Event` (variant 0) stays accepted for a harness
-resident in an older memory image; it is sinked without an
-acknowledgement, as today.
+outbox blocks the engine. The hub refuses a frame whose epoch is above
+the attach epoch, acknowledges only after the sink returned `Ok`, and
+the production sink retries the coordinator POST with a bounded
+backoff, so an acknowledgement means the coordinator stored the event.
+`HarnessEventRequest.delivery { binding_epoch, seq }` rides to the
+coordinator, which deduplicates by `(session_id, binding_epoch, seq)`.
+`Event` (variant 0) stays accepted for a harness resident in an older
+memory image; it is sinked without an acknowledgement, as today.
 
-**C5. Readiness and settlement share one column.**
-`sessions.attached_binding_epoch` is the highest generation whose first
-event the coordinator has seen. The teleport attach step waits for it
-before `Active`. When it advances, `settle_harness_generation(session,
-epoch)` appends `run_interrupted { cause: harness_replaced }` for every
-open run of an older generation, idempotently keyed per run. The
-harness engines route their channel-closed exit through their existing
-close-out block, so a non-fenced exit still emits `RunInterrupted`; a
-fenced generation cannot report, and the settlement is the authority.
-The orchestrator treats `run_interrupted` as a failed run end.
+**C5. Readiness and settlement share one column, and a continued run
+is never settled.** `sessions.attached_binding_epoch` is the highest
+generation whose first event the coordinator has seen; only an event
+stamped with that generation (C4) can advance it, so a replay never
+does. The teleport attach step waits for it before `Active`.
+
+A snapshot teleport keeps the same harness process, and that process
+keeps running the same run under the new generation. The harness is
+the only party that knows this, so it says so: an engine that is
+re-attached while a turn is in flight emits `HarnessEvent::RunContinued
+{ run_id }` (a new trailing variant, persisted as `run_continued`); a
+fresh engine announces `Idle` as today. When `attached_binding_epoch`
+advances, `settle_harness_generation(session, epoch, continued)` appends
+`run_interrupted { cause: harness_replaced }` for every open run of an
+older generation **except the runs the advancing event references**
+(`RunContinued { run_id }`, or any event that carries that `run_id`),
+idempotently keyed per run. A replaced harness references no open run,
+so every stale run settles; a continued harness names its run, so it
+survives. The harness engines route their channel-closed exit through
+their existing close-out block, so a non-fenced exit still emits
+`RunInterrupted`; a fenced generation cannot report, and the settlement
+is the authority. The orchestrator treats `run_interrupted` as a failed
+run end and `run_continued` as a non-terminal lifecycle event.
 
 **C6. Readiness is honest.** `materialize_snapshot_resume` returns
 `Result<HarnessPlan { Spawn { .. } | None }>`; an explicit no-harness
@@ -447,8 +463,8 @@ message TeleportSessionResponse { string teleport_id = 1; string kind = 2; strin
 pub enum HarnessFrame {
     Event(HarnessEvent),                        // 0, legacy, un-sequenced
     Command(HarnessCommand),                    // 1
-    SeqEvent { seq: u64, event: HarnessEvent }, // 2
-    EventAck { seq: u64 },                      // 3, cumulative
+    SeqEvent { binding_epoch: u64, seq: u64, event: HarnessEvent }, // 2
+    EventAck { seq: u64 },                                         // 3, cumulative
 }
 ```
 
@@ -489,4 +505,9 @@ pub enum HarnessFrame {
 
 ## Divergence log
 
-(Filled in as phases land.)
+- 2026-10-05 (review of the Proposed ADR): C5 as first written settled
+  "every open run of an older generation" when the generation advanced.
+  On a snapshot teleport the same process continues the same run under
+  the new generation, so the run's own first event would have settled
+  it: #1549 by policy. C4 and C5 now stamp the epoch at sequencing time,
+  add `RunContinued`, and exempt the runs the advancing event references.
