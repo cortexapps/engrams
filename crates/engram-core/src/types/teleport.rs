@@ -1,4 +1,5 @@
 use super::ids::{HostId, SandboxId, SessionId, SnapshotId, TeleportId};
+use super::session::SessionState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -73,10 +74,24 @@ impl TeleportPhase {
             .collect::<Vec<_>>()
             .join(",")
     }
+    /// Phases in which the SOURCE still holds a frozen VM or a live export
+    /// after the session's own reservation moved to the destination at
+    /// commit. The source budget stays reserved until release so a
+    /// placement cannot reuse RAM the paused VM still occupies.
+    pub const fn source_reserving_phases() -> &'static [&'static str] {
+        &["committed", "attached"]
+    }
+    pub fn source_reserving_phases_sql() -> String {
+        Self::source_reserving_phases()
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
     pub const fn can_transition_to(self, target: Self) -> bool {
         use TeleportPhase::*;
         match self {
-            Admitted => matches!(target, Captured | RollingBack),
+            Admitted => matches!(target, Admitted | Captured | RollingBack),
             Captured => matches!(target, Restored | RollingBack),
             Restored => matches!(target, Committed | RollingBack),
             Committed => matches!(target, Attached | Failed),
@@ -102,6 +117,7 @@ pub struct TeleportRow {
     pub cpu_budget_vcpus: i32,
     pub snapshot_id: Option<SnapshotId>,
     pub export_id: Option<String>,
+    pub live_payload: Option<serde_json::Value>,
     pub attempts: i32,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -130,7 +146,8 @@ mod tests {
             for to in ALL {
                 let expected = matches!(
                     (from, to),
-                    (Admitted, Captured)
+                    (Admitted, Admitted)
+                        | (Admitted, Captured)
                         | (Admitted, RollingBack)
                         | (Captured, Restored)
                         | (Captured, RollingBack)
@@ -165,4 +182,61 @@ mod tests {
             );
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeleportOutcome {
+    Done,
+    Aborted,
+    Failed,
+}
+
+/// Admission holds the session and destination placement locks until commit.
+#[derive(Clone, Debug)]
+pub struct TeleportAdmitRequest {
+    pub id: TeleportId,
+    pub session_id: SessionId,
+    pub reason: TeleportReason,
+    pub epoch: i64,
+    pub candidates: Vec<HostId>,
+    pub pinned_dest: Option<HostId>,
+    pub mem_budget_mib: i64,
+    pub cpu_budget_vcpus: i64,
+    pub max_open_per_dest: u32,
+    pub live_capable: bool,
+}
+#[derive(Clone, Debug)]
+pub enum TeleportAdmitOutcome {
+    Admitted(Box<TeleportRow>),
+    NoFit,
+    SessionNotActive(SessionState),
+    Fenced,
+}
+#[derive(Clone, Debug, Default)]
+pub struct TeleportPatch {
+    pub dest_sandbox_id: Option<SandboxId>,
+    pub snapshot_id: Option<SnapshotId>,
+    pub export_id: Option<String>,
+    pub live_payload: Option<serde_json::Value>,
+    pub kind: Option<TeleportKind>,
+    pub error: Option<String>,
+}
+/// One fenced settlement of a failed move. The session's terminal state
+/// (always detaching the binding), the source tombstone, the row's `failed`
+/// phase, and both events land in ONE transaction under the session's
+/// `current_epoch`, so a stale driver can never write a tombstone or a
+/// terminal row after a successor took the lane.
+#[derive(Clone, Debug, Default)]
+pub struct TeleportSettle {
+    pub error: String,
+    /// `Some(target)` settles the session; `None` leaves it as it is (a
+    /// crashed predecessor or the dead-host sweep already settled it).
+    pub session: Option<crate::types::session::SessionState>,
+    pub entomb_source: bool,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum SourceRelease {
+    DestroyAcked,
+    SourceHostGone,
 }

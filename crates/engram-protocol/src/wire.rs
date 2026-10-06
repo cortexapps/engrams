@@ -158,7 +158,9 @@ use serde::{Deserialize, Serialize};
 // inject/refresh route. Trailing-variant addition: every existing encoding
 // is unchanged, but a v27 host cannot decode a policy carrying the new
 // variant, so the roll is lockstep.
-pub const WIRE_VERSION: u32 = 28;
+// v29 (ADR 0123): SnapshotHold keeps a source paused through teleport commit.
+// Older hosts cannot provide this capture contract. Roll coordinator and hosts together.
+pub const WIRE_VERSION: u32 = 29;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

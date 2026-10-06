@@ -1927,11 +1927,29 @@ pub async fn sandbox_ownership_core(
     // `owned=true` here kept those orphans alive (and their guest
     // memory pinned) indefinitely. Mirrors `session_owning_sandbox`'s
     // non-terminal predicate.
-    match state.services.meta.get_session(session_id).await {
-        Ok(s) => Ok(s.sandbox_id == Some(sandbox_id) && !s.status.is_terminal()),
-        Err(engram_core::MetaError::NotFound) => Ok(false),
-        Err(e) => Err(ApiError::Internal(format!("get_session: {e}"))),
+    //
+    // ADR 0123 B: an open teleport owns BOTH its endpoints. After commit
+    // the session names the destination, but the source is still the
+    // page server of a live move (or a held snapshot source awaiting
+    // release); answering `false` would let the host's export TTL sweep
+    // destroy it under a draining destination.
+    let session = match state.services.meta.get_session(session_id).await {
+        Ok(s) => s,
+        Err(engram_core::MetaError::NotFound) => return Ok(false),
+        Err(e) => return Err(ApiError::Internal(format!("get_session: {e}"))),
+    };
+    if session.sandbox_id == Some(sandbox_id) && !session.status.is_terminal() {
+        return Ok(true);
     }
+    let moving = state
+        .services
+        .meta
+        .open_teleport_for_session(session_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("open_teleport_for_session: {e}")))?;
+    Ok(moving.is_some_and(|t| {
+        t.source_sandbox_id == sandbox_id || t.dest_sandbox_id == Some(sandbox_id)
+    }))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

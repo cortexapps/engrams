@@ -198,7 +198,7 @@ export const POLICY: Record<string, PolicyEntry> = {
   "FleetService.DeleteHost": { action: "manage", subject: "all" },
   "FleetService.GetStorageSummary": { action: "manage", subject: "all" },
   "FleetService.FlushSession": { action: "manage", subject: "all" },
-  "FleetService.EvacuateSession": { action: "manage", subject: "all" },
+  "FleetService.TeleportSession": { action: "manage", subject: "all" },
   "FleetService.ChunkGc": { action: "manage", subject: "all" },
   "FleetService.BundleGc": { action: "manage", subject: "all" },
   "FleetService.SnapshotBlobGc": { action: "manage", subject: "all" },

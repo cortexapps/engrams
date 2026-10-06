@@ -533,20 +533,20 @@ impl Driver {
         self.get_session(sid).await.status
     }
 
-    /// `FleetService.EvacuateSession` — async evacuation. Returns the full
+    /// `FleetService.TeleportSession` — async evacuation. Returns the full
     /// gRPC `Status` on error so the shape test can assert on the code (the
     /// 404/409/202 distinctions the old HTTP handler returned now map to
     /// gRPC `NotFound` / `FailedPrecondition` / `Ok`).
     async fn evacuate(
         &mut self,
         sid: SessionId,
-    ) -> Result<app::EvacuateSessionResponse, tonic::Status> {
-        let req = app::EvacuateSessionRequest {
+    ) -> Result<app::TeleportSessionResponse, tonic::Status> {
+        let req = app::TeleportSessionRequest {
             session_id: sid.to_string(),
             target_host: None,
         };
         self.fleet
-            .evacuate_session(req)
+            .teleport_session(req)
             .await
             .map(|r| r.into_inner())
     }
@@ -2058,7 +2058,7 @@ async fn e2e_update_image_cheap_edit_and_recapture_gate() {
 ///   - The RPC is bound under bearer auth.
 ///   - `NotFound` on a non-existent session id (the old HTTP 404).
 ///   - For an Active session: returns Ok with `status="evacuating"` (the old
-///     HTTP 202). The `evac_resumer` scanner drives the session to Active on
+///     HTTP 202). The `teleport` scanner drives the session to Active on
 ///     a peer in ≤10s.
 ///
 /// Pinned regressions:
@@ -2076,39 +2076,44 @@ async fn e2e_update_image_cheap_edit_and_recapture_gate() {
 #[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a baked demo image; runs in ci.yml's test-e2e-stack lane"]
 async fn e2e_evac_admin_endpoint_shape() {
     let mut driver = Driver::from_env().await;
-    let image = Driver::image_uri();
-
-    // Case 1: NotFound on a session that doesn't exist.
-    let bogus = SessionId::new();
     let err = driver
-        .evacuate(bogus)
+        .evacuate(SessionId::new())
         .await
-        .expect_err("evacuate on unknown session must error");
-    assert_eq!(
-        err.code(),
-        tonic::Code::NotFound,
-        "evacuate on unknown session should map to NotFound; got {err:?}",
-    );
-
-    // Case 2: live session — async shape. Handler must accept immediately
-    // after marking the session Evacuating. The scanner picks it up from
-    // there.
-    let sid = driver.create_session_none_harness(&image).await;
-    let resp = driver
-        .evacuate(sid)
+        .expect_err("unknown session");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    let hosts = driver
+        .fleet
+        .list_hosts(app::ListHostsRequest {})
         .await
-        .expect("evacuate must succeed on an Active session (async shape)");
-    assert_eq!(
-        resp.status, "evacuating",
-        "evacuate response status must be \"evacuating\"; got {resp:?}",
-    );
-    assert_eq!(
-        resp.session_id,
-        sid.to_string(),
-        "evacuate response must echo session_id; got {resp:?}",
-    );
-
-    driver.delete(sid).await;
+        .unwrap()
+        .into_inner()
+        .hosts;
+    let host = hosts.first().expect("host").id.clone();
+    let report = driver
+        .fleet
+        .admin_drain_host(app::AdminDrainHostRequest {
+            host_id: host.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(report.host_id, host);
+    assert!(report
+        .planned
+        .iter()
+        .all(|s| s.parse::<SessionId>().is_ok()));
+    assert!(report
+        .descended
+        .iter()
+        .all(|s| s.parse::<SessionId>().is_ok()));
+    driver
+        .fleet
+        .uncordon_host(app::UncordonHostRequest {
+            host_id: host,
+            owner: "admin".into(),
+        })
+        .await
+        .unwrap();
 }
 
 /// Whether this environment is REQUIRED to have ≥2 hosts (the teleport/evac
@@ -2124,28 +2129,11 @@ fn two_hosts_required() -> bool {
     )
 }
 
-/// Full-stack two-host teleport via `FleetService.EvacuateSession` — the
-/// teleport PRIMITIVE on the app-gRPC surface (ADR 0051). The orchestrator's
-/// teleport verb is this RPC; `EvacuateSession` pauses + flushes + snapshots
-/// the source sandbox, marks the session Evacuating, and the `evac_resumer`
-/// scanner resumes it on a PEER host (any non-source host via the standard
-/// policy — the proto's `target_host` is reserved/ignored, so unlike the old
-/// REST `/teleport` this does not pin the destination).
-///
-/// Flow: create on host A → write a UUID sentinel + sync → `EvacuateSession`
-/// → wait for Active on a peer → assert the session LEFT host A and the disk
-/// sentinel crossed byte-identical. This is the gRPC replacement for the
-/// deleted `e2e_two_host_teleport_preserves_sentinel` (which drove the removed
-/// REST route): same disk-fidelity-across-relocation guarantee, minus the
-/// destination-pinning assertion the evac primitive intentionally doesn't
-/// offer. The single-host async-accept shape stays pinned by
-/// `e2e_evac_admin_endpoint_shape` above.
-///
-/// Requires a two-host stack. On a single-host lane it skips with a warning
-/// unless `ENGRAM_EXPECT_TWO_HOSTS=1`, where <2 hosts is a hard failure.
+/// Retire a source, preserve disk data on the destination, then delete the empty host.
+/// CI runs this after the pinned-target test because it removes a fixture host.
 #[tokio::test]
 #[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a two-host stack (ENGRAM_INTEG_TWO_HOSTS=1); runs in ci.yml's test-e2e-stack teleport variant"]
-async fn e2e_two_host_evacuate_preserves_sentinel() {
+async fn e2e_retire_host_relocates_and_grants() {
     let mut driver = Driver::from_env().await;
     let image = Driver::image_uri();
 
@@ -2187,18 +2175,37 @@ async fn e2e_two_host_evacuate_preserves_sentinel() {
         write.stderr,
     );
 
-    // EvacuateSession: async-accept, then the scanner drives Evacuating →
-    // Created → Active on a peer.
-    let resp = driver
-        .evacuate(sid)
+    driver
+        .fleet
+        .retire_host(app::RetireHostRequest {
+            host_id: src.clone(),
+            owner: "admin".into(),
+            reason: "e2e".into(),
+        })
         .await
-        .expect("EvacuateSession must succeed on an Active session");
-    assert_eq!(
-        resp.status, "evacuating",
-        "evacuate response status must be \"evacuating\"; got {resp:?}",
-    );
-
-    // The evac_resumer drives Evacuating → Created → Active on the peer.
+        .expect("retirement accepted");
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let host = driver
+            .fleet
+            .get_host(app::GetHostRequest {
+                host_id: src.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .host
+            .unwrap();
+        if host.retirement.is_some_and(|r| !r.retired_at.is_empty()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retirement did not receive a grant"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // The durable machine attaches the destination before releasing the source.
     // Generous deadline: first restore on the peer may cold-fetch chunks.
     // 180s mirrors the cold-create budget.
     assert!(
@@ -2210,7 +2217,7 @@ async fn e2e_two_host_evacuate_preserves_sentinel() {
         driver.session_status(sid).await,
     );
 
-    // Left the source host. EvacuateSession picks any non-source peer, so we
+    // Left the source host. TeleportSession picks any non-source peer, so we
     // assert the move happened (session left A) — not which peer it landed on.
     let after = driver
         .session_host_id(sid)
@@ -2235,5 +2242,83 @@ async fn e2e_two_host_evacuate_preserves_sentinel() {
         "disk data lost across the host evacuation",
     );
 
+    driver.delete(sid).await;
+    driver
+        .fleet
+        .delete_host(app::DeleteHostRequest {
+            host_id: src.clone(),
+        })
+        .await
+        .unwrap();
+    driver
+        .fleet
+        .delete_host(app::DeleteHostRequest { host_id: src })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the two-host e2e stack; runs before the retirement test in CI"]
+async fn e2e_teleport_session_honors_target_host() {
+    let mut driver = Driver::from_env().await;
+    let hosts = driver.list_host_ids().await;
+    assert!(hosts.len() >= 2, "two-host fixture required");
+    let sid = driver
+        .create_session_none_harness(&Driver::image_uri())
+        .await;
+    let source = driver.session_host_id(sid).await.unwrap();
+    let target = hosts.into_iter().find(|h| *h != source).unwrap();
+    // A source cannot also be its destination. Admission must leave it Active.
+    let refused = driver
+        .fleet
+        .teleport_session(app::TeleportSessionRequest {
+            session_id: sid.to_string(),
+            target_host: Some(source.clone()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(driver.session_status(sid).await, "active");
+    assert_eq!(driver.session_host_id(sid).await, Some(source));
+    let move_row = driver
+        .fleet
+        .teleport_session(app::TeleportSessionRequest {
+            session_id: sid.to_string(),
+            target_host: Some(target.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(move_row.dest_host_id, target);
+    assert!(matches!(move_row.kind.as_str(), "snapshot" | "live"));
+    let mut events = driver
+        .sess
+        .stream_events(app::StreamEventsRequest {
+            session_id: sid.to_string(),
+            since: None,
+            durable_only: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let done = tokio::time::timeout(Duration::from_secs(180), async {
+        loop {
+            let event = events.message().await.unwrap().expect("event stream ended");
+            if event.kind == "teleport_finished"
+                && payload_str(&event.payload_json, "teleport_id").as_deref()
+                    == Some(&move_row.teleport_id)
+            {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("teleport did not finish");
+    assert_eq!(
+        payload_str(&done.payload_json, "outcome").as_deref(),
+        Some("done")
+    );
+    assert_eq!(driver.session_status(sid).await, "active");
+    assert_eq!(driver.session_host_id(sid).await, Some(target));
     driver.delete(sid).await;
 }

@@ -84,25 +84,9 @@ pub enum SessionState {
     /// there is nothing to recover. The detector no longer routes
     /// into `Evacuating` (the reactive auto-evac is retired).
     HostLost,
-    /// ADR 0018 commit 12: session is mid-relocation. The source host
-    /// has paused FC, flushed dirty pages, captured a memory snapshot,
-    /// destroyed the local sandbox, and durably committed both memory
-    /// and disk manifests to BlobStorage. The coord-side
-    /// `evac_resumer` background task scans for sessions in this
-    /// state and drives `Evacuating → Created → Active` on a peer
-    /// host via the same `resume_session` machinery `/resume from
-    /// Idle` uses. After 20 failed peer-pick / restore attempts
-    /// (~3 min), falls back to `Idle` so a user `/resume` can drive
-    /// it forward by hand. Reached **only** from `Active` via operator
-    /// drain (`POST /api/admin/sessions/:id/evacuate` or
-    /// `POST /api/admin/hosts/:id/drain`) — ADR 0044 K3. As of ADR
-    /// 0045 Phase A the dead-host detector no longer routes here (the
-    /// reactive auto-evac is retired), and `HostLost → Evacuating` is
-    /// no longer a legal edge. Post-#896 the source binding is
-    /// RETAINED through `Evacuating` (ADR 0090: a destroy
-    /// acknowledgement is not ownership proof) — the evac resumer
-    /// clears it under its claim only after the source teardown is
-    /// positively confirmed.
+    /// ADR 0123: a durable teleport owns this relocation. The source binding
+    /// stays in place until commit atomically installs the destination binding.
+    /// The source remains paused until rollback resumes it or release destroys it.
     Evacuating,
     /// ADR 0034: durable idle-eviction intent marker. The candidates
     /// handler (or the PG detection backstop) transitions

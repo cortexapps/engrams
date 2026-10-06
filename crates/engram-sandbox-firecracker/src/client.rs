@@ -266,6 +266,30 @@ impl FirecrackerClient {
         })
     }
 
+    /// Capture a paused VM without a resume guard. The caller owns recovery.
+    pub async fn create_snapshot_held(
+        &self,
+        state_path: PathBuf,
+        mem_path: PathBuf,
+        snapshot_type: SnapshotType,
+    ) -> Result<SnapshotPaths, SandboxError> {
+        self.pause().await?;
+        self.put(
+            "/snapshot/create",
+            &SnapshotCreateBody {
+                snapshot_path: state_path.to_string_lossy().into_owned(),
+                mem_file_path: mem_path.to_string_lossy().into_owned(),
+                snapshot_type,
+                vmstate_only: false,
+            },
+        )
+        .await?;
+        Ok(SnapshotPaths {
+            state_path,
+            mem_path,
+        })
+    }
+
     /// ADR 0045 C2 (fork v3): vmstate-only snapshot create — writes the
     /// state file at `state_path` and skips the guest-memory leg entirely.
     /// The post-copy blackout primitive: the destination demand-faults the

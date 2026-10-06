@@ -521,7 +521,8 @@ def main():
             "expect_two_hosts": "",
             "nextest_filter": (
                 "test(/e2e_/) "
-                "- test(e2e_two_host_evacuate_preserves_sentinel) "
+                "- test(e2e_retire_host_relocates_and_grants) "
+                "- test(e2e_teleport_session_honors_target_host) "
                 "- test(e2e_claude_with_bogus_key_surfaces_anthropic_auth_error)"
             ),
         },
@@ -529,7 +530,7 @@ def main():
             "variant": "teleport",
             "two_hosts": "1",
             "expect_two_hosts": "1",
-            "nextest_filter": "test(e2e_two_host_evacuate_preserves_sentinel)",
+            "nextest_filter": "test(e2e_teleport_session_honors_target_host)",
         },
     ]
     e2e_orchestrator_matrix = [{

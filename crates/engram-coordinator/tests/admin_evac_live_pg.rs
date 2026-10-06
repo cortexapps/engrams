@@ -1,30 +1,4 @@
-//! Live-Postgres integration tests for ADR 0018 session evacuation.
-//!
-//! Exercises `evacuate_dead_source` (dead/degraded source) against a
-//! real PG + the in-memory HostRegistry + mock HostClient backends.
-//! The PG side is what these tests really exercise — the rebind of
-//! `sessions.host_id` / `sessions.sandbox_id` via the
-//! `assign_session_*` and `transition_session` calls must work
-//! against the real legality-table-enforcing implementation, not a
-//! mock.
-//!
-//! `#[ignore]`'d by default; requires Postgres at
-//! `ENGRAM_TEST_DATABASE_URL`. CI wires this into the
-//! Postgres-gated-ignored lane alongside `admin_chunk_gc_live_pg`.
-//!
-//! Coverage:
-//! - `evacuate_dead_source_with_snapshot_uses_recorded_manifests`
-//!   — restores from a recorded snapshot's disk+memory manifests
-//!   when only the snapshot is available. Loss=None.
-//! - `evacuate_dead_source_disk_only_records_memory_loss` — when
-//!   only `sessions.live_disk_manifest_*` is set (no snapshot row),
-//!   the receipt carries `EvacLoss::Memory{reason: "source-dead-..."}`.
-//! - `evacuate_dead_source_no_state_returns_no_recoverable` — both
-//!   manifests absent → typed error; PG row stays at HostLost so the
-//!   caller (the `evac_resumer` scanner, fed by operator drain) can
-//!   surface it. (As of ADR 0045 Phase A the dead-host detector no
-//!   longer calls this — it routes recoverable sessions to Idle and
-//!   the rest to Dead directly; this primitive is drain-only now.)
+//! Host cordon, lease, and binding-strike tests against Postgres.
 
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
@@ -34,33 +8,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef as ChunkManifestRef};
-use engram_coordinator::evacuation::{evacuate_dead_source, EvacError};
 
 /// ADR 0116: the lazily-passed cold-boot materialization, pre-resolved
 /// for tests (production passes `materialize_cold_boot` un-awaited).
-fn ready_spec(
-    spec: Option<SandboxSpec>,
-) -> impl std::future::Future<Output = Result<Option<SandboxSpec>, engram_coordinator::error::ApiError>>
-{
-    std::future::ready(Ok(spec))
-}
-use engram_coordinator::host_registry::HostRegistry;
 use engram_core::traits::{HarnessDial, HostClient, MetadataStore};
-use engram_core::types::evacuation::EvacLoss;
-use engram_core::types::manifest::ManifestRef;
+
 use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
-use engram_core::types::snapshot::{SnapshotMetadata, SnapshotRecord};
+use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SessionId, SnapshotId};
 use engram_storage_local::LocalBlobStorage;
 use parking_lot::Mutex;
 
 struct TestRig {
     meta: Arc<dyn MetadataStore>,
-    chunk_store: ChunkStore,
     /// URL of this rig's private database, for tests that need a raw pool.
-    db_url: String,
     _blob_dir: tempfile::TempDir,
 }
 
@@ -70,19 +32,16 @@ async fn rig() -> Option<TestRig> {
     // would be a legal pick. ADR 0099 H1: each rig clones its own
     // database from the migrated template.
     let db = engram_testkit::pg::fresh_db().await?;
-    let db_url = db.url;
     let store = db.store;
 
     let blob_dir = tempfile::tempdir().expect("tempdir");
     let blob: Arc<dyn engram_core::traits::BlobStorage> =
         Arc::new(LocalBlobStorage::new(blob_dir.path().to_path_buf()));
-    let chunk_store = ChunkStore::new(blob);
+    let _ = blob;
 
     let pg = Arc::new(store);
     Some(TestRig {
         meta: pg as Arc<dyn MetadataStore>,
-        chunk_store,
-        db_url,
         _blob_dir: blob_dir,
     })
 }
@@ -100,9 +59,6 @@ struct FakeBackend {
 impl FakeBackend {
     fn new() -> Arc<Self> {
         Arc::new(Self::default())
-    }
-    fn set_restore_id(&self, id: SandboxId) {
-        *self.next_restore_id.lock() = Some(id);
     }
 }
 
@@ -346,366 +302,6 @@ async fn seed_active_session(
     session_id
 }
 
-async fn seed_manifest(store: &ChunkStore, kind: ManifestKind, label: &str) -> ChunkManifestRef {
-    use engram_chunk_store::{ChunkRef, Manifest};
-    let bytes = format!("{label}-{}", uuid::Uuid::new_v4()).into_bytes();
-    let hash = store.put_chunk(&bytes).await.expect("put chunk");
-    let mut manifest = Manifest::empty(kind, bytes.len() as u64);
-    manifest.chunks.push(ChunkRef { offset: 0, hash });
-    let r = ChunkManifestRef::new();
-    store
-        .put_manifest(r, &manifest)
-        .await
-        .expect("put manifest");
-    r
-}
-
-fn proto_to_core_manifest(r: ChunkManifestRef) -> ManifestRef {
-    ManifestRef {
-        manifest_id: r.manifest_id,
-        version: r.version,
-    }
-}
-
-/// ADR 0028 Fix B: the cold-boot spec a disk-only recovery rides (in
-/// prod, derived from the enabled image via `materialize_cold_boot`).
-fn test_cold_boot_spec() -> SandboxSpec {
-    SandboxSpec {
-        image: "ghcr.io/test/img:t".into(),
-        rootfs_source: None,
-        image_uri: Some("ghcr.io/test/img:t".into()),
-        rootfs_manifest: None,
-        cpu: engram_core::types::sandbox::CpuLimit { vcpus: 2 },
-        memory: engram_core::types::sandbox::MemoryLimit { max_mib: 4096 },
-        disk: engram_core::types::sandbox::DiskLimit { max_gib: 20 },
-        ttl: None,
-        env: Default::default(),
-        workdir: None,
-        network: Default::default(),
-        aux_ro_drives: Vec::new(),
-        swap_mib: None,
-    }
-}
-
-#[tokio::test]
-#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
-    let Some(rig) = rig().await else { return };
-    let meta = rig.meta.clone();
-    let registry = Arc::new(HostRegistry::new(meta.clone()));
-
-    let dead_source = HostId::new();
-    let target_host = HostId::new();
-    let target_be = FakeBackend::new();
-    let new_sandbox = SandboxId::new();
-    target_be.set_restore_id(new_sandbox);
-    registry.register(target_host, target_be.clone());
-
-    let session_id = seed_active_session(&meta, dead_source, SandboxId::new()).await;
-    ensure_host_row(&meta, target_host, "target").await;
-    // Simulate dead_host.rs's first-stage flip: Active → HostLost.
-    meta.transition_session(
-        session_id,
-        SessionState::HostLost,
-        BindingDisposition::Retain,
-    )
-    .await
-    .expect("Active → HostLost");
-
-    // Record a recoverable snapshot for this session.
-    let disk = seed_manifest(&rig.chunk_store, ManifestKind::Disk, "snap-disk").await;
-    let memory = seed_manifest(&rig.chunk_store, ManifestKind::Memory, "snap-mem").await;
-    meta.record_snapshot(SnapshotRecord {
-        id: SnapshotId::new(),
-        session_id: Some(session_id),
-        host_id: None,
-        image_version: "test".into(),
-        size_bytes: 1024,
-        created_at: Utc::now(),
-        last_accessed_at: Utc::now(),
-        disk_manifest: Some(proto_to_core_manifest(disk)),
-        memory_manifest: Some(proto_to_core_manifest(memory)),
-        recoverable: true,
-        aux_bundles: vec![],
-        events_cursor: None,
-        fc_snapshot_version: None,
-    })
-    .await
-    .expect("record snapshot");
-
-    let session = meta.get_session(session_id).await.expect("get session");
-    let snapshot = meta
-        .latest_snapshot_for_session(session_id)
-        .await
-        .expect("latest_snapshot lookup")
-        .expect("snapshot present");
-
-    let receipt = evacuate_dead_source(
-        &registry,
-        &meta,
-        session,
-        Some(snapshot),
-        ready_spec(None),
-        None,
-        None,
-        engram_core::traits::SessionFence::unfenced(),
-        None, // #800: budget — these tests keep the capacity-soft pick
-        chrono::Utc::now(),
-    )
-    .await
-    .expect("dead-source evac succeeds");
-    assert_eq!(receipt.new_host_id, target_host);
-    assert_eq!(receipt.new_sandbox_id, new_sandbox);
-    assert_eq!(receipt.loss, EvacLoss::None);
-
-    let after = meta.get_session(session_id).await.expect("get session");
-    assert_eq!(after.status, SessionState::Created);
-    assert_eq!(after.host_id, Some(target_host));
-    assert_eq!(after.sandbox_id, Some(new_sandbox));
-}
-
-#[tokio::test]
-#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn evacuate_dead_source_disk_only_records_memory_loss() {
-    let Some(rig) = rig().await else { return };
-    let meta = rig.meta.clone();
-    let registry = Arc::new(HostRegistry::new(meta.clone()));
-
-    let dead_source = HostId::new();
-    let target_host = HostId::new();
-    let target_be = FakeBackend::new();
-    target_be.set_restore_id(SandboxId::new());
-    registry.register(target_host, target_be);
-
-    let old_sandbox = SandboxId::new();
-    let session_id = seed_active_session(&meta, dead_source, old_sandbox).await;
-    ensure_host_row(&meta, target_host, "target").await;
-
-    // Set live_disk_manifest_*. The update is sandbox-id-gated so we
-    // pass the current binding.
-    let live_disk = seed_manifest(&rig.chunk_store, ManifestKind::Disk, "live-disk").await;
-    meta.update_live_disk_manifest(session_id, old_sandbox, proto_to_core_manifest(live_disk))
-        .await
-        .expect("update_live_disk_manifest");
-
-    meta.transition_session(
-        session_id,
-        SessionState::HostLost,
-        BindingDisposition::Retain,
-    )
-    .await
-    .expect("Active → HostLost");
-
-    let session = meta.get_session(session_id).await.expect("get session");
-    // ADR 0028 Fix B: disk-only recovery is a cold boot — the caller
-    // supplies the boot spec (in prod, derived from the enabled image
-    // via `materialize_cold_boot`).
-    let receipt = evacuate_dead_source(
-        &registry,
-        &meta,
-        session,
-        None,
-        ready_spec(Some(test_cold_boot_spec())),
-        None,
-        None,
-        engram_core::traits::SessionFence::unfenced(),
-        None, // #800: budget — these tests keep the capacity-soft pick
-        chrono::Utc::now(),
-    )
-    .await
-    .expect("disk-only evac succeeds");
-    match &receipt.loss {
-        EvacLoss::Memory { reason } => {
-            assert_eq!(reason, "source-dead-no-snapshot");
-        }
-        other => panic!("expected Memory loss, got {other:?}"),
-    }
-
-    let after = meta.get_session(session_id).await.expect("get session");
-    assert_eq!(after.status, SessionState::Created);
-}
-
-#[tokio::test]
-#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn evacuate_dead_source_no_state_returns_no_recoverable() {
-    let Some(rig) = rig().await else { return };
-    let meta = rig.meta.clone();
-    let registry = Arc::new(HostRegistry::new(meta.clone()));
-
-    let dead_source = HostId::new();
-    let target_host = HostId::new();
-    registry.register(target_host, FakeBackend::new());
-
-    let session_id = seed_active_session(&meta, dead_source, SandboxId::new()).await;
-    meta.transition_session(
-        session_id,
-        SessionState::HostLost,
-        BindingDisposition::Retain,
-    )
-    .await
-    .expect("Active → HostLost");
-
-    let session = meta.get_session(session_id).await.expect("get session");
-    let result = evacuate_dead_source(
-        &registry,
-        &meta,
-        session,
-        None,
-        ready_spec(None),
-        None,
-        None,
-        engram_core::traits::SessionFence::unfenced(),
-        None, // #800: budget — these tests keep the capacity-soft pick
-        chrono::Utc::now(),
-    )
-    .await;
-    assert!(matches!(result, Err(EvacError::NoRecoverableState)));
-
-    // PG row sits at HostLost — the caller routes it to Dead next.
-    let after = meta.get_session(session_id).await.expect("get session");
-    assert_eq!(after.status, SessionState::HostLost);
-}
-
-// ---------------------------------------------------------------------
-// ADR 0018 commit 12j — live-PG tests for the new evac_resumer
-// scanner primitives. These run in CI's Postgres-gated lane (same
-// `ENGRAM_TEST_DATABASE_URL` requirement) and pin the load-bearing
-// behaviour of the async-evac state machine.
-// ---------------------------------------------------------------------
-
-/// Migration 0037: `evac_attempts` column exists, defaults to 0, and
-/// the partial index `idx_sessions_evacuating` is created. Pins the
-/// schema so a future migration that drops/renames either surfaces
-/// here, not at runtime when the scanner's sweep query 500s.
-#[tokio::test]
-#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn migration_0037_landed_evac_attempts_column_and_index() {
-    let Some(rig) = rig().await else { return };
-    // Inspect the rig's OWN database — the schema assertions must run
-    // against what the template migration chain produced, not whatever
-    // state the shared admin database happens to be in.
-    let pool = sqlx::PgPool::connect(&rig.db_url).await.unwrap();
-
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT column_name, data_type, column_default \
-         FROM information_schema.columns \
-         WHERE table_name = 'sessions' AND column_name = 'evac_attempts'",
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
-    let (col, ty, default) = row.expect("evac_attempts column must exist after migration 0037");
-    assert_eq!(col, "evac_attempts");
-    assert_eq!(ty, "integer");
-    assert!(
-        default.as_deref().unwrap_or("").starts_with('0'),
-        "evac_attempts default must be 0, got {default:?}"
-    );
-
-    // Verify the CHECK constraint accepts 'evacuating' — without
-    // this an attempt to UPDATE sessions SET status='evacuating'
-    // 500s with a constraint violation (caught on dev-vm; that
-    // failure mode is exactly what the migration's first ALTER
-    // block guards against).
-    let idx: Option<(String,)> = sqlx::query_as(
-        "SELECT indexname FROM pg_indexes WHERE indexname = 'idx_sessions_evacuating'",
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
-    assert!(idx.is_some(), "idx_sessions_evacuating must exist");
-
-    drop(rig);
-}
-
-/// `list_evacuating_sessions` returns the right set + their
-/// `evac_attempts` values; `bump_evac_attempts` is atomic +1
-/// RETURNING; `transition_session(Evacuating)` resets the counter.
-/// All three are load-bearing for the scanner's sweep loop.
-#[tokio::test]
-#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn evac_attempts_primitives_round_trip() {
-    let Some(rig) = rig().await else { return };
-    let meta = rig.meta.clone();
-
-    let host_id = HostId::new();
-    let sandbox_id = SandboxId::new();
-    let session_id = seed_active_session(&meta, host_id, sandbox_id).await;
-
-    // Active → Evacuating (legal, sets counter to 0)
-    meta.transition_session(
-        session_id,
-        SessionState::Evacuating,
-        BindingDisposition::Retain,
-    )
-    .await
-    .expect("Active → Evacuating");
-
-    let candidates = meta
-        .list_evacuating_sessions()
-        .await
-        .expect("list_evacuating_sessions");
-    let entry = candidates
-        .iter()
-        .find(|(s, _)| s.id == session_id)
-        .expect("our session in the candidate list");
-    assert_eq!(entry.1, 0, "counter starts at 0 after Evacuating entry");
-
-    // bump returns new value; second bump returns 2.
-    let v1 = meta.bump_evac_attempts(session_id).await.unwrap();
-    let v2 = meta.bump_evac_attempts(session_id).await.unwrap();
-    assert_eq!(v1, 1);
-    assert_eq!(v2, 2);
-
-    // list reflects the latest bump.
-    let candidates = meta.list_evacuating_sessions().await.unwrap();
-    let after_bump = candidates.iter().find(|(s, _)| s.id == session_id).unwrap();
-    assert_eq!(after_bump.1, 2, "list reads back the bumped count");
-
-    // Transition out (Evacuating → Idle) — counter NOT reset (only
-    // re-entry into Evacuating resets, per migration 0037's CASE).
-    meta.transition_session(session_id, SessionState::Idle, BindingDisposition::Detach)
-        .await
-        .expect("Evacuating → Idle (budget-exhaustion fallback shape)");
-    let candidates = meta.list_evacuating_sessions().await.unwrap();
-    assert!(
-        candidates.iter().all(|(s, _)| s.id != session_id),
-        "session no longer Evacuating should drop out of the sweep"
-    );
-
-    // Re-enter Evacuating from Idle. Wait — Idle → Evacuating isn't
-    // legal directly. The supported re-entry path goes through
-    // Active. Drive Idle → Created → Active → Evacuating to exercise
-    // the legality + the counter-reset on entry.
-    meta.assign_session_sandbox(session_id, Some(SandboxId::new()))
-        .await
-        .unwrap();
-    meta.transition_session(
-        session_id,
-        SessionState::Created,
-        BindingDisposition::Retain,
-    )
-    .await
-    .expect("Idle → Created");
-    meta.transition_session(session_id, SessionState::Active, BindingDisposition::Retain)
-        .await
-        .expect("Created → Active");
-    meta.transition_session(
-        session_id,
-        SessionState::Evacuating,
-        BindingDisposition::Retain,
-    )
-    .await
-    .expect("Active → Evacuating (second drain)");
-
-    let candidates = meta.list_evacuating_sessions().await.unwrap();
-    let on_reentry = candidates.iter().find(|(s, _)| s.id == session_id).unwrap();
-    assert_eq!(
-        on_reentry.1, 0,
-        "re-entry into Evacuating must reset evac_attempts to 0"
-    );
-}
-
 /// Issue #215 (live-PG): the actual `sessions.missing_strikes` SQL must
 /// reset on a sandbox re-key. Accrue `grace_ticks - 1` strikes against
 /// SB1 via `apply_missing_sandbox_strikes`, then rebind to SB2 via the
@@ -807,8 +403,8 @@ async fn missing_strikes_reset_on_sandbox_rekey() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
-    use engram_coordinator::host_registry::HostRegistry;
     use engram_coordinator::placement::{self, ScheduleContext};
+    use engram_coordinator::HostRegistry;
     let Some(rig) = rig().await else { return };
     let meta = rig.meta.clone();
     let registry = Arc::new(HostRegistry::new(meta.clone()));
@@ -1158,110 +754,4 @@ async fn delete_host_refuses_unretired_then_idempotent() {
         DeleteHostOutcome::Deleted => {}
         other => panic!("a second delete of a gone row must be Deleted, got {other:?}"),
     }
-}
-
-/// ADR 0048 C8 (drain don't-strand guard): `placement_preview` is the
-/// HARD 2D fit check `drain_host` runs before starting ANY move. If the
-/// only survivor (the victim excluded) can't hold the session's budgets,
-/// it returns `false` so the drain surfaces a failure instead of parking
-/// an Active session Idle on a full fleet. A measured-but-too-small
-/// survivor → false; growing it (or its CPU budget) → true. An UNMEASURED
-/// survivor (allocatable 0) keeps the soft-fits posture → true.
-#[tokio::test]
-#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn drain_dont_strand_guard_blocks_when_no_survivor_fits() {
-    use engram_coordinator::placement::{self, ScheduleContext};
-    let Some(rig) = rig().await else { return };
-    let meta = rig.meta.clone();
-
-    let victim = HostId::new();
-    let survivor = HostId::new();
-    seed_ready_host(&meta, victim, "drain-victim").await;
-    seed_ready_host(&meta, survivor, "drain-survivor").await;
-
-    // Heartbeat the survivor as MEASURED with a small allocatable + a
-    // CPU budget. allocatable 4096 MiB; total_vcpus 4 ⇒ CPU budget
-    // 4 × overcommit (default 4.0) = 16 vCPU.
-    let heartbeat = |alloc_mib: u64, vcpus: u32| {
-        let meta = meta.clone();
-        async move {
-            meta.touch_host_heartbeat(
-                survivor,
-                engram_core::types::host::HostHeartbeat {
-                    status: engram_core::types::HostStatus::Ready,
-                    capacity: engram_core::types::HostCapacity {
-                        total_gb: 0,
-                        used_gb: 0,
-                        total_mib: 65_536,
-                        used_mib: 0,
-                        running_sandboxes: 0,
-                    },
-                    utilization: engram_core::types::host::HostUtilization {
-                        allocatable_mib: alloc_mib,
-                        ..Default::default()
-                    },
-                    ready_images: Vec::new(),
-                    current_bundles: Vec::new(),
-                    sandbox_bundles: Vec::new(),
-                    total_vcpus: vcpus,
-                    wire_version: engram_protocol::WIRE_VERSION,
-                    stages_images: false,
-                    capabilities: engram_core::types::host::HostCapabilities::default(),
-                    lease_renew_until: None,
-                },
-            )
-            .await
-            .expect("heartbeat survivor");
-        }
-    };
-    heartbeat(4_096, 4).await;
-
-    // The victim is excluded (it's draining); the survivor is the only
-    // candidate left.
-    let ctx = ScheduleContext {
-        repo: "test/img",
-        image_version: "v1",
-        snapshot_host: None,
-        memory_mib: Some(8_192),
-        cpu_budget_vcpus: Some(2),
-        required_image_digest: None,
-        exclude_host: Some(victim),
-        prefer_host: None,
-        caps: Default::default(),
-        prefer_bundles: &[],
-    };
-
-    // 8 GiB session, survivor has 4 GiB free → no fit → would strand.
-    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 2, chrono::Utc::now())
-        .await
-        .expect("placement_preview");
-    assert!(
-        !fits,
-        "a 8 GiB session must NOT fit a 4 GiB survivor — the guard blocks the drain"
-    );
-
-    // Grow the survivor's RAM → now it fits both dims.
-    heartbeat(16_384, 4).await;
-    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 2, chrono::Utc::now())
-        .await
-        .expect("placement_preview");
-    assert!(fits, "a 8 GiB session fits a 16 GiB survivor");
-
-    // CPU dimension binds independently: plenty of RAM, but a 32-vCPU
-    // ask against a 4-core × 4.0 = 16-vCPU budget → no fit.
-    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 32, chrono::Utc::now())
-        .await
-        .expect("placement_preview");
-    assert!(
-        !fits,
-        "CPU budget binds before RAM — a 32-vCPU ask exceeds the 16-vCPU host budget"
-    );
-
-    // An UNMEASURED survivor (allocatable 0, no reported cores) keeps the
-    // soft-fits posture reserve_placement takes for brand-new / dev hosts.
-    heartbeat(0, 0).await;
-    let fits = placement::placement_preview(meta.as_ref(), &ctx, 8_192, 32, chrono::Utc::now())
-        .await
-        .expect("placement_preview");
-    assert!(fits, "an unmeasured survivor soft-fits any budget");
 }

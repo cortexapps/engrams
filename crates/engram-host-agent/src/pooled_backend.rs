@@ -395,6 +395,7 @@ struct CaptureUnwind {
         Arc<DashMap<SandboxId, PendingPresetup>>,
     )>,
     defused: bool,
+    resume_on_drop: bool,
 }
 
 impl CaptureUnwind {
@@ -411,6 +412,7 @@ impl CaptureUnwind {
             disk_seal: None,
             presetup_restore: None,
             defused: true,
+            resume_on_drop: true,
         }
     }
 
@@ -433,6 +435,7 @@ impl Drop for CaptureUnwind {
             return;
         }
         let inner = self.inner.clone();
+        let resume_on_drop = self.resume_on_drop;
         let id = self.id;
         let disk_backend = self.disk_backend.take();
         let fenced = self.fenced;
@@ -479,6 +482,7 @@ impl Drop for CaptureUnwind {
                     backend.set_migration_fence(false);
                 }
             }
+            if !resume_on_drop { return; }
             if let Err(e) = inner.resume(id).await {
                 tracing::warn!(
                     sandbox_id = %id,
@@ -808,6 +812,13 @@ pub struct PooledBackend {
     /// restart between snapshot and commit/abort leaves an orphan dir
     /// — small bounded leak we accept until a host-side janitor lands).
     inflight_snapshots: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
+    /// ADR 0123 B: `snapshot_hold` keeps a captured source paused and
+    /// records the swap policy it disarmed; `resume` re-arms it once and
+    /// `destroy` clears it.
+    held_swap_policy: DashMap<SandboxId, SwapDisarm>,
+    /// The metadata of the snapshot a held source produced, for the
+    /// coordinator's `snapshot_wait` after the hold.
+    held_snapshots: DashMap<SandboxId, SnapshotMetadata>,
     /// ADR 0016 Phase A: unix-ms timestamp of the last successful
     /// `snapshot(sandbox_id)` per sandbox. Read by `cow_state` to
     /// populate the memory-tier RPO field. `0`/absent = never
@@ -1556,6 +1567,14 @@ impl PooledBackend {
     fn spawn_swap_rearm(self: &Arc<Self>, id: SandboxId) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            // Under the capture lock: a re-arm that lands inside another
+            // capture's disarm→pause window would put swap PTEs into the
+            // image that capture is about to take (ADR 0112 D3). A hold
+            // or a destroy that arrived first wins and the re-arm is moot.
+            let _capture = this.capture_lock(id).lock_owned().await;
+            if this.held_swap_policy.contains_key(&id) {
+                return;
+            }
             let script = "for d in /sys/block/vd*; do n=$(basename $d); \
                           [ \"$n\" != vda ] && [ \"$(cat $d/ro)\" = 0 ] && \
                           swapon /dev/$n; done";
@@ -2259,15 +2278,23 @@ impl PooledBackend {
                 if post_copy_dest {
                     migration_roles.insert(new_id, crate::migration::MigrationRole::PostCopyDest);
                 }
-                state
+                if let Err(error) = state
                     .backend
                     .relocate_dirty_file(&dirty_root.join(format!("{new_id}.cache")))
                     .await
-                    .map_err(|error| {
-                        SandboxError::Vm(
-                            format!("move restored sandbox dirty file into place: {error}").into(),
-                        )
-                    })?;
+                {
+                    // The VM is live on a device this task is about to
+                    // drop. Tear the VM down FIRST so the device never
+                    // disconnects under a running Firecracker (the
+                    // cross-session I/O hazard this task exists to avoid).
+                    if let Err(e) = inner.destroy(new_id).await {
+                        tracing::warn!(sandbox_id = %new_id, error = %e,
+                            "destroy after a failed dirty-file relocation failed");
+                    }
+                    return Err(SandboxError::Vm(
+                        format!("move restored sandbox dirty file into place: {error}").into(),
+                    ));
+                }
                 // ADR 0016 Phase B commit 5: post-restore wiring. The new
                 // sandbox_id is only known here; install it into
                 // `nbd_sandboxes` together with the FlushScheduler so the
@@ -2378,6 +2405,8 @@ impl PooledBackend {
             // (`with_nbd_pool`) — a pool-less host has nothing to classify,
             // so its residue report is vacuously known-empty.
             nbd_residue_known: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            held_swap_policy: DashMap::new(),
+            held_snapshots: DashMap::new(),
             inflight_snapshots: Arc::new(DashMap::new()),
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
             checkpoint_pacing: Arc::new(DashMap::new()),
@@ -2652,7 +2681,9 @@ impl PooledBackend {
         &self,
         id: SandboxId,
     ) -> Result<DeferredSnapshot, SandboxError> {
-        let (capture_guard, cap) = self.capture_phase(id, SwapDisarmPolicy::Terminal).await?;
+        let (capture_guard, cap) = self
+            .capture_phase(id, SwapDisarmPolicy::Terminal, false)
+            .await?;
         self.spawn_trace_publish(id);
         // ADR 0116 C3: the cold-base seed's multi-GiB upload is the
         // canonical background bulk producer — nested-capped so it can
@@ -2816,6 +2847,7 @@ impl PooledBackend {
         &self,
         id: SandboxId,
         swap_policy: SwapDisarmPolicy,
+        hold: bool,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, SnapshotCapture), SandboxError> {
         let capture_lock = self.capture_lock(id);
         // ADR 0038 B0: time the lock wait — the gridlock signal. With
@@ -2823,6 +2855,11 @@ impl PooledBackend {
         // here is an eviction/drain blocked on an in-flight capture.
         let lock_wait = crate::time_source::metrics_now();
         let capture_guard = capture_lock.lock_owned().await;
+        if self.held_swap_policy.contains_key(&id) {
+            return Err(SandboxError::Snapshot(
+                "snapshot hold already in progress; resume or destroy required".into(),
+            ));
+        }
         metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
             .record(lock_wait.elapsed().as_secs_f64());
         // 2026-08-03 `chain_poisoned` alert: the SIGTERM capture-quiesce
@@ -2988,6 +3025,17 @@ impl PooledBackend {
         // the (memory, disk, event-log) triple — the coord resolves
         // the session_events cursor as "last event at or before this"
         // when it records the checkpoint.
+        if hold {
+            self.held_swap_policy.insert(id, swap_disarm);
+            // Resume now owns re-arm, even if this capture is cancelled.
+            swap_rearm.target.take();
+            // Persisted BEFORE the pause: a host-agent that restarts while
+            // the move is open re-adopts this VM as a frozen source (never
+            // self-resumes, never a checkpoint candidate) instead of a
+            // running guest the periodic capture would un-pause.
+            self.set_migration_role(id, Some(crate::migration::MigrationRole::HeldSource))
+                .await?;
+        }
         let paused_at = self.clock.now_utc();
         self.inner
             .pause(id)
@@ -3005,6 +3053,7 @@ impl PooledBackend {
         // `flush_upload` takes it over (covering the cancellation gap in
         // `snapshot_begin` between this return and the finisher spawn).
         let mut unwind = CaptureUnwind::new(self.inner.clone(), id);
+        unwind.resume_on_drop = !hold;
         unwind.arm();
 
         // ADR 0038 B3: under the pause, only DRAIN the dirty buffer
@@ -3104,7 +3153,9 @@ impl PooledBackend {
         // resume path (chain seeded → diff).
         let snap_type = if chain_prev.is_some() { "diff" } else { "full" };
         let create_start = crate::time_source::metrics_now();
-        let create_res = if chain_prev.is_some() {
+        let create_res = if hold {
+            self.inner.snapshot_hold(id, chain_prev.is_some()).await
+        } else if chain_prev.is_some() {
             self.inner.snapshot_diff(id).await
         } else {
             self.inner.snapshot(id).await
@@ -4826,7 +4877,7 @@ impl PooledBackend {
         swap_policy: SwapDisarmPolicy,
         class: engram_chunk_store::UploadClass,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        let (_capture_guard, cap) = self.capture_phase(id, swap_policy).await?;
+        let (_capture_guard, cap) = self.capture_phase(id, swap_policy, false).await?;
         // Lift the per-jail working-set trace into the blob store under the
         // session-canonical key so the next resume prefaults it (#517 keyed
         // the replay; the handler can't publish it itself — SIGKILLed on
@@ -6689,8 +6740,8 @@ impl SnapshotFinisher {
         let dest = cap.dest;
         let chain_prev = cap.chain_prev;
         let paused_at = cap.paused_at;
-        // Issue #202: the finisher now owns the capture. The guest is
-        // running (inner.snapshot resumed it) and `flush_upload` below
+        // Issue #202: the finisher now owns the capture. Ordinary snapshots
+        // resume; snapshot_hold stays paused. `flush_upload` below
         // owns the drained chunks' re-queue on its own error path, so
         // take the pending out of the guard and defuse it — from here
         // the guard's resume/requeue must NOT fire.
@@ -6708,9 +6759,9 @@ impl SnapshotFinisher {
         // coordinator's own lifecycle events (median 4, prod evidence).
         metadata.paused_at = Some(paused_at);
         let post = async {
-            // ADR 0038 B3: the guest has resumed (inner.snapshot above
-            // brought it back). Upload the drained disk chunks to GCS +
-            // publish the manifest now — OFF the frozen-guest path. The
+            // ADR 0038 B3: upload the drained disk chunks and publish the
+            // manifest. Ordinary snapshots have resumed; snapshot_hold keeps
+            // the source paused throughout this upload. The
             // operation scope makes the chunk uploads attach `chunk.flush`
             // spans to the snapshot op's trace. Awaited here (before the
             // snapshot is recorded) so the recorded `disk_manifest`
@@ -7845,6 +7896,25 @@ impl SandboxBackend for PooledBackend {
         self.inner.open_guest_stream(id, port).await
     }
 
+    async fn snapshot_hold(
+        &self,
+        id: SandboxId,
+        _diff: bool,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        if let Some(metadata) = self.held_snapshots.get(&id) {
+            return Ok(metadata.clone());
+        }
+        let (_guard, cap) = self
+            .capture_phase(id, SwapDisarmPolicy::Terminal, true)
+            .await?;
+        let metadata = self
+            .finisher_with_class(engram_chunk_store::UploadClass::Foreground)
+            .finish(id, cap)
+            .await?;
+        self.held_snapshots.insert(id, metadata.clone());
+        Ok(metadata)
+    }
+
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         // ADR 0112: trait callers are the drain / operator / base-bake
         // flavors — Terminal disarm. The periodic checkpoint reaches
@@ -7904,7 +7974,9 @@ impl SandboxBackend for PooledBackend {
             ));
         };
 
-        let (capture_guard, cap) = self.capture_phase(id, SwapDisarmPolicy::Terminal).await?;
+        let (capture_guard, cap) = self
+            .capture_phase(id, SwapDisarmPolicy::Terminal, false)
+            .await?;
         // Publish the working-set trace for the next resume's prefault (see
         // `spawn_trace_publish`); detached, never blocks the eviction.
         self.spawn_trace_publish(id);
@@ -9158,34 +9230,49 @@ impl SandboxBackend for PooledBackend {
         if let Some(peer) = self.migrate_peer_server() {
             peer.remove(export_id);
         }
-        // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop the
-        // guard before the `requeue_*` awaits.
+        // The export is consumed: from here the cleanup must run to the
+        // end even if this request is cancelled, or a retry would see
+        // NotFound with the fence still raised. A detached task owns it;
+        // the request only awaits the result.
+        let inner = self.inner.clone();
+        let migration_roles = self.migration_roles.clone();
         #[cfg(target_os = "linux")]
-        let backend = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone());
-        #[cfg(target_os = "linux")]
-        if let Some(backend) = backend {
-            if let Some(pending) = export.disk_pending {
-                backend.requeue_pending(pending).await;
+        let nbd_sandboxes = self.nbd_sandboxes.clone();
+        let export_id = export_id.to_string();
+        tokio::spawn(async move {
+            // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop the
+            // guard before the `requeue_*` awaits.
+            #[cfg(target_os = "linux")]
+            let backend = nbd_sandboxes.get(&id).map(|e| e.backend.clone());
+            #[cfg(target_os = "linux")]
+            if let Some(backend) = backend {
+                if let Some(pending) = export.disk_pending {
+                    backend.requeue_pending(pending).await;
+                }
+                // Disk post-copy: the sealed bytes go back into `dirty`
+                // so the resumed guest's next flush captures them.
+                if let Some(sealed) = export.disk_seal.as_deref() {
+                    backend.requeue_postcopy_seal(sealed).await;
+                }
+                backend.set_migration_fence(false);
             }
-            // Disk post-copy: the sealed bytes go back into `dirty`
-            // so the resumed guest's next flush captures them.
-            if let Some(sealed) = export.disk_seal.as_deref() {
-                backend.requeue_postcopy_seal(sealed).await;
-            }
-            backend.set_migration_fence(false);
-        }
-        let snapshot_dir = export.snapshot_dir.clone();
-        let _ = fs::remove_dir_all(&snapshot_dir).await;
-        drop(export.capture_guard);
-        self.inner
-            .resume(id)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("migration abort resume: {e}")))?;
-        // Last: the drained bytes are back, the fence is down, and the
-        // guest runs again whether or not this manifest write succeeds.
-        self.set_migration_role(id, None).await?;
-        tracing::info!(sandbox_id = %id, "migration aborted; guest resumed in place (ADR 0045 C1)");
-        Ok(())
+            let snapshot_dir = export.snapshot_dir.clone();
+            let _ = fs::remove_dir_all(&snapshot_dir).await;
+            drop(export.capture_guard);
+            inner
+                .resume(id)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("migration abort resume: {e}")))?;
+            // Last: the drained bytes are back, the fence is down, and the
+            // guest runs again whether or not this manifest write succeeds
+            // (`resume` retries the clear). In-memory first, then the manifest.
+            migration_roles.remove(&id);
+            inner.set_manifest_migration_role(id, None).await?;
+            tracing::info!(sandbox_id = %id, export_id, "migration aborted; guest resumed in place (ADR 0045 C1)");
+            Ok(())
+        })
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("migration abort task: {e}")))?
     }
 
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -9333,7 +9420,19 @@ impl SandboxBackend for PooledBackend {
                 ));
             }
         }
-        self.inner.resume(id).await
+        self.inner.resume(id).await?;
+        if let Some((_, policy)) = self.held_swap_policy.remove(&id) {
+            self.held_snapshots.remove(&id);
+            if policy == SwapDisarm::Disarmed {
+                if let Some(backend) = self.self_ref.get().and_then(std::sync::Weak::upgrade) {
+                    backend.spawn_swap_rearm(id);
+                }
+            }
+        }
+        // A resumed guest carries no source role. Idempotent, and the retry
+        // path for a role clear that failed inside an earlier abort or hold.
+        self.set_migration_role(id, None).await?;
+        Ok(())
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
@@ -9497,6 +9596,9 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+        // A held source forgets its swap policy and metadata with the VM.
+        self.held_swap_policy.remove(&id);
+        self.held_snapshots.remove(&id);
         self.teardowns
             .run_or_join(id, || {
                 let session_bindings = self.session_bindings.clone();
@@ -11384,7 +11486,10 @@ mod tests {
             .unwrap();
 
         pooled.quiesce_captures_for_shutdown();
-        let err = match pooled.capture_phase(id, SwapDisarmPolicy::Terminal).await {
+        let err = match pooled
+            .capture_phase(id, SwapDisarmPolicy::Terminal, false)
+            .await
+        {
             Ok(_) => panic!("a quiesced capture must refuse"),
             Err(e) => e,
         };
@@ -15984,7 +16089,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (inner, release) = custody_backend(tmp.path(), false);
         let pooled = PooledBackend::new(inner.clone());
-        let mut capture = Box::pin(pooled.capture_phase(inner.id, SwapDisarmPolicy::Periodic));
+        let mut capture =
+            Box::pin(pooled.capture_phase(inner.id, SwapDisarmPolicy::Periodic, false));
         assert!(futures::poll!(&mut capture).is_pending());
         let agent = AgentSpec {
             argv: vec![],
@@ -17266,5 +17372,151 @@ mod tests {
                 "reclaim must not have been called"
             );
         }
+    }
+    struct HoldBackend {
+        inner: FakeCaptureBackend,
+        paused: std::sync::atomic::AtomicBool,
+        rearms: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl SandboxBackend for HoldBackend {
+        async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            self.inner.create(spec).await
+        }
+        async fn exec_stream(
+            &self,
+            id: SandboxId,
+            cmd: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            use std::sync::atomic::Ordering;
+            assert!(
+                !self.paused.load(Ordering::SeqCst),
+                "guest exec while paused"
+            );
+            let script = cmd.command.join(" ");
+            if script.contains("swapon") {
+                self.rearms.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(ExecStream {
+                sandbox_id: id,
+                exec_id: "swap".into(),
+                events: Box::pin(futures::stream::iter([
+                    engram_core::types::sandbox::ExecEvent::Stdout(bytes::Bytes::from_static(
+                        b"SwapTotal: 1024 kB\nSwapFree: 1024 kB\nMemAvailable: 65536 kB\n",
+                    )),
+                    engram_core::types::sandbox::ExecEvent::Exit(Some(0)),
+                ])),
+            })
+        }
+        fn swap_mib(&self, _: SandboxId) -> Option<u32> {
+            Some(1)
+        }
+        async fn pause(&self, _: SandboxId) -> Result<(), SandboxError> {
+            self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn resume(&self, _: SandboxId) -> Result<(), SandboxError> {
+            self.paused
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            panic!("hold must not call the capture that resumes")
+        }
+        async fn snapshot_hold(
+            &self,
+            id: SandboxId,
+            _: bool,
+        ) -> Result<SnapshotMetadata, SandboxError> {
+            assert!(self.paused.load(std::sync::atomic::Ordering::SeqCst));
+            self.inner.snapshot(id).await
+        }
+        fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+            self.inner.snapshot_path_for(id)
+        }
+        async fn restore(&self, meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            self.inner.restore(meta).await
+        }
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.inner.destroy(id).await
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            self.inner.list().await
+        }
+    }
+    fn held_fixture() -> (tempfile::TempDir, Arc<PooledBackend>, Arc<HoldBackend>) {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(HoldBackend {
+            inner: FakeCaptureBackend {
+                payload: vec![0; 4096],
+                staging_root: dir.path().join("snapshots"),
+                destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+            },
+            paused: std::sync::atomic::AtomicBool::new(false),
+            rearms: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let pooled = Arc::new(PooledBackend::new(inner.clone()));
+        pooled.set_self_ref(&pooled);
+        (dir, pooled, inner)
+    }
+    #[tokio::test]
+    async fn snapshot_hold_stays_paused_without_swap_rearm() {
+        let (_dir, pooled, inner) = held_fixture();
+        let id = SandboxId::new();
+        let first = pooled.snapshot_hold(id, false).await.unwrap();
+        let retry = pooled.snapshot_hold(id, false).await.unwrap();
+        assert_eq!(
+            first.id, retry.id,
+            "a lost response reuses the held capture"
+        );
+        tokio::task::yield_now().await;
+        assert!(inner.paused.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            *pooled.held_swap_policy.get(&id).unwrap(),
+            SwapDisarm::Disarmed
+        );
+        // The hold is a persisted source role: a host-agent restart
+        // re-adopts the paused VM as frozen, never as a running guest.
+        assert_eq!(
+            pooled.migration_role(id),
+            Some(crate::migration::MigrationRole::HeldSource)
+        );
+        assert!(
+            pooled.snapshot(id).await.is_err(),
+            "periodic capture must not touch a held VM"
+        );
+    }
+    #[tokio::test]
+    async fn resume_after_snapshot_hold_rearms_once() {
+        let (_dir, pooled, inner) = held_fixture();
+        let id = SandboxId::new();
+        pooled.snapshot_hold(id, false).await.unwrap();
+        pooled.resume(id).await.unwrap();
+        pooled.resume(id).await.unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!inner.paused.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!pooled.held_swap_policy.contains_key(&id));
+        assert!(!pooled.held_snapshots.contains_key(&id));
+        assert_eq!(
+            pooled.migration_role(id),
+            None,
+            "resume clears the held role"
+        );
+    }
+    #[tokio::test]
+    async fn destroy_after_snapshot_hold_clears_policy() {
+        let (_dir, pooled, inner) = held_fixture();
+        let id = SandboxId::new();
+        pooled.snapshot_hold(id, false).await.unwrap();
+        pooled.destroy(id).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!pooled.held_swap_policy.contains_key(&id));
+        assert!(!pooled.held_snapshots.contains_key(&id));
+        assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(inner.inner.destroy_calls.lock().as_slice(), &[id]);
     }
 }

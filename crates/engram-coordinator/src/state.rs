@@ -28,6 +28,14 @@ use crate::Services;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
+    TeleportFinished {
+        teleport_id: engram_core::TeleportId,
+        outcome: engram_core::types::teleport::TeleportOutcome,
+        kind: engram_core::types::teleport::TeleportKind,
+        dest_host_id: Option<engram_core::HostId>,
+        error: Option<String>,
+        at: DateTime<Utc>,
+    },
     /// Session moved between lifecycle states.
     StatusChanged {
         from: SessionState,
@@ -504,6 +512,7 @@ impl SessionEvent {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::StatusChanged { .. } => "status_changed",
+            Self::TeleportFinished { .. } => "teleport_finished",
             Self::PromptReceived { .. } => "prompt_received",
             Self::ToolResultSubmitted { .. } => "tool_result_submitted",
             Self::HarnessModeChanged { .. } => "harness_mode_changed",
@@ -2281,24 +2290,8 @@ pub(crate) mod tests {
         /// `assign_session_sandbox(None)`) so tests can verify the
         /// barrier behaviour Phase C will rely on.
         pub(crate) chunk_generation: PlMutex<u64>,
-        /// ADR 0018 commit 12b: in-memory mirror of
-        /// `sessions.evac_attempts`. Reset to 0 when the session
-        /// transitions into Evacuating; bumped by
-        /// `bump_evac_attempts`; observed by the scanner via
-        /// `list_evacuating_sessions`.
-        pub(crate) evac_attempts: PlMutex<std::collections::HashMap<SessionId, u32>>,
-        /// ADR 0034: in-memory mirror of `sessions.evict_attempts`.
-        /// Same lifecycle as `evac_attempts`, for the eviction
-        /// scanner.
+        /// ADR 0034: in-memory mirror of the eviction retry count.
         pub(crate) evict_attempts: PlMutex<std::collections::HashMap<SessionId, u32>>,
-        /// ADR 0047: in-memory mirror of `teleport_targets` (the
-        /// migration pin honored by evac_resumer as a strict
-        /// require_host). Issue #209 tests assert this is cleared on
-        /// every verb exit path — the default no-op trait impl would make
-        /// such an assertion vacuous, so the mock tracks it for real.
-        /// Issue #214: tracks the set-at timestamp alongside the pin so
-        /// the aged-pin scanner test can backdate one deterministically.
-        pub(crate) teleport_targets: PlMutex<TeleportPinMap>,
         /// Issue #531/PR #564 (ADR 0068 persist-before-reconcile
         /// regression): when true, the NEXT `touch_host_heartbeat` call
         /// fails instead of persisting — tests use this to prove the
@@ -2339,15 +2332,6 @@ pub(crate) mod tests {
         /// (the trait default returns `None`, which rejects every mode).
         pub(crate) harness: PlMutex<Option<String>>,
     }
-
-    /// Alias so `clippy::type_complexity` stays happy on MiniMeta's
-    /// `teleport_targets` field. `session_id → (target_host, set_at?)` —
-    /// `set_at` is `None` only for a pin staged before issue #214's
-    /// migration (the scanner treats such a pin as not-aged).
-    pub(crate) type TeleportPinMap = std::collections::HashMap<
-        SessionId,
-        (engram_core::HostId, Option<chrono::DateTime<chrono::Utc>>),
-    >;
 
     impl MiniMeta {
         /// ADR 0047: placement reads host rows now — tests stage a
@@ -2397,9 +2381,7 @@ pub(crate) mod tests {
                 fail_next_record_snapshot: PlMutex::new(false),
                 live_disk_manifests: PlMutex::new(std::collections::HashMap::new()),
                 chunk_generation: PlMutex::new(0),
-                evac_attempts: PlMutex::new(std::collections::HashMap::new()),
                 evict_attempts: PlMutex::new(std::collections::HashMap::new()),
-                teleport_targets: PlMutex::new(std::collections::HashMap::new()),
                 fail_next_heartbeat_persist: PlMutex::new(false),
                 fail_next_append_event: PlMutex::new(false),
                 reconcile_probe_calls: PlMutex::new(0),
@@ -2589,9 +2571,6 @@ pub(crate) mod tests {
             // budget clean. Mirrors the PG `CASE WHEN $2 =
             // 'evacuating' THEN 0` branch in
             // `engram_postgres::transition_session`.
-            if matches!(target, engram_core::types::SessionState::Evacuating) {
-                self.evac_attempts.lock().insert(id, 0);
-            }
             // ADR 0034: same reset-on-entry for Evicting. Mirrors the
             // PG `CASE WHEN $2 = 'evicting' THEN 0` branch.
             if matches!(target, engram_core::types::SessionState::Evicting) {
@@ -2665,28 +2644,7 @@ pub(crate) mod tests {
             s.host_id = host_id;
             Ok(())
         }
-        async fn set_teleport_target(
-            &self,
-            id: engram_core::SessionId,
-            target: Option<HostId>,
-        ) -> Result<(), MetaError> {
-            let mut t = self.teleport_targets.lock();
-            match target {
-                Some(h) => {
-                    t.insert(id, (h, Some(chrono::Utc::now())));
-                }
-                None => {
-                    t.remove(&id);
-                }
-            }
-            Ok(())
-        }
-        async fn get_teleport_target(
-            &self,
-            id: engram_core::SessionId,
-        ) -> Result<Option<(HostId, Option<chrono::DateTime<chrono::Utc>>)>, MetaError> {
-            Ok(self.teleport_targets.lock().get(&id).copied())
-        }
+
         async fn assign_session_sandbox(
             &self,
             id: engram_core::SessionId,
@@ -2779,6 +2737,38 @@ pub(crate) mod tests {
                 }
                 _ => Vec::new(),
             })
+        }
+        async fn get_host(&self, id: HostId) -> Result<Option<HostRecord>, MetaError> {
+            Ok(self.hosts.lock().iter().find(|h| h.id == id).cloned())
+        }
+        async fn open_teleport_for_session(
+            &self,
+            _id: SessionId,
+        ) -> Result<Option<engram_core::types::teleport::TeleportRow>, MetaError> {
+            Ok(None)
+        }
+        async fn request_host_retirement(
+            &self,
+            id: HostId,
+            owner: engram_core::types::host::CordonOwner,
+            reason: &str,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<bool, MetaError> {
+            use engram_core::types::host::HostStatus;
+            let mut hosts = self.hosts.lock();
+            let Some(h) = hosts.iter_mut().find(|h| h.id == id) else {
+                return Ok(false);
+            };
+            if !matches!(h.status, HostStatus::Ready | HostStatus::Draining)
+                || h.cordon_owner.is_some_and(|o| o != owner)
+            {
+                return Ok(false);
+            }
+            h.cordoned = true;
+            h.cordon_owner = Some(owner);
+            h.cordon_reason = Some(reason.to_owned());
+            h.retire_requested_at.get_or_insert(now);
+            Ok(true)
         }
         async fn set_host_cordon(
             &self,
@@ -3474,25 +3464,6 @@ pub(crate) mod tests {
 
         // ADR 0018 commit 12b: scanner support. MiniMeta carries one
         // session, so the list-sweep is trivially "is it Evacuating?".
-        async fn list_evacuating_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
-            let s = self.session.lock().clone();
-            if matches!(s.status, engram_core::types::SessionState::Evacuating) {
-                let attempts = self.evac_attempts.lock().get(&s.id).copied().unwrap_or(0);
-                Ok(vec![(s, attempts)])
-            } else {
-                Ok(Vec::new())
-            }
-        }
-
-        async fn bump_evac_attempts(
-            &self,
-            session_id: engram_core::SessionId,
-        ) -> Result<u32, MetaError> {
-            let mut map = self.evac_attempts.lock();
-            let entry = map.entry(session_id).or_insert(0);
-            *entry += 1;
-            Ok(*entry)
-        }
 
         // ADR 0034: eviction-scanner support, mirroring the 12b evac
         // trio above. MiniMeta carries one session, so the list-sweep

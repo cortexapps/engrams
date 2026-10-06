@@ -362,6 +362,30 @@ impl HostService for HostServiceImpl {
         .await
     }
 
+    async fn snapshot_hold(
+        &self,
+        req: Request<FencedSandboxRequest>,
+    ) -> Result<Response<SnapshotResponse>, Status> {
+        let span = tracing::info_span!("host.snapshot_hold");
+        link_remote_parent(&span, &req);
+        check_wire_version(&req)?;
+        async move {
+            let r = req.into_inner();
+            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+            let id = decode_sandbox_id(&r.uuid)?;
+            let metadata = self
+                .inner
+                .snapshot_hold(id, fence)
+                .await
+                .map_err(sandbox_to_status)?;
+            Ok(Response::new(SnapshotResponse {
+                metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+
     async fn snapshot_begin(
         &self,
         req: Request<FencedSandboxRequest>,

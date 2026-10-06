@@ -5293,7 +5293,7 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        self.snapshot_with_type(id, client::SnapshotType::Full)
+        self.snapshot_with_type(id, client::SnapshotType::Full, false)
             .await
     }
 
@@ -5302,8 +5302,21 @@ impl SandboxBackend for FirecrackerBackend {
     /// artifact is `memory.diff` (sparse, dirty-pages-only; the KVM
     /// dirty bitmap resets on capture so successive calls chain).
     /// Requires `FirecrackerConfig::track_dirty_pages`.
+    async fn snapshot_hold(
+        &self,
+        id: SandboxId,
+        diff: bool,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        let kind = if diff {
+            client::SnapshotType::Diff
+        } else {
+            client::SnapshotType::Full
+        };
+        self.snapshot_with_type(id, kind, true).await
+    }
+
     async fn snapshot_diff(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        self.snapshot_with_type(id, client::SnapshotType::Diff)
+        self.snapshot_with_type(id, client::SnapshotType::Diff, false)
             .await
     }
 
@@ -7147,6 +7160,7 @@ impl FirecrackerBackend {
         &self,
         id: SandboxId,
         snapshot_type: client::SnapshotType,
+        hold: bool,
     ) -> Result<SnapshotMetadata, SandboxError> {
         // Read sandbox state under the dashmap guard, drop guard before
         // any await so we don't hold the read lock across an HTTP call.
@@ -7214,15 +7228,24 @@ impl FirecrackerBackend {
         // 32 GiB capture). See `snapshot_create_timeout`.
         let api = FirecrackerClient::new(&socket)
             .with_timeout(snapshot_create_timeout(spec.memory.max_mib));
-        let create_result = match snapshot_type {
-            client::SnapshotType::Full => api.create_snapshot(&dest).await,
-            client::SnapshotType::Diff => {
-                api.create_snapshot_at(
-                    dest.join("state.bin"),
-                    dest.join("memory.diff"),
-                    client::SnapshotType::Diff,
-                )
+        let create_result = if hold {
+            let name = match snapshot_type {
+                client::SnapshotType::Full => "memory.bin",
+                client::SnapshotType::Diff => "memory.diff",
+            };
+            api.create_snapshot_held(dest.join("state.bin"), dest.join(name), snapshot_type)
                 .await
+        } else {
+            match snapshot_type {
+                client::SnapshotType::Full => api.create_snapshot(&dest).await,
+                client::SnapshotType::Diff => {
+                    api.create_snapshot_at(
+                        dest.join("state.bin"),
+                        dest.join("memory.diff"),
+                        client::SnapshotType::Diff,
+                    )
+                    .await
+                }
             }
         };
         // The create ran `prepare_save`, which queued a vsock

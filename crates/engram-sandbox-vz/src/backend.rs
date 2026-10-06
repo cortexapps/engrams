@@ -1381,6 +1381,15 @@ impl SandboxBackend for VzBackend {
         vm.resume().await.map_err(SandboxError::from)
     }
 
+    async fn snapshot_hold(
+        &self,
+        id: SandboxId,
+        _diff: bool,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        self.pause(id).await?;
+        self.snapshot(id).await
+    }
+
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         let (vm, spec, rootfs_path, vsock_uds_path, machine_identifier, mac_address, resolved_aux) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;

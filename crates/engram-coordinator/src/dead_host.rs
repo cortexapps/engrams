@@ -67,7 +67,7 @@
 //! `Evacuating` — the reactive auto-evac was the documented bug
 //! source (the resume-from-idle wedge, the deploy-storm cascade), so
 //! `Evacuating` is now reached *only* via operator drain (ADR 0044
-//! K3), and the `evac_resumer` scanner relocates only those.
+//! K3), and the `teleport` scanner relocates only those.
 
 use std::sync::Arc;
 use std::time::Duration;

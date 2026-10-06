@@ -140,7 +140,7 @@ fn api_http_router_real_wire() {
 /// cordons the host and moves the bound session off Active (toward
 /// Evacuating / a live rehome).
 #[test]
-fn api_drain_host_cordons_and_evacuates() {
+fn api_drain_host_cordons_and_plans() {
     rt().block_on(async {
         tokio::time::pause();
         let mut sim = Sim::new(9, Profile::Calm).with_faithful_hosts();
@@ -166,20 +166,15 @@ fn api_drain_host_cordons_and_evacuates() {
         );
         workload::drain_detached().await;
 
-        let (cordoned, off_active) = sim.world.meta.with_db(|db| {
+        let (cordoned, planned) = sim.world.meta.with_db(|db| {
             let cordoned = db.hosts.get(&host).map(|h| h.cordoned).unwrap_or(false);
-            let off_active = db
-                .sessions
-                .get(&sid)
-                .map(|r| r.session.status != engram_core::types::session::SessionState::Active)
-                .unwrap_or(true);
-            (cordoned, off_active)
+            let planned = db.session_ops.values().any(|op| {
+                op.session_id == sid && op.kind == engram_core::types::session_op::OpKind::Teleport
+            });
+            (cordoned, planned)
         });
         assert!(cordoned, "drain must durably cordon the host");
-        assert!(
-            off_active,
-            "drain must move the bound session off Active (evacuation)",
-        );
+        assert!(planned, "drain must plan a durable teleport",);
     });
 }
 

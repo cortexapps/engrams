@@ -921,6 +921,15 @@ impl HostClient for SimHostClient {
         ))
     }
 
+    async fn snapshot_hold(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        self.pause(id, fence).await?;
+        self.snapshot(id, fence).await
+    }
+
     async fn snapshot(
         &self,
         id: SandboxId,

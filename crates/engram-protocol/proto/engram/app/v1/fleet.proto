@@ -42,8 +42,9 @@ service FleetService {
   // ADR 0016 Phase B explicit flush trigger
   // (POST /api/admin/sessions/:id/flush-now).
   rpc FlushSession(FlushSessionRequest) returns (FlushSessionResponse);
-  // ADR 0018 async evacuation (POST /api/admin/sessions/:id/evacuate).
-  rpc EvacuateSession(EvacuateSessionRequest) returns (EvacuateSessionResponse);
+  // ADR 0123 B: admit one teleport for a session (synchronous admission;
+  // the durable machine drives it). Replaces the ADR 0018 evacuate route.
+  rpc TeleportSession(TeleportSessionRequest) returns (TeleportSessionResponse);
   // The three GC sweeps (ADR 0016 Phase C / ADR 0035 §5 / ADR 0028
   // addendum). Each folds today's paired /dry-run + /sweep routes into
   // one RPC discriminated by `dry_run`.
@@ -191,22 +192,12 @@ message AdminDrainHostRequest {
   string host_id = 1;
 }
 
-// Mirrors api/admin.rs DrainHostResponse (renamed: this RPC carries the
-// admin cordon+evacuate semantics; the soft status flip above keeps the
-// plain DrainHost name). HTTP returns 202 — the evac_resumer scanner is
-// the actual deliverable.
+// Admission plans return immediately; the teleport machine drives each move.
 message AdminDrainHostResponse {
   string host_id = 1;
-  // Session ids now marked Evacuating; the scanner resumes each on a
-  // peer host within its sweep interval.
-  repeated string evacuating = 2;
-  repeated DrainFailure failures = 3;
-}
-
-message DrainFailure {
-  string session_id = 1;
-  // Human-readable diagnostic; not machine-parsed, not stable.
-  string error = 2;
+  repeated string planned = 2;
+  repeated string descended = 3;
+  uint32 skipped = 4;
 }
 
 message CordonHostRequest {
@@ -325,24 +316,14 @@ message FlushSessionResponse {
   optional uint64 manifest_version = 2;
 }
 
-message EvacuateSessionRequest {
+message TeleportSessionRequest {
   string session_id = 1;
-  // Reserved for a future operator override; carried on today's HTTP
-  // body (api/admin.rs EvacuateSessionRequest.target_host) but IGNORED
-  // by the handler — the scanner picks any non-source host via the
-  // standard policy.
   optional string target_host = 2;
 }
-
-// Mirrors api/admin.rs EvacuateSessionResponse. HTTP returns 202; the
-// evac_resumer scanner completes the transition.
-message EvacuateSessionResponse {
-  string session_id = 1;
-  // Always "evacuating" on success — the session is paused,
-  // snapshotted, and the scanner will resume it on a peer within the
-  // next sweep interval (≤10s default). Watch the session's event
-  // stream for the Evacuating → Created → Active chain.
-  string status = 2;
+message TeleportSessionResponse {
+  string teleport_id = 1;
+  string kind = 2;
+  string dest_host_id = 3;
 }
 
 message GetFleetDemandRequest {}

@@ -146,6 +146,15 @@ impl HostClient for CosimHostClient {
     // result. The checkpoint-severance composition needs only attach/tail;
     // cancel's real guest verb is covered at the agentd boundary.
 
+    async fn snapshot_hold(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        self.pause(id, fence).await?;
+        self.snapshot(id, fence).await
+    }
+
     async fn snapshot(
         &self,
         id: SandboxId,

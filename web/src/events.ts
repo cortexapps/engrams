@@ -61,6 +61,15 @@ export type FileChange =
 // union with `type` as the discriminant.
 export type SessionEvent =
   | {
+      type: "teleport_finished";
+      teleport_id: string;
+      outcome: "done" | "aborted" | "failed";
+      kind: "live" | "snapshot";
+      dest_host_id: string | null;
+      error: string | null;
+      at: string;
+    }
+  | {
       type: "status_changed";
       from: SessionState;
       to: SessionState;

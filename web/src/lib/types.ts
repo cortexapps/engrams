@@ -39,7 +39,7 @@
  *                 reconciler resolves this to `idle` (if a
  *                 recoverable snapshot exists) or `dead`.
  *   evacuating  — mid-relocation to a peer host (ADR 0018); the
- *                 evac_resumer scanner drives it back to active.
+ *                 teleport driver drives it back to active.
  *   evicting    — idle-eviction in flight (ADR 0034); the eviction
  *                 scanner snapshots + suspends it to `idle` within
  *                 a couple of minutes. /prompt and /resume 409

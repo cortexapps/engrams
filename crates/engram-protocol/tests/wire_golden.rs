@@ -678,8 +678,9 @@ fn wire_version_pinned() {
     // inject rail). Existing goldens keep their bytes (trailing-variant
     // addition); the oauth-user-policy golden is ADDED and the variant index
     // is pinned at 2.
+    // 28 -> 29: SnapshotHold adds an RPC; bincode payloads are unchanged.
     assert_eq!(
-        WIRE_VERSION, 28,
+        WIRE_VERSION, 29,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

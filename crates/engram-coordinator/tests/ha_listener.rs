@@ -597,25 +597,48 @@ async fn cross_replica_scheduling_pins_and_tokens() {
         .await
         .expect("create session");
     meta_a
-        .set_teleport_target(session_id, Some(h2))
+        .assign_session_host(session_id, Some(h1))
         .await
-        .expect("pin via A");
+        .unwrap();
+    meta_a
+        .transition_session_created(session_id, engram_core::SandboxId::new())
+        .await
+        .unwrap();
+    meta_a
+        .transition_session(
+            session_id,
+            engram_core::types::SessionState::Active,
+            engram_core::types::BindingDisposition::Retain,
+        )
+        .await
+        .unwrap();
+    let admitted = meta_a
+        .teleport_admit(engram_core::types::teleport::TeleportAdmitRequest {
+            id: engram_core::TeleportId::new(),
+            session_id,
+            epoch: 0,
+            reason: engram_core::types::teleport::TeleportReason::Ui,
+            candidates: vec![h2],
+            pinned_dest: Some(h2),
+            mem_budget_mib: 1,
+            cpu_budget_vcpus: 1,
+            max_open_per_dest: 1,
+            live_capable: false,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        admitted,
+        engram_core::types::teleport::TeleportAdmitOutcome::Admitted(_)
+    ));
     assert_eq!(
         meta_b
-            .get_teleport_target(session_id)
+            .open_teleport_for_session(session_id)
             .await
-            .expect("get via B")
-            .map(|(h, _set_at)| h),
-        Some(h2),
-        "B's scanner must honor A's pin"
-    );
-    meta_b
-        .set_teleport_target(session_id, None)
-        .await
-        .expect("clear via B");
-    assert_eq!(
-        meta_a.get_teleport_target(session_id).await.expect("get"),
-        None
+            .unwrap()
+            .unwrap()
+            .dest_host_id,
+        h2
     );
 
     // --- 4. broker token sealed via A ⇒ unsealed + equal on B --------

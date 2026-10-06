@@ -1008,3 +1008,32 @@ async fn wake_queued_kind_pulls_not_before_to_now() {
         "no queued deliver left to wake",
     );
 }
+
+use engram_coordinator as coordinator;
+#[path = "support/teleport.rs"]
+pub mod teleport_support;
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn teleport_op_resumes_from_row_after_a_long_executor_gap() {
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
+        return;
+    };
+    let clock = engram_sim::ManualClock::new();
+    let meta = std::sync::Arc::new(db.store.with_clock(clock.clone()));
+    let mut rig = teleport_support::Rig::new(meta, clock).await;
+    // The no-deadline contract is pinned by session_ops::deadline_tests.
+    rig.clock.advance(std::time::Duration::from_secs(3600));
+    rig.reclaim().await;
+    assert!(matches!(
+        rig.drive().await,
+        coordinator::session_ops::OpOutcome::Done
+    ));
+    assert_eq!(rig.phase().await, None);
+    assert_eq!(
+        rig.source
+            .captures
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}

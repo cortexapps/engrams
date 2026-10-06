@@ -51,7 +51,7 @@ impl Default for CheckpointRetentionConfig {
     }
 }
 
-/// Spawn the sweeper. Mirrors [`crate::evac_resumer::spawn`].
+/// Spawn the sweeper. Mirrors [`crate::teleport::spawn`].
 pub fn spawn(cfg: CheckpointRetentionConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(cfg.poll_interval);

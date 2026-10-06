@@ -973,41 +973,6 @@ pub async fn pick_for_session(
     result
 }
 
-/// #800: the RESERVED evac/resume placement — [`pick_for_session`] with the
-/// capacity-soft fallback dropped. Returns `NoCapacity` when no schedulable
-/// host fits the session's 2D budget (rather than binding the first-ranked,
-/// possibly measured-full host), so the caller can QUEUE the session via the
-/// reserved queue path (the #795 resume precedent) and re-home it once
-/// capacity returns. The one commit point that mutates reservations stays
-/// the caller's rebind (`assign_session_host`); this makes the *decision*
-/// honor the hard bound. Emits the same K4 demand-pressure counter.
-pub async fn pick_for_session_reserved(
-    meta: &dyn MetadataStore,
-    registry: &HostRegistry,
-    ctx: &ScheduleContext<'_>,
-    now: DateTime<Utc>,
-) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
-    let result = pick_for_session_inner(meta, registry, ctx, now, true).await;
-    let outcome = match &result {
-        Ok(_) => "placed",
-        Err(PickError::NoCapacity) => "no_capacity",
-        Err(PickError::ImageNotReady(_)) => "image_not_ready",
-        Err(PickError::HostUnreachable(..)) => "host_unreachable",
-        Err(PickError::Internal(_)) => "internal",
-    };
-    ::metrics::counter!(crate::metrics::SESSION_PLACEMENT_TOTAL, "outcome" => outcome).increment(1);
-    // On NoCapacity, name the per-host exclusion reasons (present-but-full
-    // hosts show up via the ranked set; a fully-cordoned fleet via the
-    // empty-candidate summary) — the reserved NoCapacity is the QUEUE
-    // signal, not a mystery stall, but the visibility is still useful.
-    if matches!(result, Err(PickError::NoCapacity)) {
-        // `origin="resume"` — the bounded PLACEMENT_EXCLUDED_TOTAL vocabulary
-        // already scopes the resume/evac path under this label (metrics.rs).
-        log_empty_candidates(meta, ctx, "resume", now).await;
-    }
-    result
-}
-
 async fn pick_for_session_inner(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,

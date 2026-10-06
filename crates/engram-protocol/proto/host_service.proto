@@ -30,6 +30,8 @@ service HostService {
   rpc DestroySandbox(FencedSandboxRequest) returns (Empty);
   rpc ListSandboxes(Empty) returns (ListSandboxesResponse);
   rpc Snapshot(FencedSandboxRequest) returns (SnapshotResponse);
+  // Capture and retain the paused source until explicit resume or destroy.
+  rpc SnapshotHold(FencedSandboxRequest) returns (SnapshotResponse);
   // ADR 0014 issue #1/#2: signal that a just-produced snapshot's
   // downstream pipeline (record_snapshot → destroy → mark Idle)
   // fully succeeded; the host clears its in-flight tracking and the

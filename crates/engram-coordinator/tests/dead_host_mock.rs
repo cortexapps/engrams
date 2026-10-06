@@ -447,3 +447,21 @@ async fn arc_dyn_metadata_store_dispatches_correctly() {
     let result = meta.mark_host_dead_if_lease_expired(HostId::new()).await;
     assert!(result.is_ok());
 }
+
+use engram_coordinator as coordinator;
+#[path = "support/teleport.rs"]
+pub mod teleport_support;
+
+#[tokio::test]
+async fn skips_sessions_with_open_teleport_as_source() {
+    let rig = teleport_support::Rig::sim().await;
+    let meta = &rig.state.services.meta;
+    assert!(meta
+        .mark_host_dead_if_lease_expired(rig.row.source_host_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let session = meta.get_session(rig.row.session_id).await.unwrap();
+    assert_eq!(session.status, SessionState::Evacuating);
+    assert_eq!(session.sandbox_id, Some(rig.source.sandbox));
+}

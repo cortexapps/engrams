@@ -75,3 +75,66 @@ fn model_oracle_fires_on_a_dropped_live_session_row() {
         );
     });
 }
+
+#[test]
+fn capacity_oracle_counts_an_open_teleport_destination() {
+    use engram_core::traits::{Clock, Entropy, MetadataStore};
+    use engram_core::types::teleport::*;
+    rt().block_on(async {
+        tokio::time::pause();
+        let mut sim = Sim::new(11, Profile::Calm).with_faithful_hosts();
+        sim.execute(Step::HostHeartbeats).await;
+        sim.execute(Step::CreateSession).await;
+        let session = sim.world.meta.with_db(|db| {
+            db.sessions
+                .values()
+                .find(|s| s.session.status == engram_core::types::SessionState::Active)
+                .unwrap()
+                .session
+                .clone()
+        });
+        let source = session.host_id.unwrap();
+        let dest = *sim.world.host_ids.iter().find(|h| **h != source).unwrap();
+        let id = engram_core::TeleportId::from(sim.world.entropy.uuid());
+        let result = sim
+            .world
+            .meta
+            .teleport_admit(TeleportAdmitRequest {
+                id,
+                session_id: session.id,
+                reason: TeleportReason::Ui,
+                epoch: sim
+                    .world
+                    .meta
+                    .with_db(|db| db.sessions[&session.id].current_epoch),
+                candidates: vec![dest],
+                pinned_dest: Some(dest),
+                mem_budget_mib: 1,
+                cpu_budget_vcpus: 1,
+                max_open_per_dest: 1,
+                live_capable: false,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(result, TeleportAdmitOutcome::Admitted(_)));
+        sim.world.meta.with_db_mut(|db| {
+            db.teleports.get_mut(&id).unwrap().mem_budget_mib =
+                i64::try_from(db.hosts[&dest].utilization.allocatable_mib).unwrap() + 1;
+        });
+        let mut oracle = engram_dst::invariants::Oracles::default();
+        assert_eq!(
+            oracle.check_step(&sim.world).unwrap_err().invariant,
+            "placement-accounting"
+        );
+        sim.world.meta.with_db_mut(|db| {
+            let row = db.teleports.get_mut(&id).unwrap();
+            row.phase = TeleportPhase::Aborted;
+            row.finished_at = Some(sim.world.clock.now_utc());
+            db.sessions.get_mut(&session.id).unwrap().session.status =
+                engram_core::types::SessionState::Active;
+        });
+        oracle
+            .check_step(&sim.world)
+            .expect("released teleport reservation");
+    });
+}

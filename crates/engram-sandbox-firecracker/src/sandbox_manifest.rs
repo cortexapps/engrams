@@ -32,6 +32,8 @@ use serde::{Deserialize, Serialize};
 pub const ROLE_POST_COPY_SOURCE: &str = "post-copy-source";
 /// Durable role for the destination of a post-copy move.
 pub const ROLE_POST_COPY_DEST: &str = "post-copy-dest";
+/// ADR 0123 B: a snapshot-kind teleport source held paused after capture.
+pub const ROLE_HELD_SOURCE: &str = "held-source";
 
 /// Current schema version. Bumped on incompatible changes to the
 /// on-disk JSON shape. The startup reattach pass refuses to read

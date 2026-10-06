@@ -254,6 +254,21 @@ impl GrpcHostClient {
         decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
     }
 
+    pub async fn snapshot_hold(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        let resp = self
+            .inner
+            .clone()
+            .snapshot_hold(fenced_request(id, fence))
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        decode_bincode(&resp.metadata_bincode, "SnapshotMetadata")
+    }
+
     /// ADR 0045 D5. An `Unimplemented` status from a pre-D5 host-agent
     /// maps to `InvalidSpec` (same shape as the trait default), which the
     /// coordinator treats as "fall back to the composed snapshot()".
@@ -1598,6 +1613,14 @@ impl HostClient for GrpcHostClient {
     ) -> Result<SnapshotMetadata, SandboxError> {
         // Disambiguates from the trait's `snapshot` method.
         Self::snapshot(self, id, fence).await
+    }
+
+    async fn snapshot_hold(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        Self::snapshot_hold(self, id, fence).await
     }
 
     async fn snapshot_begin(

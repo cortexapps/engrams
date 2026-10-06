@@ -237,7 +237,7 @@ export function DiagnosticsPanel({
 
         {/* Admin live-ops — self-gating (admin + Active only), so a non-admin
             sees a clean read-only ledger above and nothing here. */}
-        {session && <TeleportControl session={session} />}
+        {session && <TeleportControl session={session} events={events} />}
         {session && <PauseResumeControl session={session} />}
       </TabsContent>
 
@@ -287,24 +287,39 @@ function summarizeRaw(ev: unknown): string {
 // Admin live-ops (ADR 0045 Phase F) — relocated from the session-detail rail.
 // ---------------------------------------------------------------------------
 
-// Teleport (live-migrate) an Active session onto a chosen host. Today the verb
-// rides the snapshot-rehome evac pipeline (a brief pause); ADR 0045 Phase C
-// swaps it to post-copy live migration under the same control. Renders nothing
-// unless the viewer is an admin and the session is Active (the only relocatable
-// state).
-function TeleportControl({ session }: { session: Session }) {
+// Admission returns the move identity; the durable event marks its outcome.
+function TeleportControl({ session, events }: { session: Session; events: IndexedEvent[] }) {
   const isAdmin = useIsAdmin();
   const { data: hosts } = useHosts();
   const teleport = useTeleportSession(session.id);
   const [target, setTarget] = useState<string>("");
 
-  if (!isAdmin || session.status !== "active") return null;
+  const finished = events
+    .map((item) => item.event)
+    .reverse()
+    .find(
+      (event) =>
+        event.type === "teleport_finished" && event.teleport_id === teleport.data?.teleportId,
+    );
+  if (!isAdmin || (session.status !== "active" && !teleport.data)) return null;
 
   const candidates = (hosts ?? []).filter((h) => h.status === "ready" && h.id !== session.host_id);
 
   return (
     <div className="border-t pt-4">
       <SectionLabel>Teleport</SectionLabel>
+      {teleport.error && (
+        <Text tone="muted" className="text-xs">
+          {teleport.error.message}
+        </Text>
+      )}
+      {teleport.data && (
+        <Text tone="muted" className="text-xs">
+          {teleport.data.kind} to {teleport.data.destHostId}:{" "}
+          {finished?.type === "teleport_finished" ? finished.outcome : "in progress"}
+          {finished?.type === "teleport_finished" && finished.error ? ` — ${finished.error}` : ""}
+        </Text>
+      )}
       {candidates.length === 0 ? (
         <Text tone="muted" className="text-xs">
           No other ready host is available.
@@ -331,7 +346,12 @@ function TeleportControl({ session }: { session: Session }) {
             size="sm"
             variant="secondary"
             className="w-full"
-            disabled={!target || teleport.isPending}
+            disabled={
+              !target ||
+              teleport.isPending ||
+              session.status !== "active" ||
+              (!!teleport.data && !finished)
+            }
             onClick={() => teleport.mutate(target)}
           >
             {teleport.isPending ? "Teleporting…" : "Teleport"}

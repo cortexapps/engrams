@@ -91,11 +91,12 @@ export const getStorageSummary = FleetService.method.getStorageSummary;
 export const flushSession = FleetService.method.flushSession;
 
 /**
- * ADR 0018 async evacuation (POST /api/admin/sessions/:id/evacuate).
+ * ADR 0123 B: admit one teleport for a session (synchronous admission;
+ * the durable machine drives it). Replaces the ADR 0018 evacuate route.
  *
- * @generated from rpc engram.app.v1.FleetService.EvacuateSession
+ * @generated from rpc engram.app.v1.FleetService.TeleportSession
  */
-export const evacuateSession = FleetService.method.evacuateSession;
+export const teleportSession = FleetService.method.teleportSession;
 
 /**
  * The three GC sweeps (ADR 0016 Phase C / ADR 0035 §5 / ADR 0028

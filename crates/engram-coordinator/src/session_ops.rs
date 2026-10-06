@@ -388,24 +388,6 @@ impl OpClaim {
         }
     }
 
-    /// Stamp progress (heartbeat) on the running row. The tri-state
-    /// mirrors the retired lease's `touch_checked`: `Held` = still ours,
-    /// `Lost` = a successor re-claimed (authoritative — stop),
-    /// `TransientError` = a PG blip the caller may retry through.
-    pub(crate) async fn touch(&self, step: &str) -> OpTouch {
-        match self
-            .state
-            .services
-            .meta
-            .op_record_step(self.op.id, self.epoch, step)
-            .await
-        {
-            Ok(true) => OpTouch::Held,
-            Ok(false) => OpTouch::Lost,
-            Err(e) => OpTouch::TransientError(e),
-        }
-    }
-
     /// Background heartbeat for straight-line pipelines with no touch
     /// loop of their own (the manual snapshot's capture body). Keeps the
     /// running row's `heartbeat_at` fresh so the reclaim sweep (180s
@@ -542,15 +524,6 @@ impl Drop for OpHeartbeat {
     fn drop(&mut self) {
         self.handle.abort();
     }
-}
-
-/// Outcome of an [`OpClaim::touch`]. `Lost` is authoritative (a
-/// successor re-claimed the op — give up ownership); `TransientError` is
-/// a PG-transport blip the caller may retry through.
-pub(crate) enum OpTouch {
-    Held,
-    Lost,
-    TransientError(engram_core::MetaError),
 }
 
 /// The executor loop: one per coordinator pod. Wakes on

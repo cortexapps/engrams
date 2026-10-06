@@ -124,156 +124,14 @@ pub(crate) async fn flush_now_core(
     }
 }
 
-// ---------------------------------------------------------------------
-// ADR 0018 — session evacuation admin endpoints (async shape, commit 12)
-// ---------------------------------------------------------------------
-//
-// Commit 12 rewrote evac from a synchronous
-// snapshot→restore→rebind→harness-rebuild RPC into a state-machine
-// transition + background scanner. The admin surface mirrors that
-// split:
-//
-// - `POST /api/admin/sessions/:id/evacuate` — pause + flush + snapshot
-//   the source sandbox, mark the session `Evacuating`. Returns 202
-//   immediately. The `evac_resumer` scanner picks the session up on
-//   its next tick (≤10s default) and drives it to Active on a peer.
-// - `POST /api/admin/hosts/:id/cordon` / `uncordon` — flip the
-//   in-memory `HostState.draining` flag + PG `hosts.status` so the
-//   picker excludes the host.
-// - `POST /api/admin/hosts/:id/drain` — cordon + fire Evacuating on
-//   every Active session on the host in parallel. Returns 202 with
-//   the list of session_ids being evacuated.
-//
-// The pause-before-flush ordering is what unblocks cross-host disk
-// fidelity: the evict pipeline runs Pause → Flush → Snapshot
-// → Destroy → transition_session, so the on-disk manifest the
-// scanner restores from is bit-identical to what the source saw at
-// pause time (no flush-vs-pause race; see ADR 0018 §"Commit 12
-// rework").
-
-#[derive(Serialize)]
-pub struct EvacuateSessionResponse {
-    pub session_id: SessionId,
-    /// "evacuating" — the session is paused, snapshotted, and the
-    /// `evac_resumer` scanner will resume it on a peer within the
-    /// next sweep interval (≤10s default). Operators can subscribe
-    /// to `GET /sessions/:id/events` to watch the
-    /// `Evacuating → Created → Active` chain land.
-    pub status: &'static str,
-}
-
-/// `POST /api/admin/sessions/:id/evacuate` — mark the session
-/// `Evacuating`. Pre: Active session with a bound sandbox. Post: the
-/// source sandbox is paused, flushed, snapshotted, and destroyed;
-/// PG row is at `Evacuating`; `evac_resumer` will resume on a peer.
-///
-/// Returns 202 Accepted; the scanner is the actual deliverable. Use
-/// the session events stream to observe the resume completing.
-/// Transport-agnostic core for the evacuate primitive (ADR 0051). Marks
-/// an Active session `Evacuating` via the shared eviction pipeline; the
-/// `evac_resumer` scanner resumes it on a peer. The axum handler wraps
-/// this in `(202, Json<_>)`; the gRPC `FleetService::evacuate_session`
-/// reads `.session_id` + `.status` off the bare struct.
-pub(crate) async fn evacuate_session_core(
-    state: &SharedState,
-    session_id: SessionId,
-) -> Result<EvacuateSessionResponse, ApiError> {
-    let session = state.services.meta.get_session(session_id).await?;
-    if !matches!(session.status, engram_core::types::SessionState::Active) {
-        return Err(ApiError::Conflict(format!(
-            "evacuate only supported for Active sessions (got {})",
-            session.status.as_str(),
-        )));
-    }
-    let Some(sandbox_id) = session.sandbox_id else {
-        return Err(ApiError::Conflict(format!(
-            "session {session_id} has no bound sandbox",
-        )));
-    };
-
-    // Fire the shared eviction pipeline with `target_state =
-    // Evacuating` under an inline op claim (ADR 0079 — the claim is the
-    // per-session exclusion; the pipeline is the SAME evict-verb body,
-    // step-recorded, so a coordinator death mid-drive is re-driven by
-    // the executor's reclaim sweep from the recorded step). The only
-    // difference from an idle eviction is the terminal state, so both
-    // flows inherit the same recoverability invariants (snapshot durable
-    // in BlobStorage before destroy, PG state flips before host-side
-    // destroy).
-    let claim = crate::session_ops::OpClaim::try_acquire(
-        state,
-        session_id,
-        engram_core::types::session_op::OpKind::Evict,
-        serde_json::json!({ "target": "evacuating", "allow_park": false, "nominated": false }),
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("op claim acquire failed: {e}")))?
-    .ok_or_else(|| {
-        ApiError::Conflict(format!(
-            "session {session_id} is busy (an op is in flight); retry shortly",
-        ))
-    })?;
-    let _ = sandbox_id; // the pipeline re-reads the binding under the claim
-    let result = crate::idle_evictor::run_evict_pipeline(
-        &claim.as_ctx(),
-        engram_core::types::SessionState::Evacuating,
-        false,
-        false,
-    )
-    .await;
-    match &result {
-        Ok(_) => {
-            claim
-                .finish(engram_core::types::session_op::OpState::Done, None)
-                .await
-        }
-        Err(e) => {
-            claim
-                .finish(
-                    engram_core::types::session_op::OpState::Failed,
-                    Some(&e.to_string()),
-                )
-                .await
-        }
-    }
-    // Typed conversion (issue #1012): a wire-skewed source host mid-deploy
-    // must surface as a retryable 503, not an opaque 500.
-    result.map_err(ApiError::from)?;
-
-    tracing::info!(
-        %session_id,
-        %sandbox_id,
-        "admin evacuate: session marked Evacuating; scanner will resume on peer",
-    );
-
-    Ok(EvacuateSessionResponse {
-        session_id,
-        status: "evacuating",
-    })
-}
+// Administrative eviction and durable drain planning.
 
 #[derive(Serialize)]
 pub struct EvictIdleResponse {
     pub session_id: SessionId,
-    /// The evict op's observed outcome: "idle" (full suspend — paused,
-    /// flushed, snapshotted, sandbox destroyed, resume rebinds) or the
-    /// ADR 0074 rung-2 "evicting (parked-paused, rung 2)" (VM paused in
-    /// place, un-parked by the next prompt). A busy op lane / no-op
-    /// completion surfaces as a retryable Conflict instead.
     pub status: &'static str,
 }
 
-/// Transport-agnostic core for the idle-eviction primitive (ADR 0051,
-/// restored on the gRPC surface as `SessionService::EvictIdle`). The
-/// explicit admin trigger for the idle-eviction pipeline: enqueues the
-/// exact same evict verb (`idle_evictor::run_evict_pipeline`) the idle
-/// detector's nomination enqueues on a timeout,
-/// so it is a faithful stand-in for "the session went idle" — without waiting
-/// out (or globally lowering) the idle TTL. Pre: Active session with a bound
-/// sandbox. Post: session at `Idle`, memory snapshot durable in BlobStorage,
-/// resumable. Synchronous (unlike `evacuate`, which hands off to the resumer
-/// scanner): the pipeline runs inline and the session is `Idle` by the time
-/// this returns.
 pub(crate) async fn evict_idle_core(
     state: &SharedState,
     session_id: SessionId,
@@ -518,385 +376,65 @@ pub(crate) async fn uncordon_host_core(
 #[derive(Serialize)]
 pub struct DrainHostResponse {
     pub host_id: engram_core::HostId,
-    pub evacuating: Vec<SessionId>,
-    pub failures: Vec<DrainFailure>,
+    pub planned: Vec<SessionId>,
+    pub descended: Vec<SessionId>,
+    pub skipped: u32,
 }
 
-#[derive(Debug, Serialize)]
-pub struct DrainFailure {
-    pub session_id: SessionId,
-    pub error: String,
+/// ADR 0123 A/B4: record the retirement request for `owner` and plan one
+/// teleport per Active resident. The request is durable, so the teleport
+/// scanner re-plans the host every tick: a resident that does not fit
+/// today is tried again, and until it leaves it blocks the grant as a
+/// visible `bound_sessions` blocker. `Conflict` when another owner holds
+/// the cordon or the host is dead; idempotent on a retired host.
+pub(crate) async fn request_host_retirement_core(
+    state: &SharedState,
+    host_id: engram_core::HostId,
+    owner: engram_core::types::host::CordonOwner,
+    reason: engram_core::types::teleport::TeleportReason,
+) -> Result<crate::teleport::PlanReport, ApiError> {
+    let meta = &state.services.meta;
+    let now = state.services.clock.now_utc();
+    let requested = meta
+        .request_host_retirement(host_id, owner, reason.as_str(), now)
+        .await?;
+    if !requested {
+        let row = meta
+            .get_host(host_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("host {host_id} has no row")))?;
+        if row.status != engram_core::types::host::HostStatus::Retired {
+            let why = match row.cordon_owner {
+                Some(other) if other != owner => {
+                    format!("host is cordoned by {}", other.as_str())
+                }
+                _ => format!("host is {}", row.status.as_str()),
+            };
+            return Err(ApiError::Conflict(why));
+        }
+    }
+    Ok(crate::teleport::plan_host_teleports(state, host_id, reason).await)
 }
 
-/// `POST /api/admin/hosts/:id/drain` — cordon the host, then run the
-/// evict pipeline (target `Evacuating`) for every Active session on
-/// it. Returns 202 with the per-session outcomes; the `evac_resumer`
-/// scanner is responsible for completing each transition to Active
-/// on a peer host.
-///
-/// Concurrency: each session's eviction is independent and runs in
-/// parallel — the source sandbox is paused on the source host
-/// concurrently across sessions. The eviction lease serialises
-/// per-session retries; two coord pods both running /drain on the
-/// same host will see one win per session, the other no-op via the
-/// lease guard.
-/// Transport-agnostic core for the drain primitive (ADR 0051). Cordons
-/// the host (durable `hosts.cordoned` bit), then fans out a live-first
-/// move (snapshot-rehome fallback) for every Active session on it. The
-/// axum `drain_host` handler wraps this in `(202, Json<_>)`; the gRPC
-/// `FleetService::admin_drain_host` reads `.host_id`, `.evacuating`, and
-/// `.failures` (each with `.session_id` + `.error`) off the bare struct.
-///
-/// Issue #208: the per-session live-teleport verbs hold the session lease
-/// across multi-second pause/capture/restore blackouts and a `JoinSet`
-/// aborts in-flight tasks on drop — so the whole JoinSet is driven on its
-/// own DETACHED task (not the caller's future). HTTP/gRPC cancellation
-/// then only stops us OBSERVING; the per-session verbs still run to their
-/// terminal commit/abort/parachute arms. This guard is preserved exactly.
+/// `AdminDrainHost` is the retirement request with `owner = admin`. The
+/// host is retired once it is empty; `UncordonHost{owner: admin}` cancels
+/// the request before then.
 pub(crate) async fn admin_drain_host_core(
     state: &SharedState,
     host_id: engram_core::HostId,
 ) -> Result<DrainHostResponse, ApiError> {
-    // ADR 0047: the durable cordon — heartbeats can't clobber it, every
-    // replica's picker reads it. A PG failure fails the drain (no
-    // in-memory fallback to half-drain behind).
-    match state
-        .services
-        .meta
-        .set_host_cordon(
-            host_id,
-            Some(engram_core::types::host::CordonOwner::Admin),
-            None,
-        )
-        .await
-    {
-        Ok(()) => {}
-        Err(engram_core::MetaError::NotFound) => {
-            return Err(ApiError::NotFound(format!("host {host_id} has no row")));
-        }
-        Err(e) => {
-            return Err(ApiError::Internal(format!(
-                "drain: set_host_cordon failed: {e}"
-            )));
-        }
-    }
-
-    // PG-authoritative list of sessions bound here (with budgets — ADR
-    // 0048 C8 needs them for the don't-strand guard). The in-memory
-    // `sandboxes_on_host` map is faster but can lag (post-restart
-    // rehydration window). For drain we use PG so a fresh coord pod
-    // can complete a drain initiated against a sibling.
-    let all_assignments = state
-        .services
-        .meta
-        .list_resident_assignments_with_budgets_on_host(host_id)
-        .await
-        .map_err(|e| ApiError::Internal(format!("drain: list sessions on host: {e}")))?;
-
-    // Partition by residency flavor (2026-07-21 status-set audit
-    // finding 4 — a host holding only parked VMs used to "drain"
-    // successfully with an empty list and the roll operator stalled on
-    // `running_sandboxes == 0`):
-    // - Active → the live-first move below.
-    // - Parked → the descent evict via `descend_parked_session`
-    //   (Parked → Evicting flip FIRST, then the nominated descent op —
-    //   the reaper's contract; a raw non-nominated enqueue against a
-    //   still-parked row is skipped by the pipeline's entry guard).
-    //   The paused VM cannot be live-teleported, and
-    //   Parked → Evacuating is not a legal edge. Once Idle it resumes
-    //   anywhere on demand — same operator outcome as an evacuation.
-    // - Created / Unreachable / Evicting / Pending / Evacuating →
-    //   their own machinery (boot, unreachable-recovery via prompt/
-    //   resume, the eviction pipeline, the queue scanner, the evac
-    //   resumer) already converges them off a cordoned host; listing
-    //   them here would double-drive those ops.
-    let mut assignments = Vec::new();
-    let mut parked = Vec::new();
-    let mut skipped = 0usize;
-    for a in all_assignments {
-        match a.status {
-            engram_core::types::SessionState::Active => assignments.push(a),
-            engram_core::types::SessionState::Parked => parked.push(a),
-            _ => skipped += 1,
-        }
-    }
-
-    let mut parked_evacuating: Vec<SessionId> = Vec::new();
-    let mut parked_failures: Vec<DrainFailure> = Vec::new();
-    for a in &parked {
-        // Re-read the row: the descent needs `parked_at` (the dedup key)
-        // and the listing above is a snapshot — the session may have
-        // un-parked or died since.
-        let session = match state.services.meta.get_session(a.session_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                parked_failures.push(DrainFailure {
-                    session_id: a.session_id,
-                    error: format!("drain: parked descent: get_session: {e}"),
-                });
-                continue;
-            }
-        };
-        match crate::idle_evictor::descend_parked_session(state, &session, "admin_drain").await {
-            Ok(true) => {
-                tracing::info!(%host_id, session_id = %a.session_id, sandbox_id = %a.sandbox_id,
-                    "admin drain: parked session — descent initiated (Parked → Evicting → durable Idle)");
-                parked_evacuating.push(a.session_id);
-            }
-            Ok(false) => {
-                // The Parked → Evicting flip raced (un-park ascent,
-                // delete, host death): the fresh status owns the session
-                // and this drain wave did NOT descend it. Surface it so
-                // the operator re-runs the drain rather than trusting a
-                // silently-shrunk work list.
-                parked_failures.push(DrainFailure {
-                    session_id: a.session_id,
-                    error: "drain: parked descent raced a concurrent transition; re-run the drain"
-                        .to_string(),
-                });
-            }
-            Err(e) => parked_failures.push(DrainFailure {
-                session_id: a.session_id,
-                error: format!("drain: parked descent: {e}"),
-            }),
-        }
-    }
-
-    if assignments.is_empty() {
-        tracing::info!(%host_id, parked = parked.len(), other_resident = skipped,
-            "admin drain: host cordoned; no Active sessions to evacuate");
-        return Ok(DrainHostResponse {
-            host_id,
-            evacuating: parked_evacuating,
-            failures: parked_failures,
-        });
-    }
-
-    // Fan out per-session moves. JoinSet so we collect outcomes
-    // without giving up on the first error.
-    //
-    // ADR 0045 C1: LIVE-FIRST. A drain is the teleport's marquee
-    // use-case — move each session losslessly to a peer; only fall
-    // back to the evict-to-Evacuating snapshot-rehome (the pre-C1
-    // behavior, loses post-checkpoint state) when the live move
-    // can't run (flag off, no peer capacity, pre-C1 host) or fails
-    // back to the source. A Parachute failure already left the
-    // session Evacuating with the scanner armed — same end state as
-    // the fallback, so it counts as evacuating.
-    //
-    // Issue #208: the per-session bodies each run a live-teleport verb
-    // that holds the session lease across a multi-second pause/capture/
-    // restore blackout. A `JoinSet` ABORTS all of its in-flight tasks
-    // when it is dropped — so if we held the JoinSet directly on this
-    // axum handler future, a client disconnect (drains run for minutes;
-    // LB timeouts and operator Ctrl-C are routine) would drop the
-    // handler, drop the JoinSet, and abort every in-flight migration
-    // mid-blackout. That strands frozen sources and forks sessions
-    // exactly like the inline teleport bug. Drive the whole JoinSet on
-    // its own detached task and merely await its JoinHandle here: HTTP
-    // cancellation then only stops us observing — the per-session verbs
-    // still run to their terminal arms.
-    let total = assignments.len();
-    // Own a clone for the detached driver (the core borrows `state`; the
-    // spawned task needs a `'static` owned `SharedState`).
-    let driver_state: SharedState = (*state).clone();
-    let driver = tokio::spawn(async move {
-        let state = driver_state;
-        let mut tasks = tokio::task::JoinSet::new();
-        for a in &assignments {
-            let st = state.clone();
-            let sid = a.session_id;
-            let mem_budget = a.mem_budget_mib;
-            let cpu_budget = a.cpu_budget_vcpus;
-            tasks.spawn(async move {
-                // ADR 0048 C8 don't-strand guard: before starting ANY move,
-                // confirm some SURVIVOR (a non-victim host) fits this session's
-                // budgets. If none does, do NOT begin the move — an Active
-                // session must never be parked Idle just because the fleet is
-                // full. Surface it as a failure so the operator aborts the wave.
-                let (repo, tag) = match st.services.meta.get_session(sid).await {
-                    Ok(s) => {
-                        let (r, t) = engram_core::types::session::split_image_ref(&s.image);
-                        (r.to_string(), t.to_string())
-                    }
-                    Err(e) => return (sid, Err(format!("get_session: {e}"))),
-                };
-                // ADR 0068: a capacity-fit PREVIEW, not the move itself —
-                // no snapshot/manifest is loaded here, so no substrate
-                // requirement is derivable (or needed: the actual move,
-                // `evacuate_dead_source` or `migrate_session_live` below,
-                // re-derives `caps` from the real snapshot it restores and
-                // is the authoritative gate). The base capability gate
-                // (`host_meets_capabilities` with `Default` requirements)
-                // still applies through `placement_preview`.
-                let fit_ctx = crate::placement::ScheduleContext {
-                    repo: &repo,
-                    image_version: &tag,
-                    snapshot_host: None,
-                    memory_mib: Some(mem_budget.max(0) as u32),
-                    cpu_budget_vcpus: Some(cpu_budget.max(0) as u32),
-                    required_image_digest: None,
-                    exclude_host: Some(host_id),
-                    prefer_host: None,
-                    caps: crate::placement::CapabilityRequirements::default(),
-                    prefer_bundles: &[],
-                };
-                match crate::placement::placement_preview(
-                    st.services.meta.as_ref(),
-                    &fit_ctx,
-                    mem_budget,
-                    cpu_budget as i64,
-                    st.services.clock.now_utc(),
-                )
-                .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return (
-                            sid,
-                            Err("no surviving host has capacity for this session — \
-                             drain would strand it (scale up, then retry)"
-                                .to_string()),
-                        );
-                    }
-                    Err(e) => return (sid, Err(format!("placement_preview: {e:?}"))),
-                }
-
-                if crate::live_migration::live_teleport_enabled() {
-                    let ctx = crate::placement::ScheduleContext {
-                        repo: &repo,
-                        image_version: &tag,
-                        snapshot_host: None,
-                        memory_mib: Some(mem_budget.max(0) as u32),
-                        cpu_budget_vcpus: Some(cpu_budget.max(0) as u32),
-                        required_image_digest: None,
-                        exclude_host: Some(host_id),
-                        prefer_host: None,
-                        // ADR 0068: same preview posture as `fit_ctx` above —
-                        // `migrate_session_live`'s own capture path is the
-                        // authoritative gate for the live-teleport target.
-                        caps: crate::placement::CapabilityRequirements::default(),
-                        prefer_bundles: &[],
-                    };
-                    let target = crate::placement::pick_for_session(
-                        st.services.meta.as_ref(),
-                        &st.host_registry,
-                        &ctx,
-                        st.services.clock.now_utc(),
-                    )
-                    .await
-                    .ok()
-                    .map(|(h, _)| h);
-                    if let Some(target) = target {
-                        match crate::live_migration::migrate_session_live(&st, sid, target).await {
-                            Ok(()) => return (sid, Ok(())),
-                            Err(crate::live_migration::MigrateError::Parachute(e)) => {
-                                tracing::warn!(
-                                    %sid, %host_id, error = %e,
-                                    "drain: live move parachuted; scanner rehome armed",
-                                );
-                                return (sid, Ok(()));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    %sid, %host_id, error = %e,
-                                    "drain: live move failed; falling back to snapshot-rehome",
-                                );
-                            }
-                        }
-                    }
-                }
-                // ADR 0079: inline op claim + the shared evict-verb
-                // pipeline (target Evacuating). A busy op lane (a
-                // concurrent eviction/resume owns the session) is not a
-                // drain failure: the session is being moved / handled by
-                // the other actor — fold to success, like `Skipped`.
-                let claim = match crate::session_ops::OpClaim::try_acquire(
-                    &st,
-                    sid,
-                    engram_core::types::session_op::OpKind::Evict,
-                    serde_json::json!({
-                        "target": "evacuating", "allow_park": false, "nominated": false
-                    }),
-                )
-                .await
-                {
-                    Ok(Some(c)) => c,
-                    Ok(None) => return (sid, Ok(())),
-                    Err(e) => return (sid, Err(format!("op claim acquire: {e}"))),
-                };
-                let outcome = crate::idle_evictor::run_evict_pipeline(
-                    &claim.as_ctx(),
-                    engram_core::types::SessionState::Evacuating,
-                    false,
-                    false,
-                )
-                .await;
-                match &outcome {
-                    Ok(_) => {
-                        claim
-                            .finish(engram_core::types::session_op::OpState::Done, None)
-                            .await
-                    }
-                    Err(e) => {
-                        claim
-                            .finish(
-                                engram_core::types::session_op::OpState::Failed,
-                                Some(&e.to_string()),
-                            )
-                            .await
-                    }
-                }
-                // A `Skipped` (the session was already relocated, etc.)
-                // is folded to success — drain doesn't pin a destination,
-                // so unlike teleport (issue #214) there is no stale pin
-                // to unwind. Errors still surface as failures.
-                (sid, outcome.map(|_| ()).map_err(|e| e.to_string()))
-            });
-        }
-
-        let mut evacuating: Vec<SessionId> = Vec::new();
-        let mut failures: Vec<DrainFailure> = Vec::new();
-        while let Some(join) = tasks.join_next().await {
-            match join {
-                Ok((sid, Ok(()))) => evacuating.push(sid),
-                Ok((sid, Err(e))) => {
-                    tracing::warn!(%sid, %host_id, error = %e, "drain: per-session evict/guard failed");
-                    failures.push(DrainFailure {
-                        session_id: sid,
-                        error: e,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(%host_id, error = %e, "drain: join error in per-session task");
-                }
-            }
-        }
-        (evacuating, failures)
-    });
-
-    // Await the detached driver for the normal (connected) response. If
-    // the HTTP request is cancelled, this future is dropped — but the
-    // spawned `driver` (and therefore its JoinSet of per-session verbs)
-    // keeps running to completion, so no migration is aborted mid-move.
-    let (mut evacuating, mut failures) = driver.await.map_err(|join_err| {
-        ApiError::Internal(format!("drain: driver task panicked: {join_err}"))
-    })?;
-    evacuating.extend(parked_evacuating);
-    failures.extend(parked_failures);
-
-    tracing::info!(
-        %host_id,
-        evacuating = evacuating.len(),
-        failures = failures.len(),
-        total,
-        "admin drain: per-session evac pipeline dispatched; scanner will resume each on a peer",
-    );
-
+    let plan = request_host_retirement_core(
+        state,
+        host_id,
+        engram_core::types::host::CordonOwner::Admin,
+        engram_core::types::teleport::TeleportReason::AdminDrain,
+    )
+    .await?;
     Ok(DrainHostResponse {
         host_id,
-        evacuating,
-        failures,
+        planned: plan.planned,
+        descended: plan.descended,
+        skipped: plan.skipped,
     })
 }
 

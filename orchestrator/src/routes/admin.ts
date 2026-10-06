@@ -20,7 +20,7 @@
  * are promoted to gRPC in a future task, delete these routes and migrate the
  * hooks to connect-query.
  *
- * Note: teleportSession uses FleetService.EvacuateSession (gRPC, already
+ * Note: teleportSession uses FleetService.TeleportSession (gRPC, already
  * passing through the CASL gate) — no proxy route needed for it.
  *
  * Production auth note (ADR 0051 Task 32): The forwarded bearer is

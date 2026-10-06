@@ -261,6 +261,30 @@ struct ProcessImage {
 }
 
 impl ProcessBackend {
+    fn signal_sandbox(
+        &self,
+        id: SandboxId,
+        signal: nix::sys::signal::Signal,
+    ) -> Result<(), SandboxError> {
+        let state = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+        let mut groups: Vec<u32> = state.exec_records.iter().filter_map(|r| r.pgid).collect();
+        if let Some(slot) = self.agent_children.get(&id) {
+            if let Some(child) = slot.lock().unwrap().as_ref() {
+                if let Some(pid) = child.id() {
+                    groups.push(pid);
+                }
+            }
+        }
+        for group in groups {
+            let raw = i32::try_from(group).map_err(|e| SandboxError::Vm(e.to_string().into()))?;
+            match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), signal) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                Err(e) => return Err(SandboxError::Vm(e.to_string().into())),
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(work_dir: impl Into<PathBuf>) -> Self {
         let work_dir = work_dir.into();
         // Every emulated guest path derives from this root and may be passed
@@ -781,6 +805,23 @@ impl SandboxBackend for ProcessBackend {
         ))
     }
 
+    async fn pause(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.signal_sandbox(id, nix::sys::signal::Signal::SIGSTOP)
+    }
+
+    async fn resume(&self, id: SandboxId) -> Result<(), SandboxError> {
+        self.signal_sandbox(id, nix::sys::signal::Signal::SIGCONT)
+    }
+
+    async fn snapshot_hold(
+        &self,
+        id: SandboxId,
+        _diff: bool,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        self.pause(id).await?;
+        self.snapshot(id).await
+    }
+
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         let state = self
             .sandboxes
@@ -1138,6 +1179,7 @@ async fn spawn_agent(
         .stderr(Stdio::from(log_err))
         .kill_on_drop(true);
 
+    cmd.process_group(0);
     let child = cmd
         .spawn()
         .map_err(|e| SandboxError::Vm(format!("spawn agent `{argv0}`: {e}").into()))?;

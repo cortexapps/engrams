@@ -47,7 +47,7 @@ pub enum DriverKind {
     OpReclaim,
     IdleDetector,
     IdleEvictor,
-    EvacResumer,
+    Teleport,
     /// Empty-sweep boundary: the sim world creates no enable jobs, so this
     /// exercises deadline/list/claim calls against real SimMeta methods.
     /// Deeper capture legs remain panic-stubbed per ADR 0098's deviation.
@@ -74,7 +74,7 @@ const DRIVERS: [DriverKind; 13] = [
     DriverKind::OpReclaim,
     DriverKind::IdleDetector,
     DriverKind::IdleEvictor,
-    DriverKind::EvacResumer,
+    DriverKind::Teleport,
     DriverKind::EnableScanner,
     DriverKind::CheckpointRetention,
     DriverKind::BaseSnapshotRetention,
@@ -153,22 +153,10 @@ pub enum Step {
     /// An explicit `delete_session` through the real Destroy op + teardown.
     /// A destroy that acks feeds the acked-destroy-never-resurrects oracle.
     Destroy,
-    /// An operator draining a host: cordon + evacuate its bound sessions to
-    /// Evacuating (the EvacResumer driver then re-homes them — the #775
-    /// dormant leg). FOLDED into both profile menus at small weight (#800),
-    /// completing the dormant-Evacuating-leg coverage. Both wave-4 blockers
-    /// are now cleared: (1) #799's in-memory `MemBlobStorage` removed the
-    /// evict-pipeline fs race (determinism-audit item 7), and (2) #800's
-    /// RESERVED evac placement closed the capacity-soft over-reservation
-    /// (evac now QUEUES rather than binding a measured-full survivor). The
-    /// full gRPC handler (JoinSet, live-teleport preview, don't-strand
-    /// guard) still lives only in the dedicated tests (tests/api_surface.rs
-    /// drives the real `admin_drain_host`; tests/workload_verbs.rs the
-    /// sequential cordon+evict); the swarm arm drives the same
-    /// cordon+evict-to-Evacuating pipeline sequentially. The host index is
-    /// drawn from WORLD entropy (never `self.rng`), so folding it in shifts
-    /// only the pick-table weights, not the scheduler's own pick stream.
+    /// Plan durable teleports through the fleet handler.
     DrainHost(usize),
+    /// Request retirement through the fleet handler. Driven by targeted workloads.
+    RetireHost(usize),
     /// ADR 0116 A3: ONE host registers (the store half of the register
     /// endpoint — a fresh lease written, epoch bumped, any declared
     /// handoff ended) without the fleet-wide heartbeat sweep of
@@ -196,7 +184,7 @@ pub struct Sim {
     dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig,
     queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig,
     idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig,
-    evac_cfg: engram_coordinator::evac_resumer::EvacResumerConfig,
+    teleport_cfg: engram_coordinator::teleport::TeleportConfig,
     enable_cfg: engram_coordinator::enable_scanner::EnableScannerConfig,
     checkpoint_retention_cfg: engram_coordinator::checkpoint_retention::CheckpointRetentionConfig,
     base_snapshot_retention_cfg:
@@ -230,7 +218,7 @@ impl Sim {
             dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig::default(),
             queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
             idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig::default(),
-            evac_cfg: engram_coordinator::evac_resumer::EvacResumerConfig::default(),
+            teleport_cfg: engram_coordinator::teleport::TeleportConfig::default(),
             enable_cfg: engram_coordinator::enable_scanner::EnableScannerConfig::default(),
             checkpoint_retention_cfg:
                 engram_coordinator::checkpoint_retention::CheckpointRetentionConfig {
@@ -566,8 +554,8 @@ impl Sim {
                     DriverKind::IdleEvictor => {
                         let _ = engram_coordinator::idle_evictor::scanner_run_once(&state).await;
                     }
-                    DriverKind::EvacResumer => {
-                        let _ = engram_coordinator::evac_resumer::run_once(&self.evac_cfg, &state)
+                    DriverKind::Teleport => {
+                        let _ = engram_coordinator::teleport::run_once(&self.teleport_cfg, &state)
                             .await;
                     }
                     DriverKind::EnableScanner => {
@@ -1008,7 +996,7 @@ impl Sim {
                 // Deliver op behind, and two delivery-path holes then
                 // livelock a chaos world:
                 //  1. `op_enqueue_and_claim_exclusive` treats ANY queued
-                //     op as a busy lane, so the EvacResumer's claim-or-
+                //     op as a busy lane, so the Teleport's claim-or-
                 //     give-up can never acquire an Evacuating session
                 //     that holds an undelivered prompt — the evacuation
                 //     starves forever while the deliver retries "its
@@ -1184,51 +1172,15 @@ impl Sim {
                     self.model.record_destroy_acked(sid);
                 }
             }
-            Step::DrainHost(i) => {
+            Step::DrainHost(i) | Step::RetireHost(i) => {
                 let Some(state) = self.world.replicas.iter().find_map(|r| r.state.clone()) else {
                     return;
                 };
-                let host_id = self.world.host_ids[i];
-                // The operator drain: the DURABLE cordon (ADR 0047) + evacuate
-                // each bound session to Evacuating, which the EvacResumer
-                // driver then re-homes (the #775 dormant leg). The real
-                // `admin_drain_host` fans the per-session moves out over a
-                // detached `JoinSet`; that concurrency is UNSIMULABLE — the
-                // in-flight `blob.put`s complete in nondeterministic order and
-                // diverge the entropy stream — so here we drive the SAME cordon
-                // + evict-to-Evacuating pipeline (the drain's ADR 0079
-                // fallback) SEQUENTIALLY in deterministic BTreeMap order. The
-                // full gRPC handler (JoinSet, live-teleport preview, the
-                // don't-strand guard) is exercised in tests/api_surface.rs.
-                let _ = state
-                    .services
-                    .meta
-                    .set_host_cordon(
-                        host_id,
-                        Some(engram_core::types::host::CordonOwner::Admin),
-                        None,
-                    )
-                    .await;
-                let bound = state
-                    .services
-                    .meta
-                    .list_resident_sandbox_assignments_on_host(host_id)
-                    .await
-                    .unwrap_or_default();
-                for (sid, _, st) in bound {
-                    if st != engram_core::types::SessionState::Active {
-                        continue;
-                    }
-                    Self::enqueue_and_drive(
-                        &state,
-                        sid,
-                        OpKind::Evict,
-                        serde_json::json!({
-                            "target": "evacuating", "allow_park": false, "nominated": false
-                        }),
-                        Some(&format!("drain-evict:{sid}")),
-                    )
-                    .await;
+                let host = self.world.host_ids[i];
+                if matches!(step, Step::RetireHost(_)) {
+                    crate::workload::api_retire_host(&state, host).await;
+                } else {
+                    crate::workload::api_drain_host(&state, host).await;
                 }
                 crate::workload::drain_detached().await;
             }

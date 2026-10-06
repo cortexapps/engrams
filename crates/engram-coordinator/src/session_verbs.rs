@@ -27,16 +27,13 @@ pub async fn dispatch(ctx: &OpCtx<'_>) -> OpOutcome {
         // in follow-up phases), so terminally fail the row — this FREES
         // the session's op lane (fence-then-free, the successor to the
         // retired lease reaper) and the existing recovery machinery owns
-        // the rest (periodic checkpoints for a torn manual snapshot; the
-        // ADR 0018 parachute / evac scanner for a torn teleport).
+        // the rest (periodic checkpoints for a torn manual snapshot). A
+        // Teleport op is re-drivable: `teleport::drive` resumes from the
+        // `session_teleports` row (ADR 0123 B).
         OpKind::CheckpointFinalize => OpOutcome::Failed(
             "manual snapshot claim abandoned (holder died); safe to retry the snapshot".into(),
         ),
-        OpKind::Teleport => OpOutcome::Failed(
-            "teleport claim abandoned (holder died); the parachute/evac machinery owns \
-             recovery — safe to re-issue the move"
-                .into(),
-        ),
+        OpKind::Teleport => crate::teleport::drive(ctx).await,
     }
 }
 
@@ -146,7 +143,7 @@ fn derive_resume_plan(
 ///
 /// `require_confirm` selects the teardown posture: the deterministic
 /// spawn re-plan runs against a LIVE host, so the unbind is gated on
-/// `confirm_source_teardown` (host-affirmed release — never strand a
+/// `destroy_retained_sandbox` (host-affirmed release — never strand a
 /// running VM's plane behind a cleared row); the Unreachable arm's
 /// guest is already dead, so its destroy stays best-effort and the
 /// tombstone alone owns cleanup.
@@ -171,7 +168,7 @@ async fn rebuild_binding(
                 return OpOutcome::Retry("rebuild: tombstone write failed".into());
             }
             if require_confirm {
-                if let Err(e) = crate::evac_resumer::confirm_source_teardown(
+                if let Err(e) = crate::api::snapshot::destroy_retained_sandbox(
                     state,
                     host_id,
                     sandbox_id,

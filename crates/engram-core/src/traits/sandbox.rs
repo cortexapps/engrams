@@ -355,6 +355,18 @@ pub trait SandboxBackend: Send + Sync {
     /// coord persists to the `snapshots` row.
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError>;
 
+    /// Capture without resuming. `diff` requests the same sparse format as snapshot_diff.
+    /// A caller owns resume or destroy on every exit, including cancellation.
+    async fn snapshot_hold(
+        &self,
+        _id: SandboxId,
+        _diff: bool,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "snapshot hold is unsupported".into(),
+        ))
+    }
+
     /// ADR 0045 D5: the pause-side half of an eviction snapshot — see
     /// `HostClient::snapshot_begin`. Backends that can't background the
     /// upload keep the default (callers fall back to [`Self::snapshot`]).

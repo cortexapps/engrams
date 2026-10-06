@@ -92,30 +92,17 @@ impl app::fleet_service_server::FleetService for AppFleetService {
         let owner = parse_owner(&input.owner)?;
         let meta = &self.state.services.meta;
         let now = self.state.services.clock.now_utc();
-        let requested = meta
-            .request_host_retirement(host_id, owner, &input.reason, now)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        if !requested {
-            // Idempotent on a host that is already retired; honest on the
-            // rest (unknown, dead, or cordoned by another owner).
-            let row = meta
-                .get_host(host_id)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("host not found"))?;
-            if row.status != engram_core::types::host::HostStatus::Retired {
-                let why = match row.cordon_owner {
-                    Some(other) if other != owner => {
-                        format!("host is cordoned by {}", other.as_str())
-                    }
-                    _ => format!("host is {}", row.status.as_str()),
-                };
-                return Err(Status::failed_precondition(why));
-            }
-        }
-        // TODO(ADR 0123 B4): C2 plans durable teleports here.
-        let teleports_planned = 0;
+        // Idempotent on a retired host; FailedPrecondition on the rest
+        // (unknown, dead, or cordoned by another owner).
+        let plan = crate::api::admin::request_host_retirement_core(
+            &self.state,
+            host_id,
+            owner,
+            engram_core::types::teleport::TeleportReason::RetireHost,
+        )
+        .await
+        .map_err(into_status)?;
+        let teleports_planned = plan.planned.len() as u32;
         meta.grant_host_retirement(host_id, now)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -290,15 +277,9 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .map_err(into_status)?;
         Ok(Response::new(app::AdminDrainHostResponse {
             host_id: result.host_id.to_string(),
-            evacuating: result.evacuating.iter().map(|s| s.to_string()).collect(),
-            failures: result
-                .failures
-                .into_iter()
-                .map(|f| app::DrainFailure {
-                    session_id: f.session_id.to_string(),
-                    error: f.error,
-                })
-                .collect(),
+            planned: result.planned.iter().map(ToString::to_string).collect(),
+            descended: result.descended.iter().map(ToString::to_string).collect(),
+            skipped: result.skipped,
         }))
     }
 
@@ -430,19 +411,33 @@ impl app::fleet_service_server::FleetService for AppFleetService {
         Ok(Response::new(convert::flush_now_result_to_proto(result)))
     }
 
-    async fn evacuate_session(
+    async fn teleport_session(
         &self,
-        req: Request<app::EvacuateSessionRequest>,
-    ) -> Result<Response<app::EvacuateSessionResponse>, Status> {
+        req: Request<app::TeleportSessionRequest>,
+    ) -> Result<Response<app::TeleportSessionResponse>, Status> {
         self.auth.check(&req)?;
-        let id = parse_session_id(&req.get_ref().session_id)?;
-        // `target_host` is ignored per the proto comment (future override).
-        let result = crate::api::admin::evacuate_session_core(&self.state, id)
+        let input = req.into_inner();
+        let id = parse_session_id(&input.session_id)?;
+        let target = input
+            .target_host
+            .map(|h| {
+                h.parse()
+                    .map_err(|_| Status::invalid_argument("malformed target_host"))
+            })
+            .transpose()?;
+        let row = crate::teleport::admit_for_rpc(&self.state, id, target)
             .await
-            .map_err(into_status)?;
-        Ok(Response::new(app::EvacuateSessionResponse {
-            session_id: result.session_id.to_string(),
-            status: result.status.to_string(),
+            .map_err(|e| match e {
+                crate::error::ApiError::Conflict(reason) if reason == "busy_lane" => {
+                    Status::aborted(reason)
+                }
+                crate::error::ApiError::Conflict(reason) => Status::failed_precondition(reason),
+                other => into_status(other),
+            })?;
+        Ok(Response::new(app::TeleportSessionResponse {
+            teleport_id: row.id.to_string(),
+            kind: row.kind.as_str().into(),
+            dest_host_id: row.dest_host_id.to_string(),
         }))
     }
 

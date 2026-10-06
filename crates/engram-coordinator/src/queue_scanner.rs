@@ -87,7 +87,7 @@
 //! `spawn` also parks on the same `wake`-or-`poll_interval` race before
 //! its very first sweep (not just between sweeps) — a beat for hosts to
 //! heartbeat back in on a cold coordinator start, same rationale as
-//! `evac_resumer::spawn`'s skip-the-first-tick.
+//! `teleport::spawn`'s skip-the-first-tick.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -186,7 +186,7 @@ fn partition_queue(queued: Vec<QueuedSession>) -> Vec<Vec<QueuedSession>> {
     classes
 }
 
-/// Spawn the queue scanner. Mirrors [`crate::evac_resumer::spawn`], plus
+/// Spawn the queue scanner. Mirrors [`crate::teleport::spawn`], plus
 /// the shared `wake` handle: `pg_listener` fires it on `placement_changed`
 /// NOTIFYs so a sweep runs as soon as capacity might have freed, instead
 /// of waiting for `poll_interval`.
@@ -196,7 +196,7 @@ pub fn spawn(
     wake: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Mirrors `evac_resumer::spawn`'s skip-the-first-immediate-tick:
+        // Mirrors `teleport::spawn`'s skip-the-first-immediate-tick:
         // coord just started, so don't sweep at the very first instant.
         // `wake` still lets a real `placement_changed` NOTIFY (a host
         // registering, a session enqueuing — all written straight to the

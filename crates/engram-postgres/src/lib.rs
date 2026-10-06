@@ -10,6 +10,8 @@
 use engram_core::types::host::{
     CordonOwner, HeartbeatAck, RetirementBlocker, RetirementGrant, RetirementStatus,
 };
+use engram_core::types::ids::TeleportId;
+use engram_core::types::teleport::*;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -713,11 +715,16 @@ async fn pick_host_2d(
             UNION ALL
             SELECT dest_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
             FROM session_teleports WHERE phase IN ({teleport_reserving})
+            UNION ALL
+            SELECT source_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+            FROM session_teleports WHERE phase IN ({source_reserving})
         ) reserved
         GROUP BY host_id
         "#,
         reserving = reserving_states_sql(),
         teleport_reserving = engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
+        source_reserving =
+            engram_core::types::teleport::TeleportPhase::source_reserving_phases_sql(),
     );
     let res_rows = sqlx::query(&res_sql)
         .bind(cand)
@@ -1108,6 +1115,264 @@ impl PostgresStore {
 
 #[async_trait]
 impl MetadataStore for PostgresStore {
+    async fn session_binding_generations(&self, id: SessionId) -> Result<(u64, u64), MetaError> {
+        let r: (i64, i64) = sqlx::query_as(
+            "SELECT binding_epoch, attached_binding_epoch FROM sessions WHERE id=$1",
+        )
+        .bind(id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+        Ok((r.0 as u64, r.1 as u64))
+    }
+
+    async fn teleport_admit(
+        &self,
+        req: TeleportAdmitRequest,
+    ) -> Result<TeleportAdmitOutcome, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let Some(session) = sqlx::query("SELECT status, host_id, sandbox_id FROM sessions WHERE id=$1 AND current_epoch=$2 FOR UPDATE")
+            .bind(req.session_id.as_uuid()).bind(req.epoch).fetch_optional(&mut *tx).await.map_err(db_err)? else { return Ok(TeleportAdmitOutcome::Fenced) };
+        let open: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM session_teleports WHERE session_id=$1 AND phase NOT IN ('done','aborted','failed'))")
+            .bind(req.session_id.as_uuid()).fetch_one(&mut *tx).await.map_err(db_err)?;
+        if open {
+            return Err(MetaError::Conflict(
+                "session already has an open teleport".into(),
+            ));
+        }
+        let status = row::parse_session_state_for_lib(
+            &session.try_get::<String, _>("status").map_err(db_err)?,
+        )?;
+        if status != SessionState::Active {
+            return Ok(TeleportAdmitOutcome::SessionNotActive(status));
+        }
+        let source: Option<Uuid> = session.try_get("host_id").map_err(db_err)?;
+        let sandbox: Option<Uuid> = session.try_get("sandbox_id").map_err(db_err)?;
+        let (Some(source), Some(sandbox)) = (source, sandbox) else {
+            return Err(MetaError::Conflict(
+                "active session has no source binding".into(),
+            ));
+        };
+        let mut candidates: Vec<Uuid> = req
+            .pinned_dest
+            .map(|h| vec![h])
+            .unwrap_or(req.candidates)
+            .into_iter()
+            .map(|h| h.as_uuid())
+            .filter(|h| *h != source)
+            .collect();
+        // Lock before counting open moves. Every placement writer uses this order.
+        sqlx::query("SELECT id FROM hosts WHERE id=ANY($1) ORDER BY id FOR UPDATE")
+            .bind(&candidates)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let capped: Vec<Uuid> = sqlx::query_scalar("SELECT dest_host_id FROM session_teleports WHERE dest_host_id=ANY($1) AND phase NOT IN ('done','aborted','failed') GROUP BY dest_host_id HAVING COUNT(*) >= $2")
+            .bind(&candidates).bind(i64::from(req.max_open_per_dest)).fetch_all(&mut *tx).await.map_err(db_err)?;
+        candidates.retain(|h| req.max_open_per_dest > 0 && !capped.contains(h));
+        let Some(dest) = pick_host_2d(
+            &mut tx,
+            &candidates,
+            0,
+            req.mem_budget_mib,
+            req.cpu_budget_vcpus,
+        )
+        .await?
+        else {
+            return Ok(TeleportAdmitOutcome::NoFit);
+        };
+        let cpu = i32::try_from(req.cpu_budget_vcpus)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let now = self.clock.now_utc();
+        let kind = if req.live_capable {
+            TeleportKind::Live
+        } else {
+            TeleportKind::Snapshot
+        };
+        let inserted = sqlx::query("INSERT INTO session_teleports (id,session_id,kind,reason,phase,source_host_id,source_sandbox_id,dest_host_id,pinned_dest,mem_budget_mib,cpu_budget_vcpus,created_at,updated_at) VALUES ($1,$2,$3,$4,'admitted',$5,$6,$7,$8,$9,$10,$11,$11) RETURNING to_jsonb(session_teleports) AS row")
+            .bind(req.id.as_uuid()).bind(req.session_id.as_uuid()).bind(kind.as_str()).bind(req.reason.as_str()).bind(source).bind(sandbox).bind(dest).bind(req.pinned_dest.is_some()).bind(req.mem_budget_mib).bind(cpu).bind(now)
+            .fetch_one(&mut *tx).await.map_err(|e| if e.as_database_error().is_some_and(|e| e.is_unique_violation()) { MetaError::Conflict("teleport already exists".into()) } else { db_err(e) })?;
+        let row: TeleportRow = serde_json::from_value(inserted.try_get("row").map_err(db_err)?)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        sqlx::query("UPDATE sessions SET status='evacuating', last_active_at=$2, updated_at=$2 WHERE id=$1 AND status='active'")
+            .bind(req.session_id.as_uuid()).bind(now).execute(&mut *tx).await.map_err(db_err)?;
+        append_event_idempotent_tx(
+            &mut tx,
+            req.session_id,
+            &format!("teleport:{}:admitted", req.id),
+            "status_changed",
+            serde_json::json!({"type":"status_changed","from":"active","to":"evacuating","at":now}),
+            now,
+        )
+        .await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(TeleportAdmitOutcome::Admitted(Box::new(row)))
+    }
+
+    async fn teleport_advance(
+        &self,
+        id: TeleportId,
+        from: TeleportPhase,
+        to: TeleportPhase,
+        patch: TeleportPatch,
+        epoch: i64,
+    ) -> Result<bool, MetaError> {
+        if !from.can_transition_to(to) {
+            return Err(MetaError::Conflict(format!(
+                "illegal teleport phase: {from:?} -> {to:?}"
+            )));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        if !lock_teleport_session_at_epoch(&mut tx, id, epoch).await? {
+            return Ok(false);
+        }
+        let n = sqlx::query("UPDATE session_teleports r SET phase=$3, dest_sandbox_id=COALESCE($4,r.dest_sandbox_id), snapshot_id=COALESCE($5,r.snapshot_id), export_id=COALESCE($6,r.export_id), live_payload=COALESCE($12,r.live_payload), kind=COALESCE($7,r.kind), error=$8, attempts=r.attempts+1, updated_at=$10, finished_at=CASE WHEN $11 THEN $10 ELSE NULL END FROM sessions s WHERE r.id=$1 AND r.phase=$2 AND s.id=r.session_id AND s.current_epoch=$9")
+            .bind(id.as_uuid()).bind(from.as_str()).bind(to.as_str()).bind(patch.dest_sandbox_id.map(|v| v.as_uuid())).bind(patch.snapshot_id.map(|v| v.as_uuid())).bind(patch.export_id).bind(patch.kind.map(|v| v.as_str())).bind(patch.error).bind(epoch).bind(self.clock.now_utc()).bind(to.is_terminal()).bind(patch.live_payload).execute(&mut *tx).await.map_err(db_err)?.rows_affected();
+        if n == 1 {
+            append_teleport_finished_tx(&mut tx, id, self.clock.now_utc()).await?;
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(n == 1)
+    }
+
+    async fn teleport_commit(&self, id: TeleportId, epoch: i64) -> Result<Option<u64>, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        if !lock_teleport_session_at_epoch(&mut tx, id, epoch).await? {
+            return Ok(None);
+        }
+        let result: Option<i64> = sqlx::query_scalar("WITH movement AS MATERIALIZED (
+            SELECT * FROM session_teleports WHERE id=$1 AND phase='restored' AND dest_sandbox_id IS NOT NULL FOR UPDATE
+        ), owner AS MATERIALIZED (
+            SELECT s.id FROM sessions s JOIN movement r ON s.id=r.session_id
+            WHERE s.current_epoch=$2 AND s.status='evacuating' AND s.host_id=r.source_host_id AND s.sandbox_id=r.source_sandbox_id FOR UPDATE OF s
+        ), rebound AS (
+            UPDATE sessions s SET host_id=r.dest_host_id, sandbox_id=r.dest_sandbox_id, binding_epoch=s.binding_epoch+1, missing_strikes=0, updated_at=$3
+            FROM movement r, owner o WHERE s.id=o.id RETURNING s.binding_epoch
+        ), advanced AS (
+            UPDATE session_teleports SET phase='committed', updated_at=$3, attempts=attempts+1 WHERE id=$1 AND EXISTS (SELECT 1 FROM rebound) RETURNING id
+        ) SELECT binding_epoch FROM rebound, advanced")
+            .bind(id.as_uuid()).bind(epoch).bind(self.clock.now_utc()).fetch_optional(&mut *tx).await.map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        if result.is_some() {
+            self.notify_placement_changed("teleport_committed").await;
+        }
+        Ok(result.map(|n| n as u64))
+    }
+
+    async fn teleport_release_source(
+        &self,
+        id: TeleportId,
+        epoch: i64,
+        how: SourceRelease,
+    ) -> Result<bool, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        if !lock_teleport_session_at_epoch(&mut tx, id, epoch).await? {
+            return Ok(false);
+        }
+        // A deleted host row counts as gone: nothing can answer for it.
+        let row = sqlx::query("UPDATE session_teleports r SET phase='done', finished_at=$3, updated_at=$3, attempts=r.attempts+1 FROM sessions s WHERE r.id=$1 AND r.phase='attached' AND s.id=r.session_id AND s.current_epoch=$2 AND (NOT $4 OR NOT EXISTS (SELECT 1 FROM hosts h WHERE h.id=r.source_host_id AND h.status NOT IN ('dead','retired'))) RETURNING r.source_host_id,r.source_sandbox_id,r.session_id")
+            .bind(id.as_uuid()).bind(epoch).bind(self.clock.now_utc()).bind(matches!(how,SourceRelease::SourceHostGone)).fetch_optional(&mut *tx).await.map_err(db_err)?;
+        let Some(row) = row else { return Ok(false) };
+        sqlx::query("INSERT INTO sandbox_tombstones (host_id,sandbox_id,session_id,created_at) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+            .bind(row.try_get::<Uuid,_>("source_host_id").map_err(db_err)?).bind(row.try_get::<Uuid,_>("source_sandbox_id").map_err(db_err)?).bind(row.try_get::<Uuid,_>("session_id").map_err(db_err)?).bind(self.clock.now_utc()).execute(&mut *tx).await.map_err(db_err)?;
+        append_teleport_finished_tx(&mut tx, id, self.clock.now_utc()).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(true)
+    }
+
+    async fn teleport_settle(
+        &self,
+        id: TeleportId,
+        epoch: i64,
+        settle: TeleportSettle,
+    ) -> Result<bool, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        if !lock_teleport_session_at_epoch(&mut tx, id, epoch).await? {
+            return Ok(false);
+        }
+        let now = self.clock.now_utc();
+        let Some(row) = sqlx::query("UPDATE session_teleports SET phase='failed', error=$2, finished_at=$3, updated_at=$3, attempts=attempts+1 WHERE id=$1 AND phase NOT IN ('done','aborted','failed') RETURNING session_id, source_host_id, source_sandbox_id")
+            .bind(id.as_uuid()).bind(&settle.error).bind(now).fetch_optional(&mut *tx).await.map_err(db_err)? else {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(false);
+        };
+        let session_id = SessionId::from(row.try_get::<Uuid, _>("session_id").map_err(db_err)?);
+        if let Some(target) = settle.session {
+            let current_raw: String = sqlx::query_scalar("SELECT status FROM sessions WHERE id=$1")
+                .bind(session_id.as_uuid())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            let current = row::parse_session_state_for_lib(&current_raw)?;
+            current
+                .try_transition_to(target)
+                .map_err(|e| MetaError::Conflict(e.to_string()))?;
+            sqlx::query(
+                "UPDATE sessions SET status=$2, sandbox_id=NULL, updated_at=$3 WHERE id=$1",
+            )
+            .bind(session_id.as_uuid())
+            .bind(target.as_str())
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            append_event_idempotent_tx(
+                &mut tx,
+                session_id,
+                &format!("teleport:{id}:settled"),
+                "status_changed",
+                serde_json::json!({"type":"status_changed","from":current.as_str(),"to":target.as_str(),"at":now}),
+                now,
+            )
+            .await?;
+        }
+        if settle.entomb_source {
+            sqlx::query("INSERT INTO sandbox_tombstones (host_id,sandbox_id,session_id,created_at) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+                .bind(row.try_get::<Uuid,_>("source_host_id").map_err(db_err)?).bind(row.try_get::<Uuid,_>("source_sandbox_id").map_err(db_err)?).bind(session_id.as_uuid()).bind(now).execute(&mut *tx).await.map_err(db_err)?;
+        }
+        append_teleport_finished_tx(&mut tx, id, now).await?;
+        tx.commit().await.map_err(db_err)?;
+        if settle.session.is_some() {
+            self.notify_placement_changed("teleport_settled").await;
+        }
+        Ok(true)
+    }
+    async fn teleport_abort(&self, id: TeleportId, epoch: i64) -> Result<bool, MetaError> {
+        let error: Option<String> =
+            sqlx::query_scalar("SELECT error FROM session_teleports WHERE id=$1")
+                .bind(id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?
+                .flatten();
+        self.teleport_advance(
+            id,
+            TeleportPhase::RollingBack,
+            TeleportPhase::Aborted,
+            TeleportPatch {
+                error,
+                ..Default::default()
+            },
+            epoch,
+        )
+        .await
+    }
+    async fn list_open_teleports(&self) -> Result<Vec<TeleportRow>, MetaError> {
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar("SELECT to_jsonb(r) FROM session_teleports r WHERE phase NOT IN ('done','aborted','failed') ORDER BY created_at,id").fetch_all(&self.pool).await.map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| serde_json::from_value(r).map_err(|e| MetaError::Serialization(e.to_string())))
+            .collect()
+    }
+    async fn open_teleport_for_session(
+        &self,
+        sid: SessionId,
+    ) -> Result<Option<TeleportRow>, MetaError> {
+        let row: Option<serde_json::Value> = sqlx::query_scalar("SELECT to_jsonb(r) FROM session_teleports r WHERE session_id=$1 AND phase NOT IN ('done','aborted','failed')").bind(sid.as_uuid()).fetch_optional(&self.pool).await.map_err(db_err)?;
+        row.map(|r| serde_json::from_value(r).map_err(|e| MetaError::Serialization(e.to_string())))
+            .transpose()
+    }
+
     async fn ping(&self) -> Result<(), MetaError> {
         sqlx::query("SELECT 1")
             .execute(&self.pool)
@@ -1385,46 +1650,6 @@ impl MetadataStore for PostgresStore {
             self.notify_placement_changed("enqueued").await;
         }
         Ok(disposition)
-    }
-
-    async fn set_teleport_target(
-        &self,
-        id: SessionId,
-        target: Option<HostId>,
-    ) -> Result<(), MetaError> {
-        // Issue #214: stamp `teleport_target_set_at` whenever a pin is
-        // set (NOW()), and clear it when the pin is cleared (Some→non-NULL,
-        // None→NULL), so the two columns are always consistent. The scanner
-        // ages out a stale pin off this timestamp.
-        sqlx::query(
-            "UPDATE sessions \
-             SET teleport_target_host_id = $2, \
-                 teleport_target_set_at = CASE WHEN $2 IS NULL THEN NULL ELSE $3 END \
-             WHERE id = $1",
-        )
-        .bind(id.as_uuid())
-        .bind(target.map(|h| h.as_uuid()))
-        .bind(self.clock.now_utc())
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn get_teleport_target(
-        &self,
-        id: SessionId,
-    ) -> Result<Option<(HostId, Option<chrono::DateTime<chrono::Utc>>)>, MetaError> {
-        let row: Option<(Option<uuid::Uuid>, Option<chrono::DateTime<chrono::Utc>>)> =
-            sqlx::query_as(
-                "SELECT teleport_target_host_id, teleport_target_set_at \
-                 FROM sessions WHERE id = $1",
-            )
-            .bind(id.as_uuid())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?;
-        Ok(row.and_then(|(t, set_at)| t.map(|u| (HostId(u), set_at))))
     }
 
     async fn insert_broker_token(
@@ -2330,12 +2555,17 @@ impl MetadataStore for PostgresStore {
                 UNION ALL
                 SELECT dest_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
                 FROM session_teleports WHERE phase IN ({teleport_reserving})
+                UNION ALL
+                SELECT source_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+                FROM session_teleports WHERE phase IN ({source_reserving})
             ) reserved
             GROUP BY host_id
             "#,
             reserving = reserving_states_sql(),
             teleport_reserving =
                 engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
+            source_reserving =
+                engram_core::types::teleport::TeleportPhase::source_reserving_phases_sql(),
         );
         let rows: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(&sql)
             .fetch_all(&self.pool)
@@ -2484,12 +2714,17 @@ impl MetadataStore for PostgresStore {
                 UNION ALL
                 SELECT dest_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
                 FROM session_teleports WHERE phase IN ({teleport_reserving})
+                UNION ALL
+                SELECT source_host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
+                FROM session_teleports WHERE phase IN ({source_reserving})
             ) reserved
             GROUP BY host_id
             "#,
             reserving = reserving_states_sql(),
             teleport_reserving =
                 engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
+            source_reserving =
+                engram_core::types::teleport::TeleportPhase::source_reserving_phases_sql(),
         );
         let res_rows = sqlx::query(&res_sql)
             .bind(&cand)
@@ -2846,13 +3081,7 @@ impl MetadataStore for PostgresStore {
                 target.as_str()
             )));
         }
-        // ADR 0018 commit 12b: entering Evacuating resets
-        // `evac_attempts` to 0 so a fresh drain (operator or
-        // dead-host detector) starts the scanner's retry budget
-        // clean. ADR 0034 mirrors this for Evicting/`evict_attempts`.
-        // Folded into the same UPDATE that commits the state flip so
-        // the counters and the state are always consistent.
-        //
+        // Entering Evicting resets its retry count in the same update.
         // Entering Queued stamps the queue columns (ADR 0098 D4
         // conformance finding): a bare `transition_session(_, Queued)`
         // is FSM-legal but used to leave `queued_at`/`queue_origin`
@@ -2868,7 +3097,6 @@ impl MetadataStore for PostgresStore {
                    last_active_at = $3,
                    updated_at = $3,
                    sandbox_id = CASE WHEN $4 THEN NULL ELSE sandbox_id END,
-                   evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
                    evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
                    queued_at = CASE WHEN $2 = 'queued' THEN $3 ELSE queued_at END,
                    queue_origin = CASE WHEN $2 = 'queued'
@@ -2897,43 +3125,13 @@ impl MetadataStore for PostgresStore {
         Ok(current)
     }
 
-    /// ADR 0018 commit 12b: scanner sweep query. Indexed via the
-    /// partial `idx_sessions_evacuating` from migration 0037 so the
-    /// cost stays flat as the global session row count grows.
-    async fn list_evacuating_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, status, host_id, sandbox_id,
-                   image_uri, mode,
-                   created_at, last_active_at,
-                   live_disk_manifest_id, live_disk_manifest_version,
-                   evac_attempts
-            FROM sessions
-            WHERE status = 'evacuating'
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in &rows {
-            let session = row::session_from_row(r)?;
-            let attempts: i32 = r
-                .try_get("evac_attempts")
-                .map_err(|e| MetaError::Serialization(format!("evac_attempts: {e}")))?;
-            out.push((session, attempts.max(0) as u32));
-        }
-        Ok(out)
-    }
-
     async fn list_host_lost_sessions(&self) -> Result<Vec<Session>, MetaError> {
         let rows = sqlx::query(
             r#"
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
-                   live_disk_manifest_id, live_disk_manifest_version,
-                   evac_attempts
+                   live_disk_manifest_id, live_disk_manifest_version
             FROM sessions
             WHERE status = 'host_lost'
             "#,
@@ -2946,30 +3144,6 @@ impl MetadataStore for PostgresStore {
             out.push(row::session_from_row(r)?);
         }
         Ok(out)
-    }
-
-    /// ADR 0018 commit 12b: atomic `+= 1 RETURNING`. Scanner calls
-    /// this before each resume attempt so the returned count is
-    /// the scanner's "this is my Nth try" view; when it crosses
-    /// the budget threshold, the scanner falls back to Idle.
-    async fn bump_evac_attempts(&self, session_id: SessionId) -> Result<u32, MetaError> {
-        let row = sqlx::query(
-            r#"
-            UPDATE sessions
-               SET evac_attempts = evac_attempts + 1
-             WHERE id = $1
-             RETURNING evac_attempts
-            "#,
-        )
-        .bind(session_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?
-        .ok_or(MetaError::NotFound)?;
-        let attempts: i32 = row
-            .try_get("evac_attempts")
-            .map_err(|e| MetaError::Serialization(format!("bump_evac_attempts: {e}")))?;
-        Ok(attempts.max(0) as u32)
     }
 
     /// ADR 0034: eviction-scanner sweep query. Indexed via the
@@ -4596,6 +4770,18 @@ impl MetadataStore for PostgresStore {
                       WHERE c.host_id = $1
                         AND c.stage NOT IN ('done', 'failed')
                  )
+                   -- ADR 0123 B: a move owns both endpoints while open. The
+                   -- source is unbound after commit until release; the dest
+                   -- is unbound until commit and unnamed until restore
+                   -- returns, so an open move INTO this host protects every
+                   -- unbound sandbox here the way a capture job does.
+                   AND NOT EXISTS (
+                     SELECT 1 FROM session_teleports t
+                      WHERE t.phase NOT IN ('done', 'aborted', 'failed')
+                        AND (t.source_sandbox_id = r.sandbox_id
+                             OR t.dest_sandbox_id = r.sandbox_id
+                             OR (t.dest_host_id = $1 AND t.dest_sandbox_id IS NULL))
+                 )
             ),
             pruned AS (
                 DELETE FROM sandbox_unbound_sightings
@@ -4736,6 +4922,7 @@ impl MetadataStore for PostgresStore {
                   FROM sessions
                  WHERE host_id = $1
                    AND status NOT IN ('completed','failed','dead')
+                   AND NOT EXISTS (SELECT 1 FROM session_teleports r WHERE r.session_id=sessions.id AND r.source_host_id=$1 AND r.phase NOT IN ('done','aborted','failed'))
                    FOR UPDATE
             ),
             cleared AS (
@@ -8345,7 +8532,6 @@ impl MetadataStore for PostgresStore {
                    last_active_at = $4,
                    updated_at = $4,
                    sandbox_id = CASE WHEN $5 THEN NULL ELSE sandbox_id END,
-                   evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
                    evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
                    queued_at = CASE WHEN $2 = 'queued' THEN $4 ELSE queued_at END,
                    queue_origin = CASE WHEN $2 = 'queued'
@@ -8445,7 +8631,6 @@ impl MetadataStore for PostgresStore {
                    last_active_at = $4,
                    updated_at = $4,
                    sandbox_id = CASE WHEN $5 THEN NULL ELSE sandbox_id END,
-                   evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
                    evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
                    queued_at = CASE WHEN $2 = 'queued' THEN $4 ELSE queued_at END,
                    queue_origin = CASE WHEN $2 = 'queued'
@@ -9561,4 +9746,47 @@ async fn append_event_idempotent_tx(
     ).bind(session.as_uuid()).bind(kind).bind(payload).bind(now)
         .fetch_one(&mut **tx).await.map_err(db_err)?;
     Ok(Some(row.try_get("idx").map_err(db_err)?))
+}
+
+/// Lock the teleport's session row and answer whether it is still at
+/// `epoch`. Every teleport writer takes this lock FIRST (session, then the
+/// row), so a reclaim that bumps `current_epoch` either waits for the write
+/// or is seen by it: a stale holder can never land a phase change after a
+/// successor took the lane.
+async fn lock_teleport_session_at_epoch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: TeleportId,
+    epoch: i64,
+) -> Result<bool, MetaError> {
+    let current: Option<i64> = sqlx::query_scalar(
+        "SELECT s.current_epoch FROM sessions s JOIN session_teleports r ON r.session_id=s.id WHERE r.id=$1 FOR UPDATE OF s",
+    )
+    .bind(id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    Ok(current == Some(epoch))
+}
+
+async fn append_teleport_finished_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: TeleportId,
+    now: DateTime<Utc>,
+) -> Result<(), MetaError> {
+    let raw:Option<serde_json::Value>=sqlx::query_scalar("SELECT to_jsonb(r) FROM session_teleports r WHERE id=$1 AND phase IN ('done','aborted','failed')").bind(id.as_uuid()).fetch_optional(&mut **tx).await.map_err(db_err)?;
+    if let Some(raw) = raw {
+        let row: TeleportRow =
+            serde_json::from_value(raw).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let payload = serde_json::json!({"type":"teleport_finished","teleport_id":row.id,"outcome":row.phase.as_str(),"kind":row.kind,"dest_host_id":row.dest_host_id,"error":row.error,"at":now});
+        append_event_idempotent_tx(
+            tx,
+            row.session_id,
+            &format!("teleport:{}:finished", row.id),
+            "teleport_finished",
+            payload,
+            now,
+        )
+        .await?;
+    }
+    Ok(())
 }

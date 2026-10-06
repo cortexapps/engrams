@@ -151,7 +151,6 @@ pub struct SessRow {
     pub recovery_epoch: i64,
     pub shell_pinned_until: Option<DateTime<Utc>>,
     pub durable_head: Option<SnapshotId>,
-    pub evac_attempts: i32,
     pub evict_attempts: i32,
     pub updated_at: DateTime<Utc>,
 }
@@ -235,11 +234,7 @@ pub struct SimDb {
     pub oauth_flows: std::collections::BTreeMap<uuid::Uuid, engram_core::types::oauth::OAuthFlow>,
     pub session_oauth_bindings:
         std::collections::BTreeMap<SessionId, engram_core::types::oauth::SessionOAuthBinding>,
-    /// ADR 0045 live-migration teleport pin (PG: `sessions.
-    /// teleport_target_host_id` + `_set_at`). Present only while a pin is
-    /// set. The sim runs no teleport workload today, but the boot/rebind
-    /// path clears the pin, so get/set must round-trip.
-    pub teleport_targets: std::collections::BTreeMap<SessionId, (HostId, Option<DateTime<Utc>>)>,
+
     pub session_ops: std::collections::BTreeMap<i64, OpRow>,
     pub outbox: std::collections::BTreeMap<String, OutboxRow>,
     pub bundle_gc: std::collections::BTreeMap<String, GcCandidate>,

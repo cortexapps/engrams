@@ -33,6 +33,7 @@ export interface SseHandlers {
 /** Durable event discriminants this client subscribes to explicitly. */
 export const SESSION_EVENT_KINDS: readonly SessionEventKind[] = [
   "status_changed",
+  "teleport_finished",
   "exec_started",
   "exec_completed",
   "stdout",

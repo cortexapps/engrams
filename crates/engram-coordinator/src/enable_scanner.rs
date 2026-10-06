@@ -2,7 +2,7 @@
 //!
 //! Background task that drives `enable_jobs` rows through
 //! `pending → materializing → capturing → prestaging → ready | failed`.
-//! Sibling to [`crate::evac_resumer`]: same polling shape, same
+//! Sibling to [`crate::teleport`]: same polling shape, same
 //! shared-state surface, distinct table.
 //!
 //! ## Flow
@@ -199,7 +199,7 @@ impl EnableScannerConfig {
 
 /// Spawn the scanner as a background task. Caller holds the
 /// JoinHandle for the process lifetime; dropping aborts the loop.
-/// Mirrors [`crate::evac_resumer::spawn`].
+/// Mirrors [`crate::teleport::spawn`].
 pub fn spawn(cfg: EnableScannerConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(cfg.poll_interval);

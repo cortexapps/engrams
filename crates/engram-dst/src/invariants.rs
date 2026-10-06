@@ -344,6 +344,13 @@ fn placement_accounting(world: &SimWorld) -> Result<(), Violation> {
                 }
             }
         }
+        for row in db.teleports.values() {
+            if engram_core::types::teleport::TeleportPhase::dest_reserving_phases()
+                .contains(&row.phase.as_str())
+            {
+                *reserved.entry(row.dest_host_id).or_default() += row.mem_budget_mib;
+            }
+        }
         for (host, mem) in reserved {
             if let Some(h) = db.hosts.get(&host) {
                 let alloc = h.utilization.allocatable_mib as i64;
@@ -429,6 +436,27 @@ fn sandbox_owners_agree(world: &SimWorld) -> Result<(), Violation> {
 fn snapshot_safety(world: &SimWorld) -> Result<(), Violation> {
     world.meta.with_db(|db| {
         for row in db.sessions.values() {
+            // Admission precedes capture. A live move can also retain its only
+            // copy on the source until drain completes; its row owns recovery.
+            let teleport_owns_copy = row.session.status == SessionState::Evacuating
+                && db.teleports.values().any(|t| {
+                    t.session_id == row.session.id
+                        && !t.phase.is_terminal()
+                        && (t.kind == engram_core::types::teleport::TeleportKind::Live
+                            || matches!(
+                                t.phase,
+                                engram_core::types::teleport::TeleportPhase::Admitted
+                                    | engram_core::types::teleport::TeleportPhase::RollingBack
+                            ))
+                        && ((row.session.host_id == Some(t.source_host_id)
+                            && row.session.sandbox_id == Some(t.source_sandbox_id))
+                            || (row.session.host_id == Some(t.dest_host_id)
+                                && row.session.sandbox_id == t.dest_sandbox_id
+                                && t.dest_sandbox_id.is_some()))
+                });
+            if teleport_owns_copy {
+                continue;
+            }
             let requires_durable = matches!(
                 row.session.status,
                 SessionState::Idle | SessionState::Evacuating
@@ -522,6 +550,30 @@ fn bound_sessions_point_at_live_hosts(world: &SimWorld) -> Result<(), Violation>
 /// convergence, no session may be stuck in a transient state and no
 /// op may be left undriven.
 pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
+    world.meta.with_db(|db| {
+        if let Some(row) = db.teleports.values().find(|r| !r.phase.is_terminal()) {
+            return Err(Violation {
+                invariant: "quiescence-open-teleport",
+                detail: format!("teleport {} remains {:?}", row.id, row.phase),
+            });
+        }
+        for host in db
+            .hosts
+            .values()
+            .filter(|h| h.status == engram_core::types::HostStatus::Retired)
+        {
+            if db.sessions.values().any(|s| {
+                s.session.host_id == Some(host.id) && s.session.status.reserves_host_memory()
+            }) || db.sandbox_tombstones.keys().any(|(h, _)| *h == host.id)
+            {
+                return Err(Violation {
+                    invariant: "quiescence-retired-host-owned",
+                    detail: format!("retired host {} retains work", host.id),
+                });
+            }
+        }
+        Ok(())
+    })?;
     no_op_dropped(world)?;
     no_orphan_sandboxes(world)?;
     ttft_liveness(world)?;

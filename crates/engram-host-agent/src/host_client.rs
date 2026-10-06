@@ -136,6 +136,14 @@ impl HostClient for LocalHostClient {
         self.sandbox.snapshot(id).await
     }
 
+    async fn snapshot_hold(
+        &self,
+        id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        self.sandbox.snapshot_hold(id, false).await
+    }
+
     async fn snapshot_begin(
         &self,
         id: SandboxId,

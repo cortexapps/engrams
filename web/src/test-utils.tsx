@@ -71,7 +71,7 @@ export const testTransport: Transport = createRouterTransport((router) => {
     getHost: () => ({ host: undefined }),
     getHostCowState: () => ({ hostId: "", sessions: [] }),
     drainHost: () => ({}),
-    adminDrainHost: () => ({ hostId: "", evacuating: [], failures: [] }),
+    adminDrainHost: () => ({ hostId: "", planned: [], descended: [], skipped: 0 }),
     cordonHost: () => ({ hostId: "", status: "" }),
     uncordonHost: () => ({ hostId: "", status: "" }),
     getStorageSummary: () => ({
@@ -85,7 +85,7 @@ export const testTransport: Transport = createRouterTransport((router) => {
       rows: [],
     }),
     flushSession: () => ({ outcome: "", manifestVersion: undefined }),
-    evacuateSession: () => ({ sessionId: "", status: "" }),
+    teleportSession: () => ({ teleportId: "", kind: "snapshot", destHostId: "" }),
     chunkGc: () => ({
       listedChunks: 0n,
       malformedKeys: 0n,

@@ -98,20 +98,15 @@ fn workload_verbs_drive_real_handlers() {
             .position(|h| *h == host2)
             .expect("bound host is a known host");
         sim.execute(Step::DrainHost(host2_idx)).await;
-        let (cordoned, off_active) = sim.world.meta.with_db(|db| {
+        let (cordoned, planned) = sim.world.meta.with_db(|db| {
             let cordoned = db.hosts.get(&host2).map(|h| h.cordoned).unwrap_or(false);
-            let off_active = db
-                .sessions
-                .get(&sid2)
-                .map(|r| r.session.status != SessionState::Active)
-                .unwrap_or(true);
-            (cordoned, off_active)
+            let planned = db.session_ops.values().any(|op| {
+                op.session_id == sid2 && op.kind == engram_core::types::session_op::OpKind::Teleport
+            });
+            (cordoned, planned)
         });
         assert!(cordoned, "Step::DrainHost must cordon the drained host");
-        assert!(
-            off_active,
-            "Step::DrainHost must move its bound session off Active (evacuation)",
-        );
+        assert!(planned, "Step::DrainHost must plan a durable teleport",);
 
         // And the whole thing still converges once the fleet heals (the
         // heal uncordons the drained host so the evacuated leg re-homes).
@@ -231,5 +226,60 @@ fn model_oracle_fires_when_a_confirmed_title_is_repainted() {
             model.check(&sim.world).is_ok(),
             "restoring the confirmed title clears the auditor",
         );
+    });
+}
+
+#[test]
+fn retire_host_workload_moves_then_grants() {
+    use engram_dst::DriverKind;
+    rt().block_on(async {
+        tokio::time::pause();
+        let mut sim = Sim::new(11, Profile::Calm).with_faithful_hosts();
+        let sid = boot_one_active(&mut sim).await;
+        let source = sim
+            .world
+            .meta
+            .with_db(|db| db.sessions[&sid].session.host_id.unwrap());
+        let index = sim
+            .world
+            .host_ids
+            .iter()
+            .position(|h| *h == source)
+            .unwrap();
+        sim.execute(Step::RetireHost(index)).await;
+        assert!(sim
+            .world
+            .meta
+            .with_db(|db| db.hosts[&source].retire_requested_at.is_some()));
+        for _ in 0..20 {
+            sim.execute(Step::HostHeartbeats).await;
+            for driver in [
+                DriverKind::Teleport,
+                DriverKind::SessionOps,
+                DriverKind::Reconcile,
+            ] {
+                sim.execute(Step::Driver(0, driver)).await;
+            }
+            sim.execute(Step::AdvanceTime(std::time::Duration::from_secs(2)))
+                .await;
+            if sim
+                .world
+                .meta
+                .with_db(|db| db.hosts[&source].retired_at.is_some())
+            {
+                break;
+            }
+        }
+        sim.world.meta.with_db(|db| {
+            assert!(
+                db.hosts[&source].retired_at.is_some(),
+                "retirement did not converge: {:?}",
+                db.teleports
+            );
+            assert_eq!(db.sessions[&sid].session.status, SessionState::Active);
+            assert_ne!(db.sessions[&sid].session.host_id, Some(source));
+            assert!(db.teleports.values().any(|t| t.session_id == sid
+                && t.phase == engram_core::types::teleport::TeleportPhase::Done));
+        });
     });
 }

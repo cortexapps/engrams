@@ -172,6 +172,17 @@ pub trait HostClient: Send + Sync {
         ))
     }
 
+    /// Capture a portable snapshot and keep the source paused until resume or destroy.
+    async fn snapshot_hold(
+        &self,
+        _id: SandboxId,
+        _fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        Err(SandboxError::InvalidSpec(
+            "snapshot hold is unsupported".into(),
+        ))
+    }
+
     async fn snapshot(
         &self,
         id: SandboxId,

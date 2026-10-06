@@ -580,6 +580,15 @@ impl HostClient for HostRegistry {
         backend.snapshot(id, fence).await
     }
 
+    async fn snapshot_hold(
+        &self,
+        id: SandboxId,
+        fence: SessionFence,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.snapshot_hold(id, fence).await
+    }
+
     async fn snapshot_begin(
         &self,
         id: SandboxId,

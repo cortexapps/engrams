@@ -62,6 +62,8 @@ const WIRE_FRAME_KINDS: Readonly<Record<string, FrameClass>> = {
   run_completed: "durable",
   run_interrupted: "durable",
   run_continued: "durable",
+  // ADR 0123: the result of a session teleport.
+  teleport_finished: "durable",
   harness_idle: "durable",
   prompt_queued: "durable",
   prompt_edited: "durable",

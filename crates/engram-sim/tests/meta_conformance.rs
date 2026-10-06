@@ -3060,21 +3060,6 @@ async fn broker_token_flow(ctx: &Ctx) {
         .is_none());
 }
 
-/// ADR 0045 teleport target pin (R2): set stamps host+`_set_at`, clear
-/// nulls both, get round-trips.
-async fn teleport_target_flow(ctx: &Ctx) {
-    let meta = &ctx.meta;
-    let id = meta.create_session(spec("conf:teleport")).await.unwrap();
-    assert!(meta.get_teleport_target(id).await.unwrap().is_none());
-    let host = HostId::new();
-    meta.set_teleport_target(id, Some(host)).await.unwrap();
-    let (got_host, set_at) = meta.get_teleport_target(id).await.unwrap().expect("pinned");
-    assert_eq!(got_host, host);
-    assert!(set_at.is_some(), "a set pin stamps its set_at");
-    meta.set_teleport_target(id, None).await.unwrap();
-    assert!(meta.get_teleport_target(id).await.unwrap().is_none());
-}
-
 /// ADR 0101 C: the parked lifecycle + the durability-floor settle.
 /// `parked` is a real state (`list_parked_sessions` finds it, the
 /// eviction sweep does not), and `settle_evicted_session_idle` is a
@@ -4065,7 +4050,6 @@ conformance!(
     t_parked_lifecycle_and_eviction_settle,
     super::parked_lifecycle_and_eviction_settle
 );
-conformance!(t_teleport_target_flow, super::teleport_target_flow);
 conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(
     t_binding_disposition_contract,
@@ -5516,6 +5500,7 @@ async fn teleport_fixture(
         cpu_budget_vcpus: 2,
         snapshot_id: None,
         export_id: None,
+        live_payload: None,
         attempts: 0,
         error: None,
         created_at: ctx.clock.now_utc(),
@@ -6191,4 +6176,523 @@ async fn harness_event_delivery_dedups(ctx: &Ctx) {
 conformance!(
     t_harness_event_delivery_dedups,
     super::harness_event_delivery_dedups
+);
+
+async fn teleport_admission_fixture(
+    ctx: &Ctx,
+) -> engram_core::types::teleport::TeleportAdmitRequest {
+    use engram_core::types::teleport::*;
+    let source = HostId::new();
+    let dest = HostId::new();
+    for h in [source, dest] {
+        let mut row = host_record(h, "teleport", ctx.clock.now_utc());
+        row.utilization.allocatable_mib = 4096;
+        ctx.meta.upsert_host(row).await.unwrap();
+        let mut hb = heartbeat_fixture();
+        hb.utilization.allocatable_mib = 4096;
+        ctx.meta.touch_host_heartbeat(h, hb).await.unwrap();
+    }
+    let sid = SessionId::new();
+    let ws = engram_core::traits::metadata::SessionCreateWriteSet {
+        session_id: sid,
+        spec: spec("conf:teleport-machine"),
+        mem_budget_mib: 4096,
+        cpu_budget_vcpus: 2,
+        sealed_secrets: None,
+        capabilities: Vec::new(),
+        integration_policy_json: None,
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        ),
+        oauth_binding: None,
+    };
+    assert!(matches!(
+        ctx.meta
+            .reserve_and_persist_create(ws, &[source], 0)
+            .await
+            .unwrap(),
+        engram_core::traits::metadata::CreateDisposition::Placed(_)
+    ));
+    ctx.meta
+        .transition_session_created(sid, engram_core::SandboxId::new())
+        .await
+        .unwrap();
+    ctx.meta
+        .transition_session(sid, SessionState::Active, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    TeleportAdmitRequest {
+        id: engram_core::TeleportId::new(),
+        session_id: sid,
+        reason: TeleportReason::Ui,
+        epoch: 0,
+        candidates: vec![source, dest],
+        pinned_dest: None,
+        mem_budget_mib: 4096,
+        cpu_budget_vcpus: 2,
+        max_open_per_dest: 1,
+        live_capable: false,
+    }
+}
+async fn admit_teleport(
+    ctx: &Ctx,
+    req: engram_core::types::teleport::TeleportAdmitRequest,
+) -> engram_core::types::teleport::TeleportRow {
+    let engram_core::types::teleport::TeleportAdmitOutcome::Admitted(row) =
+        ctx.meta.teleport_admit(req).await.unwrap()
+    else {
+        panic!("admission refused")
+    };
+    *row
+}
+async fn teleport_admit_reserves_dest_under_lock(ctx: &Ctx) {
+    use engram_core::types::teleport::*;
+    let req = teleport_admission_fixture(ctx).await;
+    let sid = req.session_id;
+    let mut stale = req.clone();
+    stale.epoch = 1;
+    assert!(matches!(
+        ctx.meta.teleport_admit(stale).await.unwrap(),
+        TeleportAdmitOutcome::Fenced
+    ));
+    let mut too_big = req.clone();
+    too_big.mem_budget_mib = 4097;
+    too_big.pinned_dest = Some(req.candidates[1]);
+    assert!(matches!(
+        ctx.meta.teleport_admit(too_big).await.unwrap(),
+        TeleportAdmitOutcome::NoFit
+    ));
+    assert_eq!(
+        ctx.meta.get_session(sid).await.unwrap().status,
+        SessionState::Active
+    );
+    assert!(ctx.meta.list_open_teleports().await.unwrap().is_empty());
+    let mut zero = req.clone();
+    zero.max_open_per_dest = 0;
+    assert!(matches!(
+        ctx.meta.teleport_admit(zero).await.unwrap(),
+        TeleportAdmitOutcome::NoFit
+    ));
+    ctx.meta
+        .set_host_cordon(
+            req.candidates[1],
+            Some(engram_core::types::host::CordonOwner::Admin),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        ctx.meta.teleport_admit(req.clone()).await.unwrap(),
+        TeleportAdmitOutcome::NoFit
+    ));
+    ctx.meta
+        .set_host_cordon(req.candidates[1], None, None)
+        .await
+        .unwrap();
+    let row = admit_teleport(ctx, req.clone()).await;
+    assert_eq!(
+        ctx.meta.get_session(sid).await.unwrap().host_id,
+        Some(row.source_host_id)
+    );
+    assert_eq!(
+        ctx.meta.per_host_reserved().await.unwrap()[&row.dest_host_id].mem_mib,
+        4096
+    );
+    assert_eq!(
+        ctx.meta.per_host_reserved().await.unwrap()[&row.source_host_id].mem_mib,
+        4096
+    );
+    assert!(matches!(
+        ctx.meta.teleport_admit(req).await,
+        Err(MetaError::Conflict(_))
+    ));
+    let mut second = teleport_admission_fixture(ctx).await;
+    second.candidates = vec![row.dest_host_id];
+    assert!(matches!(
+        ctx.meta.teleport_admit(second.clone()).await.unwrap(),
+        TeleportAdmitOutcome::NoFit
+    ));
+    let mut hb = heartbeat_fixture();
+    hb.utilization.allocatable_mib = 32768;
+    ctx.meta
+        .touch_host_heartbeat(row.dest_host_id, hb)
+        .await
+        .unwrap();
+    // RAM now fits both moves; the open-count limit alone refuses this one.
+    assert!(matches!(
+        ctx.meta.teleport_admit(second.clone()).await.unwrap(),
+        TeleportAdmitOutcome::NoFit
+    ));
+    ctx.meta
+        .transition_session(
+            second.session_id,
+            SessionState::Evicting,
+            BindingDisposition::Retain,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        ctx.meta.teleport_admit(second).await.unwrap(),
+        TeleportAdmitOutcome::SessionNotActive(SessionState::Evicting)
+    ));
+}
+async fn teleport_phase_cas_is_fenced_and_legal(ctx: &Ctx) {
+    use engram_core::types::teleport::*;
+    let row = admit_teleport(ctx, teleport_admission_fixture(ctx).await).await;
+    assert!(!ctx
+        .meta
+        .teleport_advance(
+            row.id,
+            TeleportPhase::Admitted,
+            TeleportPhase::Captured,
+            TeleportPatch::default(),
+            1
+        )
+        .await
+        .unwrap());
+    assert!(matches!(
+        ctx.meta
+            .teleport_advance(
+                row.id,
+                TeleportPhase::Admitted,
+                TeleportPhase::Done,
+                TeleportPatch::default(),
+                0
+            )
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    let patch = TeleportPatch {
+        export_id: Some("export".into()),
+        live_payload: Some(serde_json::json!({"peer_token":"test-token"})),
+        kind: Some(TeleportKind::Snapshot),
+        ..Default::default()
+    };
+    assert!(ctx
+        .meta
+        .teleport_advance(
+            row.id,
+            TeleportPhase::Admitted,
+            TeleportPhase::Admitted,
+            patch,
+            0
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        ctx.meta
+            .open_teleport_for_session(row.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .export_id
+            .as_deref(),
+        Some("export")
+    );
+    assert!(ctx
+        .meta
+        .teleport_advance(
+            row.id,
+            TeleportPhase::Admitted,
+            TeleportPhase::Captured,
+            TeleportPatch::default(),
+            0
+        )
+        .await
+        .unwrap());
+    assert!(!ctx
+        .meta
+        .teleport_advance(
+            row.id,
+            TeleportPhase::Admitted,
+            TeleportPhase::Captured,
+            TeleportPatch::default(),
+            0
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        ctx.meta
+            .open_teleport_for_session(row.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .live_payload,
+        Some(serde_json::json!({"peer_token":"test-token"}))
+    );
+}
+async fn restored_teleport(ctx: &Ctx) -> engram_core::types::teleport::TeleportRow {
+    use engram_core::types::teleport::*;
+    let row = admit_teleport(ctx, teleport_admission_fixture(ctx).await).await;
+    ctx.meta
+        .teleport_advance(
+            row.id,
+            TeleportPhase::Admitted,
+            TeleportPhase::Captured,
+            TeleportPatch::default(),
+            0,
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .teleport_advance(
+            row.id,
+            TeleportPhase::Captured,
+            TeleportPhase::Restored,
+            TeleportPatch {
+                dest_sandbox_id: Some(engram_core::SandboxId::new()),
+                ..Default::default()
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .open_teleport_for_session(row.session_id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+async fn teleport_commit_is_one_statement(ctx: &Ctx) {
+    use engram_core::types::teleport::*;
+    let row = restored_teleport(ctx).await;
+    let before = ctx.meta.per_host_reserved().await.unwrap();
+    assert_eq!(before[&row.source_host_id].mem_mib, 4096);
+    assert_eq!(before[&row.dest_host_id].mem_mib, 4096);
+    assert_eq!(ctx.meta.teleport_commit(row.id, 1).await.unwrap(), None);
+    assert_eq!(
+        ctx.meta
+            .session_binding_generations(row.session_id)
+            .await
+            .unwrap(),
+        (1, 0)
+    );
+    assert_eq!(ctx.meta.teleport_commit(row.id, 0).await.unwrap(), Some(2));
+    assert_eq!(
+        ctx.meta
+            .session_binding_generations(row.session_id)
+            .await
+            .unwrap(),
+        (2, 0)
+    );
+    assert_eq!(ctx.meta.teleport_commit(row.id, 0).await.unwrap(), None);
+    let s = ctx.meta.get_session(row.session_id).await.unwrap();
+    assert_eq!(s.host_id, Some(row.dest_host_id));
+    assert_eq!(s.sandbox_id, row.dest_sandbox_id);
+    assert_eq!(
+        ctx.meta
+            .open_teleport_for_session(row.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        TeleportPhase::Committed
+    );
+    assert!(ctx
+        .meta
+        .sandbox_tombstones_for_host(row.source_host_id)
+        .await
+        .unwrap()
+        .is_empty());
+    // The session's own reservation moved to the destination; the source
+    // keeps the move's budget until release (its VM is still paused there).
+    let after = ctx.meta.per_host_reserved().await.unwrap();
+    assert_eq!(
+        after.get(&row.source_host_id).map_or(0, |r| r.mem_mib),
+        row.mem_budget_mib
+    );
+    assert_eq!(
+        after[&row.dest_host_id].mem_mib,
+        before[&row.dest_host_id].mem_mib
+    );
+    let mismatch = restored_teleport(ctx).await;
+    ctx.meta
+        .assign_session_sandbox(mismatch.session_id, Some(engram_core::SandboxId::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.teleport_commit(mismatch.id, 0).await.unwrap(),
+        None
+    );
+}
+async fn teleport_release_entombs_source(ctx: &Ctx) {
+    use engram_core::types::teleport::*;
+    let row = restored_teleport(ctx).await;
+    ctx.meta.teleport_commit(row.id, 0).await.unwrap();
+    ctx.meta
+        .teleport_advance(
+            row.id,
+            TeleportPhase::Committed,
+            TeleportPhase::Attached,
+            TeleportPatch::default(),
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(!ctx
+        .meta
+        .teleport_release_source(row.id, 0, SourceRelease::SourceHostGone)
+        .await
+        .unwrap());
+    assert!(!ctx
+        .meta
+        .teleport_release_source(row.id, 1, SourceRelease::DestroyAcked)
+        .await
+        .unwrap());
+    assert!(ctx
+        .meta
+        .teleport_release_source(row.id, 0, SourceRelease::DestroyAcked)
+        .await
+        .unwrap());
+    assert!(!ctx
+        .meta
+        .teleport_release_source(row.id, 0, SourceRelease::DestroyAcked)
+        .await
+        .unwrap());
+    assert_eq!(
+        ctx.meta
+            .sandbox_tombstones_for_host(row.source_host_id)
+            .await
+            .unwrap(),
+        vec![row.source_sandbox_id]
+    );
+    let events = ctx
+        .meta
+        .list_session_events_since(row.session_id, -1, 100)
+        .await
+        .unwrap();
+    let finished: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "teleport_finished")
+        .collect();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].payload["outcome"], "done");
+    assert!(ctx
+        .meta
+        .open_teleport_for_session(row.session_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+async fn teleport_rollback_keeps_dest_reserved_until_aborted(ctx: &Ctx) {
+    use engram_core::types::teleport::*;
+    let row = restored_teleport(ctx).await;
+    ctx.meta
+        .teleport_advance(
+            row.id,
+            TeleportPhase::Restored,
+            TeleportPhase::RollingBack,
+            TeleportPatch {
+                error: Some("capture_failed".into()),
+                ..Default::default()
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.per_host_reserved().await.unwrap()[&row.dest_host_id].mem_mib,
+        4096
+    );
+    assert!(ctx.meta.teleport_abort(row.id, 0).await.unwrap());
+    assert!(!ctx
+        .meta
+        .per_host_reserved()
+        .await
+        .unwrap()
+        .contains_key(&row.dest_host_id));
+    let events = ctx
+        .meta
+        .list_session_events_since(row.session_id, -1, 100)
+        .await
+        .unwrap();
+    let finished: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "teleport_finished")
+        .collect();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].payload["outcome"], "aborted");
+    assert_eq!(finished[0].payload["error"], "capture_failed");
+}
+async fn dead_host_orphan_skips_open_teleport_sources(ctx: &Ctx) {
+    let row = restored_teleport(ctx).await;
+    assert!(ctx
+        .meta
+        .mark_host_dead_if_lease_expired(row.source_host_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let s = ctx.meta.get_session(row.session_id).await.unwrap();
+    assert_eq!(s.status, SessionState::Evacuating);
+    assert_eq!(s.sandbox_id, Some(row.source_sandbox_id));
+}
+fn lost(error: &str) -> engram_core::types::teleport::TeleportSettle {
+    engram_core::types::teleport::TeleportSettle {
+        error: error.into(),
+        session: None,
+        entomb_source: false,
+    }
+}
+async fn teleport_fail_and_abort_are_fenced(ctx: &Ctx) {
+    use engram_core::types::teleport::*;
+    let row = restored_teleport(ctx).await;
+    assert!(!ctx
+        .meta
+        .teleport_settle(row.id, 1, lost("lost"))
+        .await
+        .unwrap());
+    assert!(!ctx.meta.teleport_abort(row.id, 0).await.unwrap());
+    ctx.meta
+        .teleport_advance(
+            row.id,
+            TeleportPhase::Restored,
+            TeleportPhase::RollingBack,
+            TeleportPatch::default(),
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(!ctx.meta.teleport_abort(row.id, 1).await.unwrap());
+    assert!(ctx
+        .meta
+        .teleport_settle(row.id, 0, lost("lost"))
+        .await
+        .unwrap());
+    assert!(!ctx
+        .meta
+        .teleport_settle(row.id, 0, lost("again"))
+        .await
+        .unwrap());
+    assert!(ctx.meta.list_open_teleports().await.unwrap().is_empty());
+}
+conformance!(
+    teleport_admit_reserves_dest_under_lock_test,
+    teleport_admit_reserves_dest_under_lock
+);
+conformance!(
+    teleport_phase_cas_is_fenced_and_legal_test,
+    teleport_phase_cas_is_fenced_and_legal
+);
+conformance!(
+    teleport_commit_is_one_statement_test,
+    teleport_commit_is_one_statement
+);
+conformance!(
+    teleport_release_entombs_source_test,
+    teleport_release_entombs_source
+);
+conformance!(
+    teleport_rollback_keeps_dest_reserved_until_aborted_test,
+    teleport_rollback_keeps_dest_reserved_until_aborted
+);
+conformance!(
+    dead_host_orphan_skips_open_teleport_sources_test,
+    dead_host_orphan_skips_open_teleport_sources
+);
+conformance!(
+    teleport_fail_and_abort_are_fenced_test,
+    teleport_fail_and_abort_are_fenced
 );

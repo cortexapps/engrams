@@ -142,12 +142,22 @@ pub async fn api_delete(state: &SharedState, session_id: SessionId) -> bool {
 }
 
 /// gRPC `admin_drain_host` (handler-direct, FleetService) — the operator
-/// drain that moves bound sessions into Evacuating.
+/// drain that schedules durable teleports.
 pub async fn api_drain_host(state: &SharedState, host_id: HostId) -> bool {
     let req = grpc_req(app::AdminDrainHostRequest {
         host_id: host_id.to_string(),
     });
     fleet_service(state).admin_drain_host(req).await.is_ok()
+}
+
+/// Request retirement and schedule teleports through the real handler.
+pub async fn api_retire_host(state: &SharedState, host_id: HostId) -> bool {
+    let req = grpc_req(app::RetireHostRequest {
+        host_id: host_id.to_string(),
+        owner: "admin".into(),
+        reason: "DST retirement".into(),
+    });
+    fleet_service(state).retire_host(req).await.is_ok()
 }
 
 /// The axum internal surface for `state`, built fresh (cheap) so a

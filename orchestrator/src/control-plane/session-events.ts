@@ -23,6 +23,7 @@ export const CURATED_KINDS: ReadonlySet<string> = new Set([
   "run_completed",
   "run_interrupted",
   "run_continued",
+  "teleport_finished",
   "harness_idle",
   "harness_parked",
   "resumed",

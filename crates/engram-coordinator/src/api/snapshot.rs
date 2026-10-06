@@ -597,11 +597,7 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
         // Evacuating session is NOT inline-resumable here: `resume_session`
         // has no Evacuating arm (it would 409), and `resume_from_idle`'s
         // rebind CAS only accepts Idle. Recovery is asynchronous — the
-        // `evac_resumer` scanner (ADR 0018 commit 12) relocates the session
-        // to the destination host and drives it `Evacuating → Created →
-        // Active`. Return a retryable 409 (like Queued/Pending) so the
-        // client polls /sessions/:id/events for the flip, rather than the
-        // misleading "only Idle / Created sessions can be resumed".
+        // teleport machine completes relocation. Return a retryable conflict.
         SessionState::Evacuating => Err(ApiError::Conflict(
             "session is relocating (operator drain / teleport); it will \
              resume automatically — retry shortly."
@@ -1043,32 +1039,10 @@ pub(crate) async fn resume_from_idle(
     // oracle orphan reap GCs it. The compensation (and its blind destroy
     // of a possibly-healthy VM) is unrepresentable under step-resume.
 
-    // ADR 0090 (#896 review, HIGH): a budget-exhausted evacuation lands
-    // here Idle WITH its unconfirmed source binding still in place —
-    // ownership of a maybe-live sandbox is never released on a guess.
-    // The guarded bind below requires an unbound row, so run the SAME
-    // teardown-confirmation gate the evac resumer uses: re-issue the
-    // idempotent destroy, probe, and only a confirmed-gone source
-    // authorizes the fenced clear. Unconfirmable → 503-retryable (the
-    // dead-host lane clears the binding once the source host is declared
-    // dead; a healthy-but-lagging teardown confirms on a later attempt).
-    // Checked BEFORE the restore so we never create a VM we may have to
-    // abandon. Normal idle-evicted rows are unbound and skip this leg,
-    // as does a step-resume re-entry after the clear committed.
+    // A retained Idle binding must be destroyed before a replacement is created.
     let mut session = session;
     if let (Some(source_host), Some(source_sandbox)) = (session.host_id, session.sandbox_id) {
-        crate::evac_resumer::confirm_source_teardown(
-            state,
-            source_host,
-            source_sandbox,
-            ctx.fence(),
-        )
-        .await
-        .map_err(|e| {
-            ApiError::Unavailable(format!(
-                "resume: retained source binding could not be confirmed torn down: {e}"
-            ))
-        })?;
+        destroy_retained_sandbox(state, source_host, source_sandbox, ctx.fence()).await?;
         match state
             .services
             .meta
@@ -1145,6 +1119,30 @@ pub(crate) async fn resume_from_idle(
     ))
 }
 
+/// Destroy and probe a retained binding before a cold boot can replace it.
+pub(crate) async fn destroy_retained_sandbox(
+    state: &SharedState,
+    host: engram_core::HostId,
+    sandbox: SandboxId,
+    fence: engram_core::traits::SessionFence,
+) -> Result<(), ApiError> {
+    let backend = state.host_registry.backend_for(host).await?;
+    match backend.destroy(sandbox, fence).await {
+        Ok(()) => {}
+        Err(engram_core::SandboxError::NotFound) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    match backend.probe_sandbox(sandbox).await {
+        Ok(probe) if !probe.known_to_backend && !probe.process_alive => Ok(()),
+        Err(engram_core::SandboxError::NotFound | engram_core::SandboxError::Unsupported(_)) => {
+            Ok(())
+        }
+        other => Err(ApiError::Unavailable(format!(
+            "retained sandbox teardown not confirmed: {other:?}"
+        ))),
+    }
+}
+
 /// ADR 0028 Fix B — manual-resume flavor of the disk-only cold boot:
 /// fresh kernel boot mounting the session's `live_disk_manifest` on
 /// whichever host can take it, fresh harness. On-disk work survives;
@@ -1154,91 +1152,62 @@ async fn resume_disk_only_cold_boot(
     ctx: &crate::session_ops::OpCtx<'_>,
     session: Session,
 ) -> Result<SnapshotResponse, ApiError> {
-    use crate::evacuation::{evacuate_dead_source, EvacError};
-
     let state = ctx.state;
     let id = session.id;
-
-    // The previous host isn't dead here (Idle = the sandbox was
-    // destroyed); clearing host_id disables `exclude_host` so a
-    // single-host deployment can recover onto itself.
-    let mut relocatable = session.clone();
-    let origin = relocatable.host_id.take();
-
-    // A fresh VM comes up inside `evacuate_dead_source` — record the
-    // restore step first (crash-resume boundary).
     if !ctx.step("restore").await {
         return Err(fenced_error());
     }
-    let receipt = evacuate_dead_source(
+    let mut spec = crate::boot_materializer::materialize_cold_boot(state, &session)
+        .await?
+        .ok_or_else(|| ApiError::Conflict("disk-only recovery requires an enabled image".into()))?;
+    spec.rootfs_manifest = session.live_disk_manifest;
+    let (repo, tag) = engram_core::types::session::split_image_ref(&session.image);
+    let context = crate::placement::ScheduleContext {
+        repo,
+        image_version: tag,
+        snapshot_host: None,
+        memory_mib: None,
+        cpu_budget_vcpus: None,
+        required_image_digest: None,
+        exclude_host: None,
+        prefer_host: session.host_id,
+        caps: Default::default(),
+        prefer_bundles: &[],
+    };
+    let (host, backend) = crate::placement::pick_for_session(
+        state.services.meta.as_ref(),
         &state.host_registry,
-        &state.services.meta,
-        relocatable,
-        None,
-        // ADR 0116: lazily materialized — this path is disk-only by
-        // construction (no snapshot above), so the rung-2 branch always
-        // awaits it; the laziness keeps ONE call shape with the
-        // evac-resumer leg, where rung-1 must never run these reads.
-        crate::boot_materializer::materialize_cold_boot(state, &session),
-        None,
-        // ADR 0045 C2 (E2B fold, origin affinity): prefer the host the
-        // session last ran on — its NBD chunk cache (and base shm) are
-        // warm there. Soft tier-2: loses to capacity/draining, so this
-        // never strands the resume.
-        origin,
-        ctx.fence(),
-        // #800: `None` keeps this user-initiated single /resume path on its
-        // pre-#800 capacity-soft placement. The reserved (queue-on-no-fit)
-        // bound is wired on the drain-driven EVAC-SCANNER leg (`evac_resumer`
-        // — the #800 over-reservation wave); the resume verb's own
-        // MEMORY-snapshot path already queues via `placement_preview`
-        // (#795). Widening the reserved bound to this disk-only resume arm
-        // is a separate follow-up, out of #800's scope.
-        None,
+        &context,
         state.services.clock.now_utc(),
     )
     .await
-    .map_err(|e| match &e {
-        EvacError::NoTargetAvailable(_) => ApiError::Unavailable(format!(
-            "no host can take the disk-only cold-boot recovery right now: {e}. \
-             Retry shortly.",
-        )),
-        // Image un-enabled: structural, user-actionable — same message the
-        // eager pre-check used to produce.
-        EvacError::ColdBootUnavailable(_) => ApiError::Conflict(format!(
-            "session {id} has only a live disk manifest and its image `{}` is no \
-             longer enabled — re-enable it (POST /api/enabled-images), then retry /resume",
-            session.image,
-        )),
-        // Transient slot-resolution read: retryable, not terminal.
-        EvacError::SpecResolution(_) => ApiError::Unavailable(format!(
-            "cold-boot spec resolution hit a transient error: {e}. Retry shortly.",
-        )),
-        _ => ApiError::Internal(format!("disk-only cold-boot recovery failed: {e}")),
-    })?;
-
-    tracing::info!(
-        session_id = %id,
-        new_host = %receipt.new_host_id,
-        new_sandbox = %receipt.new_sandbox_id,
-        loss = receipt.loss.as_str(),
-        "resume: disk-only cold boot relocated session to Created — finishing harness rebuild",
-    );
-    let _ = state
-        .emit(
-            id,
-            SessionEvent::StatusChanged {
-                from: SessionState::Idle,
-                to: SessionState::Created,
-                at: state.services.clock.now_utc(),
-            },
-        )
-        .await;
+    .map_err(|e| ApiError::Unavailable(format!("disk-only recovery placement: {e:?}")))?;
+    let sandbox = backend.create(spec).await?;
+    let binding_epoch = state
+        .services
+        .meta
+        .fenced_assign_sandbox(id, ctx.epoch, Some(sandbox), Some(host))
+        .await?
+        .ok_or_else(fenced_error)?;
+    state.host_registry.record_sandbox_owner(sandbox, host);
+    crate::session_ops::transition_with_fence_emitting(
+        state,
+        id,
+        ctx.fence(),
+        SessionState::Created,
+        BindingDisposition::Retain,
+        vec![SessionEvent::StatusChanged {
+            from: session.status,
+            to: SessionState::Created,
+            at: state.services.clock.now_utc(),
+        }],
+    )
+    .await?;
 
     if !ctx.step("bind").await {
         return Err(fenced_error());
     }
-    bind_harness_generation(state, id, receipt.new_sandbox_id, receipt.binding_epoch).await?;
+    bind_harness_generation(state, id, sandbox, binding_epoch).await?;
     if !ctx.step("finish").await {
         return Err(fenced_error());
     }
@@ -1246,14 +1215,8 @@ async fn resume_disk_only_cold_boot(
     let outcome = finish_resume_to_active(
         state,
         &refreshed,
-        receipt.new_sandbox_id,
-        materialize_snapshot_resume(
-            state,
-            &refreshed,
-            receipt.new_sandbox_id,
-            receipt.binding_epoch,
-        )
-        .await?,
+        sandbox,
+        materialize_snapshot_resume(state, &refreshed, sandbox, binding_epoch).await?,
         ctx.fence(),
     )
     .await?;
@@ -1427,14 +1390,8 @@ pub enum FinishResumeOutcome {
 /// transcript as-is rather than blocking the resume — the guest is
 /// already coherent; the worst case is a confusing-but-intact log.
 ///
-/// Shared by [`resume_from_fc_snapshot`] (manual `/resume`) and
-/// `evac_resumer::run_resume_pipeline` (operator drain / teleport) — the
-/// two rung-1 entry points. The `cause` distinguishes them for the web
-/// copy (ADR 0045 F1): the manual-`/resume` path resumes a session that
-/// was idled after its host died, so it carries
-/// [`RecoveryCause::HostFailureRecovery`]; the evac-resumer path is an
-/// operator-initiated relocation, so it carries
-/// [`RecoveryCause::PlannedRelocation`].
+/// Checkpoint recovery rewinds guest-derived events to its capture cursor.
+/// Planned teleport does not rewind the transcript.
 pub async fn apply_rung1_rewind(
     state: &SharedState,
     session_id: SessionId,
@@ -1512,10 +1469,6 @@ pub async fn apply_rung1_rewind(
 /// fresh sandbox bound:
 ///
 /// - [`resume_from_fc_snapshot`] (user-initiated `/resume` from Idle).
-/// - [`crate::api::admin::evacuate_session`] (operator drain via the
-///   admin endpoint).
-/// - [`crate::evac_resumer`] scanner (drives `Evacuating → Created`
-///   for sessions an operator drain marked; ADR 0044 K3).
 /// - [`resume_from_created`] dispatcher arm (manual recovery of a
 ///   drained session).
 ///
@@ -2199,9 +2152,7 @@ async fn bind_resumed_session(
 /// replica's `/exec` / `/shell` / `/prompt` resolves the new sandbox by
 /// reading that row ([`AppState::resolve_sandbox`]).
 ///
-/// Shared with `bind_resumed_session` (the /resume path); exposed
-/// `pub(crate)` so the admin evac endpoint and the `evac_resumer`
-/// scanner (driving operator-drained sessions) can fire the same shape.
+/// Shared by resume, exec, and teleport attachment.
 pub(crate) async fn bind_harness_generation(
     state: &SharedState,
     id: SessionId,
@@ -2913,7 +2864,7 @@ mod evicting_gate_tests {
 
     /// ADR 0018: an `ensure_active` (/exec, /events) landing while an
     /// operator drain / teleport has the session at `Evacuating` must
-    /// return a RETRYABLE 409 — the `evac_resumer` relocates it back to
+    /// return a RETRYABLE 409 — the `teleport` relocates it back to
     /// Active asynchronously. It must NOT route to `resume_session` (which
     /// has no Evacuating arm and would 409 with the misleading "only Idle /
     /// Created can be resumed"), and must leave the session untouched.

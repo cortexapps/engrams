@@ -25,7 +25,9 @@ use std::time::Duration;
 use dashmap::DashMap;
 use engram_chunk_store::manifest::ChunkHash;
 use engram_core::SandboxId;
-use engram_sandbox_firecracker::sandbox_manifest::{ROLE_POST_COPY_DEST, ROLE_POST_COPY_SOURCE};
+use engram_sandbox_firecracker::sandbox_manifest::{
+    ROLE_HELD_SOURCE, ROLE_POST_COPY_DEST, ROLE_POST_COPY_SOURCE,
+};
 
 /// No commit/abort within this window triggers the coordinator
 /// ownership check (see module docs). The clock runs from the LAST
@@ -46,6 +48,11 @@ pub const EXPORT_TTL: Duration = Duration::from_secs(120);
 pub enum MigrationRole {
     PostCopySource,
     PostCopyDest,
+    /// ADR 0123 B: a snapshot-kind source held paused after its capture
+    /// (`snapshot_hold`). Like a post-copy source it never self-resumes
+    /// and is never a checkpoint candidate; the coordinator's rollback
+    /// (`resume`) or release (`destroy`) ends it.
+    HeldSource,
 }
 
 impl MigrationRole {
@@ -53,6 +60,7 @@ impl MigrationRole {
         match self {
             Self::PostCopySource => ROLE_POST_COPY_SOURCE,
             Self::PostCopyDest => ROLE_POST_COPY_DEST,
+            Self::HeldSource => ROLE_HELD_SOURCE,
         }
     }
 
@@ -60,6 +68,7 @@ impl MigrationRole {
         match s {
             ROLE_POST_COPY_SOURCE => Some(Self::PostCopySource),
             ROLE_POST_COPY_DEST => Some(Self::PostCopyDest),
+            ROLE_HELD_SOURCE => Some(Self::HeldSource),
             _ => None,
         }
     }
@@ -517,7 +526,11 @@ mod tests {
 
     #[test]
     fn migration_role_round_trips_persistence_strings() {
-        for role in [MigrationRole::PostCopySource, MigrationRole::PostCopyDest] {
+        for role in [
+            MigrationRole::PostCopySource,
+            MigrationRole::PostCopyDest,
+            MigrationRole::HeldSource,
+        ] {
             assert_eq!(MigrationRole::parse(role.as_str()), Some(role));
         }
         assert_eq!(MigrationRole::parse("garbage"), None);
@@ -683,6 +696,7 @@ fn migration_role_wire_names_agree() {
     for (role, name) in [
         (MigrationRole::PostCopySource, ROLE_POST_COPY_SOURCE),
         (MigrationRole::PostCopyDest, ROLE_POST_COPY_DEST),
+        (MigrationRole::HeldSource, ROLE_HELD_SOURCE),
     ] {
         assert_eq!(role.as_str(), name);
         assert_eq!(MigrationRole::parse(name), Some(role));

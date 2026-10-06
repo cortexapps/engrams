@@ -1,4 +1,9 @@
 use crate::types::host::DeleteHostOutcome;
+use crate::types::ids::TeleportId;
+use crate::types::teleport::{
+    SourceRelease, TeleportAdmitOutcome, TeleportAdmitRequest, TeleportPatch, TeleportPhase,
+    TeleportRow, TeleportSettle,
+};
 use async_trait::async_trait;
 
 use crate::error::MetaError;
@@ -158,6 +163,70 @@ impl ExecOutputStream {
 /// we can support SQLite for embedded deployments later.
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
+    /// Current binding generation and highest attached generation.
+    async fn session_binding_generations(&self, _id: SessionId) -> Result<(u64, u64), MetaError> {
+        unimplemented!("session_binding_generations")
+    }
+
+    /// Admit a move and reserve its destination in one transaction.
+    async fn teleport_admit(
+        &self,
+        _req: TeleportAdmitRequest,
+    ) -> Result<TeleportAdmitOutcome, MetaError> {
+        unimplemented!("teleport_admit")
+    }
+    /// Compare the phase and session fence before applying the patch.
+    async fn teleport_advance(
+        &self,
+        _id: TeleportId,
+        _from: TeleportPhase,
+        _to: TeleportPhase,
+        _patch: TeleportPatch,
+        _epoch: i64,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("teleport_advance")
+    }
+    /// Move the binding and phase together; mint one binding generation.
+    async fn teleport_commit(
+        &self,
+        _id: TeleportId,
+        _epoch: i64,
+    ) -> Result<Option<u64>, MetaError> {
+        unimplemented!("teleport_commit")
+    }
+    /// Finish only after source teardown has been confirmed.
+    async fn teleport_release_source(
+        &self,
+        _id: TeleportId,
+        _epoch: i64,
+        _how: SourceRelease,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("teleport_release_source")
+    }
+    /// Mark an open row `failed` and settle the session in one fenced
+    /// transaction (see [`TeleportSettle`]). `false` when the row is already
+    /// terminal or the epoch moved; `Conflict` on an illegal session edge.
+    async fn teleport_settle(
+        &self,
+        _id: TeleportId,
+        _epoch: i64,
+        _settle: TeleportSettle,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("teleport_settle")
+    }
+    async fn teleport_abort(&self, _id: TeleportId, _epoch: i64) -> Result<bool, MetaError> {
+        unimplemented!("teleport_abort")
+    }
+    async fn list_open_teleports(&self) -> Result<Vec<TeleportRow>, MetaError> {
+        unimplemented!("list_open_teleports")
+    }
+    async fn open_teleport_for_session(
+        &self,
+        _sid: SessionId,
+    ) -> Result<Option<TeleportRow>, MetaError> {
+        unimplemented!("open_teleport_for_session")
+    }
+
     // ---- liveness ----
     //
     // Cheap connectivity check for readiness probes. Default is
@@ -381,33 +450,6 @@ pub trait MetadataStore: Send + Sync {
     /// Default: zeros.
     async fn queued_demand(&self) -> Result<QueuedDemand, MetaError> {
         Ok(QueuedDemand::default())
-    }
-
-    /// ADR 0047 (was `state.teleport_targets`): pin / clear the
-    /// operator-chosen teleport destination on the session row. The
-    /// evac scanner — on ANY replica — honors the pin as its required
-    /// placement. Setting a pin stamps `teleport_target_set_at = NOW()`
-    /// (issue #214) so the scanner can age out a stale leaked pin;
-    /// clearing (`None`) clears the stamp too. Default impls (mocks):
-    /// no-op / no pin.
-    async fn set_teleport_target(
-        &self,
-        _id: SessionId,
-        _target: Option<HostId>,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    /// Read the operator-pinned teleport destination and the instant it
-    /// was set, if any. Issue #214: the `set_at` lets the evac scanner
-    /// ignore + clear a pin older than a TTL — degrading any future pin
-    /// leak to default placement instead of a strict hijack. A `None`
-    /// timestamp (pin set before the 0065 migration) is treated as
-    /// not-aged by the scanner. Default impls (mocks): no pin.
-    async fn get_teleport_target(
-        &self,
-        _id: SessionId,
-    ) -> Result<Option<(HostId, Option<chrono::DateTime<chrono::Utc>>)>, MetaError> {
-        Ok(None)
     }
 
     /// ADR 0047 (was `state.git_broker_tokens`): the KEK-sealed
@@ -3714,26 +3756,6 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
-    // ----------------------------------------------------------------
-    // ADR 0018 commit 12b — evac_resumer scanner support.
-    //
-    // The scanner polls `Evacuating` sessions, picks a peer host,
-    // and drives `Evacuating → Created → Active`. The retry counter
-    // is a side-car on the `sessions` row (column `evac_attempts`,
-    // migration 0037). The PG-backed `transition_session(Evacuating)`
-    // resets the counter to 0 in the same UPDATE so re-entry from a
-    // fresh drain starts fresh; bumps happen via `bump_evac_attempts`
-    // (atomic UPDATE ... RETURNING).
-    // ----------------------------------------------------------------
-
-    /// Sessions currently in `Evacuating`, paired with their current
-    /// `evac_attempts` count. The scanner uses this on every tick.
-    /// Default `Ok(vec![])` keeps in-memory mocks quiet; PG impl
-    /// runs an indexed `WHERE status = 'evacuating'` query.
-    async fn list_evacuating_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
-        Ok(Vec::new())
-    }
-
     /// Input to the dead-host driver's straggler sweep: `HostLost` rows
     /// whose inline stage-2 transition never ran or failed. These arise
     /// when eviction exhausts its retry budget or a coordinator replica
@@ -3742,15 +3764,6 @@ pub trait MetadataStore: Send + Sync {
     /// listing explicitly.
     async fn list_host_lost_sessions(&self) -> Result<Vec<Session>, MetaError> {
         Ok(Vec::new())
-    }
-
-    /// Atomically `evac_attempts = evac_attempts + 1 RETURNING
-    /// evac_attempts`. Scanner calls this before each resume attempt;
-    /// when the returned count exceeds the budget, scanner gives up
-    /// and falls back to Idle. Default returns 1 so test mocks can
-    /// observe the bump without persisting state.
-    async fn bump_evac_attempts(&self, _session_id: SessionId) -> Result<u32, MetaError> {
-        Ok(1)
     }
 
     // ----------------------------------------------------------------

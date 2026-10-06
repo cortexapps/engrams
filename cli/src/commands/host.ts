@@ -2,7 +2,7 @@
  * engrams host … — FleetService passthrough verbs (admin surfaces).
  *
  * `evacuate` closes the gap the Rust CLI documented ("no engram-cli surface
- * for EvacuateSession") — the passthrough forwards the whole FleetService.
+ * for TeleportSession") — the passthrough forwards the whole FleetService.
  */
 
 import type { Clients } from "../client.ts";
@@ -121,7 +121,7 @@ export async function uncordon(c: Clients, id: string, json: boolean): Promise<v
 }
 
 export async function evacuate(c: Clients, sessionId: string, json: boolean): Promise<void> {
-  const resp = await c.fleet.evacuateSession({ sessionId }).catch(failWith);
-  if (json) printJson({ session_id: resp.sessionId, status: resp.status });
-  else console.log(`${resp.sessionId}: ${resp.status}`);
+  const resp = await c.fleet.teleportSession({ sessionId }).catch(failWith);
+  if (json) printJson({ teleport_id: resp.teleportId, kind: resp.kind, dest_host_id: resp.destHostId });
+  else console.log(`${resp.teleportId}: ${resp.kind} to ${resp.destHostId}`);
 }

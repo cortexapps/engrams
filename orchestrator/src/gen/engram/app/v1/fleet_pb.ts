@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/fleet.proto.
  */
 export const file_engram_app_v1_fleet: GenFile = /*@__PURE__*/
-  fileDesc("ChllbmdyYW0vYXBwL3YxL2ZsZWV0LnByb3RvEg1lbmdyYW0uYXBwLnYxIhIKEExpc3RIb3N0c1JlcXVlc3QiOwoRTGlzdEhvc3RzUmVzcG9uc2USJgoFaG9zdHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IvEGCghIb3N0VmlldxIKCgJpZBgBIAEoCRIQCghob3N0bmFtZRgCIAEoCRIOCgZzdGF0dXMYAyABKAkSGgoSY2FwYWNpdHlfdG90YWxfbWliGAQgASgEEhkKEWNhcGFjaXR5X3VzZWRfbWliGAUgASgEEhkKEXJ1bm5pbmdfc2FuZGJveGVzGAYgASgNEhQKDHJlYWR5X2ltYWdlcxgIIAEoBBIbChNyZWFkeV9pbWFnZV9kaWdlc3RzGAkgAygJEhsKE3V0aWxfZGlza190b3RhbF9taWIYCiABKAQSGgoSdXRpbF9kaXNrX3VzZWRfbWliGAsgASgEEhoKEnV0aWxfbWVtX3RvdGFsX21pYhgMIAEoBBIZChF1dGlsX21lbV91c2VkX21pYhgNIAEoBBIUCgx1dGlsX2NwdV9wY3QYDiABKAISGQoRbGFzdF9oZWFydGJlYXRfYXQYDyABKAkSEAoIY29yZG9uZWQYECABKAgSFwoPYWxsb2NhdGFibGVfbWliGBEgASgEEhQKDHJlc2VydmVkX21pYhgSIAEoBBIQCghmcmVlX21pYhgTIAEoBBITCgt0b3RhbF92Y3B1cxgUIAEoDRIYChBjcHVfYnVkZ2V0X3ZjcHVzGBUgASgEEhYKDnJlc2VydmVkX3ZjcHVzGBYgASgEEhIKCmZyZWVfdmNwdXMYFyABKAQSGQoRdXRpbF9iYXNlX3NobV9taWIYGCABKAQSGwoTdXRpbF9wYXJrZWRfcHNzX21pYhgZIAEoBBIcChR1dGlsX3J1bm5pbmdfcHNzX21pYhgaIAEoBBIcChRmYWlsaW5nX2NhcGFiaWxpdGllcxgbIAMoCRIbChNmY19zbmFwc2hvdF92ZXJzaW9uGBwgASgJEhsKE2NhcGFiaWxpdGllc19zY2hlbWEYHSABKA0SGQoRbGl2ZV9tYXRlcmlhbGl6ZXMYHiABKA0SGQoRbGl2ZV9jYXB0dXJlX2pvYnMYHyABKA0SHwoXdXRpbF9jb21taXR0ZWRfc3dhcF9taWIYICABKAQSFAoMY29yZG9uX293bmVyGCEgASgJEjEKCnJldGlyZW1lbnQYIiABKAsyHS5lbmdyYW0uYXBwLnYxLkhvc3RSZXRpcmVtZW50SgQIBxAIUg9sb2NhbF9zbmFwc2hvdHMiIQoOR2V0SG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSI4Cg9HZXRIb3N0UmVzcG9uc2USJQoEaG9zdBgBIAEoCzIXLmVuZ3JhbS5hcHAudjEuSG9zdFZpZXciKQoWR2V0SG9zdENvd1N0YXRlUmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIlkKF0dldEhvc3RDb3dTdGF0ZVJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSLQoIc2Vzc2lvbnMYAiADKAsyGy5lbmdyYW0uYXBwLnYxLkNvd1N0YXRlVmlldyIjChBEcmFpbkhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiEwoRRHJhaW5Ib3N0UmVzcG9uc2UiKAoVQWRtaW5EcmFpbkhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkibAoWQWRtaW5EcmFpbkhvc3RSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEhIKCmV2YWN1YXRpbmcYAiADKAkSLQoIZmFpbHVyZXMYAyADKAsyGy5lbmdyYW0uYXBwLnYxLkRyYWluRmFpbHVyZSIxCgxEcmFpbkZhaWx1cmUSEgoKc2Vzc2lvbl9pZBgBIAEoCRINCgVlcnJvchgCIAEoCSIzChFDb3Jkb25Ib3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJEg0KBW93bmVyGAIgASgJIjwKF0JlZ2luSG9zdEhhbmRvZmZSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkSEAoIdHRsX3NlY3MYAiABKAQiPQoYQmVnaW5Ib3N0SGFuZG9mZlJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSEAoIYWNjZXB0ZWQYAiABKAgiNQoSQ29yZG9uSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSDgoGc3RhdHVzGAIgASgJIjUKE1VuY29yZG9uSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCRINCgVvd25lchgCIAEoCSI3ChRVbmNvcmRvbkhvc3RSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSIkChFEZWxldGVIb3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIhQKEkRlbGV0ZUhvc3RSZXNwb25zZSIaChhHZXRTdG9yYWdlU3VtbWFyeVJlcXVlc3QihAIKGUdldFN0b3JhZ2VTdW1tYXJ5UmVzcG9uc2USEQoJc25hcHNob3RzGAEgASgEEhYKDnNuYXBzaG90X2J5dGVzGAIgASgEEhIKCmdjX3BlbmRpbmcYAyABKAQSGQoRdHJhY2tlZF9zYW5kYm94ZXMYBCABKAQSFAoMZGlydHlfY2h1bmtzGAUgASgEEhcKD3VuZmx1c2hlZF9ieXRlcxgGIAEoBBIYChBhdmdfbG9jYWxpdHlfcGN0GAcgASgNEioKBHJvd3MYCCADKAsyHC5lbmdyYW0uYXBwLnYxLkR1cmFiaWxpdHlSb3cSGAoQZ2NfcGVuZGluZ19leGFjdBgJIAEoCCLlAQoNRHVyYWJpbGl0eVJvdxISCgpzYW5kYm94X2lkGAEgASgJEhcKCnNlc3Npb25faWQYAiABKAlIAIgBARIPCgdob3N0X2lkGAMgASgJEhQKDGRpcnR5X2NodW5rcxgEIAEoDRITCgtkaXJ0eV9ieXRlcxgFIAEoBBITCgtiYXNlX2NodW5rcxgGIAEoDRIZChFiYXNlX2NodW5rc19sb2NhbBgHIAEoDRIaCg1sYXN0X2ZsdXNoX2F0GAggASgJSAGIAQFCDQoLX3Nlc3Npb25faWRCEAoOX2xhc3RfZmx1c2hfYXQiKQoTRmx1c2hTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIlsKFEZsdXNoU2Vzc2lvblJlc3BvbnNlEg8KB291dGNvbWUYASABKAkSHQoQbWFuaWZlc3RfdmVyc2lvbhgCIAEoBEgAiAEBQhMKEV9tYW5pZmVzdF92ZXJzaW9uIlYKFkV2YWN1YXRlU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIYCgt0YXJnZXRfaG9zdBgCIAEoCUgAiAEBQg4KDF90YXJnZXRfaG9zdCI9ChdFdmFjdWF0ZVNlc3Npb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSIXChVHZXRGbGVldERlbWFuZFJlcXVlc3Qi8QEKFkdldEZsZWV0RGVtYW5kUmVzcG9uc2USEwoLcmVhZHlfaG9zdHMYASABKA0SGQoRc2NoZWR1bGFibGVfaG9zdHMYAiABKA0SEAoIZnJlZV9taWIYAyABKAQSEQoJdG90YWxfbWliGAQgASgEEhIKCmZyZWVfdmNwdXMYBSABKAQSEwoLdG90YWxfdmNwdXMYBiABKAQSFgoOY29yZG9uZWRfaG9zdHMYByABKA0SFwoPcXVldWVkX3Nlc3Npb25zGAggASgEEhIKCnF1ZXVlZF9taWIYCSABKAQSFAoMcXVldWVkX3ZjcHVzGAogASgEIkkKDkNodW5rR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzIowCCg9DaHVua0djUmVzcG9uc2USFQoNbGlzdGVkX2NodW5rcxgBIAEoBBIWCg5tYWxmb3JtZWRfa2V5cxgCIAEoBBIUCgxwaW5fc2V0X3NpemUYAyABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYBCABKAQSGAoQcHJvbW90ZWRfZGVsZXRlcxgHIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYCCABKAQSEgoKZ3JhY2Vfc2VjcxgJIAEoBBIYChBnZW5lcmF0aW9uX21vdmVkGAogASgIEhcKCm1hcmtfZXJyb3IYCyABKAlIAIgBAUINCgtfbWFya19lcnJvckoECAUQBkoECAYQByJKCg9CdW5kbGVHY1JlcXVlc3QSDwoHZHJ5X3J1bhgBIAEoCBIXCgpncmFjZV9zZWNzGAIgASgESACIAQFCDQoLX2dyYWNlX3NlY3MiwwEKEEJ1bmRsZUdjUmVzcG9uc2USDgoGbGlzdGVkGAEgASgEEhQKDHBpbl9zZXRfc2l6ZRgCIAEoBBIZChFjYW5kaWRhdGVzX21hcmtlZBgDIAEoBBIYChBwcm9tb3RlZF9kZWxldGVzGAQgASgEEh0KFXByb21vdGVfZGVsZXRlX2Vycm9ycxgFIAEoBBIVCg1yZXN0YXJ0X2NvdW50GAYgASgNEh4KFnByb21vdGVfcmVwaW5uZWRfc2tpcHMYByABKAQiUAoVU25hcHNob3RCbG9iR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzItwBChZTbmFwc2hvdEJsb2JHY1Jlc3BvbnNlEg4KBmxpc3RlZBgBIAEoBBIRCgltYWxmb3JtZWQYAiABKAQSFAoMcGluX3NldF9zaXplGAMgASgEEhkKEWNhbmRpZGF0ZXNfbWFya2VkGAQgASgEEhgKEHByb21vdGVkX2RlbGV0ZXMYBSABKAQSHgoWcHJvbW90ZV9yZXBpbm5lZF9za2lwcxgGIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYByABKAQSFQoNcmVzdGFydF9jb3VudBgIIAEoDSJDChFSZXRpcmVIb3N0UmVxdWVzdBIPCgdob3N0X2lkGAEgASgJEg0KBW93bmVyGAIgASgJEg4KBnJlYXNvbhgDIAEoCSJzChJSZXRpcmVIb3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIxCgpyZXRpcmVtZW50GAIgASgLMh0uZW5ncmFtLmFwcC52MS5Ib3N0UmV0aXJlbWVudBIZChF0ZWxlcG9ydHNfcGxhbm5lZBgDIAEoDSJuCg5Ib3N0UmV0aXJlbWVudBIUCgxyZXF1ZXN0ZWRfYXQYASABKAkSEgoKcmV0aXJlZF9hdBgCIAEoCRIyCghibG9ja2VycxgDIAMoCzIgLmVuZ3JhbS5hcHAudjEuUmV0aXJlbWVudEJsb2NrZXIiMAoRUmV0aXJlbWVudEJsb2NrZXISDAoEa2luZBgBIAEoCRINCgVjb3VudBgCIAEoBDLoCwoMRmxlZXRTZXJ2aWNlEk4KCUxpc3RIb3N0cxIfLmVuZ3JhbS5hcHAudjEuTGlzdEhvc3RzUmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuTGlzdEhvc3RzUmVzcG9uc2USSAoHR2V0SG9zdBIdLmVuZ3JhbS5hcHAudjEuR2V0SG9zdFJlcXVlc3QaHi5lbmdyYW0uYXBwLnYxLkdldEhvc3RSZXNwb25zZRJRCgpSZXRpcmVIb3N0EiAuZW5ncmFtLmFwcC52MS5SZXRpcmVIb3N0UmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuUmV0aXJlSG9zdFJlc3BvbnNlEmAKD0dldEhvc3RDb3dTdGF0ZRIlLmVuZ3JhbS5hcHAudjEuR2V0SG9zdENvd1N0YXRlUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuR2V0SG9zdENvd1N0YXRlUmVzcG9uc2USTgoJRHJhaW5Ib3N0Eh8uZW5ncmFtLmFwcC52MS5EcmFpbkhvc3RSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5EcmFpbkhvc3RSZXNwb25zZRJdCg5BZG1pbkRyYWluSG9zdBIkLmVuZ3JhbS5hcHAudjEuQWRtaW5EcmFpbkhvc3RSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5BZG1pbkRyYWluSG9zdFJlc3BvbnNlElEKCkNvcmRvbkhvc3QSIC5lbmdyYW0uYXBwLnYxLkNvcmRvbkhvc3RSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5Db3Jkb25Ib3N0UmVzcG9uc2USYwoQQmVnaW5Ib3N0SGFuZG9mZhImLmVuZ3JhbS5hcHAudjEuQmVnaW5Ib3N0SGFuZG9mZlJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkJlZ2luSG9zdEhhbmRvZmZSZXNwb25zZRJXCgxVbmNvcmRvbkhvc3QSIi5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLlVuY29yZG9uSG9zdFJlc3BvbnNlElEKCkRlbGV0ZUhvc3QSIC5lbmdyYW0uYXBwLnYxLkRlbGV0ZUhvc3RSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5EZWxldGVIb3N0UmVzcG9uc2USZgoRR2V0U3RvcmFnZVN1bW1hcnkSJy5lbmdyYW0uYXBwLnYxLkdldFN0b3JhZ2VTdW1tYXJ5UmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuR2V0U3RvcmFnZVN1bW1hcnlSZXNwb25zZRJXCgxGbHVzaFNlc3Npb24SIi5lbmdyYW0uYXBwLnYxLkZsdXNoU2Vzc2lvblJlcXVlc3QaIy5lbmdyYW0uYXBwLnYxLkZsdXNoU2Vzc2lvblJlc3BvbnNlEmAKD0V2YWN1YXRlU2Vzc2lvbhIlLmVuZ3JhbS5hcHAudjEuRXZhY3VhdGVTZXNzaW9uUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuRXZhY3VhdGVTZXNzaW9uUmVzcG9uc2USSAoHQ2h1bmtHYxIdLmVuZ3JhbS5hcHAudjEuQ2h1bmtHY1JlcXVlc3QaHi5lbmdyYW0uYXBwLnYxLkNodW5rR2NSZXNwb25zZRJLCghCdW5kbGVHYxIeLmVuZ3JhbS5hcHAudjEuQnVuZGxlR2NSZXF1ZXN0Gh8uZW5ncmFtLmFwcC52MS5CdW5kbGVHY1Jlc3BvbnNlEl0KDlNuYXBzaG90QmxvYkdjEiQuZW5ncmFtLmFwcC52MS5TbmFwc2hvdEJsb2JHY1JlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLlNuYXBzaG90QmxvYkdjUmVzcG9uc2USXQoOR2V0RmxlZXREZW1hbmQSJC5lbmdyYW0uYXBwLnYxLkdldEZsZWV0RGVtYW5kUmVxdWVzdBolLmVuZ3JhbS5hcHAudjEuR2V0RmxlZXREZW1hbmRSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session]);
+  fileDesc("ChllbmdyYW0vYXBwL3YxL2ZsZWV0LnByb3RvEg1lbmdyYW0uYXBwLnYxIhIKEExpc3RIb3N0c1JlcXVlc3QiOwoRTGlzdEhvc3RzUmVzcG9uc2USJgoFaG9zdHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLkhvc3RWaWV3IvEGCghIb3N0VmlldxIKCgJpZBgBIAEoCRIQCghob3N0bmFtZRgCIAEoCRIOCgZzdGF0dXMYAyABKAkSGgoSY2FwYWNpdHlfdG90YWxfbWliGAQgASgEEhkKEWNhcGFjaXR5X3VzZWRfbWliGAUgASgEEhkKEXJ1bm5pbmdfc2FuZGJveGVzGAYgASgNEhQKDHJlYWR5X2ltYWdlcxgIIAEoBBIbChNyZWFkeV9pbWFnZV9kaWdlc3RzGAkgAygJEhsKE3V0aWxfZGlza190b3RhbF9taWIYCiABKAQSGgoSdXRpbF9kaXNrX3VzZWRfbWliGAsgASgEEhoKEnV0aWxfbWVtX3RvdGFsX21pYhgMIAEoBBIZChF1dGlsX21lbV91c2VkX21pYhgNIAEoBBIUCgx1dGlsX2NwdV9wY3QYDiABKAISGQoRbGFzdF9oZWFydGJlYXRfYXQYDyABKAkSEAoIY29yZG9uZWQYECABKAgSFwoPYWxsb2NhdGFibGVfbWliGBEgASgEEhQKDHJlc2VydmVkX21pYhgSIAEoBBIQCghmcmVlX21pYhgTIAEoBBITCgt0b3RhbF92Y3B1cxgUIAEoDRIYChBjcHVfYnVkZ2V0X3ZjcHVzGBUgASgEEhYKDnJlc2VydmVkX3ZjcHVzGBYgASgEEhIKCmZyZWVfdmNwdXMYFyABKAQSGQoRdXRpbF9iYXNlX3NobV9taWIYGCABKAQSGwoTdXRpbF9wYXJrZWRfcHNzX21pYhgZIAEoBBIcChR1dGlsX3J1bm5pbmdfcHNzX21pYhgaIAEoBBIcChRmYWlsaW5nX2NhcGFiaWxpdGllcxgbIAMoCRIbChNmY19zbmFwc2hvdF92ZXJzaW9uGBwgASgJEhsKE2NhcGFiaWxpdGllc19zY2hlbWEYHSABKA0SGQoRbGl2ZV9tYXRlcmlhbGl6ZXMYHiABKA0SGQoRbGl2ZV9jYXB0dXJlX2pvYnMYHyABKA0SHwoXdXRpbF9jb21taXR0ZWRfc3dhcF9taWIYICABKAQSFAoMY29yZG9uX293bmVyGCEgASgJEjEKCnJldGlyZW1lbnQYIiABKAsyHS5lbmdyYW0uYXBwLnYxLkhvc3RSZXRpcmVtZW50SgQIBxAIUg9sb2NhbF9zbmFwc2hvdHMiIQoOR2V0SG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSI4Cg9HZXRIb3N0UmVzcG9uc2USJQoEaG9zdBgBIAEoCzIXLmVuZ3JhbS5hcHAudjEuSG9zdFZpZXciKQoWR2V0SG9zdENvd1N0YXRlUmVxdWVzdBIPCgdob3N0X2lkGAEgASgJIlkKF0dldEhvc3RDb3dTdGF0ZVJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSLQoIc2Vzc2lvbnMYAiADKAsyGy5lbmdyYW0uYXBwLnYxLkNvd1N0YXRlVmlldyIjChBEcmFpbkhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiEwoRRHJhaW5Ib3N0UmVzcG9uc2UiKAoVQWRtaW5EcmFpbkhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkiXgoWQWRtaW5EcmFpbkhvc3RSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEg8KB3BsYW5uZWQYAiADKAkSEQoJZGVzY2VuZGVkGAMgAygJEg8KB3NraXBwZWQYBCABKA0iMwoRQ29yZG9uSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCRINCgVvd25lchgCIAEoCSI8ChdCZWdpbkhvc3RIYW5kb2ZmUmVxdWVzdBIPCgdob3N0X2lkGAEgASgJEhAKCHR0bF9zZWNzGAIgASgEIj0KGEJlZ2luSG9zdEhhbmRvZmZSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEhAKCGFjY2VwdGVkGAIgASgIIjUKEkNvcmRvbkhvc3RSZXNwb25zZRIPCgdob3N0X2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSI1ChNVbmNvcmRvbkhvc3RSZXF1ZXN0Eg8KB2hvc3RfaWQYASABKAkSDQoFb3duZXIYAiABKAkiNwoUVW5jb3Jkb25Ib3N0UmVzcG9uc2USDwoHaG9zdF9pZBgBIAEoCRIOCgZzdGF0dXMYAiABKAkiJAoRRGVsZXRlSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCSIUChJEZWxldGVIb3N0UmVzcG9uc2UiGgoYR2V0U3RvcmFnZVN1bW1hcnlSZXF1ZXN0IoQCChlHZXRTdG9yYWdlU3VtbWFyeVJlc3BvbnNlEhEKCXNuYXBzaG90cxgBIAEoBBIWCg5zbmFwc2hvdF9ieXRlcxgCIAEoBBISCgpnY19wZW5kaW5nGAMgASgEEhkKEXRyYWNrZWRfc2FuZGJveGVzGAQgASgEEhQKDGRpcnR5X2NodW5rcxgFIAEoBBIXCg91bmZsdXNoZWRfYnl0ZXMYBiABKAQSGAoQYXZnX2xvY2FsaXR5X3BjdBgHIAEoDRIqCgRyb3dzGAggAygLMhwuZW5ncmFtLmFwcC52MS5EdXJhYmlsaXR5Um93EhgKEGdjX3BlbmRpbmdfZXhhY3QYCSABKAgi5QEKDUR1cmFiaWxpdHlSb3cSEgoKc2FuZGJveF9pZBgBIAEoCRIXCgpzZXNzaW9uX2lkGAIgASgJSACIAQESDwoHaG9zdF9pZBgDIAEoCRIUCgxkaXJ0eV9jaHVua3MYBCABKA0SEwoLZGlydHlfYnl0ZXMYBSABKAQSEwoLYmFzZV9jaHVua3MYBiABKA0SGQoRYmFzZV9jaHVua3NfbG9jYWwYByABKA0SGgoNbGFzdF9mbHVzaF9hdBgIIAEoCUgBiAEBQg0KC19zZXNzaW9uX2lkQhAKDl9sYXN0X2ZsdXNoX2F0IikKE0ZsdXNoU2Vzc2lvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSJbChRGbHVzaFNlc3Npb25SZXNwb25zZRIPCgdvdXRjb21lGAEgASgJEh0KEG1hbmlmZXN0X3ZlcnNpb24YAiABKARIAIgBAUITChFfbWFuaWZlc3RfdmVyc2lvbiJWChZUZWxlcG9ydFNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSGAoLdGFyZ2V0X2hvc3QYAiABKAlIAIgBAUIOCgxfdGFyZ2V0X2hvc3QiUgoXVGVsZXBvcnRTZXNzaW9uUmVzcG9uc2USEwoLdGVsZXBvcnRfaWQYASABKAkSDAoEa2luZBgCIAEoCRIUCgxkZXN0X2hvc3RfaWQYAyABKAkiFwoVR2V0RmxlZXREZW1hbmRSZXF1ZXN0IvEBChZHZXRGbGVldERlbWFuZFJlc3BvbnNlEhMKC3JlYWR5X2hvc3RzGAEgASgNEhkKEXNjaGVkdWxhYmxlX2hvc3RzGAIgASgNEhAKCGZyZWVfbWliGAMgASgEEhEKCXRvdGFsX21pYhgEIAEoBBISCgpmcmVlX3ZjcHVzGAUgASgEEhMKC3RvdGFsX3ZjcHVzGAYgASgEEhYKDmNvcmRvbmVkX2hvc3RzGAcgASgNEhcKD3F1ZXVlZF9zZXNzaW9ucxgIIAEoBBISCgpxdWV1ZWRfbWliGAkgASgEEhQKDHF1ZXVlZF92Y3B1cxgKIAEoBCJJCg5DaHVua0djUmVxdWVzdBIPCgdkcnlfcnVuGAEgASgIEhcKCmdyYWNlX3NlY3MYAiABKARIAIgBAUINCgtfZ3JhY2Vfc2VjcyKMAgoPQ2h1bmtHY1Jlc3BvbnNlEhUKDWxpc3RlZF9jaHVua3MYASABKAQSFgoObWFsZm9ybWVkX2tleXMYAiABKAQSFAoMcGluX3NldF9zaXplGAMgASgEEhkKEWNhbmRpZGF0ZXNfbWFya2VkGAQgASgEEhgKEHByb21vdGVkX2RlbGV0ZXMYByABKAQSHQoVcHJvbW90ZV9kZWxldGVfZXJyb3JzGAggASgEEhIKCmdyYWNlX3NlY3MYCSABKAQSGAoQZ2VuZXJhdGlvbl9tb3ZlZBgKIAEoCBIXCgptYXJrX2Vycm9yGAsgASgJSACIAQFCDQoLX21hcmtfZXJyb3JKBAgFEAZKBAgGEAciSgoPQnVuZGxlR2NSZXF1ZXN0Eg8KB2RyeV9ydW4YASABKAgSFwoKZ3JhY2Vfc2VjcxgCIAEoBEgAiAEBQg0KC19ncmFjZV9zZWNzIsMBChBCdW5kbGVHY1Jlc3BvbnNlEg4KBmxpc3RlZBgBIAEoBBIUCgxwaW5fc2V0X3NpemUYAiABKAQSGQoRY2FuZGlkYXRlc19tYXJrZWQYAyABKAQSGAoQcHJvbW90ZWRfZGVsZXRlcxgEIAEoBBIdChVwcm9tb3RlX2RlbGV0ZV9lcnJvcnMYBSABKAQSFQoNcmVzdGFydF9jb3VudBgGIAEoDRIeChZwcm9tb3RlX3JlcGlubmVkX3NraXBzGAcgASgEIlAKFVNuYXBzaG90QmxvYkdjUmVxdWVzdBIPCgdkcnlfcnVuGAEgASgIEhcKCmdyYWNlX3NlY3MYAiABKARIAIgBAUINCgtfZ3JhY2Vfc2VjcyLcAQoWU25hcHNob3RCbG9iR2NSZXNwb25zZRIOCgZsaXN0ZWQYASABKAQSEQoJbWFsZm9ybWVkGAIgASgEEhQKDHBpbl9zZXRfc2l6ZRgDIAEoBBIZChFjYW5kaWRhdGVzX21hcmtlZBgEIAEoBBIYChBwcm9tb3RlZF9kZWxldGVzGAUgASgEEh4KFnByb21vdGVfcmVwaW5uZWRfc2tpcHMYBiABKAQSHQoVcHJvbW90ZV9kZWxldGVfZXJyb3JzGAcgASgEEhUKDXJlc3RhcnRfY291bnQYCCABKA0iQwoRUmV0aXJlSG9zdFJlcXVlc3QSDwoHaG9zdF9pZBgBIAEoCRINCgVvd25lchgCIAEoCRIOCgZyZWFzb24YAyABKAkicwoSUmV0aXJlSG9zdFJlc3BvbnNlEg8KB2hvc3RfaWQYASABKAkSMQoKcmV0aXJlbWVudBgCIAEoCzIdLmVuZ3JhbS5hcHAudjEuSG9zdFJldGlyZW1lbnQSGQoRdGVsZXBvcnRzX3BsYW5uZWQYAyABKA0ibgoOSG9zdFJldGlyZW1lbnQSFAoMcmVxdWVzdGVkX2F0GAEgASgJEhIKCnJldGlyZWRfYXQYAiABKAkSMgoIYmxvY2tlcnMYAyADKAsyIC5lbmdyYW0uYXBwLnYxLlJldGlyZW1lbnRCbG9ja2VyIjAKEVJldGlyZW1lbnRCbG9ja2VyEgwKBGtpbmQYASABKAkSDQoFY291bnQYAiABKAQy6AsKDEZsZWV0U2VydmljZRJOCglMaXN0SG9zdHMSHy5lbmdyYW0uYXBwLnYxLkxpc3RIb3N0c1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RIb3N0c1Jlc3BvbnNlEkgKB0dldEhvc3QSHS5lbmdyYW0uYXBwLnYxLkdldEhvc3RSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5HZXRIb3N0UmVzcG9uc2USUQoKUmV0aXJlSG9zdBIgLmVuZ3JhbS5hcHAudjEuUmV0aXJlSG9zdFJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLlJldGlyZUhvc3RSZXNwb25zZRJgCg9HZXRIb3N0Q293U3RhdGUSJS5lbmdyYW0uYXBwLnYxLkdldEhvc3RDb3dTdGF0ZVJlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkdldEhvc3RDb3dTdGF0ZVJlc3BvbnNlEk4KCURyYWluSG9zdBIfLmVuZ3JhbS5hcHAudjEuRHJhaW5Ib3N0UmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuRHJhaW5Ib3N0UmVzcG9uc2USXQoOQWRtaW5EcmFpbkhvc3QSJC5lbmdyYW0uYXBwLnYxLkFkbWluRHJhaW5Ib3N0UmVxdWVzdBolLmVuZ3JhbS5hcHAudjEuQWRtaW5EcmFpbkhvc3RSZXNwb25zZRJRCgpDb3Jkb25Ib3N0EiAuZW5ncmFtLmFwcC52MS5Db3Jkb25Ib3N0UmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuQ29yZG9uSG9zdFJlc3BvbnNlEmMKEEJlZ2luSG9zdEhhbmRvZmYSJi5lbmdyYW0uYXBwLnYxLkJlZ2luSG9zdEhhbmRvZmZSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5CZWdpbkhvc3RIYW5kb2ZmUmVzcG9uc2USVwoMVW5jb3Jkb25Ib3N0EiIuZW5ncmFtLmFwcC52MS5VbmNvcmRvbkhvc3RSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5VbmNvcmRvbkhvc3RSZXNwb25zZRJRCgpEZWxldGVIb3N0EiAuZW5ncmFtLmFwcC52MS5EZWxldGVIb3N0UmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuRGVsZXRlSG9zdFJlc3BvbnNlEmYKEUdldFN0b3JhZ2VTdW1tYXJ5EicuZW5ncmFtLmFwcC52MS5HZXRTdG9yYWdlU3VtbWFyeVJlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLkdldFN0b3JhZ2VTdW1tYXJ5UmVzcG9uc2USVwoMRmx1c2hTZXNzaW9uEiIuZW5ncmFtLmFwcC52MS5GbHVzaFNlc3Npb25SZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5GbHVzaFNlc3Npb25SZXNwb25zZRJgCg9UZWxlcG9ydFNlc3Npb24SJS5lbmdyYW0uYXBwLnYxLlRlbGVwb3J0U2Vzc2lvblJlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLlRlbGVwb3J0U2Vzc2lvblJlc3BvbnNlEkgKB0NodW5rR2MSHS5lbmdyYW0uYXBwLnYxLkNodW5rR2NSZXF1ZXN0Gh4uZW5ncmFtLmFwcC52MS5DaHVua0djUmVzcG9uc2USSwoIQnVuZGxlR2MSHi5lbmdyYW0uYXBwLnYxLkJ1bmRsZUdjUmVxdWVzdBofLmVuZ3JhbS5hcHAudjEuQnVuZGxlR2NSZXNwb25zZRJdCg5TbmFwc2hvdEJsb2JHYxIkLmVuZ3JhbS5hcHAudjEuU25hcHNob3RCbG9iR2NSZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5TbmFwc2hvdEJsb2JHY1Jlc3BvbnNlEl0KDkdldEZsZWV0RGVtYW5kEiQuZW5ncmFtLmFwcC52MS5HZXRGbGVldERlbWFuZFJlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkdldEZsZWV0RGVtYW5kUmVzcG9uc2ViBnByb3RvMw", [file_engram_app_v1_session]);
 
 /**
  * @generated from message engram.app.v1.ListHostsRequest
@@ -421,10 +421,7 @@ export const AdminDrainHostRequestSchema: GenMessage<AdminDrainHostRequest> = /*
   messageDesc(file_engram_app_v1_fleet, 9);
 
 /**
- * Mirrors api/admin.rs DrainHostResponse (renamed: this RPC carries the
- * admin cordon+evacuate semantics; the soft status flip above keeps the
- * plain DrainHost name). HTTP returns 202 — the evac_resumer scanner is
- * the actual deliverable.
+ * Admission plans return immediately; the teleport machine drives each move.
  *
  * @generated from message engram.app.v1.AdminDrainHostResponse
  */
@@ -435,17 +432,19 @@ export type AdminDrainHostResponse = Message<"engram.app.v1.AdminDrainHostRespon
   hostId: string;
 
   /**
-   * Session ids now marked Evacuating; the scanner resumes each on a
-   * peer host within its sweep interval.
-   *
-   * @generated from field: repeated string evacuating = 2;
+   * @generated from field: repeated string planned = 2;
    */
-  evacuating: string[];
+  planned: string[];
 
   /**
-   * @generated from field: repeated engram.app.v1.DrainFailure failures = 3;
+   * @generated from field: repeated string descended = 3;
    */
-  failures: DrainFailure[];
+  descended: string[];
+
+  /**
+   * @generated from field: uint32 skipped = 4;
+   */
+  skipped: number;
 };
 
 /**
@@ -454,30 +453,6 @@ export type AdminDrainHostResponse = Message<"engram.app.v1.AdminDrainHostRespon
  */
 export const AdminDrainHostResponseSchema: GenMessage<AdminDrainHostResponse> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_fleet, 10);
-
-/**
- * @generated from message engram.app.v1.DrainFailure
- */
-export type DrainFailure = Message<"engram.app.v1.DrainFailure"> & {
-  /**
-   * @generated from field: string session_id = 1;
-   */
-  sessionId: string;
-
-  /**
-   * Human-readable diagnostic; not machine-parsed, not stable.
-   *
-   * @generated from field: string error = 2;
-   */
-  error: string;
-};
-
-/**
- * Describes the message engram.app.v1.DrainFailure.
- * Use `create(DrainFailureSchema)` to create a new message.
- */
-export const DrainFailureSchema: GenMessage<DrainFailure> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 11);
 
 /**
  * @generated from message engram.app.v1.CordonHostRequest
@@ -502,7 +477,7 @@ export type CordonHostRequest = Message<"engram.app.v1.CordonHostRequest"> & {
  * Use `create(CordonHostRequestSchema)` to create a new message.
  */
 export const CordonHostRequestSchema: GenMessage<CordonHostRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 12);
+  messageDesc(file_engram_app_v1_fleet, 11);
 
 /**
  * ADR 0116 A-D2: declare a planned handoff — extend the host's
@@ -532,7 +507,7 @@ export type BeginHostHandoffRequest = Message<"engram.app.v1.BeginHostHandoffReq
  * Use `create(BeginHostHandoffRequestSchema)` to create a new message.
  */
 export const BeginHostHandoffRequestSchema: GenMessage<BeginHostHandoffRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 13);
+  messageDesc(file_engram_app_v1_fleet, 12);
 
 /**
  * @generated from message engram.app.v1.BeginHostHandoffResponse
@@ -558,7 +533,7 @@ export type BeginHostHandoffResponse = Message<"engram.app.v1.BeginHostHandoffRe
  * Use `create(BeginHostHandoffResponseSchema)` to create a new message.
  */
 export const BeginHostHandoffResponseSchema: GenMessage<BeginHostHandoffResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 14);
+  messageDesc(file_engram_app_v1_fleet, 13);
 
 /**
  * @generated from message engram.app.v1.CordonHostResponse
@@ -582,7 +557,7 @@ export type CordonHostResponse = Message<"engram.app.v1.CordonHostResponse"> & {
  * Use `create(CordonHostResponseSchema)` to create a new message.
  */
 export const CordonHostResponseSchema: GenMessage<CordonHostResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 15);
+  messageDesc(file_engram_app_v1_fleet, 14);
 
 /**
  * @generated from message engram.app.v1.UncordonHostRequest
@@ -606,7 +581,7 @@ export type UncordonHostRequest = Message<"engram.app.v1.UncordonHostRequest"> &
  * Use `create(UncordonHostRequestSchema)` to create a new message.
  */
 export const UncordonHostRequestSchema: GenMessage<UncordonHostRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 16);
+  messageDesc(file_engram_app_v1_fleet, 15);
 
 /**
  * Same Rust type as CordonHostResponse (CordonResponse); a distinct
@@ -633,7 +608,7 @@ export type UncordonHostResponse = Message<"engram.app.v1.UncordonHostResponse">
  * Use `create(UncordonHostResponseSchema)` to create a new message.
  */
 export const UncordonHostResponseSchema: GenMessage<UncordonHostResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 17);
+  messageDesc(file_engram_app_v1_fleet, 16);
 
 /**
  * @generated from message engram.app.v1.DeleteHostRequest
@@ -650,7 +625,7 @@ export type DeleteHostRequest = Message<"engram.app.v1.DeleteHostRequest"> & {
  * Use `create(DeleteHostRequestSchema)` to create a new message.
  */
 export const DeleteHostRequestSchema: GenMessage<DeleteHostRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 18);
+  messageDesc(file_engram_app_v1_fleet, 17);
 
 /**
  * Mirrors the old `DELETE /api/admin/hosts/:id` (204 No Content) — the
@@ -667,7 +642,7 @@ export type DeleteHostResponse = Message<"engram.app.v1.DeleteHostResponse"> & {
  * Use `create(DeleteHostResponseSchema)` to create a new message.
  */
 export const DeleteHostResponseSchema: GenMessage<DeleteHostResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 19);
+  messageDesc(file_engram_app_v1_fleet, 18);
 
 /**
  * @generated from message engram.app.v1.GetStorageSummaryRequest
@@ -680,7 +655,7 @@ export type GetStorageSummaryRequest = Message<"engram.app.v1.GetStorageSummaryR
  * Use `create(GetStorageSummaryRequestSchema)` to create a new message.
  */
 export const GetStorageSummaryRequestSchema: GenMessage<GetStorageSummaryRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 20);
+  messageDesc(file_engram_app_v1_fleet, 19);
 
 /**
  * Mirrors api/storage.rs StorageSummaryResponse (ADR 0029): fleet-wide
@@ -760,7 +735,7 @@ export type GetStorageSummaryResponse = Message<"engram.app.v1.GetStorageSummary
  * Use `create(GetStorageSummaryResponseSchema)` to create a new message.
  */
 export const GetStorageSummaryResponseSchema: GenMessage<GetStorageSummaryResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 21);
+  messageDesc(file_engram_app_v1_fleet, 20);
 
 /**
  * One per-sandbox row of the durability ledger.
@@ -824,7 +799,7 @@ export type DurabilityRow = Message<"engram.app.v1.DurabilityRow"> & {
  * Use `create(DurabilityRowSchema)` to create a new message.
  */
 export const DurabilityRowSchema: GenMessage<DurabilityRow> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 22);
+  messageDesc(file_engram_app_v1_fleet, 21);
 
 /**
  * @generated from message engram.app.v1.FlushSessionRequest
@@ -841,7 +816,7 @@ export type FlushSessionRequest = Message<"engram.app.v1.FlushSessionRequest"> &
  * Use `create(FlushSessionRequestSchema)` to create a new message.
  */
 export const FlushSessionRequestSchema: GenMessage<FlushSessionRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 23);
+  messageDesc(file_engram_app_v1_fleet, 22);
 
 /**
  * Mirrors api/admin.rs FlushNowResult.
@@ -873,64 +848,56 @@ export type FlushSessionResponse = Message<"engram.app.v1.FlushSessionResponse">
  * Use `create(FlushSessionResponseSchema)` to create a new message.
  */
 export const FlushSessionResponseSchema: GenMessage<FlushSessionResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 24);
+  messageDesc(file_engram_app_v1_fleet, 23);
 
 /**
- * @generated from message engram.app.v1.EvacuateSessionRequest
+ * @generated from message engram.app.v1.TeleportSessionRequest
  */
-export type EvacuateSessionRequest = Message<"engram.app.v1.EvacuateSessionRequest"> & {
+export type TeleportSessionRequest = Message<"engram.app.v1.TeleportSessionRequest"> & {
   /**
    * @generated from field: string session_id = 1;
    */
   sessionId: string;
 
   /**
-   * Reserved for a future operator override; carried on today's HTTP
-   * body (api/admin.rs EvacuateSessionRequest.target_host) but IGNORED
-   * by the handler — the scanner picks any non-source host via the
-   * standard policy.
-   *
    * @generated from field: optional string target_host = 2;
    */
   targetHost?: string;
 };
 
 /**
- * Describes the message engram.app.v1.EvacuateSessionRequest.
- * Use `create(EvacuateSessionRequestSchema)` to create a new message.
+ * Describes the message engram.app.v1.TeleportSessionRequest.
+ * Use `create(TeleportSessionRequestSchema)` to create a new message.
  */
-export const EvacuateSessionRequestSchema: GenMessage<EvacuateSessionRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 25);
+export const TeleportSessionRequestSchema: GenMessage<TeleportSessionRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 24);
 
 /**
- * Mirrors api/admin.rs EvacuateSessionResponse. HTTP returns 202; the
- * evac_resumer scanner completes the transition.
- *
- * @generated from message engram.app.v1.EvacuateSessionResponse
+ * @generated from message engram.app.v1.TeleportSessionResponse
  */
-export type EvacuateSessionResponse = Message<"engram.app.v1.EvacuateSessionResponse"> & {
+export type TeleportSessionResponse = Message<"engram.app.v1.TeleportSessionResponse"> & {
   /**
-   * @generated from field: string session_id = 1;
+   * @generated from field: string teleport_id = 1;
    */
-  sessionId: string;
+  teleportId: string;
 
   /**
-   * Always "evacuating" on success — the session is paused,
-   * snapshotted, and the scanner will resume it on a peer within the
-   * next sweep interval (≤10s default). Watch the session's event
-   * stream for the Evacuating → Created → Active chain.
-   *
-   * @generated from field: string status = 2;
+   * @generated from field: string kind = 2;
    */
-  status: string;
+  kind: string;
+
+  /**
+   * @generated from field: string dest_host_id = 3;
+   */
+  destHostId: string;
 };
 
 /**
- * Describes the message engram.app.v1.EvacuateSessionResponse.
- * Use `create(EvacuateSessionResponseSchema)` to create a new message.
+ * Describes the message engram.app.v1.TeleportSessionResponse.
+ * Use `create(TeleportSessionResponseSchema)` to create a new message.
  */
-export const EvacuateSessionResponseSchema: GenMessage<EvacuateSessionResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 26);
+export const TeleportSessionResponseSchema: GenMessage<TeleportSessionResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_fleet, 25);
 
 /**
  * @generated from message engram.app.v1.GetFleetDemandRequest
@@ -943,7 +910,7 @@ export type GetFleetDemandRequest = Message<"engram.app.v1.GetFleetDemandRequest
  * Use `create(GetFleetDemandRequestSchema)` to create a new message.
  */
 export const GetFleetDemandRequestSchema: GenMessage<GetFleetDemandRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 27);
+  messageDesc(file_engram_app_v1_fleet, 26);
 
 /**
  * Mirrors api/admin.rs FleetDemandResponse (ADR 0044 K4 / 0047 / 0048). The
@@ -1028,7 +995,7 @@ export type GetFleetDemandResponse = Message<"engram.app.v1.GetFleetDemandRespon
  * Use `create(GetFleetDemandResponseSchema)` to create a new message.
  */
 export const GetFleetDemandResponseSchema: GenMessage<GetFleetDemandResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 28);
+  messageDesc(file_engram_app_v1_fleet, 27);
 
 /**
  * @generated from message engram.app.v1.ChunkGcRequest
@@ -1065,7 +1032,7 @@ export type ChunkGcRequest = Message<"engram.app.v1.ChunkGcRequest"> & {
  * Use `create(ChunkGcRequestSchema)` to create a new message.
  */
 export const ChunkGcRequestSchema: GenMessage<ChunkGcRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 29);
+  messageDesc(file_engram_app_v1_fleet, 28);
 
 /**
  * Mirrors api/admin.rs ChunkGcSweepResult.
@@ -1144,7 +1111,7 @@ export type ChunkGcResponse = Message<"engram.app.v1.ChunkGcResponse"> & {
  * Use `create(ChunkGcResponseSchema)` to create a new message.
  */
 export const ChunkGcResponseSchema: GenMessage<ChunkGcResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 30);
+  messageDesc(file_engram_app_v1_fleet, 29);
 
 /**
  * @generated from message engram.app.v1.BundleGcRequest
@@ -1169,7 +1136,7 @@ export type BundleGcRequest = Message<"engram.app.v1.BundleGcRequest"> & {
  * Use `create(BundleGcRequestSchema)` to create a new message.
  */
 export const BundleGcRequestSchema: GenMessage<BundleGcRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 31);
+  messageDesc(file_engram_app_v1_fleet, 30);
 
 /**
  * Mirrors bundle_gc.rs BundleSweepReport (ADR 0035 §5). Unlike the
@@ -1226,7 +1193,7 @@ export type BundleGcResponse = Message<"engram.app.v1.BundleGcResponse"> & {
  * Use `create(BundleGcResponseSchema)` to create a new message.
  */
 export const BundleGcResponseSchema: GenMessage<BundleGcResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 32);
+  messageDesc(file_engram_app_v1_fleet, 31);
 
 /**
  * @generated from message engram.app.v1.SnapshotBlobGcRequest
@@ -1251,7 +1218,7 @@ export type SnapshotBlobGcRequest = Message<"engram.app.v1.SnapshotBlobGcRequest
  * Use `create(SnapshotBlobGcRequestSchema)` to create a new message.
  */
 export const SnapshotBlobGcRequestSchema: GenMessage<SnapshotBlobGcRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 33);
+  messageDesc(file_engram_app_v1_fleet, 32);
 
 /**
  * Mirrors snapshot_blob_gc.rs SnapshotBlobSweepReport (ADR 0028
@@ -1314,7 +1281,7 @@ export type SnapshotBlobGcResponse = Message<"engram.app.v1.SnapshotBlobGcRespon
  * Use `create(SnapshotBlobGcResponseSchema)` to create a new message.
  */
 export const SnapshotBlobGcResponseSchema: GenMessage<SnapshotBlobGcResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 34);
+  messageDesc(file_engram_app_v1_fleet, 33);
 
 /**
  * ADR 0123 A3: the idempotent retirement request. Cordons the host with
@@ -1350,7 +1317,7 @@ export type RetireHostRequest = Message<"engram.app.v1.RetireHostRequest"> & {
  * Use `create(RetireHostRequestSchema)` to create a new message.
  */
 export const RetireHostRequestSchema: GenMessage<RetireHostRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 35);
+  messageDesc(file_engram_app_v1_fleet, 34);
 
 /**
  * @generated from message engram.app.v1.RetireHostResponse
@@ -1379,7 +1346,7 @@ export type RetireHostResponse = Message<"engram.app.v1.RetireHostResponse"> & {
  * Use `create(RetireHostResponseSchema)` to create a new message.
  */
 export const RetireHostResponseSchema: GenMessage<RetireHostResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 36);
+  messageDesc(file_engram_app_v1_fleet, 35);
 
 /**
  * @generated from message engram.app.v1.HostRetirement
@@ -1413,7 +1380,7 @@ export type HostRetirement = Message<"engram.app.v1.HostRetirement"> & {
  * Use `create(HostRetirementSchema)` to create a new message.
  */
 export const HostRetirementSchema: GenMessage<HostRetirement> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 37);
+  messageDesc(file_engram_app_v1_fleet, 36);
 
 /**
  * @generated from message engram.app.v1.RetirementBlocker
@@ -1435,7 +1402,7 @@ export type RetirementBlocker = Message<"engram.app.v1.RetirementBlocker"> & {
  * Use `create(RetirementBlockerSchema)` to create a new message.
  */
 export const RetirementBlockerSchema: GenMessage<RetirementBlocker> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_fleet, 38);
+  messageDesc(file_engram_app_v1_fleet, 37);
 
 /**
  * Fleet, storage, and GC operations (ADR 0051 §2.3, rev 2026-06-10).
@@ -1572,14 +1539,15 @@ export const FleetService: GenService<{
     output: typeof FlushSessionResponseSchema;
   },
   /**
-   * ADR 0018 async evacuation (POST /api/admin/sessions/:id/evacuate).
+   * ADR 0123 B: admit one teleport for a session (synchronous admission;
+   * the durable machine drives it). Replaces the ADR 0018 evacuate route.
    *
-   * @generated from rpc engram.app.v1.FleetService.EvacuateSession
+   * @generated from rpc engram.app.v1.FleetService.TeleportSession
    */
-  evacuateSession: {
+  teleportSession: {
     methodKind: "unary";
-    input: typeof EvacuateSessionRequestSchema;
-    output: typeof EvacuateSessionResponseSchema;
+    input: typeof TeleportSessionRequestSchema;
+    output: typeof TeleportSessionResponseSchema;
   },
   /**
    * The three GC sweeps (ADR 0016 Phase C / ADR 0035 §5 / ADR 0028

@@ -368,7 +368,7 @@ fn issue_790_evict_resume_snapshot_safety_faithful() {
 
 /// Issue #800: the RESERVED evac-placement over-reservation, exposed by
 /// folding the operator-drain verb into the swarm (ADR 0098 Phase 3 wave
-/// 5). Before the fix, `evac_resumer → evacuate_dead_source →
+/// 5). Before the fix, `teleport → evacuate_dead_source →
 /// pick_for_session` was capacity-SOFT: a drain-driven wave of evacuations
 /// bound measured-FULL survivors, driving Σ reserved > allocatable — the
 /// #722/#795 over-reservation class on the EVAC leg, which #795's
@@ -406,7 +406,7 @@ fn seed_33058255_quiescence_waits_for_missing_resident_reconcile() {
 /// Nightly seed 33058131: a drain evict acknowledged its source-host
 /// destroy, atomically detached the coordinator binding, and finished its
 /// op while the host-side teardown effect was still deferred. The next
-/// EvacResumer claim saw an unowned `Evacuating` row and restored a second
+/// Teleport claim saw an unowned `Evacuating` row and restored a second
 /// sandbox on a peer, violating ADR 0090 single ownership at step 79.
 ///
 /// The fix keeps the outgoing sandbox bound through `Evacuating`. The

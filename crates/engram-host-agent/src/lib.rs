@@ -639,9 +639,14 @@ impl HostAgent {
                             }
                         });
                     }
-                    migration::MigrationRole::PostCopySource => {
-                        tracing::warn!(%sandbox_id,
-                            "reattached post-copy SOURCE: staying paused under the ownership rule (never self-resumes)");
+                    // A held snapshot source has the same contract as a frozen
+                    // post-copy source: its state may already run elsewhere, so
+                    // it never self-resumes; the coordinator's rollback or
+                    // release ends it, and the ownership rule reaps a leftover.
+                    migration::MigrationRole::PostCopySource
+                    | migration::MigrationRole::HeldSource => {
+                        tracing::warn!(%sandbox_id, ?role,
+                            "reattached frozen SOURCE: staying paused under the ownership rule (never self-resumes)");
                         pooled.note_migration_role(sandbox_id, Some(role));
                         let pooled_for_src = pooled.clone();
                         let coord_for_src: Arc<dyn CoordControlPlane> =

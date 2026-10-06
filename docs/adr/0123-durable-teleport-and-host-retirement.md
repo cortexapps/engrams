@@ -560,3 +560,49 @@ pub enum HarnessFrame {
   finished destination drain is remembered so a failed role persist is
   retried by the next `migration_drain_wait` rather than reported as a
   lost drain.
+- 2026-10-06 (adversarial review, coordinator): every teleport write
+  locks the session row under its `current_epoch` FIRST (`lock_teleport_
+  session_at_epoch`), so a stale driver cannot land a phase change after a
+  reclaim; a failed move settles in ONE fenced transaction
+  (`teleport_settle`: session terminal state, source tombstone, failed row,
+  both events) and `teleport_fail` is gone. The SOURCE keeps the move's
+  budget in `committed|attached` (`source_reserving_phases`) because its VM
+  still occupies that RAM until release. The heartbeat's stably-unbound
+  cleanup never entombs a sandbox an open move names, nor any unbound
+  sandbox on a host an open move is restoring into. The host's ownership
+  question answers `owned` for both endpoints of an open move, so the
+  export TTL sweep never destroys a post-commit source under a draining
+  destination. A deleted host row counts as gone. A consumed export on
+  commit (`NotFound`) proceeds to the destroy ack. Deterministic
+  `HarnessSpawn` failures share ordinary resume's classifier.
+- 2026-10-06 (adversarial review, host): `snapshot_hold` persists a
+  `held-source` manifest role before the pause, so a host-agent restart
+  re-adopts the paused VM as a frozen source (never a checkpoint
+  candidate, never self-resumed); `resume` clears it. The detached swap
+  re-arm runs under the capture lock. The abort's cleanup after the export
+  is consumed runs in a detached task so a cancelled request cannot leave
+  the fence raised. A failed post-restore dirty-file relocation destroys
+  the VM before its NBD state is dropped.
+- 2026-10-06 (adversarial review, harness wire): `SeqEvent` carries a
+  per-process `incarnation`, and the delivery key is
+  `harness:{epoch}:{incarnation}:{seq}`, so a fresh process at the same
+  binding epoch never collides with its predecessor's keys. On a
+  connection at a HIGHER epoch the SDK announces `RunContinued` for every
+  run it has sequenced a start for and no end, BEFORE any event the engine
+  buffered across the cut; the engines no longer announce it themselves.
+  The outbox acknowledgement for a confirming event runs on a replayed
+  duplicate too and a failed acknowledgement withholds the harness ack.
+  The command forwarder never awaits the engine's channel (a full channel
+  drops the connection; durable prompts are redelivered). Known limits: a
+  legacy `Event` frame (an old memory-resident harness) does not advance
+  readiness and its POST retry is not idempotent; such a process exits on
+  `Superseded` and the respawn uses the staged (new) harness.
+- 2026-10-06 (adversarial review, operator): every live victim asks
+  `RetireHost` before any release decision (a grant that landed before a
+  failed `removing` patch is still observed); `FailedPrecondition` is a
+  foreign cordon and releases only the annotation; `mark_victim` adds a
+  Node finalizer so the record outlives the cloud instance, and
+  `DeleteHost` runs only once the Node object is being deleted; a Node
+  that was unschedulable before it became a victim keeps that cordon; the
+  GKE actuator refuses pools backed by more than one instance group
+  (setSize is per zone).
