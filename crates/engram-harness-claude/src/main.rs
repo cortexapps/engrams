@@ -5781,7 +5781,9 @@ mod adapter {
             let state_dir =
                 std::env::temp_dir().join(format!("engram-claude-state-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&state_dir).expect("test state dir");
-            let token_path = state_dir.join("attach-token");
+            // The token is agentd's file, not a per-session state file:
+            // it lives beside the state dir, never inside it.
+            let token_path = state_dir.with_extension("attach-token");
             engram_harness_proto::attach_token::AttachToken {
                 sandbox_id: engram_core::SandboxId::new(),
                 binding_epoch: 1,
