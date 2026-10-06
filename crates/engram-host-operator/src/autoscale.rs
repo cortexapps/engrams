@@ -21,15 +21,24 @@ use crate::wave::{plan_wave, WaveHost, WavePolicy};
 
 // Upgrade only with no old scale-down wave in flight. Do not read the old key.
 pub const VICTIM_ANNOTATION: &str = "fleet.engram.io/victim";
+/// Keeps the Node object, and the victim record on it, until the
+/// coordinator row is deleted: the removal journal must outlive the cloud
+/// instance.
+pub const VICTIM_FINALIZER: &str = "fleet.engram.io/victim";
 
+/// Unknown additive fields are tolerated so a rollback to an older
+/// operator still recovers the record; unknown phases and kinds are not.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VictimRecord {
     pub fleet: String,
     pub kind: VictimKind,
     pub phase: VictimPhase,
     #[serde(with = "deadline")]
     pub deadline: Option<SystemTime>,
+    /// The Node was already unschedulable when the victim was marked, so
+    /// the cordon is not ours to release.
+    #[serde(default)]
+    pub prior_unschedulable: bool,
 }
 
 mod deadline {
@@ -83,12 +92,18 @@ pub enum VictimPhase {
 pub struct Victim {
     pub node: String,
     pub record: VictimRecord,
+    /// The Node object carries a deletion timestamp: the cloud instance is
+    /// gone and only our finalizer keeps the record alive.
+    pub deleting: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Retirement {
     Pending(Vec<String>),
     Granted,
     NoRow,
+    /// The coordinator refused the request: another owner holds the
+    /// cordon, or the host is dead. The annotation is ours, the cordon is not.
+    Foreign,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReleaseReason {
@@ -96,6 +111,7 @@ pub enum ReleaseReason {
     Deadline,
     Pressure,
     NoRow,
+    Foreign,
 }
 impl ReleaseReason {
     fn label(self) -> &'static str {
@@ -104,6 +120,7 @@ impl ReleaseReason {
             Self::Deadline => "deadline",
             Self::Pressure => "pressure",
             Self::NoRow => "no_row",
+            Self::Foreign => "foreign_cordon",
         }
     }
 }
@@ -114,23 +131,32 @@ pub enum Next {
     Release(ReleaseReason),
     Hold,
 }
-pub fn plan_victim(v: &VictimRecord, in_plan: bool) -> Next {
-    match (v.phase, v.kind, in_plan) {
-        (VictimPhase::Removing, _, _) => Next::Remove,
-        (_, VictimKind::Shed, false) => Next::Release(ReleaseReason::NotInPlan),
-        _ => Next::CallRetire,
+/// A victim that is not yet removing always asks the coordinator first:
+/// a grant that landed before a failed annotation write must still be
+/// observed, never released because the retired host left the plan.
+pub fn plan_victim(v: &VictimRecord) -> Next {
+    match v.phase {
+        VictimPhase::Removing => Next::Remove,
+        VictimPhase::Retiring => Next::CallRetire,
     }
 }
-pub fn after_retire(v: &VictimRecord, r: Retirement, pressure_now: bool, now: SystemTime) -> Next {
+pub fn after_retire(
+    v: &VictimRecord,
+    r: Retirement,
+    in_plan: bool,
+    pressure_now: bool,
+    now: SystemTime,
+) -> Next {
+    let shed = v.kind == VictimKind::Shed;
     match r {
         Retirement::Granted => Next::Remove,
-        Retirement::NoRow if v.kind == VictimKind::Shed => Next::Release(ReleaseReason::NoRow),
-        Retirement::Pending(_) if v.kind == VictimKind::Shed && pressure_now => {
-            Next::Release(ReleaseReason::Pressure)
-        }
-        Retirement::Pending(_)
-            if v.kind == VictimKind::Shed && v.deadline.is_some_and(|d| now >= d) =>
-        {
+        Retirement::NoRow if shed => Next::Release(ReleaseReason::NoRow),
+        // Another owner holds the cordon: the annotation is ours, the
+        // cordon is not. A repair victim keeps waiting for its host.
+        Retirement::Foreign if shed => Next::Release(ReleaseReason::Foreign),
+        Retirement::Pending(_) if shed && !in_plan => Next::Release(ReleaseReason::NotInPlan),
+        Retirement::Pending(_) if shed && pressure_now => Next::Release(ReleaseReason::Pressure),
+        Retirement::Pending(_) if shed && v.deadline.is_some_and(|d| now >= d) => {
             Next::Release(ReleaseReason::Deadline)
         }
         _ => Next::Hold,
@@ -195,8 +221,17 @@ impl CoordApi for CoordClient {
 pub trait NodeOps: Send + Sync {
     /// Empty fleet selects all records in this DaemonSet's node snapshot after autoscaling is removed.
     async fn victims(&self, fleet: &str) -> Result<Vec<Victim>, OperatorError>;
-    async fn mark_victim(&self, node: &str, record: &VictimRecord) -> Result<(), OperatorError>;
-    async fn clear_victim(&self, node: &str) -> Result<(), OperatorError>;
+    /// One patch: the record, `spec.unschedulable = true`, and the victim
+    /// finalizer that keeps the Node object (the removal journal) until
+    /// `clear_victim`.
+    async fn mark_victim(
+        &self,
+        node: &str,
+        record: &VictimRecord,
+    ) -> Result<VictimRecord, OperatorError>;
+    /// Remove the record and the finalizer; `uncordon` also clears
+    /// `spec.unschedulable` (false when the cordon was not ours).
+    async fn clear_victim(&self, node: &str, uncordon: bool) -> Result<(), OperatorError>;
 
     /// The K8s Node object's `creationTimestamp`, for the node-ready
     /// bring-up histogram. Defaulted to `None` so the recording test
@@ -241,6 +276,7 @@ impl NodeOps for K8sNodeOps<'_> {
                     victims.push(Victim {
                         node: node.name_any(),
                         record,
+                        deleting: node.metadata.deletion_timestamp.is_some(),
                     });
                 }
                 Ok(_) => {}
@@ -255,42 +291,69 @@ impl NodeOps for K8sNodeOps<'_> {
         Ok(victims)
     }
 
-    async fn mark_victim(&self, node: &str, record: &VictimRecord) -> Result<(), OperatorError> {
-        // Never overwrite an invalid or foreign record from the snapshot.
-        if let Some(raw) = self
+    async fn mark_victim(
+        &self,
+        node: &str,
+        record: &VictimRecord,
+    ) -> Result<VictimRecord, OperatorError> {
+        let snapshot = self
             .managed_nodes
             .iter()
-            .find(|n| n.metadata.name.as_deref() == Some(node))
+            .find(|n| n.metadata.name.as_deref() == Some(node));
+        let mut record = record.clone();
+        // Never overwrite an invalid or foreign record from the snapshot.
+        // A re-mark keeps the prior-cordon fact the first mark observed.
+        match snapshot
             .and_then(|n| n.metadata.annotations.as_ref())
             .and_then(|a| a.get(VICTIM_ANNOTATION))
         {
-            let old: VictimRecord =
-                serde_json::from_str(raw).map_err(|e| OperatorError::Invalid(e.to_string()))?;
-            if old.fleet != record.fleet {
-                return Err(OperatorError::Invalid("foreign victim record".into()));
+            Some(raw) => {
+                let old: VictimRecord =
+                    serde_json::from_str(raw).map_err(|e| OperatorError::Invalid(e.to_string()))?;
+                if old.fleet != record.fleet {
+                    return Err(OperatorError::Invalid("foreign victim record".into()));
+                }
+                record.prior_unschedulable = old.prior_unschedulable;
+            }
+            None => {
+                record.prior_unschedulable = snapshot
+                    .and_then(|n| n.spec.as_ref())
+                    .and_then(|s| s.unschedulable)
+                    .unwrap_or(false);
             }
         }
+        let finalizers = snapshot
+            .and_then(|n| n.metadata.finalizers.clone())
+            .unwrap_or_default();
         let nodes: Api<Node> = Api::all(self.client.clone());
         nodes
             .patch(
                 node,
                 &PatchParams::default(),
-                &Patch::Merge(mark_victim_patch(record)?),
+                &Patch::Merge(mark_victim_patch(&record, &finalizers)?),
             )
             .await?;
-        Ok(())
+        Ok(record)
     }
-    async fn clear_victim(&self, node: &str) -> Result<(), OperatorError> {
+    async fn clear_victim(&self, node: &str, uncordon: bool) -> Result<(), OperatorError> {
+        let finalizers: Vec<String> = self
+            .managed_nodes
+            .iter()
+            .find(|n| n.metadata.name.as_deref() == Some(node))
+            .and_then(|n| n.metadata.finalizers.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| f != VICTIM_FINALIZER)
+            .collect();
+        let mut patch = serde_json::json!({
+            "metadata": { "annotations": { VICTIM_ANNOTATION: null }, "finalizers": finalizers },
+        });
+        if uncordon {
+            patch["spec"] = serde_json::json!({ "unschedulable": false });
+        }
         let nodes: Api<Node> = Api::all(self.client.clone());
         match nodes
-            .patch(
-                node,
-                &PatchParams::default(),
-                &Patch::Merge(serde_json::json!({
-                    "metadata": { "annotations": { VICTIM_ANNOTATION: null } },
-                    "spec": { "unschedulable": false }
-                })),
-            )
+            .patch(node, &PatchParams::default(), &Patch::Merge(patch))
             .await
         {
             Ok(_) => Ok(()),
@@ -331,10 +394,22 @@ impl NodeOps for K8sNodeOps<'_> {
     }
 }
 
-fn mark_victim_patch(record: &VictimRecord) -> Result<serde_json::Value, OperatorError> {
+/// The victim record, the cordon, and the finalizer that keeps the Node
+/// object (this record's home) until `clear_victim`, in one patch.
+fn mark_victim_patch(
+    record: &VictimRecord,
+    finalizers: &[String],
+) -> Result<serde_json::Value, OperatorError> {
     let value = serde_json::to_string(record).map_err(|e| OperatorError::Invalid(e.to_string()))?;
+    let mut finalizers = finalizers.to_vec();
+    if !finalizers.iter().any(|f| f == VICTIM_FINALIZER) {
+        finalizers.push(VICTIM_FINALIZER.into());
+    }
     Ok(serde_json::json!({
-        "metadata": { "annotations": { VICTIM_ANNOTATION: value, ROLL_STUCK_ANNOTATION: null } },
+        "metadata": {
+            "annotations": { VICTIM_ANNOTATION: value, ROLL_STUCK_ANNOTATION: null },
+            "finalizers": finalizers,
+        },
         "spec": { "unschedulable": true }
     }))
 }
@@ -625,19 +700,23 @@ async fn release(
     v: &Victim,
     reason: ReleaseReason,
 ) -> Result<(), OperatorError> {
-    match coord
-        .uncordon(HostId::from_node_name(&v.node), CORDON_OWNER)
-        .await
-    {
-        Ok(()) => {}
-        Err(OperatorError::Rpc { status, .. })
-            if matches!(
-                status.code(),
-                tonic::Code::NotFound | tonic::Code::FailedPrecondition
-            ) => {}
-        Err(e) => return Err(e),
+    if reason != ReleaseReason::Foreign {
+        match coord
+            .uncordon(HostId::from_node_name(&v.node), CORDON_OWNER)
+            .await
+        {
+            Ok(()) => {}
+            Err(OperatorError::Rpc { status, .. })
+                if matches!(
+                    status.code(),
+                    tonic::Code::NotFound | tonic::Code::FailedPrecondition
+                ) => {}
+            Err(e) => return Err(e),
+        }
     }
-    nodes.clear_victim(&v.node).await?;
+    nodes
+        .clear_victim(&v.node, !v.record.prior_unschedulable)
+        .await?;
     ::metrics::counter!(crate::metrics::AUTOSCALE_VICTIMS_RELEASED_TOTAL, "reason" => reason.label()).increment(1);
     Ok(())
 }
@@ -727,14 +806,19 @@ pub async fn step(
                     kind: VictimKind::Repair,
                     phase: VictimPhase::Retiring,
                     deadline: None,
+                    prior_unschedulable: false,
                 };
-                if let Err(error) = nodes.mark_victim(node, &record).await {
-                    tracing::warn!(%node, %error, "could not mark repair victim; retry next tick");
-                    continue;
-                }
+                let record = match nodes.mark_victim(node, &record).await {
+                    Ok(record) => record,
+                    Err(error) => {
+                        tracing::warn!(%node, %error, "could not mark repair victim; retry next tick");
+                        continue;
+                    }
+                };
                 victims.push(Victim {
                     node: node.clone(),
                     record,
+                    deleting: false,
                 });
                 repaired = true;
             }
@@ -793,14 +877,19 @@ pub async fn step(
                     crate::time_source::wall_now()
                         + Duration::from_secs(spec.drain_timeout_seconds),
                 ),
+                prior_unschedulable: false,
             };
-            if let Err(error) = nodes.mark_victim(node, &record).await {
-                tracing::warn!(%node, %error, "could not mark shed victim; retry next tick");
-                continue;
-            }
+            let record = match nodes.mark_victim(node, &record).await {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(%node, %error, "could not mark shed victim; retry next tick");
+                    continue;
+                }
+            };
             victims.push(Victim {
                 node: node.clone(),
                 record,
+                deleting: false,
             });
         }
     }
@@ -809,7 +898,7 @@ pub async fn step(
     for mut v in victims {
         let result: Result<bool, OperatorError> = async {
             let host = HostId::from_node_name(&v.node);
-            let mut next = plan_victim(&v.record, planned.contains(&v.node));
+            let mut next = plan_victim(&v.record);
             if next == Next::CallRetire {
                 let retirement = coord.retire_host(host, CORDON_OWNER, v.record.kind.label()).await?;
                 let pressure = if let Retirement::Pending(blockers) = &retirement {
@@ -819,16 +908,27 @@ pub async fn step(
                     let fresh = coord.fleet_demand().await?;
                     fresh.queued_sessions > 0 || policy.is_some_and(|p| desired_hosts(fresh, p) > fresh.schedulable_hosts)
                 } else { false };
-                next = after_retire(&v.record, retirement, pressure, crate::time_source::wall_now());
+                next = after_retire(&v.record, retirement, planned.contains(&v.node), pressure, crate::time_source::wall_now());
             }
             match next {
                 Next::Remove => {
-                    v.record.phase = VictimPhase::Removing;
-                    nodes.mark_victim(&v.node, &v.record).await?;
-                    // The record retains the pool even if autoscaling was removed from the CR.
-                    scaler.remove_node(&v.record.fleet, &v.node).await?;
+                    if v.record.phase != VictimPhase::Removing {
+                        v.record.phase = VictimPhase::Removing;
+                        v.record = nodes.mark_victim(&v.node, &v.record).await?;
+                    }
+                    // The cloud accepts a removal before the instance is gone.
+                    // The retired row stays until the Node object is being
+                    // deleted (the instance really went away), so a host-agent
+                    // that restarts in between re-registers as still retired.
+                    // The finalizer set by mark_victim keeps the Node object,
+                    // and this record on it, until DeleteHost has succeeded.
+                    if !v.deleting {
+                        // The record retains the pool even if autoscaling was removed from the CR.
+                        scaler.remove_node(&v.record.fleet, &v.node).await?;
+                        return Ok(false);
+                    }
                     coord.delete_host(host).await?;
-                    nodes.clear_victim(&v.node).await?;
+                    nodes.clear_victim(&v.node, false).await?;
                     ::metrics::counter!(crate::metrics::AUTOSCALE_VICTIMS_REMOVED_TOTAL, "kind" => v.record.kind.label()).increment(1);
                     Ok(true)
                 }
@@ -952,6 +1052,8 @@ mod tests {
         uncordon_result: Mutex<Option<tonic::Code>>,
         clear_victim_fails: Mutex<bool>,
         mark_victim_fails: Mutex<bool>,
+        /// Nodes whose object carries a deletion timestamp.
+        deleting: Mutex<std::collections::HashSet<String>>,
     }
     impl Rec {
         fn push(&self, s: impl Into<String>) {
@@ -1032,18 +1134,23 @@ mod tests {
                 .iter()
                 .filter(|v| fleet.is_empty() || v.record.fleet == fleet)
                 .cloned()
+                .map(|mut v| {
+                    v.deleting = self.deleting.lock().unwrap().contains(&v.node);
+                    v
+                })
                 .collect())
         }
         async fn mark_victim(
             &self,
             node: &str,
             record: &VictimRecord,
-        ) -> Result<(), OperatorError> {
+        ) -> Result<VictimRecord, OperatorError> {
             if *self.mark_victim_fails.lock().unwrap() {
                 return Err(OperatorError::Invalid("patch failed".into()));
             }
-            let patch = mark_victim_patch(record)?;
+            let patch = mark_victim_patch(record, &[])?;
             assert_eq!(patch["spec"]["unschedulable"], true);
+            assert_eq!(patch["metadata"]["finalizers"][0], VICTIM_FINALIZER);
             assert!(patch["metadata"]["annotations"]
                 .as_object()
                 .unwrap()
@@ -1051,15 +1158,27 @@ mod tests {
             assert!(patch["metadata"]["annotations"][ROLL_STUCK_ANNOTATION].is_null());
             self.push(format!("mark_victim {node} {:?}", record.phase));
             let mut victims = self.victims.lock().unwrap();
+            let prior = victims
+                .iter()
+                .find(|v| v.node == node)
+                .map(|v| v.record.prior_unschedulable);
             victims.retain(|v| v.node != node);
+            let mut record = record.clone();
+            if let Some(prior) = prior {
+                record.prior_unschedulable = prior;
+            }
             victims.push(Victim {
                 node: node.into(),
                 record: record.clone(),
+                deleting: self.deleting.lock().unwrap().contains(node),
             });
-            Ok(())
+            Ok(record)
         }
-        async fn clear_victim(&self, node: &str) -> Result<(), OperatorError> {
+        async fn clear_victim(&self, node: &str, uncordon: bool) -> Result<(), OperatorError> {
             self.push(format!("clear_victim {node}"));
+            if !uncordon {
+                self.push(format!("keep_cordon {node}"));
+            }
             if *self.clear_victim_fails.lock().unwrap() {
                 return Err(OperatorError::Invalid("clear failed".into()));
             }
@@ -1423,6 +1542,7 @@ mod tests {
             kind,
             phase,
             deadline: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(500)),
+            prior_unschedulable: false,
         }
     }
     fn retiring() -> VictimRecord {
@@ -1431,27 +1551,61 @@ mod tests {
     #[test]
     fn plan_victim_removing_is_never_released() {
         for kind in [VictimKind::Shed, VictimKind::Repair] {
-            for in_plan in [false, true] {
-                assert_eq!(
-                    plan_victim(&record(kind, VictimPhase::Removing), in_plan),
-                    Next::Remove
-                );
-            }
+            assert_eq!(
+                plan_victim(&record(kind, VictimPhase::Removing)),
+                Next::Remove
+            );
         }
     }
+    /// A retiring victim always asks the coordinator first; the plan only
+    /// decides what a Pending answer means.
     #[test]
-    fn plan_victim_shed_not_in_plan_is_released() {
+    fn plan_victim_retiring_always_asks_the_coordinator() {
+        for kind in [VictimKind::Shed, VictimKind::Repair] {
+            assert_eq!(
+                plan_victim(&record(kind, VictimPhase::Retiring)),
+                Next::CallRetire
+            );
+        }
         assert_eq!(
-            plan_victim(&retiring(), false),
+            after_retire(
+                &retiring(),
+                Retirement::Pending(vec![]),
+                false,
+                false,
+                SystemTime::UNIX_EPOCH
+            ),
             Next::Release(ReleaseReason::NotInPlan)
         );
-        assert_eq!(plan_victim(&retiring(), true), Next::CallRetire);
-    }
-    #[test]
-    fn plan_victim_repair_is_always_advanced() {
         assert_eq!(
-            plan_victim(&record(VictimKind::Repair, VictimPhase::Retiring), false),
-            Next::CallRetire
+            after_retire(
+                &retiring(),
+                Retirement::Granted,
+                false,
+                false,
+                SystemTime::UNIX_EPOCH
+            ),
+            Next::Remove
+        );
+        assert_eq!(
+            after_retire(
+                &retiring(),
+                Retirement::Foreign,
+                true,
+                false,
+                SystemTime::UNIX_EPOCH
+            ),
+            Next::Release(ReleaseReason::Foreign)
+        );
+        assert_eq!(
+            after_retire(
+                &record(VictimKind::Repair, VictimPhase::Retiring),
+                Retirement::Foreign,
+                false,
+                false,
+                SystemTime::UNIX_EPOCH
+            ),
+            Next::Hold
         );
     }
     #[test]
@@ -1460,7 +1614,13 @@ mod tests {
             for pressure in [true, false] {
                 let v = record(kind, VictimPhase::Retiring);
                 assert_eq!(
-                    after_retire(&v, Retirement::Granted, pressure, SystemTime::UNIX_EPOCH),
+                    after_retire(
+                        &v,
+                        Retirement::Granted,
+                        true,
+                        pressure,
+                        SystemTime::UNIX_EPOCH
+                    ),
                     Next::Remove
                 );
                 for result in [
@@ -1469,7 +1629,7 @@ mod tests {
                     Retirement::NoRow,
                 ] {
                     assert_ne!(
-                        after_retire(&v, result, pressure, SystemTime::UNIX_EPOCH),
+                        after_retire(&v, result, true, pressure, SystemTime::UNIX_EPOCH),
                         Next::Remove
                     );
                 }
@@ -1483,6 +1643,7 @@ mod tests {
                 &retiring(),
                 Retirement::Pending(vec![]),
                 true,
+                true,
                 SystemTime::UNIX_EPOCH
             ),
             Next::Release(ReleaseReason::Pressure)
@@ -1491,6 +1652,7 @@ mod tests {
             after_retire(
                 &record(VictimKind::Repair, VictimPhase::Retiring),
                 Retirement::Pending(vec![]),
+                true,
                 true,
                 SystemTime::UNIX_EPOCH
             ),
@@ -1501,11 +1663,17 @@ mod tests {
     fn after_retire_shed_deadline_releases_pending() {
         let v = retiring();
         assert_eq!(
-            after_retire(&v, Retirement::Pending(vec![]), false, v.deadline.unwrap()),
+            after_retire(
+                &v,
+                Retirement::Pending(vec![]),
+                true,
+                false,
+                v.deadline.unwrap()
+            ),
             Next::Release(ReleaseReason::Deadline)
         );
         assert_eq!(
-            after_retire(&v, Retirement::Granted, true, v.deadline.unwrap()),
+            after_retire(&v, Retirement::Granted, true, true, v.deadline.unwrap()),
             Next::Remove
         );
     }
@@ -1517,12 +1685,13 @@ mod tests {
                 &v,
                 Retirement::Pending(vec![]),
                 false,
+                false,
                 v.deadline.unwrap() + Duration::from_secs(10)
             ),
             Next::Hold
         );
         assert_eq!(
-            after_retire(&v, Retirement::NoRow, true, v.deadline.unwrap()),
+            after_retire(&v, Retirement::NoRow, true, true, v.deadline.unwrap()),
             Next::Hold
         );
     }
@@ -1558,7 +1727,7 @@ mod tests {
             fleet: fleet_key(&spec).into(),
             ..retiring()
         };
-        let patch = mark_victim_patch(&v).unwrap();
+        let patch = mark_victim_patch(&v, &[]).unwrap();
         let parsed: VictimRecord = serde_json::from_value(
             serde_json::from_str(
                 patch["metadata"]["annotations"][VICTIM_ANNOTATION]
@@ -1611,7 +1780,11 @@ mod tests {
         rec.victims.lock().unwrap().push(Victim {
             node: node.into(),
             record,
+            deleting: false,
         });
+    }
+    fn deleting(rec: &Rec, node: &str) {
+        rec.deleting.lock().unwrap().insert(node.into());
     }
     fn script(rec: &Rec, node: &str, results: Vec<Retirement>) {
         rec.retirements
@@ -1673,23 +1846,36 @@ mod tests {
             no_remove(&rec);
         }
     }
+    /// The grant orders the cloud removal; the coordinator row is deleted
+    /// only once the Node object is being deleted (the instance is gone),
+    /// so a host-agent that restarts in between stays retired.
     #[tokio::test]
-    async fn granted_writes_removing_before_remove_node_then_deletes() {
+    async fn granted_writes_removing_before_remove_node_then_deletes_once_the_node_goes() {
         let (rec, spec, pods) = fixture();
         script(&rec, "a", vec![Retirement::Granted]);
-        tick(&rec, &spec, &pods, &[]).await;
+        assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
         let log = rec.log();
         let pos = |p: &str| log.iter().position(|l| l.starts_with(p)).unwrap();
         assert!(pos("retire_host") < pos("mark_victim a Removing"));
         assert!(pos("mark_victim a Removing") < pos("remove_node"));
-        assert!(pos("remove_node") < pos("delete_host"));
+        assert_eq!(count(&rec, "delete_host"), 0);
+        assert_eq!(
+            rec.victims.lock().unwrap()[0].record.phase,
+            VictimPhase::Removing
+        );
+        deleting(&rec, "a");
+        assert!(!tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(count(&rec, "remove_node"), 1);
+        assert_eq!(count(&rec, "delete_host"), 1);
+        assert_eq!(count(&rec, "retire_host"), 1);
         assert!(rec.victims.lock().unwrap().is_empty());
         assert_eq!(count(&rec, "uncordon"), 0);
     }
     #[tokio::test]
     async fn delete_host_error_keeps_victim_in_flight() {
         let (rec, spec, pods) = fixture();
-        script(&rec, "a", vec![Retirement::Granted]);
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Removing);
+        deleting(&rec, "a");
         *rec.fail_delete.lock().unwrap() = true;
         assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
         assert_eq!(
@@ -1699,9 +1885,61 @@ mod tests {
         assert_eq!(count(&rec, "clear_victim"), 0);
         *rec.fail_delete.lock().unwrap() = false;
         tick(&rec, &spec, &pods, &[]).await;
-        assert_eq!(count(&rec, "retire_host"), 1);
-        assert_eq!(count(&rec, "remove_node"), 2);
+        assert_eq!(count(&rec, "retire_host"), 0);
+        assert_eq!(
+            count(&rec, "remove_node"),
+            0,
+            "a deleting Node is past removal"
+        );
+        assert_eq!(count(&rec, "delete_host"), 2);
         assert!(rec.victims.lock().unwrap().is_empty());
+    }
+    /// A grant whose `removing` patch never landed is still observed on the
+    /// next tick: the retired host is absent from ListHosts and the plan,
+    /// but the victim asks the coordinator before any release.
+    #[tokio::test]
+    async fn grant_observed_before_release_when_the_host_left_the_plan() {
+        let (rec, spec, pods) = fixture();
+        seed(&rec, "zz", VictimKind::Shed, VictimPhase::Retiring);
+        script(&rec, "zz", vec![Retirement::Granted]);
+        assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(count(&rec, "uncordon"), 0);
+        assert_eq!(count(&rec, "remove_node zz"), 1);
+        assert_eq!(
+            rec.victims.lock().unwrap()[0].record.phase,
+            VictimPhase::Removing
+        );
+    }
+    /// A cordon another owner holds is left in place: only the annotation
+    /// is ours. A repair victim keeps waiting.
+    #[tokio::test]
+    async fn foreign_cordon_releases_only_the_annotation() {
+        let (rec, spec, pods) = fixture();
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+        script(&rec, "a", vec![Retirement::Foreign]);
+        assert!(!tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        // The coordinator cordon is theirs; the Node cordon we set is ours.
+        assert_eq!(count(&rec, "uncordon"), 0);
+        assert_eq!(count(&rec, "clear_victim a"), 1);
+        assert_eq!(count(&rec, "keep_cordon a"), 0);
+        no_remove(&rec);
+        let (rec, spec, pods) = fixture();
+        seed(&rec, "c", VictimKind::Repair, VictimPhase::Retiring);
+        script(&rec, "c", vec![Retirement::Foreign]);
+        assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(count(&rec, "clear_victim"), 0);
+    }
+    /// A Node that was unschedulable before it became a victim keeps that
+    /// cordon when the victim is released.
+    #[tokio::test]
+    async fn prior_node_cordon_survives_release() {
+        let (rec, spec, pods) = fixture();
+        seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
+        rec.victims.lock().unwrap()[0].record.prior_unschedulable = true;
+        rec.demand.lock().unwrap().queued_sessions = 1;
+        assert!(!tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert_eq!(count(&rec, "uncordon"), 1);
+        assert_eq!(count(&rec, "keep_cordon a"), 1);
     }
     #[tokio::test]
     async fn demand_burst_while_pending_releases_without_remove() {
@@ -1727,8 +1965,14 @@ mod tests {
         tick(&rec, &spec, &pods, &[]).await;
         assert_eq!(count(&rec, "retire_host"), 0);
         assert_eq!(count(&rec, "uncordon"), 0);
+        assert_eq!(count(&rec, "mark_victim"), 0);
+        assert_eq!(count(&rec, "remove_node"), 1);
+        assert_eq!(count(&rec, "delete_host"), 0);
+        deleting(&rec, "a");
+        tick(&rec, &spec, &pods, &[]).await;
         assert_eq!(count(&rec, "remove_node"), 1);
         assert_eq!(count(&rec, "delete_host"), 1);
+        assert!(rec.victims.lock().unwrap().is_empty());
     }
     #[tokio::test]
     async fn restart_mid_retiring_reissues_retire_host() {
@@ -1809,10 +2053,11 @@ mod tests {
         seed(&rec, "a", VictimKind::Shed, VictimPhase::Retiring);
         seed(&rec, "b", VictimKind::Shed, VictimPhase::Removing);
         spec.autoscaling = None;
-        assert!(!tick(&rec, &spec, &pods, &[]).await.blocks_roll);
+        assert!(tick(&rec, &spec, &pods, &[]).await.blocks_roll);
         assert_eq!(count(&rec, "uncordon"), 1);
         assert_eq!(count(&rec, "remove_node b"), 1);
-        assert!(rec.victims.lock().unwrap().is_empty());
+        // The removing victim stays until its Node goes.
+        assert_eq!(rec.victims.lock().unwrap().len(), 1);
     }
     #[tokio::test]
     async fn stuck_roll_without_autoscaling_still_blocks_rolls() {
@@ -1832,7 +2077,7 @@ mod tests {
         assert!(log[1].ends_with("repair"));
         assert_eq!(log[2], "mark_victim c Removing");
         assert_eq!(log[3], "remove_node c");
-        assert!(log[4].starts_with("delete_host"));
+        assert_eq!(log.len(), 4, "DeleteHost waits for the Node to go");
     }
     #[tokio::test]
     async fn roll_stuck_repair_holds_under_pressure_but_is_not_released() {

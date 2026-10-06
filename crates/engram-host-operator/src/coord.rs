@@ -190,6 +190,9 @@ impl CoordClient {
         {
             Ok(response) => Ok(retirement_from_response(response.into_inner())),
             Err(status) if status.code() == tonic::Code::NotFound => Ok(Retirement::NoRow),
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                Ok(Retirement::Foreign)
+            }
             Err(status) => Err(OperatorError::Rpc {
                 op: "retire_host",
                 status: Box::new(status),

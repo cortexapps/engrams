@@ -122,9 +122,14 @@ impl GkeNodePoolScaler {
             .await
             .map_err(|e| BackendError::Sdk(Box::new(e)))?;
 
-        if np.instance_group_urls.len() > 1 {
-            tracing::warn!(node_pool, groups = np.instance_group_urls.len(),
-                "multiple MIGs: setSize nodeCount is per-zone; the operator targets single-zone pools");
+        // setSize's nodeCount is PER ZONE, while the operator's target is a
+        // fleet total. A regional pool would multiply every grow by its zone
+        // count, past maxHosts. Refuse rather than mis-size.
+        if np.instance_group_urls.len() != 1 {
+            return Err(BackendError::Protocol(format!(
+                "node pool {node_pool} backs {} instance groups; the operator supports single-zone pools only",
+                np.instance_group_urls.len()
+            )));
         }
         Ok(np)
     }
