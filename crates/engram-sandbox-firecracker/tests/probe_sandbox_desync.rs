@@ -101,6 +101,7 @@ fn write_manifest_pointing_at(work_dir: &std::path::Path, id: SandboxId, pid: u3
         network: None,
         netns: None,
         uffd_handler: None,
+        memory_backing: None,
         migration_role: None,
     };
     sandbox_manifest::write_manifest(&sandbox_manifest::manifest_path(work_dir, id), &manifest)

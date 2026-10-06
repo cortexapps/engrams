@@ -16,12 +16,13 @@
 //!   handshake), sends a `WireExecRequest`, and translates the
 //!   streamed `WireExecEvent`s back into `engram_core::ExecEvent`s.
 //!
-//! `restore` supports both `RestoreMode::File` (synchronous read of
-//! memory.bin, simple, slow, no extra processes) and `RestoreMode::Uffd`
-//! (lazy paging via the `engram-uffd-handler` companion process — fast,
-//! Linux-only). `FirecrackerConfig::restore_mode` defaults to `File`;
-//! set it to `Uffd` for production-grade eviction/resume latency. Both
-//! are verified by `tests/snapshot.rs` and `tests/snapshot_uffd.rs`.
+//! `restore` has two memory backends. A fresh create always uses
+//! `RestoreMode::File`: FC maps the per-image memfile privately, no
+//! extra process, residency is reclaimable page cache (ADR 0092). A
+//! resume follows `FirecrackerConfig::restore_mode`: `Uffd` (lazy paging
+//! via the `engram-uffd-handler` companion process against the
+//! substrate base shm — production) or `File` (tests). Both are
+//! verified by `tests/snapshot.rs` and `tests/snapshot_uffd.rs`.
 //!
 //! End-to-end `tests/exec_real_vm.rs` bakes a debian-slim rootfs with
 //! a static-musl `engram-agentd` exec'd out of its bundle slot (ADR 0080),
@@ -147,6 +148,13 @@ pub struct SandboxState {
     /// the ancestor's path, since the drive is re-pointed by symlink,
     /// never by `patch_drive`). `None` when the spec has no swap.
     pub swap_canonical: Option<PathBuf>,
+    /// ADR 0045 C2: the file this VM's guest RAM is a private mapping
+    /// of — the per-image memfile (fresh create, File mode) or the
+    /// substrate base shm (Uffd mode with a base dir). `None` for a
+    /// cold boot (anonymous RAM) and for a base-less Uffd restore; such
+    /// a VM cannot be a post-copy source. Persisted in the sandbox
+    /// manifest so a reattach keeps the answer.
+    pub memory_backing: Option<PathBuf>,
 }
 
 /// Reserved vsock port `engram-agentd` listens on inside the guest.
@@ -479,16 +487,11 @@ pub struct FirecrackerConfig {
     /// `UFFDIO_CONTINUE`. MUST point at a tmpfs/shmem mount (MINOR
     /// faults are shmem-only). `None` ⇒ stock anonymous Uffd restore.
     pub uffd_base_dir: Option<PathBuf>,
-    /// How to wire memory on snapshot restore. File mode synchronously
-    /// reads memory.bin (slow, simple, no extra processes). Uffd mode
-    /// spawns engram-uffd-handler and serves pages on demand (fast,
-    /// requires Linux + the handler binary on the host).
+    /// How to wire memory on a RESUME restore (a fresh create is always
+    /// File, ADR 0092). File mode maps memory.bin privately (no extra
+    /// processes). Uffd mode spawns engram-uffd-handler and serves pages
+    /// on demand (requires Linux + the handler binary on the host).
     pub restore_mode: RestoreMode,
-    /// ADR 0092: fresh-create memory backend override. `None` = derived
-    /// (`uffd_base_dir` set ⇒ Uffd, else File). `Some(File)` restores
-    /// fresh creates from the per-image memfile even on a substrate host
-    /// (reclaimable page-cache residency); resumes are unaffected.
-    pub fresh_restore_override: Option<RestoreMode>,
     /// ADR 0028: arm KVM dirty-page tracking on every VM — cold
     /// creates via `MachineConfig.track_dirty_pages`, restores via
     /// `enable_diff_snapshots` at `snapshot/load` — so periodic
@@ -641,29 +644,6 @@ pub fn restore_mode_from_env() -> RestoreMode {
     }
 }
 
-/// ADR 0092: override the *fresh-create* memory backend independently of
-/// the substrate. Unset/empty ⇒ `None` (the derived default:
-/// `effective_restore_mode` picks Uffd when `uffd_base_dir` is set, File
-/// otherwise). `file` lets a substrate host — which still needs
-/// UFFD+base-shm for resumes — restore fresh creates from the per-image
-/// memfile instead, whose residency is reclaimable page cache (the
-/// density win; pair with `ENGRAM_FC_BASE_MEMFILE_PIN=0`). `uffd` pins
-/// the derived substrate behavior explicitly.
-pub fn fresh_restore_mode_from_env() -> Option<RestoreMode> {
-    match std::env::var("ENGRAM_FC_FRESH_RESTORE_MODE") {
-        Ok(s) if s.eq_ignore_ascii_case("file") => Some(RestoreMode::File),
-        Ok(s) if s.eq_ignore_ascii_case("uffd") => Some(RestoreMode::Uffd),
-        Ok(s) if !s.trim().is_empty() => {
-            tracing::warn!(
-                value = %s,
-                "unrecognised ENGRAM_FC_FRESH_RESTORE_MODE; using the derived default",
-            );
-            None
-        }
-        _ => None,
-    }
-}
-
 /// ADR 0045 substrate (v2b): per-template base-shm directory for
 /// Uffd-mode restores from `ENGRAM_FC_UFFD_BASE_DIR`. Unset/empty ⇒
 /// `None` (stock anonymous Uffd restore — the D2 rollout gate; the
@@ -764,8 +744,10 @@ impl std::error::Error for ReattachError {}
 /// Backing-memory strategy for `restore`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestoreMode {
-    /// `mem_backend = { backend_type: "File", ... }`. Synchronous —
-    /// Firecracker reads the entire memory file before InstanceStart.
+    /// `mem_backend = { backend_type: "File", ... }`: FC maps the memory
+    /// file `MAP_PRIVATE`; pages fault in from the page cache and guest
+    /// writes are copy-on-write. The only backend for a fresh create
+    /// (ADR 0092: the per-image memfile's residency is reclaimable).
     File,
     /// `mem_backend = { backend_type: "Uffd", ... }`. Lazy — pages
     /// stream in on demand via a `engram-uffd-handler` process the
@@ -796,7 +778,6 @@ impl FirecrackerConfig {
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             uffd_base_dir: None,
             restore_mode: RestoreMode::File,
-            fresh_restore_override: None,
             track_dirty_pages: false,
             balloon: std::env::var("ENGRAM_FC_BALLOON").map_or(true, |v| v != "0"),
             host_id: None,
@@ -1270,30 +1251,18 @@ impl FirecrackerBackend {
         self.sandboxes.get(&id).map(|r| r.state.clone())
     }
 
-    /// The effective memory backend for one restore (ADR 0045 D3).
-    /// `fresh` (the `swap_aux_to_current` flavor) is a base
-    /// `session.create`: with the substrate enabled (`uffd_base_dir`
-    /// set) it restores Uffd against the shared base shm — parity-gated
-    /// against File mode (density 35% == 35%, median 61 ms vs 56 ms,
-    /// dev VM 2026-06-10) — and without it keeps ADR 0022's File-mode
-    /// density path. Idle-resume (`fresh == false`) always follows
-    /// `restore_mode`. The per-host env is the one switch, so a fleet
-    /// roll flips fresh-create and resume together host-by-host with no
-    /// coordination (the retired `ENGRAM_FC_BASE_RESTORE_MODE` knob's
-    /// job is now derived, not configured).
+    /// The effective memory backend for one restore. `fresh` (the
+    /// `swap_aux_to_current` flavor) is a base `session.create` and is
+    /// always File: FC maps the per-image memfile privately, so its
+    /// residency is reclaimable page cache (ADR 0092). Idle-resume
+    /// (`fresh == false`) follows `restore_mode` — Uffd against the
+    /// substrate base shm in production, because `UFFDIO_CONTINUE` is
+    /// shmem-only and a resume's divergent pages come from its own
+    /// chain. Neither backend is configurable per fresh create; the
+    /// retired `ENGRAM_FC_FRESH_RESTORE_MODE` knob's job is fixed.
     fn effective_restore_mode(&self, fresh: bool) -> RestoreMode {
         if fresh {
-            // ADR 0092: explicit override first — `file` on a substrate
-            // host restores fresh creates from the per-image memfile
-            // (reclaimable page-cache residency) while resumes keep Uffd.
-            if let Some(m) = self.config.fresh_restore_override {
-                return m;
-            }
-            if self.config.uffd_base_dir.is_some() {
-                RestoreMode::Uffd
-            } else {
-                RestoreMode::File
-            }
+            RestoreMode::File
         } else {
             self.config.restore_mode
         }
@@ -1576,6 +1545,7 @@ impl FirecrackerBackend {
             rootfs_canonical: fc.rootfs_canonical.clone(),
             // ADR 0112: same carry-forward for the swap drive.
             swap_canonical: fc.swap_canonical.clone(),
+            memory_backing: manifest.memory_backing.clone(),
         };
         // Reattach: agentd was already up when the previous host-
         // agent generation tracked it, so the readiness watch starts
@@ -2665,6 +2635,7 @@ impl FirecrackerBackend {
             rootfs_canonical,
             // Same contract for the swap drive (ADR 0112).
             swap_canonical: has_swap.then(|| paths::swap_canonical(&self.work_dir, sandbox_id)),
+            memory_backing: None,
         };
         // ADR 0009 §4: spawn a supervisor that watches for unexpected
         // FC process exit (kernel OOM, segfault, manual kill) and
@@ -3721,6 +3692,17 @@ impl FirecrackerBackend {
             // swap drive; the symlink at that path was re-pointed at
             // OUR fresh backing file before the load.
             swap_canonical: manifest.source_swap_canonical.clone(),
+            // ADR 0045 C2: what the guest RAM is a private mapping of.
+            // File mode maps the snapshot's memfile; Uffd mode maps the
+            // substrate base derived exactly as the load did (D4: the
+            // image base when the coordinator supplied it, else the
+            // session manifest).
+            memory_backing: match restore_mode {
+                RestoreMode::File => Some(mem_path.clone()),
+                RestoreMode::Uffd => base_memory_manifest
+                    .or(manifest.memory_manifest)
+                    .and_then(|r| self.uffd_base_path(&r)),
+            },
         };
         // ADR 0009 §4: supervisor watches restored FC + (optional)
         // UFFD handler. The UFFD handler is critical — if it dies
@@ -4287,6 +4269,7 @@ fn persist_sandbox_manifest(
         network,
         netns,
         uffd_handler: uffd_pid.map(process_record),
+        memory_backing: state.memory_backing.clone(),
         migration_role: migration_role.map(str::to_owned),
     };
     let path = sandbox_manifest::manifest_path(work_dir, sandbox_id);
@@ -5377,19 +5360,22 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     /// ADR 0045 C2: what the page server needs to read this paused
-    /// guest's memory from outside. `None` unless this is a live FC
-    /// sandbox on a substrate host (post-copy needs the base-file
-    /// mapping to translate guest offsets to FC virtual addresses).
+    /// guest's memory from outside. `None` unless this VM's guest RAM
+    /// is a private mapping of a file (post-copy needs that mapping to
+    /// translate guest offsets to FC virtual addresses and to tell
+    /// clean file-backed pages from guest-dirtied anonymous ones). A
+    /// fresh create (the per-image memfile) and a resume (the substrate
+    /// base shm) both qualify; a cold boot does not.
     fn post_copy_source_view(
         &self,
         id: SandboxId,
     ) -> Option<engram_core::traits::sandbox::PostCopySourceView> {
-        let base_dir = self.config.uffd_base_dir.clone()?;
         let live = self.sandboxes.get(&id)?;
         let fc_pid = live.fc_pid?;
+        let memory_backing = live.state.memory_backing.clone()?;
         Some(engram_core::traits::sandbox::PostCopySourceView {
             fc_pid,
-            uffd_base_dir: base_dir,
+            memory_backing,
         })
     }
 
@@ -7651,7 +7637,6 @@ mod tests {
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             uffd_base_dir: None,
             restore_mode: RestoreMode::File,
-            fresh_restore_override: None,
             track_dirty_pages: false,
             balloon: false,
             net_pool: None,
@@ -9165,83 +9150,109 @@ mod tests {
         }
     }
 
-    // ---- ADR 0045 D3: effective_restore_mode (substrate-aware) ----
+    // ---- effective_restore_mode: fresh = File, resume = restore_mode ----
 
     #[test]
-    fn effective_restore_mode_bifurcates_create_vs_resume() {
+    fn effective_restore_mode_fresh_is_file_and_resume_follows_config() {
         let (mut be, _dir) = backend();
-        // Default: no substrate dir — base session.create keeps ADR
-        // 0022's File-mode density path; idle-resume follows
-        // restore_mode.
         be.config.restore_mode = RestoreMode::Uffd;
-        be.config.uffd_base_dir = None;
-        assert_eq!(
-            be.effective_restore_mode(/*fresh=*/ true),
-            RestoreMode::File,
-            "without the substrate, base session.create stays on File",
-        );
-        assert_eq!(
-            be.effective_restore_mode(/*fresh=*/ false),
-            RestoreMode::Uffd,
-            "idle-resume always follows restore_mode",
-        );
-
-        // Substrate enabled: ONE switch flips fresh-create to Uffd
-        // against the shared base shm (ADR 0045 D3 parity-gated).
-        be.config.uffd_base_dir = Some(std::path::PathBuf::from("/dev/shm/engram"));
-        assert_eq!(be.effective_restore_mode(true), RestoreMode::Uffd);
-        assert_eq!(be.effective_restore_mode(false), RestoreMode::Uffd);
-
-        // ADR 0092: the fresh-create override beats the derivation — a
-        // substrate host restores fresh creates from the per-image
-        // memfile (reclaimable page-cache residency) while resumes keep
-        // the substrate.
-        be.config.fresh_restore_override = Some(RestoreMode::File);
-        assert_eq!(
-            be.effective_restore_mode(true),
-            RestoreMode::File,
-            "explicit file override wins for fresh creates on a substrate host",
-        );
-        assert_eq!(
-            be.effective_restore_mode(false),
-            RestoreMode::Uffd,
-            "the override never touches resumes",
-        );
-        be.config.fresh_restore_override = Some(RestoreMode::Uffd);
-        be.config.uffd_base_dir = None;
-        assert_eq!(
-            be.effective_restore_mode(true),
-            RestoreMode::Uffd,
-            "explicit uffd override wins over the substrate-off derivation",
-        );
+        for base_dir in [None, Some(std::path::PathBuf::from("/dev/shm/engram"))] {
+            be.config.uffd_base_dir = base_dir;
+            assert_eq!(
+                be.effective_restore_mode(/*fresh=*/ true),
+                RestoreMode::File,
+                "a fresh create maps the per-image memfile (ADR 0092), substrate or not",
+            );
+            assert_eq!(
+                be.effective_restore_mode(/*fresh=*/ false),
+                RestoreMode::Uffd,
+                "a resume follows restore_mode",
+            );
+        }
+        be.config.restore_mode = RestoreMode::File;
+        assert_eq!(be.effective_restore_mode(false), RestoreMode::File);
     }
 
     #[test]
     fn restore_memory_is_lazy_for_tracks_effective_mode() {
         // The host-agent restore path keys BOTH its prefetch-block gate and its
         // memory.bin-materialize gate on `restore_memory_is_lazy_for(fresh)`, so
-        // lock that it mirrors `effective_restore_mode`: lazy iff Uffd. A
-        // substrate fresh-create being lazy is exactly what lets a cold
-        // base-create background its memory prefetch instead of blocking on it.
+        // lock that it mirrors `effective_restore_mode`: lazy iff Uffd.
         let (mut be, _dir) = backend();
         be.config.restore_mode = RestoreMode::Uffd;
+        for base_dir in [None, Some(std::path::PathBuf::from("/dev/shm/engram"))] {
+            be.config.uffd_base_dir = base_dir;
+            assert!(
+                !be.restore_memory_is_lazy_for(/*fresh=*/ true),
+                "a File fresh create must materialize memory.bin (not lazy)",
+            );
+            assert!(
+                be.restore_memory_is_lazy_for(/*fresh=*/ false),
+                "a UFFD resume serves memory lazily",
+            );
+        }
+    }
 
-        // Substrate off: File base-create is NOT lazy (needs memory.bin);
-        // a UFFD resume IS lazy.
-        be.config.uffd_base_dir = None;
-        assert!(
-            !be.restore_memory_is_lazy_for(/*fresh=*/ true),
-            "File base-create must materialize memory.bin (not lazy)",
-        );
-        assert!(
-            be.restore_memory_is_lazy_for(/*fresh=*/ false),
-            "UFFD resume serves memory lazily",
-        );
+    /// ADR 0045 C2 (2026-10-07 addendum): a post-copy source is any VM
+    /// whose guest RAM is a private file mapping — the per-image memfile
+    /// (File-mode fresh create) or the substrate base shm (Uffd resume).
+    /// The answer is keyed on the recorded backing, not on the host's
+    /// substrate config, and a cold boot (anonymous RAM) is refused.
+    #[test]
+    fn post_copy_source_view_follows_the_recorded_memory_backing() {
+        let (be, _dir) = backend();
+        let id = SandboxId::new();
+        let live = |fc_pid: Option<u32>, memory_backing: Option<PathBuf>| {
+            let (_tx, agent_ready) = tokio::sync::watch::channel(true);
+            LiveSandbox {
+                state: SandboxState {
+                    spec: spec(),
+                    firecracker_socket: be.work_dir.join(id.to_string()).join("fc.sock"),
+                    rootfs_path: be.work_dir.join(id.to_string()).join("rootfs.ext4"),
+                    vsock_cid: 3,
+                    vsock_uds_path: be.work_dir.join(id.to_string()).join("vsock.sock"),
+                    rootfs_canonical: be.work_dir.join(id.to_string()).join("rootfs.ext4"),
+                    swap_canonical: None,
+                    memory_backing,
+                },
+                child: None,
+                fc_pid,
+                uffd_handler: None,
+                uffd_pid: None,
+                net: None,
+                netns: None,
+                guest_endpoints: parking_lot::Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                parked: false,
+                agentd_slot_swapped: false,
+                agent_ready,
+                vsock_epoch: tokio::sync::watch::channel(0).0,
+            }
+        };
+        assert!(be.post_copy_source_view(id).is_none(), "unknown sandbox");
 
-        // Substrate on: fresh-create flips to Uffd, so it is lazy too.
-        be.config.uffd_base_dir = Some(std::path::PathBuf::from("/dev/shm/engram"));
-        assert!(be.restore_memory_is_lazy_for(true));
-        assert!(be.restore_memory_is_lazy_for(false));
+        // A cold boot: anonymous RAM, no backing → not a source, even
+        // on a substrate host.
+        be.sandboxes.insert(id, live(Some(4242), None));
+        assert!(be.post_copy_source_view(id).is_none());
+
+        // A File-mode fresh create maps the per-image memfile.
+        let memfile = be
+            .work_dir
+            .join("snapshots")
+            .join("base")
+            .join("memory.bin");
+        be.sandboxes
+            .insert(id, live(Some(4242), Some(memfile.clone())));
+        let view = be
+            .post_copy_source_view(id)
+            .expect("file-backed guest is a source");
+        assert_eq!(view.fc_pid, 4242);
+        assert_eq!(view.memory_backing, memfile);
+
+        // No pid (not yet started) → nothing to read from.
+        be.sandboxes.insert(id, live(None, Some(memfile)));
+        assert!(be.post_copy_source_view(id).is_none());
     }
 
     /// Review finding 2 regression test: `prefault_stats_path` must be
@@ -9271,6 +9282,7 @@ mod tests {
                     vsock_uds_path: be.work_dir.join(id.to_string()).join("vsock.sock"),
                     rootfs_canonical: be.work_dir.join(id.to_string()).join("rootfs.ext4"),
                     swap_canonical: None,
+                    memory_backing: None,
                 },
                 child: None,
                 fc_pid: None,
@@ -9342,6 +9354,7 @@ mod tests {
             vsock_uds_path: PathBuf::new(),
             rootfs_canonical: PathBuf::new(),
             swap_canonical: None,
+            memory_backing: None,
         };
 
         let running_id = SandboxId::new();
@@ -9510,6 +9523,7 @@ mod tests {
                     vsock_uds_path: jail_dir.join("vsock.sock"),
                     rootfs_canonical: jail_dir.join("rootfs.ext4"),
                     swap_canonical: None,
+                    memory_backing: None,
                 },
                 child: Some(child),
                 fc_pid: Some(fc_pid),

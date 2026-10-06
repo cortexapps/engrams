@@ -190,6 +190,7 @@ async fn never_flushed_survivor_is_reserved_from_spec_and_binding() {
             network: None,
             netns: None,
             uffd_handler: None,
+            memory_backing: None,
             migration_role: None,
         },
     )

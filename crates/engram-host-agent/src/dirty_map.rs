@@ -102,10 +102,11 @@ pub fn parse_maps_line(line: &str, base_shm_path: &str) -> Option<GuestVma> {
     })
 }
 
-/// Read `/proc/<pid>/maps` and return the VMAs backed by `base_shm_path`,
+/// Read `/proc/<pid>/maps` and return the VMAs backed by `base_shm_path`
+/// (the per-image memfile or the substrate base shm the restore recorded),
 /// sorted by `file_offset`. Empty result means the process doesn't map
-/// the base (wrong pid, or a non-substrate restore) — callers treat that
-/// as "cannot post-copy", not as an empty dirty set.
+/// that file (wrong pid, or anonymous guest RAM) — callers treat that as
+/// "cannot post-copy", not as an empty dirty set.
 pub fn guest_vmas(pid: u32, base_shm_path: &Path) -> io::Result<Vec<GuestVma>> {
     let base = base_shm_path.to_string_lossy();
     let f = std::fs::File::open(format!("/proc/{pid}/maps"))?;
@@ -117,25 +118,6 @@ pub fn guest_vmas(pid: u32, base_shm_path: &Path) -> io::Result<Vec<GuestVma>> {
     }
     vmas.sort_by_key(|v| v.file_offset);
     Ok(vmas)
-}
-
-/// Find the substrate base file `pid` maps under `base_dir` — the
-/// page server's discovery step (the host-agent knows the DIR from
-/// config; the exact per-image file is whatever the restore derived).
-/// Exactly one distinct base file is expected per FC process.
-pub fn find_base_mapping(pid: u32, base_dir: &Path) -> io::Result<Option<std::path::PathBuf>> {
-    let prefix = format!("{}/", base_dir.to_string_lossy().trim_end_matches('/'));
-    let f = std::fs::File::open(format!("/proc/{pid}/maps"))?;
-    for line in BufReader::new(f).lines() {
-        let line = line?;
-        if let Some(idx) = line.find(&prefix) {
-            let path = line[idx..].trim_end();
-            if !path.ends_with(" (deleted)") {
-                return Ok(Some(std::path::PathBuf::from(path)));
-            }
-        }
-    }
-    Ok(None)
 }
 
 /// The per-page classification rule. `entry` is one raw 64-bit

@@ -67,7 +67,6 @@ firecracker:
   uffdBaseDir: /var/lib/engram/shm
   uffdBaseTmpfsSize: 32g
   # ADR 0092: base memory in reclaimable page cache, not pinned tmpfs.
-  freshRestoreMode: "file"
   baseMemfilePin: "0" # quoted on purpose — bare 0 is falsy in the chart's `with`
   baseShmMode: "lazy"
 

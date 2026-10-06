@@ -8214,6 +8214,15 @@ impl SandboxBackend for PooledBackend {
     /// the dest's first checkpoint is a safe Full = the durability
     /// catch-up), the live disk ref, and the hot set. NO pause, no
     /// fence — the guest runs until `migration_capture_postcopy`.
+    /// ADR 0045 C2: the inner backend's answer, unchanged — the pooled
+    /// layer adds nothing to "what file is this guest's RAM mapped from".
+    fn post_copy_source_view(
+        &self,
+        id: SandboxId,
+    ) -> Option<engram_core::traits::sandbox::PostCopySourceView> {
+        self.inner.post_copy_source_view(id)
+    }
+
     async fn migration_presetup(
         &self,
         id: SandboxId,
@@ -8247,9 +8256,14 @@ impl SandboxBackend for PooledBackend {
                 "presetup superseding an abandoned pending presetup",
             );
         }
+        // The guest RAM must be a private mapping of a file (the
+        // per-image memfile or the substrate base shm): the pagemap
+        // scan tells file-backed (clean) from anonymous (dirtied) pages
+        // and the dest resolves clean chunks from the chain. A cold boot
+        // is anonymous and cannot post-copy. Decided HERE, pause-free.
         if self.inner.post_copy_source_view(id).is_none() {
             return Err(SandboxError::InvalidSpec(
-                "not a substrate sandbox (no base mapping) — use snapshot-rehome".into(),
+                "guest RAM is not file-backed (cold boot) — use snapshot-rehome".into(),
             ));
         }
         // ADR 0112 D7: a swap-armed guest cannot post-copy teleport —
@@ -8464,19 +8478,13 @@ impl SandboxBackend for PooledBackend {
 
             // The pagemap dirty map (blackout-critical; measured).
             let scan_started = crate::time_source::metrics_now();
-            let base_path = crate::dirty_map::find_base_mapping(view.fc_pid, &view.uffd_base_dir)
-                .map_err(|e| SandboxError::Snapshot(format!("base mapping scan: {e}")))?
-                .ok_or_else(|| {
-                    SandboxError::Snapshot(
-                        "FC process maps no substrate base file — cannot post-copy".into(),
-                    )
-                })?;
-            let vmas = crate::dirty_map::guest_vmas(view.fc_pid, &base_path)
+            let vmas = crate::dirty_map::guest_vmas(view.fc_pid, &view.memory_backing)
                 .map_err(|e| SandboxError::Snapshot(format!("guest vmas: {e}")))?;
             if vmas.is_empty() {
-                return Err(SandboxError::Snapshot(
-                    "no base-backed guest VMAs — cannot post-copy".into(),
-                ));
+                return Err(SandboxError::Snapshot(format!(
+                    "FC process maps no guest VMA backed by {} — cannot post-copy",
+                    view.memory_backing.display()
+                )));
             }
             let chunk_size = chain_manifest.chunk_size.as_u64();
             let total_bytes = chain_manifest.total_bytes;

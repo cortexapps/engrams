@@ -1318,34 +1318,20 @@ impl HostAgent {
                 self.chunk_cache.clone(),
             ) {
                 (Some(chunk_store), Some(chunk_cache)) => {
-                    // ADR 0022 Option A / ADR 0045 D3: when base-create is
-                    // on the File backend (no substrate dir configured),
-                    // the supervisor materializes each enabled image's
-                    // contiguous per-template base memfile at residency —
-                    // at the SAME path a base session.create restore reads
+                    // ADR 0022 Option A / ADR 0092: a fresh create always
+                    // restores on the File backend, so the supervisor
+                    // materializes each enabled image's contiguous
+                    // per-template base memfile at residency — at the
+                    // SAME path a base session.create restore reads
                     // (`pooled.snapshot_path_for(base_snapshot_id)`), so
-                    // they agree by construction. With the substrate
-                    // (ENGRAM_FC_UFFD_BASE_DIR set) fresh-creates go Uffd
-                    // against the lazily-populated base shm instead, and
-                    // the eager multi-second per-template materialization
-                    // is retired along with the memfile it built.
-                    // ADR 0092: the memfile is needed whenever fresh
-                    // creates take the File path — derived (no substrate
-                    // dir) OR explicitly overridden onto a substrate host
-                    // (`ENGRAM_FC_FRESH_RESTORE_MODE=file`, the
-                    // reclaimable-residency density config).
-                    let fresh_is_file =
-                        match engram_sandbox_firecracker::fresh_restore_mode_from_env() {
-                            Some(m) => m == engram_sandbox_firecracker::RestoreMode::File,
-                            None => engram_sandbox_firecracker::uffd_base_dir_from_env().is_none(),
-                        };
-                    let base_memfile_dir: Option<image_prefetch::SnapshotDirResolver> =
-                        fresh_is_file.then(|| {
-                            let p = pooled.clone();
-                            let resolver: image_prefetch::SnapshotDirResolver =
-                                std::sync::Arc::new(move |id| p.snapshot_path_for(id));
-                            resolver
-                        });
+                    // they agree by construction. Resumes take the
+                    // substrate (UFFD + the lazily-populated base shm).
+                    let base_memfile_dir: Option<image_prefetch::SnapshotDirResolver> = {
+                        let p = pooled.clone();
+                        let resolver: image_prefetch::SnapshotDirResolver =
+                            std::sync::Arc::new(move |id| p.snapshot_path_for(id));
+                        Some(resolver)
+                    };
                     let (tx, _handle) = image_prefetch::spawn_supervisor(
                         chunk_store,
                         chunk_cache,

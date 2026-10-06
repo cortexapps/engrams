@@ -76,6 +76,12 @@ pub struct SandboxManifest {
     /// comm) on reattach. Like FC, the handler is detached (not
     /// killed) on host-agent shutdown and re-adopted by the successor.
     pub uffd_handler: Option<ProcessRecord>,
+    /// ADR 0045 C2: the file this VM's guest RAM is a private mapping
+    /// of (the per-image memfile or the substrate base shm), recorded
+    /// at restore so a reattached VM still answers whether it can be a
+    /// post-copy source. `None` for a cold boot (anonymous RAM).
+    #[serde(default)]
+    pub memory_backing: Option<std::path::PathBuf>,
     /// ADR 0045 C2: the sandbox's in-flight post-copy migration role
     /// (`"post-copy-source"` / `"post-copy-dest"`), persisted so a
     /// host-agent restart's reattach pass re-learns the lifecycle
@@ -373,6 +379,7 @@ mod tests {
             network: None,
             netns: None,
             uffd_handler: None,
+            memory_backing: None,
             migration_role: None,
         }
     }
@@ -391,6 +398,25 @@ mod tests {
         assert_eq!(back.firecracker.vsock_cid, 3);
         assert!(back.network.is_none());
         assert!(back.uffd_handler.is_none());
+        assert!(back.memory_backing.is_none());
+    }
+
+    /// ADR 0045 C2 (2026-10-07): the memory backing rides the manifest so
+    /// a reattached VM still answers whether it can be a post-copy
+    /// source; a manifest written before the field existed reads as
+    /// `None` (a conservative "not a source").
+    #[test]
+    fn memory_backing_round_trips_and_defaults_to_none() {
+        let mut m = dummy_manifest();
+        m.memory_backing = Some(std::path::PathBuf::from("/var/lib/engram/shm/img-v2.base"));
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: SandboxManifest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.memory_backing, m.memory_backing);
+
+        let mut v: serde_json::Value = serde_json::from_str(&json).expect("value");
+        v.as_object_mut().expect("object").remove("memory_backing");
+        let legacy: SandboxManifest = serde_json::from_value(v).expect("legacy manifest");
+        assert!(legacy.memory_backing.is_none());
     }
 
     #[test]

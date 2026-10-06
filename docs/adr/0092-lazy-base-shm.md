@@ -332,6 +332,26 @@ resume base) plus the hardening items, canary on the kvm pool with
 TTFM follow-ups (harness spawn priority first) proceed independently —
 they are where first-message latency actually is.
 
+## Addendum (2026-10-07): the fresh-create memory backend is fixed, not configured
+
+The canary config became the only config. `ENGRAM_FC_FRESH_RESTORE_MODE`
+and the Helm value `freshRestoreMode` are retired. A fresh create is
+always `RestoreMode::File` (a private mapping of the per-image memfile,
+reclaimable page cache, no handler); a resume always follows
+`restore_mode` (Uffd on the substrate in production, because
+`UFFDIO_CONTINUE` is shmem-only). The "derived" branch that put fresh
+creates on the substrate whenever `uffdBaseDir` was set (ADR 0045 D3) is
+gone with the knob, so the per-template memfile is materialized at
+residency on every host with a chunk store.
+
+The split had one hidden cost, found when ADR 0123's teleport machine
+first ran on the fleet: the post-copy source check was written against
+the substrate base dir, so a never-evicted fresh session (File mode)
+could not be a live teleport source and the move failed inside the
+blackout. Post-copy needs only a private file mapping of the chain's
+base, which both backends provide; see the ADR 0045 addendum of the
+same date.
+
 ---
 *Measurement appendix: raw run dirs, perf data, and strace logs on the
 dev VM (`~/.adr92/runs2/`, `/tmp/handler-perf.txt`,

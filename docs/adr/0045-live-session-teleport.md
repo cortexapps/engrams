@@ -284,6 +284,33 @@ The C1 rewrite made base-shm residency **part of what `ready_images` advertises*
 
 Net effect: a host roll no longer destroys residency (the keep-set preserves it), and any other cause of loss (tmpfs remount, operator `rm`) heals within one recheck interval instead of silently degrading first sessions.
 
+## Addendum (2026-10-07): a post-copy source is any file-backed guest, not only a substrate one
+
+The C2 source view asked "does this FC process map a file under the
+substrate base dir", answered by scanning `/proc/<pid>/maps` for the
+directory prefix inside the capture blackout. With ADR 0092's File-mode
+fresh creates that was wrong twice over: a fresh session's guest RAM is
+a private mapping of the per-image memfile under the snapshots dir, so
+it never matched; and the mismatch surfaced only after the pause, so
+the teleport aborted instead of choosing the snapshot kind.
+
+What post-copy actually needs from a source: guest RAM is a `MAP_PRIVATE`
+mapping of a file whose content is the chain's base manifest. The pagemap
+rule (`present && !file_backed`) then separates clean file-backed pages
+from guest-dirtied anonymous pages, and the destination resolves every
+unsealed chunk from the content-addressed chain. The per-image memfile
+(fresh create) and the substrate base shm (resume) both satisfy it; a
+cold boot (anonymous RAM) does not.
+
+Changes: the restore records the file it mapped as the sandbox's
+`memory_backing` (live entry + the persisted sandbox manifest, so a
+reattach keeps the answer); `PostCopySourceView` carries that path;
+`migration_presetup` refuses pause-free when it is absent; the capture
+selects the guest VMAs by that path and `dirty_map::find_base_mapping`
+is deleted. The D3 sentence "adoption is derived: fresh creates resolve
+to substrate-Uffd iff `uffd_base_dir` is set" is superseded by ADR 0092's
+addendum of the same date.
+
 ## Sources
 
 Carries forward **ADR 0042** (`docs/adr/0042-substrate-architecture-survey.md` + `0072-substrate-survey-evidence.md`): QEMU post-copy docs + Hines'09; Firecracker snapshot/UFFD docs + discussions #3119/#2938 (FC has no native live migration; UFFD restore is page-source-pluggable); `loopholelabs/drafter` + `silo` v0.2.21 (the unified-device post-copy-with-durable-backstop reference, AGPL — design reference only); REAP/FaaSnap/Catalyzer (working-set prefetch); CodeSandbox engineering blogs (`MAP_SHARED` continuous flush, local-NVMe memory). Kernel references for the substrate: `userfaultfd(2)` + `Documentation/admin-guide/mm/userfaultfd.rst` (MINOR/CONTINUE since 5.13 shmem/hugetlbfs; WP on shmem since 5.19; MISSING scope), `mmap(2)` MAP_FIXED semantics, KVM memslot/GUP behavior under address-space changes. Codebase seams verified against the current tree (the UFFD fill seam, `effective_restore_mode`, the disk flush scheduler, the eviction pipeline + lease, the operator `roll_node` + `desired_hosts`, the node-assets / detect-changes pipeline, the web admin UX). Direct read of the `loopholelabs/firecracker` compare diff happened **only** for the superseded v1 surface (recorded in Phase B history); the substrate (v2) design deliberately derives from kernel primitives alone.

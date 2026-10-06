@@ -127,9 +127,12 @@ pub struct GuestMemoryStats {
 #[derive(Clone, Debug)]
 pub struct PostCopySourceView {
     pub fc_pid: u32,
-    /// The substrate base dir (tmpfs) — the page server resolves the
-    /// exact base file by scanning the FC process's maps for it.
-    pub uffd_base_dir: PathBuf,
+    /// The file the guest's RAM is a private mapping of: the per-image
+    /// memfile (a fresh create) or the substrate base shm (a resume).
+    /// Recorded at restore time; the page server selects the guest VMAs
+    /// by this path and classifies pages as file-backed (clean) or
+    /// anonymous (dirtied by the guest).
+    pub memory_backing: PathBuf,
 }
 
 /// Result of [`SandboxBackend::start_browser`] /
@@ -862,10 +865,10 @@ pub trait SandboxBackend: Send + Sync {
 
     /// ADR 0045 C2: what the source page server needs to read this
     /// sandbox's guest memory from outside: FC's pid (this process is
-    /// its parent, so `process_vm_readv` is YAMA-legal) and the tmpfs
-    /// dir holding the substrate base file its guest RAM is
-    /// MAP_PRIVATE of (the `/proc/<pid>/maps` filter key). `None` ⇒
-    /// not a substrate-restored FC sandbox (cannot post-copy).
+    /// its parent, so `process_vm_readv` is YAMA-legal) and the file its
+    /// guest RAM is MAP_PRIVATE of (the `/proc/<pid>/maps` filter key).
+    /// `None` ⇒ the guest RAM is anonymous (a cold boot) and cannot
+    /// post-copy.
     fn post_copy_source_view(&self, _id: SandboxId) -> Option<PostCopySourceView> {
         None
     }

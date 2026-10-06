@@ -41,12 +41,6 @@ data:
   # the host-agent derives everything else from this one switch.
   ENGRAM_FC_UFFD_BASE_DIR: {{ . | quote }}
   {{- end }}
-  {{- with .Values.firecracker.freshRestoreMode }}
-  # ADR 0092: fresh-create memory backend override. "file" restores fresh
-  # creates from the per-image memfile even on a substrate host
-  # (reclaimable page-cache residency); resumes keep the substrate.
-  ENGRAM_FC_FRESH_RESTORE_MODE: {{ . | quote }}
-  {{- end }}
   {{- with .Values.firecracker.baseMemfilePin }}
   # ADR 0092: "0" skips the memfile mlock — the kernel reclaims cold base
   # pages under pressure instead of the host OOMing.
