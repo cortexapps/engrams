@@ -745,23 +745,22 @@ impl HostAgent {
             // injected production clock, constructed once for this sink.
             let events_clock: Arc<dyn engram_core::traits::Clock> =
                 Arc::new(engram_core::traits::SystemClock::new());
-            let event_sink = crate::harness::event_sink_to(move |session_id, sandbox_id, ev| {
-                let cc = coord_client_for_events.clone();
-                let events_clock = events_clock.clone();
-                async move {
-                    let req = coord_client::HarnessEventRequest {
-                        sandbox_id,
-                        event: ev,
-                        at: events_clock.now_utc(),
-                    };
-                    if let Err(e) = cc.harness_event(session_id, &req).await {
-                        tracing::debug!(
-                            %session_id, %sandbox_id, error = %e,
-                            "forward harness event to coord failed",
-                        );
+            let event_sink =
+                crate::harness::event_sink_to(move |session_id, sandbox_id, ev, delivery| {
+                    let cc = coord_client_for_events.clone();
+                    let events_clock = events_clock.clone();
+                    async move {
+                        let req = coord_client::HarnessEventRequest {
+                            sandbox_id,
+                            event: ev,
+                            at: events_clock.now_utc(),
+                            delivery,
+                        };
+                        cc.harness_event(session_id, &req)
+                            .await
+                            .map_err(|e| crate::harness::SinkError(e.to_string()))
                     }
-                }
-            });
+                });
             let bindings = crate::bindings::BindingStore::open(self.cfg.work_dir.join("bindings"))
                 .expect("open binding store under work_dir (ADR 0073)");
             let harness_hub =
@@ -2375,7 +2374,7 @@ mod tests {
 
     fn noop_hub_over(dir: &std::path::Path) -> harness::HarnessHub {
         harness::HarnessHub::new(
-            std::sync::Arc::new(|_, _, _| Box::new(Box::pin(async {}))),
+            std::sync::Arc::new(|_, _, _, _| Box::pin(async { Ok(()) })),
             bindings::BindingStore::open(dir).expect("open binding store"),
         )
     }

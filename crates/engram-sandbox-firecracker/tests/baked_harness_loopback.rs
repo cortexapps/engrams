@@ -223,7 +223,15 @@ async fn baked_noop_harness_emits_run_started() {
         .await
         .expect("read HarnessFrame::Event after attach ack");
     match frame {
-        HarnessFrame::Event(HarnessEvent::RunStarted { run_id, .. }) => {
+        HarnessFrame::SeqEvent {
+            seq,
+            event: HarnessEvent::RunStarted { run_id, .. },
+            ..
+        } => {
+            assert_eq!(seq, 1);
+            write_msg(&mut stream, &HarnessFrame::EventAck { seq })
+                .await
+                .expect("ack event");
             assert!(
                 !run_id.is_empty(),
                 "noop's RunStarted should carry a non-empty run_id",

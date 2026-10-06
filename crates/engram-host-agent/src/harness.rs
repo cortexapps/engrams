@@ -30,7 +30,7 @@ use engram_harness_proto::{
 };
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// Default timeout for a `Checkpoint` command's ack. The harness gets
 /// this long to flush its transcript and reply; on miss the caller
@@ -59,11 +59,33 @@ const DRAIN_DETACH_SLACK: Duration = Duration::from_secs(3);
 /// `send_prompt` attach-wait loop; off the hot path (idle eviction).
 const DRAIN_DETACH_POLL: Duration = Duration::from_millis(50);
 
+/// Identity of a sequenced event within one binding generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventDelivery {
+    pub binding_epoch: u64,
+    pub seq: u64,
+}
+
+#[derive(Debug)]
+pub struct SinkError(pub String);
+
+impl std::fmt::Display for SinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for SinkError {}
+
 /// Callback invoked for every `HarnessEvent` received on a connection.
 /// In production this is the host-agent's bridge into the coordinator's
 /// `session_events` log; tests pass a closure that just collects them.
 pub type EventSink = Arc<
-    dyn Fn(SessionId, SandboxId, HarnessEvent) -> Box<dyn Future<Output = ()> + Send + Unpin>
+    dyn Fn(
+            SessionId,
+            SandboxId,
+            HarnessEvent,
+            Option<EventDelivery>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), SinkError>> + Send>>
         + Send
         + Sync,
 >;
@@ -114,6 +136,8 @@ struct HubInner {
 }
 
 struct ConnectionHandle {
+    /// Ack writes retain a sender, so registration owns an explicit close signal.
+    disconnected: Arc<Notify>,
     /// Sender into the writer task; takes encoded `HarnessFrame`s.
     /// Bounded to keep an unbacked-up writer from blowing memory.
     cmd_tx: mpsc::Sender<HarnessFrame>,
@@ -130,6 +154,12 @@ struct ConnectionHandle {
     generation: u64,
 }
 
+impl Drop for ConnectionHandle {
+    fn drop(&mut self) {
+        self.disconnected.notify_one();
+    }
+}
+
 impl HarnessHub {
     /// Drive the hub's `EventSink` for a harness event that didn't
     /// originate from a local adapter loop. Used by the coord-side
@@ -143,10 +173,9 @@ impl HarnessHub {
         session_id: SessionId,
         sandbox_id: SandboxId,
         event: HarnessEvent,
-    ) {
-        let fut: Box<dyn Future<Output = ()> + Send + Unpin> =
-            (self.inner.event_sink)(session_id, sandbox_id, event);
-        Box::into_pin(fut).await;
+        delivery: Option<EventDelivery>,
+    ) -> Result<(), SinkError> {
+        (self.inner.event_sink)(session_id, sandbox_id, event, delivery).await
     }
 
     pub fn new(event_sink: EventSink, bindings: crate::bindings::BindingStore) -> Self {
@@ -746,7 +775,9 @@ async fn drive_attached<R, W>(
     // from idle detection). The generation lets the epilogue remove
     // only when it still owns the live entry.
     let my_generation = inner.next_gen.fetch_add(1, Ordering::Relaxed);
+    let disconnected = Arc::new(Notify::new());
     let handle = ConnectionHandle {
+        disconnected: disconnected.clone(),
         cmd_tx: cmd_tx.clone(),
         pending_checkpoint: Mutex::new(None),
         generation: my_generation,
@@ -804,14 +835,17 @@ async fn drive_attached<R, W>(
     // (prod 43fe13b4: seed-at-attach soft-TTL'd fresh sessions whose
     // harness needed >30s to emit its first event).
 
-    let writer_task = tokio::spawn(writer_loop(writer, cmd_rx));
+    let mut writer_task = tokio::spawn(writer_loop(writer, cmd_rx));
 
     // ADR 0073: no replay pass. Command-side at-least-once now lives in
     // the coordinator's session_outbox (redelivered until the confirming
     // event acks the row) — host memory holds nothing durable.
-    drop(cmd_tx);
-
-    let reader_outcome = reader_loop(reader, &inner, attach.session_id, sandbox_id).await;
+    let reader_outcome = tokio::select! {
+        biased;
+        _ = disconnected.notified() => Err(HarnessError::WriterClosed),
+        result = reader_loop(reader, &inner, attach.session_id, sandbox_id, attach.binding_epoch, &cmd_tx) => result,
+        _ = &mut writer_task => Err(HarnessError::WriterClosed),
+    };
     // Issue #218: guarded teardown. Only remove the registration if it
     // is STILL ours — a reconnect inserts a fresh handle with a higher
     // generation; seeing a different generation (or no entry) means a
@@ -826,7 +860,11 @@ async fn drive_attached<R, W>(
             conns.remove(&sandbox_id);
         }
     }
-    let _ = writer_task.await;
+    drop(cmd_tx);
+    if !writer_task.is_finished() {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
     if let Err(e) = reader_outcome {
         tracing::debug!(
             session_id = %attach.session_id,
@@ -842,6 +880,8 @@ async fn reader_loop<R>(
     hub: &HubInner,
     session_id: SessionId,
     sandbox_id: SandboxId,
+    binding_epoch: u64,
+    cmd_tx: &mpsc::Sender<HarnessFrame>,
 ) -> Result<(), HarnessError>
 where
     R: AsyncRead + Unpin,
@@ -866,10 +906,38 @@ where
                 // (RunStarted{prompt_id} / PromptQueued /
                 // ToolCallCompleted) also ack the outbox row at the
                 // coordinator's emit choke point.
-                let fut = (hub.event_sink)(session_id, sandbox_id, ev);
-                fut.await;
+                (hub.event_sink)(session_id, sandbox_id, ev, None)
+                    .await
+                    .map_err(HarnessError::Sink)?;
             }
-            HarnessFrame::Command(_) => {
+            HarnessFrame::SeqEvent {
+                binding_epoch: frame_epoch,
+                seq,
+                event,
+            } => {
+                if frame_epoch > binding_epoch {
+                    return Err(HarnessError::FrameEpochAboveAttach {
+                        frame_epoch,
+                        attach_epoch: binding_epoch,
+                    });
+                }
+                (hub.event_sink)(
+                    session_id,
+                    sandbox_id,
+                    event,
+                    Some(EventDelivery {
+                        binding_epoch: frame_epoch,
+                        seq,
+                    }),
+                )
+                .await
+                .map_err(HarnessError::Sink)?;
+                cmd_tx
+                    .send(HarnessFrame::EventAck { seq })
+                    .await
+                    .map_err(|_| HarnessError::WriterClosed)?;
+            }
+            HarnessFrame::Command(_) | HarnessFrame::EventAck { .. } => {
                 // Commands flow host → harness. A frame coming the
                 // wrong way is the harness's bug; ack any pending
                 // checkpoint as if it succeeded so we don't deadlock,
@@ -908,29 +976,31 @@ where
 /// `emit` should be cheap to clone (e.g. `Arc<AppState>` capturing).
 pub fn event_sink_to<F, Fut>(emit: F) -> EventSink
 where
-    F: Fn(SessionId, SandboxId, HarnessEvent) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
+    F: Fn(SessionId, SandboxId, HarnessEvent, Option<EventDelivery>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), SinkError>> + Send + 'static,
 {
-    Arc::new(move |session_id, sandbox_id, ev| {
-        let fut = emit(session_id, sandbox_id, ev);
-        Box::new(Box::pin(fut))
+    Arc::new(move |session_id, sandbox_id, ev, delivery| {
+        Box::pin(emit(session_id, sandbox_id, ev, delivery))
     })
 }
 
 #[derive(Debug)]
 pub enum HarnessError {
+    Sink(SinkError),
     Io(std::io::Error),
     SessionMismatch { expected: SessionId, got: SessionId },
     NotAttached,
     CheckpointAlreadyInFlight,
     CommandTimeout,
     WriterClosed,
+    FrameEpochAboveAttach { frame_epoch: u64, attach_epoch: u64 },
 }
 
 impl std::fmt::Display for HarnessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "harness io: {e}"),
+            Self::Sink(e) => write!(f, "harness event sink: {e}"),
             Self::SessionMismatch { expected, got } => {
                 write!(
                     f,
@@ -940,6 +1010,13 @@ impl std::fmt::Display for HarnessError {
             Self::NotAttached => write!(f, "no harness attached for this sandbox"),
             Self::CheckpointAlreadyInFlight => write!(f, "another checkpoint is already in flight"),
             Self::CommandTimeout => write!(f, "harness did not ack command in time"),
+            Self::FrameEpochAboveAttach {
+                frame_epoch,
+                attach_epoch,
+            } => write!(
+                f,
+                "event epoch {frame_epoch} exceeds attach epoch {attach_epoch}"
+            ),
             Self::WriterClosed => write!(f, "harness writer closed"),
         }
     }
@@ -949,6 +1026,7 @@ impl std::error::Error for HarnessError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::Sink(e) => Some(e),
             _ => None,
         }
     }
@@ -1005,11 +1083,12 @@ mod tests {
     fn collecting_sink() -> (EventSink, Arc<PlMutex<Vec<HarnessEvent>>>) {
         let collected: Arc<PlMutex<Vec<HarnessEvent>>> = Arc::new(PlMutex::new(Vec::new()));
         let collected_for_sink = collected.clone();
-        let sink: EventSink = Arc::new(move |_session_id, _sandbox_id, ev| {
+        let sink: EventSink = Arc::new(move |_session_id, _sandbox_id, ev, _delivery| {
             let collected = collected_for_sink.clone();
-            Box::new(Box::pin(async move {
+            Box::pin(async move {
                 collected.lock().push(ev);
-            }))
+                Ok(())
+            })
         });
         (sink, collected)
     }
@@ -1637,6 +1716,7 @@ mod tests {
             &hub.inner,
             sandbox_id,
             ConnectionHandle {
+                disconnected: Arc::new(Notify::new()),
                 cmd_tx: tx_new,
                 pending_checkpoint: Mutex::new(None),
                 generation: new_gen,
@@ -1647,6 +1727,7 @@ mod tests {
             &hub.inner,
             sandbox_id,
             ConnectionHandle {
+                disconnected: Arc::new(Notify::new()),
                 cmd_tx: tx_old,
                 pending_checkpoint: Mutex::new(None),
                 generation: old_gen,
@@ -1845,5 +1926,196 @@ mod tests {
             }
             other => panic!("expected a Prompt frame at B, got {other:?}"),
         }
+    }
+    async fn attached_test_stream(
+        sink: EventSink,
+    ) -> (HarnessHub, DuplexStream, SessionId, SandboxId) {
+        let hub = test_hub(sink);
+        let session_id = SessionId::new();
+        let sandbox_id = SandboxId::new();
+        hub.bind_session(session_id, sandbox_id, 7).unwrap();
+        let (host, mut client) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host);
+        write_msg(
+            &mut client,
+            &HarnessAttach {
+                session_id,
+                sandbox_id,
+                binding_epoch: 7,
+                harness_version: "ack-test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ack: HarnessAttachAck = read_msg(&mut client).await.unwrap();
+        assert!(ack.ok);
+        (hub, client, session_id, sandbox_id)
+    }
+
+    #[tokio::test]
+    async fn frame_epoch_above_attach_epoch_closes_connection() {
+        let sink: EventSink = Arc::new(|_, _, _, _| {
+            Box::pin(async { panic!("future epoch must not reach the sink") })
+        });
+        let (hub, mut client, _, _) = attached_test_stream(sink).await;
+        write_msg(
+            &mut client,
+            &HarnessFrame::SeqEvent {
+                binding_epoch: 8,
+                seq: 1,
+                event: HarnessEvent::Idle,
+            },
+        )
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_msg::<_, HarnessFrame>(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(hub.attached_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn ack_follows_sink_success() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let sink_entered = entered.clone();
+        let sink_release = release.clone();
+        let sink: EventSink = Arc::new(move |_, _, event, delivery| {
+            let entered = sink_entered.clone();
+            let release = sink_release.clone();
+            Box::pin(async move {
+                assert_eq!(event, HarnessEvent::Busy);
+                assert_eq!(
+                    delivery,
+                    Some(EventDelivery {
+                        binding_epoch: 6,
+                        seq: 23
+                    })
+                );
+                entered.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        });
+        let (_hub, mut client, _, _) = attached_test_stream(sink).await;
+        write_msg(
+            &mut client,
+            &HarnessFrame::SeqEvent {
+                binding_epoch: 6,
+                seq: 23,
+                event: HarnessEvent::Busy,
+            },
+        )
+        .await
+        .unwrap();
+        entered.notified().await;
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            read_msg::<_, HarnessFrame>(&mut client)
+        )
+        .await
+        .is_err());
+        release.notify_one();
+        assert_eq!(
+            read_msg::<_, HarnessFrame>(&mut client).await.unwrap(),
+            HarnessFrame::EventAck { seq: 23 }
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_failure_closes_connection_without_ack() {
+        let sink: EventSink = Arc::new(|_, _, _, delivery| {
+            Box::pin(async move {
+                assert_eq!(
+                    delivery,
+                    Some(EventDelivery {
+                        binding_epoch: 7,
+                        seq: 1
+                    })
+                );
+                Err(SinkError("store unavailable".into()))
+            })
+        });
+        let (hub, mut client, _, _) = attached_test_stream(sink).await;
+        write_msg(
+            &mut client,
+            &HarnessFrame::SeqEvent {
+                binding_epoch: 7,
+                seq: 1,
+                event: HarnessEvent::Idle,
+            },
+        )
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_msg::<_, HarnessFrame>(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(hub.attached_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_event_frame_is_sinked_without_ack() {
+        let received = Arc::new(tokio::sync::Notify::new());
+        let sink_received = received.clone();
+        let sink: EventSink = Arc::new(move |_, _, event, delivery| {
+            let received = sink_received.clone();
+            Box::pin(async move {
+                assert_eq!(event, HarnessEvent::Idle);
+                assert_eq!(delivery, None);
+                received.notify_one();
+                Ok(())
+            })
+        });
+        let (hub, mut client, _, _) = attached_test_stream(sink).await;
+        write_msg(&mut client, &HarnessFrame::Event(HarnessEvent::Idle))
+            .await
+            .unwrap();
+        received.notified().await;
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            read_msg::<_, HarnessFrame>(&mut client)
+        )
+        .await
+        .is_err());
+        assert_eq!(hub.attached_count(), 1);
+    }
+    #[tokio::test]
+    async fn new_registration_closes_previous_event_stream() {
+        let (sink, _) = collecting_sink();
+        let (hub, mut first, session_id, sandbox_id) = attached_test_stream(sink).await;
+        let (host, mut second) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host);
+        write_msg(
+            &mut second,
+            &HarnessAttach {
+                session_id,
+                sandbox_id,
+                binding_epoch: 7,
+                harness_version: "replacement".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ack: HarnessAttachAck = read_msg(&mut second).await.unwrap();
+        assert!(ack.ok);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_msg::<_, HarnessFrame>(&mut first),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(hub.attached_count(), 1);
     }
 }

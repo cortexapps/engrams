@@ -196,6 +196,10 @@ pub enum SessionEvent {
         ok: bool,
         at: DateTime<Utc>,
     },
+    HarnessRunContinued {
+        run_id: String,
+        at: DateTime<Utc>,
+    },
     /// ADR 0030: the in-flight run was stopped by an operator interrupt
     /// (`POST /sessions/:id/interrupt` → the harness SIGINT'd its child).
     /// Distinct from `HarnessRunCompleted` so the transcript shows an
@@ -514,6 +518,7 @@ impl SessionEvent {
             Self::HarnessBrowserActivity { .. } => "browser_activity",
             Self::HarnessToolCallRequested { .. } => "tool_call_requested",
             Self::HarnessRunCompleted { .. } => "run_completed",
+            Self::HarnessRunContinued { .. } => "run_continued",
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
             Self::HarnessIdle { .. } => "harness_idle",
             Self::HarnessParked { .. } => "harness_parked",
@@ -617,6 +622,7 @@ impl SessionEvent {
             HarnessEvent::RunCompleted { run_id, ok } => {
                 Self::HarnessRunCompleted { run_id, ok, at }
             }
+            HarnessEvent::RunContinued { run_id } => Self::HarnessRunContinued { run_id, at },
             HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted { run_id, at },
             HarnessEvent::Idle => Self::HarnessIdle { at },
             HarnessEvent::Parked => Self::HarnessParked { at },
@@ -1305,8 +1311,9 @@ pub async fn emit_harness_event(
 ) -> Result<(), crate::error::ApiError> {
     state
         .harness_hub
-        .emit_external(session_id, sandbox_id, event)
-        .await;
+        .emit_external(session_id, sandbox_id, event, None)
+        .await
+        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
     Ok(())
 }
 
@@ -1328,13 +1335,13 @@ fn harness_event_sink(
     // checkpoint-severed vsock reattach mid-subagent) would otherwise
     // append a redundant marker to the log on every cycle.
     let last_kind: Arc<DashMap<SessionId, &'static str>> = Arc::new(DashMap::new());
-    Arc::new(move |session_id, _sandbox_id, ev| {
+    Arc::new(move |session_id, _sandbox_id, ev, _delivery| {
         let events = events.clone();
         let meta = meta.clone();
         let clock = clock.clone();
         let last_kind = last_kind.clone();
         let outbox_wake = outbox_wake.clone();
-        Box::new(Box::pin(async move {
+        Box::pin(async move {
             // Forward every harness event into session_events for live
             // SSE / Web UI / Slackbot timeline. ADR 0005 retired the
             // auto-checkpoint branch this used to trigger on Idle /
@@ -1440,14 +1447,14 @@ fn harness_event_sink(
                     .map(|v| *v == kind)
                     .unwrap_or(false)
             {
-                return;
+                return Ok(());
             }
 
             let mut payload = match serde_json::to_value(&session_event) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "harness event serialize failed");
-                    return;
+                    return Ok(());
                 }
             };
             // Postgres `jsonb` cannot represent U+0000 anywhere in a
@@ -1496,7 +1503,7 @@ fn harness_event_sink(
                         "notify_session_delta failed; dropping ephemeral chunk",
                     );
                 }
-                return;
+                return Ok(());
             }
 
             match meta.append_session_event(session_id, kind, payload).await {
@@ -1597,14 +1604,20 @@ fn harness_event_sink(
                     }
                 }
                 Err(e) => {
+                    // No ack for an event that was not stored: the hub
+                    // closes the connection and the harness replays it.
                     tracing::warn!(
                         session_id = %session_id,
                         error = %e,
                         "append_session_event for harness event failed",
                     );
+                    return Err(engram_host_agent::harness::SinkError(format!(
+                        "append_session_event: {e}"
+                    )));
                 }
             }
-        }))
+            Ok(())
+        })
     })
 }
 
@@ -1716,6 +1729,23 @@ pub(crate) mod tests {
             !lim.per_session.contains_key(&s),
             "idle session entry should be pruned",
         );
+    }
+
+    #[test]
+    fn run_continued_maps_from_harness_with_stable_kind() {
+        let at = DateTime::<Utc>::UNIX_EPOCH;
+        let event = SessionEvent::from_harness(
+            HarnessEvent::RunContinued {
+                run_id: "r1".into(),
+            },
+            at,
+        );
+        assert!(
+            matches!(&event, SessionEvent::HarnessRunContinued { run_id, at: timestamp } if run_id == "r1" && *timestamp == at)
+        );
+        assert_eq!(event.kind(), "run_continued");
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["run_id"], "r1");
     }
 
     #[test]
@@ -2215,6 +2245,8 @@ pub(crate) mod tests {
         /// entirely on a persist failure, rather than just happening to
         /// flip nothing. Reset to false on use.
         pub(crate) fail_next_heartbeat_persist: PlMutex<bool>,
+        /// The next `append_session_event` fails once.
+        pub(crate) fail_next_append_event: PlMutex<bool>,
         /// Counts `list_resident_sandbox_assignments_on_host` calls — the
         /// entry point `Reconciler::reconcile_with_deps` hits on every
         /// tick it actually runs. A no-op default `apply_missing_sandbox_strikes`
@@ -2307,6 +2339,7 @@ pub(crate) mod tests {
                 evict_attempts: PlMutex::new(std::collections::HashMap::new()),
                 teleport_targets: PlMutex::new(std::collections::HashMap::new()),
                 fail_next_heartbeat_persist: PlMutex::new(false),
+                fail_next_append_event: PlMutex::new(false),
                 reconcile_probe_calls: PlMutex::new(0),
                 acked_outbox: PlMutex::new(Vec::new()),
                 ops: engram_core::types::session_op::InMemoryOpLog::default(),
@@ -2797,6 +2830,15 @@ pub(crate) mod tests {
             kind: &str,
             payload: serde_json::Value,
         ) -> Result<i64, MetaError> {
+            {
+                let mut fail = self.fail_next_append_event.lock();
+                if *fail {
+                    *fail = false;
+                    return Err(MetaError::Db(
+                        "MiniMeta fail_next_append_event: injected failure".into(),
+                    ));
+                }
+            }
             let mut next = self.next_idx.lock();
             let idx = *next;
             *next += 1;
@@ -3458,6 +3500,59 @@ pub(crate) mod tests {
         }
     }
 
+    /// A storage failure must reach the hub as an error, so the harness
+    /// gets no ack and replays the event. Returning Ok here would make the
+    /// SDK drop an event the transcript never received.
+    #[tokio::test]
+    async fn harness_event_sink_reports_a_failed_append_instead_of_acking() {
+        let session_id = engram_core::SessionId::new();
+        let session = Session {
+            id: session_id,
+            status: engram_core::types::SessionState::Active,
+            host_id: None,
+            sandbox_id: None,
+            image: "test/repo:sink-err".into(),
+            mode: SessionMode::Agent,
+            created_at: chrono::Utc::now(),
+            last_active_at: chrono::Utc::now(),
+            last_event_at: None,
+            live_disk_manifest: None,
+            park_rung: 0,
+            parked_at: None,
+            suggested_title: None,
+        };
+        let mini = Arc::new(MiniMeta::new(session));
+        let meta: Arc<dyn MetadataStore> = mini.clone();
+        let sink = super::harness_event_sink(
+            Arc::new(SessionEventBus::default()),
+            meta,
+            Arc::new(engram_core::traits::SystemClock::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let event = HarnessEvent::RunStarted {
+            run_id: "run-1".into(),
+            prompt_summary: None,
+            prompt_id: None,
+        };
+        *mini.fail_next_append_event.lock() = true;
+        let error = sink(
+            session_id,
+            engram_core::SandboxId::new(),
+            event.clone(),
+            None,
+        )
+        .await
+        .expect_err("a failed append is not acked");
+        assert!(error.to_string().contains("append_session_event"));
+        assert!(mini.events.lock().is_empty());
+
+        // The replay lands once storage is back.
+        sink(session_id, engram_core::SandboxId::new(), event, None)
+            .await
+            .unwrap();
+        assert_eq!(mini.events.lock().len(), 1);
+    }
+
     #[tokio::test]
     async fn harness_event_sink_dedupes_back_to_back_idles_and_parked() {
         // The claude harness re-emits Idle on every reconnect (e.g.
@@ -3495,7 +3590,9 @@ pub(crate) mod tests {
 
         // Three back-to-back idles: only the first should land.
         for _ in 0..3 {
-            sink(session_id, sandbox_id, HarnessEvent::Idle).await;
+            sink(session_id, sandbox_id, HarnessEvent::Idle, None)
+                .await
+                .unwrap();
         }
         {
             let events = mini.events.lock();
@@ -3513,10 +3610,16 @@ pub(crate) mod tests {
                 prompt_summary: None,
                 prompt_id: None,
             },
+            None,
         )
-        .await;
-        sink(session_id, sandbox_id, HarnessEvent::Idle).await;
-        sink(session_id, sandbox_id, HarnessEvent::Idle).await;
+        .await
+        .unwrap();
+        sink(session_id, sandbox_id, HarnessEvent::Idle, None)
+            .await
+            .unwrap();
+        sink(session_id, sandbox_id, HarnessEvent::Idle, None)
+            .await
+            .unwrap();
 
         let kinds: Vec<String> = mini.events.lock().iter().map(|e| e.kind.clone()).collect();
         assert_eq!(
@@ -3532,7 +3635,9 @@ pub(crate) mod tests {
         // turn remains open. Consecutive markers collapse independently
         // from Idle, while an intervening event permits the next marker.
         for _ in 0..3 {
-            sink(session_id, sandbox_id, HarnessEvent::Parked).await;
+            sink(session_id, sandbox_id, HarnessEvent::Parked, None)
+                .await
+                .unwrap();
         }
         sink(
             session_id,
@@ -3542,10 +3647,16 @@ pub(crate) mod tests {
                 prompt_summary: None,
                 prompt_id: None,
             },
+            None,
         )
-        .await;
-        sink(session_id, sandbox_id, HarnessEvent::Parked).await;
-        sink(session_id, sandbox_id, HarnessEvent::Parked).await;
+        .await
+        .unwrap();
+        sink(session_id, sandbox_id, HarnessEvent::Parked, None)
+            .await
+            .unwrap();
+        sink(session_id, sandbox_id, HarnessEvent::Parked, None)
+            .await
+            .unwrap();
 
         let kinds: Vec<String> = mini.events.lock().iter().map(|e| e.kind.clone()).collect();
         assert_eq!(
@@ -3606,8 +3717,10 @@ pub(crate) mod tests {
                 prompt_summary: None,
                 prompt_id: Some("p-missing".into()),
             },
+            None,
         )
-        .await;
+        .await
+        .unwrap();
 
         let events = mini.events.lock();
         assert_eq!(
@@ -3689,8 +3802,10 @@ pub(crate) mod tests {
                 prompt_summary: None,
                 prompt_id: Some("prompt-abc".into()),
             },
+            None,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             mini.acked_outbox.lock().as_slice(),
             ["prompt-abc".to_string()],
@@ -3707,8 +3822,10 @@ pub(crate) mod tests {
                 prompt_summary: None,
                 prompt_id: None,
             },
+            None,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             mini.acked_outbox.lock().len(),
             1,
@@ -3721,8 +3838,10 @@ pub(crate) mod tests {
             HarnessEvent::PromptSteered {
                 prompt_id: "prompt-steered".into(),
             },
+            None,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             mini.acked_outbox.lock().as_slice(),
             ["prompt-abc".to_string(), "prompt-steered".to_string()],

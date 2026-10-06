@@ -50,6 +50,7 @@ export const SESSION_EVENT_KINDS: readonly SessionEventKind[] = [
   "tool_result_submitted",
   "run_completed",
   "run_interrupted",
+  "run_continued",
   "harness_idle",
   // ADR 0107: mode directives (the plan chip + thread mode markers).
   "harness_mode_changed",

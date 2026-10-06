@@ -404,6 +404,12 @@ fn capture_sink() -> (
                 tokio::select! {
                     frame = engram_harness_proto::read_msg::<_, engram_harness_proto::HarnessFrame>(&mut reader) => {
                         match frame {
+                            Ok(engram_harness_proto::HarnessFrame::SeqEvent { seq, event, .. }) => {
+                                collected.lock().push(event);
+                                if engram_harness_proto::write_msg(&mut writer, &engram_harness_proto::HarnessFrame::EventAck { seq }).await.is_err() {
+                                    break;
+                                }
+                            }
                             Ok(engram_harness_proto::HarnessFrame::Event(ev)) => {
                                 eprintln!("--- captured HarnessEvent: {ev:?} ---");
                                 collected.lock().push(ev);

@@ -20,11 +20,12 @@ use parking_lot::Mutex;
 async fn noop_harness_events_land_in_event_sink_in_order() {
     let collected: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let collected_for_sink = collected.clone();
-    let sink: EventSink = Arc::new(move |_session_id, _sandbox_id, ev| {
+    let sink: EventSink = Arc::new(move |_session_id, _sandbox_id, ev, _delivery| {
         let collected = collected_for_sink.clone();
-        Box::new(Box::pin(async move {
+        Box::pin(async move {
             collected.lock().push(ev);
-        }))
+            Ok(())
+        })
     });
     let hub = HarnessHub::new(
         sink,
@@ -134,7 +135,7 @@ async fn survivor_redial_attaches_against_a_fresh_hub_with_zero_rebuild() {
 
     // "Old" host-agent process: binds (epoch 1), then dies.
     {
-        let sink: EventSink = Arc::new(|_, _, _| Box::new(Box::pin(async {})));
+        let sink: EventSink = Arc::new(|_, _, _, _| Box::pin(async { Ok(()) }));
         let hub = HarnessHub::new(
             sink,
             engram_host_agent::bindings::BindingStore::open(bindings_dir.path())
@@ -147,11 +148,12 @@ async fn survivor_redial_attaches_against_a_fresh_hub_with_zero_rebuild() {
     // "New" host-agent process: fresh hub, same dir, nothing rebinds.
     let collected: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let collected_for_sink = collected.clone();
-    let sink: EventSink = Arc::new(move |_session_id, _sandbox_id, ev| {
+    let sink: EventSink = Arc::new(move |_session_id, _sandbox_id, ev, _delivery| {
         let collected = collected_for_sink.clone();
-        Box::new(Box::pin(async move {
+        Box::pin(async move {
             collected.lock().push(ev);
-        }))
+            Ok(())
+        })
     });
     let hub = HarnessHub::new(
         sink,
@@ -211,7 +213,7 @@ async fn survivor_redial_attaches_against_a_fresh_hub_with_zero_rebuild() {
 async fn unknown_binding_keeps_retrying_without_registering() {
     let bindings_dir = tempfile::tempdir().unwrap();
     let session_id = SessionId::new();
-    let sink: EventSink = Arc::new(|_, _, _| Box::new(Box::pin(async {})));
+    let sink: EventSink = Arc::new(|_, _, _, _| Box::pin(async { Ok(()) }));
     let hub = HarnessHub::new(
         sink,
         engram_host_agent::bindings::BindingStore::open(bindings_dir.path()).unwrap(),

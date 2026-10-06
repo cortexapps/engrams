@@ -37,6 +37,37 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::io::ReaderStream;
 
+/// Retry only transport failures and server errors. The final failure reaches the hub.
+async fn retry_harness_event<F, Fut>(mut send: F) -> Result<(), CoordError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), CoordError>>,
+{
+    let mut delay = Duration::from_millis(200);
+    for attempt in 1..=5 {
+        match send().await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let retryable = matches!(&error, CoordError::Transport(_))
+                    || matches!(
+                        &error,
+                        CoordError::Http {
+                            status: 500..=599,
+                            ..
+                        }
+                    );
+                if !retryable || attempt == 5 {
+                    return Err(error);
+                }
+                tracing::warn!(attempt, error = %error, "harness event POST failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(3));
+            }
+        }
+    }
+    unreachable!("the fifth attempt returns")
+}
+
 /// Persistent HTTP client to the coord. One per host-agent process;
 /// cheap to clone (`reqwest::Client` is `Arc` internally).
 #[derive(Clone)]
@@ -222,20 +253,22 @@ impl HttpCoordClient {
         req: &HarnessEventRequest,
     ) -> Result<(), CoordError> {
         let url = self.endpoint(&format!("/sessions/{session_id}/harness-events"));
-        let builder = self.http.post(&url);
-        let resp = self
-            .auth(builder, req)
-            .send()
-            .await
-            .map_err(|e| CoordError::Transport(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(CoordError::Http {
-                status: resp.status().as_u16(),
-                body: resp.text().await.unwrap_or_default(),
-                what: "harness_event",
-            });
-        }
-        Ok(())
+        retry_harness_event(|| async {
+            let resp = self
+                .auth(self.http.post(&url), req)
+                .send()
+                .await
+                .map_err(|e| CoordError::Transport(e.to_string()))?;
+            if !resp.status().is_success() {
+                return Err(CoordError::Http {
+                    status: resp.status().as_u16(),
+                    body: resp.text().await.unwrap_or_default(),
+                    what: "harness_event",
+                });
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// POST /api/v1/hosts/forge
@@ -675,6 +708,8 @@ pub struct HarnessEventRequest {
     pub sandbox_id: SandboxId,
     pub event: HarnessEvent,
     pub at: DateTime<Utc>,
+    #[serde(default)]
+    pub delivery: Option<crate::harness::EventDelivery>,
 }
 
 #[derive(Deserialize)]
@@ -827,5 +862,98 @@ mod tests {
         });
         let ack: HeartbeatResponse = serde_json::from_value(ack).unwrap();
         assert_eq!(ack.tombstoned_sandboxes, vec![sb]);
+    }
+}
+
+#[cfg(test)]
+mod harness_event_retry_tests {
+    use super::*;
+
+    fn server_error() -> CoordError {
+        CoordError::Http {
+            status: 503,
+            body: "unavailable".into(),
+            what: "harness_event",
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn harness_event_retries_transport_and_server_errors() {
+        let mut responses = std::collections::VecDeque::from([
+            Err(CoordError::Transport("reset".into())),
+            Err(server_error()),
+            Ok(()),
+        ]);
+        {
+            let retry = retry_harness_event(|| std::future::ready(responses.pop_front().unwrap()));
+            tokio::pin!(retry);
+            assert!(tokio::time::timeout(Duration::from_millis(599), &mut retry)
+                .await
+                .is_err());
+            tokio::time::timeout(Duration::from_millis(2), retry)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(responses.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn harness_event_retry_exhaustion_is_an_error_after_five_attempts() {
+        let mut attempts = 0;
+        let result = {
+            let retry = retry_harness_event(|| {
+                attempts += 1;
+                std::future::ready(Err(server_error()))
+            });
+            tokio::pin!(retry);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(2999), &mut retry)
+                    .await
+                    .is_err()
+            );
+            tokio::time::timeout(Duration::from_millis(2), retry)
+                .await
+                .unwrap()
+        };
+        assert!(result.is_err());
+        assert_eq!(attempts, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn harness_event_client_error_fails_without_retry() {
+        let mut attempts = 0;
+        let result = tokio::time::timeout(
+            Duration::from_millis(1),
+            retry_harness_event(|| {
+                attempts += 1;
+                std::future::ready(Err(CoordError::Http {
+                    status: 409,
+                    body: "fenced".into(),
+                    what: "harness_event",
+                }))
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(CoordError::Http { status: 409, .. })));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn harness_event_request_carries_delivery_identity() {
+        let request = HarnessEventRequest {
+            sandbox_id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            event: HarnessEvent::Idle,
+            at: DateTime::UNIX_EPOCH,
+            delivery: Some(crate::harness::EventDelivery {
+                binding_epoch: 7,
+                seq: 42,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["delivery"],
+            serde_json::json!({"binding_epoch":7,"seq":42})
+        );
     }
 }

@@ -1159,7 +1159,13 @@ async fn drive(
                     return DriveOutcome::ChannelClosed;
                 },
             },
-            _ = reattach.notified() => if active.is_none() { emit(events, HarnessEvent::Idle).await; },
+            _ = reattach.notified() => {
+                let event = match &active {
+                    Some(run_id) => HarnessEvent::RunContinued { run_id: run_id.clone() },
+                    None => HarnessEvent::Idle,
+                };
+                emit(events, event).await;
+            },
             _ = async {
                 match interrupt.deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -2941,6 +2947,58 @@ done
         assert!(requests.contains("thread/start"));
         assert!(!requests.contains("AUTH_CACHE_LEAKED"));
         assert!(!requests.contains("access-secret"));
+    }
+
+    #[tokio::test]
+    async fn reattach_mid_turn_announces_run_continued() {
+        let (script, _) = write_fake_codex(&[]).await;
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let reattach = Arc::new(Notify::new());
+        let engine = tokio::spawn(run_engine(
+            test_cli(script),
+            command_rx,
+            reattach.clone(),
+            event_tx,
+        ));
+        assert_eq!(event_rx.recv().await, Some(HarnessEvent::Idle));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "continue".into(),
+                text: "work".into(),
+                mode: None,
+            })
+            .await
+            .unwrap();
+        let run_id = match event_rx.recv().await.unwrap() {
+            HarnessEvent::RunStarted { run_id, .. } => run_id,
+            other => panic!("expected run start: {other:?}"),
+        };
+        reattach.notify_one();
+        assert_eq!(
+            event_rx.recv().await,
+            Some(HarnessEvent::RunContinued {
+                run_id: run_id.clone()
+            })
+        );
+        // The fake responds to turn/interrupt with a completed turn.
+        command_tx.send(HarnessCommand::Interrupt).await.unwrap();
+        assert_eq!(
+            event_rx.recv().await,
+            Some(HarnessEvent::RunCompleted { run_id, ok: true })
+        );
+        assert_eq!(event_rx.recv().await, Some(HarnessEvent::Idle));
+        command_tx
+            .send(HarnessCommand::Shutdown { grace_secs: 0 })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), engine)
+                .await
+                .unwrap()
+                .unwrap(),
+            ExitCode::SUCCESS
+        );
     }
 
     #[tokio::test]

@@ -61,6 +61,7 @@ const WIRE_FRAME_KINDS: Readonly<Record<string, FrameClass>> = {
   tool_result_submitted: "durable",
   run_completed: "durable",
   run_interrupted: "durable",
+  run_continued: "durable",
   harness_idle: "durable",
   prompt_queued: "durable",
   prompt_edited: "durable",

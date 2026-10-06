@@ -64,7 +64,7 @@ impl LocalHostClient {
         let bindings = crate::bindings::BindingStore::open(dir)
             .expect("open ephemeral binding store for noop hub");
         let hub = Arc::new(HarnessHub::new(
-            crate::harness::event_sink_to(|_, _, _| async {}),
+            crate::harness::event_sink_to(|_, _, _, _| async { Ok(()) }),
             bindings,
         ));
         Self::new(sandbox, hub)
@@ -588,7 +588,9 @@ fn harness_err_to_sandbox(e: HarnessError) -> SandboxError {
         HarnessError::NotAttached => SandboxError::NotFound,
         HarnessError::Io(io) => SandboxError::Io(io),
         HarnessError::SessionMismatch { .. } => SandboxError::InvalidSpec(format!("{e}")),
-        HarnessError::CheckpointAlreadyInFlight
+        HarnessError::Sink(_)
+        | HarnessError::FrameEpochAboveAttach { .. }
+        | HarnessError::CheckpointAlreadyInFlight
         | HarnessError::CommandTimeout
         | HarnessError::WriterClosed => SandboxError::Vm(format!("{e}").into()),
     }

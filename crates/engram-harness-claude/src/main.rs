@@ -3348,9 +3348,11 @@ mod adapter {
                 // the turn-end Busy prevented, and announcing NOTHING would
                 // drop the ADR 0108 attach signal that wakes durable prompt
                 // delivery — checkpoint-severed vsock reattaches are routine
-                // mid-subagent). A mid-turn reattach emits none.
+                // mid-subagent). A mid-turn reattach identifies the continued run.
                 _ = reattach.notified() => {
-                    if turn.is_none() {
+                    if let Some(turn) = &turn {
+                        emit(evt_tx, HarnessEvent::RunContinued { run_id: turn.run_id.clone() }).await;
+                    } else {
                         emit(
                             evt_tx,
                             if bg_agents > 0 {
@@ -6065,7 +6067,7 @@ mod adapter {
         }
 
         #[tokio::test]
-        async fn connection_bounce_mid_turn_preserves_the_run() {
+        async fn reattach_mid_turn_announces_run_continued() {
             // One turn: sleep 300ms (stays in flight), then one assistant line
             // + result.
             let script = write_slow_fake_claude(
@@ -6102,17 +6104,15 @@ mod adapter {
             // Turn 1 is now in flight (the fake sleeps 300ms before its result).
             let r1 = expect_run_started(&mut evt_rx).await;
 
-            // The teleport connection bounce, mid-turn: a fresh connection
-            // attaches — exactly what the post-move SIGUSR1 re-dial drives. Fire
-            // it twice (re-dials can retry). While a turn is open the reattach
-            // arm must emit nothing.
-            reattach.notify_one();
-            reattach.notify_one();
+            // Each reattach identifies the same open run.
+            for _ in 0..2 {
+                reattach.notify_one();
+                assert_eq!(
+                    evt_rx.recv().await,
+                    Some(HarnessEvent::RunContinued { run_id: r1.clone() })
+                );
+            }
 
-            // The very next events are the turn's own assistant line and its
-            // RunCompleted — NO `Idle` injected by the bounce. (If the reattach
-            // had synthesized one mid-turn, this `expect_agent_message` would see
-            // it and panic.)
             expect_agent_message(&mut evt_rx, "ok").await;
             let c1 = expect_run_completed(&mut evt_rx).await;
             assert_eq!(
@@ -6969,7 +6969,7 @@ mod adapter {
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
 
             // A reconnect while idle re-announces Idle so the host's soft
-            // TTL re-arms; a mid-run reattach emits none.
+            // TTL re-arms; a mid-run reattach identifies the continued run.
             reattach.notify_one();
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
 

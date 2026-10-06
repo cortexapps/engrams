@@ -176,7 +176,9 @@ pub async fn run_engine(
                     }
                     Some(command) => pending.push_back(command),
                 },
-                _ = reattach.notified() => {},
+                _ = reattach.notified() => {
+                    let _ = send_event(&event_tx, HarnessEvent::RunContinued { run_id: run_id.clone() }).await;
+                },
             }
         }
     }
@@ -364,7 +366,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn prompt_run_keeps_its_tool_sleep_across_reattach() {
+    async fn reattach_mid_turn_announces_run_continued() {
         let channels = Channels::new();
         let mut events = channels.event_rx;
         let engine = tokio::spawn(run_engine(
@@ -403,7 +405,12 @@ mod tests {
         ));
         tokio::time::advance(Duration::from_secs(4)).await;
         channels.reattach.notify_one();
-        tokio::task::yield_now().await;
+        assert_eq!(
+            events.recv().await,
+            Some(HarnessEvent::RunContinued {
+                run_id: run_id.clone()
+            })
+        );
         assert!(events.try_recv().is_err());
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Error as DBOSErrors } from "@dbos-inc/dbos-sdk";
 
-import { AUTOMATION_TOPIC, type AutomationInbox } from "../../automations/engine/inbox.ts";
+import { AUTOMATION_TOPIC, inboxKeys, type AutomationInbox } from "../../automations/engine/inbox.ts";
 import {
   makeAutomationConsumer,
   type AutomationMailboxSend,
@@ -104,6 +104,45 @@ describe("Automation consumer", () => {
         idempotencyKey: "autorun:session-1:idle:12",
       },
     ]);
+  });
+
+  test("run_interrupted ends the run as failed and preserves its relay event", async () => {
+    const sent = sender();
+    const consumer = makeAutomationConsumer({
+      findSessionBinding: async () => ({ runId: RUN_ID, relay: true }),
+      send: sent.send,
+    });
+    await consumer.appliesTo("session-1");
+    const event = { idx: 14n, kind: "run_interrupted", payloadJson: '{"run_id":"run-1"}' };
+    await consumer.handle(event, { sessionId: "session-1" });
+    expect(sent.calls).toEqual([
+      {
+        destinationId: RUN_ID,
+        message: { kind: "session_event", sessionId: "session-1", event },
+        topic: AUTOMATION_TOPIC,
+        idempotencyKey: inboxKeys.sessionEvent("session-1", 14n),
+      },
+      {
+        destinationId: RUN_ID,
+        message: { kind: "session_idle", sessionId: "session-1", runFailed: true },
+        topic: AUTOMATION_TOPIC,
+        idempotencyKey: inboxKeys.sessionIdle("session-1", 14n),
+      },
+    ]);
+  });
+
+  test("run_continued does not end the run", async () => {
+    const sent = sender();
+    const consumer = makeAutomationConsumer({
+      findSessionBinding: async () => ({ runId: RUN_ID }),
+      send: sent.send,
+    });
+    await consumer.appliesTo("session-1");
+    await consumer.handle(
+      { idx: 15n, kind: "run_continued", payloadJson: '{"run_id":"run-1"}' },
+      { sessionId: "session-1" },
+    );
+    expect(sent.calls).toEqual([]);
   });
 
   test("malformed run_completed payload counts as a clean run", async () => {

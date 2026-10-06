@@ -175,6 +175,7 @@ export type SessionEvent =
   // ADR 0030: the in-flight run was stopped by an operator interrupt
   // (`POST /sessions/:id/interrupt`). The session stays alive; the
   // transcript renders an "interrupted" receipt and the run closes.
+  | { type: "run_continued"; run_id: string; at: string }
   | { type: "run_interrupted"; run_id: string; at: string }
   | { type: "harness_idle"; at: string }
   // ADR 0107: a validated session-mode directive rode a prompt (e.g. "plan").

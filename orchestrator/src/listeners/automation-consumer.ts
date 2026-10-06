@@ -1,6 +1,6 @@
 /** Stream fallback for automation runs (ADR 0119 D3).
  *
- * Mirrors the review consumer: `run_completed` becomes `session_idle` and a
+ * Mirrors the review consumer: run completion or interruption becomes `session_idle` and a
  * terminal session becomes `session_ended`, both routed to the owning run's
  * mailbox through the automation_session binding. The in-band
  * `signal_automation` tool stays authoritative; this consumer is the backstop
@@ -114,8 +114,8 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
       // Unlike a review worker, an automation session can go idle once per
       // prompt turn (a kept session takes follow-ups), so the idempotency key
       // carries the event idx — each turn's idle is its own message.
-      if (event.kind !== "run_completed") return;
-      const runFailed = runCompletedFailed(event.payloadJson);
+      if (event.kind !== "run_completed" && event.kind !== "run_interrupted") return;
+      const runFailed = event.kind === "run_interrupted" || runCompletedFailed(event.payloadJson);
       await deliver(
         live.runId,
         {

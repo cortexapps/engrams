@@ -33,7 +33,53 @@ use tokio::sync::{mpsc, Notify};
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 pub type BoxedReader = Box<dyn AsyncRead + Unpin + Send>;
 pub type BoxedWriter = Box<dyn AsyncWrite + Unpin + Send>;
-type HeldEvent = Arc<Mutex<Option<HarnessEvent>>>;
+pub const UNACKED_MAX: usize = 1024;
+
+struct Outbox {
+    next_seq: u64,
+    unacked: VecDeque<(u64, u64, HarnessEvent)>,
+}
+
+struct EventOutbox {
+    state: Mutex<Outbox>,
+    acked: Notify,
+}
+
+impl EventOutbox {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(Outbox {
+                next_seq: 1,
+                unacked: VecDeque::new(),
+            }),
+            acked: Notify::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.state.lock().expect("outbox lock").unacked.len()
+    }
+
+    fn acknowledge(&self, seq: u64) {
+        let mut state = self.state.lock().expect("outbox lock");
+        if seq >= state.next_seq {
+            tracing::warn!(
+                seq,
+                next_seq = state.next_seq,
+                "ignoring ack for an unassigned sequence"
+            );
+            return;
+        }
+        while state
+            .unacked
+            .front()
+            .is_some_and(|(_, pending, _)| *pending <= seq)
+        {
+            state.unacked.pop_front();
+        }
+        self.acked.notify_one();
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {
@@ -221,7 +267,7 @@ where
             return ExitCode::from(2);
         }
     };
-    let held: HeldEvent = Arc::new(Mutex::new(None));
+    let outbox = EventOutbox::new();
     // Outlives each connection: a reconnect mid-turn must not lose the
     // turn's stopwatch (that reconnect is often the interesting case).
     let mut first_output = first_output::FirstOutput::default();
@@ -236,8 +282,7 @@ where
         } else {
             tracing::warn!("attach token reload failed; retaining last token");
         }
-        if engine.is_finished() && event_rx.is_empty() && held.lock().expect("held lock").is_none()
-        {
+        if engine.is_finished() && event_rx.is_empty() && outbox.len() == 0 {
             break;
         }
         // ADR 0108 A1: the dial runs INSIDE the SIGUSR1 select. A dial that
@@ -253,7 +298,7 @@ where
                             &cfg.attach(token),
                             &command_tx,
                             &mut event_rx,
-                            &held,
+                            &outbox,
                             &reattach,
                             &mut first_output,
                         )
@@ -286,12 +331,12 @@ where
                         );
                         drop(command_tx);
                         // Drain the close-out events even though this generation cannot send.
-                        let mut undelivered =
-                            usize::from(held.lock().expect("held lock").is_some());
+                        let unacked = outbox.len();
+                        let mut undelivered = 0;
                         while event_rx.recv().await.is_some() {
                             undelivered += 1;
                         }
-                        tracing::warn!(undelivered, "fenced harness exit");
+                        tracing::warn!(unacked, undelivered, "fenced harness exit");
                         return engine.await.unwrap_or(ExitCode::FAILURE);
                     }
                     tokio::select! {
@@ -324,11 +369,12 @@ where
         }
     }
     drop(command_tx);
-    let mut undelivered = usize::from(held.lock().expect("held lock").is_some());
+    let unacked = outbox.len();
+    let mut undelivered = 0;
     while event_rx.recv().await.is_some() {
         undelivered += 1;
     }
-    tracing::info!(undelivered, "harness transport exit");
+    tracing::info!(unacked, undelivered, "harness transport exit");
     engine.await.unwrap_or_else(|e| {
         tracing::error!(error = %e, "harness engine task panicked");
         ExitCode::from(1)
@@ -396,7 +442,7 @@ async fn run_one_connection(
     attach: &HarnessAttach,
     command_tx: &mpsc::Sender<HarnessCommand>,
     event_rx: &mut mpsc::Receiver<HarnessEvent>,
-    held: &HeldEvent,
+    outbox: &EventOutbox,
     reattach: &Notify,
     first_output: &mut first_output::FirstOutput,
 ) -> ConnOutcome {
@@ -418,14 +464,15 @@ async fn run_one_connection(
     }
     reattach.notify_one();
     tokio::select! {
-        reason = forward_commands(&mut reader, command_tx) => ConnOutcome::Dropped(reason),
-        result = pump_events(&mut writer, event_rx, held, first_output) => result,
+        reason = forward_commands(&mut reader, command_tx, outbox) => ConnOutcome::Dropped(reason),
+        result = pump_events(&mut writer, event_rx, outbox, first_output, attach.binding_epoch) => result,
     }
 }
 
 async fn forward_commands<R: AsyncRead + Unpin>(
     reader: &mut R,
     tx: &mpsc::Sender<HarnessCommand>,
+    outbox: &EventOutbox,
 ) -> &'static str {
     loop {
         match read_msg::<_, HarnessFrame>(reader).await {
@@ -434,7 +481,8 @@ async fn forward_commands<R: AsyncRead + Unpin>(
                     return "engine gone";
                 }
             }
-            Ok(HarnessFrame::Event(_)) => {}
+            Ok(HarnessFrame::EventAck { seq }) => outbox.acknowledge(seq),
+            Ok(HarnessFrame::Event(_) | HarnessFrame::SeqEvent { .. }) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return "eof",
             Err(_) => return "read error",
         }
@@ -444,32 +492,60 @@ async fn forward_commands<R: AsyncRead + Unpin>(
 async fn pump_events<W: AsyncWrite + Unpin>(
     writer: &mut W,
     rx: &mut mpsc::Receiver<HarnessEvent>,
-    held: &HeldEvent,
+    outbox: &EventOutbox,
     first_output: &mut first_output::FirstOutput,
+    binding_epoch: u64,
 ) -> ConnOutcome {
-    loop {
-        let parked = held.lock().expect("held event lock poisoned").clone();
-        let event = match parked {
-            Some(event) => event,
-            None => match rx.recv().await {
-                Some(event) => {
-                    // Observe here — the fresh-from-the-engine arm — so
-                    // each event is seen exactly once. The `parked` arm
-                    // above re-sends a held event after a reconnect.
-                    first_output.observe(&event);
-                    *held.lock().expect("held event lock poisoned") = Some(event.clone());
-                    event
-                }
-                None => return ConnOutcome::EngineDone,
+    let replay = outbox.state.lock().expect("outbox lock").unacked.clone();
+    for (binding_epoch, seq, event) in replay {
+        if write_msg(
+            writer,
+            &HarnessFrame::SeqEvent {
+                binding_epoch,
+                seq,
+                event,
             },
-        };
-        if write_msg(writer, &HarnessFrame::Event(event))
-            .await
-            .is_err()
+        )
+        .await
+        .is_err()
         {
             return ConnOutcome::Dropped("write error");
         }
-        *held.lock().expect("held event lock poisoned") = None;
+    }
+    loop {
+        while outbox.len() >= UNACKED_MAX {
+            outbox.acked.notified().await;
+        }
+        let Some(event) = rx.recv().await else {
+            while outbox.len() != 0 {
+                outbox.acked.notified().await;
+            }
+            return ConnOutcome::EngineDone;
+        };
+        first_output.observe(&event);
+        // Park before the first await. Cancellation cannot lose this event.
+        let seq = {
+            let mut state = outbox.state.lock().expect("outbox lock");
+            let seq = state.next_seq;
+            state.next_seq = seq
+                .checked_add(1)
+                .expect("harness event sequence exhausted");
+            state.unacked.push_back((binding_epoch, seq, event.clone()));
+            seq
+        };
+        if write_msg(
+            writer,
+            &HarnessFrame::SeqEvent {
+                binding_epoch,
+                seq,
+                event,
+            },
+        )
+        .await
+        .is_err()
+        {
+            return ConnOutcome::Dropped("write error");
+        }
     }
 }
 
@@ -628,7 +704,7 @@ mod tests {
         });
         let (command_tx, _) = mpsc::channel(1);
         let (_, mut event_rx) = mpsc::channel(1);
-        let held = Arc::new(Mutex::new(None));
+        let outbox = EventOutbox::new();
         let outcome = run_one_connection(
             (Box::new(reader), Box::new(writer)),
             &cfg.attach(AttachToken {
@@ -637,7 +713,7 @@ mod tests {
             }),
             &command_tx,
             &mut event_rx,
-            &held,
+            &outbox,
             &Notify::new(),
             &mut first_output::FirstOutput::default(),
         )
@@ -649,6 +725,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn replayed_events_keep_their_sequencing_epoch() {
+        let outbox = EventOutbox::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut first_output = first_output::FirstOutput::default();
+        tx.send(HarnessEvent::Busy).await.unwrap();
+        for binding_epoch in [4, 5] {
+            let (client, mut reader) = tokio::io::duplex(4096);
+            let (client_reader, client_writer) = tokio::io::split(client);
+            let token = AttachToken {
+                sandbox_id: engram_ids::SandboxId::new(),
+                binding_epoch,
+            };
+            let attach = HarnessAttach {
+                session_id: SessionId::new(),
+                sandbox_id: token.sandbox_id,
+                binding_epoch: token.binding_epoch,
+                harness_version: "test".into(),
+            };
+            let (command_tx, _command_rx) = mpsc::channel(1);
+            let reattach = Notify::new();
+            let pump = run_one_connection(
+                (Box::new(client_reader), Box::new(client_writer)),
+                &attach,
+                &command_tx,
+                &mut rx,
+                &outbox,
+                &reattach,
+                &mut first_output,
+            );
+            tokio::pin!(pump);
+            tokio::select! {
+                _ = &mut pump => panic!("pump must stay connected"),
+                () = async {
+                    let received: HarnessAttach = read_msg(&mut reader).await.unwrap();
+                    assert_eq!(received.binding_epoch, binding_epoch);
+                    write_msg(&mut reader, &HarnessAttachAck { ok: true, reject: None, message: None }).await.unwrap();
+                    assert_eq!(read_msg::<_, HarnessFrame>(&mut reader).await.unwrap(), HarnessFrame::SeqEvent {
+                        binding_epoch: 4, seq: 1, event: HarnessEvent::Busy,
+                    });
+                    if binding_epoch == 5 {
+                        tx.send(HarnessEvent::Idle).await.unwrap();
+                        assert_eq!(read_msg::<_, HarnessFrame>(&mut reader).await.unwrap(), HarnessFrame::SeqEvent {
+                            binding_epoch: 5, seq: 2, event: HarnessEvent::Idle,
+                        });
+                    }
+                } => {}
+            }
+        }
+    }
+
     #[test]
     fn channels_apply_bounded_backpressure() {
         let channels = Channels::new();
@@ -656,35 +783,5 @@ mod tests {
             channels.event_tx.try_send(HarnessEvent::Idle).unwrap();
         }
         assert!(channels.event_tx.try_send(HarnessEvent::Idle).is_err());
-    }
-    #[tokio::test]
-    async fn failed_write_is_replayed_before_new_events() {
-        let (tx, mut rx) = mpsc::channel(2);
-        tx.send(HarnessEvent::Busy).await.unwrap();
-        tx.send(HarnessEvent::Idle).await.unwrap();
-        drop(tx);
-        let held = Arc::new(Mutex::new(None));
-        let mut timing = first_output::FirstOutput::default();
-        let (mut failed, peer) = tokio::io::duplex(1);
-        drop(peer);
-        assert!(matches!(
-            pump_events(&mut failed, &mut rx, &held, &mut timing).await,
-            ConnOutcome::Dropped("write error")
-        ));
-        assert_eq!(*held.lock().unwrap(), Some(HarnessEvent::Busy));
-        let (mut writer, mut reader) = tokio::io::duplex(4096);
-        assert!(matches!(
-            pump_events(&mut writer, &mut rx, &held, &mut timing).await,
-            ConnOutcome::EngineDone
-        ));
-        assert_eq!(
-            read_msg::<_, HarnessFrame>(&mut reader).await.unwrap(),
-            HarnessFrame::Event(HarnessEvent::Busy)
-        );
-        assert_eq!(
-            read_msg::<_, HarnessFrame>(&mut reader).await.unwrap(),
-            HarnessFrame::Event(HarnessEvent::Idle)
-        );
-        assert!(held.lock().unwrap().is_none());
     }
 }

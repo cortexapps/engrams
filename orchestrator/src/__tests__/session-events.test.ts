@@ -26,6 +26,7 @@ describe("curated()", () => {
   test("accepts forwarded content and spec lifecycle kinds", () => {
     for (const k of [
       "run_started",
+      "run_continued",
       "run_completed",
       "user_question",
       "question_answered",
@@ -227,4 +228,8 @@ describe("readSessionEventsBounded()", () => {
       expect(out.events).toEqual([]);
     });
   });
+});
+
+test("run_interrupted is a curated run end", () => {
+  expect(curated("run_interrupted")).toBe(true);
 });

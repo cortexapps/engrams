@@ -202,6 +202,12 @@ fn ev_run_completed() -> HarnessEvent {
         ok: true,
     }
 }
+fn ev_run_continued() -> HarnessEvent {
+    HarnessEvent::RunContinued {
+        run_id: "r1".into(),
+    }
+}
+
 fn ev_run_interrupted() -> HarnessEvent {
     HarnessEvent::RunInterrupted {
         run_id: "r1".into(),
@@ -327,10 +333,22 @@ fn harness_frame_golden_and_variant_indices() {
     assert_golden("frame_command", &command_frame);
     assert_variant_index(&event_frame, 0, "HarnessFrame::Event");
     assert_variant_index(&command_frame, 1, "HarnessFrame::Command");
+    let seq_event = HarnessFrame::SeqEvent {
+        binding_epoch: 3,
+        seq: 42,
+        event: ev_run_started(),
+    };
+    let event_ack = HarnessFrame::EventAck { seq: 42 };
+    assert_golden("frame_seq_event", &seq_event);
+    assert_golden("frame_event_ack", &event_ack);
+    assert_variant_index(&seq_event, 2, "HarnessFrame::SeqEvent");
+    assert_variant_index(&event_ack, 3, "HarnessFrame::EventAck");
 }
 
 #[test]
 fn harness_event_golden_and_variant_indices() {
+    assert_golden("event_run_continued", &ev_run_continued());
+    assert_variant_index(&ev_run_continued(), 20, "HarnessEvent::RunContinued");
     assert_golden("event_run_started", &ev_run_started());
     assert_golden("event_agent_message", &ev_agent_message());
     assert_golden("event_tool_call_started", &ev_tool_call_started());
@@ -603,7 +621,17 @@ fn regen_golden() {
 
     write("frame_event", &HarnessFrame::Event(ev_run_started()));
     write("frame_command", &HarnessFrame::Command(cmd_prompt()));
+    write(
+        "frame_seq_event",
+        &HarnessFrame::SeqEvent {
+            binding_epoch: 3,
+            seq: 42,
+            event: ev_run_started(),
+        },
+    );
+    write("frame_event_ack", &HarnessFrame::EventAck { seq: 42 });
 
+    write("event_run_continued", &ev_run_continued());
     write("event_run_started", &ev_run_started());
     write("event_agent_message", &ev_agent_message());
     write("event_tool_call_started", &ev_tool_call_started());

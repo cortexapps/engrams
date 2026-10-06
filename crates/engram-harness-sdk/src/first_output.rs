@@ -96,6 +96,7 @@ fn output_run_id(event: &HarnessEvent) -> Option<&str> {
         | HarnessEvent::ToolCallCompleted { .. }
         | HarnessEvent::RunCompleted { .. }
         | HarnessEvent::RunInterrupted { .. }
+        | HarnessEvent::RunContinued { .. }
         | HarnessEvent::Idle
         | HarnessEvent::PromptQueued { .. }
         | HarnessEvent::PromptEdited { .. }

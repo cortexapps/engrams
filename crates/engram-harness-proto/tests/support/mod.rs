@@ -103,6 +103,7 @@ pub fn harness_event() -> impl Strategy<Value = HarnessEvent> {
         ),
         (s(), any::<bool>()).prop_map(|(run_id, ok)| HarnessEvent::RunCompleted { run_id, ok }),
         s().prop_map(|run_id| HarnessEvent::RunInterrupted { run_id }),
+        s().prop_map(|run_id| HarnessEvent::RunContinued { run_id }),
         Just(HarnessEvent::Idle),
         (s(), opt_s())
             .prop_map(|(prompt_id, summary)| HarnessEvent::PromptQueued { prompt_id, summary }),
@@ -217,6 +218,14 @@ pub fn harness_frame() -> impl Strategy<Value = HarnessFrame> {
     prop_oneof![
         harness_event().prop_map(HarnessFrame::Event),
         harness_command().prop_map(HarnessFrame::Command),
+        (any::<u64>(), any::<u64>(), harness_event()).prop_map(|(binding_epoch, seq, event)| {
+            HarnessFrame::SeqEvent {
+                binding_epoch,
+                seq,
+                event,
+            }
+        }),
+        any::<u64>().prop_map(|seq| HarnessFrame::EventAck { seq }),
     ]
 }
 
@@ -367,6 +376,7 @@ fn _exhaustiveness_harness_event(e: &HarnessEvent) {
         HarnessEvent::ToolCallCompleted { .. } => {}
         HarnessEvent::RunCompleted { .. } => {}
         HarnessEvent::RunInterrupted { .. } => {}
+        HarnessEvent::RunContinued { .. } => {}
         HarnessEvent::Idle => {}
         HarnessEvent::PromptQueued { .. } => {}
         HarnessEvent::PromptEdited { .. } => {}
@@ -400,6 +410,8 @@ fn _exhaustiveness_harness_frame(f: &HarnessFrame) {
     match f {
         HarnessFrame::Event(_) => {}
         HarnessFrame::Command(_) => {}
+        HarnessFrame::SeqEvent { .. } => {}
+        HarnessFrame::EventAck { .. } => {}
     }
 }
 

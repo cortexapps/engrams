@@ -117,7 +117,11 @@ fn mutate_and_decode<T: serde::de::DeserializeOwned>(
 // ---- shape (a): arbitrary bytes ---------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct(concat!(env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/decode_never_panics.txt")))),
+        ..ProptestConfig::default()
+    })]
 
     /// Arbitrary byte blobs (weighted small, up to 64 KiB) decode into every
     /// public wire type without panicking.
@@ -141,7 +145,11 @@ fn weighted_blob() -> impl Strategy<Value = Vec<u8>> {
 // ---- shape (b): mutations of valid frames ------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct(concat!(env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/decode_never_panics.txt")))),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn mutated_harness_frames_never_panic(
@@ -152,6 +160,21 @@ proptest! {
     ) {
         let encoded = bincode::serialize(&frame).expect("encode");
         mutate_and_decode::<HarnessFrame>(&encoded, flip_pos, flip_val, &garbage);
+    }
+
+    #[test]
+    fn mutated_sequenced_events_and_acks_never_panic(
+        binding_epoch in any::<u64>(),
+        seq in any::<u64>(),
+        event in support::harness_event(),
+        flip_pos in any::<usize>(),
+        flip_val in any::<u8>(),
+        garbage in proptest::collection::vec(any::<u8>(), 0..=32),
+    ) {
+        for frame in [HarnessFrame::SeqEvent { binding_epoch, seq, event }, HarnessFrame::EventAck { seq }] {
+            let encoded = bincode::serialize(&frame).expect("encode");
+            mutate_and_decode::<HarnessFrame>(&encoded, flip_pos, flip_val, &garbage);
+        }
     }
 
     #[test]
