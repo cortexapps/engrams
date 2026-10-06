@@ -499,7 +499,7 @@ pub enum HarnessFrame {
 | O1 | E5, E6 | #1583 |
 | O2 | E1-E4, E7 | #1588 |
 | X1 | the KVM acceptance test: a real SDK harness survives a non-drained snapshot and finishes its run | #1589 |
-| C4 | fixture cleanup: assign_session_sandbox retired | (follows #1591) |
+| C4 | fixture cleanup: assign_session_sandbox retired; fenced binding writes carry strike reset and manifest clear | #1592 |
 
 ## Divergence log
 
