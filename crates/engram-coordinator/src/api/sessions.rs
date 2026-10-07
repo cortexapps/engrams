@@ -698,6 +698,7 @@ async fn boot_prepared(
         // review findings 2/3).
         caps: crate::placement::CapabilityRequirements {
             needs_uffd_substrate,
+            needs_live_substrate: false,
             fc_snapshot_version: None,
         },
         // Fresh create: the harness resolves against the target's own

@@ -1409,7 +1409,19 @@ impl HarnessEventWriter {
                     settled_at,
                 )
                 .await?;
-            for run in settled {
+            if settled.is_some() {
+                if let Err(e) = meta
+                    .op_wake_queued_kind(
+                        session_id,
+                        engram_core::types::session_op::OpKind::Teleport,
+                    )
+                    .await
+                {
+                    tracing::debug!(%session_id, error = %e,
+                        "teleport wake on harness generation failed (poll backstops)");
+                }
+            }
+            for run in settled.into_iter().flatten() {
                 events.publish(
                     session_id,
                     IndexedEvent {

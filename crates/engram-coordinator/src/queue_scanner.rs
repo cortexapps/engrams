@@ -492,6 +492,7 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
         prefer_host: None,
         caps: crate::placement::CapabilityRequirements {
             needs_uffd_substrate,
+            needs_live_substrate: false,
             fc_snapshot_version: None,
         },
         // Fresh create: the harness resolves against the target's own
@@ -607,6 +608,7 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> ResumeCa
         prefer_host: None,
         caps: crate::placement::CapabilityRequirements {
             needs_uffd_substrate: latest.as_ref().is_some_and(|s| s.memory_manifest.is_some()),
+            needs_live_substrate: false,
             fc_snapshot_version: latest.and_then(|s| s.fc_snapshot_version),
         },
         // Capacity PRE-check only (the resume's own pick carries the

@@ -6163,6 +6163,7 @@ async fn settle_harness_generation_exactly_once(ctx: &Ctx) {
         .settle_harness_generation(sid, 2, &["kept".into()], ctx.clock.now_utc())
         .await
         .unwrap();
+    let settled = settled.expect("generation advanced");
     assert_eq!(settled.len(), 1);
     assert_eq!(settled[0].run_id, "open");
     let no_continued: [String; 0] = [];
@@ -6170,12 +6171,12 @@ async fn settle_harness_generation_exactly_once(ctx: &Ctx) {
         .settle_harness_generation(sid, 2, &no_continued, ctx.clock.now_utc())
         .await
         .unwrap()
-        .is_empty());
+        .is_none());
     assert!(meta
         .settle_harness_generation(sid, 1, &no_continued, ctx.clock.now_utc())
         .await
         .unwrap()
-        .is_empty());
+        .is_none());
     let rows = meta
         .list_session_events_window(
             sid,
@@ -6197,14 +6198,22 @@ async fn settle_harness_generation_exactly_once(ctx: &Ctx) {
         .settle_harness_generation(sid, 3, &no_continued, ctx.clock.now_utc())
         .await
         .unwrap();
+    let settled = settled.expect("generation advanced");
     assert_eq!(settled.len(), 1);
     assert_eq!(settled[0].run_id, "kept");
     assert!(meta
         .settle_harness_generation(sid, 3, &no_continued, ctx.clock.now_utc())
         .await
         .unwrap()
-        .is_empty());
+        .is_none());
+    assert_eq!(
+        meta.settle_harness_generation(sid, 4, &no_continued, ctx.clock.now_utc())
+            .await
+            .unwrap(),
+        Some(Vec::new())
+    );
 }
+
 conformance!(
     t_settle_harness_generation_exactly_once,
     super::settle_harness_generation_exactly_once
@@ -6335,7 +6344,7 @@ async fn teleport_admission_fixture(
         mem_budget_mib: 4096,
         cpu_budget_vcpus: 2,
         max_open_per_dest: 1,
-        live_capable: false,
+        kind: engram_core::types::teleport::TeleportKind::Live,
     }
 }
 async fn admit_teleport(
@@ -6394,6 +6403,7 @@ async fn teleport_admit_reserves_dest_under_lock(ctx: &Ctx) {
         .await
         .unwrap();
     let row = admit_teleport(ctx, req.clone()).await;
+    assert_eq!(row.kind, TeleportKind::Live);
     assert_eq!(
         ctx.meta.get_session(sid).await.unwrap().host_id,
         Some(row.source_host_id)

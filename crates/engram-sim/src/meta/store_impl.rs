@@ -352,11 +352,7 @@ impl MetadataStore for SimMetadataStore {
         let row = TeleportRow {
             id: req.id,
             session_id: req.session_id,
-            kind: if req.live_capable {
-                TeleportKind::Live
-            } else {
-                TeleportKind::Snapshot
-            },
+            kind: req.kind,
             reason: req.reason,
             phase: TeleportPhase::Admitted,
             source_host_id: source,
@@ -1845,15 +1841,15 @@ impl MetadataStore for SimMetadataStore {
         epoch: u64,
         continued: &[String],
         now: DateTime<Utc>,
-    ) -> Result<Vec<engram_core::types::session::SettledRun>, MetaError> {
+    ) -> Result<Option<Vec<engram_core::types::session::SettledRun>>, MetaError> {
         self.gate()?;
         let epoch = i64::try_from(epoch).map_err(|e| MetaError::Serialization(e.to_string()))?;
         let mut db = self.db.lock();
         let Some(row) = db.sessions.get_mut(&session) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         if row.attached_binding_epoch >= epoch {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         row.attached_binding_epoch = epoch;
         let events = db.session_events.get(&session).cloned().unwrap_or_default();
@@ -1897,7 +1893,7 @@ impl MetadataStore for SimMetadataStore {
                 serde_json::json!({"session_id": session, "idx": idx}).to_string(),
             );
         }
-        Ok(settled)
+        Ok(Some(settled))
     }
 
     async fn append_session_event_idempotent(

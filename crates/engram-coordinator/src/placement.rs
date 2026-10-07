@@ -95,6 +95,14 @@ pub struct CapabilityRequirements {
     /// on resume, the enabled image's `base_snapshot_memory_manifest`
     /// presence on create.
     pub needs_uffd_substrate: bool,
+    /// ADR 0123: this placement is the DESTINATION of a live post-copy
+    /// move. The migration restore forces the UFFD backend against the
+    /// substrate, so `NotApplicable` is not enough: `base_shm_tmpfs`,
+    /// `uffd_minor_shmem` and `nbd` must be `Ok` and the backend must be
+    /// Firecracker. A host that cannot run that restore is not a
+    /// candidate (the answer is `NoFit`, never a failure after the
+    /// source blackout).
+    pub needs_live_substrate: bool,
     /// The snapshot row's recorded capture-time FC snapshot version,
     /// when known (`SnapshotRecord::fc_snapshot_version`). `Some(v)`
     /// requires the candidate host's reported `fc_snapshot_version` to
@@ -159,6 +167,20 @@ pub fn host_meets_capabilities(
         }
         if !substrate_ok(&caps.nbd) {
             return Err("nbd");
+        }
+    }
+    if req.needs_live_substrate {
+        if caps.backend != "firecracker" {
+            return Err("backend");
+        }
+        if !caps.base_shm_tmpfs.is_ok() {
+            return Err("live:base_shm_tmpfs");
+        }
+        if !caps.uffd_minor_shmem.is_ok() {
+            return Err("live:uffd_minor_shmem");
+        }
+        if !caps.nbd.is_ok() {
+            return Err("live:nbd");
         }
     }
     if let (Some(want), Some(have)) = (&req.fc_snapshot_version, &caps.fc_snapshot_version) {
@@ -1067,6 +1089,7 @@ pub fn capture_candidate_hosts_from(
 ) -> Vec<HostId> {
     let caps = CapabilityRequirements {
         needs_uffd_substrate: false,
+        needs_live_substrate: false,
         fc_snapshot_version: required_fc_version.map(str::to_string),
     };
     let mut survivors: Vec<(u64, HostId)> = Vec::new();
@@ -1244,6 +1267,7 @@ pub async fn restore_for_session(
 fn fleet_capability_req() -> CapabilityRequirements {
     CapabilityRequirements {
         needs_uffd_substrate: true,
+        needs_live_substrate: false,
         fc_snapshot_version: None,
     }
 }
@@ -1394,9 +1418,50 @@ mod tests {
             assert_eq!(h.capabilities.schema, 0);
             let req = CapabilityRequirements {
                 needs_uffd_substrate: true,
+                needs_live_substrate: false,
                 fc_snapshot_version: Some("v10.0.0".to_string()),
             };
             assert!(host_meets_capabilities(&h, &req).is_ok());
+        }
+
+        /// ADR 0123: a live post-copy DESTINATION needs the substrate to
+        /// be present, not merely "not applicable" — the migration
+        /// restore forces UFFD. A File-backend host that honestly reports
+        /// `NotApplicable` stays placeable for snapshots and is excluded
+        /// for live moves; a VZ host is excluded by backend.
+        #[test]
+        fn live_destination_requires_the_substrate_to_be_ok() {
+            let live = CapabilityRequirements {
+                needs_uffd_substrate: true,
+                needs_live_substrate: true,
+                fc_snapshot_version: None,
+            };
+            let snapshot = CapabilityRequirements {
+                needs_uffd_substrate: true,
+                needs_live_substrate: false,
+                fc_snapshot_version: None,
+            };
+            let mut file_host = host(1);
+            file_host.capabilities = caps_with(
+                CapStatus::Ok(None),
+                CapStatus::Ok(None),
+                CapStatus::NotApplicable,
+                CapStatus::NotApplicable,
+                CapStatus::NotApplicable,
+                None,
+            );
+            assert!(host_meets_capabilities(&file_host, &snapshot).is_ok());
+            assert_eq!(
+                host_meets_capabilities(&file_host, &live),
+                Err("live:base_shm_tmpfs")
+            );
+            let mut substrate_host = host(2);
+            substrate_host.capabilities = fully_ok();
+            assert!(host_meets_capabilities(&substrate_host, &live).is_ok());
+            let mut vz_host = host(3);
+            vz_host.capabilities = fully_ok();
+            vz_host.capabilities.backend = "vz".to_string();
+            assert_eq!(host_meets_capabilities(&vz_host, &live), Err("backend"));
         }
 
         /// `schema >= 1` with no substrate/version requirement still
@@ -1449,6 +1514,7 @@ mod tests {
                 );
                 let req = CapabilityRequirements {
                     needs_uffd_substrate: true,
+                    needs_live_substrate: false,
                     fc_snapshot_version: None,
                 };
                 assert_eq!(
@@ -1480,6 +1546,7 @@ mod tests {
             );
             let req = CapabilityRequirements {
                 needs_uffd_substrate: true,
+                needs_live_substrate: false,
                 fc_snapshot_version: None,
             };
             assert!(
@@ -1495,6 +1562,7 @@ mod tests {
             h.capabilities = fully_ok();
             let req = CapabilityRequirements {
                 needs_uffd_substrate: true,
+                needs_live_substrate: false,
                 fc_snapshot_version: None,
             };
             assert!(host_meets_capabilities(&h, &req).is_ok());
@@ -1529,6 +1597,7 @@ mod tests {
             );
             let req = CapabilityRequirements {
                 needs_uffd_substrate: false,
+                needs_live_substrate: false,
                 fc_snapshot_version: Some("v10.0.0".to_string()),
             };
             assert_eq!(
@@ -1550,6 +1619,7 @@ mod tests {
             );
             let req = CapabilityRequirements {
                 needs_uffd_substrate: false,
+                needs_live_substrate: false,
                 fc_snapshot_version: Some("v10.0.0".to_string()),
             };
             assert!(host_meets_capabilities(&h, &req).is_ok());
@@ -1564,6 +1634,7 @@ mod tests {
             host_no_version.capabilities = fully_ok();
             let req_wants_version = CapabilityRequirements {
                 needs_uffd_substrate: false,
+                needs_live_substrate: false,
                 fc_snapshot_version: Some("v10.0.0".to_string()),
             };
             assert!(host_meets_capabilities(&host_no_version, &req_wants_version).is_ok());
@@ -1603,6 +1674,7 @@ mod tests {
             let mut c = ctx();
             c.caps = CapabilityRequirements {
                 needs_uffd_substrate: true,
+                needs_live_substrate: false,
                 fc_snapshot_version: None,
             };
             let ranked = rank_hosts(&[ready, substrate_broken], &c, Utc::now(), TTL);

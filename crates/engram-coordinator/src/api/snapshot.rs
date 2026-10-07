@@ -1701,6 +1701,7 @@ async fn resume_from_fc_snapshot(
         // closes at placement instead of at guest-boot failure.
         caps: crate::placement::CapabilityRequirements {
             needs_uffd_substrate: record.memory_manifest.is_some(),
+            needs_live_substrate: false,
             fc_snapshot_version: record.fc_snapshot_version.clone(),
         },
         // ADR 0090: prefer hosts already staging the snapshot's pinned

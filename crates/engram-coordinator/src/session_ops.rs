@@ -803,7 +803,9 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     let meta = &state.services.meta;
     let terminal = !matches!(outcome, OpOutcome::Retry(_) | OpOutcome::RetryAfter(_, _));
     let finished_done = matches!(outcome, OpOutcome::Done);
-    let _ = match outcome {
+    let teleport_attach_wait =
+        op.kind == OpKind::Teleport && matches!(outcome, OpOutcome::RetryAfter(..));
+    let result = match outcome {
         OpOutcome::Done => meta.op_finish(op.id, epoch, OpState::Done, None).await,
         OpOutcome::Cancelled => meta.op_finish(op.id, epoch, OpState::Cancelled, None).await,
         OpOutcome::Failed(e) => {
@@ -859,6 +861,26 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
             requeued
         }
     };
+    // An attach event can arrive after the step's last read but before
+    // requeue. Its queued-only wake then misses the running op. Recheck
+    // after requeue so that this race cannot retain the full pacing delay.
+    if teleport_attach_wait
+        && matches!(result, Ok(true))
+        && matches!(meta.open_teleport_for_session(op.session_id).await,
+            Ok(Some(row)) if row.phase == engram_core::types::teleport::TeleportPhase::Committed)
+    {
+        if let Ok((generation, attached)) = meta.session_binding_generations(op.session_id).await {
+            if attached >= generation {
+                if let Err(e) = meta
+                    .op_wake_queued_kind(op.session_id, OpKind::Teleport)
+                    .await
+                {
+                    tracing::debug!(session_id = %op.session_id, error = %e,
+                        "teleport wake after requeue failed (poll backstops)");
+                }
+            }
+        }
+    }
     // ADR 0079 + ADR 0094: the initial-prompt DELIVER op is deferred
     // while the session is still booting ("session is pending — not
     // deliverable") and requeued on a growing backoff. Nothing else makes

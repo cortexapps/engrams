@@ -614,3 +614,24 @@ pub enum HarnessFrame {
   records the guest's memory backing, presetup checks it pause-free, and
   a File-mode fresh session is a valid post-copy source (ADR 0045 and
   ADR 0092 addenda, same date). `ENGRAM_FC_FRESH_RESTORE_MODE` retired.
+||||||| parent of 88b4b23e4 (fix(teleport): live is the admitted kind; the attach step wakes on the harness event)
+- 2026-10-07 (coordinator): admission always records `Live`. The source
+  host's pause-free `migration_presetup` answer decides whether the sandbox
+  supports post-copy; only `InvalidSpec` changes the row to `Snapshot`.
+  Host capability probes no longer choose the kind from the SOURCE; the
+  destination's capability does (`needs_live_substrate`: the substrate
+  probes must be `Ok` and the backend Firecracker, because the migration
+  restore forces UFFD). Admission takes the live-capable candidates when
+  any exist and stamps `Live`; otherwise it takes the snapshot-capable
+  candidates and stamps `Snapshot`; a pinned target decides alone. So a
+  host that cannot restore a post-copy export never receives one, and a
+  fleet without the substrate still moves sessions by snapshot. The first event of a
+  new harness generation wakes the queued teleport. Attach reads readiness
+  after spawn, waits up to 5 s at a 100 ms cadence, then requests a 500 ms
+  retry (the requeue adds the attempt's elapsed time, so the poll backstop
+  is about 5.5 s; the event wake cuts it short). A retry skips bind,
+  materialization, and spawn when the generation is already attached. A
+  check after requeue closes the event/requeue race. This removes the
+  measured 44 s pacing wait after harness attach. The DST workloads use
+  `HarnessPlan::None` and never deliver epoch-stamped events, so the wait
+  and the wake are covered by the coordinator unit tests, not the DST.

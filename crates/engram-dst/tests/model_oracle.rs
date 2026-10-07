@@ -112,7 +112,7 @@ fn capacity_oracle_counts_an_open_teleport_destination() {
                 mem_budget_mib: 1,
                 cpu_budget_vcpus: 1,
                 max_open_per_dest: 1,
-                live_capable: false,
+                kind: engram_core::types::teleport::TeleportKind::Live,
             })
             .await
             .unwrap();

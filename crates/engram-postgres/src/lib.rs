@@ -1185,11 +1185,7 @@ impl MetadataStore for PostgresStore {
         let cpu = i32::try_from(req.cpu_budget_vcpus)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let now = self.clock.now_utc();
-        let kind = if req.live_capable {
-            TeleportKind::Live
-        } else {
-            TeleportKind::Snapshot
-        };
+        let kind = req.kind;
         let inserted = sqlx::query("INSERT INTO session_teleports (id,session_id,kind,reason,phase,source_host_id,source_sandbox_id,dest_host_id,pinned_dest,mem_budget_mib,cpu_budget_vcpus,created_at,updated_at) VALUES ($1,$2,$3,$4,'admitted',$5,$6,$7,$8,$9,$10,$11,$11) RETURNING to_jsonb(session_teleports) AS row")
             .bind(req.id.as_uuid()).bind(req.session_id.as_uuid()).bind(kind.as_str()).bind(req.reason.as_str()).bind(source).bind(sandbox).bind(dest).bind(req.pinned_dest.is_some()).bind(req.mem_budget_mib).bind(cpu).bind(now)
             .fetch_one(&mut *tx).await.map_err(|e| if e.as_database_error().is_some_and(|e| e.is_unique_violation()) { MetaError::Conflict("teleport already exists".into()) } else { db_err(e) })?;
@@ -5345,7 +5341,7 @@ impl MetadataStore for PostgresStore {
         epoch: u64,
         continued: &[String],
         now: DateTime<Utc>,
-    ) -> Result<Vec<engram_core::types::session::SettledRun>, MetaError> {
+    ) -> Result<Option<Vec<engram_core::types::session::SettledRun>>, MetaError> {
         let epoch = i64::try_from(epoch).map_err(|e| MetaError::Serialization(e.to_string()))?;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let changed = sqlx::query(
@@ -5358,7 +5354,7 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         if changed.rows_affected() == 0 {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let runs: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT started.payload->>'run_id'
@@ -5397,7 +5393,7 @@ impl MetadataStore for PostgresStore {
             }
         }
         tx.commit().await.map_err(db_err)?;
-        Ok(settled)
+        Ok(Some(settled))
     }
 
     async fn append_session_event_idempotent(
