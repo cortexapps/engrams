@@ -1534,6 +1534,17 @@ impl ChunkedDiskBackend {
         Self::from_manifest(manifest_ref, manifest, cache, store, threshold_bytes)
     }
 
+    /// Record the initial lineage of a device that has no live coordinator ref.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn persist_recovery_ref(&self) -> Result<(), DiskBackendError> {
+        let _flush = self.flush_pipeline.lock().await;
+        let manifest = self.manifest_ref().await;
+        let tier = self.dirty_tier.lock().await;
+        write_ref_sidecar(&tier.active.path, manifest).map_err(|source| {
+            dirty_file_error("record recovery manifest", &tier.active.path, source)
+        })
+    }
+
     /// Move a newly-created temporary file to its stable sandbox path.
     /// The open descriptor stays valid across the rename.
     #[cfg(target_os = "linux")]
@@ -3551,6 +3562,7 @@ mod tests {
                     &engram_host_core::TokioFs,
                     root,
                     sid,
+                    engram_core::types::snapshot::DiskRole::Root,
                     exported_ref,
                     &spool_chunks,
                 )
@@ -3589,7 +3601,14 @@ mod tests {
 
                 let recovery_data = match written {
                     Err(error) => Err(error),
-                    Ok(_) => match spool::read_spool(&engram_host_core::TokioFs, root, sid).await {
+                    Ok(_) => match spool::read_spool(
+                        &engram_host_core::TokioFs,
+                        root,
+                        sid,
+                        engram_core::types::snapshot::DiskRole::Root,
+                    )
+                    .await
+                    {
                         Ok(Some((meta, chunks))) => Ok((
                             ManifestRef {
                                 manifest_id: meta.manifest_id,

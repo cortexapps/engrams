@@ -72,6 +72,7 @@
 //! with the eviction pipeline beyond the flush-pipeline-mutex
 //! serialization above (issue #199).
 
+use super::DiskRole;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -154,7 +155,7 @@ impl FlushSchedulerConfig {
 /// re-spawning the scheduler on assignment.
 #[async_trait]
 pub trait LiveManifestPublisher: Send + Sync {
-    async fn publish(&self, sandbox_id: SandboxId, manifest_ref: ManifestRef);
+    async fn publish(&self, sandbox_id: SandboxId, role: DiskRole, manifest_ref: ManifestRef);
 }
 
 /// Default impl until commit 4 wires the real publisher. Useful
@@ -163,7 +164,7 @@ pub struct NoOpLiveManifestPublisher;
 
 #[async_trait]
 impl LiveManifestPublisher for NoOpLiveManifestPublisher {
-    async fn publish(&self, _sandbox_id: SandboxId, _manifest_ref: ManifestRef) {}
+    async fn publish(&self, _sandbox_id: SandboxId, _role: DiskRole, _manifest_ref: ManifestRef) {}
 }
 
 /// ADR 0116 C4: escalation sink for a persistently failed data plane.
@@ -294,6 +295,7 @@ impl FlushScheduler {
     /// [`FlushHealthTracker`]), never per failed flush.
     pub fn spawn(
         sandbox_id: SandboxId,
+        role: DiskRole,
         backend: Arc<ChunkedDiskBackend>,
         publisher: Arc<dyn LiveManifestPublisher>,
         health: Arc<dyn DataPlaneHealth>,
@@ -370,7 +372,9 @@ impl FlushScheduler {
                     bytes_uploaded = outcome.bytes_uploaded,
                     "flush_scheduler: flushed; publishing live manifest",
                 );
-                publisher.publish(sandbox_id, outcome.manifest_ref).await;
+                publisher
+                    .publish(sandbox_id, role, outcome.manifest_ref)
+                    .await;
             }
         });
         FlushSchedulerHandle { task }
@@ -427,7 +431,7 @@ mod tests {
 
     #[async_trait]
     impl LiveManifestPublisher for RecordingPublisher {
-        async fn publish(&self, sandbox_id: SandboxId, manifest_ref: ManifestRef) {
+        async fn publish(&self, sandbox_id: SandboxId, _role: DiskRole, manifest_ref: ManifestRef) {
             self.events.lock().unwrap().push((sandbox_id, manifest_ref));
         }
     }
@@ -475,6 +479,7 @@ mod tests {
         };
         let _handle = FlushScheduler::spawn(
             sandbox_id,
+            DiskRole::Root,
             backend.clone(),
             Arc::new(publisher),
             Arc::new(NoOpDataPlaneHealth),
@@ -517,6 +522,7 @@ mod tests {
         };
         let _handle = FlushScheduler::spawn(
             sandbox_id,
+            DiskRole::Root,
             backend.clone(),
             Arc::new(publisher),
             Arc::new(NoOpDataPlaneHealth),
@@ -591,6 +597,7 @@ mod tests {
         };
         let _handle = FlushScheduler::spawn(
             sandbox_id,
+            DiskRole::Root,
             backend.clone(),
             Arc::new(publisher),
             Arc::new(NoOpDataPlaneHealth),
@@ -636,6 +643,7 @@ mod tests {
         };
         let _handle = FlushScheduler::spawn(
             sandbox_id,
+            DiskRole::Root,
             backend.clone(),
             Arc::new(publisher),
             Arc::new(NoOpDataPlaneHealth),
@@ -666,6 +674,7 @@ mod tests {
         };
         let handle = FlushScheduler::spawn(
             sandbox_id,
+            DiskRole::Root,
             backend.clone(),
             Arc::new(publisher),
             Arc::new(NoOpDataPlaneHealth),
@@ -846,6 +855,7 @@ mod tests {
         };
         let _handle = FlushScheduler::spawn(
             sandbox_id,
+            DiskRole::Root,
             backend.clone(),
             Arc::new(publisher),
             Arc::new(health),
@@ -897,6 +907,7 @@ mod tests {
         };
         let _handle = FlushScheduler::spawn(
             sandbox_id,
+            DiskRole::Root,
             backend.clone(),
             Arc::new(publisher),
             Arc::new(health),

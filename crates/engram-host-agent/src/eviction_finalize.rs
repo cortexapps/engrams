@@ -58,6 +58,7 @@
 //! redundant NVMe write+read of the dirty chunk bytes on the common
 //! (non-crash) path — an O(dirty-set) cost, not O(image).
 
+use engram_core::types::snapshot::DiskRole;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,6 +119,8 @@ pub(crate) fn max_attempts() -> u32 {
 /// can be multiple MiB each; the record stays small JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiskPendingRecord {
+    #[serde(default, skip_serializing_if = "DiskRole::is_root")]
+    pub role: DiskRole,
     pub base_manifest: ManifestRef,
     pub chunk_size: u64,
     pub total_bytes: u64,
@@ -153,7 +156,12 @@ pub struct EvictionFinalizeRecord {
     /// `None` ⇒ no NBD disk tier was attached at capture (VZ/Process, or
     /// FC without NBD wired). `Some` with empty `chunks` ⇒ attached but
     /// nothing dirty.
-    pub disk_pending: Option<DiskPendingRecord>,
+    #[serde(
+        default,
+        deserialize_with = "read_pending_records",
+        serialize_with = "write_pending_records"
+    )]
+    pub disk_pending: Vec<DiskPendingRecord>,
     pub aux_bundles: Vec<AuxBundleRef>,
     pub stage: FinalizeStage,
     pub attempts: u32,
@@ -161,6 +169,39 @@ pub struct EvictionFinalizeRecord {
     pub disk_manifest: Option<ManifestRef>,
     /// Filled by the `MemoryChunked` leg.
     pub memory_manifest: Option<ManifestRef>,
+}
+
+fn write_pending_records<S: serde::Serializer>(
+    records: &[DiskPendingRecord],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if records.len() <= 1 && records.iter().all(|r| r.role == DiskRole::Root) {
+        records.first().serialize(serializer)
+    } else {
+        records.serialize(serializer)
+    }
+}
+
+fn read_pending_records<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<DiskPendingRecord>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Records {
+        Many(Vec<DiskPendingRecord>),
+        Legacy(Option<DiskPendingRecord>),
+    }
+    Ok(match Records::deserialize(deserializer)? {
+        Records::Many(records) => records,
+        Records::Legacy(record) => record.into_iter().collect(),
+    })
+}
+
+pub fn disk_pending_dir(dest: &Path, role: DiskRole) -> PathBuf {
+    dest.join(match role {
+        DiskRole::Root => "disk-pending",
+        DiskRole::Swap => "disk-pending.swap",
+    })
 }
 
 impl EvictionFinalizeRecord {
@@ -301,13 +342,14 @@ impl EvictionFinalizer {
 /// NBD drain.
 pub async fn persist_disk_pending_chunks(
     dest: &Path,
+    role: DiskRole,
     chunks: &[(usize, ChunkHash, Bytes)],
 ) -> std::io::Result<()> {
     use futures::stream::{StreamExt, TryStreamExt};
     if chunks.is_empty() {
         return Ok(());
     }
-    let dir = dest.join("disk-pending");
+    let dir = disk_pending_dir(dest, role);
     tokio::fs::create_dir_all(&dir).await?;
     // ADR 0101 A: fanned out — each chunk's own write→fsync→rename
     // ordering is preserved per file; only cross-file order relaxes,
@@ -346,9 +388,10 @@ pub async fn persist_disk_pending_chunks(
 async fn read_disk_pending_chunks(
     fs: &dyn HostFs,
     dest: &Path,
+    role: DiskRole,
     chunks: &[(usize, ChunkHash)],
 ) -> Result<Vec<(usize, ChunkHash, Bytes)>, SandboxError> {
-    let dir = dest.join("disk-pending");
+    let dir = disk_pending_dir(dest, role);
     let mut out = Vec::with_capacity(chunks.len());
     for (idx, hash) in chunks {
         let path = dir.join(format!("{idx}.{}", hash.to_hex()));
@@ -515,60 +558,71 @@ async fn disk_leg_work(
     hot_chunks: Option<&[(usize, ChunkHash, Bytes)]>,
 ) -> Result<Option<ManifestRef>, SandboxError> {
     let start = crate::time_source::metrics_now();
-    let resolved = match (&f.chunk_store, &record.disk_pending) {
-        (_, None) => {
-            // No NBD disk tier at capture — nothing to carry (matches
-            // `finish()`'s behavior: `metadata.disk_manifest` stays
-            // whatever the bare backend produced, i.e. `None`, when
-            // `nbd_pending_flush` was `None`).
-            None
-        }
-        (None, Some(pending)) => {
-            // Defensive: chunk store vanished between snapshot_begin and
-            // now (shouldn't happen — gated at snapshot_begin). Carry the
-            // base forward unchanged rather than losing the disk tier.
-            Some(pending.base_manifest)
-        }
-        (Some(_), Some(pending)) if pending.chunks.is_empty() => {
-            // NBD attached but nothing dirty — carry forward unchanged,
-            // mirroring `flush_upload`'s empty-dirty-set short-circuit.
-            Some(pending.base_manifest)
-        }
-        (Some(chunk_store), Some(pending)) => {
-            // The hot bytes are trusted only when they match the durable
-            // record exactly (same indices, same hashes, in order) —
-            // anything else means they belong to a different capture
-            // generation, and the journal is the truth.
-            let hot = hot_chunks.filter(|hot| {
-                hot.len() == pending.chunks.len()
-                    && hot
-                        .iter()
-                        .zip(&pending.chunks)
-                        .all(|((hi, hh, _), (ri, rh))| hi == ri && hh == rh)
-            });
-            let owned;
-            let chunks: &[(usize, ChunkHash, Bytes)] = match hot {
-                Some(hot) => hot,
-                None => {
-                    owned = read_disk_pending_chunks(f.fs.as_ref(), &record.dest, &pending.chunks)
+    let mut root_manifest = None;
+    // Phase 2 must carry swap manifests in snapshot metadata before publishing them here.
+    for pending in record
+        .disk_pending
+        .iter()
+        .filter(|p| p.role == DiskRole::Root)
+    {
+        let resolved = match &f.chunk_store {
+            None => {
+                // Defensive: chunk store vanished between snapshot_begin and
+                // now (shouldn't happen — gated at snapshot_begin). Carry the
+                // base forward unchanged rather than losing the disk tier.
+                Some(pending.base_manifest)
+            }
+            Some(_) if pending.chunks.is_empty() => {
+                // NBD attached but nothing dirty — carry forward unchanged,
+                // mirroring `flush_upload`'s empty-dirty-set short-circuit.
+                Some(pending.base_manifest)
+            }
+            Some(chunk_store) => {
+                // The hot bytes are trusted only when they match the durable
+                // record exactly (same indices, same hashes, in order) —
+                // anything else means they belong to a different capture
+                // generation, and the journal is the truth.
+                let hot = hot_chunks
+                    .filter(|_| pending.role == DiskRole::Root)
+                    .filter(|hot| {
+                        hot.len() == pending.chunks.len()
+                            && hot
+                                .iter()
+                                .zip(&pending.chunks)
+                                .all(|((hi, hh, _), (ri, rh))| hi == ri && hh == rh)
+                    });
+                let owned;
+                let chunks: &[(usize, ChunkHash, Bytes)] = match hot {
+                    Some(hot) => hot,
+                    None => {
+                        owned = read_disk_pending_chunks(
+                            f.fs.as_ref(),
+                            &record.dest,
+                            pending.role,
+                            &pending.chunks,
+                        )
                         .await?;
-                    &owned
-                }
-            };
-            let published = publish_disk_manifest(
-                chunk_store,
-                pending.base_manifest,
-                pending.chunk_size,
-                pending.total_bytes,
-                chunks,
-            )
-            .await?;
-            Some(published)
+                        &owned
+                    }
+                };
+                let published = publish_disk_manifest(
+                    chunk_store,
+                    pending.base_manifest,
+                    pending.chunk_size,
+                    pending.total_bytes,
+                    chunks,
+                )
+                .await?;
+                Some(published)
+            }
+        };
+        if pending.role == DiskRole::Root {
+            root_manifest = resolved;
         }
-    };
+    }
     metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "disk")
         .record(start.elapsed().as_secs_f64());
-    Ok(resolved)
+    Ok(root_manifest)
 }
 
 /// The memory leg's publish work — pure (no stage/record mutation):
@@ -780,8 +834,9 @@ async fn persist_disk_bump(
             "persist finalize record: {e}"
         )));
     }
-    let pending_dir = record.dest.join("disk-pending");
-    let _ = f.fs.remove_dir(&pending_dir).await;
+    for role in DiskRole::ALL {
+        let _ = f.fs.remove_dir(&disk_pending_dir(&record.dest, role)).await;
+    }
     Ok(())
 }
 
@@ -963,6 +1018,106 @@ mod tests {
 
     struct NoopDestroyer;
 
+    #[test]
+    fn root_finalize_is_readable_by_legacy_binary() {
+        #[derive(Deserialize)]
+        struct LegacyPending {
+            base_manifest: ManifestRef,
+        }
+        #[derive(Deserialize)]
+        struct LegacyFinalize {
+            disk_pending: Option<LegacyPending>,
+        }
+        let mut record = record_with_one_staged_chunk(
+            PathBuf::from("capture"),
+            ManifestRef::new(),
+            ChunkHash::of(b"test"),
+        );
+        let old: LegacyFinalize =
+            serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(
+            old.disk_pending.unwrap().base_manifest,
+            record.disk_pending[0].base_manifest
+        );
+        record.disk_pending.clear();
+        let old: LegacyFinalize =
+            serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(old.disk_pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn finalize_does_not_publish_an_unreferenced_swap_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, base) = disk_store_with_empty_base(dir.path()).await;
+        let mut record =
+            record_with_one_staged_chunk(dir.path().join("capture"), base, ChunkHash::of(b"swap"));
+        let mut swap = record.disk_pending[0].clone();
+        swap.role = DiskRole::Swap;
+        swap.base_manifest = ManifestRef::new();
+        record.disk_pending[0].chunks.clear();
+        record.disk_pending.push(swap);
+        let finalizer = finalizer_over(&store, dir.path(), &record);
+        assert_eq!(
+            disk_leg_work(&finalizer, &record, None).await.unwrap(),
+            Some(base)
+        );
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert!(encoded["disk_pending"].is_array());
+    }
+
+    #[tokio::test]
+    async fn legacy_finalize_file_recovers_root_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = record_with_one_staged_chunk(
+            dir.path().join("capture"),
+            ManifestRef::new(),
+            ChunkHash::of(b"test"),
+        );
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        let mut pending = legacy["disk_pending"].take();
+        pending.as_object_mut().unwrap().remove("role");
+        legacy["disk_pending"] = pending;
+        let bytes =
+            crate::durable_envelope::seal(&record.snapshot_id.to_string(), &legacy.to_string());
+        let path = dir.path().join(format!("{}.json", record.snapshot_id));
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(dir.path().join("garbage.partial"), b"torn").unwrap();
+        let loaded = EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, dir.path()).await;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].disk_pending[0].role, DiskRole::Root);
+        for cut in 0..bytes.len() {
+            std::fs::write(&path, &bytes[..cut]).unwrap();
+            assert!(
+                EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, dir.path())
+                    .await
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_single_disk_record_reads_as_root() {
+        let legacy = serde_json::json!({
+            "base_manifest": ManifestRef::new(), "chunk_size": 4096,
+            "total_bytes": 4096, "chunks": []
+        });
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let record: DiskPendingRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record.role, DiskRole::Root);
+        for cut in 0..bytes.len() {
+            assert!(serde_json::from_slice::<DiskPendingRecord>(&bytes[..cut]).is_err());
+        }
+        #[derive(Deserialize)]
+        struct Journal {
+            #[serde(deserialize_with = "read_pending_records")]
+            disk_pending: Vec<DiskPendingRecord>,
+        }
+        let journal: Journal =
+            serde_json::from_value(serde_json::json!({ "disk_pending": legacy })).unwrap();
+        assert_eq!(journal.disk_pending.len(), 1);
+        assert_eq!(journal.disk_pending[0].role, DiskRole::Root);
+    }
+
     #[async_trait]
     impl EvictionSandbox for NoopDestroyer {
         async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
@@ -1000,9 +1155,13 @@ mod tests {
         let dest = tmp.path().join("capture");
         let bytes = Bytes::from(vec![0xaa; 4096]);
         let recorded_hash = ChunkHash::of(&bytes);
-        persist_disk_pending_chunks(&dest, &[(0, recorded_hash, bytes)])
-            .await
-            .expect("stage disk chunk");
+        persist_disk_pending_chunks(
+            &dest,
+            engram_core::types::snapshot::DiskRole::Root,
+            &[(0, recorded_hash, bytes)],
+        )
+        .await
+        .expect("stage disk chunk");
         let staged_path = dest
             .join("disk-pending")
             .join(format!("0.{}", recorded_hash.to_hex()));
@@ -1022,12 +1181,13 @@ mod tests {
             captured_at: DateTime::<Utc>::UNIX_EPOCH,
             dest,
             chain_prev_ref: None,
-            disk_pending: Some(DiskPendingRecord {
+            disk_pending: vec![DiskPendingRecord {
+                role: engram_core::types::snapshot::DiskRole::Root,
                 base_manifest: base_ref,
                 chunk_size: 4096,
                 total_bytes: 4096,
                 chunks: vec![(0, recorded_hash)],
-            }),
+            }],
             aux_bundles: Vec::new(),
             stage: FinalizeStage::Captured,
             attempts: 0,
@@ -1076,12 +1236,13 @@ mod tests {
             captured_at: DateTime::<Utc>::UNIX_EPOCH,
             dest,
             chain_prev_ref: None,
-            disk_pending: Some(DiskPendingRecord {
+            disk_pending: vec![DiskPendingRecord {
+                role: engram_core::types::snapshot::DiskRole::Root,
                 base_manifest: base_ref,
                 chunk_size: 4096,
                 total_bytes: 4096,
                 chunks: vec![(0, recorded_hash)],
-            }),
+            }],
             aux_bundles: Vec::new(),
             stage: FinalizeStage::Captured,
             attempts: 0,
@@ -1123,9 +1284,13 @@ mod tests {
         let dest = tmp.path().join("capture");
         let bytes = Bytes::from(vec![0xaa; 4096]);
         let recorded_hash = ChunkHash::of(&bytes);
-        persist_disk_pending_chunks(&dest, &[(0, recorded_hash, bytes.clone())])
-            .await
-            .expect("stage disk chunk");
+        persist_disk_pending_chunks(
+            &dest,
+            engram_core::types::snapshot::DiskRole::Root,
+            &[(0, recorded_hash, bytes.clone())],
+        )
+        .await
+        .expect("stage disk chunk");
         let staged_path = dest
             .join("disk-pending")
             .join(format!("0.{}", recorded_hash.to_hex()));
@@ -1159,9 +1324,13 @@ mod tests {
         let dest = tmp.path().join("capture");
         let bytes = Bytes::from(vec![0xaa; 4096]);
         let recorded_hash = ChunkHash::of(&bytes);
-        persist_disk_pending_chunks(&dest, &[(0, recorded_hash, bytes)])
-            .await
-            .expect("stage disk chunk");
+        persist_disk_pending_chunks(
+            &dest,
+            engram_core::types::snapshot::DiskRole::Root,
+            &[(0, recorded_hash, bytes)],
+        )
+        .await
+        .expect("stage disk chunk");
 
         let mut record = record_with_one_staged_chunk(dest, base_ref, recorded_hash);
         let finalizer = finalizer_over(&chunk_store, tmp.path(), &record);
@@ -1282,9 +1451,13 @@ mod tests {
         let dest = tmp.path().join("capture");
         let staged_bytes = Bytes::from(vec![0xaa; 4096]);
         let staged_hash = ChunkHash::of(&staged_bytes);
-        persist_disk_pending_chunks(&dest, &[(0, staged_hash, staged_bytes)])
-            .await
-            .expect("stage authoritative capture chunk");
+        persist_disk_pending_chunks(
+            &dest,
+            engram_core::types::snapshot::DiskRole::Root,
+            &[(0, staged_hash, staged_bytes)],
+        )
+        .await
+        .expect("stage authoritative capture chunk");
         let mut record = record_with_one_staged_chunk(dest, base_ref, staged_hash);
         let finalizer = finalizer_over(&chunk_store, tmp.path(), &record);
 
@@ -1325,7 +1498,7 @@ mod tests {
             .get_manifest(result)
             .await
             .expect("get authoritative capture manifest");
-        for (idx, hash) in &record.disk_pending.as_ref().unwrap().chunks {
+        for (idx, hash) in &record.disk_pending.first().unwrap().chunks {
             assert!(published
                 .chunks
                 .iter()

@@ -439,15 +439,34 @@ impl GrpcHostClient {
                 engram_core::types::snapshot::MigrationItem::StateBin => MigrationItem {
                     kind: Kind::StateBin as i32,
                     chunk_idx: 0,
+                    role: crate::grpc::DiskRole::Root as i32,
                 },
-                engram_core::types::snapshot::MigrationItem::DiskSealInfo => MigrationItem {
+                engram_core::types::snapshot::MigrationItem::DiskSealInfo(role) => MigrationItem {
                     kind: Kind::DiskSealInfo as i32,
                     chunk_idx: 0,
+                    role: match role {
+                        engram_core::types::snapshot::DiskRole::Root => {
+                            crate::grpc::DiskRole::Root as i32
+                        }
+                        engram_core::types::snapshot::DiskRole::Swap => {
+                            crate::grpc::DiskRole::Swap as i32
+                        }
+                    },
                 },
-                engram_core::types::snapshot::MigrationItem::DiskChunkAt(idx) => MigrationItem {
-                    kind: Kind::DiskChunkAt as i32,
-                    chunk_idx: idx,
-                },
+                engram_core::types::snapshot::MigrationItem::DiskChunkAt(role, idx) => {
+                    MigrationItem {
+                        kind: Kind::DiskChunkAt as i32,
+                        chunk_idx: idx,
+                        role: match role {
+                            engram_core::types::snapshot::DiskRole::Root => {
+                                crate::grpc::DiskRole::Root as i32
+                            }
+                            engram_core::types::snapshot::DiskRole::Swap => {
+                                crate::grpc::DiskRole::Swap as i32
+                            }
+                        },
+                    }
+                }
             })
             .collect();
         let resp = self

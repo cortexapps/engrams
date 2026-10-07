@@ -64,7 +64,10 @@ pub struct MigrationExport {
     /// tiers, raw bytes in RAM — served by index over
     /// `MigrationFetch::DiskChunkAt`, re-queued into `dirty` on abort,
     /// dropped on commit (the dest drained them).
-    pub disk_seal: Option<Arc<crate::disk_daemon::PostCopyDiskSeal>>,
+    pub disk_seal: std::collections::BTreeMap<
+        engram_core::types::snapshot::DiskRole,
+        Arc<crate::disk_daemon::PostCopyDiskSeal>,
+    >,
     /// ADR 0098 P8: the TTL clock is the INJECTED monotonic clock
     /// (`now_mono`), not a raw `Instant` — expiry DECIDES destroy/abort,
     /// so it is decision-feeding time (D1), and the paused sim clock
@@ -411,7 +414,7 @@ mod tests {
             export_id: eid,
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
-            disk_seal: None,
+            disk_seal: Default::default(),
             clock: clock.clone(),
             state_served: Arc::new(AtomicBool::new(false)),
             last_activity: last_activity.clone(),
@@ -482,7 +485,7 @@ mod tests {
             export_id: eid.clone(),
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
-            disk_seal: None,
+            disk_seal: Default::default(),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -502,7 +505,7 @@ mod tests {
             export_id: MigrationRegistry::mint_export_id(),
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
-            disk_seal: None,
+            disk_seal: Default::default(),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -528,7 +531,7 @@ mod tests {
             export_id,
             sandbox_id,
             snapshot_dir: "/tmp".into(),
-            disk_seal: None,
+            disk_seal: Default::default(),
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(

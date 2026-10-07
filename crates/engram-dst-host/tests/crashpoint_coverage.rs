@@ -73,15 +73,23 @@ async fn write_spool_op_trace_is_the_production_sequence() {
         &engram_host_core::TokioFs,
         tmp.path(),
         sid,
+        engram_core::types::snapshot::DiskRole::Root,
         refv(1),
         &chunks,
     )
     .await
     .unwrap();
     let fs = CrashFs::recording();
-    spool::write_spool(fs.as_ref(), tmp.path(), sid, refv(2), &chunks)
-        .await
-        .unwrap();
+    spool::write_spool(
+        fs.as_ref(),
+        tmp.path(),
+        sid,
+        engram_core::types::snapshot::DiskRole::Root,
+        refv(2),
+        &chunks,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         fs.trace(),
         vec![
@@ -112,14 +120,29 @@ async fn crash_schedule_covers_every_op_boundary() {
 
     // Derive the full trace length from an un-cut run.
     let recording = CrashFs::recording();
-    spool::write_spool(recording.as_ref(), tmp.path(), sid, refv(1), &chunks)
-        .await
-        .unwrap();
+    spool::write_spool(
+        recording.as_ref(),
+        tmp.path(),
+        sid,
+        engram_core::types::snapshot::DiskRole::Root,
+        refv(1),
+        &chunks,
+    )
+    .await
+    .unwrap();
     let full = recording.trace();
 
     for k in 0..=full.len() {
         let fs = CrashFs::with_crash_at(Some(k));
-        let result = spool::write_spool(fs.as_ref(), tmp.path(), sid, refv(2), &chunks).await;
+        let result = spool::write_spool(
+            fs.as_ref(),
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(2),
+            &chunks,
+        )
+        .await;
         let trace = fs.trace();
         if k < full.len() {
             assert!(
@@ -147,6 +170,7 @@ async fn crash_schedule_covers_every_op_boundary() {
             &engram_host_core::TokioFs,
             tmp.path(),
             sid,
+            engram_core::types::snapshot::DiskRole::Root,
             refv(1),
             &chunks,
         )
@@ -186,6 +210,7 @@ async fn persisted_records_and_spool_markers_are_sealed_envelopes() {
         &engram_host_core::TokioFs,
         stmp.path(),
         sid,
+        engram_core::types::snapshot::DiskRole::Root,
         refv(3),
         &[(0usize, vec![1u8; 8])],
     )

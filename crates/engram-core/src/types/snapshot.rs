@@ -314,16 +314,49 @@ pub enum DrainOutcome {
     PeerLost { remaining: u64, detail: String },
 }
 
+/// The device role within a sandbox. Missing persisted roles mean root.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskRole {
+    #[default]
+    Root,
+    Swap,
+}
+
+impl DiskRole {
+    pub const ALL: [Self; 2] = [Self::Root, Self::Swap];
+
+    pub fn is_root(&self) -> bool {
+        *self == Self::Root
+    }
+
+    pub fn dirty_file_name(self, id: crate::SandboxId) -> String {
+        match self {
+            Self::Root => format!("{id}.cache"),
+            Self::Swap => format!("{id}.swap.cache"),
+        }
+    }
+
+    pub fn seal_file_name(self) -> &'static str {
+        match self {
+            Self::Root => "disk-seal.json",
+            Self::Swap => "disk-seal.swap.json",
+        }
+    }
+}
+
 /// One artifact the destination pulls from a migration export.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MigrationItem {
     StateBin,
     /// The disk seal descriptor and published base manifest.
-    DiskSealInfo,
+    DiskSealInfo(DiskRole),
     /// ADR 0045 C2 disk post-copy: one sealed disk chunk's raw bytes,
     /// by chunk index — demand-fetched (and drained) by the dest's
     /// NBD backend straight out of the frozen source's RAM.
-    DiskChunkAt(u64),
+    DiskChunkAt(DiskRole, u64),
 }
 
 /// A frame of `migration_fetch`'s stream.

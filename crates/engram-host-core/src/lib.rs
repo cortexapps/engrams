@@ -66,7 +66,8 @@ pub use startup::{
     StartupSlot,
 };
 pub use survivor::{
-    plan_capture_disk_drain, plan_resume_attach, CaptureDrainPlan, ResumeAttachPlan,
+    all_disk_roles_served, plan_capture_disk_drain, plan_resume_attach, CaptureDrainPlan,
+    ResumeAttachPlan,
 };
 pub use swap::{plan_swap_disarm, SwapDisarmPlan, SwapDisarmPolicy, SwapRefuseReason};
 

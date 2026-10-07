@@ -423,14 +423,27 @@ impl HostService for HostServiceImpl {
             .into_iter()
             .map(|item| {
                 use engram_protocol::grpc::migration_item::Kind;
+                let role = match engram_protocol::grpc::DiskRole::try_from(item.role) {
+                    Ok(
+                        engram_protocol::grpc::DiskRole::Unspecified
+                        | engram_protocol::grpc::DiskRole::Root,
+                    ) => engram_core::types::snapshot::DiskRole::Root,
+                    Ok(engram_protocol::grpc::DiskRole::Swap) => {
+                        engram_core::types::snapshot::DiskRole::Swap
+                    }
+                    Err(_) => return Err(Status::invalid_argument("unknown disk role")),
+                };
                 match Kind::try_from(item.kind) {
                     Ok(Kind::StateBin) => Ok(engram_core::types::snapshot::MigrationItem::StateBin),
-                    Ok(Kind::DiskSealInfo) => {
-                        Ok(engram_core::types::snapshot::MigrationItem::DiskSealInfo)
-                    }
-                    Ok(Kind::DiskChunkAt) => Ok(
-                        engram_core::types::snapshot::MigrationItem::DiskChunkAt(item.chunk_idx),
+                    Ok(Kind::DiskSealInfo) => Ok(
+                        engram_core::types::snapshot::MigrationItem::DiskSealInfo(role),
                     ),
+                    Ok(Kind::DiskChunkAt) => {
+                        Ok(engram_core::types::snapshot::MigrationItem::DiskChunkAt(
+                            role,
+                            item.chunk_idx,
+                        ))
+                    }
                     Ok(Kind::Unspecified) | Err(_) => {
                         Err(Status::invalid_argument("unknown migration item kind"))
                     }
@@ -1921,6 +1934,7 @@ mod wire_version_tests {
         let mut req = Request::new(MigrationFetchRequest {
             export_id: "absent-export".into(),
             items: vec![engram_protocol::grpc::MigrationItem {
+                role: 0,
                 kind: engram_protocol::grpc::migration_item::Kind::StateBin as i32,
                 chunk_idx: 0,
             }],
@@ -1948,7 +1962,11 @@ mod wire_version_tests {
         for kind in [0, 2, 3] {
             let mut req = Request::new(MigrationFetchRequest {
                 export_id: "absent-export".into(),
-                items: vec![engram_protocol::grpc::MigrationItem { kind, chunk_idx: 0 }],
+                items: vec![engram_protocol::grpc::MigrationItem {
+                    role: 0,
+                    kind,
+                    chunk_idx: 0,
+                }],
             });
             req.metadata_mut().insert(
                 WIRE_VERSION_METADATA_KEY,

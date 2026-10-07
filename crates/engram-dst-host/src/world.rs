@@ -211,35 +211,20 @@ impl AckedWriteLedger {
 
 /// One sandbox's slot: the durable pointers survive; `backend` is the RAM
 /// tier that dies on crash.
+pub struct SandboxDisk {
+    pub base_ref: ManifestRef,
+    pub published_ref: Option<ManifestRef>,
+    pub backend: Option<Arc<ChunkedDiskBackend>>,
+    pub nbd_device: std::path::PathBuf,
+    pub lease: Option<NbdSlot>,
+    pub served_by: Option<u32>,
+    pub kernel_owner: Option<u32>,
+}
+
 pub struct SandboxSlot {
+    pub disks: crate::device_plane::SandboxDisks<SandboxDisk>,
     pub sandbox_id: SandboxId,
     pub session_id: SessionId,
-    /// The private base manifest the sandbox was created on (in the store).
-    pub base_ref: ManifestRef,
-    /// The last flush-published manifest ref (durable survivor pointer). The
-    /// successor rebuilds `from_blob` at this (or `base_ref` if never
-    /// flushed).
-    pub published_ref: Option<ManifestRef>,
-    /// The live backend — `None` after a crash, until a restart/adopt
-    /// rebuilds it.
-    pub backend: Option<Arc<ChunkedDiskBackend>>,
-
-    // ── Flow B: the NBD slot/reattach device-serving model (ADR 0098 P7) ──
-    /// The `/dev/nbdN` this sandbox's rootfs is served over.
-    pub nbd_device: std::path::PathBuf,
-    /// The current generation's real slot lease from [`SimHost::nbd_pool`].
-    /// `Some` while this generation serves the device; forgotten (not
-    /// released) on a roll, exactly like `abandon_for_shutdown`.
-    pub lease: Option<NbdSlot>,
-    /// The host-agent generation whose serve socket the kernel currently
-    /// serves this device with (`RECONFIGURE`d). `None` = unserved (post-roll,
-    /// pre-rehydrate, or after a stale-sweep DISCONNECT). "served by THIS
-    /// generation" (the un-pause gate) is `served_by == Some(host.generation)`.
-    pub served_by: Option<u32>,
-    /// The generation the kernel records as the device's configuring owner
-    /// (`/sys/block/nbdN/pid` stand-in). SURVIVES a roll — only a DISCONNECT
-    /// clears it — so the stale-binding sweep probes it against liveness.
-    pub kernel_owner: Option<u32>,
     /// Rung-2 parked (evicting-shaped: FC paused, VM resident). The 731df805
     /// class was a parked survivor whose device the sweep disconnected.
     pub parked: bool,
@@ -291,7 +276,10 @@ pub struct SandboxSlot {
 impl SandboxSlot {
     /// The ref a successor rebuilds from: the last publish, else the base.
     pub fn rebuild_ref(&self) -> ManifestRef {
-        self.published_ref.unwrap_or(self.base_ref)
+        self.disks
+            .root
+            .published_ref
+            .unwrap_or(self.disks.root.base_ref)
     }
 }
 
@@ -378,6 +366,8 @@ pub struct SimHost {
     /// touch a `SandboxSlot`.
     pub reconcile: Arc<SimReconcileBackend>,
     pub ledger: AckedWriteLedger,
+    pub swap_ledger: AckedWriteLedger,
+    recovery_owners_loaded: BTreeSet<usize>,
     /// #1003 2b: the capture cut's durability claim, keyed by slot. At
     /// `snapshot_begin` (the drain instant) the guest-visible
     /// un-uploaded content — the overlay union, per chunk — is claimed
@@ -569,13 +559,19 @@ impl SimHost {
             sandboxes.push(SandboxSlot {
                 sandbox_id,
                 session_id,
-                base_ref,
-                published_ref: None,
-                backend: Some(Arc::new(backend)),
-                nbd_device,
-                lease: Some(lease),
-                served_by: Some(generation),
-                kernel_owner: Some(generation),
+                disks: crate::device_plane::SandboxDisks {
+                    expected: [engram_core::DiskRole::Root].into_iter().collect(),
+                    root: SandboxDisk {
+                        base_ref,
+                        published_ref: None,
+                        backend: Some(Arc::new(backend)),
+                        nbd_device,
+                        lease: Some(lease),
+                        served_by: Some(generation),
+                        kernel_owner: Some(generation),
+                    },
+                    swap: None,
+                },
                 parked: false,
                 poisoned_snapshot: false,
                 migrating: false,
@@ -601,6 +597,8 @@ impl SimHost {
             sandboxes,
             reconcile,
             ledger: AckedWriteLedger::default(),
+            swap_ledger: AckedWriteLedger::default(),
+            recovery_owners_loaded: BTreeSet::new(),
             capture_cut_acks: std::collections::BTreeMap::new(),
             put_faults,
             next_tag: 0,
@@ -709,7 +707,7 @@ impl SimHost {
         if self.sandboxes[idx].migrating {
             return Ok(()); // the frozen source acks nothing
         }
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+        let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
             return Ok(());
         };
         let tag = self.next_tag();
@@ -728,6 +726,147 @@ impl SimHost {
         Ok(())
     }
 
+    /// Attach the second device with durable owner and lineage records.
+    pub async fn attach_swap(&mut self, idx: usize) -> Result<(), String> {
+        let base = self
+            .store
+            .get_manifest(self.sandboxes[idx].disks.root.base_ref)
+            .await
+            .map_err(|e| e.to_string())?;
+        let disk_ref = ManifestRef {
+            manifest_id: self.entropy.uuid(),
+            version: 1,
+        };
+        self.store
+            .put_manifest(disk_ref, &base)
+            .await
+            .map_err(|e| e.to_string())?;
+        let device = Self::device_path(self.sandboxes.len() + idx);
+        let lease = self.nbd_pool.claim(&device).await.ok_or("no swap slot")?;
+        let backend = Arc::new(
+            build_backend(
+                &self.store,
+                self.fs.cache_dir(),
+                self.sandboxes.len() + idx,
+                disk_ref,
+            )
+            .await,
+        );
+        let owner_dir = self.fs.root().join("nbd-owners");
+        let owners = engram_host_agent::disk_daemon::owners::NbdOwnerDir::open(owner_dir)
+            .map_err(|e| e.to_string())?;
+        owners
+            .record(
+                &device,
+                self.sandboxes[idx].sandbox_id,
+                engram_core::DiskRole::Swap,
+            )
+            .map_err(|e| e.to_string())?;
+        self.write_swap_ref(idx, disk_ref).await?;
+        self.sandboxes[idx]
+            .disks
+            .expected
+            .insert(engram_core::DiskRole::Swap);
+        self.sandboxes[idx].disks.swap = Some(SandboxDisk {
+            base_ref: disk_ref,
+            published_ref: None,
+            backend: Some(backend),
+            nbd_device: device,
+            lease: Some(lease),
+            served_by: Some(self.generation),
+            kernel_owner: Some(self.generation),
+        });
+        Ok(())
+    }
+
+    fn swap_ref_path(&self, idx: usize) -> std::path::PathBuf {
+        self.fs
+            .root()
+            .join(engram_core::DiskRole::Swap.dirty_file_name(self.sandboxes[idx].sandbox_id))
+            .with_extension("ref")
+    }
+
+    async fn write_swap_ref(&self, idx: usize, disk_ref: ManifestRef) -> Result<(), String> {
+        let path = self.swap_ref_path(idx);
+        let tmp = path.with_extension("ref.tmp");
+        let fs = self.effects.fs.as_ref();
+        fs.write(
+            &tmp,
+            &serde_json::to_vec(&disk_ref).map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        fs.rename(&tmp, &path).await.map_err(|e| e.to_string())
+    }
+
+    pub async fn guest_write_swap(&mut self, idx: usize, chunk_idx: u64) -> Result<(), String> {
+        if self.sandboxes[idx].migrating {
+            return Ok(());
+        }
+        let Some(backend) = self.sandboxes[idx]
+            .disks
+            .swap
+            .as_ref()
+            .and_then(|d| d.backend.clone())
+        else {
+            return Ok(());
+        };
+        let tag = self.next_tag();
+        backend
+            .write(chunk_idx * CHUNK_SIZE, &synth_chunk(tag))
+            .await
+            .map_err(|e| e.to_string())?;
+        self.swap_ledger.record(LedgerEntry {
+            sandbox: idx,
+            chunk_idx,
+            content_tag: tag,
+            lineage_at_ack: backend.manifest_ref().await,
+        });
+        Ok(())
+    }
+
+    async fn flush_swap(&mut self, idx: usize) -> Result<(), String> {
+        let Some(backend) = self.sandboxes[idx]
+            .disks
+            .swap
+            .as_ref()
+            .and_then(|d| d.backend.clone())
+        else {
+            return Ok(());
+        };
+        match backend.flush().await {
+            Ok(outcome) => {
+                self.write_swap_ref(idx, outcome.manifest_ref).await?;
+                self.sandboxes[idx]
+                    .disks
+                    .swap
+                    .as_mut()
+                    .expect("swap exists")
+                    .published_ref = Some(outcome.manifest_ref);
+                let manifest = self
+                    .store
+                    .get_manifest(outcome.manifest_ref)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                for chunk in manifest.chunks {
+                    let bytes = self
+                        .store
+                        .get_chunk(chunk.hash)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    self.swap_ledger.mark_published(
+                        idx,
+                        chunk.offset / CHUNK_SIZE,
+                        decode_tag(&bytes),
+                    );
+                }
+                Ok(())
+            }
+            Err(error) if error.to_string().contains("scripted chunk put fault") => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     /// Read a chunk back and, if the ledger has an acked tag for it, assert the
     /// HONEST read property inline (the oracle re-checks every acked chunk each
     /// step, but this gives a targeted read trace).
@@ -744,7 +883,7 @@ impl SimHost {
         if idx >= self.sandboxes.len() || chunk_idx >= NUM_CHUNKS {
             return Ok(());
         }
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+        let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
             return Ok(());
         };
         let bytes = backend
@@ -787,7 +926,8 @@ impl SimHost {
         if idx >= self.sandboxes.len() || self.sandboxes[idx].migrating {
             return Ok(()); // the export's capture lock excludes flushes
         }
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+        self.flush_swap(idx).await?;
+        let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
             return Ok(());
         };
         match backend.flush().await {
@@ -807,11 +947,11 @@ impl SimHost {
     /// the flush was a no-op/abort (the manifest didn't move; re-marking
     /// the same manifest is monotonic).
     pub async fn note_flush_published(&mut self, idx: usize) -> Result<(), String> {
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+        let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
             return Ok(());
         };
         let published = backend.manifest_ref().await;
-        self.sandboxes[idx].published_ref = Some(published);
+        self.sandboxes[idx].disks.root.published_ref = Some(published);
         // Durable handoff: observe the REAL published chunk set (read the
         // manifest + its chunks back out of the store) and record each
         // chunk's now-durable tag as the handoff floor — not an optimistic
@@ -823,6 +963,7 @@ impl SimHost {
             self.effects.fs.as_ref(),
             self.fs.spool_dir(),
             self.sandboxes[idx].sandbox_id,
+            engram_core::types::snapshot::DiskRole::Root,
         )
         .await
         .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
@@ -881,19 +1022,22 @@ impl SimHost {
         if idx >= self.sandboxes.len() {
             return Ok(());
         }
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
-            return Ok(());
-        };
-        let (exported_ref, chunks) = backend.export_unflushed().await;
-        spool::write_spool(
-            self.effects.fs.as_ref(),
-            self.fs.spool_dir(),
-            self.sandboxes[idx].sandbox_id,
-            exported_ref,
-            &chunks,
-        )
-        .await
-        .map_err(|e| format!("write_spool sandbox {idx}: {e}"))?;
+        for (role, disk) in self.sandboxes[idx].disks.iter() {
+            let Some(backend) = &disk.backend else {
+                continue;
+            };
+            let (exported_ref, chunks) = backend.export_unflushed().await;
+            spool::write_spool(
+                self.effects.fs.as_ref(),
+                self.fs.spool_dir(),
+                self.sandboxes[idx].sandbox_id,
+                role,
+                exported_ref,
+                &chunks,
+            )
+            .await
+            .map_err(|e| format!("write_spool sandbox {idx}: {e}"))?;
+        }
         Ok(())
     }
 
@@ -910,7 +1054,7 @@ impl SimHost {
             return Ok(());
         }
         // Capture the live tier first — losslessness gate.
-        if self.sandboxes[idx].backend.is_some() {
+        if self.sandboxes[idx].disks.root.backend.is_some() {
             self.spool_export(idx).await?;
         }
         self.rebuild(idx).await
@@ -925,7 +1069,7 @@ impl SimHost {
     /// [`CrashPoint`]: crate::CrashPoint
     pub async fn crash_process(&mut self) -> Result<(), String> {
         for idx in 0..self.sandboxes.len() {
-            if self.sandboxes[idx].backend.is_some() {
+            if self.sandboxes[idx].disks.root.backend.is_some() {
                 self.spool_export(idx).await?;
             }
         }
@@ -977,8 +1121,10 @@ impl SimHost {
             // parked persist. quarantine_parked CLEARS — the allocator's
             // parked set is in-process memory, and the successor's fresh
             // allocator has no record of the predecessor's parks.
-            slot.lease = None;
-            slot.served_by = None;
+            for (_, disk) in slot.disks.iter_mut() {
+                disk.lease = None;
+                disk.served_by = None;
+            }
             slot.quarantine_parked = false;
         }
         self.spare_leases.clear();
@@ -994,8 +1140,9 @@ impl SimHost {
     /// the FC config; the kernel device is still configured under the old pid.)
     fn is_resident_survivor(&self, idx: usize) -> bool {
         self.sandboxes[idx]
-            .kernel_owner
-            .is_some_and(|g| g < self.generation)
+            .disks
+            .iter()
+            .any(|(_, disk)| disk.kernel_owner.is_some_and(|g| g < self.generation))
     }
 
     /// Rung-2 PARK sandbox `idx`: the FC VM pauses but stays RESIDENT and its
@@ -1005,7 +1152,11 @@ impl SimHost {
     /// sandbox this generation is not currently serving.
     pub fn park(&mut self, idx: usize) {
         if let Some(slot) = self.sandboxes.get_mut(idx) {
-            if slot.served_by == Some(self.generation) {
+            if slot
+                .disks
+                .iter()
+                .all(|(_, disk)| disk.served_by == Some(self.generation))
+            {
                 slot.parked = true;
             }
         }
@@ -1018,31 +1169,38 @@ impl SimHost {
     /// FREE in the fresh post-roll pool, so `claim`'s fast path takes it with
     /// no retry (safe under paused tokio).
     async fn reserve_and_serve(&mut self, idx: usize) -> Result<(), String> {
-        if self.sandboxes[idx].served_by == Some(self.generation)
-            || self.finalize_pending(idx)
-            || self.terminally_destroyed(idx)
-        {
+        if self.finalize_pending(idx) || self.terminally_destroyed(idx) {
             return Ok(());
         }
-        let device = self.sandboxes[idx].nbd_device.clone();
-        let pool = self.nbd_pool.clone();
-        let Some(lease) = pool.claim(&device).await else {
-            return Err(format!(
-                "register rehydrate: claim of {} failed (not free?)",
-                device.display()
-            ));
-        };
-        // Rebuild the backend from the durable ref + adopt any spool (the
-        // seed-before-RECONFIGURE recovery leg). This is the recovery ARM the
-        // local-rehydrate pass adds to oracle #1's closure.
-        if self.sandboxes[idx].backend.is_none() {
-            self.rebuild(idx).await?;
+        if self.sandboxes[idx].disks.expected.iter().any(|role| {
+            self.sandboxes[idx]
+                .disks
+                .get(*role)
+                .is_none_or(|disk| disk.backend.is_none())
+        }) {
+            if let Err(error) = self.rebuild(idx).await {
+                self.sandboxes[idx].quarantine_parked = true;
+                return Err(error);
+            }
         }
-        let g = self.generation;
-        let s = &mut self.sandboxes[idx];
-        s.lease = Some(lease);
-        s.served_by = Some(g);
-        s.kernel_owner = Some(g);
+        let expected = self.sandboxes[idx].disks.expected.clone();
+        for (role, disk) in self.sandboxes[idx].disks.iter_mut() {
+            if !expected.contains(&role) {
+                continue;
+            }
+            if disk.served_by == Some(self.generation) {
+                continue;
+            }
+            let lease = self
+                .nbd_pool
+                .claim(&disk.nbd_device)
+                .await
+                .ok_or_else(|| "rehydrate claim failed".to_string())?;
+            disk.lease = Some(lease);
+            disk.served_by = Some(self.generation);
+            disk.kernel_owner = Some(self.generation);
+        }
+        self.sandboxes[idx].quarantine_parked = false;
         Ok(())
     }
 
@@ -1088,7 +1246,10 @@ impl SimHost {
                     continue;
                 }
                 let live = self.is_resident_survivor(idx);
-                let served = self.sandboxes[idx].served_by == Some(self.generation);
+                let served = self.sandboxes[idx]
+                    .disks
+                    .iter()
+                    .all(|(_, disk)| disk.served_by == Some(self.generation));
                 if engram_host_core::is_local_survivor_candidate(live, served, true) {
                     self.reserve_and_serve(idx).await?;
                 }
@@ -1121,34 +1282,42 @@ impl SimHost {
             .sandboxes
             .iter()
             .enumerate()
-            .map(|(idx, slot)| {
-                let liveness = match slot.kernel_owner {
-                    None => engram_host_core::PidLiveness::NoPid,
-                    Some(g) if g == gen => engram_host_core::PidLiveness::SelfPid,
-                    Some(_) => engram_host_core::PidLiveness::Dead,
-                };
-                // A resident guest still reading its rootfs is a live holder; a
-                // genuinely-gone guest is NoHolder. The sim never produces
-                // Unknown (no scan errors) — that fail-safe arm is pinned by the
-                // pure-core unit test.
-                let holder = if slot.guest_holds_device {
-                    engram_host_core::DeviceHolder::LiveHolder
-                } else {
-                    engram_host_core::DeviceHolder::NoHolder
-                };
-                let has_record =
-                    (slot.record_present && slot.guest_holds_device) || slot.quarantine_parked;
-                engram_host_core::StartupSlot {
-                    device: idx,
-                    liveness,
-                    holder,
-                    has_record,
-                    // engrams#1378: the sim models the pre-owner-record
-                    // (record-reconcile) classification; the attributed/
-                    // residue flow is the follow-up co-sim extension tracked
-                    // on #1378.
-                    attributed: false,
-                }
+            .flat_map(|(idx, slot)| {
+                slot.disks.iter().map(move |(role, disk)| {
+                    let liveness = match disk.kernel_owner {
+                        None => engram_host_core::PidLiveness::NoPid,
+                        Some(g) if g == gen => engram_host_core::PidLiveness::SelfPid,
+                        Some(_) => engram_host_core::PidLiveness::Dead,
+                    };
+                    // A resident guest still reading its rootfs is a live holder; a
+                    // genuinely-gone guest is NoHolder. The sim never produces
+                    // Unknown (no scan errors) — that fail-safe arm is pinned by the
+                    // pure-core unit test.
+                    let holder = if slot.guest_holds_device {
+                        engram_host_core::DeviceHolder::LiveHolder
+                    } else {
+                        engram_host_core::DeviceHolder::NoHolder
+                    };
+                    let has_record = (slot.record_present
+                        && slot.guest_holds_device
+                        && slot.disks.expected.contains(&role))
+                        || slot.quarantine_parked;
+                    engram_host_core::StartupSlot {
+                        device: if role == engram_core::DiskRole::Root {
+                            idx
+                        } else {
+                            idx + self.sandboxes.len()
+                        },
+                        liveness,
+                        holder,
+                        has_record,
+                        // engrams#1378: the sim models the pre-owner-record
+                        // (record-reconcile) classification; the attributed/
+                        // residue flow is the follow-up co-sim extension tracked
+                        // on #1378.
+                        attributed: false,
+                    }
+                })
             })
             .collect();
         engram_host_core::classify_startup_slots(slots)
@@ -1173,14 +1342,24 @@ impl SimHost {
             // Record the classification (oracle memory). Prod additionally fires
             // the `rehydrate-unknown-device` soft-invariant + counter; the sim's
             // observable is this set the quarantine oracles assert against.
-            let id = self.sandboxes[idx].sandbox_id;
+            let id = self.sandboxes[idx % self.sandboxes.len()].sandbox_id;
             self.quarantined_unknown.insert(id);
         }
         // reconnect devices are left kernel-bound (RECONNECTABLE) for a later
         // re-serve pass — never reaped. Only the terminal subset is DISCONNECTed.
         for idx in classification.reap.into_devices() {
             // NBD_CMD_DISCONNECT: proof of death met, no record — tear it down.
-            self.sandboxes[idx].kernel_owner = None;
+            let count = self.sandboxes.len();
+            let role = if idx < count {
+                engram_core::DiskRole::Root
+            } else {
+                engram_core::DiskRole::Swap
+            };
+            self.sandboxes[idx % count]
+                .disks
+                .get_mut(role)
+                .expect("classified device")
+                .kernel_owner = None;
         }
     }
 
@@ -1245,7 +1424,10 @@ impl SimHost {
         if !slot.parked {
             return false;
         }
-        let served = slot.served_by == Some(self.generation);
+        let served = slot
+            .disks
+            .iter()
+            .all(|(_, disk)| disk.served_by == Some(self.generation));
         if engram_host_core::resume_data_plane_served(true, served) {
             self.sandboxes[idx].parked = false;
             true
@@ -1298,7 +1480,12 @@ impl SimHost {
     /// devices + spare leases) — the "claimed + parked" term of the
     /// slot-accounting identity `free + warm + held == capacity`.
     pub fn leases_held(&self) -> usize {
-        let sandbox_leases = self.sandboxes.iter().filter(|s| s.lease.is_some()).count();
+        let sandbox_leases = self
+            .sandboxes
+            .iter()
+            .flat_map(|s| s.disks.iter())
+            .filter(|(_, d)| d.lease.is_some())
+            .count();
         sandbox_leases + self.spare_leases.len()
     }
 
@@ -1335,8 +1522,17 @@ impl SimHost {
             if self.terminally_destroyed(idx) {
                 continue;
             }
-            if self.sandboxes[idx].backend.is_none() {
-                self.rebuild(idx).await?;
+            if self.sandboxes[idx].disks.expected.iter().any(|role| {
+                self.sandboxes[idx]
+                    .disks
+                    .get(*role)
+                    .is_none_or(|disk| disk.backend.is_none())
+            }) {
+                if let Err(error) = self.rebuild(idx).await {
+                    self.sandboxes[idx].quarantine_parked = true;
+                    return Err(error);
+                }
+                self.sandboxes[idx].quarantine_parked = false;
             }
         }
         Ok(())
@@ -1396,85 +1592,146 @@ impl SimHost {
     /// seen exactly where a real rehydrate would see it.
     async fn rebuild_with(&mut self, idx: usize, fs: Arc<dyn HostFs>) -> Result<(), String> {
         let sandbox_id = self.sandboxes[idx].sandbox_id;
-        // Read the spool BEFORE picking the rebuild ref (store-ahead rule).
-        let spool = match spool::read_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id).await {
-            Ok(s) => s,
-            Err(_torn) => {
-                // Torn/spliced → discard + rebuild from the durable pointer.
-                spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id)
-                    .await
-                    .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
-                None
+        if !self.recovery_owners_loaded.contains(&idx) {
+            let mut roles = vec![engram_core::DiskRole::Root];
+            if let Some(swap) = &self.sandboxes[idx].disks.swap {
+                let owner_path = self
+                    .fs
+                    .root()
+                    .join("nbd-owners")
+                    .join(swap.nbd_device.file_name().expect("device name"));
+                let owner = fs.read(&owner_path).await.ok().and_then(|bytes| {
+                    serde_json::from_slice::<engram_host_agent::disk_daemon::owners::DiskOwner>(
+                        &bytes,
+                    )
+                    .ok()
+                });
+                if owner.is_some_and(|o| {
+                    o.sandbox_id == sandbox_id && o.role == engram_core::DiskRole::Swap
+                }) {
+                    roles.push(engram_core::DiskRole::Swap);
+                }
             }
-        };
-        let mut rebuild_ref = self.sandboxes[idx].rebuild_ref();
-        if let Some((meta, _)) = &spool {
-            let spool_ref = meta.manifest_ref();
-            if spool_ref.manifest_id == rebuild_ref.manifest_id
-                && spool_ref.version > rebuild_ref.version
-            {
-                // Store-ahead: attach from the spool's ref, adopt it as the
-                // durable pointer (coord's publish was lost).
-                rebuild_ref = spool_ref;
-                self.sandboxes[idx].published_ref = Some(spool_ref);
-            }
+            self.sandboxes[idx].disks.expected = roles.iter().copied().collect();
+            self.recovery_owners_loaded.insert(idx);
         }
-        let backend = build_backend(&self.store, self.fs.cache_dir(), idx, rebuild_ref).await;
-        if let Some((meta, chunks)) = spool {
-            // The REAL call site's lineage gate (`rehydrate_sandbox`): adopt
-            // only a same-lineage spool at-or-ahead-of the durable pointer
-            // (`meta.version >= disk_manifest.version`); a STALE spool (an
-            // older divergence than the durable tier — e.g. an eviction
-            // finalize published past it) is a loud discard, never an adopt
-            // of old bytes over newer durable state. The swarm found the sim
-            // missing the version half of this gate once Flow D could
-            // advance the durable pointer past a standing spool.
-            let spool_ref = meta.manifest_ref();
-            if spool_ref.manifest_id == rebuild_ref.manifest_id
-                && spool_ref.version >= rebuild_ref.version
-            {
-                // #810: adoption is atomic-and-fallible in prod; the sim's
-                // spool chunks come from the REAL spool reader (shape-valid
-                // by construction), so a refusal here is a world-model bug —
-                // surface it as a rebuild failure, mirroring prod's park.
-                backend
-                    .adopt_unflushed(chunks)
+        let roles: Vec<_> = self.sandboxes[idx].disks.expected.iter().copied().collect();
+        let swap_ref_path = self.swap_ref_path(idx);
+        let retry = self.sandboxes[idx].quarantine_parked;
+        for role in roles {
+            let disk = self.sandboxes[idx]
+                .disks
+                .get_mut(role)
+                .expect("listed role");
+            if retry && disk.backend.is_some() {
+                continue;
+            }
+            let swap_ref = if role == engram_core::DiskRole::Swap {
+                let sidecar = fs
+                    .read(&swap_ref_path)
                     .await
-                    .map_err(|e| format!("sandbox {idx}: spool adoption refused: {e}"))?;
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<ManifestRef>(&bytes).ok());
+                match sidecar {
+                    Some(disk_ref) => Some(disk_ref),
+                    None => Some(
+                        spool::read_spool_meta(fs.as_ref(), self.fs.spool_dir(), sandbox_id, role)
+                            .await
+                            .map_err(|e| format!("read swap spool: {e}"))?
+                            .ok_or("owned swap has no recovery manifest")?
+                            .manifest_ref(),
+                    ),
+                }
             } else {
-                // Stale refusal (an older divergence than the durable tier).
-                // Refusing is only SAFE when
-                // the durable tier already covers every spooled write — true
-                // for a legitimately-superseded spool (a later flush /
-                // eviction finalize published past it) by tag monotonicity.
-                // A refused spool holding a tag ABOVE the published floor
-                // means a durable-manifest advance failed to cover a spooled
-                // write, and discarding it rolls an acked write back under the
-                // live guest. Loud, never a silent discard of the only newer
-                // copy.
-                for (chunk_idx, bytes) in &chunks {
-                    let tag = decode_tag(bytes);
-                    let floor = self
-                        .ledger
-                        .handed_off_tag(idx, *chunk_idx as u64)
-                        .unwrap_or(0);
-                    if tag > floor {
-                        return Err(format!(
-                            "sandbox {idx}: stale-refused spool (stamped {spool_ref}, durable \
+                None
+            };
+            // Read the spool BEFORE picking the rebuild ref (store-ahead rule).
+            let spool =
+                match spool::read_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id, role).await {
+                    Ok(s) => s,
+                    Err(_torn) => {
+                        // Torn/spliced → discard + rebuild from the durable pointer.
+                        spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id, role)
+                            .await
+                            .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
+                        None
+                    }
+                };
+            let mut rebuild_ref =
+                swap_ref.unwrap_or_else(|| disk.published_ref.unwrap_or(disk.base_ref));
+            if let Some((meta, _)) = &spool {
+                let spool_ref = meta.manifest_ref();
+                if spool_ref.manifest_id == rebuild_ref.manifest_id
+                    && spool_ref.version > rebuild_ref.version
+                {
+                    // Store-ahead: attach from the spool's ref, adopt it as the
+                    // durable pointer (coord's publish was lost).
+                    rebuild_ref = spool_ref;
+                    disk.published_ref = Some(spool_ref);
+                }
+            }
+            let backend = build_backend(&self.store, self.fs.cache_dir(), idx, rebuild_ref).await;
+            if let Some((meta, chunks)) = spool {
+                // The REAL call site's lineage gate (`rehydrate_sandbox`): adopt
+                // only a same-lineage spool at-or-ahead-of the durable pointer
+                // (`meta.version >= disk_manifest.version`); a STALE spool (an
+                // older divergence than the durable tier — e.g. an eviction
+                // finalize published past it) is a loud discard, never an adopt
+                // of old bytes over newer durable state. The swarm found the sim
+                // missing the version half of this gate once Flow D could
+                // advance the durable pointer past a standing spool.
+                let spool_ref = meta.manifest_ref();
+                if spool_ref.manifest_id == rebuild_ref.manifest_id
+                    && spool_ref.version >= rebuild_ref.version
+                {
+                    // #810: adoption is atomic-and-fallible in prod; the sim's
+                    // spool chunks come from the REAL spool reader (shape-valid
+                    // by construction), so a refusal here is a world-model bug —
+                    // surface it as a rebuild failure, mirroring prod's park.
+                    backend
+                        .adopt_unflushed(chunks)
+                        .await
+                        .map_err(|e| format!("sandbox {idx}: spool adoption refused: {e}"))?;
+                } else {
+                    // Stale refusal (an older divergence than the durable tier).
+                    // Refusing is only SAFE when
+                    // the durable tier already covers every spooled write — true
+                    // for a legitimately-superseded spool (a later flush /
+                    // eviction finalize published past it) by tag monotonicity.
+                    // A refused spool holding a tag ABOVE the published floor
+                    // means a durable-manifest advance failed to cover a spooled
+                    // write, and discarding it rolls an acked write back under the
+                    // live guest. Loud, never a silent discard of the only newer
+                    // copy.
+                    for (chunk_idx, bytes) in &chunks {
+                        let tag = decode_tag(bytes);
+                        let ledger = match role {
+                            engram_core::DiskRole::Root => &self.ledger,
+                            engram_core::DiskRole::Swap => &self.swap_ledger,
+                        };
+                        let floor = ledger.handed_off_tag(idx, *chunk_idx as u64).unwrap_or(0);
+                        if tag > floor {
+                            return Err(format!(
+                                "sandbox {idx}: stale-refused spool (stamped {spool_ref}, durable \
                              {rebuild_ref}) holds chunk {chunk_idx} tag {tag} above the \
                              published floor {floor} — refusing it rolls back an acked write \
                              whose only copy was the spool (a durable-manifest advance failed \
                              to cover it)"
-                        ));
+                            ));
+                        }
                     }
                 }
+                // Adopted or stale: the spool is consumed either way.
+                spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id, role)
+                    .await
+                    .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
             }
-            // Adopted or stale: the spool is consumed either way.
-            spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id)
-                .await
-                .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
+            if role == engram_core::DiskRole::Swap {
+                disk.base_ref = rebuild_ref;
+                disk.published_ref = Some(rebuild_ref);
+            }
+            disk.backend = Some(Arc::new(backend));
         }
-        self.sandboxes[idx].backend = Some(Arc::new(backend));
         Ok(())
     }
 
@@ -1513,7 +1770,7 @@ impl SimHost {
         {
             return Ok(());
         }
-        if self.sandboxes[idx].backend.is_none() {
+        if self.sandboxes[idx].disks.root.backend.is_none() {
             return Ok(());
         }
         // 1. A flushed write raises the durable floor (the redundant copy).
@@ -1524,7 +1781,9 @@ impl SimHost {
         self.spool_export(idx).await?;
         // 3. The roll: RAM dies; the successor rehydrates from the (lied-about)
         //    spool. read #0 = meta.json, read #1 = the first chunk file.
-        self.sandboxes[idx].backend = None;
+        for (_, disk) in self.sandboxes[idx].disks.iter_mut() {
+            disk.backend = None;
+        }
         let fault = crate::fs_crash::ReadFault {
             on_read: if meta { 0 } else { 1 },
             corruption: crate::fs_crash::ReadCorruption::FlipByte { offset },
@@ -1555,7 +1814,17 @@ impl SimHost {
         let plan = engram_host_core::plan_shutdown(env_value, None);
         let overrun = plan.flush_deadline < SIM_FLUSH_COST;
         for idx in 0..self.sandboxes.len() {
-            let Some(backend) = self.sandboxes[idx].backend.clone() else {
+            if let Some(disk) = &self.sandboxes[idx].disks.swap {
+                self.effects
+                    .device
+                    .sync_device(&disk.nbd_device)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !overrun {
+                    self.flush_swap(idx).await?;
+                }
+            }
+            let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
                 continue;
             };
             // FinalFlush stage: force the host page cache down (seam-recorded),
@@ -1585,7 +1854,7 @@ impl SimHost {
                     });
                 if matches!(action, engram_host_core::SurvivorAction::Publish) {
                     let published = backend.manifest_ref().await;
-                    self.sandboxes[idx].published_ref = Some(published);
+                    self.sandboxes[idx].disks.root.published_ref = Some(published);
                     // Durable handoff via the published tier (the final-flush
                     // leg completed, so these chunks are durable independent of
                     // the spool that follows).
@@ -1650,11 +1919,16 @@ impl SimHost {
         let parkable = idx < self.sandboxes.len()
             && !self.finalize_pending(idx)
             && !self.sandboxes[idx].migrating
-            && self.sandboxes[idx].backend.is_some();
+            && self.sandboxes[idx].disks.root.backend.is_some();
         if !parkable {
             return self.sigterm(Some(0.5)).await; // 0.5 s < SIM_FLUSH_COST → overrun
         }
-        let backend = self.sandboxes[idx].backend.clone().expect("guarded above");
+        let backend = self.sandboxes[idx]
+            .disks
+            .root
+            .backend
+            .clone()
+            .expect("guarded above");
         // Guarantee a non-empty pipeline so the parked seam fires (chunk 1,
         // like flush_fence_abort).
         self.guest_write(idx, 1).await?;
@@ -1725,6 +1999,7 @@ impl SimHost {
             self.effects.fs.as_ref(),
             self.fs.spool_dir(),
             self.sandboxes[idx].sandbox_id,
+            engram_core::types::snapshot::DiskRole::Root,
         )
         .await
         .map_err(|e| format!("sigterm parked-flush spool read sandbox {idx}: {e}"))?
@@ -1755,11 +2030,11 @@ impl SimHost {
     /// the regression seed exists to drive into `rebuild`'s stale-refusal
     /// oracle.
     pub async fn detached_flush_publish(&mut self, idx: usize) -> Result<(), String> {
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+        let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
             return Ok(());
         };
         let published = backend.manifest_ref().await;
-        self.sandboxes[idx].published_ref = Some(published);
+        self.sandboxes[idx].disks.root.published_ref = Some(published);
         self.mark_flush_published(idx, published).await?;
         let req = LiveManifestPublishRequest {
             session_id: self.sandboxes[idx].session_id,
@@ -1823,7 +2098,14 @@ impl SimHost {
         // untracked RESIDENT survivor (the VM is there, its disk server
         // was never rehydrated — the 03e6535e pre-condition) is REFUSED,
         // never silently skipped into a manifestless snapshot.
-        let tracked = self.sandboxes[idx].backend.is_some();
+        let disks = &self.sandboxes[idx].disks;
+        let tracked = engram_host_core::all_disk_roles_served(
+            &disks.expected,
+            disks
+                .iter()
+                .filter(|(_, disk)| disk.backend.is_some())
+                .map(|(role, _)| role),
+        );
         match engram_host_core::plan_capture_disk_drain(tracked, true, true) {
             engram_host_core::CaptureDrainPlan::Drain => {}
             engram_host_core::CaptureDrainPlan::RefuseUntracked => {
@@ -1837,7 +2119,7 @@ impl SimHost {
                 unreachable!("every sim sandbox is NBD-backed on a data-plane host")
             }
         }
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+        let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
             return Ok(CaptureOutcome::NotCapturable);
         };
         let snapshot_id = SnapshotId::from(self.entropy.uuid());
@@ -1886,9 +2168,42 @@ impl SimHost {
             .await
             .map_err(|e| format!("snapshot_begin export sandbox {idx}: {e}"))?;
         drop(pending);
-        persist_disk_pending_chunks(&dest, &disk_chunks)
-            .await
-            .map_err(|e| format!("persist_disk_pending_chunks: {e}"))?;
+        persist_disk_pending_chunks(
+            &dest,
+            engram_core::types::snapshot::DiskRole::Root,
+            &disk_chunks,
+        )
+        .await
+        .map_err(|e| format!("persist_disk_pending_chunks: {e}"))?;
+        let mut disk_records = vec![DiskPendingRecord {
+            role: engram_core::DiskRole::Root,
+            base_manifest,
+            chunk_size: CHUNK_SIZE,
+            total_bytes: NUM_CHUNKS * CHUNK_SIZE,
+            chunks: disk_chunks.iter().map(|(i, h, _)| (*i, *h)).collect(),
+        }];
+        for (role, disk) in self.sandboxes[idx].disks.iter().skip(1) {
+            let backend = disk
+                .backend
+                .as_ref()
+                .expect("capture guard checked all disks");
+            backend.wait_idle().await;
+            let pending = backend.flush_local().await.map_err(|e| e.to_string())?;
+            let chunks = backend
+                .export_pending_chunks(&pending)
+                .await
+                .map_err(|e| e.to_string())?;
+            persist_disk_pending_chunks(&dest, role, &chunks)
+                .await
+                .map_err(|e| e.to_string())?;
+            disk_records.push(DiskPendingRecord {
+                role,
+                base_manifest: backend.manifest_ref().await,
+                chunk_size: backend.chunk_size(),
+                total_bytes: backend.total_bytes(),
+                chunks: chunks.iter().map(|(i, h, _)| (*i, *h)).collect(),
+            });
+        }
         let now = self.effects.clock.now_utc();
         let record = EvictionFinalizeRecord {
             snapshot_id,
@@ -1900,12 +2215,7 @@ impl SimHost {
             captured_at: now,
             dest,
             chain_prev_ref: None,
-            disk_pending: Some(DiskPendingRecord {
-                base_manifest,
-                chunk_size: CHUNK_SIZE,
-                total_bytes: NUM_CHUNKS * CHUNK_SIZE,
-                chunks: disk_chunks.iter().map(|(i, h, _)| (*i, *h)).collect(),
-            }),
+            disk_pending: disk_records,
             aux_bundles: Vec::new(),
             stage: FinalizeStage::Captured,
             attempts: 0,
@@ -1922,7 +2232,9 @@ impl SimHost {
         self.finalize_started.insert(snapshot_id);
         // The VM is paused for the whole finalize (and destroyed at its
         // terminal); the guest can no longer reach the data plane.
-        self.sandboxes[idx].backend = None;
+        for (_, disk) in self.sandboxes[idx].disks.iter_mut() {
+            disk.backend = None;
+        }
         self.capture_cut_acks.insert(idx, cut);
         Ok(CaptureOutcome::Began(snapshot_id))
     }
@@ -1936,7 +2248,7 @@ impl SimHost {
     pub async fn snapshot_begin_pre743(&mut self, idx: usize) -> Result<SnapshotId, String> {
         let sandbox_id = self.sandboxes[idx].sandbox_id;
         assert!(
-            self.sandboxes[idx].backend.is_none() && self.is_resident_survivor(idx),
+            self.sandboxes[idx].disks.root.backend.is_none() && self.is_resident_survivor(idx),
             "the pre-743 silent skip is only reachable for an untracked resident survivor",
         );
         let snapshot_id = SnapshotId::from(self.entropy.uuid());
@@ -1964,7 +2276,7 @@ impl SimHost {
             // THE BUG: no drain happened, so the record carries no disk
             // tier at all — indistinguishable from a legitimately
             // disk-less capture.
-            disk_pending: None,
+            disk_pending: Vec::new(),
             aux_bundles: Vec::new(),
             stage: FinalizeStage::Captured,
             attempts: 0,
@@ -1995,7 +2307,7 @@ impl SimHost {
         gated: bool,
     ) -> Result<ResumeOutcome, String> {
         assert!(
-            self.sandboxes[idx].backend.is_none() && !self.finalize_pending(idx),
+            self.sandboxes[idx].disks.root.backend.is_none() && !self.finalize_pending(idx),
             "resume targets a finalized (destroyed, non-pending) sandbox",
         );
         let poisoned = self.sandboxes[idx].poisoned_snapshot;
@@ -2015,7 +2327,7 @@ impl SimHost {
                     self.sandboxes[idx].rebuild_ref(),
                 )
                 .await;
-                self.sandboxes[idx].backend = Some(Arc::new(backend));
+                self.sandboxes[idx].disks.root.backend = Some(Arc::new(backend));
                 self.destroyer.forget(self.sandboxes[idx].sandbox_id);
                 Ok(ResumeOutcome::Attached)
             }
@@ -2033,10 +2345,10 @@ impl SimHost {
                     &self.store,
                     self.fs.cache_dir(),
                     idx,
-                    self.sandboxes[idx].base_ref,
+                    self.sandboxes[idx].disks.root.base_ref,
                 )
                 .await;
-                self.sandboxes[idx].backend = Some(Arc::new(backend));
+                self.sandboxes[idx].disks.root.backend = Some(Arc::new(backend));
                 Ok(ResumeOutcome::BootedStaleLiteral)
             }
             engram_host_core::ResumeAttachPlan::Materialize => {
@@ -2052,7 +2364,7 @@ impl SimHost {
     /// `RegisterRehydrate`); the adversarial ungated leg rides the G2 seeds.
     pub async fn finalized_resume(&mut self, idx: usize) -> Result<(), String> {
         if idx >= self.sandboxes.len()
-            || self.sandboxes[idx].backend.is_some()
+            || self.sandboxes[idx].disks.root.backend.is_some()
             || self.finalize_pending(idx)
             || !self.terminally_destroyed(idx)
         {
@@ -2091,7 +2403,7 @@ impl SimHost {
                 if let Some(published) = record.disk_manifest {
                     self.assert_finalize_covers_staging(idx, &record, published)
                         .await?;
-                    self.sandboxes[idx].published_ref = Some(published);
+                    self.sandboxes[idx].disks.root.published_ref = Some(published);
                     self.mark_flush_published(idx, published).await?;
                     // The capture cut's durability claim comes due: the VM
                     // is destroyed on this publish, so every write acked
@@ -2137,7 +2449,7 @@ impl SimHost {
         record: &EvictionFinalizeRecord,
         published: ManifestRef,
     ) -> Result<(), String> {
-        let Some(pending) = record.disk_pending.as_ref() else {
+        let Some(pending) = record.disk_pending.first() else {
             return Ok(());
         };
         let manifest = self
@@ -2195,12 +2507,12 @@ impl SimHost {
     /// dies.
     pub async fn spool_crash_at(&mut self, op_index: usize) -> Result<(), String> {
         // Guarantee a chunk-bearing spool exists to cut.
-        if let Some(backend) = self.sandboxes[0].backend.clone() {
+        if let Some(backend) = self.sandboxes[0].disks.root.backend.clone() {
             if backend.dirty_bytes().await == 0 {
                 self.guest_write(0, 0).await?;
             }
         }
-        let Some(backend) = self.sandboxes[0].backend.clone() else {
+        let Some(backend) = self.sandboxes[0].disks.root.backend.clone() else {
             self.die_abruptly();
             return Ok(());
         };
@@ -2212,6 +2524,7 @@ impl SimHost {
             self.effects.fs.as_ref(),
             self.fs.spool_dir(),
             sandbox_id,
+            engram_core::types::snapshot::DiskRole::Root,
             exported_ref,
             &chunks,
         )
@@ -2231,7 +2544,7 @@ impl SimHost {
             Err(e) => return Err(format!("spool_crash_at flush: {e}")),
         }
         let published = backend.manifest_ref().await;
-        self.sandboxes[0].published_ref = Some(published);
+        self.sandboxes[0].disks.root.published_ref = Some(published);
         self.mark_flush_published(0, published).await?;
         // The cut re-write: the process dies at fs-op `op_index` of a real
         // `write_spool` sequence. An error IS the crash landing.
@@ -2240,6 +2553,7 @@ impl SimHost {
             crash_fs.as_ref(),
             self.fs.spool_dir(),
             sandbox_id,
+            engram_core::types::snapshot::DiskRole::Root,
             exported_ref,
             &chunks,
         )
@@ -2265,7 +2579,7 @@ impl SimHost {
         {
             return Ok(()); // the export's capture lock excludes flushes
         }
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+        let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
             return Ok(());
         };
         // The drained-and-raced chunk is always chunk 0: write it (acked,
@@ -2361,7 +2675,7 @@ impl SimHost {
         {
             return Ok(()); // the export's capture lock excludes flushes
         }
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+        let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
             return Ok(());
         };
         self.guest_write(idx, 1).await?;
@@ -2422,7 +2736,7 @@ impl SimHost {
             self.die_abruptly();
             return Ok(());
         }
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+        let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
             self.die_abruptly();
             return Ok(());
         };
@@ -2466,7 +2780,7 @@ impl SimHost {
             || self.sandboxes[idx].migrating
             || self.sandboxes[idx].parked
             || self.finalize_pending(idx)
-            || self.sandboxes[idx].backend.is_none()
+            || self.sandboxes[idx].disks.root.backend.is_none()
         {
             return Ok(false);
         }
@@ -2492,7 +2806,7 @@ impl SimHost {
             export_id,
             sandbox_id,
             snapshot_dir,
-            disk_seal: None,
+            disk_seal: Default::default(),
             clock,
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(self.clock.now_mono())),
@@ -2563,7 +2877,9 @@ impl SimHost {
                 TtlVerdict::Destroy => {
                     self.migrations.remove(sandbox_id);
                     self.sandboxes[idx].migrating = false;
-                    self.sandboxes[idx].backend = None;
+                    for (_, disk) in self.sandboxes[idx].disks.iter_mut() {
+                        disk.backend = None;
+                    }
                 }
                 TtlVerdict::StayPaused => {}
             }
@@ -2580,7 +2896,9 @@ impl SimHost {
         let sandbox_id = self.sandboxes[idx].sandbox_id;
         self.migrations.remove(sandbox_id);
         self.sandboxes[idx].migrating = false;
-        self.sandboxes[idx].backend = None;
+        for (_, disk) in self.sandboxes[idx].disks.iter_mut() {
+            disk.backend = None;
+        }
     }
 
     /// Coordinator-driven EXPLICIT abort: the move never landed; the
@@ -2606,7 +2924,17 @@ impl SimHost {
     /// reconcile RAM dies, and the generation rolls.
     fn die_abruptly(&mut self) {
         for slot in &mut self.sandboxes {
-            slot.backend = None;
+            for (role, disk) in slot.disks.iter_mut() {
+                disk.backend = None;
+                if role == engram_core::DiskRole::Swap {
+                    disk.base_ref = ManifestRef {
+                        manifest_id: uuid::Uuid::nil(),
+                        version: 0,
+                    };
+                    disk.published_ref = None;
+                }
+            }
+            slot.disks.expected = [engram_core::DiskRole::Root].into_iter().collect();
             // The export registry is RAM: the frozen source's export dies
             // with the process (the reattached-source story is
             // reattach_source_verdict's — pinned as a pure-fn seed).
@@ -2617,6 +2945,7 @@ impl SimHost {
         }
         self.in_flight.clear();
         self.pending_finalizes.clear();
+        self.recovery_owners_loaded.clear();
         self.reconcile.crash_ram();
         self.roll_generation();
     }
@@ -2707,5 +3036,164 @@ impl BlobStorage for FaultablePutStorage {
         prefix: &str,
     ) -> Result<Vec<String>, engram_core::error::BlobError> {
         self.inner.list_prefix(prefix).await
+    }
+}
+
+#[cfg(test)]
+mod device_set_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn swap_oracles_cover_unflushed_and_corrupt_bytes() {
+        let mut host = SimHost::new(44, 1).await;
+        host.attach_swap(0).await.unwrap();
+        host.guest_write_swap(0, 0).await.unwrap();
+        assert!(crate::invariants::check_quiescent_floor(&host)
+            .await
+            .is_err());
+        host.flush_tick(0).await.unwrap();
+        crate::invariants::check_quiescent_floor(&host)
+            .await
+            .unwrap();
+        let backend = host.sandboxes[0]
+            .disks
+            .swap
+            .as_ref()
+            .unwrap()
+            .backend
+            .clone()
+            .unwrap();
+        backend.write(0, &synth_chunk(0)).await.unwrap();
+        assert_eq!(
+            crate::invariants::check(&host).await.unwrap_err().invariant,
+            "acked-write-durability"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn swap_missing_or_torn_lineage_stays_quarantined_until_retry() {
+        for fault in 0..3 {
+            let mut host = SimHost::new(42, 1).await;
+            host.attach_swap(0).await.unwrap();
+            host.guest_write_swap(0, 0).await.unwrap();
+            host.flush_tick(0).await.unwrap();
+            let path = host.swap_ref_path(0);
+            let saved = std::fs::read(&path).unwrap();
+            host.abrupt_crash().await.unwrap();
+            if fault == 0 {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"{").unwrap();
+            }
+            if fault == 2 {
+                let spool = host
+                    .fs
+                    .spool_dir()
+                    .join(format!("{}.swap", host.sandboxes[0].sandbox_id));
+                std::fs::create_dir_all(&spool).unwrap();
+                std::fs::write(spool.join("meta.json"), b"{").unwrap();
+            }
+            assert!(host.register_rehydrate(true, true).await.is_err());
+            assert!(host.sandboxes[0].quarantine_parked);
+            assert!(host.sandboxes[0].disks.root.backend.is_some());
+            assert!(host.sandboxes[0]
+                .disks
+                .swap
+                .as_ref()
+                .unwrap()
+                .backend
+                .is_none());
+            assert!(matches!(
+                host.snapshot_begin(0).await.unwrap(),
+                CaptureOutcome::RefusedUntracked
+            ));
+            std::fs::write(path, saved).unwrap();
+            host.register_rehydrate(true, true).await.unwrap();
+            assert!(!host.sandboxes[0].quarantine_parked);
+            crate::invariants::check_quiescent_floor(&host)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn swap_missing_or_torn_owner_is_not_rebuilt_from_ram() {
+        for torn in [false, true] {
+            let mut host = SimHost::new(43, 1).await;
+            host.attach_swap(0).await.unwrap();
+            let path = host.fs.root().join("nbd-owners/nbd1");
+            host.crash_process().await.unwrap();
+            if torn {
+                std::fs::write(path, b"{").unwrap();
+            } else {
+                std::fs::remove_file(path).unwrap();
+            }
+            host.register_rehydrate(true, true).await.unwrap();
+            let swap = host.sandboxes[0].disks.swap.as_ref().unwrap();
+            assert!(swap.backend.is_none());
+            assert!(swap.served_by.is_none());
+            assert!(!host.sandboxes[0]
+                .disks
+                .expected
+                .contains(&engram_core::DiskRole::Swap));
+            // Retrying an unattributed device must not rebuild the live root.
+            host.guest_write(0, 0).await.unwrap();
+            let root = host.sandboxes[0].disks.root.backend.clone().unwrap();
+            let bytes = root.read(0, CHUNK_SIZE).await.unwrap();
+            host.register_rehydrate(true, true).await.unwrap();
+            assert_eq!(
+                host.sandboxes[0]
+                    .disks
+                    .root
+                    .backend
+                    .as_ref()
+                    .unwrap()
+                    .read(0, CHUNK_SIZE)
+                    .await
+                    .unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn swap_spool_recovers_with_root_after_roll() {
+        let mut host = SimHost::new(41, 1).await;
+        host.attach_swap(0).await.unwrap();
+        host.guest_write(0, 0).await.unwrap();
+        host.guest_write_swap(0, 0).await.unwrap();
+        let expected = host.sandboxes[0]
+            .disks
+            .swap
+            .as_ref()
+            .unwrap()
+            .backend
+            .as_ref()
+            .unwrap()
+            .read(0, 4096)
+            .await
+            .unwrap();
+        host.sigterm(Some(0.001)).await.unwrap();
+        assert!(host.sandboxes[0]
+            .disks
+            .iter()
+            .all(|(_, disk)| disk.backend.is_none()));
+        host.register_rehydrate(true, true).await.unwrap();
+        let swap = host.sandboxes[0].disks.swap.as_ref().unwrap();
+        assert_eq!(swap.served_by, Some(host.generation));
+        assert_eq!(
+            swap.backend
+                .as_ref()
+                .unwrap()
+                .read(0, 4096)
+                .await
+                .unwrap()
+                .as_ref(),
+            expected.as_ref()
+        );
+        assert_eq!(host.leases_held(), 2);
+        let captured = host.snapshot_begin(0).await.unwrap();
+        assert!(matches!(captured, CaptureOutcome::Began(_)));
+        assert_eq!(host.in_flight[&0].disk_pending.len(), 2);
     }
 }

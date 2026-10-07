@@ -53,6 +53,14 @@ pub fn plan_capture_disk_drain(
     CaptureDrainPlan::NoNbdDisk
 }
 
+/// Every expected device must have a live server before capture or resume.
+pub fn all_disk_roles_served(
+    expected: &std::collections::BTreeSet<engram_core::DiskRole>,
+    served: impl IntoIterator<Item = engram_core::DiskRole>,
+) -> bool {
+    expected.is_subset(&served.into_iter().collect())
+}
+
 /// The resume rootfs-attach verdict for one snapshot restore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResumeAttachPlan {
@@ -93,6 +101,15 @@ pub fn plan_resume_attach(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_device_must_be_served() {
+        use engram_core::DiskRole::{Root, Swap};
+        let expected = [Root, Swap].into_iter().collect();
+        assert!(!all_disk_roles_served(&expected, [Root]));
+        assert!(all_disk_roles_served(&expected, [Root, Swap]));
+        assert!(all_disk_roles_served(&[Root].into_iter().collect(), [Root]));
+    }
 
     #[test]
     fn capture_drain_verdicts() {

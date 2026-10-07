@@ -61,6 +61,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use super::DiskRole;
 use engram_chunk_store::ChunkHash;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::SandboxId;
@@ -79,6 +80,8 @@ pub struct SpooledChunk {
 /// Completeness + lineage marker for one sandbox's spool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpoolMeta {
+    #[serde(default, skip_serializing_if = "DiskRole::is_root")]
+    pub role: DiskRole,
     /// Manifest lineage the spooled chunks diverge from.
     pub manifest_id: uuid::Uuid,
     /// Manifest version the spooled chunks diverge from.
@@ -99,8 +102,11 @@ impl SpoolMeta {
     }
 }
 
-fn spool_dir(root: &Path, sandbox_id: SandboxId) -> PathBuf {
-    root.join(sandbox_id.to_string())
+fn spool_dir(root: &Path, sandbox_id: SandboxId, role: DiskRole) -> PathBuf {
+    root.join(match role {
+        DiskRole::Root => sandbox_id.to_string(),
+        DiskRole::Swap => format!("{sandbox_id}.swap"),
+    })
 }
 
 /// Durably write `chunks` (chunk_idx → full chunk bytes) for
@@ -113,10 +119,11 @@ pub async fn write_spool(
     fs: &dyn HostFs,
     root: &Path,
     sandbox_id: SandboxId,
+    role: DiskRole,
     manifest_ref: ManifestRef,
     chunks: &[(usize, Vec<u8>)],
 ) -> io::Result<u64> {
-    let dir = spool_dir(root, sandbox_id);
+    let dir = spool_dir(root, sandbox_id, role);
     // Replace-don't-merge: a stale prior spool mixed with a fresh one
     // would splice chunks from two divergence points.
     match fs.remove_dir(&dir).await {
@@ -140,6 +147,7 @@ pub async fn write_spool(
     }
 
     let meta = SpoolMeta {
+        role,
         manifest_id: manifest_ref.manifest_id,
         version: manifest_ref.version,
         chunks: spooled,
@@ -174,8 +182,9 @@ pub async fn read_spool_meta(
     fs: &dyn HostFs,
     root: &Path,
     sandbox_id: SandboxId,
+    role: DiskRole,
 ) -> io::Result<Option<SpoolMeta>> {
-    let dir = spool_dir(root, sandbox_id);
+    let dir = spool_dir(root, sandbox_id, role);
     let meta_bytes = match fs.read(&dir.join("meta.json")).await {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -188,6 +197,12 @@ pub async fn read_spool_meta(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("spool meta: {e}")))?;
     let meta: SpoolMeta = serde_json::from_slice(&meta_body)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("spool meta body: {e}")))?;
+    if meta.role != role {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "spool role mismatch",
+        ));
+    }
     Ok(Some(meta))
 }
 
@@ -208,9 +223,10 @@ pub async fn read_spool(
     fs: &dyn HostFs,
     root: &Path,
     sandbox_id: SandboxId,
+    role: DiskRole,
 ) -> io::Result<Option<(SpoolMeta, Vec<(usize, Vec<u8>)>)>> {
-    let dir = spool_dir(root, sandbox_id);
-    let Some(meta) = read_spool_meta(fs, root, sandbox_id).await? else {
+    let dir = spool_dir(root, sandbox_id, role);
+    let Some(meta) = read_spool_meta(fs, root, sandbox_id, role).await? else {
         return Ok(None);
     };
 
@@ -275,8 +291,13 @@ pub async fn read_spool(
 }
 
 /// Remove the spool for `sandbox_id`, if any.
-pub async fn discard_spool(fs: &dyn HostFs, root: &Path, sandbox_id: SandboxId) -> io::Result<()> {
-    match fs.remove_dir(&spool_dir(root, sandbox_id)).await {
+pub async fn discard_spool(
+    fs: &dyn HostFs,
+    root: &Path,
+    sandbox_id: SandboxId,
+    role: DiskRole,
+) -> io::Result<()> {
+    match fs.remove_dir(&spool_dir(root, sandbox_id, role)).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -296,18 +317,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_marker_reads_as_root_and_roles_do_not_overlap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = SandboxId::new();
+        let dir = spool_dir(tmp.path(), sid, DiskRole::Root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = vec![7u8; 16];
+        std::fs::write(dir.join("chunk-0.bin"), &bytes).unwrap();
+        let legacy = serde_json::json!({ "manifest_id": refv(3).manifest_id, "version": 3,
+            "chunks": [{ "idx": 0, "digest": ChunkHash::of(&bytes) }] });
+        let marker = crate::durable_envelope::seal(&sid.to_string(), &legacy.to_string());
+        std::fs::write(dir.join("meta.json"), &marker).unwrap();
+        write_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            DiskRole::Swap,
+            refv(4),
+            &[(0, vec![9; 16])],
+        )
+        .await
+        .unwrap();
+        let (meta, chunks) = read_spool(&TokioFs, tmp.path(), sid, DiskRole::Root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.role, DiskRole::Root);
+        assert_eq!(chunks, vec![(0, bytes)]);
+        for cut in 0..marker.len() {
+            std::fs::write(dir.join("meta.json"), &marker[..cut]).unwrap();
+            assert!(read_spool(&TokioFs, tmp.path(), sid, DiskRole::Root)
+                .await
+                .is_err());
+            assert_eq!(
+                read_spool_meta(&TokioFs, tmp.path(), sid, DiskRole::Swap)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .role,
+                DiskRole::Swap
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn roundtrip_preserves_chunks_and_lineage() {
         let tmp = tempfile::tempdir().unwrap();
         let sid = SandboxId::new();
         let chunks = vec![(3usize, vec![7u8; 64]), (640, vec![9u8; 16])];
-        let bytes = write_spool(&TokioFs, tmp.path(), sid, refv(41), &chunks)
-            .await
-            .unwrap();
+        let bytes = write_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(41),
+            &chunks,
+        )
+        .await
+        .unwrap();
         assert_eq!(bytes, 80);
-        let (meta, back) = read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .unwrap();
+        let (meta, back) = read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(meta.manifest_ref(), refv(41));
         assert_eq!(back, chunks);
     }
@@ -316,18 +393,28 @@ mod tests {
     async fn absent_and_incomplete_spools_read_as_none() {
         let tmp = tempfile::tempdir().unwrap();
         let sid = SandboxId::new();
-        assert!(read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .unwrap()
+        .is_none());
         // Chunk file but no meta.json = crash mid-write → absent.
         let dir = tmp.path().join(sid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("chunk-0.bin"), b"x").unwrap();
-        assert!(read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     /// The local survivor-rehydrate pass's lineage probe (61a03b7e):
@@ -337,43 +424,86 @@ mod tests {
     async fn meta_only_read_yields_lineage_and_rejects_torn_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let sid = SandboxId::new();
-        assert!(read_spool_meta(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .is_none());
-        write_spool(&TokioFs, tmp.path(), sid, refv(16), &[(0, vec![1u8; 8])])
-            .await
-            .unwrap();
-        let meta = read_spool_meta(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .unwrap();
+        assert!(read_spool_meta(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .unwrap()
+        .is_none());
+        write_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(16),
+            &[(0, vec![1u8; 8])],
+        )
+        .await
+        .unwrap();
+        let meta = read_spool_meta(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(meta.manifest_ref(), refv(16));
         // The meta-only probe must ALSO be usable when chunk files are
         // gone (it never validates them — read_spool does).
         std::fs::remove_file(tmp.path().join(sid.to_string()).join("chunk-0.bin")).unwrap();
-        assert!(read_spool_meta(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(read_spool_meta(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .unwrap()
+        .is_some());
         // A torn/bit-rotted marker is a loud InvalidData, never a lineage.
         let meta_path = tmp.path().join(sid.to_string()).join("meta.json");
         let mut bytes = std::fs::read(&meta_path).unwrap();
         let mid = bytes.len() / 2;
         bytes.truncate(mid);
         std::fs::write(&meta_path, &bytes).unwrap();
-        assert!(read_spool_meta(&TokioFs, tmp.path(), sid).await.is_err());
+        assert!(read_spool_meta(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
     async fn complete_marker_with_wrong_count_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         let sid = SandboxId::new();
-        write_spool(&TokioFs, tmp.path(), sid, refv(1), &[(0, vec![1u8; 8])])
-            .await
-            .unwrap();
+        write_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(1),
+            &[(0, vec![1u8; 8])],
+        )
+        .await
+        .unwrap();
         std::fs::remove_file(tmp.path().join(sid.to_string()).join("chunk-0.bin")).unwrap();
-        assert!(read_spool(&TokioFs, tmp.path(), sid).await.is_err());
+        assert!(read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
@@ -384,25 +514,50 @@ mod tests {
             &TokioFs,
             tmp.path(),
             sid,
+            engram_core::types::snapshot::DiskRole::Root,
             refv(1),
             &[(0, vec![1u8; 8]), (1, vec![2u8; 8])],
         )
         .await
         .unwrap();
-        write_spool(&TokioFs, tmp.path(), sid, refv(2), &[(5, vec![3u8; 4])])
-            .await
-            .unwrap();
-        let (meta, back) = read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .unwrap();
+        write_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(2),
+            &[(5, vec![3u8; 4])],
+        )
+        .await
+        .unwrap();
+        let (meta, back) = read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(meta.version, 2);
         assert_eq!(back, vec![(5usize, vec![3u8; 4])]);
-        discard_spool(&TokioFs, tmp.path(), sid).await.unwrap();
-        assert!(read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .is_none());
+        discard_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .unwrap();
+        assert!(read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     // ── ADR 0099 H5: the post-crash on-disk state space, exhaustively.
@@ -417,7 +572,7 @@ mod tests {
     // sin the spool exists to prevent is a *silent* regression.)
 
     fn chunk_path(root: &Path, sid: SandboxId, idx: usize) -> PathBuf {
-        spool_dir(root, sid).join(format!("chunk-{idx}.bin"))
+        spool_dir(root, sid, DiskRole::Root).join(format!("chunk-{idx}.bin"))
     }
 
     /// State 1: a chunk file torn/short under a COMPLETE marker. The
@@ -438,22 +593,39 @@ mod tests {
         let good = vec![(0usize, full.clone()), (1usize, sibling.clone())];
 
         // The pristine spool reads back whole (the sweep's control).
-        write_spool(&TokioFs, tmp.path(), sid, refv(7), &good)
-            .await
-            .unwrap();
-        let (_m, back) = read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .unwrap();
+        write_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(7),
+            &good,
+        )
+        .await
+        .unwrap();
+        let (_m, back) = read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(back, good, "pristine spool must round-trip");
 
         // Truncate chunk 0 to every length shorter than full → digest
         // mismatch → Err. A zero-length truncation is included.
         for trunc in 0..full.len() {
             std::fs::write(chunk_path(tmp.path(), sid, 0), &full[..trunc]).unwrap();
-            let err = read_spool(&TokioFs, tmp.path(), sid)
-                .await
-                .expect_err("torn chunk must never read back as a complete spool");
+            let err = read_spool(
+                &TokioFs,
+                tmp.path(),
+                sid,
+                engram_core::types::snapshot::DiskRole::Root,
+            )
+            .await
+            .expect_err("torn chunk must never read back as a complete spool");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
 
@@ -462,15 +634,27 @@ mod tests {
         let mut flipped = full.clone();
         flipped[0] ^= 0xFF;
         std::fs::write(chunk_path(tmp.path(), sid, 0), &flipped).unwrap();
-        assert!(read_spool(&TokioFs, tmp.path(), sid).await.is_err());
+        assert!(read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .is_err());
 
         // Restoring the exact bytes makes the spool whole again — the
         // rejection was about content, not a wedged directory.
         std::fs::write(chunk_path(tmp.path(), sid, 0), &full).unwrap();
-        let (_m, back) = read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .unwrap();
+        let (_m, back) = read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(back, good, "restoring the bytes re-validates the spool");
     }
 
@@ -487,26 +671,44 @@ mod tests {
             &TokioFs,
             tmp.path(),
             sid,
+            engram_core::types::snapshot::DiskRole::Root,
             refv(3),
             &[(0, vec![1u8; 16]), (1, vec![2u8; 16])],
         )
         .await
         .unwrap();
         // Crash between the chunk writes and the marker fsync.
-        std::fs::remove_file(spool_dir(tmp.path(), sid).join("meta.json")).unwrap();
+        std::fs::remove_file(spool_dir(tmp.path(), sid, DiskRole::Root).join("meta.json")).unwrap();
         assert!(
-            read_spool(&TokioFs, tmp.path(), sid)
-                .await
-                .unwrap()
-                .is_none(),
+            read_spool(
+                &TokioFs,
+                tmp.path(),
+                sid,
+                engram_core::types::snapshot::DiskRole::Root
+            )
+            .await
+            .unwrap()
+            .is_none(),
             "no marker = incomplete spool = absent, never a partial adopt",
         );
         // And it is cleanable (the successor's discard path).
-        discard_spool(&TokioFs, tmp.path(), sid).await.unwrap();
-        assert!(read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .is_none());
+        discard_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .unwrap();
+        assert!(read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     /// State 3: a complete marker that lists a chunk whose file is gone.
@@ -520,15 +722,21 @@ mod tests {
             &TokioFs,
             tmp.path(),
             sid,
+            engram_core::types::snapshot::DiskRole::Root,
             refv(9),
             &[(0, vec![1u8; 8]), (4, vec![2u8; 8])],
         )
         .await
         .unwrap();
         std::fs::remove_file(chunk_path(tmp.path(), sid, 4)).unwrap();
-        let err = read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .expect_err("a marker referencing a missing chunk file must fail");
+        let err = read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .expect_err("a marker referencing a missing chunk file must fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -542,10 +750,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sid = SandboxId::new();
         let good = vec![(0usize, vec![1u8; 8]), (2usize, vec![2u8; 8])];
-        write_spool(&TokioFs, tmp.path(), sid, refv(5), &good)
-            .await
-            .unwrap();
-        let dir = spool_dir(tmp.path(), sid);
+        write_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(5),
+            &good,
+        )
+        .await
+        .unwrap();
+        let dir = spool_dir(tmp.path(), sid, DiskRole::Root);
         // Foreign siblings: an unparsable name, a bad-index name, a
         // leftover .partial tmpfile, a hidden file.
         std::fs::write(dir.join("README"), b"operator scratch").unwrap();
@@ -553,17 +768,27 @@ mod tests {
         std::fs::write(dir.join("chunk-abc.bin"), b"not a number").unwrap();
         std::fs::write(dir.join("chunk-0.bin.partial"), b"torn tmp").unwrap();
         std::fs::write(dir.join(".nfs0001"), b"stale nfs handle").unwrap();
-        let (_m, back) = read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .unwrap();
+        let (_m, back) = read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(back, good, "garbage siblings must not block valid chunks");
 
         // Now an unlisted but well-named extra chunk → reject (splice).
         std::fs::write(dir.join("chunk-9.bin"), vec![9u8; 8]).unwrap();
-        let err = read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .expect_err("an unlisted chunk-*.bin is an unaccounted splice");
+        let err = read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .expect_err("an unlisted chunk-*.bin is an unaccounted splice");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -576,22 +801,41 @@ mod tests {
     async fn unparsable_marker_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let sid = SandboxId::new();
-        write_spool(&TokioFs, tmp.path(), sid, refv(2), &[(0, vec![1u8; 8])])
-            .await
-            .unwrap();
-        let meta = spool_dir(tmp.path(), sid).join("meta.json");
+        write_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(2),
+            &[(0, vec![1u8; 8])],
+        )
+        .await
+        .unwrap();
+        let meta = spool_dir(tmp.path(), sid, DiskRole::Root).join("meta.json");
         // Truncated JSON (crash mid-marker-write).
         std::fs::write(&meta, b"{\"manifest_id\":\"abcd").unwrap();
         assert_eq!(
-            read_spool(&TokioFs, tmp.path(), sid)
-                .await
-                .unwrap_err()
-                .kind(),
+            read_spool(
+                &TokioFs,
+                tmp.path(),
+                sid,
+                engram_core::types::snapshot::DiskRole::Root
+            )
+            .await
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::InvalidData,
         );
         // Outright garbage.
         std::fs::write(&meta, b"\x00\xff not json at all").unwrap();
-        assert!(read_spool(&TokioFs, tmp.path(), sid).await.is_err());
+        assert!(read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .is_err());
     }
 
     /// State 6: a zero-chunk, ref-only spool — the "flush+manifest
@@ -603,20 +847,43 @@ mod tests {
     async fn zero_chunk_ref_only_spool_roundtrips_and_torn_ref_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let sid = SandboxId::new();
-        let bytes = write_spool(&TokioFs, tmp.path(), sid, refv(88), &[])
-            .await
-            .unwrap();
+        let bytes = write_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(88),
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(bytes, 0);
-        let (meta, back) = read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .unwrap()
-            .unwrap();
+        let (meta, back) = read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(meta.manifest_ref(), refv(88), "store-ahead ref preserved");
         assert!(back.is_empty(), "zero-chunk spool adopts an empty set");
 
         // Torn ref file on a zero-chunk spool → Err, not a phantom empty.
-        std::fs::write(spool_dir(tmp.path(), sid).join("meta.json"), b"{").unwrap();
-        assert!(read_spool(&TokioFs, tmp.path(), sid).await.is_err());
+        std::fs::write(
+            spool_dir(tmp.path(), sid, DiskRole::Root).join("meta.json"),
+            b"{",
+        )
+        .unwrap();
+        assert!(read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root
+        )
+        .await
+        .is_err());
     }
 
     /// State 7 (R5, storage lies): a marker corruption that stays
@@ -630,10 +897,17 @@ mod tests {
     async fn valid_but_bit_rotted_marker_is_rejected_not_trusted() {
         let tmp = tempfile::tempdir().unwrap();
         let sid = SandboxId::new();
-        write_spool(&TokioFs, tmp.path(), sid, refv(2), &[(0, vec![1u8; 8])])
-            .await
-            .unwrap();
-        let meta_path = spool_dir(tmp.path(), sid).join("meta.json");
+        write_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(2),
+            &[(0, vec![1u8; 8])],
+        )
+        .await
+        .unwrap();
+        let meta_path = spool_dir(tmp.path(), sid, DiskRole::Root).join("meta.json");
 
         // The lie: bump the marker's recorded version to 999 — still a valid
         // SpoolMeta, but the sealed content hash no longer matches. Mutate the
@@ -646,9 +920,14 @@ mod tests {
         env["body"] = serde_json::Value::String(serde_json::to_string(&meta).unwrap());
         std::fs::write(&meta_path, serde_json::to_vec(&env).unwrap()).unwrap();
 
-        let err = read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .expect_err("a bit-rotted-but-valid marker must be rejected, never trusted");
+        let err = read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .expect_err("a bit-rotted-but-valid marker must be rejected, never trusted");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("checksum"),
@@ -658,14 +937,27 @@ mod tests {
         // A MISDIRECTED marker — another sandbox's validly-sealed marker served
         // here — is caught on the identity binding, not the hash.
         let other = SandboxId::new();
-        write_spool(&TokioFs, tmp.path(), other, refv(2), &[(0, vec![1u8; 8])])
-            .await
-            .unwrap();
-        let foreign = std::fs::read(spool_dir(tmp.path(), other).join("meta.json")).unwrap();
+        write_spool(
+            &TokioFs,
+            tmp.path(),
+            other,
+            engram_core::types::snapshot::DiskRole::Root,
+            refv(2),
+            &[(0, vec![1u8; 8])],
+        )
+        .await
+        .unwrap();
+        let foreign =
+            std::fs::read(spool_dir(tmp.path(), other, DiskRole::Root).join("meta.json")).unwrap();
         std::fs::write(&meta_path, &foreign).unwrap();
-        let err = read_spool(&TokioFs, tmp.path(), sid)
-            .await
-            .expect_err("another sandbox's marker at this path is a misdirected read");
+        let err = read_spool(
+            &TokioFs,
+            tmp.path(),
+            sid,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .expect_err("another sandbox's marker at this path is a misdirected read");
         assert!(
             err.to_string().contains("identity"),
             "the rejection reason must name the identity binding: {err}",
