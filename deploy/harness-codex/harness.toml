@@ -25,43 +25,27 @@ user_env_hint = "Connect your ChatGPT account in Settings → Credentials. Perso
 provider = "openai-codex"
 delivery = "opaque_bundle"
 
-# Picker-visible catalog returned by the pinned Codex app-server's `model/list`.
-# Keep this snapshot in lockstep with the CLI pin in fetch-codex.sh.
+# Model options are model families (Sol, Astra, Luna), not pinned model ids.
+# Codex has no family alias, so each option maps its family to the current
+# model id in the pinned CLI's catalog (fetch-codex.sh). When a new model of a
+# family ships, change only its ENGRAM_CODEX_MODEL value; the option ids do
+# not change, so stored selections stay valid. ENGRAM_CODEX_MODEL must stay an
+# exact model id: the harness reports it as the generation's model.
 [[models]]
-id = "gpt-5.6-sol"
-label = "GPT-5.6 Sol"
+id = "sol"
+label = "GPT Sol"
 default = true
-env = { ENGRAM_CODEX_MODEL = "gpt-5.6-sol" }
+env = { ENGRAM_CODEX_MODEL = "gpt-6.1-sol" }
 
 [[models]]
-id = "gpt-5.6-terra"
-label = "GPT-5.6 Terra"
-env = { ENGRAM_CODEX_MODEL = "gpt-5.6-terra" }
+id = "astra"
+label = "GPT Astra"
+env = { ENGRAM_CODEX_MODEL = "gpt-6-astra" }
 
 [[models]]
-id = "gpt-5.6-luna"
-label = "GPT-5.6 Luna"
-env = { ENGRAM_CODEX_MODEL = "gpt-5.6-luna" }
-
-[[models]]
-id = "gpt-5.5"
-label = "GPT-5.5"
-env = { ENGRAM_CODEX_MODEL = "gpt-5.5" }
-
-[[models]]
-id = "gpt-5.4"
-label = "GPT-5.4"
-env = { ENGRAM_CODEX_MODEL = "gpt-5.4" }
-
-[[models]]
-id = "gpt-5.4-mini"
-label = "GPT-5.4 Mini"
-env = { ENGRAM_CODEX_MODEL = "gpt-5.4-mini" }
-
-[[models]]
-id = "gpt-5.3-codex-spark"
-label = "GPT-5.3 Codex Spark"
-env = { ENGRAM_CODEX_MODEL = "gpt-5.3-codex-spark" }
+id = "luna"
+label = "GPT Luna"
+env = { ENGRAM_CODEX_MODEL = "gpt-6-luna" }
 
 # Session modes (ADR 0107). Pure declaration: mode selection rides prompts
 # (harness_mode) and the harness maps `plan` to a read-only turn sandbox plus

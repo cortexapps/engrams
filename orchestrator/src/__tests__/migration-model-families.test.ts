@@ -28,6 +28,21 @@ const MIGRATIONS: FamilyMigration[] = [
     moved: { "opus-5": "opus", "fable-5": "fable" },
     kept: ["opus", "sonnet", "haiku", "custom-model"],
   },
+  {
+    file: "0096_codex_model_families.sql",
+    harness: "codex",
+    otherHarness: "claude",
+    moved: {
+      "gpt-5.6-sol": "sol",
+      "gpt-5.6-terra": "sol",
+      "gpt-5.6-luna": "luna",
+      "gpt-5.5": "sol",
+      "gpt-5.4": "sol",
+      "gpt-5.4-mini": "luna",
+      "gpt-5.3-codex-spark": "luna",
+    },
+    kept: ["sol", "astra", "luna", "gpt-6.1-sol", "custom-model"],
+  },
 ];
 
 const session = (id: string, model: string) => ({ id, type: "session", config: { model } });

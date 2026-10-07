@@ -74,6 +74,19 @@ mod tests {
         assert_eq!(d.egress.allow_hosts, vec!["statsig.anthropic.com"]);
         assert_eq!(d.native_egress.allow_hosts, vec!["api.anthropic.com"]);
         assert_eq!(d.router_protocols, vec!["anthropic_messages"]);
+        // Model option ids are family ids. Stored selections name them, so a
+        // change needs an orchestrator data migration.
+        assert_eq!(
+            d.models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["opus", "fable", "sonnet", "haiku"]
+        );
+        assert_eq!(
+            d.default_model().map(|model| model.id.as_str()),
+            Some("opus")
+        );
         // A built-in is never in the catalog: the name is resolved from here.
         assert!(builtin("definitely-not-a-builtin").is_none());
     }
@@ -107,22 +120,14 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-                "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex-spark",
-            ]
+            vec!["sol", "astra", "luna"]
         );
         assert_eq!(
             d.models
                 .iter()
                 .find(|model| model.default)
                 .map(|model| model.id.as_str()),
-            Some("gpt-5.6-sol")
+            Some("sol")
         );
         assert_eq!(b.stamp_key, "harness-codex");
     }
