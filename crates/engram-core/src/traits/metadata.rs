@@ -2961,7 +2961,7 @@ pub trait MetadataStore: Send + Sync {
     /// `stage_started_at` only when `stage` actually changes),
     /// `COALESCE`s in `fc_snapshot_version` once known, and — when
     /// `report.terminal` is `Some` — stamps `stage = 'done'` +
-    /// `result_bincode`, or `stage = 'failed'` + `error`/`error_stage`/
+    /// `result_json`, or `stage = 'failed'` + `error`/`error_stage`/
     /// `retryable`. Fenced `WHERE id = $1 AND epoch = $2 AND stage NOT
     /// IN ('done', 'failed')` — any replica can perform this write, no
     /// lease-holder identity to lose. Returns whether the row was
@@ -3045,7 +3045,7 @@ pub trait MetadataStore: Send + Sync {
     /// report from the just-abandoned attempt is fenced off by epoch, so
     /// [`Self::record_capture_job_report`] stays fenced on `(id, epoch)`
     /// and never needs weakening. Per-attempt fields
-    /// (`error`/`error_stage`/`retryable`/`result_bincode`/
+    /// (`error`/`error_stage`/`retryable`/`result_json`/
     /// `fc_snapshot_version`) are cleared and the stage/progress
     /// timestamps reset, mirroring what a fresh
     /// [`Self::insert_capture_job`] initializes.

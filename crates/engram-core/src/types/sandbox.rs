@@ -10,9 +10,6 @@ use serde::{Deserialize, Serialize};
 use super::ids::SandboxId;
 use super::image::NetworkPolicy;
 
-/// Host marker for a base-capture boot or harness probe.
-pub const BASE_CAPTURE_ENV: &str = "ENGRAM_BASE_CAPTURE";
-
 /// Maximum size of one composer/session file (ADR 0113).
 pub const MAX_SESSION_FILE_BYTES: u64 = 512 * 1024 * 1024;
 

@@ -40,6 +40,7 @@
 //! then `git add` the changed `golden/*.bin` and review the diff: an
 //! EXISTING golden file changing bytes is a RED FLAG (you broke the wire
 //! for a peer on the other side of a roll); only NEW files are expected.
+//! Persisted bincode is forbidden; use JSON for durable structured payloads.
 //!
 //! NOTE: every sample uses EMPTY or SINGLE-entry `HashMap`s and FIXED
 //! UUIDs / timestamps so the encoding is deterministic.
@@ -686,7 +687,8 @@ fn wire_version_pinned() {
     // it: `snapshot_metadata.bin` pins `migration_source: None`). Lockstep
     // coord+host roll.
     // 30 -> 31: migration disk items carry the device role.
-    // 31 -> 32: SnapshotMetadata appends swap_manifest (serde-default).
+    // 31 -> 32: SnapshotMetadata appends swap_manifest. Serde default does
+    // not decode old positional bincode; the exact-match wire gate makes the roll safe.
     // snapshot_metadata.bin gains one trailing zero byte for None.
     // Checkpoint adverts also carry the optional swap manifest.
     assert_eq!(

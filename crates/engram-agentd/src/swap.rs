@@ -6,11 +6,10 @@
 //! `mkswap` + `swapon`, and applies the reclaim sysctls sized for a
 //! guest whose file pages live on chunked-NBD backing.
 //!
-//! Cold boots and session binds arm inactive devices. Base-capture boots
-//! skip arming. An existing swap signature is never reformatted.
+//! Cold boots and session binds arm inactive devices.
+//! An existing swap signature is never reformatted.
 //! The bind-time kill switch disarms active swap.
 
-use engram_core::types::sandbox::BASE_CAPTURE_ENV;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -51,14 +50,6 @@ fn switched_off(value: Option<&str>) -> bool {
 /// Boot-time arm (cold boots: base capture, rung-2 recovery). Only the
 /// process env can carry the switch here — no session is bound yet.
 pub fn arm() {
-    if std::fs::read_to_string("/proc/cmdline").is_ok_and(|cmdline| {
-        cmdline
-            .split_whitespace()
-            .any(|arg| arg == "engram_base_capture=1")
-    }) {
-        tracing::info!("base capture boot; not arming swap");
-        return;
-    }
     let process_off = std::env::var(GUEST_SWAP_ENV).ok();
     if switched_off(process_off.as_deref()) {
         tracing::info!("guest swap disabled via {GUEST_SWAP_ENV}=off (process env); not arming");
@@ -100,11 +91,6 @@ pub fn arm_at_bind(env: &std::collections::HashMap<String, String>) {
                 "guest swap disabled via {GUEST_SWAP_ENV}=off; nothing armed to disarm",
             ),
         }
-        return;
-    }
-    // This flag comes from the current spawn, not the captured process env.
-    if env.get(BASE_CAPTURE_ENV).is_some_and(|v| v == "1") {
-        tracing::info!("base capture bind; not arming swap");
         return;
     }
     arm_inner();

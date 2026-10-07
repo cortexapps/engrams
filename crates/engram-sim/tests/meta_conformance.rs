@@ -718,7 +718,7 @@ async fn capture_job_scan_boundary(ctx: &Ctx) {
             progress: None,
             fc_snapshot_version: None,
             terminal: Some(CaptureTerminalReport::Done {
-                result_bincode: Vec::new(),
+                result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
             }),
         })
         .await
@@ -1452,7 +1452,7 @@ async fn sandbox_tombstones(ctx: &Ctx) {
             progress: None,
             fc_snapshot_version: None,
             terminal: Some(CaptureTerminalReport::Done {
-                result_bincode: Vec::new(),
+                result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
             }),
         })
         .await
@@ -5916,7 +5916,7 @@ async fn retirement_capture_and_enable_work(ctx: &Ctx) {
         progress: None,
         fc_snapshot_version: None,
         terminal: Some(CaptureTerminalReport::Done {
-            result_bincode: Vec::new(),
+            result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
         }),
     })
     .await
@@ -6928,4 +6928,140 @@ async fn snapshot_swap_pair_constraint(ctx: &Ctx) {
 conformance!(
     t_snapshot_swap_pair_constraint,
     super::snapshot_swap_pair_constraint
+);
+
+fn capture_result_fixture() -> engram_core::types::capture_job::CaptureJobResult {
+    serde_json::from_value(serde_json::json!({
+        "snapshot": {
+            "id": "00000000-0000-0000-0000-000000000123",
+            "size_bytes": 4096,
+            "created_at": "2026-01-01T00:00:00Z",
+            "image_version": "fixture:v1"
+        },
+        "cold_base": null
+    }))
+    .unwrap()
+}
+
+async fn cold_base_json_round_trip(ctx: &Ctx) {
+    use engram_core::types::capture_job::ColdBaseRow;
+    let mut snapshot = capture_result_fixture().snapshot;
+    snapshot.swap_manifest = Some(engram_core::types::manifest::ManifestRef {
+        manifest_id: uuid::Uuid::from_u128(0x456),
+        version: 7,
+    });
+    let row = ColdBaseRow {
+        content_key: "json-round-trip".into(),
+        snapshot_id: snapshot.id,
+        disk_manifest: "root".into(),
+        memory_manifest: "memory".into(),
+        fc_snapshot_version: "fixture".into(),
+        captured_at: snapshot.created_at,
+        snapshot_json: serde_json::to_value(&snapshot).unwrap(),
+    };
+    ctx.meta.upsert_cold_base(row.clone()).await.unwrap();
+    let got = ctx
+        .meta
+        .get_cold_base(&row.content_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let decoded: engram_core::types::snapshot::SnapshotMetadata =
+        serde_json::from_value(got.snapshot_json.clone()).unwrap();
+    assert_eq!(decoded.swap_manifest, snapshot.swap_manifest);
+    assert_eq!(got.snapshot_json, row.snapshot_json);
+    let mut replacement = row.clone();
+    replacement.snapshot_id = SnapshotId(uuid::Uuid::from_u128(0x999));
+    replacement.snapshot_json["id"] = serde_json::to_value(replacement.snapshot_id).unwrap();
+    ctx.meta
+        .upsert_cold_base(replacement.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .get_cold_base(&row.content_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot_json,
+        replacement.snapshot_json
+    );
+    assert_eq!(
+        ctx.meta.cold_base_snapshot_ids().await.unwrap(),
+        vec![replacement.snapshot_id]
+    );
+
+    // Named JSON fields keep serde defaults useful across field additions.
+    let mut old = got.snapshot_json;
+    old.as_object_mut().unwrap().remove("swap_manifest");
+    let decoded: engram_core::types::snapshot::SnapshotMetadata =
+        serde_json::from_value(old).unwrap();
+    assert!(decoded.swap_manifest.is_none());
+}
+
+async fn capture_job_result_json_round_trip(ctx: &Ctx) {
+    use engram_core::types::capture_job::{CapturedColdBase, ColdBaseMissReason};
+    let parent = ctx
+        .meta
+        .create_or_get_enable_job("conf:json-result", None, &ImageConfig::default())
+        .await
+        .unwrap()
+        .id;
+    let job = ctx
+        .meta
+        .insert_capture_job(new_capture(parent))
+        .await
+        .unwrap();
+    let mut result = capture_result_fixture();
+    result.snapshot.swap_manifest = Some(engram_core::types::manifest::ManifestRef {
+        manifest_id: uuid::Uuid::from_u128(0x789),
+        version: 3,
+    });
+    result.cold_base = Some(CapturedColdBase {
+        content_key: "nested-json".into(),
+        snapshot: result.snapshot.clone(),
+        freshly_captured: true,
+        miss_reason: Some(ColdBaseMissReason::NoCandidate),
+    });
+    let report = CaptureJobReport {
+        job_id: job.id,
+        epoch: job.epoch,
+        stage: CaptureJobStage::Done,
+        progress: None,
+        fc_snapshot_version: Some("fixture".into()),
+        terminal: Some(CaptureTerminalReport::Done {
+            result_bincode: bincode::serialize(&result).unwrap(),
+        }),
+    };
+    let mut malformed = report.clone();
+    malformed.terminal = Some(CaptureTerminalReport::Done {
+        result_bincode: vec![1],
+    });
+    assert!(matches!(
+        ctx.meta.record_capture_job_report(&malformed).await,
+        Err(MetaError::Serialization(_))
+    ));
+    let unchanged = ctx.meta.get_capture_job(job.id).await.unwrap().unwrap();
+    assert_eq!(unchanged.stage, CaptureJobStage::Assigned);
+    assert!(unchanged.result_json.is_none());
+    assert!(ctx.meta.record_capture_job_report(&report).await.unwrap());
+    let got = ctx.meta.get_capture_job(job.id).await.unwrap().unwrap();
+    let json = got.result_json.unwrap();
+    assert_eq!(json, serde_json::to_value(&result).unwrap());
+    let decoded: engram_core::types::capture_job::CaptureJobResult =
+        serde_json::from_value(json).unwrap();
+    assert_eq!(
+        decoded.snapshot.swap_manifest,
+        result.snapshot.swap_manifest
+    );
+    assert_eq!(decoded.cold_base.unwrap().content_key, "nested-json");
+}
+
+conformance!(
+    t_cold_base_json_round_trip,
+    super::cold_base_json_round_trip
+);
+conformance!(
+    t_capture_job_result_json_round_trip,
+    super::capture_job_result_json_round_trip
 );

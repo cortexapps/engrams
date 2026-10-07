@@ -2800,6 +2800,7 @@ impl MetadataStore for PostgresStore {
         )>,
         MetaError,
     > {
+        // Root only: phase 2b adds swap when swap manifests are materialized.
         // CTE picks the LATEST recoverable snapshot per session
         // (one row per session_id, ordered by created_at DESC).
         // The outer SELECT joins it with the VM-resident sessions
@@ -5206,6 +5207,7 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
+        // Root only: phase 2b adds swap when swap manifests are materialized.
         // The `idx_snapshots_disk_manifest` partial index (migration
         // 0018) makes this a fast scan over rows that actually have
         // a chunked manifest. Legacy rows (NULL disk_manifest_id)
@@ -6982,7 +6984,7 @@ impl MetadataStore for PostgresStore {
         const COLUMNS: &str = "id, enable_job_id, image_uri, manifest_digest, disk_manifest, \
             image_config, oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress, \
             last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version, \
-            result_bincode, created_at, updated_at";
+            result_json, created_at, updated_at";
         // ADR 0098 D3: stamp waiting_since AND the columns that otherwise
         // default to PG `now()` (stage_started_at / last_progress_at —
         // both compared by `expire_capture_job_stages` — plus created_at /
@@ -7063,7 +7065,7 @@ impl MetadataStore for PostgresStore {
             SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
                    oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
                    last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
-                   result_bincode, created_at, updated_at
+                   result_json, created_at, updated_at
               FROM capture_jobs
              WHERE id = $1
             "#,
@@ -7084,7 +7086,7 @@ impl MetadataStore for PostgresStore {
             SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
                    oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
                    last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
-                   result_bincode, created_at, updated_at
+                   result_json, created_at, updated_at
               FROM capture_jobs
              WHERE enable_job_id = $1
              ORDER BY created_at DESC
@@ -7118,15 +7120,15 @@ impl MetadataStore for PostgresStore {
             .map(serde_json::to_value)
             .transpose()
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
-        let (stage, retryable, error, error_stage, result_bincode): (
+        let (stage, retryable, error, error_stage, result_json): (
             &str,
             Option<bool>,
             Option<&str>,
             Option<&str>,
-            Option<&[u8]>,
+            Option<serde_json::Value>,
         ) = match &report.terminal {
-            Some(CaptureTerminalReport::Done { result_bincode }) => {
-                ("done", None, None, None, Some(result_bincode.as_slice()))
+            Some(terminal @ CaptureTerminalReport::Done { .. }) => {
+                ("done", None, None, None, terminal.result_json()?)
             }
             Some(CaptureTerminalReport::Failed {
                 error,
@@ -7152,7 +7154,7 @@ impl MetadataStore for PostgresStore {
                    retryable = COALESCE($6, retryable),
                    error = COALESCE($7, error),
                    error_stage = COALESCE($8, error_stage),
-                   result_bincode = COALESCE($9, result_bincode),
+                   result_json = COALESCE($9, result_json),
                    updated_at = $10
              WHERE id = $1 AND epoch = $2 AND stage NOT IN ('done', 'failed')
             "#,
@@ -7165,7 +7167,7 @@ impl MetadataStore for PostgresStore {
         .bind(retryable)
         .bind(error)
         .bind(error_stage)
-        .bind(result_bincode)
+        .bind(result_json)
         .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
@@ -7261,7 +7263,7 @@ impl MetadataStore for PostgresStore {
             RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
                       oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
                       last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
-                      result_bincode, created_at, updated_at
+                      result_json, created_at, updated_at
             "#,
         )
         .bind(id.as_uuid())
@@ -7321,7 +7323,7 @@ impl MetadataStore for PostgresStore {
             RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
                       oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
                       last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
-                      result_bincode, created_at, updated_at
+                      result_json, created_at, updated_at
             "#,
         )
         .bind(id.as_uuid())
@@ -7387,14 +7389,14 @@ impl MetadataStore for PostgresStore {
                    error = NULL,
                    error_stage = NULL,
                    retryable = NULL,
-                   result_bincode = NULL,
+                   result_json = NULL,
                    fc_snapshot_version = NULL,
                    updated_at = $5
              WHERE id = $1 AND epoch = $2 AND stage = 'failed' AND retryable AND attempts < $4
             RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
                       oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
                       last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
-                      result_bincode, created_at, updated_at
+                      result_json, created_at, updated_at
             "#,
         )
         .bind(id.as_uuid())
@@ -7427,7 +7429,7 @@ impl MetadataStore for PostgresStore {
             SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
                    oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
                    last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
-                   result_bincode, created_at, updated_at
+                   result_json, created_at, updated_at
               FROM capture_jobs
              WHERE stage NOT IN ('done', 'failed') AND host_id IS NOT NULL
             "#,
@@ -7461,7 +7463,7 @@ impl MetadataStore for PostgresStore {
             SELECT id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
                    oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
                    last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version,
-                   result_bincode, created_at, updated_at
+                   result_json, created_at, updated_at
               FROM capture_jobs
              WHERE stage NOT IN ('done', 'failed') AND host_id IS NULL
             "#,
@@ -7532,7 +7534,7 @@ impl MetadataStore for PostgresStore {
     async fn upsert_cold_base(&self, row: ColdBaseRow) -> Result<(), MetaError> {
         sqlx::query(
             r#"
-            INSERT INTO cold_bases (content_key, snapshot_id, disk_manifest, memory_manifest, fc_snapshot_version, captured_at, snapshot_bincode)
+            INSERT INTO cold_bases (content_key, snapshot_id, disk_manifest, memory_manifest, fc_snapshot_version, captured_at, snapshot_json)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (content_key) DO UPDATE SET
                 snapshot_id = EXCLUDED.snapshot_id,
@@ -7540,7 +7542,7 @@ impl MetadataStore for PostgresStore {
                 memory_manifest = EXCLUDED.memory_manifest,
                 fc_snapshot_version = EXCLUDED.fc_snapshot_version,
                 captured_at = EXCLUDED.captured_at,
-                snapshot_bincode = EXCLUDED.snapshot_bincode
+                snapshot_json = EXCLUDED.snapshot_json
             "#,
         )
         .bind(&row.content_key)
@@ -7549,7 +7551,7 @@ impl MetadataStore for PostgresStore {
         .bind(&row.memory_manifest)
         .bind(&row.fc_snapshot_version)
         .bind(row.captured_at)
-        .bind(&row.snapshot_bincode)
+        .bind(&row.snapshot_json)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -7559,7 +7561,7 @@ impl MetadataStore for PostgresStore {
     async fn get_cold_base(&self, content_key: &str) -> Result<Option<ColdBaseRow>, MetaError> {
         let row = sqlx::query(
             r#"
-            SELECT content_key, snapshot_id, disk_manifest, memory_manifest, fc_snapshot_version, captured_at, snapshot_bincode
+            SELECT content_key, snapshot_id, disk_manifest, memory_manifest, fc_snapshot_version, captured_at, snapshot_json
               FROM cold_bases
              WHERE content_key = $1
             "#,

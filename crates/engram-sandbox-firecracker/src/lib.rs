@@ -2428,13 +2428,6 @@ impl FirecrackerBackend {
             ),
             None => self.config.default_boot_args.clone(),
         };
-        if spec
-            .env
-            .get(engram_core::types::sandbox::BASE_CAPTURE_ENV)
-            .is_some_and(|v| v == "1")
-        {
-            boot_args.push_str(" engram_base_capture=1");
-        }
         // ADR 0019: propagate this cold-boot's trace context (+ a
         // guest-reachable OTLP collector) into the guest via the kernel
         // cmdline, so in-guest agentd roots its boot spans on this trace.

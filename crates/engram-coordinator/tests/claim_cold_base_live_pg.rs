@@ -233,7 +233,7 @@ async fn miss_with_fc_version_changed() {
         memory_manifest: format!("{}@v1", Uuid::new_v4()),
         fc_snapshot_version: "v9".to_string(),
         captured_at: Utc::now(),
-        snapshot_bincode: vec![1],
+        snapshot_json: serde_json::json!({}),
     })
     .await
     .expect("seed v9 cold base");
@@ -308,7 +308,7 @@ async fn hit_with_a_verified_present_candidate() {
         memory_manifest: mem_manifest_ref.to_string(),
         fc_snapshot_version: "v10".to_string(),
         captured_at: Utc::now(),
-        snapshot_bincode: bincode::serialize(&candidate_snapshot).unwrap(),
+        snapshot_json: serde_json::to_value(&candidate_snapshot).unwrap(),
     })
     .await
     .expect("seed hit candidate");
@@ -354,7 +354,7 @@ async fn miss_when_candidate_chunks_are_missing() {
         memory_manifest: ManifestRef::new().to_string(),
         fc_snapshot_version: "v10".to_string(),
         captured_at: Utc::now(),
-        snapshot_bincode: vec![1],
+        snapshot_json: serde_json::json!({}),
     })
     .await
     .expect("seed dangling cold base");

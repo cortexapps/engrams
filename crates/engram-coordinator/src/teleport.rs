@@ -420,6 +420,7 @@ mod steps {
                 image_version: durable
                     .as_ref()
                     .map_or_else(|| session.image.clone(), |s| s.image_version.clone()),
+                // S3 supplies the migration-source swap manifest.
                 swap_manifest: None,
                 disk_manifest: presetup.disk_manifest_ref,
                 memory_manifest: Some(presetup.memory_manifest_ref),

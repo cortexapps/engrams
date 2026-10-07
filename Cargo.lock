@@ -2893,6 +2893,7 @@ name = "engram-sim"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "bytes",
  "chrono",
  "engram-core",

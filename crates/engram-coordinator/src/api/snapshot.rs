@@ -2332,6 +2332,7 @@ pub async fn verify_snapshot_recoverable(
     memory: Option<&ManifestRef>,
     swap: Option<&ManifestRef>,
 ) -> bool {
+    // S4: swap alone cannot restore a guest; root or memory must also exist.
     let any_present = disk.is_some() || memory.is_some();
     for (kind, reference) in [("disk", disk), ("memory", memory), ("swap", swap)] {
         if let Some(reference) = reference {

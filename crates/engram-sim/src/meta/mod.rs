@@ -261,8 +261,9 @@ pub struct SimDb {
     pub session_capabilities:
         std::collections::BTreeMap<SessionId, Vec<engram_core::types::capability::Capability>>,
     pub session_integration_policy: std::collections::BTreeMap<SessionId, String>,
-    /// `cold_bases`: snapshot ids pinned as cold base images.
-    pub cold_bases: std::collections::BTreeSet<SnapshotId>,
+    /// `cold_bases`: content-keyed base snapshots, also pinned against GC.
+    pub cold_bases:
+        std::collections::BTreeMap<String, engram_core::types::capture_job::ColdBaseRow>,
     /// Every session-status flip this store performed, in order — the
     /// D6 transition-legality oracle's input (defense-in-depth over the
     /// FSM checks in the write paths, and it catches direct-write bugs

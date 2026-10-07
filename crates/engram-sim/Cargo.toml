@@ -22,6 +22,7 @@ uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+bincode.workspace = true
 engram-postgres.workspace = true
 engram-testkit.workspace = true
 sqlx.workspace = true

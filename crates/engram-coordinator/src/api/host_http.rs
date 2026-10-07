@@ -2413,7 +2413,7 @@ mod tests {
                 error: None,
                 error_stage: None,
                 fc_snapshot_version: None,
-                result_bincode: None,
+                result_json: None,
                 created_at: now,
                 updated_at: now,
             }

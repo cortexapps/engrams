@@ -838,8 +838,8 @@ pub(crate) async fn resolve_cold_base_plan(
         };
     }
 
-    match bincode::deserialize::<engram_core::types::snapshot::SnapshotMetadata>(
-        &candidate.snapshot_bincode,
+    match serde_json::from_value::<engram_core::types::snapshot::SnapshotMetadata>(
+        candidate.snapshot_json,
     ) {
         Ok(snapshot) => ColdBasePlan::Hit {
             content_key,
@@ -848,7 +848,7 @@ pub(crate) async fn resolve_cold_base_plan(
         Err(e) => {
             tracing::warn!(
                 %content_key, snapshot_id = %candidate.snapshot_id, error = %e,
-                "resolve_cold_base_plan: cold_bases row's snapshot_bincode failed to decode; \
+                "resolve_cold_base_plan: cold_bases row's snapshot_json failed to decode; \
                  treating as a miss",
             );
             ColdBasePlan::Miss {
@@ -996,8 +996,8 @@ pub(crate) async fn place_capture_job_preferring_materialize_host(
 pub(crate) type FinalizeOutcome = (ReuseHit, &'static str);
 
 /// ADR 0084 P1b/P3: consume a `stage == Done` `capture_jobs` row —
-/// decode its `result_bincode` (the executor's `CaptureJobResult`,
-/// bincode-encoded), verify the chunked manifests are actually durable,
+/// decode its `result_json` (the executor's `CaptureJobResult`,
+/// JSON-encoded), verify the chunked manifests are actually durable,
 /// record the `snapshots` row, and (P3) record/skip the `cold_bases` row
 /// per the executor's `cold_base` outcome. Mirrors the tail of the old
 /// `capture_and_record_base_snapshot` exactly, except the FC
@@ -1008,16 +1008,16 @@ pub(crate) async fn finalize_capture_job(
     state: &SharedState,
     capture_row: &engram_core::types::capture_job::CaptureJobRow,
 ) -> Result<FinalizeOutcome, ApiError> {
-    let bytes = capture_row.result_bincode.as_deref().ok_or_else(|| {
+    let json = capture_row.result_json.as_ref().ok_or_else(|| {
         ApiError::Internal(format!(
-            "capture job {} is `done` but carries no result_bincode",
+            "capture job {} is `done` but carries no result_json",
             capture_row.id
         ))
     })?;
-    let result: engram_core::types::capture_job::CaptureJobResult = bincode::deserialize(bytes)
-        .map_err(|e| {
+    let result: engram_core::types::capture_job::CaptureJobResult =
+        serde_json::from_value(json.clone()).map_err(|e| {
             ApiError::Internal(format!(
-                "capture job {} result_bincode failed to decode: {e}",
+                "capture job {} result_json failed to decode: {e}",
                 capture_row.id
             ))
         })?;
@@ -1089,7 +1089,7 @@ pub(crate) async fn finalize_capture_job(
                     capture_row.id
                 ))
             })?;
-            let snapshot_bincode = bincode::serialize(&cb.snapshot).map_err(|e| {
+            let snapshot_json = serde_json::to_value(&cb.snapshot).map_err(|e| {
                 ApiError::Internal(format!(
                     "capture job {}: failed to re-encode cold-base snapshot for storage: {e}",
                     capture_row.id
@@ -1105,7 +1105,7 @@ pub(crate) async fn finalize_capture_job(
                     memory_manifest: memory_manifest_text,
                     fc_snapshot_version,
                     captured_at: cb.snapshot.created_at,
-                    snapshot_bincode,
+                    snapshot_json,
                 })
                 .await?;
             label
@@ -1323,7 +1323,7 @@ mod tests {
                 error: None,
                 error_stage: None,
                 fc_snapshot_version: None,
-                result_bincode: None,
+                result_json: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             }

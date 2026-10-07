@@ -203,7 +203,7 @@ async fn insert_capture_job_dedups_active_jobs_per_enable_job() {
         progress: None,
         fc_snapshot_version: Some("v6".into()),
         terminal: Some(CaptureTerminalReport::Done {
-            result_bincode: vec![1, 2, 3],
+            result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
         }),
     };
     assert!(meta
@@ -299,7 +299,7 @@ async fn terminal_reports_land_once_and_become_immutable() {
         progress: None,
         fc_snapshot_version: Some("v9".into()),
         terminal: Some(CaptureTerminalReport::Done {
-            result_bincode: vec![9, 9, 9],
+            result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
         }),
     };
     assert!(meta
@@ -308,7 +308,10 @@ async fn terminal_reports_land_once_and_become_immutable() {
         .expect("done report"));
     let got = meta.get_capture_job(job.id).await.unwrap().unwrap();
     assert_eq!(got.stage, CaptureJobStage::Done);
-    assert_eq!(got.result_bincode.as_deref(), Some(&[9, 9, 9][..]));
+    assert_eq!(
+        got.result_json,
+        Some(serde_json::to_value(capture_result_fixture()).unwrap())
+    );
     assert_eq!(got.fc_snapshot_version.as_deref(), Some("v9"));
 
     // Re-advertising the SAME terminal report (the host keeps sending it
@@ -582,7 +585,7 @@ async fn redrive_revives_a_retryable_terminal_row_under_budget() {
         redriven.error.is_none()
             && redriven.error_stage.is_none()
             && redriven.retryable.is_none()
-            && redriven.result_bincode.is_none()
+            && redriven.result_json.is_none()
             && redriven.fc_snapshot_version.is_none(),
         "per-attempt fields must be cleared, mirroring a fresh insert",
     );
@@ -715,7 +718,7 @@ async fn capture_assignments_for_host_lists_only_active_rows_for_that_host() {
         progress: None,
         fc_snapshot_version: None,
         terminal: Some(CaptureTerminalReport::Done {
-            result_bincode: vec![],
+            result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
         }),
     };
     assert!(meta
@@ -802,7 +805,7 @@ async fn cold_base_upsert_and_get_round_trip() {
         memory_manifest: format!("{}@v1", Uuid::new_v4()),
         fc_snapshot_version: "v6".into(),
         captured_at: Utc::now(),
-        snapshot_bincode: vec![1, 2, 3, 4],
+        snapshot_json: serde_json::to_value(capture_result_fixture().snapshot).unwrap(),
     };
     meta.upsert_cold_base(row.clone()).await.expect("upsert");
 
@@ -815,7 +818,7 @@ async fn cold_base_upsert_and_get_round_trip() {
     assert_eq!(got.fc_snapshot_version, "v6");
     assert_eq!(got.disk_manifest, row.disk_manifest);
     assert_eq!(got.memory_manifest, row.memory_manifest);
-    assert_eq!(got.snapshot_bincode, row.snapshot_bincode);
+    assert_eq!(got.snapshot_json, row.snapshot_json);
 
     // Re-upsert at the same content key with a NEW snapshot_id (a
     // recapture landing under identical content) must overwrite, not
@@ -881,7 +884,7 @@ async fn cold_base_fc_version_changed_detects_a_version_drift_on_the_same_disk_m
         memory_manifest: format!("{}@v1", Uuid::new_v4()),
         fc_snapshot_version: "v9".into(),
         captured_at: Utc::now(),
-        snapshot_bincode: vec![1],
+        snapshot_json: serde_json::to_value(capture_result_fixture().snapshot).unwrap(),
     };
     meta.upsert_cold_base(row).await.expect("upsert v9 row");
 
@@ -935,7 +938,7 @@ async fn placed_capture_job_counts_as_live_enable_work() {
         progress: None,
         fc_snapshot_version: Some("v6".into()),
         terminal: Some(CaptureTerminalReport::Done {
-            result_bincode: vec![1],
+            result_bincode: bincode::serialize(&capture_result_fixture()).unwrap(),
         }),
     };
     assert!(meta
@@ -952,4 +955,110 @@ async fn placed_capture_job_counts_as_live_enable_work() {
         0,
         "a terminal capture releases the host: {work:?}"
     );
+}
+
+fn capture_result_fixture() -> engram_core::types::capture_job::CaptureJobResult {
+    serde_json::from_value(serde_json::json!({
+        "snapshot": {
+            "id": "00000000-0000-0000-0000-000000000123",
+            "size_bytes": 4096,
+            "created_at": "2026-01-01T00:00:00Z",
+            "image_version": "fixture:v1"
+        },
+        "cold_base": null
+    }))
+    .unwrap()
+}
+
+/// Exercise the data break with old positional blobs, without decoding them.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn capture_job_json_migration_retries_only_unfinalized_results() {
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
+        return;
+    };
+    let mut tx = db.store.pool().begin().await.unwrap();
+    // Temporary tables shadow the current schema and model the old columns.
+    sqlx::raw_sql(
+        "CREATE TEMP TABLE snapshots (id UUID);
+         CREATE TEMP TABLE cold_bases (snapshot_bincode BYTEA);
+         INSERT INTO cold_bases VALUES ('\\x0102');
+         CREATE TEMP TABLE enable_jobs (id INTEGER, state TEXT);
+         INSERT INTO enable_jobs VALUES (1, 'capturing'), (2, 'prestaging'), (3, 'ready'), (4, 'failed');
+         CREATE TEMP TABLE capture_jobs (
+             enable_job_id INTEGER, stage TEXT, retryable BOOLEAN, attempts INTEGER,
+             error TEXT, error_stage TEXT, stage_progress JSONB, result_bincode BYTEA
+         );
+         INSERT INTO capture_jobs VALUES
+             (1, 'done', NULL, 99, NULL, NULL, '{}', '\\x0102'),
+             (2, 'done', NULL, 1, NULL, NULL, '{}', '\\x0102'),
+             (3, 'done', NULL, 1, NULL, NULL, '{}', '\\x0102'),
+             (1, 'warming', NULL, 2, NULL, NULL, '{}', NULL),
+             (4, 'done', NULL, 99, NULL, NULL, '{}', '\\x0102');",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../deploy/migrations/0123_snapshots_swap_manifest.sql"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    #[derive(sqlx::FromRow)]
+    struct MigratedJob {
+        enable_job_id: i32,
+        stage: String,
+        retryable: Option<bool>,
+        attempts: i32,
+        error: Option<String>,
+    }
+    let rows: Vec<MigratedJob> = sqlx::query_as(
+        "SELECT enable_job_id, stage, retryable, attempts, error
+         FROM capture_jobs ORDER BY enable_job_id, stage",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        match (row.enable_job_id, row.stage.as_str()) {
+            (1 | 4, "failed") => {
+                assert_eq!(row.retryable, Some(true));
+                assert_eq!(row.attempts, 0);
+                assert_eq!(
+                    row.error.as_deref(),
+                    Some(
+                        "capture result invalidated by JSON storage migration; recapture required"
+                    )
+                );
+            }
+            (1, "warming") => {
+                assert_eq!(row.retryable, None);
+                assert_eq!(row.attempts, 2);
+                assert_eq!(row.error, None);
+            }
+            (2 | 3, "done") => {
+                assert_eq!(row.retryable, None);
+                assert_eq!(row.attempts, 1);
+                assert_eq!(row.error, None);
+            }
+            _ => panic!("unexpected migrated job state"),
+        }
+    }
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cold_bases")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    let old_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_attribute
+         WHERE attrelid IN ('pg_temp.cold_bases'::regclass, 'pg_temp.capture_jobs'::regclass)
+         AND attname IN ('snapshot_bincode', 'result_bincode') AND NOT attisdropped",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(old_columns, 0);
+    tx.rollback().await.unwrap();
 }

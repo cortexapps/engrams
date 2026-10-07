@@ -9115,7 +9115,7 @@ impl SandboxBackend for PooledBackend {
         use engram_core::types::capture_job::{CaptureJobResult, CapturedColdBase, ColdBasePlan};
 
         let engram_core::traits::sandbox::BuildBaseSnapshotRequest {
-            mut spec,
+            spec,
             warm,
             capture_env,
             capture_egress,
@@ -9156,16 +9156,6 @@ impl SandboxBackend for PooledBackend {
         // plus whatever secrets the warm boot needs.
         let mut session_env = spec.env.clone();
         session_env.extend(capture_env);
-        // The boot marker stops cold-boot arming. The spawn marker stops
-        // capture probes from arming, without affecting later session binds.
-        spec.env.insert(
-            engram_core::types::sandbox::BASE_CAPTURE_ENV.into(),
-            "1".into(),
-        );
-        session_env.insert(
-            engram_core::types::sandbox::BASE_CAPTURE_ENV.into(),
-            "1".into(),
-        );
         let is_warm = warm.is_some();
         // Captured before `spec` moves into `create` — the balloon
         // reclaim target below derives from guest RAM size.
