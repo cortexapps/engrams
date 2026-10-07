@@ -11240,6 +11240,72 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn base_capture_propagates_guest_death() {
+        struct DeadGuest(Arc<std::sync::atomic::AtomicBool>);
+        #[async_trait]
+        impl SandboxBackend for DeadGuest {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Ok(SandboxId::new())
+            }
+            async fn wait_agent_ready(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Err(SandboxError::Vm(
+                    "guest died before agentd dialed ready port: Kernel panic: capture-tail-marker"
+                        .into(),
+                ))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                unreachable!("dead guest must not execute a warm hook")
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                unreachable!("dead guest must not be captured")
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                unreachable!("dead guest has no snapshot")
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                unreachable!("cold boot")
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                unreachable!("base capture does not start a harness")
+            }
+        }
+        let destroyed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pooled = PooledBackend::new(Arc::new(DeadGuest(destroyed.clone())));
+        let (progress, _rx) = tokio::sync::mpsc::channel(16);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pooled.build_base_snapshot(
+                engram_core::traits::sandbox::BuildBaseSnapshotRequest {
+                    spec: live_spec("dead-guest"),
+                    warm: None,
+                    capture_env: Default::default(),
+                    capture_egress: None,
+                    cold_base_plan: engram_core::types::capture_job::ColdBasePlan::NotApplicable,
+                },
+                progress,
+            ),
+        )
+        .await
+        .expect("capture must fail promptly")
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("guest died before agentd dialed"), "{error}");
+        assert!(error.contains("capture-tail-marker"), "{error}");
+        assert!(destroyed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     /// Review finding 1: a slow cold boot (agentd-ready takes a while)
     /// must keep emitting `phase=boot` `CaptureProgress` on the keepalive
     /// interval — not just the one frame at the very start — or the
