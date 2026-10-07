@@ -151,6 +151,8 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     let peer = common::postcopy::peer(&pooled).await;
     let base = common::postcopy::base(&pooled, spec).await;

@@ -2404,6 +2404,8 @@ mod tests {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
             swap_mib: None,
+            swap_source: None,
+            swap_manifest: None,
         };
         let sandbox_id = state.services.host.create(spec).await.unwrap();
         state

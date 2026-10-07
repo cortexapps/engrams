@@ -4332,7 +4332,6 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
-                   util_committed_swap_mib,
                    ready_images, current_bundles, sandbox_bundles,
                    cordoned, cordon_owner, cordon_reason, retire_requested_at, retired_at, total_vcpus, wire_version, stages_images, capabilities,
                    lease_expires_at, lease_state, lease_epoch,
@@ -4426,8 +4425,7 @@ impl MetadataStore for PostgresStore {
                       capabilities = $19,
                       stages_images = $20,
                       last_heartbeat_at = $21,
-                      util_committed_swap_mib = $22,
-                      sandbox_bundles = $23,
+                      sandbox_bundles = $22,
                       -- ADR 0116 A-D3: the lease renewal rides the SAME
                       -- per-heartbeat UPDATE (single writer, single clock).
                       -- GREATEST: a predecessor's last racing heartbeat can
@@ -4436,11 +4434,11 @@ impl MetadataStore for PostgresStore {
                       -- active — only a register (upsert_host) ends a
                       -- handoff. A NULL renewal target (legacy/mock caller)
                       -- leaves both columns untouched.
-                      lease_expires_at = CASE WHEN $24::timestamptz IS NULL
+                      lease_expires_at = CASE WHEN $23::timestamptz IS NULL
                                               THEN hosts.lease_expires_at
-                                              ELSE GREATEST(COALESCE(hosts.lease_expires_at, $24), $24)
+                                              ELSE GREATEST(COALESCE(hosts.lease_expires_at, $23), $23)
                                          END,
-                      lease_state = CASE WHEN hosts.status = 'retired' THEN 'none' WHEN $24::timestamptz IS NULL
+                      lease_state = CASE WHEN hosts.status = 'retired' THEN 'none' WHEN $23::timestamptz IS NULL
                                               OR hosts.lease_state = 'handoff'
                                          THEN hosts.lease_state
                                          ELSE 'active'
@@ -4481,7 +4479,6 @@ impl MetadataStore for PostgresStore {
         .bind(capabilities)
         .bind(hb.stages_images)
         .bind(self.clock.now_utc())
-        .bind(hb.utilization.committed_swap_mib as i64)
         .bind(sandbox_bundles)
         .bind(hb.lease_renew_until)
         .fetch_optional(&self.pool)
@@ -4568,7 +4565,6 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
-                   util_committed_swap_mib,
                    ready_images, current_bundles, sandbox_bundles,
                    cordoned, cordon_owner, cordon_reason, retire_requested_at, retired_at, total_vcpus, wire_version, stages_images, capabilities,
                    lease_expires_at, lease_state, lease_epoch,

@@ -60,6 +60,8 @@ async fn create_list_destroy_round_trip() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
 
     // create

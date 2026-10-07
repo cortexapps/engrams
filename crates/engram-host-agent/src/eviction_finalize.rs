@@ -558,15 +558,11 @@ async fn disk_leg_work(
     f: &EvictionFinalizer,
     record: &EvictionFinalizeRecord,
     hot_chunks: Option<&[(usize, ChunkHash, Bytes)]>,
-) -> Result<Option<ManifestRef>, SandboxError> {
+) -> Result<(Option<ManifestRef>, Option<ManifestRef>), SandboxError> {
     let start = crate::time_source::metrics_now();
     let mut root_manifest = None;
-    // Phase 2 must carry swap manifests in snapshot metadata before publishing them here.
-    for pending in record
-        .disk_pending
-        .iter()
-        .filter(|p| p.role == DiskRole::Root)
-    {
+    let mut swap_manifest = None;
+    for pending in &record.disk_pending {
         let resolved = match &f.chunk_store {
             None => {
                 // Defensive: chunk store vanished between snapshot_begin and
@@ -618,13 +614,14 @@ async fn disk_leg_work(
                 Some(published)
             }
         };
-        if pending.role == DiskRole::Root {
-            root_manifest = resolved;
+        match pending.role {
+            DiskRole::Root => root_manifest = resolved,
+            DiskRole::Swap => swap_manifest = resolved,
         }
     }
     metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "disk")
         .record(start.elapsed().as_secs_f64());
-    Ok(root_manifest)
+    Ok((root_manifest, swap_manifest))
 }
 
 /// The memory leg's publish work — pure (no stage/record mutation):
@@ -824,15 +821,17 @@ async fn run_terminal(
 async fn persist_disk_bump(
     f: &EvictionFinalizer,
     record: &mut EvictionFinalizeRecord,
-    disk_manifest: Option<ManifestRef>,
+    manifests: (Option<ManifestRef>, Option<ManifestRef>),
 ) -> Result<(), SandboxError> {
     let prev_stage = record.stage;
     let prev_disk_manifest = record.disk_manifest;
-    record.disk_manifest = disk_manifest;
+    let prev_swap_manifest = record.swap_manifest;
+    (record.disk_manifest, record.swap_manifest) = manifests;
     record.stage = FinalizeStage::DiskUploaded;
     if let Err(e) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await {
         record.stage = prev_stage;
         record.disk_manifest = prev_disk_manifest;
+        record.swap_manifest = prev_swap_manifest;
         return Err(SandboxError::Snapshot(format!(
             "persist finalize record: {e}"
         )));
@@ -1077,23 +1076,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_does_not_publish_an_unreferenced_swap_manifest() {
+    async fn finalize_publishes_both_roles_and_recovers_swap_staging() {
         let dir = tempfile::tempdir().unwrap();
         let (store, base) = disk_store_with_empty_base(dir.path()).await;
-        let mut record =
-            record_with_one_staged_chunk(dir.path().join("capture"), base, ChunkHash::of(b"swap"));
+        let bytes = Bytes::from(vec![0x5a; 4096]);
+        let hash = ChunkHash::of(&bytes);
+        let mut record = record_with_one_staged_chunk(dir.path().join("capture"), base, hash);
         let mut swap = record.disk_pending[0].clone();
         swap.role = DiskRole::Swap;
         swap.base_manifest = ManifestRef::new();
+        let manifest = store.get_manifest(base).await.unwrap();
+        store
+            .put_manifest(swap.base_manifest, &manifest)
+            .await
+            .unwrap();
         record.disk_pending[0].chunks.clear();
         record.disk_pending.push(swap);
         let finalizer = finalizer_over(&store, dir.path(), &record);
-        assert_eq!(
-            disk_leg_work(&finalizer, &record, None).await.unwrap(),
-            Some(base)
-        );
-        let encoded = serde_json::to_value(&record).unwrap();
-        assert!(encoded["disk_pending"].is_array());
+        // Missing and torn swap files must fail before the durable stage advances.
+        assert!(disk_leg_work(&finalizer, &record, None).await.is_err());
+        persist_disk_pending_chunks(&record.dest, DiskRole::Swap, &[(0, hash, bytes.clone())])
+            .await
+            .unwrap();
+        let path =
+            disk_pending_dir(&record.dest, DiskRole::Swap).join(format!("0.{}", hash.to_hex()));
+        tokio::fs::write(&path, &bytes[..4095]).await.unwrap();
+        assert!(disk_leg_work(&finalizer, &record, None).await.is_err());
+        tokio::fs::write(&path, &bytes).await.unwrap();
+        let refs = disk_leg_work(&finalizer, &record, None).await.unwrap();
+        assert_eq!(refs.0, Some(base));
+        let swap_ref = refs.1.expect("swap published");
+        let swap = store.get_manifest(swap_ref).await.unwrap();
+        assert_eq!(swap.chunks[0].hash, hash);
+        persist_disk_bump(&finalizer, &mut record, refs)
+            .await
+            .unwrap();
+        assert_eq!(record.swap_manifest, Some(swap_ref));
+        assert_eq!(record.stage, FinalizeStage::DiskUploaded);
+        let recovered: EvictionFinalizeRecord =
+            serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(recovered.swap_manifest, Some(swap_ref));
     }
 
     #[tokio::test]

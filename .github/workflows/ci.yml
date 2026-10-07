@@ -1102,7 +1102,6 @@ jobs:
             --test vmstate_only_snapshot \
             --test substrate_kernel_capabilities \
             --test substrate_uffd_base \
-            --test swap_disk \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=4
@@ -1142,7 +1141,6 @@ jobs:
             --test eviction_finalize_redrive \
             --test chain_rehydrate \
             --test egress_survives_roll \
-            --test swap_capture \
             --test rehome_retained_harness \
             --run-ignored ignored-only \
             --no-fail-fast \
@@ -1226,6 +1224,7 @@ jobs:
             --test nbd_shutdown_abandon_race \
             --test nbd_shutdown_final_flush \
             --test nbd_two_devices \
+            --test swap_nbd_snapshot \
             --test nbd_spec_reserve \
             --test nbd_verify_on_read \
             --test nbd_proc_holder \

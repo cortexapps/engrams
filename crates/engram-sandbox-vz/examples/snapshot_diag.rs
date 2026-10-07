@@ -125,6 +125,8 @@ async fn run_scenario(
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
 
     eprintln!("[diag] backend.create — booting VM");

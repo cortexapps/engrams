@@ -376,27 +376,6 @@ pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lo
 /// after deploy would mean the skip path isn't exercised.
 pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
 
-/// ADR 0112 D3: counter of pre-capture swap disarms refused, labeled
-/// by capture flavor (`terminal` / `periodic`). Periodic refusals are
-/// the designed degradation under memory pressure (the continuously
-/// flushed disk is that tick's checkpoint); a SUSTAINED rate is the
-/// operator signal "this image is under-sized — raise
-/// `suggested_memory_mib`". Terminal refusals mean an eviction could
-/// not capture memory and requeued — rare, alarm-worthy.
-pub const SWAP_DISARM_REFUSED_TOTAL: &str = "engram_swap_disarm_refused_total";
-
-/// ADR 0112 D3: histogram of successful pre-capture swap disarm
-/// duration (meminfo probe + `swapoff -a` page-back-in). Steady state
-/// is one exec round trip (≈0 used swap); the tail scales with used
-/// swap, bounded by the RAM/4 device size.
-pub const SWAP_DISARM_SECONDS: &str = "engram_swap_disarm_seconds";
-
-/// ADR 0112 D5: Σ `swap_mib` over live sandboxes, in bytes — the worst
-/// case ephemeral swap can allocate on the work_dir mount (the backing
-/// inodes are anonymous, so committed is the only honest attribution).
-/// Also fed into the chunk cache's co-tenant reserve and the heartbeat.
-pub const HOST_COMMITTED_SWAP_BYTES: &str = "engram_host_committed_swap_bytes";
-
 /// ADR 0112 D5 (closing ADR 0110's open accounting gap): allocated
 /// bytes under the dirty root — the per-sandbox dirty files' real
 /// footprint on the shared mount, fed into the co-tenant reserve.

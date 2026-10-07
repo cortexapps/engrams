@@ -976,16 +976,46 @@ pub(crate) async fn attach_manifest_with_dirty_file(
     fork_at_attach: bool,
     dirty_path: PathBuf,
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
-    let backend_id = disk_manifest_ref.manifest_id.to_string();
-    let backend = ChunkedDiskBackend::from_blob_with_dirty_file(
+    let manifest = store
+        .get_manifest(disk_manifest_ref)
+        .await
+        .map_err(DiskBackendError::from)?;
+    attach_manifest_from_memory(
         disk_manifest_ref,
+        &manifest,
+        cache,
+        store,
+        slot_pool,
+        threshold_bytes,
+        fork_at_attach,
+        dirty_path,
+    )
+    .await
+}
+
+/// Attach a device whose manifest the caller already holds, so no
+/// store round trip sits on the create path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn attach_manifest_from_memory(
+    disk_manifest_ref: engram_core::types::manifest::ManifestRef,
+    manifest: &engram_chunk_store::Manifest,
+    cache: engram_chunk_store::cache::ChunkCache,
+    store: Arc<engram_chunk_store::ChunkStore>,
+    slot_pool: &Arc<NbdSlotAllocator>,
+    threshold_bytes: u64,
+    fork_at_attach: bool,
+    dirty_path: PathBuf,
+) -> Result<NbdSandboxState, NbdRuntimeError> {
+    let backend_id = disk_manifest_ref.manifest_id.to_string();
+    let backend = ChunkedDiskBackend::from_manifest_with_dirty_file(
+        disk_manifest_ref,
+        manifest,
         cache,
         store,
         threshold_bytes,
         dirty_path,
         DirtyFileOpenMode::Truncate,
-    )
-    .await?;
+    )?;
     if fork_at_attach {
         backend.fork_manifest_identity().await;
     }

@@ -127,6 +127,8 @@ pub(crate) fn capture_boot_spec(
         network,
         aux_ro_drives,
         swap_mib: (swap_mib > 0).then_some(swap_mib),
+        swap_source: None,
+        swap_manifest: None,
     }
 }
 

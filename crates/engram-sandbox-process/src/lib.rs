@@ -941,6 +941,8 @@ impl SandboxBackend for ProcessBackend {
                     network: Default::default(),
                     aux_ro_drives: Vec::new(),
                     swap_mib: None,
+                    swap_source: None,
+                    swap_manifest: None,
                 };
                 self.sandboxes.insert(id, SandboxState::new(spec, cwd));
                 return Ok(id);
@@ -992,6 +994,8 @@ impl SandboxBackend for ProcessBackend {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
             swap_mib: None,
+            swap_source: None,
+            swap_manifest: None,
         };
         self.sandboxes.insert(id, SandboxState::new(spec, cwd));
         Ok(id)
@@ -1031,6 +1035,8 @@ impl SandboxBackend for ProcessBackend {
             network: Default::default(),
             aux_ro_drives: selected_mounts,
             swap_mib: None,
+            swap_source: None,
+            swap_manifest: None,
         };
         self.sandboxes.insert(id, SandboxState::new(spec, cwd));
         Ok(id)
@@ -1865,6 +1871,8 @@ mod tests {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
             swap_mib: None,
+            swap_source: None,
+            swap_manifest: None,
         }
     }
 

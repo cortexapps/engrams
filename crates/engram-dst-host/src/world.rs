@@ -728,11 +728,10 @@ impl SimHost {
 
     /// Attach the second device with durable owner and lineage records.
     pub async fn attach_swap(&mut self, idx: usize) -> Result<(), String> {
-        let base = self
-            .store
-            .get_manifest(self.sandboxes[idx].disks.root.base_ref)
-            .await
-            .map_err(|e| e.to_string())?;
+        let base = engram_chunk_store::Manifest::empty(
+            engram_chunk_store::ManifestKind::Disk,
+            NUM_CHUNKS * CHUNK_SIZE,
+        );
         let disk_ref = ManifestRef {
             manifest_id: self.entropy.uuid(),
             version: 1,
@@ -926,7 +925,6 @@ impl SimHost {
         if idx >= self.sandboxes.len() || self.sandboxes[idx].migrating {
             return Ok(()); // the export's capture lock excludes flushes
         }
-        self.flush_swap(idx).await?;
         let Some(backend) = self.sandboxes[idx].disks.root.backend.clone() else {
             return Ok(());
         };
@@ -2099,8 +2097,12 @@ impl SimHost {
         // was never rehydrated — the 03e6535e pre-condition) is REFUSED,
         // never silently skipped into a manifestless snapshot.
         let disks = &self.sandboxes[idx].disks;
+        let mut expected = disks.expected.clone();
+        if disks.swap.is_some() {
+            expected.insert(engram_core::DiskRole::Swap);
+        }
         let tracked = engram_host_core::all_disk_roles_served(
-            &disks.expected,
+            &expected,
             disks
                 .iter()
                 .filter(|(_, disk)| disk.backend.is_some())
@@ -2330,6 +2332,26 @@ impl SimHost {
                 )
                 .await;
                 self.sandboxes[idx].disks.root.backend = Some(Arc::new(backend));
+                if let Some(reference) = self.sandboxes[idx]
+                    .disks
+                    .swap
+                    .as_ref()
+                    .and_then(|d| d.published_ref)
+                {
+                    let backend = build_backend(
+                        &self.store,
+                        self.fs.cache_dir(),
+                        self.sandboxes.len() + idx,
+                        reference,
+                    )
+                    .await;
+                    self.sandboxes[idx]
+                        .disks
+                        .swap
+                        .as_mut()
+                        .expect("swap exists")
+                        .backend = Some(Arc::new(backend));
+                }
                 self.destroyer.forget(self.sandboxes[idx].sandbox_id);
                 Ok(ResumeOutcome::Attached)
             }
@@ -2401,10 +2423,47 @@ impl SimHost {
                 // A completed finalize WITHOUT one (only reachable via the
                 // pre-#743 silent-skip capture) is a poisoned lineage the
                 // resume leg must reckon with.
+                if let Some(published) = record.swap_manifest {
+                    self.assert_finalize_covers_staging(
+                        idx,
+                        &record,
+                        engram_core::DiskRole::Swap,
+                        published,
+                    )
+                    .await?;
+                    self.sandboxes[idx]
+                        .disks
+                        .swap
+                        .as_mut()
+                        .expect("captured swap")
+                        .published_ref = Some(published);
+                    let manifest = self
+                        .store
+                        .get_manifest(published)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    for chunk in manifest.chunks {
+                        let bytes = self
+                            .store
+                            .get_chunk(chunk.hash)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        self.swap_ledger.mark_published(
+                            idx,
+                            chunk.offset / CHUNK_SIZE,
+                            decode_tag(&bytes),
+                        );
+                    }
+                }
                 self.sandboxes[idx].poisoned_snapshot = record.disk_manifest.is_none();
                 if let Some(published) = record.disk_manifest {
-                    self.assert_finalize_covers_staging(idx, &record, published)
-                        .await?;
+                    self.assert_finalize_covers_staging(
+                        idx,
+                        &record,
+                        engram_core::DiskRole::Root,
+                        published,
+                    )
+                    .await?;
                     self.sandboxes[idx].disks.root.published_ref = Some(published);
                     self.mark_flush_published(idx, published).await?;
                     // The capture cut's durability claim comes due: the VM
@@ -2449,9 +2508,14 @@ impl SimHost {
         &self,
         idx: usize,
         record: &EvictionFinalizeRecord,
+        role: engram_core::DiskRole,
         published: ManifestRef,
     ) -> Result<(), String> {
-        let Some(pending) = record.disk_pending.first() else {
+        let Some(pending) = record
+            .disk_pending
+            .iter()
+            .find(|pending| pending.role == role)
+        else {
             return Ok(());
         };
         let manifest = self
@@ -3046,6 +3110,54 @@ mod device_set_tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
+    async fn swap_is_flushless_until_capture_and_restores_from_its_manifest() {
+        let mut host = SimHost::new(45, 1).await;
+        host.attach_swap(0).await.unwrap();
+        host.guest_write_swap(0, 0).await.unwrap();
+        let backend = host.sandboxes[0]
+            .disks
+            .swap
+            .as_ref()
+            .unwrap()
+            .backend
+            .clone()
+            .unwrap();
+        let expected = backend.read(0, 4096).await.unwrap();
+        host.flush_tick(0).await.unwrap();
+        assert!(host.sandboxes[0]
+            .disks
+            .swap
+            .as_ref()
+            .unwrap()
+            .published_ref
+            .is_none());
+        assert!(backend.unflushed_bytes().await > 0);
+        assert!(matches!(
+            host.snapshot_begin(0).await.unwrap(),
+            CaptureOutcome::Began(_)
+        ));
+        assert_eq!(host.in_flight[&0].disk_pending.len(), 2);
+        host.finalize_tick(0).await.unwrap();
+        assert!(host.sandboxes[0]
+            .disks
+            .swap
+            .as_ref()
+            .unwrap()
+            .published_ref
+            .is_some());
+        host.resume_finalized(0, true).await.unwrap();
+        let restored = host.sandboxes[0]
+            .disks
+            .swap
+            .as_ref()
+            .unwrap()
+            .backend
+            .as_ref()
+            .unwrap();
+        assert_eq!(restored.read(0, 4096).await.unwrap(), expected);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn swap_oracles_cover_unflushed_and_corrupt_bytes() {
         let mut host = SimHost::new(44, 1).await;
         host.attach_swap(0).await.unwrap();
@@ -3053,7 +3165,9 @@ mod device_set_tests {
         assert!(crate::invariants::check_quiescent_floor(&host)
             .await
             .is_err());
-        host.flush_tick(0).await.unwrap();
+        host.snapshot_begin(0).await.unwrap();
+        host.finalize_tick(0).await.unwrap();
+        host.resume_finalized(0, true).await.unwrap();
         crate::invariants::check_quiescent_floor(&host)
             .await
             .unwrap();

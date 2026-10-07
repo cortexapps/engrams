@@ -405,6 +405,8 @@ async fn materialize_and_boot() {
         // stamp, mounted + exec'd by the shim the materializer injected.
         aux_ro_drives: vec![AuxRoDrive::reserved_slot(AuxRoDrive::AGENTD_SLOT_INDEX)],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     let id = backend.create(spec).await.expect("create");
 

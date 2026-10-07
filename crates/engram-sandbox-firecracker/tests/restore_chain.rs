@@ -111,6 +111,8 @@ async fn chained_restore_snapshot_lineage_holds() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
 
     // Cold create + settle + snapshot S1 + destroy. `metadata` is the

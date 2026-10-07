@@ -203,6 +203,8 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     let base = common::postcopy::base(&host_a.pooled, spec).await;
     let vm = common::postcopy::fresh(&host_a.pooled, base).await;
@@ -620,6 +622,8 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     let base = common::postcopy::base(&host_a.pooled, spec).await;
     let vm = common::postcopy::fresh(&host_a.pooled, base).await;
@@ -895,6 +899,8 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     let base = common::postcopy::base(&host_a.pooled, spec).await;
     let vm = common::postcopy::fresh(&host_a.pooled, base).await;
@@ -1078,6 +1084,8 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     let base = common::postcopy::base(&host_a.pooled, spec).await;
     let vm = common::postcopy::fresh(&host_a.pooled, base).await;

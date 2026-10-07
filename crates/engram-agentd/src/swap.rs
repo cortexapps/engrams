@@ -50,6 +50,16 @@ fn switched_off(value: Option<&str>) -> bool {
 /// Boot-time arm (cold boots: base capture, rung-2 recovery). Only the
 /// process env can carry the switch here — no session is bound yet.
 pub fn arm() {
+    if std::fs::read_to_string("/proc/cmdline")
+        .ok()
+        .is_some_and(|args| {
+            args.split_whitespace()
+                .any(|arg| arg == "engram_base_capture=1")
+        })
+    {
+        tracing::info!("base capture: leave swap inactive");
+        return;
+    }
     let process_off = std::env::var(GUEST_SWAP_ENV).ok();
     if switched_off(process_off.as_deref()) {
         tracing::info!("guest swap disabled via {GUEST_SWAP_ENV}=off (process env); not arming");

@@ -709,3 +709,19 @@ S7's base-capture rule lands with phase 2b, once the base must be swap-free for 
    on the destination with no re-arm.
 4. Chart `nbdsMax`, node recreate, measurement of swap-in latency and the
    capture upload cost on the dev VM, then the fleet roll.
+
+- **2026-10-07, phase 2b:** Host swap uses a second chunked NBD disk.
+  It attaches without a flush scheduler. Captures publish both disk roles,
+  including durable eviction-finalize redrive and checkpoint adverts.
+  `ENGRAM_BASE_CAPTURE=1` in the spec becomes `engram_base_capture=1` on
+  the kernel command line. Agentd skips cold-boot arming for base captures;
+  fresh binds format the blank private swap device. Restored sessions keep
+  their swap state. The disarm ladder, re-arm guard, refusal counters, and
+  committed-swap disk reservation are removed. D7 still refuses live
+  teleport until phase 3 adds device-tagged post-copy. Wire version is 33.
+  A snapshot taken by this host-agent carries live swap references; an
+  older host-agent restores it against a blank swap device. The exact-match
+  wire gate (33) is the protection: a host at an older wire version is refused
+  by the coordinator, so it never restores such a snapshot, and the
+  coordinator itself cannot roll back past migration 0124. The fleet rolls
+  forward only.

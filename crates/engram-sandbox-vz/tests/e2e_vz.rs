@@ -169,6 +169,8 @@ fn spec(rootfs: &Path) -> SandboxSpec {
             AuxRoDrive::reserved_slot(AuxRoDrive::GUEST_TOOLS_SLOT_INDEX),
         ],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     }
 }
 
@@ -269,7 +271,7 @@ async fn await_agent(backend: &VzBackend, id: SandboxId) {
 /// ADR 0112 VZ parity: a spec with `swap_mib` boots with exactly one
 /// writable non-vda virtio disk of that size, agentd arms it at boot
 /// (mkswap + swapon + vm.swappiness), and destroy removes the backing
-/// file. Mirrors the FC `swap_disk` assertions on the VZ attach path.
+/// file. Checks the VZ swap attach path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_swap_drive_arms() {

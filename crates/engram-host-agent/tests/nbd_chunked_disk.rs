@@ -304,6 +304,8 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
 
     // FC backend assumes spec.rootfs_source is a regular file by
@@ -444,6 +446,8 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
     let sandbox_id = pooled

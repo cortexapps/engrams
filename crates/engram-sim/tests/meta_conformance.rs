@@ -2686,9 +2686,7 @@ async fn host_lifecycle(ctx: &Ctx) {
     meta.touch_host_heartbeat(h1, hb).await.unwrap();
     assert_eq!(meta.host_status(h1).await.unwrap(), Some(HostStatus::Dead));
 
-    // ADR 0112 (D4 conformance for the util_committed_swap_mib column):
-    // the heartbeat's committed-swap term round-trips into the host
-    // read on BOTH stores — placement's floor math depends on it.
+    // Disk use, including swap dirty files, round-trips through both stores.
     // A fresh host: h1 and h2 are both dead by this point.
     let h3 = HostId::new();
     let t = ctx.clock.now_utc();
@@ -2698,21 +2696,28 @@ async fn host_lifecycle(ctx: &Ctx) {
     let util = engram_core::types::host::HostUtilization {
         disk_total_mib: 400_000,
         disk_used_mib: 100_000,
-        committed_swap_mib: 12_288,
         ..Default::default()
     };
+    let renew_until = t + chrono::Duration::seconds(30);
+    let bundles = vec![engram_core::types::sandbox::SandboxAuxBundles {
+        sandbox_id: engram_core::SandboxId::new(),
+        bundles: vec![engram_core::types::sandbox::AuxBundleRef {
+            drive_id: "tools".into(),
+            sha256: "abc123".into(),
+        }],
+    }];
     let hb2 = HostHeartbeat {
         status: HostStatus::Ready,
         capacity: host_record(h3, "conf-h3", t).capacity,
         utilization: util,
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
-        sandbox_bundles: Vec::new(),
+        sandbox_bundles: bundles.clone(),
         total_vcpus: 16,
         wire_version: 1,
         stages_images: false,
         capabilities: Default::default(),
-        lease_renew_until: None,
+        lease_renew_until: Some(renew_until),
     };
     meta.touch_host_heartbeat(h3, hb2).await.unwrap();
     let h3_row = meta
@@ -2722,8 +2727,11 @@ async fn host_lifecycle(ctx: &Ctx) {
         .into_iter()
         .find(|h| h.id == h3)
         .expect("h3 active");
-    assert_eq!(h3_row.utilization.committed_swap_mib, 12_288);
+    assert_eq!(h3_row.utilization.disk_total_mib, 400_000);
     assert_eq!(h3_row.utilization.disk_used_mib, 100_000);
+    // These binds follow disk utilization after removal of the swap counter.
+    assert_eq!(h3_row.sandbox_bundles, bundles);
+    assert_eq!(h3_row.lease_expires_at, Some(renew_until));
 }
 
 /// ADR 0035 amendment D2 (D4 conformance for `bundle_pin_set` + the

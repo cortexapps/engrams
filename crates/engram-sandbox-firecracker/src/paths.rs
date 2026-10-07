@@ -83,20 +83,11 @@ pub fn harness_canonical(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {
 /// ADR 0112: `<work_dir>/swap/<sandbox_id>.swap` — canonical symlink
 /// for the ephemeral swap drive, same shape as [`rootfs_canonical`]:
 /// `state.bin` embeds this path, and every restore re-points it at
-/// its OWN fresh backing file (under the per-source-path lock) before
+/// its own NBD device (under the per-source-path lock) before
 /// `load_snapshot` opens it. Present only when the spec has
 /// `swap_mib > 0`.
 pub fn swap_canonical(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {
     work_dir.join("swap").join(format!("{sandbox_id}.swap"))
-}
-
-/// ADR 0112: the per-residence sparse backing file the swap canonical
-/// points at. Unlinked as soon as FC holds its fd (the bytes then live
-/// in an anonymous inode the kernel reclaims at FC exit — no at-rest
-/// artifact, no orphan sweep), so this path is dangling for most of a
-/// sandbox's life by design.
-pub fn swap_backing(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {
-    work_dir.join("swap").join(format!("{sandbox_id}.img"))
 }
 
 /// Parent dirs that must exist before [`install_symlink`] can land

@@ -82,6 +82,8 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
 
     let source_id = source.create(spec).await.expect("create on source");
