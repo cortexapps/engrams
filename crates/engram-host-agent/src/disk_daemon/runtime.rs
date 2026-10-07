@@ -1333,7 +1333,31 @@ async fn attach_backend(
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
     let backend = Arc::new(backend);
     let slot = slot_pool.acquire().await;
-    let handle = spawn(backend.clone(), slot.path(), backend_id).await?;
+    // A released slot returns to the pool before the previous tenant's
+    // netlink DISCONNECT runs (`NbdHandle::drop` issues it on a detached
+    // thread). A CONNECT inside that window returns `EBUSY` while the
+    // kernel shows no serving pid. That is a teardown in flight, not the
+    // double-allocation `EBUSY` the netlink layer documents, so it is
+    // retried for a bounded grace. `EBUSY` with a serving pid still fails
+    // at once: another tenant owns the device.
+    let started = crate::time_source::metrics_now();
+    let handle = loop {
+        match spawn(backend.clone(), slot.path(), backend_id).await {
+            Ok(handle) => break handle,
+            Err(NbdRuntimeError::Io(e))
+                if e.raw_os_error() == Some(libc::EBUSY)
+                    && !kernel_serves(slot.path())
+                    && started.elapsed() < CONNECT_TEARDOWN_GRACE =>
+            {
+                tracing::debug!(
+                    device = %slot.path().display(),
+                    "NBD CONNECT returned EBUSY with no serving pid; previous teardown in flight, retrying",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    };
     // 2026-07-16 session-85e0298a corruption RCA: `/dev/nbdN` minors are
     // REUSED across tenants (ADR 0049 pool) and FC reads the device through
     // the host page cache, which the kernel does NOT reliably invalidate
@@ -1363,6 +1387,18 @@ async fn attach_backend(
         handle,
         slot,
     })
+}
+
+/// How long a fresh CONNECT waits out a previous tenant's teardown.
+const CONNECT_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// True while the kernel has a serving process for `device`: the
+/// `/sys/block/<name>/pid` attribute exists only for a connected config.
+fn kernel_serves(device: &Path) -> bool {
+    device
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| Path::new(&format!("/sys/block/{name}/pid")).exists())
 }
 
 /// `BLKFLSBUF`: write back and invalidate the kernel page cache for a
