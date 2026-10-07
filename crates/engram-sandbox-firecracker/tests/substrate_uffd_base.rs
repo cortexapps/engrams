@@ -121,6 +121,8 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
 
     let original_id = backend.create(spec).await.expect("create");
@@ -368,6 +370,8 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
 
     // Source VM -> snapshot -> chunked manifest (the substrate's source).

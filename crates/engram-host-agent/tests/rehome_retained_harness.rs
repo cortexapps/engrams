@@ -165,6 +165,8 @@ async fn non_drained_resume_reattaches_the_live_harness_and_finishes_its_run() {
             network: Default::default(),
             aux_ro_drives: vec![staged.agentd_slot()],
             swap_mib: None,
+            swap_source: None,
+            swap_manifest: None,
         })
         .await
         .expect("create source VM");

@@ -177,6 +177,8 @@ fn sandbox_spec() -> SandboxSpec {
         // arm is a single 0 byte and is covered by the legacy-decode
         // test in engram-core.
         swap_mib: Some(6144),
+        swap_source: Some(PathBuf::from("/dev/nbd1")),
+        swap_manifest: Some(fixed_manifest_ref(0x40, 7)),
     }
 }
 
@@ -691,8 +693,10 @@ fn wire_version_pinned() {
     // not decode old positional bincode; the exact-match wire gate makes the roll safe.
     // snapshot_metadata.bin gains one trailing zero byte for None.
     // Checkpoint adverts also carry the optional swap manifest.
+    // 32 -> 33: SandboxSpec appends swap_source and swap_manifest.
+    // HostUtilization also drops the committed-swap reservation.
     assert_eq!(
-        WIRE_VERSION, 32,
+        WIRE_VERSION, 33,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

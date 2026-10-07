@@ -22,11 +22,13 @@ struct Inner {
     id: SandboxId,
     root: PathBuf,
     snapshots: PathBuf,
+    spec: std::sync::Mutex<Option<SandboxSpec>>,
 }
 
 #[async_trait]
 impl SandboxBackend for Inner {
-    async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        *self.spec.lock().unwrap() = Some(spec);
         Ok(self.id)
     }
     async fn exec_stream(&self, _: SandboxId, _: ExecRequest) -> Result<ExecStream, SandboxError> {
@@ -41,6 +43,14 @@ impl SandboxBackend for Inner {
     async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         let id = SnapshotId::new();
         std::fs::create_dir_all(self.snapshot_path_for(id)).unwrap();
+        if let Some(spec) = self.spec.lock().unwrap().as_ref() {
+            std::fs::write(
+                self.snapshot_path_for(id).join("manifest.json"),
+                serde_json::to_vec(&serde_json::json!({"spec": spec})).unwrap(),
+            )
+            .unwrap();
+        }
+
         Ok(SnapshotMetadata {
             id,
             size_bytes: 0,
@@ -67,8 +77,29 @@ impl SandboxBackend for Inner {
     fn rootfs_device(&self, _: SandboxId) -> Option<PathBuf> {
         Some(self.root.clone())
     }
-    async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+    async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+        let bytes =
+            std::fs::read(self.snapshot_path_for(metadata.id).join("manifest.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        *self.spec.lock().unwrap() = Some(serde_json::from_value(value["spec"].clone()).unwrap());
         Ok(self.id)
+    }
+    async fn restore_fresh(
+        &self,
+        metadata: SnapshotMetadata,
+        _: Vec<engram_core::types::sandbox::AuxRoDrive>,
+    ) -> Result<SandboxId, SandboxError> {
+        self.restore(metadata).await
+    }
+    fn swap_device(&self, _: SandboxId) -> Option<PathBuf> {
+        self.spec.lock().unwrap().as_ref()?.swap_source.clone()
+    }
+    fn is_base_capture(&self, _: SandboxId) -> bool {
+        self.spec.lock().unwrap().as_ref().is_some_and(|spec| {
+            spec.env
+                .get("ENGRAM_BASE_CAPTURE")
+                .is_some_and(|v| v == "1")
+        })
     }
     async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
         Ok(())
@@ -138,6 +169,7 @@ async fn exercise_two_devices(final_flush: bool) {
         id,
         root: devices[0].clone(),
         snapshots: dir.path().join("snapshots"),
+        spec: std::sync::Mutex::new(None),
     });
     let (tx, mut publishes) = tokio::sync::mpsc::unbounded_channel();
     let app = axum::Router::new().route(
@@ -199,6 +231,10 @@ async fn exercise_two_devices(final_flush: bool) {
     assert_eq!(
         captured.disk_manifest,
         Some(backends[0].manifest_ref().await)
+    );
+    assert_eq!(
+        captured.swap_manifest,
+        Some(backends[1].manifest_ref().await)
     );
     for backend in &backends {
         assert_eq!(backend.unflushed_bytes().await, 0);
@@ -293,4 +329,125 @@ async fn exercise_two_devices(final_flush: bool) {
     for role in DiskRole::ALL {
         assert!(!dirty.join(role.dirty_file_name(id)).exists());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root and two NBD devices; fake VM backend"]
+async fn pooled_swap_create_capture_restore_and_fresh_attach() {
+    let Some(devices) = common::postcopy::nbd_devices(2) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let id = SandboxId::new();
+    let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(dir.path().join("blob"))));
+    let root_ref = engram_core::ManifestRef::new();
+    store
+        .put_manifest(root_ref, &Manifest::empty(ManifestKind::Disk, 8192))
+        .await
+        .unwrap();
+    let inner = Arc::new(Inner {
+        id,
+        root: devices[0].clone(),
+        snapshots: dir.path().join("snapshots"),
+        spec: std::sync::Mutex::new(None),
+    });
+    let pooled = Arc::new(
+        PooledBackend::new(inner.clone())
+            .with_chunk_store(store.clone(), dir.path().join("materialized"))
+            .with_chunk_cache(ChunkCache::new(ChunkCacheConfig::new(
+                dir.path().join("cache"),
+            )))
+            .with_nbd_pool(NbdSlotAllocator::from_paths(devices.clone()).unwrap())
+            .with_nbd_owner_dir(dir.path().join("owners")),
+    );
+    pooled.set_self_ref(&pooled);
+    let spec = SandboxSpec {
+        image: "swap-unit".into(),
+        rootfs_source: None,
+        image_uri: None,
+        rootfs_manifest: Some(root_ref),
+        cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
+        memory: engram_core::types::sandbox::MemoryLimit { max_mib: 256 },
+        disk: engram_core::types::sandbox::DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: Default::default(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: vec![],
+        swap_mib: Some(1),
+        swap_source: None,
+        swap_manifest: None,
+    };
+    pooled.create(spec).await.unwrap();
+    let live = inner.spec.lock().unwrap().clone().unwrap();
+    assert_ne!(live.rootfs_source, live.swap_source);
+    let swap_ref = live.swap_manifest.unwrap();
+    assert!(store
+        .get_manifest(swap_ref)
+        .await
+        .unwrap()
+        .chunks
+        .is_empty());
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(live.swap_source.unwrap())
+        .unwrap();
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(&[0x5a; 4096], 0).unwrap();
+    let captured = pooled.snapshot(id).await.unwrap();
+    assert!(captured.disk_manifest.is_some());
+    let swap_ref = captured.swap_manifest.unwrap();
+    assert!(!store
+        .get_manifest(swap_ref)
+        .await
+        .unwrap()
+        .chunks
+        .is_empty());
+    // Close the device before the destroy: an open descriptor keeps the
+    // kernel's NBD teardown pending, and the next attach would see EBUSY.
+    drop(file);
+    pooled.destroy(id).await.unwrap();
+    common::postcopy::wait_devices_free(&devices);
+    pooled.restore(captured.clone()).await.unwrap();
+    let swap = inner
+        .spec
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .swap_source
+        .clone()
+        .unwrap();
+    let file = std::fs::File::open(swap).unwrap();
+    let mut bytes = [0; 4096];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(bytes, [0x5a; 4096]);
+    drop(file);
+    pooled.destroy(id).await.unwrap();
+    common::postcopy::wait_devices_free(&devices);
+    let mut base = captured;
+    base.swap_manifest = None;
+    pooled.restore_fresh(base, vec![]).await.unwrap();
+    let swap = inner
+        .spec
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .swap_source
+        .clone()
+        .unwrap();
+    let file = std::fs::File::open(swap).unwrap();
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(
+        bytes, [0; 4096],
+        "fresh swap must not inherit a prior session"
+    );
+    drop(file);
+    pooled.destroy(id).await.unwrap();
+    assert!(
+        pooled.cow_state(id).await.is_none(),
+        "destroy removes both roles"
+    );
 }

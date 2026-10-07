@@ -510,72 +510,6 @@ impl crate::disk_daemon::DataPlaneHealth for QuarantineDataPlaneHealth {
     }
 }
 
-pub(crate) use engram_host_core::SwapDisarmPolicy;
-
-/// ADR 0112 D3: outcome of a successful pre-capture swap disarm.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SwapDisarm {
-    /// No swap device / never armed — nothing to do, nothing to re-arm.
-    NoSwap,
-    /// `swapoff` completed; the capture must re-arm after the guest
-    /// resumes.
-    Disarmed,
-}
-
-/// ADR 0112 D3: sentinel prefix on the refusal error. Callers
-/// (`run_checkpoint_pass`, the coordinator's eviction redrive) match
-/// it to tell "expected degradation under memory pressure" from a
-/// broken capture.
-pub(crate) const SWAP_DISARM_REFUSED: &str = "swap-disarm-refused:";
-
-/// ADR 0112 D3 (adversarial-review finding): cancellation-safe swap
-/// re-arm. Constructed right after a successful disarm; every exit
-/// from the capture — success, error `?`, or a dropped future — fires
-/// the detached best-effort `swapon` exactly once, so a transient
-/// capture failure never strands a live guest swapless. Holds a
-/// STRONG backend Arc for its short window (disarm→snapshot) so the
-/// Drop path can still spawn during teardown races.
-struct SwapRearmGuard {
-    target: Option<(Arc<PooledBackend>, SandboxId)>,
-}
-
-impl SwapRearmGuard {
-    fn new(backend: Option<Arc<PooledBackend>>, id: SandboxId) -> Self {
-        Self {
-            target: backend.map(|b| (b, id)),
-        }
-    }
-
-    /// True when a disarm happened but no self_ref was installed —
-    /// the only configuration where the guard cannot protect (warned
-    /// at the construction site).
-    fn is_disarmed_without_target(&self) -> bool {
-        self.target.is_none()
-    }
-
-    /// The success path's explicit fire (same instant the pre-guard
-    /// code re-armed). Idempotent with Drop via `take()`.
-    fn fire_now(&mut self) {
-        if let Some((backend, id)) = self.target.take() {
-            backend.spawn_swap_rearm(id);
-        }
-    }
-}
-
-impl Drop for SwapRearmGuard {
-    fn drop(&mut self) {
-        // Reached only when `fire_now` didn't run — an error or
-        // cancellation between disarm and the capture's success tail.
-        if let Some((backend, id)) = self.target.take() {
-            tracing::info!(
-                sandbox_id = %id,
-                "capture exited early after swap disarm; re-arming the live guest",
-            );
-            backend.spawn_swap_rearm(id);
-        }
-    }
-}
-
 /// Wraps an inner [`SandboxBackend`] (FC or VZ) with host-side
 /// resource resolution: image cache, chunk store, materialize-to-
 /// file, optional NBD daemon, optional egress proxy.
@@ -767,13 +701,15 @@ pub struct PooledBackend {
     /// restart between snapshot and commit/abort leaves an orphan dir
     /// — small bounded leak we accept until a host-side janitor lands).
     inflight_snapshots: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
-    /// ADR 0123 B: `snapshot_hold` keeps a captured source paused and
-    /// records the swap policy it disarmed; `resume` re-arms it once and
-    /// `destroy` clears it.
-    held_swap_policy: DashMap<SandboxId, SwapDisarm>,
     /// The metadata of the snapshot a held source produced, for the
     /// coordinator's durable finalize after the hold.
     held_snapshots: DashMap<SandboxId, SnapshotMetadata>,
+    /// Swap capacities (MiB) whose blank base manifest this process has
+    /// confirmed in the chunk store. The blank base is one deterministic
+    /// manifest per size, so a create after the first pays no store
+    /// round trip for it.
+    #[cfg(target_os = "linux")]
+    blank_swap_bases: DashMap<u32, ()>,
     /// ADR 0016 Phase A: unix-ms timestamp of the last successful
     /// `snapshot(sandbox_id)` per sandbox. Read by `cow_state` to
     /// populate the memory-tier RPO field. `0`/absent = never
@@ -1322,215 +1258,9 @@ impl PooledBackend {
         ))
     }
 
-    /// ADR 0112: run a short command in the guest and collect its
-    /// stdout. `sh -c` for busybox/full-image PATH parity, bounded by
-    /// `timeout`, error on nonzero exit. The swap disarm/re-arm legs
-    /// use this; keep it small (stdout is buffered whole).
-    async fn exec_capture_stdout(
-        &self,
-        id: SandboxId,
-        script: &str,
-        timeout: std::time::Duration,
-        what: &str,
-    ) -> Result<String, SandboxError> {
-        use engram_core::types::sandbox::ExecEvent;
-        use futures::StreamExt;
-        let req = ExecRequest {
-            command: vec!["/bin/sh".into(), "-c".into(), script.into()],
-            stdin: None,
-            env: std::collections::HashMap::new(),
-            workdir: None,
-            timeout: Some(timeout),
-            exec_id: None,
-            stdout_offset: None,
-            stderr_offset: None,
-            wake: None,
-        };
-        let stream = self
-            .exec_stream(id, req)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("{what}: exec: {e}")))?;
-        let mut events = stream.events;
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        while let Some(ev) = events.next().await {
-            match ev {
-                ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
-                ExecEvent::Stderr(b) => stderr.extend_from_slice(&b),
-                ExecEvent::Exit(Some(0)) => {
-                    return Ok(String::from_utf8_lossy(&stdout).into_owned())
-                }
-                ExecEvent::Exit(status) => {
-                    return Err(SandboxError::Snapshot(format!(
-                        "{what}: exited {status:?} (stderr: {})",
-                        String::from_utf8_lossy(&stderr),
-                    )));
-                }
-                ExecEvent::Refused(reason) => {
-                    return Err(SandboxError::Snapshot(format!(
-                        "{what}: exec refused: {reason}"
-                    )));
-                }
-            }
-        }
-        Err(SandboxError::Snapshot(format!(
-            "{what}: exec stream ended without an exit status"
-        )))
-    }
-
-    /// ADR 0112: the spec gate for the capture-time swap protocol.
-    /// `None`/0 ⇒ no swap device was ever attached, so the
-    /// disarm/re-arm legs are skipped entirely. The trait default is
-    /// `None`, which structurally confines the protocol to backends
-    /// that opt in (FC) — the Process backend's `exec` runs commands
-    /// ON THE HOST, where a `swapoff -a` would be catastrophic.
+    /// Keep the live-teleport refusal until device-tagged post-copy is available.
     fn sandbox_swap_mib(&self, id: SandboxId) -> Option<u32> {
         self.inner.swap_mib(id).filter(|m| *m > 0)
-    }
-
-    /// ADR 0112 D3: disarm guest swap ahead of a memory capture — the
-    /// core invariant is that NO restorable memory image contains swap
-    /// PTEs (restore pairs the image with a fresh zero-filled device;
-    /// live swap state pointing into it is silent corruption, worse
-    /// than ADR 0028 Defect B). Runs while the guest is live, so it
-    /// extends capture wall-time, never the guest-visible pause.
-    ///
-    /// Guarded, not unconditional — the DECISION is the pure
-    /// [`engram_host_core::plan_swap_disarm`] (unit-tested, simulator-
-    /// drivable): refuse when the page-back-in can't fit, and above
-    /// the used-swap ceiling for the periodic flavor. A swapoff that
-    /// FAILS also errors: capture must never proceed with swap
-    /// possibly armed.
-    ///
-    /// In the healthy steady state (swappiness tuned, RAM sized right)
-    /// swap used is ≈0 and this is one exec round trip.
-    async fn swap_disarm(
-        &self,
-        id: SandboxId,
-        policy: SwapDisarmPolicy,
-    ) -> Result<SwapDisarm, SandboxError> {
-        if self.sandbox_swap_mib(id).is_none() {
-            return Ok(SwapDisarm::NoSwap);
-        }
-        let started = crate::time_source::metrics_now();
-        let meminfo = self
-            .exec_capture_stdout(
-                id,
-                "cat /proc/meminfo",
-                std::time::Duration::from_secs(30),
-                "swap-disarm meminfo probe",
-            )
-            .await?;
-        let field = |name: &str| -> Option<u64> {
-            meminfo.lines().find_map(|l| {
-                l.strip_prefix(name)?
-                    .trim_start_matches(':')
-                    .split_whitespace()
-                    .next()?
-                    .parse()
-                    .ok()
-            })
-        };
-        let (Some(total), Some(free), Some(available)) =
-            (field("SwapTotal"), field("SwapFree"), field("MemAvailable"))
-        else {
-            return Err(SandboxError::Snapshot(format!(
-                "swap-disarm: /proc/meminfo missing Swap/MemAvailable fields:\n{meminfo}"
-            )));
-        };
-        let used_kb = match engram_host_core::plan_swap_disarm(total, free, available, policy) {
-            engram_host_core::SwapDisarmPlan::NoSwap => {
-                // Device attached but never armed (kill switch, arm
-                // failure) — nothing to disarm.
-                return Ok(SwapDisarm::NoSwap);
-            }
-            engram_host_core::SwapDisarmPlan::Refuse {
-                used_kb,
-                mem_available_kb,
-                reason,
-            } => {
-                metrics::counter!(
-                    crate::metrics::SWAP_DISARM_REFUSED_TOTAL,
-                    "flavor" => policy.label(),
-                )
-                .increment(1);
-                // TOCTOU note: usage can grow between the probe and a
-                // swapoff; the plan's margin absorbs it, and a swapoff
-                // that still can't fit fails loudly rather than OOMing.
-                return Err(SandboxError::Snapshot(format!(
-                    "{SWAP_DISARM_REFUSED} {} (used_kb={used_kb} \
-                     mem_available_kb={mem_available_kb} flavor={})",
-                    reason.as_str(),
-                    policy.label(),
-                )));
-            }
-            engram_host_core::SwapDisarmPlan::Disarm { used_kb } => used_kb,
-        };
-        // NOT `swapoff -a`: busybox's `-a` reads /etc/fstab ONLY — on a
-        // guest whose swap was armed by explicit `swapon /dev/vdX`
-        // (ours always is) it exits 1 on a missing fstab and, worse,
-        // silently disarms NOTHING when an fstab exists. Enumerate
-        // /proc/swaps and disarm each entry explicitly, then VERIFY the
-        // table is empty — the exit code now proves the invariant
-        // in-guest instead of trusting a userland's `-a` semantics.
-        self.exec_capture_stdout(
-            id,
-            "for d in $(awk 'NR>1{print $1}' /proc/swaps); do \
-                 swapoff \"$d\" || exit 1; done && \
-             [ \"$(awk 'NR>1' /proc/swaps | wc -l)\" -eq 0 ]",
-            std::time::Duration::from_secs(300),
-            "swap-disarm swapoff",
-        )
-        .await?;
-        metrics::histogram!(crate::metrics::SWAP_DISARM_SECONDS)
-            .record(started.elapsed().as_secs_f64());
-        tracing::info!(
-            sandbox_id = %id,
-            used_kb,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "guest swap disarmed for capture",
-        );
-        Ok(SwapDisarm::Disarmed)
-    }
-
-    /// ADR 0112 D3: re-arm guest swap after the memory capture
-    /// returned and the guest is running again. Detached + best-effort:
-    /// a guest left swapless is safe (pre-0112 behavior), logged, and
-    /// the next bind re-arms fully. No `mkswap` — the signature
-    /// survives `swapoff` within a residence.
-    /// See [`SwapRearmGuard`] — the cancellation-safe wrapper every
-    /// capture flavor holds across the disarm→snapshot window.
-    fn spawn_swap_rearm(self: &Arc<Self>, id: SandboxId) {
-        let this = Arc::clone(self);
-        tokio::spawn(async move {
-            // Under the capture lock: a re-arm that lands inside another
-            // capture's disarm→pause window would put swap PTEs into the
-            // image that capture is about to take (ADR 0112 D3). A hold
-            // or a destroy that arrived first wins and the re-arm is moot.
-            let _capture = this.capture_lock(id).lock_owned().await;
-            if this.held_swap_policy.contains_key(&id) {
-                return;
-            }
-            let script = "for d in /sys/block/vd*; do n=$(basename $d); \
-                          [ \"$n\" != vda ] && [ \"$(cat $d/ro)\" = 0 ] && \
-                          swapon /dev/$n; done";
-            match this
-                .exec_capture_stdout(
-                    id,
-                    script,
-                    std::time::Duration::from_secs(30),
-                    "swap re-arm",
-                )
-                .await
-            {
-                Ok(_) => tracing::info!(sandbox_id = %id, "guest swap re-armed after capture"),
-                Err(e) => tracing::warn!(
-                    sandbox_id = %id,
-                    error = %e,
-                    "guest swap re-arm failed; guest runs swapless until next bind",
-                ),
-            }
-        });
     }
 
     /// Run an image's capture-time `[warm]` hook ([`WarmConfig`]) in the
@@ -1985,6 +1715,26 @@ impl PooledBackend {
             tracing::info_span!("restore.prepare_nbd"),
         )
         .await?;
+        #[cfg(target_os = "linux")]
+        let mut pending_swap_state = if pending_nbd_state.is_some() {
+            self.prepare_resume_swap_attach(&metadata, &src, fresh)
+                .await?
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let swap_owner = if pending_swap_state.is_some() {
+            Some(
+                self.self_ref
+                    .get()
+                    .and_then(std::sync::Weak::upgrade)
+                    .ok_or_else(|| {
+                        SandboxError::InvalidSpec("swap attach requires backend ownership".into())
+                    })?,
+            )
+        } else {
+            None
+        };
         // Non-Linux has no NBD data plane — the fork decision has no seam
         // to apply to (the materialize-to-file fallback below has no
         // manifest chain).
@@ -2017,6 +1767,17 @@ impl PooledBackend {
                     .into_iter()
                     .collect(),
             );
+        }
+
+        #[cfg(target_os = "linux")]
+        if pending_swap_state.is_none()
+            && read_sidecar_swap_source(&src)
+                .await
+                .is_some_and(|path| path.starts_with("/dev/nbd"))
+        {
+            return Err(SandboxError::Snapshot(
+                "swap restore would reopen a stale literal NBD device".into(),
+            ));
         }
 
         // Non-NBD fallback runs only when the NBD path didn't take.
@@ -2234,6 +1995,10 @@ impl PooledBackend {
                     if let Err(e) = inner.destroy(new_id).await {
                         tracing::warn!(sandbox_id = %new_id, error = %e,
                             "destroy after a failed dirty-file relocation failed");
+                        state.abandon_for_shutdown();
+                        if let Some(swap) = pending_swap_state.take() {
+                            swap.abandon_for_shutdown();
+                        }
                     }
                     return Err(SandboxError::Vm(
                         format!("move restored sandbox dirty file into place: {error}").into(),
@@ -2279,16 +2044,27 @@ impl PooledBackend {
                          NBD data plane in-place instead of inserting after the sweep",
                     );
                     state.abandon_for_shutdown();
+                    if let Some(swap) = pending_swap_state.take() {
+                        swap.abandon_for_shutdown();
+                    }
                     return Ok::<SandboxId, SandboxError>(new_id);
                 }
                 nbd_sandboxes.insert(
                     new_id,
                     SandboxDisks {
-                        expected: [engram_core::DiskRole::Root].into_iter().collect(),
+                        expected: std::iter::once(DiskRole::Root)
+                            .chain(pending_swap_state.as_ref().map(|_| DiskRole::Swap))
+                            .collect(),
                         root: state,
                         swap: None,
                     },
                 );
+                if let (Some(owner), Some(swap)) = (swap_owner, pending_swap_state) {
+                    if let Err(error) = owner.attach_disk(new_id, DiskRole::Swap, swap).await {
+                        let _ = owner.destroy(new_id).await;
+                        return Err(error);
+                    }
+                }
                 Ok::<SandboxId, SandboxError>(new_id)
             });
             // A JoinError here means the spawned task panicked; the FC restore
@@ -2365,8 +2141,9 @@ impl PooledBackend {
             // (`with_nbd_pool`) — a pool-less host has nothing to classify,
             // so its residue report is vacuously known-empty.
             nbd_residue_known: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            held_swap_policy: DashMap::new(),
             held_snapshots: DashMap::new(),
+            #[cfg(target_os = "linux")]
+            blank_swap_bases: DashMap::new(),
             inflight_snapshots: Arc::new(DashMap::new()),
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
             checkpoint_pacing: Arc::new(DashMap::new()),
@@ -2639,9 +2416,7 @@ impl PooledBackend {
         &self,
         id: SandboxId,
     ) -> Result<DeferredSnapshot, SandboxError> {
-        let (capture_guard, cap) = self
-            .capture_phase(id, SwapDisarmPolicy::Terminal, false)
-            .await?;
+        let (capture_guard, cap) = self.capture_phase(id, false).await?;
         self.spawn_trace_publish(id);
         // ADR 0116 C3: the cold-base seed's multi-GiB upload is the
         // canonical background bulk producer — nested-capped so it can
@@ -2804,7 +2579,6 @@ impl PooledBackend {
     async fn capture_phase(
         &self,
         id: SandboxId,
-        swap_policy: SwapDisarmPolicy,
         hold: bool,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, SnapshotCapture), SandboxError> {
         let capture_lock = self.capture_lock(id);
@@ -2813,7 +2587,9 @@ impl PooledBackend {
         // here is an eviction/drain blocked on an in-flight capture.
         let lock_wait = crate::time_source::metrics_now();
         let capture_guard = capture_lock.lock_owned().await;
-        if self.held_swap_policy.contains_key(&id) {
+        if self.held_snapshots.contains_key(&id)
+            || self.migration_role(id) == Some(crate::migration::MigrationRole::HeldSource)
+        {
             return Err(SandboxError::Snapshot(
                 "snapshot hold already in progress; resume or destroy required".into(),
             ));
@@ -2834,43 +2610,6 @@ impl PooledBackend {
                  captures next"
                     .into(),
             ));
-        }
-        // ADR 0112 D3: disarm guest swap BEFORE the write-ahead chain
-        // invalidate below — a refusal (or a failed swapoff) exits with
-        // NOTHING consumed: the chain head, the dirty bitmap, and the
-        // guest all stay intact, and the caller's redrive retries. The
-        // guest is live during the swapoff, so the cost lands on
-        // capture wall-time, never the guest-visible pause. Skipped
-        // entirely (`NoSwap`) for sandboxes without a swap device —
-        // the `swap_mib` trait gate keeps this off Process/VZ execs.
-        match self.inner.wait_agent_ready(id).await {
-            Ok(()) | Err(SandboxError::InvalidSpec(_)) => {}
-            Err(e) => {
-                return Err(SandboxError::Snapshot(format!(
-                    "wait_agent_ready before swap disarm: {e}"
-                )))
-            }
-        }
-        let swap_disarm = self.swap_disarm(id, swap_policy).await?;
-        // ADR 0112 (adversarial-review finding): the re-arm must be
-        // CANCELLATION-SAFE, not success-path-only. A snapshot error,
-        // an early `?`, or a dropped future after a successful swapoff
-        // would otherwise leave a LIVE guest swapless — back to the
-        // OOM-prone behavior this feature exists to fix — until its
-        // next bind. The guard spawns the re-arm on drop; the success
-        // path fires it explicitly at the same point it always did.
-        let mut swap_rearm = SwapRearmGuard::new(
-            (swap_disarm == SwapDisarm::Disarmed)
-                .then(|| self.self_ref.get().and_then(std::sync::Weak::upgrade))
-                .flatten(),
-            id,
-        );
-        if swap_disarm == SwapDisarm::Disarmed && swap_rearm.is_disarmed_without_target() {
-            tracing::warn!(
-                sandbox_id = %id,
-                "swap re-arm guard has no self_ref (test harness?); a capture \
-                 failure leaves the guest swapless until next bind",
-            );
         }
         // Diff-mode when a checkpoint chain exists: same coherent
         // (memory, disk) capture contract, O(dirty set) cost. The
@@ -2984,9 +2723,6 @@ impl PooledBackend {
         // the session_events cursor as "last event at or before this"
         // when it records the checkpoint.
         if hold {
-            self.held_swap_policy.insert(id, swap_disarm);
-            // Resume now owns re-arm, even if this capture is cancelled.
-            swap_rearm.target.take();
             // Persisted BEFORE the pause: a host-agent that restarts while
             // the move is open re-adopts this VM as a frozen source (never
             // self-resumes, never a checkpoint candidate) instead of a
@@ -3036,6 +2772,9 @@ impl PooledBackend {
             let disk_backends = self.disk_backends(id);
             if !disk_backends.is_empty() {
                 for (role, backend) in disk_backends {
+                    if role == DiskRole::Swap && self.inner.is_base_capture(id) {
+                        continue;
+                    }
                     // Drain in-flight NBD requests so the drain sees a quiescent
                     // dirty buffer. With FC paused above, no new virtio writes
                     // are issued, and wait_idle returns once already-in-flight
@@ -3148,12 +2887,6 @@ impl PooledBackend {
             }
         };
         let dest = self.inner.snapshot_path_for(metadata.id);
-        // ADR 0112 D3: the capture returned and the guest is running —
-        // re-arm swap (detached, best-effort; the memory image just
-        // captured contains NO swap state, which was the whole point).
-        // The guard also fires on every error/cancellation path above,
-        // so a failed capture never strands a live guest swapless.
-        swap_rearm.fire_now();
         // `create_res` was Ok ⟹ `inner.snapshot`/`snapshot_diff` brought
         // the guest back running. The guard rides into `SnapshotCapture`
         // (still armed) so the cancellation gap in `snapshot_begin` and
@@ -4433,14 +4166,9 @@ impl PooledBackend {
         id: SandboxId,
     ) -> Result<SnapshotMetadata, SandboxError> {
         use engram_core::traits::SandboxBackend as _;
-        // ADR 0112: Periodic swap-disarm policy — a deeply-swapped
-        // guest REFUSES the memory checkpoint (typed, nothing
-        // consumed) instead of paging GiBs back per 30 s tick; the
-        // continuously-flushed disk is that tick's durability.
         let metadata = self
-            .snapshot_with_swap_policy(
+            .snapshot_with_class(
                 id,
-                SwapDisarmPolicy::Periodic,
                 // ADR 0116 C3: the periodic re-chunk is THE storm
                 // producer (2026-08-12: it held all 96 permits while a
                 // live NBD serve loop starved) — background class.
@@ -4451,20 +4179,13 @@ impl PooledBackend {
         Ok(metadata)
     }
 
-    /// ADR 0045 D5 composed capture with an explicit ADR 0112 swap
-    /// policy: capture, then run the post phase inline holding the
-    /// capture lock (the periodic-checkpoint and drain flavor;
-    /// eviction uses snapshot_begin and the finalize spool). `class` picks the
-    /// upload arbitration class (ADR 0116 C3): the periodic checkpoint
-    /// is `Background`, a drain a session is waiting on is
-    /// `Foreground`.
-    pub(crate) async fn snapshot_with_swap_policy(
+    /// Capture and upload under the capture lock, using the caller's upload class.
+    pub(crate) async fn snapshot_with_class(
         &self,
         id: SandboxId,
-        swap_policy: SwapDisarmPolicy,
         class: engram_chunk_store::UploadClass,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        let (_capture_guard, cap) = self.capture_phase(id, swap_policy, false).await?;
+        let (_capture_guard, cap) = self.capture_phase(id, false).await?;
         // Lift the per-jail working-set trace into the blob store under the
         // session-canonical key so the next resume prefaults it (#517 keyed
         // the replay; the handler can't publish it itself — SIGKILLed on
@@ -5119,45 +4840,16 @@ impl PooledBackend {
         }
     }
 
-    /// ADR 0112 D5: publish the two disk co-tenant terms this backend
-    /// owns and return the heartbeat's `committed_swap_mib`. Called
-    /// once per heartbeat tick, best-effort throughout:
-    ///
-    /// - `swap-committed` = Σ `swap_mib` over live sandboxes. COMMITTED,
-    ///   not walked — the backing inodes are anonymous after
-    ///   unlink-after-attach (statvfs sees their blocks in aggregate;
-    ///   no path walk can). Committed ≥ allocated always, so the
-    ///   cache reserve stays conservative.
-    /// - `dirty-files` = allocated (`st_blocks`) bytes under the ADR
-    ///   0110 dirty root — previously entirely unbudgeted (that ADR's
-    ///   own open rollout risk); now the cache budget shrinks as they
-    ///   grow instead of discovering the pressure a sweep late.
-    ///
-    /// Both also land as gauges for attribution on the shared mount.
-    pub async fn publish_disk_co_tenants(&self) -> u64 {
-        let committed_swap_mib: u64 = match self.inner.list().await {
-            Ok(ids) => ids
-                .into_iter()
-                .filter_map(|id| self.inner.swap_mib(id))
-                .map(u64::from)
-                .sum(),
-            Err(error) => {
-                tracing::warn!(%error, "co-tenant publish: backend list failed; reporting 0");
-                0
-            }
-        };
+    /// Publish allocated root and swap dirty-file bytes to the cache budget.
+    pub async fn publish_disk_co_tenants(&self) {
         let dirty_bytes: u64 = self
             .resolved_dirty_root()
             .map(|root| allocated_bytes_under(&root))
             .unwrap_or(0);
         if let Some(cache) = &self.chunk_cache {
-            cache.set_co_tenant_reserved("swap-committed", committed_swap_mib * 1024 * 1024);
             cache.set_co_tenant_reserved("dirty-files", dirty_bytes);
         }
-        metrics::gauge!(crate::metrics::HOST_COMMITTED_SWAP_BYTES)
-            .set((committed_swap_mib * 1024 * 1024) as f64);
         metrics::gauge!(crate::metrics::HOST_DIRTY_FILES_BYTES).set(dirty_bytes as f64);
-        committed_swap_mib
     }
 
     /// Run this after reattach and before coordinator registration.
@@ -5185,7 +4877,11 @@ impl PooledBackend {
         let Some(disks) = self.nbd_sandboxes.get(&id) else {
             return false;
         };
-        engram_host_core::all_disk_roles_served(&disks.expected, disks.iter().map(|(role, _)| role))
+        let mut expected = disks.expected.clone();
+        if self.inner.swap_device(id).is_some() {
+            expected.insert(DiskRole::Swap);
+        }
+        engram_host_core::all_disk_roles_served(&expected, disks.iter().map(|(role, _)| role))
     }
 
     /// Attach a host-side device to an existing sandbox. Root must exist first.
@@ -5197,55 +4893,68 @@ impl PooledBackend {
         mut state: crate::disk_daemon::NbdSandboxState,
     ) -> Result<(), SandboxError> {
         let _capture = self.capture_lock(id).lock_owned().await;
-        if role == DiskRole::Swap && self.nbd_owners.is_none() {
-            return Err(SandboxError::InvalidSpec(
-                "swap attachment requires durable device owners".into(),
-            ));
-        }
+        let prepared: Result<(), SandboxError> = async {
+            if role == DiskRole::Swap && self.nbd_owners.is_none() {
+                return Err(SandboxError::InvalidSpec(
+                    "swap attachment requires durable device owners".into(),
+                ));
+            }
 
-        if self
-            .nbd_sandboxes
-            .get(&id)
-            .map_or(role != DiskRole::Root, |disks| disks.get(role).is_some())
-        {
-            return Err(SandboxError::InvalidSpec(
-                "device role is occupied or root is absent".into(),
-            ));
-        }
-        let path = self
-            .dirty_file_path(id, role)
-            .ok_or_else(|| SandboxError::InvalidSpec("dirty root is absent".into()))?;
-        state
-            .backend
-            .relocate_dirty_file(&path)
-            .await
-            .map_err(|e| SandboxError::Vm(format!("move device dirty file: {e}").into()))?;
-        if role == DiskRole::Swap {
+            if self
+                .nbd_sandboxes
+                .get(&id)
+                .map_or(role != DiskRole::Root, |disks| disks.get(role).is_some())
+            {
+                return Err(SandboxError::InvalidSpec(
+                    "device role is occupied or root is absent".into(),
+                ));
+            }
+            let path = self
+                .dirty_file_path(id, role)
+                .ok_or_else(|| SandboxError::InvalidSpec("dirty root is absent".into()))?;
             state
                 .backend
-                .persist_recovery_ref()
+                .relocate_dirty_file(&path)
                 .await
-                .map_err(|error| {
-                    SandboxError::Vm(format!("record device lineage: {error}").into())
-                })?;
+                .map_err(|e| SandboxError::Vm(format!("move device dirty file: {e}").into()))?;
+            if role == DiskRole::Swap {
+                state
+                    .backend
+                    .persist_recovery_ref()
+                    .await
+                    .map_err(|error| {
+                        SandboxError::Vm(format!("record device lineage: {error}").into())
+                    })?;
+            }
+            if role == DiskRole::Swap {
+                self.nbd_owners
+                    .as_ref()
+                    .expect("swap owner directory checked")
+                    .record(state.device_path(), id, role)
+                    .map_err(|e| SandboxError::Vm(format!("record swap owner: {e}").into()))?;
+            }
+            let mut config = self.flush_config.clone();
+            config.enabled &= role == DiskRole::Root;
+            state.install_flush_scheduler(
+                id,
+                role,
+                self.live_manifest_publisher.clone(),
+                self.data_plane_health.clone(),
+                config,
+                self.nbd_owners.clone().filter(|_| role == DiskRole::Root),
+            );
+            Ok(())
         }
-        if role == DiskRole::Swap {
-            self.nbd_owners
-                .as_ref()
-                .expect("swap owner directory checked")
-                .record(state.device_path(), id, role)
-                .map_err(|e| SandboxError::Vm(format!("record swap owner: {e}").into()))?;
+        .await;
+        if let Err(error) = prepared {
+            // Keep the device connected until its live consumer has stopped.
+            if self.inner.swap_device(id).as_deref() == Some(state.device_path())
+                && self.inner.destroy(id).await.is_err()
+            {
+                state.abandon_for_shutdown();
+            }
+            return Err(error);
         }
-        let mut config = self.flush_config.clone();
-        config.enabled &= role == DiskRole::Root;
-        state.install_flush_scheduler(
-            id,
-            role,
-            self.live_manifest_publisher.clone(),
-            self.data_plane_health.clone(),
-            config,
-            self.nbd_owners.clone().filter(|_| role == DiskRole::Root),
-        );
         if self.is_abandoning() {
             state.abandon_for_shutdown();
             return Ok(());
@@ -5441,6 +5150,139 @@ impl PooledBackend {
         )
         .await?;
         Ok((path, nbd_state_none()))
+    }
+
+    /// Attach a private blank swap disk, or recover a snapshot's swap lineage.
+    #[cfg(target_os = "linux")]
+    async fn prepare_swap_attach(
+        &self,
+        size_mib: u32,
+        manifest: Option<engram_core::ManifestRef>,
+    ) -> Result<crate::disk_daemon::NbdSandboxState, SandboxError> {
+        let (Some(pool), Some(store), Some(cache)) =
+            (&self.nbd_pool, &self.chunk_store, &self.chunk_cache)
+        else {
+            return Err(SandboxError::InvalidSpec(
+                "swap requires the NBD data plane".into(),
+            ));
+        };
+        if self.nbd_owners.is_none() {
+            return Err(SandboxError::InvalidSpec(
+                "swap requires durable device owners".into(),
+            ));
+        }
+        let dirty_path = self
+            .pending_dirty_file_path()
+            .expect("NBD requires a dirty root");
+        let threshold = self.flush_config.dirty_threshold_bytes;
+        if let Some(reference) = manifest {
+            return crate::disk_daemon::runtime::attach_manifest_with_dirty_file(
+                reference,
+                cache.clone(),
+                Arc::new(store.clone()),
+                pool,
+                threshold,
+                false,
+                dirty_path,
+            )
+            .await
+            .map_err(|e| SandboxError::Vm(format!("attach swap: {e}").into()));
+        }
+        // A blank base is one deterministic manifest per capacity. The
+        // device forks its own identity at attach, so the shared base
+        // never receives a flush; it exists so a rehydrate after a
+        // host-agent roll can read the recovery ref. Published once per
+        // process; a conflict means another host published the same
+        // bytes first.
+        let (reference, blank) = blank_swap_base(size_mib);
+        if !self.blank_swap_bases.contains_key(&size_mib) {
+            match store.put_manifest(reference, &blank).await {
+                Ok(()) | Err(engram_chunk_store::ChunkStoreError::VersionConflict { .. }) => {}
+                Err(e) => {
+                    return Err(SandboxError::Snapshot(format!(
+                        "publish blank swap base: {e}"
+                    )))
+                }
+            }
+            self.blank_swap_bases.insert(size_mib, ());
+        }
+        crate::disk_daemon::runtime::attach_manifest_from_memory(
+            reference,
+            &blank,
+            cache.clone(),
+            Arc::new(store.clone()),
+            pool,
+            threshold,
+            true,
+            dirty_path,
+        )
+        .await
+        .map_err(|e| SandboxError::Vm(format!("attach swap: {e}").into()))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn prepare_resume_swap_attach(
+        &self,
+        metadata: &SnapshotMetadata,
+        src: &std::path::Path,
+        fresh: bool,
+    ) -> Result<Option<crate::disk_daemon::NbdSandboxState>, SandboxError> {
+        let path = src.join("manifest.json");
+        let bytes = fs::read(&path)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("read swap sidecar: {e}")))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| SandboxError::Snapshot(format!("parse swap sidecar: {e}")))?;
+        let spec = value
+            .get_mut("spec")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| SandboxError::Snapshot("sidecar spec is absent".into()))?;
+        let size = spec.get("swap_mib").and_then(|v| v.as_u64()).unwrap_or(0);
+        if size == 0 {
+            if metadata.swap_manifest.is_some() {
+                return Err(SandboxError::Snapshot(
+                    "swap manifest has no device geometry".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        let base = spec
+            .get("env")
+            .and_then(|v| v.get("ENGRAM_BASE_CAPTURE"))
+            .and_then(|v| v.as_str())
+            == Some("1");
+        if !fresh && !base && metadata.swap_manifest.is_none() {
+            return Err(SandboxError::Snapshot(
+                "swap restore has no manifest; refusing a stale device".into(),
+            ));
+        }
+        if fresh && metadata.swap_manifest.is_some() {
+            return Err(SandboxError::Snapshot(
+                "base snapshot contains swap state".into(),
+            ));
+        }
+        let size = u32::try_from(size)
+            .map_err(|_| SandboxError::Snapshot("invalid swap capacity".into()))?;
+        let state = self
+            .prepare_swap_attach(size, metadata.swap_manifest)
+            .await?;
+        spec.insert("swap_source".into(), serde_json::json!(state.device_path()));
+        spec.insert(
+            "swap_manifest".into(),
+            serde_json::json!(state.backend.manifest_ref().await),
+        );
+        if fresh {
+            if let Some(env) = spec.get_mut("env").and_then(|v| v.as_object_mut()) {
+                env.remove("ENGRAM_BASE_CAPTURE");
+            }
+        }
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&value).map_err(|e| SandboxError::Snapshot(e.to_string()))?,
+        )
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("patch swap sidecar: {e}")))?;
+        Ok(Some(state))
     }
 
     /// ADR 0028 Fix B: resolve the root disk from an explicit chunked
@@ -6120,6 +5962,35 @@ async fn read_sidecar_rootfs_source(src: &std::path::Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The blank swap base for a capacity: the same `ManifestRef` on every
+/// host, derived from the size, at version 1.
+#[cfg(target_os = "linux")]
+fn blank_swap_base(size_mib: u32) -> (engram_core::ManifestRef, engram_chunk_store::Manifest) {
+    // A fixed namespace with the capacity in the low bits: unique per
+    // size, identical on every host, no hash feature required.
+    const NAMESPACE: u128 = 0x3d6c_1b2a_7f4e_4c0b_9a51_2e8f_0b6d_0000;
+    let reference = engram_core::ManifestRef {
+        manifest_id: uuid::Uuid::from_u128(NAMESPACE | u128::from(size_mib)),
+        version: 1,
+    };
+    let manifest = engram_chunk_store::Manifest::empty(
+        engram_chunk_store::ManifestKind::Disk,
+        u64::from(size_mib) << 20,
+    );
+    (reference, manifest)
+}
+
+#[cfg(target_os = "linux")]
+async fn read_sidecar_swap_source(src: &std::path::Path) -> Option<String> {
+    let bytes = fs::read(src.join("manifest.json")).await.ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("spec")?
+        .get("swap_source")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// ADR 0008 Phase 5 final piece: ensure the disk `Manifest`
 /// referenced by `cached.bundle.disk_manifest` is reachable in
 /// the host's `BlobStorage`. For chunked-OCI images, the bake-
@@ -6538,8 +6409,9 @@ impl SnapshotFinisher {
                         bytes_uploaded = outcome.bytes_uploaded,
                         "chunked NBD disk uploaded (post-resume)",
                     );
-                    if role == DiskRole::Root {
-                        metadata.disk_manifest = Some(outcome.manifest_ref);
+                    match role {
+                        DiskRole::Root => metadata.disk_manifest = Some(outcome.manifest_ref),
+                        DiskRole::Swap => metadata.swap_manifest = Some(outcome.manifest_ref),
                     }
                 }
             }
@@ -7454,6 +7326,36 @@ impl SandboxBackend for PooledBackend {
                 }
             }
 
+            #[cfg(target_os = "linux")]
+            let mut pending_swap_state = if let Some(size) = spec.swap_mib.filter(|m| *m > 0) {
+                if pending_nbd_state.is_none() {
+                    return Err(SandboxError::InvalidSpec(
+                        "swap requires a chunked root disk".into(),
+                    ));
+                }
+                let state = self.prepare_swap_attach(size, spec.swap_manifest).await?;
+                spec.swap_source = Some(state.device_path().to_path_buf());
+                spec.swap_manifest = Some(state.backend.manifest_ref().await);
+                Some(state)
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            let swap_owner = if pending_swap_state.is_some() {
+                Some(
+                    self.self_ref
+                        .get()
+                        .and_then(std::sync::Weak::upgrade)
+                        .ok_or_else(|| {
+                            SandboxError::InvalidSpec(
+                                "swap attach requires backend ownership".into(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+
             // `fc_boot` is emitted by the inner FC backend itself
             // (see `engram_sandbox_firecracker::create`), with the
             // same metric name + label set. We don't double-record
@@ -7501,18 +7403,23 @@ impl SandboxBackend for PooledBackend {
                     .expect("NBD state requires a dirty root");
                 let join = tokio::spawn(async move {
                     let sandbox_id = inner.create(spec).await?;
-                    state
+                    if let Err(error) = state
                         .backend
                         .relocate_dirty_file(
                             &dirty_root.join(DiskRole::Root.dirty_file_name(sandbox_id)),
                         )
                         .await
-                        .map_err(|error| {
-                            SandboxError::Vm(
-                                format!("move created sandbox dirty file into place: {error}")
-                                    .into(),
-                            )
-                        })?;
+                    {
+                        if inner.destroy(sandbox_id).await.is_err() {
+                            state.abandon_for_shutdown();
+                            if let Some(swap) = pending_swap_state.take() {
+                                swap.abandon_for_shutdown();
+                            }
+                        }
+                        return Err(SandboxError::Vm(
+                            format!("move created sandbox dirty file into place: {error}").into(),
+                        ));
+                    }
                     state.install_flush_scheduler(
                         sandbox_id,
                         DiskRole::Root,
@@ -7541,16 +7448,29 @@ impl SandboxBackend for PooledBackend {
                              NBD data plane in-place instead of inserting after the sweep",
                         );
                         state.abandon_for_shutdown();
+                        if let Some(swap) = pending_swap_state.take() {
+                            swap.abandon_for_shutdown();
+                        }
                         return Ok::<SandboxId, SandboxError>(sandbox_id);
                     }
                     nbd_sandboxes.insert(
                         sandbox_id,
                         SandboxDisks {
-                            expected: [engram_core::DiskRole::Root].into_iter().collect(),
+                            expected: std::iter::once(DiskRole::Root)
+                                .chain(pending_swap_state.as_ref().map(|_| DiskRole::Swap))
+                                .collect(),
                             root: state,
                             swap: None,
                         },
                     );
+                    if let (Some(owner), Some(swap)) = (swap_owner, pending_swap_state) {
+                        if let Err(error) =
+                            owner.attach_disk(sandbox_id, DiskRole::Swap, swap).await
+                        {
+                            let _ = owner.destroy(sandbox_id).await;
+                            return Err(error);
+                        }
+                    }
                     Ok::<SandboxId, SandboxError>(sandbox_id)
                 });
                 join.await
@@ -7640,9 +7560,7 @@ impl SandboxBackend for PooledBackend {
         if let Some(metadata) = self.held_snapshots.get(&id) {
             return Ok(metadata.clone());
         }
-        let (_guard, cap) = self
-            .capture_phase(id, SwapDisarmPolicy::Terminal, true)
-            .await?;
+        let (_guard, cap) = self.capture_phase(id, true).await?;
         let metadata = self
             .finisher_with_class(engram_chunk_store::UploadClass::Foreground)
             .finish(id, cap)
@@ -7652,17 +7570,9 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        // ADR 0112: trait callers are the drain / operator / base-bake
-        // flavors — Terminal disarm. The periodic checkpoint reaches
-        // the same pipeline through `snapshot_with_swap_policy`. ADR
-        // 0116 C3: foreground — a drain/evict caller has a session
-        // waiting on this capture.
-        self.snapshot_with_swap_policy(
-            id,
-            SwapDisarmPolicy::Terminal,
-            engram_chunk_store::UploadClass::Foreground,
-        )
-        .await
+        // Foreground captures serve a waiting session.
+        self.snapshot_with_class(id, engram_chunk_store::UploadClass::Foreground)
+            .await
     }
 
     /// ADR 0045 D5 (rewritten for issue #529): the eviction flavor. Runs
@@ -7710,9 +7620,7 @@ impl SandboxBackend for PooledBackend {
             ));
         };
 
-        let (capture_guard, cap) = self
-            .capture_phase(id, SwapDisarmPolicy::Terminal, false)
-            .await?;
+        let (capture_guard, cap) = self.capture_phase(id, false).await?;
         // Publish the working-set trace for the next resume's prefault (see
         // `spawn_trace_publish`); detached, never blocks the eviction.
         self.spawn_trace_publish(id);
@@ -7961,13 +7869,8 @@ impl SandboxBackend for PooledBackend {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = &view;
-        // ADR 0112 D7: a swap-armed guest cannot post-copy teleport —
-        // the guest never pauses long enough to `swapoff`, and moving
-        // the swap device's bytes would persist exactly what the ADR
-        // promises never to persist. Refused HERE (the live spec is
-        // the authoritative swap source; an image row can drift) and
-        // pre-freeze, so nothing is consumed. Snapshot-rehome runs
-        // `capture_phase` — the disarm — and is already correct.
+        // Swap snapshots are durable. Live moves still need device-tagged
+        // post-copy, which lands in phase 3. Refuse before capture starts.
         if self.sandbox_swap_mib(id).is_some() {
             return Err(SandboxError::InvalidSpec(
                 "guest runs with ephemeral swap (ADR 0112) — use snapshot-rehome".into(),
@@ -8765,18 +8668,15 @@ impl SandboxBackend for PooledBackend {
             }
         }
         self.inner.resume(id).await?;
-        if let Some((_, policy)) = self.held_swap_policy.remove(&id) {
-            self.held_snapshots.remove(&id);
-            if policy == SwapDisarm::Disarmed {
-                if let Some(backend) = self.self_ref.get().and_then(std::sync::Weak::upgrade) {
-                    backend.spawn_swap_rearm(id);
-                }
-            }
-        }
+        self.held_snapshots.remove(&id);
         // A resumed guest carries no source role. Idempotent, and the retry
         // path for a role clear that failed inside an earlier abort or hold.
         self.set_migration_role(id, None).await?;
         Ok(())
+    }
+
+    fn swap_device(&self, id: SandboxId) -> Option<PathBuf> {
+        self.inner.swap_device(id)
     }
 
     async fn restore(&self, metadata: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
@@ -8868,7 +8768,6 @@ impl SandboxBackend for PooledBackend {
 
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
         // A held source forgets its swap policy and metadata with the VM.
-        self.held_swap_policy.remove(&id);
         self.held_snapshots.remove(&id);
         self.teardowns
             .run_or_join(id, || {
@@ -9115,12 +9014,14 @@ impl SandboxBackend for PooledBackend {
         use engram_core::types::capture_job::{CaptureJobResult, CapturedColdBase, ColdBasePlan};
 
         let engram_core::traits::sandbox::BuildBaseSnapshotRequest {
-            spec,
+            mut spec,
             warm,
             capture_env,
             capture_egress,
             cold_base_plan,
         } = req;
+
+        spec.env.insert("ENGRAM_BASE_CAPTURE".into(), "1".into());
 
         // ADR 0084 decision 11: a `Hit`/`Miss` plan means placement
         // pinned this host as FC-capable (`fc_snapshot_version` +
@@ -10904,10 +10805,7 @@ mod tests {
             .unwrap();
 
         pooled.quiesce_captures_for_shutdown();
-        let err = match pooled
-            .capture_phase(id, SwapDisarmPolicy::Terminal, false)
-            .await
-        {
+        let err = match pooled.capture_phase(id, false).await {
             Ok(_) => panic!("a quiesced capture must refuse"),
             Err(e) => e,
         };
@@ -11308,6 +11206,8 @@ mod tests {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
             swap_mib: None,
+            swap_source: None,
+            swap_manifest: None,
         }
     }
 
@@ -14293,6 +14193,8 @@ mod tests {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
             swap_mib: None,
+            swap_source: None,
+            swap_manifest: None,
         };
         spec.image_uri = Some("test:1".into());
         let _id = pooled.create(spec).await.unwrap();
@@ -15445,8 +15347,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (inner, release) = custody_backend(tmp.path(), false);
         let pooled = PooledBackend::new(inner.clone());
-        let mut capture =
-            Box::pin(pooled.capture_phase(inner.id, SwapDisarmPolicy::Periodic, false));
+        let mut capture = Box::pin(pooled.capture_phase(inner.id, false));
         assert!(futures::poll!(&mut capture).is_pending());
         let agent = AgentSpec {
             argv: vec![],
@@ -16651,10 +16552,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(inner.paused.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(
-            *pooled.held_swap_policy.get(&id).unwrap(),
-            SwapDisarm::Disarmed
-        );
+        assert!(pooled.held_snapshots.contains_key(&id));
         // The hold is a persisted source role: a host-agent restart
         // re-adopts the paused VM as frozen, never as a running guest.
         assert_eq!(
@@ -16667,7 +16565,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn resume_after_snapshot_hold_rearms_once() {
+    async fn resume_after_snapshot_hold_keeps_swap_active() {
         let (_dir, pooled, inner) = held_fixture();
         let id = SandboxId::new();
         pooled.snapshot_hold(id, false).await.unwrap();
@@ -16677,8 +16575,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(!inner.paused.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(!pooled.held_swap_policy.contains_key(&id));
+        assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!pooled.held_snapshots.contains_key(&id));
         assert_eq!(
             pooled.migration_role(id),
@@ -16687,13 +16584,12 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn destroy_after_snapshot_hold_clears_policy() {
+    async fn destroy_after_snapshot_hold_clears_metadata() {
         let (_dir, pooled, inner) = held_fixture();
         let id = SandboxId::new();
         pooled.snapshot_hold(id, false).await.unwrap();
         pooled.destroy(id).await.unwrap();
         tokio::task::yield_now().await;
-        assert!(!pooled.held_swap_policy.contains_key(&id));
         assert!(!pooled.held_snapshots.contains_key(&id));
         assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(inner.inner.destroy_calls.lock().as_slice(), &[id]);

@@ -180,6 +180,8 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     let sandbox = pooled_a.create(spec).await.expect("create");
 

@@ -90,6 +90,8 @@ async fn snapshot_then_uffd_restore_round_trips_microvm() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
 
     let original_id = backend.create(spec).await.expect("create");
@@ -322,6 +324,8 @@ async fn uffd_restore_succeeds_when_memory_bin_absent_locally() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
 
     let original_id = backend.create(spec).await.expect("create");

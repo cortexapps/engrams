@@ -191,6 +191,8 @@ async fn snapshot_restore_round_trips_per_vm_network() {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
 
     // 1. create — provisions the TAP + reserves the /30

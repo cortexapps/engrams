@@ -69,6 +69,8 @@ fn test_spec(rootfs: std::path::PathBuf) -> SandboxSpec {
         network: Default::default(),
         aux_ro_drives: Vec::new(),
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     }
 }
 

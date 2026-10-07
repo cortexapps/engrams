@@ -497,6 +497,8 @@ async fn e2e_vnc_cold_via_pooled_backend() {
         network: Default::default(),
         aux_ro_drives: vec![browser_aux_drive(browser_sha.clone()), staged.agentd_slot()],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
 

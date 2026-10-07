@@ -133,6 +133,8 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
     let vm1 = backend.create(spec).await.expect("create");

@@ -143,11 +143,9 @@ message HostView {
   // ready_images.
   uint32 live_materializes = 30;
   uint32 live_capture_jobs = 31;
-  // ADR 0112: committed ephemeral-swap (MiB) — Σ swap_mib over the
-  // host's live sandboxes; placement subtracts it from free disk
-  // before the floor test (the backing files are sparse anonymous
-  // inodes, so statvfs `used` alone under-counts what is spoken for).
-  uint64 util_committed_swap_mib = 32;
+  // Removed: swap is included in measured disk use.
+  reserved 32;
+  reserved "util_committed_swap_mib";
   // ADR 0123 A5: who holds the durable cordon — "operator" | "admin";
   // empty when the host is not cordoned.
   string cordon_owner = 33;

@@ -236,6 +236,8 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     let base = common::postcopy::base(&host_a.pooled, spec).await;
     for i in 0..SESSIONS {

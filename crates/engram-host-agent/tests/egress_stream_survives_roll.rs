@@ -295,6 +295,8 @@ async fn established_guest_stream_survives_a_host_agent_roll() {
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
+        swap_source: None,
+        swap_manifest: None,
     };
     let sandbox = pooled_a.create(spec).await.expect("create");
     let endpoints = wait_for_guest_endpoints(&pooled_a, sandbox, Duration::from_secs(30)).await;
