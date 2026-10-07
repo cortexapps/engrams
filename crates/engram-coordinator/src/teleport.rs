@@ -664,6 +664,10 @@ mod steps {
                 .ok_or_else(|| ApiError::Unavailable("teleport budget unavailable".into()))?;
         let caps = crate::placement::CapabilityRequirements {
             needs_uffd_substrate: true,
+            // The destination restores a post-copy export on the UFFD
+            // substrate; a host that honestly reports the substrate as
+            // not applicable is not a candidate.
+            needs_live_substrate: true,
             fc_snapshot_version: match session.host_id {
                 Some(h) => state.services.meta.fc_snapshot_version_for_host(h).await?,
                 None => None,
