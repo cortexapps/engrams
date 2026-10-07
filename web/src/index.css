@@ -20,10 +20,12 @@
  *     --background     the thread / page — the lightest, forward plane
  *     --card           a clean sheet raised off the page
  *
- *   Ink is petrol on paper, pale sage at night. The accent is Aston-F1
- *   LIME and it means one thing: this is the action. Lime is a FILL,
- *   never light-mode text (chartreuse on celadon is invisible), and
- *   never a status — lifecycle keeps its own glyph + text vocabulary.
+ *   Ink is petrol on paper, pale sage at night. The accent means one
+ *   thing: this is the action. It is cut for its ground — VERDIGRIS on
+ *   paper, Aston-F1 LIME on the cover and at night — because one value
+ *   cannot do both: lime on celadon measures 1.26:1 and simply is not
+ *   there. The accent is never a status — lifecycle keeps its own glyph
+ *   + text vocabulary.
  *
  *   Structure is graphite: 12px corners, low-contrast rules, one system
  *   sans for everything a person reads — except the page title, which is
@@ -38,8 +40,13 @@
   --card-foreground: oklch(0.301 0.02 206);
   --popover: oklch(0.997 0.004 128);
   --popover-foreground: oklch(0.301 0.02 206);
-  --primary: oklch(0.878 0.181 121); /* Aston-F1 lime — a FILL only */
-  --primary-foreground: oklch(0.22 0.04 150); /* deep racing-green ink on lime */
+  /* Verdigris — the action colour on paper. It holds as a FILL (6.7:1 with
+     paper ink on it) and, unlike lime, as TEXT and as a hairline: 6.0:1 on
+     the page, 6.6:1 on a card, 5.5:1 on the work pane. Hue 178 keeps it clear
+     of the instrument band (150/71/27) and of the running ring (132), so the
+     action colour still cannot be mistaken for a state. */
+  --primary: oklch(0.46 0.1 178);
+  --primary-foreground: oklch(0.975 0.012 128); /* paper ink on verdigris */
   --secondary: oklch(0.938 0.016 128); /* soft sage fill, recessed from the paper */
   --secondary-foreground: oklch(0.33 0.018 206);
   --muted: oklch(0.94 0.015 128);
@@ -49,7 +56,7 @@
   --destructive: oklch(0.52 0.2 27); /* signal red — the only red */
   --border: oklch(0.898 0.013 128); /* hairline rule */
   --input: oklch(0.885 0.014 128);
-  --ring: oklch(0.55 0.15 132); /* racing green — lime is invisible on paper */
+  --ring: oklch(0.55 0.15 132); /* racing green — the running tone on paper */
 
   /* The ground the sheets float on. The section rail is cut from it too, so
      the two read as one continuous backing rather than two panels. */
@@ -77,10 +84,11 @@
   --carbon-tile: 11px;
 
   /* Instrument status — every status dot, meter fill, and telltale.
-     A status vocabulary kept strictly apart from the lime accent: lime is
-     interactive-only, so these three never touch its hue (121). Vivid enough
-     to read as 6px dots and meter fills on the card; status text always pairs
-     a colored dot with ink, never colored body copy, so AA holds. */
+     A status vocabulary kept strictly apart from the accent: the accent is
+     interactive-only, so these three never touch either of its hues (178 on
+     paper, 121 at night). Vivid enough to read as 6px dots and meter fills on
+     the card; status text always pairs a colored dot with ink, never colored
+     body copy, so AA holds. */
   --instrument-nominal: oklch(0.6 0.15 150); /* signal green — emerald, not lime */
   --instrument-caution: oklch(0.7 0.155 71); /* amber */
   --instrument-critical: oklch(0.55 0.21 27); /* instrument red ≈ destructive */
@@ -260,6 +268,12 @@
   --border: oklch(0.93 0.03 125 / 15%);
   --input: oklch(0.93 0.03 125 / 18%);
   --ring: oklch(0.8 0.16 121);
+  /* The accent is cut for its ground, and this ground is the cover in BOTH
+     themes — so the pane keeps lime where the page takes verdigris. Dropping
+     these two lines paints the page's verdigris on bottle green: 1.3:1 against
+     the card, the mirror image of the bug that moved the page off lime. */
+  --primary: oklch(0.878 0.181 121);
+  --primary-foreground: oklch(0.2 0.03 150);
   /* Status hues lift for the dark ground. These are small mono figures — diff
      counts, health telltales — so they must clear 4.5:1 against GREEN, and
      against the CARD specifically, which is the lightest ground any of this
@@ -406,7 +420,7 @@
     background-color: color-mix(in oklch, var(--primary) 24%, transparent);
   }
 
-  /* Scrollbars: transparent track, lime thumb. Firefox first, then WebKit. */
+  /* Scrollbars: transparent track, accent thumb. Firefox first, then WebKit. */
   * {
     scrollbar-width: thin;
     scrollbar-color: var(--primary) transparent;
@@ -423,7 +437,7 @@
   ::-webkit-scrollbar-thumb {
     background-color: var(--primary);
     /* Inset the thumb with a transparent padding-box border so it reads as a
-       floating lime pill on the transparent track. */
+       floating accent pill on the transparent track. */
     border: 2px solid transparent;
     background-clip: padding-box;
     border-radius: 9999px;

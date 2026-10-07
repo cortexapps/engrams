@@ -22,7 +22,8 @@ const buttonVariants = cva(
           "border bg-background shadow-xs hover:bg-accent hover:text-accent-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50",
         secondary: "bg-secondary text-secondary-foreground hover:bg-secondary/80",
         ghost: "hover:bg-accent hover:text-accent-foreground dark:hover:bg-accent/50",
-        // Lime is invisible as text on the light paper; links read as ink.
+        // A link sits inside prose, where the accent would read as an action
+        // the sentence does not have; links are ink plus a rule.
         link: "text-foreground underline underline-offset-4 hover:text-foreground/80",
       },
       size: {
