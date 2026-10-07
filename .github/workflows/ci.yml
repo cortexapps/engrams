@@ -1521,7 +1521,7 @@ jobs:
           # Three files (binary + binary + 200-byte toml); leave
           # compression default.
 
-      - name: Download and stage Codex CLI 0.146.0
+      - name: Download and stage Codex CLI 0.161.0
         id: stage_codex
         run: |
           set -euo pipefail

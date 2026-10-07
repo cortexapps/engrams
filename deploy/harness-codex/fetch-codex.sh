@@ -3,7 +3,7 @@ set -euo pipefail
 
 arch="${1:?usage: fetch-codex.sh <x86_64|aarch64> <out-dir>}"
 out="${2:?usage: fetch-codex.sh <x86_64|aarch64> <out-dir>}"
-version=0.146.0
+version=0.161.0
 release="rust-v$version"
 asset="codex-package-${arch}-unknown-linux-musl.tar.gz"
 base="https://github.com/openai/codex/releases/download/$release"
