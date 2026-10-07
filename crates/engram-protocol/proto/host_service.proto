@@ -382,10 +382,15 @@ message MigrationFetchRequest {
 
 message MigrationItem {
   enum Kind {
-    STATE_BIN = 0;
-    DISK_SEAL_INFO = 1;
-    DISK_CHUNK_AT = 2;
+    reserved 2, 3;
+    reserved "CHUNK", "SIDECAR", "DISK_MANIFEST";
+    KIND_UNSPECIFIED = 0;
+    STATE_BIN = 1;
+    DISK_SEAL_INFO = 4;
+    DISK_CHUNK_AT = 5;
   }
+  reserved 2;
+  reserved "hash";
   Kind kind = 1;
   uint64 chunk_idx = 3;
 }

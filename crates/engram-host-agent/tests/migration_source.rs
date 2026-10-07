@@ -1,5 +1,5 @@
 //! Post-copy source lifecycle on real KVM: sealed post-checkpoint state,
-//! duplicate capture rejection, abort in place, and commit after drain.
+//! duplicate presetup rejection, abort in place, and commit after drain.
 //! The destination checkpoints the moved state to prove durability.
 
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
@@ -22,8 +22,11 @@ use futures::StreamExt;
 mod common;
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
 async fn migration_capture_freezes_abort_resumes_commit_destroys() {
+    let Some(devices) = common::postcopy::nbd_devices(2) else {
+        return;
+    };
     // ---- gating (same as checkpoint_chain) ----
     let kernel = match std::env::var("FC_TEST_KERNEL") {
         Ok(p) => std::path::PathBuf::from(p),
@@ -93,6 +96,9 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
 
     // ---- 2. PooledBackend (FC inner, chunked, dirty tracking) ----
     let mut cfg = FirecrackerConfig::with_kernel(kernel);
+    cfg.firecracker_bin = std::env::var_os("ENGRAM_FC_FORK_BIN")
+        .expect("gated fork")
+        .into();
     cfg.net_pool = None;
     // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
     // bundle and point the backend at it.
@@ -116,6 +122,10 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     let cache = engram_chunk_store::ChunkCache::new(cache_cfg);
     let pooled = Arc::new(
         PooledBackend::new(inner)
+            .with_nbd_pool(
+                engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(devices)
+                    .expect("nbd slot pool"),
+            )
             .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
             .with_chunk_cache(cache.clone())
             .with_checkpoint_dir(work.path().join("checkpoints")),
@@ -137,7 +147,8 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         swap_mib: None,
     };
     let peer = common::postcopy::peer(&pooled).await;
-    let vm = common::postcopy::fresh(&pooled, spec.clone()).await;
+    let base = common::postcopy::base(&pooled, spec).await;
+    let vm = common::postcopy::fresh(&pooled, base.clone()).await;
 
     // Full seed checkpoint, then a post-checkpoint marker — the
     // teleport delta the capture must carry.
@@ -160,10 +171,10 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         seal.sealed_chunks > 0,
         "post-checkpoint marker must be sealed"
     );
-    assert!(pooled
-        .migration_capture_postcopy(vm, &out.export_id)
-        .await
-        .is_err());
+    assert!(matches!(
+        pooled.migration_presetup(vm).await,
+        Err(engram_core::SandboxError::AlreadyExists)
+    ));
 
     // ---- 4. Abort: lossless resume ----
     pooled
@@ -225,7 +236,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         "source HostService did not bind {addr} within 5s"
     );
 
-    let vm2 = common::postcopy::fresh(&pooled, spec).await;
+    let vm2 = common::postcopy::fresh(&pooled, base).await;
     let _ = exec(&pooled, vm2, "true").await;
     let ckpt_v2 = pooled
         .checkpoint_sandbox(vm2)

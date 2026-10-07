@@ -43,12 +43,16 @@ fn build_host(
     blob_root: &Path,
     bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
+    devices: Vec<PathBuf>,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
     let work = tempfile::Builder::new()
         .prefix(&format!("drainwave-{label}-"))
         .tempdir()
         .expect("host workdir");
     let mut cfg = FirecrackerConfig::with_kernel(kernel.to_path_buf());
+    cfg.firecracker_bin = std::env::var_os("ENGRAM_FC_FORK_BIN")
+        .expect("gated fork")
+        .into();
     cfg.net_pool = None;
     // ADR 0080: both hosts stage the same agentd bundle dir (the fleet mirror).
     cfg.bundle_dir = bundle_dir.to_path_buf();
@@ -63,6 +67,10 @@ fn build_host(
         engram_chunk_store::cache::ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 1024 * 1024 * 1024;
     let pooled = PooledBackend::new(inner)
+        .with_nbd_pool(
+            engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(devices)
+                .expect("nbd slot pool"),
+        )
         .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
         .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
         .with_checkpoint_dir(work.path().join("checkpoints"));
@@ -126,7 +134,7 @@ fn heartbeat_argv() -> Vec<String> {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + Docker; boots microVMs on two host stacks"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + four NBD devices"]
 async fn drain_wave_teleports_every_session_off_host_a() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -135,6 +143,9 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
+    let Some(devices) = common::postcopy::nbd_devices(2 * SESSIONS) else {
+        return;
+    };
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -178,6 +189,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
+        devices.iter().step_by(2).cloned().collect(),
     );
     let (pooled_b, _work_b) = build_host(
         "b",
@@ -186,6 +198,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
+        devices.iter().skip(1).step_by(2).cloned().collect(),
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -203,23 +216,24 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         ckpt: engram_core::types::snapshot::SnapshotMetadata,
     }
     let mut live = Vec::with_capacity(SESSIONS);
+    let spec = SandboxSpec {
+        image: "engram-drain-wave".into(),
+        rootfs_source: Some(outcome.rootfs_path.clone()),
+        image_uri: None,
+        rootfs_manifest: None,
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 256 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
+    };
+    let base = common::postcopy::base(&host_a.pooled, spec).await;
     for i in 0..SESSIONS {
-        let spec = SandboxSpec {
-            image: "engram-drain-wave".into(),
-            rootfs_source: Some(outcome.rootfs_path.clone()),
-            image_uri: None,
-            rootfs_manifest: None,
-            cpu: CpuLimit { vcpus: 1 },
-            memory: MemoryLimit { max_mib: 256 },
-            disk: DiskLimit { max_gib: 1 },
-            ttl: None,
-            env: HashMap::new(),
-            workdir: None,
-            network: Default::default(),
-            aux_ro_drives: vec![staged.agentd_slot()],
-            swap_mib: None,
-        };
-        let vm = common::postcopy::fresh(&host_a.pooled, spec).await;
+        let vm = common::postcopy::fresh(&host_a.pooled, base.clone()).await;
         let _ = exec(&host_a.pooled, vm, "true").await;
         let ckpt = host_a
             .pooled

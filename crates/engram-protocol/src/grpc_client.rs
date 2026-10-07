@@ -1845,6 +1845,19 @@ mod grpc_err_tests {
     use super::*;
 
     #[test]
+    fn migration_client_interceptor_stamps_wire_version() {
+        let req = TraceparentInjector.call(tonic::Request::new(())).unwrap();
+        assert_eq!(
+            req.metadata()
+                .get(crate::wire::WIRE_VERSION_METADATA_KEY)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            crate::WIRE_VERSION.to_string(),
+        );
+    }
+
+    #[test]
     fn unavailable_maps_to_retryable_variant_not_vm() {
         // ADR 0050 C: tonic `Unavailable` (lazy connect failed / channel
         // evicted) must surface as the retryable `Unavailable` variant so

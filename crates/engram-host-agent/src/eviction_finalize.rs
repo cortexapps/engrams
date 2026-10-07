@@ -2,7 +2,7 @@
 //!
 //! ADR 0045 D5's original shape made the eviction finalize a function of
 //! THREE ephemeral things: a coordinator-RAM tokio task, a host-RAM tokio
-//! task + `snapshot_waits` slot, and live RPC routing to a sandbox PG
+//! task + a transient result slot, and live RPC routing to a sandbox PG
 //! already says nobody owns. Any of the three dying mid-upload silently
 //! dropped the snapshot — resume then fell back to the prior periodic
 //! checkpoint (up to `ENGRAM_CHECKPOINT_INTERVAL_SECS`, default 600s,

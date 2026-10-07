@@ -35,33 +35,16 @@ fn build_host(
     blob_root: &Path,
     bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
-) -> (Arc<PooledBackend>, tempfile::TempDir) {
-    build_host_with_nbd(
-        label,
-        kernel,
-        handler,
-        blob_root,
-        bundle_dir,
-        chunk_store,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)] // cohesive host-fixture inputs
-fn build_host_with_nbd(
-    label: &str,
-    kernel: &Path,
-    handler: &Path,
-    blob_root: &Path,
-    bundle_dir: &Path,
-    chunk_store: &engram_chunk_store::ChunkStore,
-    nbd_device: Option<&Path>,
+    nbd_device: &Path,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
     let work = tempfile::Builder::new()
         .prefix(&format!("teleport-{label}-"))
         .tempdir()
         .expect("host workdir");
     let mut cfg = FirecrackerConfig::with_kernel(kernel.to_path_buf());
+    cfg.firecracker_bin = std::env::var_os("ENGRAM_FC_FORK_BIN")
+        .expect("gated fork")
+        .into();
     cfg.net_pool = None;
     // ADR 0080: both hosts stage the same agentd bundle dir (the fleet mirror).
     cfg.bundle_dir = bundle_dir.to_path_buf();
@@ -75,16 +58,16 @@ fn build_host_with_nbd(
     let mut cache_cfg =
         engram_chunk_store::cache::ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 1024 * 1024 * 1024;
-    let mut pooled = PooledBackend::new(inner)
+    let pooled = PooledBackend::new(inner)
         .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
         .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
         .with_checkpoint_dir(work.path().join("checkpoints"));
-    if let Some(dev) = nbd_device {
-        pooled = pooled.with_nbd_pool(
-            engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(vec![dev.to_path_buf()])
-                .expect("nbd slot pool"),
-        );
-    }
+    let pooled = pooled.with_nbd_pool(
+        engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(
+            vec![nbd_device.to_path_buf()],
+        )
+        .expect("nbd slot pool"),
+    );
     (Arc::new(pooled), work)
 }
 
@@ -130,7 +113,7 @@ async fn dial(addr: std::net::SocketAddr) -> engram_protocol::grpc_client::GrpcH
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + Docker; boots microVMs on two host stacks"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
 async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -139,6 +122,9 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
+    let Some(devices) = common::postcopy::nbd_devices(2) else {
+        return;
+    };
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -180,6 +166,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
+        &devices[0],
     );
     let (pooled_b, _work_b) = build_host(
         "b",
@@ -188,6 +175,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
+        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -210,7 +198,8 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
     };
-    let vm = common::postcopy::fresh(&host_a.pooled, spec).await;
+    let base = common::postcopy::base(&host_a.pooled, spec).await;
+    let vm = common::postcopy::fresh(&host_a.pooled, base).await;
     let _ = exec(&host_a.pooled, vm, "true").await;
     let ckpt = host_a
         .pooled
@@ -512,7 +501,7 @@ int main(int argc, char **argv) {
 /// the in-flight turn) is unit-tested in engram-harness-claude's
 /// `connection_bounce_mid_turn_preserves_the_run`.
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + Docker; boots microVMs on two host stacks"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
 async fn two_host_live_teleport_held_stdin_pipe_survives() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -521,6 +510,9 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
+    let Some(devices) = common::postcopy::nbd_devices(2) else {
+        return;
+    };
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -586,6 +578,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
+        &devices[0],
     );
     let (pooled_b, _work_b) = build_host(
         "pipe-b",
@@ -594,6 +587,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
+        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -615,7 +609,8 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
     };
-    let vm = common::postcopy::fresh(&host_a.pooled, spec).await;
+    let base = common::postcopy::base(&host_a.pooled, spec).await;
+    let vm = common::postcopy::fresh(&host_a.pooled, base).await;
     let _ = exec(&host_a.pooled, vm, "true").await;
     let ckpt = host_a
         .pooled
@@ -799,7 +794,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
 /// destroyed) BEFORE probing, then drops the guest page cache and
 /// re-reads through the destination's NBD. Byte-identical or bust.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Linux + KVM + firecracker + Docker + two /dev/nbd devices"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
 async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -808,6 +803,9 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
+    let Some(devices) = common::postcopy::nbd_devices(2) else {
+        return;
+    };
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -817,27 +815,6 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         )
         .with_test_writer()
         .try_init();
-    // One real NBD device per host stack.
-    let nbd_a = PathBuf::from("/dev/nbd0");
-    let nbd_b = PathBuf::from("/dev/nbd1");
-    for dev in [&nbd_a, &nbd_b] {
-        if !dev.exists() {
-            eprintln!(
-                "SKIP: {} not present — run `sudo modprobe nbd nbds_max=4`",
-                dev.display()
-            );
-            return;
-        }
-        if std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(dev)
-            .is_err()
-        {
-            eprintln!("SKIP: cannot open {} R/W", dev.display());
-            return;
-        }
-    }
     std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
 
     let shared = tempfile::tempdir().expect("shared dir");
@@ -867,23 +844,23 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
 
     // ADR 0080: one staged agentd bundle dir shared by both hosts.
     let staged = common::stage_agentd_bundle(&shared.path().join("bundles"), &agent);
-    let (pooled_a, _work_a) = build_host_with_nbd(
+    let (pooled_a, _work_a) = build_host(
         "nbd-a",
         &kernel,
         &handler,
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        Some(&nbd_a),
+        &devices[0],
     );
-    let (pooled_b, _work_b) = build_host_with_nbd(
+    let (pooled_b, _work_b) = build_host(
         "nbd-b",
         &kernel,
         &handler,
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
-        Some(&nbd_b),
+        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -907,7 +884,8 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
     };
-    let vm = common::postcopy::fresh(&host_a.pooled, spec).await;
+    let base = common::postcopy::base(&host_a.pooled, spec).await;
+    let vm = common::postcopy::fresh(&host_a.pooled, base).await;
     let _ = exec(&host_a.pooled, vm, "true").await;
     let ckpt = host_a
         .pooled
@@ -1003,7 +981,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + Docker; boots microVMs on two host stacks"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
 async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -1012,6 +990,9 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
+    let Some(devices) = common::postcopy::nbd_devices(2) else {
+        return;
+    };
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -1049,6 +1030,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
+        &devices[0],
     );
     let (pooled_b, _work_b) = build_host(
         "kb",
@@ -1057,6 +1039,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
+        &devices[1],
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -1078,7 +1061,8 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
     };
-    let vm = common::postcopy::fresh(&host_a.pooled, spec).await;
+    let base = common::postcopy::base(&host_a.pooled, spec).await;
+    let vm = common::postcopy::fresh(&host_a.pooled, base).await;
     let _ = exec(&host_a.pooled, vm, "true").await;
     let ckpt = host_a
         .pooled
@@ -1118,22 +1102,22 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
 
     let metadata = common::postcopy::metadata(ckpt, &cap, host_a.addr);
 
-    let err = client_b
-        .restore(metadata, engram_core::traits::SessionFence::unfenced())
-        .await;
-    assert!(
-        err.is_err(),
-        "dest restore must fail when the source is gone"
-    );
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        client_b.restore(metadata, engram_core::traits::SessionFence::unfenced()),
+    )
+    .await
+    .expect("dead source must fail before the load gate budget");
+    assert!(err
+        .expect_err("dead source")
+        .to_string()
+        .contains("postcopy-never-loaded:"));
     assert!(
         host_b.pooled.list().await.unwrap().is_empty(),
         "no partial sandbox may remain on the destination"
     );
-    // Recovery posture from here is the coordinator's: the session is
-    // Evacuating (the parachute) and the scanner rehomes from the last
-    // durable checkpoint — exercised in live_migration's unit arms and
-    // admin_evac_live_pg. Host-side: A's frozen VM is the export TTL's
-    // problem (its process tree is gone in this test).
+    // The marker lets the coordinator abort to a surviving source without
+    // loss. This test stopped the source services, so clean up its VM here.
     host_a.pooled.destroy(vm).await.expect("destroy source");
     host_b.server.abort();
     host_b.peer.abort();

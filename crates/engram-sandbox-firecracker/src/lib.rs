@@ -3006,6 +3006,63 @@ impl FirecrackerBackend {
         // `None` ⇒ canonical == session (old coordinators, reattach).
         base_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
     ) -> Result<(), SandboxError> {
+        let post_copy = snapshot_dir.join(MIGRATION_PEER_FILE).exists();
+        let mut load_started = false;
+        let result = self
+            .restore_in_jail_inner(
+                sandbox_id,
+                jail_dir,
+                snapshot_dir,
+                manifest,
+                swap_aux_to_current,
+                selected_mounts,
+                restore_mode,
+                base_memory_manifest,
+                &mut load_started,
+            )
+            .await;
+        // Only failures before the load request permit a zero-loss source resume.
+        result.map_err(|error| {
+            if post_copy && !load_started {
+                let detail = match error {
+                    SandboxError::Snapshot(detail) => detail,
+                    other => other.to_string(),
+                };
+                SandboxError::Snapshot(format!("postcopy-never-loaded: {detail}"))
+            } else {
+                error
+            }
+        })
+    }
+
+    /// The body of [`Self::restore_in_jail`]. `load_started` flips to true the
+    /// instant a snapshot-load request is sent to FC; the wrapper uses it to
+    /// classify a post-copy failure as never-loaded (abortable to the source).
+    #[allow(clippy::too_many_arguments)]
+    async fn restore_in_jail_inner(
+        &self,
+        sandbox_id: SandboxId,
+        jail_dir: &Path,
+        snapshot_dir: &Path,
+        manifest: &FcSnapshotManifest,
+        swap_aux_to_current: bool,
+        // ADR 0055: per-session skills the coordinator assigned to reserved
+        // slots (dyn_i + content sha), patch_drived in load-paused. Empty on
+        // resume / reattach.
+        selected_mounts: Vec<AuxRoDrive>,
+        // ADR 0022: the effective memory backend for THIS restore
+        // (base-create may be File while resume is UFFD). Computed by the
+        // caller via `effective_restore_mode` rather than read from
+        // `self.config.restore_mode`, which is now resume-only.
+        restore_mode: RestoreMode,
+        // ADR 0045 D4: the IMAGE's base manifest from the coordinator's
+        // restore metadata (a restore-time input — the capture-time
+        // sidecar can't know it). `Some` ⇒ substrate restores CONTINUE
+        // base-identical pages against the shared per-image base shm;
+        // `None` ⇒ canonical == session (old coordinators, reattach).
+        base_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+        load_started: &mut bool,
+    ) -> Result<(), SandboxError> {
         let state_path = snapshot_dir.join("state.bin");
         let mem_path = snapshot_dir.join("memory.bin");
 
@@ -3045,8 +3102,8 @@ impl FirecrackerBackend {
                 if !tokio::fs::try_exists(&pinned).await.unwrap_or(false) {
                     return Err(SandboxError::Snapshot(format!(
                         "aux RO bundle {} ({}) pinned by the snapshot is not \
-                         staged on this host and wasn't materialized from \
-                         BlobStorage — restore can't proceed",
+                     staged on this host and wasn't materialized from \
+                     BlobStorage — restore can't proceed",
                         pinned.display(),
                         aux.drive_id
                     )));
@@ -3124,7 +3181,7 @@ impl FirecrackerBackend {
             if !tokio::fs::try_exists(&staged).await.unwrap_or(false) {
                 return Err(SandboxError::Snapshot(format!(
                     "ADR 0055 selected skill {} for slot {} is not staged on this \
-                     host (catalog materialize gap?) — restore can't proceed",
+                 host (catalog materialize gap?) — restore can't proceed",
                     sel.sha256.as_deref().unwrap_or("?"),
                     sel.drive_id,
                 )));
@@ -3266,10 +3323,10 @@ impl FirecrackerBackend {
                     let session_ref = manifest.memory_manifest.ok_or_else(|| {
                         SandboxError::Snapshot(
                             "RestoreMode::Uffd requires manifest.memory_manifest \
-                             (snapshot wasn't taken via PooledBackend with a \
-                             chunk_store attached; either wrap the FC backend \
-                             with PooledBackend.with_chunk_store(...) before \
-                             snapshotting, or switch to RestoreMode::File)"
+                         (snapshot wasn't taken via PooledBackend with a \
+                         chunk_store attached; either wrap the FC backend \
+                         with PooledBackend.with_chunk_store(...) before \
+                         snapshotting, or switch to RestoreMode::File)"
                                 .into(),
                         )
                     })?;
@@ -3355,7 +3412,7 @@ impl FirecrackerBackend {
         // the uffd handler, and the netns. They're disarmed just before the
         // `sandboxes.insert` once the VM is resumed and committed (ADR 0044
         // K2: a committed VM is decoupled from this host-agent's lifecycle).
-        let (uffd_leg, mut uffd_guard) = match uffd_leg {
+        let (mut uffd_leg, mut uffd_guard) = match uffd_leg {
             Some((handler, uds, guard)) => (Some((handler, uds)), Some(guard)),
             None => (None, None),
         };
@@ -3487,14 +3544,14 @@ impl FirecrackerBackend {
                 // stale bytes.
                 return Err(SandboxError::Snapshot(
                     "sidecar has swap_mib but no source_swap_canonical — \
-                     refusing to restore onto an unanchored swap device"
+                 refusing to restore onto an unanchored swap device"
                         .into(),
                 ));
             }
             _ => None,
         };
         let load_result: Result<(), SandboxError> = async {
-            match &uffd_leg {
+            match &mut uffd_leg {
                 None => {
                     let paths = SnapshotPaths {
                         state_path: state_path.clone(),
@@ -3505,6 +3562,7 @@ impl FirecrackerBackend {
                             // ADR 0028: restored VMs re-arm dirty
                             // tracking here (no machine-config PUT on
                             // the restore path).
+                            *load_started = true;
                             api.load_snapshot_opts(
                                 &paths,
                                 /*resume_vm=*/ aux_swap_plan.is_empty(),
@@ -3517,7 +3575,7 @@ impl FirecrackerBackend {
                     )
                     .await?;
                 }
-                Some((_handler, uffd_uds)) => {
+                Some((handler, uffd_uds)) => {
                     // ADR 0045 C2 load gates: in post-copy mode the
                     // handler binds its UDS only once SEALED, and
                     // state.bin lands only once the fetch poller pulls
@@ -3528,7 +3586,17 @@ impl FirecrackerBackend {
                     if post_copy {
                         let budget = Duration::from_secs(240);
                         let started = std::time::Instant::now();
-                        while !(uffd_uds.exists() && state_path.exists()) {
+                        loop {
+                            if let Some(status) = handler.try_wait().map_err(|e| {
+                                SandboxError::Snapshot(format!("check uffd handler: {e}"))
+                            })? {
+                                return Err(SandboxError::Snapshot(format!(
+                                    "uffd handler exited before the load ({status})"
+                                )));
+                            }
+                            if uffd_uds.exists() && state_path.exists() {
+                                break;
+                            }
                             if started.elapsed() > budget {
                                 // The "postcopy-never-loaded" marker is
                                 // LOAD-BEARING: the coordinator's abort-
@@ -3538,8 +3606,8 @@ impl FirecrackerBackend {
                                 // un-pause of the source is zero-loss
                                 // sound).
                                 return Err(SandboxError::Snapshot(format!(
-                                    "postcopy-never-loaded: load gate timed out after {budget:?} \
-                                     (uds: {}, state.bin: {})",
+                                    "load gate timed out after {budget:?} \
+                                 (uds: {}, state.bin: {})",
                                     uffd_uds.exists(),
                                     state_path.exists(),
                                 )));
@@ -3566,6 +3634,7 @@ impl FirecrackerBackend {
                     let t_load = std::time::Instant::now();
                     tracing::Instrument::instrument(
                         async {
+                            *load_started = true;
                             api.load_snapshot_uffd_opts(
                                 &state_path,
                                 uffd_uds,
@@ -7937,6 +8006,49 @@ mod tests {
         }"#;
         let manifest: FcSnapshotManifest = serde_json::from_str(json).unwrap();
         assert!(manifest.net.is_none());
+    }
+
+    #[tokio::test]
+    async fn postcopy_restore_setup_failure_is_never_loaded() {
+        let (backend, work) = backend();
+        let manifest = FcSnapshotManifest {
+            sandbox_id: SandboxId::new(),
+            created_at: Utc::now(),
+            spec: spec(),
+            net: None,
+            format: MANIFEST_FORMAT_FC.into(),
+            memory_manifest: None,
+            trace_host_hint: None,
+            trace_lineage_id: None,
+            source_rootfs_canonical: None,
+            source_swap_canonical: None,
+            source_harness_canonical: None,
+            source_vsock_canonical: None,
+        };
+        // A missing memory file fails before any process or load request.
+        for post_copy in [false, true] {
+            if post_copy {
+                std::fs::write(work.path().join(MIGRATION_PEER_FILE), b"{}").unwrap();
+            }
+            let error = backend
+                .restore_in_jail(
+                    manifest.sandbox_id,
+                    &work.path().join("jail"),
+                    work.path(),
+                    &manifest,
+                    false,
+                    Vec::new(),
+                    RestoreMode::File,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string().contains("postcopy-never-loaded:"),
+                post_copy
+            );
+            assert!(error.to_string().contains("missing"));
+        }
     }
 
     #[test]

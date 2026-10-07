@@ -416,6 +416,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<MigrationFetchRequest>,
     ) -> Result<Response<Self::MigrationFetchStream>, Status> {
+        check_wire_version(&req)?;
         let req = req.into_inner();
         let items: Vec<engram_core::types::snapshot::MigrationItem> = req
             .items
@@ -430,7 +431,9 @@ impl HostService for HostServiceImpl {
                     Ok(Kind::DiskChunkAt) => Ok(
                         engram_core::types::snapshot::MigrationItem::DiskChunkAt(item.chunk_idx),
                     ),
-                    Err(_) => Err(Status::invalid_argument("unknown migration item kind")),
+                    Ok(Kind::Unspecified) | Err(_) => {
+                        Err(Status::invalid_argument("unknown migration item kind"))
+                    }
                 }
             })
             .collect::<Result<_, Status>>()?;
@@ -514,6 +517,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<MigrationExportRef>,
     ) -> Result<Response<Empty>, Status> {
+        check_wire_version(&req)?;
         let req = req.into_inner();
         let id = decode_sandbox_id(&req.sandbox_id)?;
         let fence = self.check_session_epoch(&req.session_id, req.fencing_epoch)?;
@@ -528,6 +532,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<MigrationExportRef>,
     ) -> Result<Response<Empty>, Status> {
+        check_wire_version(&req)?;
         let req = req.into_inner();
         let id = decode_sandbox_id(&req.sandbox_id)?;
         let fence = self.check_session_epoch(&req.session_id, req.fencing_epoch)?;
@@ -542,6 +547,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<FencedSandboxRequest>,
     ) -> Result<Response<MigrationPresetupResponse>, Status> {
+        check_wire_version(&req)?;
         let r = req.into_inner();
         let id = decode_sandbox_id(&r.uuid)?;
         let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
@@ -566,6 +572,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<MigrationExportRef>,
     ) -> Result<Response<PostCopyCaptureResponse>, Status> {
+        check_wire_version(&req)?;
         let req = req.into_inner();
         let id = decode_sandbox_id(&req.sandbox_id)?;
         let fence = self.check_session_epoch(&req.session_id, req.fencing_epoch)?;
@@ -590,6 +597,7 @@ impl HostService for HostServiceImpl {
         &self,
         req: Request<SandboxIdMessage>,
     ) -> Result<Response<DrainOutcomeResponse>, Status> {
+        check_wire_version(&req)?;
         let id = decode_sandbox_id(&req.into_inner().uuid)?;
         let out = self
             .inner
@@ -1902,6 +1910,55 @@ mod wire_version_tests {
                 .insert(WIRE_VERSION_METADATA_KEY, v.to_string().parse().unwrap());
         }
         req
+    }
+
+    #[tokio::test]
+    async fn migration_fetch_rejects_wire_skew_before_artifacts() {
+        let work = tempfile::tempdir().unwrap();
+        let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(work.path()));
+        let host = Arc::new(crate::host_client::LocalHostClient::with_noop_hub(backend));
+        let service = HostServiceImpl::new(host, crate::session_epochs::ephemeral());
+        let mut req = Request::new(MigrationFetchRequest {
+            export_id: "absent-export".into(),
+            items: vec![engram_protocol::grpc::MigrationItem {
+                kind: engram_protocol::grpc::migration_item::Kind::StateBin as i32,
+                chunk_idx: 0,
+            }],
+        });
+        req.metadata_mut().insert(
+            WIRE_VERSION_METADATA_KEY,
+            (engram_protocol::WIRE_VERSION + 1)
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        let Err(status) = service.migration_fetch(req).await else {
+            panic!("wire skew must fail before serving artifacts");
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(engram_protocol::wire::parse_wire_skew_message(status.message()).is_some());
+    }
+
+    #[tokio::test]
+    async fn migration_fetch_rejects_retired_and_unspecified_kinds() {
+        let work = tempfile::tempdir().unwrap();
+        let backend = Arc::new(engram_sandbox_process::ProcessBackend::new(work.path()));
+        let host = Arc::new(crate::host_client::LocalHostClient::with_noop_hub(backend));
+        let service = HostServiceImpl::new(host, crate::session_epochs::ephemeral());
+        for kind in [0, 2, 3] {
+            let mut req = Request::new(MigrationFetchRequest {
+                export_id: "absent-export".into(),
+                items: vec![engram_protocol::grpc::MigrationItem { kind, chunk_idx: 0 }],
+            });
+            req.metadata_mut().insert(
+                WIRE_VERSION_METADATA_KEY,
+                engram_protocol::WIRE_VERSION.to_string().parse().unwrap(),
+            );
+            let Err(status) = service.migration_fetch(req).await else {
+                panic!("retired or unspecified kind must fail");
+            };
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        }
     }
 
     #[test]

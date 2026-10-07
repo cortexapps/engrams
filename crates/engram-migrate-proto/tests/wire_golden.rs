@@ -27,6 +27,7 @@
 //! cargo test -p engram-migrate-proto --test wire_golden -- --ignored regen_golden
 //! ```
 //!
+//! A change to an EXISTING golden is a red flag unless `PROTO_VERSION` was bumped.
 //! Review every changed fixture with the corresponding version change.
 
 use std::path::PathBuf;

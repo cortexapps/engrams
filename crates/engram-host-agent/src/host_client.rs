@@ -151,7 +151,7 @@ impl HostClient for LocalHostClient {
     ) -> Result<engram_core::types::SnapshotId, SandboxError> {
         // ADR 0052 Phase 2 (clean-idle-shutdown). The two-phase
         // `snapshot_begin` is the IDLE-eviction capture entry: the
-        // coordinator only drives begin/wait/commit for
+        // coordinator starts capture and waits for durable finalize for
         // `target_state == Idle` (live teleport goes through
         // `migration_capture_postcopy`; periodic + manual checkpoints through
         // `snapshot`). So this is exactly where "gate strictly to the idle
