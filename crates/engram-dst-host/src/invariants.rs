@@ -118,8 +118,17 @@ fn quarantine_reconnectable(host: &SimHost) -> Result<(), Violation> {
         if !host.quarantined_unknown.contains(&slot.sandbox_id) {
             continue;
         }
-        let served = slot.served_by == Some(gen);
-        if !served && slot.guest_holds_device && slot.kernel_owner.is_none() {
+        let served = slot
+            .disks
+            .iter()
+            .all(|(_, disk)| disk.served_by == Some(gen));
+        if !served
+            && slot.guest_holds_device
+            && slot
+                .disks
+                .iter()
+                .any(|(_, disk)| disk.kernel_owner.is_none())
+        {
             return Err(Violation {
                 invariant: "quarantine-reconnectable",
                 detail: format!(
@@ -174,7 +183,7 @@ fn no_plane_leak(host: &SimHost) -> Result<(), Violation> {
                 ),
             });
         }
-        if slot.migrating && slot.backend.is_none() {
+        if slot.migrating && slot.disks.root.backend.is_none() {
             return Err(Violation {
                 invariant: "no-plane-leak",
                 detail: format!(
@@ -315,59 +324,61 @@ fn device_serving(host: &SimHost) -> Result<(), Violation> {
     let gen = host.generation;
     let mut seen = std::collections::BTreeSet::new();
     for (idx, s) in host.sandboxes.iter().enumerate() {
-        // No two sandboxes claim the same `/dev/nbdN`.
-        if !seen.insert(s.nbd_device.clone()) {
-            return Err(Violation {
-                invariant: "single-device-ownership",
-                detail: format!(
-                    "device {} is owned by more than one sandbox (idx {idx})",
-                    s.nbd_device.display()
-                ),
-            });
-        }
-        // "served by THIS generation" ⟺ a lease is held (we actually serve it).
-        let served = s.served_by == Some(gen);
-        if served != s.lease.is_some() {
-            return Err(Violation {
-                invariant: "single-device-ownership",
-                detail: format!(
-                    "sandbox {idx}: served_by_current={served} but lease_held={} — \
+        for (_, disk) in s.disks.iter() {
+            // No two sandboxes claim the same `/dev/nbdN`.
+            if !seen.insert(disk.nbd_device.clone()) {
+                return Err(Violation {
+                    invariant: "single-device-ownership",
+                    detail: format!(
+                        "device {} is owned by more than one sandbox (idx {idx})",
+                        disk.nbd_device.display()
+                    ),
+                });
+            }
+            // "served by THIS generation" ⟺ a lease is held (we actually serve it).
+            let served = disk.served_by == Some(gen);
+            if served != disk.lease.is_some() {
+                return Err(Violation {
+                    invariant: "single-device-ownership",
+                    detail: format!(
+                        "sandbox {idx}: served_by_current={served} but lease_held={} — \
                      serving state and the slot lease disagree",
-                    s.lease.is_some()
-                ),
-            });
-        }
-        // A device we serve must have the kernel record US as its owner. If a
-        // served device's `kernel_owner` is cleared/another gen, its plane was
-        // torn down under a live serve — the 731df805 dead-plane class.
-        if served && s.kernel_owner != Some(gen) {
-            return Err(Violation {
-                invariant: "served-device-never-dead",
-                detail: format!(
-                    "sandbox {idx} is served by generation {gen} but kernel_owner={:?} — \
+                        disk.lease.is_some()
+                    ),
+                });
+            }
+            // A device we serve must have the kernel record US as its owner. If a
+            // served device's `kernel_owner` is cleared/another gen, its plane was
+            // torn down under a live serve — the 731df805 dead-plane class.
+            if served && disk.kernel_owner != Some(gen) {
+                return Err(Violation {
+                    invariant: "served-device-never-dead",
+                    detail: format!(
+                        "sandbox {idx} is served by generation {gen} but kernel_owner={:?} — \
                      a live served device was disconnected (the 731df805 dead-plane class)",
-                    s.kernel_owner
-                ),
-            });
-        }
-        // R6 (#769 gap A): a device whose FC guest still holds it open must
-        // never be fully severed — it is either served by us OR still
-        // kernel-bound (RECONNECTABLE for a re-serve pass). Both unserved AND
-        // kernel-unbound with a live holder is the stale sweep having
-        // DISCONNECTed a live guest's rootfs (the exact 2026-07-18/19 firing
-        // this layer prevents). Fails against the pre-R6 `sweep_verdict`
-        // (dead-owner ⇒ Disconnect regardless of holder); passes with the Park
-        // guard.
-        if s.guest_holds_device && !served && s.kernel_owner.is_none() {
-            return Err(Violation {
-                invariant: "severed-live-holder",
-                detail: format!(
-                    "sandbox {idx}: a live guest still holds device {} open, but it is \
+                        disk.kernel_owner
+                    ),
+                });
+            }
+            // R6 (#769 gap A): a device whose FC guest still holds it open must
+            // never be fully severed — it is either served by us OR still
+            // kernel-bound (RECONNECTABLE for a re-serve pass). Both unserved AND
+            // kernel-unbound with a live holder is the stale sweep having
+            // DISCONNECTed a live guest's rootfs (the exact 2026-07-18/19 firing
+            // this layer prevents). Fails against the pre-R6 `sweep_verdict`
+            // (dead-owner ⇒ Disconnect regardless of holder); passes with the Park
+            // guard.
+            if s.guest_holds_device && !served && disk.kernel_owner.is_none() {
+                return Err(Violation {
+                    invariant: "severed-live-holder",
+                    detail: format!(
+                        "sandbox {idx}: a live guest still holds device {} open, but it is \
                      unserved AND kernel-unbound — the stale sweep severed a surviving \
                      guest's rootfs (#769 gap A)",
-                    s.nbd_device.display()
-                ),
-            });
+                        disk.nbd_device.display()
+                    ),
+                });
+            }
         }
     }
     Ok(())
@@ -396,56 +407,61 @@ async fn acked_writes_recoverable(host: &SimHost) -> Result<(), Violation> {
     // read each chunk back through its live backend and check it against BOTH
     // the durable-handoff floor and the latest ack (the honest, bidirectional
     // form — ADR 0098 P4.5).
-    for ((idx, chunk_idx), entry) in host.ledger.latest_by_chunk() {
-        let Some(slot) = host.sandboxes.get(idx) else {
-            continue;
-        };
-        let Some(backend) = slot.backend.clone() else {
-            // Crashed, not yet restarted — recoverability is checkable only
-            // after the successor rebuilds.
-            continue;
-        };
-        let bytes = backend
-            .read(chunk_idx * CHUNK_SIZE, CHUNK_SIZE)
-            .await
-            .map_err(|e| Violation {
-                invariant: "acked-write-durability",
-                detail: format!("sandbox {idx} chunk {chunk_idx} read failed: {e}"),
-            })?;
-        let got = decode_tag(&bytes);
-        let latest = entry.content_tag;
-        // The published-tier floor: `0` (base) if this chunk was never flushed
-        // to the durable tier — its acked writes are all RAM-only or
-        // spool-transient, droppable by abrupt death.
-        let floor = host.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
-        let acked = host.ledger.acked_tags(idx, chunk_idx);
-        // A legitimate read is a tag actually acked for THIS chunk (or the tag-0
-        // base), bounded below by the published floor. Membership implies
-        // `got <= latest` (tags are globally monotone, so the chunk's latest ack
-        // is its max member) — the interval alone was NOT sufficient: tags are
-        // global, so another chunk's in-range tag must be a violation
-        // (misdirection), not a pass.
-        let member = got == 0 || acked.contains(&got);
-        if member && got >= floor {
-            continue;
-        }
-        let why = if got < floor {
-            "a durable published write rolled back below the floor"
-        } else if got > latest {
-            "a read newer than the latest ack (a never-acked tag)"
-        } else {
-            "an in-range tag never acked for THIS chunk (a misdirected read \
+    for (role, ledger) in [
+        (engram_core::DiskRole::Root, &host.ledger),
+        (engram_core::DiskRole::Swap, &host.swap_ledger),
+    ] {
+        for ((idx, chunk_idx), entry) in ledger.latest_by_chunk() {
+            let Some(slot) = host.sandboxes.get(idx) else {
+                continue;
+            };
+            let Some(backend) = slot.disks.get(role).and_then(|disk| disk.backend.clone()) else {
+                // Crashed, not yet restarted — recoverability is checkable only
+                // after the successor rebuilds.
+                continue;
+            };
+            let bytes = backend
+                .read(chunk_idx * CHUNK_SIZE, CHUNK_SIZE)
+                .await
+                .map_err(|e| Violation {
+                    invariant: "acked-write-durability",
+                    detail: format!("sandbox {idx} chunk {chunk_idx} read failed: {e}"),
+                })?;
+            let got = decode_tag(&bytes);
+            let latest = entry.content_tag;
+            // The published-tier floor: `0` (base) if this chunk was never flushed
+            // to the durable tier — its acked writes are all RAM-only or
+            // spool-transient, droppable by abrupt death.
+            let floor = ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
+            let acked = ledger.acked_tags(idx, chunk_idx);
+            // A legitimate read is a tag actually acked for THIS chunk (or the tag-0
+            // base), bounded below by the published floor. Membership implies
+            // `got <= latest` (tags are globally monotone, so the chunk's latest ack
+            // is its max member) — the interval alone was NOT sufficient: tags are
+            // global, so another chunk's in-range tag must be a violation
+            // (misdirection), not a pass.
+            let member = got == 0 || acked.contains(&got);
+            if member && got >= floor {
+                continue;
+            }
+            let why = if got < floor {
+                "a durable published write rolled back below the floor"
+            } else if got > latest {
+                "a read newer than the latest ack (a never-acked tag)"
+            } else {
+                "an in-range tag never acked for THIS chunk (a misdirected read \
              serving another chunk's write)"
-        };
-        return Err(Violation {
-            invariant: "acked-write-durability",
-            detail: format!(
+            };
+            return Err(Violation {
+                invariant: "acked-write-durability",
+                detail: format!(
                 "sandbox {idx} chunk {chunk_idx}: read {got} not a member of this chunk's acked \
                  set within [published_floor {floor}, latest_ack {latest}] — {why}; \
                  lineage-at-ack {}v{}",
                 entry.lineage_at_ack.manifest_id, entry.lineage_at_ack.version
             ),
-        });
+            });
+        }
     }
     Ok(())
 }
@@ -466,32 +482,37 @@ async fn acked_writes_recoverable(host: &SimHost) -> Result<(), Violation> {
 /// live backend (destroyed at a finalize/migration terminal, or
 /// quarantined) are exempt — their durability story is oracle #6/#8's.
 pub async fn check_quiescent_floor(host: &SimHost) -> Result<(), Violation> {
-    for ((idx, chunk_idx), _entry) in host.ledger.latest_by_chunk() {
-        let Some(slot) = host.sandboxes.get(idx) else {
-            continue;
-        };
-        let Some(backend) = slot.backend.clone() else {
-            continue;
-        };
-        let bytes = backend
-            .read(chunk_idx * CHUNK_SIZE, CHUNK_SIZE)
-            .await
-            .map_err(|e| Violation {
-                invariant: "quiescent-floor",
-                detail: format!("sandbox {idx} chunk {chunk_idx} read failed: {e}"),
-            })?;
-        let got = decode_tag(&bytes);
-        let floor = host.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
-        if got > floor {
-            return Err(Violation {
-                invariant: "quiescent-floor",
-                detail: format!(
-                    "sandbox {idx} chunk {chunk_idx}: live content {got} above the published \
+    for (role, ledger) in [
+        (engram_core::DiskRole::Root, &host.ledger),
+        (engram_core::DiskRole::Swap, &host.swap_ledger),
+    ] {
+        for ((idx, chunk_idx), _entry) in ledger.latest_by_chunk() {
+            let Some(slot) = host.sandboxes.get(idx) else {
+                continue;
+            };
+            let Some(backend) = slot.disks.get(role).and_then(|disk| disk.backend.clone()) else {
+                continue;
+            };
+            let bytes = backend
+                .read(chunk_idx * CHUNK_SIZE, CHUNK_SIZE)
+                .await
+                .map_err(|e| Violation {
+                    invariant: "quiescent-floor",
+                    detail: format!("sandbox {idx} chunk {chunk_idx} read failed: {e}"),
+                })?;
+            let got = decode_tag(&bytes);
+            let floor = ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
+            if got > floor {
+                return Err(Violation {
+                    invariant: "quiescent-floor",
+                    detail: format!(
+                        "sandbox {idx} chunk {chunk_idx}: live content {got} above the published \
                      floor {floor} after the quiescence flush — a surviving acked write the \
                      world never flushed (the loss bound is 'un-flushed at crash', not 'never \
                      flushed')"
-                ),
-            });
+                    ),
+                });
+            }
         }
     }
     Ok(())

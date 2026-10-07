@@ -550,6 +550,7 @@ async fn run_sigterm_overrun_recovery(recovery_source: Stage1RecoverySource) {
         &engram_host_core::TokioFs,
         &spool_root,
         restored_id,
+        engram_core::types::snapshot::DiskRole::Root,
     )
     .await
     .expect("spool readable")
@@ -643,6 +644,7 @@ async fn run_sigterm_overrun_recovery(recovery_source: Stage1RecoverySource) {
         &engram_host_core::TokioFs,
         &spool_root,
         restored_id,
+        engram_core::types::snapshot::DiskRole::Root,
     )
     .await
     .expect("spool root readable");
@@ -837,6 +839,7 @@ async fn sigterm_overrun_aborts_inflight_flush_so_the_spool_stamp_cannot_go_stal
         &engram_host_core::TokioFs,
         &spool_root,
         restored_id,
+        engram_core::types::snapshot::DiskRole::Root,
     )
     .await
     .expect("spool readable")

@@ -76,3 +76,8 @@ pub use runtime::{
     recover_stuck_nbd_devices, spawn, NbdHandle, NbdRuntimeError, NbdSandboxState, StartupRecords,
     NBD_BLOCK_SIZE,
 };
+
+pub use engram_core::types::snapshot::DiskRole;
+pub mod devices;
+#[cfg(target_os = "linux")]
+pub type SandboxDisks = devices::SandboxDisks<NbdSandboxState>;

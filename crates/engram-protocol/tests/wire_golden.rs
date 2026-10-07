@@ -684,8 +684,9 @@ fn wire_version_pinned() {
     // `MigrationSourceInfo` loses its C1-only fields (no golden embeds
     // it: `snapshot_metadata.bin` pins `migration_source: None`). Lockstep
     // coord+host roll.
+    // 30 -> 31: migration disk items carry the device role.
     assert_eq!(
-        WIRE_VERSION, 30,
+        WIRE_VERSION, 31,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

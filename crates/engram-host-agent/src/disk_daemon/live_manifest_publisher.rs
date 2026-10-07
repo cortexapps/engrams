@@ -2,7 +2,7 @@
 //! with per-sandbox coalescing.
 //!
 //! The FlushScheduler's `publish(sandbox_id, manifest_ref)` writes
-//! into a `DashMap<SandboxId, ManifestRef>` and wakes a single
+//! into a `DashMap<(SandboxId, DiskRole), ManifestRef>` and wakes a single
 //! drain task via `Notify`. The drain task snapshots the map, POSTs
 //! each entry to coord (skipping unbound sandboxes), and clears the
 //! entries it sent.
@@ -32,6 +32,7 @@
 //! publisher impl so both die together if the host-agent shuts
 //! down cleanly (panic / OOM aborts the task via process exit).
 
+use super::DiskRole;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -65,18 +66,18 @@ where
 /// Production publisher impl: per-sandbox coalescing into a DashMap,
 /// drained by a single background task that POSTs to coord.
 pub struct CoordLiveManifestPublisher {
-    pending: Arc<DashMap<SandboxId, ManifestRef>>,
+    pending: Arc<DashMap<(SandboxId, DiskRole), ManifestRef>>,
     wakeup: Arc<Notify>,
 }
 
 #[async_trait]
 impl LiveManifestPublisher for CoordLiveManifestPublisher {
-    async fn publish(&self, sandbox_id: SandboxId, manifest_ref: ManifestRef) {
+    async fn publish(&self, sandbox_id: SandboxId, role: DiskRole, manifest_ref: ManifestRef) {
         // Per-sandbox coalescing: a previous unpublished entry is
         // overwritten in place. Same correctness as "only the
         // latest manifest_ref matters; older ones are strictly
         // dominated by the chunk-store version chain anyway".
-        self.pending.insert(sandbox_id, manifest_ref);
+        self.pending.insert((sandbox_id, role), manifest_ref);
         // notify_one stores at most one permit; multiple writers
         // landing between drains collapse to one drain pass.
         self.wakeup.notify_one();
@@ -105,7 +106,7 @@ impl CoordLiveManifestPublisher {
         host_id: HostId,
         session_resolver: Arc<dyn SessionResolver>,
     ) -> (Arc<dyn LiveManifestPublisher>, LiveManifestPublisherHandle) {
-        let pending: Arc<DashMap<SandboxId, ManifestRef>> = Arc::new(DashMap::new());
+        let pending: Arc<DashMap<(SandboxId, DiskRole), ManifestRef>> = Arc::new(DashMap::new());
         let wakeup = Arc::new(Notify::new());
         let publisher = Arc::new(CoordLiveManifestPublisher {
             pending: pending.clone(),
@@ -125,7 +126,7 @@ impl CoordLiveManifestPublisher {
 async fn drain_loop(
     coord: Arc<dyn CoordControlPlane>,
     host_id: HostId,
-    pending: Arc<DashMap<SandboxId, ManifestRef>>,
+    pending: Arc<DashMap<(SandboxId, DiskRole), ManifestRef>>,
     wakeup: Arc<Notify>,
     session_resolver: Arc<dyn SessionResolver>,
 ) {
@@ -134,7 +135,7 @@ async fn drain_loop(
         // Snapshot the pending set. Drain entries individually so
         // a publish landing mid-drain isn't dropped — it gets a
         // fresh DashMap slot and a fresh Notify permit.
-        let to_post: Vec<(SandboxId, ManifestRef)> =
+        let to_post: Vec<((SandboxId, DiskRole), ManifestRef)> =
             pending.iter().map(|e| (*e.key(), *e.value())).collect();
         for (sandbox_id, _) in &to_post {
             // Remove the snapshotted entry. A racing publish for
@@ -146,7 +147,10 @@ async fn drain_loop(
             // exact race coverage.
             pending.remove(sandbox_id);
         }
-        for (sandbox_id, manifest_ref) in to_post {
+        for ((sandbox_id, role), manifest_ref) in to_post {
+            if role != DiskRole::Root {
+                continue;
+            }
             let session_id = match session_resolver.session_id_for(sandbox_id) {
                 Some(sid) => sid,
                 None => {
@@ -207,7 +211,7 @@ async fn drain_loop(
                         error = %e,
                         "live-manifest publish failed; re-queuing",
                     );
-                    pending.entry(sandbox_id).or_insert(manifest_ref);
+                    pending.entry((sandbox_id, role)).or_insert(manifest_ref);
                     // Wake ourselves so we retry without waiting
                     // on the next FlushScheduler tick.
                     wakeup.notify_one();
@@ -237,8 +241,24 @@ mod tests {
     /// The full drain-loop → coord round-trip is exercised by the
     /// integration test below.
     #[tokio::test]
+    async fn swap_publish_cannot_replace_root() {
+        let pending = Arc::new(DashMap::new());
+        let publisher = CoordLiveManifestPublisher {
+            pending: pending.clone(),
+            wakeup: Arc::new(Notify::new()),
+        };
+        let sandbox = SandboxId::new();
+        let root = ManifestRef::new();
+        let swap = ManifestRef::new();
+        publisher.publish(sandbox, DiskRole::Root, root).await;
+        publisher.publish(sandbox, DiskRole::Swap, swap).await;
+        assert_eq!(*pending.get(&(sandbox, DiskRole::Root)).unwrap(), root);
+        assert_eq!(*pending.get(&(sandbox, DiskRole::Swap)).unwrap(), swap);
+    }
+
+    #[tokio::test]
     async fn publish_inserts_and_coalesces_per_sandbox() {
-        let pending: Arc<DashMap<SandboxId, ManifestRef>> = Arc::new(DashMap::new());
+        let pending: Arc<DashMap<(SandboxId, DiskRole), ManifestRef>> = Arc::new(DashMap::new());
         let wakeup = Arc::new(Notify::new());
         let publisher = CoordLiveManifestPublisher {
             pending: pending.clone(),
@@ -255,15 +275,18 @@ mod tests {
             version: v1.version + 2,
         };
 
-        publisher.publish(sandbox, v1).await;
-        publisher.publish(sandbox, v2).await;
-        publisher.publish(sandbox, v3).await;
+        publisher.publish(sandbox, DiskRole::Root, v1).await;
+        publisher.publish(sandbox, DiskRole::Root, v2).await;
+        publisher.publish(sandbox, DiskRole::Root, v3).await;
 
         // Three publishes against the same sandbox → one DashMap
         // entry holding the latest value. This is the coalescing
         // property that buys us at-most-one-POST-per-drain-cycle.
         assert_eq!(pending.len(), 1);
-        assert_eq!(*pending.get(&sandbox).unwrap().value(), v3);
+        assert_eq!(
+            *pending.get(&(sandbox, DiskRole::Root)).unwrap().value(),
+            v3
+        );
 
         // notify_one stores at most one permit even after three
         // publishes — the drain runs once and sees the coalesced
@@ -281,7 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_keeps_distinct_sandboxes_separate() {
-        let pending: Arc<DashMap<SandboxId, ManifestRef>> = Arc::new(DashMap::new());
+        let pending: Arc<DashMap<(SandboxId, DiskRole), ManifestRef>> = Arc::new(DashMap::new());
         let wakeup = Arc::new(Notify::new());
         let publisher = CoordLiveManifestPublisher {
             pending: pending.clone(),
@@ -292,14 +315,20 @@ mod tests {
         let mref_a = ManifestRef::new();
         let mref_b = ManifestRef::new();
 
-        publisher.publish(sandbox_a, mref_a).await;
-        publisher.publish(sandbox_b, mref_b).await;
+        publisher.publish(sandbox_a, DiskRole::Root, mref_a).await;
+        publisher.publish(sandbox_b, DiskRole::Root, mref_b).await;
 
         // Distinct sandboxes → distinct entries. Coalescing is
         // per-sandbox; the drain task posts both.
         assert_eq!(pending.len(), 2);
-        assert_eq!(*pending.get(&sandbox_a).unwrap().value(), mref_a);
-        assert_eq!(*pending.get(&sandbox_b).unwrap().value(), mref_b);
+        assert_eq!(
+            *pending.get(&(sandbox_a, DiskRole::Root)).unwrap().value(),
+            mref_a
+        );
+        assert_eq!(
+            *pending.get(&(sandbox_b, DiskRole::Root)).unwrap().value(),
+            mref_b
+        );
     }
 
     /// Resolver behaviour: unbound sandbox returns None, drain skips.

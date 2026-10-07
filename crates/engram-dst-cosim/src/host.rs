@@ -894,11 +894,11 @@ impl CosimHost {
     fn barrier_sweep(&mut self) {
         let classification = self.device.classify_startup();
         self.sweep_parked_live
-            .extend(classification.reconnect.iter().copied());
+            .extend(classification.reconnect.iter().map(|(id, _)| *id));
         self.sweep_parked_live
-            .extend(classification.quarantined.iter().copied());
+            .extend(classification.quarantined.iter().map(|(id, _)| *id));
         self.quarantined_unknown
-            .extend(classification.quarantined.iter().copied());
+            .extend(classification.quarantined.iter().map(|(id, _)| *id));
         self.device.reap_terminal(classification.reap);
     }
 
@@ -1119,9 +1119,13 @@ impl CosimHost {
             .iter()
             .map(|(i, b)| (*i, ChunkHash::of(b), Bytes::from(b.clone())))
             .collect();
-        persist_disk_pending_chunks(&dest, &disk_chunks)
-            .await
-            .map_err(|e| format!("persist_disk_pending_chunks: {e}"))?;
+        persist_disk_pending_chunks(
+            &dest,
+            engram_core::types::snapshot::DiskRole::Root,
+            &disk_chunks,
+        )
+        .await
+        .map_err(|e| format!("persist_disk_pending_chunks: {e}"))?;
 
         let now = self.clock.now_utc();
         let record = EvictionFinalizeRecord {
@@ -1134,12 +1138,13 @@ impl CosimHost {
             captured_at: now,
             dest,
             chain_prev_ref: None,
-            disk_pending: Some(DiskPendingRecord {
+            disk_pending: vec![DiskPendingRecord {
+                role: engram_core::types::snapshot::DiskRole::Root,
                 base_manifest: base_manifest_ref,
                 chunk_size: CHUNK_SIZE,
                 total_bytes: NUM_CHUNKS * CHUNK_SIZE,
                 chunks: disk_chunks.iter().map(|(i, h, _)| (*i, *h)).collect(),
-            }),
+            }],
             // ADR 0035 amendment: the capture pins what the sandbox actually
             // has attached, so the REAL finalize's bundle-publish leg
             // (`run_upload_blobs` → `BundleStore::publish`) runs — the exact

@@ -380,6 +380,12 @@ message MigrationFetchRequest {
   repeated MigrationItem items = 2;
 }
 
+enum DiskRole {
+  DISK_ROLE_UNSPECIFIED = 0;
+  DISK_ROLE_ROOT = 1;
+  DISK_ROLE_SWAP = 2;
+}
+
 message MigrationItem {
   enum Kind {
     reserved 2, 3;
@@ -393,6 +399,7 @@ message MigrationItem {
   reserved "hash";
   Kind kind = 1;
   uint64 chunk_idx = 3;
+  DiskRole role = 4;
 }
 
 message MigrationFrame {

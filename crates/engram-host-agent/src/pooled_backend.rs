@@ -13,6 +13,9 @@
 //! better. VZ dev now pays full cold-boot (~1 s) per session;
 //! that's the explicit tradeoff.
 
+#[cfg(target_os = "linux")]
+use crate::disk_daemon::SandboxDisks;
+use engram_core::types::snapshot::DiskRole;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,7 +62,12 @@ fn should_reap_dirty_entry(name: &str, live: &HashSet<SandboxId>) -> bool {
         .strip_suffix(".ref.tmp")
         .or_else(|| name.strip_suffix(".cache"))
         .or_else(|| name.strip_suffix(".ref"));
-    let Some(id) = stem.and_then(|stem| stem.parse::<SandboxId>().ok()) else {
+    let Some(id) = stem.and_then(|stem| {
+        stem.strip_suffix(".swap")
+            .unwrap_or(stem)
+            .parse::<SandboxId>()
+            .ok()
+    }) else {
         return false;
     };
     !live.contains(&id)
@@ -189,6 +197,7 @@ struct PostCopyDestPending {
 /// coordinator rewinds.
 #[cfg(target_os = "linux")]
 struct GrpcPostCopyDiskFetcher {
+    role: DiskRole,
     source_addr: String,
     export_id: String,
     client: tokio::sync::Mutex<Option<engram_protocol::grpc_client::GrpcHostClient>>,
@@ -196,11 +205,12 @@ struct GrpcPostCopyDiskFetcher {
 
 #[cfg(target_os = "linux")]
 impl GrpcPostCopyDiskFetcher {
-    fn new(source_addr: String, export_id: String) -> Self {
+    fn new(source_addr: String, export_id: String, role: DiskRole) -> Self {
         Self {
             source_addr,
             export_id,
             client: tokio::sync::Mutex::new(None),
+            role,
         }
     }
 
@@ -222,7 +232,7 @@ impl GrpcPostCopyDiskFetcher {
             .migration_fetch(
                 &self.export_id,
                 vec![engram_core::types::snapshot::MigrationItem::DiskChunkAt(
-                    chunk_idx,
+                    self.role, chunk_idx,
                 )],
             )
             .await
@@ -314,19 +324,19 @@ struct PendingPresetup {
 struct CaptureUnwind {
     inner: Arc<dyn SandboxBackend>,
     id: SandboxId,
-    /// The disk backend to unfence + requeue against. The disk types are
+    /// The disk backends to unfence and requeue. The disk types are
     /// cross-platform (`disk_daemon::backend`), so these fields are too —
     /// only the capture call sites that POPULATE them are Linux-gated.
-    /// `None` when the sandbox has no NBD disk (non-Linux, memory-only).
-    disk_backend: Option<Arc<crate::disk_daemon::ChunkedDiskBackend>>,
+    /// Empty when the sandbox has no NBD disk (non-Linux, memory-only).
+    disk_backend: std::collections::BTreeMap<DiskRole, Arc<crate::disk_daemon::ChunkedDiskBackend>>,
     /// Whether the fence was raised by the capture (so Drop knows to
     /// lower it). Tracked separately from `disk_backend` because the
     /// ordinary-snapshot path drains WITHOUT fencing.
     fenced: bool,
     /// Drained-but-unowned dirty chunks to re-queue on unwind.
-    disk_pending: Option<crate::disk_daemon::PendingDiskFlush>,
-    /// Post-copy seal to re-queue on unwind (C2 only).
-    disk_seal: Option<Arc<crate::disk_daemon::PostCopyDiskSeal>>,
+    disk_pending: std::collections::BTreeMap<DiskRole, crate::disk_daemon::PendingDiskFlush>,
+    /// Post-copy seals to requeue on unwind (C2 only).
+    disk_seal: std::collections::BTreeMap<DiskRole, Arc<crate::disk_daemon::PostCopyDiskSeal>>,
     /// The presetup consumed by `migration_capture_postcopy`, restored
     /// on unwind so the coordinator's retry finds a matching presetup
     /// instead of failing "no matching presetup" (C2 only).
@@ -348,10 +358,10 @@ impl CaptureUnwind {
         Self {
             inner,
             id,
-            disk_backend: None,
+            disk_backend: Default::default(),
             fenced: false,
-            disk_pending: None,
-            disk_seal: None,
+            disk_pending: Default::default(),
+            disk_seal: Default::default(),
             presetup_restore: None,
             defused: true,
             resume_on_drop: true,
@@ -379,10 +389,10 @@ impl Drop for CaptureUnwind {
         let inner = self.inner.clone();
         let resume_on_drop = self.resume_on_drop;
         let id = self.id;
-        let disk_backend = self.disk_backend.take();
+        let disk_backend = std::mem::take(&mut self.disk_backend);
         let fenced = self.fenced;
-        let disk_pending = self.disk_pending.take();
-        let disk_seal = self.disk_seal.take();
+        let mut disk_pending = std::mem::take(&mut self.disk_pending);
+        let disk_seal = std::mem::take(&mut self.disk_seal);
         if let Some((pid, presetup, map)) = self.presetup_restore.take() {
             // Restore the consumed presetup so a coordinator retry finds
             // a match — unless a NEWER presetup already landed (last-
@@ -400,7 +410,7 @@ impl Drop for CaptureUnwind {
         // back to a synchronous fence clear so a fenced backend never
         // stays wedged even then.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            if let Some(backend) = &disk_backend {
+            for backend in disk_backend.values() {
                 if fenced {
                     backend.set_migration_fence(false);
                 }
@@ -413,11 +423,11 @@ impl Drop for CaptureUnwind {
             return;
         };
         handle.spawn(async move {
-            if let Some(backend) = disk_backend {
-                if let Some(pending) = disk_pending {
+            for (role, backend) in disk_backend {
+                if let Some(pending) = disk_pending.remove(&role) {
                     backend.requeue_pending(pending).await;
                 }
-                if let Some(sealed) = disk_seal.as_deref() {
+                if let Some(sealed) = disk_seal.get(&role) {
                     backend.requeue_postcopy_seal(sealed).await;
                 }
                 if fenced {
@@ -719,7 +729,7 @@ pub struct PooledBackend {
     /// restated inline. TOCTOU note: a `None`-after-clone (entry
     /// removed mid-op) is handled identically to "entry missing".
     #[cfg(target_os = "linux")]
-    nbd_sandboxes: Arc<DashMap<SandboxId, crate::disk_daemon::NbdSandboxState>>,
+    nbd_sandboxes: Arc<DashMap<SandboxId, SandboxDisks>>,
     /// engrams#1378: the durable device→sandbox OWNER RECORDS
     /// (`<work_dir>/nbd-owners`). Written at every attach's id-known point
     /// and every rehydrate; read by the startup classification barrier to
@@ -728,6 +738,9 @@ pub struct PooledBackend {
     /// to the legacy record-reconcile path).
     #[cfg(target_os = "linux")]
     nbd_owners: Option<Arc<crate::disk_daemon::owners::NbdOwnerDir>>,
+    /// Owner records read before startup writers begin; retained for recovery retries.
+    #[cfg(target_os = "linux")]
+    recovery_owners: std::collections::HashMap<PathBuf, crate::disk_daemon::owners::DiskOwner>,
     /// engrams#1378: attributed residue — kernel-connected devices whose
     /// sandbox is known (owner record) but which no rehydrate record serves
     /// and whose owner process is dead. Populated by the startup
@@ -735,7 +748,7 @@ pub struct PooledBackend {
     /// (`device_residue_sandboxes`); drained by `destroy` when the
     /// coordinator's tombstone orders the teardown.
     #[cfg(target_os = "linux")]
-    nbd_residue: Arc<DashMap<SandboxId, std::path::PathBuf>>,
+    nbd_residue: Arc<DashMap<SandboxId, Vec<std::path::PathBuf>>>,
     /// engrams#1378: `false` until the startup classification barrier has
     /// run once (or this host has no NBD pool, so there is nothing to
     /// classify). Rides the heartbeat as `device_residue_known` — the
@@ -1994,7 +2007,15 @@ impl PooledBackend {
                 self.inner.snapshot_path_for(metadata.id),
                 pending_nbd_state
                     .as_ref()
-                    .map(|n| (n.backend.clone(), n.device_path().to_path_buf())),
+                    .map(|n| {
+                        (
+                            DiskRole::Root,
+                            n.backend.clone(),
+                            n.device_path().to_path_buf(),
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
             );
         }
 
@@ -2225,7 +2246,14 @@ impl PooledBackend {
                 // in the continuous-flush pipeline. Field-ordered Drop
                 // ensures scheduler-cancel → NBD-disconnect → slot-release
                 // on subsequent destroy.
-                state.install_flush_scheduler(new_id, publisher, health, flush_config, owners);
+                state.install_flush_scheduler(
+                    new_id,
+                    DiskRole::Root,
+                    publisher,
+                    health,
+                    flush_config,
+                    owners,
+                );
                 // ADR 0019: open the resume operation window — restore-time disk
                 // reads (load_snapshot + the resumed guest's working set) attach
                 // `chunk.fetch` spans to this trace. Covers idle→resume AND
@@ -2253,7 +2281,14 @@ impl PooledBackend {
                     state.abandon_for_shutdown();
                     return Ok::<SandboxId, SandboxError>(new_id);
                 }
-                nbd_sandboxes.insert(new_id, state);
+                nbd_sandboxes.insert(
+                    new_id,
+                    SandboxDisks {
+                        expected: [engram_core::DiskRole::Root].into_iter().collect(),
+                        root: state,
+                        swap: None,
+                    },
+                );
                 Ok::<SandboxId, SandboxError>(new_id)
             });
             // A JoinError here means the spawned task panicked; the FC restore
@@ -2322,6 +2357,8 @@ impl PooledBackend {
             nbd_sandboxes: Arc::new(DashMap::new()),
             #[cfg(target_os = "linux")]
             nbd_owners: None,
+            #[cfg(target_os = "linux")]
+            recovery_owners: std::collections::HashMap::new(),
             #[cfg(target_os = "linux")]
             nbd_residue: Arc::new(DashMap::new()),
             // engrams#1378: flips false when an NBD pool is wired
@@ -2991,32 +3028,36 @@ impl PooledBackend {
             // across the drain/upload below parks contending
             // `destroy`/`create` workers on the shard's sync RwLock and
             // can deadlock the runtime.
-            let disk_backend = self
-                .nbd_sandboxes
-                .get(&id)
-                .map(|entry| entry.backend.clone());
-            if let Some(backend) = disk_backend {
-                // Drain in-flight NBD requests so the drain sees a quiescent
-                // dirty buffer. With FC paused above, no new virtio writes
-                // are issued, and wait_idle returns once already-in-flight
-                // requests have completed through backend.write().
-                // `flush_local` then syncs the HOST page cache for
-                // /dev/nbdN down first (the capture primitive owns that
-                // sync — see `ChunkedDiskBackend::sync_host_device`), so
-                // the drain captures the guest-acked bytes, not just what
-                // background writeback (~30 s) happened to deliver.
-                backend.wait_idle().await;
-                let pending = backend
-                    .flush_local()
-                    .await
-                    .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
-                // Issue #202: the dirty buffer now lives only in
-                // `pending` — move it into the guard so any error/cancel
-                // before the finisher takes over re-queues it (and
-                // resumes the guest). `fenced` stays false: this path
-                // never raises the migration fence.
-                unwind.disk_backend = Some(backend);
-                unwind.disk_pending = Some(pending);
+            if self.nbd_sandboxes.contains_key(&id) && !self.all_disks_served(id) {
+                return Err(SandboxError::Snapshot(
+                    "sandbox has an unserved owned NBD device".into(),
+                ));
+            }
+            let disk_backends = self.disk_backends(id);
+            if !disk_backends.is_empty() {
+                for (role, backend) in disk_backends {
+                    // Drain in-flight NBD requests so the drain sees a quiescent
+                    // dirty buffer. With FC paused above, no new virtio writes
+                    // are issued, and wait_idle returns once already-in-flight
+                    // requests have completed through backend.write().
+                    // `flush_local` then syncs the HOST page cache for
+                    // /dev/nbdN down first (the capture primitive owns that
+                    // sync — see `ChunkedDiskBackend::sync_host_device`), so
+                    // the drain captures the guest-acked bytes, not just what
+                    // background writeback (~30 s) happened to deliver.
+                    backend.wait_idle().await;
+                    let pending = backend
+                        .flush_local()
+                        .await
+                        .map_err(|e| SandboxError::Snapshot(format!("nbd disk drain: {e}")))?;
+                    // Issue #202: the dirty buffer now lives only in
+                    // `pending` — move it into the guard so any error/cancel
+                    // before the finisher takes over re-queues it (and
+                    // resumes the guest). `fenced` stays false: this path
+                    // never raises the migration fence.
+                    unwind.disk_backend.insert(role, backend);
+                    unwind.disk_pending.insert(role, pending);
+                }
             } else {
                 // The 2026-07-17 corruption path (session 03e6535e): a
                 // sandbox with an NBD-backed rootfs but NO `nbd_sandboxes`
@@ -3318,7 +3359,8 @@ impl PooledBackend {
         &self,
         pending: PostCopyDestPending,
         dest_dir: std::path::PathBuf,
-        nbd: Option<(
+        nbd: Vec<(
+            DiskRole,
             Arc<crate::disk_daemon::ChunkedDiskBackend>,
             std::path::PathBuf,
         )>,
@@ -3336,7 +3378,12 @@ impl PooledBackend {
             //    pre-stage finished before the capture; a failed
             //    attempt is a sub-ms NotFound on the pod network.
             let mut source: Option<engram_protocol::grpc_client::GrpcHostClient> = None;
-            let (seal_path, state_tmp, fetch_ms) = loop {
+            // These are destination roles; a source without one fails the fetch loudly.
+            let mut roles: Vec<_> = nbd.iter().map(|(role, _, _)| *role).collect();
+            if roles.is_empty() {
+                roles.push(DiskRole::Root);
+            }
+            let (state_tmp, fetch_ms) = loop {
                 if started.elapsed() > budget {
                     tracing::error!(
                         export_id = %pending.export_id,
@@ -3356,14 +3403,9 @@ impl PooledBackend {
                     },
                 };
                 let t_fetch = crate::time_source::metrics_now();
-                match Self::fetch_postcopy_artifacts(client, &pending.export_id, &tmp).await {
-                    Ok(()) => {
-                        break (
-                            tmp.join("disk-seal.json"),
-                            tmp.join("state.bin"),
-                            t_fetch.elapsed().as_millis() as u64,
-                        )
-                    }
+                match Self::fetch_postcopy_artifacts(client, &pending.export_id, &tmp, &roles).await
+                {
+                    Ok(()) => break (tmp.join("state.bin"), t_fetch.elapsed().as_millis() as u64),
                     Err(e) => {
                         // A transport-level failure poisons the cached
                         // channel; NotFound (export not open yet) does
@@ -3389,91 +3431,98 @@ impl PooledBackend {
                 manifest: Option<engram_chunk_store::Manifest>,
                 disk_ref_bincode: Option<Vec<u8>>,
             }
-            let info: SealInfo = match fs::read(&seal_path).await {
-                Ok(bytes) => match serde_json::from_slice(&bytes) {
-                    Ok(i) => i,
-                    Err(e) => {
-                        tracing::error!(error = %e,
-                            "post-copy disk seal parse failed; NOT landing state.bin");
-                        return;
-                    }
-                },
-                Err(e) => {
-                    tracing::error!(error = %e,
-                        "post-copy disk seal read failed; NOT landing state.bin");
-                    return;
-                }
-            };
-            match (&nbd, info.manifest) {
-                (Some((nbd, device)), Some(manifest)) => {
-                    let Some(rref) = info
-                        .disk_ref_bincode
-                        .as_deref()
-                        .and_then(|b| bincode::deserialize(b).ok())
-                    else {
-                        tracing::error!(
-                            "post-copy disk seal missing/invalid ref; NOT landing state.bin"
-                        );
-                        return;
-                    };
-                    let fetcher = Arc::new(GrpcPostCopyDiskFetcher::new(
-                        pending.source_addr.clone(),
-                        pending.export_id.clone(),
-                    ));
-                    match nbd
-                        .install_postcopy_overlay(
-                            &manifest,
-                            rref,
-                            &info.sealed_chunk_indices,
-                            fetcher,
-                        )
-                        .await
-                    {
-                        Ok(_subscription) => {
-                            tracing::info!(
-                                export_id = %pending.export_id,
-                                sealed = info.sealed_chunk_indices.len(),
-                                "post-copy disk overlay armed (sealed chunks demand-fault P2P)",
-                            );
-                            nbd.clone().spawn_postcopy_drain();
-                        }
+            for role in roles {
+                let device_state = nbd
+                    .iter()
+                    .find(|(r, _, _)| *r == role)
+                    .map(|(_, backend, path)| (backend, path));
+                let info: SealInfo = match fs::read(tmp.join(role.seal_file_name())).await {
+                    Ok(bytes) => match serde_json::from_slice(&bytes) {
+                        Ok(i) => i,
                         Err(e) => {
                             tracing::error!(error = %e,
+                            "post-copy disk seal parse failed; NOT landing state.bin");
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!(error = %e,
+                        "post-copy disk seal read failed; NOT landing state.bin");
+                        return;
+                    }
+                };
+                match (device_state, info.manifest) {
+                    (Some((nbd, device)), Some(manifest)) => {
+                        let Some(rref) = info
+                            .disk_ref_bincode
+                            .as_deref()
+                            .and_then(|b| bincode::deserialize(b).ok())
+                        else {
+                            tracing::error!(
+                                "post-copy disk seal missing/invalid ref; NOT landing state.bin"
+                            );
+                            return;
+                        };
+                        let fetcher = Arc::new(GrpcPostCopyDiskFetcher::new(
+                            pending.source_addr.clone(),
+                            pending.export_id.clone(),
+                            role,
+                        ));
+                        match nbd
+                            .install_postcopy_overlay(
+                                &manifest,
+                                rref,
+                                &info.sealed_chunk_indices,
+                                fetcher,
+                            )
+                            .await
+                        {
+                            Ok(_subscription) => {
+                                tracing::info!(
+                                    export_id = %pending.export_id,
+                                    sealed = info.sealed_chunk_indices.len(),
+                                    "post-copy disk overlay armed (sealed chunks demand-fault P2P)",
+                                );
+                                nbd.clone().spawn_postcopy_drain();
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e,
                                 "post-copy disk overlay install failed; NOT landing state.bin");
+                                return;
+                            }
+                        }
+                        // Drop the device's host page cache (BLKFLSBUF):
+                        // the kernel's udev/partition probe read the first
+                        // blocks at CONNECT time — before the overlay — so
+                        // the page cache may hold PRE-divergence bytes for
+                        // sealed chunks (the ext4 superblock region is
+                        // near-always sealed on a live session). FC reads
+                        // /dev/nbdN through that cache; a stale superblock
+                        // served to the resumed guest is the corruption
+                        // class this line exists for.
+                        if let Err(e) = crate::disk_daemon::flush_block_device_cache(device) {
+                            tracing::error!(error = %e, device = %device.display(),
+                            "BLKFLSBUF failed; NOT landing state.bin (stale-probe risk)");
                             return;
                         }
                     }
-                    // Drop the device's host page cache (BLKFLSBUF):
-                    // the kernel's udev/partition probe read the first
-                    // blocks at CONNECT time — before the overlay — so
-                    // the page cache may hold PRE-divergence bytes for
-                    // sealed chunks (the ext4 superblock region is
-                    // near-always sealed on a live session). FC reads
-                    // /dev/nbdN through that cache; a stale superblock
-                    // served to the resumed guest is the corruption
-                    // class this line exists for.
-                    if let Err(e) = crate::disk_daemon::flush_block_device_cache(device) {
-                        tracing::error!(error = %e, device = %device.display(),
-                            "BLKFLSBUF failed; NOT landing state.bin (stale-probe risk)");
+                    (None, Some(_)) if !info.sealed_chunk_indices.is_empty() => {
+                        // The source sealed dirty disk but this host has
+                        // no NBD data plane to overlay it on — resuming
+                        // would run on a silently-stale rootfs.
+                        tracing::error!(
+                            sealed = info.sealed_chunk_indices.len(),
+                            "post-copy disk seal present but no NBD backend; NOT landing state.bin",
+                        );
                         return;
                     }
-                }
-                (None, Some(_)) if !info.sealed_chunk_indices.is_empty() => {
-                    // The source sealed dirty disk but this host has
-                    // no NBD data plane to overlay it on — resuming
-                    // would run on a silently-stale rootfs.
-                    tracing::error!(
-                        sealed = info.sealed_chunk_indices.len(),
-                        "post-copy disk seal present but no NBD backend; NOT landing state.bin",
-                    );
-                    return;
-                }
-                _ => {
-                    // No chunked disk on the source — nothing to
-                    // overlay; release the publish fence armed at
-                    // attach (nothing gates durability).
-                    if let Some((nbd, _)) = &nbd {
-                        nbd.set_migration_fence(false);
+                    _ => {
+                        // No chunked disk on the source — nothing to
+                        // overlay; release the publish fence armed at
+                        // attach (nothing gates durability).
+                        if let Some((nbd, _)) = device_state {
+                            nbd.set_migration_fence(false);
+                        }
                     }
                 }
             }
@@ -3544,9 +3593,15 @@ impl PooledBackend {
         source: &engram_protocol::grpc_client::GrpcHostClient,
         export_id: &str,
         dir: &std::path::Path,
+        roles: &[DiskRole],
     ) -> Result<(), SandboxError> {
         use engram_core::types::snapshot::MigrationItem;
-        let item_specs = [MigrationItem::DiskSealInfo, MigrationItem::StateBin];
+        let item_specs: Vec<_> = roles
+            .iter()
+            .copied()
+            .map(MigrationItem::DiskSealInfo)
+            .chain(std::iter::once(MigrationItem::StateBin))
+            .collect();
         let mut stream = source
             .migration_fetch(export_id, item_specs.to_vec())
             .await
@@ -3569,7 +3624,7 @@ impl PooledBackend {
                 let idx = frame.item_idx as usize;
                 let name = match item_specs.get(idx) {
                     Some(MigrationItem::StateBin) => "state.bin",
-                    Some(MigrationItem::DiskSealInfo) => "disk-seal.json",
+                    Some(MigrationItem::DiskSealInfo(role)) => role.seal_file_name(),
                     _ => {
                         return Err(SandboxError::Snapshot(
                             "fetch_postcopy_artifacts: unexpected item".into(),
@@ -3630,6 +3685,43 @@ impl PooledBackend {
                 reason: e.value().reason,
             })
             .collect()
+    }
+
+    /// Keep the root recovery reference until the whole device set is served.
+    #[cfg(any(test, target_os = "linux"))]
+    async fn track_rehydrate(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        disk_manifest: engram_core::ManifestRef,
+        expects_secondary: bool,
+        recovery: impl std::future::Future<Output = Result<bool, SandboxError>>,
+        served: impl Fn() -> Option<bool>,
+    ) -> Result<bool, SandboxError> {
+        let quarantine = || {
+            self.quarantined_survivors
+                .entry(sandbox_id)
+                .and_modify(|q| q.disk_manifest = Some(disk_manifest))
+                .or_insert(QuarantinedSurvivor {
+                    session_id,
+                    disk_manifest: Some(disk_manifest),
+                    retry_attempts: 0,
+                    reason: engram_protocol::heartbeat::QuarantineReason::Rehydrate,
+                });
+        };
+        if expects_secondary {
+            quarantine();
+        }
+        let result = recovery.await;
+        match served() {
+            _ if result.is_err() => quarantine(),
+            Some(false) => quarantine(),
+            Some(true) => {
+                self.quarantined_survivors.remove(&sandbox_id);
+            }
+            None => {}
+        }
+        result
     }
 
     /// 2026-08-02 durability-rollback RCA: one retry pass over the
@@ -3885,6 +3977,10 @@ impl PooledBackend {
         };
         let served: std::collections::HashSet<SandboxId> =
             self.nbd_sandboxes.iter().map(|e| *e.key()).collect();
+        let served = served
+            .into_iter()
+            .filter(|id| self.all_disks_served(*id))
+            .collect();
         let records = crate::checkpoint::ChainHeadRecord::load_all(store.dir()).await;
         let mut rehydrated = 0usize;
         let mut failed = 0usize;
@@ -3908,6 +4004,7 @@ impl PooledBackend {
                         self.host_fs.as_ref(),
                         root,
                         sandbox_id,
+                        engram_core::types::snapshot::DiskRole::Root,
                     )
                     .await
                     {
@@ -4003,7 +4100,7 @@ impl PooledBackend {
         let mut rehydrated = 0usize;
         let mut failed = 0usize;
         for sandbox_id in &live {
-            if self.nbd_sandboxes.contains_key(sandbox_id) {
+            if self.all_disks_served(*sandbox_id) {
                 continue;
             }
             let started = crate::time_source::metrics_now();
@@ -4078,7 +4175,7 @@ impl PooledBackend {
         }
         let unserved = live
             .iter()
-            .filter(|id| !self.nbd_sandboxes.contains_key(id))
+            .filter(|id| !self.all_disks_served(**id))
             .count();
         // The durability alert feed: nonzero after ALL THREE passes
         // means a resident VM is running without its disk served.
@@ -4140,8 +4237,8 @@ impl PooledBackend {
         }
         for entry in self.nbd_sandboxes.iter() {
             records.sandboxes.insert(*entry.key());
-            if let Some(dev) = self.inner.rootfs_device(*entry.key()) {
-                records.devices.insert(dev);
+            for (_, device) in entry.iter() {
+                records.devices.insert(device.device_path().to_path_buf());
             }
         }
         // Every reattached (live) FC counts as a record: an attributed device
@@ -4183,6 +4280,9 @@ impl PooledBackend {
                     .collect();
                 dir.remove_stale(&connected);
                 dir.load()
+                    .into_iter()
+                    .map(|(device, owner)| (device, owner.sandbox_id))
+                    .collect()
             }
             None => std::collections::HashMap::new(),
         };
@@ -4203,9 +4303,14 @@ impl PooledBackend {
                  teardown; reported to the coordinator, settled by its tombstone \
                  (engrams#1378)",
             );
-            self.nbd_residue.insert(sandbox_id, device);
+            self.nbd_residue.entry(sandbox_id).or_default().push(device);
         }
-        ::metrics::gauge!(crate::metrics::NBD_RESIDUE_DEVICES).set(self.nbd_residue.len() as f64);
+        ::metrics::gauge!(crate::metrics::NBD_RESIDUE_DEVICES).set(
+            self.nbd_residue
+                .iter()
+                .map(|entry| entry.len())
+                .sum::<usize>() as f64,
+        );
         self.nbd_residue_known
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -4431,7 +4536,13 @@ impl PooledBackend {
     #[cfg(target_os = "linux")]
     pub fn with_nbd_owner_dir(mut self, dir: std::path::PathBuf) -> Self {
         match crate::disk_daemon::owners::NbdOwnerDir::open(dir) {
-            Ok(owners) => self.nbd_owners = Some(Arc::new(owners)),
+            Ok(owners) => {
+                if let Err(error) = owners.sweep_stale_tmp() {
+                    tracing::warn!(%error, "NBD owner temporary file cleanup failed");
+                }
+                self.recovery_owners = owners.load();
+                self.nbd_owners = Some(Arc::new(owners));
+            }
             Err(error) => tracing::warn!(
                 %error,
                 "NBD owner-record dir open failed; device attribution degrades \
@@ -4489,7 +4600,7 @@ impl PooledBackend {
         &self,
         id: SandboxId,
     ) -> Option<Arc<crate::disk_daemon::ChunkedDiskBackend>> {
-        self.nbd_sandboxes.get(&id).map(|e| e.backend.clone())
+        self.nbd_sandboxes.get(&id).map(|e| e.root.backend.clone())
     }
 
     /// Test-only: bind a sandbox to a session in `session_bindings`,
@@ -4539,10 +4650,18 @@ impl PooledBackend {
     /// to GCS; only the coord publish is skipped.
     #[cfg(target_os = "linux")]
     pub async fn flush_nbd_data_planes_for_shutdown(&self, deadline: std::time::Duration) {
-        let entries: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
+        let entries: Vec<(
+            SandboxId,
+            DiskRole,
+            Arc<crate::disk_daemon::ChunkedDiskBackend>,
+        )> = self
             .nbd_sandboxes
             .iter()
-            .map(|e| (*e.key(), e.value().backend.clone()))
+            .flat_map(|e| {
+                e.iter()
+                    .map(|(role, d)| (*e.key(), role, d.backend.clone()))
+                    .collect::<Vec<_>>()
+            })
             .collect();
         if entries.is_empty() {
             return;
@@ -4569,7 +4688,7 @@ impl PooledBackend {
         let publish = self.shutdown_manifest_publish.clone();
         let session_bindings = self.session_bindings.clone();
         let mut tasks = tokio::task::JoinSet::new();
-        for (sandbox_id, backend) in entries {
+        for (sandbox_id, role, backend) in entries {
             let publish = publish.clone();
             let session_id = session_bindings.get(&sandbox_id).map(|e| *e);
             tasks.spawn(async move {
@@ -4590,7 +4709,11 @@ impl PooledBackend {
                 // ADR 0098 P4: the per-survivor disposition is the pure
                 // `classify_survivor` decision; the driver only sequences
                 // the effects off its verdict.
-                let bound_publish = publish.zip(session_id);
+                let bound_publish = if role == DiskRole::Root {
+                    publish.zip(session_id)
+                } else {
+                    None
+                };
                 let outcome = match backend.flush().await {
                     Ok(o) => o,
                     Err(e) => {
@@ -4683,7 +4806,11 @@ impl PooledBackend {
             let stragglers: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
                 .nbd_sandboxes
                 .iter()
-                .map(|e| (*e.key(), e.value().backend.clone()))
+                .flat_map(|e| {
+                    e.iter()
+                        .map(|(_, d)| (*e.key(), d.backend.clone()))
+                        .collect::<Vec<_>>()
+                })
                 .collect();
             for (sandbox_id, backend) in stragglers {
                 // `unflushed_bytes`, not `dirty_bytes`: an aborted flush
@@ -4798,14 +4925,20 @@ impl PooledBackend {
         // (2026-07-16 session-85e0298a RCA — pre-spool, these acked
         // writes died with the process and the successor rolled the
         // live guest's disk back under it).
-        let mut frozen: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = Vec::new();
+        let mut frozen: Vec<(
+            SandboxId,
+            DiskRole,
+            Arc<crate::disk_daemon::ChunkedDiskBackend>,
+        )> = Vec::new();
         let drain = |frozen: &mut Vec<_>| {
             let ids: Vec<_> = self.nbd_sandboxes.iter().map(|e| *e.key()).collect();
             for id in ids {
                 if let Some((_, state)) = self.nbd_sandboxes.remove(&id) {
-                    let backend = state.backend.clone();
-                    state.abandon_for_shutdown();
-                    frozen.push((id, backend));
+                    for (role, device) in state.into_devices() {
+                        let backend = device.backend.clone();
+                        device.abandon_for_shutdown();
+                        frozen.push((id, role, backend));
+                    }
                 }
             }
         };
@@ -4816,7 +4949,7 @@ impl PooledBackend {
         let abandoned = frozen.len();
 
         let Some(spool_root) = self.shutdown_spool_root() else {
-            for (sandbox_id, backend) in &frozen {
+            for (sandbox_id, _, backend) in &frozen {
                 let dirty = backend.dirty_bytes().await;
                 if dirty > 0 {
                     tracing::error!(
@@ -4830,7 +4963,7 @@ impl PooledBackend {
             }
             return abandoned;
         };
-        for (sandbox_id, backend) in frozen {
+        for (sandbox_id, role, backend) in frozen {
             let (manifest_ref, chunks) = backend.export_unflushed().await;
             // Written even when `chunks` is empty: a zero-chunk spool still
             // carries the manifest ref, which covers the flush-succeeded-but-
@@ -4842,6 +4975,7 @@ impl PooledBackend {
                 self.host_fs.as_ref(),
                 &spool_root,
                 sandbox_id,
+                role,
                 manifest_ref,
                 &chunks,
             )
@@ -5047,9 +5181,118 @@ impl PooledBackend {
     }
 
     #[cfg(target_os = "linux")]
-    fn dirty_file_path(&self, sandbox_id: SandboxId) -> Option<PathBuf> {
+    fn all_disks_served(&self, id: SandboxId) -> bool {
+        let Some(disks) = self.nbd_sandboxes.get(&id) else {
+            return false;
+        };
+        engram_host_core::all_disk_roles_served(&disks.expected, disks.iter().map(|(role, _)| role))
+    }
+
+    /// Attach a host-side device to an existing sandbox. Root must exist first.
+    #[cfg(target_os = "linux")]
+    pub async fn attach_disk(
+        &self,
+        id: SandboxId,
+        role: DiskRole,
+        mut state: crate::disk_daemon::NbdSandboxState,
+    ) -> Result<(), SandboxError> {
+        let _capture = self.capture_lock(id).lock_owned().await;
+        if role == DiskRole::Swap && self.nbd_owners.is_none() {
+            return Err(SandboxError::InvalidSpec(
+                "swap attachment requires durable device owners".into(),
+            ));
+        }
+
+        if self
+            .nbd_sandboxes
+            .get(&id)
+            .map_or(role != DiskRole::Root, |disks| disks.get(role).is_some())
+        {
+            return Err(SandboxError::InvalidSpec(
+                "device role is occupied or root is absent".into(),
+            ));
+        }
+        let path = self
+            .dirty_file_path(id, role)
+            .ok_or_else(|| SandboxError::InvalidSpec("dirty root is absent".into()))?;
+        state
+            .backend
+            .relocate_dirty_file(&path)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("move device dirty file: {e}").into()))?;
+        if role == DiskRole::Swap {
+            state
+                .backend
+                .persist_recovery_ref()
+                .await
+                .map_err(|error| {
+                    SandboxError::Vm(format!("record device lineage: {error}").into())
+                })?;
+        }
+        if role == DiskRole::Swap {
+            self.nbd_owners
+                .as_ref()
+                .expect("swap owner directory checked")
+                .record(state.device_path(), id, role)
+                .map_err(|e| SandboxError::Vm(format!("record swap owner: {e}").into()))?;
+        }
+        let mut config = self.flush_config.clone();
+        config.enabled &= role == DiskRole::Root;
+        state.install_flush_scheduler(
+            id,
+            role,
+            self.live_manifest_publisher.clone(),
+            self.data_plane_health.clone(),
+            config,
+            self.nbd_owners.clone().filter(|_| role == DiskRole::Root),
+        );
+        if self.is_abandoning() {
+            state.abandon_for_shutdown();
+            return Ok(());
+        }
+        match role {
+            DiskRole::Root => {
+                self.nbd_sandboxes.insert(
+                    id,
+                    SandboxDisks {
+                        expected: [engram_core::DiskRole::Root].into_iter().collect(),
+                        root: state,
+                        swap: None,
+                    },
+                );
+            }
+            DiskRole::Swap => {
+                let mut disks = self
+                    .nbd_sandboxes
+                    .get_mut(&id)
+                    .ok_or(SandboxError::NotFound)?;
+                disks.expected.insert(role);
+                disks.swap = Some(state);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn disk_backends(
+        &self,
+        id: SandboxId,
+    ) -> Vec<(DiskRole, Arc<crate::disk_daemon::ChunkedDiskBackend>)> {
+        self.nbd_sandboxes
+            .get(&id)
+            .map(|entry| {
+                entry
+                    .iter()
+                    .map(|(role, state)| (role, state.backend.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dirty_file_path(&self, sandbox_id: SandboxId, role: DiskRole) -> Option<PathBuf> {
         self.resolved_dirty_root()
-            .map(|root| root.join(format!("{sandbox_id}.cache")))
+            .map(|root| root.join(role.dirty_file_name(sandbox_id)))
     }
 
     #[cfg(target_os = "linux")]
@@ -6153,7 +6396,7 @@ impl DeferredSnapshot {
 #[derive(Clone)]
 pub(crate) struct SnapshotFinisher {
     #[cfg(target_os = "linux")]
-    nbd_sandboxes: Arc<DashMap<SandboxId, crate::disk_daemon::NbdSandboxState>>,
+    nbd_sandboxes: Arc<DashMap<SandboxId, SandboxDisks>>,
     chunk_store: Option<ChunkStore>,
     chunk_cache: Option<ChunkCache>,
     bundle_dir: PathBuf,
@@ -6229,7 +6472,7 @@ impl SnapshotFinisher {
         // the guard's resume/requeue must NOT fire.
         let mut unwind = cap.unwind;
         #[cfg(target_os = "linux")]
-        let nbd_pending_flush = unwind.disk_pending.take();
+        let nbd_pending_flush = std::mem::take(&mut unwind.disk_pending);
         unwind.defuse();
         drop(unwind);
         let mut metadata = metadata;
@@ -6251,7 +6494,9 @@ impl SnapshotFinisher {
             // upload, so the background scheduler never sees a
             // not-yet-uploaded chunk.
             #[cfg(target_os = "linux")]
-            if let Some(pending) = nbd_pending_flush {
+            let mut pending_disks = nbd_pending_flush.into_iter();
+            #[cfg(target_os = "linux")]
+            while let Some((role, pending)) = pending_disks.next() {
                 // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop
                 // the guard BEFORE `flush_upload` — this is the multi-
                 // second GCS upload (~32 s for ~1,936 chunks) and the
@@ -6261,13 +6506,31 @@ impl SnapshotFinisher {
                 // the runtime. A `None`-after-clone (entry destroyed
                 // mid-upload) is treated as "entry missing", exactly as
                 // the previous `if let Some(entry)` did.
-                let backend = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone());
+                let backend = self
+                    .nbd_sandboxes
+                    .get(&id)
+                    .and_then(|e| e.get(role).map(|d| d.backend.clone()));
                 if let Some(backend) = backend {
                     backend.operation_scope().begin("snapshot");
                     let res = backend.flush_upload(pending).await;
                     backend.operation_scope().end();
-                    let outcome =
-                        res.map_err(|e| SandboxError::Snapshot(format!("nbd disk upload: {e}")))?;
+                    let outcome = match res {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            for (role, pending) in pending_disks {
+                                let backend = self
+                                    .nbd_sandboxes
+                                    .get(&id)
+                                    .and_then(|e| e.get(role).map(|d| d.backend.clone()));
+                                if let Some(backend) = backend {
+                                    backend.requeue_pending(pending).await;
+                                }
+                            }
+                            return Err(SandboxError::Snapshot(format!(
+                                "nbd disk upload: {error}"
+                            )));
+                        }
+                    };
                     tracing::info!(
                         sandbox_id = %id,
                         manifest = %outcome.manifest_ref,
@@ -6275,7 +6538,9 @@ impl SnapshotFinisher {
                         bytes_uploaded = outcome.bytes_uploaded,
                         "chunked NBD disk uploaded (post-resume)",
                     );
-                    metadata.disk_manifest = Some(outcome.manifest_ref);
+                    if role == DiskRole::Root {
+                        metadata.disk_manifest = Some(outcome.manifest_ref);
+                    }
                 }
             }
             // ADR 0007 / Phase 5: when a chunk store is wired AND the
@@ -7237,7 +7502,9 @@ impl SandboxBackend for PooledBackend {
                     let sandbox_id = inner.create(spec).await?;
                     state
                         .backend
-                        .relocate_dirty_file(&dirty_root.join(format!("{sandbox_id}.cache")))
+                        .relocate_dirty_file(
+                            &dirty_root.join(DiskRole::Root.dirty_file_name(sandbox_id)),
+                        )
                         .await
                         .map_err(|error| {
                             SandboxError::Vm(
@@ -7247,6 +7514,7 @@ impl SandboxBackend for PooledBackend {
                         })?;
                     state.install_flush_scheduler(
                         sandbox_id,
+                        DiskRole::Root,
                         publisher,
                         health,
                         flush_config,
@@ -7274,7 +7542,14 @@ impl SandboxBackend for PooledBackend {
                         state.abandon_for_shutdown();
                         return Ok::<SandboxId, SandboxError>(sandbox_id);
                     }
-                    nbd_sandboxes.insert(sandbox_id, state);
+                    nbd_sandboxes.insert(
+                        sandbox_id,
+                        SandboxDisks {
+                            expected: [engram_core::DiskRole::Root].into_iter().collect(),
+                            root: state,
+                            swap: None,
+                        },
+                    );
                     Ok::<SandboxId, SandboxError>(sandbox_id)
                 });
                 join.await
@@ -7462,39 +7737,21 @@ impl SandboxBackend for PooledBackend {
         // about to be destroyed, so there is no live reader left for its
         // rebase side effect to matter to.
         #[cfg(target_os = "linux")]
-        let (disk_pending_record, hot_disk_chunks) = match (
-            unwind.disk_backend.take(),
-            unwind.disk_pending.take(),
-        ) {
-            (Some(backend), Some(pending)) => {
-                let base_manifest = backend.manifest_ref().await;
-                let chunk_size = backend.chunk_size();
-                let total_bytes = backend.total_bytes();
-                // Export (read frozen + hash) and persist share one
-                // failure arm: either way the pending requeues, the
-                // chain poisons, and the staging dir cleans up.
-                let exported_res = backend.export_pending_chunks(&pending).await;
-                let persist_res = match &exported_res {
+        let (disk_pending_record, hot_disk_chunks) = {
+            let mut records = Vec::new();
+            let mut hot_root = None;
+            for (role, pending) in &unwind.disk_pending {
+                let backend = &unwind.disk_backend[role];
+                let exported = backend.export_pending_chunks(pending).await;
+                let persist_result = match &exported {
                     Ok(chunks) => {
-                        crate::eviction_finalize::persist_disk_pending_chunks(&dest, chunks)
+                        crate::eviction_finalize::persist_disk_pending_chunks(&dest, *role, chunks)
                             .await
-                            .map_err(|e| e.to_string())
+                            .map_err(|error| error.to_string())
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(error) => Err(error.to_string()),
                 };
-                if let Err(e) = persist_res {
-                    backend.requeue_pending(pending).await;
-                    // The guest was already resumed by `capture_phase`
-                    // (its `inner.snapshot`/`snapshot_diff` brought it
-                    // back) — defusing is correct, not a stuck-paused
-                    // guest. Clean up `dest` so this failure doesn't leak
-                    // the multi-GiB local staging dir on every retry.
-                    unwind.defuse();
-                    drop(unwind);
-                    // The Diff already consumed the dirty bitmap and the
-                    // dir removal below deletes memory.diff — poison the
-                    // chain so the retry captures Full (see
-                    // `poison_checkpoint_chain_after_failed_diff`).
+                if let Err(error) = persist_result {
                     if chain_prev.is_some() {
                         poison_checkpoint_chain_after_failed_diff(
                             &self.checkpoint_chains,
@@ -7503,37 +7760,30 @@ impl SandboxBackend for PooledBackend {
                             "eviction disk-pending persist",
                         );
                     }
-                    match tokio::fs::remove_dir_all(&dest).await {
-                        Ok(_) => {}
-                        Err(rm_err) => tracing::warn!(
-                            sandbox_id = %id, dest = %dest.display(), error = %rm_err,
-                            "snapshot_begin: disk-pending persist failed AND orphan dir cleanup failed",
-                        ),
-                    }
+                    let _ = tokio::fs::remove_dir_all(&dest).await;
                     return Err(SandboxError::Snapshot(format!(
-                        "persist disk-pending chunks: {e}"
+                        "persist disk-pending chunks: {error}"
                     )));
                 }
-                drop(pending);
-                let chunks = exported_res.expect("persist_res checked above");
-                let record = Some(crate::eviction_finalize::DiskPendingRecord {
-                    base_manifest,
-                    chunk_size,
-                    total_bytes,
+                let chunks = exported.expect("export and persist succeeded");
+                records.push(crate::eviction_finalize::DiskPendingRecord {
+                    role: *role,
+                    base_manifest: backend.manifest_ref().await,
+                    chunk_size: backend.chunk_size(),
+                    total_bytes: backend.total_bytes(),
                     chunks: chunks.iter().map(|(idx, hash, _)| (*idx, *hash)).collect(),
                 });
-                // ADR 0101 A: hand the drained bytes to the finalize job
-                // in memory — `disk-pending/` above is the crash-redrive
-                // journal, not the common read path.
-                (record, Some(chunks))
+                if *role == DiskRole::Root {
+                    hot_root = Some(chunks);
+                }
             }
-            _ => (None, None),
+            (records, hot_root)
         };
         #[cfg(not(target_os = "linux"))]
         let (disk_pending_record, hot_disk_chunks): (
-            Option<crate::eviction_finalize::DiskPendingRecord>,
+            Vec<crate::eviction_finalize::DiskPendingRecord>,
             Option<Vec<(usize, engram_chunk_store::manifest::ChunkHash, bytes::Bytes)>>,
-        ) = (None, None);
+        ) = (Vec::new(), None);
 
         // Ownership of the capture's recovery state transfers to the
         // finalize record + the spawned job from here — the same
@@ -7699,7 +7949,7 @@ impl SandboxBackend for PooledBackend {
             // Live post-copy moves the disk through the NBD seal; a
             // file-backed rootfs has nothing to seal and the destination
             // would run RAM and disk from different states.
-            if self.nbd_sandboxes.get(&id).is_none() {
+            if !self.all_disks_served(id) {
                 return Err(SandboxError::InvalidSpec(
                     "no chunked disk for this sandbox (live post-copy needs the NBD rootfs) — \
                      use snapshot-rehome"
@@ -7730,27 +7980,17 @@ impl SandboxBackend for PooledBackend {
         // guard, then drop it before the sync and
         // `manifest_ref().await` below.
         #[cfg(target_os = "linux")]
-        let disk_backend = self
-            .nbd_sandboxes
-            .get(&id)
-            .map(|entry| entry.backend.clone());
-        #[cfg(target_os = "linux")]
-        let disk_manifest_ref = match disk_backend {
-            Some(backend) => {
-                // Disk post-copy pre-copy leg: push the host block
-                // cache down into the daemon's dirty buffer WHILE the
-                // guest still runs, so the capture's under-freeze
-                // sync only carries the since-presetup delta (and
-                // any first-touch RMW base fetches happen off the
-                // blackout). Best-effort — the capture's sync is the
-                // coherence-bearing one.
-                if let Err(e) = backend.sync_host_device().await {
-                    tracing::warn!(sandbox_id = %id, error = %e,
-                        "presetup pre-pause NBD sync failed (non-fatal; capture re-syncs)");
+        let disk_manifest_ref = {
+            let mut root_ref = None;
+            for (role, backend) in self.disk_backends(id) {
+                if let Err(error) = backend.sync_host_device().await {
+                    tracing::warn!(sandbox_id = %id, %error, "presetup NBD sync failed; capture will sync again");
                 }
-                Some(backend.manifest_ref().await)
+                if role == DiskRole::Root {
+                    root_ref = Some(backend.manifest_ref().await);
+                }
             }
-            None => None,
+            root_ref
         };
         #[cfg(not(target_os = "linux"))]
         let disk_manifest_ref: Option<engram_core::types::manifest::ManifestRef> = None;
@@ -7888,12 +8128,12 @@ impl SandboxBackend for PooledBackend {
             // pre-export error arm AND on wire cancellation — a fenced
             // backend whose capture failed would otherwise no-op
             // flushes forever (silent durability stall).
-            let disk_entry = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone());
+            let disk_entry = self.disk_backends(id);
             let t_disk = crate::time_source::metrics_now();
-            if let Some(backend) = &disk_entry {
+            for (role, backend) in &disk_entry {
                 backend.set_migration_fence(true);
                 // Issue #202: record the fence on the unwind guard.
-                unwind.disk_backend = Some(backend.clone());
+                unwind.disk_backend.insert(*role, backend.clone());
                 unwind.fenced = true;
                 // `seal_for_postcopy` below is a capture primitive of its
                 // own (it does not route through `flush_local`), so this
@@ -7954,50 +8194,43 @@ impl SandboxBackend for PooledBackend {
             // requeue before returning. Only the descriptor write and
             // the export insert sit in that window.
             let t_seal = crate::time_source::metrics_now();
-            let (disk_seal, disk_seal_info) = if let Some(backend) = &disk_entry {
+            let mut disk_seal = std::collections::BTreeMap::new();
+            let mut descriptors = std::collections::BTreeMap::new();
+            for (role, backend) in &disk_entry {
                 let (sealed, base_manifest, base_ref) = backend
                     .seal_for_postcopy()
                     .await
                     .map_err(|e| SandboxError::Snapshot(e.to_string()))?;
-                let info = serde_json::json!({
-                    "sealed_chunk_indices": sealed.indices(),
-                    "manifest": base_manifest,
-                    "disk_ref_bincode": bincode::serialize(&base_ref).ok(),
-                });
-                (Some(std::sync::Arc::new(sealed)), info)
-            } else {
-                (
-                    None,
+                let sealed = Arc::new(sealed);
+                unwind.disk_seal.insert(*role, sealed.clone());
+                descriptors.insert(
+                    *role,
                     serde_json::json!({
-                        "sealed_chunk_indices": Vec::<u64>::new(),
-                        "manifest": serde_json::Value::Null,
-                        "disk_ref_bincode": serde_json::Value::Null,
+                        "sealed_chunk_indices": sealed.indices(),
+                        "manifest": base_manifest,
+                        "disk_ref_bincode": bincode::serialize(&base_ref).ok(),
                     }),
-                )
-            };
-            let sealed_disk_chunks = disk_seal.as_ref().map(|s| s.len()).unwrap_or(0) as u64;
-            // Issue #202: the seal has DRAINED the dirty buffer — from
-            // here the bytes live only in `disk_seal`. Move a reference
-            // into the unwind guard so any error/cancel re-queues them
-            // (the seal is Arc-shared; the export gets its own clone).
-            // This subsumes the per-arm `requeue_postcopy_seal` calls
-            // below AND covers the wire-cancellation case they couldn't.
-            unwind.disk_seal = disk_seal.clone();
-            // The seal descriptor rides the export for the dest's
-            // fetch poller (base manifest content + sealed indices).
-            // A NEW filename on purpose: an OLD destination still
-            // polling `disk-manifest.json` gets a fetch error forever
-            // → its FC load gate times out → NeverLoaded → zero-loss
-            // abort-to-source, never a silently-stale disk.
-            let descriptor_written = match serde_json::to_vec(&disk_seal_info) {
-                Ok(bytes) => tokio::fs::write(export_dir.join("disk-seal.json"), bytes)
+                );
+                disk_seal.insert(*role, sealed);
+            }
+            descriptors.entry(DiskRole::Root).or_insert_with(|| {
+                serde_json::json!({
+                    "sealed_chunk_indices": Vec::<u64>::new(),
+                    "manifest": serde_json::Value::Null,
+                    "disk_ref_bincode": serde_json::Value::Null,
+                })
+            });
+            let sealed_disk_chunks = disk_seal
+                .values()
+                .map(|seal| seal.len() as u64)
+                .sum::<u64>();
+            for (role, info) in descriptors {
+                let bytes = serde_json::to_vec(&info)
+                    .map_err(|e| SandboxError::Snapshot(format!("disk seal info: {e}")))?;
+                tokio::fs::write(export_dir.join(role.seal_file_name()), bytes)
                     .await
-                    .map_err(|e| SandboxError::Snapshot(format!("write disk seal info: {e}"))),
-                Err(e) => Err(SandboxError::Snapshot(format!("disk seal info: {e}"))),
-            };
-            // On error the unwind guard re-queues the seal, clears the fence,
-            // resumes the guest, and restores the presetup.
-            descriptor_written?;
+                    .map_err(|e| SandboxError::Snapshot(format!("write disk seal info: {e}")))?;
+            }
             disk_drain_ms += t_seal.elapsed().as_millis() as u64;
 
             // Register BOTH exports under the same identity, then the
@@ -8107,10 +8340,11 @@ impl SandboxBackend for PooledBackend {
         // (lost-latched) for us to read; one that succeeds clears the
         // overlay, which reads as "nothing to wait for" — also right.
         #[cfg(target_os = "linux")]
-        let disk_drain = self
-            .nbd_sandboxes
-            .get(&id)
-            .and_then(|e| e.backend.postcopy_drain_subscribe());
+        let disk_drains: Vec<_> = self
+            .disk_backends(id)
+            .into_iter()
+            .map(|(_, backend)| backend.postcopy_drain_subscribe())
+            .collect();
         let outcome = tokio::task::spawn_blocking(move || -> Result<DrainOutcome, String> {
             let mut stream = std::os::unix::net::UnixStream::connect(&sock)
                 .map_err(|e| format!("dial control sock: {e}"))?;
@@ -8166,7 +8400,11 @@ impl SandboxBackend for PooledBackend {
         // either way).
         #[cfg(target_os = "linux")]
         let outcome = match outcome {
-            DrainOutcome::Done { .. } => match Self::await_disk_drain(disk_drain).await {
+            DrainOutcome::Done { .. } => match futures::future::try_join_all(
+                disk_drains.into_iter().map(Self::await_disk_drain),
+            )
+            .await
+            {
                 Ok(_) => outcome,
                 Err(detail) => DrainOutcome::PeerLost {
                     remaining: 0,
@@ -8235,11 +8473,15 @@ impl SandboxBackend for PooledBackend {
                         .await
                         .map(bytes::Bytes::from)
                         .map_err(|e| SandboxError::Snapshot(format!("read state.bin: {e}"))),
-                    MigrationItem::DiskSealInfo => fs::read(snapshot_dir.join("disk-seal.json"))
-                        .await
-                        .map(bytes::Bytes::from)
-                        .map_err(|e| SandboxError::Snapshot(format!("read disk seal info: {e}"))),
-                    MigrationItem::DiskChunkAt(idx) => match &disk_seal {
+                    MigrationItem::DiskSealInfo(role) => {
+                        fs::read(snapshot_dir.join(role.seal_file_name()))
+                            .await
+                            .map(bytes::Bytes::from)
+                            .map_err(|e| {
+                                SandboxError::Snapshot(format!("read disk seal info: {e}"))
+                            })
+                    }
+                    MigrationItem::DiskChunkAt(role, idx) => match disk_seal.get(&role) {
                         // The seal IS the allowlist: only sealed
                         // indices are servable, straight from RAM.
                         Some(sealed) => sealed.get(idx).ok_or_else(|| {
@@ -8346,12 +8588,12 @@ impl SandboxBackend for PooledBackend {
             // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop the
             // guard before the `requeue_*` awaits.
             #[cfg(target_os = "linux")]
-            let backend = nbd_sandboxes.get(&id).map(|e| e.backend.clone());
+            let backends: Vec<_> = nbd_sandboxes.get(&id).map(|e| e.iter().map(|(role, d)| (role, d.backend.clone())).collect()).unwrap_or_default();
             #[cfg(target_os = "linux")]
-            if let Some(backend) = backend {
+            for (role, backend) in backends {
                 // Disk post-copy: the sealed bytes go back into `dirty`
                 // so the resumed guest's next flush captures them.
-                if let Some(sealed) = export.disk_seal.as_deref() {
+                if let Some(sealed) = export.disk_seal.get(&role) {
                     backend.requeue_postcopy_seal(sealed).await;
                 }
                 backend.set_migration_fence(false);
@@ -8499,7 +8741,7 @@ impl SandboxBackend for PooledBackend {
         #[cfg(target_os = "linux")]
         {
             let is_nbd_backed = self.inner.rootfs_device(id).is_some();
-            let served = self.nbd_sandboxes.contains_key(&id);
+            let served = self.all_disks_served(id);
             let ok = engram_host_core::resume_data_plane_served(is_nbd_backed, served);
             // Soft-invariant (ADR 0099 H6): logs the alertable line but never
             // diverts control — the explicit early-return below is what routes
@@ -8648,7 +8890,10 @@ impl SandboxBackend for PooledBackend {
                 #[cfg(target_os = "linux")]
                 let host_fs = self.host_fs.clone();
                 #[cfg(target_os = "linux")]
-                let dirty_file_path = self.dirty_file_path(id);
+                let dirty_file_paths: Vec<_> = DiskRole::ALL
+                    .into_iter()
+                    .filter_map(|role| self.dirty_file_path(id, role))
+                    .collect();
                 #[cfg(target_os = "linux")]
                 let shutdown_spool_root = self.shutdown_spool_root();
                 Box::pin(async move {
@@ -8688,7 +8933,7 @@ impl SandboxBackend for PooledBackend {
                     #[cfg(target_os = "linux")]
                     {
                         let _ = nbd_sandboxes.remove(&id);
-                        if let Some(path) = dirty_file_path {
+                        for path in dirty_file_paths {
                             match fs::remove_file(&path).await {
                                 Ok(()) => {}
                                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -8708,12 +8953,15 @@ impl SandboxBackend for PooledBackend {
                         // (the sandbox_id will never rehydrate again; a leftover
                         // spool is dead weight on the hostPath volume).
                         if let Some(root) = shutdown_spool_root {
-                            let _ = crate::disk_daemon::spool::discard_spool(
-                                host_fs.as_ref(),
-                                &root,
-                                id,
-                            )
-                            .await;
+                            for role in DiskRole::ALL {
+                                let _ = crate::disk_daemon::spool::discard_spool(
+                                    host_fs.as_ref(),
+                                    &root,
+                                    id,
+                                    role,
+                                )
+                                .await;
+                            }
                         }
                         // engrams#1378: complete an INTERRUPTED PREDECESSOR teardown. A
                         // destroy that died between the FC kill and the NBD disconnect
@@ -8725,32 +8973,37 @@ impl SandboxBackend for PooledBackend {
                         // finally lands. On a disconnect error the residue entry is
                         // restored, so the next tombstone advertise retries; the inert
                         // owner record is lazily cleaned at the next startup.
-                        if let Some((_, device)) = nbd_residue.remove(&id) {
-                            use engram_host_core::NbdKernel as _;
-                            match crate::disk_daemon::HostNbdKernel.disconnect(&device).await {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        sandbox_id = %id,
-                                        device = %device.display(),
-                                        "destroy completed a predecessor's interrupted NBD \
-                                         teardown (tombstone-ordered residue disconnect)",
-                                    );
-                                    ::metrics::counter!(crate::metrics::NBD_RESIDUE_TEARDOWN_TOTAL)
+                        if let Some((_, devices)) = nbd_residue.remove(&id) {
+                            for device in devices {
+                                use engram_host_core::NbdKernel as _;
+                                match crate::disk_daemon::HostNbdKernel.disconnect(&device).await {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            sandbox_id = %id,
+                                            device = %device.display(),
+                                            "destroy completed a predecessor's interrupted NBD \
+                                             teardown (tombstone-ordered residue disconnect)",
+                                        );
+                                        ::metrics::counter!(
+                                            crate::metrics::NBD_RESIDUE_TEARDOWN_TOTAL
+                                        )
                                         .increment(1);
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        sandbox_id = %id,
-                                        device = %device.display(),
-                                        %error,
-                                        "residue NBD disconnect failed; kept for the next \
-                                         tombstone advertise to retry",
-                                    );
-                                    nbd_residue.insert(id, device);
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            sandbox_id = %id,
+                                            device = %device.display(),
+                                            %error,
+                                            "residue NBD disconnect failed; kept for the next \
+                                             tombstone advertise to retry",
+                                        );
+                                        nbd_residue.entry(id).or_default().push(device);
+                                    }
                                 }
                             }
                             ::metrics::gauge!(crate::metrics::NBD_RESIDUE_DEVICES)
-                                .set(nbd_residue.len() as f64);
+                                .set(nbd_residue.iter().map(|entry| entry.len()).sum::<usize>()
+                                    as f64);
                         }
                     }
                     // ADR 0016 Phase A: drop the COW diagnostic timestamp so
@@ -8814,7 +9067,9 @@ impl SandboxBackend for PooledBackend {
         // metrics-only (no per-fetch spans for a running session).
         #[cfg(target_os = "linux")]
         if let Some(state) = self.nbd_sandboxes.get(&id) {
-            state.backend.operation_scope().end();
+            for (_, device) in state.iter() {
+                device.backend.operation_scope().end();
+            }
         }
         result
     }
@@ -9062,7 +9317,7 @@ impl SandboxBackend for PooledBackend {
             {
                 #[cfg(target_os = "linux")]
                 if let Some(state) = self.nbd_sandboxes.get(&id) {
-                    state.backend.operation_scope().end();
+                    for (_, device) in state.iter() { device.backend.operation_scope().end(); }
                 }
                 let cold_base_event = engram_core::types::CaptureProgress {
                     phase: engram_core::types::CapturePhase::Snapshot,
@@ -9269,7 +9524,7 @@ impl SandboxBackend for PooledBackend {
             // end either way).
             #[cfg(target_os = "linux")]
             if let Some(state) = self.nbd_sandboxes.get(&id) {
-                state.backend.operation_scope().end();
+                for (_, device) in state.iter() { device.backend.operation_scope().end(); }
             }
             // `phase=snapshot` — the warm hook (if any) is done; pause/flush/
             // chunk is next. Carries the warm tail forward so a live watcher
@@ -9668,8 +9923,20 @@ impl SandboxBackend for PooledBackend {
             // on the ~1 s heartbeat cadence; holding the guard across the
             // manifest read would let a contending writer on the same
             // shard stall the heartbeat worker.
-            let backend = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone())?;
-            self.cow_state_for_entry(id, backend).await
+            let mut state = None;
+            for (_, backend) in self.disk_backends(id) {
+                let next = self.cow_state_for_entry(id, backend).await?;
+                match &mut state {
+                    None => state = Some(next),
+                    Some(total) => {
+                        total.dirty_chunks += next.dirty_chunks;
+                        total.dirty_bytes += next.dirty_bytes;
+                        total.base_chunks += next.base_chunks;
+                        total.base_chunks_local += next.base_chunks_local;
+                    }
+                }
+            }
+            state
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -9686,14 +9953,14 @@ impl SandboxBackend for PooledBackend {
     async fn cow_state_all(&self) -> Vec<engram_core::types::cow_state::CowStateRecord> {
         #[cfg(target_os = "linux")]
         {
-            let ids: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
+            let ids: Vec<_> = self
                 .nbd_sandboxes
                 .iter()
-                .map(|e| (*e.key(), e.value().backend.clone()))
+                .map(|entry| *entry.key())
                 .collect();
             let mut out = Vec::with_capacity(ids.len());
-            for (sandbox_id, backend) in ids {
-                if let Some(state) = self.cow_state_for_entry(sandbox_id, backend).await {
+            for sandbox_id in ids {
+                if let Some(state) = self.cow_state(sandbox_id).await {
                     out.push(engram_core::types::cow_state::CowStateRecord { sandbox_id, state });
                 }
             }
@@ -9722,20 +9989,24 @@ impl SandboxBackend for PooledBackend {
     ) -> Result<Option<engram_core::types::manifest::ManifestRef>, SandboxError> {
         #[cfg(target_os = "linux")]
         {
-            let backend = self
-                .nbd_sandboxes
-                .get(&id)
-                .map(|entry| entry.backend.clone());
-            let Some(backend) = backend else {
-                return Ok(None);
-            };
-            let outcome = backend.flush().await.map_err(|e| {
-                SandboxError::Vm(format!("flush_sandbox: chunked-disk flush: {e}").into())
-            })?;
-            if outcome.chunks_flushed == 0 {
-                return Ok(None);
+            let mut root_ref = None;
+            let mut errors = Vec::new();
+            for (role, backend) in self.disk_backends(id) {
+                match backend.flush().await {
+                    Ok(outcome) if role == DiskRole::Root && outcome.chunks_flushed != 0 => {
+                        root_ref = Some(outcome.manifest_ref);
+                    }
+                    Ok(_) => {}
+                    Err(error) => errors.push(format!("{role:?}: {error}")),
+                }
             }
-            Ok(Some(outcome.manifest_ref))
+            if errors.is_empty() {
+                Ok(root_ref)
+            } else {
+                Err(SandboxError::Vm(
+                    format!("flush_sandbox: {}", errors.join("; ")).into(),
+                ))
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -9779,6 +10050,89 @@ impl PooledBackend {
         sandbox_id: SandboxId,
         disk_manifest: engram_core::types::manifest::ManifestRef,
     ) -> Result<bool, SandboxError> {
+        self.track_rehydrate(
+            session_id,
+            sandbox_id,
+            disk_manifest,
+            self.recovery_owners
+                .values()
+                .any(|o| o.sandbox_id == sandbox_id && o.role == DiskRole::Swap),
+            self.rehydrate_all_devices(session_id, sandbox_id, disk_manifest),
+            || {
+                self.nbd_sandboxes
+                    .contains_key(&sandbox_id)
+                    .then(|| self.all_disks_served(sandbox_id))
+            },
+        )
+        .await
+    }
+
+    async fn rehydrate_all_devices(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        disk_manifest: engram_core::ManifestRef,
+    ) -> Result<bool, SandboxError> {
+        let Some(device) = self.inner.rootfs_device(sandbox_id) else {
+            return Ok(false);
+        };
+        let mut changed = self
+            .rehydrate_device(
+                session_id,
+                sandbox_id,
+                DiskRole::Root,
+                device,
+                disk_manifest,
+            )
+            .await?;
+        if !self.nbd_sandboxes.contains_key(&sandbox_id) {
+            return Ok(changed);
+        }
+        if let Some(mut disks) = self.nbd_sandboxes.get_mut(&sandbox_id) {
+            disks.expected.extend(
+                self.recovery_owners
+                    .values()
+                    .filter(|owner| owner.sandbox_id == sandbox_id)
+                    .map(|owner| owner.role),
+            );
+        }
+        for (device, owner) in &self.recovery_owners {
+            if owner.sandbox_id != sandbox_id || owner.role == DiskRole::Root {
+                continue;
+            }
+            let mut disk_ref = self
+                .dirty_file_path(sandbox_id, owner.role)
+                .and_then(|path| crate::disk_daemon::backend::read_ref_sidecar(&path));
+            if disk_ref.is_none() {
+                if let Some(root) = self.shutdown_spool_root() {
+                    disk_ref = crate::disk_daemon::spool::read_spool_meta(
+                        self.host_fs.as_ref(),
+                        &root,
+                        sandbox_id,
+                        owner.role,
+                    )
+                    .await
+                    .map_err(|e| SandboxError::Vm(format!("read device spool: {e}").into()))?
+                    .map(|meta| meta.manifest_ref());
+                }
+            }
+            let disk_ref = disk_ref
+                .ok_or_else(|| SandboxError::Vm("owned device has no recovery manifest".into()))?;
+            changed |= self
+                .rehydrate_device(session_id, sandbox_id, owner.role, device.clone(), disk_ref)
+                .await?;
+        }
+        Ok(changed)
+    }
+
+    async fn rehydrate_device(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        role: DiskRole,
+        device: PathBuf,
+        disk_manifest: engram_core::types::manifest::ManifestRef,
+    ) -> Result<bool, SandboxError> {
         let (pool, chunk_store, chunk_cache) = match (
             self.nbd_pool.as_ref(),
             self.chunk_store.as_ref(),
@@ -9787,20 +10141,13 @@ impl PooledBackend {
             (Some(p), Some(s), Some(c)) => (p, s, c),
             _ => return Ok(false),
         };
-        if self.nbd_sandboxes.contains_key(&sandbox_id) {
-            tracing::debug!(
-                %sandbox_id,
-                "rehydrate skipped: nbd_sandboxes entry already present",
-            );
+        if self
+            .nbd_sandboxes
+            .get(&sandbox_id)
+            .is_some_and(|disks| disks.get(role).is_some())
+        {
             return Ok(false);
         }
-        let Some(device) = self.inner.rootfs_device(sandbox_id) else {
-            tracing::debug!(
-                %sandbox_id,
-                "rehydrate skipped: survivor has no block-device rootfs to re-serve",
-            );
-            return Ok(false);
-        };
         // Register-time rehydrate claims the device from the pool; a
         // RETRY (2026-08-02 durability-rollback RCA) finds it PARKED by
         // its own earlier failure and reclaims it instead — the
@@ -9830,7 +10177,7 @@ impl PooledBackend {
         };
 
         let dirty_path = self
-            .dirty_file_path(sandbox_id)
+            .dirty_file_path(sandbox_id, role)
             .expect("chunk cache provides a default dirty root");
         let dirty_file_exists = dirty_path.try_exists().map_err(|error| {
             SandboxError::Vm(
@@ -9864,8 +10211,13 @@ impl PooledBackend {
         let mut seed_dirty: Option<Vec<(usize, Vec<u8>)>> = None;
         if !dirty_file_exists {
             if let Some(root) = &spool_root {
-                match crate::disk_daemon::spool::read_spool(self.host_fs.as_ref(), root, sandbox_id)
-                    .await
+                match crate::disk_daemon::spool::read_spool(
+                    self.host_fs.as_ref(),
+                    root,
+                    sandbox_id,
+                    role,
+                )
+                .await
                 {
                     Ok(Some((meta, chunks)))
                         if meta.manifest_id == disk_manifest.manifest_id
@@ -9921,6 +10273,7 @@ impl PooledBackend {
                             self.host_fs.as_ref(),
                             root,
                             sandbox_id,
+                            role,
                         )
                         .await;
                     }
@@ -9998,25 +10351,6 @@ impl PooledBackend {
                      device; recover via evict_local → resume",
                 );
                 slot.quarantine();
-                // ADR 0090: don't just log the remediation — advertise the
-                // survivor in every heartbeat so the coordinator actually
-                // DRIVES evict_local → resume (pre-fix, nothing consumed
-                // this WARN and the teardown reconciler's orphan path
-                // SIGKILLed the healthy VM ~60s later). Preserve an
-                // existing record's retry counter: a failed RETRY lands
-                // here too, and resetting the counter would re-loudify
-                // its log pacing every attempt.
-                self.quarantined_survivors
-                    .entry(sandbox_id)
-                    .and_modify(|q| {
-                        q.disk_manifest = Some(disk_manifest);
-                    })
-                    .or_insert(QuarantinedSurvivor {
-                        session_id,
-                        disk_manifest: Some(disk_manifest),
-                        retry_attempts: 0,
-                        reason: engram_protocol::heartbeat::QuarantineReason::Rehydrate,
-                    });
                 return Err(SandboxError::Vm(
                     format!(
                         "rehydrate nbd reattach at {}: {e} \
@@ -10029,11 +10363,14 @@ impl PooledBackend {
             }
         };
 
+        let mut config = self.flush_config.clone();
+        config.enabled &= role == DiskRole::Root;
         state.install_flush_scheduler(
             sandbox_id,
+            role,
             self.live_manifest_publisher.clone(),
             self.data_plane_health.clone(),
-            self.flush_config.clone(),
+            config,
             self.nbd_owners.clone(),
         );
 
@@ -10057,7 +10394,31 @@ impl PooledBackend {
             state.abandon_for_shutdown();
             return Ok(false);
         }
-        self.nbd_sandboxes.insert(sandbox_id, state);
+        match role {
+            DiskRole::Root => {
+                self.nbd_sandboxes.insert(
+                    sandbox_id,
+                    SandboxDisks {
+                        expected: std::iter::once(DiskRole::Root)
+                            .chain(
+                                self.recovery_owners
+                                    .values()
+                                    .filter(|o| o.sandbox_id == sandbox_id)
+                                    .map(|o| o.role),
+                            )
+                            .collect(),
+                        root: state,
+                        swap: None,
+                    },
+                );
+            }
+            DiskRole::Swap => {
+                let mut disks = self.nbd_sandboxes.get_mut(&sandbox_id).ok_or_else(|| {
+                    SandboxError::Vm("swap recovery requires a served root".into())
+                })?;
+                disks.swap = Some(state);
+            }
+        }
 
         // Pre-populate session_bindings so the LiveManifestPublisher
         // resolver finds the binding on the first post-rehydrate
@@ -10076,6 +10437,7 @@ impl PooledBackend {
                     self.host_fs.as_ref(),
                     root,
                     sandbox_id,
+                    role,
                 )
                 .await
                 {
@@ -10087,13 +10449,6 @@ impl PooledBackend {
                 }
             }
         }
-
-        // 2026-08-02 durability-rollback RCA: a successful (re-)serve
-        // clears the quarantine — the heartbeat stops advertising the
-        // survivor and the coordinator's parked quarantine op captures
-        // cleanly on its next attempt. No-op for the register-time
-        // first attempt (no entry exists yet).
-        self.quarantined_survivors.remove(&sandbox_id);
 
         tracing::info!(
             %session_id,
@@ -10337,6 +10692,89 @@ mod tests {
     use crate::image_cache::ImageBundle;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
+
+    #[tokio::test]
+    async fn root_recovered_swap_lineage_failure_remains_retryable() {
+        use engram_core::DiskRole::{Root, Swap};
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(FakeCaptureBackend {
+            payload: vec![],
+            staging_root: dir.path().join("snapshots"),
+            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+        });
+        let pooled = PooledBackend::new(inner);
+        let id = SandboxId::new();
+        let session = SessionId::new();
+        let root_ref = engram_core::ManifestRef::new();
+        let swap_ref = engram_core::ManifestRef::new();
+        let expected = [Root, Swap].into_iter().collect();
+        let served_roles = PlMutex::new(std::collections::BTreeSet::new());
+        let sidecar = dir.path().join("swap.ref");
+        let served = || {
+            Some(engram_host_core::all_disk_roles_served(
+                &expected,
+                served_roles.lock().iter().copied(),
+            ))
+        };
+        let recover = || async {
+            served_roles.lock().insert(Root);
+            let bytes = tokio::fs::read(&sidecar)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("swap lineage: {e}").into()))?;
+            let _: engram_core::ManifestRef = serde_json::from_slice(&bytes)
+                .map_err(|e| SandboxError::Vm(format!("swap lineage: {e}").into()))?;
+            served_roles.lock().insert(Swap);
+            Ok(true)
+        };
+        assert!(pooled
+            .track_rehydrate(session, id, root_ref, true, recover(), served)
+            .await
+            .is_err());
+        assert_eq!(*served_roles.lock(), [Root].into_iter().collect());
+        let retry = pooled.quarantined_survivors.get(&id).unwrap().clone();
+        assert_eq!(retry.disk_manifest, Some(root_ref));
+        assert_eq!(pooled.quarantined_survivors().len(), 1);
+        tokio::fs::write(sidecar.clone(), serde_json::to_vec(&swap_ref).unwrap())
+            .await
+            .unwrap();
+        assert!(pooled
+            .track_rehydrate(
+                retry.session_id,
+                id,
+                retry.disk_manifest.unwrap(),
+                true,
+                recover(),
+                served
+            )
+            .await
+            .unwrap());
+        assert_eq!(*served_roles.lock(), expected);
+        assert!(pooled.quarantined_survivors().is_empty());
+    }
+
+    #[test]
+    fn dirty_role_names_and_reaping() {
+        let id = SandboxId::new();
+        assert_eq!(DiskRole::Root.dirty_file_name(id), format!("{id}.cache"));
+        assert_eq!(
+            DiskRole::Swap.dirty_file_name(id),
+            format!("{id}.swap.cache")
+        );
+        for role in DiskRole::ALL {
+            assert!(should_reap_dirty_entry(
+                &role.dirty_file_name(id),
+                &HashSet::new()
+            ));
+            assert!(!should_reap_dirty_entry(
+                &role.dirty_file_name(id),
+                &HashSet::from([id])
+            ));
+        }
+        assert!(should_reap_dirty_entry(
+            &format!("{id}.swap.ref"),
+            &HashSet::new()
+        ));
+    }
 
     #[test]
     fn dirty_sweep_classifies_entries_by_owner() {
@@ -12089,7 +12527,7 @@ mod tests {
             export_id: export_id.clone(),
             sandbox_id,
             snapshot_dir: export_dir,
-            disk_seal: None,
+            disk_seal: Default::default(),
             clock: std::sync::Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -12111,7 +12549,10 @@ mod tests {
         let stream = pooled
             .migration_fetch(
                 &export_id,
-                vec![MigrationItem::StateBin, MigrationItem::DiskSealInfo],
+                vec![
+                    MigrationItem::StateBin,
+                    MigrationItem::DiskSealInfo(DiskRole::Root),
+                ],
             )
             .await
             .expect("valid fetch");
@@ -12291,7 +12732,7 @@ mod tests {
             export_id: export_id.clone(),
             sandbox_id,
             snapshot_dir: export_dir,
-            disk_seal: Some(Arc::new(seal)),
+            disk_seal: [(DiskRole::Root, Arc::new(seal))].into_iter().collect(),
             clock: std::sync::Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -12304,7 +12745,10 @@ mod tests {
         let stream = pooled
             .migration_fetch(
                 &export_id,
-                vec![MigrationItem::DiskSealInfo, MigrationItem::DiskChunkAt(0)],
+                vec![
+                    MigrationItem::DiskSealInfo(DiskRole::Root),
+                    MigrationItem::DiskChunkAt(DiskRole::Root, 0),
+                ],
             )
             .await
             .expect("valid fetch");
@@ -12328,7 +12772,10 @@ mod tests {
 
         // Unsealed index: refused (streamed error).
         let stream = pooled
-            .migration_fetch(&export_id, vec![MigrationItem::DiskChunkAt(1)])
+            .migration_fetch(
+                &export_id,
+                vec![MigrationItem::DiskChunkAt(DiskRole::Root, 1)],
+            )
             .await
             .expect("stream opens; the per-item error rides it");
         let results: Vec<_> = stream.collect().await;
@@ -12464,9 +12911,9 @@ mod tests {
         {
             let mut guard = CaptureUnwind::new(inner.clone(), id);
             guard.arm();
-            guard.disk_backend = Some(backend.clone());
+            guard.disk_backend.insert(DiskRole::Root, backend.clone());
             guard.fenced = true;
-            guard.disk_pending = Some(pending);
+            guard.disk_pending.insert(DiskRole::Root, pending);
             // guard dropped here (never defused)
         }
         // Drop spawns the async recovery; let it run.
@@ -12516,12 +12963,12 @@ mod tests {
         {
             let mut guard = CaptureUnwind::new(inner.clone(), id);
             guard.arm();
-            guard.disk_backend = Some(backend.clone());
+            guard.disk_backend.insert(DiskRole::Root, backend.clone());
             guard.fenced = true;
-            guard.disk_pending = Some(pending);
+            guard.disk_pending.insert(DiskRole::Root, pending);
             // Success path: the export takes ownership of the drained
             // pending, then the guard is defused.
-            let _owned_by_export = guard.disk_pending.take();
+            let _owned_by_export = std::mem::take(&mut guard.disk_pending);
             guard.defuse();
         }
         // Give any erroneously-spawned recovery task a chance to run.
@@ -15014,7 +15461,7 @@ mod tests {
             export_id: export_id.clone(),
             sandbox_id: id,
             snapshot_dir: dir,
-            disk_seal: None,
+            disk_seal: Default::default(),
             clock: pooled.clock.clone(),
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
@@ -15502,7 +15949,7 @@ mod tests {
             captured_at: chrono::Utc::now(),
             dest,
             chain_prev_ref: None,
-            disk_pending: None,
+            disk_pending: Default::default(),
             aux_bundles: vec![],
             stage: crate::eviction_finalize::FinalizeStage::Captured,
             attempts: 0,

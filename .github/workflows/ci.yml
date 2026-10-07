@@ -1225,6 +1225,7 @@ jobs:
             --test nbd_restore_cancel \
             --test nbd_shutdown_abandon_race \
             --test nbd_shutdown_final_flush \
+            --test nbd_two_devices \
             --test nbd_spec_reserve \
             --test nbd_verify_on_read \
             --test nbd_proc_holder \

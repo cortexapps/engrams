@@ -21,6 +21,7 @@
 //! Keyed by [`SandboxId`] so both hosts share one impl. Iteration that feeds a
 //! decision is `BTreeMap`-ordered (determinism, ADR 0098 D5).
 
+use engram_core::types::snapshot::DiskRole;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,6 +32,8 @@ use engram_host_core::{
     classify_startup_slots, is_local_survivor_candidate, resume_data_plane_served, DeviceHolder,
     PidLiveness, ReapList, StartupClassification, StartupSlot,
 };
+
+pub use engram_host_agent::disk_daemon::devices::SandboxDisks;
 
 /// One sandbox's device-plane slot — the Flow B fields, lifted verbatim out of
 /// `SimHost`'s `SandboxSlot`. The DISK tier (`backend`/`published_ref`) is the
@@ -124,7 +127,7 @@ pub struct DevicePlane {
     pub nbd_capacity: u32,
     /// Per-sandbox device slots, keyed by the (coordinator-minted, or
     /// SimHost-literal) [`SandboxId`].
-    pub slots: BTreeMap<SandboxId, DeviceSlot>,
+    pub slots: BTreeMap<SandboxId, SandboxDisks<DeviceSlot>>,
     /// Spare-device leases held for the slot-accounting exercise (dropped on a
     /// roll). Separate from per-sandbox `lease`s so the accounting oracle sees
     /// every held slot.
@@ -149,8 +152,14 @@ impl DevicePlane {
     /// brief synchronous lock). The lease must have come from
     /// [`nbd_pool`](DevicePlane::nbd_pool).
     pub fn insert_served_slot(&mut self, id: SandboxId, device: PathBuf, lease: NbdSlot) {
-        self.slots
-            .insert(id, DeviceSlot::fresh(device, lease, self.generation));
+        self.slots.insert(
+            id,
+            SandboxDisks {
+                expected: [engram_core::DiskRole::Root].into_iter().collect(),
+                root: DeviceSlot::fresh(device, lease, self.generation),
+                swap: None,
+            },
+        );
     }
 
     /// The lowest `/dev/nbdN` ordinal (`N < capacity`) not owned by any
@@ -160,8 +169,11 @@ impl DevicePlane {
     /// load-bearing: a spare `slot_claim` holds a real pool lease on its path,
     /// so returning it here would make the subsequent `claim` fail.
     pub fn next_free_device(&self) -> Option<PathBuf> {
-        let mut in_use: std::collections::BTreeSet<PathBuf> =
-            self.slots.values().map(|s| s.nbd_device.clone()).collect();
+        let mut in_use: std::collections::BTreeSet<PathBuf> = self
+            .slots
+            .values()
+            .flat_map(|disks| disks.iter().map(|(_, s)| s.nbd_device.clone()))
+            .collect();
         in_use.extend(self.spare_leases.iter().map(|l| l.path().to_path_buf()));
         (0..self.nbd_capacity)
             .map(|n| PathBuf::from(format!("/dev/nbd{n}")))
@@ -185,7 +197,11 @@ impl DevicePlane {
     /// persist — the FC VM (a separate process) stays resident across the roll.
     pub fn roll(&mut self) {
         self.generation += 1;
-        for slot in self.slots.values_mut() {
+        for slot in self
+            .slots
+            .values_mut()
+            .flat_map(|disks| disks.iter_mut().map(|(_, s)| s))
+        {
             slot.lease = None;
             slot.served_by = None;
             // The allocator's parked set is in-process memory; the successor's
@@ -201,18 +217,21 @@ impl DevicePlane {
     /// Is `id` a resident survivor whose device is bound to a DEAD (prior)
     /// generation — i.e. it needs rehydrating?
     pub fn is_resident_survivor(&self, id: SandboxId) -> bool {
-        self.slots
-            .get(&id)
-            .and_then(|s| s.kernel_owner)
-            .is_some_and(|g| g < self.generation)
+        self.slots.get(&id).is_some_and(|disks| {
+            disks
+                .iter()
+                .any(|(_, s)| s.kernel_owner.is_some_and(|g| g < self.generation))
+        })
     }
 
     /// Is `id`'s device served by THIS generation (the un-pause gate's serve
     /// predicate / the sweep's claimed-in-pool gate)?
     pub fn served_by_current(&self, id: SandboxId) -> bool {
-        self.slots
-            .get(&id)
-            .is_some_and(|s| s.served_by == Some(self.generation))
+        self.slots.get(&id).is_some_and(|disks| {
+            disks
+                .iter()
+                .all(|(_, s)| s.served_by == Some(self.generation))
+        })
     }
 
     /// Rung-2 PARK: the FC VM pauses but stays RESIDENT and its NBD device
@@ -221,7 +240,12 @@ impl DevicePlane {
     /// this generation is not currently serving.
     pub fn park(&mut self, id: SandboxId) {
         let gen = self.generation;
-        if let Some(slot) = self.slots.get_mut(&id) {
+        for (_, slot) in self
+            .slots
+            .get_mut(&id)
+            .into_iter()
+            .flat_map(|disks| disks.iter_mut())
+        {
             if slot.served_by == Some(gen) {
                 slot.parked = true;
             }
@@ -232,7 +256,12 @@ impl DevicePlane {
     /// it no longer holds its `/dev/nbdN` node open. After this a dead-owner
     /// sweep sees `NoHolder` and a DISCONNECT is legal.
     pub fn kill_guest(&mut self, id: SandboxId) {
-        if let Some(slot) = self.slots.get_mut(&id) {
+        for (_, slot) in self
+            .slots
+            .get_mut(&id)
+            .into_iter()
+            .flat_map(|disks| disks.iter_mut())
+        {
             slot.guest_holds_device = false;
         }
     }
@@ -242,7 +271,12 @@ impl DevicePlane {
     /// precondition. A resident guest still holds the device, but no record
     /// accounts for it, so the barrier QUARANTINES (never skips/severs) it.
     pub fn lose_record(&mut self, id: SandboxId) {
-        if let Some(slot) = self.slots.get_mut(&id) {
+        for (_, slot) in self
+            .slots
+            .get_mut(&id)
+            .into_iter()
+            .flat_map(|disks| disks.iter_mut())
+        {
             slot.record_present = false;
         }
     }
@@ -250,7 +284,12 @@ impl DevicePlane {
     /// The operator/runbook reconcile: `id`'s record is restored so the next
     /// register re-serves the reconnectable device with zero loss.
     pub fn regain_record(&mut self, id: SandboxId) {
-        if let Some(slot) = self.slots.get_mut(&id) {
+        for (_, slot) in self
+            .slots
+            .get_mut(&id)
+            .into_iter()
+            .flat_map(|disks| disks.iter_mut())
+        {
             slot.record_present = true;
         }
     }
@@ -266,20 +305,23 @@ impl DevicePlane {
         if self.served_by_current(id) {
             return Ok(ServeOutcome::AlreadyServed);
         }
-        let device = self
+        let disks = self
             .slots
-            .get(&id)
-            .map(|s| s.nbd_device.clone())
+            .get_mut(&id)
             .ok_or_else(|| format!("serve: unknown sandbox {id}"))?;
-        let lease =
-            self.nbd_pool.claim(&device).await.ok_or_else(|| {
-                format!("serve: claim of {} failed (not free?)", device.display())
-            })?;
-        let g = self.generation;
-        let slot = self.slots.get_mut(&id).expect("slot present (just read)");
-        slot.lease = Some(lease);
-        slot.served_by = Some(g);
-        slot.kernel_owner = Some(g);
+        for (_, slot) in disks.iter_mut() {
+            if slot.served_by == Some(self.generation) {
+                continue;
+            }
+            let lease = self
+                .nbd_pool
+                .claim(&slot.nbd_device)
+                .await
+                .ok_or_else(|| "device claim failed".to_string())?;
+            slot.lease = Some(lease);
+            slot.served_by = Some(self.generation);
+            slot.kernel_owner = Some(self.generation);
+        }
         Ok(ServeOutcome::NewlyServed)
     }
 
@@ -305,35 +347,37 @@ impl DevicePlane {
     /// proof of death — OR while THIS generation quarantine-parked it (PR #828:
     /// the allocator's parked set is device-keyed, so it keeps a
     /// rehydrate-failed survivor tracked even after its FC entry vacates).
-    pub fn classify_startup(&self) -> StartupClassification<SandboxId> {
+    pub fn classify_startup(&self) -> StartupClassification<(SandboxId, DiskRole)> {
         let gen = self.generation;
         let slots = self
             .slots
             .iter()
-            .map(|(id, slot)| {
-                let liveness = match slot.kernel_owner {
-                    None => PidLiveness::NoPid,
-                    Some(g) if g == gen => PidLiveness::SelfPid,
-                    Some(_) => PidLiveness::Dead,
-                };
-                let holder = if slot.guest_holds_device {
-                    DeviceHolder::LiveHolder
-                } else {
-                    DeviceHolder::NoHolder
-                };
-                let has_record =
-                    (slot.record_present && slot.guest_holds_device) || slot.quarantine_parked;
-                StartupSlot {
-                    device: *id,
-                    liveness,
-                    holder,
-                    has_record,
-                    // engrams#1378: the sim models the pre-owner-record
-                    // (record-reconcile) classification; the attributed/
-                    // residue flow is the follow-up co-sim extension tracked
-                    // on #1378.
-                    attributed: false,
-                }
+            .flat_map(|(id, disks)| {
+                disks.iter().map(move |(role, slot)| {
+                    let liveness = match slot.kernel_owner {
+                        None => PidLiveness::NoPid,
+                        Some(g) if g == gen => PidLiveness::SelfPid,
+                        Some(_) => PidLiveness::Dead,
+                    };
+                    let holder = if slot.guest_holds_device {
+                        DeviceHolder::LiveHolder
+                    } else {
+                        DeviceHolder::NoHolder
+                    };
+                    let has_record =
+                        (slot.record_present && slot.guest_holds_device) || slot.quarantine_parked;
+                    StartupSlot {
+                        device: (*id, role),
+                        liveness,
+                        holder,
+                        has_record,
+                        // engrams#1378: the sim models the pre-owner-record
+                        // (record-reconcile) classification; the attributed/
+                        // residue flow is the follow-up co-sim extension tracked
+                        // on #1378.
+                        attributed: false,
+                    }
+                })
             })
             .collect();
         classify_startup_slots(slots)
@@ -349,9 +393,13 @@ impl DevicePlane {
     /// `QuarantinedUnknown` devices are UNTOUCHED — a re-served survivor, a
     /// recorded survivor, and a record-invisible live survivor are each left
     /// RECONNECTABLE, never severed (the 731df805 + #769 gap-A protection).
-    pub fn reap_terminal(&mut self, reap: ReapList<SandboxId>) {
-        for id in reap.into_devices() {
-            if let Some(slot) = self.slots.get_mut(&id) {
+    pub fn reap_terminal(&mut self, reap: ReapList<(SandboxId, DiskRole)>) {
+        for (id, role) in reap.into_devices() {
+            if let Some(slot) = self
+                .slots
+                .get_mut(&id)
+                .and_then(|disks| disks.get_mut(role))
+            {
                 slot.kernel_owner = None;
             }
         }
@@ -365,14 +413,16 @@ impl DevicePlane {
     /// `true` if un-paused, `false` if the gate fired (or nothing to un-pause).
     pub fn unpause(&mut self, id: SandboxId) -> bool {
         let served = self.served_by_current(id);
-        let Some(slot) = self.slots.get_mut(&id) else {
+        let Some(disks) = self.slots.get_mut(&id) else {
             return false;
         };
-        if !slot.parked {
+        if !disks.iter().any(|(_, slot)| slot.parked) {
             return false;
         }
         if resume_data_plane_served(true, served) {
-            slot.parked = false;
+            for (_, slot) in disks.iter_mut() {
+                slot.parked = false;
+            }
             true
         } else {
             false
@@ -381,23 +431,29 @@ impl DevicePlane {
 
     /// Is `id` currently parked?
     pub fn is_parked(&self, id: SandboxId) -> bool {
-        self.slots.get(&id).is_some_and(|s| s.parked)
+        self.slots
+            .get(&id)
+            .is_some_and(|disks| disks.iter().any(|(_, s)| s.parked))
     }
 
     /// Does a live guest still hold `id`'s device node open?
     pub fn guest_holds_device(&self, id: SandboxId) -> bool {
-        self.slots.get(&id).is_some_and(|s| s.guest_holds_device)
+        self.slots
+            .get(&id)
+            .is_some_and(|disks| disks.iter().any(|(_, s)| s.guest_holds_device))
     }
 
     /// Does a tracked record reference `id`'s device (Wave 7b reconcile input)?
     pub fn record_present(&self, id: SandboxId) -> bool {
-        self.slots.get(&id).is_some_and(|s| s.record_present)
+        self.slots
+            .get(&id)
+            .is_some_and(|disks| disks.iter().all(|(_, s)| s.record_present))
     }
 
     /// The kernel-recorded owner generation for `id`'s device (`None` = no
     /// binding / disconnected).
     pub fn kernel_owner(&self, id: SandboxId) -> Option<u32> {
-        self.slots.get(&id).and_then(|s| s.kernel_owner)
+        self.slots.get(&id).and_then(|s| s.root.kernel_owner)
     }
 
     /// Exercise the REAL slot allocator: `try_claim` a spare device (Free →
@@ -423,7 +479,42 @@ impl DevicePlane {
     /// devices + spare leases) — the "claimed + parked" term of the
     /// slot-accounting identity `free + warm + held == capacity`.
     pub fn leases_held(&self) -> usize {
-        let sandbox_leases = self.slots.values().filter(|s| s.lease.is_some()).count();
+        let sandbox_leases = self
+            .slots
+            .values()
+            .flat_map(|disks| disks.iter())
+            .filter(|(_, s)| s.lease.is_some())
+            .count();
         sandbox_leases + self.spare_leases.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn two_devices_roll_serve_and_resume_together() {
+        let mut plane = DevicePlane::new(2);
+        let id = SandboxId::from(uuid::Uuid::from_u128(1));
+        let root = PathBuf::from("/dev/nbd0");
+        let swap = PathBuf::from("/dev/nbd1");
+        let root_lease = plane.nbd_pool.claim(&root).await.unwrap();
+        let swap_lease = plane.nbd_pool.claim(&swap).await.unwrap();
+        plane.insert_served_slot(id, root, root_lease);
+        plane.slots.get_mut(&id).unwrap().swap =
+            Some(DeviceSlot::fresh(swap, swap_lease, plane.generation));
+        plane.park(id);
+        assert_eq!(plane.leases_held(), 2);
+        plane.roll();
+        assert!(!plane.unpause(id));
+        let classified = plane.classify_startup();
+        assert_eq!(classified.reconnect.len(), 2);
+        assert!(classified.reap.into_devices().is_empty());
+        assert_eq!(plane.serve(id).await.unwrap(), ServeOutcome::NewlyServed);
+        assert_eq!(plane.leases_held(), 2);
+        assert!(plane.unpause(id));
+        plane.remove_slot(id);
+        assert_eq!(plane.leases_held(), 0);
     }
 }

@@ -861,6 +861,7 @@ impl NbdSandboxState {
     pub fn install_flush_scheduler(
         &mut self,
         sandbox_id: engram_core::SandboxId,
+        role: super::DiskRole,
         publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
         health: Arc<dyn crate::disk_daemon::DataPlaneHealth>,
         config: crate::disk_daemon::FlushSchedulerConfig,
@@ -871,13 +872,16 @@ impl NbdSandboxState {
         // flush-scheduler kill-switch gate (attribution is not a flush
         // concern).
         if let Some(owners) = owners.as_ref() {
-            owners.record(self.device_path(), sandbox_id);
+            if let Err(error) = owners.record(self.device_path(), sandbox_id, role) {
+                tracing::warn!(%sandbox_id, %error, "NBD owner record write failed");
+            }
         }
         if !config.enabled {
             return;
         }
         let handle = crate::disk_daemon::FlushScheduler::spawn(
             sandbox_id,
+            role,
             self.backend.clone(),
             publisher,
             health,

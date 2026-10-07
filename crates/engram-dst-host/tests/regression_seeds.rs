@@ -341,9 +341,14 @@ async fn sigterm_tiny_budget_overrun_spools_stragglers_and_recovers_every_acked_
     // final-flush leg overruns and is skipped; the spool is the ONLY copy.
     host.sigterm(Some(0.001)).await.unwrap();
     for slot in &host.sandboxes {
-        let spooled = spool::read_spool(&TokioFs, host.fs.spool_dir(), slot.sandbox_id)
-            .await
-            .unwrap();
+        let spooled = spool::read_spool(
+            &TokioFs,
+            host.fs.spool_dir(),
+            slot.sandbox_id,
+            engram_core::types::snapshot::DiskRole::Root,
+        )
+        .await
+        .unwrap();
         assert!(
             spooled.is_some_and(|(_, chunks)| !chunks.is_empty()),
             "an overrun straggler must leave a complete, chunk-bearing spool",
@@ -375,22 +380,27 @@ async fn store_ahead_lost_publish_ack_recovers_from_the_spool_ref_not_coords_sta
     // The final flush UPLOADS chunks + a v2 manifest to the store and advances
     // the backend's version — but the coord publish is lost, so the durable
     // pointer (`published_ref`, standing in for coord's ref) stays base-stale.
-    let backend = host.sandboxes[0].backend.clone().unwrap();
+    let backend = host.sandboxes[0].disks.root.backend.clone().unwrap();
     backend.flush().await.unwrap();
     let store_ahead = backend.manifest_ref().await;
-    assert!(store_ahead.version > host.sandboxes[0].base_ref.version);
+    assert!(store_ahead.version > host.sandboxes[0].disks.root.base_ref.version);
     assert!(
-        host.sandboxes[0].published_ref.is_none(),
+        host.sandboxes[0].disks.root.published_ref.is_none(),
         "the publish ack was lost — coord never learned the store-ahead ref",
     );
 
     // The abandon sweep exports the ref-only store-ahead spool.
     host.spool_export(0).await.unwrap();
     let sid = host.sandboxes[0].sandbox_id;
-    let (meta, chunks) = spool::read_spool(&TokioFs, host.fs.spool_dir(), sid)
-        .await
-        .unwrap()
-        .unwrap();
+    let (meta, chunks) = spool::read_spool(
+        &TokioFs,
+        host.fs.spool_dir(),
+        sid,
+        engram_core::types::snapshot::DiskRole::Root,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         meta.manifest_ref(),
         store_ahead,
@@ -403,10 +413,10 @@ async fn store_ahead_lost_publish_ack_recovers_from_the_spool_ref_not_coords_sta
 
     // Crash + restart: the successor's rebuild ref is coord's stale base; the
     // store-ahead rule attaches from the spool's ahead ref instead.
-    host.sandboxes[0].backend = None;
+    host.sandboxes[0].disks.root.backend = None;
     host.restart().await.unwrap();
     assert_eq!(
-        host.sandboxes[0].published_ref,
+        host.sandboxes[0].disks.root.published_ref,
         Some(store_ahead),
         "the successor adopts the store-ahead ref, never rolls back to the stale one",
     );
@@ -496,7 +506,7 @@ async fn sigterm_inflight_flush_abort_keeps_the_spool_adoptable_at_every_seam() 
             .get(&(0, 1))
             .expect("chunk 1 was written")
             .content_tag;
-        let backend = host.sandboxes[0].backend.clone().unwrap();
+        let backend = host.sandboxes[0].disks.root.backend.clone().unwrap();
         let bytes = backend.read(CHUNK_SIZE, CHUNK_SIZE).await.unwrap();
         assert_eq!(
             decode_tag(&bytes),
@@ -534,7 +544,7 @@ async fn detached_flush_publish_after_spool_export_is_caught_at_rebuild() {
     // tag2 dirty; the SIGTERM final flush drains it and parks pre-publish
     // (the prod shape: a 318 MiB upload still in flight at the deadline).
     host.guest_write(0, 1).await.unwrap();
-    let backend = host.sandboxes[0].backend.clone().unwrap();
+    let backend = host.sandboxes[0].disks.root.backend.clone().unwrap();
     let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PostUploadPrePublish);
     let flush = tokio::spawn({
         let b = backend.clone();
@@ -563,17 +573,22 @@ async fn detached_flush_publish_after_spool_export_is_caught_at_rebuild() {
         .expect("flush task join")
         .expect("detached flush completes");
     host.detached_flush_publish(0).await.unwrap();
-    let published = host.sandboxes[0].published_ref.unwrap();
+    let published = host.sandboxes[0].disks.root.published_ref.unwrap();
     assert!(
         stamped_at.version < published.version,
         "the incident state: the spool stamp ({stamped_at}) must be BEHIND the \
          published ref ({published})",
     );
     let sid = host.sandboxes[0].sandbox_id;
-    let (meta, chunks) = spool::read_spool(&TokioFs, host.fs.spool_dir(), sid)
-        .await
-        .unwrap()
-        .expect("the behind-stamped spool is standing");
+    let (meta, chunks) = spool::read_spool(
+        &TokioFs,
+        host.fs.spool_dir(),
+        sid,
+        engram_core::types::snapshot::DiskRole::Root,
+    )
+    .await
+    .unwrap()
+    .expect("the behind-stamped spool is standing");
     assert_eq!(meta.manifest_ref(), stamped_at);
     assert!(
         chunks
@@ -585,7 +600,7 @@ async fn detached_flush_publish_after_spool_export_is_caught_at_rebuild() {
     // The roll. The successor's rebuild refuses the behind-stamped spool —
     // and the stale-refusal oracle catches that the refusal drops the only
     // copy of acked tag3 (the floor is tag2).
-    host.sandboxes[0].backend = None;
+    host.sandboxes[0].disks.root.backend = None;
     let err = host
         .restart()
         .await
@@ -610,13 +625,14 @@ async fn spool_cut_at_every_op_recovers_every_acked_write() {
     let probe = {
         let mut host = scenario_host(0, 2).await;
         host.guest_write(0, 0).await.unwrap();
-        let backend = host.sandboxes[0].backend.clone().unwrap();
+        let backend = host.sandboxes[0].disks.root.backend.clone().unwrap();
         let (exported_ref, chunks) = backend.export_unflushed().await;
         let fs = CrashFs::recording();
         spool::write_spool(
             fs.as_ref(),
             host.fs.spool_dir(),
             host.sandboxes[0].sandbox_id,
+            engram_core::types::snapshot::DiskRole::Root,
             exported_ref,
             &chunks,
         )
@@ -667,7 +683,7 @@ async fn finalize_completes_publishes_the_floor_and_destroys() {
         panic!("expected a fresh finalize to begin");
     };
     assert!(
-        host.sandboxes[0].backend.is_none(),
+        host.sandboxes[0].disks.root.backend.is_none(),
         "the captured VM is paused for the whole finalize",
     );
     // One tick completes every leg (disk → memory → blobs → terminal).
@@ -683,9 +699,11 @@ async fn finalize_completes_publishes_the_floor_and_destroys() {
         "the terminal leg issued the (best-effort) destroy",
     );
     let published = host.sandboxes[0]
+        .disks
+        .root
         .published_ref
         .expect("the finalize disk manifest is the durable pointer");
-    assert!(published.version > host.sandboxes[0].base_ref.version);
+    assert!(published.version > host.sandboxes[0].disks.root.base_ref.version);
 
     // The floor was raised: a restart rebuilds from the finalize-published
     // manifest and the acked writes read back exactly (floor == latest).
@@ -743,9 +761,11 @@ async fn finalize_crash_at_every_op_resumes_and_completes() {
         // and the healed successor completes on its first. The acked writes
         // ride the finalize-published floor — crash placement is invisible.
         let published = host.sandboxes[0]
+            .disks
+            .root
             .published_ref
             .unwrap_or_else(|| panic!("cut {op_index}: the finalize must have published"));
-        assert!(published.version > host.sandboxes[0].base_ref.version);
+        assert!(published.version > host.sandboxes[0].disks.root.base_ref.version);
         host.restart().await.unwrap();
         host.guest_read(0, 2).await.unwrap();
         host.guest_read(0, 7).await.unwrap();
@@ -766,7 +786,7 @@ async fn finalize_quarantine_after_max_attempts_is_convergent() {
     // A prior flush establishes the floor the quarantine falls back to.
     host.guest_write(0, 3).await.unwrap();
     host.flush_tick(0).await.unwrap();
-    let prior_published = host.sandboxes[0].published_ref.expect("flushed");
+    let prior_published = host.sandboxes[0].disks.root.published_ref.expect("flushed");
     // A newer acked write that will ride the (doomed) finalize.
     host.guest_write(0, 3).await.unwrap();
 
@@ -811,7 +831,7 @@ async fn finalize_quarantine_after_max_attempts_is_convergent() {
     // the newer un-published write is the accepted bounded rollback.
     host.restart().await.unwrap();
     assert_eq!(
-        host.sandboxes[0].published_ref,
+        host.sandboxes[0].disks.root.published_ref,
         Some(prior_published),
         "quarantine must not move the durable pointer",
     );
@@ -909,7 +929,7 @@ async fn post_ack_pre_handoff_crash_is_honest_loss() {
 
     // The chunk legitimately reads BASE — the acked (un-handed-off) write is
     // gone, exactly as production loses it.
-    let backend = host.sandboxes[0].backend.clone().unwrap();
+    let backend = host.sandboxes[0].disks.root.backend.clone().unwrap();
     let got = decode_tag(&backend.read(3 * CHUNK_SIZE, CHUNK_SIZE).await.unwrap());
     assert_eq!(
         got, 0,
@@ -946,7 +966,7 @@ async fn post_ack_pre_handoff_crash_is_honest_loss() {
     );
     host.abrupt_crash().await.unwrap();
     host.restart().await.unwrap();
-    let backend = host.sandboxes[0].backend.clone().unwrap();
+    let backend = host.sandboxes[0].disks.root.backend.clone().unwrap();
     let got = decode_tag(&backend.read(4 * CHUNK_SIZE, CHUNK_SIZE).await.unwrap());
     assert_eq!(got, handed, "a handed-off write survives even abrupt death");
     invariants::check(&host)
@@ -962,6 +982,8 @@ async fn misdirected_read_in_range_tag_fires_the_membership_oracle() {
     host.guest_write(0, 0).await.unwrap();
 
     host.sandboxes[0]
+        .disks
+        .root
         .backend
         .clone()
         .unwrap()
@@ -1027,11 +1049,13 @@ async fn park_roll_local_pass_reserves_survivor_sweep_skips_it_unpause_serves() 
         "the parked VM stays resident across the roll"
     );
     assert_eq!(
-        host.sandboxes[0].served_by, None,
+        host.sandboxes[0].disks.root.served_by, None,
         "the roll leaves the device unserved (the successor's serve socket)"
     );
     assert!(
         host.sandboxes[0]
+            .disks
+            .root
             .kernel_owner
             .is_some_and(|g| g < host.generation),
         "the kernel device is still bound to the dead generation",
@@ -1046,12 +1070,12 @@ async fn park_roll_local_pass_reserves_survivor_sweep_skips_it_unpause_serves() 
     .unwrap();
 
     assert_eq!(
-        host.sandboxes[0].served_by,
+        host.sandboxes[0].disks.root.served_by,
         Some(host.generation),
         "the #739 local pass re-served the parked survivor's device the coord list missed",
     );
     assert_eq!(
-        host.sandboxes[0].kernel_owner,
+        host.sandboxes[0].disks.root.kernel_owner,
         Some(host.generation),
         "the stale-binding sweep did NOT disconnect the re-served live device",
     );
@@ -1096,13 +1120,15 @@ async fn park_roll_ungated_live_holder_sweep_parks_then_reattach_reserves_zero_l
     // the parked survivor, so its dead-owner device reaches the stale sweep.
     host.register_rehydrate(false, false).await.unwrap();
     assert_eq!(
-        host.sandboxes[0].served_by, None,
+        host.sandboxes[0].disks.root.served_by, None,
         "no pass re-served the parked survivor",
     );
     // The R6 change: the sweep PARKED the live-held device instead of
     // disconnecting it — the kernel binding is intact (RECONNECTABLE).
     assert!(
         host.sandboxes[0]
+            .disks
+            .root
             .kernel_owner
             .is_some_and(|g| g < host.generation),
         "the stale sweep PARKED the live-held survivor device (kernel binding intact), \
@@ -1119,12 +1145,12 @@ async fn park_roll_ungated_live_holder_sweep_parks_then_reattach_reserves_zero_l
     // served with zero loss.
     host.register_rehydrate(true, true).await.unwrap();
     assert_eq!(
-        host.sandboxes[0].served_by,
+        host.sandboxes[0].disks.root.served_by,
         Some(host.generation),
         "the corrected reattach pass re-served the parked survivor's device",
     );
     assert_eq!(
-        host.sandboxes[0].kernel_owner,
+        host.sandboxes[0].disks.root.kernel_owner,
         Some(host.generation),
         "the re-served device is bound to the current generation",
     );
@@ -1157,11 +1183,11 @@ async fn park_roll_guest_gone_noholder_disconnect_legal_unpause_gate_still_guard
     // Pre-#739 world again, but this time the sweep has proof of death.
     host.register_rehydrate(false, false).await.unwrap();
     assert_eq!(
-        host.sandboxes[0].served_by, None,
+        host.sandboxes[0].disks.root.served_by, None,
         "no pass re-served the survivor",
     );
     assert_eq!(
-        host.sandboxes[0].kernel_owner, None,
+        host.sandboxes[0].disks.root.kernel_owner, None,
         "the sweep legally DISCONNECTED a dead-owner device with no live holder (NoHolder)",
     );
 
@@ -1224,11 +1250,13 @@ async fn gap_a_record_invisible_survivor_is_quarantined_not_severed_then_recover
     // neither pass can re-serve it. The barrier must QUARANTINE it.
     host.register_rehydrate(false, true).await.unwrap();
     assert_eq!(
-        host.sandboxes[0].served_by, None,
+        host.sandboxes[0].disks.root.served_by, None,
         "no rehydrate pass could re-serve the record-invisible survivor",
     );
     assert!(
         host.sandboxes[0]
+            .disks
+            .root
             .kernel_owner
             .is_some_and(|g| g < host.generation),
         "the device is left RECONNECTABLE (kernel binding intact) — never severed",
@@ -1248,7 +1276,7 @@ async fn gap_a_record_invisible_survivor_is_quarantined_not_severed_then_recover
     host.regain_record(0);
     host.register_rehydrate(true, true).await.unwrap();
     assert_eq!(
-        host.sandboxes[0].served_by,
+        host.sandboxes[0].disks.root.served_by,
         Some(host.generation),
         "the reconciled record let the reattach re-serve the quarantined device",
     );
@@ -1299,12 +1327,14 @@ async fn quarantine_parked_survivor_stays_tracked_never_unknown() {
     );
     assert!(
         host.sandboxes[0]
+            .disks
+            .root
             .kernel_owner
             .is_some_and(|g| g < host.generation),
         "the parked survivor's device stays RECONNECTABLE (kernel binding intact)",
     );
     assert_eq!(
-        host.sandboxes[0].served_by, None,
+        host.sandboxes[0].disks.root.served_by, None,
         "parked means parked: nothing re-serves the device this generation",
     );
     invariants::check(&host)
@@ -1320,7 +1350,7 @@ async fn quarantine_parked_survivor_stays_tracked_never_unknown() {
     host.regain_record(0);
     host.register_rehydrate(true, true).await.unwrap();
     assert_eq!(
-        host.sandboxes[0].served_by,
+        host.sandboxes[0].disks.root.served_by,
         Some(host.generation),
         "the reconciled record lets the next generation re-serve the device",
     );
@@ -1453,7 +1483,7 @@ async fn untracked_survivor_capture_refuses_never_a_manifestless_snapshot() {
 
     // The roll: RAM dies, the VM stays resident, nothing rehydrates it.
     host.abrupt_crash().await.unwrap();
-    assert!(host.sandboxes[0].backend.is_none());
+    assert!(host.sandboxes[0].disks.root.backend.is_none());
 
     let outcome = host.snapshot_begin(0).await.unwrap();
     assert_eq!(
@@ -1544,7 +1574,7 @@ async fn poisoned_snapshot_resume_gate_refuses_the_stale_literal() {
         "the resume gate must refuse the stale literal device",
     );
     assert!(
-        host.sandboxes[0].backend.is_none(),
+        host.sandboxes[0].disks.root.backend.is_none(),
         "no boot happened — the guest never lands on the dead plane",
     );
     invariants::check(&host)
@@ -1602,7 +1632,7 @@ async fn concurrent_flushes_serialize_never_reorder_publishes() {
     use engram_host_agent::disk_daemon::backend::FlushSeamPoint;
     let mut host = scenario_host(0, 1).await;
     host.guest_write(0, 3).await.unwrap();
-    let backend = host.sandboxes[0].backend.clone().unwrap();
+    let backend = host.sandboxes[0].disks.root.backend.clone().unwrap();
 
     // Flush A drains the first write and parks post-upload/pre-publish.
     let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PostUploadPrePublish);
@@ -1732,7 +1762,7 @@ async fn state_served_export_never_unpauses_then_destroys_on_ownership_flip() {
         "ownership moved on — destroyed"
     );
     assert!(
-        host.sandboxes[0].backend.is_none(),
+        host.sandboxes[0].disks.root.backend.is_none(),
         "the stale source is torn down, never resumed",
     );
     assert!(
@@ -1926,9 +1956,14 @@ async fn a_valid_but_corrupt_spool_marker_is_rejected_not_trusted() {
         .await
         .unwrap();
 
-    let err = spool::read_spool(&TokioFs, host.fs.spool_dir(), sid)
-        .await
-        .expect_err("a bit-rotted-but-valid spool marker must be rejected, never trusted");
+    let err = spool::read_spool(
+        &TokioFs,
+        host.fs.spool_dir(),
+        sid,
+        engram_core::types::snapshot::DiskRole::Root,
+    )
+    .await
+    .expect_err("a bit-rotted-but-valid spool marker must be rejected, never trusted");
     assert!(
         err.to_string().contains("checksum"),
         "the R5 envelope names the content-hash gap: {err}",
@@ -1952,7 +1987,7 @@ async fn a_valid_but_corrupt_spool_marker_is_rejected_not_trusted() {
 #[tokio::test(start_paused = true)]
 async fn finalize_publishes_past_store_ahead_orphan_and_resume_covers_acked_writes() {
     let mut host = scenario_host(0, 1).await;
-    let base_version = host.sandboxes[0].base_ref.version;
+    let base_version = host.sandboxes[0].disks.root.base_ref.version;
 
     // Floor raised over an acked write: published v(base+1).
     host.guest_write(0, 0).await.unwrap();
@@ -1984,6 +2019,8 @@ async fn finalize_publishes_past_store_ahead_orphan_and_resume_covers_acked_writ
     // authoritative capture to v(base+3) — returning v(base+2) is the #897
     // bug (and the finalize-coverage oracle inside finalize_tick fires).
     let published = host.sandboxes[0]
+        .disks
+        .root
         .published_ref
         .expect("a completed finalize publishes the durable pointer");
     assert_eq!(
@@ -1997,12 +2034,12 @@ async fn finalize_publishes_past_store_ahead_orphan_and_resume_covers_acked_writ
     host.abrupt_crash().await.unwrap();
     host.restart().await.unwrap();
     assert!(
-        host.sandboxes[0].backend.is_none(),
+        host.sandboxes[0].disks.root.backend.is_none(),
         "a terminally-finalized sandbox must never be resurrected by restart",
     );
     host.spool_adopt(0).await.unwrap();
     assert!(
-        host.sandboxes[0].backend.is_none(),
+        host.sandboxes[0].disks.root.backend.is_none(),
         "spool adoption must not resurrect a terminally-finalized sandbox",
     );
 
@@ -2011,7 +2048,7 @@ async fn finalize_publishes_past_store_ahead_orphan_and_resume_covers_acked_writ
     // every acked write back (chunk 1's drained tag, chunk 0's flushed tag).
     host.finalized_resume(0).await.unwrap();
     assert!(
-        host.sandboxes[0].backend.is_some(),
+        host.sandboxes[0].disks.root.backend.is_some(),
         "the finalized resume re-creates the sandbox",
     );
     host.guest_read(0, 0).await.unwrap();
