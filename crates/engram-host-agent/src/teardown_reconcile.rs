@@ -6,7 +6,7 @@
 //! sweeps the *other* direction, session-alive → sandbox-missing). This
 //! module's reconcile (driven in `lib.rs`, which owns the async coord +
 //! backend handles) generalizes the migration source-ownership rule
-//! (ADR 0045 C1) to all sandboxes: a sandbox whose session no longer owns
+//! (ADR 0045) to all sandboxes: a sandbox whose session no longer owns
 //! it (`sessions.sandbox_id` — PG, ADR 0047's sole authority — no longer
 //! points at it) is destroyed **locally**, where the destroy can't be
 //! defeated by the same gRPC flakiness that leaked it.
@@ -80,7 +80,7 @@ pub struct CoordUnreachable;
 /// async spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconcileInput {
-    /// A migration-role sandbox (ADR 0045 C1 runs its own ownership rules)
+    /// A migration-role sandbox (ADR 0045 runs its own ownership rules)
     /// or a live base-snapshot capture VM (ADR 0084 P1b — host-local +
     /// transient, never session-owned; a slow `[warm]` hook must not be
     /// reaped mid-capture). Exempt WITHOUT a coordinator call.

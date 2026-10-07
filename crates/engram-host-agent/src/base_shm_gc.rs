@@ -20,7 +20,7 @@
 //!   `/proc/*/fd` scan) is a precise keep-set with zero cross-process
 //!   bookkeeping.
 //! - While its image is ENABLED: `image_prefetch` pre-warms the file at
-//!   readiness (ADR 0045 C1) and the scheduler places sessions on the
+//!   readiness (ADR 0045) and the scheduler places sessions on the
 //!   strength of that residency. Sweeping it voids the C1 guarantee —
 //!   the next session pays lazy population at NVMe latency under its
 //!   own resume storm (see the ADR 0045 addendum, 2026-07-10: a host

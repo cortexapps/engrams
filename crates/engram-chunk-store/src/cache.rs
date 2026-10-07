@@ -112,8 +112,6 @@ pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 ///   fetch happened but the cache did NOT fill — see the `write_local`
 ///   error-handling comment just above the increment site).
 /// - `source="peer"` is ALSO incremented by
-///   `engram-host-agent::pooled_backend` at the loops that land
-///   migration-sourced chunks via [`ChunkCache::put_no_evict`], and by
 ///   `engram-host-agent::peer_fill` at the bulk
 ///   [`ChunkCache::put_unverified_no_evict`] landings (ADR 0095).
 pub const CHUNK_FILL_TOTAL: &str = "engram_chunk_fill_total";

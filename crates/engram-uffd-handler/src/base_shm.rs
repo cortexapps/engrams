@@ -112,7 +112,7 @@ impl BaseShm {
     /// Answered from an in-memory data-range map built ONCE (one
     /// `SEEK_DATA`/`SEEK_HOLE` walk of the whole file on first probe),
     /// NOT a per-probe `lseek(SEEK_HOLE)`. The per-probe lseek was the
-    /// teleport tail-latency killer (ADR 0045 C1): on a freshly-rolled
+    /// teleport tail-latency killer (ADR 0045): on a freshly-rolled
     /// host the kernel's extent map is cold and a DENSE (pre-warmed)
     /// file makes each `SEEK_HOLE` walk every extent from `offset` to
     /// the next hole — thousands of first-touch faults compounded into

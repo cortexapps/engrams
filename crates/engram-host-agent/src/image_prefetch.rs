@@ -1028,7 +1028,7 @@ async fn prefetch_one(
             prefetch_manifest_chunks(memory_manifest.clone(), chunk_store, chunk_cache, semaphore)
                 .await?;
 
-        // ADR 0045 C1 (the handshake-breakdown follow-up): pre-warm the
+        // ADR 0045 (the handshake-breakdown follow-up): pre-warm the
         // SUBSTRATE's per-image base shm file from the just-prefetched
         // NVMe-warm chunks. Without this, the FIRST session on a
         // freshly-rolled host pays fetch+pwrite+CONTINUE for every
@@ -1104,7 +1104,7 @@ async fn prefetch_one(
                                 image_uri = %image.image_uri,
                                 path = %base_path.display(),
                                 chunks = written,
-                                "per-image base shm pre-warmed at prefetch (ADR 0045 C1)",
+                                "per-image base shm pre-warmed at prefetch (ADR 0045)",
                             );
                         }
                         Err(e) => {
@@ -1174,7 +1174,7 @@ fn manifest_non_hole_bytes(manifest: &Manifest) -> u64 {
         .sum()
 }
 
-/// ADR 0045 C1: populate a per-image base shm file from a memory
+/// ADR 0045: populate a per-image base shm file from a memory
 /// manifest's chunks (NVMe-warm after the preceding prefetch). Grow-only
 /// size like the handler's `BaseShm::open`; chunk bytes land at their
 /// manifest offsets; elided ranges stay holes. Returns chunks written.
@@ -2363,7 +2363,7 @@ mod prewarm_tests {
     use super::*;
     use std::sync::Arc;
 
-    /// ADR 0045 C1: the pre-warm writes each manifest chunk at its
+    /// ADR 0045: the pre-warm writes each manifest chunk at its
     /// offset, sizes the file to total_bytes, and leaves elided ranges
     /// as holes (the handler's ZEROPAGE arm owns zeros).
     #[tokio::test]

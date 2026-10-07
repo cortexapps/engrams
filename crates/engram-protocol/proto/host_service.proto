@@ -43,37 +43,9 @@ service HostService {
   // sidecar.json, working_set.json) so they don't accumulate as
   // 4 GiB-per-attempt leaks during retry storms. Idempotent.
   rpc AbortSnapshot(FencedSandboxRequest) returns (Empty);
-  // ADR 0045 D5: the teardown reorder. SnapshotBegin runs only the
-  // pause-side capture (pause -> NBD drain -> FC create; for eviction
-  // the VM stays paused) and spawns the chunk+upload work as a host-side
-  // background task; SnapshotWait awaits that task and returns the
-  // durable SnapshotMetadata. The coordinator marks the session Idle
-  // between the two — user-visible teardown ends at Begin. The legacy
-  // Snapshot RPC stays as the composed begin+wait (periodic checkpoints,
-  // drain paths, old coordinators).
+  // Capture an eviction and persist its background finalize job on the host.
   rpc SnapshotBegin(FencedSandboxRequest) returns (SnapshotBeginResponse);
-  rpc SnapshotWait(FencedSandboxRequest) returns (SnapshotResponse);
-  // ADR 0045 Phase C1: live-teleport source-side surface.
-  // MigrationCapture freezes the sandbox for a move: pause + NBD drain +
-  // FC diff capture + LOCAL-sink re-chunk (no GCS on the pause path);
-  // the guest STAYS PAUSED and the sandbox is fenced (no flush publish,
-  // no checkpoints) until Commit or Abort. Returns the not-yet-durable
-  // next manifests inline plus the transfer set the destination must
-  // pull. MigrationFetch is the one host-to-host RPC: the DESTINATION
-  // host-agent streams the export's artifacts (state.bin, sidecar,
-  // chunk bytes), gated by the export_id nonce + a server-side
-  // allowlist. Commit destroys the source VM + drops the export; Abort
-  // un-pauses the guest in place and unfences (zero loss).
-  //
-  // ADR 0079: the FIVE source-mutating RPCs (Capture, Presetup,
-  // CapturePostCopy, Commit, Abort) carry the (session_id,
-  // fencing_epoch) fence — Capture/Presetup via `FencedSandboxRequest`,
-  // the export-scoped three via the fence fields on `MigrationExportRef`
-  // — so the host's `check_session_epoch` gate rejects a stale
-  // (reclaimed-out) teleport holder. MigrationFetch (host-to-host,
-  // export-nonce gated) and MigrationDrainWait (dest-side wait) are NOT
-  // fenced: they make no source-mutating write on behalf of the holder.
-  rpc MigrationCapture(FencedSandboxRequest) returns (MigrationCaptureResponse);
+  // Post-copy artifacts and source lifecycle.
   rpc MigrationFetch(MigrationFetchRequest) returns (stream MigrationFrame);
   rpc MigrationCommit(MigrationExportRef) returns (Empty);
   rpc MigrationAbort(MigrationExportRef) returns (Empty);
@@ -347,37 +319,6 @@ message ListSandboxesResponse {
 
 // --- Snapshot ---
 
-message MigrationCaptureResponse {
-  // Single-use unguessable nonce naming this export on the source;
-  // the destination presents it to MigrationFetch.
-  string export_id = 1;
-  // The next memory manifest (fork lineage @v+1), serialized Manifest
-  // JSON — NOT yet in the blob store; durable only after the
-  // destination's catch-up upload.
-  bytes memory_manifest_json = 2;
-  // The drained, coherent disk manifest JSON (coherence cut = the
-  // pause-window drain).
-  bytes disk_manifest_json = 3;
-  // Chunk hashes the destination must pull from this export (rebuilt
-  // memory chunks + pending-tier disk chunks). 32-byte raw hashes.
-  repeated bytes new_memory_chunk_hashes = 4;
-  repeated bytes new_disk_chunk_hashes = 5;
-  bytes snapshot_id = 6;
-  int64 paused_at_unix_ms = 7;
-  // bincode ManifestRef for each inline manifest. The memory ref is
-  // the fork lineage's next version (owned by this session); the disk
-  // ref is PROVISIONAL — the destination's catch-up publish does the
-  // version-conflict retry dance (shared-template disk lineages).
-  bytes memory_manifest_ref = 8;
-  bytes disk_manifest_ref = 9;
-  // ADR 0045 C2 (E2B fold): the source guest's hot set in FAULT ORDER
-  // (the handler's working-set recorder, dumped per-jail). The
-  // destination pulls/prefaults these FIRST so the post-move re-fault
-  // storm hits warm NVMe. 32-byte raw hashes; empty when the source
-  // had no trace (best-effort rider, never load-bearing).
-  repeated bytes hot_chunks = 10;
-}
-
 message MigrationExportRef {
   bytes sandbox_id = 1;
   string export_id = 2;
@@ -440,29 +381,17 @@ message MigrationFetchRequest {
 }
 
 message MigrationItem {
-  // Exactly one of:
-  //   kind = STATE_BIN | SIDECAR  (hash + chunk_idx empty)
-  //   kind = CHUNK                (hash = 32-byte chunk hash)
-  //   kind = DISK_CHUNK_AT        (chunk_idx = disk chunk index)
   enum Kind {
-    CHUNK = 0;
+    reserved 2, 3;
+    reserved "CHUNK", "SIDECAR", "DISK_MANIFEST";
+    KIND_UNSPECIFIED = 0;
     STATE_BIN = 1;
-    SIDECAR = 2;
-    // ADR 0045 C2: the drained coherent disk manifest JSON.
-    DISK_MANIFEST = 3;
-    // ADR 0045 C2 disk post-copy: the seal descriptor JSON (base
-    // manifest content + sealed chunk indices). Intentionally a NEW
-    // kind (not DISK_MANIFEST) so an old destination polling a new
-    // source fails LOUDLY at the fetch (NeverLoaded → zero-loss
-    // abort-to-source) instead of resuming against a stale disk.
     DISK_SEAL_INFO = 4;
-    // ADR 0045 C2 disk post-copy: one sealed disk chunk's RAW bytes,
-    // by chunk index — served from the frozen source's sealed
-    // dirty/pending tiers (RAM), never hashed or uploaded.
     DISK_CHUNK_AT = 5;
   }
+  reserved 2;
+  reserved "hash";
   Kind kind = 1;
-  bytes hash = 2;
   uint64 chunk_idx = 3;
 }
 

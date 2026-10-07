@@ -1138,9 +1138,6 @@ jobs:
             --test checkpoint_chain \
             --test warm_hook_capture \
             --test cold_base_capture \
-            --test migration_source \
-            --test two_host_live_teleport \
-            --test two_host_drain_wave \
             --test pagemap_scanner \
             --test eviction_finalize_redrive \
             --test chain_rehydrate \
@@ -1220,6 +1217,9 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-host-agent \
+            --test migration_source \
+            --test two_host_live_teleport \
+            --test two_host_drain_wave \
             --test nbd_chunked_disk \
             --test nbd_netlink_reconfigure \
             --test nbd_restore_cancel \

@@ -1,31 +1,8 @@
-//! ADR 0048 C10: the scale-down DRAIN WAVE's physical invariant, end to
-//! end across two real host-agent stacks.
+//! Two-host post-copy drain wave on real KVM. Each source guest has
+//! post-checkpoint RAM and a running harness. Drain and commit move all
+//! guests off host A; each harness must continue on host B.
 //!
-//! The autoscaler's scale-down packs live sessions onto fewer nodes by
-//! live-teleporting every session off a victim host, then deletes the
-//! emptied node. This test pins the FC-layer half of that: N real
-//! microVMs on host A, each ACTIVELY running a harness, are teleported to
-//! host B via the same `migration_capture → restore → migration_commit`
-//! sequence the coordinator's `migrate_session_live` drives over the
-//! wire — until host A holds ZERO sandboxes and every session is alive on
-//! B. That zero-sandbox state is exactly the precondition the wave checks
-//! (`running_sandboxes(A) == 0`) before `remove_node` +
-//! `DELETE /api/admin/hosts/:id`.
-//!
-//! The COORDINATOR-layer half of the wave — the don't-strand guard (no
-//! move starts unless a survivor fits the session's RAM+CPU budgets),
-//! `delete_host` refuse-while-bound / idempotent-when-gone, and the
-//! "no Active session is left Idle/Evacuating on a full fleet" contract
-//! — is covered against real Postgres in
-//! `engram-coordinator/tests/admin_evac_live_pg.rs`
-//! (`drain_dont_strand_guard_blocks_when_no_survivor_fits`,
-//! `delete_host_refuses_bound_then_idempotent`). The guard is a
-//! pre-check that fires BEFORE any FC operation, so it needs PG, not real
-//! VMs; splitting the wave this way keeps each half at the layer it
-//! belongs to instead of standing up a coordinator + 2× FC mega-harness.
-//!
-//! Gated like the rest of the FC suite; wired into ci.yml's
-//! `test-firecracker` job. `ENGRAM_INTEG_TWO_HOSTS=0` skips.
+//! The existing test-firecracker CI target runs this file.
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
@@ -38,7 +15,6 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{
     AgentSpec, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
 };
-use engram_core::types::snapshot::MigrationSourceInfo;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
@@ -57,6 +33,7 @@ struct HostStack {
     pooled: Arc<PooledBackend>,
     addr: std::net::SocketAddr,
     server: tokio::task::JoinHandle<()>,
+    peer: tokio::task::JoinHandle<()>,
 }
 
 fn build_host(
@@ -66,12 +43,16 @@ fn build_host(
     blob_root: &Path,
     bundle_dir: &Path,
     chunk_store: &engram_chunk_store::ChunkStore,
+    devices: Vec<PathBuf>,
 ) -> (Arc<PooledBackend>, tempfile::TempDir) {
     let work = tempfile::Builder::new()
         .prefix(&format!("drainwave-{label}-"))
         .tempdir()
         .expect("host workdir");
     let mut cfg = FirecrackerConfig::with_kernel(kernel.to_path_buf());
+    cfg.firecracker_bin = std::env::var_os("ENGRAM_FC_FORK_BIN")
+        .expect("gated fork")
+        .into();
     cfg.net_pool = None;
     // ADR 0080: both hosts stage the same agentd bundle dir (the fleet mirror).
     cfg.bundle_dir = bundle_dir.to_path_buf();
@@ -86,6 +67,10 @@ fn build_host(
         engram_chunk_store::cache::ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 1024 * 1024 * 1024;
     let pooled = PooledBackend::new(inner)
+        .with_nbd_pool(
+            engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(devices)
+                .expect("nbd slot pool"),
+        )
         .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
         .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
         .with_checkpoint_dir(work.path().join("checkpoints"));
@@ -93,6 +78,7 @@ fn build_host(
 }
 
 async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
+    let peer = common::postcopy::peer(&pooled).await;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     drop(listener);
@@ -119,6 +105,7 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
         pooled,
         addr,
         server,
+        peer,
     }
 }
 
@@ -147,7 +134,7 @@ fn heartbeat_argv() -> Vec<String> {
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + Docker; boots microVMs on two host stacks"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + four NBD devices"]
 async fn drain_wave_teleports_every_session_off_host_a() {
     if std::env::var("ENGRAM_INTEG_TWO_HOSTS")
         .map(|v| v == "0")
@@ -156,6 +143,9 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         eprintln!("SKIP: ENGRAM_INTEG_TWO_HOSTS=0");
         return;
     }
+    let Some(devices) = common::postcopy::nbd_devices(2 * SESSIONS) else {
+        return;
+    };
     let Some((kernel, handler, agent, busybox)) = gate() else {
         return;
     };
@@ -199,6 +189,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
+        devices.iter().step_by(2).cloned().collect(),
     );
     let (pooled_b, _work_b) = build_host(
         "b",
@@ -207,6 +198,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         &blob_root,
         &staged.bundle_dir,
         &chunk_store,
+        devices.iter().skip(1).step_by(2).cloned().collect(),
     );
     let host_a = serve(pooled_a).await;
     let host_b = serve(pooled_b).await;
@@ -224,23 +216,30 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         ckpt: engram_core::types::snapshot::SnapshotMetadata,
     }
     let mut live = Vec::with_capacity(SESSIONS);
+    let spec = SandboxSpec {
+        image: "engram-drain-wave".into(),
+        rootfs_source: None,
+        image_uri: None,
+        // The chunked disk manifest: an NBD-served root is what presetup
+        // requires (the disk half of post-copy is the NBD seal).
+        rootfs_manifest: Some(
+            outcome
+                .disk_manifest
+                .expect("ext4 bake produces a chunked disk manifest"),
+        ),
+        cpu: CpuLimit { vcpus: 1 },
+        memory: MemoryLimit { max_mib: 256 },
+        disk: DiskLimit { max_gib: 1 },
+        ttl: None,
+        env: HashMap::new(),
+        workdir: None,
+        network: Default::default(),
+        aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
+    };
+    let base = common::postcopy::base(&host_a.pooled, spec).await;
     for i in 0..SESSIONS {
-        let spec = SandboxSpec {
-            image: "engram-drain-wave".into(),
-            rootfs_source: Some(outcome.rootfs_path.clone()),
-            image_uri: None,
-            rootfs_manifest: None,
-            cpu: CpuLimit { vcpus: 1 },
-            memory: MemoryLimit { max_mib: 256 },
-            disk: DiskLimit { max_gib: 1 },
-            ttl: None,
-            env: HashMap::new(),
-            workdir: None,
-            network: Default::default(),
-            aux_ro_drives: vec![staged.agentd_slot()],
-            swap_mib: None,
-        };
-        let vm = host_a.pooled.create(spec).await.expect("create on A");
+        let vm = common::postcopy::fresh(&host_a.pooled, base.clone()).await;
         let _ = exec(&host_a.pooled, vm, "true").await;
         let ckpt = host_a
             .pooled
@@ -309,40 +308,13 @@ async fn drain_wave_teleports_every_session_off_host_a() {
     );
 
     // ---- The drain wave: teleport each session A → B ----
-    // Same capture → restore → commit sequence migrate_session_live drives.
+    // Each source remains alive until both destination drains complete.
     let mut moved_vms = Vec::with_capacity(SESSIONS);
     for (i, s) in live.iter().enumerate() {
-        let cap = client_a
-            .migration_capture(s.vm, engram_core::traits::SessionFence::unfenced())
-            .await
-            .expect("capture on A");
-        let mut metadata = s.ckpt.clone();
-        metadata.id = cap.snapshot_id;
-        metadata.memory_manifest = Some(cap.memory_manifest_ref);
-        metadata.disk_manifest =
-            (!cap.disk_manifest_json.is_empty()).then_some(cap.disk_manifest_ref);
-        metadata.state_blob_key = None;
-        metadata.sidecar_blob_key = None;
-        metadata.migration_source = Some(MigrationSourceInfo {
-            export_id: cap.export_id.clone(),
-            source_addr: format!("http://{}", host_a.addr),
-            memory_manifest_json: cap.memory_manifest_json.clone(),
-            disk_manifest_json: cap.disk_manifest_json.clone(),
-            memory_manifest_ref: cap.memory_manifest_ref,
-            disk_manifest_ref: cap.disk_manifest_ref,
-            new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
-            new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
-            hot_chunks: vec![],
-            post_copy: false,
-            peer_addr: None,
-            peer_token: None,
-            sidecar_json: Vec::new(),
-        });
-
-        let moved = client_b
-            .restore(metadata, engram_core::traits::SessionFence::unfenced())
-            .await
-            .expect("restore on B");
+        let (moved, cap) =
+            common::postcopy::move_guest(&client_a, &client_b, s.vm, s.ckpt.clone(), host_a.addr)
+                .await;
+        common::postcopy::drain(&host_b.pooled, moved).await;
 
         // The post-checkpoint sentinel survived the move (a genuine live
         // teleport, not a cold rehome from the checkpoint).
@@ -449,7 +421,9 @@ async fn drain_wave_teleports_every_session_off_host_a() {
         host_b.pooled.destroy(moved).await.expect("destroy moved");
     }
     host_a.server.abort();
+    host_a.peer.abort();
     host_b.server.abort();
+    host_b.peer.abort();
 }
 
 fn gate() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {

@@ -52,7 +52,7 @@ pub const IDLE_DRAIN_GRACE_SECS: u32 = 10;
 /// reap + process exit + the host reader-loop observing EOF and tearing
 /// the connection down. If the connection is still up past grace+slack we
 /// give up waiting and capture anyway (a still-live child is reattached
-/// on resume, ADR 0045 C1).
+/// on resume, ADR 0045).
 const DRAIN_DETACH_SLACK: Duration = Duration::from_secs(3);
 
 /// Poll cadence while waiting for the post-drain disconnect. Mirrors the
@@ -637,7 +637,7 @@ async fn run_connection<S>(
     // where the bytes came from, the record tells us which GENERATION
     // currently owns the session. The epoch is the fence; the token's
     // sandbox_id is informational only (a live-moved harness carries
-    // its old sandbox in a frozen env — ADR 0045 C1 — and is still
+    // its old sandbox in a frozen env — ADR 0045 — and is still
     // the current generation). Connection state is keyed on the
     // TRANSPORT sandbox: on a live move the record may briefly lag
     // the VM the bytes actually arrived from.
@@ -694,7 +694,7 @@ where
 /// - presented epoch > record        → `UnknownBinding` (the bind for
 ///   the harness's own generation hasn't landed yet — retry);
 /// - equal epoch → accept. The token's sandbox_id is deliberately NOT
-///   compared: a live-moved harness (ADR 0045 C1) presents its frozen
+///   compared: a live-moved harness (ADR 0045) presents its frozen
 ///   spawn-time sandbox while remaining the current generation.
 fn validate_attach(
     inner: &HubInner,

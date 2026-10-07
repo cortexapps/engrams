@@ -988,28 +988,6 @@ pub(crate) async fn attach_manifest_with_dirty_file(
     attach_backend(backend, slot_pool, &backend_id).await
 }
 
-pub(crate) async fn attach_manifest_content_with_dirty_file(
-    disk_manifest_ref: engram_core::types::manifest::ManifestRef,
-    manifest: &engram_chunk_store::Manifest,
-    cache: engram_chunk_store::cache::ChunkCache,
-    store: Arc<engram_chunk_store::ChunkStore>,
-    slot_pool: &Arc<NbdSlotAllocator>,
-    threshold_bytes: u64,
-    dirty_path: PathBuf,
-) -> Result<NbdSandboxState, NbdRuntimeError> {
-    let backend_id = disk_manifest_ref.manifest_id.to_string();
-    let backend = ChunkedDiskBackend::from_manifest_with_dirty_file(
-        disk_manifest_ref,
-        manifest,
-        cache,
-        store,
-        threshold_bytes,
-        dirty_path,
-        DirtyFileOpenMode::Truncate,
-    )?;
-    attach_backend(backend, slot_pool, &backend_id).await
-}
-
 /// Survivor rehydrate (ADR 0044 K2): rebuild the data plane for a
 /// device the kernel ALREADY serves under a surviving FC. The slot
 /// must have been [`NbdSlotAllocator::claim`]ed for the survivor's

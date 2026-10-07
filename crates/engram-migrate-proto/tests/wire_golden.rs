@@ -20,18 +20,15 @@
 //!
 //! ## Regenerating the corpus (only when you INTENTIONALLY evolve a type)
 //!
-//! Adding a *trailing* enum variant or a *trailing* struct field is the
-//! only wire-safe evolution. After such a change, regenerate:
+//! A wire break requires a protocol-version bump and coordinated endpoint
+//! updates. Version 5 removes the unused by-hash request and reply. Regenerate:
 //!
 //! ```text
-//!   cargo test -p engram-migrate-proto --test wire_golden -- --ignored regen_golden
+//! cargo test -p engram-migrate-proto --test wire_golden -- --ignored regen_golden
 //! ```
 //!
-//! then `git add` the changed `golden/*.bin` and review the diff: an
-//! EXISTING golden file changing bytes is a RED FLAG (you broke the wire
-//! for an old peer); only NEW files (for the new trailing case) are
-//! expected. Reordering/inserting is never OK — see the `ToSource` /
-//! `FromSource` / `HandlerControl` doc comments in `src/lib.rs`.
+//! A change to an EXISTING golden is a red flag unless `PROTO_VERSION` was bumped.
+//! Review every changed fixture with the corresponding version change.
 
 use std::path::PathBuf;
 
@@ -120,10 +117,6 @@ fn to_source_golden_and_variant_indices() {
         req_id: 7,
         chunk_offset: 512 * 1024 * 3,
     };
-    let get_chunk = ToSource::GetChunk {
-        req_id: 8,
-        hash: [0xAB; 32],
-    };
     let drain_done = ToSource::DrainDone {
         pulled: 100,
         alt_sourced: 3,
@@ -132,13 +125,11 @@ fn to_source_golden_and_variant_indices() {
 
     assert_golden("to_source_hello", &hello);
     assert_golden("to_source_need_at", &need_at);
-    assert_golden("to_source_get_chunk", &get_chunk);
     assert_golden("to_source_drain_done", &drain_done);
 
     assert_variant_index(&hello, 0, "ToSource::Hello");
     assert_variant_index(&need_at, 1, "ToSource::NeedAt");
-    assert_variant_index(&get_chunk, 2, "ToSource::GetChunk");
-    assert_variant_index(&drain_done, 3, "ToSource::DrainDone");
+    assert_variant_index(&drain_done, 2, "ToSource::DrainDone");
 }
 
 #[test]
@@ -175,10 +166,6 @@ fn from_source_golden_and_variant_indices() {
         chunk_offset: 1024 * 1024,
         durable_sha256: [0x22; 32],
     };
-    let chunk_bytes = FromSource::ChunkBytes {
-        req_id: 4,
-        bytes: vec![1, 2, 3],
-    };
     let error = FromSource::Error {
         req_id: None,
         message: "bad hello".into(),
@@ -189,7 +176,6 @@ fn from_source_golden_and_variant_indices() {
     assert_golden("from_source_page", &page);
     assert_golden("from_source_zero_chunk", &zero_chunk);
     assert_golden("from_source_alt_source", &alt_source);
-    assert_golden("from_source_chunk_bytes", &chunk_bytes);
     assert_golden("from_source_error", &error);
 
     assert_variant_index(&hello_ack, 0, "FromSource::HelloAck");
@@ -197,8 +183,7 @@ fn from_source_golden_and_variant_indices() {
     assert_variant_index(&page, 2, "FromSource::Page");
     assert_variant_index(&zero_chunk, 3, "FromSource::ZeroChunk");
     assert_variant_index(&alt_source, 4, "FromSource::AltSource");
-    assert_variant_index(&chunk_bytes, 5, "FromSource::ChunkBytes");
-    assert_variant_index(&error, 6, "FromSource::Error");
+    assert_variant_index(&error, 5, "FromSource::Error");
 }
 
 #[test]
@@ -275,13 +260,6 @@ fn regen_golden() {
         },
     );
     write(
-        "to_source_get_chunk",
-        &ToSource::GetChunk {
-            req_id: 8,
-            hash: [0xAB; 32],
-        },
-    );
-    write(
         "to_source_drain_done",
         &ToSource::DrainDone {
             pulled: 100,
@@ -330,13 +308,6 @@ fn regen_golden() {
             req_id: 3,
             chunk_offset: 1024 * 1024,
             durable_sha256: [0x22; 32],
-        },
-    );
-    write(
-        "from_source_chunk_bytes",
-        &FromSource::ChunkBytes {
-            req_id: 4,
-            bytes: vec![1, 2, 3],
         },
     );
     write(

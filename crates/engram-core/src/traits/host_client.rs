@@ -191,8 +191,8 @@ pub trait HostClient: Send + Sync {
     /// ADR 0045 D5: the pause-side half of an eviction snapshot — pause +
     /// drain + FC capture, then the guest is re-paused (it's being torn
     /// down; today's pipeline already discards post-capture execution).
-    /// The chunk+upload work runs as a host-side background task; await it via
-    /// [`Self::snapshot_wait`]. Returns the new snapshot's id once the
+    /// The host persists and drives the upload through its finalize spool.
+    /// Returns the new snapshot's id once the
     /// capture itself has succeeded — the point where the coordinator
     /// may mark the session Idle. Default errs so backends without the
     /// split path (VZ, Process) fall back to the composed
@@ -209,33 +209,8 @@ pub trait HostClient: Send + Sync {
             "this host doesn't support `snapshot_begin`".into(),
         ))
     }
-    /// ADR 0045 D5: await the background upload spawned by
-    /// [`Self::snapshot_begin`] and return the durable
-    /// [`SnapshotMetadata`]. Idempotent w.r.t. reconnects — the upload
-    /// is host-autonomous once begun.
-    async fn snapshot_wait(
-        &self,
-        _id: SandboxId,
-        _fence: SessionFence,
-    ) -> Result<SnapshotMetadata, SandboxError> {
-        Err(SandboxError::InvalidSpec(
-            "this host doesn't support `snapshot_wait`".into(),
-        ))
-    }
 
-    /// ADR 0045 C1: see `SandboxBackend::migration_capture`. Default
-    /// errs so old hosts route the coordinator to snapshot-rehome.
-    async fn migration_capture(
-        &self,
-        _id: SandboxId,
-        _fence: SessionFence,
-    ) -> Result<crate::types::snapshot::MigrationCaptureOut, SandboxError> {
-        Err(SandboxError::InvalidSpec(
-            "this host doesn't support `migration_capture`".into(),
-        ))
-    }
-
-    /// ADR 0045 C1: see `SandboxBackend::migration_fetch`. Called by
+    /// ADR 0045: see `SandboxBackend::migration_fetch`. Called by
     /// the DESTINATION host-agent (the one host-to-host RPC).
     async fn migration_fetch(
         &self,
@@ -286,7 +261,7 @@ pub trait HostClient: Send + Sync {
         ))
     }
 
-    /// ADR 0045 C1: see `SandboxBackend::migration_commit`.
+    /// ADR 0045: see `SandboxBackend::migration_commit`.
     async fn migration_commit(
         &self,
         _id: SandboxId,
@@ -298,7 +273,7 @@ pub trait HostClient: Send + Sync {
         ))
     }
 
-    /// ADR 0045 C1: see `SandboxBackend::migration_abort`.
+    /// ADR 0045: see `SandboxBackend::migration_abort`.
     async fn migration_abort(
         &self,
         _id: SandboxId,

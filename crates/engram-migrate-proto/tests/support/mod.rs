@@ -50,8 +50,6 @@ pub fn to_source() -> impl Strategy<Value = ToSource> {
             req_id,
             chunk_offset
         }),
-        (any::<u64>(), any::<[u8; 32]>())
-            .prop_map(|(req_id, hash)| ToSource::GetChunk { req_id, hash }),
         (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
             |(pulled, alt_sourced, zero_chunks)| ToSource::DrainDone {
                 pulled,
@@ -101,8 +99,6 @@ pub fn from_source() -> impl Strategy<Value = FromSource> {
                 durable_sha256,
             }
         ),
-        (any::<u64>(), small_bytes())
-            .prop_map(|(req_id, bytes)| FromSource::ChunkBytes { req_id, bytes }),
         (proptest::option::of(any::<u64>()), s())
             .prop_map(|(req_id, message)| FromSource::Error { req_id, message }),
     ]
@@ -165,7 +161,6 @@ fn _exhaustiveness_to_source(m: &ToSource) {
     match m {
         ToSource::Hello { .. } => {}
         ToSource::NeedAt { .. } => {}
-        ToSource::GetChunk { .. } => {}
         ToSource::DrainDone { .. } => {}
     }
 }
@@ -177,7 +172,6 @@ fn _exhaustiveness_from_source(m: &FromSource) {
         FromSource::Page { .. } => {}
         FromSource::ZeroChunk { .. } => {}
         FromSource::AltSource { .. } => {}
-        FromSource::ChunkBytes { .. } => {}
         FromSource::Error { .. } => {}
     }
 }

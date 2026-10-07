@@ -443,7 +443,7 @@ impl HostAgent {
                 fc_snapshot_version,
             );
             capture_jobs.rehydrate().await;
-            // ADR 0045 C1: the migration export TTL sweep — the
+            // ADR 0045: the migration export TTL sweep — the
             // dumb-host rule. An export past EXPORT_TTL means the
             // coordinator never sent commit/abort (it died mid-move):
             // ask it who owns the sandbox now and abort-in-place /
@@ -1270,11 +1270,7 @@ impl HostAgent {
             // capture registers an export. The handle rides on the pooled
             // backend so the capture path can reach the registry.
             let _migrate_peer_task = self.cfg.migrate_peer_listen_addr.map(|addr| {
-                let server = migrate_peer::PeerServer::new(
-                    addr.port(),
-                    self.chunk_cache.clone(),
-                    self.chunk_store.as_ref().map(|(cs, _)| cs.clone()),
-                );
+                let server = migrate_peer::PeerServer::new(addr.port());
                 pooled.set_migrate_peer_server(server.clone());
                 tokio::spawn(async move {
                     if let Err(e) = server.serve(addr).await {

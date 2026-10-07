@@ -122,7 +122,7 @@ impl BindingStore {
     /// Record (or refresh) the binding for `session_id`. Monotonic in
     /// `binding_epoch`: a lower epoch is refused `Stale`. An
     /// EQUAL-epoch write may re-point the sandbox — that is the live
-    /// move shape (ADR 0045 C1: the harness process survives a
+    /// move shape (ADR 0045: the harness process survives a
     /// teleport, so its generation is unchanged while the VM identity
     /// changes; the record follows the VM). Same-epoch writers are
     /// serialized upstream by the session lease.
@@ -371,7 +371,7 @@ mod tests {
         let (sid, sbx) = (SessionId::new(), SandboxId::new());
         s.bind(sid, sbx, 1).expect("first");
         s.bind(sid, sbx, 1).expect("refresh");
-        // Live-move shape (ADR 0045 C1): the harness generation is
+        // Live-move shape (ADR 0045): the harness generation is
         // unchanged while the VM identity changes — the record follows.
         let moved = SandboxId::new();
         s.bind(sid, moved, 1).expect("same-epoch re-point");

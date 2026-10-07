@@ -598,15 +598,6 @@ impl HostClient for HostRegistry {
         backend.snapshot_begin(id, fence).await
     }
 
-    async fn snapshot_wait(
-        &self,
-        id: SandboxId,
-        fence: SessionFence,
-    ) -> Result<SnapshotMetadata, SandboxError> {
-        let (_, backend) = self.resolve_owner(id).await?;
-        backend.snapshot_wait(id, fence).await
-    }
-
     async fn migration_presetup(
         &self,
         id: SandboxId,
@@ -634,15 +625,6 @@ impl HostClient for HostRegistry {
     ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
         let (_, backend) = self.resolve_owner(id).await?;
         backend.migration_drain_wait(id).await
-    }
-
-    async fn migration_capture(
-        &self,
-        id: SandboxId,
-        fence: SessionFence,
-    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
-        let (_, backend) = self.resolve_owner(id).await?;
-        backend.migration_capture(id, fence).await
     }
 
     async fn migration_commit(

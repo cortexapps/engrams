@@ -36,11 +36,7 @@ pub struct SnapshotMetadata {
     /// mixed-version fallback — old coordinators simply don't send it).
     #[serde(default)]
     pub base_memory_manifest: Option<super::manifest::ManifestRef>,
-    /// ADR 0045 C1: present when this restore is the DESTINATION leg of
-    /// a live teleport — everything the dest needs to pull the frozen
-    /// source's export and restore from not-yet-durable manifests.
-    /// serde-default ⇒ mixed-roll-safe; old hosts ignore it and the
-    /// coordinator falls back to snapshot-rehome on `InvalidSpec`.
+    /// The presetup package for a live post-copy restore.
     #[serde(default)]
     pub migration_source: Option<MigrationSourceInfo>,
     /// ADR 0014: source sandbox_id at snapshot time. Required for
@@ -205,20 +201,14 @@ pub struct SnapshotRecord {
     pub fc_snapshot_version: Option<String>,
 }
 
-/// ADR 0045 C1: the destination-side rider on a migration restore's
-/// metadata. The coordinator assembles it from `MigrationCaptureOut` +
-/// the source's `host_addr`.
+/// The post-copy restore package from presetup and the source address.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MigrationSourceInfo {
     pub export_id: String,
     /// h2c URL of the source host-agent, e.g. `http://10.10.0.42:9101`.
     pub source_addr: String,
     pub memory_manifest_json: Vec<u8>,
-    pub disk_manifest_json: Vec<u8>,
     pub memory_manifest_ref: super::manifest::ManifestRef,
-    pub disk_manifest_ref: super::manifest::ManifestRef,
-    pub new_memory_chunk_hashes: Vec<[u8; 32]>,
-    pub new_disk_chunk_hashes: Vec<[u8; 32]>,
     /// ADR 0045 C2 (E2B fold): the source guest's hot set in fault
     /// order — the destination pulls these FIRST. Best-effort rider
     /// (empty when the source had no trace); serde-default keeps
@@ -230,8 +220,7 @@ pub struct MigrationSourceInfo {
     /// `peer_addr` with `peer_token`, parks until the source's SEAL,
     /// and serves sealed (dirtied-since-checkpoint) faults from the
     /// peer; `state.bin` is fetch-polled (it exists only post-pause).
-    /// `false`/absent ⇒ the C1 stop-and-copy shape (artifacts exist
-    /// before restore begins).
+    /// Must be true. A false value is rejected before restore.
     #[serde(default)]
     pub post_copy: bool,
     /// ADR 0045 C2: `host:port` of the source host-agent's page-server
@@ -242,10 +231,7 @@ pub struct MigrationSourceInfo {
     /// its `Hello` (delivered to the handler via env, never argv).
     #[serde(default)]
     pub peer_token: Option<String>,
-    /// ADR 0045 C2: the presetup-composed restore sidecar
-    /// (`manifest.json` content). C1 fetches the sidecar from the
-    /// export; post-copy can't (it must restore BEFORE the capture
-    /// exists), so the rider carries it. Empty for C1.
+    /// The restore sidecar composed before the source pauses.
     #[serde(default)]
     pub sidecar_json: Vec<u8>,
 }
@@ -328,43 +314,11 @@ pub enum DrainOutcome {
     PeerLost { remaining: u64, detail: String },
 }
 
-/// ADR 0045 C1: what `migration_capture` hands the coordinator — the
-/// frozen sandbox's not-yet-durable next manifests (inline JSON; durable
-/// only after the destination's catch-up) plus the transfer set the
-/// destination must pull from the source's export.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct MigrationCaptureOut {
-    pub export_id: String,
-    pub memory_manifest_json: Vec<u8>,
-    pub disk_manifest_json: Vec<u8>,
-    pub memory_manifest_ref: super::manifest::ManifestRef,
-    /// PROVISIONAL — shared-template disk lineages version-race; the
-    /// destination's catch-up publish does the conflict-retry dance.
-    pub disk_manifest_ref: super::manifest::ManifestRef,
-    pub new_memory_chunk_hashes: Vec<[u8; 32]>,
-    pub new_disk_chunk_hashes: Vec<[u8; 32]>,
-    /// ADR 0045 C2 (E2B fold): see `MigrationSourceInfo::hot_chunks`.
-    #[serde(default)]
-    pub hot_chunks: Vec<[u8; 32]>,
-    pub snapshot_id: super::ids::SnapshotId,
-    pub paused_at_unix_ms: i64,
-}
-
 /// One artifact the destination pulls from a migration export.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MigrationItem {
     StateBin,
-    Sidecar,
-    Chunk([u8; 32]),
-    /// ADR 0045 C2: the post-pause drained coherent disk manifest
-    /// (inline JSON). The destination fetch-polls it alongside
-    /// `StateBin` and REBASES its NBD attach before FC load.
-    DiskManifest,
-    /// ADR 0045 C2 disk post-copy: the seal descriptor (inline JSON —
-    /// the source's published base manifest content + the sealed
-    /// chunk-index list). A NEW item kind (not `DiskManifest`) so an
-    /// old destination polling a new source fails LOUDLY (fetch error
-    /// → NeverLoaded → zero-loss abort) instead of resuming stale.
+    /// The disk seal descriptor and published base manifest.
     DiskSealInfo,
     /// ADR 0045 C2 disk post-copy: one sealed disk chunk's raw bytes,
     /// by chunk index — demand-fetched (and drained) by the dest's

@@ -236,7 +236,7 @@ successor, which resumes from the phase on the row.
 | Phase on entry | Step | Recovery after process loss |
 |---|---|---|
 | (none) | **admit**: resolve the budget; pick a destination inside the `pick_host_2d` locked transaction (candidates minus source, per-destination open-teleport cap); insert the row; flip `Active -> Evacuating` in the same transaction. `NoFit` leaves no row and the session `Active` on the source. | Nothing durable before the transaction. The idempotency key and the unique open index make a re-admit exactly once. |
-| `admitted` | **capture**: snapshot kind: `snapshot_begin` + `snapshot_wait` on the paused source, record the snapshot, advance with `snapshot_id`. Live kind: `migration_presetup` (advance with `export_id`), spawn the destination restore, `migration_capture_postcopy`. A live refusal downgrades `kind` in place. Any capture error enters `rolling_back`. | Snapshot: re-issue the capture; an orphaned upload is swept by snapshot blob GC. Live: `export_id` set means presetup is done. |
+| `admitted` | **capture**: snapshot kind: `snapshot_hold` on the paused source, record the snapshot, advance with `snapshot_id`. Live kind: `migration_presetup` (advance with `export_id`), spawn the destination restore, `migration_capture_postcopy`. A live refusal downgrades `kind` in place. Any capture error enters `rolling_back`. | Snapshot: re-issue the capture; an orphaned upload is swept by snapshot blob GC. Live: `export_id` set means presetup is done. |
 | `captured` | **restore**: build the metadata, `restore` on the destination with the fence, advance with `dest_sandbox_id`. | A successor restores again; the first VM is unbound on the destination and is entombed by the stably-unbound sweep (ADR 0116 A5). |
 | `restored` | **commit**: `teleport_commit` (B6). `None` enters `rolling_back`. | Idempotent: the phase is already `committed`. |
 | `committed` | **attach**: bind the record at the new generation, `start_agent`, wait until `sessions.attached_binding_epoch >= new epoch` (C5), then fenced `Evacuating -> Active`. `HarnessPlan::None` flips at once. A deterministic spawn failure flips `Evacuating -> Created` and the move continues; the destination owns the session. | Bind, materialize, and `start_agent` are idempotent. |
@@ -505,6 +505,13 @@ pub enum HarnessFrame {
 | C4 | fixture cleanup: assign_session_sandbox retired; fenced binding writes carry strike reset and manifest clear | #1592 |
 
 ## Divergence log
+
+- 2026-10-07: retire ADR 0045 C1 from the host and wire APIs. The durable
+  teleport driver already selects C2 for every live move. The source,
+  two-host, and drain-wave KVM targets now use post-copy, with drain before
+  commit and a full destination checkpoint for durability. Remove unused
+  page-channel by-hash verbs and C1 restore fields. Host wire version 30
+  and page-channel version 5 require a coordinated image roll.
 
 - 2026-10-05 (review of the Proposed ADR): C5 as first written settled
   "every open run of an older generation" when the generation advanced.

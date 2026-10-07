@@ -1,25 +1,7 @@
-//! ADR 0045 C1: real-FC integration for the live-teleport SOURCE side.
-//!
-//! Proves on a live microVM:
-//!   1. `migration_capture` freezes the guest, mints the next fork-chain
-//!      memory manifest WITHOUT publishing it, and lands every transfer
-//!      chunk in the host-local NVMe cache (no blob-store PUT).
-//!   2. `migration_abort` resumes the guest in place with ZERO loss —
-//!      markers written before the capture survive, the guest accepts
-//!      new exec, and the next checkpoint is a FULL on a fresh lineage:
-//!      the capture's diff consumed the KVM dirty bitmap while its
-//!      manifest stayed unpublished (durability is the dest's), so the
-//!      chain is retired at capture — a post-abort diff against the old
-//!      head would silently omit the pre-capture dirty pages.
-//!   3. The FULL same-host teleport loop over real gRPC (ADR 0045 C1
-//!      PR3): capture VM2 -> destination-style restore with a
-//!      `migration_source` rider pulls the export over a live tonic
-//!      HostService on loopback -> the moved VM carries the
-//!      post-checkpoint marker -> `snapshot_wait` drives the durability
-//!      catch-up -> commit destroys the frozen source. The two-host
-//!      integration's same-host precursor.
-//!
-//! Wired into ci.yml's `test-firecracker` job.
+//! Post-copy source lifecycle on real KVM: sealed post-checkpoint state,
+//! duplicate presetup rejection, abort in place, and commit after drain.
+//! The destination checkpoints the moved state to prove durability.
+
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
@@ -40,8 +22,11 @@ use futures::StreamExt;
 mod common;
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
+#[ignore = "requires Linux + KVM + root + ENGRAM_FC_FORK_BIN + two NBD devices"]
 async fn migration_capture_freezes_abort_resumes_commit_destroys() {
+    let Some(devices) = common::postcopy::nbd_devices(2) else {
+        return;
+    };
     // ---- gating (same as checkpoint_chain) ----
     let kernel = match std::env::var("FC_TEST_KERNEL") {
         Ok(p) => std::path::PathBuf::from(p),
@@ -111,6 +96,9 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
 
     // ---- 2. PooledBackend (FC inner, chunked, dirty tracking) ----
     let mut cfg = FirecrackerConfig::with_kernel(kernel);
+    cfg.firecracker_bin = std::env::var_os("ENGRAM_FC_FORK_BIN")
+        .expect("gated fork")
+        .into();
     cfg.net_pool = None;
     // ADR 0080: agentd rides its reserved bundle slot — stage the fixture
     // bundle and point the backend at it.
@@ -134,6 +122,10 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     let cache = engram_chunk_store::ChunkCache::new(cache_cfg);
     let pooled = Arc::new(
         PooledBackend::new(inner)
+            .with_nbd_pool(
+                engram_host_agent::disk_daemon::NbdSlotAllocator::from_paths(devices)
+                    .expect("nbd slot pool"),
+            )
             .with_chunk_store(chunk_store.clone(), work.path().join("materialize"))
             .with_chunk_cache(cache.clone())
             .with_checkpoint_dir(work.path().join("checkpoints")),
@@ -141,9 +133,15 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
 
     let spec = SandboxSpec {
         image: "engram-migration-src-test".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        // The chunked disk manifest: an NBD-served root is what presetup
+        // requires (the disk half of post-copy is the NBD seal).
+        rootfs_manifest: Some(
+            outcome
+                .disk_manifest
+                .expect("ext4 bake produces a chunked disk manifest"),
+        ),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -154,7 +152,9 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
     };
-    let vm = pooled.create(spec.clone()).await.expect("create vm");
+    let peer = common::postcopy::peer(&pooled).await;
+    let base = common::postcopy::base(&pooled, spec).await;
+    let vm = common::postcopy::fresh(&pooled, base.clone()).await;
 
     // Full seed checkpoint, then a post-checkpoint marker — the
     // teleport delta the capture must carry.
@@ -166,39 +166,21 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     let m1 = ckpt1.memory_manifest.expect("seed manifest");
     let sum = plant_marker(&pooled, vm, 1).await;
 
-    // ---- 3. Capture: frozen + local-only artifacts ----
-    let out = pooled.migration_capture(vm).await.expect("capture");
-    assert_eq!(
-        out.memory_manifest_ref.manifest_id, m1.manifest_id,
-        "capture continues the session's fork lineage"
-    );
-    assert_eq!(out.memory_manifest_ref.version, m1.version + 1);
+    // Capture seals the post-checkpoint pages without a new manifest.
+    let out = pooled.migration_presetup(vm).await.expect("presetup");
+    assert_eq!(out.memory_manifest_ref, m1);
+    let seal = pooled
+        .migration_capture_postcopy(vm, &out.export_id)
+        .await
+        .expect("capture");
     assert!(
-        !out.new_memory_chunk_hashes.is_empty(),
-        "the post-checkpoint marker must be in the transfer set"
+        seal.sealed_chunks > 0,
+        "post-checkpoint marker must be sealed"
     );
-    // Unpublished: the v+1 manifest is inline-only.
-    assert!(
-        chunk_store
-            .get_manifest(out.memory_manifest_ref)
-            .await
-            .is_err(),
-        "capture must not publish the manifest (durability is the dest's catch-up)"
-    );
-    // Every transfer chunk is cache-resident without a store fallback.
-    for h in &out.new_memory_chunk_hashes {
-        let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
-        cache
-            .get(hash, || async {
-                Err(engram_chunk_store::error::ChunkStoreError::Internal(
-                    "transfer chunk must be cache-resident".into(),
-                ))
-            })
-            .await
-            .expect("transfer chunk in local cache");
-    }
-    // Double-capture refused while the export is open.
-    assert!(pooled.migration_capture(vm).await.is_err());
+    assert!(matches!(
+        pooled.migration_presetup(vm).await,
+        Err(engram_core::SandboxError::AlreadyExists)
+    ));
 
     // ---- 4. Abort: lossless resume ----
     pooled
@@ -207,24 +189,37 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         .expect("abort");
     let check = exec(&pooled, vm, "sha256sum /dev/shm/marker1 | cut -d' ' -f1").await;
     assert_eq!(check.trim(), sum, "marker survives the aborted move");
-    // The capture's diff consumed the KVM dirty bitmap and its v+1
-    // manifest was never published (the dest's catch-up owns that), so
-    // the chain was retired at capture: the post-abort checkpoint MUST
-    // be a Full on a fresh lineage. A diff re-minting m1's v+1 here
-    // would silently omit every page dirtied before the capture (the
-    // marker!) — the manifest would restore pre-marker bytes at those
-    // pages while claiming the post-marker cut.
+    // Post-copy does not consume the KVM dirty bitmap. The next checkpoint
+    // must still contain the marker and be durable.
     let ckpt2 = pooled
         .checkpoint_sandbox(vm)
         .await
         .expect("post-abort checkpoint");
     let m2 = ckpt2.memory_manifest.expect("post-abort manifest");
-    assert_ne!(
-        m2.manifest_id, m1.manifest_id,
-        "post-abort capture must NOT diff on the retired chain"
-    );
-    assert_eq!(m2.version, 1, "fresh Full lineage after an aborted move");
+    chunk_store
+        .get_manifest(m2)
+        .await
+        .expect("post-abort manifest durable");
     pooled.destroy(vm).await.expect("destroy vm1");
+    let restored = pooled
+        .restore(ckpt2)
+        .await
+        .expect("restore post-abort checkpoint");
+    let restored_sum = exec(
+        &pooled,
+        restored,
+        "sha256sum /dev/shm/marker1 | cut -d' ' -f1",
+    )
+    .await;
+    assert_eq!(
+        restored_sum.trim(),
+        sum,
+        "post-abort checkpoint retains all marker bytes"
+    );
+    pooled
+        .destroy(restored)
+        .await
+        .expect("destroy post-abort restore");
 
     // ---- 5. The full same-host teleport loop over real gRPC ----
     // Serve THIS PooledBackend as a HostService on loopback — the
@@ -247,41 +242,24 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         "source HostService did not bind {addr} within 5s"
     );
 
-    let vm2 = pooled.create(spec).await.expect("create vm2");
+    let vm2 = common::postcopy::fresh(&pooled, base).await;
     let _ = exec(&pooled, vm2, "true").await;
     let ckpt_v2 = pooled
         .checkpoint_sandbox(vm2)
         .await
         .expect("vm2 seed checkpoint");
     let moved_sum = plant_marker(&pooled, vm2, 7).await;
-    let out2 = pooled.migration_capture(vm2).await.expect("capture vm2");
-
-    // Build the destination restore metadata the coordinator (PR4)
-    // will assemble: the captured snapshot + the migration rider.
-    let mut metadata = ckpt_v2.clone();
-    metadata.id = out2.snapshot_id;
-    metadata.memory_manifest = Some(out2.memory_manifest_ref);
-    metadata.disk_manifest =
-        (!out2.disk_manifest_json.is_empty()).then_some(out2.disk_manifest_ref);
-    metadata.state_blob_key = None;
-    metadata.sidecar_blob_key = None;
-    metadata.migration_source = Some(engram_core::types::snapshot::MigrationSourceInfo {
-        export_id: out2.export_id.clone(),
-        source_addr: format!("http://{addr}"),
-        memory_manifest_json: out2.memory_manifest_json.clone(),
-        disk_manifest_json: out2.disk_manifest_json.clone(),
-        memory_manifest_ref: out2.memory_manifest_ref,
-        disk_manifest_ref: out2.disk_manifest_ref,
-        new_memory_chunk_hashes: out2.new_memory_chunk_hashes.clone(),
-        new_disk_chunk_hashes: out2.new_disk_chunk_hashes.clone(),
-        hot_chunks: vec![],
-        post_copy: false,
-        peer_addr: None,
-        peer_token: None,
-        sidecar_json: Vec::new(),
-    });
-
-    let moved = pooled.restore(metadata).await.expect("teleport restore");
+    let out2 = pooled.migration_presetup(vm2).await.expect("presetup vm2");
+    let metadata = common::postcopy::metadata(ckpt_v2, &out2, addr);
+    let dest = pooled.clone();
+    let restore = tokio::spawn(async move { dest.restore(metadata).await });
+    tokio::task::yield_now().await;
+    pooled
+        .migration_capture_postcopy(vm2, &out2.export_id)
+        .await
+        .expect("capture vm2");
+    let moved = restore.await.unwrap().expect("teleport restore");
+    common::postcopy::drain(&pooled, moved).await;
     let check = exec(&pooled, moved, "sha256sum /dev/shm/marker7 | cut -d' ' -f1").await;
     assert_eq!(
         check.trim(),
@@ -290,21 +268,14 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
          differentiator vs snapshot-rehome"
     );
 
-    // Durability catch-up: snapshot_wait returns the row metadata once
-    // chunks + manifests are store-durable.
-    let row = pooled.snapshot_wait(moved).await.expect("catch-up");
-    assert_eq!(row.memory_manifest, Some(out2.memory_manifest_ref));
-    chunk_store
-        .get_manifest(out2.memory_manifest_ref)
+    let row = pooled
+        .checkpoint_sandbox(moved)
         .await
-        .expect("memory manifest durable after catch-up");
-    for h in &out2.new_memory_chunk_hashes {
-        let hash = engram_chunk_store::manifest::ChunkHash::from_bytes(*h);
-        chunk_store
-            .get_chunk(hash)
-            .await
-            .expect("transfer chunk durable after catch-up");
-    }
+        .expect("durable destination checkpoint");
+    chunk_store
+        .get_manifest(row.memory_manifest.unwrap())
+        .await
+        .expect("memory manifest durable");
 
     // Commit destroys the frozen source; the moved VM lives on.
     pooled
@@ -315,6 +286,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
     assert!(!listed.contains(&vm2), "committed source must be destroyed");
     assert!(listed.contains(&moved), "the moved VM survives the commit");
     pooled.destroy(moved).await.expect("destroy moved");
+    peer.abort();
 }
 
 async fn plant_marker(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, n: u32) -> String {
