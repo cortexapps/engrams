@@ -85,13 +85,17 @@ async fn swap_pages_survive_cross_host_snapshot() {
     let shim = engram_rootfs_materializer::inject::DEFAULT_INIT_SHIM;
     let start = shim.find("AGENTD_DIR=\"\"").unwrap();
     let end = shim[start..].find("mkdir -p /run/engram").unwrap() + start;
+    // A caller-supplied init is installed verbatim, so this fixture
+    // fills the shim's placeholders itself (the default path does it).
     std::fs::write(
         &init,
         format!(
             "{}AGENTD_DIR=/opt/test-agentd\n{}",
             &shim[..start],
             &shim[end..]
-        ),
+        )
+        .replace("__VSOCK_PORT__", &ENGRAM_AGENTD_PORT.to_string())
+        .replace("__TRANSPORT__", Transport::Vsock.env_value()),
     )
     .unwrap();
     let store = engram_chunk_store::ChunkStore::new(Arc::new(
