@@ -589,16 +589,20 @@ pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
                     row.session.sandbox_id,
                     row.mem_budget_mib,
                     i64::from(row.cpu_budget_vcpus),
+                    row.nbd_slot_need,
                 )
             })
             .collect::<Vec<_>>()
     });
     let hosts = world.host_world.hosts.lock();
-    for (sid, status, host_id, sandbox_id, mem_budget_mib, cpu_budget_vcpus) in sessions {
+    for (sid, status, host_id, sandbox_id, mem_budget_mib, cpu_budget_vcpus, nbd_slot_need) in
+        sessions
+    {
         if status == SessionState::Queued {
-            if let Some(host) = world
-                .meta
-                .oracle_pick_any_host(mem_budget_mib, cpu_budget_vcpus)
+            if let Some(host) =
+                world
+                    .meta
+                    .oracle_pick_any_host(mem_budget_mib, cpu_budget_vcpus, nbd_slot_need)
             {
                 return Err(Violation {
                     invariant: "quiescence-queued-with-capacity",

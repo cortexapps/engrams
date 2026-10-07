@@ -1598,7 +1598,15 @@ impl HostAgent {
                             kind: r.kind,
                         })
                         .collect();
-                    let utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
+                    let mut utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
+                    if let Some(pool) = &nbd_pool_for_heartbeat {
+                        utilization.nbd_sandboxes = pooled_for_heartbeat.nbd_sandbox_slots();
+                        utilization.nbd_slots_total = pool.capacity() as u32;
+                        // Retain the sampled attachments if one releases while
+                        // the allocator count is read. This can only overcount.
+                        utilization.nbd_slots_in_use =
+                            pool.in_use().max(utilization.nbd_sandboxes.values().sum());
+                    }
                     pooled_for_heartbeat.publish_disk_co_tenants().await;
                     // ADR 0068: re-run every probe this tick. Cheap
                     // (statfs/stat/one TCP connect/a memfd-backed uffd

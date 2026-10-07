@@ -489,15 +489,57 @@ fn catalog_harness_from_row(row: HarnessRow) -> engram_core::types::CatalogHarne
 const HARNESS_ROW_COLS: &str =
     "id, owner, name, oci_ref, manifest_digest, descriptor_toml, squashfs_sha256, squashfs_size_bytes, created_at";
 
+/// Slots promised to bindings not yet in the host's NBD sample. Keep the
+/// same lifetime predicates as the memory ledger, including both teleport
+/// sides. RuntimeSpec has no swap size; sessions stamp their need at create.
+fn reserved_nbd_sql() -> String {
+    format!(
+        r#"
+        SELECT r.host_id, COALESCE(SUM(GREATEST(r.need - COALESCE((h.nbd_sandboxes ->> r.sandbox_id::text)::bigint, 0), 0)), 0)::BIGINT AS slots
+        FROM (
+            SELECT host_id, sandbox_id, nbd_slot_need AS need FROM sessions
+            WHERE status IN ({reserving})
+            UNION ALL
+            SELECT host_id, (stage_progress->>'sandbox_id')::uuid,
+                   1 + CASE WHEN COALESCE((image_config->'resources'->>'suggested_swap_mib')::bigint, 0) > 0 THEN 1 ELSE 0 END
+            FROM capture_jobs WHERE stage NOT IN ('done', 'failed')
+            UNION ALL
+            SELECT t.dest_host_id, t.dest_sandbox_id, s.nbd_slot_need
+            FROM session_teleports t JOIN sessions s ON s.id = t.session_id
+            WHERE t.phase IN ({dest})
+            UNION ALL
+            SELECT t.source_host_id, t.source_sandbox_id, s.nbd_slot_need
+            FROM session_teleports t JOIN sessions s ON s.id = t.session_id
+            WHERE t.phase IN ({source})
+        ) r JOIN hosts h ON h.id = r.host_id
+        GROUP BY r.host_id
+    "#,
+        reserving = reserving_states_sql(),
+        dest = engram_core::types::teleport::TeleportPhase::reserving_phases_sql(),
+        source = engram_core::types::teleport::TeleportPhase::source_reserving_phases_sql()
+    )
+}
+
 /// ADR 0048: per-host placement inputs. `alloc_mib` is the host-measured
 /// RAM headroom (`<= 0` = unmeasured); `cpu_budget` is `total_vcpus ×
 /// overcommit` (`0` = host hasn't reported its core count → no CPU gate).
+/// NBD capacity zero selects the file fallback; otherwise slots are a hard gate.
 #[derive(Clone, Copy, Debug, Default)]
 struct HostFit {
+    nbd_slots_total: i64,
+    nbd_slots_in_use: i64,
+    reserved_slots: i64,
     alloc_mib: i64,
     reserved_mib: i64,
     cpu_budget: i64,
     reserved_vcpus: i64,
+}
+
+impl HostFit {
+    fn slots_fit(&self, need: u32) -> bool {
+        self.nbd_slots_total == 0
+            || self.nbd_slots_total - self.nbd_slots_in_use - self.reserved_slots >= i64::from(need)
+    }
 }
 
 /// ADR 0046/0048: BEST-FIT, 2D placement among `candidates` (ranked, with the
@@ -516,18 +558,36 @@ fn choose_placement_host(
     fit: &std::collections::HashMap<uuid::Uuid, HostFit>,
     budget_mib: i64,
     budget_vcpus: i64,
+    need_slots: u32,
 ) -> Option<uuid::Uuid> {
     let split = affinity_len.min(candidates.len());
-    best_fit_measured(&candidates[..split], fit, budget_mib, budget_vcpus)
-        .or_else(|| best_fit_measured(&candidates[split..], fit, budget_mib, budget_vcpus))
-        // Last resort across BOTH tiers: a host with no allocatable
-        // measurement yet (don't gate on a bogus 0; let dev/new hosts work).
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|h| fit.get(h).is_some_and(|f| f.alloc_mib <= 0))
-                .copied()
-        })
+    best_fit_measured(
+        &candidates[..split],
+        fit,
+        budget_mib,
+        budget_vcpus,
+        need_slots,
+    )
+    .or_else(|| {
+        best_fit_measured(
+            &candidates[split..],
+            fit,
+            budget_mib,
+            budget_vcpus,
+            need_slots,
+        )
+    })
+    // Last resort across BOTH tiers: a host with no allocatable
+    // measurement yet (don't gate on a bogus 0; let dev/new hosts work).
+    .or_else(|| {
+        candidates
+            .iter()
+            .find(|h| {
+                fit.get(h)
+                    .is_some_and(|f| f.alloc_mib <= 0 && f.slots_fit(need_slots))
+            })
+            .copied()
+    })
 }
 
 /// Per-candidate no-fit classification — the diagnostic twin of
@@ -540,6 +600,7 @@ fn classify_no_fit(
     fit: &std::collections::HashMap<uuid::Uuid, HostFit>,
     budget_mib: i64,
     budget_vcpus: i64,
+    need_slots: u32,
 ) -> Vec<engram_core::traits::PlacementNoFit> {
     candidates
         .iter()
@@ -558,7 +619,9 @@ fn classify_no_fit(
                 i64::MAX
             };
             let free_mib = f.alloc_mib - f.reserved_mib;
-            let reason = if f.alloc_mib <= 0 {
+            let reason = if !f.slots_fit(need_slots) {
+                "nbd_slots"
+            } else if f.alloc_mib <= 0 {
                 "unmeasured"
             } else if free_mib < budget_mib {
                 "ram_full"
@@ -585,13 +648,14 @@ fn best_fit_measured(
     fit: &std::collections::HashMap<uuid::Uuid, HostFit>,
     budget_mib: i64,
     budget_vcpus: i64,
+    need_slots: u32,
 ) -> Option<uuid::Uuid> {
     let mut best: Option<(i64, uuid::Uuid)> = None; // (free_mib, host)
     for h in candidates {
         let Some(f) = fit.get(h) else {
             continue; // not ready/draining at lock time
         };
-        if f.alloc_mib <= 0 {
+        if f.alloc_mib <= 0 || !f.slots_fit(need_slots) {
             continue; // unmeasured — handled by the fallback tier
         }
         let free_mib = f.alloc_mib - f.reserved_mib;
@@ -632,13 +696,14 @@ async fn pick_host_2d(
     affinity_len: usize,
     budget_mib: i64,
     budget_vcpus: i64,
+    need_slots: u32,
 ) -> Result<Option<uuid::Uuid>, MetaError> {
     if cand.is_empty() {
         return Ok(None);
     }
     let host_rows = sqlx::query(
         r#"
-        SELECT id, allocatable_mib, total_vcpus
+        SELECT id, allocatable_mib, total_vcpus, nbd_slots_total, nbd_slots_in_use
         FROM hosts
         WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
         -- ORDER BY id BEFORE `FOR UPDATE`: every placer (any replica)
@@ -668,6 +733,9 @@ async fn pick_host_2d(
         fit.insert(
             hid,
             HostFit {
+                nbd_slots_total: r.try_get("nbd_slots_total").map_err(db_err)?,
+                nbd_slots_in_use: r.try_get("nbd_slots_in_use").map_err(db_err)?,
+                reserved_slots: 0,
                 alloc_mib,
                 reserved_mib: 0,
                 cpu_budget: engram_core::types::host::host_cpu_budget(total_vcpus.max(0) as u32),
@@ -740,12 +808,22 @@ async fn pick_host_2d(
             f.reserved_vcpus = cpu;
         }
     }
+    let slot_rows: Vec<(uuid::Uuid, i64)> = sqlx::query_as(&reserved_nbd_sql())
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    for (h, slots) in slot_rows {
+        if let Some(f) = fit.get_mut(&h) {
+            f.reserved_slots = slots;
+        }
+    }
     Ok(choose_placement_host(
         cand,
         affinity_len,
         &fit,
         budget_mib,
         budget_vcpus,
+        need_slots,
     ))
 }
 
@@ -757,6 +835,48 @@ mod placement_tests {
     use super::{choose_placement_host, HostFit};
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[test]
+    fn nbd_slots_gate_every_tier_and_report_no_fit() {
+        let ids = ids(2);
+        for alloc in [0, 8192] {
+            let mut fit = HashMap::from([
+                (
+                    ids[0],
+                    HostFit {
+                        alloc_mib: alloc,
+                        nbd_slots_total: 4,
+                        nbd_slots_in_use: 2,
+                        reserved_slots: 1,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    ids[1],
+                    HostFit {
+                        alloc_mib: alloc,
+                        ..Default::default()
+                    },
+                ),
+            ]);
+            assert_eq!(
+                choose_placement_host(&ids, 1, &fit, 1024, 1, 1),
+                Some(ids[0])
+            );
+            assert_eq!(
+                choose_placement_host(&ids, 1, &fit, 1024, 1, 2),
+                Some(ids[1])
+            );
+            assert_eq!(
+                super::classify_no_fit(&ids, &fit, 1024, 1, 2)[0].reason,
+                "nbd_slots"
+            );
+            fit.remove(&ids[1]);
+            assert_eq!(choose_placement_host(&ids, 1, &fit, 1024, 1, 2), None);
+            fit.get_mut(&ids[0]).unwrap().nbd_slots_in_use = 9;
+            assert_eq!(choose_placement_host(&ids, 0, &fit, 1024, 1, 1), None);
+        }
+    }
 
     fn ids(n: usize) -> Vec<Uuid> {
         (1..=n as u128).map(Uuid::from_u128).collect()
@@ -771,6 +891,9 @@ mod placement_tests {
                 (
                     id,
                     HostFit {
+                        nbd_slots_total: 0,
+                        nbd_slots_in_use: 0,
+                        reserved_slots: 0,
                         alloc_mib: alloc,
                         reserved_mib: reserved,
                         cpu_budget: 0,
@@ -786,7 +909,7 @@ mod placement_tests {
         // h0 has LESS free (4768) than h1 (32768); best-fit packs h0.
         let h = ids(2);
         let fit = ram_fit(&[(h[0], 32768, 28000), (h[1], 32768, 0)]);
-        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 0), Some(h[0]));
+        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 0, 1), Some(h[0]));
     }
 
     /// The diagnostic classifier must agree with the pick: whenever
@@ -803,6 +926,9 @@ mod placement_tests {
         fit.insert(
             h[2],
             HostFit {
+                nbd_slots_total: 0,
+                nbd_slots_in_use: 0,
+                reserved_slots: 0,
                 alloc_mib: 32768,
                 reserved_mib: 0,
                 cpu_budget: 8,
@@ -810,7 +936,7 @@ mod placement_tests {
             },
         );
         // h[3] deliberately absent from the map → not_lockable.
-        let details = super::classify_no_fit(&h, &fit, 4096, 2);
+        let details = super::classify_no_fit(&h, &fit, 4096, 2, 1);
         let by_id: HashMap<Uuid, &str> = details
             .iter()
             .map(|d| (d.host_id.as_uuid(), d.reason))
@@ -832,7 +958,7 @@ mod placement_tests {
     fn classify_no_fit_reports_fits_now_on_race() {
         let h = ids(1);
         let fit = ram_fit(&[(h[0], 8192, 0)]);
-        let details = super::classify_no_fit(&h, &fit, 4096, 0);
+        let details = super::classify_no_fit(&h, &fit, 4096, 0, 1);
         assert_eq!(details[0].reason, "fits_now");
     }
 
@@ -840,7 +966,7 @@ mod placement_tests {
     fn rejects_when_none_fit() {
         let h = ids(2);
         let fit = ram_fit(&[(h[0], 8192, 6000), (h[1], 8192, 6000)]);
-        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 0), None);
+        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 0, 1), None);
     }
 
     #[test]
@@ -853,6 +979,9 @@ mod placement_tests {
             (
                 h[0],
                 HostFit {
+                    nbd_slots_total: 0,
+                    nbd_slots_in_use: 0,
+                    reserved_slots: 0,
                     alloc_mib: 32768,
                     reserved_mib: 28000,
                     cpu_budget: 8,
@@ -862,6 +991,9 @@ mod placement_tests {
             (
                 h[1],
                 HostFit {
+                    nbd_slots_total: 0,
+                    nbd_slots_in_use: 0,
+                    reserved_slots: 0,
                     alloc_mib: 32768,
                     reserved_mib: 0,
                     cpu_budget: 32,
@@ -870,7 +1002,7 @@ mod placement_tests {
             ),
         ]
         .into();
-        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 2), Some(h[1]));
+        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 2, 1), Some(h[1]));
     }
 
     #[test]
@@ -878,11 +1010,11 @@ mod placement_tests {
         let h = ids(2);
         // h0 unmeasured (0), h1 measured + fits → prefer the measured host.
         let fit = ram_fit(&[(h[0], 0, 0), (h[1], 32768, 0)]);
-        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 0), Some(h[1]));
+        assert_eq!(choose_placement_host(&h, 0, &fit, 4096, 0, 1), Some(h[1]));
         // only the unmeasured host (dev backend / brand-new) → fall back to it.
         let only0 = ram_fit(&[(h[0], 0, 0)]);
         assert_eq!(
-            choose_placement_host(&h[..1], 0, &only0, 4096, 0),
+            choose_placement_host(&h[..1], 0, &only0, 4096, 0, 1),
             Some(h[0])
         );
     }
@@ -894,12 +1026,12 @@ mod placement_tests {
         // affinity tier is tried first and h0 fits.
         let h = ids(2);
         let fit = ram_fit(&[(h[0], 32768, 0), (h[1], 32768, 28000)]);
-        assert_eq!(choose_placement_host(&h, 1, &fit, 4096, 0), Some(h[0]));
+        assert_eq!(choose_placement_host(&h, 1, &fit, 4096, 0, 1), Some(h[0]));
         // ...but if the affinity host can't fit, fall through to best-fit
         // over the remainder.
         let full_affinity = ram_fit(&[(h[0], 8192, 8000), (h[1], 32768, 28000)]);
         assert_eq!(
-            choose_placement_host(&h, 1, &full_affinity, 4096, 0),
+            choose_placement_host(&h, 1, &full_affinity, 4096, 0, 1),
             Some(h[1])
         );
     }
@@ -919,7 +1051,7 @@ mod placement_tests {
                 (h[0], 16384, reserved.get(&h[0]).copied().unwrap_or(0)),
                 (h[1], 16384, reserved.get(&h[1]).copied().unwrap_or(0)),
             ]);
-            match choose_placement_host(&h, 0, &fit, budget, 0) {
+            match choose_placement_host(&h, 0, &fit, budget, 0, 1) {
                 Some(p) => {
                     *reserved.entry(p).or_default() += budget;
                     picks.push(Some(p));
@@ -1137,7 +1269,7 @@ impl MetadataStore for PostgresStore {
         req: TeleportAdmitRequest,
     ) -> Result<TeleportAdmitOutcome, MetaError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        let Some(session) = sqlx::query("SELECT status, host_id, sandbox_id FROM sessions WHERE id=$1 AND current_epoch=$2 FOR UPDATE")
+        let Some(session) = sqlx::query("SELECT status, host_id, sandbox_id, nbd_slot_need FROM sessions WHERE id=$1 AND current_epoch=$2 FOR UPDATE")
             .bind(req.session_id.as_uuid()).bind(req.epoch).fetch_optional(&mut *tx).await.map_err(db_err)? else { return Ok(TeleportAdmitOutcome::Fenced) };
         let open: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM session_teleports WHERE session_id=$1 AND phase NOT IN ('done','aborted','failed'))")
             .bind(req.session_id.as_uuid()).fetch_one(&mut *tx).await.map_err(db_err)?;
@@ -1182,6 +1314,7 @@ impl MetadataStore for PostgresStore {
             0,
             req.mem_budget_mib,
             req.cpu_budget_vcpus,
+            session.try_get::<i64, _>("nbd_slot_need").map_err(db_err)? as u32,
         )
         .await?
         else {
@@ -1468,6 +1601,7 @@ impl MetadataStore for PostgresStore {
             affinity_len,
             ws.mem_budget_mib,
             ws.cpu_budget_vcpus as i64,
+            ws.nbd_slot_need,
         )
         .await?;
 
@@ -1479,8 +1613,8 @@ impl MetadataStore for PostgresStore {
                         (id, status, host_id, sandbox_id,
                          image_uri, mode, mem_budget_mib, cpu_budget_vcpus,
                          harness,
-                         created_at, last_active_at)
-                    VALUES ($1, 'pending', $2, NULL, $3, $4, $5, $6, $7, $8, $8)
+                         created_at, last_active_at, nbd_slot_need)
+                    VALUES ($1, 'pending', $2, NULL, $3, $4, $5, $6, $7, $8, $8, $9)
                     "#,
                 )
                 .bind(ws.session_id.as_uuid())
@@ -1495,6 +1629,7 @@ impl MetadataStore for PostgresStore {
                 // below (migration 0090 dropped the column).
                 .bind(ws.runtime_spec.selected_harness.as_deref())
                 .bind(now)
+                .bind(i64::from(ws.nbd_slot_need))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -1511,8 +1646,8 @@ impl MetadataStore for PostgresStore {
                          mem_budget_mib, cpu_budget_vcpus,
                          harness,
                          queued_at, queue_origin,
-                         created_at, last_active_at)
-                    VALUES ($1, 'queued', NULL, NULL, $2, $3, $4, $5, $6, $7, 'create', $7, $7)
+                         created_at, last_active_at, nbd_slot_need)
+                    VALUES ($1, 'queued', NULL, NULL, $2, $3, $4, $5, $6, $7, 'create', $7, $7, $8)
                     "#,
                 )
                 .bind(ws.session_id.as_uuid())
@@ -1524,6 +1659,7 @@ impl MetadataStore for PostgresStore {
                 // selected_skills column (lives in the RuntimeSpec below).
                 .bind(ws.runtime_spec.selected_harness.as_deref())
                 .bind(now)
+                .bind(i64::from(ws.nbd_slot_need))
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -2426,7 +2562,7 @@ impl MetadataStore for PostgresStore {
                    live_disk_manifest_id, live_disk_manifest_version,
                    COALESCE(mem_budget_mib, 0)::BIGINT AS mem_budget_mib,
                    COALESCE(cpu_budget_vcpus, 0) AS cpu_budget_vcpus,
-                   queue_origin, queued_at
+                   queue_origin, queued_at, nbd_slot_need
             FROM sessions
             WHERE status = 'queued'
             ORDER BY queued_at ASC
@@ -2454,12 +2590,18 @@ impl MetadataStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // Same FOR UPDATE serialization + 2D fit as every reserving placer
         // (shared `pick_host_2d`, ADR 0046/0048/0081).
+        let need: i64 = sqlx::query_scalar("SELECT nbd_slot_need FROM sessions WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
         let Some(picked) = pick_host_2d(
             &mut tx,
             &cand,
             affinity_len,
             mem_budget_mib,
             cpu_budget_vcpus as i64,
+            need as u32,
         )
         .await?
         else {
@@ -2572,12 +2714,23 @@ impl MetadataStore for PostgresStore {
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
+        let slots: std::collections::HashMap<uuid::Uuid, i64> =
+            sqlx::query_as::<_, (uuid::Uuid, i64)>(&reserved_nbd_sql())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?
+                .into_iter()
+                .collect();
         Ok(rows
             .into_iter()
             .map(|(h, mem_mib, vcpus)| {
                 (
                     HostId(h),
-                    engram_core::types::host::ReservedBudget { mem_mib, vcpus },
+                    engram_core::types::host::ReservedBudget {
+                        mem_mib,
+                        vcpus,
+                        nbd_slots: slots.get(&h).copied().unwrap_or(0),
+                    },
                 )
             })
             .collect())
@@ -2656,6 +2809,7 @@ impl MetadataStore for PostgresStore {
         candidates: &[HostId],
         mem_budget_mib: i64,
         cpu_budget_vcpus: i32,
+        need_slots: u32,
     ) -> Result<Vec<engram_core::traits::PlacementNoFit>, MetaError> {
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -2663,7 +2817,7 @@ impl MetadataStore for PostgresStore {
         let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
         let host_rows = sqlx::query(
             r#"
-            SELECT id, allocatable_mib, total_vcpus
+            SELECT id, allocatable_mib, total_vcpus, nbd_slots_total, nbd_slots_in_use
             FROM hosts
             WHERE id = ANY($1) AND status IN ('ready','draining') AND NOT cordoned
             "#,
@@ -2681,6 +2835,9 @@ impl MetadataStore for PostgresStore {
             fit.insert(
                 hid,
                 HostFit {
+                    nbd_slots_total: r.try_get("nbd_slots_total").map_err(db_err)?,
+                    nbd_slots_in_use: r.try_get("nbd_slots_in_use").map_err(db_err)?,
+                    reserved_slots: 0,
                     alloc_mib,
                     reserved_mib: 0,
                     cpu_budget: engram_core::types::host::host_cpu_budget(
@@ -2741,11 +2898,21 @@ impl MetadataStore for PostgresStore {
                 f.reserved_vcpus = cpu;
             }
         }
+        let slot_rows: Vec<(uuid::Uuid, i64)> = sqlx::query_as(&reserved_nbd_sql())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        for (h, slots) in slot_rows {
+            if let Some(f) = fit.get_mut(&h) {
+                f.reserved_slots = slots;
+            }
+        }
         Ok(classify_no_fit(
             &cand,
             &fit,
             mem_budget_mib,
             cpu_budget_vcpus as i64,
+            need_slots,
         ))
     }
 
@@ -4328,6 +4495,7 @@ impl MetadataStore for PostgresStore {
                    capacity_total_gb, capacity_used_gb,
                    capacity_total_mib, capacity_used_mib,
                    running_sandboxes_count,
+                   nbd_slots_total, nbd_slots_in_use, nbd_sandboxes,
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
@@ -4398,7 +4566,7 @@ impl MetadataStore for PostgresStore {
             // `draining` is the agent's own preStop flag and a host that
             // finished/aborted its drain legitimately reports ready again.
             r#"WITH previous AS MATERIALIZED (
-                    SELECT status, allocatable_mib, ready_images, total_vcpus,
+                    SELECT status, allocatable_mib, ready_images, total_vcpus, nbd_slots_total, nbd_slots_in_use, nbd_sandboxes,
                            wire_version, capabilities
                       FROM hosts
                      WHERE id = $1
@@ -4415,6 +4583,9 @@ impl MetadataStore for PostgresStore {
                       util_mem_used_mib = $9,
                       util_cpu_pct = $10,
                       allocatable_mib = $11,
+                      nbd_slots_total = $24,
+                      nbd_slots_in_use = $25,
+                      nbd_sandboxes = $26,
                       ready_images = $12,
                       current_bundles = $13,
                       total_vcpus = $14,
@@ -4454,6 +4625,9 @@ impl MetadataStore for PostgresStore {
                     OR previous.total_vcpus IS DISTINCT FROM $14::int
                     OR previous.wire_version IS DISTINCT FROM $15::int
                     OR previous.capabilities IS DISTINCT FROM $19::jsonb
+                    OR previous.nbd_slots_total IS DISTINCT FROM $24::bigint
+                    OR previous.nbd_slots_in_use IS DISTINCT FROM $25::bigint
+                    OR previous.nbd_sandboxes IS DISTINCT FROM $26::jsonb
                 )"#,
         )
         .bind(id.as_uuid())
@@ -4481,6 +4655,9 @@ impl MetadataStore for PostgresStore {
         .bind(self.clock.now_utc())
         .bind(sandbox_bundles)
         .bind(hb.lease_renew_until)
+        .bind(i64::from(hb.utilization.nbd_slots_total))
+        .bind(i64::from(hb.utilization.nbd_slots_in_use))
+        .bind(serde_json::to_value(&hb.utilization.nbd_sandboxes).map_err(|e| MetaError::Serialization(e.to_string()))?)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4561,6 +4738,7 @@ impl MetadataStore for PostgresStore {
                    capacity_total_gb, capacity_used_gb,
                    capacity_total_mib, capacity_used_mib,
                    running_sandboxes_count,
+                   nbd_slots_total, nbd_slots_in_use, nbd_sandboxes,
                    util_disk_total_mib, util_disk_used_mib,
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
@@ -7243,7 +7421,9 @@ impl MetadataStore for PostgresStore {
             tx.rollback().await.map_err(db_err)?;
             return self.get_capture_job(id).await;
         }
-        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64).await?;
+        let need: i64 = sqlx::query_scalar("SELECT 1::bigint + CASE WHEN COALESCE((image_config->'resources'->>'suggested_swap_mib')::bigint, 0) > 0 THEN 1 ELSE 0 END FROM capture_jobs WHERE id = $1")
+            .bind(id.as_uuid()).fetch_one(&mut *tx).await.map_err(db_err)?;
+        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64, need as u32).await?;
         // Fit → bind host_id, clear the wait clock, re-anchor the
         // `assigned` deadline from dispatch. No fit → leave waiting,
         // stamping `waiting_since` on the first miss (COALESCE).
@@ -7302,7 +7482,9 @@ impl MetadataStore for PostgresStore {
             tx.rollback().await.map_err(db_err)?;
             return Ok(None); // fence missed (already reassigned, or terminal)
         };
-        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64).await?;
+        let need: i64 = sqlx::query_scalar("SELECT 1::bigint + CASE WHEN COALESCE((image_config->'resources'->>'suggested_swap_mib')::bigint, 0) > 0 THEN 1 ELSE 0 END FROM capture_jobs WHERE id = $1")
+            .bind(id.as_uuid()).fetch_one(&mut *tx).await.map_err(db_err)?;
+        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64, need as u32).await?;
         let row = sqlx::query(
             r#"
             UPDATE capture_jobs
@@ -7370,7 +7552,9 @@ impl MetadataStore for PostgresStore {
             tx.rollback().await.map_err(db_err)?;
             return Ok(None); // exhausted, raced, or no longer retryable-failed
         };
-        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64).await?;
+        let need: i64 = sqlx::query_scalar("SELECT 1::bigint + CASE WHEN COALESCE((image_config->'resources'->>'suggested_swap_mib')::bigint, 0) > 0 THEN 1 ELSE 0 END FROM capture_jobs WHERE id = $1")
+            .bind(id.as_uuid()).fetch_one(&mut *tx).await.map_err(db_err)?;
+        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64, need as u32).await?;
         let row = sqlx::query(
             r#"
             UPDATE capture_jobs

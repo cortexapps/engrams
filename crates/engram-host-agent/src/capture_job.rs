@@ -539,6 +539,7 @@ impl CaptureJobExecutor {
                     epoch,
                     stage: record.stage,
                     progress: Some(CaptureJobProgress {
+                        sandbox_id: record.sandbox_id,
                         detail: progress.detail.clone(),
                         log_tail: Some(progress.output_tail.clone()),
                         warm_stages,
@@ -600,6 +601,7 @@ impl CaptureJobExecutor {
                 None
             } else {
                 Some(CaptureJobProgress {
+                    sandbox_id: None,
                     detail: None,
                     log_tail: None,
                     warm_stages,

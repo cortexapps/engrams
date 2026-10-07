@@ -101,8 +101,10 @@ egress:
 
 # ADR 0049: bounded NBD slot pool with a warm front.
 nbd:
+  # Two slots per swap-enabled guest. Changes require node recreation:
+  # the kernel reads nbds_max only when the module loads.
   nbdsMax: 128
-  warmSlots: 64
+  warmSlots: 128
 
 # ADR 0044 K3 + ADR 0048 + ADR 0122: the rollout/autoscaling
 # operator. scaler=asg actuates the EC2 Auto Scaling group via IRSA

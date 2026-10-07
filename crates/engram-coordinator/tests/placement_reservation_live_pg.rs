@@ -123,6 +123,7 @@ fn bare_write_set(
     cpu_budget_vcpus: i32,
 ) -> SessionCreateWriteSet {
     SessionCreateWriteSet {
+        nbd_slot_need: 1,
         session_id,
         spec: spec(),
         mem_budget_mib,
@@ -237,7 +238,7 @@ async fn placement_no_fit_details_classifies_against_real_pg() {
     let placed = reserve(&meta, sid, 16384, 2, &[host], 0).await;
     assert_eq!(placed, Some(host), "the 16 GiB session reserves the host");
     let details = meta
-        .placement_no_fit_details(&[host], 4096, 2)
+        .placement_no_fit_details(&[host], 4096, 2, 1)
         .await
         .expect("placement_no_fit_details SQL runs");
     assert_eq!(details.len(), 1);
@@ -266,6 +267,7 @@ async fn reserve_and_persist_create_commits_the_full_write_set_together() {
     let session_id = SessionId::new();
     let cap = Capability::parse("github:read@owner/repo").expect("valid capability");
     let ws = SessionCreateWriteSet {
+        nbd_slot_need: 1,
         session_id,
         spec: spec(),
         mem_budget_mib: 2048,

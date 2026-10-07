@@ -109,6 +109,9 @@ impl UtilizationProbe {
         let (disk_total_mib, disk_used_mib) = self.sample_disk(work_dir);
         let cpu_pct = self.cpu_pct();
         HostUtilization {
+            nbd_slots_total: 0,
+            nbd_slots_in_use: 0,
+            nbd_sandboxes: Default::default(),
             disk_total_mib,
             disk_used_mib,
             // ADR 0112: filled by the heartbeat loop from

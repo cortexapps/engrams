@@ -707,8 +707,9 @@ S7's base-capture rule lands with phase 2b, once the base must be swap-free for 
    and the whole disarm machinery deleted. The two-host KVM lane proves a
    paged-out sentinel survives a live move, and `/proc/swaps` is active
    on the destination with no re-arm.
-4. Chart `nbdsMax`, node recreate, measurement of swap-in latency and the
-   capture upload cost on the dev VM, then the fleet roll.
+4. NBD slot placement, chart `nbdsMax` and `warmSlots` defaults of 128,
+   and node recreation. Operators then measure swap-in latency and capture
+   upload cost on the dev VM before the fleet roll.
 
 - **2026-10-07, phase 2b:** Host swap uses a second chunked NBD disk.
   It attaches without a flush scheduler. Captures publish both disk roles,
@@ -731,3 +732,21 @@ S7's base-capture rule lands with phase 2b, once the base must be swap-free for 
   both devices, fetches both seals, and joins both drains. D7 is deleted.
   Wire version is 34. The two-host KVM test moves a paged-out sentinel once
   and checks the active swap device and its unchanged header after the move.
+
+
+- **2026-10-07, phase 4:** NBD slots are a placement dimension. Heartbeat
+  utilization reports capacity, claimed slots (including quarantine), and
+  attached device counts by sandbox. The placement ledger reserves only
+  the remaining device need for sessions, captures, and both teleport
+  sides. `RuntimeSpec` has no swap size, so each session stores its root
+  plus swap slot need at create; migration 0125 backfills existing rows
+  from their image config or a swap-bearing snapshot (a live guest is
+  counted by its host's sample either way). Resume and teleport pickers
+  read the ledger without a transaction, as the memory ledger does; the
+  host-side allocator stays the final arbiter. Capture jobs derive their
+  need from the stored image config. Slot
+  exhaustion returns no fit with reason `nbd_slots`; NBD-off hosts retain
+  the file fallback. Fleet views expose both counters. Chart defaults are
+  128 total and 128 warm slots, for two devices per swap-enabled guest.
+  Changes to the module parameter require node recreation. Swap-in latency
+  and capture-upload measurements on the dev VM remain an operator step.

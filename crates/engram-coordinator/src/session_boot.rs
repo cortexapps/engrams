@@ -142,6 +142,7 @@ pub(crate) struct BootInputs {
 /// its response). Built by `sessions::prepare_from_request` (from a live
 /// request) or `sessions::prepare_from_row` (from a durable queued row).
 pub(crate) struct PreparedBoot {
+    pub nbd_slot_need: u32,
     pub inputs: BootInputs,
     pub memory_mib: u32,
     pub cpu_budget_vcpus: u32,

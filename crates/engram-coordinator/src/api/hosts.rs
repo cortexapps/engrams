@@ -52,6 +52,8 @@ pub(crate) async fn enrichment_for_session(
 
 #[derive(Serialize)]
 pub struct HostView {
+    pub nbd_slots_total: u32,
+    pub nbd_slots_in_use: u32,
     pub id: HostId,
     pub hostname: String,
     pub status: &'static str,
@@ -163,6 +165,8 @@ impl HostView {
             util_base_shm_mib: row.utilization.base_shm_mib,
             util_parked_pss_mib: row.utilization.parked_pss_mib,
             util_running_pss_mib: row.utilization.running_pss_mib,
+            nbd_slots_total: row.utilization.nbd_slots_total,
+            nbd_slots_in_use: row.utilization.nbd_slots_in_use,
             allocatable_mib,
             reserved_mib,
             free_mib: allocatable_mib.saturating_sub(reserved_mib),

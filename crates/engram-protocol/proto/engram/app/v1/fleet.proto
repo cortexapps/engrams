@@ -152,6 +152,8 @@ message HostView {
   // ADR 0123 A2: retirement status. Unset when no retirement was
   // requested; `retired_at` set means the grant landed.
   HostRetirement retirement = 34;
+  uint32 nbd_slots_total = 35;
+  uint32 nbd_slots_in_use = 36;
 }
 
 message GetHostRequest {

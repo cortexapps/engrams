@@ -61,6 +61,7 @@ async fn boot_session(
         .expect("replica 0 is up");
     let session_id = SessionId::from(sim.world.entropy.uuid());
     let ws = SessionCreateWriteSet {
+        nbd_slot_need: 1,
         session_id,
         spec: SessionSpec {
             image: SIM_IMAGE.into(),

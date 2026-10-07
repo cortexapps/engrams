@@ -556,6 +556,7 @@ async fn cross_replica_scheduling_pins_and_tokens() {
     registry_b.register(h2, backend.clone());
 
     let ctx = ScheduleContext {
+        nbd_slot_need: 1,
         repo: "r",
         image_version: "v",
         snapshot_host: None,

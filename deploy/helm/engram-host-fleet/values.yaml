@@ -204,8 +204,10 @@ nbd:
   # value) and keeps `warmSlots` pre-validated slots ready for an O(1)
   # `acquire()`. Total is overridable per deployment. Set nbdsMax: 0 to
   # disable NBD (materialize-to-file fallback).
-  nbdsMax: 64
-  warmSlots: 64
+  # Two slots per swap-enabled guest. Changes require node recreation:
+  # the kernel reads nbds_max only when the module loads.
+  nbdsMax: 128
+  warmSlots: 128
 
 nodePrep:
   enabled: true

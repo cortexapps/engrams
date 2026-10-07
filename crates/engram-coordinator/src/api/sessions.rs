@@ -640,6 +640,7 @@ async fn boot_prepared(
     oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
+        nbd_slot_need,
         inputs,
         memory_mib,
         cpu_budget_vcpus,
@@ -666,6 +667,7 @@ async fn boot_prepared(
     // a capacity miss does. A straggler host that hasn't staged yet simply
     // isn't in the ranked pool; its next heartbeat un-gates it.
     let ctx = crate::placement::ScheduleContext {
+        nbd_slot_need,
         repo: &image_repo,
         image_version: &image_tag,
         // ADR 0078: a base snapshot is fleet-wide (prewarmed on many
@@ -744,6 +746,7 @@ async fn boot_prepared(
     };
 
     let write_set = engram_core::traits::SessionCreateWriteSet {
+        nbd_slot_need,
         session_id,
         spec: inputs.spec.clone(),
         mem_budget_mib: memory_mib as i64,
@@ -1494,6 +1497,7 @@ async fn prepare_inner(
     let manifest_digest = bundle.enabled.manifest_digest.clone();
 
     Ok(crate::session_boot::PreparedBoot {
+        nbd_slot_need: 1 + u32::from(config.resolved_swap_mib() > 0),
         inputs: crate::session_boot::BootInputs {
             session_id,
             spec,

@@ -102,6 +102,7 @@ pub(crate) fn queued_session_from_row(
     let cpu_budget_vcpus: i32 = row.try_get("cpu_budget_vcpus").map_err(col_err)?;
     let queued_at: DateTime<Utc> = row.try_get("queued_at").map_err(col_err)?;
     Ok(engram_core::types::session::QueuedSession {
+        nbd_slot_need: row.try_get::<i64, _>("nbd_slot_need").map_err(col_err)? as u32,
         session,
         origin,
         mem_budget_mib,
@@ -180,6 +181,16 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
             running_sandboxes: running_sandboxes.max(0) as u32,
         },
         utilization: HostUtilization {
+            nbd_slots_total: row
+                .try_get::<i64, _>("nbd_slots_total")
+                .map_err(col_err)?
+                .max(0) as u32,
+            nbd_slots_in_use: row
+                .try_get::<i64, _>("nbd_slots_in_use")
+                .map_err(col_err)?
+                .max(0) as u32,
+            nbd_sandboxes: serde_json::from_value(row.try_get("nbd_sandboxes").map_err(col_err)?)
+                .map_err(|e| MetaError::Serialization(e.to_string()))?,
             disk_total_mib: util_disk_total_mib.max(0) as u64,
             disk_used_mib: util_disk_used_mib.max(0) as u64,
             mem_total_mib: util_mem_total_mib.max(0) as u64,

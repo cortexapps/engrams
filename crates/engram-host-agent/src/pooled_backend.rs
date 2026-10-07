@@ -4387,9 +4387,23 @@ impl PooledBackend {
         }
     }
 
-    /// The NBD slot pool, when this host serves chunked rootfs via
-    /// NBD. Used by the post-rehydrate stale-binding sweep to scope
-    /// itself to still-free slots (ADR 0044 K2).
+    /// Current disk attachments. Sample before the allocator count so
+    /// an attachment still in progress retains its placement reservation.
+    pub fn nbd_sandbox_slots(&self) -> std::collections::HashMap<SandboxId, u32> {
+        #[cfg(target_os = "linux")]
+        {
+            self.nbd_sandboxes
+                .iter()
+                .map(|entry| (*entry.key(), 1 + u32::from(entry.swap.is_some())))
+                .collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Default::default()
+        }
+    }
+
+    /// The NBD pool used for chunked disks and survivor recovery.
     pub fn nbd_pool(&self) -> Option<Arc<crate::disk_daemon::NbdSlotAllocator>> {
         self.nbd_pool.clone()
     }
