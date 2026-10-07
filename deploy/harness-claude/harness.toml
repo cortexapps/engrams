@@ -35,31 +35,30 @@ user_env = "CLAUDE_CODE_OAUTH_TOKEN"
 # Setup instructions shown on the settings + create surfaces.
 user_env_hint = "Run `claude setup-token` on your machine and paste the token it prints. It's required before you can start an interactive Claude session."
 
+# Model options are Claude Code family aliases, not pinned ids. The bundled
+# `claude` CLI resolves each alias to the latest model of that family, so a
+# CLI bump moves every option forward and the option ids never change. The
+# generation events still report the resolved model id.
 [[models]]
-id      = "opus-5"
-label   = "Claude Opus 5"
+id      = "opus"
+label   = "Claude Opus"
 default = true
-env     = { ANTHROPIC_MODEL = "claude-opus-5" }
+env     = { ANTHROPIC_MODEL = "opus" }
 
 [[models]]
-id    = "fable-5"
-label = "Claude Fable 5"
-env   = { ANTHROPIC_MODEL = "claude-fable-5" }
-
-[[models]]
-id    = "opus"
-label = "Claude Opus 4.8"
-env   = { ANTHROPIC_MODEL = "claude-opus-4-8" }
+id    = "fable"
+label = "Claude Fable"
+env   = { ANTHROPIC_MODEL = "fable" }
 
 [[models]]
 id    = "sonnet"
-label = "Claude Sonnet 4.6"
-env   = { ANTHROPIC_MODEL = "claude-sonnet-4-6" }
+label = "Claude Sonnet"
+env   = { ANTHROPIC_MODEL = "sonnet" }
 
 [[models]]
 id    = "haiku"
-label = "Claude Haiku 4.5"
-env   = { ANTHROPIC_MODEL = "claude-haiku-4-5" }
+label = "Claude Haiku"
+env   = { ANTHROPIC_MODEL = "haiku" }
 
 # Session modes (ADR 0107). Pure declaration: mode selection rides prompts
 # (harness_mode) and the harness maps `plan` to `--permission-mode plan`.
