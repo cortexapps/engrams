@@ -47,6 +47,7 @@ impl SandboxBackend for Inner {
             created_at: chrono::Utc::now(),
             image_version: "test".into(),
             disk_manifest: None,
+            swap_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
             migration_source: None,
