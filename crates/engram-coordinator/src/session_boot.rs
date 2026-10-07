@@ -252,6 +252,7 @@ pub(crate) async fn boot_on_reserved_host(
         size_bytes: record.size_bytes,
         created_at: record.created_at,
         image_version: record.image_version,
+        swap_manifest: record.swap_manifest,
         disk_manifest: record.disk_manifest,
         memory_manifest: record.memory_manifest,
         source_sandbox_id: None,

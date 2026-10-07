@@ -55,6 +55,7 @@ async fn snapshot_disk_manifest_round_trips_through_pg() {
         size_bytes: 1024,
         created_at: Utc::now(),
         last_accessed_at: Utc::now(),
+        swap_manifest: None,
         disk_manifest: Some(mref),
         memory_manifest: None,
         recoverable: false,

@@ -268,6 +268,7 @@ async fn abandon_during_in_flight_restore_does_not_disconnect_survivor() {
         size_bytes: bytes.len() as u64,
         created_at: chrono::Utc::now(),
         image_version: "t".into(),
+        swap_manifest: None,
         disk_manifest: Some(disk_ref),
         memory_manifest: None,
         base_memory_manifest: None,

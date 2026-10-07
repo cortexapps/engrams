@@ -287,6 +287,7 @@ async fn hit_with_a_verified_present_candidate() {
         size_bytes: 0,
         created_at: Utc::now(),
         image_version: "cold-base-fixture:1".into(),
+        swap_manifest: None,
         disk_manifest: Some(disk_manifest_ref),
         memory_manifest: Some(mem_manifest_ref),
         base_memory_manifest: None,

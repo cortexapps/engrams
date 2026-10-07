@@ -197,6 +197,7 @@ fn snapshot_metadata() -> SnapshotMetadata {
         size_bytes: 4096,
         created_at: DateTime::from_timestamp(1_770_000_000, 0).unwrap(),
         image_version: "warm-1".into(),
+        swap_manifest: None,
         disk_manifest: Some(fixed_manifest_ref(0x21, 1)),
         memory_manifest: Some(fixed_manifest_ref(0x22, 1)),
         base_memory_manifest: None,
@@ -685,8 +686,11 @@ fn wire_version_pinned() {
     // it: `snapshot_metadata.bin` pins `migration_source: None`). Lockstep
     // coord+host roll.
     // 30 -> 31: migration disk items carry the device role.
+    // 31 -> 32: SnapshotMetadata appends swap_manifest (serde-default).
+    // snapshot_metadata.bin gains one trailing zero byte for None.
+    // Checkpoint adverts also carry the optional swap manifest.
     assert_eq!(
-        WIRE_VERSION, 31,
+        WIRE_VERSION, 32,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

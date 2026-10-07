@@ -167,6 +167,8 @@ pub struct EvictionFinalizeRecord {
     pub attempts: u32,
     /// Filled by the `DiskUploaded` leg.
     pub disk_manifest: Option<ManifestRef>,
+    #[serde(default)]
+    pub swap_manifest: Option<ManifestRef>,
     /// Filled by the `MemoryChunked` leg.
     pub memory_manifest: Option<ManifestRef>,
 }
@@ -770,6 +772,7 @@ async fn run_terminal(
         sandbox_id: record.sandbox_id,
         image_version: record.image_version.clone(),
         size_bytes: record.size_bytes,
+        swap_manifest: record.swap_manifest,
         disk_manifest: record.disk_manifest,
         memory_manifest: record.memory_manifest,
         aux_bundles: record.aux_bundles.clone(),
@@ -1016,6 +1019,34 @@ pub(crate) async fn run_eviction_finalize(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn swap_manifest_legacy_record_and_torn_files_recover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = record_with_one_staged_chunk(
+            tmp.path().join("capture"),
+            ManifestRef::new(),
+            ChunkHash::of(b"test"),
+        );
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("swap_manifest");
+        let body = serde_json::to_string(&legacy).unwrap();
+        let bytes = crate::durable_envelope::seal(&record.snapshot_id.to_string(), &body);
+        let path = tmp.path().join(format!("{}.json", record.snapshot_id));
+        for end in 0..bytes.len() {
+            std::fs::write(&path, &bytes[..end]).unwrap();
+            assert!(
+                EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, tmp.path())
+                    .await
+                    .is_empty()
+            );
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(tmp.path().join("torn.partial"), b"{").unwrap();
+        let loaded = EvictionFinalizeRecord::load_all(&engram_host_core::TokioFs, tmp.path()).await;
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].swap_manifest.is_none());
+    }
+
     struct NoopDestroyer;
 
     #[test]
@@ -1191,6 +1222,7 @@ mod tests {
             aux_bundles: Vec::new(),
             stage: FinalizeStage::Captured,
             attempts: 0,
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
         };
@@ -1246,6 +1278,7 @@ mod tests {
             aux_bundles: Vec::new(),
             stage: FinalizeStage::Captured,
             attempts: 0,
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
         }

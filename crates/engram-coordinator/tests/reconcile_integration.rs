@@ -101,6 +101,7 @@ async fn seed_recoverable_snapshot(
         size_bytes: 1024,
         created_at: Utc::now(),
         last_accessed_at: Utc::now(),
+        swap_manifest: None,
         disk_manifest: Some(ManifestRef {
             manifest_id: uuid::Uuid::new_v4(),
             version: 1,

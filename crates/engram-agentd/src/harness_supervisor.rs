@@ -167,19 +167,8 @@ impl HarnessSupervisor {
         let mut gate_env = req.session_env.clone();
         gate_env.extend(req.env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-        // ADR 0112: re-arm the ephemeral swap device. A restored guest
-        // meets its FRESH zero-filled backing here (capture ran swapoff
-        // before the pause; restore re-pointed the drive at a new
-        // sparse file), so it needs mkswap + swapon again. Idempotent —
-        // an already-armed device (mid-residence respawn) is skipped
-        // via /proc/swaps. Best-effort; never blocks the spawn.
-        //
-        // The kill switch rides the spawn-delivered env (the coordinator
-        // builds it from the CURRENT image/session config at bind time),
-        // so `ENGRAM_GUEST_SWAP=off` reaches every session at its next
-        // bind with no re-capture — and actively disarms one that is
-        // already armed. agentd's own process env (frozen into the base
-        // snapshot at capture) is the boot-time fallback only.
+        // Arm inactive swap without changing an existing signature. Capture
+        // probes skip arming; the kill switch still disarms active swap.
         crate::swap::arm_at_bind(&gate_env);
 
         // ADR 0027: wire whatever RO bundles the init shim mounted (the

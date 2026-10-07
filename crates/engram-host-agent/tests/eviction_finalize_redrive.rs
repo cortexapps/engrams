@@ -329,6 +329,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         size_bytes: checkpoint.size_bytes,
         created_at: checkpoint.captured_at,
         image_version: checkpoint.image_version.clone(),
+        swap_manifest: checkpoint.swap_manifest,
         disk_manifest: checkpoint.disk_manifest,
         memory_manifest: Some(memory_manifest),
         base_memory_manifest: None,

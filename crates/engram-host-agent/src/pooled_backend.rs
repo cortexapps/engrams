@@ -6875,6 +6875,7 @@ impl SnapshotFinisher {
             sandbox_id: id,
             image_version: metadata.image_version.clone(),
             size_bytes: metadata.size_bytes,
+            swap_manifest: metadata.swap_manifest,
             disk_manifest: metadata.disk_manifest,
             memory_manifest: metadata.memory_manifest,
             aux_bundles: metadata.aux_bundles.clone(),
@@ -7806,6 +7807,7 @@ impl SandboxBackend for PooledBackend {
             aux_bundles: metadata.aux_bundles.clone(),
             stage: crate::eviction_finalize::FinalizeStage::default(),
             attempts: 0,
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
         };
@@ -9113,7 +9115,7 @@ impl SandboxBackend for PooledBackend {
         use engram_core::types::capture_job::{CaptureJobResult, CapturedColdBase, ColdBasePlan};
 
         let engram_core::traits::sandbox::BuildBaseSnapshotRequest {
-            spec,
+            mut spec,
             warm,
             capture_env,
             capture_egress,
@@ -9154,6 +9156,16 @@ impl SandboxBackend for PooledBackend {
         // plus whatever secrets the warm boot needs.
         let mut session_env = spec.env.clone();
         session_env.extend(capture_env);
+        // The boot marker stops cold-boot arming. The spawn marker stops
+        // capture probes from arming, without affecting later session binds.
+        spec.env.insert(
+            engram_core::types::sandbox::BASE_CAPTURE_ENV.into(),
+            "1".into(),
+        );
+        session_env.insert(
+            engram_core::types::sandbox::BASE_CAPTURE_ENV.into(),
+            "1".into(),
+        );
         let is_warm = warm.is_some();
         // Captured before `spec` moves into `create` — the balloon
         // reclaim target below derives from guest RAM size.
@@ -11365,6 +11377,7 @@ mod tests {
                     size_bytes: 4096,
                     created_at: chrono::Utc::now(),
                     image_version: "t:1".into(),
+                    swap_manifest: None,
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
@@ -11840,6 +11853,7 @@ mod tests {
                     size_bytes: 4096,
                     created_at: chrono::Utc::now(),
                     image_version: "t:1".into(),
+                    swap_manifest: None,
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
@@ -11978,6 +11992,7 @@ mod tests {
                     size_bytes: 4096,
                     created_at: chrono::Utc::now(),
                     image_version: "t:1".into(),
+                    swap_manifest: None,
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
@@ -12158,6 +12173,7 @@ mod tests {
                     size_bytes: 4096,
                     created_at: chrono::Utc::now(),
                     image_version: "t:1".into(),
+                    swap_manifest: None,
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
@@ -12207,6 +12223,7 @@ mod tests {
                 size_bytes: 4096,
                 created_at: chrono::Utc::now(),
                 image_version: "cold-base:1".into(),
+                swap_manifest: None,
                 disk_manifest: None,
                 memory_manifest: None,
                 base_memory_manifest: None,
@@ -13151,6 +13168,7 @@ mod tests {
                     size_bytes: self.payload.len() as u64,
                     created_at: chrono::Utc::now(),
                     image_version: "test:1".into(),
+                    swap_manifest: None,
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
@@ -13292,6 +13310,7 @@ mod tests {
                     size_bytes: self.payload.len() as u64,
                     created_at: chrono::Utc::now(),
                     image_version: "test:1".into(),
+                    swap_manifest: None,
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
@@ -13433,6 +13452,7 @@ mod tests {
                     size_bytes: self.payload.len() as u64,
                     created_at: chrono::Utc::now(),
                     image_version: "t".into(),
+                    swap_manifest: None,
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
@@ -13592,6 +13612,7 @@ mod tests {
                     size_bytes: 3,
                     created_at: chrono::Utc::now(),
                     image_version: "t".into(),
+                    swap_manifest: None,
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
@@ -13903,6 +13924,7 @@ mod tests {
             size_bytes: 0,
             created_at: chrono::Utc::now(),
             image_version: "test:1".into(),
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: Some(manifest_ref),
             base_memory_manifest: None,
@@ -14034,6 +14056,7 @@ mod tests {
             size_bytes: 0,
             created_at: chrono::Utc::now(),
             image_version: "test:1".into(),
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: Some(engram_core::types::manifest::ManifestRef::new()),
             base_memory_manifest: None,
@@ -15017,6 +15040,7 @@ mod tests {
                     size_bytes: 4096,
                     created_at: chrono::Utc::now(),
                     image_version: "test:1".into(),
+                    swap_manifest: None,
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,
@@ -15565,6 +15589,7 @@ mod tests {
             size_bytes: 4242,
             created_at: chrono::Utc::now(),
             image_version: "test-image:v1".into(),
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
@@ -15696,6 +15721,7 @@ mod tests {
                 size_bytes: self.payload.len() as u64,
                 created_at: chrono::Utc::now(),
                 image_version: "test:1".into(),
+                swap_manifest: None,
                 disk_manifest: None,
                 memory_manifest: None,
                 base_memory_manifest: None,
@@ -15953,6 +15979,7 @@ mod tests {
             aux_bundles: vec![],
             stage: crate::eviction_finalize::FinalizeStage::Captured,
             attempts: 0,
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
         };

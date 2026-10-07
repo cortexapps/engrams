@@ -1589,6 +1589,7 @@ impl HostAgent {
                             sandbox_id: r.sandbox_id,
                             image_version: r.image_version.clone(),
                             size_bytes: r.size_bytes,
+                            swap_manifest: r.swap_manifest,
                             disk_manifest: r.disk_manifest,
                             memory_manifest: r.memory_manifest,
                             aux_bundles: r.aux_bundles.clone(),

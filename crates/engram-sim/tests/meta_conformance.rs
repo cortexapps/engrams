@@ -547,6 +547,7 @@ fn snapshot(
         size_bytes: 0,
         created_at: at,
         last_accessed_at: at,
+        swap_manifest: None,
         disk_manifest: None,
         memory_manifest: None,
         recoverable,
@@ -6811,4 +6812,120 @@ conformance!(
 conformance!(
     teleport_fail_and_abort_are_fenced_test,
     teleport_fail_and_abort_are_fenced
+);
+
+/// Swap references survive every snapshot read and upsert. Only recoverable
+/// snapshots pin root and swap manifests; no row pins an unrelated manifest.
+async fn snapshot_swap_manifest(ctx: &Ctx) {
+    use engram_core::types::manifest::ManifestRef;
+    let meta = &ctx.meta;
+    let sid = meta
+        .create_session(spec("test.invalid/swap:latest"))
+        .await
+        .unwrap();
+    let mut row = snapshot(SnapshotId::new(), sid, ctx.clock.now_utc(), true);
+    let id = row.id;
+    meta.record_snapshot(row.clone()).await.unwrap();
+    assert_eq!(
+        meta.get_snapshot(id).await.unwrap().unwrap().swap_manifest,
+        None
+    );
+    let root = ManifestRef::new();
+    let swap = ManifestRef::new();
+    let orphan = ManifestRef::new();
+    row.disk_manifest = Some(root);
+    row.swap_manifest = Some(swap);
+    assert!(!meta.record_snapshot(row.clone()).await.unwrap());
+    assert_eq!(
+        meta.get_snapshot(id).await.unwrap().unwrap().swap_manifest,
+        Some(swap)
+    );
+    assert_eq!(
+        meta.latest_snapshot_for_session(sid)
+            .await
+            .unwrap()
+            .unwrap()
+            .swap_manifest,
+        Some(swap)
+    );
+    assert_eq!(
+        meta.list_snapshots_for_session(sid).await.unwrap()[0].swap_manifest,
+        Some(swap)
+    );
+    let refs = meta
+        .list_recoverable_snapshot_disk_manifests()
+        .await
+        .unwrap();
+    assert!(refs.contains(&(Some(root), Some(swap))));
+    assert!(!refs
+        .iter()
+        .flat_map(|(root, swap)| [*root, *swap])
+        .flatten()
+        .any(|r| r == orphan));
+    row.recoverable = false;
+    meta.record_snapshot(row.clone()).await.unwrap();
+    assert!(meta
+        .list_recoverable_snapshot_disk_manifests()
+        .await
+        .unwrap()
+        .is_empty());
+    row.recoverable = true;
+    row.disk_manifest = None;
+    meta.record_snapshot(row.clone()).await.unwrap();
+    assert_eq!(
+        meta.list_recoverable_snapshot_disk_manifests()
+            .await
+            .unwrap(),
+        vec![(None, Some(swap))]
+    );
+    row.swap_manifest = None;
+    meta.record_snapshot(row).await.unwrap();
+    assert_eq!(
+        meta.get_snapshot(id).await.unwrap().unwrap().swap_manifest,
+        None
+    );
+}
+conformance!(t_snapshot_swap_manifest, super::snapshot_swap_manifest);
+
+/// The typed store input cannot represent a half reference. Both stores reject
+/// its JSON form before a write; PG also rejects direct SQL that bypasses it.
+async fn snapshot_swap_pair_constraint(ctx: &Ctx) {
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/swap-pair:latest"))
+        .await
+        .unwrap();
+    let row = snapshot(SnapshotId::new(), sid, ctx.clock.now_utc(), true);
+    ctx.meta.record_snapshot(row.clone()).await.unwrap();
+    for partial in [
+        serde_json::json!({"manifest_id": uuid::Uuid::from_u128(123)}),
+        serde_json::json!({"version": 1}),
+    ] {
+        let mut raw = serde_json::to_value(&row).unwrap();
+        raw["swap_manifest"] = partial;
+        assert!(serde_json::from_value::<SnapshotRecord>(raw).is_err());
+    }
+    if let Some(db) = &ctx._pg {
+        for (id, version) in [(Some(uuid::Uuid::from_u128(123)), None), (None, Some(1i64))] {
+            let err = sqlx::query("UPDATE snapshots SET swap_manifest_id = $2, swap_manifest_version = $3 WHERE id = $1")
+                .bind(row.id.as_uuid()).bind(id).bind(version).execute(db.store.pool()).await.unwrap_err();
+            assert_eq!(
+                err.as_database_error().unwrap().constraint(),
+                Some("snapshots_swap_manifest_both_or_neither")
+            );
+        }
+    }
+    assert_eq!(
+        ctx.meta
+            .get_snapshot(row.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .swap_manifest,
+        None
+    );
+}
+conformance!(
+    t_snapshot_swap_pair_constraint,
+    super::snapshot_swap_pair_constraint
 );

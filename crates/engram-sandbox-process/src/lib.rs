@@ -873,6 +873,7 @@ impl SandboxBackend for ProcessBackend {
             image_version: manifest.image_version,
             // ProcessBackend doesn't write disks in ext4 form; chunked
             // storage doesn't apply here (the rootfs is a directory).
+            swap_manifest: None,
             disk_manifest: None,
             // No memory snapshot in ProcessBackend — there's no
             // guest RAM to capture.
@@ -2670,6 +2671,7 @@ mod tests {
             size_bytes: 0,
             created_at: chrono::Utc::now(),
             image_version: "test".into(),
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,

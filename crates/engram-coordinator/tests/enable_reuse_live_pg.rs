@@ -383,6 +383,7 @@ fn spawn_capture_job_simulator(
                     size_bytes: 4096,
                     created_at: Utc::now(),
                     image_version: "reuse-fixture".into(),
+                    swap_manifest: None,
                     disk_manifest: Some(capture_host.snapshot_disk_ref),
                     memory_manifest: None,
                     base_memory_manifest: None,

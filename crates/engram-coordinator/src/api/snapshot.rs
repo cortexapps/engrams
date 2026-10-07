@@ -282,6 +282,7 @@ pub(crate) async fn snapshot_core(
                     // ADR 0007: chunked manifests are the durability primitive.
                     // FC backends produce both fields via the PooledBackend wrap;
                     // VZ produces disk_manifest only; Process produces neither.
+                    swap_manifest: metadata.swap_manifest,
                     disk_manifest: metadata.disk_manifest,
                     memory_manifest: metadata.memory_manifest,
                     recoverable: false,
@@ -326,6 +327,7 @@ pub(crate) async fn snapshot_core(
                         st.services.blob.as_ref(),
                         metadata.disk_manifest.as_ref(),
                         metadata.memory_manifest.as_ref(),
+                        metadata.swap_manifest.as_ref(),
                     )
                     .await;
                     if recoverable {
@@ -1902,6 +1904,7 @@ async fn resume_from_fc_snapshot(
         image_version: record.image_version.clone(),
         base_memory_manifest,
         migration_source: None,
+        swap_manifest: record.swap_manifest,
         disk_manifest: effective_disk_manifest,
         memory_manifest: record.memory_manifest,
         // ADR 0028 cross-host recovery: a memory-bearing FC snapshot
@@ -2327,32 +2330,14 @@ pub async fn verify_snapshot_recoverable(
     blob: &(dyn BlobStorage + 'static),
     disk: Option<&ManifestRef>,
     memory: Option<&ManifestRef>,
+    swap: Option<&ManifestRef>,
 ) -> bool {
-    let mut any_present = false;
-    if let Some(r) = disk {
-        any_present = true;
-        match blob.head(&r.storage_key()).await {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    manifest_key = %r.storage_key(),
-                    error = %e,
-                    "disk manifest HEAD failed; snapshot recorded as not-recoverable"
-                );
-                return false;
-            }
-        }
-    }
-    if let Some(r) = memory {
-        any_present = true;
-        match blob.head(&r.storage_key()).await {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    manifest_key = %r.storage_key(),
-                    error = %e,
-                    "memory manifest HEAD failed; snapshot recorded as not-recoverable"
-                );
+    let any_present = disk.is_some() || memory.is_some();
+    for (kind, reference) in [("disk", disk), ("memory", memory), ("swap", swap)] {
+        if let Some(reference) = reference {
+            if let Err(error) = blob.head(&reference.storage_key()).await {
+                tracing::warn!(kind, manifest_key = %reference.storage_key(), %error,
+                    "manifest HEAD failed; snapshot recorded as not-recoverable");
                 return false;
             }
         }
@@ -2387,7 +2372,14 @@ async fn snapshot_artifacts_present(
     // portable state.bin + sidecar blobs the abort path deletes — the
     // 89f7984d failure was exactly "manifests survived, state/sidecar
     // did not, but the row still said recoverable=true".
-    if !verify_snapshot_recoverable(blob, record.disk_manifest.as_ref(), Some(memory)).await {
+    if !verify_snapshot_recoverable(
+        blob,
+        record.disk_manifest.as_ref(),
+        Some(memory),
+        record.swap_manifest.as_ref(),
+    )
+    .await
+    {
         return false;
     }
     for key in [
@@ -2434,7 +2426,7 @@ mod recoverable_tests {
         // Phase 2's contract: no manifests → reconcile flips to Dead
         // on sandbox loss, not Idle (no chunked artifact to resume).
         let (blob, _g) = make_blob();
-        let r = verify_snapshot_recoverable(blob.as_ref(), None, None).await;
+        let r = verify_snapshot_recoverable(blob.as_ref(), None, None, None).await;
         assert!(!r);
     }
 
@@ -2451,7 +2443,7 @@ mod recoverable_tests {
         blob.put(&mem.storage_key(), b"{}".to_vec().into())
             .await
             .unwrap();
-        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), Some(&mem)).await;
+        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), Some(&mem), None).await;
         assert!(r, "both manifests durable → recoverable=true");
     }
 
@@ -2460,7 +2452,7 @@ mod recoverable_tests {
         let (blob, _g) = make_blob();
         let disk = make_ref();
         // Don't seed; HEAD will fail.
-        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), None).await;
+        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), None, None).await;
         assert!(!r);
     }
 
@@ -2473,7 +2465,7 @@ mod recoverable_tests {
             .await
             .unwrap();
         // mem not seeded.
-        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), Some(&mem)).await;
+        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), Some(&mem), None).await;
         assert!(
             !r,
             "any missing manifest disqualifies recoverable (partial recovery is worse than Dead)"
@@ -2489,8 +2481,23 @@ mod recoverable_tests {
         blob.put(&disk.storage_key(), b"{}".to_vec().into())
             .await
             .unwrap();
-        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), None).await;
+        let r = verify_snapshot_recoverable(blob.as_ref(), Some(&disk), None, None).await;
         assert!(r, "disk-only snapshots are recoverable on cold-boot");
+    }
+
+    #[tokio::test]
+    async fn snapshot_swap_manifest_must_be_durable() {
+        let (blob, _guard) = make_blob();
+        let disk = make_ref();
+        let swap = make_ref();
+        blob.put(&disk.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        assert!(!verify_snapshot_recoverable(blob.as_ref(), Some(&disk), None, Some(&swap)).await);
+        blob.put(&swap.storage_key(), b"{}".to_vec().into())
+            .await
+            .unwrap();
+        assert!(verify_snapshot_recoverable(blob.as_ref(), Some(&disk), None, Some(&swap)).await);
     }
 
     fn make_record(
@@ -2506,6 +2513,7 @@ mod recoverable_tests {
             size_bytes: 0,
             created_at: chrono::Utc::now(),
             last_accessed_at: chrono::Utc::now(),
+            swap_manifest: None,
             disk_manifest: disk,
             memory_manifest: memory,
             recoverable: true,
@@ -3281,6 +3289,7 @@ mod resume_queue_fence_tests {
             size_bytes: 1,
             created_at: Utc::now(),
             last_accessed_at: Utc::now(),
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
             recoverable: true,

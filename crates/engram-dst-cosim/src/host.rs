@@ -1152,6 +1152,7 @@ impl CosimHost {
             aux_bundles,
             stage: FinalizeStage::Captured,
             attempts: 0,
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
         };

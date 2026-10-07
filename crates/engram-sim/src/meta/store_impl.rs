@@ -4757,8 +4757,16 @@ impl MetadataStore for SimMetadataStore {
 
     async fn list_recoverable_snapshot_disk_manifests(
         &self,
-    ) -> Result<Vec<ManifestRef>, MetaError> {
-        panic!("SimMeta: list_recoverable_snapshot_disk_manifests not implemented — add it plus a conformance case (ADR 0098 D4)")
+    ) -> Result<Vec<(Option<ManifestRef>, Option<ManifestRef>)>, MetaError> {
+        self.gate()?;
+        let mut refs = Vec::new();
+        for snapshot in self.db.lock().snapshots.values().filter(|s| s.recoverable) {
+            let pair = (snapshot.disk_manifest, snapshot.swap_manifest);
+            if !refs.contains(&pair) {
+                refs.push(pair);
+            }
+        }
+        Ok(refs)
     }
 
     async fn list_recoverable_snapshot_memory_manifests(

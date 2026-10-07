@@ -124,6 +124,7 @@ async fn generated_session_has_skills_and_browser_tooling() {
                 size_bytes: 0,
                 created_at: chrono::DateTime::UNIX_EPOCH,
                 image_version: "dev.local/process:latest".into(),
+                swap_manifest: None,
                 disk_manifest: None,
                 memory_manifest: None,
                 base_memory_manifest: None,

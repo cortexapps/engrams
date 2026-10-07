@@ -245,6 +245,21 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         }),
         _ => None,
     };
+    let swap_manifest_id: Option<Uuid> = row.try_get("swap_manifest_id").map_err(col_err)?;
+    let swap_manifest_version: Option<i64> =
+        row.try_get("swap_manifest_version").map_err(col_err)?;
+    let swap_manifest = match (swap_manifest_id, swap_manifest_version) {
+        (Some(manifest_id), Some(version)) => Some(engram_core::types::manifest::ManifestRef {
+            manifest_id,
+            version: version as u64,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(MetaError::Serialization(
+                "snapshots swap manifest pair is incomplete".into(),
+            ))
+        }
+    };
     let memory_manifest_id: Option<Uuid> = row.try_get("memory_manifest_id").map_err(col_err)?;
     let memory_manifest_version: Option<i64> =
         row.try_get("memory_manifest_version").map_err(col_err)?;
@@ -278,6 +293,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         created_at,
         last_accessed_at,
         disk_manifest,
+        swap_manifest,
         memory_manifest,
         recoverable,
         aux_bundles,

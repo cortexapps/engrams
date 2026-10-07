@@ -1,7 +1,7 @@
 //! ADR 0016 Phase C: chunk-GC pin-set collection.
 //!
 //! [`PinSet`] is the union of every chunk hash currently referenced
-//! by a live row in the metadata store. Six pin-set sources:
+//! by a live row in the metadata store. Eight pin-set sources:
 //!
 //! 1. `enabled_images.disk_manifest_*` — every chunked-disk enabled
 //!    image pins its base manifest's chunks.
@@ -24,13 +24,14 @@
 //!    `snapshots` row (only the warm overlay it seeds does), so
 //!    without this a live `cold_bases` row's chunks would be reaped
 //!    right out from under it.
+//! 8. `snapshots.swap_manifest_*` WHERE `recoverable=true` pins swap chunks.
 //!
 //! Sources 5 & 6 frequently dedup against #3/#4 (the base snapshot is
 //! usually still `recoverable`); their distinct value is keeping the
 //! memfile + rootfs pinned even if that flag is ever cleared while an
 //! enabled template still has live sharers.
 //!
-//! Each source returns a `Vec<ManifestRef>`; we dedup at the
+//! The root and swap snapshot refs share one query. We dedup at the
 //! `ManifestRef` level (a manifest referenced by both a session and
 //! a snapshot is fetched once), fetch the manifest JSON from the
 //! chunk store (bounded by a 16-permit semaphore), and fold
@@ -350,7 +351,7 @@ impl PinSet {
     }
 }
 
-/// Run the four list queries and dedup their results at the
+/// Run the pin-source list queries and dedup their results at the
 /// `ManifestRef` level. Returned set is the input to the manifest-
 /// fetch fan-out.
 async fn collect_manifest_refs(meta: &dyn MetadataStore) -> Result<HashSet<ManifestRef>, GcError> {
@@ -361,8 +362,9 @@ async fn collect_manifest_refs(meta: &dyn MetadataStore) -> Result<HashSet<Manif
     for r in meta.list_live_session_disk_manifest_ids().await? {
         refs.insert(r);
     }
-    for r in meta.list_recoverable_snapshot_disk_manifests().await? {
-        refs.insert(r);
+    for (disk, swap) in meta.list_recoverable_snapshot_disk_manifests().await? {
+        refs.extend(disk);
+        refs.extend(swap);
     }
     for r in meta.list_recoverable_snapshot_memory_manifests().await? {
         refs.insert(r);
@@ -418,6 +420,7 @@ mod tests {
         enabled: Vec<ManifestRef>,
         live: Vec<ManifestRef>,
         snap_disk: Vec<ManifestRef>,
+        snap_swap: Vec<ManifestRef>,
         snap_mem: Vec<ManifestRef>,
         // ADR 0022 sources #5 + #6.
         enabled_base_mem: Vec<ManifestRef>,
@@ -648,8 +651,13 @@ mod tests {
         }
         async fn list_recoverable_snapshot_disk_manifests(
             &self,
-        ) -> Result<Vec<ManifestRef>, MetaError> {
-            Ok(self.snap_disk.clone())
+        ) -> Result<Vec<(Option<ManifestRef>, Option<ManifestRef>)>, MetaError> {
+            Ok(self
+                .snap_disk
+                .iter()
+                .map(|r| (Some(*r), None))
+                .chain(self.snap_swap.iter().map(|r| (None, Some(*r))))
+                .collect())
         }
         async fn list_recoverable_snapshot_memory_manifests(
             &self,
@@ -704,6 +712,20 @@ mod tests {
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         let store = ChunkStore::new(blob);
         (store, dir)
+    }
+
+    #[tokio::test]
+    async fn snapshot_swap_pins_chunks_but_unreferenced_swap_is_collectable() {
+        let (store, _dir) = fresh_store();
+        let swap = seed_manifest(&store, &[b"swap-live"], ManifestKind::Disk).await;
+        seed_manifest(&store, &[b"swap-orphan"], ManifestKind::Disk).await;
+        let meta = PinSetMockMeta {
+            snap_swap: vec![swap],
+            ..Default::default()
+        };
+        let pins = PinSet::collect(&meta, &store).await.unwrap();
+        assert!(pins.contains(&crate::manifest::ChunkHash::of(b"swap-live")));
+        assert!(!pins.contains(&crate::manifest::ChunkHash::of(b"swap-orphan")));
     }
 
     #[tokio::test]

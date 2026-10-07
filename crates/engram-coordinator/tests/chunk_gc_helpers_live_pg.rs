@@ -46,6 +46,7 @@ async fn seed_base_snapshot(meta: &Arc<dyn MetadataStore>) -> SnapshotId {
         size_bytes: 0,
         created_at: Utc::now(),
         last_accessed_at: Utc::now(),
+        swap_manifest: None,
         disk_manifest: None,
         memory_manifest: None,
         recoverable: true,
@@ -264,6 +265,7 @@ async fn record_snapshot_bumps_chunk_generation() {
         size_bytes: 1024,
         created_at: Utc::now(),
         last_accessed_at: Utc::now(),
+        swap_manifest: None,
         disk_manifest: Some(ManifestRef {
             manifest_id: Uuid::new_v4(),
             version: 1,
@@ -293,6 +295,7 @@ async fn record_snapshot_bumps_chunk_generation() {
         size_bytes: 2048,
         created_at: Utc::now(),
         last_accessed_at: Utc::now(),
+        swap_manifest: None,
         disk_manifest: None,
         memory_manifest: None,
         recoverable: false,

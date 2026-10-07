@@ -126,6 +126,7 @@ impl HostClient for ScriptedHost {
             size_bytes: 1024,
             created_at: self.clock.now_utc(),
             image_version: "test".into(),
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,

@@ -1031,6 +1031,7 @@ pub(crate) async fn finalize_capture_job(
         state.services.blob.as_ref(),
         meta.disk_manifest.as_ref(),
         meta.memory_manifest.as_ref(),
+        meta.swap_manifest.as_ref(),
     )
     .await;
     if !recoverable {
@@ -1131,6 +1132,7 @@ pub(crate) async fn finalize_capture_job(
             last_accessed_at: now,
             // ADR 0035: pin the capture's bundle generations.
             aux_bundles: meta.aux_bundles.clone(),
+            swap_manifest: meta.swap_manifest,
             disk_manifest: meta.disk_manifest,
             memory_manifest: meta.memory_manifest,
             recoverable,

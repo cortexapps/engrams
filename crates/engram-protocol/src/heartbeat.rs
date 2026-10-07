@@ -125,6 +125,8 @@ pub struct CheckpointAdvert {
     pub image_version: String,
     pub size_bytes: u64,
     pub disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    #[serde(default)]
+    pub swap_manifest: Option<engram_core::types::manifest::ManifestRef>,
     pub memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
     /// ADR 0035 pins for this checkpoint's device model.
     #[serde(default)]

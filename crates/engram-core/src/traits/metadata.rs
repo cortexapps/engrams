@@ -2105,7 +2105,7 @@ pub trait MetadataStore: Send + Sync {
     }
 
     /// ADR 0016 Phase C: pin-set source #3 — every recoverable
-    /// snapshot's chunked-disk `ManifestRef` (id + version). Unlike
+    /// snapshot's root and swap `ManifestRef` pair (id + version). Unlike
     /// `list_live_disk_manifest_ids` (which returns Uuid-only for
     /// the `reap_materialize_dir` reaper), the pin-set query needs
     /// the version so `chunk_store.get_manifest` reads the exact
@@ -2117,10 +2117,10 @@ pub trait MetadataStore: Send + Sync {
     /// BlobStorage growing forever.
     ///
     /// Default `Ok(vec![])` keeps mocks quiet; PG override returns
-    /// DISTINCT (id, version) tuples wrapped as `ManifestRef`.
+    /// DISTINCT (root, swap) pairs of optional `ManifestRef` values.
     async fn list_recoverable_snapshot_disk_manifests(
         &self,
-    ) -> Result<Vec<ManifestRef>, MetaError> {
+    ) -> Result<Vec<(Option<ManifestRef>, Option<ManifestRef>)>, MetaError> {
         Ok(Vec::new())
     }
 

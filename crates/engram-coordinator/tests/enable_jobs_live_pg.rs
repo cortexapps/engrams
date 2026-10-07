@@ -562,6 +562,7 @@ async fn find_enabled_image_by_content_keys_on_disk_manifest_and_resources() {
         size_bytes: 0,
         created_at: Utc::now(),
         last_accessed_at: Utc::now(),
+        swap_manifest: None,
         disk_manifest: None,
         memory_manifest: None,
         recoverable: true,

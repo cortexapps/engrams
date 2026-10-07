@@ -252,6 +252,7 @@ async fn never_flushed_survivor_is_reserved_from_spec_and_binding() {
         size_bytes: chunk_size as u64,
         created_at: chrono::Utc::now(),
         image_version: "t".into(),
+        swap_manifest: None,
         disk_manifest: Some(disk_ref),
         memory_manifest: None,
         base_memory_manifest: None,

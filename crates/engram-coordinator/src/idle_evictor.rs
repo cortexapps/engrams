@@ -860,6 +860,7 @@ pub(crate) async fn run_evict_pipeline(
         created_at: metadata.created_at,
         last_accessed_at: now,
         // ADR 0007: chunked manifests are the durability primitive.
+        swap_manifest: metadata.swap_manifest,
         disk_manifest: metadata.disk_manifest,
         memory_manifest: metadata.memory_manifest,
         // ADR 0009 Phase 2: HEAD-verify the chunked manifests so
@@ -869,6 +870,7 @@ pub(crate) async fn run_evict_pipeline(
             state.services.blob.as_ref(),
             metadata.disk_manifest.as_ref(),
             metadata.memory_manifest.as_ref(),
+            metadata.swap_manifest.as_ref(),
         )
         .await,
         // ADR 0035: pin the generations this snapshot references.
@@ -2233,6 +2235,7 @@ mod tests {
                 size_bytes: 0,
                 created_at: chrono::Utc::now(),
                 last_accessed_at: chrono::Utc::now(),
+                swap_manifest: None,
                 disk_manifest: None,
                 memory_manifest: None,
                 recoverable: true,

@@ -294,6 +294,7 @@ async fn fenced_record_snapshot_writes_only_under_current_epoch() {
         size_bytes: 2048,
         created_at: chrono::Utc::now(),
         last_accessed_at: chrono::Utc::now(),
+        swap_manifest: None,
         disk_manifest: None,
         memory_manifest: None,
         recoverable,

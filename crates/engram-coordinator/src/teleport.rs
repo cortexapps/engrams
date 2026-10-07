@@ -420,6 +420,7 @@ mod steps {
                 image_version: durable
                     .as_ref()
                     .map_or_else(|| session.image.clone(), |s| s.image_version.clone()),
+                swap_manifest: None,
                 disk_manifest: presetup.disk_manifest_ref,
                 memory_manifest: Some(presetup.memory_manifest_ref),
                 base_memory_manifest: crate::api::snapshot::base_memory_manifest_for_image(
@@ -782,12 +783,14 @@ mod steps {
             size_bytes: metadata.size_bytes,
             created_at: metadata.created_at,
             last_accessed_at: ctx.state.services.clock.now_utc(),
+            swap_manifest: metadata.swap_manifest,
             disk_manifest: metadata.disk_manifest,
             memory_manifest: metadata.memory_manifest,
             recoverable: crate::api::snapshot::verify_snapshot_recoverable(
                 ctx.state.services.blob.as_ref(),
                 metadata.disk_manifest.as_ref(),
                 metadata.memory_manifest.as_ref(),
+                metadata.swap_manifest.as_ref(),
             )
             .await,
             aux_bundles: metadata.aux_bundles,
@@ -865,6 +868,7 @@ mod steps {
             size_bytes: snapshot.size_bytes,
             created_at: snapshot.created_at,
             image_version: snapshot.image_version,
+            swap_manifest: snapshot.swap_manifest,
             disk_manifest: snapshot.disk_manifest,
             memory_manifest: snapshot.memory_manifest,
             base_memory_manifest: crate::api::snapshot::base_memory_manifest_for_image(

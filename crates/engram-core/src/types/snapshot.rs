@@ -117,6 +117,9 @@ pub struct SnapshotMetadata {
     /// registry: the chunks are already durable and hash-addressed.
     #[serde(default)]
     pub peer_hints: Vec<String>,
+    /// Chunked swap device captured with this snapshot.
+    #[serde(default)]
+    pub swap_manifest: Option<super::manifest::ManifestRef>,
 }
 
 /// Persisted row in the `snapshots` table.
@@ -149,6 +152,9 @@ pub struct SnapshotRecord {
     /// after Phase 7 deletion landed.
     #[serde(default)]
     pub disk_manifest: Option<super::manifest::ManifestRef>,
+    /// Chunked swap device captured with this snapshot.
+    #[serde(default)]
+    pub swap_manifest: Option<super::manifest::ManifestRef>,
     /// ADR 0007 / Phase 5: chunked memory manifest. Set on FC
     /// snapshots whose host wraps the backend in a `PooledBackend`
     /// with a `ChunkStore` attached; `None` for backends that
