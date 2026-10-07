@@ -59,6 +59,15 @@ async fn swap_pages_survive_cross_host_snapshot() {
     let Some(busybox) = common::find_busybox() else {
         return;
     };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            "engram_host_agent=debug,engram_chunk_store=debug,engram_sandbox_firecracker=info",
+        )
+        .with_test_writer()
+        .try_init();
+    // The runner's disk can sit under the cache's default free floor; the
+    // live-teleport tests pin the same value.
+    std::env::set_var("ENGRAM_CHUNK_CACHE_FREE_FLOOR_PCT", "0.01");
     let agent = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/x86_64-unknown-linux-musl/release/engram-agentd");
     assert!(agent.exists(), "build static agentd before the NBD lane");
@@ -124,9 +133,11 @@ async fn swap_pages_survive_cross_host_snapshot() {
         swap_source: None,
         swap_manifest: None,
     };
-    let base = common::postcopy::base(&source, spec).await;
+    let base = timed("base capture", 120, common::postcopy::base(&source, spec)).await;
     assert!(base.swap_manifest.is_none(), "base must be swap-free");
-    let vm = source.restore_fresh(base, vec![]).await.unwrap();
+    let vm = timed("fresh restore", 90, source.restore_fresh(base, vec![]))
+        .await
+        .unwrap();
     source.bind_session(engram_core::SessionId::new(), vm);
     wait_for(&source, vm, "test $(wc -l < /proc/swaps) -eq 1", 20).await;
     source
@@ -174,13 +185,17 @@ async fn swap_pages_survive_cross_host_snapshot() {
         20,
     )
     .await;
-    let snapshot = source.snapshot(vm).await.unwrap();
+    let snapshot = timed("snapshot", 120, source.snapshot(vm)).await.unwrap();
     assert!(snapshot.swap_manifest.is_some());
-    source.destroy(vm).await.unwrap();
+    timed("source destroy", 30, source.destroy(vm))
+        .await
+        .unwrap();
     drop(source);
     let dest_work = tempfile::tempdir().unwrap();
     let dest = host(dest_work.path(), &kernel, &devices, &store);
-    let restored = dest.restore(snapshot).await.unwrap();
+    let restored = timed("restore on second host", 120, dest.restore(snapshot))
+        .await
+        .unwrap();
     wait_for(&dest, restored, "grep -q /dev/vdb /proc/swaps", 20).await;
     dest.start_agent(
         restored,
@@ -219,7 +234,18 @@ async fn swap_pages_survive_cross_host_snapshot() {
         20,
     )
     .await;
-    dest.destroy(restored).await.unwrap();
+    timed("dest destroy", 30, dest.destroy(restored))
+        .await
+        .unwrap();
+}
+
+/// Bound a phase so a hang names its step instead of hitting the lane's
+/// silent per-test timeout.
+async fn timed<T>(label: &str, secs: u64, fut: impl std::future::Future<Output = T>) -> T {
+    match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+        Ok(v) => v,
+        Err(_) => panic!("{label} did not finish within {secs}s"),
+    }
 }
 
 /// Poll a shell predicate inside the guest until it exits 0 (agentd
