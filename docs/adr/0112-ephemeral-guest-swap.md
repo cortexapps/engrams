@@ -566,3 +566,144 @@ appended per the bookend norm, the original body stands.
    beside `plan_capture_disk_drain` — ADR 0098 discipline), and the
    re-arm is cancellation-safe (a drop-guard fires the `swapon` on
    every capture exit, not just success).
+
+## Addendum (2026-10-07): swap becomes a chunked disk; D1 (raw file), D3 (disarm) and D7 (no live teleport) are superseded
+
+**Status: Proposed.** Lands as a PR series; this section flips to Accepted
+with the commit chain at the end.
+
+### Why
+
+The ADR 0123 teleport machine made live (post-copy) moves reachable, and
+every production image carries swap, so D7 refused every live move on the
+fleet. A first attempt (#1598, closed) kept the raw-file device and ran the
+D3 disarm inside the live capture. Two adversarial reviews found the same
+shape of defect on every path: swap ownership is handed between the disarm,
+the export, abort, unwind, agentd's bind-time arm and the destination's
+drain-done, and each handoff has a gap (a `swapoff` that times out or is
+cancelled leaves the source swapless; a refusal loops host retirement and
+leaks a parked destination; drain-done re-arms a session whose kill switch
+is set). The mechanism is explainable only to someone holding all of it in
+their head at once. That is the wrong design.
+
+The right design is the one the root disk already has. Swap is a block
+device. The root block device snapshots by draining and flushing its
+chunks, and post-copies by sealing the chunks dirtied since the last flush,
+serving them lazily to the destination's NBD overlay on first read, and
+draining the rest in the background, with the guest never paused for it.
+If the swap device is the same kind of device, every capture flavor and
+both teleport kinds carry its state with no swap-specific step, and the
+disarm, the re-arm guard, the fit planner, the held policy and the D7
+guard are deleted.
+
+### Decision
+
+**S1 — the swap drive is a second chunked NBD disk.** The FC `"swap"`
+drive keeps its id and its position in `state.bin`; only the canonical
+symlink's target changes, from a fresh sparse file to a `/dev/nbdM` the
+host disk daemon serves (the same re-point the root drive already uses
+through `rootfs_source`). `SandboxSpec` gains `swap_source: Option<PathBuf>`
+and `swap_manifest: Option<ManifestRef>` (bincode; lockstep wire bump).
+`create_sparse_swap_backing`, `SwapBackingGuard`, the unlink-after-attach
+and the destroy unlink go away. Firecracker needs nothing: `DriveConfig`
+has no cache or io_engine field, and no new virtio device is added.
+
+**S2 — one `NbdSandboxState` per device.** `nbd_sandboxes` holds
+`{ root, swap: Option<_> }` per sandbox. Every site that assumed one device
+(capture drain and the RefuseUntracked guard, SIGTERM flush, abandon, the
+spool, rehydrate, the startup slot classifier, destroy's dirty-file
+removal, the resume dead-plane gate, `CaptureUnwind`, the DST device plane)
+iterates the pair. The dirty file for swap is `<id>.swap.cache` and the
+reaper's name parser learns it. Owner records are already keyed by device.
+A swap-enabled sandbox takes two NBD slots; `nbdsMax` doubles in the chart
+(a module reload, so a node recreate), and placement starts counting free
+slots as a capacity dimension so exhaustion is `NoFit`, not the ADR 0049
+acquire wedge.
+
+**S3 — post-copy carries a device id.** `MigrationItem::DiskSealInfo` and
+`DiskChunkAt` gain a `device` (`root | swap`), as do the seal files, the
+export's seal map, the destination fetcher, the poller (one overlay and one
+`BLKFLSBUF` per device before `state.bin` lands), `await_disk_drain` (joins
+both) and abort's requeue. The D7 guard in `migration_presetup` is deleted.
+The source RAM cost of the seal is bounded by the swap size; the seal of a
+disk that is never flushed is its whole dirty tier, which is why S4 flushes
+swap.
+
+**S4 — durability: local during residence, durable at capture.** The swap
+backend attaches on `Manifest::empty(Disk, swap_mib << 20)` with no flush
+scheduler (the "flushless attach"), so during residence its chunks live
+only in the host dirty file (ADR 0110 recovery mode keeps them across a
+host-agent restart). At capture, `flush_local` under the pause and
+`flush_upload` after resume run for both devices and the snapshot row
+gains `swap_manifest_{id,version}` (both-or-neither CHECK, mirroring
+migration 0018); the snapshot pins it for GC. A session row carries no
+live swap manifest, so the live-manifest publisher needs no second entry.
+Only allocated extents are chunked, so an idle swap costs nothing.
+
+**S5 — D6 restated.** Swap bytes are guest memory. The memory image already
+persists the same plaintext to the chunk store under the same encryption
+at rest, and post-copy already carries guest RAM over the peer channel.
+Swap chunks get exactly that posture: at rest only inside a snapshot the
+session owns, GC'd with it, never shared across sessions (the manifest is
+forked per sandbox like the root's), in transit only host to host. "Never
+leaves the host" is replaced by "the same posture as guest RAM".
+
+**S6 — D3 is no longer an invariant anyone maintains.** A restorable
+memory image may contain swap PTEs because the device they point at is
+restored with it: the snapshot's `swap_manifest` attaches before the load,
+exactly as the root does. The capture-time disarm, `SwapRearmGuard`,
+`spawn_swap_rearm`, `plan_swap_disarm` (the whole `engram-host-core::swap`
+module), the periodic-checkpoint refusal and skip counters, and the two
+disarm metrics are deleted. `held_swap_policy` is only a "hold in
+progress" flag after that and is replaced by a check on `held_snapshots`.
+
+**S7 — agentd arms only an unformatted, inactive device.** `arm_inner`
+keeps its "already active" skip and additionally never runs `mkswap` when
+`/proc/swaps` cannot be read or the device already carries a swap
+signature; a restored guest finds its swap active and the bind-time arm is
+a no-op. Base-capture VMs do not arm swap, so a base snapshot carries no
+swap state and every fresh create attaches a blank forked device that the
+first bind formats. The kill switch keeps its bind-time `swapoff`.
+
+**S8 — the ledger counts swap once.** `committed_swap_mib` goes; the
+dirty-files walk already counts the swap dirty file's blocks, and
+`host_disk_floor_ok` reads that. The placement memory ledger is unchanged
+(D8 stands).
+
+### What this costs
+
+- Swap-in through NBD adds roughly 100 µs per page over a page-cache read
+  (D1's figure, to be measured on the dev VM before the roll). Swap-in is
+  already the slow path and `page-cluster=0` keeps it per page.
+- Host page cache double-buffers swap bytes (the D1 non-goal), bounded by
+  the swap size per guest and reclaimable.
+- Two NBD slots per swap-enabled guest.
+- A capture uploads used swap (allocated extents only). A 6 GiB device
+  with 200 MiB in use uploads 200 MiB.
+
+### Superseded text
+
+D1 (the raw sparse file and its four objections: the `remove_on_drop`
+corruption class is closed by ADR 0110's recovered dirty files, slot
+density is a chart value plus a placement dimension, the one-device
+assumptions are S2, the latency is the cost above), D3 (the disarm), D6
+(restated in S5), D7 (lifted), implementation notes 3, 4, 5 and 9 (the
+disarm ladder and its guard), and the "Teleport: guarded" and
+"Host death: the file dies with the host" rows of the lifecycle table
+(swap now follows the root disk's row in both).
+
+### Phases
+
+1. **S2** (host): per-device NBD state and every one-device site, with the
+   DST device plane, behind no behavior change (swap still raw). KVM tests
+   for two devices through capture, SIGTERM, rehydrate and destroy.
+2. **S1 + S4 + S7 + S8** (host, agentd, coordinator, PG): the swap drive
+   on NBD, flushless attach, `swap_manifest` through snapshot rows and
+   GC, agentd's arm rule, the ledger. The snapshot KVM lane proves a
+   paged-out sentinel survives capture → restore on another host.
+3. **S3 + S6** (host, coordinator): device-tagged post-copy, the D7 guard
+   and the whole disarm machinery deleted. The two-host KVM lane proves a
+   paged-out sentinel survives a live move, and `/proc/swaps` is active
+   on the destination with no re-arm.
+4. Chart `nbdsMax`, node recreate, measurement of swap-in latency and the
+   capture upload cost on the dev VM, then the fleet roll.
