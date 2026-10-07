@@ -773,7 +773,7 @@ bundles-squashfs: dev-link-shared
         # re-fires id-stable, the MCP bridge serves the stash) and the
         # steering behavior (`python3 scripts/claude-steer-probe.py` must
         # report STEER — ADR 0052 2026-08-20 update).
-        CLAUDE_VERSION=2.1.228
+        CLAUDE_VERSION=2.1.285
         case "$(uname -m)" in
             arm64 | aarch64) htarget=aarch64-unknown-linux-musl; carch=linux-arm64 ;;
             x86_64 | amd64)  htarget=x86_64-unknown-linux-musl;   carch=linux-x64  ;;
