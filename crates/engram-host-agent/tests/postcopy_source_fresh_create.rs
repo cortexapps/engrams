@@ -148,7 +148,9 @@ impl TestEnv {
         let fork_bin = match std::env::var("ENGRAM_FC_FORK_BIN") {
             Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
             _ => {
-                eprintln!("SKIP: ENGRAM_FC_FORK_BIN not set (the vmstate-only capture is fork-only)");
+                eprintln!(
+                    "SKIP: ENGRAM_FC_FORK_BIN not set (the vmstate-only capture is fork-only)"
+                );
                 return None;
             }
         };
@@ -167,14 +169,12 @@ impl TestEnv {
             );
             return None;
         }
-        for bin in ["mksquashfs"] {
-            let missing = std::env::var_os("PATH")
-                .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
-                .unwrap_or(true);
-            if missing {
-                eprintln!("SKIP: {bin} not on PATH");
-                return None;
-            }
+        let mksquashfs_missing = std::env::var_os("PATH")
+            .map(|p| !std::env::split_paths(&p).any(|d| d.join("mksquashfs").is_file()))
+            .unwrap_or(true);
+        if mksquashfs_missing {
+            eprintln!("SKIP: mksquashfs not on PATH");
+            return None;
         }
         let Some(busybox) = common::find_busybox() else {
             eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
