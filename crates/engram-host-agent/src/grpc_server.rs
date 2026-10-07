@@ -434,6 +434,7 @@ impl HostService for HostServiceImpl {
                     Err(_) => return Err(Status::invalid_argument("unknown disk role")),
                 };
                 match Kind::try_from(item.kind) {
+                    Ok(Kind::HotHint) => Ok(engram_core::types::snapshot::MigrationItem::HotHint),
                     Ok(Kind::StateBin) => Ok(engram_core::types::snapshot::MigrationItem::StateBin),
                     Ok(Kind::DiskSealInfo) => Ok(
                         engram_core::types::snapshot::MigrationItem::DiskSealInfo(role),

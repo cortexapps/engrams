@@ -43,6 +43,7 @@ pub mod harness;
 pub mod host_client;
 pub mod migrate_peer;
 pub mod migration;
+pub mod page_idle;
 pub mod peer_fill;
 pub mod session_epochs;
 pub mod substrate_server;

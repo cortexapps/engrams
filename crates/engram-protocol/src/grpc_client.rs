@@ -441,6 +441,11 @@ impl GrpcHostClient {
         let wire_items = items
             .into_iter()
             .map(|item| match item {
+                engram_core::types::snapshot::MigrationItem::HotHint => MigrationItem {
+                    kind: Kind::HotHint as i32,
+                    chunk_idx: 0,
+                    role: crate::grpc::DiskRole::Root as i32,
+                },
                 engram_core::types::snapshot::MigrationItem::StateBin => MigrationItem {
                     kind: Kind::StateBin as i32,
                     chunk_idx: 0,

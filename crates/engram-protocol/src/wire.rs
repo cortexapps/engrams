@@ -170,7 +170,8 @@ use serde::{Deserialize, Serialize};
 // the same snapshot with an untyped error, which the resume verb counts toward
 // the Dead budget instead of recovering from disk.
 // v36 gates page-channel v6 fault windows for a lockstep host roll.
-pub const WIRE_VERSION: u32 = 36;
+// v37 appends HostCapabilities.page_idle and the optional MigrationItem::HotHint.
+pub const WIRE_VERSION: u32 = 37;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

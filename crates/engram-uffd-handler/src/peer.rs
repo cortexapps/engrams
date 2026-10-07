@@ -165,6 +165,8 @@ pub fn fault_window(
 /// Drain accounting (rides `ToSource::DrainDone` + the control sock).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DrainStats {
+    pub hot_hint_received: bool,
+    pub hot_leading: u64,
     pub pulled: u64,
     pub alt_sourced: u64,
     pub zero_chunks: u64,

@@ -113,12 +113,55 @@ impl WorkingSetRecorder {
     }
 }
 
+/// Capture-time migration traces arrive after the peer seal. The handler must
+/// never wait for them in the drain. Call only from an independent hint task.
+pub async fn load_migration_trace(path: &std::path::Path) -> std::io::Result<WorkingSetTrace> {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            match tokio::fs::read(path).await {
+                Ok(bytes) => return serde_json::from_slice(&bytes).map_err(std::io::Error::other),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "capture-time trace did not arrive",
+        )
+    })?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn h(byte: u8) -> ChunkHash {
         ChunkHash::of(&[byte])
+    }
+
+    #[tokio::test]
+    async fn migration_trace_reports_read_and_parse_failures_to_hint_task_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hint");
+        tokio::fs::write(&path, b"invalid").await.unwrap();
+        assert!(load_migration_trace(&path).await.is_err());
+        assert!(load_migration_trace(dir.path()).await.is_err());
+        tokio::fs::remove_file(&path).await.unwrap();
+        let pending = load_migration_trace(&path);
+        tokio::pin!(pending);
+        assert!(tokio::time::timeout(Duration::from_millis(5), &mut pending)
+            .await
+            .is_err());
+        let trace = WorkingSetTrace::new(0, 0, chrono::DateTime::UNIX_EPOCH);
+        tokio::fs::write(&path, serde_json::to_vec(&trace).unwrap())
+            .await
+            .unwrap();
+        assert!(pending.await.unwrap().chunks.is_empty());
     }
 
     #[test]

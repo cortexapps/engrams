@@ -395,6 +395,7 @@ message MigrationItem {
     STATE_BIN = 1;
     DISK_SEAL_INFO = 4;
     DISK_CHUNK_AT = 5;
+    HOT_HINT = 6;
   }
   reserved 2;
   reserved "hash";

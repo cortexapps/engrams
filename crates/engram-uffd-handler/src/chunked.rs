@@ -154,6 +154,7 @@ impl PositionalManifest {
 pub struct ChunkedMemoryBackend {
     canonical: PositionalManifest,
     session: PositionalManifest,
+    session_positions: std::collections::HashMap<ChunkHash, Vec<u64>>,
     /// ADR 0075: the READ-ONLY view of the shared cache dir. The
     /// handler cannot mutate the directory by construction.
     reader: ChunkCacheReader,
@@ -238,9 +239,19 @@ impl ChunkedMemoryBackend {
                 canonical.total_bytes, session.total_bytes
             )));
         }
+        let mut session_positions = std::collections::HashMap::<ChunkHash, Vec<u64>>::new();
+        for (idx, hash) in session.chunks.iter().enumerate() {
+            if let Some(hash) = hash {
+                session_positions
+                    .entry(*hash)
+                    .or_default()
+                    .push(idx as u64 * session.chunk_size);
+            }
+        }
         Ok(Self {
             canonical,
             session,
+            session_positions,
             reader,
             populate,
             store,
@@ -504,20 +515,13 @@ impl ChunkedMemoryBackend {
     /// names a chunk hash, the runtime asks "where does the session
     /// place this chunk?" and pre-installs it at each position.
     ///
-    /// Linear scan over `chunks` because the chunked manifest is
-    /// typically small (≤8192 entries for a 4 GiB / 512 KiB layout)
-    /// and the prefault path runs once per restore, before vCPUs
-    /// unfreeze — not a hot loop.
+    /// Built once at load, so ordering a large hot set is linear in the
+    /// number of returned positions instead of trace length times RAM size.
     pub fn session_positions_of(&self, hash: ChunkHash) -> Vec<u64> {
-        self.session
-            .chunks
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, entry)| match entry {
-                Some(h) if *h == hash => Some((idx as u64) * self.session.chunk_size),
-                _ => None,
-            })
-            .collect()
+        self.session_positions
+            .get(&hash)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -552,6 +556,32 @@ mod fallback_tests {
         let r = ManifestRef::new();
         store.put_manifest(r, m).await.unwrap();
         r
+    }
+
+    #[tokio::test]
+    async fn hash_index_keeps_all_positions_in_offset_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob.clone());
+        let mut manifest = mem_manifest(4 * 4096, 4096, 3);
+        let repeated = manifest.chunks[0].hash;
+        manifest.chunks[2].hash = repeated;
+        manifest.chunks.remove(1); // sparse zero chunk has no hash
+        let r = put(&store, &manifest).await;
+        let (backend, _) = ChunkedMemoryBackend::build_with_canonical_fallback(
+            r,
+            r,
+            None,
+            blob,
+            &dir.path().join("cache"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(backend.session_positions_of(repeated), vec![0, 8192]);
+        assert!(backend
+            .session_positions_of(ChunkHash::of(b"absent"))
+            .is_empty());
     }
 
     /// #1066: a session whose layout predates a guest resize must fail
