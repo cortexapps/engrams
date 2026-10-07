@@ -1462,7 +1462,7 @@ jobs:
           # STEER — ADR 0052 2026-08-20 update; needs model credentials, so
           # it runs on the bumper's machine, not here). Keep in lockstep with
           # the justfile and bake-images.yml.
-          CLAUDE_VERSION=2.1.228
+          CLAUDE_VERSION=2.1.285
           curl -fsSL --retry 3 \
             "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
             -o /tmp/claude
@@ -1522,7 +1522,7 @@ jobs:
           # Three files (binary + binary + 200-byte toml); leave
           # compression default.
 
-      - name: Download and stage Codex CLI 0.146.0
+      - name: Download and stage Codex CLI 0.161.0
         id: stage_codex
         run: |
           set -euo pipefail
