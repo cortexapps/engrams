@@ -472,6 +472,7 @@ impl QueueOrigin {
 /// boot the session for the delivery driver to forward it.
 #[derive(Clone, Debug)]
 pub struct QueuedSession {
+    pub nbd_slot_need: u32,
     pub session: Session,
     pub origin: QueueOrigin,
     pub mem_budget_mib: i64,

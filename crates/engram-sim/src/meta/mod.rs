@@ -138,6 +138,7 @@ use engram_core::{HostId, SessionId, SnapshotId};
 /// keeps that the domain type doesn't carry.
 #[derive(Clone, Debug)]
 pub struct SessRow {
+    pub nbd_slot_need: u32,
     pub session: Session,
     pub mem_budget_mib: i64,
     pub cpu_budget_vcpus: i32,

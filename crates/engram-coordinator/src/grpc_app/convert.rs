@@ -418,6 +418,8 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         cordoned,
         cordon_owner,
         retirement,
+        nbd_slots_total,
+        nbd_slots_in_use,
         allocatable_mib,
         reserved_mib,
         free_mib,
@@ -457,6 +459,8 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
             .map(|o| o.as_str().to_owned())
             .unwrap_or_default(),
         retirement: retirement.as_ref().map(retirement_to_proto),
+        nbd_slots_total: *nbd_slots_total,
+        nbd_slots_in_use: *nbd_slots_in_use,
         allocatable_mib: *allocatable_mib,
         reserved_mib: *reserved_mib,
         free_mib: *free_mib,

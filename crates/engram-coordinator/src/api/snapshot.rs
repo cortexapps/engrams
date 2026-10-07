@@ -1165,6 +1165,7 @@ async fn resume_disk_only_cold_boot(
     spec.rootfs_manifest = session.live_disk_manifest;
     let (repo, tag) = engram_core::types::session::split_image_ref(&session.image);
     let context = crate::placement::ScheduleContext {
+        nbd_slot_need: 1 + u32::from(spec.swap_mib.unwrap_or(0) > 0),
         repo,
         image_version: tag,
         snapshot_host: None,
@@ -1678,6 +1679,7 @@ async fn resume_from_fc_snapshot(
     let resume_budget =
         crate::boot_materializer::resolve_resume_budget(&state.services.meta, &session).await;
     let ctx = ScheduleContext {
+        nbd_slot_need: 1 + u32::from(record.swap_manifest.is_some()),
         repo: image_repo,
         image_version: image_tag,
         // ADR 0078: authoritative affinity — the host that holds this

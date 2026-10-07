@@ -128,6 +128,16 @@ pub const HOST_DISK_CACHE_FLOOR_MIB: u64 = HOST_DISK_CACHE_FLOOR_BYTES / (1024 *
 /// UI renders an empty bar rather than failing.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HostUtilization {
+    /// NBD capacity. Zero means the host uses file-backed disks.
+    #[serde(default)]
+    pub nbd_slots_total: u32,
+    /// Claimed slots, including quarantined devices.
+    #[serde(default)]
+    pub nbd_slots_in_use: u32,
+    /// Attached device counts included in the slot sample, by sandbox.
+    /// Placement reserves the remaining need, including a partial attach.
+    #[serde(default)]
+    pub nbd_sandboxes: std::collections::HashMap<super::ids::SandboxId, u32>,
     /// Total / used bytes (MiB) of the host's work_dir filesystem —
     /// the mount that holds the chunk cache, jails, and FC memory
     /// dumps. `statvfs(2)`; available on Linux and macOS.
@@ -496,12 +506,14 @@ pub struct HostHeartbeat {
     pub lease_renew_until: Option<DateTime<Utc>>,
 }
 
-/// ADR 0048: per-host reserved budget across BOTH placement dimensions —
+/// Per-host reserved memory, CPU, and NBD device budgets.
 /// Σ over the memory-reserving session states of `mem_budget_mib` and
 /// `cpu_budget_vcpus`. The read-side twin of `reserve_placement`'s
 /// in-transaction aggregate, for the resume/evac picker and the fleet view.
+/// NBD slots exclude devices already in the heartbeat count.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReservedBudget {
+    pub nbd_slots: i64,
     pub mem_mib: i64,
     pub vcpus: i64,
 }

@@ -51,6 +51,8 @@ pub enum DisableEnabledImageOutcome {
 /// to commit in a single transaction, before any host RPC.
 #[derive(Clone, Debug)]
 pub struct SessionCreateWriteSet {
+    /// One root slot plus one slot when swap is enabled.
+    pub nbd_slot_need: u32,
     pub session_id: SessionId,
     pub spec: SessionSpec,
     pub mem_budget_mib: i64,
@@ -80,7 +82,7 @@ pub struct SessionCreateWriteSet {
 
 /// One candidate host's fit verdict from
 /// [`MetadataStore::placement_no_fit_details`]. `reason` is a bounded
-/// vocabulary (metric-label safe): `ram_full` / `cpu_full` /
+/// vocabulary (metric-label safe): `nbd_slots` / `ram_full` / `cpu_full` /
 /// `unmeasured` (no allocatable measurement yet) / `not_lockable`
 /// (status/cordon changed between ranking and the pick) / `fits_now`
 /// (freed up since the failed pick — indicates a race, not a bug).
@@ -330,6 +332,7 @@ pub trait MetadataStore: Send + Sync {
         _candidates: &[HostId],
         _mem_budget_mib: i64,
         _cpu_budget_vcpus: i32,
+        _nbd_slot_need: u32,
     ) -> Result<Vec<PlacementNoFit>, MetaError> {
         Ok(Vec::new())
     }

@@ -361,6 +361,9 @@ mod tests {
     fn utilization_round_trips_through_json() {
         let mut original = sample();
         original.utilization = engram_core::types::host::HostUtilization {
+            nbd_slots_total: 128,
+            nbd_slots_in_use: 37,
+            nbd_sandboxes: Default::default(),
             disk_total_mib: 102_400,
             disk_used_mib: 81_920,
             mem_total_mib: 32_768,
@@ -375,6 +378,8 @@ mod tests {
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.utilization.nbd_slots_total, 128);
+        assert_eq!(back.utilization.nbd_slots_in_use, 37);
         assert_eq!(back.utilization.disk_total_mib, 102_400);
         assert_eq!(back.utilization.disk_used_mib, 81_920);
         assert_eq!(back.utilization.mem_total_mib, 32_768);
@@ -495,6 +500,7 @@ mod tests {
                 epoch: 2,
                 stage: CaptureJobStage::Warming,
                 progress: Some(CaptureJobProgress {
+                    sandbox_id: None,
                     detail: Some("install-deps".into()),
                     log_tail: Some("Successfully installed foo-1.2.3".into()),
                     // ADR 0088 addendum: the capture timeline rides the

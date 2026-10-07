@@ -34,6 +34,7 @@ use crate::host_registry::HostRegistry;
 /// the backing store moved from the in-memory mirror to the hosts rows.)
 #[derive(Clone, Debug)]
 pub struct ScheduleContext<'a> {
+    pub nbd_slot_need: u32,
     pub repo: &'a str,
     pub image_version: &'a str,
     /// ADR 0078 (GCS-free resume) tier-0 authoritative affinity: the host
@@ -543,7 +544,16 @@ pub fn pick_from(
     pick_from_2d(hosts, reserved, ctx, now, ttl, false)
 }
 
-/// The ranked 2D pick, with an explicit `require_fit` knob.
+fn nbd_slots_fit(h: &HostRecord, reserved: &HashMap<HostId, ReservedBudget>, need: u32) -> bool {
+    h.utilization.nbd_slots_total == 0
+        || i64::from(h.utilization.nbd_slots_total)
+            - i64::from(h.utilization.nbd_slots_in_use)
+            - reserved.get(&h.id).map(|r| r.nbd_slots).unwrap_or(0)
+            >= i64::from(need)
+}
+
+/// The ranked RAM/CPU pick, with an explicit `require_fit` knob.
+/// NBD slot capacity is a hard gate in every mode.
 ///
 /// `require_fit=false` (the historical `pick_from` behavior) keeps the
 /// ADR 0046 capacity-SOFT last-resort fallback: when nothing fits both
@@ -573,6 +583,17 @@ pub fn pick_from_2d(
             Some(d) => Err(PickError::ImageNotReady(d.clone())),
             None => Err(PickError::NoCapacity),
         };
+    }
+    // Slots are a hard gate, including affinity and unmeasured-RAM hosts.
+    let slot_hosts: Vec<_> = hosts
+        .iter()
+        .filter(|h| nbd_slots_fit(h, reserved, ctx.nbd_slot_need))
+        .cloned()
+        .collect();
+    let hosts = slot_hosts.as_slice();
+    let ranked = rank_hosts(hosts, ctx, now, ttl);
+    if ranked.hosts.is_empty() {
+        return Err(PickError::NoCapacity);
     }
     let need_mib = ctx.memory_mib.unwrap_or(0) as i64;
     let need_vcpus = ctx.cpu_budget_vcpus.unwrap_or(0) as i64;
@@ -803,6 +824,9 @@ pub async fn placement_preview(
             return false;
         };
         let alloc = h.utilization.allocatable_mib as i64;
+        if !nbd_slots_fit(h, &reserved, ctx.nbd_slot_need) {
+            return false;
+        }
         if alloc <= 0 {
             return true; // unmeasured → soft fallback fits
         }
@@ -907,7 +931,12 @@ pub async fn log_reserve_no_fit(
 ) -> Vec<(HostId, String)> {
     let mut summary: Vec<(HostId, String)> = Vec::new();
     match meta
-        .placement_no_fit_details(candidates, mem_budget_mib, cpu_budget_vcpus)
+        .placement_no_fit_details(
+            candidates,
+            mem_budget_mib,
+            cpu_budget_vcpus,
+            ctx.nbd_slot_need,
+        )
         .await
     {
         Ok(details) => {
@@ -1020,6 +1049,7 @@ pub async fn pick_specific_host(
     registry: &HostRegistry,
     host_id: HostId,
     exclude_host: Option<HostId>,
+    nbd_slot_need: u32,
     now: DateTime<Utc>,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
     if Some(host_id) == exclude_host {
@@ -1039,6 +1069,9 @@ pub async fn pick_specific_host(
     // gates (`needs_uffd_substrate`/`fc_snapshot_version`), which stay
     // soft for an explicit pin.
     if host_meets_capabilities(h, &CapabilityRequirements::default()).is_err() {
+        return Err(PickError::NoCapacity);
+    }
+    if !nbd_slots_fit(h, &reserved, nbd_slot_need) {
         return Err(PickError::NoCapacity);
     }
     let alloc = h.utilization.allocatable_mib as i64;
@@ -1728,8 +1761,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn nbd_slots_are_hard_even_for_affinity_and_soft_fallback() {
+        let mut h = host(1);
+        h.utilization.nbd_slots_total = 2;
+        h.utilization.nbd_slots_in_use = 1;
+        let mut c = ctx();
+        c.nbd_slot_need = 2;
+        c.snapshot_host = Some(h.id);
+        c.prefer_host = Some(h.id);
+        let mut reserved = HashMap::new();
+        for require_fit in [false, true] {
+            assert!(
+                pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, require_fit).is_err()
+            );
+        }
+        c.nbd_slot_need = 1;
+        assert_eq!(
+            pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).unwrap(),
+            h.id
+        );
+        reserved.insert(
+            h.id,
+            ReservedBudget {
+                nbd_slots: 1,
+                ..Default::default()
+            },
+        );
+        assert!(pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).is_err());
+        h.utilization.nbd_slots_total = 0;
+        assert_eq!(
+            pick_from_2d(&[h.clone()], &reserved, &c, Utc::now(), TTL, false).unwrap(),
+            h.id
+        );
+    }
+
     fn ctx<'a>() -> ScheduleContext<'a> {
         ScheduleContext {
+            nbd_slot_need: 1,
             repo: "r",
             image_version: "v",
             snapshot_host: None,
@@ -1748,7 +1817,16 @@ mod tests {
     fn mem_reserved(entries: &[(HostId, i64)]) -> HashMap<HostId, ReservedBudget> {
         entries
             .iter()
-            .map(|&(id, mem_mib)| (id, ReservedBudget { mem_mib, vcpus: 0 }))
+            .map(|&(id, mem_mib)| {
+                (
+                    id,
+                    ReservedBudget {
+                        mem_mib,
+                        vcpus: 0,
+                        nbd_slots: 0,
+                    },
+                )
+            })
             .collect()
     }
 
@@ -1977,6 +2055,7 @@ mod tests {
             (
                 hid(1),
                 ReservedBudget {
+                    nbd_slots: 0,
                     mem_mib: 0,
                     vcpus: 32,
                 },
@@ -1984,6 +2063,7 @@ mod tests {
             (
                 hid(2),
                 ReservedBudget {
+                    nbd_slots: 0,
                     mem_mib: 0,
                     vcpus: 0,
                 },

@@ -80,6 +80,8 @@ impl std::fmt::Display for CaptureJobStage {
 /// `warming`, a chunking/upload detail during `freezing`, etc.).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CaptureJobProgress {
+    #[serde(default)]
+    pub sandbox_id: Option<super::ids::SandboxId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     /// Rolling tail of the stage's log/hook output (UTF-8-lossy),

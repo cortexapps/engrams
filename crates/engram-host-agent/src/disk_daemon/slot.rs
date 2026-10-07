@@ -447,6 +447,7 @@ pub struct NbdSlotAllocator {
     /// Total universe size — constant after construction, so kept out
     /// of the mutex for a lock-free `capacity()`.
     capacity: usize,
+    claimed: std::sync::atomic::AtomicU32,
     free_check: FreeCheck,
     /// Devices parked by [`NbdSlot::quarantine`] — the allocator's record
     /// of `Parked` slots, which the reserved bitset alone cannot express
@@ -531,6 +532,7 @@ impl NbdSlotAllocator {
             warm: Mutex::new(VecDeque::with_capacity(warm_target)),
             warm_target,
             capacity,
+            claimed: std::sync::atomic::AtomicU32::new(0),
             free_check,
             parked: std::sync::Mutex::new(std::collections::HashSet::new()),
         });
@@ -547,6 +549,12 @@ impl NbdSlotAllocator {
         self.capacity
     }
 
+    /// Claimed slots, including parked devices. Warm slots and the
+    /// populator's validation window do not consume placement capacity.
+    pub fn in_use(&self) -> u32 {
+        self.claimed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Wait for + claim a free slot. Pops a pre-validated slot off the
     /// warm pool (O(1), no syscall). If the warm pool is momentarily
     /// empty (a burst outran the populator), re-polls until one is
@@ -554,6 +562,8 @@ impl NbdSlotAllocator {
     pub async fn acquire(self: &Arc<Self>) -> NbdSlot {
         loop {
             if let Some(slot) = self.warm.lock().await.pop_front() {
+                self.claimed
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 return NbdSlot {
                     slot,
                     path: slot_path(slot),
@@ -603,6 +613,8 @@ impl NbdSlotAllocator {
             {
                 let mut inner = self.inner.lock().await;
                 if inner.reserve_specific(slot) {
+                    self.claimed
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     return Some(NbdSlot {
                         slot,
                         path: slot_path(slot),
@@ -617,6 +629,8 @@ impl NbdSlotAllocator {
             let mut warm = self.warm.lock().await;
             if let Some(pos) = warm.iter().position(|&s| s == slot) {
                 warm.remove(pos);
+                self.claimed
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 return Some(NbdSlot {
                     slot,
                     path: slot_path(slot),
@@ -690,6 +704,8 @@ impl NbdSlotAllocator {
         if let Some(pos) = warm.iter().position(|&s| s == slot) {
             warm.remove(pos);
         }
+        self.claimed
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Some(NbdSlot {
             slot,
             path: slot_path(slot),
@@ -718,7 +734,10 @@ impl NbdSlotAllocator {
     /// populator re-validates (free-check) before re-warming, so a
     /// still-tearing-down device is skipped until truly free.
     async fn release(&self, slot: u32) {
-        self.inner.lock().await.unreserve(slot);
+        let mut inner = self.inner.lock().await;
+        inner.unreserve(slot);
+        self.claimed
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Count of slots neither warm-waiting nor handed out — i.e. still
@@ -1031,9 +1050,12 @@ mod tests {
             }
         );
 
+        assert_eq!(pool.in_use(), 0);
         let claimed = pool.acquire().await;
+        assert_eq!(pool.in_use(), 1);
         assert_eq!(pool.slot_counts().await.in_use, 1);
         claimed.quarantine();
+        assert_eq!(pool.in_use(), 1);
         assert_eq!(
             pool.slot_counts().await,
             NbdSlotCounts {
@@ -1044,6 +1066,12 @@ mod tests {
                 parked: 1,
             }
         );
+        let device = pool.parked_devices().pop().unwrap();
+        let reclaimed = pool.reclaim_parked(&device).unwrap();
+        assert_eq!(pool.in_use(), 1);
+        drop(reclaimed);
+        wait_warm(&pool, 4).await;
+        assert_eq!(pool.in_use(), 0);
     }
 
     #[tokio::test]
