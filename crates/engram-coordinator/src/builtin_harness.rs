@@ -107,22 +107,14 @@ mod tests {
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-                "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex-spark",
-            ]
+            vec!["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"]
         );
         assert_eq!(
             d.models
                 .iter()
                 .find(|model| model.default)
                 .map(|model| model.id.as_str()),
-            Some("gpt-5.6-sol")
+            Some("gpt-6.1-sol")
         );
         assert_eq!(b.stamp_key, "harness-codex");
     }
