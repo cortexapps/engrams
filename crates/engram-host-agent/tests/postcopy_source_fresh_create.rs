@@ -48,12 +48,13 @@ async fn file_mode_fresh_create_is_a_post_copy_source() {
     // registers the export with it (no dest dials in this test).
     pooled.set_migrate_peer_server(PeerServer::new(0, None, Some(env.chunk_store.clone())));
     let rootfs = env.bake("engram-postcopy-fresh-source").await;
+    let spec = env.spec(rootfs);
 
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
     let result = pooled
         .build_base_snapshot(
             engram_core::traits::sandbox::BuildBaseSnapshotRequest {
-                spec: env.spec(&rootfs),
+                spec,
                 warm: None,
                 capture_env: Default::default(),
                 capture_egress: None,
@@ -239,7 +240,10 @@ impl TestEnv {
         )
     }
 
-    async fn bake(&self, name: &str) -> std::path::PathBuf {
+    /// The chunked disk manifest of the baked rootfs: the base snapshot
+    /// then captures an NBD-served root, which presetup requires (the
+    /// disk half of post-copy is the NBD seal).
+    async fn bake(&self, name: &str) -> engram_core::types::manifest::ManifestRef {
         let outcome = common::bake_fixture_ext4(
             &self.images.path().join(format!("{name}.ext4")),
             &self.chunk_store,
@@ -252,15 +256,17 @@ impl TestEnv {
             |_tree| Ok(()),
         )
         .await;
-        outcome.rootfs_path
+        outcome
+            .disk_manifest
+            .expect("ext4 bake produces a chunked disk manifest")
     }
 
-    fn spec(&self, rootfs: &Path) -> SandboxSpec {
+    fn spec(&self, rootfs_manifest: engram_core::types::manifest::ManifestRef) -> SandboxSpec {
         SandboxSpec {
             image: "engram-postcopy-fresh-source".into(),
-            rootfs_source: Some(rootfs.to_path_buf()),
+            rootfs_source: None,
             image_uri: None,
-            rootfs_manifest: None,
+            rootfs_manifest: Some(rootfs_manifest),
             cpu: CpuLimit { vcpus: 1 },
             memory: MemoryLimit { max_mib: 256 },
             disk: DiskLimit { max_gib: 1 },
