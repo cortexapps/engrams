@@ -163,6 +163,15 @@ pub fn nbd_devices(count: usize) -> Option<Vec<std::path::PathBuf>> {
 /// before that returns `EBUSY`. Wait for the kernel's free signal (the
 /// same two signals the slot allocator reads) for a bounded time; a
 /// device that stays busy still fails loudly at attach.
+/// Wait for every device in `devices` to read as free (see
+/// [`wait_until_free`]). A test that re-attaches a device it just
+/// released calls this between the destroy and the next attach.
+pub fn wait_devices_free(devices: &[std::path::PathBuf]) {
+    for dev in devices {
+        wait_until_free(dev);
+    }
+}
+
 fn wait_until_free(dev: &std::path::Path) {
     let Some(name) = dev.file_name().and_then(|n| n.to_str()) else {
         return;

@@ -357,7 +357,7 @@ async fn pooled_swap_create_capture_restore_and_fresh_attach() {
             .with_chunk_cache(ChunkCache::new(ChunkCacheConfig::new(
                 dir.path().join("cache"),
             )))
-            .with_nbd_pool(NbdSlotAllocator::from_paths(devices).unwrap())
+            .with_nbd_pool(NbdSlotAllocator::from_paths(devices.clone()).unwrap())
             .with_nbd_owner_dir(dir.path().join("owners")),
     );
     pooled.set_self_ref(&pooled);
@@ -404,8 +404,11 @@ async fn pooled_swap_create_capture_restore_and_fresh_attach() {
         .unwrap()
         .chunks
         .is_empty());
-    pooled.destroy(id).await.unwrap();
+    // Close the device before the destroy: an open descriptor keeps the
+    // kernel's NBD teardown pending, and the next attach would see EBUSY.
     drop(file);
+    pooled.destroy(id).await.unwrap();
+    common::postcopy::wait_devices_free(&devices);
     pooled.restore(captured.clone()).await.unwrap();
     let swap = inner
         .spec
@@ -422,6 +425,7 @@ async fn pooled_swap_create_capture_restore_and_fresh_attach() {
     assert_eq!(bytes, [0x5a; 4096]);
     drop(file);
     pooled.destroy(id).await.unwrap();
+    common::postcopy::wait_devices_free(&devices);
     let mut base = captured;
     base.swap_manifest = None;
     pooled.restore_fresh(base, vec![]).await.unwrap();
