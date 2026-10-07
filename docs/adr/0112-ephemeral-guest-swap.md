@@ -566,3 +566,53 @@ appended per the bookend norm, the original body stands.
    beside `plan_capture_disk_drain` — ADR 0098 discipline), and the
    re-arm is cancellation-safe (a drop-guard fires the `swapon` on
    every capture exit, not just success).
+
+## Addendum: live teleport with swap (2026-10-07)
+
+D7 is lifted. `migration_presetup` admits a file-backed guest with swap.
+`migration_capture_postcopy` now runs the D3 disarm under the capture lock,
+while the source is live and before it pauses. This is the same disarm point
+as `capture_phase`. It uses the Terminal policy: the 256 MiB periodic ceiling
+does not apply, but `WontFit` still refuses a page-in that cannot fit in RAM.
+The last guest exec before the pause checks that `/proc/swaps` is empty.
+
+A disarm refusal returns `InvalidSpec` with `swap-disarm-refused:` and restores
+the consumed presetup. No pause, dirty scan, or export occurs. Other capture
+errors and cancellation also restore presetup until the export takes ownership.
+The coordinator currently maps a capture-side `InvalidSpec` to rollback; only a
+presetup-side refusal selects snapshot-rehome in the same teleport row. A later
+coordinator PR will add the capture-side in-row downgrade. This change does not
+alter the coordinator.
+
+The bytes that cross the wire are guest RAM. `swapoff` first brings used swap
+pages into that RAM; post-copy then seals and serves those pages like other
+dirty memory. Swap-device bytes never cross the wire and are never persisted.
+D3 and D6 are unchanged. The destination still attaches a fresh zeroed device.
+
+The export records whether capture disarmed swap. Source abort and capture
+unwind resume the guest in place, then schedule re-arm under the capture lock.
+They use `swapon` alone because the same device still has its swap signature.
+On the destination, agentd runs `mkswap` and `swapon` at harness bind. For a
+session with no harness bind, the host schedules the same commands when both
+post-copy drains are done and the `PostCopyDest` role is cleared. The shared
+host re-arm script selects the sole writable non-root virtio disk and skips it
+if `/proc/swaps` already lists it, as agentd does. Repeated drain completion is
+safe. Re-arm remains best-effort; a failed exec is logged and the next bind can
+retry.
+
+Residual risks:
+
+- The page-in cost of `swapoff` is live time, not pause time. A heavily swapped
+  guest can take longer to reach the pause even when all pages fit in RAM.
+- The capture lock excludes a detached checkpoint re-arm and host-driven
+  `start_agent` calls. A guest-side `arm_at_bind` already in flight, or another
+  guest-root process, can still arm swap after the empty-table check and before
+  the pause. This is the accepted D3 guest-root window from implementation
+  note 5; the host check does not remove it.
+
+Tests cover disarm-before-pause, refusal with presetup retained, one source
+re-arm on abort or unwind, and destination formatting only while inactive.
+The pooled KVM `swap_capture` target adds a 256 MiB guest with 64 MiB swap and
+a 4 MiB sentinel paged out with `MADV_PAGEOUT`. Live capture and source abort
+must preserve the sentinel and leave swap active. This target remains in the
+pooled-backend CI test list.

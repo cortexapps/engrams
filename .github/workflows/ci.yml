@@ -1132,6 +1132,7 @@ jobs:
       # across CI *jobs* (= separate hosts) is legal while `-jN`
       # within one job is not.
       - name: Firecracker `#[ignore]` tests (PooledBackend host-agent)
+        # swap_capture includes live capture with used swap and source abort.
         run: |
           cargo nextest run \
             -p engram-host-agent \

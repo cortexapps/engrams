@@ -614,3 +614,10 @@ pub enum HarnessFrame {
   records the guest's memory backing, presetup checks it pause-free, and
   a File-mode fresh session is a valid post-copy source (ADR 0045 and
   ADR 0092 addenda, same date). `ENGRAM_FC_FRESH_RESTORE_MODE` retired.
+- 2026-10-07 (live teleport with swap): ADR 0112 D7 is lifted. The host
+  disarms swap under the live-capture lock before pause, restores presetup on
+  refusal, and re-arms on source abort/unwind or destination bind/drain-done.
+  See the [ADR 0112 addendum](0112-ephemeral-guest-swap.md#addendum-live-teleport-with-swap-2026-10-07)
+  for the RAM-only transfer contract and residual risks. Capture-side
+  `InvalidSpec` still causes coordinator rollback; the in-row downgrade needs
+  a later coordinator PR.

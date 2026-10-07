@@ -396,6 +396,8 @@ struct CaptureUnwind {
     )>,
     defused: bool,
     resume_on_drop: bool,
+    swap_rearm: Option<SwapRearmGuard>,
+    capture_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl CaptureUnwind {
@@ -413,11 +415,13 @@ impl CaptureUnwind {
             presetup_restore: None,
             defused: true,
             resume_on_drop: true,
+            swap_rearm: None,
+            capture_guard: None,
         }
     }
 
-    /// Mark the guard armed (the pause has happened; from here Drop must
-    /// run the unwind unless `defuse` is called).
+    /// Enable recovery on drop. Before pause, recovery only restores
+    /// presetup and swap; after pause, it also resumes the guest.
     fn arm(&mut self) {
         self.defused = false;
     }
@@ -425,6 +429,9 @@ impl CaptureUnwind {
     /// Ownership transferred (export registered / capture handed to the
     /// finisher). Drop becomes a no-op.
     fn defuse(&mut self) {
+        if let Some(rearm) = &mut self.swap_rearm {
+            rearm.target = None;
+        }
         self.defused = true;
     }
 }
@@ -436,6 +443,8 @@ impl Drop for CaptureUnwind {
         }
         let inner = self.inner.clone();
         let resume_on_drop = self.resume_on_drop;
+        let mut swap_rearm = self.swap_rearm.take();
+        let capture_guard = self.capture_guard.take();
         let id = self.id;
         let disk_backend = self.disk_backend.take();
         let fenced = self.fenced;
@@ -449,8 +458,8 @@ impl Drop for CaptureUnwind {
         }
         tracing::warn!(
             sandbox_id = %id,
-            "capture unwind: capture failed or was cancelled after pause+fence+drain; \
-             requeueing drained disk state, clearing the migration fence, resuming the guest",
+            resume_on_drop,
+            "capture unwind: restoring presetup and captured source state",
         );
         // The dirty re-queue + resume are async; Drop can't await, so
         // hand the SAME recovery `migration_abort` runs to a task. Drop
@@ -458,6 +467,9 @@ impl Drop for CaptureUnwind {
         // back to a synchronous fence clear so a fenced backend never
         // stays wedged even then.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            if let Some(rearm) = &mut swap_rearm {
+                rearm.target = None;
+            }
             if let Some(backend) = &disk_backend {
                 if fenced {
                     backend.set_migration_fence(false);
@@ -482,8 +494,13 @@ impl Drop for CaptureUnwind {
                     backend.set_migration_fence(false);
                 }
             }
+            let _capture_guard = capture_guard;
+            let mut swap_rearm = swap_rearm;
             if !resume_on_drop { return; }
             if let Err(e) = inner.resume(id).await {
+                if let Some(rearm) = &mut swap_rearm {
+                    rearm.target = None;
+                }
                 tracing::warn!(
                     sandbox_id = %id,
                     error = %e,
@@ -605,7 +622,7 @@ impl SwapRearmGuard {
     /// code re-armed). Idempotent with Drop via `take()`.
     fn fire_now(&mut self) {
         if let Some((backend, id)) = self.target.take() {
-            backend.spawn_swap_rearm(id);
+            backend.spawn_swap_rearm(id, false);
         }
     }
 }
@@ -619,7 +636,7 @@ impl Drop for SwapRearmGuard {
                 sandbox_id = %id,
                 "capture exited early after swap disarm; re-arming the live guest",
             );
-            backend.spawn_swap_rearm(id);
+            backend.spawn_swap_rearm(id, false);
         }
     }
 }
@@ -1504,8 +1521,14 @@ impl PooledBackend {
         };
         let used_kb = match engram_host_core::plan_swap_disarm(total, free, available, policy) {
             engram_host_core::SwapDisarmPlan::NoSwap => {
-                // Device attached but never armed (kill switch, arm
-                // failure) — nothing to disarm.
+                // Verify the table even when the earlier probe saw no swap.
+                self.exec_capture_stdout(
+                    id,
+                    "[ \"$(awk 'NR>1' /proc/swaps | wc -l)\" -eq 0 ]",
+                    std::time::Duration::from_secs(30),
+                    "swap-disarm verify empty",
+                )
+                .await?;
                 return Ok(SwapDisarm::NoSwap);
             }
             engram_host_core::SwapDisarmPlan::Refuse {
@@ -1560,11 +1583,11 @@ impl PooledBackend {
     /// ADR 0112 D3: re-arm guest swap after the memory capture
     /// returned and the guest is running again. Detached + best-effort:
     /// a guest left swapless is safe (pre-0112 behavior), logged, and
-    /// the next bind re-arms fully. No `mkswap` — the signature
-    /// survives `swapoff` within a residence.
+    /// the next bind re-arms fully. A fresh device needs `mkswap`;
+    /// within a residence the signature survives `swapoff`.
     /// See [`SwapRearmGuard`] — the cancellation-safe wrapper every
     /// capture flavor holds across the disarm→snapshot window.
-    fn spawn_swap_rearm(self: &Arc<Self>, id: SandboxId) {
+    fn spawn_swap_rearm(self: &Arc<Self>, id: SandboxId, fresh_device: bool) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             // Under the capture lock: a re-arm that lands inside another
@@ -1575,13 +1598,25 @@ impl PooledBackend {
             if this.held_swap_policy.contains_key(&id) {
                 return;
             }
-            let script = "for d in /sys/block/vd*; do n=$(basename $d); \
-                          [ \"$n\" != vda ] && [ \"$(cat $d/ro)\" = 0 ] && \
-                          swapon /dev/$n; done";
+            let format = if fresh_device {
+                "mkswap \"$node\" || exit 1;"
+            } else {
+                ""
+            };
+            // Match agentd: one writable non-root disk; skip an active device.
+            // The capture lock also serializes host-driven harness binds.
+            let script = format!(
+                "set --; for d in /sys/block/vd*; do n=$(basename \"$d\"); \
+                 if [ \"$n\" != vda ] && [ \"$(cat \"$d/ro\")\" = 0 ]; then \
+                 set -- \"$@\" /dev/$n; fi; done; \
+                 [ \"$#\" -eq 1 ] || exit 0; node=$1; \
+                 if awk -v node=\"$node\" 'NR>1 && $1==node {{found=1}} END {{exit !found}}' /proc/swaps; then exit 0; fi; \
+                 {format} swapon \"$node\""
+            );
             match this
                 .exec_capture_stdout(
                     id,
-                    script,
+                    &script,
                     std::time::Duration::from_secs(30),
                     "swap re-arm",
                 )
@@ -1595,6 +1630,14 @@ impl PooledBackend {
                 ),
             }
         });
+    }
+
+    fn rearm_drained_destination(&self, id: SandboxId) {
+        if self.sandbox_swap_mib(id).is_some() {
+            if let Some(backend) = self.self_ref.get().and_then(std::sync::Weak::upgrade) {
+                backend.spawn_swap_rearm(id, true);
+            }
+        }
     }
 
     /// Run an image's capture-time `[warm]` hook ([`WarmConfig`]) in the
@@ -8266,19 +8309,6 @@ impl SandboxBackend for PooledBackend {
                 "guest RAM is not file-backed (cold boot) — use snapshot-rehome".into(),
             ));
         }
-        // ADR 0112 D7: a swap-armed guest cannot post-copy teleport —
-        // the guest never pauses long enough to `swapoff`, and moving
-        // the swap device's bytes would persist exactly what the ADR
-        // promises never to persist. Refused HERE (the live spec is
-        // the authoritative swap source; an image row can drift) and
-        // pre-freeze, so nothing is consumed. Snapshot-rehome runs
-        // `capture_phase` — the disarm — and is already correct.
-        if self.sandbox_swap_mib(id).is_some() {
-            return Err(SandboxError::InvalidSpec(
-                "guest runs with ephemeral swap (ADR 0112) — use snapshot-rehome".into(),
-            ));
-        }
-
         let sidecar_json = self.inner.compose_live_sidecar(id, Some(chain_ref))?;
         let memory_manifest_json = serde_json::to_vec(&chain_manifest)
             .map_err(|e| SandboxError::Snapshot(format!("chain manifest json: {e}")))?;
@@ -8376,7 +8406,10 @@ impl SandboxBackend for PooledBackend {
             // unwind can re-insert it — otherwise a coordinator retry
             // hits "no matching presetup" and the dest parks until its
             // 120 s budget burns out.
-            let presetup_restore = pending.clone();
+            let mut unwind = CaptureUnwind::new(self.inner.clone(), id);
+            unwind.arm();
+            unwind.resume_on_drop = false;
+            unwind.presetup_restore = Some((id, pending.clone(), self.pending_presetups.clone()));
             let Some((chain_ref, chain_manifest)) = self
                 .checkpoint_chains
                 .get(&id)
@@ -8408,26 +8441,34 @@ impl SandboxBackend for PooledBackend {
             }
 
             // Checkpoint fence: held for the export's lifetime.
-            let capture_guard = self.capture_lock(id).lock_owned().await;
+            unwind.capture_guard = Some(self.capture_lock(id).lock_owned().await);
+            // Terminal policy drains all used swap that fits in RAM. The final
+            // exec verifies /proc/swaps before the pause (ADR 0112 D3).
+            let swap_disarmed = match self.swap_disarm(id, SwapDisarmPolicy::Terminal).await {
+                Ok(disarm) => disarm == SwapDisarm::Disarmed,
+                Err(SandboxError::Snapshot(message))
+                    if message.starts_with(SWAP_DISARM_REFUSED) =>
+                {
+                    return Err(SandboxError::InvalidSpec(message));
+                }
+                Err(error) => return Err(error),
+            };
+            unwind.swap_rearm = Some(SwapRearmGuard::new(
+                swap_disarmed
+                    .then(|| self.self_ref.get().and_then(std::sync::Weak::upgrade))
+                    .flatten(),
+                id,
+            ));
 
             // Blackout leg 1: pause. (PR 10 decomposition.)
             let t_pause = crate::time_source::metrics_now();
             let paused_at = self.clock.now_utc();
+            unwind.resume_on_drop = true;
             self.inner
                 .pause(id)
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("post-copy pause: {e}")))?;
             let pause_ms = t_pause.elapsed().as_millis() as u64;
-
-            // Issue #202: arm the unwind guard the instant the guest is
-            // paused. Any error/cancel before the export is registered
-            // must resume the guest, clear the fence, re-queue the
-            // (later-taken) seal, AND restore the consumed presetup. The
-            // old `FenceGuard` only lowered the fence — it left the guest
-            // frozen, dropped the seal, and consumed the presetup.
-            let mut unwind = CaptureUnwind::new(self.inner.clone(), id);
-            unwind.arm();
-            unwind.presetup_restore = Some((id, presetup_restore, self.pending_presetups.clone()));
 
             // Blackout leg 2: disk COHERENCE (disk post-copy). Fence
             // flush publishes, push the host's block-device page cache
@@ -8579,9 +8620,10 @@ impl SandboxBackend for PooledBackend {
                 clock: self.clock.clone(),
                 created_at: self.clock.now_mono(),
                 post_copy: true,
+                swap_disarmed,
                 state_served,
                 last_activity,
-                capture_guard,
+                capture_guard: unwind.capture_guard.take().expect("capture lock held"),
             });
             if !inserted {
                 // The unwind guard re-queues the seal (Arc clone),
@@ -8599,7 +8641,9 @@ impl SandboxBackend for PooledBackend {
                 // The export must not outlive a role the manifest does not
                 // carry: take it back so the unwind guard resumes a guest
                 // no export holds, and a restart sees no source role.
-                drop(self.migrations.remove_validated(id, export_id));
+                if let Some(export) = self.migrations.remove_validated(id, export_id) {
+                    unwind.capture_guard = Some(export.capture_guard);
+                }
                 self.note_migration_role(id, None);
                 return Err(error);
             }
@@ -8660,6 +8704,7 @@ impl SandboxBackend for PooledBackend {
         if let Some(done) = self.drained_dests.get(&id).map(|d| d.clone()) {
             // The drain already finished; only the role clear is pending.
             self.set_migration_role(id, None).await?;
+            self.rearm_drained_destination(id);
             return Ok(done);
         }
         let Some(sock) = self.inner.post_copy_control_sock(id) else {
@@ -8757,6 +8802,7 @@ impl SandboxBackend for PooledBackend {
             // retried by the next call rather than reported as a lost drain.
             self.drained_dests.insert(id, outcome.clone());
             self.set_migration_role(id, None).await?;
+            self.rearm_drained_destination(id);
         }
         Ok(outcome)
     }
@@ -8999,6 +9045,7 @@ impl SandboxBackend for PooledBackend {
             // dest pulls eagerly; post-copy captures (C2) construct
             // their own export with post_copy: true.
             post_copy: false,
+            swap_disarmed: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(self.clock.now_mono())),
             capture_guard,
@@ -9244,6 +9291,7 @@ impl SandboxBackend for PooledBackend {
         // the request only awaits the result.
         let inner = self.inner.clone();
         let migration_roles = self.migration_roles.clone();
+        let pooled = self.self_ref.get().and_then(std::sync::Weak::upgrade);
         #[cfg(target_os = "linux")]
         let nbd_sandboxes = self.nbd_sandboxes.clone();
         let export_id = export_id.to_string();
@@ -9266,11 +9314,16 @@ impl SandboxBackend for PooledBackend {
             }
             let snapshot_dir = export.snapshot_dir.clone();
             let _ = fs::remove_dir_all(&snapshot_dir).await;
-            drop(export.capture_guard);
             inner
                 .resume(id)
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("migration abort resume: {e}")))?;
+            if export.swap_disarmed {
+                if let Some(pooled) = pooled {
+                    pooled.spawn_swap_rearm(id, false);
+                }
+            }
+            drop(export.capture_guard);
             // Last: the drained bytes are back, the fence is down, and the
             // guest runs again whether or not this manifest write succeeds
             // (`resume` retries the clear). In-memory first, then the manifest.
@@ -9433,7 +9486,7 @@ impl SandboxBackend for PooledBackend {
             self.held_snapshots.remove(&id);
             if policy == SwapDisarm::Disarmed {
                 if let Some(backend) = self.self_ref.get().and_then(std::sync::Weak::upgrade) {
-                    backend.spawn_swap_rearm(id);
+                    backend.spawn_swap_rearm(id, false);
                 }
             }
         }
@@ -13166,6 +13219,7 @@ mod tests {
             clock: std::sync::Arc::new(engram_core::traits::SystemClock::new()),
             created_at: std::time::Duration::ZERO,
             post_copy: false,
+            swap_disarmed: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
                 engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
@@ -13280,11 +13334,8 @@ mod tests {
             matches!(&err, SandboxError::InvalidSpec(m) if m.contains("checkpoint chain vanished")),
             "expected to pass the presetup gate and fail at the chain check, got: {err:?}"
         );
-        // E2 was consumed by the matching capture.
-        assert!(
-            !pooled.pending_presetups.contains_key(&id),
-            "the matching capture must consume the presetup"
-        );
+        // A pre-pause failure restores the matching presetup for retry.
+        assert!(pooled.pending_presetups.contains_key(&id));
     }
 
     /// ADR 0045 C2 disk post-copy: `DiskChunkAt` serves a sealed
@@ -13367,6 +13418,7 @@ mod tests {
             clock: std::sync::Arc::new(engram_core::traits::SystemClock::new()),
             created_at: std::time::Duration::ZERO,
             post_copy: true,
+            swap_disarmed: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
                 engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
@@ -16133,6 +16185,7 @@ mod tests {
             clock: pooled.clock.clone(),
             created_at: std::time::Duration::ZERO,
             post_copy: false,
+            swap_disarmed: false,
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
             capture_guard: pooled.capture_lock(id).lock_owned().await,
@@ -17385,6 +17438,10 @@ mod tests {
         inner: FakeCaptureBackend,
         paused: std::sync::atomic::AtomicBool,
         rearms: std::sync::atomic::AtomicUsize,
+        calls: PlMutex<Vec<String>>,
+        refuse_swap: std::sync::atomic::AtomicBool,
+        swap_used_kb: std::sync::atomic::AtomicU64,
+        fail_vmstate: std::sync::atomic::AtomicBool,
     }
     #[async_trait]
     impl SandboxBackend for HoldBackend {
@@ -17401,29 +17458,87 @@ mod tests {
                 !self.paused.load(Ordering::SeqCst),
                 "guest exec while paused"
             );
-            let script = cmd.command.join(" ");
-            if script.contains("swapon") {
+            let script = cmd.command.last().unwrap();
+            self.calls.lock().push(script.clone());
+            let stdout = if script.contains("swapon") {
                 self.rearms.fetch_add(1, Ordering::SeqCst);
-            }
+                // Execute the production script against a small guest filesystem.
+                // Only device commands and absolute guest paths are substituted.
+                let root = self.inner.staging_root.parent().unwrap();
+                let script = script
+                    .replace("/sys/block", &format!("{}/sys/block", root.display()))
+                    .replace("/proc/swaps", &format!("{}/swaps", root.display()))
+                    .replace("mkswap", &format!("{}/mkswap", root.display()))
+                    .replace("swapon", &format!("{}/swapon", root.display()));
+                let out = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(script)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                Vec::new()
+            } else if self.refuse_swap.load(Ordering::SeqCst) {
+                b"SwapTotal: 65536 kB\nSwapFree: 0 kB\nMemAvailable: 1024 kB\n".to_vec()
+            } else {
+                format!(
+                    "SwapTotal: 1048576 kB\nSwapFree: {} kB\nMemAvailable: 4194304 kB\n",
+                    1048576 - self.swap_used_kb.load(Ordering::SeqCst)
+                )
+                .into_bytes()
+            };
             Ok(ExecStream {
                 sandbox_id: id,
                 exec_id: "swap".into(),
                 events: Box::pin(futures::stream::iter([
-                    engram_core::types::sandbox::ExecEvent::Stdout(bytes::Bytes::from_static(
-                        b"SwapTotal: 1024 kB\nSwapFree: 1024 kB\nMemAvailable: 65536 kB\n",
-                    )),
+                    engram_core::types::sandbox::ExecEvent::Stdout(bytes::Bytes::from(stdout)),
                     engram_core::types::sandbox::ExecEvent::Exit(Some(0)),
                 ])),
             })
+        }
+        fn post_copy_source_view(
+            &self,
+            _: SandboxId,
+        ) -> Option<engram_core::traits::sandbox::PostCopySourceView> {
+            Some(engram_core::traits::sandbox::PostCopySourceView {
+                fc_pid: std::process::id(),
+                memory_backing: self.inner.staging_root.parent().unwrap().join("memory.bin"),
+            })
+        }
+        fn compose_live_sidecar(
+            &self,
+            _: SandboxId,
+            _: Option<engram_core::types::manifest::ManifestRef>,
+        ) -> Result<Vec<u8>, SandboxError> {
+            Ok(b"{}".to_vec())
+        }
+        async fn snapshot_vmstate_only_package(
+            &self,
+            _: SandboxId,
+            _: &[u8],
+        ) -> Result<(engram_core::SnapshotId, PathBuf), SandboxError> {
+            if self.fail_vmstate.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SandboxError::Snapshot("vmstate failed".into()));
+            }
+            std::fs::create_dir_all(&self.inner.staging_root).unwrap();
+            Ok((
+                engram_core::SnapshotId::new(),
+                self.inner.staging_root.clone(),
+            ))
         }
         fn swap_mib(&self, _: SandboxId) -> Option<u32> {
             Some(1)
         }
         async fn pause(&self, _: SandboxId) -> Result<(), SandboxError> {
+            self.calls.lock().push("pause".into());
             self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn resume(&self, _: SandboxId) -> Result<(), SandboxError> {
+            self.calls.lock().push("resume".into());
             self.paused
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -17454,6 +17569,37 @@ mod tests {
     }
     fn held_fixture() -> (tempfile::TempDir, Arc<PooledBackend>, Arc<HoldBackend>) {
         let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for device in ["vda", "vdb"] {
+            let path = dir.path().join("sys/block").join(device);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("ro"), "0").unwrap();
+        }
+        std::fs::write(
+            dir.path().join("swaps"),
+            "Filename Type Size Used Priority\n",
+        )
+        .unwrap();
+        for command in ["mkswap", "swapon"] {
+            let path = dir.path().join(command);
+            let arm = if command == "swapon" {
+                format!(
+                    "echo '/dev/vdb partition 65532 0 -2' >> {}/swaps",
+                    dir.path().display()
+                )
+            } else {
+                String::new()
+            };
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho {command} >> {}/arms\n{arm}\n",
+                    dir.path().display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let inner = Arc::new(HoldBackend {
             inner: FakeCaptureBackend {
                 payload: vec![0; 4096],
@@ -17462,11 +17608,241 @@ mod tests {
             },
             paused: std::sync::atomic::AtomicBool::new(false),
             rearms: std::sync::atomic::AtomicUsize::new(0),
+            calls: PlMutex::new(Vec::new()),
+            refuse_swap: std::sync::atomic::AtomicBool::new(false),
+            swap_used_kb: std::sync::atomic::AtomicU64::new(4096),
+            fail_vmstate: std::sync::atomic::AtomicBool::new(false),
         });
         let pooled = Arc::new(PooledBackend::new(inner.clone()));
         pooled.set_self_ref(&pooled);
         (dir, pooled, inner)
     }
+
+    async fn await_swap_rearms(inner: &HoldBackend, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while inner.rearms.load(std::sync::atomic::Ordering::SeqCst) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_drain_swap_rearm_formats_only_an_inactive_device() {
+        use engram_core::types::snapshot::DrainOutcome;
+        for already_active in [false, true] {
+            let (dir, pooled, inner) = held_fixture();
+            let id = SandboxId::new();
+            if already_active {
+                std::fs::write(
+                    dir.path().join("swaps"),
+                    "Filename Type Size Used Priority\n/dev/vdb partition 65532 0 -2\n",
+                )
+                .unwrap();
+            }
+            pooled.note_migration_role(id, Some(crate::migration::MigrationRole::PostCopyDest));
+            pooled.drained_dests.insert(
+                id,
+                DrainOutcome::Done {
+                    pulled: 1,
+                    alt_sourced: 0,
+                    zero_chunks: 0,
+                    ms: 1,
+                },
+            );
+            pooled.migration_drain_wait(id).await.unwrap();
+            await_swap_rearms(&inner, 1).await;
+            pooled.migration_drain_wait(id).await.unwrap();
+            await_swap_rearms(&inner, 2).await;
+            let arms = std::fs::read_to_string(dir.path().join("arms")).unwrap_or_default();
+            assert_eq!(
+                arms,
+                if already_active {
+                    ""
+                } else {
+                    "mkswap\nswapon\n"
+                }
+            );
+            assert_eq!(pooled.migration_role(id), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_swap_abort_rearms_source_once() {
+        let (dir, pooled, inner) = held_fixture();
+        let id = SandboxId::new();
+        let export_id = open_export(&pooled, id, dir.path().join("export")).await;
+        let mut export = pooled.migrations.remove_validated(id, &export_id).unwrap();
+        export.swap_disarmed = true;
+        assert!(pooled.migrations.insert(export));
+        inner
+            .paused
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        pooled.migration_abort(id, &export_id).await.unwrap();
+        await_swap_rearms(&inner, 1).await;
+        assert!(matches!(
+            pooled.migration_abort(id, &export_id).await,
+            Err(SandboxError::NotFound)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("arms")).unwrap(),
+            "swapon\n"
+        );
+        assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct SwapMemoryMap(usize);
+    #[cfg(target_os = "linux")]
+    impl Drop for SwapMemoryMap {
+        fn drop(&mut self) {
+            // SAFETY: this is the mapping returned by mmap in swap_postcopy_fixture.
+            unsafe {
+                libc::munmap(self.0 as *mut libc::c_void, 4096);
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn swap_postcopy_fixture(pooled: &PooledBackend, root: &Path, id: SandboxId) -> SwapMemoryMap {
+        use std::os::fd::AsRawFd;
+        let path = root.join("memory.bin");
+        std::fs::write(&path, vec![0; 4096]).unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        // SAFETY: map one page of the open file. The guard owns the mapping.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        pooled.checkpoint_chains.insert(
+            id,
+            crate::checkpoint::CheckpointChain {
+                manifest_ref: engram_core::types::manifest::ManifestRef::new(),
+                manifest: engram_chunk_store::Manifest::empty(
+                    engram_chunk_store::ManifestKind::Memory,
+                    4096,
+                ),
+            },
+        );
+        pooled.set_migrate_peer_server(crate::migrate_peer::PeerServer::new(0, None, None));
+        SwapMemoryMap(ptr as usize)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn migration_swap_capture_disarms_before_pause_and_abort_rearms_once() {
+        let (dir, pooled, inner) = held_fixture();
+        let id = SandboxId::new();
+        let _mapping = swap_postcopy_fixture(&pooled, dir.path(), id);
+        // Terminal capture accepts more than the periodic 256 MiB ceiling.
+        inner
+            .swap_used_kb
+            .store(512 * 1024, std::sync::atomic::Ordering::SeqCst);
+        let pending = pooled.migration_presetup(id).await.unwrap();
+        pooled
+            .migration_capture_postcopy(id, &pending.export_id)
+            .await
+            .unwrap();
+        let export = pooled.migrations.find_by_export_id(&pending.export_id);
+        assert!(export.is_some());
+        assert!(export.unwrap().swap_disarmed);
+        let calls = inner.calls.lock().clone();
+        let pause = calls.iter().position(|s| s == "pause").unwrap();
+        assert!(calls[pause - 1].contains("swapoff"));
+        assert!(calls[pause - 1].contains("/proc/swaps | wc -l"));
+        assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 0);
+        pooled
+            .migration_abort(id, &pending.export_id)
+            .await
+            .unwrap();
+        await_swap_rearms(&inner, 1).await;
+        assert!(matches!(
+            pooled.migration_abort(id, &pending.export_id).await,
+            Err(SandboxError::NotFound)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("arms")).unwrap(),
+            "swapon\n"
+        );
+        assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn migration_swap_refusal_restores_presetup_before_pause() {
+        let (dir, pooled, inner) = held_fixture();
+        let id = SandboxId::new();
+        let _mapping = swap_postcopy_fixture(&pooled, dir.path(), id);
+        let pending = pooled.migration_presetup(id).await.unwrap();
+        inner
+            .refuse_swap
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = pooled
+            .migration_capture_postcopy(id, &pending.export_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SandboxError::InvalidSpec(m) if m.starts_with(SWAP_DISARM_REFUSED))
+        );
+        assert_eq!(
+            pooled.pending_presetups.get(&id).unwrap().export_id,
+            pending.export_id
+        );
+        assert!(!inner
+            .calls
+            .lock()
+            .iter()
+            .any(|s| s == "pause" || s.contains("swapoff")));
+        assert!(!pooled.migrations.validate_open(id));
+        inner
+            .refuse_swap
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        pooled
+            .migration_capture_postcopy(id, &pending.export_id)
+            .await
+            .unwrap();
+        pooled
+            .migration_abort(id, &pending.export_id)
+            .await
+            .unwrap();
+        await_swap_rearms(&inner, 1).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn migration_swap_capture_unwind_resumes_then_rearms_once() {
+        let (dir, pooled, inner) = held_fixture();
+        let id = SandboxId::new();
+        let _mapping = swap_postcopy_fixture(&pooled, dir.path(), id);
+        let pending = pooled.migration_presetup(id).await.unwrap();
+        inner
+            .fail_vmstate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = pooled
+            .migration_capture_postcopy(id, &pending.export_id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("vmstate failed"));
+        await_swap_rearms(&inner, 1).await;
+        assert_eq!(
+            pooled.pending_presetups.get(&id).unwrap().export_id,
+            pending.export_id
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("arms")).unwrap(),
+            "swapon\n"
+        );
+        assert_eq!(inner.rearms.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!inner.paused.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[tokio::test]
     async fn snapshot_hold_stays_paused_without_swap_rearm() {
         let (_dir, pooled, inner) = held_fixture();

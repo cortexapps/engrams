@@ -2498,6 +2498,7 @@ impl SimHost {
             clock,
             created_at: self.clock.now_mono(),
             post_copy: false,
+            swap_disarmed: false,
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(self.clock.now_mono())),
             capture_guard: guard,

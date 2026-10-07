@@ -42,6 +42,16 @@ const SWAP_MIB: u32 = 64;
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker; bakes a rootfs and boots microVMs"]
 async fn capture_disarms_swap_and_restore_wakes_swapless() {
+    swap_capture(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + gcc; boots a swap-armed microVM"]
+async fn live_capture_with_used_swap_aborts_without_memory_loss() {
+    swap_capture(true).await;
+}
+
+async fn swap_capture(live: bool) {
     // ---- gating (mirrors checkpoint_chain.rs) ----
     let kernel = match std::env::var("FC_TEST_KERNEL") {
         Ok(p) => std::path::PathBuf::from(p),
@@ -86,6 +96,20 @@ async fn capture_disarms_swap_and_restore_wakes_swapless() {
         engram_storage_local::LocalBlobStorage::new(work.path().join("blob")),
     );
     let chunk_store = engram_chunk_store::ChunkStore::new(blob);
+    let pageout = work.path().join("swap_pageout");
+    if live {
+        let output = std::process::Command::new("gcc")
+            .args(["-O2", "-static", "-o"])
+            .arg(&pageout)
+            .arg(Path::new(&manifest_dir).join("tests/fixtures/swap_pageout.c"))
+            .output()
+            .expect("gcc for the swap page-out fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let outcome = common::bake_fixture_ext4(
         &images.path().join("rootfs.ext4"),
         &chunk_store,
@@ -95,7 +119,12 @@ async fn capture_disarms_swap_and_restore_wakes_swapless() {
             transport: Transport::Vsock,
             init_script: None,
         }),
-        |_tree| Ok(()),
+        |tree| {
+            if live {
+                std::fs::copy(&pageout, tree.join("usr/bin/swap_pageout"))?;
+            }
+            Ok(())
+        },
     )
     .await;
 
@@ -198,6 +227,47 @@ async fn capture_disarms_swap_and_restore_wakes_swapless() {
         "fresh swap device failed to re-arm on the restored guest: {rearm:?}",
     );
 
+    if live {
+        pooled.set_migrate_peer_server(engram_host_agent::migrate_peer::PeerServer::new(
+            0,
+            None,
+            Some(chunk_store),
+        ));
+        // Page out 4 MiB directly. This proves real swap use without a
+        // guest-wide allocation storm or an OOM-dependent test.
+        exec_ok(
+            &pooled,
+            restored,
+            "swap_pageout >/tmp/pageout.log 2>&1 & echo $! >/tmp/pageout.pid",
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for(&pooled, restored,
+            "test -f /tmp/pageout-ready && awk '/SwapTotal:/{t=$2} /SwapFree:/{f=$2} END {exit !(t-f >= 2048)}' /proc/meminfo",
+            10).await;
+        let presetup = pooled
+            .migration_presetup(restored)
+            .await
+            .expect("swap presetup");
+        let capture = pooled
+            .migration_capture_postcopy(restored, &presetup.export_id)
+            .await
+            .expect("live capture drains used swap");
+        assert!(capture.sealed_chunks > 0);
+        pooled
+            .migration_abort(restored, &presetup.export_id)
+            .await
+            .expect("abort resumes source");
+        wait_for(&pooled, restored, "grep -q /dev/vd /proc/swaps", 10).await;
+        exec_ok(
+            &pooled,
+            restored,
+            "kill -USR1 $(cat /tmp/pageout.pid)",
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for(&pooled, restored, "test -f /tmp/pageout-ok", 10).await;
+    }
     pooled.destroy(restored).await.expect("destroy restored");
 }
 

@@ -104,6 +104,8 @@ pub struct MigrationExport {
     /// set. (The TTL clock is `last_activity` for ALL exports now — see
     /// `expired()` — so this no longer gates the anchor.)
     pub post_copy: bool,
+    /// Source swap was disarmed before capture; abort must re-arm it.
+    pub swap_disarmed: bool,
     /// ADR 0045 C2 split-brain guard: set the moment `state.bin`
     /// leaves this host (`MigrationFetch` StateBin). From then on the
     /// dest may be running this state — the source must NEVER
@@ -485,6 +487,7 @@ mod tests {
             created_at: stale,
             // The bug specifically affected C1 (non-post-copy) exports.
             post_copy: false,
+            swap_disarmed: false,
             state_served: Arc::new(AtomicBool::new(false)),
             last_activity: last_activity.clone(),
             capture_guard: guard,
@@ -558,6 +561,7 @@ mod tests {
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             created_at: Duration::ZERO,
             post_copy: false,
+            swap_disarmed: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
                 engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
@@ -582,6 +586,7 @@ mod tests {
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             created_at: Duration::ZERO,
             post_copy: false,
+            swap_disarmed: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
                 engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
@@ -612,6 +617,7 @@ mod tests {
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             created_at: Duration::ZERO,
             post_copy: false,
+            swap_disarmed: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
                 engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
