@@ -506,6 +506,13 @@ pub enum HarnessFrame {
 
 ## Divergence log
 
+- 2026-10-07: retire ADR 0045 C1 from the host and wire APIs. The durable
+  teleport driver already selects C2 for every live move. The source,
+  two-host, and drain-wave KVM targets now use post-copy, with drain before
+  commit and a full destination checkpoint for durability. Remove unused
+  page-channel by-hash verbs and C1 restore fields. Host wire version 30
+  and page-channel version 5 require a coordinated image roll.
+
 - 2026-10-05 (review of the Proposed ADR): C5 as first written settled
   "every open run of an older generation" when the generation advanced.
   On a snapshot teleport the same process continues the same run under

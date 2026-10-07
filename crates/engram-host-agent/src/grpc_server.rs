@@ -32,14 +32,13 @@ use engram_protocol::grpc::{
     HostReadFileMetadata, HostReadFileRequest, HostReadFileResponse, HostWriteFileRequest,
     HostWriteFileResponse, IdePortResponse, InterruptHarnessRequest, ListSandboxesResponse,
     MaterializeImageDone, MaterializeImageEvent, MaterializeImageFailed, MaterializeImageRequest,
-    MaterializeProgress, MigrationCaptureResponse, MigrationExportRef, MigrationFetchRequest,
-    MigrationFrame, MigrationPresetupResponse, PeerChunkFrame, PeerChunkGetRequest,
-    PostCopyCaptureResponse, ProbeSandboxResponse, ProxyPortData, ProxyPortMessage,
-    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing, ProxyShellPong,
-    ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SendHarnessToolResultRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    MaterializeProgress, MigrationExportRef, MigrationFetchRequest, MigrationFrame,
+    MigrationPresetupResponse, PeerChunkFrame, PeerChunkGetRequest, PostCopyCaptureResponse,
+    ProbeSandboxResponse, ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose,
+    ProxyShellMessage, ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SendHarnessToolResultRequest, SnapshotBeginResponse,
+    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -410,70 +409,6 @@ impl HostService for HostServiceImpl {
         .await
     }
 
-    async fn snapshot_wait(
-        &self,
-        req: Request<FencedSandboxRequest>,
-    ) -> Result<Response<SnapshotResponse>, Status> {
-        let span = tracing::info_span!("host.snapshot_wait");
-        link_remote_parent(&span, &req);
-        check_wire_version(&req)?;
-        async move {
-            let r = req.into_inner();
-            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
-            let id = decode_sandbox_id(&r.uuid)?;
-            let metadata = self
-                .inner
-                .snapshot_wait(id, fence)
-                .await
-                .map_err(sandbox_to_status)?;
-            Ok(Response::new(SnapshotResponse {
-                metadata_bincode: encode_bincode(&metadata, "SnapshotMetadata")?,
-            }))
-        }
-        .instrument(span)
-        .await
-    }
-
-    async fn migration_capture(
-        &self,
-        req: Request<FencedSandboxRequest>,
-    ) -> Result<Response<MigrationCaptureResponse>, Status> {
-        let span = tracing::info_span!("host.migration_capture");
-        link_remote_parent(&span, &req);
-        async move {
-            let r = req.into_inner();
-            let id = decode_sandbox_id(&r.uuid)?;
-            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
-            let out = self
-                .inner
-                .migration_capture(id, fence)
-                .await
-                .map_err(sandbox_to_status)?;
-            Ok(Response::new(MigrationCaptureResponse {
-                export_id: out.export_id,
-                memory_manifest_json: out.memory_manifest_json,
-                disk_manifest_json: out.disk_manifest_json,
-                new_memory_chunk_hashes: out
-                    .new_memory_chunk_hashes
-                    .into_iter()
-                    .map(|h| h.to_vec())
-                    .collect(),
-                new_disk_chunk_hashes: out
-                    .new_disk_chunk_hashes
-                    .into_iter()
-                    .map(|h| h.to_vec())
-                    .collect(),
-                snapshot_id: out.snapshot_id.as_uuid().as_bytes().to_vec(),
-                paused_at_unix_ms: out.paused_at_unix_ms,
-                memory_manifest_ref: encode_bincode(&out.memory_manifest_ref, "ManifestRef")?,
-                disk_manifest_ref: encode_bincode(&out.disk_manifest_ref, "ManifestRef")?,
-                hot_chunks: out.hot_chunks.into_iter().map(|h| h.to_vec()).collect(),
-            }))
-        }
-        .instrument(span)
-        .await
-    }
-
     type MigrationFetchStream =
         Pin<Box<dyn Stream<Item = Result<MigrationFrame, Status>> + Send + 'static>>;
 
@@ -489,23 +424,12 @@ impl HostService for HostServiceImpl {
                 use engram_protocol::grpc::migration_item::Kind;
                 match Kind::try_from(item.kind) {
                     Ok(Kind::StateBin) => Ok(engram_core::types::snapshot::MigrationItem::StateBin),
-                    Ok(Kind::Sidecar) => Ok(engram_core::types::snapshot::MigrationItem::Sidecar),
-                    Ok(Kind::DiskManifest) => {
-                        Ok(engram_core::types::snapshot::MigrationItem::DiskManifest)
-                    }
                     Ok(Kind::DiskSealInfo) => {
                         Ok(engram_core::types::snapshot::MigrationItem::DiskSealInfo)
                     }
                     Ok(Kind::DiskChunkAt) => Ok(
                         engram_core::types::snapshot::MigrationItem::DiskChunkAt(item.chunk_idx),
                     ),
-                    Ok(Kind::Chunk) => {
-                        let hash: [u8; 32] =
-                            item.hash.as_slice().try_into().map_err(|_| {
-                                Status::invalid_argument("chunk hash must be 32 bytes")
-                            })?;
-                        Ok(engram_core::types::snapshot::MigrationItem::Chunk(hash))
-                    }
                     Err(_) => Err(Status::invalid_argument("unknown migration item kind")),
                 }
             })

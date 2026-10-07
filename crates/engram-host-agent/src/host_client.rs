@@ -153,7 +153,7 @@ impl HostClient for LocalHostClient {
         // `snapshot_begin` is the IDLE-eviction capture entry: the
         // coordinator only drives begin/wait/commit for
         // `target_state == Idle` (live teleport goes through
-        // `migration_capture`; periodic + manual checkpoints through
+        // `migration_capture_postcopy`; periodic + manual checkpoints through
         // `snapshot`). So this is exactly where "gate strictly to the idle
         // path" lands — no `CheckpointReason` plumbing needed.
         //
@@ -179,14 +179,6 @@ impl HostClient for LocalHostClient {
         self.sandbox.snapshot_begin(id).await
     }
 
-    async fn snapshot_wait(
-        &self,
-        id: SandboxId,
-        _fence: SessionFence,
-    ) -> Result<SnapshotMetadata, SandboxError> {
-        self.sandbox.snapshot_wait(id).await
-    }
-
     async fn migration_presetup(
         &self,
         id: SandboxId,
@@ -209,14 +201,6 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
     ) -> Result<engram_core::types::snapshot::DrainOutcome, SandboxError> {
         self.sandbox.migration_drain_wait(id).await
-    }
-
-    async fn migration_capture(
-        &self,
-        id: SandboxId,
-        _fence: SessionFence,
-    ) -> Result<engram_core::types::snapshot::MigrationCaptureOut, SandboxError> {
-        self.sandbox.migration_capture(id).await
     }
 
     async fn migration_fetch(

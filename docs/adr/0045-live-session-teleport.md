@@ -317,6 +317,28 @@ refresh) still matches, and `dirty_map::find_base_mapping` is deleted. The D3 se
 to substrate-Uffd iff `uffd_base_dir` is set" is superseded by ADR 0092's
 addendum of the same date.
 
+## Addendum — 2026-10-07: retire C1
+
+C2 post-copy is the only live migration path. ADR 0123 already uses C2 for
+all live moves. Remove C1 capture, destination prestage and finish-restore,
+synchronous chunk pulls, inline disk manifests, and the capture RPC and
+response. Remove unused chunk, sidecar, and disk-manifest export items.
+The unused `SnapshotWait` RPC and its result map also leave with the C1
+finish-restore producer. Eviction already uses the durable finalize spool.
+There are no compatibility stubs.
+
+Remove the unused page-channel by-hash request and reply, their cache wiring,
+and write-only export fields. Compose the live sidecar once in presetup and
+retain it for capture. Share the source gRPC dial helper between artifact and
+disk fetches. The host wire version is 30; the page-channel version is 5.
+Coordinator, hosts, and handler images must use the new versions together.
+
+The existing source, two-host, and drain-wave KVM targets now exercise C2.
+They retain abort, commit, post-checkpoint state, harness and stdin continuity,
+NBD independence after source destruction, and failed-restore cleanup checks.
+The destination starts restore before capture, drains memory and disk before
+commit, and uses a full checkpoint for durable memory after the move.
+
 ## Sources
 
 Carries forward **ADR 0042** (`docs/adr/0042-substrate-architecture-survey.md` + `0072-substrate-survey-evidence.md`): QEMU post-copy docs + Hines'09; Firecracker snapshot/UFFD docs + discussions #3119/#2938 (FC has no native live migration; UFFD restore is page-source-pluggable); `loopholelabs/drafter` + `silo` v0.2.21 (the unified-device post-copy-with-durable-backstop reference, AGPL — design reference only); REAP/FaaSnap/Catalyzer (working-set prefetch); CodeSandbox engineering blogs (`MAP_SHARED` continuous flush, local-NVMe memory). Kernel references for the substrate: `userfaultfd(2)` + `Documentation/admin-guide/mm/userfaultfd.rst` (MINOR/CONTINUE since 5.13 shmem/hugetlbfs; WP on shmem since 5.19; MISSING scope), `mmap(2)` MAP_FIXED semantics, KVM memslot/GUP behavior under address-space changes. Codebase seams verified against the current tree (the UFFD fill seam, `effective_restore_mode`, the disk flush scheduler, the eviction pipeline + lease, the operator `roll_node` + `desired_hosts`, the node-assets / detect-changes pipeline, the web admin UX). Direct read of the `loopholelabs/firecracker` compare diff happened **only** for the superseded v1 surface (recorded in Phase B history); the substrate (v2) design deliberately derives from kernel primitives alone.

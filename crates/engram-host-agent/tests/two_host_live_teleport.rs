@@ -1,27 +1,7 @@
-//! ADR 0045 C1 PR5: the TWO-HOST live teleport integration — the real
-//! mechanism end to end, across two complete host-agent stacks.
-//!
-//! Host A and Host B are fully separate PooledBackend stacks (own
-//! workdirs, own NVMe chunk caches, own checkpoint dirs, own jails),
-//! sharing only the blob store (the GCS stand-in) — exactly the prod
-//! topology. Each is served by its own gRPC HostService on loopback;
-//! every byte of the move crosses the wire.
-//!
-//! Arms:
-//!   1. The G2 headline: a sentinel dirtied AFTER the last checkpoint on
-//!      host A survives the move to host B (snapshot-rehome provably
-//!      loses it), with the source frozen during the move and destroyed
-//!      at commit. Downtime legs printed for the G1 ledger.
-//!   2. Durability catch-up on B: `snapshot_wait` proves chunks +
-//!      manifest store-durable; B can then checkpoint the moved VM
-//!      (diff, continuing the fork lineage).
-//!   3. Kill arm `kill_source_mid_pull`: host A's gRPC server dies
-//!      between capture and the dest pull → B's restore fails CLEANLY
-//!      (no partial sandbox on B), the parachute posture: recovery
-//!      belongs to the coordinator's scanner from the last durable row.
-//!
-//! Gated like the FC suite; wired into ci.yml's `test-firecracker` job.
-//! `ENGRAM_INTEG_TWO_HOSTS=0` skips (defaults on where the suite runs).
+//! Two-host post-copy integration on real KVM. File-mode sources retain
+//! post-checkpoint RAM, a running harness, and held stdin across the move.
+//! NBD probes run after source destruction. A lost source must leave no VM.
+
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
@@ -32,7 +12,6 @@ use std::sync::Arc;
 
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
-use engram_core::types::snapshot::MigrationSourceInfo;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{
@@ -46,6 +25,7 @@ struct HostStack {
     pooled: Arc<PooledBackend>,
     addr: std::net::SocketAddr,
     server: tokio::task::JoinHandle<()>,
+    peer: tokio::task::JoinHandle<()>,
 }
 
 fn build_host(
@@ -109,6 +89,7 @@ fn build_host_with_nbd(
 }
 
 async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
+    let peer = common::postcopy::peer(&pooled).await;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     drop(listener);
@@ -135,6 +116,7 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
         pooled,
         addr,
         server,
+        peer,
     }
 }
 
@@ -228,7 +210,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
     };
-    let vm = host_a.pooled.create(spec).await.expect("create on A");
+    let vm = common::postcopy::fresh(&host_a.pooled, spec).await;
     let _ = exec(&host_a.pooled, vm, "true").await;
     let ckpt = host_a
         .pooled
@@ -246,7 +228,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     .to_string();
     assert_eq!(sentinel.len(), 64);
 
-    // ---- A LIVE harness, mid-run (ADR 0045 C1: the reattach arm) ----
+    // ---- A LIVE harness, mid-run (ADR 0045: the reattach arm) ----
     // The marquee teleport use-case is a session whose harness is
     // ACTIVELY RUNNING. agentd must REATTACH to the moved harness on
     // the post-move handshake — the old kill-and-respawn destroyed the
@@ -305,46 +287,21 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     assert_eq!(alive.trim(), "alive", "harness alive on A");
 
     // ---- The move, over the wire (the G1 downtime legs) ----
-    let t_capture = std::time::Instant::now();
-    let cap = client_a
-        .migration_capture(vm, engram_core::traits::SessionFence::unfenced())
-        .await
-        .expect("capture on A");
-    let capture_ms = t_capture.elapsed().as_millis();
+    let (moved, cap) =
+        common::postcopy::move_guest(&client_a, &client_b, vm, ckpt.clone(), host_a.addr).await;
+    common::postcopy::drain(&host_b.pooled, moved).await;
 
-    let mut metadata = ckpt.clone();
-    metadata.id = cap.snapshot_id;
-    metadata.memory_manifest = Some(cap.memory_manifest_ref);
-    metadata.disk_manifest = (!cap.disk_manifest_json.is_empty()).then_some(cap.disk_manifest_ref);
-    metadata.state_blob_key = None;
-    metadata.sidecar_blob_key = None;
-    metadata.migration_source = Some(MigrationSourceInfo {
-        export_id: cap.export_id.clone(),
-        source_addr: format!("http://{}", host_a.addr),
-        memory_manifest_json: cap.memory_manifest_json.clone(),
-        disk_manifest_json: cap.disk_manifest_json.clone(),
-        memory_manifest_ref: cap.memory_manifest_ref,
-        disk_manifest_ref: cap.disk_manifest_ref,
-        new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
-        new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
-        hot_chunks: vec![],
-        post_copy: false,
-        peer_addr: None,
-        peer_token: None,
-        sidecar_json: Vec::new(),
-    });
-
-    let t_restore = std::time::Instant::now();
-    let moved = client_b
-        .restore(metadata, engram_core::traits::SessionFence::unfenced())
+    // Commit destroys A's frozen source; the moved VM lives on B.
+    client_a
+        .migration_commit(
+            vm,
+            &cap.export_id,
+            engram_core::traits::SessionFence::unfenced(),
+        )
         .await
-        .expect("restore on B");
-    let restore_ms = t_restore.elapsed().as_millis();
-    eprintln!(
-        "TELEPORT: capture {capture_ms} ms, dest pull+restore {restore_ms} ms, \
-         total {} ms",
-        capture_ms + restore_ms
-    );
+        .expect("commit on A");
+    assert!(!host_a.pooled.list().await.unwrap().contains(&vm));
+    assert!(host_b.pooled.list().await.unwrap().contains(&moved));
 
     // G2: the post-checkpoint sentinel survives on B.
     let check = exec(
@@ -441,39 +398,35 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
 
     // Durability catch-up on B, then B checkpoints the moved VM (the
     // lineage continues on the new host).
-    let row = host_b.pooled.snapshot_wait(moved).await.expect("catch-up");
-    assert_eq!(row.memory_manifest, Some(cap.memory_manifest_ref));
-    chunk_store
-        .get_manifest(cap.memory_manifest_ref)
+    let row = host_b
+        .pooled
+        .checkpoint_sandbox(moved)
         .await
-        .expect("v+1 durable after catch-up");
+        .expect("durable checkpoint");
+    let durable_ref = row.memory_manifest.expect("durable memory manifest");
+    assert_ne!(durable_ref.manifest_id, cap.memory_manifest_ref.manifest_id);
+    chunk_store
+        .get_manifest(durable_ref)
+        .await
+        .expect("destination memory manifest is durable");
     let next = host_b
         .pooled
         .checkpoint_sandbox(moved)
         .await
         .expect("B checkpoints the moved VM");
     let next_ref = next.memory_manifest.expect("manifest");
-    assert_eq!(next_ref.manifest_id, cap.memory_manifest_ref.manifest_id);
+    assert_eq!(next_ref.manifest_id, durable_ref.manifest_id);
     assert_eq!(
         next_ref.version,
-        cap.memory_manifest_ref.version + 1,
+        durable_ref.version + 1,
         "the fork lineage continues on the destination"
     );
 
-    // Commit destroys A's frozen source; the moved VM lives on B.
-    client_a
-        .migration_commit(
-            vm,
-            &cap.export_id,
-            engram_core::traits::SessionFence::unfenced(),
-        )
-        .await
-        .expect("commit on A");
-    assert!(!host_a.pooled.list().await.unwrap().contains(&vm));
-    assert!(host_b.pooled.list().await.unwrap().contains(&moved));
     host_b.pooled.destroy(moved).await.expect("destroy moved");
     host_a.server.abort();
+    host_a.peer.abort();
     host_b.server.abort();
+    host_b.peer.abort();
 }
 
 /// A faithful `claude`(libuv) stdin reader for the Phase 4 spike: hold a pipe
@@ -498,7 +451,7 @@ int main(int argc, char **argv) {
     if (argc != 5) { fprintf(stderr, "usage: %s fifo out pid ready\n", argv[0]); return 2; }
     const char *fifo = argv[1], *outp = argv[2], *pidp = argv[3], *readyp = argv[4];
 
-    /* The post-move C1 reattach nudge SIGUSR1s us; default action is terminate,
+    /* The post-move live reattach nudge SIGUSR1s us; default action is terminate,
      * so ignore it (this fake doesn't re-dial — the test drives I/O directly). */
     signal(SIGUSR1, SIG_IGN);
 
@@ -662,7 +615,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
     };
-    let vm = host_a.pooled.create(spec).await.expect("create on A");
+    let vm = common::postcopy::fresh(&host_a.pooled, spec).await;
     let _ = exec(&host_a.pooled, vm, "true").await;
     let ckpt = host_a
         .pooled
@@ -746,37 +699,11 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
     );
 
     // ---- The move, over the wire ----
-    let cap = client_a
-        .migration_capture(vm, engram_core::traits::SessionFence::unfenced())
-        .await
-        .expect("capture on A");
-    let mut metadata = ckpt.clone();
-    metadata.id = cap.snapshot_id;
-    metadata.memory_manifest = Some(cap.memory_manifest_ref);
-    metadata.disk_manifest = (!cap.disk_manifest_json.is_empty()).then_some(cap.disk_manifest_ref);
-    metadata.state_blob_key = None;
-    metadata.sidecar_blob_key = None;
-    metadata.migration_source = Some(MigrationSourceInfo {
-        export_id: cap.export_id.clone(),
-        source_addr: format!("http://{}", host_a.addr),
-        memory_manifest_json: cap.memory_manifest_json.clone(),
-        disk_manifest_json: cap.disk_manifest_json.clone(),
-        memory_manifest_ref: cap.memory_manifest_ref,
-        disk_manifest_ref: cap.disk_manifest_ref,
-        new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
-        new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
-        hot_chunks: vec![],
-        post_copy: false,
-        peer_addr: None,
-        peer_token: None,
-        sidecar_json: Vec::new(),
-    });
-    let moved = client_b
-        .restore(metadata, engram_core::traits::SessionFence::unfenced())
-        .await
-        .expect("restore on B");
+    let (moved, cap) =
+        common::postcopy::move_guest(&client_a, &client_b, vm, ckpt.clone(), host_a.addr).await;
+    common::postcopy::drain(&host_b.pooled, moved).await;
 
-    // Post-move handshake → the C1 reattach arm (SIGUSR1 ignored by this fake).
+    // Post-move handshake → the live reattach arm (SIGUSR1 ignored by this fake).
     host_b
         .pooled
         .start_agent(
@@ -854,7 +781,9 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         .expect("commit on A");
     host_b.pooled.destroy(moved).await.expect("destroy moved");
     host_a.server.abort();
+    host_a.peer.abort();
     host_b.server.abort();
+    host_b.peer.abort();
 }
 
 /// The NBD-rootfs arm (prod canaries 5fa742b7 / 4391e591): production
@@ -978,7 +907,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
     };
-    let vm = host_a.pooled.create(spec).await.expect("create on A");
+    let vm = common::postcopy::fresh(&host_a.pooled, spec).await;
     let _ = exec(&host_a.pooled, vm, "true").await;
     let ckpt = host_a
         .pooled
@@ -1006,41 +935,20 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
     assert_eq!(probe_hash_a.len(), 64, "pre-move probe hash");
 
     // ---- The move ----
-    let cap = client_a
-        .migration_capture(vm, engram_core::traits::SessionFence::unfenced())
-        .await
-        .expect("capture on A");
+    let (moved, cap) =
+        common::postcopy::move_guest(&client_a, &client_b, vm, ckpt.clone(), host_a.addr).await;
+    common::postcopy::drain(&host_b.pooled, moved).await;
     assert!(
-        !cap.disk_manifest_json.is_empty(),
-        "an NBD-backed source must export its disk manifest"
+        cap.disk_manifest_ref.is_some(),
+        "NBD source advertises its disk base"
     );
-    let mut metadata = ckpt.clone();
-    metadata.id = cap.snapshot_id;
-    metadata.memory_manifest = Some(cap.memory_manifest_ref);
-    metadata.disk_manifest = Some(cap.disk_manifest_ref);
-    metadata.state_blob_key = None;
-    metadata.sidecar_blob_key = None;
-    metadata.migration_source = Some(MigrationSourceInfo {
-        export_id: cap.export_id.clone(),
-        source_addr: format!("http://{}", host_a.addr),
-        memory_manifest_json: cap.memory_manifest_json.clone(),
-        disk_manifest_json: cap.disk_manifest_json.clone(),
-        memory_manifest_ref: cap.memory_manifest_ref,
-        disk_manifest_ref: cap.disk_manifest_ref,
-        new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
-        new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
-        hot_chunks: vec![],
-        post_copy: false,
-        peer_addr: None,
-        peer_token: None,
-        sidecar_json: Vec::new(),
-    });
-    let moved = client_b
-        .restore(metadata, engram_core::traits::SessionFence::unfenced())
+    let row = host_b
+        .pooled
+        .checkpoint_sandbox(moved)
         .await
-        .expect("restore on B");
-    let row = host_b.pooled.snapshot_wait(moved).await.expect("catch-up");
-    assert_eq!(row.memory_manifest, Some(cap.memory_manifest_ref));
+        .expect("durable checkpoint");
+    let durable_ref = row.memory_manifest.expect("durable memory manifest");
+    assert_ne!(durable_ref.manifest_id, cap.memory_manifest_ref.manifest_id);
 
     // COMMIT FIRST: the frozen source — whose NBD device on a
     // one-machine test would happily keep serving the right bytes —
@@ -1089,7 +997,9 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
 
     host_b.pooled.destroy(moved).await.expect("destroy moved");
     host_a.server.abort();
+    host_a.peer.abort();
     host_b.server.abort();
+    host_b.peer.abort();
 }
 
 #[tokio::test]
@@ -1168,7 +1078,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         aux_ro_drives: vec![staged.agentd_slot()],
         swap_mib: None,
     };
-    let vm = host_a.pooled.create(spec).await.expect("create on A");
+    let vm = common::postcopy::fresh(&host_a.pooled, spec).await;
     let _ = exec(&host_a.pooled, vm, "true").await;
     let ckpt = host_a
         .pooled
@@ -1176,7 +1086,16 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         .await
         .expect("seed checkpoint");
     let cap = client_a
-        .migration_capture(vm, engram_core::traits::SessionFence::unfenced())
+        .migration_presetup(vm, engram_core::traits::SessionFence::unfenced())
+        .await
+        .expect("capture");
+
+    client_a
+        .migration_capture_postcopy(
+            vm,
+            &cap.export_id,
+            engram_core::traits::SessionFence::unfenced(),
+        )
         .await
         .expect("capture");
 
@@ -1185,6 +1104,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     // stops accepting (connect refused) rather than blind-sleeping, so the
     // dest genuinely pulls against a dead source.
     host_a.server.abort();
+    host_a.peer.abort();
     let source_addr = host_a.addr;
     assert!(
         common::poll_until_async(
@@ -1196,27 +1116,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         "aborted source server still accepted a connection after 5s"
     );
 
-    let mut metadata = ckpt.clone();
-    metadata.id = cap.snapshot_id;
-    metadata.memory_manifest = Some(cap.memory_manifest_ref);
-    metadata.disk_manifest = (!cap.disk_manifest_json.is_empty()).then_some(cap.disk_manifest_ref);
-    metadata.state_blob_key = None;
-    metadata.sidecar_blob_key = None;
-    metadata.migration_source = Some(MigrationSourceInfo {
-        export_id: cap.export_id.clone(),
-        source_addr: format!("http://{}", host_a.addr),
-        memory_manifest_json: cap.memory_manifest_json.clone(),
-        disk_manifest_json: cap.disk_manifest_json.clone(),
-        memory_manifest_ref: cap.memory_manifest_ref,
-        disk_manifest_ref: cap.disk_manifest_ref,
-        new_memory_chunk_hashes: cap.new_memory_chunk_hashes.clone(),
-        new_disk_chunk_hashes: cap.new_disk_chunk_hashes.clone(),
-        hot_chunks: vec![],
-        post_copy: false,
-        peer_addr: None,
-        peer_token: None,
-        sidecar_json: Vec::new(),
-    });
+    let metadata = common::postcopy::metadata(ckpt, &cap, host_a.addr);
 
     let err = client_b
         .restore(metadata, engram_core::traits::SessionFence::unfenced())
@@ -1234,7 +1134,9 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
     // durable checkpoint — exercised in live_migration's unit arms and
     // admin_evac_live_pg. Host-side: A's frozen VM is the export TTL's
     // problem (its process tree is gone in this test).
+    host_a.pooled.destroy(vm).await.expect("destroy source");
     host_b.server.abort();
+    host_b.peer.abort();
 }
 
 fn gate() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {

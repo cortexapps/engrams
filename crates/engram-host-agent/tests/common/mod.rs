@@ -10,6 +10,9 @@
 #![allow(clippy::disallowed_methods)]
 #![allow(dead_code)]
 
+#[cfg(target_os = "linux")]
+pub mod postcopy;
+
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::endpoints::GuestEndpoints;

@@ -382,28 +382,6 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// ADR 0045 D5: await the background upload spawned by
-    /// [`Self::snapshot_begin`]; returns the durable metadata.
-    async fn snapshot_wait(&self, _id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        Err(SandboxError::InvalidSpec(
-            "this backend doesn't support `snapshot_wait`".into(),
-        ))
-    }
-
-    /// ADR 0045 C1: freeze this sandbox for a live move — pause + NBD
-    /// drain + diff capture + local-sink re-chunk; the guest STAYS
-    /// PAUSED and the sandbox is fenced until commit/abort. Default
-    /// errs (`InvalidSpec`) so non-FC backends and pre-C1 binaries
-    /// fall back to the snapshot-rehome teleport.
-    async fn migration_capture(
-        &self,
-        _id: SandboxId,
-    ) -> Result<crate::types::snapshot::MigrationCaptureOut, SandboxError> {
-        Err(SandboxError::InvalidSpec(
-            "this backend doesn't support `migration_capture`".into(),
-        ))
-    }
-
     /// ADR 0045 C2: the pre-pause half of a post-copy move. Mints the
     /// export identity (the page server parks the dest handler's Hello
     /// until the capture registers it) and packages everything the
@@ -447,7 +425,7 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// ADR 0045 C1: stream an open export's artifacts (allowlisted).
+    /// ADR 0045: stream an open export's artifacts (allowlisted).
     async fn migration_fetch(
         &self,
         _export_id: &str,
@@ -464,7 +442,7 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// ADR 0045 C1: the move landed — destroy the frozen source VM and
+    /// ADR 0045: the move landed — destroy the frozen source VM and
     /// drop its export + local snapshot dir.
     async fn migration_commit(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(
@@ -472,7 +450,7 @@ pub trait SandboxBackend: Send + Sync {
         ))
     }
 
-    /// ADR 0045 C1: the move failed — re-queue the drained disk tier,
+    /// ADR 0045: the move failed — re-queue the drained disk tier,
     /// unfence, and un-pause the guest in place. Zero loss.
     async fn migration_abort(&self, _id: SandboxId, _export_id: &str) -> Result<(), SandboxError> {
         Err(SandboxError::InvalidSpec(

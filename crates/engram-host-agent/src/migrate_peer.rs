@@ -23,9 +23,6 @@
 //! - chunks whose live bytes hash to the durable manifest entry answer
 //!   `AltSource` (the over-approximation demote);
 //! - everything else ships as `Page` with its sha256.
-//! - `GetChunk` serves allowlisted durable chunks from the local NVMe
-//!   cache (the dest handler's mid-drain fallback when its own cache
-//!   misses) — same allowlist posture as the gRPC `MigrationFetch`.
 //!
 //! Connections are handled on `spawn_blocking` threads with the proto's
 //! sync codec (symmetric with the handler client; ≤ a few conns per
@@ -33,13 +30,12 @@
 //! connection — `req_id` keeps the wire order-independent so the dest
 //! scales by opening more drain connections, not by a fancier stream.
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use engram_chunk_store::{ChunkCache, ChunkHash, ChunkStore};
+use engram_chunk_store::ChunkHash;
 use engram_core::SandboxId;
 use engram_migrate_proto::{
     read_frame, write_frame, FromSource, SealBitmap, ToSource, PROTO_VERSION,
@@ -69,19 +65,11 @@ pub struct PeerExport {
     /// Chunk-index → durable manifest hash at the dest's restore manifest
     /// (the last checkpoint chain manifest). `AltSource` comparisons.
     pub durable_at: Vec<Option<ChunkHash>>,
-    /// `GetChunk` gate — the same full-session-manifest allowlist the
-    /// gRPC `MigrationFetch` uses.
-    pub allowed_chunks: HashSet<ChunkHash>,
     pub chunk_size: u64,
     pub total_bytes: u64,
     /// Per-leg serve attribution (logged at DrainDone): where the
     /// per-request wall actually goes on this no-SHA-NI fleet.
     pub serve: ServeStats,
-    /// Serve-side marker, set when the dest reports `DrainDone`: every
-    /// sealed chunk has been drained off this source. Observability /
-    /// test signal only — the commit path does NOT consult it (commit is
-    /// gated elsewhere); production never reads this field.
-    pub drained: AtomicBool,
     /// Issue #216 Gap 2: the TTL clock SHARED with the registry's
     /// `MigrationExport.last_activity` (same `Arc`). The post-copy TTL
     /// is documented to run from "last page-serving activity," but the
@@ -89,7 +77,7 @@ pub struct PeerExport {
     /// `migration_fetch` — a drain that proceeds purely over this TCP
     /// page channel never refreshed the clock, so a >120 s drain let
     /// `expired()` fire and the sweep DESTROY the source mid-drain.
-    /// Every `NeedAt`/`GetChunk` serve now stamps this, keeping the
+    /// Every `NeedAt` serve now stamps this, keeping the
     /// registry export alive exactly as long as the dest is pulling. A
     /// `now_mono` reading off the injected clock (ADR 0098 P8).
     pub last_activity: Arc<std::sync::Mutex<std::time::Duration>>,
@@ -234,33 +222,21 @@ pub struct PeerServer {
     /// Bounds concurrently-parked unknown-export Hellos
     /// ([`MAX_PARKED_HELLOS`]).
     park_slots: Semaphore,
-    /// `GetChunk` backing. `None` ⇒ `GetChunk` answers `Error` (the dest
-    /// falls back to GCS) — hosts without chunk machinery can't be
-    /// migration sources anyway.
-    cache: Option<ChunkCache>,
-    store: Option<ChunkStore>,
 }
 
 impl PeerServer {
-    pub fn new(port: u16, cache: Option<ChunkCache>, store: Option<ChunkStore>) -> Arc<Self> {
-        Self::new_with_park_budget(port, cache, store, std::time::Duration::from_secs(120))
+    pub fn new(port: u16) -> Arc<Self> {
+        Self::new_with_park_budget(port, std::time::Duration::from_secs(120))
     }
 
     /// Test seam: shrink the unknown-export park window.
-    pub fn new_with_park_budget(
-        port: u16,
-        cache: Option<ChunkCache>,
-        store: Option<ChunkStore>,
-        park_budget: std::time::Duration,
-    ) -> Arc<Self> {
+    pub fn new_with_park_budget(port: u16, park_budget: std::time::Duration) -> Arc<Self> {
         Arc::new(Self {
             port,
             park_budget,
             exports: DashMap::new(),
             registered: Notify::new(),
             park_slots: Semaphore::new(MAX_PARKED_HELLOS),
-            cache,
-            store,
         })
     }
 
@@ -369,10 +345,9 @@ impl PeerServer {
             tracing::warn!(%peer, error = %e, "peer conn set_nonblocking failed");
             return Ok(());
         }
-        let handle = tokio::runtime::Handle::current();
         let server = Arc::clone(&self);
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = server.serve_resolved_conn(&std_stream, &export, purpose, &handle) {
+            if let Err(e) = server.serve_resolved_conn(&std_stream, &export, purpose) {
                 tracing::debug!(%peer, error = %e, "peer conn request loop ended with error");
             }
         })
@@ -513,7 +488,6 @@ impl PeerServer {
         stream: &std::net::TcpStream,
         export: &Arc<PeerExport>,
         purpose: engram_migrate_proto::ConnPurpose,
-        handle: &tokio::runtime::Handle,
     ) -> std::io::Result<()> {
         let mut stream = stream;
         write_frame(
@@ -554,20 +528,11 @@ impl PeerServer {
                         .write_us
                         .fetch_add(t_write.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
-                ToSource::GetChunk { req_id, hash } => {
-                    // Issue #216 Gap 2: stamp the shared TTL clock (see
-                    // NeedAt) — a drain that falls back to GetChunk for
-                    // every page must also count as activity.
-                    export.touch();
-                    let resp = self.serve_get_chunk(export, req_id, hash, handle);
-                    write_frame(&mut stream, &resp)?;
-                }
                 ToSource::DrainDone {
                     pulled,
                     alt_sourced,
                     zero_chunks,
                 } => {
-                    export.drained.store(true, Ordering::SeqCst);
                     let st = &export.serve;
                     tracing::info!(
                         export_id = %export.export_id,
@@ -699,42 +664,6 @@ impl PeerServer {
             }
         }
     }
-
-    fn serve_get_chunk(
-        &self,
-        export: &PeerExport,
-        req_id: u64,
-        hash: [u8; 32],
-        handle: &tokio::runtime::Handle,
-    ) -> FromSource {
-        let hash = ChunkHash::from_bytes(hash);
-        if !export.allowed_chunks.contains(&hash) {
-            return FromSource::Error {
-                req_id: Some(req_id),
-                message: "chunk not in export allowlist".into(),
-            };
-        }
-        let (Some(cache), Some(store)) = (self.cache.as_ref(), self.store.as_ref()) else {
-            return FromSource::Error {
-                req_id: Some(req_id),
-                message: "source has no chunk cache/store".into(),
-            };
-        };
-        let store = store.clone();
-        match handle.block_on(cache.get(hash, move || {
-            let store = store.clone();
-            async move { store.get_chunk(hash).await }
-        })) {
-            Ok(bytes) => FromSource::ChunkBytes {
-                req_id,
-                bytes: bytes.to_vec(),
-            },
-            Err(e) => FromSource::Error {
-                req_id: Some(req_id),
-                message: format!("chunk fetch failed: {e}"),
-            },
-        }
-    }
 }
 
 /// Read one length-prefixed frame asynchronously — the SAME wire format
@@ -853,11 +782,9 @@ mod tests {
             vmas: vec![],
             seal,
             durable_at: vec![None; 4],
-            allowed_chunks: HashSet::new(),
             chunk_size: 4096,
             total_bytes: 4 * 4096,
             serve: Default::default(),
-            drained: AtomicBool::new(false),
             last_activity,
             clock: Arc::new(engram_core::traits::SystemClock::new()),
         }
@@ -901,12 +828,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_export_and_bad_token_are_rejected() {
-        let server = PeerServer::new_with_park_budget(
-            9102,
-            None,
-            None,
-            std::time::Duration::from_millis(50),
-        );
+        let server = PeerServer::new_with_park_budget(9102, std::time::Duration::from_millis(50));
         server.register(test_export("right"));
 
         let got = talk(server.clone(), vec![hello("nope", "right")], 1).await;
@@ -922,7 +844,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_skew_is_rejected() {
-        let server = PeerServer::new(9102, None, None);
+        let server = PeerServer::new(9102);
         server.register(test_export("t"));
         let got = talk(
             server,
@@ -942,7 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn good_hello_acks_and_pushes_seal_then_validates_need_at() {
-        let server = PeerServer::new(9102, None, None);
+        let server = PeerServer::new(9102);
         server.register(test_export("t"));
         let got = talk(
             server,
@@ -991,27 +913,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn get_chunk_outside_allowlist_is_rejected() {
-        let server = PeerServer::new(9102, None, None);
-        server.register(test_export("t"));
-        let got = talk(
-            server,
-            vec![
-                hello("exp-1", "t"),
-                ToSource::GetChunk {
-                    req_id: 9,
-                    hash: [0xEE; 32],
-                },
-            ],
-            3,
-        )
-        .await;
-        assert!(
-            matches!(&got[2], FromSource::Error { req_id: Some(9), message } if message.contains("allowlist"))
-        );
-    }
-
     /// ADR 0045 C2: the pre-staged destination dials BEFORE the
     /// capture registers the export — the server PARKS the Hello and
     /// completes the handshake the moment registration lands. (The
@@ -1019,7 +920,7 @@ mod tests {
     /// post-copy move fail by construction; found prod-probing.)
     #[tokio::test]
     async fn early_hello_parks_until_the_export_registers() {
-        let server = PeerServer::new(9102, None, None);
+        let server = PeerServer::new(9102);
         let registrar = server.clone();
         // Register 150ms AFTER the Hello is in flight.
         tokio::spawn(async move {
@@ -1051,7 +952,7 @@ mod tests {
         // reading (SystemClock is monotone from construction).
         let stale = std::time::Duration::ZERO;
         let clock = Arc::new(std::sync::Mutex::new(stale));
-        let server = PeerServer::new(9102, None, None);
+        let server = PeerServer::new(9102);
         server.register(test_export_with_clock("t", clock.clone()));
 
         // Hello + Seal (2 replies) + one NeedAt reply for the sealed
@@ -1070,7 +971,7 @@ mod tests {
         .await;
 
         // The conn handler is on a blocking thread; poll the shared
-        // clock with a deadline (mirrors `drain_done_marks_export`).
+        // clock with a deadline.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let advanced = *clock.lock().unwrap() > stale;
@@ -1086,38 +987,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_done_marks_export_and_closes() {
-        let server = PeerServer::new(9102, None, None);
+    async fn drain_done_closes_connection() {
+        let server = PeerServer::new(9102);
         server.register(test_export("t"));
-        let _ = talk(
-            server.clone(),
-            vec![
-                hello("exp-1", "t"),
-                ToSource::DrainDone {
-                    pulled: 1,
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            server.handle_conn(stream, peer).await.unwrap();
+        });
+        tokio::task::spawn_blocking(move || {
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            write_frame(&mut stream, &hello("exp-1", "t")).unwrap();
+            let _: FromSource = read_frame(&mut stream).unwrap();
+            let _: FromSource = read_frame(&mut stream).unwrap();
+            write_frame(
+                &mut stream,
+                &ToSource::DrainDone {
+                    pulled: 0,
                     alt_sourced: 0,
                     zero_chunks: 0,
                 },
-            ],
-            2,
-        )
-        .await;
-        // `talk` returns once the CLIENT has its two reply frames
-        // (HelloAck + Seal); the server's blocking conn loop may not
-        // have consumed the trailing DrainDone yet. Poll with a
-        // deadline instead of asserting instantly (flaked on CI,
-        // 2026-06-12).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if server.get("exp-1").unwrap().drained.load(Ordering::SeqCst) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "DrainDone never marked the export drained",
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+            )
+            .unwrap();
+            let err = read_frame::<_, FromSource>(&mut stream).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        })
+        .await
+        .unwrap();
+        task.await.unwrap();
     }
 
     /// Helper: dial the server, send `Hello`, return the connected
@@ -1160,12 +1061,7 @@ mod tests {
         rt.block_on(async {
             // Long park budget: pre-fix, parked conns would hold the lone
             // blocking thread for this whole window.
-            let server = PeerServer::new_with_park_budget(
-                9102,
-                None,
-                None,
-                std::time::Duration::from_secs(30),
-            );
+            let server = PeerServer::new_with_park_budget(9102, std::time::Duration::from_secs(30));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let serve = tokio::spawn(server.clone().serve_on(listener));
@@ -1222,8 +1118,7 @@ mod tests {
     async fn parked_hello_limit_rejects_beyond_cap() {
         // Park budget long enough that the first wave stays parked while
         // we probe the cap.
-        let server =
-            PeerServer::new_with_park_budget(9102, None, None, std::time::Duration::from_secs(30));
+        let server = PeerServer::new_with_park_budget(9102, std::time::Duration::from_secs(30));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let serve = tokio::spawn(server.clone().serve_on(listener));

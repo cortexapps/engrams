@@ -389,7 +389,7 @@ impl CoordControlPlane for HttpCoordClient {
     }
 
     /// POST /api/v1/hosts/:id/idle-eviction-candidates
-    /// ADR 0045 C1: the export-TTL ownership check. `Ok(true)` = the
+    /// ADR 0045: the export-TTL ownership check. `Ok(true)` = the
     /// coordinator still binds this sandbox to the session (the move
     /// never landed — abort the export, un-pause in place);
     /// `Ok(false)` = ownership moved on (destroy the stale frozen

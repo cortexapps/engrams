@@ -679,8 +679,13 @@ fn wire_version_pinned() {
     // addition); the oauth-user-policy golden is ADDED and the variant index
     // is pinned at 2.
     // 28 -> 29: SnapshotHold adds an RPC; bincode payloads are unchanged.
+    // 29 -> 30: ADR 0045 C1 retired — `MigrationCapture`, `SnapshotWait`
+    // and the `Chunk`/`Sidecar`/`DiskManifest` export items are deleted;
+    // `MigrationSourceInfo` loses its C1-only fields (no golden embeds
+    // it: `snapshot_metadata.bin` pins `migration_source: None`). Lockstep
+    // coord+host roll.
     assert_eq!(
-        WIRE_VERSION, 29,
+        WIRE_VERSION, 30,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

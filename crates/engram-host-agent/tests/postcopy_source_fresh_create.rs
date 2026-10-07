@@ -46,7 +46,7 @@ async fn file_mode_fresh_create_is_a_post_copy_source() {
     let pooled = env.pooled();
     // The page server is a presetup precondition; the capture only
     // registers the export with it (no dest dials in this test).
-    pooled.set_migrate_peer_server(PeerServer::new(0, None, Some(env.chunk_store.clone())));
+    pooled.set_migrate_peer_server(PeerServer::new(0));
     let rootfs = env.bake("engram-postcopy-fresh-source").await;
     let spec = env.spec(rootfs);
 

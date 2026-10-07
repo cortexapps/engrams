@@ -431,13 +431,7 @@ mod steps {
                     export_id: presetup.export_id.clone(),
                     source_addr,
                     memory_manifest_json: presetup.memory_manifest_json,
-                    disk_manifest_json: Vec::new(),
                     memory_manifest_ref: presetup.memory_manifest_ref,
-                    disk_manifest_ref: presetup.disk_manifest_ref.ok_or_else(|| {
-                        ApiError::Internal("live export has no disk manifest".into())
-                    })?,
-                    new_memory_chunk_hashes: Vec::new(),
-                    new_disk_chunk_hashes: Vec::new(),
                     hot_chunks: presetup.hot_chunks,
                     post_copy: true,
                     peer_addr: Some(peer_addr),

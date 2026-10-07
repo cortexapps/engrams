@@ -269,7 +269,7 @@ impl ChunkedMemoryBackend {
         .await
     }
 
-    /// ADR 0045 C1: like [`Self::from_blob`], but when
+    /// ADR 0045: like [`Self::from_blob`], but when
     /// `session_manifest_json` is `Some(path)` the SESSION manifest is
     /// read from that local file instead of the blob store. A migration
     /// destination restores from a manifest that is deliberately NOT
@@ -338,7 +338,7 @@ impl ChunkedMemoryBackend {
         populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
     ) -> Result<Self, ChunkedBackendError> {
         let store = engram_chunk_store::ChunkStore::new(blob);
-        // ADR 0045 C1: when the canonical and session refs coincide on a
+        // ADR 0045: when the canonical and session refs coincide on a
         // migration restore (no image-base rider), the canonical IS the
         // local file too — store-fetching it would 404 (the v+1 manifest
         // is deliberately unpublished until the catch-up).

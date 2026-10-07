@@ -437,7 +437,7 @@ pub struct Runtime {
     /// checkpoint) chunks are peer-authoritative: the fault path asks
     /// the source's page server instead of `resolve()`, and the drain
     /// task pulls the rest in the background. `None` ⇒ everything
-    /// above is byte-identical to a C1 restore.
+    /// above is independent of the source.
     peer: Option<std::sync::Arc<crate::peer::PeerSession>>,
     /// One-way progress/failure reports to the host-agent (peer mode).
     control: Option<std::sync::Arc<crate::peer::ControlTx>>,
@@ -681,7 +681,7 @@ impl Runtime {
         result
     }
 
-    /// ADR 0045 C1 tail latency: eagerly install EVERY chunk of the
+    /// ADR 0045 tail latency: eagerly install EVERY chunk of the
     /// session — canonical via the shared base (CONTINUE), divergent
     /// via fetch + COPY — as a background producer racing the fault
     /// loop, exactly like `prefault_from_trace` but with total
@@ -798,7 +798,7 @@ impl Runtime {
             zero_skipped = deferred,
             elapsed_ms = started.elapsed().as_millis() as u64,
             total_chunks = total.div_ceil(chunk_size),
-            "eager sweep complete (ADR 0045 C1)"
+            "eager sweep complete (ADR 0045)"
         );
         Ok(())
     }
@@ -1915,7 +1915,7 @@ pub fn run_listener(
                 // trip the fault loop shrink to the race window. The
                 // sweep is what kills the migration-restore crawl: no
                 // host trace exists on a fresh dest, and the divergent
-                // chunk set otherwise faults in serially (ADR 0045 C1).
+                // chunk set otherwise faults in serially (ADR 0045).
                 if let Some(trace) = prefault_trace {
                     if let Err(e) = rt.prefault_from_trace(&trace) {
                         tracing::warn!(

@@ -1080,7 +1080,7 @@ pub struct ChunkedDiskBackend {
     /// `u64::MAX` to disable threshold-driven wakeups (tests, or
     /// any caller that doesn't run a scheduler against this backend).
     threshold_notify: Arc<Notify>,
-    /// ADR 0045 C1: while a migration export is open on this sandbox,
+    /// ADR 0045: while a migration export is open on this sandbox,
     /// `flush()` no-ops — the capture's drained manifest is the
     /// coherence cut the destination restores from, and a concurrent
     /// flush would publish a newer live_disk_manifest racing the
@@ -1460,10 +1460,8 @@ impl ChunkedDiskBackend {
         )
     }
 
-    /// ADR 0045 C1: construct from manifest CONTENT the caller already
-    /// holds — a migration destination attaches a not-yet-durable disk
-    /// manifest delivered inline (its chunks pre-pulled into the local
-    /// cache); the store is only the fallthrough for base chunks.
+    /// Construct from a manifest already held by the caller. Missing
+    /// base chunks are fetched through the cache and chunk store.
     pub fn from_manifest(
         manifest_ref: ManifestRef,
         manifest: &engram_chunk_store::Manifest,
@@ -2022,16 +2020,6 @@ impl ChunkedDiskBackend {
         self.flush_upload(pending).await
     }
 
-    /// ADR 0045 C1 (destination): point the backend at the manifest
-    /// ref the durability catch-up actually published (the provisional
-    /// ref can lose the shared-lineage version race). Future flushes
-    /// chain from here.
-    pub async fn rebase_manifest_ref(&self, manifest_ref: ManifestRef) {
-        let mut state = self.state.lock().await;
-        state.manifest_ref = manifest_ref;
-        state.fork_identity = None;
-    }
-
     /// ADR 0049 follow-up: arm the lazy per-session manifest fork. Called
     /// on the fresh-create attach path (where the backend is born on the
     /// SHARED base `manifest_id`) so the first flush mints a private id
@@ -2050,7 +2038,7 @@ impl ChunkedDiskBackend {
         self.state.lock().await.fork_identity = Some(self.entropy.uuid());
     }
 
-    /// ADR 0045 C1: see `migration_fence`.
+    /// ADR 0045: see `migration_fence`.
     pub fn set_migration_fence(&self, fenced: bool) {
         self.migration_fence
             .store(fenced, std::sync::atomic::Ordering::SeqCst);
@@ -2213,85 +2201,6 @@ impl ChunkedDiskBackend {
         }
     }
 
-    /// ADR 0038 B3 — phase 2 (runs post-resume on the snapshot path):
-    /// upload the chunks captured by `flush_local` to GCS, then publish
-    /// the manifest and rebase `base`. Keeping the rebase *after* the
-    /// upload preserves "a manifest someone restores from ⟹ its chunks
-    /// are durable" — the background scheduler reads `base`, so it never
-    /// references a not-yet-uploaded chunk. A failed upload releases the
-    /// claims to the dirty set so the next flush retries them.
-    /// ADR 0045 C1: the migration flavor of `flush_upload` — land the
-    /// claimed chunks in the host-local NVMe cache ONLY (no GCS PUT on
-    /// the teleport pause path) and return the post-drain manifest
-    /// WITHOUT publishing or rebasing. The manifest's chunks are
-    /// reachable through the cache for the destination's pull; the
-    /// destination's durability catch-up uploads + publishes later.
-    /// The source's own `state` is untouched: on commit the VM is
-    /// destroyed; on abort call [`Self::requeue_pending`] first.
-    ///
-    /// Returns `(manifest, new_hashes)` for the destination pull.
-    pub async fn flush_to_local_cache(
-        &self,
-        pending: &PendingDiskFlush,
-    ) -> Result<(Manifest, Vec<ChunkHash>), DiskBackendError> {
-        let chunk_size = self.chunk_size;
-        let mut new_hashes = Vec::with_capacity(pending.chunks.len());
-        let mut hashed: Vec<(usize, ChunkHash)> = Vec::with_capacity(pending.chunks.len());
-        for &(chunk_idx, chunk_len) in &pending.chunks {
-            let bytes = {
-                let tier = self.dirty_tier.lock().await;
-                tier.read_frozen_chunk(chunk_idx, chunk_len as usize, chunk_size)?
-            };
-            let hash = ChunkHash::of(&bytes);
-            // No per-write sweep — batch-closing sweep below.
-            self.cache
-                .put_no_evict(hash, &bytes)
-                .await
-                .map_err(DiskBackendError::Chunk)?;
-            new_hashes.push(hash);
-            hashed.push((chunk_idx, hash));
-        }
-        self.cache.sweep().await.map_err(DiskBackendError::Chunk)?;
-        let state = self.state.lock().await;
-        let mut chunks: Vec<ChunkRef> = state
-            .base
-            .chunks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, h)| {
-                h.map(|hash| ChunkRef {
-                    offset: (i as u64) * chunk_size,
-                    hash,
-                })
-            })
-            .collect();
-        for (idx, hash) in &hashed {
-            let offset = (*idx as u64) * chunk_size;
-            if let Some(existing) = chunks.iter_mut().find(|c| c.offset == offset) {
-                existing.hash = *hash;
-            } else {
-                chunks.push(ChunkRef {
-                    offset,
-                    hash: *hash,
-                });
-            }
-        }
-        chunks.sort_by_key(|c| c.offset);
-        Ok((
-            Manifest {
-                schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
-                kind: ManifestKind::Disk,
-                chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(chunk_size),
-                total_bytes: self.total_bytes,
-                chunks,
-                parent: Some(state.manifest_ref),
-                working_set_trace: None,
-                annotations: serde_json::Value::Null,
-            },
-            new_hashes,
-        ))
-    }
-
     /// Eviction handoff (ADR 0101): materialize the pending flush's
     /// chunks as bytes — read from the frozen overlay + hashed — for
     /// the finalize state machine, which persists them into its own
@@ -2317,7 +2226,7 @@ impl ChunkedDiskBackend {
         Ok(out)
     }
 
-    /// ADR 0045 C1 abort path. ADR 0110 addendum: nothing to release —
+    /// ADR 0045 abort path. ADR 0110 addendum: nothing to release —
     /// the frozen overlay is still on disk and the next flush re-drains
     /// it. Consuming the pending drops the pipeline guard. Idempotent.
     pub async fn requeue_pending(&self, pending: PendingDiskFlush) {
@@ -5833,9 +5742,8 @@ mod tests {
     /// Simulate the current migration abort sequence. The file-backed
     /// phase will no longer need to put captured bytes back into RAM.
     async fn abort_migration(backend: &ChunkedDiskBackend) -> Result<(), DiskBackendError> {
-        let pending = backend.flush_local().await?;
-        backend.flush_to_local_cache(&pending).await?;
-        backend.requeue_pending(pending).await;
+        let (sealed, _, _) = backend.seal_for_postcopy().await?;
+        backend.requeue_postcopy_seal(&sealed).await;
         backend.set_migration_fence(false);
         Ok(())
     }
@@ -5857,7 +5765,7 @@ mod tests {
         restored.read(0, length).await.unwrap()
     }
 
-    /// ADR 0045 C1: a migration fence prevents a publish. Aborting the
+    /// ADR 0045: a migration fence prevents a publish. Aborting the
     /// migration preserves every acked byte for the next flush.
     #[tokio::test]
     async fn migration_fence_prevents_publish_and_abort_preserves_bytes() {

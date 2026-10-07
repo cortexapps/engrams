@@ -138,7 +138,7 @@ mod linux {
         pub listen: PathBuf,
         pub canonical_manifest: ManifestRef,
         pub session_manifest: ManifestRef,
-        /// ADR 0045 C1: read the SESSION manifest from this local JSON
+        /// ADR 0045: read the SESSION manifest from this local JSON
         /// file instead of the blob store — a migration destination
         /// restores from a not-yet-durable manifest whose chunks the
         /// host-agent pre-pulled into the NVMe cache.

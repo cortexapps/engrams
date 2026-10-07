@@ -29,7 +29,7 @@
 //! path, one or more for the background drain) — the token is per-export,
 //! not per-connection, and every authenticated connection receives the
 //! `Seal` push. `GET_STATE` from the original ADR sketch is deliberately
-//! ABSENT: `state.bin` rides the C1 gRPC `MigrationFetch` (`StateBin`
+//! ABSENT: `state.bin` rides the gRPC `MigrationFetch` (`StateBin`
 //! item) between host-agents; the handler never needs it.
 //!
 //! ## Soundness notes encoded in the message set
@@ -71,7 +71,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// bytes (no SHA-NI on the fleet); blake3 is cryptographic at
 /// ~1–2 GB/s in software. `AltSource.durable_sha256` STAYS sha256 —
 /// that is the chunk-store's content address, not wire integrity.
-pub const PROTO_VERSION: u32 = 4;
+///
+/// v5: remove the unused by-hash request and reply.
+pub const PROTO_VERSION: u32 = 5;
 
 /// Wire-integrity hash for `Page` payloads (v4: blake3 over the wire
 /// bytes — the SAME bytes shipped, compressed or raw). One helper so
@@ -187,10 +189,6 @@ pub enum ToSource {
     /// space). The server rejects unsealed or unaligned offsets — those
     /// are protocol bugs, not races.
     NeedAt { req_id: u64, chunk_offset: u64 },
-    /// Class-2 by-hash pull from the source's NVMe cache (allowlist-
-    /// gated, same posture as the gRPC `MigrationFetch` chunk items).
-    /// The fallback when the dest's local fetch misses mid-drain.
-    GetChunk { req_id: u64, hash: [u8; 32] },
     /// The drain finished: every sealed chunk is installed (or demoted
     /// and durably fetchable). The source may release the export early.
     /// Stats are informational (metrics/logs).
@@ -243,9 +241,6 @@ pub enum FromSource {
         chunk_offset: u64,
         durable_sha256: [u8; 32],
     },
-    /// `GetChunk` reply; the integrity check is the requested hash
-    /// itself (content-addressed).
-    ChunkBytes { req_id: u64, bytes: Vec<u8> },
     /// Protocol or serving error. `req_id: None` ⇒ connection-fatal
     /// (bad hello, version skew); `Some` ⇒ that request failed.
     Error {
@@ -289,7 +284,7 @@ pub enum HandlerControl {
     /// Periodic drain progress (every N chunks).
     DrainProgress { pulled: u64, remaining: u64 },
     /// All sealed chunks installed or demoted; the peer connections are
-    /// closed and the handler is byte-identical to a C1 restore from
+    /// closed and the handler is independent of the source from
     /// here on. `faults`/`fault_us` are the FAULT-path totals (guest
     /// faults that round-tripped the peer + their cumulative wall) —
     /// the serial P2P cost inside the FC load + early execution, the
@@ -389,10 +384,6 @@ mod tests {
             req_id: 7,
             chunk_offset: 512 * 1024 * 3,
         });
-        round_trip(&ToSource::GetChunk {
-            req_id: 8,
-            hash: [0xAB; 32],
-        });
         round_trip(&ToSource::DrainDone {
             pulled: 100,
             alt_sourced: 3,
@@ -441,10 +432,6 @@ mod tests {
             req_id: 3,
             chunk_offset: 1024 * 1024,
             durable_sha256: [0x22; 32],
-        });
-        round_trip(&FromSource::ChunkBytes {
-            req_id: 4,
-            bytes: vec![1, 2, 3],
         });
         round_trip(&FromSource::Error {
             req_id: None,

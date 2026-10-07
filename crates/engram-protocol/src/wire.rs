@@ -160,7 +160,8 @@ use serde::{Deserialize, Serialize};
 // variant, so the roll is lockstep.
 // v29 (ADR 0123): SnapshotHold keeps a source paused through teleport commit.
 // Older hosts cannot provide this capture contract. Roll coordinator and hosts together.
-pub const WIRE_VERSION: u32 = 29;
+// v30 removes stop-and-copy capture and its artifact kinds.
+pub const WIRE_VERSION: u32 = 30;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

@@ -1,40 +1,20 @@
-//! ADR 0045 Phase C1: the live-teleport SOURCE side.
-//!
-//! `MigrationCapture` freezes a sandbox for a move: pause + NBD drain +
-//! FC diff capture + LOCAL-sink re-chunk — no GCS traffic on the pause
-//! path; every byte the destination needs is then reachable through
-//! this host's NVMe chunk cache or the export's snapshot dir. The guest
-//! STAYS PAUSED and the sandbox is fenced (no flush publishes, no
-//! checkpoints — the export holds the capture lock) until `Commit`
-//! (destroy) or `Abort` (un-pause in place, zero loss).
-//!
-//! The export registry is the auth + lifetime story: a single-use
-//! unguessable `export_id` names the export; `MigrationFetch` serves
-//! ONLY artifacts on the export's allowlist; and the dumb-host TTL rule
-//! cleans up if the coordinator vanishes — after [`EXPORT_TTL`] with no
-//! commit/abort, the source asks the coordinator "do I still own this
-//! session?" and either un-pauses (yes) or destroys (no), staying
-//! paused and retrying while the coordinator is unreachable.
+//! Post-copy source exports hold the checkpoint fence and sealed disk bytes.
+//! Capture pauses the source. Commit destroys it; an explicit abort resumes it.
+//! The TTL sweep checks coordinator ownership after serving activity stops.
+//! Once state.bin is served, the sweep must not resume the source.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use engram_chunk_store::manifest::ChunkHash;
 use engram_core::SandboxId;
 use engram_sandbox_firecracker::sandbox_manifest::{
     ROLE_HELD_SOURCE, ROLE_POST_COPY_DEST, ROLE_POST_COPY_SOURCE,
 };
 
-/// No commit/abort within this window triggers the coordinator
-/// ownership check (see module docs). The clock runs from the LAST
-/// artifact/page-serving activity, not creation — for BOTH C1 (gRPC
-/// `migration_fetch`) and post-copy (the TCP page server) exports: an
-/// export actively serving the move is alive by definition; 120 s of
-/// silence is the trigger.
+/// Check ownership after this interval without artifact or page serves.
 pub const EXPORT_TTL: Duration = Duration::from_secs(120);
 
 /// ADR 0045 C2: a sandbox's role in an in-flight post-copy migration.
@@ -80,13 +60,6 @@ pub struct MigrationExport {
     pub sandbox_id: SandboxId,
     /// Holds state.bin + the (patched) sidecar manifest.json.
     pub snapshot_dir: PathBuf,
-    /// Chunk hashes `MigrationFetch` may serve — the rebuilt memory
-    /// chunks + the pending-tier disk chunks, all resident in the
-    /// host-local NVMe cache.
-    pub allowed_chunks: HashSet<ChunkHash>,
-    /// Drained-but-not-uploaded disk chunks, kept for the abort
-    /// re-queue (`ChunkedDiskBackend::requeue_pending`).
-    pub disk_pending: Option<crate::disk_daemon::PendingDiskFlush>,
     /// ADR 0045 C2 disk post-copy: the sealed dirty/pending disk
     /// tiers, raw bytes in RAM — served by index over
     /// `MigrationFetch::DiskChunkAt`, re-queued into `dirty` on abort,
@@ -97,13 +70,6 @@ pub struct MigrationExport {
     /// so it is decision-feeding time (D1), and the paused sim clock
     /// drives it deterministically.
     pub clock: Arc<dyn engram_core::traits::Clock>,
-    pub created_at: Duration,
-    /// ADR 0045 C2: this export serves a post-copy move (the guest
-    /// already resumed on the dest; this frozen source is a page
-    /// server). FORBIDS the abort-unpause arm once `state_served` is
-    /// set. (The TTL clock is `last_activity` for ALL exports now — see
-    /// `expired()` — so this no longer gates the anchor.)
-    pub post_copy: bool,
     /// ADR 0045 C2 split-brain guard: set the moment `state.bin`
     /// leaves this host (`MigrationFetch` StateBin). From then on the
     /// dest may be running this state — the source must NEVER
@@ -209,13 +175,7 @@ impl MigrationRegistry {
     /// Exports older than [`EXPORT_TTL`] (the dumb-host sweep input).
     /// ALL exports age from their last serving activity, not creation:
     /// an export actively serving fetches/pages is alive by definition.
-    /// `touch()` is called on every serve for BOTH C1 (gRPC
-    /// `migration_fetch`) and post-copy (the peer page server) exports;
-    /// a fresh export's `last_activity` is seeded to its creation
-    /// instant, so an export that has served NOTHING still ages from
-    /// creation. (Previously C1 anchored on `created_at`, so a >120 s
-    /// live-teleport that was actively serving `migration_fetch`
-    /// streams was spuriously aborted mid-read — issue #216 Gap 1.)
+    /// Artifact and page serves refresh the shared activity clock.
     pub fn expired(&self) -> Vec<SandboxId> {
         let mut expired = self
             .by_sandbox
@@ -288,7 +248,7 @@ impl MigrationRegistry {
     }
 }
 
-/// ADR 0045 C1: what the TTL sweep should do with an expired export,
+/// ADR 0045: what the TTL sweep should do with an expired export,
 /// given the coordinator's ownership answer. Pure — the decision the
 /// dumb-host rule encodes, unit-tested apart from any I/O.
 #[derive(Debug, PartialEq, Eq)]
@@ -404,14 +364,6 @@ mod tests {
 
     /// ADR 0045 C2: once state.bin shipped, yes⇒un-pause is FORBIDDEN
     /// (split-brain); everything else is unchanged.
-    ///
-    /// Issue #216 Gap 1: `state_served` now arms for C1 too
-    /// (`migration_fetch` sets it on any StateBin serve, dropping the
-    /// old `post_copy` gate). `ttl_verdict` is mode-agnostic, so the
-    /// SAME forbidden-unpause arm protects a C1 export whose state.bin
-    /// shipped before it expired — a >120 s C1 teleport that already
-    /// shipped state must STAY PAUSED, never `AbortInPlace` (which would
-    /// resume the source while the dest may be running that state).
     #[test]
     fn ttl_verdict_state_served_forbids_unpause() {
         // C2 (post-copy) — the original cases.
@@ -419,28 +371,9 @@ mod tests {
         assert_eq!(ttl_verdict(true, Some(false), true), TtlVerdict::Destroy);
         assert_eq!(ttl_verdict(true, None, true), TtlVerdict::StayPaused);
         assert_eq!(ttl_verdict(false, Some(true), true), TtlVerdict::Destroy);
-
-        // C1 with state_served armed: identical verdicts. The crucial
-        // arm is `(bound, owned=true, state_served=true)` ⇒ StayPaused,
-        // NOT AbortInPlace — the C1 split-brain protection issue #216
-        // wires by dropping the `post_copy` gate on the
-        // `state_served`-set in `migration_fetch`.
-        assert_eq!(
-            ttl_verdict(true, Some(true), true),
-            TtlVerdict::StayPaused,
-            "C1 export that shipped state must not be un-paused (issue #216 Gap 1)"
-        );
     }
 
-    /// Issue #216 Gap 1: a C1 (non-post-copy) export that is actively
-    /// serving fetches must NOT expire from `created_at` — `expired()`
-    /// anchors on `last_activity`, and `migration_fetch` calls `touch()`
-    /// for C1 too. We simulate by seeding `created_at` and the shared
-    /// `last_activity` clock far in the past, then `touch()`ing: a C1
-    /// export born >TTL ago but touched now must NOT be expired.
-    /// A settable-mono test clock: `SystemClock::now_mono` anchors at
-    /// construction, so a fresh test process cannot mint a "stale" mark by
-    /// subtraction (it saturates to zero). This fake advances explicitly.
+    /// An explicit monotonic clock for export expiry tests.
     #[derive(Debug)]
     struct TestMonoClock(std::sync::Mutex<Duration>);
 
@@ -460,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn c1_export_ages_from_last_activity_not_creation() {
+    fn postcopy_export_ages_from_last_activity() {
         let reg = MigrationRegistry::default();
         let id = SandboxId::new();
         let eid = MigrationRegistry::mint_export_id();
@@ -478,13 +411,8 @@ mod tests {
             export_id: eid,
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
-            allowed_chunks: HashSet::new(),
-            disk_pending: None,
             disk_seal: None,
             clock: clock.clone(),
-            created_at: stale,
-            // The bug specifically affected C1 (non-post-copy) exports.
-            post_copy: false,
             state_served: Arc::new(AtomicBool::new(false)),
             last_activity: last_activity.clone(),
             capture_guard: guard,
@@ -492,16 +420,18 @@ mod tests {
 
         // Born >TTL ago AND silent >TTL ⇒ expired (the abandoned case
         // the sweep is for).
-        assert_eq!(reg.expired(), vec![id], "stale C1 export must expire");
+        assert_eq!(
+            reg.expired(),
+            vec![id],
+            "stale post-copy export must expire"
+        );
 
-        // An active fetch refreshes the clock — the export is alive
-        // again even though `created_at` is ancient. (Pre-fix: C1 aged
-        // on `created_at`, so this stayed expired → spurious mid-read
-        // abort of a healthy >120 s teleport.)
-        *last_activity.lock().unwrap() = clock.now_mono();
+        reg.find_by_export_id(&reg.export_id_of(id).unwrap())
+            .unwrap()
+            .touch();
         assert!(
             reg.expired().is_empty(),
-            "a freshly-touched C1 export must NOT expire (issue #216 Gap 1)"
+            "a freshly-touched post-copy export must NOT expire (issue #216 Gap 1)"
         );
     }
 
@@ -552,12 +482,8 @@ mod tests {
             export_id: eid.clone(),
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
-            allowed_chunks: HashSet::new(),
-            disk_pending: None,
             disk_seal: None,
             clock: Arc::new(engram_core::traits::SystemClock::new()),
-            created_at: Duration::ZERO,
-            post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
                 engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
@@ -576,12 +502,8 @@ mod tests {
             export_id: MigrationRegistry::mint_export_id(),
             sandbox_id: id,
             snapshot_dir: "/tmp".into(),
-            allowed_chunks: HashSet::new(),
-            disk_pending: None,
             disk_seal: None,
             clock: Arc::new(engram_core::traits::SystemClock::new()),
-            created_at: Duration::ZERO,
-            post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
                 engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
@@ -606,12 +528,8 @@ mod tests {
             export_id,
             sandbox_id,
             snapshot_dir: "/tmp".into(),
-            allowed_chunks: HashSet::new(),
-            disk_pending: None,
             disk_seal: None,
             clock: Arc::new(engram_core::traits::SystemClock::new()),
-            created_at: Duration::ZERO,
-            post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
                 engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
