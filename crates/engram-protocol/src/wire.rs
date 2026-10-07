@@ -163,7 +163,9 @@ use serde::{Deserialize, Serialize};
 // v30 removes stop-and-copy capture and its artifact kinds.
 // v31 tags migration disk items with their device role.
 // v32 appends SnapshotMetadata.swap_manifest; coordinator and hosts roll together.
-pub const WIRE_VERSION: u32 = 33;
+// v33 appends the chunked swap source and manifest to SandboxSpec.
+// v34 carries the swap base lineage in live migration presetup.
+pub const WIRE_VERSION: u32 = 34;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

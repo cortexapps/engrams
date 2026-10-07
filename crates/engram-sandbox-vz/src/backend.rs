@@ -1656,16 +1656,6 @@ impl SandboxBackend for VzBackend {
         }).await.map_err(|error| SandboxError::Vm(Box::new(error)))
     }
 
-    /// ADR 0112: the live spec's swap size — gates the pooled backend's
-    /// capture-time disarm/re-arm. Load-bearing on VZ despite its
-    /// dev-only role: the ADR 0096 WARM snapshot saves guest memory, so
-    /// a swap-armed VZ guest captured without the disarm would restore
-    /// with swap PTEs over a fresh zero-filled backing — the same
-    /// corruption class the FC path guards against.
-    fn swap_mib(&self, id: SandboxId) -> Option<u32> {
-        self.sandboxes.get(&id)?.spec.swap_mib
-    }
-
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         // ADR 0096: exclude sandboxes whose stop delegate fired — the
         // heartbeat's `running_sandboxes` must reflect ground truth so

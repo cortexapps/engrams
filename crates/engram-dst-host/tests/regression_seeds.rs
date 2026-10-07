@@ -1878,7 +1878,7 @@ async fn explicit_abort_after_state_served_is_legal_and_resumes() {
 
     // The coordinator learns the dest never loaded the shipped state and
     // explicitly aborts — legal despite state_served.
-    host.migration_abort(0);
+    host.migration_abort(0).await;
     assert!(!host.sandboxes[0].migrating, "the source resumes in place");
     assert!(
         host.split_brain_unpauses.is_empty(),
@@ -2112,4 +2112,51 @@ async fn upload_fault_then_eviction_capture_preserves_active_writes() {
     invariants::check(&host).await.unwrap();
     host.guest_read(0, 0).await.unwrap();
     host.guest_read(0, 1).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn migration_abort_preserves_root_and_swap() {
+    let mut host = scenario_host(0, 1).await;
+    host.attach_swap(0).await.unwrap();
+    host.guest_write(0, 1).await.unwrap();
+    host.guest_write_swap(0, 2).await.unwrap();
+    assert!(host.migration_begin(0).await.unwrap());
+    let export_id = host
+        .migrations
+        .export_id_of(host.sandboxes[0].sandbox_id)
+        .unwrap();
+    {
+        let export = host.migrations.find_by_export_id(&export_id).unwrap();
+        assert_eq!(
+            export.disk_seal.keys().copied().collect::<Vec<_>>(),
+            vec![engram_core::DiskRole::Root, engram_core::DiskRole::Swap]
+        );
+        assert_eq!(
+            export.disk_seal[&engram_core::DiskRole::Root].indices(),
+            vec![1]
+        );
+        // Swap uses Manifest::empty's production chunk size. All eight
+        // 4 KiB model write regions fit in its first disk chunk.
+        assert_eq!(
+            export.disk_seal[&engram_core::DiskRole::Swap].indices(),
+            vec![0]
+        );
+    }
+    host.migration_abort(0).await;
+    assert!(!host.sandboxes[0].migrating);
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{}: {}", v.invariant, v.detail));
+    for (_, disk) in host.sandboxes[0].disks.iter() {
+        assert_eq!(
+            disk.backend
+                .as_ref()
+                .unwrap()
+                .flush()
+                .await
+                .unwrap()
+                .chunks_flushed,
+            1
+        );
+    }
 }

@@ -315,6 +315,11 @@ impl GrpcHostClient {
             memory_manifest_json: resp.memory_manifest_json,
             memory_manifest_ref: decode_bincode(&resp.memory_manifest_ref, "ManifestRef")?,
             disk_manifest_ref: decode_bincode(&resp.disk_manifest_ref, "Option<ManifestRef>")?,
+            swap_manifest_ref: resp
+                .swap_manifest_ref
+                .as_deref()
+                .map(|bytes| decode_bincode(bytes, "ManifestRef"))
+                .transpose()?,
             hot_chunks: resp
                 .hot_chunks
                 .into_iter()

@@ -65,6 +65,7 @@ pub fn metadata(
             .disk_manifest_ref
             .expect("post-copy source must have an NBD disk manifest"),
     );
+    row.swap_manifest = presetup.swap_manifest_ref;
     row.source_sandbox_id = None;
     row.state_blob_key = None;
     row.sidecar_blob_key = None;

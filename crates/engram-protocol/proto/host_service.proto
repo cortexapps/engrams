@@ -340,6 +340,7 @@ message MigrationPresetupResponse {
   bytes memory_manifest_ref = 6;   // bincode ManifestRef
   bytes disk_manifest_ref = 7;     // bincode Option<ManifestRef> (empty = none)
   repeated bytes hot_chunks = 8;
+  optional bytes swap_manifest_ref = 9; // bincode ManifestRef
 }
 
 message PostCopyCaptureResponse {

@@ -2868,11 +2868,34 @@ impl SimHost {
         let guard = Arc::new(tokio::sync::Mutex::new(()))
             .try_lock_owned()
             .expect("fresh mutex");
+        let mut disk_seal = std::collections::BTreeMap::new();
+        let backends: Vec<_> = self.sandboxes[idx]
+            .disks
+            .iter()
+            .filter_map(|(role, disk)| disk.backend.clone().map(|backend| (role, backend)))
+            .collect();
+        for (role, backend) in &backends {
+            backend.set_migration_fence(true);
+            match backend.seal_for_postcopy().await {
+                Ok((seal, _, _)) => {
+                    disk_seal.insert(*role, Arc::new(seal));
+                }
+                Err(error) => {
+                    for (role, backend) in &backends {
+                        if let Some(seal) = disk_seal.get(role) {
+                            backend.requeue_postcopy_seal(seal).await;
+                        }
+                        backend.set_migration_fence(false);
+                    }
+                    return Err(format!("migration seal: {error}"));
+                }
+            }
+        }
         let inserted = self.migrations.insert(MigrationExport {
             export_id,
             sandbox_id,
             snapshot_dir,
-            disk_seal: Default::default(),
+            disk_seal,
             clock,
             state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: Arc::new(std::sync::Mutex::new(self.clock.now_mono())),
@@ -2937,8 +2960,7 @@ impl SimHost {
                         // regresses.
                         self.split_brain_unpauses.push(sandbox_id);
                     }
-                    self.migrations.remove(sandbox_id);
-                    self.sandboxes[idx].migrating = false;
+                    self.migration_abort(idx).await;
                 }
                 TtlVerdict::Destroy => {
                     self.migrations.remove(sandbox_id);
@@ -2976,12 +2998,21 @@ impl SimHost {
     /// first CI run of the P9 host-sim lane caught the sim being
     /// STRICTER than prod here — calm seeds 14/16 fired oracle #7 on a
     /// legal explicit abort.)
-    pub fn migration_abort(&mut self, idx: usize) {
+    pub async fn migration_abort(&mut self, idx: usize) {
         if idx >= self.sandboxes.len() || !self.sandboxes[idx].migrating {
             return;
         }
         let sandbox_id = self.sandboxes[idx].sandbox_id;
-        self.migrations.remove(sandbox_id);
+        if let Some(export) = self.migrations.remove(sandbox_id) {
+            for (role, disk) in self.sandboxes[idx].disks.iter() {
+                if let Some(backend) = &disk.backend {
+                    if let Some(seal) = export.disk_seal.get(&role) {
+                        backend.requeue_postcopy_seal(seal).await;
+                    }
+                    backend.set_migration_fence(false);
+                }
+            }
+        }
         self.sandboxes[idx].migrating = false;
     }
 

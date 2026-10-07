@@ -725,3 +725,9 @@ S7's base-capture rule lands with phase 2b, once the base must be swap-free for 
   by the coordinator, so it never restores such a snapshot, and the
   coordinator itself cannot roll back past migration 0124. The fleet rolls
   forward only.
+
+- **2026-10-07, phase 3:** Device-tagged post-copy carries the root and swap
+  disks. Presetup advertises the swap base manifest. The destination attaches
+  both devices, fetches both seals, and joins both drains. D7 is deleted.
+  Wire version is 34. The two-host KVM test moves a paged-out sentinel once
+  and checks the active swap device and its unchanged header after the move.
