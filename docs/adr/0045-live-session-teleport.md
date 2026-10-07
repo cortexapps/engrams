@@ -303,11 +303,17 @@ unsealed chunk from the content-addressed chain. The per-image memfile
 cold boot (anonymous RAM) does not.
 
 Changes: the restore records the file it mapped as the sandbox's
-`memory_backing` (live entry + the persisted sandbox manifest, so a
-reattach keeps the answer); `PostCopySourceView` carries that path;
-`migration_presetup` refuses pause-free when it is absent; the capture
-selects the guest VMAs by that path and `dirty_map::find_base_mapping`
-is deleted. The D3 sentence "adoption is derived: fresh creates resolve
+`memory_backing` (in the FC `SandboxState`, canonical so it matches the
+kernel's mapping path, and in the persisted sandbox manifest, so a
+reattach keeps the answer; a VM reattached from a manifest written before
+this change reads `None` and is refused until it is next restored — one
+roll's worth of sessions take the snapshot kind); `PostCopySourceView`
+carries that path; `migration_presetup` refuses pause-free when it is
+absent, when the running guest maps no VMA backed by it, or when the
+sandbox has no chunked NBD rootfs (the disk half of post-copy needs the
+seal); the capture selects the guest VMAs by that path, an unlinked
+memfile (` (deleted)` in the maps line, routine after an image disable or
+refresh) still matches, and `dirty_map::find_base_mapping` is deleted. The D3 sentence "adoption is derived: fresh creates resolve
 to substrate-Uffd iff `uffd_base_dir` is set" is superseded by ADR 0092's
 addendum of the same date.
 

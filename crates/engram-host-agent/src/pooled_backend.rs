@@ -8261,11 +8261,38 @@ impl SandboxBackend for PooledBackend {
         // scan tells file-backed (clean) from anonymous (dirtied) pages
         // and the dest resolves clean chunks from the chain. A cold boot
         // is anonymous and cannot post-copy. Decided HERE, pause-free.
-        if self.inner.post_copy_source_view(id).is_none() {
+        let Some(view) = self.inner.post_copy_source_view(id) else {
             return Err(SandboxError::InvalidSpec(
                 "guest RAM is not file-backed (cold boot) — use snapshot-rehome".into(),
             ));
+        };
+        #[cfg(target_os = "linux")]
+        {
+            // The same VMA scan the capture runs, on the running guest
+            // (guest-RAM VMAs never change after load), so a backing that
+            // does not match the mapping refuses here instead of inside
+            // the blackout.
+            let vmas = crate::dirty_map::guest_vmas(view.fc_pid, &view.memory_backing)
+                .map_err(|e| SandboxError::Snapshot(format!("guest vmas: {e}")))?;
+            if vmas.is_empty() {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "FC process maps no guest VMA backed by {} — use snapshot-rehome",
+                    view.memory_backing.display()
+                )));
+            }
+            // Live post-copy moves the disk through the NBD seal; a
+            // file-backed rootfs has nothing to seal and the destination
+            // would run RAM and disk from different states.
+            if self.nbd_sandboxes.get(&id).is_none() {
+                return Err(SandboxError::InvalidSpec(
+                    "no chunked disk for this sandbox (live post-copy needs the NBD rootfs) — \
+                     use snapshot-rehome"
+                        .into(),
+                ));
+            }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = &view;
         // ADR 0112 D7: a swap-armed guest cannot post-copy teleport —
         // the guest never pauses long enough to `swapoff`, and moving
         // the swap device's bytes would persist exactly what the ADR

@@ -78,8 +78,8 @@ firecracker:
   # instead of an eager ~45 s/image pre-warm. Fresh creates are always
   # File-mode (not a knob). Set "" to fall back to the binary defaults
   # (mlock pin + eager pre-warm). baseMemfilePin MUST stay a quoted
-  # string — a bare 0 is
-  # falsy under the configmap's `with` and silently drops the env var.
+  # string — a bare 0 is falsy under the configmap's `with` and silently
+  # drops the env var.
   baseMemfilePin: "0"      # "" / "1" (mlock) | "0" (reclaimable cache, default)
   baseShmMode: "lazy"      # "" / full (eager pre-warm) | lazy (default)
   # tmpfs size cap for uffdBaseDir (one base per enabled template; each

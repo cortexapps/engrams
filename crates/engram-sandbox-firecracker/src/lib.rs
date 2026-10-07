@@ -655,6 +655,19 @@ pub fn restore_mode_from_env() -> RestoreMode {
 /// dir — the SINGLE naming authority shared by the handler spawn, the
 /// FC load, and the host-agent's image-prefetch pre-warm (so they can't
 /// diverge).
+/// The path the kernel prints for a mapping of `path`: the parent
+/// directory resolved (it exists; the file may be lazily created, as the
+/// substrate base is) joined with the file name. Falls back to `path`
+/// when the directory cannot be resolved.
+fn canonical_backing_path(path: PathBuf) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+            .map(|d| d.join(name))
+            .unwrap_or(path),
+        _ => path,
+    }
+}
+
 pub fn uffd_base_path_in(
     dir: &Path,
     canonical_ref: &engram_core::types::manifest::ManifestRef,
@@ -3697,12 +3710,16 @@ impl FirecrackerBackend {
             // substrate base derived exactly as the load did (D4: the
             // image base when the coordinator supplied it, else the
             // session manifest).
+            // Recorded in the form `/proc/<pid>/maps` prints (absolute,
+            // symlinks resolved): a relative or symlinked work dir would
+            // otherwise never match the mapping.
             memory_backing: match restore_mode {
                 RestoreMode::File => Some(mem_path.clone()),
                 RestoreMode::Uffd => base_memory_manifest
                     .or(manifest.memory_manifest)
                     .and_then(|r| self.uffd_base_path(&r)),
-            },
+            }
+            .map(canonical_backing_path),
         };
         // ADR 0009 §4: supervisor watches restored FC + (optional)
         // UFFD handler. The UFFD handler is critical — if it dies

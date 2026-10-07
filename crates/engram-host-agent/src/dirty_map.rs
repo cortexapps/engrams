@@ -74,9 +74,11 @@ impl GuestVma {
 /// Line shape: `start-end perms offset dev inode          pathname`.
 /// The first five columns never contain spaces; the pathname is the
 /// remainder (it may contain spaces, so it is NOT `split_whitespace`'d).
-/// A ` (deleted)` suffix means the base file was unlinked under a live
-/// VM — that is a bug elsewhere (base_shm_gc holds an open-fd keep-set),
-/// and such lines deliberately do NOT match.
+/// A ` (deleted)` suffix means the file was unlinked under the live VM.
+/// That is routine for the per-image memfile (image disable or refresh
+/// unlinks it while sharers keep the inode alive through their private
+/// mappings) and the mapping's content is unchanged, so such lines
+/// match too.
 pub fn parse_maps_line(line: &str, base_shm_path: &str) -> Option<GuestVma> {
     let mut rest = line;
     let mut cols = Vec::with_capacity(5);
@@ -87,7 +89,8 @@ pub fn parse_maps_line(line: &str, base_shm_path: &str) -> Option<GuestVma> {
         rest = &trimmed[end..];
     }
     let pathname = rest.trim_start_matches(' ').trim_end();
-    if pathname != base_shm_path {
+    let unlinked = pathname.strip_suffix(" (deleted)").unwrap_or(pathname);
+    if unlinked != base_shm_path {
         return None;
     }
 
@@ -209,14 +212,23 @@ mod tests {
             format!("7f1200000000-7f1240000000 rw-p 00000000 00:01 12345  {BASE}.other"),
             "7f1200000000-7f1240000000 rw-p 00000000 00:00 0 ".to_string(),
             "7f1200000000-7f1240000000 rw-p 00000000 00:01 12345  [heap]".to_string(),
-            // Unlinked base = a bug elsewhere; deliberately no match.
-            format!("7f1200000000-7f1240000000 rw-p 00000000 00:01 12345  {BASE} (deleted)"),
         ] {
             assert!(
                 parse_maps_line(&line, BASE).is_none(),
                 "should not match: {line}"
             );
         }
+    }
+
+    /// An image disable or refresh unlinks the per-image memfile while
+    /// live sharers keep the inode; the mapping still carries the chain
+    /// base, so it stays a valid post-copy source.
+    #[test]
+    fn maps_line_of_an_unlinked_backing_still_matches() {
+        let line = format!("7f1200000000-7f1240000000 rw-p 00200000 00:01 12345  {BASE} (deleted)");
+        let vma = parse_maps_line(&line, BASE).expect("unlinked backing matches");
+        assert_eq!(vma.file_offset, 0x200000);
+        assert!(parse_maps_line(&line, &format!("{BASE}.other")).is_none());
     }
 
     #[test]

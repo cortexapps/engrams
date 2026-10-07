@@ -14,6 +14,10 @@
 //! (the guest wrote a 4 MiB sentinel into RAM after the restore, so the
 //! pagemap scan MUST classify those anonymous COW pages as sealed); and
 //! `migration_abort` resumes the guest with the sentinel intact.
+//!
+//! Runs in the NBD CI lane (root, `ENGRAM_TEST_NBD_DEVICE`): presetup
+//! requires the chunked NBD rootfs (the disk half of post-copy), and the
+//! vmstate-only capture needs the forked Firecracker (`ENGRAM_FC_FORK_BIN`).
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
@@ -26,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
+use engram_host_agent::disk_daemon::NbdSlotAllocator;
 use engram_host_agent::migrate_peer::PeerServer;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
@@ -35,7 +40,7 @@ use engram_sandbox_firecracker::{
 use futures::StreamExt;
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
+#[ignore = "requires Linux + KVM + ENGRAM_FC_FORK_BIN + /dev/nbd0 (root) + Docker; boots microVMs"]
 async fn file_mode_fresh_create_is_a_post_copy_source() {
     let Some(env) = TestEnv::gate() else { return };
     let pooled = env.pooled();
@@ -118,6 +123,8 @@ async fn file_mode_fresh_create_is_a_post_copy_source() {
 
 struct TestEnv {
     kernel: std::path::PathBuf,
+    fork_bin: std::path::PathBuf,
+    nbd_device: std::path::PathBuf,
     staged: common::StagedAgentdBundle,
     busybox: std::path::PathBuf,
     work: tempfile::TempDir,
@@ -138,7 +145,29 @@ impl TestEnv {
             eprintln!("SKIP: /dev/kvm not present");
             return None;
         }
-        for bin in ["firecracker", "mksquashfs"] {
+        let fork_bin = match std::env::var("ENGRAM_FC_FORK_BIN") {
+            Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+            _ => {
+                eprintln!("SKIP: ENGRAM_FC_FORK_BIN not set (the vmstate-only capture is fork-only)");
+                return None;
+            }
+        };
+        let nbd_device = std::path::PathBuf::from(
+            std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
+        );
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&nbd_device)
+            .is_err()
+        {
+            eprintln!(
+                "SKIP: cannot open {} R/W (needs `modprobe nbd` and root)",
+                nbd_device.display()
+            );
+            return None;
+        }
+        for bin in ["mksquashfs"] {
             let missing = std::env::var_os("PATH")
                 .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
                 .unwrap_or(true);
@@ -172,6 +201,8 @@ impl TestEnv {
         std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
         Some(Self {
             kernel,
+            fork_bin,
+            nbd_device,
             staged,
             busybox,
             work,
@@ -182,6 +213,7 @@ impl TestEnv {
 
     fn pooled(&self) -> Arc<PooledBackend> {
         let mut cfg = FirecrackerConfig::with_kernel(self.kernel.clone());
+        cfg.firecracker_bin = self.fork_bin.clone();
         cfg.bundle_dir = self.staged.bundle_dir.clone();
         cfg.net_pool = None;
         cfg.restore_mode = RestoreMode::File;
@@ -199,7 +231,11 @@ impl TestEnv {
                     self.work.path().join("materialize"),
                 )
                 .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
-                .with_checkpoint_dir(self.work.path().join("checkpoints")),
+                .with_checkpoint_dir(self.work.path().join("checkpoints"))
+                .with_nbd_pool(
+                    NbdSlotAllocator::from_paths(vec![self.nbd_device.clone()])
+                        .expect("nbd slot pool"),
+                ),
         )
     }
 
