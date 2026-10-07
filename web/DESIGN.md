@@ -2,8 +2,10 @@
 name: engrams
 description: A logbook page lifted off its cover — the agent's work is the only lit surface.
 colors:
+  verdigris: "oklch(0.46 0.1 178)"
+  verdigris-ink: "oklch(0.975 0.012 128)"
   lime: "oklch(0.878 0.181 121)"
-  lime-ink: "oklch(0.22 0.04 150)"
+  lime-ink: "oklch(0.2 0.03 150)"
   paper: "oklch(0.964 0.013 128)"
   sheet: "oklch(0.995 0.005 128)"
   ink: "oklch(0.301 0.02 206)"
@@ -147,23 +149,35 @@ regions with rules instead of with surfaces.**
 
 - One cover, two depths; one lit work surface.
 - Sentence case everywhere. No tracked caps, ever.
-- Lime is action, never status.
+- The accent is action, never status. It is cut for its ground.
 - Cards have edges. Bands do not.
 - Stock shadcn until a real reason forces a fork.
 
 ## Colors
 
 A single ground hue split across two materials: paper on the work surface,
-bottle-green on everything that frames it. Lime is the only saturated colour
-that acts.
+bottle-green on everything that frames it. The accent is the only saturated
+colour that acts.
 
 ### Primary
 
-- **Aston Lime** (`{colors.lime}`): interactive accent only — the primary
-  button, the send control, the active rail marker, the focus ring on dark
-  ground, and the selection wash. It never carries state, never fills a badge
-  that means "healthy", and never appears as body text on paper (chartreuse on
-  celadon is invisible).
+The accent is one *role* in two values, because the two materials cannot share
+one. It marks the primary button, the send control, the active rail marker, the
+focus ring on dark ground, and the selection wash. It never carries state and
+never fills a badge that means "healthy".
+
+- **Verdigris** (`{colors.verdigris}`): the accent on paper. Unlike lime it
+  holds as text and as a hairline, not only as a fill — 6.0:1 on the page,
+  6.6:1 on a sheet, 5.5:1 on the work pane, and 6.2:1 the other way with
+  `{colors.verdigris-ink}` on it. Hue 178 sits clear of the instrument band and
+  of the running ring, so it still cannot be read as a state.
+- **Aston Lime** (`{colors.lime}`): the accent on every green ground — the
+  cover, the rails, `.work-pane`, and the whole dark theme. It is a fill or
+  light text there, with `{colors.lime-ink}` on it.
+
+Lime never touches paper. Chartreuse on celadon measures **1.26:1** — below
+even the 3:1 graphic floor, so a lime word, icon, or hairline on the page is
+not dim, it is absent.
 
 ### Secondary
 
@@ -208,7 +222,7 @@ in both themes, so a single set clears both floors.
 
 **Running** is not one of these three. It has its own tone, `{colors.ring}`,
 set by `Glyph`'s `toneFor` and by `StatusDot`'s `active` — racing green on
-paper, lime at night. That is the deliberate exception to the Lime-Is-Action
+paper, lime at night. That is the deliberate exception to the Accent-Is-Action
 rule, and the only one.
 
 **Thresholds live with the primitive**, not the caller (`components/meter.tsx`,
@@ -224,11 +238,17 @@ destructive actions, not for a meter.
 between the sheets are one continuous backing. If a region is not the work
 surface, it is the cover — it does not get a background of its own.
 
-**The Lime-Is-Action Rule.** Lime marks what you can do. The moment it marks
-what something *is*, the status vocabulary has been broken. The one sanctioned
-exception is `Glyph`'s running tone, which is `{colors.ring}` — and `ring`
-resolves to lime only at night, where it is the accent doing double duty on a
-dark ground.
+**The Accent-Is-Action Rule.** The accent marks what you can do. The moment it
+marks what something *is*, the status vocabulary has been broken. The one
+sanctioned exception is `Glyph`'s running tone, which is `{colors.ring}` — and
+`ring` resolves to lime only at night, where it is the accent doing double duty
+on a dark ground.
+
+**The Accent-Follows-Its-Ground Rule.** `--primary` is verdigris on paper and
+lime on green, and the switch is per *ground*, not per theme. A scope that puts
+a green ground inside the light theme re-declares the pair: `.work-pane` does,
+because it is the cover showing through. Forget it and the page's verdigris
+lands on bottle green at 1.3:1 — the same failure as lime on paper, mirrored.
 
 **The Ink-For-Text Rule.** A status colour applied to a word or a figure uses
 the `-ink` variant, never the graphic one. Reach for the plain token only when
@@ -395,7 +415,8 @@ the whole app its sentence case.
 ### Buttons
 
 - **Shape:** gently rounded (10px), 36px tall at default, 32px small.
-- **Primary:** lime fill, deep racing-green ink, sentence case, medium weight.
+- **Primary:** accent fill (verdigris on paper, lime on green), its matching
+  ink, sentence case, medium weight.
 - **Ghost / Outline:** the default for anything in a rail, a masthead or a pane
   header. Ghost carries icon-only controls.
 - **Hover / Focus:** hover lightens the accent wash; focus is a 2px ring offset
@@ -406,7 +427,8 @@ the whole app its sentence case.
 - **Counts and states:** full-round, muted fill, `{typography.mono}` for the
   count, sentence case for the word. The count beside a page title; a status
   badge.
-- **Descriptors:** 8px corners (`built-in`, a tag, a category). Never lime:
+- **Descriptors:** 8px corners (`built-in`, a tag, a category). Never the
+  accent:
   `Badge`'s default variant says "you can do this", not "this is what it is".
 - A chip never carries an action.
 
@@ -543,7 +565,9 @@ end. No middle nodes, no lattice, no shape-swapping. Stroke 9 at 64px and up,
 - **Don't** elevate anything except the thread and the work pane.
 - **Don't** hand-roll a component that shadcn ships. The retired `TabRow` is the
   cautionary example: it existed only because stock `Tabs` was never tried.
-- **Don't** use lime for status, or an instrument colour for an action.
+- **Don't** use the accent for status, or an instrument colour for an action.
+- **Don't** put lime on paper or verdigris on green — pick the accent the
+  ground calls for.
 - **Don't** invent a size (`text-[0.7rem]`), a dot, an empty state, a loader,
   or a relative-time format. Each has one home.
 - **Don't** animate outside the motion vocabulary, and never without a

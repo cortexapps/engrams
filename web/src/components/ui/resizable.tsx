@@ -6,7 +6,7 @@ import { cn } from "@/lib/utils";
 
 // Thin wrapper over react-resizable-panels in the Aston-racing voice: the
 // handle IS the gutter between two surfaces — nothing at rest, so the cover
-// shows through, and a lime pill under the pointer. The same grammar as
+// shows through, and an accent pill under the pointer. The same grammar as
 // `SidebarResizeHandle`, which resizes a rail by hand rather than through this
 // library; a drag handle should not look like two different controls depending
 // on which edge of the page it sits on.

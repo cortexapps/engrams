@@ -40,8 +40,9 @@ const chipClass = (active: boolean) =>
     "inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-2 text-xs font-medium transition-colors",
     "focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none",
     "disabled:pointer-events-none disabled:opacity-50",
-    // The on state has to read as pressed in BOTH themes — pale lime ink on
-    // the light canvas was barely legible, so it carries a ring and normal ink.
+    // The on state has to read as pressed in BOTH themes — a pale accent ink
+    // on the light canvas was barely legible, so it carries a ring and normal
+    // ink.
     active
       ? "bg-primary/20 text-foreground ring-1 ring-primary/40 hover:bg-primary/25"
       : "text-muted-foreground/70 hover:bg-accent hover:text-foreground",
