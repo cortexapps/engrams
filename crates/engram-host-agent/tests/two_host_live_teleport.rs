@@ -185,9 +185,15 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     // ---- Session lives on A: create, seed checkpoint, dirty a sentinel ----
     let spec = SandboxSpec {
         image: "engram-two-host-teleport".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        // The chunked disk manifest: an NBD-served root is what presetup
+        // requires (the disk half of post-copy is the NBD seal).
+        rootfs_manifest: Some(
+            outcome
+                .disk_manifest
+                .expect("ext4 bake produces a chunked disk manifest"),
+        ),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -596,9 +602,15 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
 
     let spec = SandboxSpec {
         image: "engram-teleport-pipe".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        // The chunked disk manifest: an NBD-served root is what presetup
+        // requires (the disk half of post-copy is the NBD seal).
+        rootfs_manifest: Some(
+            outcome
+                .disk_manifest
+                .expect("ext4 bake produces a chunked disk manifest"),
+        ),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
@@ -1048,9 +1060,15 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
 
     let spec = SandboxSpec {
         image: "engram-kill-source-test".into(),
-        rootfs_source: Some(outcome.rootfs_path),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        // The chunked disk manifest: an NBD-served root is what presetup
+        // requires (the disk half of post-copy is the NBD seal).
+        rootfs_manifest: Some(
+            outcome
+                .disk_manifest
+                .expect("ext4 bake produces a chunked disk manifest"),
+        ),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },

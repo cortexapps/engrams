@@ -218,9 +218,15 @@ async fn drain_wave_teleports_every_session_off_host_a() {
     let mut live = Vec::with_capacity(SESSIONS);
     let spec = SandboxSpec {
         image: "engram-drain-wave".into(),
-        rootfs_source: Some(outcome.rootfs_path.clone()),
+        rootfs_source: None,
         image_uri: None,
-        rootfs_manifest: None,
+        // The chunked disk manifest: an NBD-served root is what presetup
+        // requires (the disk half of post-copy is the NBD seal).
+        rootfs_manifest: Some(
+            outcome
+                .disk_manifest
+                .expect("ext4 bake produces a chunked disk manifest"),
+        ),
         cpu: CpuLimit { vcpus: 1 },
         memory: MemoryLimit { max_mib: 256 },
         disk: DiskLimit { max_gib: 1 },
