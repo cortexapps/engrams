@@ -67,7 +67,6 @@ blob:
 firecracker:
   uffdBaseDir: /var/lib/engram/shm
   uffdBaseTmpfsSize: 32g
-  freshRestoreMode: "file"
   baseMemfilePin: "0" # quoted on purpose — bare 0 is falsy in the chart's `with`
   baseShmMode: "lazy"
 

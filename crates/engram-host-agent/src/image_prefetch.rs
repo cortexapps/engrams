@@ -260,8 +260,8 @@ enum BaseShmMode {
     /// Never pre-warm: the uffd handler creates/sizes the base and
     /// populates canonical pages on first fault from the NVMe cache, so
     /// tmpfs holds only what resumed sessions actually touch. Fresh
-    /// creates should pair this with `ENGRAM_FC_FRESH_RESTORE_MODE=file`
-    /// (the memfile path) so they don't repopulate it either.
+    /// creates always take the memfile path (ADR 0092), so they never
+    /// populate it.
     Lazy,
 }
 

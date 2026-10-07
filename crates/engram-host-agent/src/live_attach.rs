@@ -493,7 +493,6 @@ mod tests {
             uffd_base_dir: None,
             uffd_substrate_sock: None,
             restore_mode: engram_sandbox_firecracker::RestoreMode::File,
-            fresh_restore_override: None,
             track_dirty_pages: false,
             balloon: false,
             net_pool: None,
@@ -622,6 +621,7 @@ mod tests {
             network: None,
             netns: None,
             uffd_handler: None,
+            memory_backing: None,
             migration_role: None,
         };
         for (role, expected) in [
@@ -690,6 +690,7 @@ mod tests {
             network: None,
             netns: None,
             uffd_handler: None,
+            memory_backing: None,
             migration_role: None,
         };
         engram_sandbox_firecracker::sandbox_manifest::write_manifest(&manifest_path, &manifest)

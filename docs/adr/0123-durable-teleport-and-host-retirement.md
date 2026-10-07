@@ -606,3 +606,11 @@ pub enum HarnessFrame {
   that was unschedulable before it became a victim keeps that cordon; the
   GKE actuator refuses pools backed by more than one instance group
   (setSize is per zone).
+- 2026-10-07 (first fleet run): every live admission aborted with "FC
+  process maps no substrate base file" because fresh creates are File
+  mode (ADR 0092) and the source check keyed on the substrate dir; the
+  refusal arrived from capture (a `Snapshot` error), not presetup, so it
+  aborted instead of downgrading. Fixed at the source: the restore
+  records the guest's memory backing, presetup checks it pause-free, and
+  a File-mode fresh session is a valid post-copy source (ADR 0045 and
+  ADR 0092 addenda, same date). `ENGRAM_FC_FRESH_RESTORE_MODE` retired.

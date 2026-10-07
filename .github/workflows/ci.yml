@@ -1229,6 +1229,7 @@ jobs:
             --test nbd_verify_on_read \
             --test nbd_proc_holder \
             --test nbd_connected_inventory \
+            --test postcopy_source_fresh_create \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
