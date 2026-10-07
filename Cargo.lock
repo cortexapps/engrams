@@ -3037,6 +3037,7 @@ dependencies = [
  "engram-substrate-proto",
  "engram-telemetry",
  "libc",
+ "proptest",
  "sendfd",
  "serde",
  "serde_json",

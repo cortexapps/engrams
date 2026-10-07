@@ -6,9 +6,8 @@
 //! Deliberately minimal and fully synchronous: the fault loop is a
 //! blocking thread, and this client must never grow tonic/tokio. One
 //! connection serves the fault path (single in-flight request — the
-//! fault loop serves one fault at a time, so pipelining buys nothing
-//! there); the background drain opens its own connection(s) and
-//! pipelines.
+//! fault loop requests one chunk at a time). Fault-around uses its own
+//! worker connection; the background drain opens its own connections and pipelines.
 //!
 //! ## Lifecycle / soundness
 //!
@@ -26,7 +25,7 @@
 //! session lost — the caller reports `PeerLost` and the fault loop
 //! exits loud rather than papering over missing state.
 
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -53,8 +52,19 @@ const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 /// exceeds the source's worst-case `process_vm_readv` service: it serves
 /// from the PAUSED guest's resident RAM (no disk, no network), and the
 /// drain's hot-first ordering keeps any single chunk's serve sub-ms.
-const PEER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PEER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// First response from a new worker: each attempt can connect, send Hello,
+/// read HelloAck and Seal, send NeedWindow, then read the first page.
+/// Include the initial attempt and every redial, plus reconnect backoff.
+#[cfg(target_os = "linux")]
+pub(crate) const WINDOW_FIRST_RESPONSE_TIMEOUT: Duration = PEER_READ_TIMEOUT
+    .saturating_mul(4)
+    .saturating_add(PEER_WRITE_TIMEOUT.saturating_mul(2))
+    .saturating_mul(RECONNECT_ATTEMPTS + 1)
+    .saturating_add(RECONNECT_BACKOFF.saturating_mul(RECONNECT_ATTEMPTS));
+
 /// TCP keepalive so a dropped path with no in-flight data still surfaces
 /// (the read/write timeouts only fire while a request is outstanding;
 /// keepalive catches an idle fault conn between faults). Idle 10 s, then
@@ -129,6 +139,29 @@ pub enum PeerPage {
     AltSource([u8; 32]),
 }
 
+/// Default number of chunks in a demand window.
+pub const DEFAULT_FAULT_AROUND_CHUNKS: usize = 8;
+
+/// Select sealed, uninstalled chunks from the fault through this region.
+/// The faulting chunk can straddle a region boundary; later chunks cannot.
+pub fn fault_window(
+    seal: &SealBitmap,
+    first: u64,
+    region_end: u64,
+    limit: usize,
+    installed: impl Fn(usize) -> bool,
+) -> Vec<u64> {
+    (first / seal.chunk_size..seal.chunk_count)
+        .map(|idx| (idx, idx * seal.chunk_size))
+        .take_while(|&(_, offset)| {
+            offset == first || offset.saturating_add(seal.chunk_size) <= region_end
+        })
+        .filter(|&(idx, _)| seal.get(idx) && !installed(idx as usize))
+        .take(limit)
+        .map(|(_, offset)| offset)
+        .collect()
+}
+
 /// Drain accounting (rides `ToSource::DrainDone` + the control sock).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DrainStats {
@@ -196,9 +229,67 @@ fn dial(
     expect_total_bytes: u64,
     purpose: engram_migrate_proto::ConnPurpose,
 ) -> Result<(TcpStream, SealBitmap), PeerError> {
-    let mut stream = TcpStream::connect(addr)?;
+    dial_with_socket(
+        addr,
+        export_id,
+        token,
+        expect_chunk_size,
+        expect_total_bytes,
+        purpose,
+        |_| Ok(true),
+    )
+}
+
+/// `None` checks cancellation before and after each connect attempt. `Some`
+/// registers the connected socket before the handshake can block.
+fn connect_with_socket(
+    addr: &str,
+    connected: &impl Fn(Option<&TcpStream>) -> Result<bool, PeerError>,
+) -> Result<TcpStream, PeerError> {
+    if !connected(None)? {
+        return Err(PeerError::Lost("connection canceled".into()));
+    }
+    let deadline = std::time::Instant::now() + PEER_READ_TIMEOUT;
+    let mut last_error = std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "peer address resolved to no addresses",
+    );
+    for address in addr.to_socket_addrs()? {
+        if !connected(None)? {
+            return Err(PeerError::Lost("connection canceled".into()));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+        }
+        let result = TcpStream::connect_timeout(&address, remaining);
+        if !connected(None)? {
+            return Err(PeerError::Lost("connection canceled".into()));
+        }
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error.into())
+}
+
+fn dial_with_socket(
+    addr: &str,
+    export_id: &str,
+    token: &str,
+    expect_chunk_size: u64,
+    expect_total_bytes: u64,
+    purpose: engram_migrate_proto::ConnPurpose,
+    connected: impl Fn(Option<&TcpStream>) -> Result<bool, PeerError>,
+) -> Result<(TcpStream, SealBitmap), PeerError> {
+    let mut stream = connect_with_socket(addr, &connected)?;
     stream.set_nodelay(true)?;
     apply_peer_sockopts(&stream)?;
+    // Register worker sockets before any blocking handshake read or write.
+    if !connected(Some(&stream))? {
+        return Err(PeerError::Lost("connection canceled".into()));
+    }
     write_frame(
         &mut stream,
         &ToSource::Hello {
@@ -356,26 +447,86 @@ impl PeerSession {
         Ok(stream)
     }
 
-    /// Fault-path request: one round-trip on the shared connection,
-    /// sha-verified. Reconnects through `RECONNECT_ATTEMPTS` before
-    /// declaring the peer lost.
-    pub fn need_at(&self, chunk_offset: u64) -> Result<PeerPage, PeerError> {
+    /// Fault windows use their own connection; the source permits multiple
+    /// Fault connections per export. This does not hold the drain priority gate.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_prefetch_conn(
+        &self,
+        connected: impl Fn(Option<&TcpStream>) -> Result<bool, PeerError>,
+    ) -> Result<TcpStream, PeerError> {
+        dial_with_socket(
+            &self.addr,
+            &self.export_id,
+            &self.token,
+            self.chunk_size,
+            self.expected_total,
+            engram_migrate_proto::ConnPurpose::Fault,
+            connected,
+        )
+        .map(|(stream, _)| stream)
+    }
+
+    /// Run a one-chunk demand window on the fault connection.
+    pub fn need_at(&self, offset: u64) -> Result<PeerPage, PeerError> {
+        let mut page = None;
+        self.need_window(&[offset], |_, next| {
+            page = Some(next);
+            Ok::<_, std::convert::Infallible>(())
+        })?
+        .unwrap();
+        Ok(page.expect("one response"))
+    }
+
+    /// Stream a window; retry only the suffix not yet installed.
+    /// The outer error is a peer failure. The inner error is from the
+    /// installer; it stops the stream and the caller must exit the handler.
+    pub fn need_window<E>(
+        &self,
+        offsets: &[u64],
+        install: impl FnMut(u64, PeerPage) -> Result<(), E>,
+    ) -> Result<Result<(), E>, PeerError> {
         if self.is_lost() {
             return Err(PeerError::Lost("peer already marked lost".into()));
         }
         let _fault = self.begin_fault();
         let mut conn = self.fault_conn.lock().expect("fault conn poisoned");
+        let result = self.stream_window(&mut conn, offsets, install, || false, |_| Ok(true));
+        if result.is_err() {
+            self.mark_lost();
+        }
+        result
+    }
+
+    /// Shared streaming and suffix-only retry logic. The prefetch caller owns
+    /// its connection and handles errors under its cancellation lock, so a
+    /// canceled window cannot latch the session lost after DrainDone.
+    pub(crate) fn stream_window<E>(
+        &self,
+        conn: &mut TcpStream,
+        offsets: &[u64],
+        mut install: impl FnMut(u64, PeerPage) -> Result<(), E>,
+        cancelled: impl Fn() -> bool,
+        connected: impl Fn(Option<&TcpStream>) -> Result<bool, PeerError>,
+    ) -> Result<Result<(), E>, PeerError> {
+        let mut completed = 0;
         let mut last_err: Option<PeerError> = None;
         for attempt in 0..=RECONNECT_ATTEMPTS {
+            if cancelled() {
+                return Ok(Ok(()));
+            }
             if attempt > 0 {
                 std::thread::sleep(RECONNECT_BACKOFF);
-                match dial(
+                if cancelled() {
+                    return Ok(Ok(()));
+                }
+                match dial_with_socket(
                     &self.addr,
                     &self.export_id,
                     &self.token,
                     self.chunk_size,
                     self.expected_total,
                     engram_migrate_proto::ConnPurpose::Fault,
+                    &connected,
                 ) {
                     Ok((fresh, _seal)) => *conn = fresh,
                     Err(e) => {
@@ -385,15 +536,43 @@ impl PeerSession {
                     }
                 }
             }
-            match request_chunk(&mut conn, &self.next_req, chunk_offset) {
-                Ok(page) => return Ok(page),
+            if !connected(Some(conn))? {
+                return Ok(Ok(()));
+            }
+            let result = (|| {
+                let req_id = self.next_req.fetch_add(1, Ordering::Relaxed);
+                write_frame(
+                    &mut *conn,
+                    &ToSource::NeedWindow {
+                        req_id,
+                        chunk_offsets: offsets[completed..].to_vec(),
+                    },
+                )?;
+                while completed < offsets.len() {
+                    let offset = offsets[completed];
+                    let response = read_frame(&mut *conn)?;
+                    if cancelled() {
+                        return Ok(Ok(()));
+                    }
+                    let page = decode_page(response, req_id, offset)?;
+                    if let Err(e) = install(offset, page) {
+                        return Ok(Err(e));
+                    }
+                    completed += 1;
+                }
+                Ok(Ok(()))
+            })();
+            if cancelled() {
+                return Ok(Ok(()));
+            }
+            match result {
+                Ok(result) => return Ok(result),
                 // Terminal classifications never retry: corrupt content, a
                 // connection-fatal server error (`Error{req_id: None}`),
                 // or geometry skew are all unrecoverable on any conn.
                 Err(e @ PeerError::ShaMismatch { .. })
                 | Err(e @ PeerError::Server(_))
                 | Err(e @ PeerError::GeometryMismatch(_)) => {
-                    self.mark_lost();
                     return Err(e);
                 }
                 // Per-request failures (`Error{req_id: Some}`) and
@@ -410,12 +589,10 @@ impl PeerSession {
                 Err(e @ PeerError::Lost(_)) => {
                     // Should not surface from request_chunk, but treat as
                     // terminal if it ever does.
-                    self.mark_lost();
                     return Err(e);
                 }
             }
         }
-        self.mark_lost();
         Err(PeerError::Lost(format!(
             "reconnects exhausted: {}",
             last_err.map(|e| e.to_string()).unwrap_or_default()
@@ -428,7 +605,7 @@ impl PeerSession {
     /// drain's park condition), and on drop — every return path —
     /// accumulates the elapsed wall, tracks the max, and stamps the
     /// completion time for the drain's recent-fault window.
-    fn begin_fault(&self) -> impl Drop + '_ {
+    pub(crate) fn begin_fault(&self) -> impl Drop + '_ {
         self.fault_count.fetch_add(1, Ordering::Relaxed);
         self.faults_inflight.fetch_add(1, Ordering::Relaxed);
         struct G<'a>(&'a PeerSession, std::time::Instant);
@@ -447,9 +624,9 @@ impl PeerSession {
     }
 }
 
-/// One `NeedAt` round-trip on `conn` (used by the fault path and, with
-/// its own connection, the drain).
-pub fn request_chunk(
+/// Legacy single-chunk request, used to check one-chunk equivalence.
+#[cfg(test)]
+fn request_chunk(
     conn: &mut TcpStream,
     next_req: &AtomicU64,
     chunk_offset: u64,
@@ -498,19 +675,24 @@ pub fn decode_page(
                 .map_err(PeerError::Server)?;
             Ok(PeerPage::Bytes(raw))
         }
-        FromSource::ZeroChunk { req_id, .. } if req_id == want_req => Ok(PeerPage::Zero),
+        FromSource::ZeroChunk {
+            req_id,
+            chunk_offset,
+        } if req_id == want_req && chunk_offset == want_offset => Ok(PeerPage::Zero),
         FromSource::AltSource {
             req_id,
             durable_sha256,
-            ..
-        } if req_id == want_req => Ok(PeerPage::AltSource(durable_sha256)),
+            chunk_offset,
+        } if req_id == want_req && chunk_offset == want_offset => {
+            Ok(PeerPage::AltSource(durable_sha256))
+        }
         // Honor the wire contract: `req_id: Some` ⇒ THAT request failed
         // (the conn keeps serving — retryable); `req_id: None` ⇒
         // connection-fatal (terminal).
         FromSource::Error {
-            req_id: Some(_),
+            req_id: Some(req_id),
             message,
-        } => Err(PeerError::RequestFailed(message)),
+        } if req_id == want_req => Err(PeerError::RequestFailed(message)),
         FromSource::Error {
             req_id: None,
             message,
@@ -602,7 +784,14 @@ impl ControlInner {
     /// invariant on the fields). Never blocks beyond the per-write timeout;
     /// dead subscribers are pruned.
     fn report(&self, msg: HandlerControl) {
+        self.report_if(msg, || true);
+    }
+
+    fn report_if(&self, msg: HandlerControl, publish: impl FnOnce() -> bool) {
         let mut backlog = self.backlog.lock().expect("backlog poisoned");
+        if !publish() {
+            return;
+        }
         backlog.push(msg.clone());
         let mut subs = self.subscribers.lock().expect("subscribers poisoned");
         subs.retain_mut(|s| write_frame(s, &msg).is_ok());
@@ -644,6 +833,13 @@ impl ControlTx {
         self.inner.report(msg);
     }
 
+    /// Check publication after waiting for the backlog lock. The caller can
+    /// serialize cancellation here without holding its lock during socket I/O.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn report_if(&self, msg: HandlerControl, publish: impl FnOnce() -> bool) {
+        self.inner.report_if(msg, publish);
+    }
+
     /// Test-only: install a hook fired between a subscriber's backlog
     /// snapshot and its registration (while the backlog lock is held).
     #[cfg(test)]
@@ -653,7 +849,7 @@ impl ControlTx {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::net::TcpListener;
 
     use super::*;
@@ -661,10 +857,100 @@ mod tests {
     const CHUNK: u64 = 4096;
     const TOTAL: u64 = 4 * 4096;
 
+    /// A full Linux accept queue makes the next TCP handshake stay pending.
+    /// No routing assumptions or external black-hole address are needed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_during_pending_connect_is_bounded() {
+        let listener = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        listener
+            .bind(
+                &"127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap();
+        listener.listen(0).unwrap();
+        let addr = listener.local_addr().unwrap().as_socket().unwrap();
+        // Linux permits backlog + 1 established connections. Never accept it.
+        let _queued = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).unwrap();
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_stopped = stopped.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = dial_with_socket(
+                &addr.to_string(),
+                "e",
+                "tok",
+                CHUNK,
+                TOTAL,
+                engram_migrate_proto::ConnPurpose::Fault,
+                |socket| {
+                    assert!(
+                        socket.is_none(),
+                        "full accept queue must prevent connection"
+                    );
+                    let _ = entered_tx.send(());
+                    Ok(!worker_stopped.load(Ordering::SeqCst))
+                },
+            );
+            done_tx.send(result).unwrap();
+        });
+        // The two checks occur before resolution and immediately before connect.
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        let started = std::time::Instant::now();
+        stopped.store(true, Ordering::SeqCst);
+        let result = done_rx
+            .recv_timeout(PEER_READ_TIMEOUT + Duration::from_secs(1))
+            .expect("canceled connect exceeded its deadline");
+        assert!(
+            matches!(result, Err(PeerError::Lost(ref message)) if message == "connection canceled")
+        );
+        assert!(started.elapsed() < PEER_READ_TIMEOUT + Duration::from_secs(1));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn canceled_connect_does_not_resolve_or_open_a_socket() {
+        let result = dial_with_socket(
+            "invalid address",
+            "e",
+            "tok",
+            CHUNK,
+            TOTAL,
+            engram_migrate_proto::ConnPurpose::Fault,
+            |_| Ok(false),
+        );
+        assert!(
+            matches!(result, Err(PeerError::Lost(ref message)) if message == "connection canceled")
+        );
+    }
+
     /// A minimal fake source: accepts conns, answers Hello/Ack/Seal,
     /// then serves canned NeedAt responses.
-    fn fake_source(
+    pub(crate) fn fake_source(
         seal_bits: Vec<u64>,
+        respond: impl Fn(u64, u64) -> FromSource + Send + Clone + 'static,
+    ) -> std::net::SocketAddr {
+        fake_source_geometry(seal_bits, CHUNK, TOTAL, respond)
+    }
+
+    pub(crate) fn fake_source_geometry(
+        seal_bits: Vec<u64>,
+        chunk_size: u64,
+        total_bytes: u64,
         respond: impl Fn(u64, u64) -> FromSource + Send + Clone + 'static,
     ) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -693,12 +979,12 @@ mod tests {
                         &mut s,
                         &FromSource::HelloAck {
                             version: PROTO_VERSION,
-                            chunk_size: CHUNK,
-                            total_bytes: TOTAL,
+                            chunk_size,
+                            total_bytes,
                         },
                     )
                     .unwrap();
-                    let mut bitmap = SealBitmap::new(CHUNK, TOTAL / CHUNK);
+                    let mut bitmap = SealBitmap::new(chunk_size, total_bytes / chunk_size);
                     for b in &seal_bits {
                         bitmap.set(*b);
                     }
@@ -714,6 +1000,21 @@ mod tests {
                                     return;
                                 }
                             }
+                            ToSource::NeedWindow {
+                                req_id,
+                                chunk_offsets,
+                            } => {
+                                for offset in chunk_offsets {
+                                    let resp = respond(req_id, offset);
+                                    let failed = matches!(resp, FromSource::Error { .. });
+                                    if write_frame(&mut s, &resp).is_err() {
+                                        return;
+                                    }
+                                    if failed {
+                                        break;
+                                    }
+                                }
+                            }
                             ToSource::DrainDone { .. } => return,
                             _ => return,
                         }
@@ -724,7 +1025,7 @@ mod tests {
         addr
     }
 
-    fn page_resp(req_id: u64, chunk_offset: u64) -> FromSource {
+    pub(crate) fn page_resp(req_id: u64, chunk_offset: u64) -> FromSource {
         // Through the REAL compression path — the canned server
         // serves exactly what the prod source serves.
         let (bytes, lz4) = engram_migrate_proto::compress_page(vec![0xAB; CHUNK as usize]);
@@ -735,6 +1036,244 @@ mod tests {
             bytes,
             hash,
             lz4,
+        }
+    }
+
+    #[test]
+    fn every_page_shape_checks_request_and_offset_before_install() {
+        for response in [
+            page_resp(7, CHUNK),
+            FromSource::ZeroChunk {
+                req_id: 7,
+                chunk_offset: CHUNK,
+            },
+            FromSource::AltSource {
+                req_id: 7,
+                chunk_offset: CHUNK,
+                durable_sha256: [0; 32],
+            },
+        ] {
+            assert!(matches!(
+                decode_page(response.clone(), 7, 0),
+                Err(PeerError::Server(_))
+            ));
+            assert!(matches!(
+                decode_page(response, 8, CHUNK),
+                Err(PeerError::Server(_))
+            ));
+        }
+        assert!(matches!(
+            decode_page(
+                FromSource::Error {
+                    req_id: Some(8),
+                    message: "wrong request".into(),
+                },
+                7,
+                0
+            ),
+            Err(PeerError::Server(_))
+        ));
+    }
+
+    #[test]
+    fn reordered_mixed_window_fails_before_any_install() {
+        let addr = fake_source(vec![0, 1], |req_id, offset| {
+            if offset == 0 {
+                FromSource::ZeroChunk {
+                    req_id,
+                    chunk_offset: CHUNK,
+                }
+            } else {
+                FromSource::AltSource {
+                    req_id,
+                    chunk_offset: 0,
+                    durable_sha256: [0; 32],
+                }
+            }
+        });
+        let peer =
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), CHUNK, TOTAL).unwrap();
+        let mut installs = 0;
+        let result = peer.need_window(&[0, CHUNK], |_, _| {
+            installs += 1;
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(result, Err(PeerError::Server(_))));
+        assert_eq!(installs, 0);
+        assert!(peer.is_lost());
+    }
+
+    #[test]
+    fn duplicate_from_previous_window_fails_before_any_new_install() {
+        let saved = std::sync::Arc::new(Mutex::new(None));
+        let addr = fake_source(vec![0, 1], move |req_id, offset| {
+            saved
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| FromSource::ZeroChunk {
+                    req_id,
+                    chunk_offset: offset,
+                })
+                .clone()
+        });
+        let peer =
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), CHUNK, TOTAL).unwrap();
+        peer.need_at(0).unwrap();
+        let mut installs = 0;
+        let result = peer.need_window(&[CHUNK], |_, _| {
+            installs += 1;
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(result, Err(PeerError::Server(_))));
+        assert_eq!(installs, 0);
+        assert!(peer.is_lost());
+    }
+
+    #[test]
+    fn duplicate_reply_fails_before_installing_duplicate() {
+        let addr = fake_source(vec![0, 1], |req_id, _| FromSource::ZeroChunk {
+            req_id,
+            chunk_offset: 0,
+        });
+        let peer =
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), CHUNK, TOTAL).unwrap();
+        let mut installed = Vec::new();
+        let result = peer.need_window(&[0, CHUNK], |offset, _| {
+            installed.push(offset);
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(result, Err(PeerError::Server(_))));
+        // The valid prefix stays installed; the duplicate never reaches the installer.
+        assert_eq!(installed, [0]);
+        assert!(peer.is_lost());
+    }
+
+    #[test]
+    fn window_streams_verified_pages_and_keeps_prefix_on_corruption() {
+        let addr = fake_source(vec![0, 1, 2], |req_id, offset| {
+            if offset == 2 * CHUNK {
+                FromSource::Page {
+                    req_id,
+                    chunk_offset: offset,
+                    bytes: vec![7],
+                    hash: [0; 32],
+                    lz4: false,
+                }
+            } else {
+                page_resp(req_id, offset)
+            }
+        });
+        let sess =
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), CHUNK, TOTAL).unwrap();
+        let mut installed = Vec::new();
+        let err = sess
+            .need_window(&[0, CHUNK, 2 * CHUNK], |offset, page| {
+                let PeerPage::Bytes(bytes) = page else {
+                    panic!("expected bytes")
+                };
+                assert_eq!(bytes, vec![0xAB; CHUNK as usize]);
+                installed.push(offset);
+                Ok::<_, ()>(())
+            })
+            .unwrap_err();
+        assert!(matches!(err, PeerError::ShaMismatch { .. }));
+        assert_eq!(installed, vec![0, CHUNK]);
+        assert!(sess.is_lost());
+        assert_eq!(sess.fault_stats().0, 1);
+    }
+
+    #[test]
+    fn window_installs_before_next_response_and_retries_only_suffix() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let rx = std::sync::Arc::new(Mutex::new(rx));
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen_source = seen.clone();
+        let failed = std::sync::Arc::new(AtomicBool::new(false));
+        let addr = fake_source(vec![0, 1, 2], move |req, offset| {
+            seen_source.lock().unwrap().push(offset);
+            if offset == CHUNK && !failed.swap(true, Ordering::SeqCst) {
+                // The server will not send chunk 1 until chunk 0 was installed.
+                rx.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                return FromSource::Error {
+                    req_id: Some(req),
+                    message: "transient read failure".into(),
+                };
+            }
+            page_resp(req, offset)
+        });
+        let sess =
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), CHUNK, TOTAL).unwrap();
+        let mut installed = Vec::new();
+        sess.need_window(&[0, CHUNK, 2 * CHUNK], |offset, _| {
+            installed.push(offset);
+            if offset == 0 {
+                tx.send(()).unwrap();
+            }
+            Ok::<_, ()>(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(installed, vec![0, CHUNK, 2 * CHUNK]);
+        assert_eq!(*seen.lock().unwrap(), vec![0, CHUNK, CHUNK, 2 * CHUNK]);
+        assert_eq!(sess.fault_stats().0, 1);
+        assert!(!sess.is_lost());
+    }
+
+    #[test]
+    fn one_chunk_window_matches_need_at() {
+        let addr = fake_source(vec![0], page_resp);
+        let sess =
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), CHUNK, TOTAL).unwrap();
+        let PeerPage::Bytes(single) =
+            request_chunk(&mut sess.fault_conn.lock().unwrap(), &sess.next_req, 0).unwrap()
+        else {
+            panic!("bytes")
+        };
+        sess.need_window(&[0], |offset, page| {
+            assert_eq!(offset, 0);
+            let PeerPage::Bytes(bytes) = page else {
+                panic!("bytes")
+            };
+            assert_eq!(bytes, single);
+            Ok::<_, ()>(())
+        })
+        .unwrap()
+        .unwrap();
+    }
+
+    #[test]
+    fn window_skips_installed_and_unsealed_and_region_tail() {
+        let mut seal = SealBitmap::new(4096, 8);
+        for i in [0, 2, 3, 4, 5, 6, 7] {
+            seal.set(i);
+        }
+        assert_eq!(
+            fault_window(&seal, 0, 5 * 4096 + 100, 8, |i| i == 2),
+            vec![0, 3 * 4096, 4 * 4096]
+        );
+        assert_eq!(fault_window(&seal, 0, 8 * 4096, 1, |_| false), vec![0]);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct("proptest-regressions/fault_window.txt"))),
+            ..proptest::test_runner::Config::default()
+        })]
+        #[test]
+        fn selected_window_is_sealed_uninstalled_and_bounded(
+            bits in proptest::collection::vec((proptest::bool::ANY, proptest::bool::ANY), 1..128),
+            first in 0usize..128, end in 1usize..129, limit in 1usize..257,
+        ) {
+            let end = end.min(bits.len());
+            let first = first.min(end - 1);
+            let mut seal = SealBitmap::new(4096, bits.len() as u64);
+            for (i, &(sealed, _)) in bits.iter().enumerate() { if sealed { seal.set(i as u64); } }
+            let got = fault_window(&seal, first as u64 * 4096, end as u64 * 4096, limit, |i| bits[i].1);
+            let expected: Vec<_> = (first..end).filter(|&i| bits[i].0 && !bits[i].1).take(limit).map(|i| i as u64 * 4096).collect();
+            proptest::prop_assert_eq!(got, expected);
         }
     }
 
@@ -1024,13 +1563,15 @@ mod tests {
                     if drop_after_seal {
                         return; // connection dies before serving
                     }
-                    while let Ok(ToSource::NeedAt {
+                    while let Ok(ToSource::NeedWindow {
                         req_id,
-                        chunk_offset,
+                        chunk_offsets,
                     }) = read_frame::<_, ToSource>(&mut s)
                     {
-                        if write_frame(&mut s, &page_resp(req_id, chunk_offset)).is_err() {
-                            return;
+                        for offset in chunk_offsets {
+                            if write_frame(&mut s, &page_resp(req_id, offset)).is_err() {
+                                return;
+                            }
                         }
                     }
                 });
@@ -1124,6 +1665,7 @@ mod tests {
                         faults: 0,
                         fault_us: 0,
                         fault_max_us: 0,
+                        fault_around_chunks_installed: 0,
                     });
                 });
                 std::thread::sleep(Duration::from_millis(200));
@@ -1181,6 +1723,7 @@ mod tests {
                     faults: 0,
                     fault_us: 0,
                     fault_max_us: 0,
+                    fault_around_chunks_installed: 0,
                 });
             })
         };

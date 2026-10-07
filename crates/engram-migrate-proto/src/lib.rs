@@ -26,7 +26,7 @@
 //! ```
 //!
 //! A handler may open MULTIPLE connections per export (one for the fault
-//! path, one or more for the background drain) — the token is per-export,
+//! path, one for fault-around prefetch, and one or more for the background drain) — the token is per-export,
 //! not per-connection, and every authenticated connection receives the
 //! `Seal` push. `GET_STATE` from the original ADR sketch is deliberately
 //! ABSENT: `state.bin` rides the gRPC `MigrationFetch` (`StateBin`
@@ -73,7 +73,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 /// that is the chunk-store's content address, not wire integrity.
 ///
 /// v5: remove the unused by-hash request and reply.
-pub const PROTO_VERSION: u32 = 5;
+/// v6: ordered fault windows and fault-around installation accounting.
+pub const PROTO_VERSION: u32 = 6;
+
+/// Bound a demand window to limit request and response work.
+pub const MAX_FAULT_AROUND_CHUNKS: usize = 256;
 
 /// Wire-integrity hash for `Page` payloads (v4: blake3 over the wire
 /// bytes — the SAME bytes shipped, compressed or raw). One helper so
@@ -86,8 +90,8 @@ pub fn wire_hash(bytes: &[u8]) -> [u8; 32] {
 /// it (see the v3 note on [`PROTO_VERSION`]).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ConnPurpose {
-    /// The handler's fault-loop connection: latency-critical, single
-    /// in-flight request, a stalled vCPU behind every frame.
+    /// Demand or fault-around connection: latency-critical first response,
+    /// one in-flight request. A fault window may have a speculative suffix.
     Fault,
     /// Background drain: throughput-oriented, pipelined, yields to
     /// faults on the dest side.
@@ -197,6 +201,12 @@ pub enum ToSource {
         alt_sourced: u64,
         zero_chunks: u64,
     },
+    /// One response per offset, in request order, with the same req_id.
+    /// Stop the window at the first Error response.
+    NeedWindow {
+        req_id: u64,
+        chunk_offsets: Vec<u64>,
+    },
 }
 
 /// source host-agent → dest uffd-handler.
@@ -299,6 +309,7 @@ pub enum HandlerControl {
         faults: u64,
         fault_us: u64,
         fault_max_us: u64,
+        fault_around_chunks_installed: u64,
     },
     /// The peer is gone (dial/reconnect exhausted, frame error, or sha
     /// mismatch) with sealed chunks still uninstalled. FATAL by design:
@@ -458,6 +469,7 @@ mod tests {
             faults: 42,
             fault_us: 55_000,
             fault_max_us: 9_000,
+            fault_around_chunks_installed: 0,
         });
         round_trip(&HandlerControl::PeerLost {
             remaining: 3,

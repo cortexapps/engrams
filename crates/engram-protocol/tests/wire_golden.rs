@@ -699,8 +699,10 @@ fn wire_version_pinned() {
     // Existing bincode goldens do not embed presetup; their bytes do not change.
     // 34 -> 35: the memory image refusal is typed. No payload changes; the
     // bump fences old hosts that refuse untyped.
+    // 35 -> 36: page-channel v6 fault windows require a lockstep host roll.
+    // Coordinator bincode payload bytes are unchanged.
     assert_eq!(
-        WIRE_VERSION, 35,
+        WIRE_VERSION, 36,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

@@ -169,7 +169,8 @@ use serde::{Deserialize, Serialize};
 // payloads do not change. The bump fences mixed fleets: an older host refuses
 // the same snapshot with an untyped error, which the resume verb counts toward
 // the Dead budget instead of recovering from disk.
-pub const WIRE_VERSION: u32 = 35;
+// v36 gates page-channel v6 fault windows for a lockstep host roll.
+pub const WIRE_VERSION: u32 = 36;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

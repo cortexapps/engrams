@@ -46,6 +46,12 @@ pub fn to_source() -> impl Strategy<Value = ToSource> {
                 purpose,
             }
         ),
+        (any::<u64>(), prop::collection::vec(any::<u64>(), 1..=256)).prop_map(
+            |(req_id, chunk_offsets)| ToSource::NeedWindow {
+                req_id,
+                chunk_offsets
+            }
+        ),
         (any::<u64>(), any::<u64>()).prop_map(|(req_id, chunk_offset)| ToSource::NeedAt {
             req_id,
             chunk_offset
@@ -125,9 +131,19 @@ pub fn handler_control() -> impl Strategy<Value = HandlerControl> {
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
+            any::<u64>(),
         )
             .prop_map(
-                |(pulled, alt_sourced, zero_chunks, ms, faults, fault_us, fault_max_us)| {
+                |(
+                    pulled,
+                    alt_sourced,
+                    zero_chunks,
+                    ms,
+                    faults,
+                    fault_us,
+                    fault_max_us,
+                    fault_around_chunks_installed,
+                )| {
                     HandlerControl::DrainDone {
                         pulled,
                         alt_sourced,
@@ -136,6 +152,7 @@ pub fn handler_control() -> impl Strategy<Value = HandlerControl> {
                         faults,
                         fault_us,
                         fault_max_us,
+                        fault_around_chunks_installed,
                     }
                 }
             ),
@@ -161,6 +178,7 @@ fn _exhaustiveness_to_source(m: &ToSource) {
     match m {
         ToSource::Hello { .. } => {}
         ToSource::NeedAt { .. } => {}
+        ToSource::NeedWindow { .. } => {}
         ToSource::DrainDone { .. } => {}
     }
 }

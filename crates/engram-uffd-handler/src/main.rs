@@ -17,6 +17,7 @@
 //!   --listen /tmp/uffd.sock \
 //!   --canonical-manifest <uuid>@v<n> \
 //!   --session-manifest   <uuid>@v<n> \
+//!   [--fault-around-chunks N] (env ENGRAM_UFFD_FAULT_AROUND, default 8)
 //!   [--prefault-trace file:<path>|<host-uuid>] \
 //!   [--publish-trace-host <host-uuid>] \
 //!   [--trace-key <session-uuid>] \
@@ -191,6 +192,7 @@ mod linux {
         /// the background. The token rides `ENGRAM_PEER_TOKEN` (argv
         /// leaks via /proc/*/cmdline); `--peer-token` is a dev override.
         pub peer_addr: Option<String>,
+        pub fault_around_chunks: usize,
         pub peer_export_id: Option<String>,
         pub peer_token: Option<String>,
         /// ADR 0045 C2: bind a UnixListener here and stream one-way
@@ -220,6 +222,8 @@ mod linux {
         let mut cache_root: Option<PathBuf> = None;
         let mut recorder_window_ms: u64 = DEFAULT_RECORDER_WINDOW_MS;
         let mut base_shm: Option<PathBuf> = None;
+        let mut fault_around_chunks = std::env::var("ENGRAM_UFFD_FAULT_AROUND")
+            .unwrap_or_else(|_| engram_uffd_handler::peer::DEFAULT_FAULT_AROUND_CHUNKS.to_string());
         let mut peer_addr: Option<String> = None;
         let mut peer_export_id: Option<String> = None;
         let mut peer_token: Option<String> = None;
@@ -229,6 +233,11 @@ mod linux {
         let mut argv = std::env::args().skip(1);
         while let Some(arg) = argv.next() {
             match arg.as_str() {
+                "--fault-around-chunks" => {
+                    fault_around_chunks = argv
+                        .next()
+                        .ok_or("--fault-around-chunks requires a value")?;
+                }
                 "--listen" => {
                     listen = Some(PathBuf::from(
                         argv.next()
@@ -371,7 +380,14 @@ mod linux {
             }
         }
 
+        let fault_around_chunks: usize = fault_around_chunks
+            .parse()
+            .map_err(|_| "invalid fault-around chunk count")?;
+        if !(1..=engram_migrate_proto::MAX_FAULT_AROUND_CHUNKS).contains(&fault_around_chunks) {
+            return Err("fault-around chunk count must be in 1..=256".into());
+        }
         Ok(Args {
+            fault_around_chunks,
             listen,
             canonical_manifest,
             session_manifest,
@@ -665,6 +681,7 @@ mod linux {
                     handle,
                     engram_uffd_handler::runtime::RunListenerOpts {
                         prefault_trace: prefault,
+                        fault_around_chunks: args.fault_around_chunks,
                         recorder_window: window,
                         trace_output: trace_out,
                         base_shm,
@@ -784,6 +801,7 @@ mod linux {
   --listen <sock> \\
   --canonical-manifest <uuid>@v<num> \\
   --session-manifest <uuid>@v<num> \\
+  [--fault-around-chunks N] (env ENGRAM_UFFD_FAULT_AROUND, default 8)
   [--prefault-trace file:<path>|<host-uuid>] \\
   [--publish-trace-host <host-uuid>] \\
   [--cache-root <path>] \\
