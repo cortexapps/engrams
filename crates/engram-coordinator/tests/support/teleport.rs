@@ -410,6 +410,7 @@ impl Rig {
                 mem_budget_mib: 128,
                 cpu_budget_vcpus: 1,
                 max_open_per_dest: 1,
+                kind: engram_core::types::teleport::TeleportKind::Live,
             })
             .await
             .unwrap()

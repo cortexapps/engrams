@@ -6344,6 +6344,7 @@ async fn teleport_admission_fixture(
         mem_budget_mib: 4096,
         cpu_budget_vcpus: 2,
         max_open_per_dest: 1,
+        kind: engram_core::types::teleport::TeleportKind::Live,
     }
 }
 async fn admit_teleport(

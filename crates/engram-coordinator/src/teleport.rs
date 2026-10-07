@@ -662,18 +662,46 @@ mod steps {
             crate::boot_materializer::resolve_resume_budget(&state.services.meta, &session)
                 .await
                 .ok_or_else(|| ApiError::Unavailable("teleport budget unavailable".into()))?;
-        let caps = crate::placement::CapabilityRequirements {
-            needs_uffd_substrate: true,
-            // The destination restores a post-copy export on the UFFD
-            // substrate; a host that honestly reports the substrate as
-            // not applicable is not a candidate.
-            needs_live_substrate: true,
-            fc_snapshot_version: match session.host_id {
-                Some(h) => state.services.meta.fc_snapshot_version_for_host(h).await?,
-                None => None,
-            },
+        // Two candidate sets: hosts that can restore a post-copy export
+        // (the substrate probes `Ok`, backend Firecracker — the migration
+        // restore forces UFFD) and hosts that can restore a snapshot. The
+        // kind follows the destination: live when a live-capable
+        // destination exists (the source may still downgrade at
+        // presetup), snapshot otherwise. A pinned target decides alone.
+        let fc_snapshot_version = match session.host_id {
+            Some(h) => state.services.meta.fc_snapshot_version_for_host(h).await?,
+            None => None,
         };
-        if let Some(target) = target {
+        let caps_for = |live: bool| crate::placement::CapabilityRequirements {
+            needs_uffd_substrate: true,
+            needs_live_substrate: live,
+            fc_snapshot_version: fc_snapshot_version.clone(),
+        };
+        let candidates_for = |caps: crate::placement::CapabilityRequirements| {
+            let context = crate::placement::ScheduleContext {
+                repo: &session.image,
+                image_version: "",
+                snapshot_host: None,
+                memory_mib: Some(mem),
+                cpu_budget_vcpus: Some(cpu),
+                required_image_digest: None,
+                exclude_host: session.host_id,
+                prefer_host: None,
+                caps,
+                prefer_bundles: &[],
+            };
+            async move {
+                crate::placement::candidates_for(
+                    state.services.meta.as_ref(),
+                    &context,
+                    state.services.clock.now_utc(),
+                )
+                .await
+                .map(|c| c.hosts)
+                .map_err(|e| ApiError::Unavailable(format!("placement: {e:?}")))
+            }
+        };
+        let (kind, candidates) = if let Some(target) = target {
             let host = state
                 .services
                 .meta
@@ -683,33 +711,30 @@ mod steps {
             if host.cordoned {
                 return Err(ApiError::Conflict("target_cordoned".into()));
             }
-            if crate::placement::host_meets_capabilities(&host, &caps).is_err() {
+            let kind = if crate::placement::host_meets_capabilities(&host, &caps_for(true)).is_ok()
+            {
+                TeleportKind::Live
+            } else if crate::placement::host_meets_capabilities(&host, &caps_for(false)).is_ok() {
+                TeleportKind::Snapshot
+            } else {
                 return Err(ApiError::Conflict("target_lacks_capability".into()));
+            };
+            let candidates = candidates_for(caps_for(kind == TeleportKind::Live)).await?;
+            if !candidates.contains(&target) {
+                return Ok(TeleportAdmitOutcome::NoFit);
             }
-        }
-        let context = crate::placement::ScheduleContext {
-            repo: &session.image,
-            image_version: "",
-            snapshot_host: None,
-            memory_mib: Some(mem),
-            cpu_budget_vcpus: Some(cpu),
-            required_image_digest: None,
-            exclude_host: session.host_id,
-            prefer_host: None,
-            caps,
-            prefer_bundles: &[],
+            (kind, candidates)
+        } else {
+            let live = candidates_for(caps_for(true)).await?;
+            if live.is_empty() {
+                (
+                    TeleportKind::Snapshot,
+                    candidates_for(caps_for(false)).await?,
+                )
+            } else {
+                (TeleportKind::Live, live)
+            }
         };
-        let candidates = crate::placement::candidates_for(
-            state.services.meta.as_ref(),
-            &context,
-            state.services.clock.now_utc(),
-        )
-        .await
-        .map_err(|e| ApiError::Unavailable(format!("placement: {e:?}")))?
-        .hosts;
-        if target.is_some_and(|h| !candidates.contains(&h)) {
-            return Ok(TeleportAdmitOutcome::NoFit);
-        }
         state
             .services
             .meta
@@ -729,6 +754,7 @@ mod steps {
                     .and_then(|n| n.as_u64())
                     .and_then(|n| u32::try_from(n).ok())
                     .unwrap_or(TeleportConfig::default().max_open_per_dest),
+                kind,
             })
             .await
             .map_err(Into::into)

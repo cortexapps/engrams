@@ -618,11 +618,14 @@ pub enum HarnessFrame {
 - 2026-10-07 (coordinator): admission always records `Live`. The source
   host's pause-free `migration_presetup` answer decides whether the sandbox
   supports post-copy; only `InvalidSpec` changes the row to `Snapshot`.
-  Host capability probes no longer choose the kind; they gate the
-  DESTINATION instead (`needs_live_substrate`: the substrate probes must
-  be `Ok` and the backend Firecracker, because the migration restore
-  forces UFFD), so a host that cannot restore a post-copy export is not
-  a candidate and the answer is `NoFit` before any blackout. The first event of a
+  Host capability probes no longer choose the kind from the SOURCE; the
+  destination's capability does (`needs_live_substrate`: the substrate
+  probes must be `Ok` and the backend Firecracker, because the migration
+  restore forces UFFD). Admission takes the live-capable candidates when
+  any exist and stamps `Live`; otherwise it takes the snapshot-capable
+  candidates and stamps `Snapshot`; a pinned target decides alone. So a
+  host that cannot restore a post-copy export never receives one, and a
+  fleet without the substrate still moves sessions by snapshot. The first event of a
   new harness generation wakes the queued teleport. Attach reads readiness
   after spawn, waits up to 5 s at a 100 ms cadence, then requests a 500 ms
   retry (the requeue adds the attempt's elapsed time, so the poll backstop

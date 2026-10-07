@@ -204,6 +204,11 @@ pub struct TeleportAdmitRequest {
     pub mem_budget_mib: i64,
     pub cpu_budget_vcpus: i64,
     pub max_open_per_dest: u32,
+    /// `Live` when every candidate can restore a post-copy export
+    /// (ADR 0123: the coordinator filters candidates on the destination's
+    /// substrate); `Snapshot` when none can. The source host may still
+    /// downgrade a `Live` row at presetup.
+    pub kind: TeleportKind,
 }
 #[derive(Clone, Debug)]
 pub enum TeleportAdmitOutcome {

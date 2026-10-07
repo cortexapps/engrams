@@ -352,7 +352,7 @@ impl MetadataStore for SimMetadataStore {
         let row = TeleportRow {
             id: req.id,
             session_id: req.session_id,
-            kind: TeleportKind::Live,
+            kind: req.kind,
             reason: req.reason,
             phase: TeleportPhase::Admitted,
             source_host_id: source,
