@@ -294,6 +294,7 @@ struct PendingPresetup {
     /// The chain ref the presetup advertised as the session manifest
     /// (the capture validates the chain hasn't moved underneath).
     chain_ref: engram_core::types::manifest::ManifestRef,
+    swap_manifest_ref: Option<engram_core::types::manifest::ManifestRef>,
     sidecar_json: Vec<u8>,
 }
 
@@ -1058,6 +1059,101 @@ fn spawn_leg_keepalive(
 }
 
 impl PooledBackend {
+    /// Compose the pre-pause export from the current device lineages.
+    async fn prepare_migration_export(
+        &self,
+        id: SandboxId,
+        chain_ref: engram_core::types::manifest::ManifestRef,
+        chain_manifest: &engram_chunk_store::Manifest,
+        peer_port: u16,
+        backends: Vec<(DiskRole, Arc<crate::disk_daemon::ChunkedDiskBackend>)>,
+    ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
+        let sidecar_json = self.inner.compose_live_sidecar(id, Some(chain_ref))?;
+        let memory_manifest_json = serde_json::to_vec(&chain_manifest)
+            .map_err(|e| SandboxError::Snapshot(format!("chain manifest json: {e}")))?;
+
+        // The caller releases the device map guard before these awaits.
+        let (disk_manifest_ref, swap_manifest_ref) = {
+            let mut root_ref = None;
+            let mut swap_ref = None;
+            for (role, backend) in backends {
+                if let Err(error) = backend.sync_host_device().await {
+                    tracing::warn!(sandbox_id = %id, %error, "presetup NBD sync failed; capture will sync again");
+                }
+                match role {
+                    DiskRole::Root => root_ref = Some(backend.manifest_ref().await),
+                    DiskRole::Swap => swap_ref = Some(backend.manifest_ref().await),
+                }
+            }
+            (root_ref, swap_ref)
+        };
+
+        let export_id = crate::migration::MigrationRegistry::mint_export_id();
+        let peer_token = crate::migration::MigrationRegistry::mint_export_id();
+        let pending = PendingPresetup {
+            export_id: export_id.clone(),
+            peer_token: peer_token.clone(),
+            chain_ref,
+            swap_manifest_ref,
+            sidecar_json: sidecar_json.clone(),
+        };
+        self.pending_presetups.insert(id, pending.clone());
+
+        Ok(engram_core::types::snapshot::MigrationPresetupOut {
+            export_id,
+            peer_token,
+            peer_port,
+            sidecar_json,
+            memory_manifest_json,
+            memory_manifest_ref: chain_ref,
+            disk_manifest_ref,
+            swap_manifest_ref: pending.swap_manifest_ref,
+            hot_chunks: self.read_hot_chunks(id),
+        })
+    }
+
+    /// Restore all sealed devices before the source resumes.
+    async fn abort_migration_export(
+        &self,
+        export: crate::migration::MigrationExport,
+        backends: Vec<(DiskRole, Arc<crate::disk_daemon::ChunkedDiskBackend>)>,
+    ) -> Result<(), SandboxError> {
+        // The export is consumed: from here the cleanup must run to the
+        // end even if this request is cancelled, or a retry would see
+        // NotFound with the fence still raised. A detached task owns it;
+        // the request only awaits the result.
+        let inner = self.inner.clone();
+        let migration_roles = self.migration_roles.clone();
+        let id = export.sandbox_id;
+        let export_id = export.export_id.clone();
+        tokio::spawn(async move {
+            for (role, backend) in backends {
+                // Disk post-copy: the sealed bytes go back into `dirty`
+                // so the resumed guest's next flush captures them.
+                if let Some(sealed) = export.disk_seal.get(&role) {
+                    backend.requeue_postcopy_seal(sealed).await;
+                }
+                backend.set_migration_fence(false);
+            }
+            let snapshot_dir = export.snapshot_dir.clone();
+            let _ = fs::remove_dir_all(&snapshot_dir).await;
+            drop(export.capture_guard);
+            inner
+                .resume(id)
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("migration abort resume: {e}")))?;
+            // Last: the drained bytes are back, the fence is down, and the
+            // guest runs again whether or not this manifest write succeeds
+            // (`resume` retries the clear). In-memory first, then the manifest.
+            migration_roles.remove(&id);
+            inner.set_manifest_migration_role(id, None).await?;
+            tracing::info!(sandbox_id = %id, export_id, "migration aborted; guest resumed in place (ADR 0045)");
+            Ok(())
+        })
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("migration abort task: {e}")))?
+    }
+
     /// ADR 0019 / telemetry restoration (#526): read the uffd-handler's
     /// per-jail prefault-effectiveness snapshot and emit the
     /// `engram_resume_prefault_*` counters. Detached into a bounded,
@@ -1256,11 +1352,6 @@ impl PooledBackend {
         Err(SandboxError::Snapshot(
             "pre-capture guest sync: exec stream ended without an exit status".into(),
         ))
-    }
-
-    /// Keep the live-teleport refusal until device-tagged post-copy is available.
-    fn sandbox_swap_mib(&self, id: SandboxId) -> Option<u32> {
-        self.inner.swap_mib(id).filter(|m| *m > 0)
     }
 
     /// Run an image's capture-time `[warm]` hook ([`WarmConfig`]) in the
@@ -1749,23 +1840,26 @@ impl PooledBackend {
         // makes the dest self-sufficient.
         #[cfg(target_os = "linux")]
         if let Some((_, pending)) = self.postcopy_dests.remove(&metadata.id) {
-            if let Some(nbd) = pending_nbd_state.as_ref() {
-                nbd.backend.set_migration_fence(true);
-            }
+            let nbd = [
+                (DiskRole::Root, pending_nbd_state.as_ref()),
+                (DiskRole::Swap, pending_swap_state.as_ref()),
+            ]
+            .into_iter()
+            .filter_map(|(role, state)| {
+                state.map(|state| {
+                    state.backend.set_migration_fence(true);
+                    (
+                        role,
+                        state.backend.clone(),
+                        state.device_path().to_path_buf(),
+                    )
+                })
+            })
+            .collect();
             self.spawn_postcopy_fetch_poller(
                 pending,
                 self.inner.snapshot_path_for(metadata.id),
-                pending_nbd_state
-                    .as_ref()
-                    .map(|n| {
-                        (
-                            DiskRole::Root,
-                            n.backend.clone(),
-                            n.device_path().to_path_buf(),
-                        )
-                    })
-                    .into_iter()
-                    .collect(),
+                nbd,
             );
         }
 
@@ -5176,13 +5270,16 @@ impl PooledBackend {
             .expect("NBD requires a dirty root");
         let threshold = self.flush_config.dirty_threshold_bytes;
         if let Some(reference) = manifest {
+            // A live move can start before swap has ever flushed. Its base
+            // is still shared; keep the first destination publish private.
+            // A restored private lineage continues without another fork.
             return crate::disk_daemon::runtime::attach_manifest_with_dirty_file(
                 reference,
                 cache.clone(),
                 Arc::new(store.clone()),
                 pool,
                 threshold,
-                false,
+                reference == blank_swap_base(size_mib).0,
                 dirty_path,
             )
             .await
@@ -7869,59 +7966,12 @@ impl SandboxBackend for PooledBackend {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = &view;
-        // Swap snapshots are durable. Live moves still need device-tagged
-        // post-copy, which lands in phase 3. Refuse before capture starts.
-        if self.sandbox_swap_mib(id).is_some() {
-            return Err(SandboxError::InvalidSpec(
-                "guest runs with ephemeral swap (ADR 0112) — use snapshot-rehome".into(),
-            ));
-        }
-
-        let sidecar_json = self.inner.compose_live_sidecar(id, Some(chain_ref))?;
-        let memory_manifest_json = serde_json::to_vec(&chain_manifest)
-            .map_err(|e| SandboxError::Snapshot(format!("chain manifest json: {e}")))?;
-
-        // INVARIANT (see `nbd_sandboxes`): clone the Arc out of the
-        // guard, then drop it before the sync and
-        // `manifest_ref().await` below.
         #[cfg(target_os = "linux")]
-        let disk_manifest_ref = {
-            let mut root_ref = None;
-            for (role, backend) in self.disk_backends(id) {
-                if let Err(error) = backend.sync_host_device().await {
-                    tracing::warn!(sandbox_id = %id, %error, "presetup NBD sync failed; capture will sync again");
-                }
-                if role == DiskRole::Root {
-                    root_ref = Some(backend.manifest_ref().await);
-                }
-            }
-            root_ref
-        };
+        let backends = self.disk_backends(id);
         #[cfg(not(target_os = "linux"))]
-        let disk_manifest_ref: Option<engram_core::types::manifest::ManifestRef> = None;
-
-        let export_id = crate::migration::MigrationRegistry::mint_export_id();
-        let peer_token = crate::migration::MigrationRegistry::mint_export_id();
-        self.pending_presetups.insert(
-            id,
-            PendingPresetup {
-                export_id: export_id.clone(),
-                peer_token: peer_token.clone(),
-                chain_ref,
-                sidecar_json: sidecar_json.clone(),
-            },
-        );
-
-        Ok(engram_core::types::snapshot::MigrationPresetupOut {
-            export_id,
-            peer_token,
-            peer_port: peer.port(),
-            sidecar_json,
-            memory_manifest_json,
-            memory_manifest_ref: chain_ref,
-            disk_manifest_ref,
-            hot_chunks: self.read_hot_chunks(id),
-        })
+        let backends = Vec::new();
+        self.prepare_migration_export(id, chain_ref, &chain_manifest, peer.port(), backends)
+            .await
     }
 
     /// ADR 0045 C2: the blackout half. Pause → NBD host-cache fsync +
@@ -8480,46 +8530,11 @@ impl SandboxBackend for PooledBackend {
         if let Some(peer) = self.migrate_peer_server() {
             peer.remove(export_id);
         }
-        // The export is consumed: from here the cleanup must run to the
-        // end even if this request is cancelled, or a retry would see
-        // NotFound with the fence still raised. A detached task owns it;
-        // the request only awaits the result.
-        let inner = self.inner.clone();
-        let migration_roles = self.migration_roles.clone();
         #[cfg(target_os = "linux")]
-        let nbd_sandboxes = self.nbd_sandboxes.clone();
-        let export_id = export_id.to_string();
-        tokio::spawn(async move {
-            // INVARIANT (see `nbd_sandboxes`): clone the Arc and drop the
-            // guard before the `requeue_*` awaits.
-            #[cfg(target_os = "linux")]
-            let backends: Vec<_> = nbd_sandboxes.get(&id).map(|e| e.iter().map(|(role, d)| (role, d.backend.clone())).collect()).unwrap_or_default();
-            #[cfg(target_os = "linux")]
-            for (role, backend) in backends {
-                // Disk post-copy: the sealed bytes go back into `dirty`
-                // so the resumed guest's next flush captures them.
-                if let Some(sealed) = export.disk_seal.get(&role) {
-                    backend.requeue_postcopy_seal(sealed).await;
-                }
-                backend.set_migration_fence(false);
-            }
-            let snapshot_dir = export.snapshot_dir.clone();
-            let _ = fs::remove_dir_all(&snapshot_dir).await;
-            drop(export.capture_guard);
-            inner
-                .resume(id)
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("migration abort resume: {e}")))?;
-            // Last: the drained bytes are back, the fence is down, and the
-            // guest runs again whether or not this manifest write succeeds
-            // (`resume` retries the clear). In-memory first, then the manifest.
-            migration_roles.remove(&id);
-            inner.set_manifest_migration_role(id, None).await?;
-            tracing::info!(sandbox_id = %id, export_id, "migration aborted; guest resumed in place (ADR 0045)");
-            Ok(())
-        })
-        .await
-        .map_err(|e| SandboxError::Snapshot(format!("migration abort task: {e}")))?
+        let backends = self.disk_backends(id);
+        #[cfg(not(target_os = "linux"))]
+        let backends = Vec::new();
+        self.abort_migration_export(export, backends).await
     }
 
     async fn commit_snapshot(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -12524,6 +12539,7 @@ mod tests {
                 export_id: live_export.clone(),
                 peer_token: "tok".into(),
                 chain_ref: engram_core::types::manifest::ManifestRef::new(),
+                swap_manifest_ref: None,
                 sidecar_json: Vec::new(),
             },
         );
@@ -12624,6 +12640,10 @@ mod tests {
         let (seal, _m, _r) = disk.seal_for_postcopy().await.unwrap();
         assert_eq!(seal.indices(), vec![0]);
 
+        disk.write(0, &vec![0x73u8; chunk_size as usize])
+            .await
+            .unwrap();
+        let (swap_seal, _, _) = disk.seal_for_postcopy().await.unwrap();
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(&export_dir).unwrap();
         std::fs::write(export_dir.join("state.bin"), b"vmstate-bytes").unwrap();
@@ -12632,6 +12652,7 @@ mod tests {
             b"{\"seal\":\"descriptor\"}",
         )
         .unwrap();
+        std::fs::write(export_dir.join("disk-seal.swap.json"), b"swap-descriptor").unwrap();
         let sandbox_id = SandboxId::new();
         let export_id = crate::migration::MigrationRegistry::mint_export_id();
         let guard = Arc::new(tokio::sync::Mutex::new(()));
@@ -12639,7 +12660,12 @@ mod tests {
             export_id: export_id.clone(),
             sandbox_id,
             snapshot_dir: export_dir,
-            disk_seal: [(DiskRole::Root, Arc::new(seal))].into_iter().collect(),
+            disk_seal: [
+                (DiskRole::Root, Arc::new(seal)),
+                (DiskRole::Swap, Arc::new(swap_seal))
+            ]
+            .into_iter()
+            .collect(),
             clock: std::sync::Arc::new(engram_core::traits::SystemClock::new()),
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_activity: std::sync::Arc::new(std::sync::Mutex::new(
@@ -12655,6 +12681,8 @@ mod tests {
                 vec![
                     MigrationItem::DiskSealInfo(DiskRole::Root),
                     MigrationItem::DiskChunkAt(DiskRole::Root, 0),
+                    MigrationItem::DiskSealInfo(DiskRole::Swap),
+                    MigrationItem::DiskChunkAt(DiskRole::Swap, 0),
                 ],
             )
             .await
@@ -12676,6 +12704,19 @@ mod tests {
             chunk.iter().all(|b| *b == 0x42),
             "the SEALED bytes, not base"
         );
+
+        let swap_info: Vec<u8> = frames
+            .iter()
+            .filter(|f| f.item_idx == 2)
+            .flat_map(|f| f.data.to_vec())
+            .collect();
+        assert_eq!(swap_info, b"swap-descriptor");
+        let swap_chunk: Vec<u8> = frames
+            .iter()
+            .filter(|f| f.item_idx == 3)
+            .flat_map(|f| f.data.to_vec())
+            .collect();
+        assert_eq!(swap_chunk, vec![0x73; chunk_size as usize]);
 
         // Unsealed index: refused (streamed error).
         let stream = pooled
@@ -12707,6 +12748,13 @@ mod tests {
     }
     #[async_trait]
     impl SandboxBackend for ResumeSpy {
+        fn compose_live_sidecar(
+            &self,
+            _: SandboxId,
+            _: Option<engram_core::types::manifest::ManifestRef>,
+        ) -> Result<Vec<u8>, SandboxError> {
+            Ok(b"{}".to_vec())
+        }
         async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
             Err(SandboxError::InvalidSpec("unused".into()))
         }
@@ -12785,6 +12833,76 @@ mod tests {
             .await
             .unwrap();
         (backend, store, dir)
+    }
+
+    #[tokio::test]
+    async fn presetup_reports_each_device_base_lineage() {
+        let (root, store, _root_dir) = unwind_test_disk_backend().await;
+        let (swap, _, _swap_dir) = unwind_test_disk_backend().await;
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            resumes: Default::default(),
+        }));
+        let root_ref = root.manifest_ref().await;
+        let swap_ref = swap.manifest_ref().await;
+        let manifest = store.get_manifest(root_ref).await.unwrap();
+        for swap_present in [false, true] {
+            let id = SandboxId::new();
+            let mut disks = vec![(DiskRole::Root, root.clone())];
+            if swap_present {
+                disks.push((DiskRole::Swap, swap.clone()));
+            }
+            let presetup = pooled
+                .prepare_migration_export(id, root_ref, &manifest, 9000, disks)
+                .await
+                .unwrap();
+            assert_eq!(presetup.disk_manifest_ref, Some(root_ref));
+            assert_eq!(presetup.swap_manifest_ref, swap_present.then_some(swap_ref));
+            assert_eq!(
+                pooled.pending_presetups.get(&id).unwrap().swap_manifest_ref,
+                presetup.swap_manifest_ref
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_abort_requeues_both_device_seals() {
+        let (root, root_store, _root_dir) = unwind_test_disk_backend().await;
+        let (swap, swap_store, _swap_dir) = unwind_test_disk_backend().await;
+        swap.write(0, &[0x73; 4096]).await.unwrap();
+        let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            resumes: resumes.clone(),
+        }));
+        let id = SandboxId::new();
+        let dir = tempfile::tempdir().unwrap();
+        let export_id = open_export(&pooled, id, dir.path().join("export")).await;
+        let mut export = pooled.migrations.remove_validated(id, &export_id).unwrap();
+        let disks = vec![
+            (DiskRole::Root, root.clone()),
+            (DiskRole::Swap, swap.clone()),
+        ];
+        for (role, backend) in &disks {
+            backend.set_migration_fence(true);
+            let (seal, _, _) = backend.seal_for_postcopy().await.unwrap();
+            export.disk_seal.insert(*role, Arc::new(seal));
+            // Remove the local dirty copy so recovery must use the role's seal.
+            backend.set_migration_fence(false);
+            assert_eq!(backend.flush().await.unwrap().chunks_flushed, 1);
+            backend.set_migration_fence(true);
+        }
+        pooled.abort_migration_export(export, disks).await.unwrap();
+        assert_eq!(*resumes.lock(), vec![id]);
+        for (backend, store, byte) in [(root, root_store, 0x42), (swap, swap_store, 0x73)] {
+            let flushed = backend.flush().await.unwrap();
+            assert_eq!(
+                flushed.chunks_flushed, 1,
+                "abort must requeue and unfence each device"
+            );
+            let manifest = store.get_manifest(flushed.manifest_ref).await.unwrap();
+            assert_eq!(manifest.chunks.len(), 1);
+            let data = store.get_chunk(manifest.chunks[0].hash).await.unwrap();
+            assert_eq!(data.as_ref(), &[byte; 4096]);
+        }
     }
 
     /// THE regression: an armed-but-not-defused guard (an error or a
@@ -16487,9 +16605,6 @@ mod tests {
                     engram_core::types::sandbox::ExecEvent::Exit(Some(0)),
                 ])),
             })
-        }
-        fn swap_mib(&self, _: SandboxId) -> Option<u32> {
-            Some(1)
         }
         async fn pause(&self, _: SandboxId) -> Result<(), SandboxError> {
             self.paused.store(true, std::sync::atomic::Ordering::SeqCst);

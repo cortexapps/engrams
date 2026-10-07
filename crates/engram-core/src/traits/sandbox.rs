@@ -880,11 +880,6 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
-    /// Attached swap capacity, used by the live-teleport gate.
-    fn swap_mib(&self, _id: SandboxId) -> Option<u32> {
-        None
-    }
-
     /// ADR 0045 C2: compose the restore sidecar from LIVE sandbox
     /// state (the presetup's pre-pause package; byte-identical to the
     /// capture-time sidecar by construction).

@@ -577,6 +577,11 @@ impl HostService for HostServiceImpl {
             memory_manifest_json: out.memory_manifest_json,
             memory_manifest_ref: encode_bincode(&out.memory_manifest_ref, "ManifestRef")?,
             disk_manifest_ref: encode_bincode(&out.disk_manifest_ref, "Option<ManifestRef>")?,
+            swap_manifest_ref: out
+                .swap_manifest_ref
+                .as_ref()
+                .map(|value| encode_bincode(value, "ManifestRef"))
+                .transpose()?,
             hot_chunks: out.hot_chunks.into_iter().map(|h| h.to_vec()).collect(),
         }))
     }

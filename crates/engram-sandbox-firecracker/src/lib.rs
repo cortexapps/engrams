@@ -5374,11 +5374,6 @@ impl SandboxBackend for FirecrackerBackend {
         path.starts_with("/dev").then_some(path)
     }
 
-    /// Attached swap capacity for the live-teleport gate.
-    fn swap_mib(&self, id: SandboxId) -> Option<u32> {
-        self.sandboxes.get(&id)?.state.spec.swap_mib
-    }
-
     /// ADR 0045 C2: rewrite the sandbox manifest with the post-copy
     /// role (atomic tmp+rename, same discipline as the original
     /// write). A missing manifest is an error — the role fence must

@@ -695,8 +695,10 @@ fn wire_version_pinned() {
     // Checkpoint adverts also carry the optional swap manifest.
     // 32 -> 33: SandboxSpec appends swap_source and swap_manifest.
     // HostUtilization also drops the committed-swap reservation.
+    // 33 -> 34: MigrationPresetup advertises the swap base lineage.
+    // Existing bincode goldens do not embed presetup; their bytes do not change.
     assert_eq!(
-        WIRE_VERSION, 33,
+        WIRE_VERSION, 34,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

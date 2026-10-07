@@ -361,6 +361,16 @@ async fn crash_after_presetup_reuses_live_payload(mut rig: Rig) {
     let payload = row.live_payload.unwrap();
     assert_eq!(row.export_id.as_deref(), Some("export-one"));
     assert_eq!(payload["migration_source"]["peer_token"], "token-one");
+    let metadata: engram_core::types::snapshot::SnapshotMetadata =
+        serde_json::from_value(payload.clone()).unwrap();
+    assert_eq!(
+        metadata.swap_manifest,
+        Some(engram_core::ManifestRef {
+            manifest_id: uuid::Uuid::from_u128(34),
+            version: 7,
+        })
+    );
+    assert_ne!(metadata.swap_manifest, metadata.disk_manifest);
     assert_eq!(payload["migration_source"]["peer_addr"], "source:9000");
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());

@@ -269,6 +269,8 @@ pub struct MigrationPresetupOut {
     /// published view; the post-pause drain's final manifest arrives
     /// with the capture and the dest REBASES before FC load).
     pub disk_manifest_ref: Option<super::manifest::ManifestRef>,
+    /// Swap base lineage; sealed changes arrive before the VM state.
+    pub swap_manifest_ref: Option<super::manifest::ManifestRef>,
     #[serde(default)]
     pub hot_chunks: Vec<[u8; 32]>,
 }

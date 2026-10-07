@@ -1,4 +1,4 @@
-//! Swap pages survive a snapshot and restore on a second pooled host.
+//! Swap pages survive snapshot restore and live post-copy on a second host.
 #![cfg(target_os = "linux")]
 // Tests drive a live system; wall clock and entropy are inputs (ADR 0098 D1).
 #![allow(clippy::disallowed_methods)]
@@ -23,12 +23,17 @@ fn host(
     kernel: &Path,
     devices: &[PathBuf],
     store: &engram_chunk_store::ChunkStore,
+    blob_root: &Path,
 ) -> Arc<PooledBackend> {
     let mut config = FirecrackerConfig::with_kernel(kernel.to_path_buf());
     config.firecracker_bin = std::env::var_os("ENGRAM_FC_FORK_BIN").unwrap().into();
     config.net_pool = None;
     config.restore_mode = RestoreMode::File;
     config.track_dirty_pages = true;
+    config.uffd_handler_bin =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/engram-uffd-handler");
+    config.uffd_blob_root = Some(blob_root.to_path_buf());
+    config.uffd_cache_root = Some(work.join("cache"));
     let inner = Arc::new(FirecrackerBackend::new(work, config));
     let pooled = Arc::new(
         PooledBackend::new(inner)
@@ -50,7 +55,18 @@ fn host(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux, KVM, two NBD devices, fork, static agentd and C compiler"]
 async fn swap_pages_survive_cross_host_snapshot() {
-    let Some(devices) = common::postcopy::nbd_devices(2) else {
+    moves_swapped_guest(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux, KVM, four NBD devices, fork, UFFD handler, static agentd and C compiler"]
+async fn two_host_live_teleport_moves_swapped_guest() {
+    moves_swapped_guest(true).await;
+}
+
+async fn moves_swapped_guest(live: bool) {
+    // CI provisions 16 devices. The paused source keeps both of its devices.
+    let Some(devices) = common::postcopy::nbd_devices(if live { 4 } else { 2 }) else {
         return;
     };
     let Some(kernel) = std::env::var_os("FC_TEST_KERNEL").map(PathBuf::from) else {
@@ -119,7 +135,13 @@ async fn swap_pages_survive_cross_host_snapshot() {
     )
     .await;
     let source_work = tempfile::tempdir().unwrap();
-    let source = host(source_work.path(), &kernel, &devices, &store);
+    let source = host(
+        source_work.path(),
+        &kernel,
+        &devices[..2],
+        &store,
+        &fixture.path().join("blob"),
+    );
     let spec = SandboxSpec {
         image: "swap-nbd-test".into(),
         rootfs_source: None,
@@ -139,9 +161,13 @@ async fn swap_pages_survive_cross_host_snapshot() {
     };
     let base = timed("base capture", 120, common::postcopy::base(&source, spec)).await;
     assert!(base.swap_manifest.is_none(), "base must be swap-free");
-    let vm = timed("fresh restore", 90, source.restore_fresh(base, vec![]))
-        .await
-        .unwrap();
+    let vm = timed(
+        "fresh restore",
+        90,
+        source.restore_fresh(base.clone(), vec![]),
+    )
+    .await
+    .unwrap();
     source.bind_session(engram_core::SessionId::new(), vm);
     wait_for(&source, vm, "test $(wc -l < /proc/swaps) -eq 1", 20).await;
     source
@@ -189,30 +215,70 @@ async fn swap_pages_survive_cross_host_snapshot() {
         20,
     )
     .await;
-    let snapshot = timed("snapshot", 120, source.snapshot(vm)).await.unwrap();
-    assert!(snapshot.swap_manifest.is_some());
-    timed("source destroy", 30, source.destroy(vm))
-        .await
-        .unwrap();
-    drop(source);
     let dest_work = tempfile::tempdir().unwrap();
-    let dest = host(dest_work.path(), &kernel, &devices, &store);
-    let restored = timed("restore on second host", 120, dest.restore(snapshot))
+    let mut servers = Vec::new();
+    let (dest, restored) = if live {
+        let dest = host(
+            dest_work.path(),
+            &kernel,
+            &devices[2..],
+            &store,
+            &fixture.path().join("blob"),
+        );
+        let (source_client, source_addr, source_tasks) = serve(source.clone()).await;
+        let (dest_client, _, dest_tasks) = serve(dest.clone()).await;
+        servers.extend(source_tasks);
+        servers.extend(dest_tasks);
+        let (restored, presetup) = timed(
+            "live move",
+            180,
+            common::postcopy::move_guest(&source_client, &dest_client, vm, base, source_addr),
+        )
+        .await;
+        assert!(presetup.swap_manifest_ref.is_some());
+        timed("dest drain", 120, common::postcopy::drain(&dest, restored)).await;
+        timed(
+            "source commit",
+            60,
+            source.migration_commit(vm, &presetup.export_id),
+        )
         .await
         .unwrap();
+        assert!(!source.list().await.unwrap().contains(&vm));
+        (dest, restored)
+    } else {
+        let snapshot = timed("snapshot", 120, source.snapshot(vm)).await.unwrap();
+        assert!(snapshot.swap_manifest.is_some());
+        timed("source destroy", 30, source.destroy(vm))
+            .await
+            .unwrap();
+        let dest = host(
+            dest_work.path(),
+            &kernel,
+            &devices,
+            &store,
+            &fixture.path().join("blob"),
+        );
+        let restored = timed("restore on second host", 120, dest.restore(snapshot))
+            .await
+            .unwrap();
+        (dest, restored)
+    };
     wait_for(&dest, restored, "grep -q /dev/vdb /proc/swaps", 20).await;
-    dest.start_agent(
-        restored,
-        engram_core::types::sandbox::AgentSpec {
-            argv: vec![],
-            env: Default::default(),
-            session_env: Default::default(),
-            binding_epoch: 1,
-            host_ca_pem: None,
-        },
-    )
-    .await
-    .unwrap();
+    if !live {
+        dest.start_agent(
+            restored,
+            engram_core::types::sandbox::AgentSpec {
+                argv: vec![],
+                env: Default::default(),
+                session_env: Default::default(),
+                binding_epoch: 1,
+                host_ca_pem: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
     let restored_signature = exec_ok(
         &dest,
         restored,
@@ -241,6 +307,9 @@ async fn swap_pages_survive_cross_host_snapshot() {
     timed("dest destroy", 30, dest.destroy(restored))
         .await
         .unwrap();
+    for task in servers {
+        task.abort();
+    }
 }
 
 /// Bound a phase so a hang names its step instead of hitting the lane's
@@ -334,4 +403,40 @@ async fn try_exec(
         }
     }
     Ok((exit, String::from_utf8_lossy(&stdout).into_owned()))
+}
+
+async fn serve(
+    pooled: Arc<PooledBackend>,
+) -> (
+    engram_protocol::grpc_client::GrpcHostClient,
+    std::net::SocketAddr,
+    [tokio::task::JoinHandle<()>; 2],
+) {
+    let peer = common::postcopy::peer(&pooled).await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let client = Arc::new(engram_host_agent::host_client::LocalHostClient::with_noop_hub(pooled));
+    let server = tokio::spawn(async move {
+        engram_host_agent::grpc_server::boot(
+            addr,
+            client,
+            None,
+            engram_host_agent::session_epochs::ephemeral(),
+            None,
+        )
+        .await
+        .unwrap();
+    });
+    assert!(common::wait_tcp_bound(addr, Duration::from_secs(5)).await);
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    (
+        engram_protocol::grpc_client::GrpcHostClient::new(channel),
+        addr,
+        [peer, server],
+    )
 }

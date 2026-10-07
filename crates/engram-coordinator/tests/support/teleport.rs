@@ -221,7 +221,9 @@ impl HostClient for ScriptedHost {
     ) -> Result<engram_core::types::snapshot::MigrationPresetupOut, SandboxError> {
         self.presetups.fetch_add(1, Ordering::SeqCst);
         if self.live_refused.load(Ordering::SeqCst) {
-            return Err(SandboxError::InvalidSpec("swap enabled".into()));
+            return Err(SandboxError::InvalidSpec(
+                "guest RAM is not file-backed".into(),
+            ));
         }
         let manifest = engram_core::types::manifest::ManifestRef {
             manifest_id: self.snapshot.as_uuid(),
@@ -235,6 +237,10 @@ impl HostClient for ScriptedHost {
             memory_manifest_json: vec![2],
             memory_manifest_ref: manifest,
             disk_manifest_ref: Some(manifest),
+            swap_manifest_ref: Some(engram_core::ManifestRef {
+                manifest_id: uuid::Uuid::from_u128(34),
+                version: 7,
+            }),
             hot_chunks: vec![[3; 32]],
         })
     }

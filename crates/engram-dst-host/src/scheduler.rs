@@ -558,7 +558,7 @@ impl Sim {
             Step::MigrationTouch(idx) => self.host.migration_touch(idx),
             Step::MigrationTtlSweep => self.host.migration_ttl_sweep().await?,
             Step::MigrationCommit(idx) => self.host.migration_commit(idx),
-            Step::MigrationAbort(idx) => self.host.migration_abort(idx),
+            Step::MigrationAbort(idx) => self.host.migration_abort(idx).await,
             Step::Park(idx) => self.host.park(idx),
             // The un-pause gate firing (unserved plane) is CORRECT behavior, not
             // a step failure — the guest stays parked, routed to recovery.
