@@ -162,7 +162,8 @@ use serde::{Deserialize, Serialize};
 // Older hosts cannot provide this capture contract. Roll coordinator and hosts together.
 // v30 removes stop-and-copy capture and its artifact kinds.
 // v31 tags migration disk items with their device role.
-pub const WIRE_VERSION: u32 = 31;
+// v32 appends SnapshotMetadata.swap_manifest; coordinator and hosts roll together.
+pub const WIRE_VERSION: u32 = 32;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

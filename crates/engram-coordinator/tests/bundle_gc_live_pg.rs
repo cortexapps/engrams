@@ -58,6 +58,7 @@ async fn seed_snapshot_with_bundles(
         size_bytes: 0,
         created_at: Utc::now(),
         last_accessed_at: Utc::now(),
+        swap_manifest: None,
         disk_manifest: None,
         memory_manifest: None,
         recoverable: true,

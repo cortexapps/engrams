@@ -264,6 +264,7 @@ mod tests {
             size_bytes: 1024,
             created_at: chrono::Utc::now(),
             last_accessed_at: chrono::Utc::now(),
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
             recoverable: true,

@@ -175,6 +175,7 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         size_bytes: metadata.size_bytes,
         created_at: metadata.created_at,
         image_version: metadata.image_version.clone(),
+        swap_manifest: metadata.swap_manifest,
         disk_manifest: metadata.disk_manifest,
         memory_manifest: Some(manifest_ref),
         base_memory_manifest: None,

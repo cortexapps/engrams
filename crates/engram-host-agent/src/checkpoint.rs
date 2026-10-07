@@ -66,6 +66,8 @@ pub struct CheckpointRecord {
     pub image_version: String,
     pub size_bytes: u64,
     pub disk_manifest: Option<ManifestRef>,
+    #[serde(default)]
+    pub swap_manifest: Option<ManifestRef>,
     pub memory_manifest: Option<ManifestRef>,
     /// ADR 0035 pins for this checkpoint's device model.
     pub aux_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,

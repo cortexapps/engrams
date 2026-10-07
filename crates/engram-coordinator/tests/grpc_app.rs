@@ -176,6 +176,7 @@ async fn stage_enabled_image(meta: &dyn MetadataStore, uri: &str) {
         size_bytes: 0,
         created_at: now,
         last_accessed_at: now,
+        swap_manifest: None,
         disk_manifest: None,
         memory_manifest: None,
         recoverable: true,

@@ -245,6 +245,21 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         }),
         _ => None,
     };
+    let swap_manifest_id: Option<Uuid> = row.try_get("swap_manifest_id").map_err(col_err)?;
+    let swap_manifest_version: Option<i64> =
+        row.try_get("swap_manifest_version").map_err(col_err)?;
+    let swap_manifest = match (swap_manifest_id, swap_manifest_version) {
+        (Some(manifest_id), Some(version)) => Some(engram_core::types::manifest::ManifestRef {
+            manifest_id,
+            version: version as u64,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(MetaError::Serialization(
+                "snapshots swap manifest pair is incomplete".into(),
+            ))
+        }
+    };
     let memory_manifest_id: Option<Uuid> = row.try_get("memory_manifest_id").map_err(col_err)?;
     let memory_manifest_version: Option<i64> =
         row.try_get("memory_manifest_version").map_err(col_err)?;
@@ -278,6 +293,7 @@ pub(crate) fn snapshot_from_row(row: &PgRow) -> Result<SnapshotRecord, MetaError
         created_at,
         last_accessed_at,
         disk_manifest,
+        swap_manifest,
         memory_manifest,
         recoverable,
         aux_bundles,
@@ -673,7 +689,7 @@ pub(crate) fn capture_job_from_row(row: &PgRow) -> Result<CaptureJobRow, MetaErr
         error: row.try_get("error").map_err(col_err)?,
         error_stage: row.try_get("error_stage").map_err(col_err)?,
         fc_snapshot_version: row.try_get("fc_snapshot_version").map_err(col_err)?,
-        result_bincode: row.try_get("result_bincode").map_err(col_err)?,
+        result_json: row.try_get("result_json").map_err(col_err)?,
         created_at: row.try_get("created_at").map_err(col_err)?,
         updated_at: row.try_get("updated_at").map_err(col_err)?,
     })
@@ -681,19 +697,7 @@ pub(crate) fn capture_job_from_row(row: &PgRow) -> Result<CaptureJobRow, MetaErr
 
 pub(crate) fn cold_base_from_row(row: &PgRow) -> Result<ColdBaseRow, MetaError> {
     let snapshot_id: Uuid = row.try_get("snapshot_id").map_err(col_err)?;
-    // Migration 0098: nullable for schema-evolution safety, but every
-    // row `upsert_cold_base` writes always sets it — a NULL here means
-    // a row written before 0098 landed (impossible in practice: the
-    // table was dormant until this same change started writing it) or
-    // a hand-edited row. Either way, treat it as unusable rather than
-    // handing the executor a `Vec::new()` it would fail to bincode-
-    // decode with a confusing error.
-    let snapshot_bincode: Option<Vec<u8>> = row.try_get("snapshot_bincode").map_err(col_err)?;
-    let snapshot_bincode = snapshot_bincode.ok_or_else(|| {
-        MetaError::Serialization(format!(
-            "cold_bases row {snapshot_id} has no snapshot_bincode (pre-migration-0098 row?)"
-        ))
-    })?;
+    let snapshot_json = row.try_get("snapshot_json").map_err(col_err)?;
     Ok(ColdBaseRow {
         content_key: row.try_get("content_key").map_err(col_err)?,
         snapshot_id: SnapshotId(snapshot_id),
@@ -701,7 +705,7 @@ pub(crate) fn cold_base_from_row(row: &PgRow) -> Result<ColdBaseRow, MetaError> 
         memory_manifest: row.try_get("memory_manifest").map_err(col_err)?,
         fc_snapshot_version: row.try_get("fc_snapshot_version").map_err(col_err)?,
         captured_at: row.try_get("captured_at").map_err(col_err)?,
-        snapshot_bincode,
+        snapshot_json,
     })
 }
 

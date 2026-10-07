@@ -7428,6 +7428,7 @@ impl FirecrackerBackend {
             // FC snapshots capture VM state + memory only; disk state
             // lives on the per-sandbox rootfs file. Phase 4's NBD work
             // produces a disk_manifest here when it lands.
+            swap_manifest: None,
             disk_manifest: None,
             // FC backend's bare snapshot writes memory.bin to disk
             // and stops there. `PooledBackend::snapshot` is the
@@ -7959,6 +7960,7 @@ mod tests {
             size_bytes: 0,
             created_at: Utc::now(),
             image_version: "test:1".into(),
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,
@@ -8120,6 +8122,7 @@ mod tests {
             size_bytes: 0,
             created_at: Utc::now(),
             image_version: "test:1".into(),
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,

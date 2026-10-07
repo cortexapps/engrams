@@ -776,6 +776,7 @@ mod tests {
                     size_bytes: 1,
                     created_at: chrono::Utc::now(),
                     image_version: "mock:1".into(),
+                    swap_manifest: None,
                     disk_manifest: None,
                     memory_manifest: None,
                     base_memory_manifest: None,

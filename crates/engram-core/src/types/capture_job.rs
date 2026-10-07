@@ -100,11 +100,8 @@ pub struct CaptureJobProgress {
     pub warm_stages: Vec<crate::types::WarmStageRecord>,
 }
 
-/// A capture job's terminal outcome, carried on the last
-/// [`CaptureJobReport`] the host sends. `Done`'s `result_bincode` is
-/// the bincode-encoded `CaptureJobResult` (executor-defined artifact —
-/// snapshot/manifest identity — landing in a later commit); this crate
-/// only needs to move the opaque bytes into `capture_jobs.result_bincode`.
+/// A capture job's terminal outcome on the version-gated host wire.
+/// Stores decode `Done` with the current wire schema and persist JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CaptureTerminalReport {
     Done {
@@ -115,6 +112,22 @@ pub enum CaptureTerminalReport {
         error_stage: String,
         retryable: bool,
     },
+}
+
+impl CaptureTerminalReport {
+    /// Convert the version-gated wire result before durable storage.
+    pub fn result_json(&self) -> Result<Option<serde_json::Value>, crate::MetaError> {
+        match self {
+            Self::Done { result_bincode } => {
+                let result: CaptureJobResult = bincode::deserialize(result_bincode)
+                    .map_err(|e| crate::MetaError::Serialization(e.to_string()))?;
+                serde_json::to_value(result)
+                    .map(Some)
+                    .map_err(|e| crate::MetaError::Serialization(e.to_string()))
+            }
+            Self::Failed { .. } => Ok(None),
+        }
+    }
 }
 
 /// One host -> coordinator report on a capture job's progress,
@@ -205,8 +218,8 @@ pub struct CaptureJobRow {
     pub error_stage: Option<String>,
     /// Stamped by the capturing host; `None` for VZ/Process.
     pub fc_snapshot_version: Option<String>,
-    /// The bincode-encoded `CaptureJobResult`, set on `stage == Done`.
-    pub result_bincode: Option<Vec<u8>>,
+    /// The JSON `CaptureJobResult`, set on `stage == Done`.
+    pub result_json: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -332,10 +345,7 @@ pub enum ColdBaseMissReason {
     FcVersionChanged,
 }
 
-/// ADR 0084 §B: the executor's result for one capture-job attempt —
-/// bincode-encoded into `capture_jobs.result_bincode` on `stage=Done`,
-/// replacing the bare `SnapshotMetadata` P1b shipped with (a mechanical,
-/// additive change: `finalize_capture_job` is this type's only decoder).
+/// The executor's result for one capture attempt, persisted as JSON.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureJobResult {
     /// The artifact the enabled image / `snapshots` row must point at:
@@ -428,13 +438,13 @@ pub struct ColdBaseRow {
     pub memory_manifest: String,
     pub fc_snapshot_version: String,
     pub captured_at: DateTime<Utc>,
-    /// Migration 0098: the executor's own bincode-encoded
+    /// The executor's JSON-encoded
     /// `SnapshotMetadata` for this cold base, verbatim — what the claim
     /// handler hands back as [`ColdBasePlan::Hit::snapshot`] for the
     /// executor to `restore()` directly. `disk_manifest`/`memory_manifest`
     /// above are kept as separate text columns for cheap SQL-level
     /// inspection/debugging; this is the source of truth for restore.
-    pub snapshot_bincode: Vec<u8>,
+    pub snapshot_json: serde_json::Value,
 }
 
 #[cfg(test)]

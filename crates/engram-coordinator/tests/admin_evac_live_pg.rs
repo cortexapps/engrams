@@ -100,6 +100,7 @@ impl HostClient for FakeBackend {
             size_bytes: 1024,
             created_at: Utc::now(),
             image_version: "test".into(),
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
             base_memory_manifest: None,

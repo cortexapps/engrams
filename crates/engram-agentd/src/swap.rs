@@ -6,22 +6,11 @@
 //! `mkswap` + `swapon`, and applies the reclaim sysctls sized for a
 //! guest whose file pages live on chunked-NBD backing.
 //!
-//! Called from two places, both best-effort (log-and-continue — swap
-//! must never block agent bring-up, and a swapless guest is merely
-//! the pre-0112 behavior):
-//! - **Cold boot** (`main.rs`, beside `tuning::apply_block_readahead`)
-//!   — the base-capture VM and rung-2 disk-only recovery boots.
-//! - **Session bind** (`harness_supervisor::spawn`, beside
-//!   `remount_and_log`) — a restored guest meets its FRESH zero-filled
-//!   backing here (capture ran `swapoff` before the pause, restore
-//!   re-pointed the device at a new sparse file), so the full
-//!   `mkswap` + `swapon` re-arm runs again.
-//!
-//! Kill switch: `ENGRAM_GUEST_SWAP=off` in agentd's environment makes
-//! every arm a no-op — the device stays attached and unused, which is
-//! safe, and the flag reaches sessions through an agentd roll with no
-//! image re-capture.
+//! Cold boots and session binds arm inactive devices.
+//! An existing swap signature is never reformatted.
+//! The bind-time kill switch disarms active swap.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// `vm.*` sysctls applied when (and only when) a swap device is armed.
@@ -116,23 +105,8 @@ fn arm_inner() {
         // No writable non-vda disk ⇒ the image doesn't opt into swap.
         return;
     };
-    if swap_is_active(Path::new("/proc/swaps"), &dev) == Some(true) {
-        // Mid-residence re-bind (e.g. a second SpawnHarness): the
-        // device is already armed; mkswap over live swap would be
-        // destructive and swapon would EBUSY. `None` (unreadable
-        // /proc/swaps) falls through — mkswap/swapon speak for
-        // themselves.
-        tracing::debug!(dev, "swap already active; skipping re-arm");
-        return;
-    }
     let node = format!("/dev/{dev}");
-    // A fresh backing is zero-filled (no signature), and a
-    // mid-residence swapoff'd device still carries one — mkswap
-    // unconditionally so both cases converge on a known-good header.
-    if !run_logged("mkswap", &[&node]) {
-        return;
-    }
-    if !run_logged("swapon", &[&node]) {
+    if !arm_device(Path::new("/proc/swaps"), &dev, &node, run_logged) {
         return;
     }
     for (path, value) in VM_SYSCTLS {
@@ -142,6 +116,41 @@ fn arm_inner() {
         }
     }
     tracing::info!(dev, "guest swap armed");
+}
+
+fn arm_device(
+    proc_swaps: &Path,
+    dev: &str,
+    node: &str,
+    mut run: impl FnMut(&str, &[&str]) -> bool,
+) -> bool {
+    match swap_is_active(proc_swaps, dev) {
+        Some(true) => {
+            tracing::debug!(dev, "swap already active; skipping re-arm");
+            return false;
+        }
+        None => {
+            tracing::warn!(dev, "cannot read /proc/swaps; not arming swap");
+            return false;
+        }
+        Some(false) => {}
+    }
+    match has_swap_signature(Path::new(node)) {
+        Ok(true) => {}
+        Ok(false) => {
+            if !run("mkswap", &[node]) {
+                return false;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(dev, %error, "cannot read swap header; not arming swap");
+            return false;
+        }
+    }
+    if !run("swapon", &[node]) {
+        return false;
+    }
+    true
 }
 
 /// The swap device is the only WRITABLE non-vda virtio disk (aux
@@ -177,8 +186,7 @@ pub fn find_swap_device(sys_block: &Path) -> Option<String> {
 }
 
 /// Is `dev` already an active swap area, per `/proc/swaps`? `None` =
-/// unreadable (treat as inactive; the arm's mkswap/swapon will speak
-/// for themselves).
+/// unreadable; arming must stop without formatting.
 fn swap_is_active(proc_swaps: &Path, dev: &str) -> Option<bool> {
     let raw = std::fs::read_to_string(proc_swaps).ok()?;
     let node = PathBuf::from("/dev").join(dev);
@@ -187,6 +195,13 @@ fn swap_is_active(proc_swaps: &Path, dev: &str) -> Option<bool> {
             .skip(1) // header
             .any(|l| l.split_whitespace().next() == node.to_str()),
     )
+}
+
+/// The guest uses 4 KiB pages. The v1 signature ends the first page.
+fn has_swap_signature(device: &Path) -> std::io::Result<bool> {
+    let mut header = [0u8; 4096];
+    std::fs::File::open(device)?.read_exact(&mut header)?;
+    Ok(&header[4086..] == b"SWAPSPACE2")
 }
 
 /// Run a command to completion; log the outcome, return success.
@@ -216,6 +231,68 @@ fn run_logged(cmd: &str, args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_arm_formats_only_known_inactive_unformatted_devices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_swaps = tmp.path().join("swaps");
+        let device = tmp.path().join("device");
+        let node = device.to_str().unwrap();
+        let mut commands = Vec::new();
+        assert!(!arm_device(&proc_swaps, "vdd", node, |cmd, _| {
+            commands.push(cmd.to_string());
+            true
+        }));
+        assert!(commands.is_empty());
+        std::fs::write(
+            &proc_swaps,
+            "Filename Type Size Used Priority\n/dev/vdd partition 1024 0 -2\n",
+        )
+        .unwrap();
+        assert!(!arm_device(&proc_swaps, "vdd", node, |cmd, _| {
+            commands.push(cmd.to_string());
+            true
+        }));
+        assert!(commands.is_empty());
+        std::fs::write(&proc_swaps, "Filename Type Size Used Priority\n").unwrap();
+        assert!(!arm_device(&proc_swaps, "vdd", node, |cmd, _| {
+            commands.push(cmd.to_string());
+            true
+        }));
+        assert!(commands.is_empty());
+        let mut header = [0u8; 4096];
+        std::fs::write(&device, header).unwrap();
+        assert!(arm_device(&proc_swaps, "vdd", node, |cmd, _| {
+            commands.push(cmd.to_string());
+            true
+        }));
+        assert_eq!(commands, ["mkswap", "swapon"]);
+        commands.clear();
+        header[4086..].copy_from_slice(b"SWAPSPACE2");
+        std::fs::write(&device, header).unwrap();
+        assert!(arm_device(&proc_swaps, "vdd", node, |cmd, _| {
+            commands.push(cmd.to_string());
+            true
+        }));
+        assert_eq!(commands, ["swapon"]);
+    }
+
+    #[test]
+    fn swap_signature_preserves_formatted_devices() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut header = [0u8; 4096];
+        std::fs::write(file.path(), header).unwrap();
+        assert!(!has_swap_signature(file.path()).unwrap());
+        header[4086..].copy_from_slice(b"SWAPSPACE2");
+        std::fs::write(file.path(), header).unwrap();
+        assert!(has_swap_signature(file.path()).unwrap());
+        header[4086] = 0;
+        std::fs::write(file.path(), header).unwrap();
+        assert!(!has_swap_signature(file.path()).unwrap());
+        std::fs::write(file.path(), &header[..4095]).unwrap();
+        assert!(has_swap_signature(file.path()).is_err());
+        assert!(has_swap_signature(&file.path().with_extension("missing")).is_err());
+    }
 
     fn mk_dev(root: &Path, name: &str, ro: &str) {
         let d = root.join(name);

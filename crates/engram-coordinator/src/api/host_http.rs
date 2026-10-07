@@ -805,6 +805,7 @@ pub async fn heartbeat(
             state.services.blob.as_ref(),
             adv.disk_manifest.as_ref(),
             adv.memory_manifest.as_ref(),
+            adv.swap_manifest.as_ref(),
         )
         .await;
         let record = engram_core::types::snapshot::SnapshotRecord {
@@ -815,6 +816,7 @@ pub async fn heartbeat(
             size_bytes: adv.size_bytes,
             created_at: adv.captured_at,
             last_accessed_at: state.services.clock.now_utc(),
+            swap_manifest: adv.swap_manifest,
             disk_manifest: adv.disk_manifest,
             memory_manifest: adv.memory_manifest,
             recoverable,
@@ -2411,7 +2413,7 @@ mod tests {
                 error: None,
                 error_stage: None,
                 fc_snapshot_version: None,
-                result_bincode: None,
+                result_json: None,
                 created_at: now,
                 updated_at: now,
             }

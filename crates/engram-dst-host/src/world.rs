@@ -2219,6 +2219,7 @@ impl SimHost {
             aux_bundles: Vec::new(),
             stage: FinalizeStage::Captured,
             attempts: 0,
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
         };
@@ -2280,6 +2281,7 @@ impl SimHost {
             aux_bundles: Vec::new(),
             stage: FinalizeStage::Captured,
             attempts: 0,
+            swap_manifest: None,
             disk_manifest: None,
             memory_manifest: None,
         };

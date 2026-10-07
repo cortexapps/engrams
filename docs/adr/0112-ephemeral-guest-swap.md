@@ -694,6 +694,8 @@ disarm ladder and its guard), and the "Teleport: guarded" and
 
 ### Phases
 
+S7's base-capture rule lands with phase 2b, once the base must be swap-free for the chunked device; until then the D3 disarm keeps it so.
+
 1. **S2** (host): per-device NBD state and every one-device site, with the
    DST device plane, behind no behavior change (swap still raw). KVM tests
    for two devices through capture, SIGTERM, rehydrate and destroy.

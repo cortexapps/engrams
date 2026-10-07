@@ -4284,7 +4284,13 @@ impl MetadataStore for SimMetadataStore {
     /// `SELECT snapshot_id FROM cold_bases` — the GC pin source.
     async fn cold_base_snapshot_ids(&self) -> Result<Vec<SnapshotId>, MetaError> {
         self.gate()?;
-        Ok(self.db.lock().cold_bases.iter().copied().collect())
+        Ok(self
+            .db
+            .lock()
+            .cold_bases
+            .values()
+            .map(|row| row.snapshot_id)
+            .collect())
     }
 
     /// The chunk-gc backlog. The sim always knows the exact length; it
@@ -4441,14 +4447,14 @@ impl MetadataStore for SimMetadataStore {
         Ok(self.db.lock().broker_tokens.get(&id).cloned())
     }
 
-    async fn get_capture_job(&self, _id: CaptureJobId) -> Result<Option<CaptureJobRow>, MetaError> {
-        panic!("SimMeta: get_capture_job not implemented — add it plus a conformance case (ADR 0098 D4)")
+    async fn get_capture_job(&self, id: CaptureJobId) -> Result<Option<CaptureJobRow>, MetaError> {
+        self.gate()?;
+        Ok(self.db.lock().capture_jobs.get(&id).cloned())
     }
 
-    async fn get_cold_base(&self, _content_key: &str) -> Result<Option<ColdBaseRow>, MetaError> {
-        panic!(
-            "SimMeta: get_cold_base not implemented — add it plus a conformance case (ADR 0098 D4)"
-        )
+    async fn get_cold_base(&self, content_key: &str) -> Result<Option<ColdBaseRow>, MetaError> {
+        self.gate()?;
+        Ok(self.db.lock().cold_bases.get(content_key).cloned())
     }
 
     async fn get_enable_job(&self, _id: uuid::Uuid) -> Result<Option<EnableJob>, MetaError> {
@@ -4580,7 +4586,7 @@ impl MetadataStore for SimMetadataStore {
             error: None,
             error_stage: None,
             fc_snapshot_version: None,
-            result_bincode: None,
+            result_json: None,
             created_at: now,
             updated_at: now,
         };
@@ -4757,8 +4763,16 @@ impl MetadataStore for SimMetadataStore {
 
     async fn list_recoverable_snapshot_disk_manifests(
         &self,
-    ) -> Result<Vec<ManifestRef>, MetaError> {
-        panic!("SimMeta: list_recoverable_snapshot_disk_manifests not implemented — add it plus a conformance case (ADR 0098 D4)")
+    ) -> Result<Vec<(Option<ManifestRef>, Option<ManifestRef>)>, MetaError> {
+        self.gate()?;
+        let mut refs = Vec::new();
+        for snapshot in self.db.lock().snapshots.values().filter(|s| s.recoverable) {
+            let pair = (snapshot.disk_manifest, snapshot.swap_manifest);
+            if !refs.contains(&pair) {
+                refs.push(pair);
+            }
+        }
+        Ok(refs)
     }
 
     async fn list_recoverable_snapshot_memory_manifests(
@@ -4980,6 +4994,12 @@ impl MetadataStore for SimMetadataStore {
         report: &CaptureJobReport,
     ) -> Result<bool, MetaError> {
         self.gate()?;
+        let result_json = report
+            .terminal
+            .as_ref()
+            .map(CaptureTerminalReport::result_json)
+            .transpose()?
+            .flatten();
         let now = self.now();
         let mut db = self.db.lock();
         let Some(row) = db.capture_jobs.get_mut(&report.job_id) else {
@@ -4989,8 +5009,8 @@ impl MetadataStore for SimMetadataStore {
             return Ok(false);
         }
         let stage = match &report.terminal {
-            Some(CaptureTerminalReport::Done { result_bincode }) => {
-                row.result_bincode = Some(result_bincode.clone());
+            Some(CaptureTerminalReport::Done { .. }) => {
+                row.result_json = result_json;
                 CaptureJobStage::Done
             }
             Some(CaptureTerminalReport::Failed {
@@ -5319,8 +5339,13 @@ impl MetadataStore for SimMetadataStore {
         Ok(())
     }
 
-    async fn upsert_cold_base(&self, _row: ColdBaseRow) -> Result<(), MetaError> {
-        panic!("SimMeta: upsert_cold_base not implemented — add it plus a conformance case (ADR 0098 D4)")
+    async fn upsert_cold_base(&self, row: ColdBaseRow) -> Result<(), MetaError> {
+        self.gate()?;
+        self.db
+            .lock()
+            .cold_bases
+            .insert(row.content_key.clone(), row);
+        Ok(())
     }
 
     async fn upsert_org_secret(

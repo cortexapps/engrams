@@ -341,11 +341,8 @@ async fn run(args: Args) -> std::io::Result<()> {
     // setting into every restored session.
     engram_agentd::tuning::apply_block_readahead();
 
-    // ADR 0112: arm the ephemeral swap device (mkswap + swapon + the
-    // reclaim sysctls). Cold boots only reach here (base capture,
-    // rung-2 recovery); restored sessions re-arm at bind
-    // (`harness_supervisor::spawn`), where the fresh zero-filled
-    // backing needs a new signature. Best-effort, like the readahead.
+    // Arm swap on cold recovery boots. The host marks base captures in
+    // the boot arguments; arm() skips them. Session binds arm separately.
     engram_agentd::swap::arm();
 
     let token = args.token.clone();

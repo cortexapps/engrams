@@ -244,6 +244,7 @@ async fn cancelled_restore_keeps_the_daemon_and_slot() {
         size_bytes: bytes.len() as u64,
         created_at: chrono::Utc::now(),
         image_version: "t".into(),
+        swap_manifest: None,
         disk_manifest: Some(disk_ref),
         memory_manifest: None,
         base_memory_manifest: None,
