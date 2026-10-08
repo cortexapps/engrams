@@ -176,21 +176,22 @@ code {
   background: var(--primary);
 }
 
-/* ---- header ---- */
+/* ---- Slack banner (above the masthead; scrolls away) ---- */
 :root {
   --banner-h: 40px;
-  --masthead-h: calc(81px + var(--banner-h));
 }
-/* The Slack banner is the top row of the masthead, so it stays in view. */
+html.banner-closed {
+  --banner-h: 0px;
+}
+html.banner-closed .banner {
+  display: none;
+}
 .banner {
-  display: block;
-  position: relative;
-  z-index: 1;
   box-sizing: border-box;
   height: var(--banner-h);
-  /* A dark gap keeps the lime bar apart from the lime in the stripe below. */
+  /* A dark gap keeps the orange bar apart from the orange in the stripe below. */
   border-bottom: 4px solid var(--panel-deep);
-  background: var(--primary);
+  background: var(--amber);
   color: var(--primary-foreground);
   font-family: var(--font-mono);
   font-size: 12px;
@@ -201,22 +202,47 @@ code {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 14px;
   height: 100%;
+}
+.banner a {
+  display: flex;
+  align-items: center;
+  gap: 14px;
   white-space: nowrap;
+}
+.banner a:hover .long,
+.banner a:hover .short {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .banner .tag {
   border: 1px solid currentColor;
   padding: 1px 8px;
   font-size: 10px;
 }
-.banner:hover .long,
-.banner:hover .short {
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
 .banner .short {
   display: none;
+}
+.banner .close {
+  position: absolute;
+  right: 60px;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.banner .close svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* ---- header ---- */
+:root {
+  --masthead-h: 81px;
 }
 /* The masthead stays pinned while the page scrolls. Its cover background is
    opaque, so content passes under it cleanly; once the page leaves the top, a
@@ -449,7 +475,7 @@ html.menu-open {
 /* The cover fills the first screen under the masthead, so the floor grid
    always meets the bottom of the window, whatever the hero's own height. */
 .cover-hero {
-  min-height: calc(100svh - var(--masthead-h));
+  min-height: calc(100svh - var(--masthead-h) - var(--banner-h));
 }
 .hero {
   display: grid;
@@ -1597,13 +1623,19 @@ html.menu-open {
     padding: 0 20px;
   }
   :root {
-    --masthead-h: calc(69px + var(--banner-h));
+    --masthead-h: 69px;
   }
   .banner .long {
     display: none;
   }
   .banner .short {
     display: inline;
+  }
+  .banner .tag {
+    display: none;
+  }
+  .banner .close {
+    right: 8px;
   }
   .site-header {
     height: 64px;
