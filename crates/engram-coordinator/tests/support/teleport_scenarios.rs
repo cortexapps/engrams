@@ -442,6 +442,33 @@ async fn lost_live_export_rolls_back_with_durable_error(rig: Rig) {
 }
 scenario!(lost_live_export_rolls_back_with_durable_error);
 
+/// A destination that refuses the guest's memory image refuses it on
+/// every attempt. The move rolls back at once and the source keeps
+/// running; it never retries into `fail_move`, which would destroy it.
+async fn refused_memory_image_rolls_back_live_move(rig: Rig) {
+    rig.make_live().await;
+    rig.dest.memory_refused.store(true, Ordering::SeqCst);
+    // One drive settles the move: before the typed arm, the refusal
+    // returned Retry here and went to `fail_move` after three attempts.
+    assert!(matches!(rig.drive().await, OpOutcome::Done));
+    assert_eq!(rig.dest.restores.load(Ordering::SeqCst), 1, "no retry");
+    assert!(
+        rig.source.aborts.load(Ordering::SeqCst) >= 1,
+        "the live export is released through migration_abort",
+    );
+    assert_eq!(
+        rig.source.destroys.load(Ordering::SeqCst),
+        0,
+        "the source guest is never destroyed",
+    );
+    assert_eq!(rig.phase().await, None);
+    assert_eq!(
+        meta_session(&rig).await.status,
+        engram_core::types::SessionState::Active
+    );
+}
+scenario!(refused_memory_image_rolls_back_live_move);
+
 /// A consumed export (an earlier abort passed its point of no return) is
 /// not a resumed guest: the rollback still needs the resume ack before it
 /// declares Active.

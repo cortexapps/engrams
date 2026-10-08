@@ -47,6 +47,8 @@ export function SystemMessage() {
       return <Recovery marker={marker} />;
     case "durability_rollback":
       return <DurabilityRollback marker={marker} />;
+    case "resumed_from_disk":
+      return <ResumedFromDisk marker={marker} />;
     case "user_question":
       return <UserQuestionCard marker={marker} />;
     case "plan":
@@ -128,6 +130,37 @@ function DurabilityRollback({
             </Badge>
           </div>
         )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// The host refused the session's memory image, so the resume booted a fresh
+// kernel on the newest disk. Files are intact, but anything that was running
+// (dev servers, shells, background jobs) stopped. Surfaced so the user knows
+// why, never hidden.
+function ResumedFromDisk({
+  marker,
+}: {
+  marker: Extract<SystemMarker, { kind: "resumed_from_disk" }>;
+}) {
+  return (
+    <Card className="border-primary/40 bg-primary/5 py-0">
+      <CardContent className="flex flex-col gap-1.5 p-4">
+        <div className="flex items-center gap-2 text-xs text-primary">
+          <RotateCcwIcon className="size-3.5" />
+          <Text as="span" variant="label">
+            resumed from disk
+          </Text>
+          <span className="ml-auto font-mono tabular-nums text-muted-foreground">
+            {hms(marker.at)}
+          </span>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          This session could not restore its saved memory, so it started again on its latest disk.
+          Your files are intact. Processes that were running, such as dev servers and shells, were
+          stopped; start them again if you need them.
+        </p>
       </CardContent>
     </Card>
   );

@@ -489,6 +489,24 @@ describe("buildMessages — message/part shaping", () => {
     });
   });
 
+  test("resumed_from_disk becomes a resumed_from_disk marker with the reason", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "resumed_from_disk",
+          disk_manifest: { manifest_id: "abc", version: 8 },
+          reason: "swap restore has no manifest",
+          at: AT,
+        },
+      ]),
+      SID,
+    );
+    expect(customMarker(real(messages)[0]!)).toMatchObject({
+      kind: "resumed_from_disk",
+      reason: "swap restore has no manifest",
+    });
+  });
+
   test("a system-role agent_message becomes a note system marker", () => {
     const { messages } = buildMessages(
       indexed([

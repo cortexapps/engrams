@@ -36,6 +36,16 @@ pub struct SimHostState {
     pub rpc_hang: Option<std::time::Duration>,
     /// sandbox -> owning session (as told to us via create's spec).
     pub sandboxes: BTreeMap<SandboxId, Option<SessionId>>,
+    /// Refuse every snapshot `restore` as `MemoryImageUnusable`, the
+    /// answer a real host gives for a memory image it cannot restore
+    /// exactly (for example, one captured before swap was a chunked
+    /// disk). Off by default, so seeds are unchanged.
+    pub refuse_memory_images: bool,
+    /// How many restores `refuse_memory_images` refused.
+    pub memory_refusals: u32,
+    /// The root disk manifest each `create` was asked to mount, in call
+    /// order. A disk-only cold boot carries `Some`.
+    pub created_rootfs: Vec<Option<engram_core::types::manifest::ManifestRef>>,
 }
 
 /// A mutating host-verb's WORLD-side effect (ADR 0098 R2). Every
@@ -863,13 +873,16 @@ impl SimHostClient {
 
 #[async_trait]
 impl HostClient for SimHostClient {
-    async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+    async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         self.maybe_hang().await;
         // Draw the id BEFORE the liveness gate so the entropy stream is
         // identical to the pre-effect-queue world even on a down-host
         // failure (Calm determinism).
         let id = SandboxId::from(self.entropy.uuid());
         self.world.require_up(self.host_id)?;
+        if let Some(h) = self.world.hosts.lock().get_mut(&self.host_id) {
+            h.created_rootfs.push(spec.rootfs_manifest);
+        }
         // Ownership is learned at bind_session time (the spec is a
         // template, not a binding — see sandbox.rs's type docs).
         self.world.record_effect(
@@ -1003,6 +1016,18 @@ impl HostClient for SimHostClient {
         self.maybe_hang().await;
         let id = SandboxId::from(self.entropy.uuid());
         self.world.require_up(self.host_id)?;
+        if let Some(h) = self
+            .world
+            .hosts
+            .lock()
+            .get_mut(&self.host_id)
+            .filter(|h| h.refuse_memory_images)
+        {
+            h.memory_refusals += 1;
+            return Err(SandboxError::MemoryImageUnusable(
+                "sim: memory image refused".into(),
+            ));
+        }
         // ADR 0108 E: a snapshot restore resumes a captured-warm harness
         // (ADR 0037) which re-dials on the vsock epoch bump. The dial is
         // scheduled by the effect's APPLICATION (the harness lives inside

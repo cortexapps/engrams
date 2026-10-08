@@ -161,6 +161,12 @@ export type SystemMarker =
       reason: string;
       at: string;
     }
+  // The resume booted a fresh kernel on the disk: files kept, processes lost.
+  | {
+      kind: "resumed_from_disk";
+      reason: string;
+      at: string;
+    }
   // ADR 0107: the agent proposed a plan via the deferred `exit_plan_mode`
   // tool. Rendered as an INTERACTIVE card — the doc + approve/reject while
   // unresolved, a one-line receipt once decided. `resolution` folds in from
@@ -1169,6 +1175,15 @@ export function buildMessages(
           manifest: ev.rewind_disk_manifest
             ? `${ev.rewind_disk_manifest.manifest_id}@v${ev.rewind_disk_manifest.version}`
             : null,
+          reason: ev.reason,
+          at: ev.at,
+        });
+        break;
+
+      // The host refused the memory image; the resume booted on the disk.
+      case "resumed_from_disk":
+        pushSystem(`rfd:${idx}`, "resumed from disk; running processes were stopped", {
+          kind: "resumed_from_disk",
           reason: ev.reason,
           at: ev.at,
         });

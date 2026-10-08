@@ -1856,6 +1856,10 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
                 crate::wire::parse_harness_spawn_message(status.message())
             {
                 SandboxError::HarnessSpawn { kind, message }
+            } else if let Some(message) =
+                crate::wire::parse_memory_image_unusable_message(status.message())
+            {
+                SandboxError::MemoryImageUnusable(message)
             } else {
                 SandboxError::Vm(format!("grpc {}: {}", status.code(), status.message()).into())
             }
@@ -1957,6 +1961,19 @@ mod grpc_err_tests {
                 assert!(message.contains("ENOENT"));
             }
             other => panic!("expected HarnessSpawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_image_unusable_failed_precondition_maps_to_typed_variant() {
+        let status = tonic::Status::failed_precondition(
+            crate::wire::memory_image_unusable_message("swap restore has no manifest"),
+        );
+        match grpc_to_sandbox_err(status) {
+            SandboxError::MemoryImageUnusable(message) => {
+                assert_eq!(message, "swap restore has no manifest");
+            }
+            other => panic!("expected MemoryImageUnusable, got {other:?}"),
         }
     }
 }

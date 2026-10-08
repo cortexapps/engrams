@@ -165,7 +165,11 @@ use serde::{Deserialize, Serialize};
 // v32 appends SnapshotMetadata.swap_manifest; coordinator and hosts roll together.
 // v33 appends the chunked swap source and manifest to SandboxSpec.
 // v34 carries the swap base lineage in live migration presetup.
-pub const WIRE_VERSION: u32 = 34;
+// v35 types the memory image refusal (`memory_image_unusable:` marker). The
+// payloads do not change. The bump fences mixed fleets: an older host refuses
+// the same snapshot with an untyped error, which the resume verb counts toward
+// the Dead budget instead of recovering from disk.
+pub const WIRE_VERSION: u32 = 35;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic
@@ -230,6 +234,30 @@ pub fn parse_harness_spawn_message(msg: &str) -> Option<(String, String)> {
         return None;
     }
     Some((kind.to_string(), message.trim().to_string()))
+}
+
+/// Marker prefix for the host-agent's "memory image unusable" restore
+/// refusal ([`engram_core::SandboxError::MemoryImageUnusable`], the
+/// [`HARNESS_SPAWN_STATUS_PREFIX`] precedent). The host returns a
+/// `failed_precondition` status whose message starts with this prefix;
+/// the coord-side client maps it back to the typed variant, so the resume
+/// verb can fall back to a disk-only cold boot. Unlike the harness-spawn
+/// marker, it came with a `WIRE_VERSION` bump (v35): an older host refuses
+/// the same snapshot untyped, so the exact-match gate fences it out.
+pub const MEMORY_IMAGE_UNUSABLE_STATUS_PREFIX: &str = "memory_image_unusable:";
+
+/// Render the host-agent's memory-image refusal message.
+pub fn memory_image_unusable_message(message: &str) -> String {
+    format!("{MEMORY_IMAGE_UNUSABLE_STATUS_PREFIX} {message}")
+}
+
+/// Parse the reason out of a [`memory_image_unusable_message`]. Returns
+/// `None` if `msg` isn't that marker.
+pub fn parse_memory_image_unusable_message(msg: &str) -> Option<String> {
+    let rest = msg
+        .strip_prefix(MEMORY_IMAGE_UNUSABLE_STATUS_PREFIX)?
+        .trim();
+    (!rest.is_empty()).then(|| rest.to_string())
 }
 
 /// Wire-friendly mirror of [`engram_core::types::sandbox::ExecRequest`].
@@ -352,6 +380,30 @@ mod tests {
         assert_eq!(parse_wire_skew_message("wire_version skew: garbage"), None);
         assert_eq!(
             parse_wire_skew_message("wire_version skew: host=x coord=3"),
+            None
+        );
+    }
+
+    #[test]
+    fn memory_image_unusable_message_round_trips() {
+        let msg = memory_image_unusable_message("swap restore has no manifest");
+        assert_eq!(
+            parse_memory_image_unusable_message(&msg),
+            Some("swap restore has no manifest".to_string())
+        );
+        // The core Display is prefix-compatible with the marker.
+        let err = engram_core::SandboxError::MemoryImageUnusable("x y".into());
+        assert_eq!(
+            parse_memory_image_unusable_message(&err.to_string()),
+            Some("x y".to_string())
+        );
+        assert_eq!(parse_memory_image_unusable_message("image not ready"), None);
+        assert_eq!(
+            parse_memory_image_unusable_message("memory_image_unusable:"),
+            None
+        );
+        assert_eq!(
+            parse_memory_image_unusable_message("harness_spawn: kind=NotFound x"),
             None
         );
     }
