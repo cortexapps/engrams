@@ -750,3 +750,17 @@ S7's base-capture rule lands with phase 2b, once the base must be swap-free for 
   128 total and 128 warm slots, for two devices per swap-enabled guest.
   Changes to the module parameter require node recreation. Swap-in latency
   and capture-upload measurements on the dev VM remain an operator step.
+
+- **2026-10-08, resume fallback:** The phase 2b rollout did not cover a
+  memory snapshot taken before phase 2b. Such a snapshot has no swap
+  manifest, so every host refuses to restore it, and the coordinator set
+  the session `Dead` after five refusals. A host-agent that adopts a running
+  guest from an older host-agent also writes snapshots of this kind, because
+  the guest still uses a raw swap file and the new capture runs no `swapoff`.
+  The two kinds look the same in PG, so neither a migration nor a host
+  rule can tell a safe one from an unsafe one. The host now refuses these
+  memory images with the typed `MemoryImageUnusable` error (a marker on
+  `failed_precondition`; no wire version change). The resume verb then does
+  a disk-only cold boot on the newer of the live and snapshot disk lineages.
+  The guest loses its processes and keeps its disk. Teleport already rolls
+  back on a destination refusal.

@@ -172,6 +172,15 @@ pub enum SandboxError {
         kind: String,
         message: String,
     },
+    /// The host refused a snapshot restore because the memory image
+    /// cannot be restored exactly on this fleet, for example a memory
+    /// image that can reference swap pages no snapshot holds. The
+    /// refusal is deterministic: every host gives the same answer, so
+    /// a retry cannot succeed. The disk is unaffected, and the resume
+    /// recovers with a disk-only cold boot. Crosses the host→coord
+    /// gRPC boundary as a `failed_precondition` with a marker message
+    /// (the `HarnessSpawn` precedent).
+    MemoryImageUnusable(String),
 }
 
 /// ADR 0116 B-D4: is a harness-spawn failure of this `kind`
@@ -214,6 +223,7 @@ impl fmt::Display for SandboxError {
             Self::HarnessSpawn { kind, message } => {
                 write!(f, "harness_spawn: kind={kind} {message}")
             }
+            Self::MemoryImageUnusable(msg) => write!(f, "memory_image_unusable: {msg}"),
         }
     }
 }

@@ -1869,7 +1869,7 @@ impl PooledBackend {
                 .await
                 .is_some_and(|path| path.starts_with("/dev/nbd"))
         {
-            return Err(SandboxError::Snapshot(
+            return Err(SandboxError::MemoryImageUnusable(
                 "swap restore would reopen a stale literal NBD device".into(),
             ));
         }
@@ -5351,7 +5351,7 @@ impl PooledBackend {
         let size = spec.get("swap_mib").and_then(|v| v.as_u64()).unwrap_or(0);
         if size == 0 {
             if metadata.swap_manifest.is_some() {
-                return Err(SandboxError::Snapshot(
+                return Err(SandboxError::MemoryImageUnusable(
                     "swap manifest has no device geometry".into(),
                 ));
             }
@@ -5363,7 +5363,7 @@ impl PooledBackend {
             .and_then(|v| v.as_str())
             == Some("1");
         if !fresh && !base && metadata.swap_manifest.is_none() {
-            return Err(SandboxError::Snapshot(
+            return Err(SandboxError::MemoryImageUnusable(
                 "swap restore has no manifest; refusing a stale device".into(),
             ));
         }

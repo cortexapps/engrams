@@ -1106,8 +1106,8 @@ pub(crate) async fn resume_from_idle(
     // instead of declaring the session dead. This is also the documented
     // recovery path for `ColdBootUnavailable` Idle fallbacks: re-enable
     // the image, then /resume lands here.
-    if session.live_disk_manifest.is_some() {
-        return resume_disk_only_cold_boot(ctx, session).await;
+    if let Some(rootfs) = session.live_disk_manifest {
+        return resume_disk_only_cold_boot(ctx, session, rootfs).await;
     }
     tracing::warn!(
         session_id = %id,
@@ -1146,13 +1146,16 @@ pub(crate) async fn destroy_retained_sandbox(
 }
 
 /// ADR 0028 Fix B — manual-resume flavor of the disk-only cold boot:
-/// fresh kernel boot mounting the session's `live_disk_manifest` on
-/// whichever host can take it, fresh harness. On-disk work survives;
-/// in-RAM context does not (this path only exists because no coherent
-/// memory snapshot was ever recorded).
+/// fresh kernel boot mounting `rootfs` on whichever host can take it,
+/// fresh harness. On-disk work survives; in-RAM context does not. This
+/// path runs when no coherent memory snapshot was recorded (`rootfs` is
+/// the session's `live_disk_manifest`), or when the host refused the
+/// memory image as unusable (`rootfs` is the newest disk of the live
+/// and snapshot lineages).
 async fn resume_disk_only_cold_boot(
     ctx: &crate::session_ops::OpCtx<'_>,
     session: Session,
+    rootfs: engram_core::types::manifest::ManifestRef,
 ) -> Result<SnapshotResponse, ApiError> {
     let state = ctx.state;
     let id = session.id;
@@ -1162,7 +1165,7 @@ async fn resume_disk_only_cold_boot(
     let mut spec = crate::boot_materializer::materialize_cold_boot(state, &session)
         .await?
         .ok_or_else(|| ApiError::Conflict("disk-only recovery requires an enabled image".into()))?;
-    spec.rootfs_manifest = session.live_disk_manifest;
+    spec.rootfs_manifest = Some(rootfs);
     let (repo, tag) = engram_core::types::session::split_image_ref(&session.image);
     let context = crate::placement::ScheduleContext {
         nbd_slot_need: 1 + u32::from(spec.swap_mib.unwrap_or(0) > 0),
@@ -1949,6 +1952,31 @@ async fn resume_from_fc_snapshot(
     .await
     {
         Ok(v) => v,
+        // The host refused the memory image (for example, one that can
+        // reference swap pages no snapshot holds). Every host refuses
+        // it the same way, so a retry cannot help, but the disk is
+        // intact: boot a fresh kernel on the newest disk. The memory
+        // pairing rule above does not apply, because no memory is
+        // restored, so the live lineage wins when it is newer.
+        Err(SandboxError::MemoryImageUnusable(reason)) => {
+            let Some(rootfs) =
+                effective_resume_disk_manifest(session.live_disk_manifest, record.disk_manifest)
+            else {
+                return Err(ApiError::Internal(format!(
+                    "memory image unusable and the session has no disk manifest: {reason}"
+                )));
+            };
+            ::metrics::counter!(crate::metrics::SESSION_RESUME_MEMORY_IMAGE_FALLBACK_TOTAL)
+                .increment(1);
+            tracing::warn!(
+                session_id = %id,
+                snapshot_id = %record.id,
+                rootfs = ?rootfs,
+                %reason,
+                "resume: host refused the memory image; recovering with a disk-only cold boot",
+            );
+            return resume_disk_only_cold_boot(op_ctx, session, rootfs).await;
+        }
         Err(SandboxError::Snapshot(msg)) => {
             // Lost local artifacts on every viable host — chunked
             // restore couldn't rehydrate from the manifest either.

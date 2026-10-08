@@ -1793,6 +1793,11 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         SandboxError::HarnessSpawn { kind, message } => Status::failed_precondition(
             engram_protocol::wire::harness_spawn_message(&kind, &message),
         ),
+        // Same marker shape: the coordinator reads the typed variant and
+        // recovers the session from its disk instead of retrying.
+        SandboxError::MemoryImageUnusable(message) => Status::failed_precondition(
+            engram_protocol::wire::memory_image_unusable_message(&message),
+        ),
     }
 }
 
@@ -2039,6 +2044,18 @@ mod wire_version_tests {
                 "NotFound".to_string(),
                 "spawn_harness: spawn \"/opt/engram/dyn/0/bin/h\": ENOENT".to_string()
             )),
+        );
+    }
+
+    #[test]
+    fn memory_image_unusable_maps_to_failed_precondition_marker() {
+        let status = sandbox_to_status(SandboxError::MemoryImageUnusable(
+            "swap restore has no manifest".into(),
+        ));
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            engram_protocol::wire::parse_memory_image_unusable_message(status.message()),
+            Some("swap restore has no manifest".to_string()),
         );
     }
 }

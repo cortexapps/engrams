@@ -232,6 +232,30 @@ pub fn parse_harness_spawn_message(msg: &str) -> Option<(String, String)> {
     Some((kind.to_string(), message.trim().to_string()))
 }
 
+/// Marker prefix for the host-agent's "memory image unusable" restore
+/// refusal ([`engram_core::SandboxError::MemoryImageUnusable`], the
+/// [`HARNESS_SPAWN_STATUS_PREFIX`] precedent). The host returns a
+/// `failed_precondition` status whose message starts with this prefix;
+/// the coord-side client maps it back to the typed variant, so the resume
+/// verb can fall back to a disk-only cold boot. A peer that predates the
+/// marker sees an ordinary `failed_precondition` string — no
+/// `WIRE_VERSION` bump.
+pub const MEMORY_IMAGE_UNUSABLE_STATUS_PREFIX: &str = "memory_image_unusable:";
+
+/// Render the host-agent's memory-image refusal message.
+pub fn memory_image_unusable_message(message: &str) -> String {
+    format!("{MEMORY_IMAGE_UNUSABLE_STATUS_PREFIX} {message}")
+}
+
+/// Parse the reason out of a [`memory_image_unusable_message`]. Returns
+/// `None` if `msg` isn't that marker.
+pub fn parse_memory_image_unusable_message(msg: &str) -> Option<String> {
+    let rest = msg
+        .strip_prefix(MEMORY_IMAGE_UNUSABLE_STATUS_PREFIX)?
+        .trim();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
 /// Wire-friendly mirror of [`engram_core::types::sandbox::ExecRequest`].
 ///
 /// Defined here so the gRPC payload bincode roundtrips cleanly via
@@ -352,6 +376,30 @@ mod tests {
         assert_eq!(parse_wire_skew_message("wire_version skew: garbage"), None);
         assert_eq!(
             parse_wire_skew_message("wire_version skew: host=x coord=3"),
+            None
+        );
+    }
+
+    #[test]
+    fn memory_image_unusable_message_round_trips() {
+        let msg = memory_image_unusable_message("swap restore has no manifest");
+        assert_eq!(
+            parse_memory_image_unusable_message(&msg),
+            Some("swap restore has no manifest".to_string())
+        );
+        // The core Display is prefix-compatible with the marker.
+        let err = engram_core::SandboxError::MemoryImageUnusable("x y".into());
+        assert_eq!(
+            parse_memory_image_unusable_message(&err.to_string()),
+            Some("x y".to_string())
+        );
+        assert_eq!(parse_memory_image_unusable_message("image not ready"), None);
+        assert_eq!(
+            parse_memory_image_unusable_message("memory_image_unusable:"),
+            None
+        );
+        assert_eq!(
+            parse_memory_image_unusable_message("harness_spawn: kind=NotFound x"),
             None
         );
     }
