@@ -1245,9 +1245,6 @@ html.menu-open {
   font-size: 20px;
   opacity: 0.85;
 }
-.cortex-cta .actions {
-  margin-top: 0;
-}
 .cortex-cta .btn {
   height: 44px;
   font-size: 13px;
@@ -1267,7 +1264,8 @@ html.menu-open {
 }
 .site-footer nav {
   display: flex;
-  gap: 24px;
+  flex-wrap: wrap;
+  gap: 12px 24px;
 }
 .site-footer .stripe {
   margin-top: 24px;
