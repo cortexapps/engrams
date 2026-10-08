@@ -525,7 +525,14 @@ mod steps {
             Err(SandboxError::NotFound | SandboxError::AlreadyExists) => {
                 rollback_begin(ctx, row, "live_export_lost".into()).await
             }
-            Err(e) if e.to_string().contains("postcopy-never-loaded") => {
+            // The destination refused the guest's memory image (for
+            // example, a guest still on a raw swap file). Every host
+            // refuses it the same way, so a retry cannot help; abort the
+            // export and keep the source running.
+            Err(e)
+                if matches!(e, SandboxError::MemoryImageUnusable(_))
+                    || e.to_string().contains("postcopy-never-loaded") =>
+            {
                 ctx.state
                     .host_registry
                     .backend_for(row.source_host_id)

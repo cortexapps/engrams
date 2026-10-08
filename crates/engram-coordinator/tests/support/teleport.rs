@@ -21,6 +21,8 @@ pub struct ScriptedHost {
     pub clock: Arc<dyn Clock>,
     pub capture_fails: AtomicBool,
     pub restore_fails: AtomicBool,
+    /// `restore` refuses the memory image (`MemoryImageUnusable`).
+    pub memory_refused: AtomicBool,
     pub resume_fails: AtomicBool,
     /// `resume` answers NotFound: the source sandbox no longer exists.
     pub resume_not_found: AtomicBool,
@@ -50,6 +52,7 @@ impl ScriptedHost {
             clock,
             capture_fails: AtomicBool::new(false),
             restore_fails: AtomicBool::new(false),
+            memory_refused: AtomicBool::new(false),
             resume_fails: AtomicBool::new(false),
             resume_not_found: AtomicBool::new(false),
             abort_not_found: AtomicBool::new(false),
@@ -161,6 +164,11 @@ impl HostClient for ScriptedHost {
         _fence: engram_core::traits::SessionFence,
     ) -> Result<SandboxId, SandboxError> {
         self.restores.fetch_add(1, Ordering::SeqCst);
+        if self.memory_refused.load(Ordering::SeqCst) {
+            return Err(SandboxError::MemoryImageUnusable(
+                "swap restore has no manifest".into(),
+            ));
+        }
         if self.restore_fails.load(Ordering::SeqCst) {
             return Err(SandboxError::Snapshot("restore failed".into()));
         }
