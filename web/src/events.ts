@@ -301,6 +301,15 @@ export type SessionEvent =
       rewind_disk_manifest: { manifest_id: string; version: number } | null;
       reason: string;
       at: string;
+    }
+  // The host refused the session's memory image, so the resume booted a fresh
+  // kernel on the newest disk. Files are kept; running processes, shells and
+  // in-memory state are gone. Coordinator-authoritative.
+  | {
+      type: "resumed_from_disk";
+      disk_manifest: { manifest_id: string; version: number };
+      reason: string;
+      at: string;
     };
 
 export type SessionEventKind = SessionEvent["type"];

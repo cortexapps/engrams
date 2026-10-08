@@ -73,6 +73,7 @@ const WIRE_FRAME_KINDS: Readonly<Record<string, FrameClass>> = {
   file_shared: "durable",
   recovered_from_checkpoint: "durable",
   durability_rollback: "durable",
+  resumed_from_disk: "durable",
   user_question: "durable",
   question_answered: "durable",
   file_changed: "durable",

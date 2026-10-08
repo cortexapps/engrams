@@ -751,7 +751,7 @@ S7's base-capture rule lands with phase 2b, once the base must be swap-free for 
   Changes to the module parameter require node recreation. Swap-in latency
   and capture-upload measurements on the dev VM remain an operator step.
 
-- **2026-10-08, resume fallback:** The phase 2b rollout did not cover a
+- **2026-10-07, resume fallback:** The phase 2b rollout did not cover a
   memory snapshot taken before phase 2b. Such a snapshot has no swap
   manifest, so every host refuses to restore it, and the coordinator set
   the session `Dead` after five refusals. A host-agent that adopts a running
@@ -760,7 +760,12 @@ S7's base-capture rule lands with phase 2b, once the base must be swap-free for 
   The two kinds look the same in PG, so neither a migration nor a host
   rule can tell a safe one from an unsafe one. The host now refuses these
   memory images with the typed `MemoryImageUnusable` error (a marker on
-  `failed_precondition`; no wire version change). The resume verb then does
-  a disk-only cold boot on the newer of the live and snapshot disk lineages.
-  The guest loses its processes and keeps its disk. Teleport already rolls
-  back on a destination refusal.
+  `failed_precondition`). Wire version is 35, so an older host that refuses
+  with an untyped error is fenced out during the roll. The resume verb then
+  does a disk-only cold boot on the newer of the live and snapshot disk
+  lineages, with the image's memory and CPU budgets, and appends a
+  `resumed_from_disk` event. The guest loses its processes and keeps its
+  disk. A teleport whose destination refuses the memory image rolls back
+  at once, for both the captured and the live kind, so the source keeps
+  running. The refused snapshot row stays `recoverable`: demoting it would
+  unpin the disk the cold boot can mount.

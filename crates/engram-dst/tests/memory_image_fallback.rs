@@ -125,5 +125,28 @@ fn refused_memory_image_resumes_by_disk_only_cold_boot() {
             vec![Some(live)],
             "exactly one cold boot, on the live disk (newer than the snapshot's)",
         );
+        // The cold boot came from the refusal, not from the resume skipping
+        // the snapshot (that path boots the same disk).
+        let refusals: u32 = sim
+            .world
+            .host_world
+            .hosts
+            .lock()
+            .values()
+            .map(|h| h.memory_refusals)
+            .sum();
+        assert_eq!(refusals, 1, "the host refused the memory image once");
+        let notices = sim.world.meta.with_db(|db| {
+            db.session_events
+                .get(&sid)
+                .map(|events| {
+                    events
+                        .iter()
+                        .filter(|e| e.kind == "resumed_from_disk")
+                        .count()
+                })
+                .unwrap_or(0)
+        });
+        assert_eq!(notices, 1, "the user is told the processes were lost");
     });
 }

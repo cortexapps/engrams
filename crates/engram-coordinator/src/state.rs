@@ -420,6 +420,17 @@ pub enum SessionEvent {
         reason: String,
         at: DateTime<Utc>,
     },
+    /// A resume recovered with a disk-only cold boot because the host
+    /// refused the session's memory image. The disk and every file on it
+    /// are kept; running processes, shells and in-memory state are gone.
+    /// Coordinator-authoritative, so a rewind keeps it.
+    ResumedFromDisk {
+        /// The disk the fresh kernel booted on.
+        disk_manifest: engram_core::types::manifest::ManifestRef,
+        /// Why the host refused the memory image.
+        reason: String,
+        at: DateTime<Utc>,
+    },
     /// ADR 0107: a validated session-mode directive rode a prompt (e.g.
     /// `plan`). Coordinator-authoritative — the user genuinely selected the
     /// mode — so `rewind_session_to_cursor` excludes this kind from its
@@ -549,6 +560,7 @@ impl SessionEvent {
             Self::FileShared { .. } => "file_shared",
             Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
             Self::DurabilityRollback { .. } => "durability_rollback",
+            Self::ResumedFromDisk { .. } => "resumed_from_disk",
         }
     }
 

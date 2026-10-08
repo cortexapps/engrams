@@ -41,6 +41,8 @@ pub struct SimHostState {
     /// exactly (for example, one captured before swap was a chunked
     /// disk). Off by default, so seeds are unchanged.
     pub refuse_memory_images: bool,
+    /// How many restores `refuse_memory_images` refused.
+    pub memory_refusals: u32,
     /// The root disk manifest each `create` was asked to mount, in call
     /// order. A disk-only cold boot carries `Some`.
     pub created_rootfs: Vec<Option<engram_core::types::manifest::ManifestRef>>,
@@ -1014,13 +1016,14 @@ impl HostClient for SimHostClient {
         self.maybe_hang().await;
         let id = SandboxId::from(self.entropy.uuid());
         self.world.require_up(self.host_id)?;
-        if self
+        if let Some(h) = self
             .world
             .hosts
             .lock()
-            .get(&self.host_id)
-            .is_some_and(|h| h.refuse_memory_images)
+            .get_mut(&self.host_id)
+            .filter(|h| h.refuse_memory_images)
         {
+            h.memory_refusals += 1;
             return Err(SandboxError::MemoryImageUnusable(
                 "sim: memory image refused".into(),
             ));

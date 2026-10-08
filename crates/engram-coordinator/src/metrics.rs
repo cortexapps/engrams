@@ -389,9 +389,10 @@ pub const SESSION_OP_RESUME_BUDGET_EXHAUSTED_TOTAL: &str =
 /// unresumable instead of churning the outbox shim forever.
 pub const SESSION_UNRESUMABLE_DEMOTED_TOTAL: &str = "engram_session_unresumable_demoted_total";
 /// Resumes whose memory image the host refused as unusable (for
-/// example, a memory image captured before swap was a chunked disk),
-/// recovered with a disk-only cold boot. Each increment is one session
-/// that lost its in-RAM context but kept its disk.
+/// example, a memory image captured before swap was a chunked disk)
+/// that then completed with a disk-only cold boot. Counted only on
+/// success: each increment is one session that lost its in-RAM context
+/// but kept its disk.
 pub const SESSION_RESUME_MEMORY_IMAGE_FALLBACK_TOTAL: &str =
     "engram_session_resume_memory_image_fallback_total";
 /// ADR 0079 (review finding #5): orphaned Pending sessions (placed but

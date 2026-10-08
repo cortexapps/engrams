@@ -1167,13 +1167,17 @@ async fn resume_disk_only_cold_boot(
         .ok_or_else(|| ApiError::Conflict("disk-only recovery requires an enabled image".into()))?;
     spec.rootfs_manifest = Some(rootfs);
     let (repo, tag) = engram_core::types::session::split_image_ref(&session.image);
+    // The same budgets the memory restore was admitted with: a cold boot
+    // needs the RAM and CPU too, so placement must check that they fit.
+    let budget =
+        crate::boot_materializer::resolve_resume_budget(&state.services.meta, &session).await;
     let context = crate::placement::ScheduleContext {
         nbd_slot_need: 1 + u32::from(spec.swap_mib.unwrap_or(0) > 0),
         repo,
         image_version: tag,
         snapshot_host: None,
-        memory_mib: None,
-        cpu_budget_vcpus: None,
+        memory_mib: budget.map(|(mib, _)| mib),
+        cpu_budget_vcpus: budget.map(|(_, vcpus)| vcpus),
         required_image_digest: None,
         exclude_host: None,
         prefer_host: session.host_id,
@@ -1966,8 +1970,6 @@ async fn resume_from_fc_snapshot(
                     "memory image unusable and the session has no disk manifest: {reason}"
                 )));
             };
-            ::metrics::counter!(crate::metrics::SESSION_RESUME_MEMORY_IMAGE_FALLBACK_TOTAL)
-                .increment(1);
             tracing::warn!(
                 session_id = %id,
                 snapshot_id = %record.id,
@@ -1975,7 +1977,23 @@ async fn resume_from_fc_snapshot(
                 %reason,
                 "resume: host refused the memory image; recovering with a disk-only cold boot",
             );
-            return resume_disk_only_cold_boot(op_ctx, session, rootfs).await;
+            let response = resume_disk_only_cold_boot(op_ctx, session, rootfs).await?;
+            ::metrics::counter!(crate::metrics::SESSION_RESUME_MEMORY_IMAGE_FALLBACK_TOTAL)
+                .increment(1);
+            // Tell the user why their processes are gone. Best-effort: the
+            // session is already Active, and a failed emit must not undo that.
+            let _ = state
+                .emit_fenced(
+                    id,
+                    op_ctx.fence(),
+                    SessionEvent::ResumedFromDisk {
+                        disk_manifest: rootfs,
+                        reason,
+                        at: state.services.clock.now_utc(),
+                    },
+                )
+                .await;
+            return Ok(response);
         }
         Err(SandboxError::Snapshot(msg)) => {
             // Lost local artifacts on every viable host — chunked
