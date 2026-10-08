@@ -178,7 +178,45 @@ code {
 
 /* ---- header ---- */
 :root {
-  --masthead-h: 81px;
+  --banner-h: 40px;
+  --masthead-h: calc(81px + var(--banner-h));
+}
+/* The Slack banner is the top row of the masthead, so it stays in view. */
+.banner {
+  display: block;
+  position: relative;
+  z-index: 1;
+  box-sizing: border-box;
+  height: var(--banner-h);
+  /* A dark gap keeps the lime bar apart from the lime in the stripe below. */
+  border-bottom: 4px solid var(--panel-deep);
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.banner .wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  height: 100%;
+  white-space: nowrap;
+}
+.banner .tag {
+  border: 1px solid currentColor;
+  padding: 1px 8px;
+  font-size: 10px;
+}
+.banner:hover .long,
+.banner:hover .short {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.banner .short {
+  display: none;
 }
 /* The masthead stays pinned while the page scrolls. Its cover background is
    opaque, so content passes under it cleanly; once the page leaves the top, a
@@ -1559,7 +1597,13 @@ html.menu-open {
     padding: 0 20px;
   }
   :root {
-    --masthead-h: 69px;
+    --masthead-h: calc(69px + var(--banner-h));
+  }
+  .banner .long {
+    display: none;
+  }
+  .banner .short {
+    display: inline;
   }
   .site-header {
     height: 64px;

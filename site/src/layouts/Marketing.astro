@@ -55,6 +55,14 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
   <body>
     <GoogleTagManager part="body" />
     <div class:list={["cover", "masthead", { landing }]}>
+      <a class="banner" href={`${base}/slack/`}>
+        <span class="wrap">
+          <span class="tag">Community</span>
+          <span class="long">Join the engrams Slack: talk with the engineers who build it</span>
+          <span class="short">Join the engrams Slack</span>
+          <span aria-hidden="true">→</span>
+        </span>
+      </a>
       <div class="layer grid"></div>
       <div class="layer scan"></div>
       <div class="wrap">
