@@ -215,10 +215,9 @@ pub struct MigrationSourceInfo {
     pub source_addr: String,
     pub memory_manifest_json: Vec<u8>,
     pub memory_manifest_ref: super::manifest::ManifestRef,
-    /// ADR 0045 C2 (E2B fold): the source guest's hot set in fault
-    /// order — the destination pulls these FIRST. Best-effort rider
-    /// (empty when the source had no trace); serde-default keeps
-    /// mixed rolls safe.
+    /// The presetup handler trace in fault order. The source retains this
+    /// first-tier order and adds idle-derived hashes to the capture-time
+    /// root seal update. Empty when the source had no handler trace.
     #[serde(default)]
     pub hot_chunks: Vec<[u8; 32]>,
     /// ADR 0045 C2: this is a POST-COPY move. The destination restores
@@ -365,6 +364,8 @@ pub enum MigrationItem {
     /// by chunk index — demand-fetched (and drained) by the dest's
     /// NBD backend straight out of the frozen source's RAM.
     DiskChunkAt(DiskRole, u64),
+    /// Optional advisory hot-set hint, fetched after the required VM state.
+    HotHint,
 }
 
 /// A frame of `migration_fetch`'s stream.

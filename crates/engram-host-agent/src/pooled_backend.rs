@@ -184,6 +184,7 @@ fn legacy_rootfs_path(cached: &CachedImage) -> Result<PathBuf, SandboxError> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone)]
 struct PostCopyDestPending {
+    hot_trace_file: String,
     source_addr: String,
     export_id: String,
 }
@@ -296,6 +297,8 @@ struct PendingPresetup {
     chain_ref: engram_core::types::manifest::ManifestRef,
     swap_manifest_ref: Option<engram_core::types::manifest::ManifestRef>,
     sidecar_json: Vec<u8>,
+    idle_marked: bool,
+    hot_chunks: Vec<[u8; 32]>,
 }
 
 /// Issue #202: the unwind guard for a migration / snapshot capture's
@@ -818,6 +821,8 @@ pub struct PooledBackend {
     /// failed manifest write is retried by the next call and never turns a
     /// complete drain into a rewind.
     drained_dests: Arc<DashMap<SandboxId, engram_core::types::snapshot::DrainOutcome>>,
+    /// Optional hint polling stops as soon as the memory drain terminates.
+    hint_pollers: Arc<DashMap<SandboxId, AbortTaskOnDrop>>,
     /// ADR 0044 K2 (issue #224): terminal-mode flag for graceful
     /// shutdown. `abandon_nbd_data_planes_for_shutdown` sets this
     /// `true` (SeqCst) BEFORE draining `nbd_sandboxes`, turning
@@ -1015,15 +1020,70 @@ fn record_warm_hook_failure_metric(kind: engram_core::types::CaptureFailureKind)
         .increment(1);
 }
 
-/// RAII: aborts the wrapped keepalive task on drop. A leg wrapped by
+/// Abort the wrapped task on drop, including hint polling after DrainDone.
+/// A leg wrapped by
 /// [`spawn_leg_keepalive`] stops resending stale progress the moment
 /// the guard goes out of scope — on every path, including an early
 /// `?`-return, since `Drop` runs during unwind too.
-struct KeepaliveGuard(tokio::task::JoinHandle<()>);
+struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
 
-impl Drop for KeepaliveGuard {
+impl Drop for AbortTaskOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// Observe the local handler independently of the coordinator's drain-wait RPC.
+/// ControlTx replays terminal reports to each subscriber, including late ones.
+fn monitor_hint_poller(poller: AbortTaskOnDrop, sock: Option<PathBuf>) -> AbortTaskOnDrop {
+    AbortTaskOnDrop(tokio::spawn(async move {
+        let mut poller = poller;
+        let Some(sock) = sock else { return };
+        tokio::select! {
+            biased;
+            result = observe_memory_drain(&sock) => {
+                if let Err(error) = result {
+                    tracing::info!(%error, "post-copy hint observer failed; stop optional polling");
+                }
+            }
+            _ = &mut poller.0 => {}
+        }
+        // Drop also cancels an in-flight fetch. Destroy/restore failure cancels
+        // this owner and closes the local subscription without a blocking task.
+    }))
+}
+
+async fn observe_memory_drain(sock: &Path) -> std::io::Result<()> {
+    use engram_migrate_proto::HandlerControl;
+    let mut stream = tokio::net::UnixStream::connect(sock).await?;
+    loop {
+        match crate::migrate_peer::read_frame_async(&mut stream).await? {
+            HandlerControl::DrainDone { .. } | HandlerControl::PeerLost { .. } => return Ok(()),
+            HandlerControl::Sealed { .. } | HandlerControl::DrainProgress { .. } => {}
+        }
+    }
+}
+
+/// Retry only while the advisory budget remains. The owner cancels this future
+/// at the local memory drain outcome, including during a fetch or backoff sleep.
+#[cfg(any(target_os = "linux", test))]
+async fn poll_hot_hint<F, Fut>(budget: std::time::Duration, mut fetch: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut delay = std::time::Duration::from_millis(100);
+    let poll = async {
+        loop {
+            if fetch().await {
+                return;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(2));
+        }
+    };
+    if tokio::time::timeout(budget, poll).await.is_err() {
+        tracing::info!("post-copy hot trace fetch timed out; drain continues");
     }
 }
 
@@ -1046,8 +1106,8 @@ impl Drop for KeepaliveGuard {
 fn spawn_leg_keepalive(
     progress: tokio::sync::mpsc::Sender<engram_core::types::CaptureProgress>,
     event: engram_core::types::CaptureProgress,
-) -> KeepaliveGuard {
-    KeepaliveGuard(tokio::spawn(async move {
+) -> AbortTaskOnDrop {
+    AbortTaskOnDrop(tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(crate::warm_progress::capture_keepalive_secs_from_env());
         interval.tick().await; // consume the immediate first tick
@@ -1056,6 +1116,50 @@ fn spawn_leg_keepalive(
             let _ = progress.try_send(event.clone());
         }
     }))
+}
+
+/// Publish the optional hint without changing the required disk seal.
+#[cfg(any(target_os = "linux", test))]
+fn publish_hot_hint(dir: &Path, hot: &[[u8; 32]]) -> std::io::Result<()> {
+    let tmp = dir.join("hot-hint.json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(&serde_json::json!({"hot_chunks": hot}))?,
+    )?;
+    std::fs::rename(tmp, dir.join("hot-hint.json"))
+}
+
+/// Parse the optional hint independently of the required disk seal.
+#[cfg(any(target_os = "linux", test))]
+fn parse_hot_hint(bytes: &[u8]) -> Option<Vec<[u8; 32]>> {
+    let result = (|| {
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
+        value
+            .get("hot_chunks")
+            .map(|hot| serde_json::from_value(hot.clone()))
+            .transpose()
+    })();
+    match result {
+        Ok(hot) => hot,
+        Err(error) => {
+            tracing::info!(%error, "post-copy hint malformed; drain continues");
+            Some(Vec::new())
+        }
+    }
+}
+
+/// Atomically stage an advisory hint after state.bin has opened the load gate.
+#[cfg(any(target_os = "linux", test))]
+fn stage_hot_trace(path: &Path, hot: &[[u8; 32]]) -> std::io::Result<()> {
+    let mut trace =
+        engram_chunk_store::working_set::WorkingSetTrace::new(0, 0, chrono::DateTime::UNIX_EPOCH);
+    trace.chunks = hot
+        .iter()
+        .map(|h| engram_chunk_store::manifest::ChunkHash::from_bytes(*h))
+        .collect();
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&trace)?)?;
+    std::fs::rename(tmp, path)
 }
 
 impl PooledBackend {
@@ -1096,6 +1200,8 @@ impl PooledBackend {
             chain_ref,
             swap_manifest_ref,
             sidecar_json: sidecar_json.clone(),
+            idle_marked: false,
+            hot_chunks: self.read_hot_chunks(id),
         };
         self.pending_presetups.insert(id, pending.clone());
 
@@ -1108,7 +1214,7 @@ impl PooledBackend {
             memory_manifest_ref: chain_ref,
             disk_manifest_ref,
             swap_manifest_ref: pending.swap_manifest_ref,
-            hot_chunks: self.read_hot_chunks(id),
+            hot_chunks: pending.hot_chunks,
         })
     }
 
@@ -1838,8 +1944,10 @@ impl PooledBackend {
         // chunk peer overlay before landing state.bin (the FC load
         // gate), and the publisher stays fenced until the disk drain
         // makes the dest self-sufficient.
+        #[cfg(not(target_os = "linux"))]
+        let hint_poller: Option<AbortTaskOnDrop> = None;
         #[cfg(target_os = "linux")]
-        if let Some((_, pending)) = self.postcopy_dests.remove(&metadata.id) {
+        let hint_poller = if let Some((_, pending)) = self.postcopy_dests.remove(&metadata.id) {
             let nbd = [
                 (DiskRole::Root, pending_nbd_state.as_ref()),
                 (DiskRole::Swap, pending_swap_state.as_ref()),
@@ -1856,12 +1964,14 @@ impl PooledBackend {
                 })
             })
             .collect();
-            self.spawn_postcopy_fetch_poller(
+            Some(AbortTaskOnDrop(self.spawn_postcopy_fetch_poller(
                 pending,
                 self.inner.snapshot_path_for(metadata.id),
                 nbd,
-            );
-        }
+            )))
+        } else {
+            None
+        };
 
         #[cfg(target_os = "linux")]
         if pending_swap_state.is_none()
@@ -2068,12 +2178,18 @@ impl PooledBackend {
                 .resolved_dirty_root()
                 .expect("NBD state requires a dirty root");
             let migration_roles = self.migration_roles.clone();
+            let hint_pollers = self.hint_pollers.clone();
             let join = tokio::spawn(async move {
                 let new_id = if fresh {
                     inner.restore_fresh(metadata, selected_mounts).await?
                 } else {
                     inner.restore(metadata).await?
                 };
+                // Subscribe as soon as the backend exposes the restored VM.
+                // Replay covers a drain that finished during restore.
+                let hint_poller = hint_poller.map(|poller| {
+                    monitor_hint_poller(poller, inner.post_copy_control_sock(new_id))
+                });
                 if post_copy_dest {
                     migration_roles.insert(new_id, crate::migration::MigrationRole::PostCopyDest);
                 }
@@ -2159,6 +2275,9 @@ impl PooledBackend {
                         return Err(error);
                     }
                 }
+                if let Some(poller) = hint_poller {
+                    hint_pollers.insert(new_id, poller);
+                }
                 Ok::<SandboxId, SandboxError>(new_id)
             });
             // A JoinError here means the spawned task panicked; the FC restore
@@ -2172,12 +2291,19 @@ impl PooledBackend {
 
         let inner = self.inner.clone();
         let migration_roles = self.migration_roles.clone();
+        let hint_pollers = self.hint_pollers.clone();
         tokio::spawn(async move {
             let new_id = if fresh {
                 inner.restore_fresh(metadata, selected_mounts).await?
             } else {
                 inner.restore(metadata).await?
             };
+            if let Some(poller) = hint_poller {
+                hint_pollers.insert(
+                    new_id,
+                    monitor_hint_poller(poller, inner.post_copy_control_sock(new_id)),
+                );
+            }
             if post_copy_dest {
                 migration_roles.insert(new_id, crate::migration::MigrationRole::PostCopyDest);
             }
@@ -2260,6 +2386,7 @@ impl PooledBackend {
             postcopy_dests: Arc::new(DashMap::new()),
             migration_roles: Arc::new(DashMap::new()),
             drained_dests: Arc::new(DashMap::new()),
+            hint_pollers: Arc::new(DashMap::new()),
             #[cfg(target_os = "linux")]
             abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             captures_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3140,6 +3267,10 @@ impl PooledBackend {
         fs::create_dir_all(&dest)
             .await
             .map_err(|e| SandboxError::Snapshot(format!("create snapshot dir: {e}")))?;
+        let hot_trace_file = format!(
+            "migration-hot-{}.json",
+            crate::time_source::unique_path_token()
+        );
         fs::write(dest.join("manifest.json"), &mig.sidecar_json)
             .await
             .map_err(|e| SandboxError::Snapshot(format!("write sidecar: {e}")))?;
@@ -3150,10 +3281,10 @@ impl PooledBackend {
         .await
         .map_err(|e| SandboxError::Snapshot(format!("write session manifest: {e}")))?;
         let peer_spec = engram_sandbox_firecracker::MigrationPeerSpec {
+            hot_trace_file: hot_trace_file.clone(),
             peer_addr: peer_addr.clone(),
             export_id: mig.export_id.clone(),
             peer_token: peer_token.clone(),
-            hot_chunks: mig.hot_chunks.clone(),
         };
         fs::write(
             dest.join(engram_sandbox_firecracker::MIGRATION_PEER_FILE),
@@ -3165,6 +3296,7 @@ impl PooledBackend {
         self.postcopy_dests.insert(
             metadata.id,
             PostCopyDestPending {
+                hot_trace_file,
                 source_addr: mig.source_addr.clone(),
                 export_id: mig.export_id.clone(),
             },
@@ -3191,7 +3323,7 @@ impl PooledBackend {
             Arc<crate::disk_daemon::ChunkedDiskBackend>,
             std::path::PathBuf,
         )>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let budget = std::time::Duration::from_secs(240);
             let started = crate::time_source::metrics_now();
@@ -3230,7 +3362,20 @@ impl PooledBackend {
                     },
                 };
                 let t_fetch = crate::time_source::metrics_now();
-                match Self::fetch_postcopy_artifacts(client, &pending.export_id, &tmp, &roles).await
+                match Self::fetch_postcopy_artifacts(
+                    client,
+                    &pending.export_id,
+                    &tmp,
+                    &roles
+                        .iter()
+                        .copied()
+                        .map(engram_core::types::snapshot::MigrationItem::DiskSealInfo)
+                        .chain(std::iter::once(
+                            engram_core::types::snapshot::MigrationItem::StateBin,
+                        ))
+                        .collect::<Vec<_>>(),
+                )
+                .await
                 {
                     Ok(()) => break (tmp.join("state.bin"), t_fetch.elapsed().as_millis() as u64),
                     Err(e) => {
@@ -3365,7 +3510,46 @@ impl PooledBackend {
                 fetch_ms,
                 "post-copy restore inputs staged (state.bin landed)",
             );
-        });
+            // Demand faults can run now. The hint task polls for the
+            // optional artifact, so idle reads do not extend blackout.
+            poll_hot_hint(budget.saturating_sub(started.elapsed()), || async {
+                let Some(client) = source.as_ref() else {
+                    return true;
+                };
+                if let Err(error) = Self::fetch_postcopy_artifacts(
+                    client,
+                    &pending.export_id,
+                    &tmp,
+                    &[engram_core::types::snapshot::MigrationItem::HotHint],
+                )
+                .await
+                {
+                    if !matches!(error, SandboxError::NotFound) {
+                        tracing::info!(%error, "post-copy hint fetch failed; drain continues");
+                    }
+                    return false;
+                }
+                let bytes = match fs::read(tmp.join("hot-hint.json")).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::info!(%error, "post-copy hint read failed; drain continues");
+                        return true;
+                    }
+                };
+                let Some(hot) = parse_hot_hint(&bytes) else {
+                    return false;
+                };
+                let path = dest_dir.join(&pending.hot_trace_file);
+                // File I/O is independent of the Tokio workers serving the move.
+                if let result @ (Ok(Err(_)) | Err(_)) =
+                    tokio::task::spawn_blocking(move || stage_hot_trace(&path, &hot)).await
+                {
+                    tracing::info!(?result, "post-copy hint staging failed; drain continues");
+                }
+                true
+            })
+            .await;
+        })
     }
 
     /// Await the disk drain's terminal outcome. `None` subscription =
@@ -3420,24 +3604,17 @@ impl PooledBackend {
         source: &engram_protocol::grpc_client::GrpcHostClient,
         export_id: &str,
         dir: &std::path::Path,
-        roles: &[DiskRole],
+        item_specs: &[engram_core::types::snapshot::MigrationItem],
     ) -> Result<(), SandboxError> {
         use engram_core::types::snapshot::MigrationItem;
-        let item_specs: Vec<_> = roles
-            .iter()
-            .copied()
-            .map(MigrationItem::DiskSealInfo)
-            .chain(std::iter::once(MigrationItem::StateBin))
-            .collect();
         let mut stream = source
             .migration_fetch(export_id, item_specs.to_vec())
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("migration fetch: {e}")))?;
+            .await?;
         use futures::StreamExt;
         let mut current: Vec<u8> = Vec::new();
         let mut current_idx: Option<u32> = None;
         while let Some(frame) = stream.next().await {
-            let frame = frame.map_err(|e| SandboxError::Snapshot(format!("fetch frame: {e}")))?;
+            let frame = frame?;
             if current_idx != Some(frame.item_idx) {
                 if !current.is_empty() {
                     return Err(SandboxError::Snapshot(
@@ -3451,6 +3628,7 @@ impl PooledBackend {
                 let idx = frame.item_idx as usize;
                 let name = match item_specs.get(idx) {
                     Some(MigrationItem::StateBin) => "state.bin",
+                    Some(MigrationItem::HotHint) => "hot-hint.json",
                     Some(MigrationItem::DiskSealInfo(role)) => role.seal_file_name(),
                     _ => {
                         return Err(SandboxError::Snapshot(
@@ -7984,8 +8162,30 @@ impl SandboxBackend for PooledBackend {
         let backends = self.disk_backends(id);
         #[cfg(not(target_os = "linux"))]
         let backends = Vec::new();
-        self.prepare_migration_export(id, chain_ref, &chain_manifest, peer.port(), backends)
-            .await
+        let out = self
+            .prepare_migration_export(id, chain_ref, &chain_manifest, peer.port(), backends)
+            .await?;
+        #[cfg(target_os = "linux")]
+        {
+            let pending_presetups = self.pending_presetups.clone();
+            let export_id = out.export_id.clone();
+            // Marking is advisory too: never make presetup wait for procfs or sysfs.
+            tokio::task::spawn_blocking(move || {
+                let started = crate::time_source::metrics_now();
+                let idle_marked = crate::dirty_map::guest_vmas(view.fc_pid, &view.memory_backing)
+                    .and_then(|vmas| crate::page_idle::mark(view.fc_pid, &vmas))
+                    .inspect_err(crate::page_idle::note_unavailable)
+                    .is_ok();
+                if let Some(mut pending) = pending_presetups.get_mut(&id) {
+                    if pending.export_id == export_id {
+                        pending.idle_marked = idle_marked;
+                    }
+                }
+                tracing::info!(sandbox_id = %id, idle_mark_ms = started.elapsed().as_millis() as u64,
+                    idle_marked, "post-copy idle mark complete");
+            });
+        }
+        Ok(out)
     }
 
     /// ADR 0045 C2: the blackout half. Pause → NBD host-cache fsync +
@@ -8193,8 +8393,9 @@ impl SandboxBackend for PooledBackend {
                 .values()
                 .map(|seal| seal.len() as u64)
                 .sum::<u64>();
-            for (role, info) in descriptors {
-                let bytes = serde_json::to_vec(&info)
+            // Publish immutable, hint-free disk seals before registering the export.
+            for (role, info) in &descriptors {
+                let bytes = serde_json::to_vec(info)
                     .map_err(|e| SandboxError::Snapshot(format!("disk seal info: {e}")))?;
                 tokio::fs::write(export_dir.join(role.seal_file_name()), bytes)
                     .await
@@ -8215,7 +8416,7 @@ impl SandboxBackend for PooledBackend {
             let inserted = self.migrations.insert(crate::migration::MigrationExport {
                 export_id: export_id.to_string(),
                 sandbox_id: id,
-                snapshot_dir: export_dir,
+                snapshot_dir: export_dir.clone(),
                 disk_seal,
                 clock: self.clock.clone(),
                 state_served,
@@ -8248,7 +8449,7 @@ impl SandboxBackend for PooledBackend {
                 token: pending.peer_token,
                 sandbox_id: id,
                 fc_pid: view.fc_pid,
-                vmas,
+                vmas: vmas.clone(),
                 seal,
                 durable_at,
                 chunk_size,
@@ -8256,6 +8457,42 @@ impl SandboxBackend for PooledBackend {
                 serve: Default::default(),
                 last_activity: peer_last_activity,
                 clock: self.clock.clone(),
+            });
+
+            let fallback = pending.hot_chunks;
+            let idle_marked = pending.idle_marked;
+            tokio::task::spawn_blocking(move || {
+                let started = crate::time_source::metrics_now();
+                let mut pages = Vec::new();
+                let captured = !idle_marked
+                    || crate::dirty_map::walk_pagemap(view.fc_pid, &vmas, |offset, entry| {
+                        if offset < total_bytes {
+                            if let Some(pfn) = crate::page_idle::present_pfn(entry) {
+                                pages.push((offset, pfn));
+                            }
+                        }
+                        Ok(())
+                    })
+                    .inspect_err(crate::page_idle::note_unavailable)
+                    .is_ok();
+                let pfn_capture_ms = started.elapsed().as_millis() as u64;
+                let offsets = if idle_marked && captured {
+                    match crate::page_idle::scan(&pages, chunk_size) {
+                        Ok(offsets) => offsets,
+                        Err(error) => {
+                            crate::page_idle::note_unavailable(&error);
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                let hot = crate::page_idle::hot_hashes(&chain_manifest, &offsets, &fallback);
+                tracing::info!(sandbox_id = %id, idle_scan_ms = started.elapsed().as_millis() as u64,
+                    pfn_capture_ms, hot_chunks = hot.len(), "post-copy idle scan complete after export registration");
+                if let Err(error) = publish_hot_hint(&export_dir, &hot) {
+                    tracing::info!(%error, "post-copy hot hint unavailable; drain continues");
+                }
             });
 
             tracing::info!(
@@ -8314,6 +8551,7 @@ impl SandboxBackend for PooledBackend {
             .into_iter()
             .map(|(_, backend)| backend.postcopy_drain_subscribe())
             .collect();
+        let hint_pollers = self.hint_pollers.clone();
         let outcome = tokio::task::spawn_blocking(move || -> Result<DrainOutcome, String> {
             let mut stream = std::os::unix::net::UnixStream::connect(&sock)
                 .map_err(|e| format!("dial control sock: {e}"))?;
@@ -8335,6 +8573,7 @@ impl SandboxBackend for PooledBackend {
                         fault_max_us,
                         fault_around_chunks_installed,
                     } => {
+                        hint_pollers.remove(&id);
                         // Restore-tail attribution: the fault-path
                         // totals are the serial P2P cost inside the FC
                         // load + early guest execution (cross-ref with
@@ -8354,6 +8593,7 @@ impl SandboxBackend for PooledBackend {
                         });
                     }
                     engram_migrate_proto::HandlerControl::PeerLost { remaining, detail } => {
+                        hint_pollers.remove(&id);
                         return Ok(DrainOutcome::PeerLost { remaining, detail });
                     }
                     engram_migrate_proto::HandlerControl::Sealed { .. }
@@ -8424,9 +8664,15 @@ impl SandboxBackend for PooledBackend {
             let Some(export) = self.migrations.find_by_export_id(export_id) else {
                 return Err(SandboxError::NotFound);
             };
-            // Artifact serves refresh the TTL. Once state.bin is served,
-            // the destination may run: the TTL sweep must not resume us.
-            export.touch();
+            // Advisory hints never extend the export lease, even when absent.
+            // Required artifacts and disk chunks still count as activity.
+            if items
+                .iter()
+                .any(|item| !matches!(item, MigrationItem::HotHint))
+            {
+                export.touch();
+            }
+            // Once state.bin is served, the TTL sweep must not resume us.
             if items.iter().any(|i| matches!(i, MigrationItem::StateBin)) {
                 export
                     .state_served
@@ -8444,6 +8690,16 @@ impl SandboxBackend for PooledBackend {
                         .await
                         .map(bytes::Bytes::from)
                         .map_err(|e| SandboxError::Snapshot(format!("read state.bin: {e}"))),
+                    MigrationItem::HotHint => fs::read(snapshot_dir.join("hot-hint.json"))
+                        .await
+                        .map(bytes::Bytes::from)
+                        .map_err(|e| {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                SandboxError::NotFound
+                            } else {
+                                SandboxError::Snapshot(format!("read hot hint: {e}"))
+                            }
+                        }),
                     MigrationItem::DiskSealInfo(role) => {
                         fs::read(snapshot_dir.join(role.seal_file_name()))
                             .await
@@ -8800,6 +9056,7 @@ impl SandboxBackend for PooledBackend {
     async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
         // A held source forgets its swap policy and metadata with the VM.
         self.held_snapshots.remove(&id);
+        self.hint_pollers.remove(&id);
         self.teardowns
             .run_or_join(id, || {
                 let session_bindings = self.session_bindings.clone();
@@ -12576,6 +12833,242 @@ mod tests {
         assert!(frames.iter().any(|f| f.item_idx == 1 && f.last));
     }
 
+    /// The first descriptor permits resume; a later update carries the final
+    /// order. The handler loader must wait and preserve that order exactly.
+    #[test]
+    fn malformed_hint_is_separate_from_required_seal_fields() {
+        for hot in [
+            serde_json::json!("invalid"),
+            serde_json::json!([[1, 2]]),
+            serde_json::Value::Null,
+        ] {
+            let bytes = serde_json::to_vec(
+                &serde_json::json!({"sealed_chunk_indices": [], "hot_chunks": hot}),
+            )
+            .unwrap();
+            assert_eq!(parse_hot_hint(&bytes), Some(Vec::new()));
+        }
+        assert_eq!(parse_hot_hint(br#"{"hot_chunks":[]}"#), Some(vec![]));
+        assert!(parse_hot_hint(br#"{}"#).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hot_hint_polling_has_bounded_requests_and_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let requests = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        poll_hot_hint(Duration::from_secs(240), || async {
+            requests.fetch_add(1, Ordering::SeqCst);
+            false // Publication failed: every request returns NotFound.
+        })
+        .await;
+        assert!(requests.load(Ordering::SeqCst) <= 125);
+        assert!(requests.load(Ordering::SeqCst) > 5);
+        assert_eq!(started.elapsed(), Duration::from_secs(240));
+
+        // An unresponsive fetch cannot extend the remaining budget either.
+        let started = tokio::time::Instant::now();
+        poll_hot_hint(Duration::from_millis(37), std::future::pending).await;
+        assert_eq!(started.elapsed(), Duration::from_millis(37));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hot_hint_polls_stop_on_local_drain_without_drain_wait() {
+        use engram_migrate_proto::HandlerControl;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        // Socket I/O must not let Tokio auto-advance the paused clock. Only
+        // the explicit advances below may expire a polling backoff.
+        let _keep_clock_paused = AbortTaskOnDrop(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }));
+        for terminal in [
+            HandlerControl::DrainDone {
+                pulled: 1,
+                alt_sourced: 0,
+                zero_chunks: 0,
+                ms: 1,
+                faults: 0,
+                fault_us: 0,
+                fault_max_us: 0,
+                fault_around_chunks_installed: 0,
+            },
+            HandlerControl::PeerLost {
+                remaining: 1,
+                detail: "peer closed".into(),
+            },
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let sock = tmp.path().join("control.sock");
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+            let mut source = AbortTaskOnDrop(tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                ready_tx.send(()).unwrap();
+                report_rx.await.unwrap();
+                let mut bytes = Vec::new();
+                engram_migrate_proto::write_frame(&mut bytes, &terminal).unwrap();
+                stream.write_all(&bytes).await.unwrap();
+            }));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let count = requests.clone();
+            let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+            let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+            let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+            let poller = AbortTaskOnDrop(tokio::spawn(async move {
+                start_rx.await.unwrap();
+                poll_hot_hint(Duration::from_secs(240), || async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    request_tx.send(()).unwrap();
+                    false
+                })
+                .await;
+                // Cancellation drops this sender instead of completing normally.
+                finished_tx.send(()).unwrap();
+            }));
+            let mut observer = monitor_hint_poller(poller, Some(sock));
+            ready_rx.await.unwrap();
+            start_tx.send(()).unwrap();
+            request_rx.recv().await.unwrap();
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            let intervals = [100, 200, 400];
+            for (index, millis) in intervals.into_iter().enumerate() {
+                tokio::time::advance(Duration::from_millis(millis)).await;
+                request_rx.recv().await.unwrap();
+                assert_eq!(requests.load(Ordering::SeqCst), index + 2);
+            }
+            // No coordinator calls migration_drain_wait. The local report
+            // must cancel polling while the hint remains unavailable.
+            report_tx.send(()).unwrap();
+            (&mut source.0).await.unwrap();
+            (&mut observer.0).await.unwrap();
+            assert!(finished_rx.await.is_err(), "poller must be cancelled");
+            let expected = 1 + intervals.len();
+            assert_eq!(requests.load(Ordering::SeqCst), expected);
+            tokio::time::advance(Duration::from_millis(800)).await;
+            assert_eq!(requests.load(Ordering::SeqCst), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_hot_hint_leaves_initial_artifacts_unchanged() {
+        use engram_core::types::snapshot::MigrationItem;
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = Arc::new(engram_sandbox_process::ProcessBackend::new(tmp.path()));
+        let pooled = PooledBackend::new(inner);
+        let export_dir = tmp.path().join("export");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&export_dir).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let descriptor = serde_json::json!({"sealed_chunk_indices": [0], "manifest": null, "disk_ref_bincode": null});
+        std::fs::write(
+            export_dir.join("disk-seal.json"),
+            serde_json::to_vec(&descriptor).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(export_dir.join("state.bin"), b"state").unwrap();
+        let id = SandboxId::new();
+        let guard = pooled.capture_lock(id).lock_owned().await;
+        assert!(pooled.migrations.insert(crate::migration::MigrationExport {
+            export_id: "hot-export".into(),
+            sandbox_id: id,
+            snapshot_dir: export_dir.clone(),
+            disk_seal: Default::default(),
+            clock: pooled.clock.clone(),
+            state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_activity: Arc::new(std::sync::Mutex::new(pooled.clock.now_mono())),
+            capture_guard: guard,
+        }));
+        let trace_path = dest.join(engram_sandbox_firecracker::MIGRATION_HOT_TRACE_FILE);
+        let mut loader = Box::pin(engram_uffd_handler::working_set::load_migration_trace(
+            &trace_path,
+        ));
+        assert!(futures::poll!(&mut loader).is_pending());
+        let descriptor_bytes = std::fs::read(export_dir.join("disk-seal.json")).unwrap();
+        // Even a large, already published hint cannot enlarge the initial fetch.
+        let hot = vec![[255; 32]; 4096];
+        publish_hot_hint(&export_dir, &hot).unwrap();
+        assert_eq!(
+            std::fs::read(export_dir.join("disk-seal.json")).unwrap(),
+            descriptor_bytes
+        );
+        assert_eq!(
+            std::fs::metadata(export_dir.join("disk-seal.json"))
+                .unwrap()
+                .len(),
+            descriptor_bytes.len() as u64
+        );
+        let frames: Vec<_> = pooled
+            .migration_fetch(
+                "hot-export",
+                vec![
+                    MigrationItem::DiskSealInfo(DiskRole::Root),
+                    MigrationItem::StateBin,
+                ],
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].as_ref().unwrap().data.as_ref(), descriptor_bytes);
+        assert_eq!(frames[1].as_ref().unwrap().data.as_ref(), b"state");
+        // Both missing and published hints must leave the lease untouched.
+        let last_activity = pooled
+            .migrations
+            .find_by_export_id("hot-export")
+            .unwrap()
+            .last_activity
+            .clone();
+        let anchor = *last_activity.lock().unwrap();
+        std::fs::remove_file(export_dir.join("hot-hint.json")).unwrap();
+        for _ in 0..3 {
+            let frames: Vec<_> = pooled
+                .migration_fetch("hot-export", vec![MigrationItem::HotHint])
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            assert!(matches!(&frames[0], Err(SandboxError::NotFound)));
+            assert_eq!(*last_activity.lock().unwrap(), anchor);
+        }
+        publish_hot_hint(&export_dir, &[[2; 32], [1; 32]]).unwrap();
+        let frames: Vec<_> = pooled
+            .migration_fetch("hot-export", vec![MigrationItem::HotHint])
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let bytes: Vec<_> = frames
+            .into_iter()
+            .flat_map(|f| f.unwrap().data.to_vec())
+            .collect();
+        assert_eq!(*last_activity.lock().unwrap(), anchor);
+        let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let hot: Vec<[u8; 32]> = serde_json::from_value(info["hot_chunks"].clone()).unwrap();
+        stage_hot_trace(&trace_path, &hot).unwrap();
+        let trace = loader.await.unwrap();
+        assert_eq!(
+            trace
+                .chunks
+                .iter()
+                .map(|h| *h.as_bytes())
+                .collect::<Vec<_>>(),
+            vec![[2; 32], [1; 32]]
+        );
+        assert_eq!(
+            std::fs::read(export_dir.join("disk-seal.json")).unwrap(),
+            descriptor_bytes
+        );
+    }
+
     #[tokio::test]
     async fn migration_presetup_without_chain_signals_fallback() {
         let tmp = tempfile::tempdir().unwrap();
@@ -12623,6 +13116,8 @@ mod tests {
                 chain_ref: engram_core::types::manifest::ManifestRef::new(),
                 swap_manifest_ref: None,
                 sidecar_json: Vec::new(),
+                idle_marked: false,
+                hot_chunks: Vec::new(),
             },
         );
 
@@ -12826,10 +13321,40 @@ mod tests {
     /// Inner backend double that records `resume` calls so the test can
     /// assert the unwind guard un-pauses the guest.
     struct ResumeSpy {
+        capture_root: Option<PathBuf>,
         resumes: std::sync::Arc<parking_lot::Mutex<Vec<SandboxId>>>,
     }
     #[async_trait]
     impl SandboxBackend for ResumeSpy {
+        fn post_copy_source_view(
+            &self,
+            _: SandboxId,
+        ) -> Option<engram_core::traits::sandbox::PostCopySourceView> {
+            Some(engram_core::traits::sandbox::PostCopySourceView {
+                fc_pid: std::process::id(),
+                memory_backing: self.capture_root.as_ref()?.join("ram"),
+            })
+        }
+        fn working_set_trace_path(&self, _: SandboxId) -> Option<PathBuf> {
+            Some(self.capture_root.as_ref()?.join("trace.json"))
+        }
+        async fn pause(&self, _: SandboxId) -> Result<(), SandboxError> {
+            Ok(())
+        }
+        async fn snapshot_vmstate_only_package(
+            &self,
+            _: SandboxId,
+            _: &[u8],
+        ) -> Result<(engram_core::SnapshotId, PathBuf), SandboxError> {
+            let root = self
+                .capture_root
+                .as_ref()
+                .expect("capture fixture")
+                .join("export");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("state.bin"), b"state").unwrap();
+            Ok((engram_core::SnapshotId::new(), root))
+        }
         fn compose_live_sidecar(
             &self,
             _: SandboxId,
@@ -12865,6 +13390,246 @@ mod tests {
         async fn resume(&self, id: SandboxId) -> Result<(), SandboxError> {
             self.resumes.lock().push(id);
             Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fake_capture_and_destination_poller_deliver_final_hot_trace() {
+        use engram_chunk_store::manifest::{ChunkHash, ChunkRef, ChunkSize, ManifestKind};
+        use std::os::fd::AsRawFd;
+        let tmp = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(tmp.path().join("ram")).unwrap();
+        file.set_len(4096).unwrap();
+        drop(file);
+        let file = std::fs::File::open(tmp.path().join("ram")).unwrap();
+        // SAFETY: private file mapping owned by the guard below.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        struct Mapping(*mut libc::c_void);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: this guard owns the complete live mapping.
+                unsafe {
+                    libc::munmap(self.0, 4096);
+                }
+            }
+        }
+        let _mapping = Mapping(ptr);
+        let inner = Arc::new(ResumeSpy {
+            capture_root: Some(tmp.path().to_path_buf()),
+            resumes: Default::default(),
+        });
+        let source = Arc::new(PooledBackend::new(inner));
+        source.set_migrate_peer_server(crate::migrate_peer::PeerServer::new(0));
+        let mut trace = engram_chunk_store::working_set::WorkingSetTrace::new(
+            0,
+            0,
+            chrono::DateTime::UNIX_EPOCH,
+        );
+        trace.chunks = vec![ChunkHash::from_bytes([7; 32])];
+        std::fs::write(
+            tmp.path().join("trace.json"),
+            serde_json::to_vec(&trace).unwrap(),
+        )
+        .unwrap();
+        let manifest = engram_chunk_store::Manifest {
+            schema_version: 1,
+            kind: ManifestKind::Memory,
+            chunk_size: ChunkSize::bytes(4096),
+            total_bytes: 4096,
+            chunks: vec![ChunkRef {
+                offset: 0,
+                hash: trace.chunks[0],
+            }],
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        let id = SandboxId::new();
+        let chain_ref = engram_core::types::manifest::ManifestRef::new();
+        let pre = source
+            .prepare_migration_export(id, chain_ref, &manifest, 0, vec![])
+            .await
+            .unwrap();
+        source.checkpoint_chains.insert(
+            id,
+            crate::checkpoint::CheckpointChain {
+                manifest_ref: chain_ref,
+                manifest,
+            },
+        );
+        let capture = source
+            .migration_capture_postcopy(id, &pre.export_id)
+            .await
+            .unwrap();
+        assert_eq!(capture.total_chunks, 1);
+        // Wait for the independent publisher before the first initial fetch.
+        let seal_path = tmp.path().join("export/disk-seal.json");
+        let descriptor_bytes = std::fs::read(&seal_path).unwrap();
+        let hint_path = tmp.path().join("export/hot-hint.json");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !hint_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for case in [
+            "published",
+            "fetch-failed",
+            "fetch-stage-failed",
+            "unavailable",
+            "empty",
+            "delayed",
+            "malformed",
+            "write-failed",
+            "rename-failed",
+        ] {
+            let _ = std::fs::remove_file(&hint_path);
+            let _ = std::fs::remove_dir(&hint_path);
+            match case {
+                "published" | "fetch-stage-failed" => {
+                    publish_hot_hint(&tmp.path().join("export"), &vec![[7; 32]; 4096]).unwrap()
+                }
+                "fetch-failed" => std::fs::create_dir(&hint_path).unwrap(),
+                "empty" => publish_hot_hint(&tmp.path().join("export"), &[]).unwrap(),
+                "malformed" => std::fs::write(&hint_path, br#"{"hot_chunks":"invalid"}"#).unwrap(),
+                "write-failed" | "rename-failed" => {
+                    publish_hot_hint(&tmp.path().join("export"), &[[7; 32]]).unwrap()
+                }
+                _ => {}
+            }
+            assert_eq!(std::fs::read(&seal_path).unwrap(), descriptor_bytes);
+            assert_eq!(
+                std::fs::metadata(&seal_path).unwrap().len(),
+                descriptor_bytes.len() as u64
+            );
+            let listen = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listen.local_addr().unwrap();
+            drop(listen);
+            let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(
+                crate::host_client::LocalHostClient::with_noop_hub(source.clone()),
+            );
+            let server = tokio::spawn(crate::grpc_server::boot(
+                addr,
+                client,
+                None,
+                crate::session_epochs::ephemeral(),
+                None,
+            ));
+            let dest = tmp.path().join(case);
+            std::fs::create_dir_all(&dest).unwrap();
+            let destination = PooledBackend::new(Arc::new(
+                engram_sandbox_process::ProcessBackend::new(tmp.path().join("dest-inner")),
+            ));
+            let path = dest.join(engram_sandbox_firecracker::MIGRATION_HOT_TRACE_FILE);
+            if case == "write-failed" {
+                std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+            }
+            if case == "rename-failed" {
+                std::fs::create_dir(&path).unwrap();
+            }
+            if case == "fetch-stage-failed" {
+                std::fs::create_dir_all(dest.join("postcopy-tmp/hot-hint.json")).unwrap();
+            }
+            let poller = destination.spawn_postcopy_fetch_poller(
+                PostCopyDestPending {
+                    hot_trace_file: engram_sandbox_firecracker::MIGRATION_HOT_TRACE_FILE.into(),
+                    source_addr: format!("http://{addr}"),
+                    export_id: pre.export_id.clone(),
+                },
+                dest.clone(),
+                vec![],
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !dest.join("state.bin").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(dest.join("state.bin")).unwrap(), b"state");
+            if matches!(case, "fetch-failed" | "fetch-stage-failed" | "unavailable") {
+                let client = PooledBackend::dial_migration_source(&format!("http://{addr}"))
+                    .await
+                    .unwrap();
+                let error = PooledBackend::fetch_postcopy_artifacts(
+                    &client,
+                    &pre.export_id,
+                    &dest.join("postcopy-tmp"),
+                    &[engram_core::types::snapshot::MigrationItem::HotHint],
+                )
+                .await
+                .unwrap_err();
+                if case == "unavailable" {
+                    assert!(matches!(error, SandboxError::NotFound));
+                }
+                assert_eq!(std::fs::read(dest.join("state.bin")).unwrap(), b"state");
+            }
+            if case == "delayed" {
+                assert!(!path.exists());
+                publish_hot_hint(&tmp.path().join("export"), &[[7; 32]]).unwrap();
+                let loaded = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    engram_uffd_handler::working_set::load_migration_trace(&path),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(loaded.chunks, trace.chunks);
+            }
+            if case == "published" {
+                let loaded = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    engram_uffd_handler::working_set::load_migration_trace(&path),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(loaded.chunks.len(), 4096);
+            }
+            assert_eq!(
+                std::fs::read(dest.join("postcopy-tmp/disk-seal.json")).unwrap(),
+                descriptor_bytes
+            );
+            // A local terminal report stops the real fetch loop without a
+            // migration_drain_wait RPC, even when publication failed.
+            let sock = dest.join("control.sock");
+            let control = engram_uffd_handler::peer::ControlTx::bind(&sock).unwrap();
+            control.report(engram_migrate_proto::HandlerControl::DrainDone {
+                pulled: 1,
+                alt_sourced: 0,
+                zero_chunks: 0,
+                ms: 1,
+                faults: 0,
+                fault_us: 0,
+                fault_max_us: 0,
+                fault_around_chunks_installed: 0,
+            });
+            let abort = poller.abort_handle();
+            let mut observer = monitor_hint_poller(AbortTaskOnDrop(poller), Some(sock));
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut observer.0)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !abort.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            server.abort();
         }
     }
 
@@ -12922,6 +13687,7 @@ mod tests {
         let (root, store, _root_dir) = unwind_test_disk_backend().await;
         let (swap, _, _swap_dir) = unwind_test_disk_backend().await;
         let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
             resumes: Default::default(),
         }));
         let root_ref = root.manifest_ref().await;
@@ -12953,6 +13719,7 @@ mod tests {
         swap.write(0, &[0x73; 4096]).await.unwrap();
         let resumes = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let pooled = PooledBackend::new(Arc::new(ResumeSpy {
+            capture_root: None,
             resumes: resumes.clone(),
         }));
         let id = SandboxId::new();
@@ -12997,6 +13764,7 @@ mod tests {
         let (backend, store, _dir) = unwind_test_disk_backend().await;
         let resumes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let inner: Arc<dyn SandboxBackend> = Arc::new(ResumeSpy {
+            capture_root: None,
             resumes: resumes.clone(),
         });
         let id = SandboxId::new();
@@ -13060,6 +13828,7 @@ mod tests {
         let (backend, _store, _dir) = unwind_test_disk_backend().await;
         let resumes = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let inner: Arc<dyn SandboxBackend> = Arc::new(ResumeSpy {
+            capture_root: None,
             resumes: resumes.clone(),
         });
         let id = SandboxId::new();

@@ -1208,6 +1208,12 @@ jobs:
       # pushes past its window (it timed out under parallelism in CI). The
       # contention can't be slot-partitioned away, so this batch stays
       # serial; the dedup below is the win that doesn't risk a flake.
+      - name: Idle-page tracking and advisory drain tests (root)
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-host-agent -p engram-uffd-handler --lib \
+            -E 'test(page_idle::tests::anonymous_mapping_accesses_clear_idle_bits) | test(fake_capture_and_destination_poller_deliver_final_hot_trace) | test(peer_mode_drains_sealed_chunks_and_sweep_never_overwrites_them)'
+
       - name: NBD chunked-disk + netlink tests (Linux + KVM + nbd, root)
         if: steps.nbd_setup.outputs.available == 'true'
         env:

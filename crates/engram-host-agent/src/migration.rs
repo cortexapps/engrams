@@ -80,7 +80,7 @@ pub struct MigrationExport {
     /// session (`ttl_verdict` returns StayPaused, converging via the
     /// scanner within one cycle).
     pub state_served: Arc<AtomicBool>,
-    /// Last page/artifact-serving activity (the export TTL clock), as a
+    /// Last required page/artifact-serving activity (the export TTL clock), as a
     /// `now_mono` reading.
     pub last_activity: Arc<std::sync::Mutex<Duration>>,
     /// The sandbox's capture lock, held for the export's lifetime —
@@ -90,7 +90,7 @@ pub struct MigrationExport {
 }
 
 impl MigrationExport {
-    /// Refresh the activity clock (every artifact/page serve) off the
+    /// Refresh the activity clock (required artifact/page serves only) off the
     /// injected monotonic clock.
     pub fn touch(&self) {
         *self.last_activity.lock().expect("last_activity poisoned") = self.clock.now_mono();

@@ -21,6 +21,27 @@ use futures::StreamExt;
 
 mod common;
 
+fn idle_hint_probe() -> bool {
+    use std::os::unix::fs::FileExt;
+    let probe = || -> std::io::Result<()> {
+        engram_host_agent::page_idle::open_bitmap()?;
+        let page = Box::new([1u8; 4096]);
+        std::hint::black_box(&page);
+        let mut bytes = [0; 8];
+        std::fs::File::open("/proc/self/pagemap")?
+            .read_exact_at(&mut bytes, (page.as_ptr() as u64 / 4096) * 8)?;
+        let pfn = engram_host_agent::page_idle::present_pfn(u64::from_ne_bytes(bytes))
+            .ok_or_else(|| std::io::Error::other("PFN hidden or shared"))?;
+        std::fs::File::open("/proc/kpageflags")?.read_exact_at(&mut bytes, pfn * 8)?;
+        let bitmap = engram_host_agent::page_idle::open_bitmap()?;
+        let (word, bit) = engram_host_agent::page_idle::pfn_word_bit(pfn);
+        bitmap.write_all_at(&bit.to_ne_bytes(), word)?;
+        bitmap.read_exact_at(&mut bytes, word)?;
+        Ok(())
+    };
+    probe().is_ok()
+}
+
 struct HostStack {
     pooled: Arc<PooledBackend>,
     addr: std::net::SocketAddr,
@@ -284,8 +305,33 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     assert_eq!(alive.trim(), "alive", "harness alive on A");
 
     // ---- The move, over the wire (the G1 downtime legs) ----
-    let (moved, cap) =
-        common::postcopy::move_guest(&client_a, &client_b, vm, ckpt.clone(), host_a.addr).await;
+    let cap = client_a
+        .migration_presetup(vm, engram_core::traits::SessionFence::unfenced())
+        .await
+        .expect("presetup");
+    // Allocate and write private shell memory after the idle mark.
+    let touched = exec(
+        &host_a.pooled,
+        vm,
+        "buf=$(head -c 65536 /dev/zero | tr '\\000' x); echo ${#buf}",
+    )
+    .await;
+    assert_eq!(touched.trim(), "65536");
+    let row = common::postcopy::metadata(ckpt.clone(), &cap, host_a.addr);
+    let dest = client_b.clone();
+    let restore = tokio::spawn(async move {
+        dest.restore(row, engram_core::traits::SessionFence::unfenced())
+            .await
+    });
+    client_a
+        .migration_capture_postcopy(
+            vm,
+            &cap.export_id,
+            engram_core::traits::SessionFence::unfenced(),
+        )
+        .await
+        .expect("capture");
+    let moved = restore.await.unwrap().expect("restore");
     common::postcopy::drain(&host_b.pooled, moved).await;
     let stats_path = host_b
         .pooled
@@ -306,6 +352,43 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .await,
         "handler must report the demand-window install counter"
     );
+    if idle_hint_probe() {
+        let path = host_b
+            .pooled
+            .prefault_stats_path(moved)
+            .expect("handler stats path");
+        assert!(
+            common::poll_until_async(
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_millis(10),
+                || {
+                    let path = path.clone();
+                    async move {
+                        tokio::fs::read(path)
+                            .await
+                            .ok()
+                            .and_then(|bytes| {
+                                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                            })
+                            .is_some_and(|stats| stats["hot_hint_received"].as_bool().is_some())
+                    }
+                }
+            )
+            .await,
+            "drain stats must be published"
+        );
+        let stats: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
+        assert_eq!(
+            stats["hot_hint_received"].as_bool(),
+            Some(true),
+            "the hint must arrive when the idle-page probes pass"
+        );
+    } else {
+        eprintln!(
+            "SKIP hot_hint_received assertion: page_idle, pagemap PFNs, or kpageflags unavailable"
+        );
+    }
 
     // Commit destroys A's frozen source; the moved VM lives on B.
     client_a

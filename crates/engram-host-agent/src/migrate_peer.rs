@@ -701,10 +701,11 @@ impl PeerServer {
 /// as the proto's sync `read_frame` (4-byte big-endian length + bincode
 /// body, bounded by `MAX_FRAME_BYTES`). The page channel's codec is sync
 /// by design (the dest client must stay tokio-free), but the SOURCE
-/// reads only the opening `Hello` async so an unknown-export park can
+/// reads the opening `Hello` async so an unknown-export park can
 /// run on a tokio task instead of pinning a blocking-pool thread (issue
-/// #226 (b)); everything after the export resolves uses the sync codec.
-async fn read_frame_async<R, T>(r: &mut R) -> std::io::Result<T>
+/// #226 (b)); the destination also uses this for cancellable control reports.
+/// Page serving after the export resolves uses the sync codec.
+pub(crate) async fn read_frame_async<R, T>(r: &mut R) -> std::io::Result<T>
 where
     R: tokio::io::AsyncRead + Unpin,
     T: serde::de::DeserializeOwned,

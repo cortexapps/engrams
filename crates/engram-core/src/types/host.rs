@@ -271,6 +271,9 @@ pub struct HostCapabilities {
     /// dev fallback — this only makes a prod misconfiguration visible.
     #[serde(default)]
     pub nbd: CapStatus,
+    /// Idle-page bitmap access. Informational; never a placement requirement.
+    #[serde(default)]
+    pub page_idle: CapStatus,
     /// `bundles::read_stamp(bundle_dir)` returned a non-empty stamp —
     /// the host has *some* current RO-bundle generation staged.
     #[serde(default)]
@@ -316,6 +319,9 @@ impl HostCapabilities {
         }
         if is_failing(&self.nbd) {
             out.push("nbd");
+        }
+        if matches!(self.page_idle, CapStatus::Failed(_)) {
+            out.push("page_idle");
         }
         if is_failing(&self.bundle_stamp) {
             out.push("bundle_stamp");
@@ -772,11 +778,20 @@ mod tests {
             base_shm_tmpfs: CapStatus::NotApplicable,
             uffd_minor_shmem: CapStatus::NotApplicable,
             nbd: CapStatus::NotApplicable,
+            page_idle: CapStatus::NotApplicable,
             bundle_stamp: CapStatus::Failed("no stamp".to_string()),
             fc_snapshot_version: None,
             wire_version: 7,
         };
         assert_eq!(vz_like.failing_capabilities(), vec!["bundle_stamp"]);
+    }
+
+    #[test]
+    fn page_idle_failure_is_visible_but_old_payloads_still_decode() {
+        let mut caps: HostCapabilities = serde_json::from_str("{}").unwrap();
+        assert_eq!(caps.page_idle, CapStatus::Unknown);
+        caps.page_idle = CapStatus::Failed("not configured".into());
+        assert_eq!(caps.failing_capabilities(), vec!["page_idle"]);
     }
 
     #[test]
@@ -788,6 +803,7 @@ mod tests {
             base_shm_tmpfs: CapStatus::Failed("x".into()),
             uffd_minor_shmem: CapStatus::Ok(None),
             nbd: CapStatus::Unknown,
+            page_idle: CapStatus::Unknown,
             bundle_stamp: CapStatus::Ok(None),
             fc_snapshot_version: None,
             wire_version: 7,

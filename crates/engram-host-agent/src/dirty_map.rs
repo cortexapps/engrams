@@ -31,8 +31,7 @@
 //!   server hashes the live bytes on request and demotes matches to the
 //!   class-2 fetch.
 //!
-//! Everything here is blackout-critical (the scan sits between the pause
-//! and the SEAL push) — reads are batched (4096 entries = 32 KiB per
+//! The dirty scan is blackout-critical (between pause and the SEAL push) — reads are batched (4096 entries = 32 KiB per
 //! `pread`) and the caller records `scan_ms` (R6: measure, never quote).
 
 use std::io::{self, BufRead, BufReader};
@@ -149,45 +148,60 @@ pub fn scan_dirty_chunks(
     chunk_size: u64,
     total_bytes: u64,
 ) -> io::Result<SealBitmap> {
-    use std::os::unix::fs::FileExt;
+    let mut seal = SealBitmap::new(chunk_size, total_bytes.div_ceil(chunk_size));
+    walk_pagemap_batches(pid, vmas, |base, bytes| {
+        let mut i = 0;
+        while i < bytes.len() / 8 {
+            let entry = u64::from_ne_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+            let offset = base + i as u64 * PAGE_SIZE;
+            if offset < total_bytes && pagemap_entry_is_dirty(entry) {
+                let chunk = offset / chunk_size;
+                seal.set(chunk);
+                i += (((chunk + 1) * chunk_size - offset).div_ceil(PAGE_SIZE) as usize).max(1);
+            } else {
+                i += 1;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(seal)
+}
 
-    let chunk_count = total_bytes.div_ceil(chunk_size);
-    let mut seal = SealBitmap::new(chunk_size, chunk_count);
+/// Visit each page once, in snapshot-offset order, with batched pagemap reads.
+#[cfg(target_os = "linux")]
+pub(crate) fn walk_pagemap(
+    pid: u32,
+    vmas: &[GuestVma],
+    mut visit: impl FnMut(u64, u64) -> io::Result<()>,
+) -> io::Result<()> {
+    walk_pagemap_batches(pid, vmas, |base, bytes| {
+        let (entries, _) = bytes.as_chunks::<8>();
+        for (i, entry) in entries.iter().enumerate() {
+            visit(base + i as u64 * PAGE_SIZE, u64::from_ne_bytes(*entry))?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn walk_pagemap_batches(
+    pid: u32,
+    vmas: &[GuestVma],
+    mut visit: impl FnMut(u64, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
     let pagemap = std::fs::File::open(format!("/proc/{pid}/pagemap"))?;
     let mut buf = vec![0u8; PAGEMAP_BATCH_ENTRIES * 8];
-
     for vma in vmas {
         let mut va = vma.start;
         while va < vma.end {
-            let pages_left = ((vma.end - va) / PAGE_SIZE) as usize;
-            let n = pages_left.min(PAGEMAP_BATCH_ENTRIES);
-            let byte_len = n * 8;
-            pagemap.read_exact_at(&mut buf[..byte_len], (va / PAGE_SIZE) * 8)?;
-
-            let mut i = 0usize;
-            while i < n {
-                let entry = u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
-                if pagemap_entry_is_dirty(entry) {
-                    let offset = vma.file_offset + (va - vma.start) + (i as u64) * PAGE_SIZE;
-                    if offset < total_bytes {
-                        let chunk = offset / chunk_size;
-                        seal.set(chunk);
-                        // Any-page rule satisfied: skip the rest of this
-                        // chunk (within the batch; the next batch
-                        // re-checks cheaply via the bitmap).
-                        let chunk_end_off = (chunk + 1) * chunk_size;
-                        let pages_to_skip =
-                            (chunk_end_off.saturating_sub(offset)).div_ceil(PAGE_SIZE) as usize;
-                        i += pages_to_skip.max(1);
-                        continue;
-                    }
-                }
-                i += 1;
-            }
-            va += (n as u64) * PAGE_SIZE;
+            let n = (((vma.end - va) / PAGE_SIZE) as usize).min(PAGEMAP_BATCH_ENTRIES);
+            pagemap.read_exact_at(&mut buf[..n * 8], (va / PAGE_SIZE) * 8)?;
+            visit(vma.file_offset + va - vma.start, &buf[..n * 8])?;
+            va += n as u64 * PAGE_SIZE;
         }
     }
-    Ok(seal)
+    Ok(())
 }
 
 #[cfg(test)]

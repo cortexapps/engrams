@@ -104,6 +104,11 @@ The dead-host detector's own host-level `Ping` probe (added in `7fcc4c3c`) is un
 beyond a paired `engram_dead_host_probe_rescues_total` counter so both rescue paths are
 graphable together.
 
+The informational `page_idle` probe reports read/write access to the kernel idle
+bitmap on every Firecracker host, including File-mode hosts. Failure appears in
+the fleet capability list but never gates placement. Post-copy uses this feature
+for recency hints and falls back to the handler trace when it is unavailable.
+
 ## What was deferred / deviations from the issue's literal plan
 
 - The issue sketched three PRs (host probes / coordinator gate+surface / probe-before-

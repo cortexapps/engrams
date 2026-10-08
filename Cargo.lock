@@ -3027,6 +3027,7 @@ dependencies = [
 name = "engram-uffd-handler"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "engram-blob-client",

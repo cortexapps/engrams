@@ -1,3 +1,6 @@
+//! Invariant: a hot-set hint must never fail, delay, or block a move, resume,
+//! drain, or blackout. Hint errors mean no hint.
+//!
 //! UFFD event loop. Linux-only — `userfaultfd(2)` is a Linux kernel
 //! syscall and the upstream `userfaultfd` crate fails to compile on
 //! other targets.
@@ -130,6 +133,12 @@ pub struct PrefaultStats {
     /// Chunks installed by demand windows, including the faulting chunk.
     #[serde(default)]
     pub fault_around_chunks_installed: u64,
+    /// Sealed chunks placed first by the final migration trace.
+    #[serde(default)]
+    pub hot_leading: u64,
+    /// Set after drain completion: a nonempty hint arrived while requests remained.
+    #[serde(default)]
+    pub hot_hint_received: Option<bool>,
 }
 
 /// Filename for [`PrefaultStats`], colocated with
@@ -179,13 +188,22 @@ pub fn write_prefault_stats(path: &std::path::Path, stats: &PrefaultStats) {
 /// would mask it.
 fn patch_peer_fields(
     existing_bytes: Option<&[u8]>,
-    (peer_pulled, peer_alt_sourced, peer_zero_chunks, peer_live_faults): (u64, u64, u64, u64),
+    (
+        peer_pulled,
+        peer_alt_sourced,
+        peer_zero_chunks,
+        peer_live_faults,
+        hot_leading,
+        hot_hint_received,
+    ): (u64, u64, u64, u64, u64, bool),
 ) -> Option<PrefaultStats> {
     let mut stats: PrefaultStats = serde_json::from_slice(existing_bytes?).ok()?;
     stats.peer_pulled = peer_pulled;
     stats.peer_alt_sourced = peer_alt_sourced;
     stats.peer_zero_chunks = peer_zero_chunks;
     stats.peer_live_faults = peer_live_faults;
+    stats.hot_leading = hot_leading;
+    stats.hot_hint_received = Some(hot_hint_received);
     Some(stats)
 }
 
@@ -1851,6 +1869,15 @@ impl Runtime {
         peer: &crate::peer::PeerSession,
         hot: Option<&engram_chunk_store::working_set::WorkingSetTrace>,
     ) -> Result<crate::peer::DrainStats, HandlerError> {
+        self.drain_with_hint(peer, &mut hot.cloned(), &mut || None)
+    }
+
+    fn drain_with_hint(
+        &self,
+        peer: &crate::peer::PeerSession,
+        hot: &mut Option<WorkingSetTrace>,
+        hint: &mut impl FnMut() -> Option<WorkingSetTrace>,
+    ) -> Result<crate::peer::DrainStats, HandlerError> {
         use crate::peer::{DrainStats, PeerPage};
 
         const PIPELINE_DEPTH: usize = 8;
@@ -1876,7 +1903,7 @@ impl Runtime {
         // cold remainder keeps offset order.
         let mut todo: Vec<u64> = Vec::with_capacity(seal.count_ones() as usize);
         let mut queued = std::collections::HashSet::new();
-        if let Some(trace) = hot {
+        if let Some(trace) = hot.as_ref() {
             for hash in &trace.chunks {
                 for offset in self.backend.session_positions_of(*hash) {
                     let idx = offset / chunk_size;
@@ -1887,6 +1914,8 @@ impl Runtime {
             }
         }
         let hot_leading = todo.len();
+        stats.hot_leading = hot_leading as u64;
+        stats.hot_hint_received = hot.as_ref().is_some_and(|trace| !trace.chunks.is_empty());
         for i in (0..seal.chunk_count).filter(|i| seal.get(*i)) {
             if !queued.contains(&i) {
                 todo.push(i * chunk_size);
@@ -1898,7 +1927,7 @@ impl Runtime {
         let total_sealed = todo.len();
 
         let mut in_flight: std::collections::VecDeque<(u64, u64)> = Default::default(); // (req_id, offset)
-        let mut iter = todo.into_iter();
+        let mut todo: std::collections::VecDeque<_> = todo.into();
         // Issue #227 (b): offsets the source answered with a per-request
         // error (`Error{req_id: Some}`, e.g. a transient process_vm_readv
         // EAGAIN/ENOMEM). Re-queued for a bounded re-request through the
@@ -1909,6 +1938,28 @@ impl Runtime {
         let mut attempts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         let mut processed = 0usize;
         loop {
+            if let Some(trace) = hint() {
+                stats.hot_hint_received |= !trace.chunks.is_empty() && !todo.is_empty();
+                let mut rank = std::collections::HashMap::new();
+                for hash in &trace.chunks {
+                    for offset in self.backend.session_positions_of(*hash) {
+                        let next = rank.len();
+                        rank.entry(offset).or_insert(next);
+                    }
+                }
+                stats.hot_leading += todo
+                    .iter()
+                    .filter(|o| {
+                        rank.contains_key(o) && !self.chunk_installed((**o / chunk_size) as usize)
+                    })
+                    .count() as u64;
+                todo.make_contiguous()
+                    .sort_by_key(|o| rank.get(o).copied().unwrap_or(usize::MAX));
+                // The source already merged handler and idle hints in priority
+                // order. Keep all hashes, including unsealed chunks, for the
+                // post-drain prefault. Never wait for another hint.
+                *hot = Some(trace);
+            }
             // Fill the pipeline — but YIELD to guest faults. A fault
             // request queuing behind the drain's in-flight bulk bytes
             // was the measured ~7 ms/fault (vs ~1 ms on a quiet wire);
@@ -1925,7 +1976,7 @@ impl Runtime {
                 // the fresh todo list.
                 let offset = match retry.pop_front() {
                     Some(o) => o,
-                    None => match iter.next() {
+                    None => match todo.pop_front() {
                         Some(o) => o,
                         None => break,
                     },
@@ -2091,6 +2142,8 @@ impl Runtime {
 pub struct RunListenerOpts {
     pub prefault_trace: Option<WorkingSetTrace>,
     pub fault_around_chunks: usize,
+    /// Advisory capture-time trace, delivered concurrently with the drain.
+    pub migration_trace: Option<PathBuf>,
     pub recorder_window: Duration,
     pub trace_output: Option<PathBuf>,
     pub base_shm: Option<crate::base_shm::BaseShm>,
@@ -2109,8 +2162,9 @@ pub fn run_listener(
     opts: RunListenerOpts,
 ) -> Result<WorkingSetTrace, HandlerError> {
     let RunListenerOpts {
-        prefault_trace,
+        mut prefault_trace,
         fault_around_chunks,
+        migration_trace,
         recorder_window,
         trace_output,
         base_shm,
@@ -2159,12 +2213,19 @@ pub fn run_listener(
         std::thread::Builder::new()
             .name("engram-uffd-prefault".to_string())
             .spawn(move || {
+                let (hint_tx, mut hint_rx) = tokio::sync::oneshot::channel();
+                let hint_task = migration_trace.map(|path| rt.handle.spawn(async move {
+                    match crate::working_set::load_migration_trace(&path).await {
+                        Ok(trace) => { let _ = hint_tx.send(trace); }
+                        Err(error) => tracing::info!(%error, "migration hint unavailable; drain continues"),
+                    }
+                }));
                 // Review finding 6: (pulled, alt_sourced, zero_chunks, live
                 // faults) from the peer drain, captured below if this
                 // restore is peer mode — `None` otherwise (base/resume
                 // restores never set `rt.peer`). Patched onto
                 // `prefault-stats.json` at the end of this closure.
-                let mut peer_drain_stats: Option<(u64, u64, u64, u64)> = None;
+                let mut peer_drain_stats: Option<(u64, u64, u64, u64, u64, bool)> = None;
                 // ADR 0045 C2: in peer mode the sealed drain runs FIRST —
                 // sealed content exists only in the paused source, so
                 // draining it is what releases the source, and it makes
@@ -2175,7 +2236,9 @@ pub fn run_listener(
                 // whole VM; warming a doomed guest is wasted I/O.
                 if let Some(peer) = rt.peer.clone() {
                     let started = std::time::Instant::now();
-                    match rt.drain_from_peer(&peer, prefault_trace.as_ref()) {
+                    let outcome = rt.drain_with_hint(&peer, &mut prefault_trace, &mut || hint_rx.try_recv().ok());
+                    if let Some(task) = hint_task { task.abort(); }
+                    match outcome {
                         Ok(stats) => {
                             // Issue #227 (a): latch drain-complete BEFORE
                             // reporting DrainDone. The host-agent acts on
@@ -2193,8 +2256,14 @@ pub fn run_listener(
                             // `prefault-stats.json` once every other writer
                             // in this closure has had its turn (see the
                             // read-modify-write patch below `sweep_all`).
-                            peer_drain_stats =
-                                Some((stats.pulled, stats.alt_sourced, stats.zero_chunks, faults));
+                            peer_drain_stats = Some((
+                                stats.pulled,
+                                stats.alt_sourced,
+                                stats.zero_chunks,
+                                faults,
+                                stats.hot_leading,
+                                stats.hot_hint_received,
+                            ));
                             tracing::info!(
                                 pulled = stats.pulled,
                                 alt_sourced = stats.alt_sourced,
@@ -2328,6 +2397,8 @@ mod tests {
             peer_zero_chunks: 0,
             peer_live_faults: 0,
             fault_around_chunks_installed: 0,
+            hot_leading: 0,
+            hot_hint_received: None,
         };
         write_prefault_stats(&stats_path, &stats);
 
@@ -2382,7 +2453,8 @@ mod tests {
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&base).unwrap();
-        let patched = patch_peer_fields(Some(&bytes), (3, 1, 4, 7)).expect("existing file parses");
+        let patched =
+            patch_peer_fields(Some(&bytes), (3, 1, 4, 7, 2, true)).expect("existing file parses");
         assert_eq!(
             patched,
             PrefaultStats {
@@ -2396,6 +2468,8 @@ mod tests {
                 peer_zero_chunks: 4,
                 peer_live_faults: 7,
                 fault_around_chunks_installed: 0,
+                hot_leading: 2,
+                hot_hint_received: Some(true),
             },
         );
     }
@@ -2405,8 +2479,8 @@ mod tests {
     /// the `stats_missing` alarm finding 1 exists to protect.
     #[test]
     fn patch_peer_fields_none_when_no_prior_writer_ran() {
-        assert!(patch_peer_fields(None, (1, 2, 3, 4)).is_none());
-        assert!(patch_peer_fields(Some(b"not json"), (1, 2, 3, 4)).is_none());
+        assert!(patch_peer_fields(None, (1, 2, 3, 4, 0, false)).is_none());
+        assert!(patch_peer_fields(Some(b"not json"), (1, 2, 3, 4, 0, false)).is_none());
     }
 
     /// ADR 0043 P1: the prefault now runs on a background thread CONCURRENT
@@ -2577,18 +2651,79 @@ mod tests {
     /// construction) NEVER overwritten by sweep/resolve installs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn peer_mode_drains_sealed_chunks_and_sweep_never_overwrites_them() {
+        for hint in [
+            "unavailable",
+            "empty",
+            "delayed",
+            "failed",
+            "installed",
+            "in-flight",
+            "unsealed",
+            "late-unsealed",
+        ] {
+            peer_drain_hint_case(hint).await;
+        }
+    }
+
+    struct RecordingStorage {
+        inner: LocalBlobStorage,
+        fetched: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStorage for RecordingStorage {
+        async fn put_streaming(
+            &self,
+            key: &str,
+            body: engram_core::traits::ByteStream,
+        ) -> Result<u64, engram_core::error::BlobError> {
+            self.inner.put_streaming(key, body).await
+        }
+
+        async fn get_streaming(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::ByteStream, engram_core::error::BlobError> {
+            self.fetched.lock().unwrap().push(key.to_owned());
+            self.inner.get_streaming(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+            self.inner.head(key).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), engram_core::error::BlobError> {
+            self.inner.delete(key).await
+        }
+
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, engram_core::error::BlobError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    async fn peer_drain_hint_case(hint_kind: &str) {
         use engram_migrate_proto::{
             read_frame, write_frame, FromSource, SealBitmap, ToSource, PROTO_VERSION,
         };
         let page_size = 4096u64;
         let chunk_size = page_size;
-        let n_chunks = 8usize;
+        let n_chunks = 20usize;
         let total = chunk_size * n_chunks as u64;
         const PEER_BYTE: u8 = 0xEE;
 
         // Manifest content: chunk i = byte i+1 (the STALE durable view).
         let dir = tempfile::tempdir().unwrap();
-        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let durable = Arc::new(RecordingStorage {
+            inner: LocalBlobStorage::new(dir.path().to_path_buf()),
+            fetched: Default::default(),
+        });
+        let blob: Arc<dyn BlobStorage> = durable.clone();
         let store = ChunkStore::new(blob);
         let mut entries = Vec::new();
         for i in 0..n_chunks {
@@ -2628,11 +2763,14 @@ mod tests {
         // Fake source: seals chunks {1, 3, 5}; chunk 1 = peer bytes,
         // chunk 3 = ZeroChunk, chunk 5 = AltSource (content matches the
         // durable manifest, so the dest fetches it itself).
+        let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = requested.clone();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { break };
+                let requests = requests.clone();
                 std::thread::spawn(move || {
                     let Ok(ToSource::Hello { .. }) = read_frame::<_, ToSource>(&mut s) else {
                         return;
@@ -2647,7 +2785,7 @@ mod tests {
                     )
                     .unwrap();
                     let mut bitmap = SealBitmap::new(chunk_size, n_chunks as u64);
-                    for i in [1u64, 3, 5] {
+                    for i in [1u64, 3, 5].into_iter().chain(8..20) {
                         bitmap.set(i);
                     }
                     write_frame(&mut s, &FromSource::Seal { bitmap }).unwrap();
@@ -2656,6 +2794,7 @@ mod tests {
                         chunk_offset,
                     }) = read_frame::<_, ToSource>(&mut s)
                     {
+                        requests.lock().unwrap().push(chunk_offset / chunk_size);
                         let resp = match chunk_offset / chunk_size {
                             1 => {
                                 let raw = vec![PEER_BYTE; chunk_size as usize];
@@ -2673,7 +2812,7 @@ mod tests {
                                 req_id,
                                 chunk_offset,
                             },
-                            5 => FromSource::AltSource {
+                            5 | 8..=19 => FromSource::AltSource {
                                 req_id,
                                 chunk_offset,
                                 durable_sha256: [0; 32],
@@ -2753,11 +2892,55 @@ mod tests {
         let rt = Arc::new(rt);
 
         // Producer order, exactly as run_listener does it: drain, then
-        // sweep. Off the tokio workers (block_on inside).
+        // prefault, then sweep. Off the tokio workers (block_on inside).
         let rt_drain = Arc::clone(&rt);
         let sess = Arc::clone(&session);
+        let kind = hint_kind.to_owned();
+        let mut trace = WorkingSetTrace::new(0, 0, chrono::DateTime::UNIX_EPOCH);
+        trace.chunks = match hint_kind {
+            "installed" => vec![manifest.chunks[1].hash],
+            "in-flight" => vec![manifest.chunks[3].hash],
+            "unsealed" | "late-unsealed" => {
+                vec![manifest.chunks[7].hash, manifest.chunks[6].hash]
+            }
+            _ => vec![manifest.chunks[19].hash, manifest.chunks[1].hash],
+        };
         let stats = std::thread::spawn(move || {
-            let stats = rt_drain.drain_from_peer(&sess, None).expect("drain");
+            let mut delivered = false;
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<WorkingSetTrace>();
+            let _pending = if kind == "failed" {
+                drop(tx);
+                None
+            } else {
+                Some(tx)
+            };
+            let mut hot = None;
+            let stats = rt_drain
+                .drain_with_hint(&sess, &mut hot, &mut || {
+                    // An unresolved or failed delivery must not gate the first request.
+                    if kind == "unavailable" || kind == "failed" {
+                        return rx.try_recv().ok();
+                    }
+                    let ready = if kind == "late-unsealed" {
+                        rt_drain.sealed_uninstalled_count(&sess) == 0
+                    } else {
+                        rt_drain.chunk_installed(1)
+                    };
+                    if delivered || !ready {
+                        return None;
+                    }
+                    delivered = true;
+                    Some(if kind == "empty" {
+                        WorkingSetTrace::new(0, 0, chrono::DateTime::UNIX_EPOCH)
+                    } else {
+                        trace.clone()
+                    })
+                })
+                .expect("advisory hints cannot fail the drain");
+            rt_drain.mark_drain_done();
+            if let Some(trace) = hot {
+                rt_drain.prefault_from_trace(&trace).expect("prefault");
+            }
             rt_drain.sweep_all().expect("sweep");
             stats
         })
@@ -2765,8 +2948,58 @@ mod tests {
         .unwrap();
         assert_eq!(
             (stats.pulled, stats.zero_chunks, stats.alt_sourced),
-            (1, 1, 1),
+            (1, 1, 13),
             "drain accounting"
+        );
+
+        assert!(
+            !session.is_lost(),
+            "hint failure must not mark the peer lost"
+        );
+        let requests = requested.lock().unwrap();
+        assert_eq!(requests[0], 1, "drain starts before hint delivery");
+        assert_eq!(requests[8], if hint_kind == "delayed" { 19 } else { 13 });
+        assert_eq!(
+            requests.len(),
+            15,
+            "installed and in-flight chunks are not requeued"
+        );
+        assert_eq!(stats.hot_leading, u64::from(hint_kind == "delayed"));
+        assert_eq!(
+            stats.hot_hint_received,
+            matches!(
+                hint_kind,
+                "delayed" | "installed" | "in-flight" | "unsealed"
+            )
+        );
+        drop(requests);
+
+        // Only unsealed durable reads matter here: sealed AltSource reads
+        // happen during the drain. The hint must move late unsealed chunks
+        // ahead of offset zero, preserving the source's merged trace order.
+        let unsealed = [0, 2, 4, 6, 7];
+        let fetched: Vec<_> = durable
+            .fetched
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|key| {
+                unsealed
+                    .iter()
+                    .copied()
+                    .find(|&i| key == &manifest.chunks[i].hash.storage_key())
+            })
+            .collect();
+        assert_eq!(
+            fetched,
+            if matches!(hint_kind, "unsealed" | "late-unsealed") {
+                // The uncached sweep fetches hot chunks again; installation
+                // remains idempotent. Their first fetch must precede the sweep.
+                vec![7, 6, 0, 2, 4, 6, 7]
+            } else {
+                vec![0, 2, 4, 6, 7]
+            },
+            "unsealed durable fetch order ({hint_kind})"
         );
 
         // A fault on an already-drained sealed chunk takes the wake

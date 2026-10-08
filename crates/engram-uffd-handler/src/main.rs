@@ -517,7 +517,73 @@ mod linux {
         .map_err(|e| format!("build chunked backend: {e}"))?;
         let backend = Arc::new(backend);
 
-        let prefault = if let Some(spec) = args.prefault_trace {
+        // ADR 0045 C2: peer mode. Ordering is the soundness story:
+        //   1. bind the control sock (host-agent can subscribe NOW);
+        //   2. connect the peer session — BLOCKS until the source's
+        //      capture registers the export and pushes the Seal (the
+        //      page server parks pre-capture Hellos);
+        //   3. only then bind the FC-facing UDS (inside run_listener).
+        // FC's snapshot load waits on the UDS path, so "FC can touch
+        // guest memory" structurally implies "seal held" — no fault is
+        // ever served without a classification.
+        let peer_wiring = match (args.peer_addr.as_ref(), args.peer_export_id.as_ref()) {
+            (Some(addr), Some(export_id)) => {
+                let control = match args.control_sock.as_ref() {
+                    Some(path) => {
+                        let tx = engram_uffd_handler::peer::ControlTx::bind(path)
+                            .map_err(|e| format!("bind --control-sock {}: {e}", path.display()))?;
+                        Some(Arc::new(tx))
+                    }
+                    None => None,
+                };
+                let token = args.peer_token.clone().expect("validated in parse_args");
+                let addr = addr.clone();
+                let export_id = export_id.clone();
+                let chunk_size = backend.chunk_size();
+                let total_bytes = backend.total_bytes();
+                // The dial blocks (server parks until capture) — do it off
+                // the async runtime.
+                let session = tokio::task::spawn_blocking(move || {
+                    engram_uffd_handler::peer::PeerSession::connect(
+                        addr,
+                        export_id,
+                        token,
+                        chunk_size,
+                        total_bytes,
+                    )
+                })
+                .await
+                .map_err(|e| format!("peer connect join: {e}"))?
+                .map_err(|e| format!("peer connect: {e}"))?;
+                let session = Arc::new(session);
+                if let Some(control) = control.as_ref() {
+                    control.report(engram_migrate_proto::HandlerControl::Sealed {
+                        dirty_chunks: session.seal().count_ones(),
+                        total_chunks: session.seal().chunk_count,
+                        at_unix_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0),
+                    });
+                }
+                Some((session, control))
+            }
+            _ => None,
+        };
+
+        // Defer file loading to the producer in peer mode. Fault service and
+        // FC resume must not wait for the source's idle scan.
+        let migration_trace = if peer_wiring.is_some() {
+            match args.prefault_trace.as_ref() {
+                Some(PrefaultTraceSpec::File(path)) => Some(path.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let prefault = if migration_trace.is_some() {
+            None
+        } else if let Some(spec) = args.prefault_trace {
             let loaded = match &spec {
                 PrefaultTraceSpec::File(path) => tokio::fs::read(path)
                     .await
@@ -586,60 +652,6 @@ mod linux {
             }
         }
 
-        // ADR 0045 C2: peer mode. Ordering is the soundness story:
-        //   1. bind the control sock (host-agent can subscribe NOW);
-        //   2. connect the peer session — BLOCKS until the source's
-        //      capture registers the export and pushes the Seal (the
-        //      page server parks pre-capture Hellos);
-        //   3. only then bind the FC-facing UDS (inside run_listener).
-        // FC's snapshot load waits on the UDS path, so "FC can touch
-        // guest memory" structurally implies "seal held" — no fault is
-        // ever served without a classification.
-        let peer_wiring = match (args.peer_addr.as_ref(), args.peer_export_id.as_ref()) {
-            (Some(addr), Some(export_id)) => {
-                let control = match args.control_sock.as_ref() {
-                    Some(path) => {
-                        let tx = engram_uffd_handler::peer::ControlTx::bind(path)
-                            .map_err(|e| format!("bind --control-sock {}: {e}", path.display()))?;
-                        Some(Arc::new(tx))
-                    }
-                    None => None,
-                };
-                let token = args.peer_token.clone().expect("validated in parse_args");
-                let addr = addr.clone();
-                let export_id = export_id.clone();
-                let chunk_size = backend.chunk_size();
-                let total_bytes = backend.total_bytes();
-                // The dial blocks (server parks until capture) — do it off
-                // the async runtime.
-                let session = tokio::task::spawn_blocking(move || {
-                    engram_uffd_handler::peer::PeerSession::connect(
-                        addr,
-                        export_id,
-                        token,
-                        chunk_size,
-                        total_bytes,
-                    )
-                })
-                .await
-                .map_err(|e| format!("peer connect join: {e}"))?
-                .map_err(|e| format!("peer connect: {e}"))?;
-                let session = Arc::new(session);
-                if let Some(control) = control.as_ref() {
-                    control.report(engram_migrate_proto::HandlerControl::Sealed {
-                        dirty_chunks: session.seal().count_ones(),
-                        total_chunks: session.seal().chunk_count,
-                        at_unix_ms: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0),
-                    });
-                }
-                Some((session, control))
-            }
-            _ => None,
-        };
-
         // ADR 0045 substrate (v2b): create + size the base shm file NOW —
         // before run_listener binds the UDS. The host-agent orders FC's
         // load (which open(O_RDONLY)s + mmaps this file) after the socket
@@ -682,6 +694,7 @@ mod linux {
                     engram_uffd_handler::runtime::RunListenerOpts {
                         prefault_trace: prefault,
                         fault_around_chunks: args.fault_around_chunks,
+                        migration_trace,
                         recorder_window: window,
                         trace_output: trace_out,
                         base_shm,

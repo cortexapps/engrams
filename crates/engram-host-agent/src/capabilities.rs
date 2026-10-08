@@ -324,6 +324,24 @@ pub async fn fc_snapshot_version(firecracker_bin: Option<&Path>) -> Option<Strin
     version
 }
 
+/// Informational on every FC host, including File-mode fresh creates.
+pub fn probe_page_idle(is_fc: bool) -> CapStatus {
+    if !is_fc {
+        return CapStatus::NotApplicable;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match crate::page_idle::open_bitmap() {
+            Ok(_) => CapStatus::Ok(None),
+            Err(error) => CapStatus::Failed(error.to_string()),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        CapStatus::NotApplicable
+    }
+}
+
 /// Run every probe and assemble the vector this tick. `schema: 1`
 /// unconditionally — a `HostCapabilities::default()` (`schema: 0`)
 /// only ever comes from an old host-agent's absent field, never from
@@ -355,6 +373,7 @@ pub async fn probe_all(inputs: &ProbeInputs) -> HostCapabilities {
         base_shm_tmpfs,
         uffd_minor_shmem,
         nbd,
+        page_idle: probe_page_idle(is_fc),
         bundle_stamp,
         fc_snapshot_version,
         wire_version: engram_protocol::WIRE_VERSION,

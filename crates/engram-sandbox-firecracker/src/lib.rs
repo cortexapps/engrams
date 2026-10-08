@@ -428,13 +428,15 @@ pub const UFFD_CONTROL_SOCK_FILE: &str = "uffd-control.sock";
 /// state.bin appears late via the fetch poller).
 pub const MIGRATION_PEER_FILE: &str = "migration-peer.json";
 
-/// ADR 0045 C2 (E2B fold): the staged source-hot-set trace the spawn
-/// writes into the jail for the handler's drain ordering + prefault.
+/// The final source hot trace, staged by the destination poller in the
+/// snapshot directory. The handler reads this advisory file concurrently with drain.
 pub const MIGRATION_HOT_TRACE_FILE: &str = "migration-hot-trace.json";
 
 /// ADR 0045 C2: `migration-peer.json` content.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MigrationPeerSpec {
+    /// Unique to this restore attempt; stale hints need no cleanup.
+    pub hot_trace_file: String,
     /// `host:port` of the source's page server (9102).
     pub peer_addr: String,
     pub export_id: String,
@@ -442,14 +444,6 @@ pub struct MigrationPeerSpec {
     /// on /proc/*/cmdline). The file lives root-owned in the snapshot
     /// staging dir for the restore's lifetime.
     pub peer_token: String,
-    /// E2B fold: the SOURCE's resume-time working set (the capture
-    /// rider's `hot_chunks`) — the prediction of exactly the pages
-    /// the dest guest will fault first. The spawn stages it as a
-    /// local trace file so the handler drains hot-first AND the
-    /// post-drain prefault walks it. Serde-default: an old spec
-    /// simply yields no hot ordering.
-    #[serde(default)]
-    pub hot_chunks: Vec<[u8; 32]>,
 }
 
 /// Host-wide knobs for `FirecrackerBackend`. The kernel image lives
@@ -2130,32 +2124,16 @@ impl FirecrackerBackend {
             }
             cmd.arg("--base-shm").arg(&base);
         }
-        // Post-copy: the source's hot set beats any host-local trace —
-        // it is the working set of THIS guest measured minutes ago,
-        // not a same-template cousin's. Staged as a local file; the
-        // handler both orders its drain by it and prefaults from it.
-        let migration_hot_trace = match peer {
-            Some(p) if !p.hot_chunks.is_empty() => {
-                let trace = engram_chunk_store::working_set::WorkingSetTrace {
-                    schema_version: 1,
-                    captured_at: chrono::Utc::now(),
-                    vcpu_count: 0, // unknown here; replay ignores it
-                    capture_window_ms: 0,
-                    chunks: p
-                        .hot_chunks
-                        .iter()
-                        .map(|h| engram_chunk_store::manifest::ChunkHash::from_bytes(*h))
-                        .collect(),
-                };
-                let path = jail_dir.join(MIGRATION_HOT_TRACE_FILE);
-                let json = serde_json::to_vec(&trace)
-                    .map_err(|e| vm_err(format!("serialize migration hot trace: {e}")))?;
-                tokio::fs::write(&path, json)
-                    .await
-                    .map_err(|e| vm_err(format!("write migration hot trace: {e}")))?;
-                Some(path)
-            }
-            _ => None,
+        // The destination poller atomically stages the capture-time rider in
+        // the snapshot directory. Hint reads run independently: neither the drain
+        // nor the fault loop or Firecracker resume waits for this file.
+        let migration_hot_trace = if let Some(peer) = peer {
+            let dir = session_manifest_json
+                .and_then(Path::parent)
+                .ok_or_else(|| vm_err("post-copy requires a staged session manifest"))?;
+            Some(dir.join(&peer.hot_trace_file))
+        } else {
+            None
         };
         if let Some(path) = migration_hot_trace.as_ref() {
             cmd.arg("--prefault-trace")

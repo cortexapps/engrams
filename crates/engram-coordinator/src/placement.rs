@@ -1417,6 +1417,7 @@ mod tests {
                 base_shm_tmpfs: base_shm,
                 uffd_minor_shmem: uffd_minor,
                 nbd,
+                page_idle: CapStatus::Unknown,
                 bundle_stamp: bundle,
                 fc_snapshot_version: fc_snapshot_version.map(str::to_string),
                 wire_version: 7,
@@ -1446,6 +1447,19 @@ mod tests {
                 needs_uffd_substrate: true,
                 needs_live_substrate: false,
                 fc_snapshot_version: Some("v10.0.0".to_string()),
+            };
+            assert!(host_meets_capabilities(&h, &req).is_ok());
+        }
+
+        #[test]
+        fn page_idle_failure_never_gates_placement() {
+            let mut h = host(1);
+            h.capabilities = fully_ok();
+            h.capabilities.page_idle = CapStatus::Failed("unavailable".into());
+            let req = CapabilityRequirements {
+                needs_uffd_substrate: true,
+                needs_live_substrate: true,
+                fc_snapshot_version: None,
             };
             assert!(host_meets_capabilities(&h, &req).is_ok());
         }
@@ -2349,6 +2363,7 @@ mod tests {
                 base_shm_tmpfs: engram_core::types::host::CapStatus::Ok(None),
                 uffd_minor_shmem: engram_core::types::host::CapStatus::Ok(None),
                 nbd: engram_core::types::host::CapStatus::Ok(None),
+                page_idle: engram_core::types::host::CapStatus::Unknown,
                 bundle_stamp: engram_core::types::host::CapStatus::Ok(None),
                 fc_snapshot_version: Some("v9.0.0".into()),
                 wire_version: 7,
