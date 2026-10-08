@@ -194,6 +194,13 @@ export const extensible = {
   ],
 };
 
+export const community = {
+  badge: "Sec. 6",
+  label: "Community",
+  title: "Join the community",
+  lede: "Join our Slack to chat directly with the engineers building engrams, get support on your software factory, and see what other teams are running in production.",
+  cta: { label: "Join the Slack" },
+};
 
 export const start = {
   eyebrow: "Start with one task",

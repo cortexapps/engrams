@@ -97,7 +97,10 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
             <CortexWordmark height={22} />
             <p>Mission control for your AI software factory</p>
           </div>
-          <a class="btn ghost" href="https://www.cortex.io">Visit cortex.io <span>→</span></a>
+          <div class="actions">
+            <a class="btn ghost" href={`${base}/slack/`}>Join our Slack community <span>→</span></a>
+            <a class="btn ghost" href="https://www.cortex.io">Visit cortex.io <span>→</span></a>
+          </div>
         </div>
         <div class="row">
           <span>engrams · open source</span>

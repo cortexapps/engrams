@@ -1181,6 +1181,9 @@ html.menu-open {
   font-size: 20px;
   opacity: 0.85;
 }
+.cortex-cta .actions {
+  margin-top: 0;
+}
 .cortex-cta .btn {
   height: 44px;
   font-size: 13px;
