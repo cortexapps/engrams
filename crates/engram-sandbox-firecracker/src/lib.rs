@@ -812,6 +812,31 @@ impl FirecrackerConfig {
     }
 }
 
+/// The sandbox owns the listener. Waiters keep the console note after removal.
+struct AgentReadiness {
+    receiver: tokio::sync::watch::Receiver<bool>,
+    listener: Option<tokio::task::JoinHandle<()>>,
+    death_note: Arc<std::sync::OnceLock<String>>,
+}
+
+impl From<tokio::sync::watch::Receiver<bool>> for AgentReadiness {
+    fn from(receiver: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self {
+            receiver,
+            listener: None,
+            death_note: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+}
+
+impl Drop for AgentReadiness {
+    fn drop(&mut self) {
+        if let Some(listener) = &self.listener {
+            listener.abort();
+        }
+    }
+}
+
 /// Live sandbox handle. Keeps the spawned firecracker `Child` so
 /// `destroy` can SIGKILL it. ADR 0044 K2 removed `kill_on_drop` from
 /// the FC and uffd-handler `Child`s so a live VM is decoupled from the
@@ -883,7 +908,7 @@ struct LiveSandbox {
     /// sandboxes pre-set to `true` because agentd was already
     /// running when the snapshot was captured. Replaces the
     /// pre-M1 boot-race CONNECT-then-retry on port 1024.
-    agent_ready: tokio::sync::watch::Receiver<bool>,
+    agent_ready: AgentReadiness,
     /// RAM ledger (issue #540): true iff this sandbox is RAM-resident
     /// but its session no longer holds a coordinator memory reservation
     /// (epic-parking-ladder rungs 2-3). Always `false` today — no
@@ -1237,6 +1262,7 @@ impl FirecrackerBackend {
                 net_allocator,
                 vm_cgroup_parent,
                 work_dir,
+                true,
             ))
         }
     }
@@ -1579,7 +1605,7 @@ impl FirecrackerBackend {
                 #[cfg(target_os = "linux")]
                 parked: false,
                 agentd_slot_swapped: false,
-                agent_ready: ready_rx,
+                agent_ready: ready_rx.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );
@@ -2705,7 +2731,7 @@ impl FirecrackerBackend {
     /// watch sender to `true`; `start_agent` blocks on the matching
     /// receiver and proceeds straight to SpawnHarness with no poll.
     ///
-    /// Returns the receiver half; caller stores it in `LiveSandbox`.
+    /// Returns the receiver and owned task; caller stores them in `LiveSandbox`.
     /// The accept task owns the sender and exits after the first
     /// successful dial (subsequent dials are no-ops — agentd only
     /// signals once per process lifetime).
@@ -2713,7 +2739,7 @@ impl FirecrackerBackend {
         &self,
         sandbox_id: SandboxId,
         vsock_uds_path: &Path,
-    ) -> Result<tokio::sync::watch::Receiver<bool>, SandboxError> {
+    ) -> Result<AgentReadiness, SandboxError> {
         let path = per_port_uds(vsock_uds_path, engram_agentd::ENGRAM_AGENTD_READY_PORT);
         let _ = tokio::fs::remove_file(&path).await;
         let listener = tokio::net::UnixListener::bind(&path).map_err(|e| {
@@ -2726,7 +2752,7 @@ impl FirecrackerBackend {
             )
         })?;
         let (tx, rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(async move {
+        let listener = tokio::spawn(async move {
             // ADR 0020: keep accepting until we read a valid AgentReady, rather
             // than giving up after the first connection. On a slow cold boot the
             // guest's vsock connect can time out (FC's single device thread
@@ -2736,7 +2762,7 @@ impl FirecrackerBackend {
             // first failure drops `tx`, the channel closes, and `wait_agent_ready`
             // returns "channel closed" instead of waiting its full deadline.
             // Bounded just past `wait_agent_ready`'s 180s so the task + UDS
-            // listener can't outlive a destroyed sandbox.
+            // listener has a backstop even if no caller waits.
             let listen = async {
                 loop {
                     match listener.accept().await {
@@ -2778,7 +2804,9 @@ impl FirecrackerBackend {
             };
             let _ = tokio::time::timeout(Duration::from_secs(190), listen).await;
         });
-        Ok(rx)
+        let mut readiness = AgentReadiness::from(rx);
+        readiness.listener = Some(listener);
+        Ok(readiness)
     }
 
     /// Bind a host-side UDS for inbound harness connections from
@@ -3790,7 +3818,7 @@ impl FirecrackerBackend {
                 #[cfg(target_os = "linux")]
                 parked: false,
                 agentd_slot_swapped,
-                agent_ready: ready_rx,
+                agent_ready: ready_rx.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );
@@ -5087,9 +5115,9 @@ async fn read_tail(path: &Path, max: u64) -> Option<String> {
     if len > max {
         f.seek(SeekFrom::Start(len - max)).await.ok()?;
     }
-    let mut buf = String::new();
-    f.read_to_string(&mut buf).await.ok()?;
-    Some(buf)
+    let mut buf = Vec::new();
+    f.take(max).read_to_end(&mut buf).await.ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 #[async_trait]
@@ -5598,7 +5626,15 @@ impl SandboxBackend for FirecrackerBackend {
                 let work_dir = self.work_dir.clone();
                 Box::pin(async move {
                     if let Some(live) = live {
-                        destroy_teardown(id, live, net_allocator, vm_cgroup_parent, work_dir).await;
+                        destroy_teardown(
+                            id,
+                            live,
+                            net_allocator,
+                            vm_cgroup_parent,
+                            work_dir,
+                            false,
+                        )
+                        .await;
                     }
                     Ok(())
                 })
@@ -6238,9 +6274,12 @@ impl SandboxBackend for FirecrackerBackend {
     /// reach a quiescent guest without spawning a session harness.
     #[tracing::instrument(name = "fc.wait_agent_ready", skip_all, fields(sandbox_id = %id))]
     async fn wait_agent_ready(&self, id: SandboxId) -> Result<(), SandboxError> {
-        let mut agent_ready = {
+        let (mut agent_ready, death_note) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            live.agent_ready.clone()
+            (
+                live.agent_ready.receiver.clone(),
+                live.agent_ready.death_note.clone(),
+            )
         };
         // Generous deadline (180 s): the dev-vm's fake-gcs path can
         // stretch chunked-NBD page-ins to ~2-3 min on a cold cache;
@@ -6263,7 +6302,13 @@ impl SandboxBackend for FirecrackerBackend {
                 )
             })?
             .map_err(|e| {
-                SandboxError::Vm(format!("agent_ready watch closed unexpectedly: {e}").into())
+                let tail = death_note
+                    .get()
+                    .map(String::as_str)
+                    .unwrap_or("console tail unavailable");
+                SandboxError::Vm(format!(
+                    "guest died before agentd dialed ready port: {e}\n--- firecracker log ---\n{tail}"
+                ).into())
             })?;
         }
         Ok(())
@@ -6652,6 +6697,7 @@ async fn destroy_teardown(
     net_allocator: Arc<parking_lot::Mutex<net::NetworkAllocator>>,
     vm_cgroup_parent: Option<PathBuf>,
     work_dir: PathBuf,
+    unexpected: bool,
 ) {
     // Belt-and-braces kill backstop (issue #196): arm a SIGKILL guard for
     // the FC and uffd pids up front. If this task is itself aborted before
@@ -6665,6 +6711,20 @@ async fn destroy_teardown(
         .and_then(|h| h.id())
         .or(live.uffd_pid)
         .map(SpawnKillGuard::new);
+
+    // Save the console before the jail is removed, then wake all ready waiters.
+    let log_path = work_dir.join(id.to_string()).join("firecracker.log");
+    let tail = read_tail(&log_path, 4096)
+        .await
+        .unwrap_or_else(|| "console tail unavailable".into());
+    if unexpected {
+        tracing::warn!(sandbox_id = %id, console_tail = %tail, "unexpected guest death");
+    }
+    let _ = live.agent_ready.death_note.set(tail);
+    if let Some(listener) = live.agent_ready.listener.take() {
+        listener.abort();
+        let _ = listener.await;
+    }
 
     // Try a graceful shutdown first: PUT /actions { SendCtrlAltDel }
     // tells the guest kernel to halt cleanly via the keyboard
@@ -9240,7 +9300,7 @@ mod tests {
                 #[cfg(target_os = "linux")]
                 parked: false,
                 agentd_slot_swapped: false,
-                agent_ready,
+                agent_ready: agent_ready.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
             }
         };
@@ -9309,7 +9369,7 @@ mod tests {
                 #[cfg(target_os = "linux")]
                 parked: false,
                 agentd_slot_swapped: false,
-                agent_ready,
+                agent_ready: agent_ready.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
             }
         };
@@ -9349,6 +9409,114 @@ mod tests {
         assert!(super::read_smaps_rollup_pss_rss(u32::MAX).await.is_none());
     }
 
+    #[tokio::test]
+    async fn console_tail_keeps_marker_after_partial_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("firecracker.log");
+        let marker = "Kernel panic: tail-marker";
+        std::fs::write(&log, format!("é{marker}")).unwrap();
+        // The tail starts at the second byte of the first character.
+        let tail = read_tail(&log, marker.len() as u64 + 1).await.unwrap();
+        assert!(tail.ends_with(marker), "{tail}");
+    }
+
+    async fn dead_guest_fails_ready_waiters(console: Option<&str>, unexpected: bool) {
+        let (be, _dir) = backend();
+        let id = SandboxId::new();
+        let jail = be.work_dir.join(id.to_string());
+        std::fs::create_dir_all(&jail).unwrap();
+        if let Some(console) = console {
+            std::fs::write(jail.join("firecracker.log"), console).unwrap();
+        }
+        // Keep the UDS below macOS's 104-byte path limit.
+        let sockets = tempfile::tempdir_in("/tmp").unwrap();
+        let vsock = sockets.path().join("vsock.sock");
+        let readiness = be.spawn_agent_ready_listener(id, &vsock).await.unwrap();
+        let listener_abort = readiness.listener.as_ref().unwrap().abort_handle();
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        be.sandboxes.insert(
+            id,
+            LiveSandbox {
+                state: SandboxState {
+                    spec: spec(),
+                    firecracker_socket: jail.join("firecracker.sock"),
+                    rootfs_path: jail.join("rootfs.ext4"),
+                    vsock_cid: 3,
+                    vsock_uds_path: vsock,
+                    rootfs_canonical: jail.join("rootfs.ext4"),
+                    swap_canonical: None,
+                    memory_backing: None,
+                },
+                child: Some(child),
+                fc_pid: Some(pid),
+                uffd_handler: None,
+                uffd_pid: None,
+                net: None,
+                netns: None,
+                guest_endpoints: parking_lot::Mutex::new(None),
+                agentd_slot_swapped: false,
+                agent_ready: readiness,
+                #[cfg(target_os = "linux")]
+                parked: false,
+                vsock_epoch: tokio::sync::watch::channel(0).0,
+            },
+        );
+        let mut first = Box::pin(be.wait_agent_ready(id));
+        let mut second = Box::pin(be.wait_agent_ready(id));
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            // Call the supervisor's actual prune callback, without its polling delay.
+            if unexpected {
+                let (_, live) = be.sandboxes.remove(&id).unwrap();
+                be.supervisor_teardown_fn()(id, live).await;
+            } else {
+                be.destroy(id).await.unwrap();
+            }
+        })
+        .await
+        .expect("prune must stop the ready listener within one second");
+        assert!(!jail.exists(), "tail must survive removal of the jail");
+        for waiter in [first, second] {
+            let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("dead guest must wake every waiter")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("guest died before agentd dialed"), "{error}");
+            assert!(
+                error.contains(console.unwrap_or("console tail unavailable")),
+                "{error}"
+            );
+        }
+        assert!(
+            listener_abort.is_finished(),
+            "listener must stop during teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn pruned_guest_fails_ready_waiters_with_console_tail() {
+        dead_guest_fails_ready_waiters(Some("Kernel panic: ready-tail-marker"), true).await;
+    }
+
+    #[tokio::test]
+    async fn pruned_guest_without_console_fails_ready_waiters() {
+        dead_guest_fails_ready_waiters(None, true).await;
+    }
+
+    #[tokio::test]
+    async fn destroyed_guest_fails_ready_waiters() {
+        dead_guest_fails_ready_waiters(Some("destroy-tail-marker"), false).await;
+    }
+
     /// Issue #540: `guest_memory_stats` must bucket PSS/RSS by the
     /// per-sandbox `parked` flag so the RAM ledger never adds a parked
     /// resident's memory back into `allocatable_mib`. Both entries
@@ -9386,7 +9554,7 @@ mod tests {
                 guest_endpoints: parking_lot::Mutex::new(None),
                 parked: false,
                 agentd_slot_swapped: false,
-                agent_ready: agent_ready.clone(),
+                agent_ready: agent_ready.clone().into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );
@@ -9404,7 +9572,7 @@ mod tests {
                 guest_endpoints: parking_lot::Mutex::new(None),
                 parked: false,
                 agentd_slot_swapped: false,
-                agent_ready: agent_ready.clone(),
+                agent_ready: agent_ready.clone().into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );
@@ -9550,7 +9718,7 @@ mod tests {
                 #[cfg(target_os = "linux")]
                 parked: false,
                 agentd_slot_swapped: false,
-                agent_ready,
+                agent_ready: agent_ready.into(),
                 vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );

@@ -135,3 +135,57 @@ async fn create_list_destroy_round_trip() {
         .await
         .expect("destroy on unknown id is no-op");
 }
+
+/// A PID 1 exit must reach ready waiters before the normal boot deadline.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + static busybox"]
+async fn init_exit_fails_ready_with_kernel_panic() {
+    let Some(env) = common::fc_preflight() else {
+        return;
+    };
+    let busybox = common::find_busybox().expect("static busybox fixture dependency");
+    let work = tempfile::tempdir().unwrap();
+    let blobs = std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
+        work.path().join("blobs"),
+    ));
+    let chunks = engram_chunk_store::ChunkStore::new(blobs);
+    let rootfs = work.path().join("panic.ext4");
+    common::bake_fixture_ext4(&rootfs, &chunks, &busybox, None, |tree| {
+        use std::os::unix::fs::PermissionsExt;
+        let init = tree.join("sbin/engram-init");
+        std::fs::write(&init, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(init, std::fs::Permissions::from_mode(0o755))
+    })
+    .await;
+    let mut cfg = FirecrackerConfig::with_kernel(env.kernel);
+    cfg.net_pool = None;
+    let backend = FirecrackerBackend::new(work.path(), cfg);
+    let id = backend
+        .create(SandboxSpec {
+            image: "init-exit-fixture".into(),
+            rootfs_source: Some(rootfs),
+            image_uri: None,
+            rootfs_manifest: None,
+            cpu: CpuLimit { vcpus: 1 },
+            memory: MemoryLimit { max_mib: 64 },
+            disk: DiskLimit { max_gib: 1 },
+            ttl: None,
+            env: HashMap::new(),
+            workdir: None,
+            network: Default::default(),
+            aux_ro_drives: Vec::new(),
+            swap_mib: None,
+            swap_source: None,
+            swap_manifest: None,
+        })
+        .await
+        .expect("boot exit fixture");
+    let result = tokio::time::timeout(Duration::from_secs(15), backend.wait_agent_ready(id)).await;
+    backend.destroy(id).await.expect("cleanup");
+    let error = result
+        .expect("dead guest must fail within 15 seconds")
+        .expect_err("PID 1 exited")
+        .to_string();
+    assert!(error.contains("guest died before agentd dialed"), "{error}");
+    assert!(error.contains("Kernel panic"), "{error}");
+}
