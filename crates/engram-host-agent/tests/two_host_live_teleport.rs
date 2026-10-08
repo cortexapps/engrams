@@ -287,6 +287,25 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
     let (moved, cap) =
         common::postcopy::move_guest(&client_a, &client_b, vm, ckpt.clone(), host_a.addr).await;
     common::postcopy::drain(&host_b.pooled, moved).await;
+    let stats_path = host_b
+        .pooled
+        .prefault_stats_path(moved)
+        .expect("handler stats path");
+    assert!(
+        common::poll_until_async(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(20),
+            || async {
+                std::fs::read(&stats_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|stats| stats["fault_around_chunks_installed"].as_u64())
+                    .is_some()
+            },
+        )
+        .await,
+        "handler must report the demand-window install counter"
+    );
 
     // Commit destroys A's frozen source; the moved VM lives on B.
     client_a
@@ -299,6 +318,10 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         .expect("commit on A");
     assert!(!host_a.pooled.list().await.unwrap().contains(&vm));
     assert!(host_b.pooled.list().await.unwrap().contains(&moved));
+    assert!(
+        stats_path.is_file(),
+        "successful move retains handler stats"
+    );
 
     // G2: the post-checkpoint sentinel survives on B.
     let check = exec(

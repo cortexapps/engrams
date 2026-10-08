@@ -339,6 +339,42 @@ NBD independence after source destruction, and failed-restore cleanup checks.
 The destination starts restore before capture, drains memory and disk before
 commit, and uses a full checkpoint for durable memory after the move.
 
+## Addendum — 2026-10-07: demand fault windows
+
+C2 demand faults request up to eight sealed, uninstalled chunks in one
+`NeedWindow` frame. The faulting chunk is first. Following chunks stay
+inside its memory region. Each response retains its own framing and wire
+hash. Every response must match both the request ID and the next requested
+offset, including ZeroChunk and AltSource. A dedicated prefetch worker sends
+the window on its own Fault connection; the source accepts multiple such
+connections per export. The fault loop installs the first response, wakes
+the faulting page, and returns. The worker installs the suffix without holding
+the fault-active guard. All copies use DONTWAKE; only the faulting page gets
+an explicit wake. The existing install claims deduplicate concurrent drain
+work. Retries request only the unfinished suffix.
+
+There is one prefetch slot and no waiting queue. While it is busy, a new fault
+uses the separate demand connection, including faults inside the pending window.
+Install claims deduplicate the worker's later response. New speculative windows
+are dropped. DrainDone and teardown cancel the socket and wait at most five
+seconds for the worker to exit, then detach it with a warning if necessary.
+Cancellation prevents late installs and PeerLost reports; a detached worker
+holds only a weak runtime reference between installs. Initial and retry TCP
+connects have a five-second bound and check cancellation before and after
+connecting. The first response also uses the existing five-second timeout.
+
+`--fault-around-chunks` or `ENGRAM_UFFD_FAULT_AROUND` selects 1 through 256
+chunks (default 8). A value of 1 preserves single-chunk demand behavior.
+`fault_around_chunks_installed` counts successful demand installs, including
+the faulting chunk, in handler stats and the drain completion report.
+The drain order, hot-first policy, and seal rules are unchanged.
+
+The page-channel `PROTO_VERSION` advances from 5 to 6. Existing request
+variant numbers stay fixed. The separate coordinator/host `WIRE_VERSION`
+advances from 35 to 36. Its exact-match gate keeps hosts on the same version
+during a roll, as for the page-channel v5 bump. The handler and host must use
+page-channel version 6 together. Coordinator bincode payload bytes do not change.
+
 ## Sources
 
 Carries forward **ADR 0042** (`docs/adr/0042-substrate-architecture-survey.md` + `0072-substrate-survey-evidence.md`): QEMU post-copy docs + Hines'09; Firecracker snapshot/UFFD docs + discussions #3119/#2938 (FC has no native live migration; UFFD restore is page-source-pluggable); `loopholelabs/drafter` + `silo` v0.2.21 (the unified-device post-copy-with-durable-backstop reference, AGPL — design reference only); REAP/FaaSnap/Catalyzer (working-set prefetch); CodeSandbox engineering blogs (`MAP_SHARED` continuous flush, local-NVMe memory). Kernel references for the substrate: `userfaultfd(2)` + `Documentation/admin-guide/mm/userfaultfd.rst` (MINOR/CONTINUE since 5.13 shmem/hugetlbfs; WP on shmem since 5.19; MISSING scope), `mmap(2)` MAP_FIXED semantics, KVM memslot/GUP behavior under address-space changes. Codebase seams verified against the current tree (the UFFD fill seam, `effective_restore_mode`, the disk flush scheduler, the eviction pipeline + lease, the operator `roll_node` + `desired_hosts`, the node-assets / detect-changes pipeline, the web admin UX). Direct read of the `loopholelabs/firecracker` compare diff happened **only** for the superseded v1 surface (recorded in Phase B history); the substrate (v2) design deliberately derives from kernel primitives alone.

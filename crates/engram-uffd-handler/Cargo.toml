@@ -71,4 +71,5 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 userfaultfd = { version = "0.9", features = ["linux5_13"] }
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile = "3"

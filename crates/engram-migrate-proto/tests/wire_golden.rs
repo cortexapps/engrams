@@ -21,7 +21,7 @@
 //! ## Regenerating the corpus (only when you INTENTIONALLY evolve a type)
 //!
 //! A wire break requires a protocol-version bump and coordinated endpoint
-//! updates. Version 5 removes the unused by-hash request and reply. Regenerate:
+//! updates. Version 6 adds demand windows and install accounting. Regenerate:
 //!
 //! ```text
 //! cargo test -p engram-migrate-proto --test wire_golden -- --ignored regen_golden
@@ -123,6 +123,12 @@ fn to_source_golden_and_variant_indices() {
         zero_chunks: 42,
     };
 
+    let window = ToSource::NeedWindow {
+        req_id: 8,
+        chunk_offsets: vec![0, 1048576],
+    };
+    assert_golden("to_source_need_window", &window);
+    assert_variant_index(&window, 3, "ToSource::NeedWindow");
     assert_golden("to_source_hello", &hello);
     assert_golden("to_source_need_at", &need_at);
     assert_golden("to_source_drain_done", &drain_done);
@@ -205,6 +211,7 @@ fn handler_control_golden_and_variant_indices() {
         faults: 42,
         fault_us: 55_000,
         fault_max_us: 9_000,
+        fault_around_chunks_installed: 0,
     };
     let peer_lost = HandlerControl::PeerLost {
         remaining: 3,
@@ -243,6 +250,13 @@ fn regen_golden() {
         eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
     }
 
+    write(
+        "to_source_need_window",
+        &ToSource::NeedWindow {
+            req_id: 8,
+            chunk_offsets: vec![0, 1048576],
+        },
+    );
     write(
         "to_source_hello",
         &ToSource::Hello {
@@ -343,6 +357,7 @@ fn regen_golden() {
             faults: 42,
             fault_us: 55_000,
             fault_max_us: 9_000,
+            fault_around_chunks_installed: 0,
         },
     );
     write(

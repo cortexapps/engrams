@@ -528,6 +528,37 @@ impl PeerServer {
                         .write_us
                         .fetch_add(t_write.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
+                ToSource::NeedWindow {
+                    req_id,
+                    chunk_offsets,
+                } => {
+                    if chunk_offsets.is_empty()
+                        || chunk_offsets.len() > engram_migrate_proto::MAX_FAULT_AROUND_CHUNKS
+                    {
+                        write_frame(
+                            &mut stream,
+                            &FromSource::Error {
+                                req_id: Some(req_id),
+                                message: "invalid fault window size".into(),
+                            },
+                        )?;
+                        continue;
+                    }
+                    for offset in chunk_offsets {
+                        export.touch();
+                        let resp = self.serve_need_at(export, req_id, offset, purpose);
+                        let failed = matches!(resp, FromSource::Error { .. });
+                        let t_write = crate::time_source::metrics_now();
+                        write_frame(&mut stream, &resp)?;
+                        export
+                            .serve
+                            .write_us
+                            .fetch_add(t_write.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        if failed {
+                            break;
+                        }
+                    }
+                }
                 ToSource::DrainDone {
                     pulled,
                     alt_sourced,
@@ -860,6 +891,55 @@ mod tests {
         assert!(
             matches!(&got[0], FromSource::Error { req_id: None, message } if message.contains("version mismatch"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn fault_window_streams_in_request_order_with_per_chunk_integrity() {
+        let server = PeerServer::new(9102);
+        let memory: Vec<u8> = (0..16384).map(|i| (i / 4096 + 1) as u8).collect();
+        let mut export = test_export("t");
+        for i in 0..4 {
+            export.seal.set(i);
+        }
+        export.vmas = vec![GuestVma {
+            start: memory.as_ptr() as u64,
+            end: memory.as_ptr() as u64 + memory.len() as u64,
+            file_offset: 0,
+        }];
+        server.register(export);
+        let offsets = vec![8192, 0, 4096];
+        let got = talk(
+            server,
+            vec![
+                hello("exp-1", "t"),
+                ToSource::NeedWindow {
+                    req_id: 7,
+                    chunk_offsets: offsets.clone(),
+                },
+            ],
+            5,
+        )
+        .await;
+        assert_eq!(got.len(), 5);
+        for (response, offset) in got[2..].iter().zip(offsets) {
+            let FromSource::Page {
+                req_id,
+                chunk_offset,
+                bytes,
+                hash,
+                lz4,
+            } = response
+            else {
+                panic!("expected Page, got {response:?}")
+            };
+            assert_eq!((*req_id, *chunk_offset), (7, offset));
+            assert_eq!(*hash, engram_migrate_proto::wire_hash(bytes));
+            assert_eq!(
+                engram_migrate_proto::decompress_page(bytes.clone(), *lz4).unwrap(),
+                memory[offset as usize..offset as usize + 4096]
+            );
+        }
     }
 
     #[tokio::test]

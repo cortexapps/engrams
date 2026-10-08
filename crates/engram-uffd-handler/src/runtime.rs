@@ -37,6 +37,7 @@
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -126,6 +127,9 @@ pub struct PrefaultStats {
     /// reaches that chunk.
     #[serde(default)]
     pub peer_live_faults: u64,
+    /// Chunks installed by demand windows, including the faulting chunk.
+    #[serde(default)]
+    pub fault_around_chunks_installed: u64,
 }
 
 /// Filename for [`PrefaultStats`], colocated with
@@ -387,6 +391,66 @@ enum Claim {
     Done,
 }
 
+/// One bounded prefetch slot. Requests are never queued behind a window.
+struct FaultWindow {
+    progress: Arc<WindowProgress>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+struct WindowProgress {
+    stopped: AtomicBool,
+    // Serializes the final cancellation check with installs and report publication.
+    socket: Mutex<Option<std::net::TcpStream>>,
+}
+
+impl WindowProgress {
+    fn new() -> Self {
+        Self {
+            stopped: AtomicBool::new(false),
+            socket: Mutex::new(None),
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+}
+
+impl FaultWindow {
+    fn stop(self) {
+        let deadline = std::time::Instant::now() + crate::peer::PEER_READ_TIMEOUT;
+        loop {
+            match self.progress.socket.try_lock() {
+                Ok(socket) => {
+                    self.progress.stopped.store(true, Ordering::SeqCst);
+                    if let Some(socket) = &*socket {
+                        let _ = socket.shutdown(std::net::Shutdown::Both);
+                    }
+                    break;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => panic!("window poisoned"),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                self.progress.stopped.store(true, Ordering::SeqCst);
+                tracing::warn!("fault-around install lock missed stop deadline; detaching");
+                return;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+        while !self.thread.is_finished() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!("fault-around worker did not stop before deadline; detaching");
+                return;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+        let _ = self.thread.join();
+    }
+}
+
 /// All the state the event loop needs after the handshake.
 pub struct Runtime {
     mappings: Vec<GuestRegionUffdMapping>,
@@ -439,6 +503,9 @@ pub struct Runtime {
     /// task pulls the rest in the background. `None` ⇒ everything
     /// above is independent of the source.
     peer: Option<std::sync::Arc<crate::peer::PeerSession>>,
+    fault_window: Mutex<Option<FaultWindow>>,
+    fault_around_chunks: usize,
+    fault_around_chunks_installed: std::sync::atomic::AtomicU64,
     /// One-way progress/failure reports to the host-agent (peer mode).
     control: Option<std::sync::Arc<crate::peer::ControlTx>>,
     /// ADR 0045 C2: latched once the background drain has pulled every
@@ -526,6 +593,9 @@ impl Runtime {
             base_shm,
             zeropage_ok: std::sync::atomic::AtomicBool::new(true),
             peer: None,
+            fault_window: Mutex::new(None),
+            fault_around_chunks: crate::peer::DEFAULT_FAULT_AROUND_CHUNKS,
+            fault_around_chunks_installed: std::sync::atomic::AtomicU64::new(0),
             control: None,
             drain_done: std::sync::atomic::AtomicBool::new(false),
             window_dump_done: std::sync::atomic::AtomicBool::new(false),
@@ -1025,6 +1095,17 @@ impl Runtime {
             Claim::Claimed => {}
             _ => return Ok(false),
         }
+        self.install_claimed_chunk_at(byte_offset, bytes, wake)
+    }
+
+    fn install_claimed_chunk_at(
+        &self,
+        byte_offset: u64,
+        bytes: Bytes,
+        wake: bool,
+    ) -> Result<bool, HandlerError> {
+        let chunk_size = self.backend.chunk_size();
+        let chunk_idx = (byte_offset / chunk_size) as usize;
 
         // The chunk's bytes occupy file offsets
         // [byte_offset, byte_offset + total_len). Walk every region the
@@ -1064,6 +1145,12 @@ impl Runtime {
             Claim::Claimed => {}
             _ => return Ok(false),
         }
+        self.install_claimed_zero_at(byte_offset, wake)
+    }
+
+    fn install_claimed_zero_at(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
+        let chunk_size = self.backend.chunk_size();
+        let chunk_idx = (byte_offset / chunk_size) as usize;
 
         // Zero the chunk's whole [byte_offset, +total_len) range,
         // walking every region it spans (clamped to the manifest's
@@ -1180,13 +1267,22 @@ impl Runtime {
     /// mappings, in which case fall back to a private COPY of a zeroed
     /// buffer (correct, costs one private page per touched page).
     fn install_zero_substrate(&self, byte_offset: u64, wake: bool) -> Result<bool, HandlerError> {
-        use std::sync::atomic::Ordering;
         let chunk_size = self.backend.chunk_size();
         let chunk_idx = (byte_offset / chunk_size) as usize;
         match self.claim_for_install(chunk_idx) {
             Claim::Claimed => {}
             _ => return Ok(false),
         }
+        self.install_claimed_zero_substrate(byte_offset, wake)
+    }
+
+    fn install_claimed_zero_substrate(
+        &self,
+        byte_offset: u64,
+        wake: bool,
+    ) -> Result<bool, HandlerError> {
+        let chunk_size = self.backend.chunk_size();
+        let chunk_idx = (byte_offset / chunk_size) as usize;
 
         // Walk every region the chunk spans (clamped to the manifest's
         // total). Per segment try ZEROPAGE; on a kernel that rejects it
@@ -1235,7 +1331,7 @@ impl Runtime {
     /// Run forever, draining events from the UFFD and serving each
     /// page fault. Returns `Ok(())` cleanly when the UFFD is closed
     /// (Firecracker exited / sandbox destroyed).
-    pub fn run(&self) -> Result<(), HandlerError> {
+    pub fn run(self: &Arc<Self>) -> Result<(), HandlerError> {
         let mut faults_served: u64 = 0;
         loop {
             match self.uffd.read_event() {
@@ -1285,7 +1381,71 @@ impl Runtime {
         }
     }
 
-    fn serve_pagefault(&self, fault_addr: u64) -> Result<(), HandlerError> {
+    /// Install one verified peer response without waking adjacent pages.
+    fn install_peer_page(
+        &self,
+        offset: u64,
+        page: crate::peer::PeerPage,
+    ) -> Result<bool, HandlerError> {
+        let bytes = Self::prepare_peer_page(&self.backend, &self.handle, offset, page)?;
+        self.install_prepared_peer_page(offset, bytes)
+    }
+
+    /// Resolve durable bytes without a runtime reference or the install lock.
+    fn prepare_peer_page(
+        backend: &ChunkedMemoryBackend,
+        handle: &TokioHandle,
+        offset: u64,
+        page: crate::peer::PeerPage,
+    ) -> Result<Option<Bytes>, HandlerError> {
+        use crate::peer::PeerPage;
+        Ok(match page {
+            PeerPage::Bytes(bytes) => Some(Bytes::from(bytes)),
+            PeerPage::Zero => None,
+            PeerPage::AltSource(_) => {
+                let hash = match backend.resolve(offset) {
+                    Some(ResolvedPage::Chunk { hash }) => Some(hash),
+                    Some(ResolvedPage::Canonical { canonical_offset }) => {
+                        backend.canonical_chunk_hash(canonical_offset)
+                    }
+                    Some(ResolvedPage::Zero { .. }) => None,
+                    None => {
+                        return Err(HandlerError::PeerLost(format!(
+                            "AltSource for unresolvable offset {offset:#x}"
+                        )))
+                    }
+                };
+                hash.map(|hash| handle.block_on(backend.fetch_chunk(hash)))
+                    .transpose()?
+            }
+        })
+    }
+
+    fn install_prepared_peer_page(
+        &self,
+        offset: u64,
+        bytes: Option<Bytes>,
+    ) -> Result<bool, HandlerError> {
+        let chunk_idx = (offset / self.backend.chunk_size()) as usize;
+        if self.claim_for_install(chunk_idx) != Claim::Claimed {
+            return Ok(false);
+        }
+        self.install_claimed_peer_page(offset, bytes)
+    }
+
+    fn install_claimed_peer_page(
+        &self,
+        offset: u64,
+        bytes: Option<Bytes>,
+    ) -> Result<bool, HandlerError> {
+        match bytes {
+            Some(bytes) => self.install_claimed_chunk_at(offset, bytes, false),
+            None if self.base_shm.is_some() => self.install_claimed_zero_substrate(offset, false),
+            None => self.install_claimed_zero_at(offset, false),
+        }
+    }
+
+    fn serve_pagefault(self: &Arc<Self>, fault_addr: u64) -> Result<(), HandlerError> {
         // Locate the region this fault came from to translate
         // host_va → byte_offset (the inverse of `locate_offset`).
         let region = self
@@ -1330,60 +1490,29 @@ impl Runtime {
                          not dialing torn-down peer, falling through to resolve()"
                     );
                 } else {
-                    match peer.need_at(chunk_byte_offset) {
-                        Ok(crate::peer::PeerPage::Bytes(bytes)) => {
-                            let installed =
-                                self.install_chunk_at(chunk_byte_offset, bytes.into(), true)?;
-                            if !installed {
-                                self.wake_page(page_aligned, page_size)?;
-                            }
+                    let offsets = crate::peer::fault_window(
+                        peer.seal(),
+                        chunk_byte_offset,
+                        region.offset + region.size as u64,
+                        self.fault_around_chunks,
+                        |idx| self.chunk_installed(idx),
+                    );
+                    if offsets.is_empty() {
+                        self.wake_page(page_aligned, page_size)?;
+                        return Ok(());
+                    }
+                    match self.serve_fault_window(peer, offsets, chunk_byte_offset) {
+                        Ok(()) => {
+                            self.wake_page(page_aligned, page_size)?;
                             return Ok(());
-                        }
-                        Ok(crate::peer::PeerPage::Zero) => {
-                            // Private zero install — NEVER the shared base
-                            // (sealed content is divergence by definition).
-                            let installed = if self.base_shm.is_some() {
-                                self.install_zero_substrate(chunk_byte_offset, true)?
-                            } else {
-                                self.install_zero_at(chunk_byte_offset, true)?
-                            };
-                            if !installed {
-                                self.wake_page(page_aligned, page_size)?;
-                            }
-                            return Ok(());
-                        }
-                        Ok(crate::peer::PeerPage::AltSource(_durable)) => {
-                            // Over-approximation demote: the source proved this
-                            // chunk equals the durable manifest entry, so the
-                            // normal resolve() arms below serve it (class 2).
                         }
                         Err(e) => {
-                            // Issue #227 (a): before fatally escalating, re-check
-                            // whether the chunk landed meanwhile — the drain or a
-                            // sibling fault may have installed it while THIS fault
-                            // sat parked mid-redial (a multi-second window), or the
-                            // drain may have just finished and torn down the export
-                            // out from under us. If it's installed now, the peer
-                            // was never actually needed: wake and return Ok rather
-                            // than rewinding a healthy destination.
                             if self.chunk_installed(chunk_idx) {
-                                tracing::info!(
-                                    chunk_idx,
-                                    error = %e,
-                                    "sealed fault errored but chunk landed via drain/sibling; \
-                                     waking instead of escalating PeerLost"
-                                );
                                 self.wake_page(page_aligned, page_size)?;
                                 return Ok(());
                             }
-                            peer.mark_lost();
-                            if let Some(control) = self.control.as_ref() {
-                                control.report(engram_migrate_proto::HandlerControl::PeerLost {
-                                    remaining: self.sealed_uninstalled_count(peer),
-                                    detail: e.to_string(),
-                                });
-                            }
-                            return Err(HandlerError::PeerLost(e.to_string()));
+                            self.report_window_failure(peer, &e.to_string());
+                            return Err(e);
                         }
                     }
                 }
@@ -1495,11 +1624,197 @@ impl Runtime {
             .unwrap_or(false)
     }
 
-    /// Latch the drain-complete flag (DrainDone). Once set, the fault
-    /// path stops dialing the peer (see `drain_done` field doc).
-    fn mark_drain_done(&self) {
+    fn report_window_failure(&self, peer: &crate::peer::PeerSession, detail: &str) {
+        peer.mark_lost();
+        if let Some(control) = &self.control {
+            control.report(engram_migrate_proto::HandlerControl::PeerLost {
+                remaining: self.sealed_uninstalled_count(peer),
+                detail: detail.to_owned(),
+            });
+        }
+    }
+
+    fn install_window_page(
+        &self,
+        offset: u64,
+        page: crate::peer::PeerPage,
+    ) -> Result<(), HandlerError> {
+        if self.install_peer_page(offset, page)? {
+            self.fault_around_chunks_installed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Only the requested chunk holds fault priority. A busy prefetch slot
+    /// drops new speculative work; every demand uses the fault connection.
+    fn serve_fault_window(
+        self: &Arc<Self>,
+        peer: &Arc<crate::peer::PeerSession>,
+        offsets: Vec<u64>,
+        fault_offset: u64,
+    ) -> Result<(), HandlerError> {
+        use crate::peer::PEER_READ_TIMEOUT;
+        let mut slot = self.fault_window.lock().expect("window slot poisoned");
+        if slot.as_ref().is_some_and(|job| job.thread.is_finished()) {
+            slot.take().unwrap().stop();
+        }
+        if self.is_drain_done()
+            || self.chunk_installed((fault_offset / self.backend.chunk_size()) as usize)
+        {
+            return Ok(());
+        }
+        if slot.is_some() {
+            drop(slot);
+            // Overlapping demands also bypass the worker. Install claims
+            // deduplicate its later response without waiting for the suffix.
+            let page = peer
+                .need_at(fault_offset)
+                .map_err(|e| HandlerError::PeerLost(e.to_string()))?;
+            return self.install_window_page(fault_offset, page);
+        }
+        if peer.is_lost() {
+            return Err(HandlerError::PeerLost("peer already marked lost".into()));
+        }
+        let _fault = peer.begin_fault();
+        let progress = Arc::new(WindowProgress::new());
+        let worker_progress = progress.clone();
+        let runtime = Arc::downgrade(self);
+        let backend = self.backend.clone();
+        let handle = self.handle.clone();
+        let worker_peer = peer.clone();
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let (installed_tx, installed_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("uffd-fault-around".into())
+            .spawn(move || {
+                let connected = |conn: Option<&std::net::TcpStream>| {
+                    let mut socket = worker_progress.socket.lock().expect("window poisoned");
+                    if worker_progress.stopped() {
+                        return Ok(false);
+                    }
+                    if let Some(conn) = conn {
+                        *socket = Some(conn.try_clone()?);
+                    }
+                    Ok(true)
+                };
+                let result = (|| -> Result<(), String> {
+                    let mut conn = worker_peer
+                        .open_prefetch_conn(connected)
+                        .map_err(|e| e.to_string())?;
+                    worker_peer
+                        .stream_window(
+                            &mut conn,
+                            &offsets,
+                            |offset, page| {
+                                if worker_progress.stopped() {
+                                    return Ok(());
+                                }
+                                if offset == fault_offset {
+                                    first_tx.send(page).map_err(|e| e.to_string())?;
+                                    installed_rx
+                                        .recv_timeout(PEER_READ_TIMEOUT)
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    // Fetches may outlive stop(). They own only the backend,
+                                    // never the runtime or its mappings.
+                                    let bytes =
+                                        Self::prepare_peer_page(&backend, &handle, offset, page)
+                                            .map_err(|e| e.to_string())?;
+                                    if worker_progress.stopped() {
+                                        return Ok(());
+                                    }
+                                    let Some(rt) = runtime.upgrade() else {
+                                        return Ok(());
+                                    };
+                                    let chunk_idx = (offset / backend.chunk_size()) as usize;
+                                    // A competing installer may be fetching durable bytes too.
+                                    // Wait for its claim outside the cancellation lock.
+                                    if rt.claim_for_install(chunk_idx) != Claim::Claimed {
+                                        return Ok(());
+                                    }
+                                    let _guard =
+                                        worker_progress.socket.lock().expect("window poisoned");
+                                    if worker_progress.stopped() {
+                                        rt.release_chunk(chunk_idx);
+                                        return Ok(());
+                                    }
+                                    if rt
+                                        .install_claimed_peer_page(offset, bytes)
+                                        .map_err(|e| e.to_string())?
+                                    {
+                                        rt.fault_around_chunks_installed
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Ok::<_, String>(())
+                            },
+                            || worker_progress.stopped(),
+                            connected,
+                        )
+                        .map_err(|e| e.to_string())??;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    if let Some(rt) = runtime.upgrade() {
+                        let message = engram_migrate_proto::HandlerControl::PeerLost {
+                            remaining: rt.sealed_uninstalled_count(&worker_peer),
+                            detail: error,
+                        };
+                        let publish = || {
+                            let _guard = worker_progress.socket.lock().expect("window poisoned");
+                            if worker_progress.stopped() {
+                                return false;
+                            }
+                            if rt.sealed_uninstalled_count(&worker_peer) == 0 {
+                                tracing::debug!(
+                                    "discarding fault-window failure: all sealed chunks installed"
+                                );
+                                return false;
+                            }
+                            worker_peer.mark_lost();
+                            true
+                        };
+                        if let Some(control) = &rt.control {
+                            control.report_if(message, publish);
+                        } else {
+                            publish();
+                        }
+                    }
+                }
+            })?;
+        *slot = Some(FaultWindow { progress, thread });
+        drop(slot);
+        let page = first_rx
+            .recv_timeout(crate::peer::WINDOW_FIRST_RESPONSE_TIMEOUT)
+            .map_err(|e| HandlerError::PeerLost(format!("fault window first response: {e}")))?;
+        self.install_window_page(fault_offset, page)?;
+        // The fault loop installs the first response. The worker owns all later
+        // responses and never wakes a page or holds the fault-active guard.
+        let _ = installed_tx.send(());
+        Ok(())
+    }
+
+    fn stop_fault_window(&self) {
+        let mut slot = self.fault_window.lock().expect("window slot poisoned");
+        if let Some(job) = slot.take() {
+            job.stop();
+        }
+        // Keep the slot locked until new windows are prohibited.
         self.drain_done
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Cancel the prefetch worker and bound the join before publishing DrainDone.
+    fn mark_drain_done(&self) {
+        self.stop_fault_window();
+    }
+
+    #[cfg(test)]
+    fn finish_fault_window(&self) {
+        if let Some(job) = self.fault_window.lock().unwrap().take() {
+            job.thread.join().unwrap();
+        }
     }
 
     /// True once the background drain has reported DrainDone.
@@ -1775,6 +2090,7 @@ impl Runtime {
 /// open and treats our close as a protocol error).
 pub struct RunListenerOpts {
     pub prefault_trace: Option<WorkingSetTrace>,
+    pub fault_around_chunks: usize,
     pub recorder_window: Duration,
     pub trace_output: Option<PathBuf>,
     pub base_shm: Option<crate::base_shm::BaseShm>,
@@ -1794,6 +2110,7 @@ pub fn run_listener(
 ) -> Result<WorkingSetTrace, HandlerError> {
     let RunListenerOpts {
         prefault_trace,
+        fault_around_chunks,
         recorder_window,
         trace_output,
         base_shm,
@@ -1817,6 +2134,7 @@ pub fn run_listener(
         "handshake complete",
     );
     let mut rt = Runtime::new(mappings, uffd, backend, handle, recorder_window, base_shm)?;
+    rt.fault_around_chunks = fault_around_chunks;
     if let Some(path) = trace_output {
         rt.set_trace_output(path);
     }
@@ -1866,6 +2184,9 @@ pub fn run_listener(
                             // path must already know not to dial the peer by
                             // the time that frame is observed.
                             rt.mark_drain_done();
+                            let fault_around_chunks_installed = rt
+                                .fault_around_chunks_installed
+                                .load(std::sync::atomic::Ordering::Relaxed);
                             let (faults, fault_us, fault_max_us) = peer.fault_stats();
                             // Review finding 6: stash the drain + live-fault
                             // snapshot so it can be patched onto
@@ -1893,6 +2214,7 @@ pub fn run_listener(
                                     faults,
                                     fault_us,
                                     fault_max_us,
+                                    fault_around_chunks_installed,
                                 });
                             }
                         }
@@ -1944,9 +2266,12 @@ pub fn run_listener(
                 if let Some(peer_drain_stats) = peer_drain_stats {
                     if let Some(path) = rt.prefault_stats_path() {
                         let existing = std::fs::read(&path).ok();
-                        if let Some(patched) =
+                        if let Some(mut patched) =
                             patch_peer_fields(existing.as_deref(), peer_drain_stats)
                         {
+                            patched.fault_around_chunks_installed = rt
+                                .fault_around_chunks_installed
+                                .load(std::sync::atomic::Ordering::Relaxed);
                             write_prefault_stats(&path, &patched);
                         }
                     }
@@ -1957,6 +2282,7 @@ pub fn run_listener(
     tracing::info!(pid, "starting fault loop");
     let result = rt.run();
     tracing::info!(pid, ?result, "fault loop returned");
+    rt.stop_fault_window();
     // Join the prefault producer before freezing the recorder so it's
     // quiesced. Once the uffd closes (FC exited) the prefault's next install
     // errors out, so this returns promptly rather than blocking teardown.
@@ -2001,6 +2327,7 @@ mod tests {
             peer_alt_sourced: 0,
             peer_zero_chunks: 0,
             peer_live_faults: 0,
+            fault_around_chunks_installed: 0,
         };
         write_prefault_stats(&stats_path, &stats);
 
@@ -2068,6 +2395,7 @@ mod tests {
                 peer_alt_sourced: 1,
                 peer_zero_chunks: 4,
                 peer_live_faults: 7,
+                fault_around_chunks_installed: 0,
             },
         );
     }
@@ -3113,17 +3441,16 @@ mod tests {
     // (no privileged userfaultfd required); the end-to-end retry through
     // a real UFFD is covered by `fetch_failure_rolls_back_then_retries`.
 
-    /// Build a minimal single-page-per-chunk Runtime with NO real UFFD
-    /// region wired to the guest — only the install bookkeeping is
-    /// exercised. The UFFD is created over a throwaway anonymous page so
-    /// `Runtime::new` has a valid fd; tests here never call the install
-    /// ioctls, only `claim_chunk`/`mark_installed`/`release_chunk`/
-    /// `wait_until_settled`/`chunk_installed`. Returns `None` if the
-    /// kernel forbids unprivileged uffd (so the test SKIPs, like the
-    /// real-region tests above).
+    /// Build a small runtime with a real anonymous UFFD mapping, for
+    /// install-state tests and demand-window tests. Returns None when
+    /// the kernel forbids userfaultfd. Tests that use the mapping must
+    /// keep it live until their reader and installer threads have joined.
     fn bookkeeping_runtime(n_chunks: usize) -> Option<Arc<Runtime>> {
+        test_runtime_with_chunk_size(n_chunks, 4096)
+    }
+
+    fn test_runtime_with_chunk_size(n_chunks: usize, chunk_size: u64) -> Option<Arc<Runtime>> {
         let page_size = 4096u64;
-        let chunk_size = page_size;
         let total = chunk_size * n_chunks as u64;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3198,6 +3525,748 @@ mod tests {
             )
             .unwrap(),
         ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_suffix_does_not_block_another_fault_or_drain_and_late_reply_is_dropped() {
+        use crate::peer::{
+            tests::{fake_source, page_resp},
+            PeerSession,
+        };
+        let Some(mut rt) = bookkeeping_runtime(4) else {
+            return;
+        };
+        let (stalled_tx, stalled_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let addr = fake_source(vec![0, 1, 2, 3], move |req, offset| {
+            if offset == 4096 && !stalled.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                stalled_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                // This invalid late frame must not mark a drained peer lost.
+                return engram_migrate_proto::FromSource::ZeroChunk {
+                    req_id: req,
+                    chunk_offset: 0,
+                };
+            }
+            page_resp(req, offset)
+        });
+        let peer = tokio::task::spawn_blocking(move || {
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 4096, 16384)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let peer = Arc::new(peer);
+        let mutable = Arc::get_mut(&mut rt).unwrap();
+        mutable.fault_around_chunks = 2;
+        mutable.set_peer(peer.clone(), None);
+        let base = rt.mappings[0].base_host_virt_addr;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let fault_rt = rt.clone();
+        let first =
+            std::thread::spawn(move || done_tx.send(fault_rt.serve_pagefault(base)).unwrap());
+        stalled_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first fault waited for suffix")
+            .unwrap();
+        first.join().unwrap();
+        assert!(!peer.fault_active_within(Duration::ZERO));
+        assert_eq!(
+            rt.fault_around_chunks_installed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let fault_rt = rt.clone();
+        let second = std::thread::spawn(move || {
+            done_tx.send(fault_rt.serve_pagefault(base + 8192)).unwrap()
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second fault waited for suffix")
+            .unwrap();
+        second.join().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let drain_rt = rt.clone();
+        let drain_peer = peer.clone();
+        let drain = std::thread::spawn(move || {
+            let result = drain_rt.drain_from_peer(&drain_peer, None);
+            drain_rt.mark_drain_done();
+            done_tx.send(result).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("drain waited for suffix")
+            .unwrap();
+        drain.join().unwrap();
+        let count = rt
+            .fault_around_chunks_installed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        release_tx.send(()).unwrap();
+        assert!(!peer.is_lost());
+        assert_eq!(
+            rt.fault_around_chunks_installed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            count
+        );
+        assert!((0..4).all(|i| rt.chunk_installed(i)));
+        // SAFETY: DrainDone fenced all later installs; no installer remains.
+        unsafe {
+            libc::munmap(base as *mut _, 16384);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlapping_and_unrelated_faults_and_drain_bypass_stalled_suffix() {
+        use crate::peer::{
+            tests::{fake_source, page_resp},
+            PeerSession,
+        };
+        let Some(mut rt) = bookkeeping_runtime(4) else {
+            return;
+        };
+        let (stalled_tx, stalled_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let source_seen = seen.clone();
+        let addr = fake_source(vec![0, 1, 2, 3], move |req, offset| {
+            source_seen.lock().unwrap().push(offset);
+            if offset == 4096 && !stalled.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                stalled_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            page_resp(req, offset)
+        });
+        let peer = tokio::task::spawn_blocking(move || {
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 4096, 16384)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let peer = Arc::new(peer);
+        let mutable = Arc::get_mut(&mut rt).unwrap();
+        mutable.fault_around_chunks = 3;
+        mutable.set_peer(peer.clone(), None);
+        let base = rt.mappings[0].base_host_virt_addr;
+        // Exercise the same serial fault loop: A, overlapping C, unrelated D.
+        // B stays blocked throughout all three faults and the drain.
+        for offset in [0, 8192, 12288] {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let fault_rt = rt.clone();
+            let fault = std::thread::spawn(move || {
+                done_tx
+                    .send(fault_rt.serve_pagefault(base + offset))
+                    .unwrap();
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("demand waited for speculative B")
+                .unwrap();
+            fault.join().unwrap();
+            if offset == 0 {
+                stalled_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            assert!(!peer.fault_active_within(Duration::ZERO));
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let drain_rt = rt.clone();
+        let drain_peer = peer.clone();
+        let drain = std::thread::spawn(move || {
+            done_tx
+                .send(drain_rt.drain_from_peer(&drain_peer, None))
+                .unwrap();
+        });
+        let stats = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("drain waited for speculative B")
+            .unwrap();
+        drain.join().unwrap();
+        assert_eq!(stats.pulled, 1);
+        assert!((0..4).all(|i| rt.chunk_installed(i)));
+        assert_eq!(
+            rt.fault_around_chunks_installed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+
+        // Let the worker attempt both duplicate installs, without cancellation.
+        release_tx.send(()).unwrap();
+        rt.finish_fault_window();
+        assert_eq!(
+            rt.fault_around_chunks_installed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+        let mut requests = seen.lock().unwrap().clone();
+        requests.sort_unstable();
+        assert_eq!(requests, [0, 4096, 4096, 8192, 8192, 12288]);
+        assert!(!peer.is_lost());
+        // SAFETY: all faults, the drain, and the prefetch worker have joined.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(base as *const u8, 16384);
+            assert!(bytes.iter().all(|byte| *byte == 0xAB));
+            libc::munmap(base as *mut _, 16384);
+        }
+    }
+
+    #[test]
+    fn fault_window_stop_detaches_a_worker_that_misses_the_deadline() {
+        let progress = Arc::new(WindowProgress::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+            exited_tx.send(()).unwrap();
+        });
+        let job = FaultWindow {
+            progress: progress.clone(),
+            thread,
+        };
+        let started = std::time::Instant::now();
+        job.stop();
+        assert!(started.elapsed() < crate::peer::PEER_READ_TIMEOUT + Duration::from_secs(1));
+        assert!(progress.stopped());
+        release_tx.send(()).unwrap();
+        exited_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn fault_window_stop_deadline_includes_install_lock() {
+        let progress = Arc::new(WindowProgress::new());
+        let worker_progress = progress.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _guard = worker_progress.socket.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            assert!(worker_progress.stopped());
+            exited_tx.send(()).unwrap();
+        });
+        locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let job = FaultWindow {
+            progress: progress.clone(),
+            thread,
+        };
+        let started = std::time::Instant::now();
+        job.stop();
+        let elapsed = started.elapsed();
+        // Release even when the timing assertion fails.
+        release_tx.send(()).unwrap();
+        exited_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(elapsed < crate::peer::PEER_READ_TIMEOUT + Duration::from_secs(1));
+        assert!(progress.stopped());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_alt_source_does_not_block_stop_or_install_after_cancellation() {
+        use crate::peer::{
+            tests::{fake_source, page_resp},
+            PeerSession,
+        };
+        use engram_substrate_proto::{read_frame, write_frame, FromWriter, ToWriter};
+        use std::os::fd::AsFd;
+        use std::os::unix::net::UnixListener;
+
+        // Both late success and late failure must be discarded.
+        for fail in [false, true] {
+            let Some(mut rt) = bookkeeping_runtime(2) else {
+                return;
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let blob: Arc<dyn BlobStorage> =
+                Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
+            let store = ChunkStore::new(blob);
+            let bytes = vec![0xCD; 4096];
+            let hash = store.put_chunk(&bytes).await.unwrap();
+            let manifest = Manifest {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                kind: ManifestKind::Memory,
+                chunk_size: ChunkSize::bytes(4096),
+                total_bytes: 8192,
+                chunks: vec![ChunkRef { offset: 4096, hash }],
+                parent: None,
+                working_set_trace: None,
+                annotations: serde_json::Value::Null,
+            };
+            let path = dir.path().join("populate.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let file_path = dir.path().join("chunk");
+            std::fs::write(&file_path, bytes).unwrap();
+            let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let durable = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let request: ToWriter = read_frame(&mut socket).unwrap();
+                assert!(matches!(request, ToWriter::Populate { .. }));
+                fetch_tx.send(()).unwrap();
+                // No answer until stop has returned. This is below the client's
+                // 15-second timeout, so the worker cannot finish on its own.
+                release_rx.recv().unwrap();
+                if fail {
+                    write_frame(
+                        &mut socket,
+                        &FromWriter::PopulateErr {
+                            msg: "durable source failed".into(),
+                        },
+                    )
+                    .unwrap();
+                } else {
+                    write_frame(&mut socket, &FromWriter::Populated { len: 4096 }).unwrap();
+                    let file = std::fs::File::open(file_path).unwrap();
+                    engram_substrate_proto::send_fd(&socket, file.as_fd()).unwrap();
+                }
+            });
+            Arc::get_mut(&mut rt).unwrap().backend = Arc::new(
+                ChunkedMemoryBackend::new(
+                    &manifest,
+                    &manifest,
+                    engram_chunk_store::reader::ChunkCacheReader::new(dir.path().join("cache")),
+                    Some(Arc::new(crate::populate_client::PopulateClient::new(path))),
+                    store,
+                )
+                .unwrap(),
+            );
+            let addr = fake_source(vec![0, 1], move |req, offset| {
+                if offset == 4096 {
+                    engram_migrate_proto::FromSource::AltSource {
+                        req_id: req,
+                        chunk_offset: offset,
+                        durable_sha256: *hash.as_bytes(),
+                    }
+                } else {
+                    page_resp(req, offset)
+                }
+            });
+            let peer = Arc::new(
+                tokio::task::spawn_blocking(move || {
+                    PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 4096, 8192)
+                })
+                .await
+                .unwrap()
+                .unwrap(),
+            );
+            Arc::get_mut(&mut rt).unwrap().set_peer(peer.clone(), None);
+            let base = rt.mappings[0].base_host_virt_addr;
+            let fault_rt = rt.clone();
+            std::thread::spawn(move || fault_rt.serve_pagefault(base))
+                .join()
+                .unwrap()
+                .unwrap();
+            fetch_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let progress = rt
+                .fault_window
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .progress
+                .clone();
+            assert!(
+                progress.socket.try_lock().is_ok(),
+                "durable fetch held install lock"
+            );
+            assert_eq!(Arc::strong_count(&rt), 1, "fetch retained runtime mappings");
+            let started = std::time::Instant::now();
+            rt.mark_drain_done();
+            let elapsed = started.elapsed();
+            assert!(progress.stopped());
+            assert!(rt.is_drain_done());
+            release_tx.send(()).unwrap();
+            durable.join().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while Arc::strong_count(&progress) != 1 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "detached worker did not exit"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(elapsed < crate::peer::PEER_READ_TIMEOUT + Duration::from_secs(1));
+            assert!(!rt.chunk_installed(1));
+            assert_eq!(rt.fault_around_chunks_installed.load(Ordering::Relaxed), 1);
+            assert!(!peer.is_lost());
+            // SAFETY: the fault and detached prefetch worker have exited.
+            unsafe {
+                libc::munmap(base as *mut _, 8192);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn demand_window_installs_all_shapes_and_wakes_only_faulting_page() {
+        use crate::peer::{tests::fake_source_geometry, PeerSession};
+        let Some(mut rt) = test_runtime_with_chunk_size(4, 8192) else {
+            return;
+        };
+        let addr =
+            fake_source_geometry(vec![0, 1, 2, 3], 8192, 32768, |req, offset| match offset {
+                8192 => engram_migrate_proto::FromSource::ZeroChunk {
+                    req_id: req,
+                    chunk_offset: offset,
+                },
+                16384 => engram_migrate_proto::FromSource::AltSource {
+                    req_id: req,
+                    chunk_offset: offset,
+                    durable_sha256: [0; 32],
+                },
+                _ => {
+                    let (bytes, lz4) = engram_migrate_proto::compress_page(vec![0xAB; 8192]);
+                    let hash = engram_migrate_proto::wire_hash(&bytes);
+                    engram_migrate_proto::FromSource::Page {
+                        req_id: req,
+                        chunk_offset: offset,
+                        bytes,
+                        hash,
+                        lz4,
+                    }
+                }
+            });
+        let peer = tokio::task::spawn_blocking(move || {
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 8192, 32768)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        Arc::get_mut(&mut rt)
+            .unwrap()
+            .set_peer(Arc::new(peer), None);
+        let base = rt.mappings[0].base_host_virt_addr;
+        // Queue faults in the first chunk and the next chunk before the install.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let readers: Vec<_> = [0, 4096, 8192]
+            .into_iter()
+            .map(|offset| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    // SAFETY: the registered mapping remains live until all readers join.
+                    let byte = unsafe { std::ptr::read_volatile((base + offset) as *const u8) };
+                    tx.send((offset, byte)).unwrap();
+                })
+            })
+            .collect();
+        for _ in 0..3 {
+            assert!(matches!(
+                rt.uffd.read_event().unwrap(),
+                Some(Event::Pagefault { .. })
+            ));
+        }
+        let serve = rt.clone();
+        std::thread::spawn(move || serve.serve_pagefault(base))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), (0, 0xAB));
+        assert!(
+            rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "adjacent page was woken"
+        );
+        rt.finish_fault_window();
+        assert!((0..4).all(|i| rt.chunk_installed(i)));
+        assert_eq!(
+            rt.fault_around_chunks_installed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4
+        );
+        rt.serve_pagefault(base + 4096).unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (4096, 0xAB)
+        );
+        rt.serve_pagefault(base + 8192).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), (8192, 0));
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        // SAFETY: no reader or installer still uses the mapping.
+        unsafe {
+            libc::munmap(base as *mut _, 32768);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn demand_window_deduplicates_concurrent_drain_install() {
+        use crate::peer::{
+            tests::{fake_source, page_resp},
+            PeerSession,
+        };
+        let Some(mut rt) = bookkeeping_runtime(4) else {
+            return;
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let source_barrier = barrier.clone();
+        let addr = fake_source(vec![0, 1, 2, 3], move |req, offset| {
+            if offset == 4096 {
+                source_barrier.wait();
+                source_barrier.wait();
+            }
+            page_resp(req, offset)
+        });
+        let peer = tokio::task::spawn_blocking(move || {
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 4096, 16384)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        Arc::get_mut(&mut rt)
+            .unwrap()
+            .set_peer(Arc::new(peer), None);
+        let base = rt.mappings[0].base_host_virt_addr;
+        let fault_rt = rt.clone();
+        let fault = std::thread::spawn(move || fault_rt.serve_pagefault(base));
+        barrier.wait();
+        assert!(rt
+            .install_chunk_at(4096, Bytes::from(vec![0xCD; 4096]), false)
+            .unwrap());
+        barrier.wait();
+        fault.join().unwrap().unwrap();
+        rt.finish_fault_window();
+        assert_eq!(
+            rt.fault_around_chunks_installed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+        // SAFETY: all chunks are installed, and the fault worker has joined.
+        assert_eq!(unsafe { std::ptr::read((base + 4096) as *const u8) }, 0xCD);
+        unsafe {
+            libc::munmap(base as *mut _, 16384);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn demand_window_skips_unsealed_and_installed_chunks() {
+        use crate::peer::{
+            tests::{fake_source, page_resp},
+            PeerSession,
+        };
+        let Some(mut rt) = bookkeeping_runtime(4) else {
+            return;
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let source_seen = seen.clone();
+        let addr = fake_source(vec![0, 1, 3], move |req, offset| {
+            source_seen.lock().unwrap().push(offset);
+            page_resp(req, offset)
+        });
+        let peer = tokio::task::spawn_blocking(move || {
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 4096, 16384)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        Arc::get_mut(&mut rt)
+            .unwrap()
+            .set_peer(Arc::new(peer), None);
+        assert!(rt
+            .install_chunk_at(4096, Bytes::from(vec![0xCD; 4096]), false)
+            .unwrap());
+        let base = rt.mappings[0].base_host_virt_addr;
+        let fault_rt = rt.clone();
+        std::thread::spawn(move || fault_rt.serve_pagefault(base))
+            .join()
+            .unwrap()
+            .unwrap();
+        rt.finish_fault_window();
+        assert_eq!(*seen.lock().unwrap(), vec![0, 12288]);
+        assert!(!rt.chunk_installed(2));
+        // SAFETY: the fault worker has joined and no thread uses the mapping.
+        unsafe {
+            libc::munmap(base as *mut _, 16384);
+        }
+    }
+
+    /// Read the control backlog after the worker has exited. Any earlier
+    /// PeerLost must appear before DrainDone and fail this assertion.
+    fn assert_window_drain_done(rt: &Runtime, control_path: &std::path::Path) {
+        use engram_migrate_proto::{read_frame, HandlerControl};
+        rt.mark_drain_done();
+        rt.control
+            .as_ref()
+            .unwrap()
+            .report(HandlerControl::DrainDone {
+                pulled: 0,
+                alt_sourced: 0,
+                zero_chunks: 0,
+                ms: 0,
+                faults: 0,
+                fault_us: 0,
+                fault_max_us: 0,
+                fault_around_chunks_installed: 0,
+            });
+        let mut subscriber = std::os::unix::net::UnixStream::connect(control_path).unwrap();
+        subscriber
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert!(matches!(
+            read_frame::<_, HandlerControl>(&mut subscriber).unwrap(),
+            HandlerControl::DrainDone { .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn demand_window_first_read_timeout_reconnects_before_first_response_deadline() {
+        use crate::peer::{
+            tests::{fake_source, page_resp},
+            ControlTx, PeerSession,
+        };
+        // The single-chunk setting must retain the same retry policy.
+        for window in [1, 2] {
+            let Some(mut rt) = bookkeeping_runtime(4) else {
+                return;
+            };
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let source_requests = requests.clone();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Arc::new(Mutex::new(release_rx));
+            let addr = fake_source(vec![0], move |req, offset| {
+                if source_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Only a read timeout can start the retry: keep the first
+                    // connection open without sending any response bytes.
+                    let _ = release_rx.lock().unwrap().recv();
+                }
+                page_resp(req, offset)
+            });
+            let peer = Arc::new(
+                PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 4096, 16384)
+                    .unwrap(),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("control.sock");
+            let control = Arc::new(ControlTx::bind(&path).unwrap());
+            let mutable = Arc::get_mut(&mut rt).unwrap();
+            mutable.fault_around_chunks = window;
+            mutable.set_peer(peer.clone(), Some(control));
+            let base = rt.mappings[0].base_host_virt_addr;
+            let fault_rt = rt.clone();
+            let result = std::thread::spawn(move || fault_rt.serve_pagefault(base))
+                .join()
+                .unwrap();
+            release_tx.send(()).unwrap();
+            result.unwrap();
+            rt.finish_fault_window();
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+            assert!(rt.chunk_installed(0));
+            assert!(!peer.is_lost());
+            assert_window_drain_done(&rt, &path);
+            // SAFETY: the fault and prefetch worker have exited.
+            unsafe {
+                libc::munmap(base as *mut _, 16384);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn obsolete_suffix_failure_before_cancellation_does_not_report_peer_lost() {
+        use crate::peer::{
+            tests::{fake_source, page_resp},
+            ControlTx, PeerSession,
+        };
+        let Some(mut rt) = bookkeeping_runtime(4) else {
+            return;
+        };
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let addr = fake_source(vec![0, 1], move |req, offset| {
+            if offset == 4096 {
+                pending_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                engram_migrate_proto::FromSource::Error {
+                    req_id: None,
+                    message: "obsolete suffix failed".into(),
+                }
+            } else {
+                page_resp(req, offset)
+            }
+        });
+        let peer = Arc::new(
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 4096, 16384).unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let control = Arc::new(ControlTx::bind(&path).unwrap());
+        Arc::get_mut(&mut rt)
+            .unwrap()
+            .set_peer(peer.clone(), Some(control));
+        let base = rt.mappings[0].base_host_virt_addr;
+        let fault_rt = rt.clone();
+        std::thread::spawn(move || fault_rt.serve_pagefault(base))
+            .join()
+            .unwrap()
+            .unwrap();
+        pending_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(rt
+            .install_chunk_at(4096, Bytes::from(vec![0xCD; 4096]), false)
+            .unwrap());
+        assert_eq!(rt.sealed_uninstalled_count(&peer), 0);
+        assert!(!rt.is_drain_done());
+        assert!(!rt
+            .fault_window
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .progress
+            .stopped());
+        release_tx.send(()).unwrap();
+        // Let the error reach publication BEFORE mark_drain_done cancels work.
+        rt.finish_fault_window();
+        assert!(!peer.is_lost());
+        assert_window_drain_done(&rt, &path);
+        // SAFETY: the fault and prefetch worker have exited.
+        unsafe {
+            libc::munmap(base as *mut _, 16384);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn demand_window_error_preserves_installed_prefix_and_reports_peer_lost() {
+        use crate::peer::{
+            tests::{fake_source, page_resp},
+            PeerSession,
+        };
+        let Some(mut rt) = bookkeeping_runtime(4) else {
+            return;
+        };
+        let addr = fake_source(vec![0, 1, 2, 3], |req, offset| {
+            if offset == 4096 {
+                engram_migrate_proto::FromSource::Error {
+                    req_id: None,
+                    message: "source lost".into(),
+                }
+            } else {
+                page_resp(req, offset)
+            }
+        });
+        let peer = tokio::task::spawn_blocking(move || {
+            PeerSession::connect(addr.to_string(), "e".into(), "tok".into(), 4096, 16384)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        Arc::get_mut(&mut rt)
+            .unwrap()
+            .set_peer(Arc::new(peer), None);
+        let base = rt.mappings[0].base_host_virt_addr;
+        let fault_rt = rt.clone();
+        std::thread::spawn(move || fault_rt.serve_pagefault(base))
+            .join()
+            .unwrap()
+            .unwrap();
+        rt.finish_fault_window();
+        assert!(rt.chunk_installed(0));
+        assert!(!rt.chunk_installed(1));
+        assert!(rt.peer.as_ref().unwrap().is_lost());
+        // SAFETY: the fault worker has joined and no thread uses the mapping.
+        unsafe {
+            libc::munmap(base as *mut _, 16384);
+        }
     }
 
     /// Acceptance #2 + #1 (state level): a claim that ends in error rolls
