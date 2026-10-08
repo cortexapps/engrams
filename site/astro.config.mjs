@@ -18,12 +18,18 @@ const site = process.env.SITE_URL ?? "http://localhost:4321";
 const base = process.env.BASE_PATH ?? "/";
 const outDir = base === "/" ? "./dist" : `./dist${base.replace(/\/$/, "")}`;
 
+// The stable community link: the site and the README point at <site>/slack/,
+// so a new Slack invite changes only this line.
+const slackInvite = "https://join.slack.com/t/engramscommunity/shared_invite/zt-4bwkz6mfb-BAH7s00BtvA5FAMXZvgmUA";
+
 export default defineConfig({
   site,
   base,
   outDir,
   trailingSlash: "always",
   output: "static",
+  // A static host has no server redirects, so Astro writes a page that redirects at once.
+  redirects: { "/slack": slackInvite },
   integrations: [
     starlight({
       title: "engrams",

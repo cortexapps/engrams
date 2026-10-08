@@ -2,7 +2,7 @@
 import Marketing from "../layouts/Marketing.astro";
 import TraceMark from "../components/TraceMark.astro";
 import pelican from "../assets/screenshots/session-pelican.png";
-import { hero, modules, slack, automations, how, session, extensible, start } from "../landing/copy";
+import { hero, modules, slack, automations, how, session, extensible, community, start } from "../landing/copy";
 import { nodes, edges, frame } from "../landing/demo";
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
@@ -237,6 +237,22 @@ const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
       {beltItems.map((l) => (
         <div class="item"><i style={`--logo:url(${l.src})`}></i><span>{l.label}</span></div>
       ))}
+    </div>
+  </section>
+
+  <!-- SEC. 6 — COMMUNITY -->
+  <section class="sec">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-badge">{community.badge}</span><span>{community.label}</span><span class="sec-rule"></span></div>
+      <div class="sec-intro">
+        <h2 class="display">{community.title}</h2>
+        <div>
+          <p class="lede">{community.lede}</p>
+          <div class="actions">
+            <a class="btn outline" href={`${base}/slack/`}>{community.cta.label} <span>→</span></a>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
 

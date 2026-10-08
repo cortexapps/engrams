@@ -176,6 +176,70 @@ code {
   background: var(--primary);
 }
 
+/* ---- Slack banner (above the masthead; scrolls away) ---- */
+:root {
+  --banner-h: 40px;
+}
+html.banner-closed {
+  --banner-h: 0px;
+}
+html.banner-closed .banner {
+  display: none;
+}
+.banner {
+  box-sizing: border-box;
+  height: var(--banner-h);
+  /* A dark gap keeps the orange bar apart from the orange in the stripe below. */
+  border-bottom: 4px solid var(--panel-deep);
+  background: var(--amber);
+  color: var(--primary-foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.banner .wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+.banner a {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  white-space: nowrap;
+}
+.banner a:hover .long,
+.banner a:hover .short {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.banner .tag {
+  border: 1px solid currentColor;
+  padding: 1px 8px;
+  font-size: 10px;
+}
+.banner .short {
+  display: none;
+}
+.banner .close {
+  position: absolute;
+  right: 60px;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.banner .close svg {
+  width: 18px;
+  height: 18px;
+}
+
 /* ---- header ---- */
 :root {
   --masthead-h: 81px;
@@ -411,7 +475,7 @@ html.menu-open {
 /* The cover fills the first screen under the masthead, so the floor grid
    always meets the bottom of the window, whatever the hero's own height. */
 .cover-hero {
-  min-height: calc(100svh - var(--masthead-h));
+  min-height: calc(100svh - var(--masthead-h) - var(--banner-h));
 }
 .hero {
   display: grid;
@@ -1200,7 +1264,8 @@ html.menu-open {
 }
 .site-footer nav {
   display: flex;
-  gap: 24px;
+  flex-wrap: wrap;
+  gap: 12px 24px;
 }
 .site-footer .stripe {
   margin-top: 24px;
@@ -1557,6 +1622,18 @@ html.menu-open {
   }
   :root {
     --masthead-h: 69px;
+  }
+  .banner .long {
+    display: none;
+  }
+  .banner .short {
+    display: inline;
+  }
+  .banner .tag {
+    display: none;
+  }
+  .banner .close {
+    right: 8px;
   }
   .site-header {
     height: 64px;

@@ -34,6 +34,11 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script is:inline>
+      try {
+        if (localStorage.getItem("slack-banner-closed")) document.documentElement.classList.add("banner-closed");
+      } catch {}
+    </script>
     <GoogleTagManager part="head" />
     <title>{title}</title>
     <meta name="description" content={description} />
@@ -54,6 +59,21 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
   </head>
   <body>
     <GoogleTagManager part="body" />
+    <!-- The Slack banner scrolls away with the page. A visitor who closes it
+         does not see it again (the head script hides it before first paint). -->
+    <div class="banner" data-banner>
+      <div class="wrap">
+        <a href={`${base}/slack/`}>
+          <span class="tag">Community</span>
+          <span class="long">Join the engrams Slack: talk with the engineers who build it</span>
+          <span class="short">Join the engrams Slack</span>
+          <span aria-hidden="true">→</span>
+        </a>
+        <button class="close" type="button" aria-label="Close the Slack banner" data-banner-close>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+        </button>
+      </div>
+    </div>
     <div class:list={["cover", "masthead", { landing }]}>
       <div class="layer grid"></div>
       <div class="layer scan"></div>
@@ -106,6 +126,7 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
             <a href={`${base}/compare/`}>Compare</a>
             <a href={`${base}/docs/`}>Docs</a>
             <a href="https://github.com/cortexapps/engrams">GitHub</a>
+            <a href={`${base}/slack/`}>Join our Slack community</a>
           </nav>
         </div>
         <div class="stripe"><span class="lime"></span><span class="amber"></span><span class="sage"></span><span></span></div>
@@ -115,10 +136,21 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
 </html>
 
 <script>
+  document.querySelector("[data-banner-close]")?.addEventListener("click", () => {
+    document.documentElement.classList.add("banner-closed");
+    try {
+      localStorage.setItem("slack-banner-closed", "1");
+    } catch {}
+  });
+
   const toggle = document.querySelector<HTMLButtonElement>("[data-menu-toggle]");
   const panel = document.getElementById("site-menu");
   if (toggle && panel) {
+    const masthead = document.querySelector<HTMLElement>(".masthead");
     const set = (open: boolean) => {
+      // The banner above the masthead can push it down, so the panel starts
+      // where the masthead ends now.
+      if (open && masthead) panel.style.top = `${masthead.getBoundingClientRect().bottom}px`;
       toggle.setAttribute("aria-expanded", String(open));
       panel.hidden = !open;
       document.documentElement.classList.toggle("menu-open", open);
