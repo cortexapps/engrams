@@ -165,7 +165,11 @@ use serde::{Deserialize, Serialize};
 // v32 appends SnapshotMetadata.swap_manifest; coordinator and hosts roll together.
 // v33 appends the chunked swap source and manifest to SandboxSpec.
 // v34 carries the swap base lineage in live migration presetup.
-pub const WIRE_VERSION: u32 = 34;
+// v35 types the memory image refusal (`memory_image_unusable:` marker). The
+// payloads do not change. The bump fences mixed fleets: an older host refuses
+// the same snapshot with an untyped error, which the resume verb counts toward
+// the Dead budget instead of recovering from disk.
+pub const WIRE_VERSION: u32 = 35;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic
@@ -237,9 +241,9 @@ pub fn parse_harness_spawn_message(msg: &str) -> Option<(String, String)> {
 /// [`HARNESS_SPAWN_STATUS_PREFIX`] precedent). The host returns a
 /// `failed_precondition` status whose message starts with this prefix;
 /// the coord-side client maps it back to the typed variant, so the resume
-/// verb can fall back to a disk-only cold boot. A peer that predates the
-/// marker sees an ordinary `failed_precondition` string — no
-/// `WIRE_VERSION` bump.
+/// verb can fall back to a disk-only cold boot. Unlike the harness-spawn
+/// marker, it came with a `WIRE_VERSION` bump (v35): an older host refuses
+/// the same snapshot untyped, so the exact-match gate fences it out.
 pub const MEMORY_IMAGE_UNUSABLE_STATUS_PREFIX: &str = "memory_image_unusable:";
 
 /// Render the host-agent's memory-image refusal message.

@@ -697,8 +697,10 @@ fn wire_version_pinned() {
     // HostUtilization also drops the committed-swap reservation.
     // 33 -> 34: MigrationPresetup advertises the swap base lineage.
     // Existing bincode goldens do not embed presetup; their bytes do not change.
+    // 34 -> 35: the memory image refusal is typed. No payload changes; the
+    // bump fences old hosts that refuse untyped.
     assert_eq!(
-        WIRE_VERSION, 34,
+        WIRE_VERSION, 35,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
