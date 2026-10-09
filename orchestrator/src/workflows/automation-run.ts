@@ -48,6 +48,9 @@ import { makeAutomationStateStore } from "../db/automation-state.ts";
 import { makePrRefStore } from "../db/pr-refs.ts";
 import { makeIntegrationActionRuntime } from "../automations/actions/runtime.ts";
 import { makeAutomationInstanceStore } from "../db/automation-instances.ts";
+import { isRouterConnected } from "../model-routers/connected.ts";
+import { getOpenRouterDecisions } from "../integrations/openrouter.ts";
+import { loadProfileCards } from "../automations/profile-cards.ts";
 
 export interface AutomationRunWorkflowInput {
   runId: string;
@@ -289,6 +292,11 @@ function productionEngineDeps(): EngineDeps {
       },
     },
     integrationActions: makeIntegrationActionRuntime(),
+    decisions: {
+      connected: () => isRouterConnected("openrouter"),
+      decide: async (request) => (await getOpenRouterDecisions()).decide(request),
+    },
+    profileCards: () => loadProfileCards(),
     instances: {
       closeInstance: (input) => makeAutomationInstanceStore().closeInstance(input),
       recordInstanceHandle: (input) => makeAutomationInstanceStore().recordInstanceHandle(input),
