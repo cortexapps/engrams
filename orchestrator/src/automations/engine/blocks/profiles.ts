@@ -11,7 +11,8 @@ import { registerBlock } from "./registry.ts";
 
 export const listProfilesConfigSchema = z.object({
   /** Restrict the candidates to these profile ids (unknown ids are
-   * skipped). Absent = every active profile. */
+   * skipped). Absent or empty = every active profile, so an unset list
+   * input means "all". */
   ids: z.array(z.string().min(1)).optional(),
 });
 export type ListProfilesConfig = z.infer<typeof listProfilesConfigSchema>;
@@ -32,7 +33,7 @@ export function registerListProfilesBlock(): void {
         };
       }
       let cards = await load();
-      if (config.ids) {
+      if (config.ids && config.ids.length > 0) {
         const wanted = new Set(config.ids);
         cards = cards.filter((card) => wanted.has(card.id));
       }

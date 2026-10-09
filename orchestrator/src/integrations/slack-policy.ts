@@ -216,6 +216,15 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
       return post(m, text, blocks);
     },
 
+    async onChoice(m, choice) {
+      log.info({ channel: m.channel, thread: m.threadRoot }, "slack: posting a choice");
+      const blocks = buildQuestionBlocks(route(m), {
+        toolCallId: choice.id,
+        questions: [{ question: choice.question, header: "", multiSelect: false, options: choice.options }],
+      });
+      return post(m, choice.question, blocks);
+    },
+
     async onAnswered(m, ev, ref) {
       const answers = parseQuestionAnswers(ev.payloadJson);
       const blocks = buildAnsweredBlocks(answers);

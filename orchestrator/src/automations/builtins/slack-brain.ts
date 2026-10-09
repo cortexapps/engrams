@@ -38,9 +38,14 @@
  * continues in it (a fresh session only when none exists or it is gone).
  * Only an explicit end (halted, superseded) closes the workstream.
  *
- * One divergence from the legacy loop, deliberate: the LLM profile picker +
- * the "which profile?" dropdown are retired — the channel → profile map
- * input decides, with `default_profile` as the fallback.
+ * Routing: a channel override always decides. Otherwise `routing` picks:
+ * `default` runs every thread on `default_profile`; `smart` lets a decision
+ * model (the `decide` block, Jev through OpenRouter) pick the profile from
+ * the thread, and asks the person with a card (`slack_choice`) when the
+ * model is not confident or the person asks to choose. Without an
+ * OpenRouter key, smart routing falls back to the default profile — the
+ * same behavior as `default`. Only a NEW session is routed; a kept session
+ * resumes on its own profile.
  */
 
 import {
@@ -54,16 +59,25 @@ import { RELAY_CLOSE_TYPE } from "../engine/blocks/relay-close.ts";
 import { LOOKUP_INSTANCE_SESSION_TYPE } from "../engine/blocks/instance-session.ts";
 import { RELAY_SESSION_TYPE } from "../engine/blocks/relay.ts";
 import { RESOLVE_USER_TYPE } from "../engine/blocks/resolve-user.ts";
+import { SLACK_CHOICE_TYPE } from "../engine/blocks/slack-choice.ts";
+import { profileRouteQuestions } from "../profile-cards.ts";
 import { NO_USER_MSG } from "../../integrations/slack-identity.ts";
 import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 11;
+export const SLACK_BRAIN_DEFINITION_VERSION = 12;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
+/** Smart routing routes without asking at or above this confidence. */
+/** From a routing benchmark against real history: at 0.8 the model routes
+ * about 60% of new threads alone and is right ~82-89% of the time on those;
+ * the 0.6-0.8 band is barely better than a coin flip, so it asks. */
+export const SLACK_BRAIN_DEFAULT_MIN_CONFIDENCE = 0.8;
+/** How long the profile card waits for a click before the model's pick. */
+export const SLACK_BRAIN_DEFAULT_ASK_TIMEOUT_S = 600;
 /** A turn — the harness working on one prompt — has NO deadline: a task
  * may run for hours, and nothing time-based may fail a thread. A wait has
  * an engine ceiling, so a turn is waited for in slices of that length,
@@ -108,8 +122,12 @@ export default ({ event, inputs, trigger }) => {
   // the reply entrypoint (joined into this run's mailbox), never here.
   if (key !== "app_mention") return null;
   const channels = inputs.channels ?? {};
-  const profile = channels[channel] ?? inputs.default_profile ?? "";
-  if (!profile) return null;
+  const override = channels[channel] ?? "";
+  // Smart routing decides where no override does; the default profile is
+  // its fallback. Without either, the mention is not answered.
+  const smart = !override && inputs.routing === "smart";
+  const profile = override || inputs.default_profile || "";
+  if (!profile && !smart) return null;
   const text = String(ev.text ?? "")
     .replace(/<@[^>]+>/g, " ")
     .replace(/[^\\S\\n]+/g, " ")
@@ -118,6 +136,8 @@ export default ({ event, inputs, trigger }) => {
   return {
     admit: true,
     profile_id: String(profile),
+    override: Boolean(override),
+    smart,
     team: str(raw.team_id),
     channel,
     thread_ts: str(ev.thread_ts || ev.ts),
@@ -336,12 +356,183 @@ const opening: BlockDef[] = [
   { id: "opening", type: "code", config: { source: OPENING_TEXT_SOURCE, mode: "value" } },
 ];
 
+/** Smart routing's verdict on the model's answer: ask the person when the
+ * model is not confident or the person asks to choose, with the model's
+ * best candidates (and the default profile) as the card's buttons. When the
+ * model could not decide, the default profile serves — and with no default,
+ * the person is asked, unless there is no OpenRouter key at all (then smart
+ * routing behaves exactly like default routing). */
+export const SLACK_TRIAGE_SOURCE = `
+export default ({ steps, inputs }) => {
+  const route = steps.route ?? {};
+  const options = steps.candidates?.options ?? [];
+  const labelOf = new Map(options.map((o) => [o.value, o.label ?? o.value]));
+  const fallback = String(inputs.default_profile ?? "");
+  const card = (ids) => {
+    const order = [...ids];
+    if (fallback && labelOf.has(fallback) && !order.includes(fallback)) order.push(fallback);
+    return order.filter((id) => labelOf.has(id)).slice(0, 5).map((id) => ({ value: id, label: labelOf.get(id) }));
+  };
+  if (options.length === 0) return { ask: false, options: [] };
+  if (!route.decided) {
+    const ask = !fallback && route.reason !== "router_not_connected" && options.length > 1;
+    return { ask, options: ask ? card(options.map((o) => o.value)) : [] };
+  }
+  const pick = route.answers.profile;
+  const min = Number(inputs.smart_min_confidence ?? ${SLACK_BRAIN_DEFAULT_MIN_CONFIDENCE});
+  const wants = Number(route.answers.wants_choice?.yes ?? 0);
+  const ask = options.length > 1 && (pick.confidence < min || wants >= 0.5);
+  return { ask, options: ask ? card(pick.ranked.slice(0, 4)) : [] };
+};
+`.trim();
+
+/** Smart routing's verdict: the profile the new session runs on, and how it
+ * was chosen — the person's click, else the model's pick, else the default.
+ * An empty id means nobody chose: the run ends `filtered` before any
+ * session exists. */
+export const SLACK_RESOLVE_SOURCE = `
+export default ({ steps }) => {
+  const facts = steps.facts.value;
+  const route = steps.route ?? {};
+  // No OpenRouter key: exactly default routing.
+  if (route.reason === "router_not_connected") {
+    return { profile_id: facts.profile_id, label: "", card: "" };
+  }
+  const options = steps.candidates?.options ?? [];
+  const name = (id) => options.find((o) => o.value === id)?.label ?? "";
+  const pick = route.decided ? route.answers.profile : null;
+  const pct = pick ? Math.round(pick.confidence * 100) : 0;
+  let id = "";
+  let how = "";
+  if (steps.ask?.outcome === "answered") {
+    id = steps.ask.value;
+    how = "picked in the thread";
+  } else if (pick) {
+    id = pick.value;
+    how = (steps.ask?.outcome === "deadline" ? "no answer, so " : "") + "routed by Jev, " + pct + "% confident";
+  } else if (facts.profile_id) {
+    id = facts.profile_id;
+    how = (steps.ask?.outcome === "deadline" ? "no answer, so " : "") + "the default profile";
+  }
+  if (!id) return { profile_id: "", label: "", card: "No profile was chosen. Mention me again to retry." };
+  const shown = name(id) || "the default profile";
+  return {
+    profile_id: id,
+    label: " on *" + shown + "* (" + how + ")",
+    card: "Profile: *" + shown + "* (" + how + ")",
+  };
+};
+`.trim();
+
+const resolveProfile: BlockDef = {
+  id: "resolve",
+  type: "code",
+  config: { source: SLACK_RESOLVE_SOURCE, mode: "value" },
+};
+
+/** The card becomes the outcome line (its buttons go), so the thread shows
+ * what was decided, answered or not. */
+const closeCard: BlockDef = {
+  id: "asked",
+  type: "branch",
+  config: {
+    conditions: { mode: "all", conditions: [{ path: "steps.triage.value.ask", op: "is_true" }] },
+  },
+  then: [
+    {
+      id: "close_card",
+      type: "integration_action",
+      config: {
+        provider: "slack",
+        actionId: "update_message",
+        params: {
+          channel: `\${{ ${F}.channel }}`,
+          ts: "${{ steps.ask.message_ts | default: '' }}",
+          text: "${{ steps.resolve.value.card }}",
+        },
+      },
+    },
+  ],
+  else: [],
+};
+
+const routed: BlockDef = {
+  id: "routed",
+  type: "filter",
+  config: {
+    conditions: {
+      mode: "all",
+      conditions: [{ path: "steps.resolve.value.profile_id", op: "not_equals", value: "" }],
+    },
+  },
+};
+
+/** Smart routing, on the create arm only: the candidates, the model's
+ * answer, a card for the person when it is unsure, and the verdict. Default
+ * routing skips all of it (one condition step), so it adds nothing to a
+ * thread's first reply. */
+const smartRoute: BlockDef = {
+  id: "smart_route",
+  type: "branch",
+  config: {
+    conditions: { mode: "all", conditions: [{ path: `${F}.smart`, op: "is_true" }] },
+  },
+  then: [
+    { id: "candidates", type: "list_profiles", config: { ids: { $ref: "inputs.smart_profiles" } } },
+    {
+      id: "route",
+      type: "decide",
+      config: {
+        // The opening fold: the thread so far plus the mention, the same
+        // text the session will get as its first prompt.
+        state: { message: "${{ steps.opening.value.text }}" },
+        questions: profileRouteQuestions({ $ref: "steps.candidates.options" }),
+        // A model outage must never cost the thread its answer.
+        onError: "undecided",
+      },
+    },
+    { id: "triage", type: "code", config: { source: SLACK_TRIAGE_SOURCE, mode: "value" } },
+    {
+      id: "unsure",
+      type: "branch",
+      config: {
+        conditions: {
+          mode: "all",
+          conditions: [{ path: "steps.triage.value.ask", op: "is_true" }],
+        },
+      },
+      then: [
+        {
+          id: "ask",
+          type: SLACK_CHOICE_TYPE,
+          tunable: ["question"],
+          config: {
+            provider: "slack",
+            team: `\${{ ${F}.team }}`,
+            channel: `\${{ ${F}.channel }}`,
+            threadTs: `\${{ ${F}.thread_ts }}`,
+            question: "Which profile should handle this thread?",
+            options: { $ref: "steps.triage.value.options" },
+            deadlineSeconds: { $ref: "inputs.ask_timeout" },
+          },
+        },
+      ],
+      else: [],
+    },
+    resolveProfile,
+    closeCard,
+    routed,
+  ],
+  else: [],
+};
+
 const session: BlockDef = {
   id: "session",
   type: "create_session",
   tunable: ["promptTemplate"],
   config: {
-    profileId: `\${{ ${F}.profile_id }}`,
+    // Smart routing's verdict, else the facts' (override or default).
+    profileId: `\${{ steps.resolve.value.profile_id | default: ${F}.profile_id }}`,
     promptTemplate: "${{ steps.opening.value.text }}",
     titleTemplate: `\${{ ${F}.title }}`,
     role: "primary",
@@ -367,7 +558,7 @@ const started: BlockDef = {
     params: {
       channel: `\${{ ${F}.channel }}`,
       threadTs: `\${{ ${F}.thread_ts }}`,
-      text: "Started a session — ${{ steps.session.web_url }}",
+      text: "Started a session${{ steps.resolve.value.label | default: '' }} — ${{ steps.session.web_url }}",
     },
   },
 };
@@ -393,7 +584,7 @@ const sessionUnlessResumed: BlockDef = {
     conditions: { mode: "all", conditions: [{ path: "steps.previous.found", op: "is_true" }] },
   },
   then: [],
-  else: [session, started],
+  else: [smartRoute, session, started],
 };
 
 const pick: BlockDef = { id: "pick", type: "code", config: { source: PICK_SOURCE, mode: "value" } };
@@ -628,6 +819,40 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       default: "",
     },
     {
+      key: "routing",
+      label: "Routing",
+      type: "enum",
+      values: ["default", "smart"],
+      help: "default: threads without a channel override run on the default profile. smart: a decision model picks the profile from the thread and asks in the thread when it is not sure (needs an OpenRouter key; without one, smart works like default).",
+      default: "default",
+    },
+    {
+      key: "smart_profiles",
+      label: "Profiles smart routing can pick",
+      type: "list",
+      help: "Profile ids smart routing chooses between. Empty = every active profile. Leave out worker profiles no thread should run on.",
+      default: [],
+      valueShape: { type: "string" },
+    },
+    {
+      key: "smart_min_confidence",
+      label: "Smart routing confidence",
+      type: "number",
+      help: "Smart routing picks on its own at or above this confidence (0-1); below it, it asks in the thread.",
+      default: SLACK_BRAIN_DEFAULT_MIN_CONFIDENCE,
+      min: 0,
+      max: 1,
+    },
+    {
+      key: "ask_timeout",
+      label: "Profile question timeout (seconds)",
+      type: "number",
+      help: "How long the profile question waits for a click before smart routing takes the model's pick.",
+      default: SLACK_BRAIN_DEFAULT_ASK_TIMEOUT_S,
+      min: 30,
+      max: MAX_WAIT_DEADLINE_S,
+    },
+    {
       key: "idle_timeout",
       label: "Idle timeout (seconds)",
       type: "number",
@@ -718,6 +943,10 @@ export const SLACK_BRAIN_BUILTIN: BuiltinAutomation = {
     return {
       channels: {},
       default_profile: "",
+      routing: "default",
+      smart_profiles: [],
+      smart_min_confidence: SLACK_BRAIN_DEFAULT_MIN_CONFIDENCE,
+      ask_timeout: SLACK_BRAIN_DEFAULT_ASK_TIMEOUT_S,
       idle_timeout: SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S,
       max_turns: SLACK_BRAIN_DEFAULT_MAX_TURNS,
     };

@@ -19,6 +19,7 @@ import { registerRelayCloseBlock } from "./relay-close.ts";
 import { registerResolveUserBlock } from "./resolve-user.ts";
 import { registerDecideBlock } from "./decide.ts";
 import { registerListProfilesBlock } from "./profiles.ts";
+import { registerSlackChoiceBlock } from "./slack-choice.ts";
 import { getBlock, listBlockTypes } from "./registry.ts";
 
 let registered = false;
@@ -43,6 +44,7 @@ export function registerEngineBlocks(): void {
   registerResolveUserBlock();
   registerDecideBlock();
   registerListProfilesBlock();
+  registerSlackChoiceBlock();
 }
 
 export const V1_BLOCK_TYPES = [
@@ -77,6 +79,7 @@ export const V1_BLOCK_TYPES = [
   "relay_close",
   "decide",
   "list_profiles",
+  "slack_choice",
 ] as const;
 
 /** Boot assertion (next to assertSweepPoliciesExhaustive): every v1 type is

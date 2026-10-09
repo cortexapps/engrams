@@ -68,6 +68,14 @@ organization's credential: post or update a Slack message, join a channel, post 
 request review, create or update an issue comment, set a commit status, create a Linear
 issue or comment. The credential is resolved on the server and the block never sees it.
 
+**Decisions.** Decide asks a decision model typed questions about a state, in one call:
+pick one of a list of options, rate on ordered levels, or yes or no. Each answer has a
+calibrated confidence, so a branch can act on a sure answer and ask a person about the rest.
+It needs an [OpenRouter key](../../guides/model-routers/); without one it answers
+`decided: false` and the graph takes its fallback, and the builder does not offer it. List
+profiles returns the organization's profiles as options for a Decide question. Slack choice
+posts a question with one button per option into a thread and waits for the click.
+
 **Control.** Filter ends the run quietly when its conditions fail. Branch runs one of two
 lists. Loop repeats a list until a condition holds or an iteration cap is reached. Code runs
 a JavaScript module in a sandbox with no network, no timers, and no filesystem, to compute a

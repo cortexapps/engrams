@@ -8,7 +8,11 @@ const setEntry = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const setValue = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const setEnabled = vi.hoisted(() => vi.fn().mockResolvedValue({}));
 const state = vi.hoisted(() => ({
-  inputs: { channels: {} as Record<string, string>, default_profile: "" },
+  inputs: { channels: {} as Record<string, string>, default_profile: "" } as Record<
+    string,
+    unknown
+  >,
+  openRouter: false,
   enabled: false,
   profiles: [] as Array<{ id: string; name: string }>,
   instances: [] as Array<Record<string, unknown>>,
@@ -53,6 +57,12 @@ vi.mock("../../hooks/useAutomationInputs", () => ({
 vi.mock("../../hooks/useProfiles", () => ({
   useProfiles: () => ({ data: { profiles: state.profiles } }),
 }));
+vi.mock("../../hooks/useConnectedRouters", () => ({
+  useConnectedRouters: () => new Set(state.openRouter ? ["openrouter"] : []),
+}));
+vi.mock("@/hooks/useConnectedRouters", () => ({
+  useConnectedRouters: () => new Set(state.openRouter ? ["openrouter"] : []),
+}));
 vi.mock("../../hooks/useNow", () => ({ useNow: () => Date.parse("2026-09-30T12:00:00Z") }));
 
 beforeEach(() => {
@@ -61,6 +71,7 @@ beforeEach(() => {
   setEnabled.mockClear();
   state.inputs = { channels: { C0123456789: "prof-a" }, default_profile: "prof-d" };
   state.enabled = true;
+  state.openRouter = false;
   state.profiles = [
     { id: "prof-d", name: "Helpdesk" },
     { id: "prof-a", name: "Alerts" },
@@ -180,6 +191,59 @@ describe("SlackThreads", () => {
         inputKey: "channels",
         entryKey: "C0123456789",
         enable: false,
+      }),
+    );
+  });
+});
+
+describe("SlackThreads — smart routing", () => {
+  it("offers no routing choice without an OpenRouter key", async () => {
+    renderWithProviders(<SlackThreads />);
+    await screen.findByRole("combobox", { name: "Default profile" });
+    expect(screen.queryByRole("region", { name: "Routing" })).toBeNull();
+    expect(screen.queryByText(/smart routing/i)).toBeNull();
+  });
+
+  it("with a key, turning smart routing on writes only the routing input", async () => {
+    state.openRouter = true;
+    renderWithProviders(<SlackThreads />);
+    await userEvent.click(await screen.findByRole("combobox", { name: "Routing" }));
+    await userEvent.click(await screen.findByRole("option", { name: "Smart routing" }));
+    await waitFor(() =>
+      expect(setValue).toHaveBeenCalledWith({
+        automationId: "auto-slack",
+        inputKey: "routing",
+        valueJson: JSON.stringify("smart"),
+      }),
+    );
+  });
+
+  it("smart: leaving a profile out stores the remaining candidates", async () => {
+    state.openRouter = true;
+    state.inputs = { ...state.inputs, routing: "smart" };
+    renderWithProviders(<SlackThreads />);
+    await userEvent.click(
+      await screen.findByRole("switch", { name: "Smart routing can pick Alerts" }),
+    );
+    await waitFor(() =>
+      expect(setValue).toHaveBeenCalledWith({
+        automationId: "auto-slack",
+        inputKey: "smart_profiles",
+        valueJson: JSON.stringify(["prof-d"]),
+      }),
+    );
+  });
+
+  it("smart routing saved but the key is gone: paused, with the way back", async () => {
+    state.inputs = { ...state.inputs, routing: "smart" };
+    renderWithProviders(<SlackThreads />);
+    expect(await screen.findByText(/Smart routing is paused/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Use default routing" }));
+    await waitFor(() =>
+      expect(setValue).toHaveBeenCalledWith({
+        automationId: "auto-slack",
+        inputKey: "routing",
+        valueJson: JSON.stringify("default"),
       }),
     );
   });

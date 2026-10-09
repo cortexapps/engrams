@@ -49,6 +49,7 @@ function recordingPolicy() {
       calls.onUserQuestion.push([m, e]);
       return "q-ts";
     },
+    onChoice: async () => "c-ts",
     onAnswered: async (m, e, ref) => void calls.onAnswered.push([m, e, ref]),
     onAsset: async (m, e) => void calls.onAsset.push([m, e]),
     onComplete: async () => {},

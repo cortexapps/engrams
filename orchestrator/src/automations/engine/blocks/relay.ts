@@ -59,6 +59,11 @@ const log = rootLog.child({ component: "slack-relay" });
 /** Signal name the interactivity route sends an AskUserQuestion answer as. */
 export const SLACK_ANSWER_SIGNAL = "slack_answer";
 
+/** Every slack_choice card's answer id starts with this. The relay consumes
+ * a late click on such a card silently: the choice was already settled (it
+ * timed out into its fallback), and it is not an agent question. */
+export const CHOICE_ID_PREFIX = "choice:";
+
 const ANSWER_FAIL_MSG = "I couldn't record that answer — the session may have ended.";
 const LEGACY_QUESTION_MSG = "This question predates an upgrade and can no longer be answered.";
 /** Cap an assistant bubble's accumulated text (the retired workflow's cap). */
@@ -257,6 +262,7 @@ async function onMessage(
   if (msg.kind === "signal" && msg.name === SLACK_ANSWER_SIGNAL) {
     const answer = parseAnswer(msg.payload);
     if (!answer) return { verdict: "consumed" };
+    if (answer.toolCallId.startsWith(CHOICE_ID_PREFIX)) return { verdict: "consumed" };
     const via = st.questionProtocols[answer.toolCallId] ?? "legacy";
     if (via === "legacy") {
       await pol.onDeliveryError(st.mention, LEGACY_QUESTION_MSG).catch(() => {});

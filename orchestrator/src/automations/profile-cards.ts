@@ -90,3 +90,25 @@ export async function loadProfileCards(deps: ProfileCardDeps = {}): Promise<Prof
     envVarNames: Object.keys(r.envVars),
   }));
 }
+
+/** The routing questions a profile router asks a `decide` block: which
+ * profile fits, and whether the person asks to pick one themselves. One
+ * definition, so the Slack relay and the routing benchmark ask the model the
+ * same thing. */
+export const PROFILE_ROUTE_INSTRUCTIONS =
+  "Which profile should handle this request? A profile is an agent workspace: " +
+  "the repositories it contains, its integrations and its tools. Pick the profile " +
+  "whose purpose and repositories fit the request best.";
+
+export const WANTS_CHOICE_INSTRUCTIONS =
+  "Does the person explicitly ask to choose the profile or workspace themselves " +
+  '(for example "which profile should I use?" or "let me pick")?';
+
+/** The routing questions as `decide` config. `options` is a ChoiceOption[]
+ * or a `{ $ref }` to a list_profiles block's options (the Slack relay). */
+export function profileRouteQuestions<O>(options: O) {
+  return {
+    profile: { type: "choice" as const, instructions: PROFILE_ROUTE_INSTRUCTIONS, options },
+    wants_choice: { type: "yes_no" as const, instructions: WANTS_CHOICE_INSTRUCTIONS },
+  };
+}
