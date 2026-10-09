@@ -2,7 +2,7 @@
  *
  * Dispatches on the client registry: generic typed-field forms for most
  * kinds, custom inspectors for create_session / branch / loop / filter /
- * code / integration_action, and a read-only view for system blocks.
+ * code / integration_action / decide, and a read-only view for system blocks.
  *
  * Editing model: on a built-in, a field is editable iff its top-level config
  * key is in the block's `tunable` list; everything else is pinned. */
@@ -40,6 +40,7 @@ import {
 
 import { asFilterGroup, ConditionEditor } from "./fields/ConditionEditor";
 import { CodeInspector } from "./inspectors/CodeInspector";
+import { DecideInspector } from "./inspectors/DecideInspector";
 import { GenericField } from "./fields/GenericField";
 import { VariablePicker } from "./fields/VariablePicker";
 
@@ -107,6 +108,8 @@ export function BlockInspector(props: BlockInspectorProps) {
         <CodeInspector {...props} />
       ) : spec.inspector === "integration_action" ? (
         <IntegrationActionInspector {...props} />
+      ) : spec.inspector === "decide" ? (
+        <DecideInspector {...props} />
       ) : (
         <GenericForm {...props} fields={spec.fields ?? []} />
       )}

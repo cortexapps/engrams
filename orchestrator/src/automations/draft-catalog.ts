@@ -70,6 +70,7 @@ export function draftBlockCatalog(): Record<string, unknown> {
       'Prose fields render Liquid with ${{ }}; structured values use {"$ref": "steps.<id>.<output>"}.',
       'Missing variables are render errors. `x | default: y` tolerates a missing x but NOT a missing y (the argument is strict); to pick the first present of several paths use `${{ event.raw | coalesce: "pull_request.number", "issue.number" }}`.',
       "At most one cron trigger per automation; extra entrypoints take integration, cron, or manual triggers.",
+      'decide asks a decision model typed questions in one call; gate on its answers with a branch (`steps.<id>.answers.<question>.confidence`, `.value`, `.yes`). It outputs decided: false when the org has no OpenRouter key, so give the graph a fallback. list_profiles.options feeds a choice question directly (value = profile id).',
       'create_session.profileId takes a profile id. Profile ids differ per org, so a portable definition reads it from a string input (`${{ inputs.profile }}`) the org fills in; an empty value fails the block.',
     ],
   };
