@@ -91,7 +91,16 @@ describe("seedBuiltinAutomations — slack_brain", () => {
     // On from the first boot; with no default profile it admits nothing.
     expect(row.enabled).toBe(true);
     expect(row.kind).toBe("builtin");
-    expect(row.inputs).toEqual({ channels: {}, default_profile: "", idle_timeout: 3600, max_turns: 50 });
+    expect(row.inputs).toEqual({
+      channels: {},
+      default_profile: "",
+      routing: "default",
+      smart_profiles: [],
+      smart_min_confidence: 0.8,
+      ask_timeout: 600,
+      idle_timeout: 3600,
+      max_turns: 50,
+    });
     expect(row.version.trigger).toMatchObject({
       kind: "integration",
       provider: "slack",

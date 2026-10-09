@@ -8,6 +8,8 @@ import {
   SLACK_BRAIN_BUILTIN,
   SLACK_BRAIN_DEFINITION,
   SLACK_FACTS_SOURCE,
+  SLACK_RESOLVE_SOURCE,
+  SLACK_TRIAGE_SOURCE,
 } from "../slack-brain.ts";
 
 registerEngineBlocks();
@@ -90,6 +92,10 @@ describe("Slack thread brain built-in — definition", () => {
     expect(inputs).toEqual({
       channels: {},
       default_profile: "",
+      routing: "default",
+      smart_profiles: [],
+      smart_min_confidence: 0.8,
+      ask_timeout: 600,
       idle_timeout: 3600,
       max_turns: 50,
     });
@@ -152,5 +158,128 @@ describe("Slack thread brain — admission code", () => {
     const edited = { ...reply, event: { ...reply.event, subtype: "message_changed" } };
     const editedOut = await run(edited, "message", { channels: { C1: "p" } });
     expect(editedOut.ok && editedOut.value).toBeNull();
+  });
+});
+
+describe("Slack thread brain — smart routing code", () => {
+  const mention = {
+    team_id: "T1",
+    event_id: "Ev1",
+    event: { type: "app_mention", channel: "C1", user: "U1", ts: "1.1", text: "<@UBOT> fix the deploy" },
+  };
+  const facts = async (inputs: Record<string, unknown>) => {
+    const out = await evaluateCode(
+      SLACK_FACTS_SOURCE,
+      { event: { raw: mention }, inputs, trigger: { event: "app_mention" } },
+      "value",
+    );
+    return out.ok ? (out.value as Record<string, unknown> | null) : undefined;
+  };
+
+  test("facts: smart admits without a default; an override is never smart", async () => {
+    expect(await facts({ channels: {}, routing: "smart" })).toMatchObject({
+      admit: true,
+      profile_id: "",
+      smart: true,
+      override: false,
+    });
+    expect(await facts({ channels: { C1: "p-o" }, routing: "smart", default_profile: "p-d" })).toMatchObject({
+      profile_id: "p-o",
+      smart: false,
+      override: true,
+    });
+    expect(await facts({ channels: {}, routing: "default", default_profile: "p-d" })).toMatchObject({
+      profile_id: "p-d",
+      smart: false,
+    });
+  });
+
+  const options = [
+    { value: "p-web", label: "Web" },
+    { value: "p-infra", label: "Infra" },
+    { value: "p-d", label: "General" },
+  ];
+  const decided = (confidence: number, wants = 0.02) => ({
+    decided: true,
+    answers: {
+      profile: { value: "p-infra", confidence, ranked: ["p-infra", "p-web", "p-d"] },
+      wants_choice: { yes: wants },
+    },
+  });
+  const triage = async (route: unknown, inputs: Record<string, unknown> = { default_profile: "p-d" }) => {
+    const out = await evaluateCode(
+      SLACK_TRIAGE_SOURCE,
+      { inputs, steps: { route, candidates: { options } } },
+      "value",
+    );
+    return out.ok ? (out.value as { ask: boolean; options: Array<{ value: string }> }) : undefined;
+  };
+
+  test("triage: confident → no card; unsure or asked → a card with the ranked picks and the default", async () => {
+    expect(await triage(decided(0.9))).toEqual({ ask: false, options: [] });
+    const unsure = await triage(decided(0.4));
+    expect(unsure!.ask).toBe(true);
+    expect(unsure!.options.map((o) => o.value)).toEqual(["p-infra", "p-web", "p-d"]);
+    expect((await triage(decided(0.95, 0.8)))!.ask).toBe(true);
+    // The org's threshold is honored.
+    expect((await triage(decided(0.7), { default_profile: "p-d", smart_min_confidence: 0.8 }))!.ask).toBe(true);
+  });
+
+  test("triage: no OpenRouter → never a card; a failed call asks only when there is no default", async () => {
+    expect(await triage({ decided: false, reason: "router_not_connected" }, {})).toEqual({ ask: false, options: [] });
+    expect((await triage({ decided: false, reason: "decision_failed: 529" }))!.ask).toBe(false);
+    expect((await triage({ decided: false, reason: "decision_failed: 529" }, {}))!.ask).toBe(true);
+  });
+
+  const resolve = async (steps: Record<string, unknown>) => {
+    const out = await evaluateCode(SLACK_RESOLVE_SOURCE, { steps }, "value");
+    return out.ok ? (out.value as { profile_id: string; label: string; card: string }) : undefined;
+  };
+  const smartFacts = { value: { smart: true, profile_id: "p-d" } };
+
+  test("resolve: the click wins, then the model, then the default", async () => {
+    const picked = await resolve({
+      facts: smartFacts,
+      candidates: { options },
+      route: decided(0.4),
+      ask: { outcome: "answered", value: "p-web" },
+    });
+    expect(picked).toMatchObject({ profile_id: "p-web", card: "Profile: *Web* (picked in the thread)" });
+    const routed = await resolve({ facts: smartFacts, candidates: { options }, route: decided(0.82) });
+    expect(routed).toMatchObject({ profile_id: "p-infra", label: " on *Infra* (routed by Jev, 82% confident)" });
+    const timedOut = await resolve({
+      facts: smartFacts,
+      candidates: { options },
+      route: decided(0.4),
+      ask: { outcome: "deadline" },
+    });
+    expect(timedOut!.card).toBe("Profile: *Infra* (no answer, so routed by Jev, 40% confident)");
+    const fallback = await resolve({
+      facts: smartFacts,
+      candidates: { options },
+      route: { decided: false, reason: "router_not_connected" },
+    });
+    // No OpenRouter key: exactly default routing, with no routing note.
+    expect(fallback).toEqual({ profile_id: "p-d", label: "", card: "" });
+    const failed = await resolve({
+      facts: smartFacts,
+      candidates: { options },
+      route: { decided: false, reason: "decision_failed: 529" },
+    });
+    expect(failed).toMatchObject({ profile_id: "p-d", label: " on *General* (the default profile)" });
+    const nobody = await resolve({
+      facts: { value: { smart: true, profile_id: "" } },
+      candidates: { options },
+      route: { decided: false, reason: "decision_failed: 529" },
+      ask: { outcome: "deadline" },
+    });
+    expect(nobody!.profile_id).toBe("");
+    // One candidate, no default, the model down: nothing to choose between.
+    const sole = await resolve({
+      facts: { value: { smart: true, profile_id: "" } },
+      candidates: { options: [options[0]] },
+      route: { decided: false, reason: "decision_failed: 529" },
+    });
+    expect(sole).toMatchObject({ profile_id: "p-web", card: "Profile: *Web* (the only profile smart routing can pick)" });
   });
 });

@@ -222,6 +222,9 @@ export interface BlockKindSpec {
     | "integration_action"
     | "decide"
     | "readonly";
+  /** The model router the block calls. It is offered for insertion only
+   * while that router has a key; an existing block still renders. */
+  requiresRouter?: string;
   /** Whether this kind nests child lists (branch: then/else; loop: body). */
   nests?: "branch" | "loop";
   /** Fresh default config when inserted. */
@@ -906,6 +909,7 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       "Ask a decision model (Jev, through OpenRouter) typed questions about a state: pick an option, rate on levels, or yes / no. Answers carry a calibrated confidence a branch can gate on. Without OpenRouter it outputs decided: false.",
     icon: Scale,
     inspector: "decide",
+    requiresRouter: "openrouter",
     summary: (c) => {
       const questions =
         typeof c["questions"] === "object" && c["questions"] !== null
@@ -956,9 +960,14 @@ export function blockKind(kind: string): BlockKindSpec {
   };
 }
 
-/** Kinds a user may insert. */
-export function insertableBlockKinds(): readonly BlockKindSpec[] {
-  return BLOCK_KINDS;
+/** Kinds a user may insert: every kind, except one whose model router has
+ * no key (`connectedRouters` = the routers that have one). */
+export function insertableBlockKinds(
+  connectedRouters: ReadonlySet<string>,
+): readonly BlockKindSpec[] {
+  return BLOCK_KINDS.filter(
+    (spec) => spec.requiresRouter === undefined || connectedRouters.has(spec.requiresRouter),
+  );
 }
 
 // ---------------------------------------------------------------------------

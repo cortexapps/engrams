@@ -83,6 +83,11 @@ export interface CommunicationPolicy {
   onAssistantMessage(m: SourceMention, text: string, ref: string | undefined): Promise<string>;
   /** Render an `AskUserQuestion`; return the provider message ref. */
   onUserQuestion(m: SourceMention, ev: CuratedEvent): Promise<string>;
+  /** Ask the person to pick one of `options` (Slack: a card with one button
+   *  per option). The answer comes back as a `SourceAnswer` whose
+   *  `toolCallId` is `id` and whose answers map `question` to the picked
+   *  label. Returns the provider message ref. */
+  onChoice(m: SourceMention, choice: { id: string; question: string; options: string[] }): Promise<string>;
   /** A question was answered; `ref` is the value `onUserQuestion` returned. */
   onAnswered(m: SourceMention, ev: CuratedEvent, ref: string | undefined): Promise<void>;
   /** Render an asset (a PR `integration_asset` or a `file_shared` artifact). The

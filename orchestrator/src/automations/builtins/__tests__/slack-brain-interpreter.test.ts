@@ -21,6 +21,24 @@ import { interpretAutomation } from "../../engine/interpreter.ts";
 import type { CommunicationPolicy } from "../../../workflows/communication-policy.ts";
 import { config } from "../../../config.ts";
 import { SLACK_BRAIN_DEFINITION } from "../slack-brain.ts";
+import type { DecisionsRequest, DecisionsResponse } from "../../../integrations/openrouter-decisions.ts";
+import type { ProfileCard } from "../../profile-cards.ts";
+
+const card = (id: string, name: string, description: string): ProfileCard => ({
+  id,
+  name,
+  description,
+  repos: [],
+  skills: [],
+  integrations: [],
+  allowHosts: [],
+  envVarNames: [],
+});
+const CARDS: ProfileCard[] = [
+  card("p-web", "Web", "The web app"),
+  card("p-infra", "Infra", "Terraform and Kubernetes"),
+  card("p-d", "General", "Anything else"),
+];
 
 registerEngineBlocks();
 
@@ -92,6 +110,8 @@ interface Harness {
   policyCalls: string[];
   ended: string[];
   finalized: Array<{ status: string; error?: string }>;
+  decisionRequests: DecisionsRequest[];
+  choices: Array<{ id: string; question: string; options: string[] }>;
 }
 
 function harness(options: {
@@ -119,6 +139,9 @@ function harness(options: {
    * is simulated by big steps: a wait's slice deadline then passes in a
    * couple of empty recvs. */
   clockStepMs?: number;
+  /** The Decisions API: `connected` (default true) and the scripted answers. */
+  decisions?: { connected?: boolean; replies?: DecisionsResponse[] };
+  profileCards?: ProfileCard[];
 }): Harness {
   const runner = options.replay ? makeReplayRunner(options.replay) : null;
   const names: string[] = runner ? runner.names : [];
@@ -149,6 +172,9 @@ function harness(options: {
     }),
   ];
   const runSessions: Array<{ sessionId: string; keep: boolean }> = [];
+  const decisionRequests: DecisionsRequest[] = [];
+  const decisionReplies = [...(options.decisions?.replies ?? [])];
+  const choices: Array<{ id: string; question: string; options: string[] }> = [];
   let clock = 1_000_000;
 
   const policy: CommunicationPolicy = {
@@ -157,6 +183,11 @@ function harness(options: {
     async onIdle(m) { policyCalls.push(`idle:${m.ts}`); },
     async onAssistantMessage(_m, text) { policyCalls.push(`msg:${text}`); return "b1"; },
     async onUserQuestion() { policyCalls.push("question"); return "q1"; },
+    async onChoice(_m, choice) {
+      choices.push(choice);
+      policyCalls.push(`choice:${choice.options.join("|")}`);
+      return "c1";
+    },
     async onAnswered() { policyCalls.push("answered"); },
     async onAsset() { policyCalls.push("asset"); },
     async onComplete(_m, _s, summary) { policyCalls.push(`complete:${summary.lastMessage ?? ""}`); },
@@ -266,6 +297,16 @@ function harness(options: {
         return true;
       },
     },
+    decisions: {
+      connected: async () => options.decisions?.connected ?? true,
+      async decide(request) {
+        decisionRequests.push(request);
+        const next = decisionReplies.shift();
+        if (!next) throw new Error("fake decisions exhausted");
+        return next;
+      },
+    },
+    profileCards: async () => options.profileCards ?? CARDS,
     integrationActions: {
       async execute(input) {
         // The real contract: the connector's declared input schema, after
@@ -290,7 +331,7 @@ function harness(options: {
     },
   };
 
-  return { deps, runner, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized, resolved, actions, closed };
+  return { deps, runner, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized, resolved, actions, closed, decisionRequests, choices };
 }
 
 afterEach(() => {
@@ -802,5 +843,232 @@ describe("Slack thread brain through the interpreter", () => {
     expect(result.status).toBe("failed");
     expect(h.policyCalls.some((c) => c.startsWith("fail:"))).toBe(true);
     expect(h.ended).toEqual([]);
+  });
+});
+
+describe("Slack thread brain — smart routing", () => {
+  const SMART = {
+    channels: { C9: "p-web" },
+    default_profile: "p-d",
+    routing: "smart",
+    smart_profiles: [],
+    smart_min_confidence: 0.8,
+    ask_timeout: 600,
+    idle_timeout: 600,
+    max_turns: 5,
+  };
+  const QUESTION = "Which profile should handle this thread?";
+  const ASK_ID = `choice:${RUN.runId}:has_previous.smart_route.unsure.ask`;
+  const answer = (profile: string, confidence: number, wants = 0.02): DecisionsResponse => ({
+    model: "typesafe/jev-1.13-20260917",
+    answers: {
+      profile: {
+        type: "choice",
+        choice: profile,
+        confidence,
+        // The rest of the mass on the other profiles, Web before General.
+        probabilities: {
+          Infra: profile === "Infra" ? confidence : 0.05,
+          Web: profile === "Web" ? confidence : (1 - confidence) * 0.5,
+          General: profile === "General" ? confidence : (1 - confidence) * 0.4,
+        },
+      },
+      wants_choice: { type: "noul", noul: wants },
+    },
+    usage: { input_tokens: 120, output_tokens: 0, cost: 0.000005 },
+  });
+  const posts = (h: Harness) => h.actions.filter((a) => a.actionId === "post_message").map((a) => a.params["text"]);
+
+  test("(r1) a confident pick routes the new session without asking", async () => {
+    const h = harness({
+      inputs: SMART,
+      decisions: { replies: [answer("Infra", 0.91)] },
+      recv: [{ kind: "session_idle", sessionId: "s-1" }, null, null],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    // The model saw the opening fold and the profile cards, in one call.
+    expect(h.decisionRequests).toHaveLength(1);
+    expect(h.decisionRequests[0]!.state).toEqual({ message: "summarize the incident" });
+    expect(Object.keys(h.decisionRequests[0]!.questions)).toEqual(["profile", "wants_choice"]);
+    expect(h.choices).toEqual([]);
+    expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-infra" })]);
+    expect(posts(h)).toEqual([
+      `Started a session on *Infra* (routed by Jev, 91% confident) — ${config.baseUrl}/sessions/s-1`,
+    ]);
+  });
+
+  test("(r2) an unsure pick asks in the thread; the click decides and the card shows it", async () => {
+    const h = harness({
+      inputs: SMART,
+      decisions: { replies: [answer("Infra", 0.41)] },
+      recv: [
+        { kind: "signal", name: "slack_answer", payload: { toolCallId: ASK_ID, answers: { [QUESTION]: ["Web"] } } },
+        { kind: "session_idle", sessionId: "s-1" },
+        null,
+        null,
+      ],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    // The card lists the model's ranking plus the default, by name.
+    expect(h.choices).toEqual([{ id: ASK_ID, question: QUESTION, options: ["Infra", "Web", "General"] }]);
+    expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-web" })]);
+    expect(h.actions.filter((a) => a.actionId === "update_message").map((a) => a.params)).toEqual([
+      { channel: "C1", ts: "c1", text: "Profile: *Web* (picked in the thread)" },
+    ]);
+  });
+
+  test("(r2b) a click on a label the card never offered is ignored", async () => {
+    const h = harness({
+      inputs: SMART,
+      decisions: { replies: [answer("Infra", 0.41)] },
+      recv: [
+        { kind: "signal", name: "slack_answer", payload: { toolCallId: ASK_ID, answers: { [QUESTION]: ["Mobile"] } } },
+        null,
+        { kind: "session_idle", sessionId: "s-1" },
+        null,
+        null,
+      ],
+      clockStepMs: 400_000,
+    });
+    await interpretAutomation(RUN, h.deps);
+    expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-infra" })]);
+  });
+
+  test("(r3) no click before the timeout: the model's pick, and the run goes on", async () => {
+    const h = harness({
+      inputs: SMART,
+      decisions: { replies: [answer("Infra", 0.41)] },
+      recv: [null, { kind: "session_idle", sessionId: "s-1" }, null, null],
+      // One empty recv passes the 600 s card deadline.
+      clockStepMs: 400_000,
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-infra" })]);
+    expect(h.actions.find((a) => a.actionId === "update_message")!.params["text"]).toBe(
+      "Profile: *Infra* (no answer, so routed by Jev, 41% confident)",
+    );
+  });
+
+  test("(r4) a person who asks to choose gets the card even when the model is sure", async () => {
+    const h = harness({
+      inputs: SMART,
+      decisions: { replies: [answer("Infra", 0.95, 0.9)] },
+      recv: [
+        { kind: "signal", name: "slack_answer", payload: { toolCallId: ASK_ID, answers: { [QUESTION]: ["General"] } } },
+        { kind: "session_idle", sessionId: "s-1" },
+        null,
+        null,
+      ],
+    });
+    await interpretAutomation(RUN, h.deps);
+    expect(h.choices).toHaveLength(1);
+    expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-d" })]);
+  });
+
+  test("(r5) a channel override wins: the model is never asked", async () => {
+    const h = harness({
+      inputs: { ...SMART, channels: { C1: "p-web" } },
+      recv: [{ kind: "session_idle", sessionId: "s-1" }, null, null],
+    });
+    await interpretAutomation(RUN, h.deps);
+    expect(h.decisionRequests).toEqual([]);
+    expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-web" })]);
+    expect(posts(h)).toEqual([`Started a session — ${config.baseUrl}/sessions/s-1`]);
+  });
+
+  test("(r6) without an OpenRouter key smart routing is default routing", async () => {
+    const h = harness({
+      inputs: SMART,
+      decisions: { connected: false },
+      recv: [{ kind: "session_idle", sessionId: "s-1" }, null, null],
+    });
+    await interpretAutomation(RUN, h.deps);
+    expect(h.decisionRequests).toEqual([]);
+    expect(h.choices).toEqual([]);
+    expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-d" })]);
+    expect(posts(h)).toEqual([`Started a session — ${config.baseUrl}/sessions/s-1`]);
+  });
+
+  test("(r7) no key and no default: the mention is not answered, as before", async () => {
+    const h = harness({
+      inputs: { ...SMART, default_profile: "" },
+      decisions: { connected: false },
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("filtered");
+    expect(h.sessions).toEqual([]);
+    expect(h.choices).toEqual([]);
+  });
+
+  test("(r9) the candidates are the org's chosen profiles only", async () => {
+    const h = harness({
+      inputs: { ...SMART, smart_profiles: ["p-web", "p-infra"] },
+      decisions: { replies: [answer("Infra", 0.91)] },
+      recv: [{ kind: "session_idle", sessionId: "s-1" }, null, null],
+    });
+    await interpretAutomation(RUN, h.deps);
+    const profile = h.decisionRequests[0]!.questions["profile"] as { criteria: Record<string, unknown> };
+    expect(Object.keys(profile.criteria)).toEqual(["Web", "Infra"]);
+  });
+
+  test("(r10) default routing adds only one condition step to a new thread", async () => {
+    const h = harness({ recv: [{ kind: "session_idle", sessionId: "s-1" }, null, null] });
+    await interpretAutomation(RUN, h.deps);
+    const routing = h.names.filter((n) => n.includes("smart_route"));
+    expect(routing).toEqual(["step:has_previous.smart_route.__cond__:0"]);
+  });
+
+  test("(r11) every chosen profile gone: no model call, the default profile serves", async () => {
+    const h = harness({
+      inputs: { ...SMART, smart_profiles: ["p-archived"] },
+      recv: [{ kind: "session_idle", sessionId: "s-1" }, null, null],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.decisionRequests).toEqual([]);
+    expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-d" })]);
+  });
+
+  test("(r12) a long profile name is cut to fit a Slack button", async () => {
+    const long = "W".repeat(120);
+    const h = harness({
+      inputs: SMART,
+      profileCards: [
+        { ...CARDS[0]!, name: long },
+        CARDS[1]!,
+        CARDS[2]!,
+      ],
+      decisions: {
+        replies: [
+          {
+            model: "typesafe/jev-1.13-20260917",
+            answers: {
+              profile: { type: "choice", choice: "Infra", confidence: 0.4, probabilities: { Infra: 0.4, [long]: 0.35, General: 0.25 } },
+              wants_choice: { type: "noul", noul: 0 },
+            },
+            usage: { input_tokens: 1, output_tokens: 0 },
+          },
+        ],
+      },
+      recv: [null, { kind: "session_idle", sessionId: "s-1" }, null, null],
+      clockStepMs: 400_000,
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.choices[0]!.options).toEqual(["Infra", "W".repeat(75), "General"]);
+  });
+
+  test("(r8) a resumed thread is never re-routed", async () => {
+    const h = harness({
+      inputs: SMART,
+      previousSession: { sessionId: "s-old", runId: "r-old", alive: true },
+      recv: [{ kind: "session_idle", sessionId: "s-old" }, null, null],
+    });
+    await interpretAutomation(RUN, h.deps);
+    expect(h.decisionRequests).toEqual([]);
+    expect(h.sessions).toEqual([]);
   });
 });

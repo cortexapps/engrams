@@ -17,6 +17,7 @@ import {
 import { useInputKeyLabels, useInputKeyOptions } from "../../hooks/useAutomationInputs";
 import { useInstanceList, useRecentDrops } from "../../hooks/useInstances";
 import { useNow } from "../../hooks/useNow";
+import { useConnectedRouters } from "../../hooks/useConnectedRouters";
 import { useProfiles } from "../../hooks/useProfiles";
 import { errorMessage } from "../../lib/errors";
 import { EmptyState } from "@/components/empty-state";
@@ -73,6 +74,7 @@ import {
   type ChannelNames,
 } from "./slack-format";
 import { ChannelCombobox, SLACK_CHANNEL_ID_RE } from "./ChannelCombobox";
+import { routingOf, SmartRouting } from "./SmartRouting";
 
 /** The built-in behind this page. */
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
@@ -106,7 +108,10 @@ export function SlackThreads() {
   const setEnabled = useSetAutomationEnabled();
   const setDefault = useSetInputValue();
   const enabled = automation?.enabled === true;
-  const answersSomewhere = defaultProfile !== "" || channels.length > 0;
+  // Smart routing answers everywhere on its own, but only while it can run.
+  const openRouterConnected = useConnectedRouters().has("openrouter");
+  const smartLive = routingOf(inputs) === "smart" && openRouterConnected;
+  const answersSomewhere = defaultProfile !== "" || channels.length > 0 || smartLive;
 
   const onEnabledChange = async (next: boolean) => {
     if (!automationId) return;
@@ -222,6 +227,8 @@ export function SlackThreads() {
           </div>
         )}
       </section>
+
+      <SmartRouting automationId={automationId} inputs={inputs} profiles={profiles} />
 
       <section className="flex flex-col gap-3" aria-label="Channel overrides">
         <div className="flex flex-wrap items-center gap-3">

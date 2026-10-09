@@ -258,6 +258,7 @@ function message(error: unknown): string {
 export function registerDecideBlock(): void {
   registerBlock<DecideConfig>({
     type: "decide",
+    requiresRouter: "openrouter",
     outputs: ["decided", "reason", "model", "answers", "cost"],
     configSchema: decideConfigSchema,
     async execute(config, ctx): Promise<BlockOutcome> {

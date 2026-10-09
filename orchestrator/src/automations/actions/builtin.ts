@@ -16,7 +16,10 @@ import {
   runIntegrationOp as defaultRunIntegrationOp,
   type RunOpDeps,
 } from "../../integrations/run-op.ts";
+import type { KnownBlock } from "@slack/types";
+
 import { getSlackClient } from "../../integrations/slack.ts";
+import { buildMessageBlocks } from "../../integrations/slack-blocks.ts";
 import { replyText, type SlackReply } from "../../integrations/slack-message-text.ts";
 import {
   makeLinearIssueClient,
@@ -40,6 +43,7 @@ export interface SlackChatClient {
       channel: string;
       ts: string;
       text: string;
+      blocks: KnownBlock[];
     }): Promise<{ ts?: string; channel?: string }>;
   };
   conversations: {
@@ -250,10 +254,14 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
 
   "slack.update_message": async (params, _ctx, deps) => {
     const client = await deps.slackClient();
+    // The message becomes exactly this text: its blocks are replaced too, so
+    // updating an interactive card (a choice) removes its buttons.
+    const text = requireString(params, "text");
     const response = await client.chat.update({
       channel: requireString(params, "channel"),
       ts: requireString(params, "ts"),
-      text: requireString(params, "text"),
+      text,
+      blocks: buildMessageBlocks(text),
     });
     return { ts: response.ts ?? null, channel: response.channel ?? null };
   },
