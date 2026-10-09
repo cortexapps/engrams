@@ -14,6 +14,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { useConnectedRouters } from "@/hooks/useConnectedRouters";
 import {
   insertableBlockKinds,
   type BlockDef,
@@ -226,6 +227,7 @@ function AddStepNode({
   index: number;
   onInsert: (at: ListPath, index: number, kind: string) => void;
 }) {
+  const connectedRouters = useConnectedRouters();
   return (
     <div
       className="absolute z-20 -translate-x-1/2 -translate-y-1/2"
@@ -244,7 +246,7 @@ function AddStepNode({
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="center">
-          {insertableBlockKinds().map((spec) => (
+          {insertableBlockKinds(connectedRouters).map((spec) => (
             <DropdownMenuItem key={spec.kind} onSelect={() => onInsert(at, index, spec.kind)}>
               <spec.icon className="size-4" aria-hidden />
               {spec.label}

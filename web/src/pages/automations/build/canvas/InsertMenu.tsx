@@ -11,6 +11,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { useConnectedRouters } from "@/hooks/useConnectedRouters";
 import { insertableBlockKinds, type ListPath } from "@/lib/automation-blocks";
 
 export interface InsertMenuProps {
@@ -22,6 +23,7 @@ export interface InsertMenuProps {
 }
 
 export function InsertMenu({ x, y, at, index, onInsert }: InsertMenuProps) {
+  const connectedRouters = useConnectedRouters();
   return (
     <div
       className="group/insert absolute z-20 flex size-8 -translate-x-1/2 -translate-y-1/2 items-center justify-center"
@@ -38,7 +40,7 @@ export function InsertMenu({ x, y, at, index, onInsert }: InsertMenuProps) {
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="center">
-          {insertableBlockKinds().map((spec) => (
+          {insertableBlockKinds(connectedRouters).map((spec) => (
             <DropdownMenuItem key={spec.kind} onSelect={() => onInsert(at, index, spec.kind)}>
               <spec.icon className="size-4" aria-hidden />
               {spec.label}

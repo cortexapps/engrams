@@ -81,6 +81,7 @@ function harness(current: AutomationRow | null, options: { raceToVersion?: numbe
   const saved: Harness["saved"] = [];
   const meta: Harness["meta"] = [];
   const deps: AutomationDraftToolDeps = {
+    routerConnected: async () => true,
     store: {
       async getByDraftSession(sessionId) {
         return current && current.draftSessionId === sessionId ? current : null;
@@ -332,9 +333,21 @@ describe("automation_read patterns", () => {
 });
 
 describe("draftBlockCatalog", () => {
+  test("a router-backed block is offered only while its router has a key", () => {
+    registerEngineBlocks();
+    const types = (routers: string[]) =>
+      (draftBlockCatalog(new Set(routers)) as { blocks: Array<{ type: string }>; notes: string[] }).blocks.map(
+        (b) => b.type,
+      );
+    expect(types([])).not.toContain("decide");
+    expect(types(["openrouter"])).toContain("decide");
+    const notes = (draftBlockCatalog() as { notes: string[] }).notes;
+    expect(notes.some((n) => n.startsWith("decide "))).toBe(false);
+  });
+
   test("golden: every user block type projects with a real JSON schema", () => {
     registerEngineBlocks();
-    const catalog = draftBlockCatalog() as {
+    const catalog = draftBlockCatalog(new Set(["openrouter"])) as {
       blocks: Array<{ type: string; config_schema: unknown }>;
     };
     // A registry change (new block, renamed type) must be a visible diff here.

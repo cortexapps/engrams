@@ -184,12 +184,21 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
     ]) {
       const spec = blockKind(kind);
       expect(spec.description).not.toBe("Unknown block kind.");
-      expect(insertableBlockKinds().some((s) => s.kind === kind)).toBe(true);
+      expect(insertableBlockKinds(new Set()).some((s) => s.kind === kind)).toBe(true);
     }
   });
 
+  it("a router-backed kind is insertable only while its router has a key", () => {
+    expect(insertableBlockKinds(new Set()).some((s) => s.kind === "decide")).toBe(false);
+    expect(insertableBlockKinds(new Set(["openrouter"])).some((s) => s.kind === "decide")).toBe(
+      true,
+    );
+    // An existing block still renders with its own inspector.
+    expect(blockKind("decide").inspector).toBe("decide");
+  });
+
   it("defaults satisfy the summary renderers", () => {
-    for (const spec of insertableBlockKinds()) {
+    for (const spec of insertableBlockKinds(new Set(["openrouter"]))) {
       expect(() => spec.summary(spec.defaults())).not.toThrow();
     }
   });
