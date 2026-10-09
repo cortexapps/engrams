@@ -84,6 +84,23 @@ describe("decisions client", () => {
     expect(error.message).toContain("usage");
   });
 
+  test("a body that fails after the headers arrived is retryable", async () => {
+    const client = makeDecisionsClient({
+      apiKey: "k",
+      fetch: async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new TypeError("connection reset"));
+            },
+          }),
+          { status: 200 },
+        ),
+    });
+    const error = await failure(client.decide(REQUEST));
+    expect(error.retryable).toBe(true);
+  });
+
   test("a network failure is retryable", async () => {
     const client = makeDecisionsClient({
       apiKey: "k",

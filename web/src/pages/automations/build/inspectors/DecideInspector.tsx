@@ -129,11 +129,15 @@ export function DecideInspector(props: DecideInspectorProps) {
   const questionsPinned = pinned("questions");
 
   const setQuestions = (next: Record<string, Question>) => update("questions", next);
-  const renameQuestion = (from: string, to: string) => {
-    if (to === from || to in questions) return;
+  /** False when `to` is taken by another question: the caller restores
+   * the shown id, so the field never shows an id the config does not have. */
+  const renameQuestion = (from: string, to: string): boolean => {
+    if (to === from) return true;
+    if (Object.hasOwn(questions, to)) return false;
     const next: Record<string, Question> = {};
     for (const [id, q] of Object.entries(questions)) next[id === from ? to : id] = q;
     setQuestions(next);
+    return true;
   };
 
   const field = (spec: FieldSpec) => (
@@ -221,7 +225,7 @@ function QuestionCard({
   id: string;
   question: Question;
   disabled: boolean;
-  onRename: (to: string) => void;
+  onRename: (to: string) => boolean;
   onChange: (next: Question) => void;
   onRemove: () => void;
 }) {
@@ -238,8 +242,7 @@ function QuestionCard({
           disabled={disabled}
           onBlur={(e) => {
             const to = e.target.value.trim();
-            if (/^[a-z][a-z0-9_]*$/.test(to)) onRename(to);
-            else e.target.value = id;
+            if (!/^[a-z][a-z0-9_]*$/.test(to) || !onRename(to)) e.target.value = id;
           }}
         />
         <Select

@@ -18,7 +18,15 @@
  *
  * An org without OpenRouter gets `{ decided: false }` — a normal output, so a
  * graph falls back deterministically and the org keeps today's behavior.
- * The call runs inside the block's checkpointed step: replay never pays twice.
+ *
+ * The call runs inside the block's checkpointed step: a call whose result was
+ * recorded is never made again on replay. The guarantee is at-least-once, not
+ * exactly-once — a crash after the provider answered and before the step was
+ * recorded repeats the call (the Decisions API has no idempotency key).
+ *
+ * An editor dry run makes the call for real: the block is read-only and
+ * costs fractions of a cent, and a dry run is how an author tries their
+ * questions before saving.
  */
 
 import { z } from "zod";
@@ -43,32 +51,41 @@ const decisionText = z.union([
   z.array(z.unknown()),
 ]);
 
-const choiceOptionSchema = z.object({
-  /** What the block outputs when this option wins (a profile id, a label). */
-  value: z.string().min(1),
+/** One choice option, as a graph supplies it. */
+export interface ChoiceOption {
+  /** What the block outputs when this option wins (a profile id, a label).
+   * Unique within the question. */
+  value: string;
   /** What the model reads. Default: `value`. Unique within the question. */
-  label: z.string().min(1).optional(),
+  label?: string;
   /** What the option covers — the main lever for telling similar options
    * apart. A string or a structured object. */
+  description?: DecisionText;
+}
+
+// Every field a run can fill in (`instructions` or an option's `value` from a
+// template, `options` from a `$ref` to an earlier block, a templated level)
+// is lenient in the SCHEMA: save-time validation strips run-time values —
+// a nested required field or an array element too — and relaxes only
+// top-level keys. `prepareQuestions` enforces all of it on the resolved
+// config, before any call.
+const choiceOptionSchema = z.object({
+  value: z.string().min(1).optional(),
+  label: z.string().min(1).optional(),
   description: decisionText.optional(),
 });
-export type ChoiceOption = z.infer<typeof choiceOptionSchema>;
 
-// The fields a run fills in (`instructions` from a template, `options` from
-// a `$ref` to an earlier block) are optional in the SCHEMA because save-time
-// validation strips run-time values and relaxes only top-level keys.
-// `checkQuestions` enforces them on the resolved config.
 const questionSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("choice"),
     instructions: decisionText.optional(),
-    options: z.array(choiceOptionSchema).min(1).max(MAX_CHOICE_OPTIONS).optional(),
+    options: z.array(choiceOptionSchema).max(MAX_CHOICE_OPTIONS).optional(),
   }),
   z.object({
     type: z.literal("score"),
     instructions: decisionText.optional(),
     /** Ordered lowest → highest. */
-    levels: z.array(decisionText).min(2).max(10).optional(),
+    levels: z.array(decisionText).max(10).optional(),
   }),
   z.object({
     type: z.literal("yes_no"),
@@ -118,17 +135,32 @@ export function prepareQuestions(
         if (!q.options || q.options.length === 0) {
           return { ok: false, error: `choice question "${id}" has no options` };
         }
-        const criteria: Record<string, DecisionText | null> = {};
+        // Labels are author-controlled object keys: build the wire map from
+        // entries (an own property even for "__proto__"), never by assignment.
+        const criteria: Array<[string, DecisionText | null]> = [];
         const byLabel = new Map<string, string>();
+        const values = new Set<string>();
         for (const option of q.options) {
+          if (option.value === undefined) {
+            return { ok: false, error: `choice question "${id}" has an option with no value` };
+          }
+          if (values.has(option.value)) {
+            // Two options with one value would merge their probabilities.
+            return { ok: false, error: `choice question "${id}" repeats the option value "${option.value}"` };
+          }
+          values.add(option.value);
           const label = option.label ?? option.value;
           if (byLabel.has(label)) {
             return { ok: false, error: `choice question "${id}" repeats the option label "${label}"` };
           }
           byLabel.set(label, option.value);
-          criteria[label] = option.description ?? null;
+          criteria.push([label, option.description ?? null]);
         }
-        out.questions[id] = { type: "choice", instructions: q.instructions, criteria };
+        out.questions[id] = {
+          type: "choice",
+          instructions: q.instructions,
+          criteria: Object.fromEntries(criteria),
+        };
         out.valuesByLabel[id] = byLabel;
         break;
       }
@@ -174,19 +206,18 @@ export function mapAnswers(
         if (value === undefined) {
           return { ok: false, error: `the model chose "${answer.choice}", not an option of "${id}"` };
         }
-        const probabilities: Record<string, number> = {};
+        const byValue = new Map<string, number>();
         for (const [label, p] of Object.entries(answer.probabilities ?? {})) {
           const v = byLabel.get(label);
-          if (v !== undefined) probabilities[v] = p;
+          if (v !== undefined) byValue.set(v, p);
         }
-        if (probabilities[value] === undefined) probabilities[value] = answer.confidence ?? 1;
-        const ranked = Object.entries(probabilities)
-          .sort((a, b) => b[1] - a[1])
-          .map(([v]) => v);
+        if (!byValue.has(value)) byValue.set(value, answer.confidence ?? 1);
+        const ranked = [...byValue.entries()].sort((a, b) => b[1] - a[1]).map(([v]) => v);
+        const probabilities = Object.fromEntries(byValue);
         out[id] = {
           value,
           label: answer.choice,
-          confidence: answer.confidence ?? probabilities[value],
+          confidence: answer.confidence ?? byValue.get(value),
           probabilities,
           ranked,
         };

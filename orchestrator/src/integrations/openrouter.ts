@@ -6,10 +6,11 @@
  * up a key rotation without a restart.
  */
 
+import { Code, ConnectError } from "@connectrpc/connect";
 import { createOpenRouter, type OpenRouterProvider } from "@openrouter/ai-sdk-provider";
 
 import { asBearer, getIntegrationClient, registerIntegrationClient } from "./clients.ts";
-import { makeDecisionsClient, type DecisionsClient } from "./openrouter-decisions.ts";
+import { DecisionsApiError, makeDecisionsClient, type DecisionsClient } from "./openrouter-decisions.ts";
 
 interface OpenRouterClients {
   sdk: OpenRouterProvider;
@@ -26,7 +27,26 @@ export async function getOpenRouterClient(): Promise<OpenRouterProvider> {
   return (await getIntegrationClient<OpenRouterClients>("openrouter")).sdk;
 }
 
-/** A ready Decisions API client, authenticated with the org key. */
+/** Control-plane codes a credential lookup can recover from on a retry. */
+const TRANSIENT_LOOKUP_CODES = new Set([
+  Code.Unavailable,
+  Code.DeadlineExceeded,
+  Code.ResourceExhausted,
+  Code.Aborted,
+  Code.Internal,
+]);
+
+/** A ready Decisions API client, authenticated with the org key. A
+ * transient failure to resolve the key (the control plane briefly
+ * unreachable) is a retryable DecisionsApiError, so the decide block's
+ * retry applies; a missing or rejected key stays permanent. */
 export async function getOpenRouterDecisions(): Promise<DecisionsClient> {
-  return (await getIntegrationClient<OpenRouterClients>("openrouter")).decisions;
+  try {
+    return (await getIntegrationClient<OpenRouterClients>("openrouter")).decisions;
+  } catch (error) {
+    if (error instanceof ConnectError && TRANSIENT_LOOKUP_CODES.has(error.code)) {
+      throw new DecisionsApiError(`resolve the OpenRouter key: ${error.rawMessage}`, null, true);
+    }
+    throw error;
+  }
 }

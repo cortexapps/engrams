@@ -223,6 +223,28 @@ describe("BlockInspector — decide", () => {
     });
   });
 
+  it("a rename onto a taken id is refused and the field shows the real id again", async () => {
+    const { onChange } = mount(
+      {
+        ...decide,
+        config: {
+          ...decide.config,
+          questions: {
+            q1: { type: "yes_no", instructions: "a" },
+            q2: { type: "yes_no", instructions: "b" },
+          },
+        },
+      },
+      false,
+    );
+    const card = await screen.findByTestId("question-q1");
+    const idInput = card.querySelector("input[aria-label='Question id']") as HTMLInputElement;
+    fireEvent.change(idInput, { target: { value: "q2" } });
+    fireEvent.blur(idInput);
+    expect(onChange).not.toHaveBeenCalled();
+    expect(idInput.value).toBe("q1");
+  });
+
   it("pins every field on a built-in without tunables", async () => {
     mount(decide, true);
     expect(await screen.findByRole("button", { name: /add question/i })).toHaveProperty(

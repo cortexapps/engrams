@@ -35,17 +35,23 @@ export interface ProfileCard {
  * routing benchmark against real history, bought no accuracy. Empty facts are
  * left out. Pure. */
 export function profileOptions(cards: ProfileCard[]): ChoiceOption[] {
-  const seen = new Map<string, number>();
+  // Every emitted label is taken, so "Dev", "Dev", "Dev (2)" gives
+  // "Dev", "Dev (2)", "Dev (2) (2)" — never a repeat.
+  const taken = new Set<string>();
+  const unique = (name: string): string => {
+    let label = name;
+    for (let n = 2; taken.has(label); n += 1) label = `${name} (${n})`;
+    taken.add(label);
+    return label;
+  };
   return cards.map((card) => {
-    const count = (seen.get(card.name) ?? 0) + 1;
-    seen.set(card.name, count);
     const description: Record<string, unknown> = {};
     if (card.description.trim()) description["purpose"] = card.description.trim();
     if (card.repos.length) description["repositories"] = card.repos;
     if (card.integrations.length) description["integrations"] = card.integrations;
     return {
       value: card.id,
-      label: count === 1 ? card.name : `${card.name} (${count})`,
+      label: unique(card.name),
       ...(Object.keys(description).length ? { description } : {}),
     };
   });

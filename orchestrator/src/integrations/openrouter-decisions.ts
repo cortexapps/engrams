@@ -94,6 +94,7 @@ export function makeDecisionsClient(options: DecisionsClientOptions): DecisionsC
   return {
     async decide(request) {
       let res: Response;
+      let text: string;
       try {
         res = await doFetch(DECISIONS_URL, {
           method: "POST",
@@ -104,6 +105,9 @@ export function makeDecisionsClient(options: DecisionsClientOptions): DecisionsC
           body: JSON.stringify(request),
           signal: AbortSignal.timeout(timeoutMs),
         });
+        // The body read is part of the transport: a reset or the abort after
+        // the headers arrived is as transient as one before them.
+        text = await res.text();
       } catch (error) {
         // Network failure or the abort: transient by definition.
         throw new DecisionsApiError(
@@ -112,7 +116,6 @@ export function makeDecisionsClient(options: DecisionsClientOptions): DecisionsC
           true,
         );
       }
-      const text = await res.text();
       if (!res.ok) {
         throw new DecisionsApiError(
           `decisions API ${res.status}: ${errorMessage(text)}`,

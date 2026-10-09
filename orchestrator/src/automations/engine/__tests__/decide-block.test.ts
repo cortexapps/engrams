@@ -321,7 +321,53 @@ describe("decide block", () => {
   });
 });
 
+describe("decide save-time validation", () => {
+  test("a templated option value and a templated level save", () => {
+    const definition: AutomationDefinition = {
+      engine: 1,
+      trigger: { kind: "manual" },
+      blocks: [
+        {
+          id: "route",
+          type: "decide",
+          config: {
+            state: "x",
+            questions: {
+              team: {
+                type: "choice",
+                instructions: "Which team?",
+                options: [{ value: "${{ inputs.team }}", label: "Web" }, { value: "infra" }],
+              },
+              risk: { type: "score", instructions: "How risky?", levels: ["low", "${{ inputs.high }}"] },
+            },
+          },
+        },
+      ],
+      inputsSchema: [],
+      settings: { endSessionsOnFinish: false },
+    };
+    expect(() => validateDefinition(definition)).not.toThrow();
+  });
+});
+
 describe("prepareQuestions", () => {
+  test("two options with one value are refused (their probabilities would merge)", () => {
+    expect(
+      prepareQuestions({
+        q: { type: "choice", instructions: "pick", options: [{ value: "a", label: "A" }, { value: "a", label: "B" }] },
+      }),
+    ).toEqual({ ok: false, error: 'choice question "q" repeats the option value "a"' });
+  });
+
+  test("a label that is an object-prototype key is still sent as an option", () => {
+    const prepared = prepareQuestions({
+      q: { type: "choice", instructions: "pick", options: [{ value: "p", label: "__proto__" }, { value: "o" }] },
+    });
+    if (!prepared.ok) throw new Error(prepared.error);
+    const criteria = (prepared.value.questions["q"] as { criteria: Record<string, unknown> }).criteria;
+    expect(Object.keys(JSON.parse(JSON.stringify(criteria)))).toEqual(["__proto__", "o"]);
+  });
+
   test("refuses what save-time validation cannot see", () => {
     expect(prepareQuestions({ q: { type: "choice", instructions: "pick" } })).toEqual({
       ok: false,
@@ -358,5 +404,14 @@ describe("profileOptions", () => {
     ]);
     expect(options[0]).toEqual({ value: "a", label: "Dev" });
     expect(options[1]!.label).toBe("Dev (2)");
+  });
+
+  test("a suffix never collides with a name that already has one", () => {
+    const labels = profileOptions([
+      { ...CARDS[0]!, id: "a", name: "Dev" },
+      { ...CARDS[0]!, id: "b", name: "Dev" },
+      { ...CARDS[0]!, id: "c", name: "Dev (2)" },
+    ]).map((o) => o.label);
+    expect(new Set(labels).size).toBe(3);
   });
 });
