@@ -185,13 +185,8 @@ describe("decide block", () => {
       instructions: "Which profile should handle this request?",
       criteria: {
         Web: { purpose: "Frontend work in the web app", repositories: ["acme/web"], integrations: ["github"] },
-        Infra: {
-          purpose: "Terraform and Kubernetes",
-          repositories: ["acme/deploy"],
-          skills: ["kubectl"],
-          network: ["*.googleapis.com"],
-          env_vars: ["GOOGLE_PROJECT"],
-        },
+        // Purpose facts only: skills, hosts and env var names stay off the wire.
+        Infra: { purpose: "Terraform and Kubernetes", repositories: ["acme/deploy"] },
       },
     });
     expect(wire.questions["severity"]).toEqual({

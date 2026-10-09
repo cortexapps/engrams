@@ -29,8 +29,11 @@ export interface ProfileCard {
 
 /** Choice options for a `decide` question, one per card. The value is the
  * profile id; the label is the name, made unique (`Name (2)`) because the
- * model answers by label. Empty facts are left out so they cost no tokens.
- * Pure; the benchmark builds its requests with it too. */
+ * model answers by label. The option carries only what tells profiles apart
+ * by PURPOSE — the description, the repositories, the integrations. Network
+ * hosts, env var names and skill bundles cost most of the tokens and, in a
+ * routing benchmark against real history, bought no accuracy. Empty facts are
+ * left out. Pure. */
 export function profileOptions(cards: ProfileCard[]): ChoiceOption[] {
   const seen = new Map<string, number>();
   return cards.map((card) => {
@@ -39,10 +42,7 @@ export function profileOptions(cards: ProfileCard[]): ChoiceOption[] {
     const description: Record<string, unknown> = {};
     if (card.description.trim()) description["purpose"] = card.description.trim();
     if (card.repos.length) description["repositories"] = card.repos;
-    if (card.skills.length) description["skills"] = card.skills;
     if (card.integrations.length) description["integrations"] = card.integrations;
-    if (card.allowHosts.length) description["network"] = card.allowHosts;
-    if (card.envVarNames.length) description["env_vars"] = card.envVarNames;
     return {
       value: card.id,
       label: count === 1 ? card.name : `${card.name} (${count})`,
