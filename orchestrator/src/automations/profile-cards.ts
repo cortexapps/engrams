@@ -11,7 +11,7 @@
 
 import { makeIntegrationConnectionStore, type IntegrationConnectionStore } from "../db/integration-connections.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
-import type { ChoiceOption } from "./engine/blocks/decide.ts";
+import type { ChoiceOption, DecideQuestion } from "./engine/blocks/decide.ts";
 
 export interface ProfileCard {
   id: string;
@@ -83,4 +83,24 @@ export async function loadProfileCards(deps: ProfileCardDeps = {}): Promise<Prof
     allowHosts: [...r.network.allowHosts, ...r.network.allowHostPatterns],
     envVarNames: Object.keys(r.envVars),
   }));
+}
+
+/** The routing questions a profile router asks a `decide` block: which
+ * profile fits, and whether the person asks to pick one themselves. One
+ * definition, so the Slack relay and the routing benchmark ask the model the
+ * same thing. */
+export const PROFILE_ROUTE_INSTRUCTIONS =
+  "Which profile should handle this request? A profile is an agent workspace: " +
+  "the repositories it contains, its integrations and its tools. Pick the profile " +
+  "whose purpose and repositories fit the request best.";
+
+export const WANTS_CHOICE_INSTRUCTIONS =
+  "Does the person explicitly ask to choose the profile or workspace themselves " +
+  '(for example "which profile should I use?" or "let me pick")?';
+
+export function profileRouteQuestions(options: ChoiceOption[]): Record<string, DecideQuestion> {
+  return {
+    profile: { type: "choice", instructions: PROFILE_ROUTE_INSTRUCTIONS, options },
+    wants_choice: { type: "yes_no", instructions: WANTS_CHOICE_INSTRUCTIONS },
+  };
 }
