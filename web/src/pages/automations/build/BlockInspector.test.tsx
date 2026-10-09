@@ -177,3 +177,57 @@ describe("BlockInspector", () => {
     expect("number" in (cleared.config["params"] as Record<string, unknown>)).toBe(false);
   });
 });
+
+describe("BlockInspector — decide", () => {
+  const decide: BlockDef = {
+    id: "route",
+    type: "decide",
+    config: {
+      state: "${{ event.text }}",
+      questions: {
+        profile: {
+          type: "choice",
+          instructions: "Which profile?",
+          options: { $ref: "steps.candidates.options" },
+        },
+      },
+    },
+  };
+
+  it("shows a variable-fed choice question and edits its instructions", async () => {
+    const { onChange } = mount(decide, false);
+    const card = await screen.findByTestId("question-profile");
+    expect(card.querySelector("input[placeholder='steps.candidates.options']")).toHaveProperty(
+      "value",
+      "steps.candidates.options",
+    );
+    fireEvent.change(card.querySelector("textarea")!, { target: { value: "Who handles it?" } });
+    const next = onChange.mock.calls.at(-1)![0] as BlockDef;
+    expect(next.config["questions"]).toEqual({
+      profile: {
+        type: "choice",
+        instructions: "Who handles it?",
+        options: { $ref: "steps.candidates.options" },
+      },
+    });
+  });
+
+  it("adds a yes / no question under the next free id", async () => {
+    const { onChange } = mount(decide, false);
+    fireEvent.click(await screen.findByRole("button", { name: /add question/i }));
+    const next = onChange.mock.calls.at(-1)![0] as BlockDef;
+    expect(Object.keys(next.config["questions"] as object)).toEqual(["profile", "q1"]);
+    expect((next.config["questions"] as Record<string, unknown>)["q1"]).toEqual({
+      type: "yes_no",
+      instructions: "",
+    });
+  });
+
+  it("pins every field on a built-in without tunables", async () => {
+    mount(decide, true);
+    expect(await screen.findByRole("button", { name: /add question/i })).toHaveProperty(
+      "disabled",
+      true,
+    );
+  });
+});

@@ -26,8 +26,10 @@ import {
   MailOpen,
   Play,
   Repeat,
+  Scale,
   Send,
   Terminal,
+  Users,
   Zap,
 } from "lucide-react";
 
@@ -218,6 +220,7 @@ export interface BlockKindSpec {
     | "filter"
     | "code"
     | "integration_action"
+    | "decide"
     | "readonly";
   /** Whether this kind nests child lists (branch: then/else; loop: body). */
   nests?: "branch" | "loop";
@@ -895,6 +898,43 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
         : "No action selected";
     },
     defaults: () => ({ provider: "", actionId: "", params: {} }),
+  },
+  {
+    kind: "decide",
+    label: "Decide",
+    description:
+      "Ask a decision model (Jev, through OpenRouter) typed questions about a state: pick an option, rate on levels, or yes / no. Answers carry a calibrated confidence a branch can gate on. Without OpenRouter it outputs decided: false.",
+    icon: Scale,
+    inspector: "decide",
+    summary: (c) => {
+      const questions =
+        typeof c["questions"] === "object" && c["questions"] !== null
+          ? Object.keys(c["questions"])
+          : [];
+      return questions.length === 0 ? "No questions" : truncate(`Ask ${questions.join(", ")}`, 60);
+    },
+    defaults: () => ({
+      state: "",
+      questions: { q1: { type: "yes_no", instructions: "" } },
+    }),
+  },
+  {
+    kind: "list_profiles",
+    label: "List profiles",
+    description:
+      "The org's active profiles as capability cards, plus options a Decide choice question takes directly (value = profile id).",
+    icon: Users,
+    fields: [
+      {
+        type: "json",
+        key: "ids",
+        label: "Only these profile ids",
+        help: 'Optional JSON list, e.g. ["id-1", "id-2"]. Empty = every active profile.',
+      },
+    ],
+    summary: (c) =>
+      Array.isArray(c["ids"]) ? `${c["ids"].length} chosen profiles` : "Every active profile",
+    defaults: () => ({}),
   },
 ];
 
