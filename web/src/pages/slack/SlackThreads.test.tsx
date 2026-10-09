@@ -234,6 +234,28 @@ describe("SlackThreads — smart routing", () => {
     );
   });
 
+  it("smart: a saved id of a deleted profile never turns 'some' into 'all'", async () => {
+    state.openRouter = true;
+    state.profiles = [
+      { id: "prof-d", name: "Helpdesk" },
+      { id: "prof-a", name: "Alerts" },
+      { id: "prof-c", name: "Crons" },
+    ];
+    // prof-x was deleted; prof-c was left out on purpose.
+    state.inputs = { ...state.inputs, routing: "smart", smart_profiles: ["prof-d", "prof-x"] };
+    renderWithProviders(<SlackThreads />);
+    await userEvent.click(
+      await screen.findByRole("switch", { name: "Smart routing can pick Alerts" }),
+    );
+    await waitFor(() =>
+      expect(setValue).toHaveBeenCalledWith({
+        automationId: "auto-slack",
+        inputKey: "smart_profiles",
+        valueJson: JSON.stringify(["prof-d", "prof-a"]),
+      }),
+    );
+  });
+
   it("smart routing saved but the key is gone: paused, with the way back", async () => {
     state.inputs = { ...state.inputs, routing: "smart" };
     renderWithProviders(<SlackThreads />);

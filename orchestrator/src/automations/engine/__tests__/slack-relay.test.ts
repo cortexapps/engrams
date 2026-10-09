@@ -5,6 +5,7 @@ import type { CommunicationPolicy } from "../../../workflows/communication-polic
 import { registerEngineBlocks } from "../blocks/index.ts";
 import { getBlock } from "../blocks/registry.ts";
 import {
+  CHOICE_ID_PREFIX,
   MAX_BUBBLE_CHARS,
   RELAY_SESSION_TYPE,
   SLACK_ANSWER_SIGNAL,
@@ -278,6 +279,19 @@ describe("relay_session", () => {
     });
     expect(h.completed).toEqual([]);
     expect(h.policy.calls.onDeliveryError[0]![1]).toMatch(/predates an upgrade/);
+  });
+
+  test("an answer to a slack_choice card passes on to the graph's wait, with no notice", async () => {
+    const h = harness();
+    await h.install();
+    const verdict = await h.send({
+      kind: "signal",
+      name: SLACK_ANSWER_SIGNAL,
+      payload: { toolCallId: `${CHOICE_ID_PREFIX}run-1:ask`, answers: { "Which?": ["A"] } },
+    });
+    expect(verdict).toBe("pass");
+    expect(h.completed).toEqual([]);
+    expect(h.policy.calls.onDeliveryError).toEqual([]);
   });
 
   test("a failed tool completion keeps the thread alive with a ⚠️ note", async () => {

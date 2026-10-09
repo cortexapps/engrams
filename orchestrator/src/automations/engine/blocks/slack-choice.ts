@@ -26,6 +26,12 @@ export const SLACK_CHOICE_TYPE = "slack_choice";
 /** Slack allows 25 buttons in one actions block; a choice past ten is a
  * dropdown's job, not a card's. */
 export const MAX_CHOICE_BUTTONS = 10;
+/** Every button's value carries the question, its label, the answer id
+ * and the thread route, and Slack caps a button value at 2,000
+ * characters. These caps keep the worst case near 1,000. A label is also
+ * the button's text, which Slack shows up to 75 characters of. */
+export const SLACK_CHOICE_QUESTION_MAX = 500;
+export const SLACK_CHOICE_LABEL_MAX = 75;
 
 export const slackChoiceConfigSchema = z.object({
   provider: z.enum(["slack"]).default("slack"),
@@ -33,11 +39,16 @@ export const slackChoiceConfigSchema = z.object({
   channel: z.string().min(1),
   threadTs: z.string().min(1),
   /** The question on the card. */
-  question: z.string().min(1),
+  question: z.string().min(1).max(SLACK_CHOICE_QUESTION_MAX),
   /** value = what the block outputs; label = the button text (default:
    * value). From a `$ref` (a code block shaping the candidates) or inline. */
   options: z
-    .array(z.object({ value: z.string().min(1), label: z.string().min(1).optional() }))
+    .array(
+      z.object({
+        value: z.string().min(1),
+        label: z.string().min(1).max(SLACK_CHOICE_LABEL_MAX).optional(),
+      }),
+    )
     .min(1)
     .max(MAX_CHOICE_BUTTONS),
   deadlineSeconds: z.number().int().min(1).max(MAX_WAIT_DEADLINE_S).optional(),
@@ -64,6 +75,14 @@ export function registerSlackChoiceBlock(): void {
     configSchema: slackChoiceConfigSchema,
     async execute(config, ctx) {
       const labels = config.options.map(labelOf);
+      if (labels.some((label) => label.length > SLACK_CHOICE_LABEL_MAX)) {
+        return {
+          kind: "error",
+          code: "slack_choice_config_invalid",
+          message: `an option label (or a value without a label) is longer than ${SLACK_CHOICE_LABEL_MAX} characters`,
+          retryable: false,
+        };
+      }
       if (new Set(labels).size !== labels.length) {
         return {
           kind: "error",

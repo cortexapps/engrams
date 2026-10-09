@@ -41,10 +41,14 @@ export function SmartRouting({ automationId, inputs, profiles }: SmartRoutingPro
   const routing = routingOf(inputs);
   const threshold =
     typeof inputs["smart_min_confidence"] === "number" ? inputs["smart_min_confidence"] : 0.8;
+  const active = new Set(profiles.map((p) => p.id));
+  // Saved ids of profiles that no longer exist are not candidates.
   const chosen = Array.isArray(inputs["smart_profiles"])
-    ? inputs["smart_profiles"].filter((id): id is string => typeof id === "string")
+    ? inputs["smart_profiles"].filter(
+        (id): id is string => typeof id === "string" && active.has(id),
+      )
     : [];
-  // Empty = every active profile.
+  // Empty (or nothing still active) = every active profile.
   const candidates = chosen.length === 0 ? profiles.map((p) => p.id) : chosen;
 
   const save = async (inputKey: string, value: unknown, message: string) => {
@@ -155,8 +159,10 @@ export function SmartRouting({ automationId, inputs, profiles }: SmartRoutingPro
                         const list = next
                           ? [...candidates, p.id]
                           : candidates.filter((id) => id !== p.id);
-                        // Every profile on = the empty list, so a new profile is a candidate too.
-                        const value = list.length === profiles.length ? [] : list;
+                        // Every active profile on = the empty list, so a new
+                        // profile is a candidate too.
+                        const all = profiles.every((profile) => list.includes(profile.id));
+                        const value = all ? [] : list;
                         void save("smart_profiles", value, "Candidates saved");
                       }}
                     />

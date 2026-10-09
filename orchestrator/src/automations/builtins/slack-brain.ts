@@ -59,7 +59,7 @@ import { RELAY_CLOSE_TYPE } from "../engine/blocks/relay-close.ts";
 import { LOOKUP_INSTANCE_SESSION_TYPE } from "../engine/blocks/instance-session.ts";
 import { RELAY_SESSION_TYPE } from "../engine/blocks/relay.ts";
 import { RESOLVE_USER_TYPE } from "../engine/blocks/resolve-user.ts";
-import { SLACK_CHOICE_TYPE } from "../engine/blocks/slack-choice.ts";
+import { SLACK_CHOICE_LABEL_MAX, SLACK_CHOICE_TYPE } from "../engine/blocks/slack-choice.ts";
 import { profileRouteQuestions } from "../profile-cards.ts";
 import { NO_USER_MSG } from "../../integrations/slack-identity.ts";
 import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
@@ -371,7 +371,12 @@ export default ({ steps, inputs }) => {
   const card = (ids) => {
     const order = [...ids];
     if (fallback && labelOf.has(fallback) && !order.includes(fallback)) order.push(fallback);
-    return order.filter((id) => labelOf.has(id)).slice(0, 5).map((id) => ({ value: id, label: labelOf.get(id) }));
+    // Slack shows at most 75 characters of a button; the card's labels
+    // are the profile names, cut to fit.
+    return order
+      .filter((id) => labelOf.has(id))
+      .slice(0, 5)
+      .map((id) => ({ value: id, label: String(labelOf.get(id)).slice(0, ${SLACK_CHOICE_LABEL_MAX}) }));
   };
   if (options.length === 0) return { ask: false, options: [] };
   if (!route.decided) {
@@ -413,6 +418,10 @@ export default ({ steps }) => {
   } else if (facts.profile_id) {
     id = facts.profile_id;
     how = (steps.ask?.outcome === "deadline" ? "no answer, so " : "") + "the default profile";
+  } else if (options.length === 1) {
+    // One candidate and no default: there was nothing to choose between.
+    id = options[0].value;
+    how = "the only profile smart routing can pick";
   }
   if (!id) return { profile_id: "", label: "", card: "No profile was chosen. Mention me again to retry." };
   const shown = name(id) || "the default profile";
@@ -479,17 +488,32 @@ const smartRoute: BlockDef = {
   },
   then: [
     { id: "candidates", type: "list_profiles", config: { ids: { $ref: "inputs.smart_profiles" } } },
+    // No candidate left (every chosen profile archived): there is nothing
+    // to ask the model, and the verdict falls back to the default.
     {
-      id: "route",
-      type: "decide",
+      id: "has_candidates",
+      type: "branch",
       config: {
-        // The opening fold: the thread so far plus the mention, the same
-        // text the session will get as its first prompt.
-        state: { message: "${{ steps.opening.value.text }}" },
-        questions: profileRouteQuestions({ $ref: "steps.candidates.options" }),
-        // A model outage must never cost the thread its answer.
-        onError: "undecided",
+        conditions: {
+          mode: "all",
+          conditions: [{ path: "steps.candidates.count", op: "gt", value: 0 }],
+        },
       },
+      then: [
+        {
+          id: "route",
+          type: "decide",
+          config: {
+            // The opening fold: the thread so far plus the mention, the same
+            // text the session will get as its first prompt.
+            state: { message: "${{ steps.opening.value.text }}" },
+            questions: profileRouteQuestions({ $ref: "steps.candidates.options" }),
+            // A model outage must never cost the thread its answer.
+            onError: "undecided",
+          },
+        },
+      ],
+      else: [],
     },
     { id: "triage", type: "code", config: { source: SLACK_TRIAGE_SOURCE, mode: "value" } },
     {

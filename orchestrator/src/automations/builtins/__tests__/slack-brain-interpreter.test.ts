@@ -141,6 +141,7 @@ function harness(options: {
   clockStepMs?: number;
   /** The Decisions API: `connected` (default true) and the scripted answers. */
   decisions?: { connected?: boolean; replies?: DecisionsResponse[] };
+  profileCards?: ProfileCard[];
 }): Harness {
   const runner = options.replay ? makeReplayRunner(options.replay) : null;
   const names: string[] = runner ? runner.names : [];
@@ -305,7 +306,7 @@ function harness(options: {
         return next;
       },
     },
-    profileCards: async () => CARDS,
+    profileCards: async () => options.profileCards ?? CARDS,
     integrationActions: {
       async execute(input) {
         // The real contract: the connector's declared input schema, after
@@ -1018,6 +1019,46 @@ describe("Slack thread brain — smart routing", () => {
     await interpretAutomation(RUN, h.deps);
     const routing = h.names.filter((n) => n.includes("smart_route"));
     expect(routing).toEqual(["step:has_previous.smart_route.__cond__:0"]);
+  });
+
+  test("(r11) every chosen profile gone: no model call, the default profile serves", async () => {
+    const h = harness({
+      inputs: { ...SMART, smart_profiles: ["p-archived"] },
+      recv: [{ kind: "session_idle", sessionId: "s-1" }, null, null],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.decisionRequests).toEqual([]);
+    expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-d" })]);
+  });
+
+  test("(r12) a long profile name is cut to fit a Slack button", async () => {
+    const long = "W".repeat(120);
+    const h = harness({
+      inputs: SMART,
+      profileCards: [
+        { ...CARDS[0]!, name: long },
+        CARDS[1]!,
+        CARDS[2]!,
+      ],
+      decisions: {
+        replies: [
+          {
+            model: "typesafe/jev-1.13-20260917",
+            answers: {
+              profile: { type: "choice", choice: "Infra", confidence: 0.4, probabilities: { Infra: 0.4, [long]: 0.35, General: 0.25 } },
+              wants_choice: { type: "noul", noul: 0 },
+            },
+            usage: { input_tokens: 1, output_tokens: 0 },
+          },
+        ],
+      },
+      recv: [null, { kind: "session_idle", sessionId: "s-1" }, null, null],
+      clockStepMs: 400_000,
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.choices[0]!.options).toEqual(["Infra", "W".repeat(75), "General"]);
   });
 
   test("(r8) a resumed thread is never re-routed", async () => {

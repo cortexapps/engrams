@@ -274,5 +274,12 @@ describe("Slack thread brain — smart routing code", () => {
       ask: { outcome: "deadline" },
     });
     expect(nobody!.profile_id).toBe("");
+    // One candidate, no default, the model down: nothing to choose between.
+    const sole = await resolve({
+      facts: { value: { smart: true, profile_id: "" } },
+      candidates: { options: [options[0]] },
+      route: { decided: false, reason: "decision_failed: 529" },
+    });
+    expect(sole).toMatchObject({ profile_id: "p-web", card: "Profile: *Web* (the only profile smart routing can pick)" });
   });
 });
