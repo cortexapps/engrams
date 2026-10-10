@@ -96,6 +96,15 @@
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
 
+          # The cc-wrapper's fortify hardening adds -D_FORTIFY_SOURCE to every
+          # C compile. Debug builds compile C at -O0, so glibc then emits
+          # "_FORTIFY_SOURCE requires compiling with optimization". jemalloc's
+          # configure probes compile with -Werror, so every probe fails and
+          # configure stops ("cannot determine return type of strerror_r").
+          # This shell only makes development builds; release images are
+          # built outside it.
+          hardeningDisable = [ "fortify" ];
+
           shellHook = ''
             # Insulate cargo from the host's rustup installation.
             #
