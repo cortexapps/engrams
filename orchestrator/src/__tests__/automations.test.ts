@@ -1009,6 +1009,32 @@ describe("AutomationService v2", () => {
     ).rejects.toThrow(/entrypoint "gone"/);
   });
 
+  test("enabling schedules a cron trigger that lives on an extra entrypoint", async () => {
+    const deps = adminDeps();
+    const { automations } = clients(deps);
+    const created = await automations.createAutomation({
+      name: "Sweep",
+      description: "",
+      enabled: false,
+      definitionJson: JSON.stringify(
+        cronDefinition({
+          trigger: { kind: "manual" },
+          entrypoints: [
+            { id: "sweep", trigger: { kind: "cron", schedule: "*/5 * * * *", timezone: "UTC" }, blocks: [] },
+          ],
+        }),
+      ),
+      inputsJson: "{}",
+    });
+    expect(created.automation?.nextFireAt).toBeUndefined();
+
+    const enabled = await automations.setAutomationEnabled({ id: created.automation!.id, enabled: true });
+    expect(enabled.automation?.nextFireAt).toBe("2026-08-21T12:05:00.000Z");
+
+    const disabled = await automations.setAutomationEnabled({ id: created.automation!.id, enabled: false });
+    expect(disabled.automation?.nextFireAt).toBeUndefined();
+  });
+
   test("ListInputKeyOptions goes through the injected source", async () => {
     const { automations } = clients(
       adminDeps({

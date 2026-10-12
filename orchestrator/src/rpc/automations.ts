@@ -9,7 +9,6 @@
 import { create } from "@bufbuild/protobuf";
 import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter } from "@connectrpc/connect";
-import { Cron } from "croner";
 
 import {
   AutomationRunService,
@@ -29,6 +28,7 @@ import {
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { requireAdmin } from "./require.ts";
 import { evaluateCode, type CodeInput } from "../automations/code/sandbox.ts";
+import { nextFireAtOf } from "../automations/cron.ts";
 import { CODE_SOURCE_MAX_CHARS } from "../automations/engine/blocks/code.ts";
 import {
   definitionOf,
@@ -282,34 +282,6 @@ function verificationScheme(value: string): WebhookVerificationScheme {
       );
     default:
       throw new ConnectError("unknown verification_scheme", Code.InvalidArgument);
-  }
-}
-
-function assertTimezone(timezone: string): void {
-  if (!timezone) throw new ConnectError("cron timezone is required", Code.InvalidArgument);
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(new Date(0));
-  } catch {
-    throw new ConnectError(`invalid IANA timezone "${timezone}"`, Code.InvalidArgument);
-  }
-}
-
-function nextCronFire(schedule: string, timezone: string, now: Date): Date {
-  assertTimezone(timezone);
-  try {
-    const cron = new Cron(schedule, { timezone, paused: true });
-    const next = cron.nextRun(now);
-    if (!next) throw new Error("schedule has no future occurrence");
-    return next;
-  } catch (error) {
-    throw new BlockValidationError([
-      blockError(
-        "",
-        "trigger.schedule",
-        "invalid_cron",
-        `invalid cron schedule: ${error instanceof Error ? error.message : String(error)}`,
-      ),
-    ]);
   }
 }
 
@@ -653,12 +625,17 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     await validateSessionBlocks(definition);
     // D9: every entrypoint's trigger validates; the (single, validated)
     // cron entrypoint yields the automation's next_fire_at.
-    let nextFireAt: Date | null = null;
+    let nextFireAt: Date | null;
+    try {
+      nextFireAt = nextFireAtOf(definition, now());
+    } catch (error) {
+      const be = toBlockError(error);
+      if (be) throw new BlockValidationError([be]);
+      throw error;
+    }
     for (const entrypoint of entrypointsOf(definition)) {
       const trigger = entrypoint.trigger;
-      if (trigger.kind === "cron") {
-        nextFireAt = nextCronFire(trigger.schedule, trigger.timezone, now());
-      } else if (trigger.kind === "webhook") {
+      if (trigger.kind === "webhook") {
         if (!(await store.getRegistration(trigger.registrationId))) {
           throw new BlockValidationError([
             blockError("", "trigger.registrationId", "unknown_registration", "webhook registration not found"),
@@ -1109,13 +1086,9 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const id = requiredText(req.id, "id");
       const existing = await store.getActive(id);
       if (!existing) throw new ConnectError("automation not found", Code.NotFound);
-      const trigger = existing.version.trigger;
-      const nextFireAt =
-        req.enabled && trigger.kind === "cron"
-          ? nextCronFire(trigger.schedule, trigger.timezone, now())
-          : req.enabled
-            ? undefined
-            : null;
+      const nextFireAt = req.enabled
+        ? nextFireAtOf(definitionOf(existing.version), now())
+        : null;
       const row = await store.setEnabled(id, req.enabled, nextFireAt);
       if (!row) throw new ConnectError("automation not found", Code.NotFound);
       return { automation: toProtoAutomation(row) };
@@ -1260,15 +1233,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       // The copy folds overrides into the graph and is fully editable.
       const definition = effectiveDefinition(row.version, row.blockOverrides);
       const name = req.name?.trim() || `${row.name} (copy)`;
-      const nextFireAt =
-        definition.trigger.kind === "cron"
-          ? nextCronFire(definition.trigger.schedule, definition.trigger.timezone, now())
-          : null;
       const copy = await store.create(
         { name, description: row.description, enabled: false, definition, nextFireAt: null, inputs: row.inputs },
         userId,
       );
-      void nextFireAt;
       return { automation: toProtoAutomation(copy) };
     },
 

@@ -73,7 +73,11 @@ function row(def: AutomationDefinition, version = 1): AutomationRow {
 
 interface Harness {
   deps: AutomationDraftToolDeps;
-  saved: Array<{ automationId: string; definition: AutomationDefinition }>;
+  saved: Array<{
+    automationId: string;
+    definition: AutomationDefinition;
+    nextFireAt: Date | null | undefined;
+  }>;
   meta: Array<Record<string, unknown>>;
 }
 
@@ -86,14 +90,14 @@ function harness(current: AutomationRow | null, options: { raceToVersion?: numbe
       async getByDraftSession(sessionId) {
         return current && current.draftSessionId === sessionId ? current : null;
       },
-      async saveVersion(automationId, def, _user, _meta, opts) {
+      async saveVersion(automationId, def, _user, meta, opts) {
         // The in-transaction fence: the row may have advanced past the
         // handler's read (a concurrent human save).
         const liveVersion = options.raceToVersion ?? current?.currentVersion ?? 1;
         if (opts?.expectedVersion !== undefined && opts.expectedVersion !== liveVersion) {
           throw new SaveVersionConflictError(liveVersion);
         }
-        saved.push({ automationId, definition: def });
+        saved.push({ automationId, definition: def, nextFireAt: meta?.nextFireAt });
         return current;
       },
       async updateMeta(_id, patch) {
@@ -206,6 +210,59 @@ describe("automation draft tools", () => {
     })) as { applied: boolean; errors?: Array<{ field: string }> };
     expect(junk.applied).toBe(false);
     expect(junk.errors?.[0]?.field).toBe("definition_json");
+  });
+
+  test("propose moves next_fire_at with the trigger on an enabled automation", async () => {
+    const h = harness({ ...row(definition()), enabled: true });
+    const cron = definition({
+      trigger: { kind: "cron", schedule: "0 10 * * 1", timezone: "America/New_York" },
+    });
+    const ok = (await call(h.deps, "automation_propose", {
+      definition_json: JSON.stringify(cron),
+      expected_version: 1,
+    })) as { applied: boolean };
+    expect(ok.applied).toBe(true);
+    // 2026-08-25 is a Tuesday: the next Monday 10:00 New York (EDT) is 14:00 UTC.
+    expect(h.saved[0]?.nextFireAt).toEqual(new Date("2026-08-31T14:00:00Z"));
+
+    await call(h.deps, "automation_propose", {
+      definition_json: JSON.stringify(definition()),
+      expected_version: 1,
+    });
+    expect(h.saved[1]?.nextFireAt).toBeNull();
+  });
+
+  test("propose leaves a disabled automation unscheduled", async () => {
+    const h = harness(row(definition()));
+    await call(h.deps, "automation_propose", {
+      definition_json: JSON.stringify(
+        definition({ trigger: { kind: "cron", schedule: "0 9 * * *", timezone: "UTC" } }),
+      ),
+      expected_version: 1,
+    });
+    expect(h.saved[0]?.nextFireAt).toBeNull();
+  });
+
+  test("an invalid cron schedule or timezone is a soft refusal", async () => {
+    const h = harness(row(definition()));
+    const schedule = (await call(h.deps, "automation_propose", {
+      definition_json: JSON.stringify(
+        definition({ trigger: { kind: "cron", schedule: "nope", timezone: "UTC" } }),
+      ),
+      expected_version: 1,
+    })) as { applied: boolean; errors?: Array<{ field: string }> };
+    expect(schedule.applied).toBe(false);
+    expect(schedule.errors?.[0]?.field).toBe("trigger.schedule");
+
+    const timezone = (await call(h.deps, "automation_propose", {
+      definition_json: JSON.stringify(
+        definition({ trigger: { kind: "cron", schedule: "0 9 * * *", timezone: "Mars/Olympus" } }),
+      ),
+      expected_version: 1,
+    })) as { applied: boolean; errors?: Array<{ field: string }> };
+    expect(timezone.applied).toBe(false);
+    expect(timezone.errors?.[0]?.field).toBe("trigger.timezone");
+    expect(h.saved).toHaveLength(0);
   });
 
   test("an unknown profile is a soft refusal pointing at the block", async () => {

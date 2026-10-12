@@ -35,6 +35,7 @@ import {
   draftPatterns,
   type DraftEventCatalogDeps,
 } from "../automations/draft-catalog.ts";
+import { nextFireAtOf } from "../automations/cron.ts";
 import { AUTOMATION_DRAFT_TASK_TYPE } from "../automations/draft.ts";
 import type { ToolContext, ToolRegistry } from "./registry.ts";
 
@@ -288,8 +289,12 @@ export function registerAutomationDraftTools(
       }
       registerEngineBlocks();
       let definition: AutomationDefinition;
+      let nextFireAt: Date | null;
       try {
         definition = validateDefinition(parsed);
+        // A trigger change must move next_fire_at too: a cron automation
+        // with a null next_fire_at is never due.
+        nextFireAt = nextFireAtOf(definition, (deps.now ?? (() => new Date()))());
       } catch (error) {
         if (error instanceof DefinitionError) {
           return {
@@ -310,9 +315,13 @@ export function registerAutomationDraftTools(
       // the read and the write throws here instead of being clobbered.
       let saved: AutomationRow | null;
       try {
-        saved = await deps.store.saveVersion(row.id, definition, ctx.userId ?? null, undefined, {
-          expectedVersion: args.expected_version,
-        });
+        saved = await deps.store.saveVersion(
+          row.id,
+          definition,
+          ctx.userId ?? null,
+          { nextFireAt: row.enabled ? nextFireAt : null },
+          { expectedVersion: args.expected_version },
+        );
       } catch (error) {
         if (error instanceof SaveVersionConflictError) {
           const fresh = await deps.store.getByDraftSession(ctx.sessionId);
