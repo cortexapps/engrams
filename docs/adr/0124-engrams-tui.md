@@ -126,7 +126,7 @@ pauses while scrolled up.
 - The TUI cannot show full tool output. The wire carries summaries only.
   That is a server limit and is out of scope here.
 - Native scrollback mode cannot page history on scroll-up; the terminal owns
-  the scrollback. A pager overlay covers search.
+  the scrollback; the terminal's own search covers it.
 - Zellij and ConPTY do not honor scroll regions reliably. Inline mode there
   uses the full-redraw fallback ratatui provides without the feature.
 
@@ -134,8 +134,8 @@ pauses while scrolled up.
 
 - PR4: this ADR, the crate core, both screen modes, session list, attach,
   composer, footer, keymap, tests and budgets.
-- PR5: markdown writer, tool cells, file-change hunks, pager, `$EDITOR`,
-  `NO_COLOR`, screen-reader flattening.
+- PR5: markdown writer, tool cells, file-change hunks, transcript search,
+  `$EDITOR`, `NO_COLOR`, screen-reader flattening.
 - PR6: approvals and questions via `CompleteToolCall`, notifications.
 - PR7: shell pane (`vt100`) and `engrams session shell`.
 - PR8: new session from the TUI, `/` commands, help overlay, docs,
@@ -160,6 +160,31 @@ pauses while scrolled up.
   (D6). In native scrollback mode the first page is written to the
   terminal and older events are not loaded; the pager overlay in PR5
   covers search.
+- **PR5, links.** A ratatui cell carries no hyperlink, so links render as
+  `text (url)` with the target dimmed, not as OSC 8. The URL is on screen
+  and the terminal's own URL detection still makes it clickable.
+- **PR5, streaming.** Chunks are rendered up to the last blank line
+  outside a code fence or table (Codex's rule); the tail is shown as plain
+  text until it commits, and a durable `agent_message` renders in full at
+  once. Once a cell is final the markdown source is dropped and only the
+  display text and its style runs stay (D3: text once).
+- **PR5, search instead of a pager.** Ctrl+T opens an in-place transcript
+  search (Enter walks to older hits and wraps, the hit heads the viewport)
+  rather than a separate pager overlay. Dump-to-scrollback and the
+  transcript-in-`$EDITOR` view are deferred to PR8. In native scrollback
+  mode the terminal owns the history, so Ctrl+T points at its search.
+- **PR5, `$EDITOR`.** Ctrl+G hands the terminal to `$VISUAL`/`$EDITOR`
+  (`vi` by default). The input stream is dropped first: crossterm's reader
+  thread would otherwise steal keystrokes from the editor. A non-zero exit
+  leaves the draft unchanged.
+- **PR5, screen-reader mode.** `--ax` (or `ENGRAMS_TUI_AX=1`) forces native
+  scrollback, no mouse, and word gutters (`you:`, `agent:`, `tool:`,
+  `edit:`, `shell:`, `question:`, `plan:`, `note:`) in a 10-column gutter
+  in place of glyphs; the `⎿` body gutter is dropped.
+- **PR5, file changes.** A `file_changed` event re-renders the write/edit
+  tool card in place as a diff (`+`/`-` lines, counts on the head row,
+  collapsed like a tool body); the completion that follows leaves the
+  diff alone, and a failed edit keeps its error card (ADR 0054 Flavor A).
 - **PR4, cursor-position query.** An inline viewport needs the terminal
   to answer `CSI 6n`. A pseudo-terminal with no emulator behind it never
   does, and start-up blocks in crossterm's query. Real terminals answer.
