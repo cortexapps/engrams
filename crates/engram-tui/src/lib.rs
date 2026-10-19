@@ -93,7 +93,7 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
         // Run the commands the last update emitted.
         let mut failed: Option<String> = None;
         let mut edited: Option<Option<String>> = None;
-        let cmds: Vec<Cmd> = app.cmds.drain(..).collect();
+        let cmds: Vec<Cmd> = std::mem::take(&mut app.cmds);
         for cmd in cmds {
             match cmd {
                 Cmd::LoadSessions => net.load_sessions(),
