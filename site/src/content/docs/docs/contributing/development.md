@@ -5,15 +5,14 @@ sidebar:
   order: 1
 ---
 
-engrams is one repository with a Rust workspace at the root and three TypeScript projects
+engrams is one repository with a Rust workspace at the root and two TypeScript projects
 beside it.
 
 | Path | What it is | Tooling |
 |---|---|---|
-| `crates/` | The Rust workspace: the coordinator, the host agent, the in-guest daemon, the sandbox backends, the storage and cloud backends, the harness adapters | cargo |
+| `crates/` | The Rust workspace: the coordinator, the host agent, the in-guest daemon, the sandbox backends, the storage and cloud backends, the harness adapters, the `engrams` CLI | cargo |
 | `orchestrator/` | The product API and integrations, on Bun and Hono | bun |
 | `web/` | The dashboard, a React app | pnpm |
-| `cli/` | The `engrams` CLI | bun |
 | `site/` | This site, Astro and Starlight | pnpm |
 | `deploy/` | Helm charts, Terraform, the demo image, the harness descriptors | |
 | `docs/` | Design notes and runbooks for people working on engrams | |

@@ -23,9 +23,8 @@ Lanes:
   host_image    host_binaries OR host_base. The union gates the OSS
                 publish-host-binaries job — the GHCR artifact must exist at
                 this SHA for either downstream bake to consume.
-  cli_tools     the `engrams` CLI changed — cli/ sources or the protos it
-                codegens from (no cargo closure: the CLI is Bun/TS since the
-                orchestrator-native rewrite). Gates the OSS publish-cli-tools
+  cli_tools     the `engrams` CLI changed — its release closure or the app
+                protos its client crate compiles. Gates the OSS publish-cli-tools
                 job, which republishes the "golden" cli GHCR artifact
                 (cli-tools) that CI consumers pull instead of recompiling.
                 Same role publish-host-binaries plays for the FC-host bakes.
@@ -137,15 +136,12 @@ CONTAINER_BINS = {
 # harness-only change shipped nothing (the bug this gate fixes).
 SESSION_HARNESS_BINS = {"engram-harness-claude", "engram-harness-codex"}
 HARNESS_PATHS = ["deploy/harness-claude/", "deploy/harness-codex/"]
-# The product CLI (`engrams`, cli/ — Bun/TS, orchestrator-native; the Rust
-# engram-cli crate is retired). No cargo closure: its inputs are its own
-# sources + the generated proto bindings. OSS publishes it once as the
-# `cli-tools` GHCR artifact (publish-cli-tools); CI consumers pull that
-# instead of recompiling — exactly how the FC-host bakes consume
-# publish-host-binaries.
-# `.bun-version` is the Bun runtime for every Bun lane — a bump must run them
-# all, or a runtime change ships untested (see ORCH_PATHS).
-CLI_PATHS = ["cli/", ".bun-version"]
+# The product CLI (`engrams`, crates/engram-cli, orchestrator-native). Its
+# inputs are its release closure plus the app protos its client crate
+# compiles (PROTO_PATHS). OSS publishes it once as the `cli-tools` GHCR
+# artifact (publish-cli-tools); CI consumers pull that instead of
+# recompiling — exactly how the FC-host bakes consume publish-host-binaries.
+CLI_BINS = {"engram-cli"}
 # ADR 0080: the in-guest agent, exec'd out of its reserved bundle slot by the
 # stage-1 init. A change to it (or its release closure) must republish
 # `bundle-agentd` via publish-bundles — the identical coupling (and failure
@@ -153,12 +149,13 @@ CLI_PATHS = ["cli/", ".bun-version"]
 # fresh create runs yesterday's agentd.
 AGENTD_BINS = {"engram-agentd"}
 # The binaries the `test-e2e-stack` lane builds + boots: coord + host-agent
-# (the stack), agentd (staged into the host bundle stamp; ADR 0080), and
-# harness-claude (likewise; ADR 0062). The `engrams` CLI (which drives
-# enable/registry in that lane) is not a crate — it rides E2E_PATHS via
-# `cli/`. A change anywhere in this closure means the e2e lane could behave
-# differently, so run it. Gates the expensive e2e stack lane.
+# (the stack), agentd (staged into the host bundle stamp; ADR 0080),
+# harness-claude (likewise; ADR 0062), and the `engrams` CLI (which drives
+# enable/registry/session in that lane). A change anywhere in this closure
+# means the e2e lane could behave differently, so run it. Gates the
+# expensive e2e stack lane.
 E2E_BINS = {
+    "engram-cli",
     "engram-coordinator",
     "engram-host-agent",
     "engram-agentd",
@@ -250,7 +247,6 @@ E2E_PATHS = [
     "deploy/initdb/",
     "deploy/demo/",
     "deploy/bundles/",
-    "cli/",  # the `engrams` CLI drives enable/registry/session in the lane
     ".github/workflows/ci.yml",
     ".github/scripts/detect-rebake-lanes.py",
 ]
@@ -448,6 +444,7 @@ def main():
     e2e_closure = release_closure(meta, E2E_BINS)
     host_sim_closure = release_closure(meta, HOST_SIM_BINS)
     cosim_closure = release_closure(meta, COSIM_BINS)
+    cli = release_closure(meta, CLI_BINS)
 
     # ADR 0045 Phase B: a Firecracker-fork bump (submodule pointer) restages the
     # FC binary in the node-assets image. It trips `images` so the notify job
@@ -461,11 +458,11 @@ def main():
     # Union — gates the publish-host-binaries job so the GHCR artifact exists
     # at this SHA for whichever downstream bake (thin and/or base) fires.
     host_image = host_binaries or host_base
-    # Golden cli artifact (cli-tools = the Bun-compiled `engrams` binary).
-    # Republish whenever cli/ sources moved, the protos it codegens from
-    # changed, or the bake workflow / this script changed. No cargo terms:
-    # the orchestrator-native rewrite took the CLI out of the Rust workspace.
-    cli_tools = (any_path(changed, CLI_PATHS)
+    # Golden cli artifact (cli-tools = the `engrams` binary). Republish
+    # whenever its release closure moved, the app protos it compiles changed
+    # (they live in engram-protocol, outside the closure), or the bake
+    # workflow / this script changed.
+    cli_tools = (bool(cc & cli)
                  or any_path(changed, PROTO_PATHS)
                  or any_path(changed, BAKE_ALL_PATHS))
     tf_or_helm = any_path(changed, TF_HELM_PATHS)
@@ -575,10 +572,10 @@ def main():
     # tripping FC on a bundle-payload edit was a needless ~KVM lane. The
     # e2e-STACK lane still gates on `e2e`, so bundle staging is validated there.
     test_fc = ci_self or bool(cc & e2e_closure) or fc_fork
-    # web / orchestrator / cli: their own sources or the protos they codegen from.
+    # web / orchestrator: their own sources or the protos they codegen from.
+    # (The `engrams` CLI is a workspace crate: test_rust covers it.)
     test_web = ci_self or proto or any_path(changed, WEB_PATHS)
     test_orchestrator = ci_self or proto or any_path(changed, ORCH_PATHS)
-    test_cli = ci_self or proto or any_path(changed, CLI_PATHS)
     # buf only lints/breaking-checks/codegen-drifts the protos.
     test_buf = ci_self or proto
     test_integrations_cli = ci_self or any_path(changed, INTEGRATIONS_CLI_PATHS)
@@ -668,7 +665,7 @@ def main():
           file=sys.stderr)
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
-          f"test_cli={test_cli} test_buf={test_buf} ci_self={ci_self} proto={proto} "
+          f"test_buf={test_buf} ci_self={ci_self} proto={proto} "
           f"test_host_sim={test_host_sim} test_cosim={test_cosim} "
           f"test_integrations_cli={test_integrations_cli} "
           f"test_deploy={test_deploy} test_site={test_site}",
@@ -702,7 +699,6 @@ def main():
             f.write(f"test_fc={b(test_fc)}\n")
             f.write(f"test_web={b(test_web)}\n")
             f.write(f"test_orchestrator={b(test_orchestrator)}\n")
-            f.write(f"test_cli={b(test_cli)}\n")
             f.write(f"test_buf={b(test_buf)}\n")
             f.write(f"test_host_sim={b(test_host_sim)}\n")
             f.write(f"test_cosim={b(test_cosim)}\n")

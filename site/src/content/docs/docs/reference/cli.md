@@ -10,13 +10,13 @@ uses, and nothing else; the coordinator and the hosts are internal to a deployme
 
 ## Install
 
-The CLI is a single binary built with Bun from the `cli/` directory of the repository:
+The CLI is a single static binary. Each release attaches builds for Linux x86-64, Linux
+arm64 and macOS arm64 to the GitHub release; copy the one for your machine somewhere on your
+`PATH` as `engrams`. To build it from the repository:
 
 ```sh
-cd cli && bun install && bun run build   # -> cli/dist/engrams
+cargo build --profile cli -p engram-cli   # -> target/cli/engrams
 ```
-
-Copy `cli/dist/engrams` somewhere on your `PATH`.
 
 ## Authentication
 

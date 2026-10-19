@@ -5,8 +5,8 @@
 # then call `engrams …`. The CLI drives the ORCHESTRATOR (:8787) — the
 # coordinator's app-gRPC is internal (orchestrator↔coord only).
 #
-#   ENGRAMS_BIN      — path to a compiled binary (CI downloads one); unset →
-#                      `bun cli/src/main.ts` from source (one-time bun install).
+#   ENGRAMS_BIN      — path to a compiled binary (CI builds one); unset →
+#                      `cargo build -p engram-cli` and target/debug/engrams.
 #   ENGRAMS_URL      — orchestrator base URL (default the `just dev` stack).
 #   ENGRAMS_API_KEY  — admin credential; defaults to var/dev-api-key, which
 #                      the Tilt `dev-api-key` resource seeds at stack-up.
@@ -18,9 +18,8 @@ if [ -z "$ENGRAMS_API_KEY" ]; then
     return 1 2>/dev/null || exit 1
 fi
 
-if [ -n "${ENGRAMS_BIN:-}" ]; then
-    engrams() { "$ENGRAMS_BIN" "$@"; }
-else
-    (cd cli && bun install --silent)
-    engrams() { bun cli/src/main.ts "$@"; }
+if [ -z "${ENGRAMS_BIN:-}" ]; then
+    cargo build -q -p engram-cli >&2
+    ENGRAMS_BIN="$(pwd)/target/debug/engrams"
 fi
+engrams() { "$ENGRAMS_BIN" "$@"; }

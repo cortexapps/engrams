@@ -24,9 +24,6 @@ name: CI
 #                       comment above the jobs for the batch split.
 #   - web:              pnpm install + oxfmt + oxlint + tsc +
 #                       vite build + vitest
-#   - cli:              the `engrams` product CLI (cli/, Bun):
-#                       typecheck + stub-orchestrator tests + a
-#                       compiled-binary smoke
 #   - bake-demo-image:  push-to-main only. ADR 0080: a plain
 #                       `docker build && docker push` of deploy/demo
 #                       to `ghcr.io/cortexapps/engrams/demo:warm-<sha>`
@@ -37,9 +34,9 @@ name: CI
 #                       engram-host-agent + musl engram-agentd ONCE
 #                       and uploads as a workflow artifact. Consumed
 #                       by `test-e2e-stack` so the e2e lane doesn't
-#                       pay the compile cost again. (The `engrams`
-#                       CLI is Bun — the e2e job runs it from cli/
-#                       source.)
+#                       pay the compile cost again. The `engrams`
+#                       CLI (crates/engram-cli) is built here too and
+#                       the e2e job runs that binary.
 #   - test-e2e-stack:   true end-to-end against the prod-shape
 #                       stack: real coord HTTP API + real gRPC + real
 #                       host-agent + real Firecracker + real chunked
@@ -135,7 +132,6 @@ jobs:
       test_orchestrator: ${{ steps.lanes.outputs.test_orchestrator }}
       test_host_sim: ${{ steps.lanes.outputs.test_host_sim }}
       test_cosim: ${{ steps.lanes.outputs.test_cosim }}
-      test_cli: ${{ steps.lanes.outputs.test_cli }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
       test_integrations_cli: ${{ steps.lanes.outputs.test_integrations_cli }}
       test_deploy: ${{ steps.lanes.outputs.test_deploy }}
@@ -900,33 +896,6 @@ jobs:
         run: bun run migrate
       - name: bun test
         run: bun test
-
-  # The `engrams` product CLI (cli/, Bun + TS, orchestrator-native).
-  # Typecheck + the stub-orchestrator test suite (spawns the real entrypoint
-  # against an in-process Connect server — no external services needed).
-  cli:
-    name: cli (bun)
-    needs: detect
-    if: needs.detect.outputs.test_cli == 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    defaults:
-      run:
-        working-directory: cli
-    steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: .bun-version
-      - name: bun install
-        run: bun install --frozen-lockfile
-      - name: bun typecheck
-        run: bun run typecheck
-      - name: bun test
-        run: bun test
-      - name: compiled binary smoke
-        run: |
-          bun run build
-          ./dist/engrams --version
 
   # ADR 0051 §7: buf owns crates/engram-protocol/proto. Lint GATES style —
   # legacy host_service.proto carries scoped exceptions in buf.yaml;
@@ -1741,12 +1710,14 @@ jobs:
           # registry without a separate cargo build (ADR 0021 P0).
           # ADR 0121: host-agent refuses to serve without a confirmed
           # egress daemon (fail-closed), so the stack ships the daemon
-          # binary beside it.
+          # binary beside it. `engram-cli` is the `engrams` binary the
+          # e2e lane drives enable/registry/session with (ENGRAMS_BIN).
           cargo build --release \
               -p engram-coordinator \
               -p engram-host-agent \
               -p engram-egress-proxyd \
-              -p engram-publish-builtin-harness
+              -p engram-publish-builtin-harness \
+              -p engram-cli
 
       - name: Build musl agentd (release)
         run: |
@@ -1762,6 +1733,7 @@ jobs:
             target/release/engram-host-agent
             target/release/engram-egress-proxyd
             target/release/engram-publish-builtin-harness
+            target/release/engrams
             target/x86_64-unknown-linux-musl/release/engram-agentd
           retention-days: 1
           if-no-files-found: error
@@ -1867,6 +1839,10 @@ jobs:
     permissions:
       contents: read
       packages: read
+    env:
+      # deploy/dev/engrams-cli.sh runs this binary (from the e2e-binaries
+      # artifact) instead of a debug build.
+      ENGRAMS_BIN: ${{ github.workspace }}/target/release/engrams
     steps:
       - uses: actions/checkout@v7
 
@@ -1973,8 +1949,10 @@ jobs:
       - name: Mark e2e binaries executable
         run: |
           chmod +x target/release/engram-{coordinator,host-agent,egress-proxyd,publish-builtin-harness}
+          chmod +x target/release/engrams
           chmod +x target/x86_64-unknown-linux-musl/release/engram-agentd
           ls -l target/release/engram-{coordinator,host-agent,egress-proxyd,publish-builtin-harness} \
+                target/release/engrams \
                 target/x86_64-unknown-linux-musl/release/engram-agentd
 
       # `tilt up` (via tilt-up-ci.sh) boots: postgres + fake-gcs +
@@ -1992,7 +1970,7 @@ jobs:
           tilt version
 
       # The orchestrator (a core stack member — the Tiltfile boots it even
-      # under ENGRAM_SKIP_WEB=1) and the `engrams` CLI both run on bun.
+      # under ENGRAM_SKIP_WEB=1) runs on bun.
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: .bun-version
@@ -2491,7 +2469,6 @@ jobs:
       - web
       - site
       - orchestrator
-      - cli
       - buf
       - test-fc-unprivileged
       - test-fc-pooled

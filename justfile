@@ -426,7 +426,7 @@ fc-colima-provision profile='fc-dev':
 # snapshot an enabled image clones from is preserved (re-captured on re-enable).
 #
 # Use it to reclaim disk or get a clean slate before a re-bake. Drives the
-# LOCAL orchestrator (:8787) via the `engrams` CLI (bun, cli/) with
+# LOCAL orchestrator (:8787) via the `engrams` CLI (crates/engram-cli) with
 # ENGRAMS_API_KEY auth; the stack must be up.
 reap-sessions profile='' mac_docker_context='colima':
     #!/usr/bin/env bash
@@ -465,8 +465,8 @@ reap-sessions profile='' mac_docker_context='colima':
         }'
     }
     echo "==> starting reaper"
-    (cd cli && bun install --silent)
-    cli() { bun cli/src/main.ts "$@"; }
+    source deploy/dev/engrams-cli.sh
+    cli() { engrams "$@"; }
     before_kb="$(dir_kb "$sandboxes_dir")"; before_kb="${before_kb:-0}"
     # 1. Reap every live session via the production DeleteSession path.
     echo "==> loading sessions from the orchestrator"
@@ -600,8 +600,8 @@ reap-bundles:
     export ENGRAMS_URL="http://localhost:8787"
     export ENGRAMS_API_KEY="${ENGRAMS_API_KEY:-$(cat var/dev-api-key 2>/dev/null || true)}"
     [ -n "$ENGRAMS_API_KEY" ] || { echo "no ENGRAMS_API_KEY and no var/dev-api-key — is the stack up (just dev)?" >&2; exit 1; }
-    (cd cli && bun install --silent)
-    cli() { bun cli/src/main.ts "$@"; }
+    source deploy/dev/engrams-cli.sh
+    cli() { engrams "$@"; }
     echo "==> deregistering dead host rows"
     dead="$(cli --json host list \
         | python3 -c 'import sys,json;print("\n".join(h["id"] for h in json.load(sys.stdin)["hosts"] if h["status"]=="dead"))')"
@@ -656,8 +656,8 @@ bake-demo-enable:
     export ENGRAMS_URL="${ENGRAMS_URL:-http://localhost:8787}"
     export ENGRAMS_API_KEY="${ENGRAMS_API_KEY:-$(cat var/dev-api-key 2>/dev/null || true)}"
     [ -n "$ENGRAMS_API_KEY" ] || { echo "no ENGRAMS_API_KEY and no var/dev-api-key — is the stack up (just dev)?" >&2; exit 1; }
-    (cd cli && bun install --silent)
-    cli() { bun cli/src/main.ts "$@"; }
+    source deploy/dev/engrams-cli.sh
+    cli() { engrams "$@"; }
     uri=localhost:5001/demo:warm-1
     if cli --json image list \
         | python3 -c "import sys,json; sys.exit(0 if any(i.get('image_uri')=='$uri' for i in json.load(sys.stdin).get('images',[])) else 1)"; then

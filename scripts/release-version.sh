@@ -32,8 +32,7 @@ SITES=(
   'deploy/helm/engram/Chart.yaml|^(appVersion: ")[^"]+(")$'
   'deploy/helm/engram-host-fleet/Chart.yaml|^(version: )[^[:space:]]+()$'
   'deploy/helm/engram-host-fleet/Chart.yaml|^(appVersion: ")[^"]+(")$'
-  'cli/package.json|^(  "version": ")[^"]+(",)$'
-  'cli/src/main.ts|^(  \.version\(")[^"]+("\))$'
+  'crates/engram-cli/src/main.rs|^(const VERSION: &str = ")[^"]+(";)$'
 )
 
 fail=0
