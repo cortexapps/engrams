@@ -11,7 +11,7 @@ use crate::composer::Composer;
 use crate::event::{Envelope, Event};
 use crate::keymap::{resolve, Action};
 use crate::reducer::{is_terminal, Reducer};
-use crate::sessions::{fuzzy, SessionRow};
+use crate::sessions::{fuzzy, ProfileRow, SessionRow};
 use crate::shell::ShellPane;
 use crate::transcript::Cell;
 
@@ -61,6 +61,13 @@ pub enum Cmd {
         tool_call_id: String,
         result_json: String,
     },
+    /// The profiles for the new-session picker.
+    LoadProfiles,
+    /// `TaskService.CreateTask`; the runtime answers with `NetMsg::Created`.
+    CreateTask {
+        profile_id: String,
+        prompt: String,
+    },
     /// Open the session shell at this screen size.
     ShellOpen {
         session_id: String,
@@ -101,6 +108,9 @@ pub enum Msg {
 #[derive(Debug)]
 pub enum NetMsg {
     Sessions(Result<Vec<SessionRow>, String>),
+    Profiles(Result<Vec<ProfileRow>, String>),
+    /// The task was created: its primary session id and title.
+    Created(Result<(String, String), String>),
     /// A history page. `older` pages prepend; the first page replaces.
     History {
         session_id: String,
@@ -429,6 +439,69 @@ impl Attached {
     }
 }
 
+/// Which step of the new-session flow has the keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewStage {
+    /// Pick a profile from the list (type to filter).
+    Pick,
+    /// Type the first prompt.
+    Prompt,
+}
+
+/// The new-session overlay (Ctrl+N, `/new`): a profile picker, then the
+/// first prompt, then `CreateTask` and an attach to the primary session.
+#[derive(Debug)]
+pub struct NewSession {
+    pub profiles: Vec<ProfileRow>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub selected: usize,
+    pub filter: String,
+    pub stage: NewStage,
+    pub composer: Composer,
+    /// `CreateTask` is in flight; Enter does nothing until it answers.
+    pub creating: bool,
+}
+
+impl NewSession {
+    fn new() -> Self {
+        NewSession {
+            profiles: Vec::new(),
+            loading: true,
+            error: None,
+            selected: 0,
+            filter: String::new(),
+            stage: NewStage::Pick,
+            composer: Composer::default(),
+            creating: false,
+        }
+    }
+
+    /// Indices of profiles matching the filter.
+    pub fn visible(&self) -> impl Iterator<Item = usize> + '_ {
+        self.profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| self.filter.is_empty() || fuzzy(&self.filter, &p.name))
+            .map(|(i, _)| i)
+    }
+
+    pub fn selected_profile(&self) -> Option<&ProfileRow> {
+        self.visible().nth(self.selected).map(|i| &self.profiles[i])
+    }
+
+    fn step(&mut self, down: bool) {
+        let n = self.visible().count();
+        if n == 0 {
+            self.selected = 0;
+        } else if down {
+            self.selected = (self.selected + 1).min(n - 1);
+        } else {
+            self.selected = self.selected.saturating_sub(1);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SessionList {
     pub rows: Vec<SessionRow>,
@@ -483,6 +556,8 @@ pub struct App {
     /// flag; `sessions.filter` is its query.
     pub palette: bool,
     pub help: bool,
+    /// The new-session overlay, while open.
+    pub new_session: Option<NewSession>,
     pub inline: bool,
     /// Screen-reader mode (`--ax`): word gutters, no glyph-only state.
     pub ax: bool,
@@ -512,6 +587,7 @@ impl App {
             attached: None,
             palette: false,
             help: false,
+            new_session: None,
             inline,
             ax: false,
             focused: true,
@@ -632,7 +708,12 @@ impl App {
                 }
             }
             Msg::Paste(text) => {
-                if self.screen == Screen::Attached && !self.palette {
+                if let Some(ns) = &mut self.new_session {
+                    match ns.stage {
+                        NewStage::Prompt => ns.composer.paste(&text),
+                        NewStage::Pick => ns.filter.push_str(text.trim()),
+                    }
+                } else if self.screen == Screen::Attached && !self.palette {
                     if let Some(a) = &mut self.attached {
                         if let Some(sh) = a.shell.as_ref().filter(|s| s.focused && s.connected) {
                             let mut out = Vec::with_capacity(text.len() + 12);
@@ -693,10 +774,11 @@ impl App {
             return;
         }
         // `?` is help only on an empty draft and outside a search query.
-        let draft_empty = self
-            .attached
-            .as_ref()
-            .is_none_or(|a| a.composer.is_empty() && a.search.is_none());
+        let draft_empty = self.new_session.is_none()
+            && self
+                .attached
+                .as_ref()
+                .is_none_or(|a| a.composer.is_empty() && a.search.is_none());
         let Some(action) = resolve(&key, draft_empty) else {
             return;
         };
@@ -709,7 +791,9 @@ impl App {
         if action != Action::Detach {
             self.detach_at = None;
         }
-        if self.screen == Screen::Sessions || self.palette {
+        if self.new_session.is_some() {
+            self.new_session_key(action);
+        } else if self.screen == Screen::Sessions || self.palette {
             self.list_key(action);
         } else if self.attached.as_ref().is_some_and(|a| a.search.is_some()) {
             self.search_key(action);
@@ -849,6 +933,107 @@ impl App {
         }
     }
 
+    /// Ctrl+N or `/new`: open the picker and fetch the profiles.
+    pub fn open_new_session(&mut self) {
+        if self.new_session.is_some() {
+            return;
+        }
+        self.palette = false;
+        self.new_session = Some(NewSession::new());
+        self.cmds.push(Cmd::LoadProfiles);
+    }
+
+    fn new_session_key(&mut self, action: Action) {
+        let width = self.width.saturating_sub(6).max(1);
+        let Some(ns) = &mut self.new_session else {
+            return;
+        };
+        match ns.stage {
+            NewStage::Pick => match action {
+                Action::Up => ns.step(false),
+                Action::Down => ns.step(true),
+                Action::Send => {
+                    if ns.selected_profile().is_some() {
+                        ns.stage = NewStage::Prompt;
+                    }
+                }
+                Action::Escape => {
+                    if ns.filter.is_empty() {
+                        self.new_session = None;
+                    } else {
+                        ns.filter.clear();
+                        ns.selected = 0;
+                    }
+                }
+                Action::CtrlC | Action::Detach | Action::NewSession => self.new_session = None,
+                Action::Backspace => {
+                    ns.filter.pop();
+                    ns.selected = 0;
+                }
+                Action::KillToStart | Action::KillWord => {
+                    ns.filter.clear();
+                    ns.selected = 0;
+                }
+                Action::Help => self.help = true,
+                Action::Char(c) if !c.is_control() => {
+                    ns.filter.push(c);
+                    ns.selected = 0;
+                }
+                _ => {}
+            },
+            NewStage::Prompt => match action {
+                Action::Send => {
+                    if ns.creating {
+                        return;
+                    }
+                    let Some(profile_id) = ns.selected_profile().map(|p| p.id.clone()) else {
+                        ns.stage = NewStage::Pick;
+                        return;
+                    };
+                    if let Some(prompt) = ns.composer.take() {
+                        ns.creating = true;
+                        ns.error = None;
+                        self.cmds.push(Cmd::CreateTask { profile_id, prompt });
+                    }
+                }
+                Action::Escape => {
+                    if ns.creating {
+                        return;
+                    }
+                    ns.stage = NewStage::Pick;
+                }
+                Action::CtrlC => {
+                    if !ns.composer.is_empty() {
+                        ns.composer.clear();
+                    } else {
+                        self.new_session = None;
+                    }
+                }
+                Action::Newline => ns.composer.insert_char('\n'),
+                Action::Backspace => ns.composer.backspace(),
+                Action::Delete => ns.composer.delete(),
+                Action::Left => ns.composer.left(),
+                Action::Right => ns.composer.right(),
+                Action::WordLeft => ns.composer.word_left(),
+                Action::WordRight => ns.composer.word_right(),
+                Action::Home => ns.composer.home(),
+                Action::End => ns.composer.end(),
+                Action::KillToEnd => ns.composer.kill_to_end(),
+                Action::KillToStart => ns.composer.kill_to_start(),
+                Action::KillWord => ns.composer.kill_word(),
+                Action::Yank => ns.composer.yank(),
+                Action::Up => {
+                    ns.composer.move_row(width, false);
+                }
+                Action::Down => {
+                    ns.composer.move_row(width, true);
+                }
+                Action::Char(c) => ns.composer.insert_char(c),
+                _ => {}
+            },
+        }
+    }
+
     fn list_key(&mut self, action: Action) {
         match action {
             Action::Up => self.sessions.step(false),
@@ -896,6 +1081,7 @@ impl App {
                 self.sessions.selected = 0;
             }
             Action::Help => self.help = true,
+            Action::NewSession => self.open_new_session(),
             Action::Char(c) if !c.is_control() => {
                 self.sessions.filter.push(c);
                 self.sessions.selected = 0;
@@ -975,6 +1161,7 @@ impl App {
                 }
             }
             Action::Shell => self.toggle_shell(),
+            Action::NewSession => self.open_new_session(),
             Action::CtrlC => {
                 let now = Instant::now();
                 if !a.composer.is_empty() {
@@ -1130,6 +1317,35 @@ impl App {
                     Err(e) => self.sessions.error = Some(e),
                 }
             }
+            NetMsg::Profiles(res) => {
+                if let Some(ns) = &mut self.new_session {
+                    ns.loading = false;
+                    match res {
+                        Ok(rows) => {
+                            ns.profiles = rows;
+                            ns.error = None;
+                        }
+                        Err(e) => ns.error = Some(e),
+                    }
+                }
+            }
+            NetMsg::Created(res) => match res {
+                Ok((session_id, title)) => {
+                    self.new_session = None;
+                    self.attach(&session_id);
+                    if let Some(a) = &mut self.attached {
+                        a.title = title;
+                    }
+                    self.sessions.loading = true;
+                    self.cmds.push(Cmd::LoadSessions);
+                }
+                Err(e) => {
+                    if let Some(ns) = &mut self.new_session {
+                        ns.creating = false;
+                        ns.error = Some(e);
+                    }
+                }
+            },
             NetMsg::History {
                 session_id,
                 events,

@@ -1,7 +1,7 @@
 //! The session list: rows from `TaskService.ListTasks`, state markers that
 //! carry meaning without color, and a subsequence filter for the palette.
 
-use engram_app_client::proto::Task;
+use engram_app_client::proto::{Profile, Task};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionRow {
@@ -57,6 +57,30 @@ pub fn rows_from_tasks(tasks: &[Task], now_unix: u64) -> Vec<SessionRow> {
                 status,
                 age_secs,
             })
+        })
+        .collect()
+}
+
+/// A profile the new-session picker offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileRow {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// Rows from a profile listing, in the server's order.
+pub fn rows_from_profiles(profiles: &[Profile]) -> Vec<ProfileRow> {
+    profiles
+        .iter()
+        .map(|p| ProfileRow {
+            id: p.id.clone(),
+            name: if p.name.is_empty() {
+                p.id.clone()
+            } else {
+                p.name.clone()
+            },
+            description: p.description.clone(),
         })
         .collect()
 }
