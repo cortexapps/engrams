@@ -201,6 +201,35 @@ pauses while scrolled up.
   and OSC 777 when a decision starts waiting or a run ends; the title
   carries `⚠ needs you` / `⟳` while attached. Terminals that know neither
   sequence ignore them.
+- **PR7, the shell socket.** `engram_app_client::shell` speaks ttyd's
+  frames over the orchestrator's `tty` WebSocket. The socket verifies TLS
+  the way the reqwest clients do (rustls, the platform trust store, via
+  `engram_tls::client_config`), so the CLI still carries one TLS stack;
+  tokio-tungstenite's `rustls-tls-webpki-roots` feature only unlocks the
+  connector type, its bundled roots are not used. Keystrokes go as text
+  frames when they are UTF-8 (the web's shape) and binary otherwise, which
+  ttyd reads the same way.
+- **PR7, one key for the pane.** Ctrl+` opens the shell and moves the keys
+  to it; Ctrl+` again moves them back and leaves the pane open. Without
+  the kitty keyboard protocol most terminals send NUL for Ctrl+`, so
+  Ctrl+Space and Ctrl+@ are the same action. There is no prefix key: a
+  shell program sees every other chord, Ctrl+C and Ctrl+D included. Esc
+  from the composer closes an unfocused pane; after the remote shell exits
+  Enter reopens a fresh one (the server never resumes a PTY).
+- **PR7, pane size.** The pane takes two fifths of the fullscreen body,
+  header included, and the transcript absorbs the composer's growth, so
+  the emulated screen never resizes while a draft is typed. The size is a
+  pure function of the terminal size, shared by the renderer and the
+  resize path, so a resize frame goes out exactly when the screen changed.
+  `vt100` keeps no scrollback: the pane is a window on the live screen.
+- **PR7, native scrollback mode.** The pane is an alternate-screen overlay
+  drawn through a second fullscreen terminal while the shell has focus;
+  the inline terminal keeps its state and resumes when focus returns, so
+  the scrollback above the viewport is untouched. Nothing from the shell
+  is written into native scrollback.
+- **PR7, `engrams session shell`.** The CLI verb is raw passthrough: raw
+  mode, bytes both ways, `SIGWINCH` to a resize frame, and the process ends
+  when the remote shell does. It has no escape key of its own.
 - **PR4, cursor-position query.** An inline viewport needs the terminal
   to answer `CSI 6n`. A pseudo-terminal with no emulator behind it never
   does, and start-up blocks in crossterm's query. Real terminals answer.
