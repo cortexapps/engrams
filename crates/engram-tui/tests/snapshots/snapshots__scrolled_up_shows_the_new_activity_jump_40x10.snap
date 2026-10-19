@@ -1,0 +1,14 @@
+---
+source: crates/engram-tui/tests/snapshots.rs
+expression: "frame(&mut app, 40, 10)"
+---
+" Add a README                           "
+"  I will look at the layout first.      "
+"✓ Bash ls -la                           "
+"  ⎿ Cargo.toml                          "
+"    src                                 "
+"    tests                               "
+"    docs                                "
+" ↓ 1 new (Ctrl+End)                     "
+"› message the agent                     "
+" ● ready                   idx 9        "
