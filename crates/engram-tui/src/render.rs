@@ -1037,6 +1037,47 @@ fn draw_sessions(buf: &mut Buffer, area: Rect, app: &App, th: &Theme, title: &st
     }
 }
 
+/// Rows the slash-command popup takes above the composer: one per match,
+/// at most six. Zero when the draft is not a command prefix.
+pub fn slash_rows(draft: &str) -> u16 {
+    crate::commands::matches(draft).count().min(6) as u16
+}
+
+/// The slash-command popup: the matching commands, the first one (what
+/// Tab completes to and Enter runs when it is the only match) marked.
+fn draw_slash(buf: &mut Buffer, area: Rect, draft: &str, th: &Theme) {
+    if area.height == 0 {
+        return;
+    }
+    fill(buf, area, Style::new());
+    for (i, c) in crate::commands::matches(draft)
+        .take(area.height as usize)
+        .enumerate()
+    {
+        let y = area.y + i as u16;
+        let style = if i == 0 { th.selected } else { Style::new() };
+        let line = Rect {
+            y,
+            height: 1,
+            ..area
+        };
+        fill(buf, line, style);
+        let mut x = area.x + 2;
+        x += put(buf, x, y, "/", 1, style);
+        x += put(buf, x, y, c.name, 12, style);
+        let pad = 14u16.saturating_sub(x - area.x);
+        x += put(buf, x, y, "              ", pad, style);
+        put(
+            buf,
+            x,
+            y,
+            c.help,
+            area.right().saturating_sub(x + 1),
+            style.patch(th.dim),
+        );
+    }
+}
+
 /// The new-session overlay: the profile list with its filter, or the
 /// prompt composer under the chosen profile. Returns the cursor.
 fn draw_new_session(
@@ -1276,9 +1317,16 @@ pub fn draw_fullscreen(
                 height: shell_rows,
                 ..body
             };
+            let slash_h =
+                slash_rows(a.composer.text()).min(shell.y.saturating_sub(body.y + title_h));
+            let slash = Rect {
+                y: shell.y.saturating_sub(slash_h),
+                height: slash_h,
+                ..body
+            };
             let transcript = Rect {
                 y: body.y + title_h,
-                height: shell.y.saturating_sub(body.y + title_h),
+                height: slash.y.saturating_sub(body.y + title_h),
                 ..body
             };
             a.page_rows = transcript.height;
@@ -1293,6 +1341,9 @@ pub fn draw_fullscreen(
                 );
             }
             want_older = draw_transcript(buf, transcript, a, th, scratch) && a.scroll_up > 0;
+            if slash.height > 0 {
+                draw_slash(buf, slash, a.composer.text(), th);
+            }
             draw_queue(buf, queue, a, th);
             cursor = Some(draw_composer(buf, composer, a, th));
             if shell.height > 0 {
@@ -1387,14 +1438,23 @@ pub fn draw_inline(
                 height: queue_rows.min(composer.y - body.y),
                 ..body
             };
+            let slash_h = slash_rows(a.composer.text()).min(queue.y.saturating_sub(body.y));
+            let slash = Rect {
+                y: queue.y.saturating_sub(slash_h),
+                height: slash_h,
+                ..body
+            };
             let live = Rect {
                 y: body.y,
-                height: queue.y.saturating_sub(body.y),
+                height: slash.y.saturating_sub(body.y),
                 ..body
             };
             a.scroll_up = 0;
             a.page_rows = live.height;
             draw_transcript(buf, live, a, th, scratch);
+            if slash.height > 0 {
+                draw_slash(buf, slash, a.composer.text(), th);
+            }
             draw_queue(buf, queue, a, th);
             cursor = Some(draw_composer(buf, composer, a, th));
         }

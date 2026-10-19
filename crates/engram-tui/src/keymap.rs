@@ -141,6 +141,11 @@ pub const BINDINGS: &[Binding] = &[
         help: "redraw",
     },
     Binding {
+        keys: "/",
+        action: Action::Char('/'),
+        help: "commands (/new /shell /resume /transcript /dump …); Tab completes",
+    },
+    Binding {
         keys: "?",
         action: Action::Help,
         help: "this list (on an empty draft)",

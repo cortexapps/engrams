@@ -248,6 +248,24 @@ impl Net {
         });
     }
 
+    pub fn resume(&self, session_id: String) {
+        let c = self.clients.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let res = c
+                .resume(ResumeRequest {
+                    session_id: session_id.clone(),
+                })
+                .await;
+            if let Err(e) = res {
+                let _ = tx.send(Msg::Net(NetMsg::Failed {
+                    session_id,
+                    error: format!("resume failed: {e}"),
+                }));
+            }
+        });
+    }
+
     pub fn dequeue(&self, session_id: String, prompt_id: String) {
         let c = self.clients.clone();
         let tx = self.tx.clone();
