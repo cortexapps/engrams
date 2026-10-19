@@ -10,6 +10,23 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **The `engrams` CLI is a Rust binary.** The release assets keep their names
+  (`engrams-linux-x64`, `engrams-linux-arm64`, `engrams-darwin-arm64`), and the commands,
+  flags, `--json` shapes, `hosts.json` credential file, and exit codes do not change. Build it
+  from the repository with `cargo build --profile cli -p engram-cli`; the `cli/` directory and
+  its Bun toolchain are gone.
+
+### Changed
+
+- The `engrams` CLI moved from Bun to Rust (`crates/engram-cli` on the new
+  `crates/engram-app-client` library). The binary is 3 MB and uses about 8 MB of memory.
+
+### Fixed
+
+- `engrams session logs` printed the event-stream envelope instead of the event payload.
+
 ## [0.11.0] - 2026-10-19
 
 ### Upgrade notes
