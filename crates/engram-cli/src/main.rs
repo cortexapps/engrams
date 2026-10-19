@@ -97,6 +97,9 @@ enum Commands {
         /// do not capture the mouse (wheel scrolling off; native selection on)
         #[arg(long)]
         no_mouse: bool,
+        /// screen-reader mode: native scrollback, word labels, no mouse
+        #[arg(long)]
+        ax: bool,
     },
 }
 
@@ -513,6 +516,7 @@ fn main() {
         session_id,
         no_alt_screen,
         no_mouse,
+        ax,
     }) = &cli.command
     {
         let ctx = Ctx {
@@ -528,11 +532,13 @@ fn main() {
             Err(CliError::Exit(code)) => std::process::exit(code),
         };
         let env_on = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty() && v != "0");
+        let ax = *ax || env_on("ENGRAMS_TUI_AX");
         let opts = engram_tui::Options {
             session_id: session_id.clone(),
-            inline: *no_alt_screen || env_on("ENGRAMS_TUI_NO_ALT_SCREEN"),
-            mouse: !*no_mouse && !env_on("ENGRAMS_TUI_NO_MOUSE"),
+            inline: ax || *no_alt_screen || env_on("ENGRAMS_TUI_NO_ALT_SCREEN"),
+            mouse: !ax && !*no_mouse && !env_on("ENGRAMS_TUI_NO_MOUSE"),
             color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
+            ax,
         };
         if let Err(m) = engram_tui::run(clients, opts) {
             eprintln!("engrams: {m}");

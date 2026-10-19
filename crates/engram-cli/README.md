@@ -33,7 +33,7 @@ engrams host list|get|drain|delete|uncordon|evacuate
 engrams profile list|get
 engrams apikey create|list|revoke                      # admin service keys
 engrams admin flush|evict-idle|gc
-engrams tui [session-id] [--no-alt-screen] [--no-mouse] # terminal client (ADR 0124)
+engrams tui [session-id] [--no-alt-screen] [--no-mouse] [--ax] # terminal client (ADR 0124)
 ```
 
 `engrams tui` opens the session list, or attaches to one session, in a
