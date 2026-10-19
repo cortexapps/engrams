@@ -165,11 +165,13 @@ async fn generated_session_has_skills_and_browser_tooling() {
         "# Process image\n",
         "the local image rootfs was not materialized into the session",
     );
-    for _ in 0..50 {
+    // The harness is a spawned shell: give it a bound that holds under a
+    // full-workspace test run, not just an idle machine.
+    for _ in 0..500 {
         if cwd.join("workspace/harness-ran").exists() {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(
         cwd.join("workspace/harness-ran").exists(),
