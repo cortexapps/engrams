@@ -42,7 +42,22 @@ pub enum Cmd {
         session_id: String,
         prompt_id: String,
     },
+    /// Open the draft in `$EDITOR`; the runtime answers with
+    /// [`App::draft_edited`].
+    EditDraft {
+        text: String,
+    },
     Quit,
+}
+
+/// Transcript search (Ctrl+T, fullscreen). `cursor` is the cell of the
+/// current hit; Enter walks to older hits and wraps.
+#[derive(Debug, Default)]
+pub struct Search {
+    pub query: String,
+    /// `query` lowercased, what the matcher compares against.
+    pub lower: String,
+    pub cursor: Option<usize>,
 }
 
 /// Inputs to the update step.
@@ -115,6 +130,7 @@ pub struct Attached {
     pub page_rows: u16,
     /// The last scroll-up walk hit the top of memory: load more.
     pub want_older: bool,
+    pub search: Option<Search>,
 }
 
 impl Attached {
@@ -136,7 +152,44 @@ impl Attached {
             run_started_at: None,
             page_rows: 20,
             want_older: false,
+            search: None,
         }
+    }
+
+    /// Walk to the next older cell containing the search query (wrapping
+    /// at the top) and scroll so it heads the viewport. False when
+    /// nothing matches.
+    fn search_next(&mut self, width: u16) -> bool {
+        let Some(s) = &mut self.search else {
+            return false;
+        };
+        s.lower = s.query.to_lowercase();
+        if s.lower.is_empty() {
+            s.cursor = None;
+            return false;
+        }
+        let t = &mut self.reducer.transcript;
+        let first = t.first_index();
+        let len = t.len();
+        if len == 0 {
+            return false;
+        }
+        let from = s.cursor.unwrap_or(len);
+        let hit = (first..from)
+            .rev()
+            .chain((from..len).rev())
+            .find(|&i| t.get(i).is_some_and(|e| e.matches(&s.lower)));
+        let Some(i) = hit else {
+            s.cursor = None;
+            return false;
+        };
+        s.cursor = Some(i);
+        let rows = t.rows_from(i, width);
+        self.scroll_up = rows.saturating_sub(self.page_rows as u32);
+        if self.scroll_up == 0 {
+            self.unseen = 0;
+        }
+        true
     }
 
     fn apply_envelope(&mut self, env: &Envelope) {
@@ -223,6 +276,8 @@ pub struct App {
     pub palette: bool,
     pub help: bool,
     pub inline: bool,
+    /// Screen-reader mode (`--ax`): word gutters, no glyph-only state.
+    pub ax: bool,
     pub focused: bool,
     pub width: u16,
     pub height: u16,
@@ -247,6 +302,7 @@ impl App {
             palette: false,
             help: false,
             inline,
+            ax: false,
             focused: true,
             width,
             height,
@@ -398,7 +454,11 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) {
-        let draft_empty = self.attached.as_ref().is_none_or(|a| a.composer.is_empty());
+        // `?` is help only on an empty draft and outside a search query.
+        let draft_empty = self
+            .attached
+            .as_ref()
+            .is_none_or(|a| a.composer.is_empty() && a.search.is_none());
         let Some(action) = resolve(&key, draft_empty) else {
             return;
         };
@@ -417,8 +477,64 @@ impl App {
         }
         if self.screen == Screen::Sessions || self.palette {
             self.list_key(action);
+        } else if self.attached.as_ref().is_some_and(|a| a.search.is_some()) {
+            self.search_key(action);
         } else {
             self.attached_key(action);
+        }
+    }
+
+    fn search_key(&mut self, action: Action) {
+        let width = self.width.saturating_sub(self.gutter_width()).max(1);
+        let Some(a) = &mut self.attached else {
+            return;
+        };
+        let Some(s) = &mut a.search else {
+            return;
+        };
+        match action {
+            Action::Escape | Action::Search | Action::CtrlC => a.search = None,
+            Action::Send | Action::Down => {
+                if !a.search_next(width) {
+                    self.note("no match");
+                }
+            }
+            Action::Backspace => {
+                s.query.pop();
+                s.cursor = None;
+            }
+            Action::KillToStart | Action::KillWord => {
+                s.query.clear();
+                s.cursor = None;
+            }
+            Action::ScrollUp | Action::ScrollDown | Action::ScrollTop | Action::ScrollBottom => {
+                self.attached_key(action)
+            }
+            Action::Char(c) if !c.is_control() => {
+                s.query.push(c);
+                s.cursor = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn gutter_width(&self) -> u16 {
+        if self.ax {
+            crate::render::GUTTER_AX
+        } else {
+            crate::render::GUTTER
+        }
+    }
+
+    /// The runtime brings the draft back from `$EDITOR` (None when the
+    /// editor failed or was abandoned).
+    pub fn draft_edited(&mut self, text: Option<String>) {
+        let Some(t) = text else {
+            self.note("editor exited without saving; the draft is unchanged");
+            return;
+        };
+        if let Some(a) = &mut self.attached {
+            a.composer.set_text(&t);
         }
     }
 
@@ -479,10 +595,10 @@ impl App {
     }
 
     fn attached_key(&mut self, action: Action) {
+        let width = self.width.saturating_sub(self.gutter_width()).max(1);
         let Some(a) = &mut self.attached else {
             return;
         };
-        let width = self.width.saturating_sub(2).max(1);
         match action {
             Action::Send => {
                 if !a.can_send() {
@@ -569,11 +685,25 @@ impl App {
             }
             Action::PrevSession => self.neighbour(false),
             Action::NextSession => self.neighbour(true),
+            Action::Search => {
+                if self.inline {
+                    self.note("native scrollback mode: use your terminal's search");
+                } else {
+                    a.search = Some(Search::default());
+                }
+            }
+            Action::EditDraft => {
+                self.cmds.push(Cmd::EditDraft {
+                    text: a.composer.text().to_string(),
+                });
+            }
             Action::ExpandLast => {
                 let t = &mut a.reducer.transcript;
                 for e in t.iter_mut().rev() {
                     match &mut e.cell {
-                        Cell::Tool { expanded, .. } | Cell::Exec { expanded, .. } => {
+                        Cell::Tool { expanded, .. }
+                        | Cell::Exec { expanded, .. }
+                        | Cell::Diff { expanded, .. } => {
                             *expanded = !*expanded;
                             e.invalidate();
                             break;
@@ -586,12 +716,18 @@ impl App {
                 let t = &mut a.reducer.transcript;
                 let mut any_collapsed = false;
                 for e in t.iter_mut() {
-                    if let Cell::Tool { expanded, .. } | Cell::Exec { expanded, .. } = &e.cell {
+                    if let Cell::Tool { expanded, .. }
+                    | Cell::Exec { expanded, .. }
+                    | Cell::Diff { expanded, .. } = &e.cell
+                    {
                         any_collapsed |= !*expanded;
                     }
                 }
                 for e in t.iter_mut() {
-                    if let Cell::Tool { expanded, .. } | Cell::Exec { expanded, .. } = &mut e.cell {
+                    if let Cell::Tool { expanded, .. }
+                    | Cell::Exec { expanded, .. }
+                    | Cell::Diff { expanded, .. } = &mut e.cell
+                    {
                         *expanded = any_collapsed;
                         e.invalidate();
                     }

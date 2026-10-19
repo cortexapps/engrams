@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 
+use crate::markdown::{Markdown, Rendered, Run};
 use crate::wrap::{wrap_into, Row};
 
 /// How a tool call ended.
@@ -38,7 +39,9 @@ pub enum Cell {
         steered: bool,
     },
     Assistant {
-        text: String,
+        /// The message as markdown: source while streaming, display text
+        /// plus style runs always.
+        md: Markdown,
         /// Token deltas are still landing; the final message replaces them.
         streaming: bool,
         /// More durable text may still be appended (the run is open and no
@@ -69,8 +72,17 @@ pub enum Cell {
     },
     Plan {
         tool_call_id: Box<str>,
-        text: Box<str>,
+        text: Rendered,
         approved: Option<bool>,
+    },
+    /// A file the agent wrote or edited (`file_changed`): the tool call
+    /// re-renders as a diff. `text` holds `+`/`-` prefixed lines.
+    Diff {
+        path: Box<str>,
+        text: Box<str>,
+        added: u32,
+        removed: u32,
+        expanded: bool,
     },
     Marker {
         kind: Marker,
@@ -151,18 +163,30 @@ impl Entry {
         &self.layout
     }
 
-    /// Text was appended to a single-source cell: re-wrap only from the
-    /// start of the last cached row. A stale or empty cache is left for
-    /// the next full layout.
-    pub fn text_appended(&mut self) {
-        let Some(last) = self.layout.rows.pop() else {
+    /// The text of a single-source cell changed from byte `offset` on.
+    /// Rows never cross a newline, so every row that ends at or before the
+    /// last newline before `offset` is unchanged; the rest is re-wrapped.
+    /// A stale or empty cache is left for the next full layout.
+    pub fn relayout_from(&mut self, offset: usize) {
+        if self.layout.rows.is_empty() {
             return;
-        };
+        }
         let width = self.layout.width;
-        let text = self.source(Src::Text);
-        let start = last.row.start as usize;
-        if last.src != Src::Text || start > text.len() {
-            self.layout.rows.clear();
+        let text = source_of(&self.cell, Src::Text);
+        let offset = offset.min(text.len());
+        let nl = text[..offset].rfind('\n');
+        let keep = match nl {
+            Some(p) => self
+                .layout
+                .rows
+                .iter()
+                .take_while(|r| r.src == Src::Text && r.row.end as usize <= p)
+                .count(),
+            None => 0,
+        };
+        let start = nl.map(|p| p + 1).unwrap_or(0);
+        self.layout.rows.truncate(keep);
+        if start >= text.len() && keep > 0 {
             return;
         }
         let mut scratch = Vec::new();
@@ -198,32 +222,77 @@ impl Entry {
             } => !streaming && !open,
             Cell::Tool { state, .. } => *state != ToolState::Running,
             Cell::Exec { done, .. } => *done,
-            Cell::Question { .. } | Cell::Plan { .. } | Cell::Marker { .. } | Cell::Hidden => true,
+            Cell::Question { .. }
+            | Cell::Plan { .. }
+            | Cell::Diff { .. }
+            | Cell::Marker { .. }
+            | Cell::Hidden => true,
         }
     }
 
     /// The text a layout row points into.
     pub fn source(&self, src: Src) -> &str {
-        match (&self.cell, src) {
-            (Cell::User { text, .. }, Src::Text) => text,
-            (Cell::Assistant { text, .. }, Src::Text) => text,
-            (Cell::Marker { text, .. }, Src::Text) => text,
-            (Cell::Plan { text, .. }, Src::Text) => text,
-            (Cell::Tool { args, .. }, Src::Head) => args,
-            (Cell::Tool { result, .. }, Src::Body) => result.as_deref().unwrap_or(""),
-            (Cell::Exec { command, .. }, Src::Head) => command,
-            (Cell::Exec { output, .. }, Src::Body) => output,
-            (Cell::Question { questions, .. }, Src::Question(i)) => questions
-                .get(i as usize)
-                .map(|q| q.question.as_str())
-                .unwrap_or(""),
-            (Cell::Question { questions, .. }, Src::Option(i, j)) => questions
-                .get(i as usize)
-                .and_then(|q| q.options.get(j as usize))
-                .map(|o| o.label.as_str())
-                .unwrap_or(""),
-            _ => "",
+        source_of(&self.cell, src)
+    }
+
+    /// Does any text of the cell contain `needle` (lowercase)?
+    pub fn matches(&self, needle: &str) -> bool {
+        let srcs: &[Src] = match &self.cell {
+            Cell::User { .. }
+            | Cell::Assistant { .. }
+            | Cell::Marker { .. }
+            | Cell::Plan { .. } => &[Src::Text],
+            Cell::Tool { .. } | Cell::Exec { .. } | Cell::Diff { .. } => &[Src::Head, Src::Body],
+            Cell::Question { questions, .. } => {
+                return questions.iter().any(|q| {
+                    crate::render::find_ci(&q.question, needle).is_some()
+                        || q.options
+                            .iter()
+                            .any(|o| crate::render::find_ci(&o.label, needle).is_some())
+                });
+            }
+            Cell::Hidden => &[],
+        };
+        srcs.iter().any(|&s| {
+            let text = self.source(s);
+            text.lines()
+                .any(|l| crate::render::find_ci(l, needle).is_some())
+        })
+    }
+
+    /// Style runs over the `Text` source (markdown cells); empty for the
+    /// rest.
+    pub fn runs(&self) -> &[Run] {
+        match &self.cell {
+            Cell::Assistant { md, .. } => md.runs(),
+            Cell::Plan { text, .. } => &text.runs,
+            _ => &[],
         }
+    }
+}
+
+fn source_of(cell: &Cell, src: Src) -> &str {
+    match (cell, src) {
+        (Cell::User { text, .. }, Src::Text) => text,
+        (Cell::Assistant { md, .. }, Src::Text) => md.text(),
+        (Cell::Marker { text, .. }, Src::Text) => text,
+        (Cell::Plan { text, .. }, Src::Text) => &text.text,
+        (Cell::Diff { path, .. }, Src::Head) => path,
+        (Cell::Diff { text, .. }, Src::Body) => text,
+        (Cell::Tool { args, .. }, Src::Head) => args,
+        (Cell::Tool { result, .. }, Src::Body) => result.as_deref().unwrap_or(""),
+        (Cell::Exec { command, .. }, Src::Head) => command,
+        (Cell::Exec { output, .. }, Src::Body) => output,
+        (Cell::Question { questions, .. }, Src::Question(i)) => questions
+            .get(i as usize)
+            .map(|q| q.question.as_str())
+            .unwrap_or(""),
+        (Cell::Question { questions, .. }, Src::Option(i, j)) => questions
+            .get(i as usize)
+            .and_then(|q| q.options.get(j as usize))
+            .map(|o| o.label.as_str())
+            .unwrap_or(""),
+        _ => "",
     }
 }
 
@@ -273,13 +342,21 @@ fn push_body(
 fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
     let mut scratch = Vec::new();
     match cell {
-        Cell::User { text, .. } | Cell::Assistant { text, .. } => {
-            push_rows(Src::Text, text, width, out, &mut scratch);
-        }
+        Cell::User { text, .. } => push_rows(Src::Text, text, width, out, &mut scratch),
+        Cell::Assistant { md, .. } => push_rows(Src::Text, md.text(), width, out, &mut scratch),
         Cell::Marker { text, .. } => push_rows(Src::Text, text, width, out, &mut scratch),
         Cell::Hidden => {}
+        Cell::Diff {
+            path,
+            text,
+            expanded,
+            ..
+        } => {
+            push_rows(Src::Head, path, width, out, &mut scratch);
+            push_body(text, *expanded, width, out, &mut scratch);
+        }
         Cell::Plan { text, .. } => {
-            push_rows(Src::Text, text, width, out, &mut scratch);
+            push_rows(Src::Text, &text.text, width, out, &mut scratch);
             out.push(LayoutRow {
                 src: Src::Tail,
                 row: Row { start: 0, end: 0 },
@@ -436,6 +513,17 @@ impl Transcript {
             self.base += 1;
         }
         self.committed += 1;
+    }
+
+    /// Rows from the first row of `index` to the end of the transcript at
+    /// `width` (lays out what it counts).
+    pub fn rows_from(&mut self, index: usize, width: u16) -> u32 {
+        let from = index.saturating_sub(self.base);
+        self.entries
+            .iter_mut()
+            .skip(from)
+            .map(|e| e.height(width) as u32)
+            .sum()
     }
 
     /// Total rows at `width`, laying out every entry still in memory. Used

@@ -124,7 +124,104 @@ pub enum Event {
     TitleSuggested {
         title: String,
     },
+    /// A file the agent wrote or edited. `text` is the diff as `+`/`-`
+    /// prefixed lines (hunks separated by a `⋯` line); a `patch` change
+    /// carries its unified diff as is.
+    FileChanged {
+        tool_call_id: String,
+        path: String,
+        text: String,
+        added: u32,
+        removed: u32,
+    },
     Other,
+}
+
+#[derive(Deserialize)]
+struct FileChangedP {
+    tool_call_id: String,
+    path: String,
+    change: ChangeP,
+}
+
+#[derive(Deserialize, Default)]
+struct ChangeP {
+    write: Option<WriteP>,
+    edit: Option<EditP>,
+    patch: Option<PatchP>,
+}
+
+#[derive(Deserialize)]
+struct WriteP {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct EditP {
+    hunks: Vec<HunkP>,
+}
+
+#[derive(Deserialize)]
+struct HunkP {
+    #[serde(default)]
+    old: String,
+    #[serde(default)]
+    new: String,
+}
+
+#[derive(Deserialize)]
+struct PatchP {
+    unified_diff: String,
+}
+
+fn push_lines(out: &mut String, prefix: char, text: &str) -> u32 {
+    let mut n = 0;
+    for line in text.trim_end_matches('\n').split('\n') {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push(prefix);
+        out.push_str(line);
+        n += 1;
+    }
+    n
+}
+
+/// Flatten a change into `+`/`-` lines; returns `(text, added, removed)`.
+fn diff_text(change: ChangeP) -> (String, u32, u32) {
+    let mut out = String::new();
+    let (mut added, mut removed) = (0, 0);
+    if let Some(w) = change.write {
+        added += push_lines(&mut out, '+', &w.content);
+    } else if let Some(e) = change.edit {
+        for (i, h) in e.hunks.iter().enumerate() {
+            if i > 0 {
+                out.push_str("\n⋯");
+            }
+            if !h.old.is_empty() {
+                removed += push_lines(&mut out, '-', &h.old);
+            }
+            if !h.new.is_empty() {
+                added += push_lines(&mut out, '+', &h.new);
+            }
+        }
+    } else if let Some(p) = change.patch {
+        for line in p.unified_diff.trim_end_matches('\n').split('\n') {
+            if line.starts_with("+++") || line.starts_with("---") {
+                continue;
+            }
+            match line.as_bytes().first() {
+                Some(b'+') => added += 1,
+                Some(b'-') => removed += 1,
+                _ => {}
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+    }
+    (out, added, removed)
 }
 
 #[derive(Deserialize)]
@@ -349,6 +446,16 @@ impl Event {
             "title_suggested" => {
                 p::<TitleP>(payload).map(|v| Event::TitleSuggested { title: v.title })
             }
+            "file_changed" => p::<FileChangedP>(payload).map(|v| {
+                let (text, added, removed) = diff_text(v.change);
+                Event::FileChanged {
+                    tool_call_id: v.tool_call_id,
+                    path: v.path,
+                    text,
+                    added,
+                    removed,
+                }
+            }),
             _ => None,
         };
         decoded.unwrap_or(Event::Other)
@@ -430,6 +537,33 @@ mod tests {
     #[test]
     fn garbage_never_panics() {
         assert!(matches!(Event::decode("run_started", "nope"), Event::Other));
+        match Event::decode(
+            "file_changed",
+            r#"{"run_id":"r","tool_call_id":"t","path":"src/a.rs","change":{"edit":{"hunks":[{"old":"a\nb","new":"c"},{"old":"","new":"d\n"}]}},"at":"2026-01-01T00:00:00Z"}"#,
+        ) {
+            Event::FileChanged {
+                path,
+                text,
+                added,
+                removed,
+                ..
+            } => {
+                assert_eq!(path, "src/a.rs");
+                assert_eq!(text, "-a\n-b\n+c\n⋯\n+d");
+                assert_eq!((added, removed), (2, 2));
+            }
+            other => panic!("{other:?}"),
+        }
+        match Event::decode(
+            "file_changed",
+            r#"{"tool_call_id":"t","path":"n.txt","change":{"write":{"content":"x\ny\n"}}}"#,
+        ) {
+            Event::FileChanged { text, added, .. } => {
+                assert_eq!(text, "+x\n+y");
+                assert_eq!(added, 2);
+            }
+            other => panic!("{other:?}"),
+        }
         assert!(matches!(Event::decode("unknown_kind", "{}"), Event::Other));
         assert!(matches!(
             Event::decode("agent_message", "{}"),

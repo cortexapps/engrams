@@ -203,3 +203,40 @@ fn a_resize_relayouts_without_duplicating_committed_cells() {
     assert_eq!(joined.matches("message the agent").count(), 1, "{joined}");
     assert_eq!(joined.matches("Add a README to the").count(), 1, "{joined}");
 }
+
+#[test]
+fn screen_reader_mode_labels_every_cell_with_a_word() {
+    // Tall enough that nothing scrolls off the modelled scrollback.
+    let backend = TestBackend::new(60, 30);
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(VIEW),
+        },
+    )
+    .unwrap();
+    let mut theme = Theme::new(false);
+    theme.ax = true;
+    let mut app = common::attached_app(true, 60, 30);
+    app.ax = true;
+    draw(&mut terminal, &mut app, &theme);
+    let lines = text_of(terminal.backend().buffer());
+    let labels: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.split(':').next())
+        .filter(|w| matches!(*w, "you" | "agent" | "tool" | "note"))
+        .collect();
+    assert_eq!(
+        labels,
+        ["you", "agent", "tool", "agent", "note"],
+        "{lines:#?}"
+    );
+    assert!(
+        lines.iter().all(|l| !l.contains('⎿')),
+        "no glyph-only body gutter in ax mode: {lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("tool:     Bash ls -la")),
+        "{lines:#?}"
+    );
+}

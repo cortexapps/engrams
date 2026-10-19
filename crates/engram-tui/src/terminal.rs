@@ -55,29 +55,7 @@ impl Guard {
     /// terminal reports support; `event-types` is left out because several
     /// terminals mis-handle key releases with it.
     pub fn enter(alt_screen: bool, mouse: bool) -> io::Result<Guard> {
-        enable_raw_mode()?;
-        ACTIVE.store(true, Ordering::SeqCst);
-        let mut out = io::stdout();
-        if alt_screen {
-            queue!(out, EnterAlternateScreen)?;
-            ALT_SCREEN.store(true, Ordering::SeqCst);
-        }
-        queue!(out, EnableBracketedPaste, EnableFocusChange)?;
-        if mouse {
-            queue!(out, EnableMouseCapture)?;
-            MOUSE.store(true, Ordering::SeqCst);
-        }
-        if matches!(supports_keyboard_enhancement(), Ok(true)) {
-            queue!(
-                out,
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-                )
-            )?;
-            KITTY.store(true, Ordering::SeqCst);
-        }
-        out.flush()?;
+        enter_modes(alt_screen, mouse)?;
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore();
@@ -86,9 +64,46 @@ impl Guard {
         Ok(Guard { _private: () })
     }
 
+    /// Hand the terminal to another program (`$EDITOR`). [`Guard::resume`]
+    /// takes it back.
+    pub fn suspend(&self) {
+        restore();
+    }
+
+    pub fn resume(&self, alt_screen: bool, mouse: bool) -> io::Result<()> {
+        enter_modes(alt_screen, mouse)
+    }
+
     pub fn stdout(&self) -> Stdout {
         io::stdout()
     }
+}
+
+fn enter_modes(alt_screen: bool, mouse: bool) -> io::Result<()> {
+    enable_raw_mode()?;
+    ACTIVE.store(true, Ordering::SeqCst);
+    let mut out = io::stdout();
+    if alt_screen {
+        queue!(out, EnterAlternateScreen)?;
+        ALT_SCREEN.store(true, Ordering::SeqCst);
+    }
+    queue!(out, EnableBracketedPaste, EnableFocusChange)?;
+    if mouse {
+        queue!(out, EnableMouseCapture)?;
+        MOUSE.store(true, Ordering::SeqCst);
+    }
+    if matches!(supports_keyboard_enhancement(), Ok(true)) {
+        queue!(
+            out,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        )?;
+        KITTY.store(true, Ordering::SeqCst);
+    }
+    out.flush()?;
+    Ok(())
 }
 
 impl Drop for Guard {

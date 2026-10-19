@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::event::{parse_plan, parse_plan_decision, parse_questions, Event};
+use crate::markdown::{Markdown, Rendered};
 use crate::transcript::{Cell, Marker, ToolState, Transcript};
 
 /// Session states in which no run can be in flight.
@@ -116,8 +117,18 @@ impl Reducer {
     fn close_active(&mut self) {
         if let Some(i) = self.active.take() {
             if let Some(e) = self.transcript.get_mut(i) {
-                if let Cell::Assistant { open, .. } = &mut e.cell {
+                if let Cell::Assistant {
+                    md,
+                    open,
+                    streaming,
+                    ..
+                } = &mut e.cell
+                {
                     *open = false;
+                    if !*streaming {
+                        md.finalize();
+                        e.invalidate();
+                    }
                 }
             }
         }
@@ -131,7 +142,7 @@ impl Reducer {
             }
         }
         let i = self.transcript.push(Cell::Assistant {
-            text: String::new(),
+            md: Markdown::default(),
             streaming: false,
             open: true,
             failed: false,
@@ -174,15 +185,16 @@ impl Reducer {
             if let Some(e) = self.transcript.get_mut(i) {
                 match &mut e.cell {
                     Cell::Assistant {
+                        md,
                         open,
                         streaming,
                         failed,
-                        ..
                     } => {
                         if *open || *streaming {
                             *open = false;
                             *streaming = false;
                             *failed = !ok;
+                            md.finalize();
                             e.invalidate();
                         }
                     }
@@ -364,16 +376,11 @@ impl Reducer {
                             // The stream's cell was closed by a boundary;
                             // the final text still belongs there.
                             if let Some(e) = self.transcript.get_mut(i) {
-                                if let Cell::Assistant {
-                                    text: t, streaming, ..
-                                } = &mut e.cell
-                                {
-                                    t.truncate(self.stream_base.min(t.len()));
-                                    if !t.is_empty() {
-                                        t.push_str("\n\n");
-                                    }
-                                    t.push_str(&text);
+                                if let Cell::Assistant { md, streaming, .. } = &mut e.cell {
+                                    md.replace_from(self.stream_base, &text);
                                     *streaming = false;
+                                    // Closed and no longer streaming: final.
+                                    md.finalize();
                                     e.invalidate();
                                 }
                             }
@@ -384,17 +391,12 @@ impl Reducer {
                     };
                     let mut base = self.stream_base;
                     if let Some(e) = self.transcript.get_mut(i) {
-                        if let Cell::Assistant {
-                            text: t, streaming, ..
-                        } = &mut e.cell
-                        {
-                            t.truncate(base.min(t.len()));
-                            if !t.is_empty() {
-                                t.push_str("\n\n");
-                            }
-                            t.push_str(&text);
+                        if let Cell::Assistant { md, streaming, .. } = &mut e.cell {
+                            md.replace_from(base, &text);
+                            // Durable text is complete: render its tail now.
+                            md.commit_all();
                             *streaming = false;
-                            base = t.len();
+                            base = md.raw().len();
                         }
                         e.invalidate();
                     }
@@ -411,11 +413,8 @@ impl Reducer {
                     _ => {
                         let i = self.ensure_assistant();
                         if let Some(e) = self.transcript.get_mut(i) {
-                            if let Cell::Assistant { text, .. } = &mut e.cell {
-                                text.truncate(self.stream_base.min(text.len()));
-                                if !text.is_empty() {
-                                    text.push_str("\n\n");
-                                }
+                            if let Cell::Assistant { md, .. } = &mut e.cell {
+                                md.replace_from(self.stream_base, "");
                             }
                             e.invalidate();
                         }
@@ -424,14 +423,14 @@ impl Reducer {
                     }
                 };
                 if let Some(e) = self.transcript.get_mut(i) {
-                    if let Cell::Assistant {
-                        text, streaming, ..
-                    } = &mut e.cell
-                    {
-                        text.push_str(&chunk);
+                    let mut from = None;
+                    if let Cell::Assistant { md, streaming, .. } = &mut e.cell {
+                        from = Some(md.push(&chunk));
                         *streaming = true;
                     }
-                    e.text_appended();
+                    if let Some(from) = from {
+                        e.relayout_from(from);
+                    }
                 }
             }
             Event::ToolCallStarted {
@@ -476,7 +475,7 @@ impl Reducer {
                         self.close_active();
                         let i = self.transcript.push(Cell::Plan {
                             tool_call_id: tool_call_id.as_str().into(),
-                            text: plan.into(),
+                            text: Rendered::render(&plan),
                             approved: None,
                         });
                         self.decisions.insert(tool_call_id.clone(), i);
@@ -573,6 +572,37 @@ impl Reducer {
                             duration_ms,
                             expanded: false,
                         });
+                    }
+                }
+            }
+            Event::FileChanged {
+                tool_call_id,
+                path,
+                text,
+                added,
+                removed,
+            } => {
+                // ADR 0054 Flavor A: the diff replaces the generic tool
+                // card of the write/edit call that produced it. A failed
+                // edit emits no `file_changed` and keeps its error card.
+                let cell = Cell::Diff {
+                    path: path.into(),
+                    text: text.into(),
+                    added,
+                    removed,
+                    expanded: false,
+                };
+                // The entry stays in `open_tools` so the completion that
+                // follows finds the card (and leaves a diff cell alone).
+                match self.open_tools.get(&tool_call_id).copied() {
+                    Some(i) if self.transcript.get(i).is_some() => {
+                        let e = self.transcript.get_mut(i).expect("checked");
+                        e.cell = cell;
+                        e.invalidate();
+                    }
+                    _ => {
+                        self.close_active();
+                        self.transcript.push(cell);
                     }
                 }
             }
@@ -763,17 +793,79 @@ mod tests {
                 Cell::User { text, pending, .. } => {
                     format!("user:{text}{}", if *pending { "?" } else { "" })
                 }
-                Cell::Assistant { text, open, .. } => {
-                    format!("agent:{text}{}", if *open { "…" } else { "" })
+                Cell::Assistant { md, open, .. } => {
+                    format!("agent:{}{}", md.text(), if *open { "…" } else { "" })
                 }
                 Cell::Tool { name, state, .. } => format!("tool:{name}:{state:?}"),
                 Cell::Exec { command, exit, .. } => format!("exec:{command}:{exit:?}"),
                 Cell::Question { answered, .. } => format!("question:{answered}"),
                 Cell::Plan { approved, .. } => format!("plan:{approved:?}"),
+                Cell::Diff { path, .. } => format!("diff:{path}"),
                 Cell::Marker { text, .. } => format!("marker:{text}"),
                 Cell::Hidden => "hidden".to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn chunks_render_markdown_as_paragraphs_commit() {
+        let mut r = Reducer::new();
+        r.apply(ev("run_started", r#"{"run_id":"r1","prompt_id":"p1"}"#));
+        r.apply(ev(
+            "agent_message_chunk",
+            r#"{"run_id":"r1","message_id":"m1","chunk":"**bold** start\n\n- it"}"#,
+        ));
+        assert_eq!(texts(&r), vec!["user:?", "agent:bold start\n\n- it…"]);
+        r.apply(ev(
+            "agent_message_chunk",
+            r#"{"run_id":"r1","message_id":"m1","chunk":"em\n- two"}"#,
+        ));
+        assert_eq!(
+            texts(&r),
+            vec!["user:?", "agent:bold start\n\n- item\n- two…"]
+        );
+        r.apply(ev(
+            "agent_message",
+            r#"{"run_id":"r1","message_id":"m1","role":"assistant","text":"**bold** start\n\n- item\n- two"}"#,
+        ));
+        r.apply(ev("run_completed", r#"{"run_id":"r1","ok":true}"#));
+        assert_eq!(
+            texts(&r),
+            vec!["user:?", "agent:bold start\n\n• item\n• two"]
+        );
+        let e = r.transcript.get(1).unwrap();
+        assert!(e.is_final());
+        if let Cell::Assistant { md, .. } = &e.cell {
+            assert!(md.raw().is_empty(), "the source is dropped once final");
+            assert_eq!(md.runs().len(), 3, "bold + two bullet markers");
+        } else {
+            panic!("assistant cell");
+        }
+    }
+
+    #[test]
+    fn file_changed_replaces_its_tool_card() {
+        let mut r = Reducer::new();
+        r.apply(ev("run_started", r#"{"run_id":"r1","prompt_id":"p1"}"#));
+        r.apply(ev(
+            "tool_call_started",
+            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Write","args_summary":"a.txt"}"#,
+        ));
+        r.apply(ev(
+            "file_changed",
+            r#"{"run_id":"r1","tool_call_id":"t1","path":"a.txt","change":{"write":{"content":"hi\n"}}}"#,
+        ));
+        r.apply(ev(
+            "tool_call_completed",
+            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Write","ok":true}"#,
+        ));
+        assert_eq!(texts(&r), vec!["user:?", "diff:a.txt"]);
+        // Out of window: a diff with no card of its own stands alone.
+        r.apply(ev(
+            "file_changed",
+            r#"{"run_id":"r1","tool_call_id":"t9","path":"b.txt","change":{"write":{"content":"x"}}}"#,
+        ));
+        assert_eq!(texts(&r), vec!["user:?", "diff:a.txt", "diff:b.txt"]);
     }
 
     #[test]
