@@ -107,3 +107,89 @@ fn help_overlay_80x20() {
     )));
     insta::assert_snapshot!(frame(&mut app, 80, 20));
 }
+
+#[test]
+fn markdown_reply_60x18() {
+    let mut app = common::attached_app(false, 60, 18);
+    app.update(Msg::Net(NetMsg::Live {
+        session_id: "s-1".into(),
+        envelope: common::env(9, "run_started", r#"{"run_id":"r2","prompt_id":"p2"}"#),
+    }));
+    app.update(Msg::Net(NetMsg::Live {
+        session_id: "s-1".into(),
+        envelope: common::env(
+            10,
+            "agent_message",
+            r###"{"run_id":"r1","message_id":"m4","role":"assistant","text":"## Plan\n\nI will add a **usage** section with `engrams tui`:\n\n1. read the README\n2. append the section\n\n```sh\nengrams tui\n```\n\n> keep the intro\n\nSee [the docs](https://example.com/docs)."}"###,
+        ),
+    }));
+    app.update(Msg::Net(NetMsg::Live {
+        session_id: "s-1".into(),
+        envelope: common::env(11, "run_completed", r#"{"run_id":"r2","ok":true}"#),
+    }));
+    insta::assert_snapshot!(frame(&mut app, 60, 18));
+}
+
+#[test]
+fn file_change_diff_60x14() {
+    let mut app = common::attached_app(false, 60, 14);
+    for e in [
+        common::env(9, "run_started", r#"{"run_id":"r2","prompt_id":"p2"}"#),
+        common::env(
+            10,
+            "tool_call_started",
+            r#"{"run_id":"r2","tool_call_id":"t2","tool_name":"Edit","args_summary":"README.md"}"#,
+        ),
+        common::env(
+            11,
+            "file_changed",
+            r###"{"run_id":"r2","tool_call_id":"t2","path":"README.md","change":{"edit":{"hunks":[{"old":"# engrams\n","new":"# engrams\n\n## Usage\n\nengrams tui\n"}]}}}"###,
+        ),
+        common::env(
+            12,
+            "tool_call_completed",
+            r#"{"run_id":"r2","tool_call_id":"t2","tool_name":"Edit","ok":true,"duration_ms":3}"#,
+        ),
+    ] {
+        app.update(Msg::Net(NetMsg::Live {
+            session_id: "s-1".into(),
+            envelope: e,
+        }));
+    }
+    let shot = frame(&mut app, 60, 14);
+    let shot = shot
+        .lines()
+        .map(|l| {
+            if l.contains("working") {
+                "<footer: working>".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(shot);
+}
+
+#[test]
+fn search_jumps_to_the_hit_60x12() {
+    let mut app = common::attached_app(false, 60, 12);
+    frame(&mut app, 60, 12);
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    )));
+    for c in "layout".chars() {
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )));
+    }
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    let a = app.attached.as_ref().unwrap();
+    assert_eq!(a.search.as_ref().unwrap().cursor, Some(1));
+    insta::assert_snapshot!(frame(&mut app, 60, 12));
+    // Esc closes the search and leaves the scroll where it is.
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(app.attached.as_ref().unwrap().search.is_none());
+}

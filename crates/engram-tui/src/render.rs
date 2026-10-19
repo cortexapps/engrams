@@ -10,9 +10,10 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{App, Attached, Screen};
 use crate::keymap::BINDINGS;
+use crate::markdown::{flags, Run};
 use crate::sessions::{age, marker};
 use crate::transcript::{Cell, Entry, Marker, Src, ToolState};
-use crate::wrap::grapheme_width;
+use crate::wrap::{display_width, grapheme_width};
 
 /// The styles, resolved once from `NO_COLOR`.
 #[derive(Clone, Copy, Debug)]
@@ -26,12 +27,29 @@ pub struct Theme {
     pub accent: Style,
     pub selected: Style,
     pub pending: Style,
+    pub code: Style,
+    pub heading: Style,
+    pub link: Style,
+    pub add: Style,
+    pub del: Style,
+    /// Screen-reader mode: word gutters (`agent:`) instead of glyphs.
+    pub ax: bool,
 }
+
+/// Width of the gutter column: a glyph and a space, or a word.
+pub const GUTTER: u16 = 2;
+pub const GUTTER_AX: u16 = 10;
 
 impl Theme {
     pub fn new(color: bool) -> Self {
         let c = |s: Style, col: Color| if color { s.fg(col) } else { s };
         Theme {
+            code: c(Style::new(), Color::Cyan),
+            heading: c(Style::new().add_modifier(Modifier::BOLD), Color::Green),
+            link: c(Style::new().add_modifier(Modifier::UNDERLINED), Color::Blue),
+            add: c(Style::new(), Color::Green),
+            del: c(Style::new(), Color::Red),
+            ax: false,
             user: Style::new().add_modifier(Modifier::BOLD),
             agent: Style::new(),
             dim: c(Style::new().add_modifier(Modifier::DIM), Color::DarkGray),
@@ -43,6 +61,106 @@ impl Theme {
             pending: c(Style::new().add_modifier(Modifier::DIM), Color::DarkGray),
         }
     }
+}
+
+impl Theme {
+    pub fn gutter_width(&self) -> u16 {
+        if self.ax {
+            GUTTER_AX
+        } else {
+            GUTTER
+        }
+    }
+
+    /// The style of a markdown run.
+    fn run_style(&self, base: Style, f: u8) -> Style {
+        let mut st = base;
+        if f & flags::DIM != 0 {
+            st = st.patch(self.dim);
+        }
+        if f & flags::CODE != 0 {
+            st = st.patch(self.code);
+        }
+        if f & flags::HEADING != 0 {
+            st = st.patch(self.heading);
+        }
+        if f & flags::LINK != 0 {
+            st = st.patch(self.link);
+        }
+        if f & flags::BOLD != 0 {
+            st = st.add_modifier(Modifier::BOLD);
+        }
+        if f & (flags::ITALIC | flags::QUOTE) != 0 {
+            st = st.add_modifier(Modifier::ITALIC);
+        }
+        if f & flags::STRIKE != 0 {
+            st = st.add_modifier(Modifier::CROSSED_OUT);
+        }
+        st
+    }
+}
+
+/// Text with its style runs (a markdown cell's display text).
+#[derive(Clone, Copy)]
+struct Styled<'a> {
+    text: &'a str,
+    runs: &'a [Run],
+}
+
+/// Paint `text[start..end]` with its style runs. Zero allocations: the
+/// first run is found by binary search, the rest are walked.
+fn put_runs(
+    buf: &mut Buffer,
+    at: Position,
+    styled: Styled<'_>,
+    (start, end): (usize, usize),
+    max_width: u16,
+    base: Style,
+    th: &Theme,
+) -> u16 {
+    let Styled { text, runs } = styled;
+    let (x, y) = (at.x, at.y);
+    let mut cx = 0u16;
+    let mut pos = start;
+    let mut i = runs.partition_point(|r| r.end as usize <= start);
+    while pos < end && cx < max_width {
+        let (seg_end, style) = match runs.get(i) {
+            Some(r) if (r.start as usize) <= pos => {
+                i += 1;
+                ((r.end as usize).min(end), th.run_style(base, r.flags))
+            }
+            Some(r) => ((r.start as usize).min(end), base),
+            None => (end, base),
+        };
+        if seg_end > pos {
+            cx += put(buf, x + cx, y, &text[pos..seg_end], max_width - cx, style);
+            pos = seg_end;
+        }
+    }
+    cx
+}
+
+/// Case-insensitive find without allocating; `needle` is lowercase.
+pub fn find_ci(hay: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    'outer: for (start, _) in hay.char_indices() {
+        let mut h = hay[start..].char_indices();
+        let mut n = needle.chars();
+        loop {
+            let Some(nc) = n.next() else {
+                let consumed = h.next().map(|(o, _)| o).unwrap_or(hay.len() - start);
+                return Some((start, start + consumed));
+            };
+            let (_, hc) = h.next()?;
+            let mut lower = hc.to_lowercase();
+            if lower.next() != Some(nc) || lower.next().is_some() {
+                continue 'outer;
+            }
+        }
+    }
+    None
 }
 
 /// Paint `text` at (x, y) clipped to `max_width` cells. Control characters
@@ -88,9 +206,17 @@ fn fill(buf: &mut Buffer, area: Rect, style: Style) {
     }
 }
 
-/// Paint one layout row of a cell at `y`. `first` marks the cell's first
-/// row (it gets the gutter glyph).
-fn paint_row(buf: &mut Buffer, area: Rect, y: u16, e: &Entry, row: usize, th: &Theme) {
+/// Paint one layout row of a cell at `y`. `hl` is a lowercase search
+/// query to highlight in this row.
+fn paint_row(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    e: &Entry,
+    row: usize,
+    th: &Theme,
+    hl: Option<&str>,
+) {
     let layout_row = e.layout_row(row);
     let Some(lr) = layout_row else {
         return;
@@ -98,25 +224,28 @@ fn paint_row(buf: &mut Buffer, area: Rect, y: u16, e: &Entry, row: usize, th: &T
     let first = row == 0;
     let x = area.x;
     let w = area.width;
-    let (gutter, style): (&str, Style) = match &e.cell {
+    let (gutter, word, style): (&str, &str, Style) = match &e.cell {
         Cell::User {
             pending, steered, ..
         } => (
             if *steered { "↳" } else { "›" },
+            "you:",
             if *pending { th.pending } else { th.user },
         ),
-        Cell::Assistant { failed, .. } => ("", if *failed { th.dim } else { th.agent }),
+        Cell::Assistant { failed, .. } => ("", "agent:", if *failed { th.dim } else { th.agent }),
         Cell::Tool { state, .. } => (
             match state {
                 ToolState::Running => "⚙",
                 ToolState::Ok => "✓",
                 ToolState::Err => "✗",
             },
+            "tool:",
             match state {
                 ToolState::Err => th.err,
                 _ => th.tool,
             },
         ),
+        Cell::Diff { .. } => ("±", "edit:", th.tool),
         Cell::Exec { done, exit, .. } => (
             if !*done {
                 "⚙"
@@ -125,12 +254,20 @@ fn paint_row(buf: &mut Buffer, area: Rect, y: u16, e: &Entry, row: usize, th: &T
             } else {
                 "✗"
             },
+            "shell:",
             th.tool,
         ),
-        Cell::Question { answered, .. } => ("?", if *answered { th.dim } else { th.warn }),
-        Cell::Plan { approved, .. } => ("≡", if approved.is_some() { th.dim } else { th.warn }),
+        Cell::Question { answered, .. } => {
+            ("?", "question:", if *answered { th.dim } else { th.warn })
+        }
+        Cell::Plan { approved, .. } => (
+            "≡",
+            "plan:",
+            if approved.is_some() { th.dim } else { th.warn },
+        ),
         Cell::Marker { kind, .. } => (
             "·",
+            "note:",
             match kind {
                 Marker::Rollback | Marker::ResumedFromDisk | Marker::PlanAttempt => th.warn,
                 _ => th.dim,
@@ -138,16 +275,59 @@ fn paint_row(buf: &mut Buffer, area: Rect, y: u16, e: &Entry, row: usize, th: &T
         ),
         Cell::Hidden => return,
     };
-    if first && !gutter.is_empty() {
-        put(buf, x, y, gutter, 1, style);
+    let gw = th.gutter_width();
+    if first {
+        if th.ax {
+            put(buf, x, y, word, gw, style);
+        } else if !gutter.is_empty() {
+            put(buf, x, y, gutter, 1, style);
+        }
     }
-    let body_x = x + 2;
-    let body_w = w.saturating_sub(2);
+    let body = Rect {
+        x: x + gw,
+        y,
+        width: w.saturating_sub(gw),
+        height: 1,
+    };
+    let painted = paint_src(buf, e, lr, row, body, style, th);
+    // The search hit: repaint the match reversed over what is there. Rows
+    // with a painted prefix (a tool name, an option number) are matched
+    // but not overlaid.
+    let overlay = match lr.src {
+        Src::Text | Src::Body => true,
+        Src::Head => !matches!(e.cell, Cell::Tool { .. }),
+        _ => false,
+    };
+    if let (true, Some(q), Some(src_text)) = (overlay, hl, painted) {
+        let s = &src_text[lr.row.start as usize..lr.row.end as usize];
+        if let Some((a, b)) = find_ci(s, q) {
+            let off = display_width(&s[..a]) as u16;
+            let shift = if lr.src == Src::Body { 2 } else { 0 };
+            let hx = body.x + shift + off;
+            if hx < body.right() {
+                put(buf, hx, y, &s[a..b], body.right() - hx, th.selected);
+            }
+        }
+    }
+}
+
+/// Paint the row's source text into the one-row `body` area; returns that
+/// text when the row is searchable (so the caller can overlay a match).
+fn paint_src<'e>(
+    buf: &mut Buffer,
+    e: &'e Entry,
+    lr: &crate::transcript::LayoutRow,
+    row: usize,
+    body: Rect,
+    style: Style,
+    th: &Theme,
+) -> Option<&'e str> {
+    let (body_x, body_w, y) = (body.x, body.width, body.y);
     match lr.src {
         Src::Tail => {
             let tail_style = th.dim;
             match &e.cell {
-                Cell::Tool { .. } => {
+                Cell::Tool { .. } | Cell::Diff { .. } => {
                     let folded = lr.row.end.saturating_sub(lr.row.start);
                     let mut cx = put(
                         buf,
@@ -221,6 +401,7 @@ fn paint_row(buf: &mut Buffer, area: Rect, y: u16, e: &Entry, row: usize, th: &T
                 }
                 _ => {}
             }
+            None
         }
         Src::Body => {
             let text = e.source(Src::Body);
@@ -233,11 +414,28 @@ fn paint_row(buf: &mut Buffer, area: Rect, y: u16, e: &Entry, row: usize, th: &T
                 buf,
                 body_x,
                 y,
-                if is_first_body { "⎿" } else { " " },
+                if is_first_body && !th.ax { "⎿" } else { " " },
                 1,
                 th.dim,
             );
-            put(buf, body_x + 2, y, s, body_w.saturating_sub(2), th.dim);
+            let body_style = match &e.cell {
+                Cell::Diff { .. } => {
+                    // The line's first byte says what kind of line it is;
+                    // a wrapped continuation row inherits it.
+                    let line_start = text[..lr.row.start as usize]
+                        .rfind('\n')
+                        .map(|p| p + 1)
+                        .unwrap_or(0);
+                    match text.as_bytes().get(line_start) {
+                        Some(b'+') => th.add,
+                        Some(b'-') => th.del,
+                        _ => th.dim,
+                    }
+                }
+                _ => th.dim,
+            };
+            put(buf, body_x + 2, y, s, body_w.saturating_sub(2), body_style);
+            Some(text)
         }
         Src::Head => {
             let mut cx = 0;
@@ -256,7 +454,35 @@ fn paint_row(buf: &mut Buffer, area: Rect, y: u16, e: &Entry, row: usize, th: &T
             }
             let text = e.source(Src::Head);
             let s = &text[lr.row.start as usize..lr.row.end as usize];
-            put(buf, body_x + cx, y, s, body_w.saturating_sub(cx), th.dim);
+            let head_style = match &e.cell {
+                Cell::Diff { .. } => style.add_modifier(Modifier::BOLD),
+                _ => th.dim,
+            };
+            cx += put(
+                buf,
+                body_x + cx,
+                y,
+                s,
+                body_w.saturating_sub(cx),
+                head_style,
+            );
+            if let Cell::Diff { added, removed, .. } = &e.cell {
+                if lr.row.end as usize == text.len() {
+                    cx += put(
+                        buf,
+                        body_x + cx,
+                        y,
+                        "  +",
+                        body_w.saturating_sub(cx),
+                        th.add,
+                    );
+                    cx += put_num(buf, body_x + cx, y, *added as u64, th.add);
+                    cx += put(buf, body_x + cx, y, " −", body_w.saturating_sub(cx), th.del);
+                    cx += put_num(buf, body_x + cx, y, *removed as u64, th.del);
+                }
+            }
+            let _ = cx;
+            Some(text)
         }
         Src::Question(_) => {
             let text = e.source(lr.src);
@@ -269,6 +495,7 @@ fn paint_row(buf: &mut Buffer, area: Rect, y: u16, e: &Entry, row: usize, th: &T
                 body_w,
                 style.add_modifier(Modifier::BOLD),
             );
+            Some(text)
         }
         Src::Option(_, j) => {
             let text = e.source(lr.src);
@@ -286,11 +513,26 @@ fn paint_row(buf: &mut Buffer, area: Rect, y: u16, e: &Entry, row: usize, th: &T
                 body_w.saturating_sub(2 + cx),
                 style,
             );
+            Some(text)
         }
         Src::Text => {
             let text = e.source(Src::Text);
-            let s = &text[lr.row.start as usize..lr.row.end as usize];
-            put(buf, body_x, y, s, body_w, style);
+            let runs = e.runs();
+            if runs.is_empty() {
+                let s = &text[lr.row.start as usize..lr.row.end as usize];
+                put(buf, body_x, y, s, body_w, style);
+            } else {
+                put_runs(
+                    buf,
+                    Position::new(body_x, y),
+                    Styled { text, runs },
+                    (lr.row.start as usize, lr.row.end as usize),
+                    body_w,
+                    style,
+                    th,
+                );
+            }
+            Some(text)
         }
     }
 }
@@ -323,9 +565,13 @@ pub fn draw_transcript(
     scratch: &mut Vec<(usize, u16)>,
 ) -> bool {
     scratch.clear();
-    let width = area.width.saturating_sub(2).max(1);
+    let width = area.width.saturating_sub(th.gutter_width()).max(1);
     let want = area.height as usize;
     let mut skip = a.scroll_up;
+    let hl = a
+        .search
+        .as_ref()
+        .and_then(|s| s.cursor.map(|c| (c, s.lower.as_str())));
     let t = &mut a.reducer.transcript;
     let first = t.first_index();
     let mut i = t.len();
@@ -362,7 +608,8 @@ pub fn draw_transcript(
     for (y, &(idx, row)) in (area.y..).zip(scratch.iter().rev()) {
         if let Some(e) = t.get_mut(idx) {
             let _ = e.height(width);
-            paint_row(buf, area, y, e, row as usize, th);
+            let q = hl.filter(|&(c, _)| c == idx).map(|(_, q)| q);
+            paint_row(buf, area, y, e, row as usize, th, q);
         }
     }
     if a.unseen > 0 && a.scroll_up > 0 && area.height > 0 {
@@ -485,6 +732,33 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) {
     if let Some((note, _)) = &app.note {
         cx += put(buf, area.x, y, " ", 1, th.warn);
         put(buf, area.x + cx, y, note, w.saturating_sub(cx), th.warn);
+        return;
+    }
+    if let Some(s) = app.attached.as_ref().and_then(|a| a.search.as_ref()) {
+        cx += put(buf, area.x, y, " /", 2, th.accent);
+        cx += put(
+            buf,
+            area.x + cx,
+            y,
+            &s.query,
+            w.saturating_sub(cx + 1),
+            th.user,
+        );
+        let hint = if s.cursor.is_some() {
+            "  Enter next (older) · Esc close"
+        } else if s.query.is_empty() {
+            "  type to search · Esc close"
+        } else {
+            "  Enter search · Esc close"
+        };
+        put(
+            buf,
+            area.x + cx + 1,
+            y,
+            hint,
+            w.saturating_sub(cx + 1),
+            th.dim,
+        );
         return;
     }
     match (&app.attached, app.screen) {
@@ -742,6 +1016,13 @@ pub fn draw_fullscreen(
             want_older = draw_transcript(buf, transcript, a, th, scratch) && a.scroll_up > 0;
             draw_queue(buf, queue, a, th);
             cursor = Some(draw_composer(buf, composer, a, th));
+            if let Some(s) = &a.search {
+                let qx = 2 + display_width(&s.query) as u16;
+                cursor = Some(Position::new(
+                    footer.x + qx.min(footer.width.saturating_sub(1)),
+                    footer.y,
+                ));
+            }
         }
     }
     draw_footer(buf, footer, app, th);
@@ -838,9 +1119,9 @@ pub fn draw_inline(
 /// `insert_before` callback for native scrollback mode).
 pub fn paint_cell(buf: &mut Buffer, e: &mut Entry, th: &Theme) {
     let area = buf.area;
-    let width = area.width.saturating_sub(2).max(1);
+    let width = area.width.saturating_sub(th.gutter_width()).max(1);
     let h = e.height(width);
     for row in 0..h {
-        paint_row(buf, area, area.y + row, e, row as usize, th);
+        paint_row(buf, area, area.y + row, e, row as usize, th, None);
     }
 }

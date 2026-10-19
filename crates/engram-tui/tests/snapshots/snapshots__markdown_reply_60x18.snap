@@ -1,0 +1,22 @@
+---
+source: crates/engram-tui/tests/snapshots.rs
+expression: "frame(&mut app, 60, 18)"
+---
+" Add a README                                               "
+"· snapshot taken                                            "
+"›                                                           "
+"  Plan                                                      "
+"                                                            "
+"  I will add a usage section with engrams tui:              "
+"                                                            "
+"  1. read the README                                        "
+"  2. append the section                                     "
+"                                                            "
+"  sh                                                        "
+"    engrams tui                                             "
+"                                                            "
+"  │ keep the intro                                          "
+"                                                            "
+"  See the docs (https://example.com/docs).                  "
+"› message the agent                                         "
+" ● ready  Ctrl+D sessions · ? keys             idx 11       "

@@ -21,6 +21,10 @@ pub enum Action {
     NextSession,
     Help,
     Redraw,
+    /// Transcript search (fullscreen).
+    Search,
+    /// Edit the draft in `$EDITOR`.
+    EditDraft,
     Backspace,
     Delete,
     Left,
@@ -103,6 +107,16 @@ pub const BINDINGS: &[Binding] = &[
         help: "emacs editing",
     },
     Binding {
+        keys: "Ctrl+T",
+        action: Action::Search,
+        help: "search the transcript (Enter next · Esc close)",
+    },
+    Binding {
+        keys: "Ctrl+G",
+        action: Action::EditDraft,
+        help: "edit the draft in $EDITOR",
+    },
+    Binding {
         keys: "Ctrl+L",
         action: Action::Redraw,
         help: "redraw",
@@ -158,6 +172,8 @@ pub fn resolve(key: &KeyEvent, draft_empty: bool) -> Option<Action> {
             'y' => Action::Yank,
             'l' => Action::Redraw,
             'h' => Action::Backspace,
+            't' => Action::Search,
+            'g' => Action::EditDraft,
             _ => return None,
         },
         KeyCode::Char(c) if alt => match c {
