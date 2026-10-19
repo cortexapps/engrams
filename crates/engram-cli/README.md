@@ -39,7 +39,9 @@ engrams tui [session-id] [--no-alt-screen] [--no-mouse] [--ax] # terminal client
 `engrams tui` opens the session list, or attaches to one session, in a
 full-screen terminal UI. `--no-alt-screen` (or `ENGRAMS_TUI_NO_ALT_SCREEN=1`)
 keeps the terminal's own scrollback instead: finished turns are written into
-it and only the composer and footer stay live. `?` lists the keys. Ctrl+`
+it and only the composer and footer stay live. `?` lists the keys; a draft
+that starts with `/` is a command (`/new`, `/shell`, `/resume`,
+`/transcript`, `/dump`, …). Ctrl+N starts a session from a profile. Ctrl+`
 (Ctrl+Space in terminals that send NUL for it) opens a shell in the sandbox
 below the transcript; the same key hands the keys back to the agent.
 `engrams session shell <id>` is the same shell in the terminal itself, with
