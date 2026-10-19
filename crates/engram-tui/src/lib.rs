@@ -15,6 +15,7 @@ pub mod net;
 pub mod reducer;
 pub mod render;
 pub mod sessions;
+pub mod shell;
 pub mod terminal;
 pub mod transcript;
 pub mod wrap;
@@ -31,6 +32,7 @@ use tokio::sync::mpsc;
 use crate::app::{App, Cmd, Msg};
 use crate::net::Net;
 use crate::render::Theme;
+use engram_app_client::shell::{Shell, ShellMsg};
 use engram_app_client::Clients;
 
 #[derive(Debug, Clone, Default)]
@@ -89,6 +91,10 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
     let mut last_draw = Instant::now() - FRAME;
     let mut dirty = true;
     let mut title = String::new();
+    // Native scrollback mode shows a focused shell on the alternate
+    // screen, through a second terminal; the inline one keeps its state
+    // and resumes when the overlay leaves.
+    let mut overlay: Option<Term> = None;
     let result = loop {
         // Run the commands the last update emitted.
         let mut failed: Option<String> = None;
@@ -118,6 +124,14 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
                     tool_call_id,
                     result_json,
                 } => net.complete_tool_call(session_id, tool_call_id, result_json),
+                Cmd::ShellOpen {
+                    session_id,
+                    cols,
+                    rows,
+                } => net.shell_open(session_id, cols, rows),
+                Cmd::ShellInput(bytes) => net.shell_input(bytes),
+                Cmd::ShellResize { cols, rows } => net.shell_resize(cols, rows),
+                Cmd::ShellClose => net.shell_close(),
                 Cmd::EditDraft { text } => {
                     // The editor owns the tty: stop reading input (the
                     // stream's reader thread would steal keystrokes), give
@@ -152,7 +166,35 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
         }
 
         if dirty && last_draw.elapsed() >= FRAME {
-            if let Err(e) = draw(&mut terminal, &mut app, &theme, &mut scratch) {
+            let want_overlay = opts.inline
+                && app
+                    .attached
+                    .as_ref()
+                    .is_some_and(|a| a.shell.as_ref().is_some_and(|s| s.focused));
+            if want_overlay != overlay.is_some() {
+                if want_overlay {
+                    let ov = terminal::enter_overlay().and_then(|()| {
+                        Terminal::with_options(
+                            CrosstermBackend::new(guard.stdout()),
+                            TerminalOptions {
+                                viewport: Viewport::Fullscreen,
+                            },
+                        )
+                    });
+                    match ov {
+                        Ok(t) => overlay = Some(t),
+                        Err(e) => break Err(e.to_string()),
+                    }
+                } else {
+                    overlay = None;
+                    terminal::leave_overlay();
+                }
+            }
+            let drawn = match &mut overlay {
+                Some(ov) => draw_overlay(ov, &app, &theme),
+                None => draw(&mut terminal, &mut app, &theme, &mut scratch),
+            };
+            if let Err(e) = drawn {
                 break Err(e.to_string());
             }
             last_draw = Instant::now();
@@ -213,6 +255,9 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
 
     input.abort();
     net.detach();
+    if overlay.take().is_some() {
+        terminal::leave_overlay();
+    }
     if opts.inline {
         // Leave the shell prompt below the viewport.
         let _ = terminal.clear();
@@ -275,6 +320,85 @@ fn edit_in_editor(text: &str) -> Option<String> {
     };
     let _ = std::fs::remove_file(&path);
     edited
+}
+
+/// One overlay frame: the shell pane over the whole alternate screen.
+fn draw_overlay(terminal: &mut Term, app: &App, theme: &Theme) -> std::io::Result<()> {
+    let mut out = std::io::stdout();
+    crossterm::queue!(out, crossterm::terminal::BeginSynchronizedUpdate)?;
+    terminal.draw(|f| {
+        let area = f.area();
+        if let Some(p) = render::draw_overlay(f.buffer_mut(), area, app, theme) {
+            f.set_cursor_position(p);
+        }
+    })?;
+    crossterm::queue!(out, crossterm::terminal::EndSynchronizedUpdate)?;
+    out.flush()
+}
+
+/// `engrams session shell <id>`: the local terminal becomes the session
+/// shell until the remote shell exits. Raw mode, every byte through, the
+/// window size follows `SIGWINCH`.
+pub fn shell_passthrough(clients: Clients, session_id: &str) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let result = rt.block_on(async {
+        let (cols, rows) = crossterm::terminal::size().map_err(|e| e.to_string())?;
+        let mut shell = Shell::open(&clients.transport, session_id, cols, rows)
+            .await
+            .map_err(|e| e.to_string())?;
+        let raw = terminal::Guard::raw().map_err(|e| e.to_string())?;
+        let result = passthrough_loop(&mut shell).await;
+        drop(raw);
+        result
+    });
+    // A blocked stdin read must not hold the process open.
+    rt.shutdown_background();
+    result
+}
+
+async fn passthrough_loop(shell: &mut Shell) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+    let mut stdin = tokio::io::stdin();
+    let mut out = std::io::stdout();
+    let mut buf = [0u8; 4096];
+    #[cfg(unix)]
+    let mut winch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        .map_err(|e| e.to_string())?;
+    #[cfg(not(unix))]
+    let mut winch = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            n = stdin.read(&mut buf) => match n {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(n) => shell.input(&buf[..n]).await.map_err(|e| e.to_string())?,
+            },
+            msg = shell.next() => match msg {
+                Ok(Some(ShellMsg::Output(bytes))) => {
+                    out.write_all(&bytes).and_then(|()| out.flush()).map_err(|e| e.to_string())?;
+                }
+                Ok(Some(ShellMsg::Title(_))) => {}
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            },
+            _ = winch_wait(&mut winch) => {
+                let (cols, rows) = crossterm::terminal::size().map_err(|e| e.to_string())?;
+                shell.resize(cols, rows).await.map_err(|e| e.to_string())?;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn winch_wait(sig: &mut tokio::signal::unix::Signal) {
+    let _ = sig.recv().await;
+}
+
+#[cfg(not(unix))]
+async fn winch_wait(tick: &mut tokio::time::Interval) {
+    tick.tick().await;
 }
 
 fn draw(

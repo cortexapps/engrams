@@ -5,17 +5,25 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 
 use crate::composer::Composer;
 use crate::event::{Envelope, Event};
 use crate::keymap::{resolve, Action};
 use crate::reducer::{is_terminal, Reducer};
 use crate::sessions::{fuzzy, SessionRow};
+use crate::shell::ShellPane;
 use crate::transcript::Cell;
 
 /// Events per history page (the web's window size).
 pub const PAGE: i64 = 200;
+
+/// Rows of a `body` (everything above the footer) the shell pane takes in
+/// fullscreen mode, header included: two fifths, never so much that the
+/// title, a transcript row and the composer lose their rows.
+pub fn shell_pane_rows(body: u16) -> u16 {
+    (body * 2 / 5).clamp(3, body.saturating_sub(3).max(3))
+}
 const DOUBLE_TAP: Duration = Duration::from_secs(1);
 
 /// What the runtime must do after an update.
@@ -53,6 +61,18 @@ pub enum Cmd {
         tool_call_id: String,
         result_json: String,
     },
+    /// Open the session shell at this screen size.
+    ShellOpen {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    ShellInput(Vec<u8>),
+    ShellResize {
+        cols: u16,
+        rows: u16,
+    },
+    ShellClose,
     Quit,
 }
 
@@ -117,6 +137,22 @@ pub enum NetMsg {
         tool_call_id: String,
         error: String,
     },
+    ShellOpened {
+        session_id: String,
+    },
+    ShellOutput {
+        session_id: String,
+        bytes: bytes::Bytes,
+    },
+    ShellTitle {
+        session_id: String,
+        title: String,
+    },
+    /// The shell ended: `None` for a clean close, else the reason.
+    ShellEnded {
+        session_id: String,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -144,6 +180,8 @@ pub struct Attached {
     pub search: Option<Search>,
     /// The composer collects feedback for a plan rejection (Tab).
     pub feedback: bool,
+    /// The shell pane (Ctrl+`), open until closed or the shell exits.
+    pub shell: Option<ShellPane>,
 }
 
 impl Attached {
@@ -167,6 +205,7 @@ impl Attached {
             want_older: false,
             search: None,
             feedback: false,
+            shell: None,
         }
     }
 
@@ -576,8 +615,12 @@ impl App {
             Msg::Resize(w, h) => {
                 self.width = w;
                 self.height = h;
+                let (cols, rows) = self.shell_geometry();
                 if let Some(a) = &mut self.attached {
                     a.reducer.transcript.invalidate_all();
+                    if a.shell.as_mut().is_some_and(|s| s.resize(cols, rows)) {
+                        self.cmds.push(Cmd::ShellResize { cols, rows });
+                    }
                 }
             }
             Msg::Focus(f) => self.focused = f,
@@ -591,7 +634,13 @@ impl App {
             Msg::Paste(text) => {
                 if self.screen == Screen::Attached && !self.palette {
                     if let Some(a) = &mut self.attached {
-                        a.composer.paste(&text);
+                        if let Some(sh) = a.shell.as_ref().filter(|s| s.focused && s.connected) {
+                            let mut out = Vec::with_capacity(text.len() + 12);
+                            sh.encode_paste(&text, &mut out);
+                            self.cmds.push(Cmd::ShellInput(out));
+                        } else {
+                            a.composer.paste(&text);
+                        }
                     }
                 } else {
                     self.sessions.filter.push_str(text.trim());
@@ -627,6 +676,22 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) {
+        if self.help {
+            if key.kind != KeyEventKind::Release {
+                self.help = false;
+            }
+            return;
+        }
+        if self.screen == Screen::Attached
+            && !self.palette
+            && self
+                .attached
+                .as_ref()
+                .is_some_and(|a| a.shell.as_ref().is_some_and(|s| s.focused))
+        {
+            self.shell_key(&key);
+            return;
+        }
         // `?` is help only on an empty draft and outside a search query.
         let draft_empty = self
             .attached
@@ -635,10 +700,6 @@ impl App {
         let Some(action) = resolve(&key, draft_empty) else {
             return;
         };
-        if self.help {
-            self.help = false;
-            return;
-        }
         if action != Action::CtrlC {
             self.ctrl_c_at = None;
         }
@@ -696,6 +757,83 @@ impl App {
             crate::render::GUTTER_AX
         } else {
             crate::render::GUTTER
+        }
+    }
+
+    /// Screen size of the shell pane: the split below the transcript in
+    /// fullscreen mode, the whole terminal less a header and the footer
+    /// in native scrollback mode (where it is an alternate-screen
+    /// overlay). Pure in the terminal size, so the renderer and the
+    /// resize path agree.
+    pub fn shell_geometry(&self) -> (u16, u16) {
+        let cols = self.width.max(1);
+        let rows = if self.inline {
+            self.height.saturating_sub(2)
+        } else {
+            shell_pane_rows(self.height.saturating_sub(1)).saturating_sub(1)
+        };
+        (cols, rows.max(1))
+    }
+
+    /// Keys while the shell has focus: Ctrl+` (or Ctrl+Space) hands focus
+    /// back; after the shell ended, Enter reopens and Esc closes the pane;
+    /// everything else is encoded for the shell.
+    fn shell_key(&mut self, key: &KeyEvent) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        let (cols, rows) = self.shell_geometry();
+        let Some(a) = &mut self.attached else {
+            return;
+        };
+        let Some(sh) = &mut a.shell else {
+            return;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('`' | ' ' | '@')) {
+            sh.focused = false;
+            return;
+        }
+        if sh.ended.is_some() {
+            match key.code {
+                KeyCode::Enter => {
+                    sh.reset();
+                    self.cmds.push(Cmd::ShellOpen {
+                        session_id: a.session_id.clone(),
+                        cols,
+                        rows,
+                    });
+                }
+                KeyCode::Esc => a.shell = None,
+                _ => {}
+            }
+            return;
+        }
+        if !sh.connected {
+            return;
+        }
+        let mut out = Vec::with_capacity(8);
+        if sh.encode_key(key, &mut out) {
+            self.cmds.push(Cmd::ShellInput(out));
+        }
+    }
+
+    /// Ctrl+` from the composer: open the shell, or focus the open pane.
+    fn toggle_shell(&mut self) {
+        let (cols, rows) = self.shell_geometry();
+        let Some(a) = &mut self.attached else {
+            return;
+        };
+        match &mut a.shell {
+            Some(sh) => sh.focused = true,
+            None => {
+                a.shell = Some(ShellPane::new(cols, rows));
+                self.cmds.push(Cmd::ShellOpen {
+                    session_id: a.session_id.clone(),
+                    cols,
+                    rows,
+                });
+            }
         }
     }
 
@@ -831,8 +969,12 @@ impl App {
                 } else if a.scroll_up > 0 {
                     a.scroll_up = 0;
                     a.unseen = 0;
+                } else if a.shell.is_some() {
+                    a.shell = None;
+                    self.cmds.push(Cmd::ShellClose);
                 }
             }
+            Action::Shell => self.toggle_shell(),
             Action::CtrlC => {
                 let now = Instant::now();
                 if !a.composer.is_empty() {
@@ -1141,7 +1283,36 @@ impl App {
                 }
                 self.note(format!("answer failed: {error}"));
             }
+            NetMsg::ShellOpened { session_id } => {
+                if let Some(sh) = self.shell_of(&session_id) {
+                    sh.connected = true;
+                    sh.ended = None;
+                }
+            }
+            NetMsg::ShellOutput { session_id, bytes } => {
+                if let Some(sh) = self.shell_of(&session_id) {
+                    sh.feed(&bytes);
+                }
+            }
+            NetMsg::ShellTitle { session_id, title } => {
+                if let Some(sh) = self.shell_of(&session_id) {
+                    sh.title = title;
+                }
+            }
+            NetMsg::ShellEnded { session_id, error } => {
+                if let Some(sh) = self.shell_of(&session_id) {
+                    sh.connected = false;
+                    sh.ended = Some(error.unwrap_or_else(|| "the shell exited".to_string()));
+                }
+            }
         }
+    }
+
+    fn shell_of(&mut self, session_id: &str) -> Option<&mut ShellPane> {
+        self.attached
+            .as_mut()
+            .filter(|a| a.session_id == session_id)
+            .and_then(|a| a.shell.as_mut())
     }
 
     /// The renderer reports that the scroll-up walk ran out of cells:

@@ -64,6 +64,21 @@ impl Guard {
         Ok(Guard { _private: () })
     }
 
+    /// Raw mode only, for `engrams session shell`: no alternate screen,
+    /// no paste or focus reports, and no kitty flags, because every byte
+    /// the local terminal sends goes to the remote shell as-is. Restored
+    /// on drop and from the panic hook like the full guard.
+    pub fn raw() -> io::Result<Guard> {
+        enable_raw_mode()?;
+        ACTIVE.store(true, Ordering::SeqCst);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore();
+            prev(info);
+        }));
+        Ok(Guard { _private: () })
+    }
+
     /// Hand the terminal to another program (`$EDITOR`). [`Guard::resume`]
     /// takes it back.
     pub fn suspend(&self) {
@@ -109,6 +124,21 @@ fn enter_modes(alt_screen: bool, mouse: bool) -> io::Result<()> {
 impl Drop for Guard {
     fn drop(&mut self) {
         restore();
+    }
+}
+
+/// Enter the alternate screen for an overlay (native scrollback mode's
+/// shell pane). The flag keeps [`restore`] exact if the process dies
+/// while the overlay is up.
+pub fn enter_overlay() -> io::Result<()> {
+    execute!(io::stdout(), EnterAlternateScreen)?;
+    ALT_SCREEN.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+pub fn leave_overlay() {
+    if ALT_SCREEN.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
 }
 

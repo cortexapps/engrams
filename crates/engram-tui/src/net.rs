@@ -5,9 +5,10 @@
 use std::time::Duration;
 
 use engram_app_client::proto::*;
+use engram_app_client::shell::{Shell, ShellMsg};
 use engram_app_client::sse::EventStream;
 use engram_app_client::Clients;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::app::{Msg, NetMsg, PAGE};
@@ -18,6 +19,18 @@ pub struct Net {
     clients: Clients,
     tx: UnboundedSender<Msg>,
     attach: Option<JoinHandle<()>>,
+    shell: Option<ShellLink>,
+}
+
+/// The open shell: its task and the channel that feeds it keystrokes.
+struct ShellLink {
+    task: JoinHandle<()>,
+    tx: UnboundedSender<ShellOut>,
+}
+
+enum ShellOut {
+    Input(Vec<u8>),
+    Resize(u16, u16),
 }
 
 fn now_unix() -> u64 {
@@ -33,6 +46,7 @@ impl Net {
             clients,
             tx,
             attach: None,
+            shell: None,
         }
     }
 
@@ -62,8 +76,40 @@ impl Net {
     }
 
     pub fn detach(&mut self) {
+        self.shell_close();
         if let Some(h) = self.attach.take() {
             h.abort();
+        }
+    }
+
+    /// Dial the session shell; one at a time.
+    pub fn shell_open(&mut self, session_id: String, cols: u16, rows: u16) {
+        self.shell_close();
+        let (stx, srx) = mpsc::unbounded_channel();
+        let c = self.clients.clone();
+        let tx = self.tx.clone();
+        let task = tokio::spawn(async move {
+            shell_task(c, tx, session_id, cols, rows, srx).await;
+        });
+        self.shell = Some(ShellLink { task, tx: stx });
+    }
+
+    pub fn shell_input(&self, bytes: Vec<u8>) {
+        if let Some(s) = &self.shell {
+            let _ = s.tx.send(ShellOut::Input(bytes));
+        }
+    }
+
+    pub fn shell_resize(&self, cols: u16, rows: u16) {
+        if let Some(s) = &self.shell {
+            let _ = s.tx.send(ShellOut::Resize(cols, rows));
+        }
+    }
+
+    /// Drop the socket; the server ends the PTY.
+    pub fn shell_close(&mut self) {
+        if let Some(s) = self.shell.take() {
+            s.task.abort();
         }
     }
 
@@ -300,6 +346,71 @@ async fn attach_task(c: Clients, tx: UnboundedSender<Msg>, session_id: String) {
             attempt,
         });
         tokio::time::sleep(backoff(attempt)).await;
+    }
+}
+
+/// Pump the shell: frames in become messages, keystrokes out go on the
+/// socket. Ends with one `ShellEnded`.
+async fn shell_task(
+    c: Clients,
+    tx: UnboundedSender<Msg>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+    mut out: UnboundedReceiver<ShellOut>,
+) {
+    let send = |m: NetMsg| {
+        let _ = tx.send(Msg::Net(m));
+    };
+    let ended = |error: Option<String>| NetMsg::ShellEnded {
+        session_id: session_id.clone(),
+        error,
+    };
+    let mut shell = match Shell::open(&c.transport, &session_id, cols, rows).await {
+        Ok(s) => s,
+        Err(e) => {
+            send(ended(Some(e.to_string())));
+            return;
+        }
+    };
+    send(NetMsg::ShellOpened {
+        session_id: session_id.clone(),
+    });
+    loop {
+        tokio::select! {
+            msg = shell.next() => match msg {
+                Ok(Some(ShellMsg::Output(bytes))) => send(NetMsg::ShellOutput {
+                    session_id: session_id.clone(),
+                    bytes,
+                }),
+                Ok(Some(ShellMsg::Title(title))) => send(NetMsg::ShellTitle {
+                    session_id: session_id.clone(),
+                    title,
+                }),
+                Ok(None) => {
+                    send(ended(None));
+                    return;
+                }
+                Err(e) => {
+                    send(ended(Some(e.to_string())));
+                    return;
+                }
+            },
+            req = out.recv() => {
+                let res = match req {
+                    Some(ShellOut::Input(b)) => shell.input(&b).await,
+                    Some(ShellOut::Resize(c, r)) => shell.resize(c, r).await,
+                    None => {
+                        shell.close().await;
+                        return;
+                    }
+                };
+                if let Err(e) = res {
+                    send(ended(Some(e.to_string())));
+                    return;
+                }
+            }
+        }
     }
 }
 
