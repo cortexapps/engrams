@@ -95,11 +95,17 @@ impl Transport {
         method: &str,
         req: &Req,
     ) -> Result<Resp, Error> {
+        let body = req.encode_to_vec();
         let resp = self
             .authorize(self.http.post(self.rpc_url(service, method)))
             .header("content-type", "application/proto")
             .header("connect-protocol-version", PROTOCOL_VERSION)
-            .body(req.encode_to_vec())
+            // Explicit even at zero: hyper sends no Content-Length for an
+            // empty HTTP/1.1 POST body, and a Google front end answers that
+            // with 411 Length Required. Every request with no fields set (a
+            // WhoAmI, a default-paged list) encodes to zero bytes.
+            .header("content-length", body.len())
+            .body(body)
             .send()
             .await?;
         let status = resp.status().as_u16();
@@ -128,6 +134,7 @@ impl Transport {
             .authorize(self.http.post(self.rpc_url(service, method)))
             .header("content-type", "application/connect+proto")
             .header("connect-protocol-version", PROTOCOL_VERSION)
+            .header("content-length", body.len())
             .body(body)
             .send()
             .await?;

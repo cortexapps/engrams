@@ -30,6 +30,9 @@ async fn who_am_i(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
     let _ = req;
     assert_eq!(headers.get("content-type").unwrap(), "application/proto");
     assert_eq!(headers.get("connect-protocol-version").unwrap(), "1");
+    // A WhoAmI encodes to zero bytes; the length must still be on the wire
+    // (a Google front end answers a length-less HTTP/1.1 POST with 411).
+    assert_eq!(headers.get("content-length").unwrap(), "0");
     let key = headers
         .get("x-api-key")
         .map(|v| v.to_str().unwrap().to_string());
