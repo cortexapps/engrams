@@ -56,6 +56,7 @@ members = [
     "crates/engram-storage-gcs",
     "crates/engram-blob-client",
     "crates/engram-app-client",
+    "crates/engram-cli",
     "workspace-hack",
 ]
 
@@ -144,6 +145,7 @@ engram-storage-s3 = { path = "crates/engram-storage-s3" }
 engram-storage-gcs = { path = "crates/engram-storage-gcs" }
 engram-blob-client = { path = "crates/engram-blob-client" }
 engram-app-client = { path = "crates/engram-app-client" }
+engram-cli = { path = "crates/engram-cli" }
 engram-chunk-store = { path = "crates/engram-chunk-store" }
 engram-telemetry = { path = "crates/engram-telemetry" }
 
@@ -388,6 +390,18 @@ codegen-units = 1
 # symbolization against a rebuilt binary is not an option. Costs ~10 MB
 # of image size per Rust binary.
 strip = "debuginfo"
+
+# The `engrams` CLI binary ships through this profile (bake-images.yml):
+# the smallest and fastest build. It is a separate profile so the release
+# profile above keeps its symbol table for the services' in-process
+# profilers.
+[profile.cli]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
 
 # Trim third-party debug info to line tables only. Our own crates keep
 # full debug info (jump-to-def in IDEs, locals in lldb) — workspace

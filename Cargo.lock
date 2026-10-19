@@ -1994,6 +1994,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-cli"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "engram-app-client",
+ "nix 0.31.3",
+ "prost",
+ "serde",
+ "serde_json",
+ "tokio",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-cloud-aws"
 version = "0.1.0"
 dependencies = [
