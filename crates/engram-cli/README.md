@@ -33,7 +33,14 @@ engrams host list|get|drain|delete|uncordon|evacuate
 engrams profile list|get
 engrams apikey create|list|revoke                      # admin service keys
 engrams admin flush|evict-idle|gc
+engrams tui [session-id] [--no-alt-screen] [--no-mouse] # terminal client (ADR 0124)
 ```
+
+`engrams tui` opens the session list, or attaches to one session, in a
+full-screen terminal UI. `--no-alt-screen` (or `ENGRAMS_TUI_NO_ALT_SCREEN=1`)
+keeps the terminal's own scrollback instead: finished turns are written into
+it and only the composer and footer stay live. `?` lists the keys.
+`NO_COLOR` turns color off. The crate is `crates/engram-tui`.
 
 Output contract: default = human tables; `--json` = pretty JSON on stdout
 and nothing else; errors on stderr as `engrams: …` + exit 1. `session exec`
