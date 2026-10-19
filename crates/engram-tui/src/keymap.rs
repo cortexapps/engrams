@@ -25,6 +25,8 @@ pub enum Action {
     Search,
     /// Edit the draft in `$EDITOR`.
     EditDraft,
+    /// Open or focus the shell pane.
+    Shell,
     Backspace,
     Delete,
     Left,
@@ -122,6 +124,11 @@ pub const BINDINGS: &[Binding] = &[
         help: "edit the draft in $EDITOR",
     },
     Binding {
+        keys: "Ctrl+` / Ctrl+Space",
+        action: Action::Shell,
+        help: "shell in the sandbox (again: back to the agent)",
+    },
+    Binding {
         keys: "Ctrl+L",
         action: Action::Redraw,
         help: "redraw",
@@ -179,6 +186,9 @@ pub fn resolve(key: &KeyEvent, draft_empty: bool) -> Option<Action> {
             'h' => Action::Backspace,
             't' => Action::Search,
             'g' => Action::EditDraft,
+            // Ctrl+` arrives as NUL (Ctrl+Space / Ctrl+@) without the
+            // kitty protocol, as '`' with it.
+            '`' | ' ' | '@' => Action::Shell,
             _ => return None,
         },
         KeyCode::Char(c) if alt => match c {

@@ -8,7 +8,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::app::{App, Attached, Screen};
+use crate::app::{shell_pane_rows, App, Attached, Screen};
 use crate::keymap::BINDINGS;
 use crate::markdown::{flags, Run};
 use crate::sessions::{age, marker};
@@ -885,12 +885,20 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) {
                 cx += put(buf, area.x + cx, y, " · ", 3, th.err);
                 cx += put(buf, area.x + cx, y, e, w.saturating_sub(cx), th.err);
             }
-            let hints = if a.reducer.is_running() {
+            let hints = if a.shell.as_ref().is_some_and(|s| s.focused) {
+                "  shell has the keys · Ctrl+` back to the agent"
+            } else if a.shell.is_some() {
+                "  Ctrl+` shell · Esc closes it · Ctrl+D sessions · ? keys"
+            } else if a.reducer.is_running() {
                 "  Esc interrupt · Enter queue · Ctrl+D sessions · ? keys"
             } else {
                 "  Enter send · Ctrl+D sessions · Ctrl+P switch · ? keys"
             };
-            let short = "  Ctrl+D sessions · ? keys";
+            let short = if a.shell.as_ref().is_some_and(|s| s.focused) {
+                "  Ctrl+` back to the agent"
+            } else {
+                "  Ctrl+D sessions · ? keys"
+            };
             let right_w = 14u16;
             let avail = w.saturating_sub(cx + right_w);
             if avail as usize >= hints.len() {
@@ -1091,9 +1099,19 @@ pub fn draw_fullscreen(
                 ..body
             };
             let title_h = u16::from(body.height > 4);
+            let shell_rows = if a.shell.is_some() {
+                shell_pane_rows(body.height).min(queue.y.saturating_sub(body.y + title_h))
+            } else {
+                0
+            };
+            let shell = Rect {
+                y: queue.y.saturating_sub(shell_rows),
+                height: shell_rows,
+                ..body
+            };
             let transcript = Rect {
                 y: body.y + title_h,
-                height: queue.y.saturating_sub(body.y + title_h),
+                height: shell.y.saturating_sub(body.y + title_h),
                 ..body
             };
             a.page_rows = transcript.height;
@@ -1110,6 +1128,11 @@ pub fn draw_fullscreen(
             want_older = draw_transcript(buf, transcript, a, th, scratch) && a.scroll_up > 0;
             draw_queue(buf, queue, a, th);
             cursor = Some(draw_composer(buf, composer, a, th));
+            if shell.height > 0 {
+                if let Some(c) = draw_shell(buf, shell, a, th) {
+                    cursor = Some(c);
+                }
+            }
             if let Some(s) = &a.search {
                 let qx = 2 + display_width(&s.query) as u16;
                 cursor = Some(Position::new(
@@ -1206,6 +1229,90 @@ pub fn draw_inline(
         draw_help(buf, body, th);
         cursor = None;
     }
+    cursor
+}
+
+/// The shell pane: a header row and the emulated screen. Returns the
+/// cursor when the pane has focus.
+fn draw_shell(buf: &mut Buffer, area: Rect, a: &Attached, th: &Theme) -> Option<Position> {
+    let Some(sh) = &a.shell else {
+        return None;
+    };
+    let head = Rect { height: 1, ..area };
+    let style = if sh.focused { th.selected } else { th.dim };
+    fill(buf, head, style);
+    let mut cx = put(buf, head.x, head.y, " shell", 6, style);
+    if !sh.title.is_empty() {
+        cx += put(buf, head.x + cx, head.y, " · ", 3, style);
+        cx += put(
+            buf,
+            head.x + cx,
+            head.y,
+            &sh.title,
+            head.width.saturating_sub(cx),
+            style,
+        );
+    }
+    let hint = match (&sh.ended, sh.focused) {
+        (Some(_), true) => "  ended · Enter reopens · Esc closes · Ctrl+` back",
+        (Some(_), false) => "  ended · Ctrl+` focus · Esc closes",
+        (None, true) if !sh.connected => "  connecting… · Ctrl+` back",
+        (None, true) => "  Ctrl+` back to the agent",
+        (None, false) => "  Ctrl+` focus · Esc closes",
+    };
+    cx += put(
+        buf,
+        head.x + cx,
+        head.y,
+        hint,
+        head.width.saturating_sub(cx),
+        style,
+    );
+    if let Some(e) = &sh.ended {
+        cx += put(buf, head.x + cx, head.y, " · ", 3, style);
+        put(
+            buf,
+            head.x + cx,
+            head.y,
+            e,
+            head.width.saturating_sub(cx),
+            style,
+        );
+    }
+    let screen = Rect {
+        y: area.y + 1,
+        height: area.height - 1,
+        ..area
+    };
+    sh.paint(buf, screen);
+    if sh.focused {
+        sh.cursor(screen)
+    } else {
+        None
+    }
+}
+
+/// Native scrollback mode shows the shell as an alternate-screen overlay:
+/// the pane over the whole terminal, the footer below it.
+pub fn draw_overlay(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) -> Option<Position> {
+    fill(buf, area, Style::new());
+    if area.height < 2 {
+        return None;
+    }
+    let footer = Rect {
+        y: area.bottom() - 1,
+        height: 1,
+        ..area
+    };
+    let body = Rect {
+        height: area.height - 1,
+        ..area
+    };
+    let cursor = app
+        .attached
+        .as_ref()
+        .and_then(|a| draw_shell(buf, body, a, th));
+    draw_footer(buf, footer, app, th);
     cursor
 }
 
