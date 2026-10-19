@@ -2111,6 +2111,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "workspace-hack",
 ]
 
@@ -3223,6 +3224,7 @@ version = "0.1.0"
 dependencies = [
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "tokio",
  "tracing",
  "workspace-hack",
@@ -3243,6 +3245,7 @@ dependencies = [
 name = "engram-tui"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "crossterm",
  "engram-app-client",
  "futures",
@@ -3255,6 +3258,7 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "unicode-width",
+ "vt100",
  "workspace-hack",
 ]
 
@@ -6102,7 +6106,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -6123,7 +6127,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -7885,8 +7889,12 @@ checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite 0.30.0",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -8265,6 +8273,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.10.2",
+ "rustls",
+ "rustls-pki-types",
  "sha1 0.11.0",
  "thiserror 2.0.21",
 ]
@@ -8477,6 +8487,27 @@ checksum = "6ba782755fc073877e567c2253c0be48e4aa9a254c232d36d3985dfae0bd5205"
 dependencies = [
  "libc",
  "nix 0.31.3",
+]
+
+[[package]]
+name = "vt100"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb05cdd19ae8707bf6a0a269972c07e6358103a7079faec749dec318a5b3dc23"
+dependencies = [
+ "itoa",
+ "unicode-width",
+ "vte",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
 ]
 
 [[package]]
@@ -9191,6 +9222,7 @@ dependencies = [
  "hyper-util",
  "idna",
  "indexmap",
+ "itertools 0.14.0",
  "lazy_static",
  "libc",
  "log",
@@ -9243,6 +9275,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-tungstenite 0.30.0",
  "tokio-util",
  "toml_datetime",
  "toml_parser",
@@ -9251,6 +9284,7 @@ dependencies = [
  "tower-http 0.6.11",
  "tracing",
  "tracing-core",
+ "tungstenite 0.30.0",
  "typenum",
  "uuid",
  "winnow",

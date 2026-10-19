@@ -14,6 +14,10 @@ workspace = true
 # other provider (see the root manifest), so the install below is
 # unambiguous by construction.
 rustls.workspace = true
+# The verifier reqwest 0.13 uses (`rustls-no-provider` selects the platform
+# trust store). The one non-reqwest TLS client, the shell WebSocket, must
+# verify the same way, so the config lives here.
+rustls-platform-verifier.workspace = true
 # This crate owns `Client` construction for the whole workspace, so it is
 # the one place reqwest is a direct dependency for that purpose.
 reqwest.workspace = true
