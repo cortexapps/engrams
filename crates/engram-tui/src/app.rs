@@ -47,6 +47,12 @@ pub enum Cmd {
     EditDraft {
         text: String,
     },
+    /// Answer a deferred tool call (question, plan decision).
+    Complete {
+        session_id: String,
+        tool_call_id: String,
+        result_json: String,
+    },
     Quit,
 }
 
@@ -106,6 +112,11 @@ pub enum NetMsg {
         prompt_id: String,
         error: String,
     },
+    CompleteFailed {
+        session_id: String,
+        tool_call_id: String,
+        error: String,
+    },
 }
 
 #[derive(Debug)]
@@ -131,6 +142,8 @@ pub struct Attached {
     /// The last scroll-up walk hit the top of memory: load more.
     pub want_older: bool,
     pub search: Option<Search>,
+    /// The composer collects feedback for a plan rejection (Tab).
+    pub feedback: bool,
 }
 
 impl Attached {
@@ -153,7 +166,163 @@ impl Attached {
             page_rows: 20,
             want_older: false,
             search: None,
+            feedback: false,
         }
+    }
+
+    /// Submit the pending decision at cell `i` and lock the cell.
+    fn complete(&mut self, i: usize, tool_call_id: String, cmds: &mut Vec<Cmd>) -> bool {
+        let Some(e) = self.reducer.transcript.get(i) else {
+            return false;
+        };
+        let (result_json, approved) = match &e.cell {
+            Cell::Question {
+                questions, picks, ..
+            } => {
+                if picks.iter().any(Vec::is_empty) {
+                    return false;
+                }
+                let mut map = serde_json::Map::new();
+                for (q, p) in questions.iter().zip(picks) {
+                    let labels: Vec<serde_json::Value> = p
+                        .iter()
+                        .filter_map(|&j| q.options.get(j as usize))
+                        .map(|o| serde_json::Value::String(o.label.clone()))
+                        .collect();
+                    map.insert(q.question.clone(), serde_json::Value::Array(labels));
+                }
+                (serde_json::Value::Object(map).to_string(), None)
+            }
+            Cell::Plan { choice, .. } => {
+                let Some(approve) = *choice else {
+                    return false;
+                };
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    "decision".into(),
+                    serde_json::Value::String(if approve { "approve" } else { "reject" }.into()),
+                );
+                if !approve && self.feedback {
+                    let text = self.composer.text().trim().to_string();
+                    if !text.is_empty() {
+                        map.insert("feedback".into(), serde_json::Value::String(text));
+                    }
+                }
+                (serde_json::Value::Object(map).to_string(), Some(approve))
+            }
+            _ => return false,
+        };
+        if self.feedback {
+            self.feedback = false;
+            self.composer.clear();
+        }
+        self.reducer.decide(&tool_call_id, approved);
+        cmds.push(Cmd::Complete {
+            session_id: self.session_id.clone(),
+            tool_call_id,
+            result_json,
+        });
+        true
+    }
+
+    /// A key for the pending decision. Returns true when consumed.
+    fn decision_key(&mut self, action: Action, cmds: &mut Vec<Cmd>) -> bool {
+        let Some((i, tool_call_id)) = self.reducer.pending_decision() else {
+            self.feedback = false;
+            return false;
+        };
+        if self.feedback {
+            return match action {
+                Action::Send => self.complete(i, tool_call_id, cmds),
+                Action::Escape => {
+                    self.feedback = false;
+                    true
+                }
+                _ => false,
+            };
+        }
+        if !self.composer.is_empty() {
+            return false;
+        }
+        let Some(e) = self.reducer.transcript.get_mut(i) else {
+            return false;
+        };
+        let consumed = match (&mut e.cell, action) {
+            (
+                Cell::Question {
+                    questions,
+                    picks,
+                    current,
+                    ..
+                },
+                Action::Char(c @ '1'..='9'),
+            ) => {
+                let qi = *current as usize;
+                let n = (c as u8 - b'1') as u16;
+                if let (Some(q), Some(p)) = (questions.get(qi), picks.get_mut(qi)) {
+                    if (n as usize) < q.options.len() {
+                        if q.multi_select {
+                            match p.iter().position(|&x| x == n) {
+                                Some(pos) => {
+                                    p.remove(pos);
+                                }
+                                None => p.push(n),
+                            }
+                        } else {
+                            *p = vec![n];
+                        }
+                    }
+                }
+                true
+            }
+            (
+                Cell::Question {
+                    questions,
+                    picks,
+                    current,
+                    ..
+                },
+                Action::Send,
+            ) => {
+                let qi = *current as usize;
+                if picks.get(qi).is_some_and(|p| p.is_empty()) {
+                    true
+                } else if qi + 1 < questions.len() {
+                    *current += 1;
+                    true
+                } else {
+                    e.invalidate();
+                    return self.complete(i, tool_call_id, cmds);
+                }
+            }
+            (Cell::Plan { choice, .. }, Action::Char('1')) => {
+                *choice = Some(true);
+                true
+            }
+            (Cell::Plan { choice, .. }, Action::Char('2')) => {
+                *choice = Some(false);
+                true
+            }
+            (Cell::Plan { choice, .. }, Action::Char('\t')) => {
+                *choice = Some(false);
+                e.invalidate();
+                self.feedback = true;
+                return true;
+            }
+            (Cell::Plan { choice, .. }, Action::Send) => {
+                if choice.is_none() {
+                    true
+                } else {
+                    e.invalidate();
+                    return self.complete(i, tool_call_id, cmds);
+                }
+            }
+            _ => false,
+        };
+        if consumed {
+            e.invalidate();
+        }
+        consumed
     }
 
     /// Walk to the next older cell containing the search query (wrapping
@@ -282,6 +451,9 @@ pub struct App {
     pub width: u16,
     pub height: u16,
     pub note: Option<(String, Instant)>,
+    /// Desktop notifications the runtime emits (bell + OSC) when the
+    /// terminal is unfocused.
+    pub alerts: Vec<String>,
     pub quit: bool,
     ctrl_c_at: Option<Instant>,
     esc_at: Option<Instant>,
@@ -307,6 +479,7 @@ impl App {
             width,
             height,
             note: None,
+            alerts: Vec::new(),
             quit: false,
             ctrl_c_at: None,
             esc_at: None,
@@ -599,6 +772,14 @@ impl App {
         let Some(a) = &mut self.attached else {
             return;
         };
+        if a.can_send() {
+            let mut cmds = Vec::new();
+            let consumed = a.decision_key(action, &mut cmds);
+            self.cmds.extend(cmds);
+            if consumed {
+                return;
+            }
+        }
         match action {
             Action::Send => {
                 if !a.can_send() {
@@ -860,9 +1041,20 @@ impl App {
                 else {
                     return;
                 };
+                let was_awaiting = a.reducer.awaiting_decision();
+                let was_running = a.reducer.is_running();
                 a.apply_envelope(&envelope);
                 if let Some(t) = a.reducer.title.take() {
                     a.title = t;
+                }
+                let awaiting = a.reducer.awaiting_decision();
+                let running = a.reducer.is_running();
+                if !self.focused {
+                    if awaiting && !was_awaiting {
+                        self.alerts.push(format!("{}: needs you", a.title));
+                    } else if was_running && !running && !awaiting {
+                        self.alerts.push(format!("{}: done", a.title));
+                    }
                 }
             }
             NetMsg::Status {
@@ -934,6 +1126,20 @@ impl App {
                     a.reducer.send_failed(&prompt_id);
                 }
                 self.note(format!("send failed: {error}"));
+            }
+            NetMsg::CompleteFailed {
+                session_id,
+                tool_call_id,
+                error,
+            } => {
+                if let Some(a) = self
+                    .attached
+                    .as_mut()
+                    .filter(|a| a.session_id == session_id)
+                {
+                    a.reducer.decision_failed(&tool_call_id);
+                }
+                self.note(format!("answer failed: {error}"));
             }
         }
     }

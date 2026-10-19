@@ -113,6 +113,11 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
                     session_id,
                     prompt_id,
                 } => net.dequeue(session_id, prompt_id),
+                Cmd::Complete {
+                    session_id,
+                    tool_call_id,
+                    result_json,
+                } => net.complete_tool_call(session_id, tool_call_id, result_json),
                 Cmd::EditDraft { text } => {
                     // The editor owns the tty: stop reading input (the
                     // stream's reader thread would steal keystrokes), give
@@ -155,11 +160,23 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
             let want = app
                 .attached
                 .as_ref()
-                .map(|a| format!("{} · engrams", a.title))
+                .map(|a| {
+                    let mark = if a.reducer.awaiting_decision() {
+                        "⚠ needs you · "
+                    } else if a.reducer.is_running() {
+                        "⟳ "
+                    } else {
+                        ""
+                    };
+                    format!("{mark}{} · engrams", a.title)
+                })
                 .unwrap_or_else(|| "engrams".to_string());
             if want != title {
                 terminal::set_title(&want);
                 title = want;
+            }
+            for alert in app.alerts.drain(..) {
+                terminal::notify(&alert);
             }
             // The walk hit the top of memory: page history in.
             if app.attached.as_ref().is_some_and(|a| a.want_older) {

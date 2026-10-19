@@ -108,6 +108,33 @@ impl Net {
         });
     }
 
+    /// Answer a deferred tool call (a question, a plan decision).
+    pub fn complete_tool_call(
+        &self,
+        session_id: String,
+        tool_call_id: String,
+        result_json: String,
+    ) {
+        let c = self.clients.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let res = c
+                .complete_tool_call(CompleteToolCallRequest {
+                    session_id: session_id.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    result_json,
+                })
+                .await;
+            if let Err(e) = res {
+                let _ = tx.send(Msg::Net(NetMsg::CompleteFailed {
+                    session_id,
+                    tool_call_id,
+                    error: e.to_string(),
+                }));
+            }
+        });
+    }
+
     pub fn interrupt(&self, session_id: String) {
         let c = self.clients.clone();
         let tx = self.tx.clone();

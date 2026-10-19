@@ -69,11 +69,17 @@ pub enum Cell {
         tool_call_id: Box<str>,
         questions: Vec<crate::event::Question>,
         answered: bool,
+        /// The user's picks per question (option indices), while open.
+        picks: Vec<Vec<u16>>,
+        /// The question the number keys act on.
+        current: u16,
     },
     Plan {
         tool_call_id: Box<str>,
         text: Rendered,
         approved: Option<bool>,
+        /// The user's highlighted choice before Enter confirms it.
+        choice: Option<bool>,
     },
     /// A file the agent wrote or edited (`file_changed`): the tool call
     /// re-renders as a diff. `text` holds `+`/`-` prefixed lines.
