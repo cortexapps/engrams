@@ -136,11 +136,6 @@ pub const BINDINGS: &[Binding] = &[
         help: "shell in the sandbox (again: back to the agent)",
     },
     Binding {
-        keys: "Ctrl+L",
-        action: Action::Redraw,
-        help: "redraw",
-    },
-    Binding {
         keys: "/",
         action: Action::Char('/'),
         help: "commands (/new /shell /resume /transcript /dump …); Tab completes",
@@ -149,6 +144,11 @@ pub const BINDINGS: &[Binding] = &[
         keys: "?",
         action: Action::Help,
         help: "this list (on an empty draft)",
+    },
+    Binding {
+        keys: "Ctrl+L",
+        action: Action::Redraw,
+        help: "redraw",
     },
 ];
 
