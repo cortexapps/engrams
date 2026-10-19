@@ -178,7 +178,7 @@ zeroize = { version = "1", features = ["derive"] }
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
-nix = { version = "0.31", features = ["ioctl", "mount", "socket"] }
+nix = { version = "0.31", features = ["hostname", "ioctl", "mount", "socket"] }
 nom = { version = "7" }
 num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
@@ -198,7 +198,7 @@ rustix = { version = "1", features = ["fs"] }
 [target.x86_64-unknown-linux-musl.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
-nix = { version = "0.31", features = ["ioctl", "mount", "socket"] }
+nix = { version = "0.31", features = ["hostname", "ioctl", "mount", "socket"] }
 nom = { version = "7" }
 num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
@@ -218,7 +218,7 @@ rustix = { version = "1", features = ["fs"] }
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 errno = { version = "0.3" }
-nix = { version = "0.31", default-features = false, features = ["socket"] }
+nix = { version = "0.31", default-features = false, features = ["hostname", "socket"] }
 rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
@@ -233,7 +233,7 @@ rustix = { version = "1", features = ["fs"] }
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 errno = { version = "0.3" }
-nix = { version = "0.31", default-features = false, features = ["socket"] }
+nix = { version = "0.31", default-features = false, features = ["hostname", "socket"] }
 rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
