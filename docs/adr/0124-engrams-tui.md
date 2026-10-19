@@ -1,6 +1,6 @@
 # ADR 0124: `engrams tui`, a terminal client for sessions
 
-Status: Proposed (2026-10-19)
+Status: Accepted (2026-10-20); PR4-PR8 implemented in the PR chain listed under Phases.
 
 Terms used in this document:
 
@@ -132,14 +132,20 @@ pauses while scrolled up.
 
 ## Phases
 
-- PR4: this ADR, the crate core, both screen modes, session list, attach,
-  composer, footer, keymap, tests and budgets.
-- PR5: markdown writer, tool cells, file-change hunks, transcript search,
-  `$EDITOR`, `NO_COLOR`, screen-reader flattening.
-- PR6: approvals and questions via `CompleteToolCall`, notifications.
-- PR7: shell pane (`vt100`) and `engrams session shell`.
-- PR8: new session from the TUI, `/` commands, help overlay, docs,
-  status → Accepted.
+- PR4 (#1647): this ADR, the crate core, both screen modes, session list,
+  attach, composer, footer, keymap, tests and budgets.
+- PR5 (#1648): markdown writer, tool cells, file-change hunks, transcript
+  search, `$EDITOR`, `NO_COLOR`, screen-reader flattening.
+- PR6 (#1649): approvals and questions via `CompleteToolCall`,
+  notifications.
+- PR7 (#1650): shell pane (`vt100`) and `engrams session shell`.
+- PR8: new session from the TUI, `/` commands, `/transcript` and `/dump`,
+  docs, status → Accepted.
+
+The Rust CLI the TUI rides on landed first (#1644, #1645). One transport
+bug surfaced on the first run against a production deployment and was
+fixed on main before this chain merged (#1652): an empty-body POST needs
+an explicit `Content-Length: 0` through some front ends.
 
 ## Divergence log
 
@@ -230,6 +236,32 @@ pauses while scrolled up.
 - **PR7, `engrams session shell`.** The CLI verb is raw passthrough: raw
   mode, bytes both ways, `SIGWINCH` to a resize frame, and the process ends
   when the remote shell does. It has no escape key of its own.
+- **PR8, new session.** Ctrl+N (or `/new`) is an overlay over either
+  screen, not a screen of its own: a profile list from `ListProfiles`
+  (filtered as you type), then a prompt composer, then `CreateTask` with
+  the profile and the prompt. The TUI attaches to the task's primary
+  session from the response and refreshes the list; a failed create keeps
+  the prompt and shows the error. Harness, model and effort overrides are
+  not offered; the profile's defaults apply, as in the web's quick path.
+- **PR8, slash commands.** A draft of `/` plus letters is a command, not
+  a prompt. One static table drives the popup above the composer, Tab
+  completion (to the first match) and dispatch on Enter (an exact name,
+  or the only prefix match; an ambiguous prefix leaves the draft and
+  shows a note). There is no command history or argument parsing: every
+  command is a verb with no arguments.
+- **PR8, transcript export.** `/transcript` and `/dump` export the cells
+  still in memory as plain text (tool bodies in full, never collapsed).
+  `/transcript` reuses the `$EDITOR` hand-off from PR5 and discards the
+  file. `/dump` leaves the alternate screen, writes the text to the main
+  screen and comes back, so the terminal holds it as scrollback once the
+  TUI exits (Codex's dump technique). In native scrollback mode `/dump` is
+  a note: the transcript is already in the terminal. The export covers
+  the loaded window only, not events never paged in.
+- **PR8, the budgets.** The RSS gate against a stub orchestrator (D5)
+  stays unbuilt; the measured numbers are in the PR texts: 13-16 MB RSS
+  attached to a 5k-event session in fullscreen mode, 14 MB in native
+  scrollback mode, binary 4.2 MB. The in-process heap and frame budgets
+  in `tests/perf.rs` are the enforced part.
 - **PR4, cursor-position query.** An inline viewport needs the terminal
   to answer `CSI 6n`. A pseudo-terminal with no emulator behind it never
   does, and start-up blocks in crossterm's query. Real terminals answer.
