@@ -1916,6 +1916,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-app-client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "engram-tls",
+ "futures",
+ "prost",
+ "prost-build",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-aws"
 version = "0.1.0"
 dependencies = [
@@ -8402,6 +8419,8 @@ dependencies = [
  "ppv-lite86",
  "proc-macro2",
  "prost",
+ "prost-build",
+ "prost-types",
  "quote",
  "rand 0.8.7",
  "rand 0.9.4",
@@ -8427,6 +8446,7 @@ dependencies = [
  "subtle",
  "syn 2.0.117",
  "syn 3.0.3",
+ "tempfile",
  "thiserror 2.0.21",
  "time",
  "time-macros",

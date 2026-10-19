@@ -55,6 +55,7 @@ members = [
     "crates/engram-storage-s3",
     "crates/engram-storage-gcs",
     "crates/engram-blob-client",
+    "crates/engram-app-client",
     "workspace-hack",
 ]
 
@@ -142,6 +143,7 @@ engram-storage-local = { path = "crates/engram-storage-local" }
 engram-storage-s3 = { path = "crates/engram-storage-s3" }
 engram-storage-gcs = { path = "crates/engram-storage-gcs" }
 engram-blob-client = { path = "crates/engram-blob-client" }
+engram-app-client = { path = "crates/engram-app-client" }
 engram-chunk-store = { path = "crates/engram-chunk-store" }
 engram-telemetry = { path = "crates/engram-telemetry" }
 
@@ -217,6 +219,10 @@ tonic-prost-build = "0.14"
 tonic-reflection = "0.14"
 prost = "0.14"
 prost-types = "0.14"
+# Message-only codegen (no tonic services) for client crates that must not
+# pull the coordinator's gRPC stack: engram-app-client compiles the
+# orchestrator app contract with it.
+prost-build = "0.14"
 
 # data
 serde = { version = "1", features = ["derive"] }
