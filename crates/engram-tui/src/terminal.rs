@@ -112,6 +112,18 @@ impl Drop for Guard {
     }
 }
 
+/// Ring the bell and post a desktop notification (OSC 9, OSC 777) for an
+/// unfocused terminal. Terminals that know neither ignore the sequences.
+pub fn notify(text: &str) {
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    let mut out = io::stdout();
+    let _ = write!(
+        out,
+        "\x07\x1b]9;{text}\x07\x1b]777;notify;engrams;{text}\x07"
+    );
+    let _ = out.flush();
+}
+
 /// Set the window title.
 pub fn set_title(title: &str) {
     let _ = execute!(io::stdout(), crossterm::terminal::SetTitle(title));

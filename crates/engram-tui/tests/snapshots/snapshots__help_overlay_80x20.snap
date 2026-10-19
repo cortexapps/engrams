@@ -2,7 +2,6 @@
 source: crates/engram-tui/tests/snapshots.rs
 expression: "frame(&mut app, 80, 20)"
 ---
-" Add a README                                                                   "
 " keys any key closes                                                            "
 " Enter                      send (queues while the agent works)                 "
 " Shift+Enter / Ctrl+J       newline                                             "
@@ -15,6 +14,7 @@ expression: "frame(&mut app, 80, 20)"
 " PgUp / PgDn                scroll the transcript                               "
 " Ctrl+Home / Ctrl+End       jump to the top / bottom                            "
 " Ctrl+A/E/K/U/W/Y, Alt+B/F  emacs editing                                       "
+" 1-9 / Enter / Tab          answer a question / decide on a plan                "
 " Ctrl+T                     search the transcript (Enter next · Esc close)      "
 " Ctrl+G                     edit the draft in $EDITOR                           "
 " Ctrl+L                     redraw                                              "

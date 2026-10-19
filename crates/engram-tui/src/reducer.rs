@@ -83,6 +83,52 @@ impl Reducer {
         !self.pending_decisions.is_empty()
     }
 
+    /// The oldest pending decision: its cell and tool_call_id.
+    pub fn pending_decision(&self) -> Option<(usize, String)> {
+        self.pending_decisions
+            .iter()
+            .filter_map(|id| self.decisions.get(id).map(|&i| (i, id.clone())))
+            .min()
+    }
+
+    /// The user answered (optimistically, like the web): the cell locks
+    /// into its receipt and the run counts as running again. The
+    /// authoritative `tool_result_submitted` lands later.
+    pub fn decide(&mut self, tool_call_id: &str, approved: Option<bool>) {
+        if !self.pending_decisions.remove(tool_call_id) {
+            return;
+        }
+        if let Some(e) = self
+            .decisions
+            .get(tool_call_id)
+            .and_then(|&i| self.transcript.get_mut(i))
+        {
+            match &mut e.cell {
+                Cell::Question { answered, .. } => *answered = true,
+                Cell::Plan { approved: a, .. } => *a = approved,
+                _ => {}
+            }
+            e.invalidate();
+        }
+    }
+
+    /// The RPC failed: the decision is pending again.
+    pub fn decision_failed(&mut self, tool_call_id: &str) {
+        let Some(&i) = self.decisions.get(tool_call_id) else {
+            return;
+        };
+        let Some(e) = self.transcript.get_mut(i) else {
+            return;
+        };
+        match &mut e.cell {
+            Cell::Question { answered, .. } if *answered => *answered = false,
+            Cell::Plan { approved, .. } if approved.is_some() => *approved = None,
+            _ => return,
+        }
+        e.invalidate();
+        self.pending_decisions.insert(tool_call_id.to_string());
+    }
+
     fn tail_awaiting(&self) -> bool {
         let Some(last) = self.transcript.last_index() else {
             return false;
@@ -477,6 +523,7 @@ impl Reducer {
                             tool_call_id: tool_call_id.as_str().into(),
                             text: Rendered::render(&plan),
                             approved: None,
+                            choice: None,
                         });
                         self.decisions.insert(tool_call_id.clone(), i);
                         self.pending_decisions.insert(tool_call_id);
@@ -486,10 +533,13 @@ impl Reducer {
                 if name == "ask_user_question" {
                     if let Some(questions) = parse_questions(&args_json) {
                         self.close_active();
+                        let picks = vec![Vec::new(); questions.len()];
                         let i = self.transcript.push(Cell::Question {
                             tool_call_id: tool_call_id.as_str().into(),
                             questions,
                             answered: false,
+                            picks,
+                            current: 0,
                         });
                         self.decisions.insert(tool_call_id.clone(), i);
                         self.pending_decisions.insert(tool_call_id);
@@ -698,10 +748,13 @@ impl Reducer {
                 questions,
             } => {
                 self.close_active();
+                let picks = vec![Vec::new(); questions.len()];
                 let i = self.transcript.push(Cell::Question {
                     tool_call_id: tool_call_id.as_str().into(),
                     questions,
                     answered: false,
+                    picks,
+                    current: 0,
                 });
                 self.decisions.insert(tool_call_id.clone(), i);
                 self.pending_decisions.insert(tool_call_id);

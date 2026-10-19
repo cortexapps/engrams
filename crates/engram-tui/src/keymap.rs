@@ -107,6 +107,11 @@ pub const BINDINGS: &[Binding] = &[
         help: "emacs editing",
     },
     Binding {
+        keys: "1-9 / Enter / Tab",
+        action: Action::Char('1'),
+        help: "answer a question / decide on a plan",
+    },
+    Binding {
         keys: "Ctrl+T",
         action: Action::Search,
         help: "search the transcript (Enter next · Esc close)",

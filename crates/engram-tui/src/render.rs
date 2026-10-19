@@ -383,19 +383,70 @@ fn paint_src<'e>(
                     }
                     let _ = cx;
                 }
-                Cell::Plan { approved, .. } => {
-                    let text = match approved {
-                        None => "plan awaiting your decision",
-                        Some(true) => "plan approved",
-                        Some(false) => "plan rejected",
-                    };
-                    put(buf, body_x, y, text, body_w, tail_style);
-                }
-                Cell::Question { answered, .. } => {
+                Cell::Plan {
+                    approved, choice, ..
+                } => match approved {
+                    Some(true) => {
+                        put(buf, body_x, y, "plan approved", body_w, tail_style);
+                    }
+                    Some(false) => {
+                        put(buf, body_x, y, "plan rejected", body_w, tail_style);
+                    }
+                    None => {
+                        let a = if *choice == Some(true) {
+                            th.accent
+                        } else {
+                            tail_style
+                        };
+                        let r = if *choice == Some(false) {
+                            th.accent
+                        } else {
+                            tail_style
+                        };
+                        let mut cx = put(buf, body_x, y, "1 approve", body_w, a);
+                        cx += put(
+                            buf,
+                            body_x + cx,
+                            y,
+                            "  ",
+                            body_w.saturating_sub(cx),
+                            tail_style,
+                        );
+                        cx += put(
+                            buf,
+                            body_x + cx,
+                            y,
+                            "2 reject",
+                            body_w.saturating_sub(cx),
+                            r,
+                        );
+                        put(
+                            buf,
+                            body_x + cx,
+                            y,
+                            "  Tab feedback · Enter confirm",
+                            body_w.saturating_sub(cx),
+                            tail_style,
+                        );
+                    }
+                },
+                Cell::Question {
+                    answered,
+                    questions,
+                    current,
+                    ..
+                } => {
                     let text = if *answered {
                         "answered"
+                    } else if questions
+                        .get(*current as usize)
+                        .is_some_and(|q| q.multi_select)
+                    {
+                        "1-9 toggle · Enter confirm"
+                    } else if questions.len() > 1 {
+                        "1-9 pick · Enter next question"
                     } else {
-                        "question awaiting your answer"
+                        "1-9 pick · Enter confirm"
                     };
                     put(buf, body_x, y, text, body_w, tail_style);
                 }
@@ -497,21 +548,60 @@ fn paint_src<'e>(
             );
             Some(text)
         }
-        Src::Option(_, j) => {
+        Src::Option(qi, j) => {
             let text = e.source(lr.src);
             let s = &text[lr.row.start as usize..lr.row.end as usize];
             let mut cx = 0;
+            let (picked, multi, live, current) = match &e.cell {
+                Cell::Question {
+                    questions,
+                    picks,
+                    answered,
+                    current,
+                    ..
+                } => (
+                    picks.get(qi as usize).is_some_and(|p| p.contains(&j)),
+                    questions.get(qi as usize).is_some_and(|q| q.multi_select),
+                    !*answered,
+                    *current == qi,
+                ),
+                _ => (false, false, false, false),
+            };
             if lr.row.start == 0 {
                 cx = put_num(buf, body_x + 2, y, j as u64 + 1, th.dim);
                 cx += put(buf, body_x + 2 + cx, y, ". ", body_w, th.dim);
+                if live || picked {
+                    let mark = match (multi, picked) {
+                        (true, true) => "[x] ",
+                        (true, false) => "[ ] ",
+                        (false, true) => "(•) ",
+                        (false, false) => "( ) ",
+                    };
+                    let ms = if picked { th.accent } else { th.dim };
+                    cx += put(
+                        buf,
+                        body_x + 2 + cx,
+                        y,
+                        mark,
+                        body_w.saturating_sub(2 + cx),
+                        ms,
+                    );
+                }
             }
+            let os = if picked {
+                style.add_modifier(Modifier::BOLD)
+            } else if live && !current {
+                th.dim
+            } else {
+                style
+            };
             put(
                 buf,
                 body_x + 2 + cx,
                 y,
                 s,
                 body_w.saturating_sub(2 + cx),
-                style,
+                os,
             );
             Some(text)
         }
@@ -680,7 +770,11 @@ fn draw_composer(buf: &mut Buffer, area: Rect, a: &mut Attached, th: &Theme) -> 
         put(buf, area.x + 2, y, s, width, Style::new());
     }
     if text.is_empty() {
-        let hint = if running {
+        let hint = if a.feedback {
+            "feedback for the agent · Enter rejects the plan with it · Esc cancels"
+        } else if a.reducer.awaiting_decision() {
+            "answer above, or type to queue a message"
+        } else if running {
             "type to queue a message · Esc interrupts"
         } else if !can_send {
             "this session is finished"
