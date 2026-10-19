@@ -41,7 +41,7 @@ IMAGE_URI="${ENGRAM_E2E_IMAGE_URI:-ghcr.io/cortex/demo:warm-1}"
 # All verbs go through the `engrams` CLI → the orchestrator's Connect
 # surface. Endpoint + admin key default to the `just dev` stack (Tilt
 # seeds var/dev-api-key). (The coord `/healthz` check below is a KEPT
-# internal REST route, left as-is.) The helper resolves cli/ +
+# internal REST route, left as-is.) The helper resolves the binary +
 # var/dev-api-key relative to the repo root.
 cd "$(git rev-parse --show-toplevel)"
 source deploy/dev/engrams-cli.sh

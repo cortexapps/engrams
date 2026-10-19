@@ -62,15 +62,15 @@ The agent needs a model key. In the dashboard, open Settings and either connect 
 Now build the CLI and start a session against the demo image:
 
 ```bash
-(cd cli && bun install && bun run build)      # -> cli/dist/engrams
+cargo build --profile cli -p engram-cli      # -> target/cli/engrams
 export ENGRAMS_URL=http://localhost:8787
 export ENGRAMS_API_KEY=$(cat var/dev-api-key)  # the admin key `just dev` seeds
 
-SID=$(cli/dist/engrams session create \
+SID=$(target/cli/engrams session create \
   --image localhost:5001/demo:warm-1 \
   --harness claude \
   --prompt "List /workspace and describe what you find.")
-cli/dist/engrams session logs "$SID"
+target/cli/engrams session logs "$SID"
 ```
 
 The log shows the agent's messages and tool calls as they happen. The same session is now in the dashboard. Leave it alone for a few minutes and it snapshots and stops; send another prompt with `engrams session prompt "$SID" "..."` and it resumes where it left off.

@@ -11,13 +11,13 @@ moving parts; the dashboard does the same things with a form.
 
 ## Build the CLI
 
-The `engrams` CLI is a single binary built with Bun:
+The `engrams` CLI is a single binary built with cargo:
 
 ```sh
-(cd cli && bun install && bun run build)
+cargo build --profile cli -p engram-cli
 ```
 
-That leaves `cli/dist/engrams`. Put it on your `PATH` or call it by path; the examples below
+That leaves `target/cli/engrams`. Put it on your `PATH` or call it by path; the examples below
 call it by path.
 
 ## Point it at the stack
@@ -37,7 +37,7 @@ the browser and stores a personal key in `~/.config/engrams/hosts.json`. The
 ## Start a session
 
 ```sh
-SID=$(cli/dist/engrams session create \
+SID=$(target/cli/engrams session create \
   --image localhost:5001/demo:warm-1 \
   --harness claude \
   --prompt "List /workspace and describe what you find.")
@@ -51,7 +51,7 @@ and the Claude Code harness started with your prompt.
 Watch the transcript:
 
 ```sh
-cli/dist/engrams session logs "$SID"
+target/cli/engrams session logs "$SID"
 ```
 
 This tails the session's event log: the agent's messages, each tool call as it starts and
@@ -65,7 +65,7 @@ diagnostics.
 Run a command inside the VM while the agent works:
 
 ```sh
-cli/dist/engrams session exec "$SID" 'uname -a; ls /workspace'
+target/cli/engrams session exec "$SID" 'uname -a; ls /workspace'
 ```
 
 `session exec` streams stdout and stderr and exits with the remote command's exit code. The
@@ -82,7 +82,7 @@ as idle and it holds no host resources.
 Now send another prompt:
 
 ```sh
-cli/dist/engrams session prompt "$SID" "Now write a short README for what you found."
+target/cli/engrams session prompt "$SID" "Now write a short README for what you found."
 ```
 
 The prompt resumes the snapshot, and the agent continues in the same process with the same
@@ -91,7 +91,7 @@ context, because the memory it had is the memory it gets back.
 When you are done:
 
 ```sh
-cli/dist/engrams session delete "$SID"
+target/cli/engrams session delete "$SID"
 ```
 
 ## Tasks and profiles
@@ -100,7 +100,7 @@ cli/dist/engrams session delete "$SID"
 beyond an enabled image. Day to day, work starts as a task from a profile:
 
 ```sh
-cli/dist/engrams task create --profile backend --prompt "Fix the flaky test in CI"
+target/cli/engrams task create --profile backend --prompt "Fix the flaky test in CI"
 ```
 
 A profile bundles the image, the repositories to clone, environment variables, the egress

@@ -12,8 +12,8 @@
 #     host-agent are all up).
 #   - docker (for `docker build && docker push`).
 #   - the `engrams` CLI (for `image enable` + the readiness polls):
-#     a compiled binary via ENGRAMS_BIN, else run from cli/ source
-#     with bun (see deploy/dev/engrams-cli.sh).
+#     a compiled binary via ENGRAMS_BIN, else a debug build of
+#     crates/engram-cli (see deploy/dev/engrams-cli.sh).
 #
 # Side effects:
 #   - Pushes a standard docker image to localhost:5001 under
