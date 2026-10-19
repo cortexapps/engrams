@@ -191,12 +191,16 @@ async fn dispatch(
                 )
             }
         }
+        // The frames the orchestrator's events route writes: `data:` is the
+        // `{idx, kind, payload_json}` envelope, and a lagged frame has no
+        // `id:` line and a null idx.
         p if p.starts_with("/api/v1/sessions/") && p.ends_with("/events") => (
             [(header::CONTENT_TYPE, "text/event-stream")],
             concat!(
                 "event: ping\ndata: \n\n",
-                "id: 0\nevent: run_started\ndata: {\"run_id\":\"r-1\"}\n\n",
-                "id: 1\nevent: agent_message\ndata: {\"text\":\"hello\"}\n\n",
+                "id: 0\nevent: run_started\ndata: {\"idx\":0,\"kind\":\"run_started\",\"payload_json\":\"{\\\"run_id\\\":\\\"r-1\\\"}\"}\n\n",
+                "id: 1\nevent: agent_message\ndata: {\"idx\":1,\"kind\":\"agent_message\",\"payload_json\":\"{ \\\"text\\\": \\\"hello\\\" }\"}\n\n",
+                "event: lagged\ndata: {\"idx\":null,\"kind\":\"lagged\",\"payload_json\":\"{\\\"missed\\\":3}\"}\n\n",
             ),
         )
             .into_response(),
@@ -354,8 +358,11 @@ async fn session_logs_tails_the_sse_route_skipping_pings() {
     let r = h.run(&["session", "logs", "sess-1"], &[], None).await;
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     let lines: Vec<&str> = r.stdout.trim().split('\n').collect();
+    // The payload, compacted, not the `{idx,kind,payload_json}` envelope.
     assert_eq!(lines[0], r#"[     0] run_started: {"run_id":"r-1"}"#);
     assert_eq!(lines[1], r#"[     1] agent_message: {"text":"hello"}"#);
+    assert_eq!(lines[2], r#"[     -] lagged: {"missed":3}"#);
+    assert_eq!(lines.len(), 3);
     assert!(!r.stdout.contains("ping"));
 }
 

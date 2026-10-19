@@ -243,6 +243,16 @@ pub fn format_event_line(idx: Option<&str>, kind: &str, payload_json: &str) -> S
     format!("[{}] {kind}: {payload}", pad_start(idx.unwrap_or("-"), 6))
 }
 
+/// The `data:` line of one event frame on the orchestrator's SSE route:
+/// `{"idx": n | null, "kind": …, "payload_json": "…"}`. `idx` is null on a
+/// `lagged` frame, which also carries no `id:` line.
+#[derive(serde::Deserialize)]
+struct EventEnvelope {
+    idx: Option<i64>,
+    kind: String,
+    payload_json: String,
+}
+
 /// Tail the persistent event log via the orchestrator's SSE route
 /// (`GET /api/v1/sessions/:id/events`). Stays open; Ctrl-C to stop.
 pub async fn logs(c: &Clients, id: &str, since: Option<i64>) -> CliResult {
@@ -257,15 +267,22 @@ pub async fn logs(c: &Clients, id: &str, since: Option<i64>) -> CliResult {
         .await
         .map_err(|e| CliError::Message(e.message))?
     {
-        match frame.event.as_deref() {
-            Some("ping") | None => continue,
-            Some(kind) => {
-                println!(
-                    "{}",
-                    format_event_line(frame.id.as_deref(), kind, &frame.data.join("\n"))
-                )
-            }
+        let Some(kind) = frame.event.as_deref() else {
+            continue;
+        };
+        if kind == "ping" {
+            continue;
         }
+        let data = frame.data.join("\n");
+        let line = match serde_json::from_str::<EventEnvelope>(&data) {
+            Ok(env) => {
+                let idx = env.idx.map(|i| i.to_string());
+                format_event_line(idx.as_deref(), &env.kind, &env.payload_json)
+            }
+            // Not the orchestrator's envelope: show the frame as it came.
+            Err(_) => format_event_line(frame.id.as_deref(), kind, &data),
+        };
+        println!("{line}");
     }
     Ok(())
 }
