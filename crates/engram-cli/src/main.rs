@@ -87,6 +87,17 @@ enum Commands {
         #[command(subcommand)]
         cmd: AdminCmd,
     },
+    /// attach a terminal UI to a session (ADR 0124)
+    Tui {
+        /// session to attach to; omit for the session list
+        session_id: Option<String>,
+        /// keep the terminal's own scrollback: no alternate screen
+        #[arg(long)]
+        no_alt_screen: bool,
+        /// do not capture the mouse (wheel scrolling off; native selection on)
+        #[arg(long)]
+        no_mouse: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -476,6 +487,8 @@ async fn run(cli: Cli) -> CliResult {
                 AdminCmd::Gc { apply, grace_secs } => admin::gc(&c, apply, grace_secs, json).await,
             }
         }
+        // Dispatched in `main` before the runtime starts.
+        Commands::Tui { .. } => Ok(()),
     }
 }
 
@@ -492,6 +505,39 @@ fn main() {
     };
     if cli.version {
         println!("{VERSION}");
+        return;
+    }
+    // The TUI owns its own runtime and the terminal; it never runs inside
+    // the CLI's runtime below.
+    if let Some(Commands::Tui {
+        session_id,
+        no_alt_screen,
+        no_mouse,
+    }) = &cli.command
+    {
+        let ctx = Ctx {
+            host: resolve_host(cli.url.as_deref()),
+            json: false,
+        };
+        let clients = match ctx.clients() {
+            Ok(c) => c,
+            Err(CliError::Message(m)) => {
+                eprintln!("engrams: {m}");
+                std::process::exit(1);
+            }
+            Err(CliError::Exit(code)) => std::process::exit(code),
+        };
+        let env_on = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty() && v != "0");
+        let opts = engram_tui::Options {
+            session_id: session_id.clone(),
+            inline: *no_alt_screen || env_on("ENGRAMS_TUI_NO_ALT_SCREEN"),
+            mouse: !*no_mouse && !env_on("ENGRAMS_TUI_NO_MOUSE"),
+            color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
+        };
+        if let Err(m) = engram_tui::run(clients, opts) {
+            eprintln!("engrams: {m}");
+            std::process::exit(1);
+        }
         return;
     }
     let rt = tokio::runtime::Builder::new_current_thread()
