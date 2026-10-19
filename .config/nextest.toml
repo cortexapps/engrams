@@ -55,3 +55,11 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [[profile.default.overrides]]
 filter = "package(engram-dst-host) & binary(regression_seeds)"
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+# ADR 0124 D5: the TUI frame-time budget is a wall-clock measurement. Under
+# a full-workspace run every core is busy and a debug frame that takes 3 ms
+# alone has been observed at 70 ms, so the test takes the whole machine and
+# runs once the other tests have drained.
+[[profile.default.overrides]]
+filter = "package(engram-tui) & binary(perf)"
+threads-required = "num-cpus"
