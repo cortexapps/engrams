@@ -8,7 +8,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::app::{shell_pane_rows, App, Attached, Screen};
+use crate::app::{shell_pane_rows, App, Attached, NewSession, NewStage, Screen};
 use crate::keymap::BINDINGS;
 use crate::markdown::{flags, Run};
 use crate::sessions::{age, marker};
@@ -855,6 +855,14 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) {
         );
         return;
     }
+    if let Some(ns) = &app.new_session {
+        let hint = match ns.stage {
+            NewStage::Pick => " new session  ↑↓ pick · type to filter · Enter choose · Esc close",
+            NewStage::Prompt => " new session  Enter create · Shift+Enter newline · Esc back",
+        };
+        put(buf, area.x, y, hint, w, th.dim);
+        return;
+    }
     match (&app.attached, app.screen) {
         (Some(a), Screen::Attached) => {
             let m = marker(a.reducer.status.as_deref().unwrap_or(""));
@@ -1029,6 +1037,165 @@ fn draw_sessions(buf: &mut Buffer, area: Rect, app: &App, th: &Theme, title: &st
     }
 }
 
+/// The new-session overlay: the profile list with its filter, or the
+/// prompt composer under the chosen profile. Returns the cursor.
+fn draw_new_session(
+    buf: &mut Buffer,
+    area: Rect,
+    ns: &mut NewSession,
+    th: &Theme,
+) -> Option<Position> {
+    if area.height < 2 {
+        return None;
+    }
+    fill(buf, area, Style::new());
+    let y0 = area.y;
+    let mut cx = put(
+        buf,
+        area.x + 1,
+        y0,
+        "new session",
+        area.width.saturating_sub(1),
+        th.accent,
+    );
+    let inner = Rect {
+        y: y0 + 1,
+        height: area.height - 1,
+        ..area
+    };
+    match ns.stage {
+        NewStage::Pick => {
+            cx += put(buf, area.x + 1 + cx, y0, "  / ", 4, th.dim);
+            put(
+                buf,
+                area.x + 1 + cx,
+                y0,
+                &ns.filter,
+                area.width.saturating_sub(1 + cx),
+                th.user,
+            );
+            if let Some(e) = &ns.error {
+                put(
+                    buf,
+                    inner.x + 1,
+                    inner.y,
+                    e,
+                    inner.width.saturating_sub(1),
+                    th.err,
+                );
+                return None;
+            }
+            if ns.loading {
+                put(buf, inner.x + 1, inner.y, "loading profiles…", 17, th.dim);
+                return None;
+            }
+            let n = inner.height as usize;
+            let selected = ns.selected;
+            let first = selected.saturating_sub(n.saturating_sub(1));
+            let mut shown = 0usize;
+            for (row, i) in ns.visible().skip(first).take(n).enumerate() {
+                let p = &ns.profiles[i];
+                let y = inner.y + row as u16;
+                let style = if first + row == selected {
+                    th.selected
+                } else {
+                    Style::new()
+                };
+                let line = Rect {
+                    y,
+                    height: 1,
+                    ..inner
+                };
+                fill(buf, line, style);
+                let mut x = inner.x + 1;
+                x += put(buf, x, y, &p.name, inner.width.saturating_sub(1), style);
+                if !p.description.is_empty() && x + 3 < inner.right() {
+                    x += put(buf, x, y, "  ", 2, style);
+                    put(
+                        buf,
+                        x,
+                        y,
+                        &p.description,
+                        inner.right().saturating_sub(x + 1),
+                        style.patch(th.dim),
+                    );
+                }
+                shown += 1;
+            }
+            if shown == 0 {
+                let msg = if ns.profiles.is_empty() {
+                    "no profiles; an admin must create one"
+                } else {
+                    "no profile matches"
+                };
+                put(
+                    buf,
+                    inner.x + 1,
+                    inner.y,
+                    msg,
+                    inner.width.saturating_sub(1),
+                    th.dim,
+                );
+            }
+            None
+        }
+        NewStage::Prompt => {
+            if let Some(p) = ns.selected_profile() {
+                cx += put(buf, area.x + 1 + cx, y0, " · ", 3, th.dim);
+                put(
+                    buf,
+                    area.x + 1 + cx,
+                    y0,
+                    &p.name,
+                    area.width.saturating_sub(1 + cx),
+                    th.user,
+                );
+            }
+            let width = inner.width.saturating_sub(3).max(1);
+            let (crow, ccol) = ns.composer.layout(width);
+            let rows = ns.composer.rows();
+            let text = ns.composer.text();
+            let visible = inner.height.saturating_sub(1) as usize;
+            let top = (crow as usize + 1).saturating_sub(visible.max(1));
+            put(buf, inner.x + 1, inner.y, "›", 1, th.user);
+            for (y, r) in (inner.top()..inner.bottom().saturating_sub(1)).zip(rows.iter().skip(top))
+            {
+                let line = &text[r.start as usize..r.end as usize];
+                put(buf, inner.x + 3, y, line, width, Style::new());
+            }
+            if text.is_empty() {
+                put(
+                    buf,
+                    inner.x + 3,
+                    inner.y,
+                    "describe the task",
+                    width,
+                    th.dim,
+                );
+            }
+            let hint_y = inner.bottom() - 1;
+            if let Some(e) = &ns.error {
+                put(
+                    buf,
+                    inner.x + 1,
+                    hint_y,
+                    e,
+                    inner.width.saturating_sub(1),
+                    th.err,
+                );
+                return None;
+            }
+            if ns.creating {
+                put(buf, inner.x + 1, hint_y, "creating…", 9, th.dim);
+            }
+            Some(Position::new(
+                inner.x + 3 + ccol.min(width.saturating_sub(1)),
+                inner.y + (crow as usize - top) as u16,
+            ))
+        }
+    }
+}
+
 fn draw_help(buf: &mut Buffer, area: Rect, th: &Theme) {
     let h = (BINDINGS.len() as u16 + 2).min(area.height);
     // Full width on a narrow terminal so no transcript shows through.
@@ -1155,6 +1322,19 @@ pub fn draw_fullscreen(
         draw_sessions(buf, r, app, th, "switch session");
         cursor = None;
     }
+    if let Some(ns) = &mut app.new_session {
+        let rows = match ns.stage {
+            NewStage::Pick => ns.visible().count().max(1) as u16 + 1,
+            NewStage::Prompt => 8,
+        };
+        let h = (rows + 1).clamp(3, body.height.saturating_sub(1).max(3));
+        let r = Rect {
+            y: body.y + 1,
+            height: h.min(body.height),
+            ..body
+        };
+        cursor = draw_new_session(buf, r, ns, th);
+    }
     if app.help {
         draw_help(buf, body, th);
         cursor = None;
@@ -1224,6 +1404,9 @@ pub fn draw_inline(
         fill(buf, body, Style::new());
         draw_sessions(buf, body, app, th, "switch session");
         cursor = None;
+    }
+    if let Some(ns) = &mut app.new_session {
+        cursor = draw_new_session(buf, body, ns, th);
     }
     if app.help {
         draw_help(buf, body, th);

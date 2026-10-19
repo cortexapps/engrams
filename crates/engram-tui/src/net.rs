@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::app::{Msg, NetMsg, PAGE};
 use crate::event::Envelope;
-use crate::sessions::rows_from_tasks;
+use crate::sessions::{rows_from_profiles, rows_from_tasks};
 
 pub struct Net {
     clients: Clients,
@@ -63,6 +63,54 @@ impl Net {
                 .map(|r| rows_from_tasks(&r.tasks, now_unix()))
                 .map_err(|e| e.to_string());
             let _ = tx.send(Msg::Net(NetMsg::Sessions(res)));
+        });
+    }
+
+    pub fn load_profiles(&self) {
+        let c = self.clients.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let res = c
+                .list_profiles(ListProfilesRequest {
+                    include_archived: false,
+                })
+                .await
+                .map(|r| rows_from_profiles(&r.profiles))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Net(NetMsg::Profiles(res)));
+        });
+    }
+
+    /// `CreateTask` with the prompt; answers with the primary session's id
+    /// and the task's title (the prompt's first line when the server set
+    /// none).
+    pub fn create_task(&self, profile_id: String, prompt: String) {
+        let c = self.clients.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let fallback = prompt.lines().next().unwrap_or_default().to_string();
+            let res = c
+                .create_task(CreateTaskRequest {
+                    r#type: "chat".into(),
+                    prompt: Some(prompt),
+                    profile_id,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| {
+                    let task = r
+                        .task
+                        .ok_or_else(|| "the server returned no task".to_string())?;
+                    let session_id = task
+                        .sessions
+                        .first()
+                        .map(|s| s.session_id.clone())
+                        .ok_or_else(|| "the task has no session".to_string())?;
+                    let title = task.title.filter(|t| !t.is_empty()).unwrap_or(fallback);
+                    Ok((session_id, title))
+                });
+            let _ = tx.send(Msg::Net(NetMsg::Created(res)));
         });
     }
 

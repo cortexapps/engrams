@@ -103,6 +103,8 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
         for cmd in cmds {
             match cmd {
                 Cmd::LoadSessions => net.load_sessions(),
+                Cmd::LoadProfiles => net.load_profiles(),
+                Cmd::CreateTask { profile_id, prompt } => net.create_task(profile_id, prompt),
                 Cmd::Attach { session_id } => net.attach(session_id),
                 Cmd::Detach => net.detach(),
                 Cmd::LoadOlder {

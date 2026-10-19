@@ -27,6 +27,8 @@ pub enum Action {
     EditDraft,
     /// Open or focus the shell pane.
     Shell,
+    /// The new-session picker.
+    NewSession,
     Backspace,
     Delete,
     Left,
@@ -82,6 +84,11 @@ pub const BINDINGS: &[Binding] = &[
         keys: "Ctrl+P",
         action: Action::Palette,
         help: "session palette",
+    },
+    Binding {
+        keys: "Ctrl+N",
+        action: Action::NewSession,
+        help: "new session (pick a profile, type the first prompt)",
     },
     Binding {
         keys: "Alt+↑ / Alt+↓",
@@ -174,6 +181,7 @@ pub fn resolve(key: &KeyEvent, draft_empty: bool) -> Option<Action> {
             'c' => Action::CtrlC,
             'd' => Action::Detach,
             'p' => Action::Palette,
+            'n' => Action::NewSession,
             'o' => Action::ExpandLast,
             'e' => Action::ExpandAll,
             'j' | 'm' => Action::Newline,
