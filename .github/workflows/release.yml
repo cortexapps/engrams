@@ -11,7 +11,9 @@ name: Release
 # release ships are the bytes that CI tested on main.
 #
 # How to release:
-#   1. Merge a PR that runs `scripts/release-version.sh set <version>`.
+#   1. Merge a PR that runs `scripts/release-version.sh set <version>` and
+#      adds the `## [<version>]` entry to CHANGELOG.md. The entry is the
+#      text of the GitHub release.
 #   2. Wait for the 'Bake container images' run of that merge to finish.
 #   3. Start this workflow on main with the same version. Use `dry_run` to see
 #      the plan first.
@@ -123,6 +125,28 @@ jobs:
             exit 1
           fi
 
+      # The release notes are the CHANGELOG.md entry of the version. Read it
+      # before the first write, so a release with no entry changes nothing.
+      # The entry uses reference links, so the notes also get the link
+      # definitions at the end of the file.
+      - name: Read the release notes
+        run: |
+          set -euo pipefail
+          awk -v head="## [$VERSION]" '
+            index($0, head) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/changelog.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/changelog.md"; then
+            echo "::error::CHANGELOG.md has no entry for $VERSION. Add a '## [$VERSION] - <date>' section and merge it before the release."
+            exit 1
+          fi
+          {
+            echo
+            grep -E '^\[[^]]+\]: ' CHANGELOG.md || true
+          } >> "$RUNNER_TEMP/changelog.md"
+          cat "$RUNNER_TEMP/changelog.md" >> "$GITHUB_STEP_SUMMARY"
+
       # detect-rebake-lanes.py reads the cargo dependency graph.
       - uses: dtolnay/rust-toolchain@stable
 
@@ -227,21 +251,18 @@ jobs:
           {
             echo "To install or upgrade, see [Releases and upgrades](https://github.com/$REPO/blob/v$VERSION/docs/deploy.md#releases-and-upgrades)."
             echo
+            cat "$RUNNER_TEMP/changelog.md"
+            echo
+            echo "<details><summary>Artifacts</summary>"
+            echo
             cat "$RUNNER_TEMP/images.md"
+            echo
+            echo "</details>"
           } > "$RUNNER_TEMP/notes.md"
-          # Generated notes list the pull requests since the last version
-          # tag. The repository also has `fc-kernel-*` releases, so name the
-          # start tag; the first version has no start tag and gets no list.
-          notes_args=()
-          previous="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)"
-          if [[ -n "$previous" ]]; then
-            notes_args=(--generate-notes --notes-start-tag "$previous")
-          fi
           gh release create "v$VERSION" \
             --target "$SHA" \
             --title "v$VERSION" \
             --notes-file "$RUNNER_TEMP/notes.md" \
-            "${notes_args[@]}" \
             --latest \
             "$RUNNER_TEMP"/cli/engrams-* "$RUNNER_TEMP/cli/SHA256SUMS"
           echo "Released https://github.com/$REPO/releases/tag/v$VERSION" >> "$GITHUB_STEP_SUMMARY"

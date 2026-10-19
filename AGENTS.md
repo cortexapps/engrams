@@ -163,6 +163,9 @@ that commit). A version tag never moves.
 1. Merge a PR that runs `scripts/release-version.sh set <version>`. The version lives in
    both charts (`version` and `appVersion`) and in the CLI; the script is the only way to
    change it. The chart `appVersion` is the default image tag and the version the site shows.
+   The same PR adds the `## [<version>]` entry to `CHANGELOG.md` (Keep a Changelog, with
+   upgrade notes first). That entry is the text of the GitHub release; a release with no
+   entry stops before it changes anything.
 2. Wait for the `Bake container images` run of that merge.
 3. Start the `Release` workflow on `main` with the same version. `dry_run` prints the plan
    and publishes nothing.
