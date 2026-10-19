@@ -185,6 +185,22 @@ pauses while scrolled up.
   tool card in place as a diff (`+`/`-` lines, counts on the head row,
   collapsed like a tool body); the completion that follows leaves the
   diff alone, and a failed edit keeps its error card (ADR 0054 Flavor A).
+- **PR6, decisions without a modal.** A pending question or plan takes
+  the number keys, Enter and Tab only while the draft is empty; a draft
+  in progress keeps every key, and Enter with a draft sends it (the
+  harness queues it). Plans need an explicit `1`/`2` before Enter, so a
+  stray Enter never approves one. Feedback for a rejection is typed in
+  the composer after Tab. Answers are `{question: [labels]}` and
+  decisions `{decision, feedback?}`, the web's shapes, through
+  `CompleteToolCall`; the cell locks optimistically and reopens when the
+  RPC fails (the web's answered-set behaviour).
+- **PR6, generic approvals.** Only `ask_user_question` and
+  `exit_plan_mode` are deferred decisions on the wire today (as in the
+  web); other `tool_call_requested` events render as tool cards.
+- **PR6, notifications.** An unfocused terminal gets a bell plus OSC 9
+  and OSC 777 when a decision starts waiting or a run ends; the title
+  carries `⚠ needs you` / `⟳` while attached. Terminals that know neither
+  sequence ignore them.
 - **PR4, cursor-position query.** An inline viewport needs the terminal
   to answer `CSI 6n`. A pseudo-terminal with no emulator behind it never
   does, and start-up blocks in crossterm's query. Real terminals answer.
