@@ -2586,14 +2586,19 @@ mod tests {
             .await
             .expect("spawn guest-absolute harness from a relative backend root");
 
+        // The shell opens the marker before `printf` writes it, so an
+        // existence check can observe an empty file under load. Wait for
+        // the content.
         let marker = backend.cwd_for(id).join("agent-started");
-        for _ in 0..50 {
-            if marker.exists() {
+        let mut content = String::new();
+        for _ in 0..250 {
+            content = fs::read_to_string(&marker).unwrap_or_default();
+            if content == "started" {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(fs::read_to_string(marker).expect("agent marker"), "started");
+        assert_eq!(content, "started");
     }
 
     #[tokio::test]
