@@ -99,6 +99,111 @@ pub enum Cell {
     Hidden,
 }
 
+fn write_body(text: &str, out: &mut String) {
+    for line in text.lines() {
+        out.push_str("    ");
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+fn write_cell(cell: &Cell, out: &mut String) {
+    match cell {
+        Cell::User { text, .. } => {
+            out.push_str("› ");
+            out.push_str(text);
+            out.push_str("\n\n");
+        }
+        Cell::Assistant { md, .. } => {
+            out.push_str(md.text());
+            out.push_str("\n\n");
+        }
+        Cell::Tool {
+            name,
+            args,
+            result,
+            state,
+            ..
+        } => {
+            out.push_str(match state {
+                ToolState::Running => "… ",
+                ToolState::Ok => "✓ ",
+                ToolState::Err => "✗ ",
+            });
+            out.push_str(name);
+            if !args.is_empty() {
+                out.push(' ');
+                out.push_str(args);
+            }
+            out.push('\n');
+            if let Some(r) = result {
+                write_body(r, out);
+            }
+            out.push('\n');
+        }
+        Cell::Exec {
+            command,
+            output,
+            exit,
+            ..
+        } => {
+            out.push_str("$ ");
+            out.push_str(command);
+            out.push('\n');
+            write_body(output, out);
+            if let Some(code) = exit {
+                out.push_str("    exit ");
+                out.push_str(&code.to_string());
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        Cell::Question { questions, .. } => {
+            for q in questions {
+                out.push_str("? ");
+                out.push_str(&q.question);
+                out.push('\n');
+                for (i, o) in q.options.iter().enumerate() {
+                    out.push_str("    ");
+                    out.push_str(&(i + 1).to_string());
+                    out.push_str(". ");
+                    out.push_str(&o.label);
+                    out.push('\n');
+                }
+            }
+            out.push('\n');
+        }
+        Cell::Plan { text, approved, .. } => {
+            out.push_str(match approved {
+                Some(true) => "plan (approved)\n",
+                Some(false) => "plan (rejected)\n",
+                None => "plan\n",
+            });
+            write_body(&text.text, out);
+            out.push('\n');
+        }
+        Cell::Diff {
+            path,
+            text,
+            added,
+            removed,
+            ..
+        } => {
+            out.push_str("edit ");
+            out.push_str(path);
+            out.push_str(&format!(" (+{added} -{removed})\n"));
+            write_body(text, out);
+            out.push('\n');
+        }
+        Cell::Marker { text, .. } => {
+            out.push_str("· ");
+            out.push_str(text);
+            out.push_str("\n\n");
+        }
+        Cell::Hidden => {}
+    }
+}
+
 /// Which text of a cell a row comes from, and how it is styled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Src {
@@ -490,6 +595,15 @@ impl Transcript {
 
     pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Entry> {
         self.entries.iter_mut()
+    }
+
+    /// The cells still in memory as plain text, oldest first: what
+    /// `/transcript` opens in `$EDITOR` and `/dump` writes to the
+    /// terminal. Tool bodies are written in full, never collapsed.
+    pub fn to_text(&self, out: &mut String) {
+        for e in &self.entries {
+            write_cell(&e.cell, out);
+        }
     }
 
     pub fn invalidate_all(&mut self) {

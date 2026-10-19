@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 
+use crate::commands::{self, Slash};
 use crate::composer::Composer;
 use crate::event::{Envelope, Event};
 use crate::keymap::{resolve, Action};
@@ -60,6 +61,20 @@ pub enum Cmd {
         session_id: String,
         tool_call_id: String,
         result_json: String,
+    },
+    /// `SessionService.Resume` (`/resume`).
+    Resume {
+        session_id: String,
+    },
+    /// Open the transcript text in `$EDITOR`, read-only in effect: the
+    /// runtime discards the file (`/transcript`).
+    ViewTranscript {
+        text: String,
+    },
+    /// Write the transcript text to the terminal's own scrollback
+    /// (`/dump`, fullscreen mode).
+    Dump {
+        text: String,
     },
     /// The profiles for the new-session picker.
     LoadProfiles,
@@ -933,6 +948,67 @@ impl App {
         }
     }
 
+    /// Run a slash command from the composer.
+    fn slash(&mut self, cmd: Slash) {
+        match cmd {
+            Slash::New => self.open_new_session(),
+            Slash::Sessions => self.detach(),
+            Slash::Shell => self.toggle_shell(),
+            Slash::Help => self.help = true,
+            Slash::Quit => {
+                self.cmds.push(Cmd::Quit);
+                self.quit = true;
+            }
+            Slash::Interrupt => {
+                let Some(a) = &self.attached else {
+                    return;
+                };
+                if a.reducer.is_running() {
+                    self.cmds.push(Cmd::Interrupt {
+                        session_id: a.session_id.clone(),
+                    });
+                    self.note("interrupting…");
+                } else {
+                    self.note("no run to interrupt");
+                }
+            }
+            Slash::Resume => {
+                let Some(a) = &self.attached else {
+                    return;
+                };
+                if a.reducer.status.as_deref() == Some("idle") {
+                    self.cmds.push(Cmd::Resume {
+                        session_id: a.session_id.clone(),
+                    });
+                    self.note("resuming…");
+                } else {
+                    self.note("only an idle session resumes; a prompt wakes it too");
+                }
+            }
+            Slash::Transcript => {
+                let Some(a) = &self.attached else {
+                    return;
+                };
+                let mut text = String::new();
+                a.reducer.transcript.to_text(&mut text);
+                self.cmds.push(Cmd::ViewTranscript { text });
+            }
+            Slash::Dump => {
+                if self.inline {
+                    self.note("native scrollback mode: the transcript is already in the terminal");
+                    return;
+                }
+                let Some(a) = &self.attached else {
+                    return;
+                };
+                let mut text = String::new();
+                a.reducer.transcript.to_text(&mut text);
+                self.cmds.push(Cmd::Dump { text });
+                self.note("transcript written to the scrollback; leave the TUI to read it");
+            }
+        }
+    }
+
     /// Ctrl+N or `/new`: open the picker and fetch the profiles.
     pub fn open_new_session(&mut self) {
         if self.new_session.is_some() {
@@ -1105,6 +1181,25 @@ impl App {
             }
         }
         match action {
+            Action::Send if commands::prefix(a.composer.text()).is_some() => {
+                let draft = a.composer.text().to_string();
+                match commands::resolve(&draft) {
+                    Some(cmd) => {
+                        a.composer.clear();
+                        self.slash(cmd);
+                    }
+                    None => self.note("unknown command; type / to list them"),
+                }
+            }
+            Action::Char('\t') if commands::prefix(a.composer.text()).is_some() => {
+                let name = commands::matches(a.composer.text()).next().map(|c| c.name);
+                if let Some(name) = name {
+                    let mut t = String::with_capacity(name.len() + 1);
+                    t.push('/');
+                    t.push_str(name);
+                    a.composer.set_text(&t);
+                }
+            }
             Action::Send => {
                 if !a.can_send() {
                     self.note("this session is finished; nothing can be sent to it");

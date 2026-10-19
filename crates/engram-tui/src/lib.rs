@@ -7,6 +7,7 @@
 //! network task.
 
 pub mod app;
+pub mod commands;
 pub mod composer;
 pub mod event;
 pub mod keymap;
@@ -117,6 +118,42 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
                     text,
                 } => net.send_prompt(session_id, prompt_id, text),
                 Cmd::Interrupt { session_id } => net.interrupt(session_id),
+                Cmd::Resume { session_id } => net.resume(session_id),
+                Cmd::ViewTranscript { text } => {
+                    input.abort();
+                    let _ = (&mut input).await;
+                    guard.suspend();
+                    let _ = edit_in_editor(&text);
+                    if let Err(e) = guard.resume(!opts.inline, opts.mouse) {
+                        failed = Some(e.to_string());
+                        break;
+                    }
+                    input = spawn_input(tx.clone());
+                    if let Err(e) = terminal.clear() {
+                        failed = Some(e.to_string());
+                        break;
+                    }
+                    dirty = true;
+                }
+                Cmd::Dump { text } => {
+                    // Leave the alternate screen, write to the main one
+                    // (the terminal keeps it as scrollback), come back.
+                    guard.suspend();
+                    {
+                        let mut out = std::io::stdout();
+                        let _ = out.write_all(text.as_bytes());
+                        let _ = out.flush();
+                    }
+                    if let Err(e) = guard.resume(!opts.inline, opts.mouse) {
+                        failed = Some(e.to_string());
+                        break;
+                    }
+                    if let Err(e) = terminal.clear() {
+                        failed = Some(e.to_string());
+                        break;
+                    }
+                    dirty = true;
+                }
                 Cmd::Dequeue {
                     session_id,
                     prompt_id,
