@@ -57,6 +57,7 @@ members = [
     "crates/engram-blob-client",
     "crates/engram-app-client",
     "crates/engram-cli",
+    "crates/engram-tui",
     "workspace-hack",
 ]
 
@@ -146,6 +147,7 @@ engram-storage-gcs = { path = "crates/engram-storage-gcs" }
 engram-blob-client = { path = "crates/engram-blob-client" }
 engram-app-client = { path = "crates/engram-app-client" }
 engram-cli = { path = "crates/engram-cli" }
+engram-tui = { path = "crates/engram-tui" }
 engram-chunk-store = { path = "crates/engram-chunk-store" }
 engram-telemetry = { path = "crates/engram-telemetry" }
 
