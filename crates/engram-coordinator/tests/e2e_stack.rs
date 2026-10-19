@@ -2314,9 +2314,13 @@ async fn e2e_teleport_session_honors_target_host() {
     })
     .await
     .expect("teleport did not finish");
+    // The event carries the rollback reason; a bare outcome mismatch in CI
+    // is otherwise undiagnosable (the stack-log dump ends before the move).
     assert_eq!(
         payload_str(&done.payload_json, "outcome").as_deref(),
-        Some("done")
+        Some("done"),
+        "teleport did not complete: {}",
+        done.payload_json
     );
     assert_eq!(driver.session_status(sid).await, "active");
     assert_eq!(driver.session_host_id(sid).await, Some(target));
