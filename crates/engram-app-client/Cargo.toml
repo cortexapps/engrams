@@ -1,0 +1,29 @@
+[package]
+name = "engram-app-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Client for the orchestrator's app surface: Connect RPC over HTTP/1.1, the SSE event tail, the device-flow login, and the hosts.json credential store. The engrams CLI and TUI are built on it."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-tls.workspace = true
+bytes.workspace = true
+futures.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["time"] }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[build-dependencies]
+prost-build.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+engram-tls.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "net"] }
