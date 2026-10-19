@@ -71,6 +71,7 @@ Tasks are the product-level unit of work: a profile plus a prompt.
 | `session list` | List sessions. |
 | `session get <id>` | Print one session. |
 | `session exec <id> <cmd> [--timeout-secs <n>]` | Run a shell command in the sandbox, streaming its output, and exit with its exit code. |
+| `session shell <id>` | An interactive shell in the sandbox, in your terminal. Exit the shell to return. |
 | `session logs <id> [--since <idx>]` | Tail the session's event log. `--since N` replays everything after index N first. Ctrl-C to stop. |
 | `session log <id> [--limit <n>] [--from-start]` | Print the conversation timeline, newest rows first by default. |
 | `session resume <id>` | Resume an idle session from its snapshot. |
