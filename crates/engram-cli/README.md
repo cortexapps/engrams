@@ -26,7 +26,7 @@ For local dev (`just dev`): `ENGRAMS_URL=http://localhost:8787`.
 engrams auth login|logout|status
 engrams task create --profile <name|id> [--prompt …]   # THE product create
 engrams task list|get|delete
-engrams session create|list|get|exec|delete|logs|log|resume|prompt
+engrams session create|list|get|exec|shell|delete|logs|log|resume|prompt
 engrams image list|enable|config|update|disable|refresh|jobs|job|poll-job|retry-job
 engrams registry add|list|rm
 engrams host list|get|drain|delete|uncordon|evacuate
@@ -39,8 +39,11 @@ engrams tui [session-id] [--no-alt-screen] [--no-mouse] [--ax] # terminal client
 `engrams tui` opens the session list, or attaches to one session, in a
 full-screen terminal UI. `--no-alt-screen` (or `ENGRAMS_TUI_NO_ALT_SCREEN=1`)
 keeps the terminal's own scrollback instead: finished turns are written into
-it and only the composer and footer stay live. `?` lists the keys.
-`NO_COLOR` turns color off. The crate is `crates/engram-tui`.
+it and only the composer and footer stay live. `?` lists the keys. Ctrl+`
+(Ctrl+Space in terminals that send NUL for it) opens a shell in the sandbox
+below the transcript; the same key hands the keys back to the agent.
+`engrams session shell <id>` is the same shell in the terminal itself, with
+no UI around it. `NO_COLOR` turns color off. The crate is `crates/engram-tui`.
 
 Output contract: default = human tables; `--json` = pretty JSON on stdout
 and nothing else; errors on stderr as `engrams: …` + exit 1. `session exec`

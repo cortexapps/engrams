@@ -143,6 +143,8 @@ enum SessionCmd {
     },
     /// mark the session completed and tear down its sandbox
     Delete { id: String },
+    /// an interactive shell in the session's sandbox (exit it to return)
+    Shell { id: String },
     /// tail the persistent event log (SSE; Ctrl-C to stop)
     Logs {
         id: String,
@@ -404,6 +406,8 @@ async fn run(cli: Cli) -> CliResult {
                     timeout_secs,
                 } => session::exec(&c, &id, &cmd, timeout_secs, json).await,
                 SessionCmd::Delete { id } => session::remove(&c, &id).await,
+                // Handled before the runtime starts, like `tui`.
+                SessionCmd::Shell { .. } => Ok(()),
                 SessionCmd::Logs { id, since } => session::logs(&c, &id, since).await,
                 SessionCmd::Log {
                     id,
@@ -508,6 +512,29 @@ fn main() {
     };
     if cli.version {
         println!("{VERSION}");
+        return;
+    }
+    // The shell owns the terminal and its own runtime, like the TUI.
+    if let Some(Commands::Session {
+        cmd: SessionCmd::Shell { id },
+    }) = &cli.command
+    {
+        let ctx = Ctx {
+            host: resolve_host(cli.url.as_deref()),
+            json: false,
+        };
+        let clients = match ctx.clients() {
+            Ok(c) => c,
+            Err(CliError::Message(m)) => {
+                eprintln!("engrams: {m}");
+                std::process::exit(1);
+            }
+            Err(CliError::Exit(code)) => std::process::exit(code),
+        };
+        if let Err(m) = engram_tui::shell_passthrough(clients, id) {
+            eprintln!("engrams: {m}");
+            std::process::exit(1);
+        }
         return;
     }
     // The TUI owns its own runtime and the terminal; it never runs inside
