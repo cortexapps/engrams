@@ -13,6 +13,8 @@ pub const DEFAULT_WIDTH: u16 = 80;
 /// A table column never shrinks under its longest word, up to this many
 /// cells; when even that does not fit, the table is written as records.
 const TABLE_MAX_FLOOR: usize = 12;
+/// Between two columns: space, no rule (the rows' rules separate them).
+const TABLE_GAP: &str = "   ";
 
 /// Inline flags a run carries. They combine (`BOLD | CODE`).
 pub mod flags {
@@ -532,7 +534,7 @@ impl<'r> Writer<'r> {
                 self.line_prefix();
                 for (i, w) in widths.iter().enumerate() {
                     if i > 0 {
-                        self.raw(" │ ", flags::DIM);
+                        self.out.text.push_str(TABLE_GAP);
                     }
                     let c = row.get(i).map(String::as_str).unwrap_or("");
                     let seg = wrapped[i]
@@ -558,17 +560,24 @@ impl<'r> Writer<'r> {
                 }
                 self.newline();
             }
-            if ri == 0 {
-                self.line_prefix();
-                for (i, w) in widths.iter().enumerate() {
-                    if i > 0 {
-                        self.raw("─┼─", flags::DIM);
-                    }
-                    let bar: String = "─".repeat(*w);
-                    self.raw(&bar, flags::DIM);
+            // A heavy rule under the header and a light one between body
+            // rows, so a wrapped cell never runs into the next row.
+            let rule = if ri == 0 {
+                '━'
+            } else if ri + 1 < t.rows.len() {
+                '─'
+            } else {
+                continue;
+            };
+            self.line_prefix();
+            for (i, w) in widths.iter().enumerate() {
+                if i > 0 {
+                    self.out.text.push_str(TABLE_GAP);
                 }
-                self.newline();
+                let bar: String = std::iter::repeat_n(rule, *w).collect();
+                self.raw(&bar, flags::DIM);
             }
+            self.newline();
         }
     }
 
@@ -850,7 +859,7 @@ mod tests {
         );
         assert_eq!(
             r.text,
-            "See docs (https://example.com/d) and https://example.com.\n\na │ bb\n──┼───\n1 │ 22\n\n• [x] done\n• [ ] open"
+            "See docs (https://example.com/d) and https://example.com.\n\na   bb\n━   ━━\n1   22\n\n• [x] done\n• [ ] open"
         );
         assert_eq!(
             runs_of(&r, flags::LINK),
@@ -865,7 +874,7 @@ mod tests {
         assert!(table);
         assert_eq!(
             r.text,
-            "Rule     │ Violation\n─────────┼──────────────────────────────\nbe brief │ the long sentence that\n         │ explains why the rule was\n         │ broken\nbe kind  │ ok"
+            "Rule       Violation\n━━━━━━━━   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nbe brief   the long sentence that\n           explains why the rule was\n           broken\n────────   ─────────────────────────────\nbe kind    ok"
         );
         assert!(r.text.lines().all(|l| display_width(l) <= 40));
         let (r, _) = Rendered::render_at(md, 12);
