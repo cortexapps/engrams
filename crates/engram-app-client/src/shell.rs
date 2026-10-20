@@ -134,6 +134,7 @@ impl Shell {
         loop {
             let msg = match self.ws.next().await {
                 None => return Ok(None),
+                Some(Err(e)) if ended_abruptly(&e) => return Ok(None),
                 Some(Err(e)) => return Err(ws_error(e)),
                 Some(Ok(m)) => m,
             };
@@ -177,6 +178,21 @@ pub fn decode(body: Bytes) -> Option<ShellMsg> {
             Some(ShellMsg::Title(title))
         }
         _ => None,
+    }
+}
+
+/// The server ended the connection without a close handshake: a TCP FIN
+/// with no WebSocket close frame, or a TLS session cut without
+/// `close_notify`. The PTY behind the socket is gone either way, so the
+/// shell has simply ended; a front end that drops the TLS session when
+/// the backend closes makes this the normal exit.
+fn ended_abruptly(e: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    use tokio_tungstenite::tungstenite::Error as E;
+    match e {
+        E::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        E::Io(io) => io.kind() == std::io::ErrorKind::UnexpectedEof,
+        _ => false,
     }
 }
 
