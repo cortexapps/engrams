@@ -80,6 +80,9 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
         Terminal::with_options(backend, TerminalOptions { viewport }).map_err(|e| e.to_string())?;
     let mut theme = Theme::new(opts.color);
     theme.ax = opts.ax;
+    if opts.color {
+        theme.overlay = Some(render::overlay_color(terminal::probe().bg));
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     let mut input = spawn_input(tx.clone());

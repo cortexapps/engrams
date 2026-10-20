@@ -361,30 +361,55 @@ fn a_title_never_carries_control_characters() {
 }
 
 #[test]
-fn the_probe_reads_both_replies_and_stops_at_the_sentinel() {
-    let both = b"\x1b[?1u\x1b]7501;?:states=idle,working,done,blocked,error\x1b\\\x1b[?62;22c";
+fn the_probe_reads_every_reply_and_stops_at_the_sentinel() {
+    let all = b"\x1b[?1u\x1b]7501;?:states=idle,working,done,blocked,error\x1b\\\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\\x1b[?62;22c";
     assert_eq!(
-        scan(both),
+        scan(all),
         (
             Probe {
                 kitty: true,
-                program_status: true
+                program_status: true,
+                bg: Some((0x1e, 0x1e, 0x2e)),
             },
             true
         )
     );
-    // A terminal that knows neither answers DA1 only.
+    // A terminal that knows none of them answers DA1 only.
     assert_eq!(scan(b"\x1b[?62;c"), (Probe::default(), true));
     // The sentinel has not arrived yet: keep reading.
     assert_eq!(
         scan(b"\x1b]7501;?\x07"),
         (
             Probe {
-                kitty: false,
-                program_status: true
+                program_status: true,
+                ..Probe::default()
             },
             false
         )
+    );
+    // Two hex digits a channel, BEL-terminated; a cut reply is not read.
+    assert_eq!(
+        scan(b"\x1b]11;rgb:ff/80/00\x07").0.bg,
+        Some((0xff, 0x80, 0))
+    );
+    assert_eq!(scan(b"\x1b]11;rgb:ffff/80").0.bg, None);
+}
+
+/// Overlays are a darker shade of the terminal's own background; black
+/// when it did not say.
+#[test]
+fn the_overlay_is_a_shade_of_the_background() {
+    use engram_tui::render::overlay_color;
+    use ratatui::style::Color;
+    assert_eq!(overlay_color(None), Color::Black);
+    assert_eq!(
+        overlay_color(Some((0x1e, 0x1e, 0x2e))),
+        Color::Rgb(18, 18, 27)
+    );
+    // A light background darkens less.
+    assert_eq!(
+        overlay_color(Some((250, 250, 250))),
+        Color::Rgb(230, 230, 230)
     );
 }
 

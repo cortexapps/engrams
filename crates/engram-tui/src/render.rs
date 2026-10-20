@@ -36,6 +36,9 @@ pub struct Theme {
     pub del: Style,
     /// Screen-reader mode: word gutters (`agent:`) instead of glyphs.
     pub ax: bool,
+    /// The background of overlays (`?`, new session, the palette, the
+    /// slash popup); `None` without color.
+    pub overlay: Option<Color>,
 }
 
 /// Width of the gutter column: a glyph and a space, or a word.
@@ -52,6 +55,7 @@ impl Theme {
             add: c(Style::new(), Color::Green),
             del: c(Style::new(), Color::Red),
             ax: false,
+            overlay: None,
             user: Style::new().add_modifier(Modifier::BOLD),
             agent: Style::new(),
             dim: c(Style::new().add_modifier(Modifier::DIM), Color::DarkGray),
@@ -208,6 +212,35 @@ fn fill(buf: &mut Buffer, area: Rect, style: Style) {
             if let Some(c) = buf.cell_mut(Position::new(x, y)) {
                 c.set_char(' ');
                 c.set_style(style);
+            }
+        }
+    }
+}
+
+/// The overlay background for a terminal whose own background is `bg`:
+/// a darker shade of it, as Neovim paints floating windows (a light
+/// background darkens less). Black when the terminal did not say.
+pub fn overlay_color(bg: Option<(u8, u8, u8)>) -> Color {
+    let Some((r, g, b)) = bg else {
+        return Color::Black;
+    };
+    let luma = (299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b)) / 1000;
+    let keep = if luma < 128 { 60 } else { 92 };
+    let shade = |c: u8| (u32::from(c) * keep / 100) as u8;
+    Color::Rgb(shade(r), shade(g), shade(b))
+}
+
+/// Paint the overlay background under `area`, where nothing set one.
+fn shade(buf: &mut Buffer, area: Rect, th: &Theme) {
+    let Some(bg) = th.overlay else {
+        return;
+    };
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(c) = buf.cell_mut(Position::new(x, y)) {
+                if c.bg == Color::Reset {
+                    c.set_bg(bg);
+                }
             }
         }
     }
@@ -1417,6 +1450,7 @@ fn draw_help(buf: &mut Buffer, area: Rect, th: &Theme) {
         put(buf, r.x + 1, y, b.keys, 26, th.user);
         put(buf, r.x + 28, y, b.help, w.saturating_sub(29), Style::new());
     }
+    shade(buf, r, th);
 }
 
 /// Fullscreen frame: transcript, queue rail, composer, footer; the
@@ -1515,6 +1549,7 @@ pub fn draw_fullscreen(
             want_older = draw_transcript(buf, transcript, a, th, scratch);
             if slash.height > 0 {
                 draw_slash(buf, slash, a.composer.text(), th);
+                shade(buf, slash, th);
             }
             draw_rule(buf, rule_above, th);
             draw_queue(buf, queue, a, th);
@@ -1545,6 +1580,7 @@ pub fn draw_fullscreen(
         };
         fill(buf, r, Style::new());
         draw_sessions(buf, r, app, th, "switch session");
+        shade(buf, r, th);
         cursor = None;
     }
     if let Some(ns) = &mut app.new_session {
@@ -1559,6 +1595,7 @@ pub fn draw_fullscreen(
             ..body
         };
         cursor = draw_new_session(buf, r, ns, th);
+        shade(buf, r, th);
     }
     if app.help {
         draw_help(buf, body, th);
@@ -1634,6 +1671,7 @@ pub fn draw_inline(
             draw_transcript(buf, live, a, th, scratch);
             if slash.height > 0 {
                 draw_slash(buf, slash, a.composer.text(), th);
+                shade(buf, slash, th);
             }
             draw_rule(buf, rule_above, th);
             draw_queue(buf, queue, a, th);
@@ -1644,10 +1682,12 @@ pub fn draw_inline(
     if app.palette {
         fill(buf, body, Style::new());
         draw_sessions(buf, body, app, th, "switch session");
+        shade(buf, body, th);
         cursor = None;
     }
     if let Some(ns) = &mut app.new_session {
         cursor = draw_new_session(buf, body, ns, th);
+        shade(buf, body, th);
     }
     if app.help {
         draw_help(buf, body, th);
