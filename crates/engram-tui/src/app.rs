@@ -100,7 +100,45 @@ pub enum Cmd {
         rows: u16,
     },
     ShellClose,
+    /// Ask the terminal to set its clipboard (OSC 52): the runtime writes
+    /// it between frames. `seq` is the copy it belongs to.
+    CopyToTerminal {
+        seq: u64,
+        text: String,
+    },
     Quit,
+}
+
+/// A mouse selection in the transcript. The ends are (cell, layout row,
+/// column) so the selection stays on its text while the transcript
+/// scrolls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (usize, u16, u16),
+    pub head: (usize, u16, u16),
+    /// The pointer moved since the press: a drag, not a click.
+    pub moved: bool,
+}
+
+impl Selection {
+    /// The ends in transcript order.
+    pub fn range(&self) -> ((usize, u16, u16), (usize, u16, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
+/// How a copy reached the clipboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Copied {
+    /// The platform's clipboard command took it.
+    Native,
+    /// Sent to the terminal (OSC 52); terminals do not confirm it.
+    Terminal,
+    Failed(String),
 }
 
 /// Transcript search (Ctrl+T, fullscreen). `cursor` is the cell of the
@@ -123,6 +161,16 @@ pub enum Msg {
     Focus(bool),
     Tick,
     Net(NetMsg),
+    /// A copy of `chars` characters finished.
+    Copied {
+        /// The copy this answers: a result for an older copy is dropped.
+        seq: u64,
+        chars: usize,
+        how: Copied,
+        /// The text, when the platform command failed and the terminal
+        /// should be asked instead.
+        fallback: Option<String>,
+    },
 }
 
 /// A result of the attached session the user has not seen yet: the
@@ -232,9 +280,17 @@ pub struct Attached {
     pub page_rows: u16,
     /// The last scroll-up walk hit the top of memory: load more.
     pub want_older: bool,
-    /// The cell under each transcript row of the last frame, from
-    /// `hits_y` down: a click resolves to a cell through it.
-    pub hits: Vec<usize>,
+    /// The (cell, layout row) under each transcript row of the last
+    /// frame, from `hits_y` down: a click or a drag resolves through it.
+    pub hits: Vec<(usize, u16)>,
+    /// The left edge of the transcript area of the last frame.
+    pub hits_x: u16,
+    pub selection: Option<Selection>,
+    /// Copy the selection on the next frame: the text is read from what
+    /// the frame shows.
+    pub copy_request: bool,
+    /// The text of the last copy request, for the runtime.
+    pub copied: Option<String>,
     pub hits_y: u16,
     pub search: Option<Search>,
     /// The composer collects feedback for a plan rejection (Tab).
@@ -244,6 +300,8 @@ pub struct Attached {
     /// `/plan`: the mode the next prompt asks for, when it differs from
     /// the session's current mode (the web's not-yet-sent toggle).
     pub mode_override: Option<String>,
+    /// The highlighted command in the slash popup.
+    pub slash_sel: usize,
 }
 
 impl Attached {
@@ -266,11 +324,16 @@ impl Attached {
             page_rows: 20,
             want_older: false,
             hits: Vec::new(),
+            hits_x: 0,
+            selection: None,
+            copy_request: false,
+            copied: None,
             hits_y: 0,
             search: None,
             feedback: false,
             shell: None,
             mode_override: None,
+            slash_sel: 0,
         }
     }
 
@@ -565,6 +628,9 @@ impl NewSession {
 
 #[derive(Debug, Default)]
 pub struct SessionList {
+    /// Letters type into the filter (after `/`); otherwise they are Vim
+    /// keys. The palette always filters.
+    pub filtering: bool,
     pub rows: Vec<SessionRow>,
     pub selected: usize,
     pub filter: String,
@@ -599,6 +665,25 @@ impl SessionList {
         } else {
             self.selected.saturating_sub(1)
         };
+    }
+
+    fn jump(&mut self, bottom: bool) {
+        self.selected = if bottom {
+            self.visible().count().saturating_sub(1)
+        } else {
+            0
+        };
+    }
+}
+
+/// A key that moves a list selection, as arrows, fzf and Vim completion
+/// do: Down / Ctrl+N / Ctrl+J is the next row, Up / Ctrl+P / Ctrl+K the
+/// previous one. `Some(true)` is down.
+fn list_step(action: Action) -> Option<bool> {
+    match action {
+        Action::Down | Action::NewSession | Action::Newline => Some(true),
+        Action::Up | Action::Palette | Action::KillToEnd => Some(false),
+        _ => None,
     }
 }
 
@@ -635,6 +720,8 @@ pub struct App {
     pub attach_seq: u64,
     /// The terminal takes OSC 7501 reports (set by the runtime).
     pub program_status: bool,
+    /// The newest copy asked for; results for older ones are dropped.
+    pub copy_seq: u64,
     /// The other sessions, for the terminal.
     pub inbox: Inbox,
     /// A background session-list poll is in flight.
@@ -671,6 +758,7 @@ impl App {
             auth_failed: false,
             attach_seq: 0,
             program_status: false,
+            copy_seq: 0,
             inbox: Inbox::default(),
             refreshing: false,
             poll_failures: 0,
@@ -809,6 +897,11 @@ impl App {
             Msg::Resize(w, h) => {
                 self.width = w;
                 self.height = h;
+                // The rows re-wrap: a selection's (row, column) ends would
+                // name other text.
+                if let Some(a) = &mut self.attached {
+                    a.selection = None;
+                }
                 let (cols, rows) = self.shell_geometry();
                 if let Some(a) = &mut self.attached {
                     a.reducer.transcript.invalidate_all();
@@ -818,6 +911,30 @@ impl App {
                 }
             }
             Msg::Focus(f) => self.focused = f,
+            Msg::Copied {
+                seq,
+                chars,
+                how,
+                fallback,
+            } => {
+                // A newer copy was asked for since: this one's result (and
+                // its fallback) would put older text back.
+                if seq != self.copy_seq {
+                    return;
+                }
+                let unit = if chars == 1 { "char" } else { "chars" };
+                match (how, fallback) {
+                    (Copied::Native, _) => self.note(format!("Copied {chars} {unit} to clipboard")),
+                    (Copied::Terminal, _) => {
+                        self.note(format!("Sent {chars} {unit} to the terminal's clipboard"))
+                    }
+                    // The platform command failed: ask the terminal.
+                    (Copied::Failed(_), Some(text)) => {
+                        self.cmds.push(Cmd::CopyToTerminal { seq, text });
+                    }
+                    (Copied::Failed(e), None) => self.note(format!("copy failed: {e}")),
+                }
+            }
             Msg::Tick => {
                 if let Some((_, at)) = &self.note {
                     if at.elapsed() > Duration::from_secs(4) {
@@ -859,18 +976,51 @@ impl App {
         if self.screen != Screen::Attached {
             return;
         }
+        // The transcript row under the pointer, clamped into the rows
+        // the last frame showed (a drag past the edge keeps selecting).
+        let hit = |a: &Attached, clamp: bool| -> Option<(usize, u16, u16)> {
+            let last = a.hits.len().checked_sub(1)?;
+            let row = m.row.checked_sub(a.hits_y).map(usize::from);
+            let row = match row {
+                Some(r) if r <= last => r,
+                Some(_) if clamp => last,
+                None if clamp => 0,
+                _ => return None,
+            };
+            let (cell, r) = a.hits[row];
+            Some((cell, r, m.column.saturating_sub(a.hits_x)))
+        };
         match m.kind {
             MouseEventKind::ScrollUp => Self::scroll(a, 3),
             MouseEventKind::ScrollDown => Self::scroll(a, -3),
             MouseEventKind::Down(MouseButton::Left) => {
+                a.selection = hit(a, false).map(|at| Selection {
+                    anchor: at,
+                    head: at,
+                    moved: false,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(at) = hit(a, true) {
+                    if let Some(sel) = &mut a.selection {
+                        sel.moved |= at != sel.head;
+                        sel.head = at;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // A drag copies what it selected, and the selection stays
+                // on screen until Esc or a click.
+                if a.selection.is_some_and(|s| s.moved) {
+                    a.copy_request = true;
+                    return;
+                }
+                let Some(sel) = a.selection.take() else {
+                    return;
+                };
                 // A click on a folded turn opens it; on a tool call,
                 // toggles its output.
-                let Some(row) = m.row.checked_sub(a.hits_y) else {
-                    return;
-                };
-                let Some(&i) = a.hits.get(row as usize) else {
-                    return;
-                };
+                let i = sel.anchor.0;
                 let t = &mut a.reducer.transcript;
                 if t.toggle_fold(i) {
                     return;
@@ -920,7 +1070,16 @@ impl App {
                 .attached
                 .as_ref()
                 .is_none_or(|a| a.composer.is_empty() && a.search.is_none());
-        let Some(action) = resolve(&key, draft_empty) else {
+        // Does the focused composer hold text? Then Ctrl+D/E/N/P edit it,
+        // as in Codex; on an empty one they keep the TUI's own meaning.
+        let has_text = match &self.new_session {
+            Some(ns) => ns.stage == NewStage::Prompt && !ns.composer.is_empty(),
+            None => self
+                .attached
+                .as_ref()
+                .is_some_and(|a| !a.composer.is_empty() && a.search.is_none()),
+        };
+        let Some(action) = resolve(&key, draft_empty, has_text) else {
             return;
         };
         if action != Action::CtrlC {
@@ -1168,8 +1327,7 @@ impl App {
         };
         match ns.stage {
             NewStage::Pick => match action {
-                Action::Up => ns.step(false),
-                Action::Down => ns.step(true),
+                a if list_step(a).is_some() => ns.step(list_step(a) == Some(true)),
                 Action::Send => {
                     if ns.selected_profile().is_some() {
                         ns.stage = NewStage::Prompt;
@@ -1183,7 +1341,7 @@ impl App {
                         ns.selected = 0;
                     }
                 }
-                Action::CtrlC | Action::Detach | Action::NewSession => self.new_session = None,
+                Action::CtrlC | Action::Detach => self.new_session = None,
                 Action::Backspace => {
                     ns.filter.pop();
                     ns.selected = 0;
@@ -1239,6 +1397,7 @@ impl App {
                 Action::KillToEnd => ns.composer.kill_to_end(),
                 Action::KillToStart => ns.composer.kill_to_start(),
                 Action::KillWord => ns.composer.kill_word(),
+                Action::KillWordForward => ns.composer.kill_word_forward(),
                 Action::Yank => ns.composer.yank(),
                 Action::Up => {
                     ns.composer.move_row(width, false);
@@ -1253,10 +1412,32 @@ impl App {
     }
 
     fn list_key(&mut self, action: Action) {
+        if let Some(down) = list_step(action) {
+            self.sessions.step(down);
+            return;
+        }
+        // The session list outside a filter: Vim keys.
+        if !self.palette && !self.sessions.filtering {
+            if let Action::Char(c) = action {
+                match c {
+                    'j' => self.sessions.step(true),
+                    'k' => self.sessions.step(false),
+                    'g' => self.sessions.jump(false),
+                    'G' => self.sessions.jump(true),
+                    '/' => self.sessions.filtering = true,
+                    'n' => self.open_new_session(),
+                    'r' => {
+                        self.sessions.loading = true;
+                        self.cmds.push(Cmd::LoadSessions);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
         match action {
-            Action::Up => self.sessions.step(false),
-            Action::Down => self.sessions.step(true),
             Action::Send => {
+                self.sessions.filtering = false;
                 if let Some(r) = self.sessions.selected_row() {
                     let id = r.session_id.clone();
                     self.attach(&id);
@@ -1266,6 +1447,9 @@ impl App {
                 if self.palette {
                     self.palette = false;
                     self.sessions.filter.clear();
+                } else if self.sessions.filtering {
+                    // Back to the Vim keys; the filter stays.
+                    self.sessions.filtering = false;
                 } else if !self.sessions.filter.is_empty() {
                     self.sessions.filter.clear();
                     self.sessions.selected = 0;
@@ -1282,13 +1466,11 @@ impl App {
                     self.quit = true;
                 }
             }
-            Action::Palette => {
-                if self.palette {
-                    self.palette = false;
-                } else {
-                    self.sessions.loading = true;
-                    self.cmds.push(Cmd::LoadSessions);
-                }
+            // Backspace on an empty filter leaves it, as from Vim's `/`.
+            Action::Backspace
+                if !self.palette && self.sessions.filtering && self.sessions.filter.is_empty() =>
+            {
+                self.sessions.filtering = false;
             }
             Action::Backspace => {
                 self.sessions.filter.pop();
@@ -1299,7 +1481,6 @@ impl App {
                 self.sessions.selected = 0;
             }
             Action::Help => self.help = true,
-            Action::NewSession => self.open_new_session(),
             Action::Char(c) if !c.is_control() => {
                 self.sessions.filter.push(c);
                 self.sessions.selected = 0;
@@ -1314,6 +1495,20 @@ impl App {
         let Some(a) = &mut self.attached else {
             return;
         };
+        // A selection takes Esc (clear) and Ctrl+C (copy again) first.
+        if a.selection.is_some() {
+            match action {
+                Action::Escape => {
+                    a.selection = None;
+                    return;
+                }
+                Action::CtrlC => {
+                    a.copy_request = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
         if a.can_send() {
             let mut cmds = Vec::new();
             let consumed = a.decision_key(action, &mut cmds);
@@ -1322,10 +1517,29 @@ impl App {
                 return;
             }
         }
+        // The slash popup is open: list keys move its selection.
+        let popup = commands::matches(a.composer.text()).count();
+        if popup > 0 {
+            if let Some(down) = list_step(action) {
+                a.slash_sel = if down {
+                    (a.slash_sel + 1) % popup
+                } else {
+                    (a.slash_sel + popup - 1) % popup
+                };
+                return;
+            }
+        }
+        if !matches!(action, Action::Send | Action::Char('\t')) {
+            a.slash_sel = 0;
+        }
         match action {
             Action::Send if commands::prefix(a.composer.text()).is_some() => {
                 let draft = a.composer.text().to_string();
-                match commands::resolve(&draft) {
+                // An exact or unique name, else the highlighted command.
+                let cmd = commands::resolve(&draft)
+                    .or_else(|| commands::matches(&draft).nth(a.slash_sel).map(|c| c.slash));
+                a.slash_sel = 0;
+                match cmd {
                     Some(cmd) => {
                         a.composer.clear();
                         self.slash(cmd);
@@ -1334,7 +1548,10 @@ impl App {
                 }
             }
             Action::Char('\t') if commands::prefix(a.composer.text()).is_some() => {
-                let name = commands::matches(a.composer.text()).next().map(|c| c.name);
+                let name = commands::matches(a.composer.text())
+                    .nth(a.slash_sel)
+                    .map(|c| c.name);
+                a.slash_sel = 0;
                 if let Some(name) = name {
                     let mut t = String::with_capacity(name.len() + 1);
                     t.push('/');
@@ -1525,6 +1742,7 @@ impl App {
             Action::KillToEnd => a.composer.kill_to_end(),
             Action::KillToStart => a.composer.kill_to_start(),
             Action::KillWord => a.composer.kill_word(),
+            Action::KillWordForward => a.composer.kill_word_forward(),
             Action::Yank => a.composer.yank(),
             Action::Up => {
                 if !a.composer.move_row(width, false) {
@@ -1656,6 +1874,10 @@ impl App {
                 if older {
                     a.loading_older = false;
                     a.want_older = false;
+                    // Prepending shifts every cell index: a selection (and
+                    // the last frame's hit map) would name other cells.
+                    a.selection = None;
+                    a.hits.clear();
                     if (events.len() as i64) < PAGE {
                         a.exhausted = true;
                     }

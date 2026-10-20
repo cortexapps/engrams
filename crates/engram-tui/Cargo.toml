@@ -33,6 +33,11 @@ unicode-segmentation = "1"
 # The shell pane's terminal emulator (ADR 0124 D5 allow-list): vte + a grid,
 # no I/O, no threads.
 vt100 = "0.18"
+# Syntax highlighting for code blocks and diffs, as Codex does it: the
+# two-face grammar bundle on Oniguruma (about 1.9 MB, 4x faster than the
+# pure-Rust engine). Only the parser: colors come from the terminal palette.
+syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-onig"] }
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 # The start-up probe polls the terminal for its replies with a deadline.

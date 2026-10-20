@@ -171,7 +171,16 @@ Explicit triggers for things engrams otherwise does on its own schedule.
 client. With no session id it shows your sessions; with one it attaches to that session.
 The transcript streams as the agent works, tool calls fold to their first lines
 (Ctrl+O expands the last one), and questions and plan approvals are answered with the
-number keys. `?` lists the keys.
+number keys. Code blocks and file changes are syntax highlighted in your terminal's colors.
+`?` lists the keys.
+
+Drag across the transcript to select text: it is copied when you let go, and the footer says
+how much. `Esc` clears the selection, `Ctrl+C` copies it again. The copy uses your system's
+clipboard command, or asks the terminal to set its clipboard (OSC 52) over SSH.
+
+On the session list, `j`/`k` move, `g`/`G` jump to the top and bottom, `/` filters (Esc
+returns to the keys), `n` starts a new session and `r` reloads. In any list or popup
+`Ctrl+N`/`Ctrl+P` and `Ctrl+J`/`Ctrl+K` move as well as the arrows.
 
 | Key | What it does |
 |---|---|
@@ -179,13 +188,14 @@ number keys. `?` lists the keys.
 | `Shift+Enter`, `Ctrl+J` | Newline in the draft. |
 | `Esc` | Interrupt the run. On a draft, twice clears it. |
 | `Ctrl+C` | Clear the draft; twice quits. |
-| `Ctrl+D` | Back to the session list; twice quits. |
+| `Ctrl+D` | On an empty draft, back to the session list; twice quits. |
 | `Ctrl+P`, `Alt+↑/↓` | Switch session. |
 | `Ctrl+N` | New session: pick a profile, type the first prompt. |
 | `Ctrl+\``, `Ctrl+Space` | A shell in the sandbox below the transcript. The same key hands the keys back to the agent. |
 | `Ctrl+T` | Search the transcript. |
 | `Ctrl+G` | Edit the draft in `$EDITOR`. |
 | `PgUp`, `PgDn`, `Ctrl+Home`, `Ctrl+End` | Scroll. Scrolling to the top loads older history. |
+| `Ctrl+A`/`E`, `Ctrl+B`/`F`, `Alt+B`/`F` | In a draft, the editing keys Codex uses: line start/end, character, word. `Ctrl+D`, `Ctrl+H`, `Alt+D`, `Alt+Backspace`, `Ctrl+W`, `Ctrl+U`, `Ctrl+K` and `Ctrl+Y` delete and yank. |
 
 A draft that starts with `/` is a command. Type `/` to list them; Tab completes.
 
@@ -213,9 +223,9 @@ elsewhere.
 Beside that status, the terminal gets one entry for each running subagent, for the sandbox
 while it starts, resumes or moves, and for programs in the shell pane that report their own
 status. Your other sessions are there too: each one that waits on you, runs, or finished or
-failed while you were elsewhere. The TUI checks them every 5 seconds while the terminal
-takes these reports or the session list is open, and a finished entry stays until you open
-that session.
+failed while you were elsewhere. The TUI checks them every 5 seconds while the session list
+is open and every 15 seconds otherwise while the terminal takes these reports, and a finished
+entry stays until you open that session.
 
 Flags and environment:
 
@@ -224,10 +234,12 @@ Flags and environment:
   turns off the status that `auth login` and `session exec` report while they wait.
 - `--no-alt-screen` (or `ENGRAMS_TUI_NO_ALT_SCREEN=1`) keeps the terminal's own scrollback.
   Finished turns are written into it as they complete and only the composer and footer stay
-  live, so your terminal's scroll, search and copy work on the transcript. History older than
-  the loaded window is not paged in this mode.
+  live, so your terminal's scroll, search and copy work on the transcript. The mouse is left
+  to the terminal in this mode. History older than the loaded window is not paged in this
+  mode.
 - `--no-mouse` (or `ENGRAMS_TUI_NO_MOUSE=1`) leaves the mouse to the terminal, for its own
   text selection.
 - `--ax` (or `ENGRAMS_TUI_AX=1`) is screen-reader mode: native scrollback, no mouse, and word
   labels (`you:`, `agent:`, `tool:`) in place of glyphs.
-- `NO_COLOR` turns color off. State markers carry their meaning without it.
+- `NO_COLOR` turns color off, syntax highlighting included. State markers carry their
+  meaning without it.

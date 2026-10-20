@@ -137,6 +137,8 @@ pub enum Cell {
         added: u32,
         removed: u32,
         expanded: bool,
+        /// Syntax highlight spans of `text`, made on first layout.
+        hl: Option<Box<[crate::highlight::Span]>>,
     },
     Marker {
         kind: Marker,
@@ -301,12 +303,18 @@ pub enum Fold {
     },
 }
 
-/// Does the cell belong in a turn's fold?
+/// Does the cell belong in a turn's fold? Not a file change: edits
+/// stay in view after the turn, as Claude Code shows them.
 fn foldable(c: &Cell) -> bool {
     matches!(
         c,
-        Cell::Tool { .. } | Cell::Exec { .. } | Cell::Explore { .. } | Cell::Diff { .. }
+        Cell::Tool { .. } | Cell::Exec { .. } | Cell::Explore { .. }
     )
+}
+
+/// Tool-like cells in a row share one block (no gap between them).
+fn tool_like(c: &Cell) -> bool {
+    foldable(c) || matches!(c, Cell::Diff { .. })
 }
 
 fn plural(out: &mut String, n: usize, one: &str, many: &str) {
@@ -346,7 +354,7 @@ pub struct Entry {
 
 /// Does `next` get a blank row after `prev`?
 fn wants_gap(prev: &Cell, next: &Cell) -> bool {
-    let tool_like = foldable;
+    let tool_like = tool_like;
     match next {
         Cell::Hidden => false,
         Cell::Marker {
@@ -426,8 +434,17 @@ impl Entry {
                 }
                 _ => {}
             }
-            if let Cell::Assistant { md, .. } | Cell::Plan { md, .. } = &mut self.cell {
-                md.fit(width);
+            // Highlighting happens here, on the cell's first layout (and
+            // for code that arrived since): never on a steady frame.
+            match &mut self.cell {
+                Cell::Assistant { md, .. } | Cell::Plan { md, .. } => {
+                    md.fit(width);
+                    md.highlight();
+                }
+                Cell::Diff { path, text, hl, .. } if hl.is_none() => {
+                    *hl = Some(crate::highlight::diff(path, text).into_boxed_slice());
+                }
+                _ => {}
             }
             layout_cell(&self.cell, width, &mut self.layout.rows);
         }
@@ -441,6 +458,11 @@ impl Entry {
     pub fn relayout_from(&mut self, offset: usize) {
         if self.layout.rows.is_empty() {
             return;
+        }
+        // A chunk can complete a code block: highlight it now, as the
+        // full layout would (only blocks not done yet are parsed).
+        if let Cell::Assistant { md, .. } = &mut self.cell {
+            md.highlight();
         }
         let width = self.layout.width;
         let text = source_of(&self.cell, Src::Text);
@@ -950,7 +972,7 @@ impl Transcript {
     }
 
     fn fold_range(&mut self, start: usize, end: usize) {
-        let (mut shell, mut tools, mut reads, mut edits) = (0usize, 0usize, 0usize, 0usize);
+        let (mut shell, mut tools, mut reads) = (0usize, 0usize, 0usize);
         for e in self.entries.range(start..end) {
             match &e.cell {
                 Cell::Exec { .. } => shell += 1,
@@ -962,11 +984,10 @@ impl Transcript {
                     }
                 }
                 Cell::Explore { items, .. } => reads += items.len(),
-                Cell::Diff { .. } => edits += 1,
                 _ => {}
             }
         }
-        if shell + tools + reads + edits == 0 {
+        if shell + tools + reads == 0 {
             return;
         }
         let mut text = String::new();
@@ -983,7 +1004,6 @@ impl Transcript {
         part(&mut text, "ran ", shell, "shell command", "shell commands");
         part(&mut text, "called ", tools, "tool", "tools");
         part(&mut text, "read ", reads, "file", "files");
-        part(&mut text, "edited ", edits, "file", "files");
         if let Some(c) = text.get(..1) {
             let up = c.to_ascii_uppercase();
             text.replace_range(..1, &up);

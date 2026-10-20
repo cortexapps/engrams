@@ -947,7 +947,11 @@ impl Reducer {
                     text: text.into(),
                     added,
                     removed,
-                    expanded: false,
+                    // An edit or a patch is shown whole, as Claude Code and
+                    // Codex show them; a whole-file write keeps its first
+                    // lines until opened.
+                    expanded: verb != "Wrote",
+                    hl: None,
                 };
                 // The entry stays in `open_tools` so the completion that
                 // follows finds the card (and leaves a diff cell alone).
@@ -1663,16 +1667,17 @@ mod tests {
         assert!(!r.transcript.get(1).unwrap().is_fold_head());
         r.apply(ev("run_completed", r#"{"run_id":"r1","ok":true}"#));
         let t = &mut r.transcript;
-        // The three calls before the reply are one closed fold; the single
-        // call after it is a fold of its own.
+        // The shell and read calls before the reply are one closed fold;
+        // the edit stays in view; the single call after the reply is a
+        // fold of its own.
         let head = t.get(1).unwrap();
         assert!(head.is_fold_head());
         assert_eq!(
             head.source(crate::transcript::Src::Fold),
-            "Ran 1 shell command, read 1 file, edited 1 file"
+            "Ran 1 shell command, read 1 file"
         );
         assert!(t.get(2).unwrap().hidden_by_fold());
-        assert!(t.get(3).unwrap().hidden_by_fold());
+        assert!(!t.get(3).unwrap().hidden_by_fold(), "an edit is not folded");
         assert!(!t.get(4).unwrap().is_fold_head());
         assert!(t.get(5).unwrap().is_fold_head());
         assert_eq!(
@@ -1684,7 +1689,7 @@ mod tests {
         assert_eq!(t.get_mut(2).unwrap().height(40), 0);
         // Opening the fold shows the calls again; a second run does not
         // re-fold what is folded.
-        assert!(t.toggle_fold(3));
+        assert!(t.toggle_fold(2));
         assert!(t.get_mut(2).unwrap().height(40) > 0);
         assert_eq!(t.get(1).unwrap().first_row(), 2);
         t.fold_turn();

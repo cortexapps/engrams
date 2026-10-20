@@ -250,6 +250,14 @@ impl Composer {
         self.rows_width = 0;
     }
 
+    /// `Alt+D`: kill the word after the cursor.
+    pub fn kill_word_forward(&mut self) {
+        let e = self.word_end();
+        self.kill = self.text[self.cursor..e].to_string();
+        self.text.replace_range(self.cursor..e, "");
+        self.rows_width = 0;
+    }
+
     /// `Ctrl+Y`: yank the last kill.
     pub fn yank(&mut self) {
         let k = std::mem::take(&mut self.kill);

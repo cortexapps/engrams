@@ -50,11 +50,11 @@ fn profiles() -> Vec<ProfileRow> {
 }
 
 #[test]
-fn ctrl_n_lists_profiles_and_enter_creates_the_task() {
+fn n_lists_profiles_and_enter_creates_the_task() {
     let mut app = App::new(false, 60, 16);
     app.update(Msg::Net(NetMsg::Sessions(Ok(common::rows()))));
     app.cmds.clear();
-    key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+    key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
     assert_eq!(app.cmds, vec![Cmd::LoadProfiles]);
     app.cmds.clear();
     app.update(Msg::Net(NetMsg::Profiles(Ok(profiles()))));
@@ -98,7 +98,7 @@ fn ctrl_n_lists_profiles_and_enter_creates_the_task() {
 #[test]
 fn a_failed_create_reopens_the_prompt_with_the_error() {
     let mut app = App::new(false, 60, 16);
-    key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+    key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
     app.update(Msg::Net(NetMsg::Profiles(Ok(profiles()))));
     key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
     type_str(&mut app, "hello");

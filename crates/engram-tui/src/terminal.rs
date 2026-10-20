@@ -36,6 +36,9 @@ pub struct Probe {
     pub kitty: bool,
     /// The Program Status Protocol (an `OSC 7501 ; ?` reply).
     pub program_status: bool,
+    /// The default background color (an `OSC 11` reply), 8 bits a
+    /// channel: overlays are painted a shade of it.
+    pub bg: Option<(u8, u8, u8)>,
 }
 
 /// The probe's answer; all false before [`Guard::enter`].
@@ -215,9 +218,9 @@ fn run_probe() -> Probe {
     let forced = program_status_override();
     let mut out = io::stdout();
     let query: &[u8] = if forced.is_some() {
-        b"\x1b[?u\x1b[c"
+        b"\x1b[?u\x1b]11;?\x1b\\\x1b[c"
     } else {
-        b"\x1b[?u\x1b]7501;?\x1b\\\x1b[c"
+        b"\x1b[?u\x1b]7501;?\x1b\\\x1b]11;?\x1b\\\x1b[c"
     };
     if out.write_all(query).and_then(|()| out.flush()).is_err() {
         return Probe::default();
@@ -245,6 +248,7 @@ fn run_probe() -> Probe {
         let (probe, done) = scan(&buf[..len]);
         found.kitty |= probe.kitty;
         found.program_status |= probe.program_status;
+        found.bg = found.bg.or(probe.bg);
         if done {
             return Probe {
                 program_status: forced.unwrap_or(found.program_status),
@@ -291,16 +295,28 @@ fn run_probe() -> Probe {
     Probe {
         kitty: false,
         program_status: program_status_override().unwrap_or(false),
+        bg: None,
     }
 }
 
 /// Read the replies in `buf`: the kitty flags (`CSI ? <n> u`), the OSC
-/// 7501 detection reply (`OSC 7501 ; ? …`), and whether the DA1 reply
-/// (`CSI ? … c`), which always comes last, has arrived.
+/// 7501 detection reply (`OSC 7501 ; ? …`), the background color
+/// (`OSC 11 ; rgb:R/G/B`), and whether the DA1 reply (`CSI ? … c`), which
+/// always comes last, has arrived.
 pub fn scan(buf: &[u8]) -> (Probe, bool) {
     let mut p = Probe::default();
     let mut i = 0;
     while i < buf.len() {
+        const BG_REPLY: &[u8] = b"\x1b]11;rgb:";
+        if buf[i..].starts_with(BG_REPLY) {
+            let rest = &buf[i + BG_REPLY.len()..];
+            // Only a whole reply: it ends with BEL or ST.
+            if let Some(end) = rest.iter().position(|&b| b == 0x07 || b == 0x1b) {
+                p.bg = parse_rgb(&rest[..end]);
+                i += BG_REPLY.len() + end;
+                continue;
+            }
+        }
         const STATUS_REPLY: &[u8] = b"\x1b]7501;?";
         if buf[i..].starts_with(STATUS_REPLY) {
             p.program_status = true;
@@ -324,4 +340,21 @@ pub fn scan(buf: &[u8]) -> (Probe, bool) {
         i += 1;
     }
     (p, false)
+}
+
+/// `RRRR/GGGG/BBBB` (1 to 4 hex digits a channel) as 8 bits a channel.
+fn parse_rgb(s: &[u8]) -> Option<(u8, u8, u8)> {
+    let s = std::str::from_utf8(s).ok()?;
+    let mut parts = s.split('/');
+    let mut channel = || -> Option<u8> {
+        let h = parts.next()?;
+        if h.is_empty() || h.len() > 4 {
+            return None;
+        }
+        let v = u32::from_str_radix(h, 16).ok()?;
+        let max = (1u32 << (4 * h.len())) - 1;
+        Some((v * 255 / max) as u8)
+    };
+    let rgb = (channel()?, channel()?, channel()?);
+    parts.next().is_none().then_some(rgb)
 }

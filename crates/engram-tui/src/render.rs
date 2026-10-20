@@ -36,6 +36,14 @@ pub struct Theme {
     pub del: Style,
     /// Screen-reader mode: word gutters (`agent:`) instead of glyphs.
     pub ax: bool,
+    /// The background of overlays (`?`, new session, the palette, the
+    /// slash popup); `None` without color.
+    pub overlay: Option<Color>,
+    /// Syntax highlighting is drawn (off under `NO_COLOR`).
+    pub color: bool,
+    /// Faint backgrounds for added and removed diff lines, from the
+    /// terminal's own background; `None` when it did not say.
+    pub diff_bg: Option<(Color, Color)>,
 }
 
 /// Width of the gutter column: a glyph and a space, or a word.
@@ -52,6 +60,9 @@ impl Theme {
             add: c(Style::new(), Color::Green),
             del: c(Style::new(), Color::Red),
             ax: false,
+            overlay: None,
+            color,
+            diff_bg: None,
             user: Style::new().add_modifier(Modifier::BOLD),
             agent: Style::new(),
             dim: c(Style::new().add_modifier(Modifier::DIM), Color::DarkGray),
@@ -76,6 +87,32 @@ impl Theme {
             GUTTER_AX
         } else {
             GUTTER
+        }
+    }
+
+    /// The color of a syntax highlight tone, from the terminal's palette.
+    pub fn tone(&self, tone: u8) -> Style {
+        use crate::highlight::Tone;
+        if !self.color {
+            return Style::new();
+        }
+        let Some(t) = Tone::from_u8(tone) else {
+            return Style::new();
+        };
+        let fg = match t {
+            Tone::Comment => Color::DarkGray,
+            Tone::String => Color::Green,
+            Tone::Keyword => Color::Magenta,
+            Tone::Number | Tone::Type => Color::Yellow,
+            Tone::Constant => Color::Cyan,
+            Tone::Function => Color::Blue,
+            Tone::Tag => Color::Red,
+        };
+        let st = Style::new().fg(fg);
+        if t == Tone::Comment {
+            st.add_modifier(Modifier::ITALIC)
+        } else {
+            st
         }
     }
 
@@ -134,7 +171,10 @@ fn put_runs(
         let (seg_end, style) = match runs.get(i) {
             Some(r) if (r.start as usize) <= pos => {
                 i += 1;
-                ((r.end as usize).min(end), th.run_style(base, r.flags))
+                (
+                    (r.end as usize).min(end),
+                    th.run_style(base, r.flags).patch(th.tone(r.tone)),
+                )
             }
             Some(r) => ((r.start as usize).min(end), base),
             None => (end, base),
@@ -213,6 +253,45 @@ fn fill(buf: &mut Buffer, area: Rect, style: Style) {
     }
 }
 
+/// Faint green and red backgrounds for added and removed diff lines: the
+/// terminal's background with a little of each mixed in.
+pub fn diff_backgrounds(bg: (u8, u8, u8)) -> (Color, Color) {
+    let mix = |(r, g, b): (u8, u8, u8), (tr, tg, tb): (u8, u8, u8)| {
+        let m = |c: u8, t: u8| ((u32::from(c) * 82 + u32::from(t) * 18) / 100) as u8;
+        Color::Rgb(m(r, tr), m(g, tg), m(b, tb))
+    };
+    (mix(bg, (0, 200, 0)), mix(bg, (220, 0, 0)))
+}
+
+/// The overlay background for a terminal whose own background is `bg`:
+/// a darker shade of it, as Neovim paints floating windows (a light
+/// background darkens less). Black when the terminal did not say.
+pub fn overlay_color(bg: Option<(u8, u8, u8)>) -> Color {
+    let Some((r, g, b)) = bg else {
+        return Color::Black;
+    };
+    let luma = (299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b)) / 1000;
+    let keep = if luma < 128 { 60 } else { 92 };
+    let shade = |c: u8| (u32::from(c) * keep / 100) as u8;
+    Color::Rgb(shade(r), shade(g), shade(b))
+}
+
+/// Paint the overlay background under `area`, where nothing set one.
+fn shade(buf: &mut Buffer, area: Rect, th: &Theme) {
+    let Some(bg) = th.overlay else {
+        return;
+    };
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(c) = buf.cell_mut(Position::new(x, y)) {
+                if c.bg == Color::Reset {
+                    c.set_bg(bg);
+                }
+            }
+        }
+    }
+}
+
 /// A dim rule across `area` (one row, or nothing when it has no height):
 /// the edge of the composer, as in Claude Code.
 fn draw_rule(buf: &mut Buffer, area: Rect, th: &Theme) {
@@ -223,6 +302,84 @@ fn draw_rule(buf: &mut Buffer, area: Rect, th: &Theme) {
         if let Some(c) = buf.cell_mut(Position::new(x, area.y)) {
             c.set_symbol("─");
             c.set_style(th.dim);
+        }
+    }
+}
+
+/// Where a diff row sits in the diff text.
+#[derive(Clone, Copy)]
+struct DiffRow {
+    start: usize,
+    end: usize,
+    /// The start of the line the row belongs to (its sign).
+    line_start: usize,
+    sign: Option<u8>,
+}
+
+/// One row of a highlighted diff: the sign in the add/remove color, the
+/// code in its tones, an added or removed line on a faint background.
+/// Context lines stay dim.
+fn paint_diff_row(
+    buf: &mut Buffer,
+    area: Rect,
+    text: &str,
+    row: DiffRow,
+    spans: &[crate::highlight::Span],
+    th: &Theme,
+) {
+    let DiffRow {
+        start,
+        end,
+        line_start,
+        sign,
+    } = row;
+    let (base, bg) = match sign {
+        Some(b'+') => (Style::new(), th.diff_bg.map(|b| b.0)),
+        Some(b'-') => (Style::new(), th.diff_bg.map(|b| b.1)),
+        _ => (Style::new().add_modifier(Modifier::DIM), None),
+    };
+    let base = match bg {
+        Some(bg) => base.bg(bg),
+        None => base,
+    };
+    if bg.is_some() {
+        fill(buf, area, base);
+    }
+    let (x, y) = (area.x, area.y);
+    let mut cx = 0u16;
+    let mut pos = start;
+    if start == line_start && end > start {
+        let sign_style = match sign {
+            Some(b'+') => th.add,
+            Some(b'-') => th.del,
+            _ => th.dim,
+        };
+        let w = text[start..].chars().next().map_or(1, char::len_utf8);
+        cx += put(
+            buf,
+            x,
+            y,
+            &text[start..start + w],
+            area.width,
+            base.patch(sign_style),
+        );
+        pos += w;
+    }
+    let mut i = spans.partition_point(|s| (s.end as usize) <= pos);
+    while pos < end && cx < area.width {
+        let (seg_end, style) = match spans.get(i) {
+            Some(s) if (s.start as usize) <= pos => {
+                i += 1;
+                ((s.end as usize).min(end), base.patch(th.tone(s.tone as u8)))
+            }
+            Some(s) => ((s.start as usize).min(end), base),
+            None => (end, base),
+        };
+        if seg_end > pos {
+            cx += put(buf, x + cx, y, &text[pos..seg_end], area.width - cx, style);
+            pos = seg_end;
+        } else {
+            break;
         }
     }
 }
@@ -573,14 +730,35 @@ fn paint_src<'e>(
                 return Some(text);
             }
             let body_style = match &e.cell {
-                Cell::Diff { .. } => {
+                Cell::Diff { hl, .. } => {
                     // The line's first byte says what kind of line it is;
                     // a wrapped continuation row inherits it.
                     let line_start = text[..lr.row.start as usize]
                         .rfind('\n')
                         .map(|p| p + 1)
                         .unwrap_or(0);
-                    match text.as_bytes().get(line_start) {
+                    let sign = text.as_bytes().get(line_start).copied();
+                    if let Some(spans) = hl.as_deref().filter(|h| th.color && !h.is_empty()) {
+                        paint_diff_row(
+                            buf,
+                            Rect {
+                                x: body_x + 2,
+                                width: body_w.saturating_sub(2),
+                                ..body
+                            },
+                            text,
+                            DiffRow {
+                                start: lr.row.start as usize,
+                                end: lr.row.end as usize,
+                                line_start,
+                                sign,
+                            },
+                            spans,
+                            th,
+                        );
+                        return Some(text);
+                    }
+                    match sign {
                         Some(b'+') => th.add,
                         Some(b'-') => th.del,
                         _ => th.dim,
@@ -829,8 +1007,9 @@ pub fn draw_transcript(
     }
     a.hits.clear();
     a.hits_y = area.y;
-    for &(idx, _) in scratch.iter().rev() {
-        a.hits.push(idx);
+    a.hits_x = area.x;
+    for &(idx, row) in scratch.iter().rev() {
+        a.hits.push((idx, row));
     }
     // Paint top-down. A short transcript is top-aligned.
     for (y, &(idx, row)) in (area.y..).zip(scratch.iter().rev()) {
@@ -838,6 +1017,13 @@ pub fn draw_transcript(
             let _ = e.height(width);
             let q = hl.filter(|&(c, _)| c == idx).map(|(_, q)| q);
             paint_row(buf, area, y, e, row as usize, th, q);
+        }
+    }
+    if let Some(sel) = a.selection {
+        highlight_selection(buf, area, a, sel, th);
+        if a.copy_request {
+            a.copy_request = false;
+            a.copied = Some(selection_text(buf, area, a, sel, width, th));
         }
     }
     if a.unseen > 0 && a.scroll_up > 0 && area.height > 0 {
@@ -867,6 +1053,172 @@ pub fn draw_transcript(
     }
     // A scroll up that reached the top of memory asks for older history.
     asked && (ran_out || clamped)
+}
+
+/// The columns a selection covers on screen row `k` of the transcript:
+/// from the start column on the first row, to the end column on the last,
+/// never into the gutter, and only up to the row's last character.
+fn selected_cols(
+    buf: &Buffer,
+    area: Rect,
+    y: u16,
+    key: (usize, u16),
+    sel: crate::app::Selection,
+    th: &Theme,
+) -> Option<(u16, u16)> {
+    let ((sc, sr, scol), (ec, er, ecol)) = sel.range();
+    if key < (sc, sr) || key > (ec, er) {
+        return None;
+    }
+    let left = area.x + th.gutter_width();
+    let text_end = (left..area.right())
+        .rev()
+        .find(|&x| buf[(x, y)].symbol().trim() != "")
+        .map_or(left, |x| x + 1);
+    let x0 = if key == (sc, sr) {
+        (area.x + scol).max(left)
+    } else {
+        left
+    };
+    let x1 = if key == (ec, er) {
+        (area.x + ecol + 1).min(text_end)
+    } else {
+        text_end
+    };
+    (x0 < x1).then_some((x0, x1))
+}
+
+/// Mark the selection over what the frame painted.
+fn highlight_selection(
+    buf: &mut Buffer,
+    area: Rect,
+    a: &Attached,
+    sel: crate::app::Selection,
+    th: &Theme,
+) {
+    for (y, &(idx, row)) in (area.y..area.bottom()).zip(&a.hits) {
+        if let Some((x0, x1)) = selected_cols(buf, area, y, (idx, row), sel, th) {
+            for x in x0..x1 {
+                let c = &mut buf[(x, y)];
+                c.set_style(c.style().patch(th.selected));
+            }
+        }
+    }
+}
+
+/// The selected text. Rows on screen are read from the frame, so the
+/// columns are what the user sees; rows that scrolled away are taken from
+/// the cell's text. A row the layout wrapped joins the next with a space;
+/// a real line break stays a newline.
+fn selection_text(
+    buf: &Buffer,
+    area: Rect,
+    a: &mut Attached,
+    sel: crate::app::Selection,
+    width: u16,
+    th: &Theme,
+) -> String {
+    let ((sc, sr, scol), (ec, er, ecol)) = sel.range();
+    let gw = th.gutter_width();
+    let mut out = String::new();
+    let mut prev: Option<(usize, u16)> = None;
+    let mut line = String::new();
+    for i in sc..=ec {
+        let Some(e) = a.reducer.transcript.get_mut(i) else {
+            continue;
+        };
+        let h = e.height(width);
+        if h == 0 {
+            continue;
+        }
+        let from = if i == sc { sr } else { 0 };
+        let to = if i == ec { er } else { h - 1 };
+        for r in from..=to.min(h - 1) {
+            line.clear();
+            let on_screen = a.hits.iter().position(|&k| k == (i, r));
+            match on_screen {
+                Some(k) => {
+                    let y = area.y + k as u16;
+                    if let Some((x0, x1)) = selected_cols(buf, area, y, (i, r), sel, th) {
+                        let mut skip = 0;
+                        for x in x0..x1 {
+                            if skip > 0 {
+                                skip -= 1;
+                                continue;
+                            }
+                            let s = buf[(x, y)].symbol();
+                            skip = display_width(s).saturating_sub(1);
+                            line.push_str(s);
+                        }
+                    }
+                }
+                None => {
+                    // Scrolled away: the row's own text, cut at the
+                    // selection's columns on its first and last row.
+                    if let Some(lr) = e.layout_row(r as usize) {
+                        let src = e.source(lr.src);
+                        if let Some(s) = src.get(lr.row.start as usize..lr.row.end as usize) {
+                            // Where the row's text starts on screen.
+                            let lead = gw + if lr.src == Src::Body { 2 } else { 0 };
+                            let to_byte = |col: u16| byte_at_col(s, col.saturating_sub(lead));
+                            let from = if (i, r) == (sc, sr) { to_byte(scol) } else { 0 };
+                            let to = if (i, r) == (ec, er) {
+                                to_byte(ecol + 1)
+                            } else {
+                                s.len()
+                            };
+                            line.push_str(s.get(from..to.max(from)).unwrap_or(""));
+                        }
+                    }
+                }
+            }
+            let text = line.trim_end();
+            // Does this row continue the previous one (a wrap the layout
+            // made, not a line break in the text)? Then the text between
+            // the two rows is what joins them: the space the wrap took,
+            // or nothing when a long word was cut.
+            let soft = prev.and_then(|(pi, pr)| {
+                if pi != i || pr + 1 != r {
+                    return None;
+                }
+                match (e.layout_row(pr as usize), e.layout_row(r as usize)) {
+                    (Some(p), Some(c)) if p.src == c.src => e
+                        .source(c.src)
+                        .get(p.row.end as usize..c.row.start as usize)
+                        .filter(|between| !between.contains('\n'))
+                        .map(|between| !between.is_empty()),
+                    _ => None,
+                }
+            });
+            if let Some(spaced) = soft {
+                let cont = text.trim_start();
+                if spaced && !cont.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                out.push_str(cont);
+            } else {
+                if prev.is_some() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+            prev = Some((i, r));
+        }
+    }
+    out.trim_matches('\n').to_string()
+}
+
+/// The byte offset in `s` where display column `col` falls (the end of
+/// `s` past its width), never inside a character.
+fn byte_at_col(s: &str, col: u16) -> usize {
+    let mut w = 0u16;
+    for (i, c) in s.char_indices() {
+        if w >= col {
+            return i;
+        }
+        w += display_width(c.encode_utf8(&mut [0; 4])) as u16;
+    }
+    s.len()
 }
 
 fn draw_queue(buf: &mut Buffer, area: Rect, a: &Attached, th: &Theme) {
@@ -1090,7 +1442,11 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) {
                 buf,
                 area.x + cx,
                 y,
-                "  type to filter · Enter attach · Esc quit · ? keys",
+                if app.sessions.filtering {
+                    "  type to filter · Enter attach · Esc done"
+                } else {
+                    "  j/k move · / filter · n new · Enter attach · Esc quit · ? keys"
+                },
                 w.saturating_sub(cx),
                 th.dim,
             );
@@ -1111,7 +1467,7 @@ fn draw_sessions(buf: &mut Buffer, area: Rect, app: &App, th: &Theme, title: &st
         area.width.saturating_sub(1),
         th.accent,
     );
-    if !app.sessions.filter.is_empty() || app.palette {
+    if !app.sessions.filter.is_empty() || app.palette || app.sessions.filtering {
         cx += put(buf, area.x + 1 + cx, y0, "  / ", 4, th.dim);
         put(
             buf,
@@ -1202,19 +1558,21 @@ pub fn slash_rows(draft: &str) -> u16 {
     crate::commands::matches(draft).count().min(6) as u16
 }
 
-/// The slash-command popup: the matching commands, the first one (what
-/// Tab completes to and Enter runs when it is the only match) marked.
-fn draw_slash(buf: &mut Buffer, area: Rect, draft: &str, th: &Theme) {
+/// The slash-command popup: the matching commands, the highlighted one
+/// (what Tab completes to and Enter runs) marked, scrolled into view.
+fn draw_slash(buf: &mut Buffer, area: Rect, draft: &str, sel: usize, th: &Theme) {
     if area.height == 0 {
         return;
     }
     fill(buf, area, Style::new());
+    let top = sel.saturating_sub(area.height as usize - 1);
     for (i, c) in crate::commands::matches(draft)
-        .take(area.height as usize)
         .enumerate()
+        .skip(top)
+        .take(area.height as usize)
     {
-        let y = area.y + i as u16;
-        let style = if i == 0 { th.selected } else { Style::new() };
+        let y = area.y + (i - top) as u16;
+        let style = if i == sel { th.selected } else { Style::new() };
         let line = Rect {
             y,
             height: 1,
@@ -1417,6 +1775,7 @@ fn draw_help(buf: &mut Buffer, area: Rect, th: &Theme) {
         put(buf, r.x + 1, y, b.keys, 26, th.user);
         put(buf, r.x + 28, y, b.help, w.saturating_sub(29), Style::new());
     }
+    shade(buf, r, th);
 }
 
 /// Fullscreen frame: transcript, queue rail, composer, footer; the
@@ -1514,7 +1873,8 @@ pub fn draw_fullscreen(
             }
             want_older = draw_transcript(buf, transcript, a, th, scratch);
             if slash.height > 0 {
-                draw_slash(buf, slash, a.composer.text(), th);
+                draw_slash(buf, slash, a.composer.text(), a.slash_sel, th);
+                shade(buf, slash, th);
             }
             draw_rule(buf, rule_above, th);
             draw_queue(buf, queue, a, th);
@@ -1545,6 +1905,7 @@ pub fn draw_fullscreen(
         };
         fill(buf, r, Style::new());
         draw_sessions(buf, r, app, th, "switch session");
+        shade(buf, r, th);
         cursor = None;
     }
     if let Some(ns) = &mut app.new_session {
@@ -1559,6 +1920,7 @@ pub fn draw_fullscreen(
             ..body
         };
         cursor = draw_new_session(buf, r, ns, th);
+        shade(buf, r, th);
     }
     if app.help {
         draw_help(buf, body, th);
@@ -1633,7 +1995,8 @@ pub fn draw_inline(
             a.page_rows = live.height;
             draw_transcript(buf, live, a, th, scratch);
             if slash.height > 0 {
-                draw_slash(buf, slash, a.composer.text(), th);
+                draw_slash(buf, slash, a.composer.text(), a.slash_sel, th);
+                shade(buf, slash, th);
             }
             draw_rule(buf, rule_above, th);
             draw_queue(buf, queue, a, th);
@@ -1644,10 +2007,12 @@ pub fn draw_inline(
     if app.palette {
         fill(buf, body, Style::new());
         draw_sessions(buf, body, app, th, "switch session");
+        shade(buf, body, th);
         cursor = None;
     }
     if let Some(ns) = &mut app.new_session {
         cursor = draw_new_session(buf, body, ns, th);
+        shade(buf, body, th);
     }
     if app.help {
         draw_help(buf, body, th);
