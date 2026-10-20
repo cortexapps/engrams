@@ -41,6 +41,8 @@ pub enum Event {
     RunStarted {
         prompt_id: Option<String>,
         prompt_summary: Option<String>,
+        /// When the run started, in Unix seconds.
+        at: Option<u64>,
     },
     AgentMessage {
         role: String,
@@ -89,6 +91,8 @@ pub enum Event {
     RunEnded {
         ok: bool,
         interrupted: bool,
+        /// When the run ended, in Unix seconds.
+        at: Option<u64>,
     },
     HarnessIdle,
     HarnessModeChanged {
@@ -134,6 +138,8 @@ pub enum Event {
     FileChanged {
         tool_call_id: String,
         path: String,
+        /// `Wrote`, `Edited` or `Patched`.
+        verb: &'static str,
         text: String,
         added: u32,
         removed: u32,
@@ -232,6 +238,11 @@ fn diff_text(change: ChangeP) -> (String, u32, u32) {
 struct RunStartedP {
     prompt_id: Option<String>,
     prompt_summary: Option<String>,
+    at: Option<String>,
+}
+#[derive(Deserialize)]
+struct AtP {
+    at: Option<String>,
 }
 #[derive(Deserialize)]
 struct AgentMessageP {
@@ -307,6 +318,7 @@ struct ExecCompletedP {
 struct RunCompletedP {
     #[serde(default)]
     ok: bool,
+    at: Option<String>,
 }
 #[derive(Deserialize)]
 struct ModeP {
@@ -358,6 +370,7 @@ impl Event {
             "run_started" => p::<RunStartedP>(payload).map(|v| Event::RunStarted {
                 prompt_id: v.prompt_id.filter(|s| !s.is_empty()),
                 prompt_summary: v.prompt_summary.filter(|s| !s.is_empty()),
+                at: v.at.as_deref().and_then(unix_secs),
             }),
             "agent_message" => p::<AgentMessageP>(payload).map(|v| Event::AgentMessage {
                 role: v.role,
@@ -412,10 +425,15 @@ impl Event {
             "run_completed" => p::<RunCompletedP>(payload).map(|v| Event::RunEnded {
                 ok: v.ok,
                 interrupted: false,
+                at: v.at.as_deref().and_then(unix_secs),
             }),
             "run_interrupted" => Some(Event::RunEnded {
                 ok: false,
                 interrupted: true,
+                at: p::<AtP>(payload)
+                    .and_then(|v| v.at)
+                    .as_deref()
+                    .and_then(unix_secs),
             }),
             "harness_idle" => Some(Event::HarnessIdle),
             "harness_mode_changed" => {
@@ -455,10 +473,18 @@ impl Event {
                 p::<TitleP>(payload).map(|v| Event::TitleSuggested { title: v.title })
             }
             "file_changed" => p::<FileChangedP>(payload).map(|v| {
+                let verb = if v.change.write.is_some() {
+                    "Wrote"
+                } else if v.change.patch.is_some() {
+                    "Patched"
+                } else {
+                    "Edited"
+                };
                 let (text, added, removed) = diff_text(v.change);
                 Event::FileChanged {
                     tool_call_id: v.tool_call_id,
                     path: v.path,
+                    verb,
                     text,
                     added,
                     removed,
@@ -468,6 +494,64 @@ impl Event {
         };
         decoded.unwrap_or(Event::Other)
     }
+}
+
+/// Unix seconds of an RFC 3339 timestamp (`2026-01-02T03:04:05.678Z`).
+/// Fractions are dropped; a zone offset is applied. Anything else is
+/// `None`.
+pub fn unix_secs(at: &str) -> Option<u64> {
+    let b = at.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> {
+        let s = b.get(from..from + len)?;
+        if !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(s).ok()?.parse().ok()
+    };
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let (y, m, d) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hh, mm, ss) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Days from civil (Howard Hinnant's algorithm).
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let mut secs = days * 86_400 + hh * 3_600 + mm * 60 + ss;
+    // The zone: `Z`, or `±HH:MM` after the seconds and any fraction.
+    let mut i = 19;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    match b.get(i) {
+        Some(b'Z') | None => {}
+        Some(sign @ (b'+' | b'-')) => {
+            let (oh, om) = (num(i + 1, 2)?, num(i + 4, 2)?);
+            let off = oh * 3_600 + om * 60;
+            secs = if *sign == b'+' {
+                secs - off
+            } else {
+                secs + off
+            };
+        }
+        _ => return None,
+    }
+    u64::try_from(secs).ok()
 }
 
 /// The `questions` array of an `ask_user_question` request's `args_json`.
@@ -521,6 +605,7 @@ mod tests {
             Event::RunStarted {
                 prompt_id,
                 prompt_summary,
+                ..
             } => {
                 assert_eq!(prompt_id.as_deref(), Some("p1"));
                 assert!(prompt_summary.is_none());
@@ -595,5 +680,14 @@ mod tests {
         assert_eq!(parse_plan(r#"{"plan":"do x"}"#).as_deref(), Some("do x"));
         assert_eq!(parse_plan_decision(r#"{"decision":"approve"}"#), Some(true));
         assert_eq!(parse_plan_decision(r#"{"ok":true}"#), None);
+    }
+
+    #[test]
+    fn timestamps_parse_to_unix_seconds() {
+        assert_eq!(unix_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(unix_secs("2026-01-02T03:04:05.678Z"), Some(1_767_323_045));
+        assert_eq!(unix_secs("2026-01-02T03:04:05+01:00"), Some(1_767_319_445));
+        assert_eq!(unix_secs("2026-01-02 03:04:05"), None);
+        assert_eq!(unix_secs("garbage"), None);
     }
 }

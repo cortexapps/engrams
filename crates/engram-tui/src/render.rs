@@ -533,18 +533,22 @@ fn paint_src<'e>(
         }
         Src::Head => {
             let mut cx = 0;
-            if let Cell::Tool { name, .. } = &e.cell {
-                if lr.row.start == 0 {
-                    cx = put(
-                        buf,
-                        body_x,
-                        y,
-                        name,
-                        body_w,
-                        style.add_modifier(Modifier::BOLD),
-                    );
-                    cx += put(buf, body_x + cx, y, " ", body_w.saturating_sub(cx), style);
-                }
+            // The tool's name, or the edit's verb, leads the first row.
+            let lead = match &e.cell {
+                Cell::Tool { name, .. } => Some(&**name),
+                Cell::Diff { verb, .. } => Some(*verb),
+                _ => None,
+            };
+            if let (Some(lead), true) = (lead, lr.row.start == 0) {
+                cx = put(
+                    buf,
+                    body_x,
+                    y,
+                    lead,
+                    body_w,
+                    style.add_modifier(Modifier::BOLD),
+                );
+                cx += put(buf, body_x + cx, y, " ", body_w.saturating_sub(cx), style);
             }
             let text = e.source(Src::Head);
             let s = &text[lr.row.start as usize..lr.row.end as usize];

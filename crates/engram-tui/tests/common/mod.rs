@@ -23,7 +23,11 @@ pub fn scripted() -> Vec<Envelope> {
             "agent_message",
             r#"{"run_id":"","message_id":"u1","role":"user","text":"Add a README to the repo.","prompt_id":"p1"}"#,
         ),
-        env(2, "run_started", r#"{"run_id":"r1","prompt_id":"p1"}"#),
+        env(
+            2,
+            "run_started",
+            r#"{"run_id":"r1","prompt_id":"p1","at":"2026-01-01T10:00:00Z"}"#,
+        ),
         env(
             3,
             "agent_message",
@@ -44,7 +48,11 @@ pub fn scripted() -> Vec<Envelope> {
             "agent_message",
             r#"{"run_id":"r1","message_id":"m2","role":"assistant","text":"There is already a README.md. I will extend it with a usage section and keep the existing introduction intact."}"#,
         ),
-        env(7, "run_completed", r#"{"run_id":"r1","ok":true}"#),
+        env(
+            7,
+            "run_completed",
+            r#"{"run_id":"r1","ok":true,"at":"2026-01-01T10:01:05Z"}"#,
+        ),
         env(8, "resumed", r#"{}"#),
     ]
 }

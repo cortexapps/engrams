@@ -26,6 +26,8 @@ pub enum Marker {
     ResumedFromDisk,
     Mode,
     PlanAttempt,
+    /// The turn's receipt (`worked for 2m 14s`), right under its last cell.
+    Worked,
 }
 
 /// One read-only call inside an `Explore` cell.
@@ -128,6 +130,8 @@ pub enum Cell {
     /// re-renders as a diff. `text` holds `+`/`-` prefixed lines.
     Diff {
         path: Box<str>,
+        /// `Wrote`, `Edited` or `Patched`.
+        verb: &'static str,
         text: Box<str>,
         added: u32,
         removed: u32,
@@ -236,12 +240,14 @@ fn write_cell(cell: &Cell, out: &mut String) {
         }
         Cell::Diff {
             path,
+            verb,
             text,
             added,
             removed,
             ..
         } => {
-            out.push_str("edit ");
+            out.push_str(verb);
+            out.push(' ');
             out.push_str(path);
             out.push_str(&format!(" (+{added} -{removed})\n"));
             write_body(text, out);
@@ -306,6 +312,10 @@ fn wants_gap(prev: &Cell, next: &Cell) -> bool {
         |c: &Cell| matches!(c, Cell::Tool { .. } | Cell::Exec { .. } | Cell::Diff { .. });
     match next {
         Cell::Hidden => false,
+        Cell::Marker {
+            kind: Marker::Worked,
+            ..
+        } => false,
         Cell::Marker { .. } => !matches!(prev, Cell::Marker { .. }),
         c if tool_like(c) => !tool_like(prev),
         _ => true,

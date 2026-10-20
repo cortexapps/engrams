@@ -59,6 +59,8 @@ pub struct Reducer {
     sent: HashMap<String, usize>,
     plan_handoff: bool,
     run_start_len: usize,
+    /// When the open run started (Unix seconds), for its receipt.
+    run_started_unix: Option<u64>,
     pub mode: String,
     pub status: Option<String>,
     pub waking: bool,
@@ -462,9 +464,11 @@ impl Reducer {
             Event::RunStarted {
                 prompt_id,
                 prompt_summary,
+                at,
             } => {
                 self.waking = false;
                 self.run_open = true;
+                self.run_started_unix = at;
                 self.harness_idle = false;
                 self.plan_handoff = false;
                 self.close_active();
@@ -762,6 +766,7 @@ impl Reducer {
             Event::FileChanged {
                 tool_call_id,
                 path,
+                verb,
                 text,
                 added,
                 removed,
@@ -771,6 +776,7 @@ impl Reducer {
                 // edit emits no `file_changed` and keeps its error card.
                 let cell = Cell::Diff {
                     path: path.into(),
+                    verb,
                     text: text.into(),
                     added,
                     removed,
@@ -825,7 +831,11 @@ impl Reducer {
                     e.invalidate();
                 }
             }
-            Event::RunEnded { ok, interrupted } => {
+            Event::RunEnded {
+                ok,
+                interrupted,
+                at,
+            } => {
                 // A plan decision ends the read-only turn by design: that
                 // interrupt is a handoff, not a failure.
                 let was_interrupt = interrupted;
@@ -835,7 +845,21 @@ impl Reducer {
                 } else {
                     was_interrupt || ok
                 };
+                let started = self.run_started_unix.take();
                 self.settle_run(ok);
+                // The turn's receipt: how long the agent worked, and how
+                // the turn ended when not by its own choice.
+                if let (Some(a), Some(b)) = (started, at) {
+                    let took = fmt_secs(b.saturating_sub(a));
+                    let text = if interrupted {
+                        format!("interrupted after {took}")
+                    } else if ok {
+                        format!("worked for {took}")
+                    } else {
+                        format!("failed after {took}")
+                    };
+                    self.push_marker(Marker::Worked, &text);
+                }
             }
             Event::HarnessIdle => {
                 self.close_active();
@@ -925,6 +949,20 @@ impl Reducer {
         });
         self.open_execs.insert(exec_id.to_string(), i);
         i
+    }
+}
+
+/// `<1s`, `42s`, `2m 14s`, `1h 03m`.
+fn fmt_secs(secs: u64) -> String {
+    let (h, m, s) = (secs / 3_600, (secs % 3_600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else if s > 0 {
+        format!("{s}s")
+    } else {
+        "<1s".to_string()
     }
 }
 
@@ -1264,5 +1302,42 @@ mod tests {
             ]
         );
         assert!(r.transcript.get(1).unwrap().is_final());
+    }
+
+    #[test]
+    fn a_run_with_timestamps_ends_in_a_receipt() {
+        let mut r = Reducer::new();
+        r.apply(ev(
+            "run_started",
+            r#"{"run_id":"r1","prompt_id":"p1","at":"2026-01-01T10:00:00Z"}"#,
+        ));
+        r.apply(ev(
+            "agent_message",
+            r#"{"run_id":"r1","message_id":"m1","role":"assistant","text":"Done."}"#,
+        ));
+        r.apply(ev(
+            "run_completed",
+            r#"{"run_id":"r1","ok":true,"at":"2026-01-01T10:02:14Z"}"#,
+        ));
+        assert_eq!(
+            texts(&r),
+            vec!["user:?", "agent:Done.", "marker:worked for 2m 14s"]
+        );
+        assert!(!r.is_running());
+        r.apply(ev(
+            "run_started",
+            r#"{"run_id":"r2","prompt_id":"p2","at":"2026-01-01T10:03:00Z"}"#,
+        ));
+        r.apply(ev(
+            "run_interrupted",
+            r#"{"run_id":"r2","at":"2026-01-01T10:03:05Z"}"#,
+        ));
+        assert_eq!(texts(&r).last().unwrap(), "marker:interrupted after 5s");
+        // No timestamps: no receipt.
+        r.apply(ev("run_started", r#"{"run_id":"r3","prompt_id":"p3"}"#));
+        r.apply(ev("run_completed", r#"{"run_id":"r3","ok":true}"#));
+        assert_eq!(texts(&r).last().unwrap(), "user:?");
+        assert_eq!(fmt_secs(0), "<1s");
+        assert_eq!(fmt_secs(3_780), "1h 03m");
     }
 }

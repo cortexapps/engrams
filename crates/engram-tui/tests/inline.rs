@@ -71,14 +71,15 @@ fn finalized_cells_land_in_scrollback_once_and_leave_memory() {
 
     let committed = draw(&mut terminal, &mut app, &theme);
     // Every scripted cell is final after `run_completed` + the resume
-    // marker: the prompt, two replies, the tool row and the marker.
-    assert_eq!(committed, 5);
+    // marker: the prompt, two replies, the tool row, the turn's receipt
+    // and the marker.
+    assert_eq!(committed, 6);
     let a = app.attached.as_ref().unwrap();
     assert!(
         a.reducer.transcript.is_empty(),
         "committed cells are released"
     );
-    assert_eq!(a.reducer.transcript.len(), 5, "indices stay absolute");
+    assert_eq!(a.reducer.transcript.len(), 6, "indices stay absolute");
 
     // The screen above the viewport plus the scrollback hold the cells in
     // order; nothing is duplicated.
@@ -148,7 +149,7 @@ fn a_streaming_cell_stays_in_the_viewport_until_final() {
     assert!(view.contains("partial words"), "{view}");
     let a = app.attached.as_ref().unwrap();
     assert!(matches!(
-        a.reducer.transcript.get(5).map(|e| &e.cell),
+        a.reducer.transcript.get(6).map(|e| &e.cell),
         Some(Cell::Assistant {
             streaming: true,
             ..
@@ -225,7 +226,7 @@ fn screen_reader_mode_labels_every_cell_with_a_word() {
         .collect();
     assert_eq!(
         labels,
-        ["you", "agent", "tool", "agent", "note"],
+        ["you", "agent", "tool", "agent", "note", "note"],
         "{lines:#?}"
     );
     assert!(
