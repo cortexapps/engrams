@@ -6048,6 +6048,10 @@ mod adapter {
                 .await
                 .unwrap();
             let (run_id, _) = expect_run_started_id(&mut evt_rx).await;
+            // The fake answers the prompt line with this message. Take it
+            // before the close: otherwise it can arrive before or after the
+            // interrupt, and the next event below is not deterministic.
+            expect_agent_message(&mut evt_rx, "working").await;
             drop(cmd_tx);
             assert_eq!(
                 evt_rx.recv().await,
