@@ -254,3 +254,35 @@ fn pending_plan_with_feedback_60x14() {
         .join("\n");
     insta::assert_snapshot!(shot);
 }
+
+#[test]
+fn the_tool_row_behind_a_deferred_question_is_withdrawn() {
+    // The harness emits a tool_call_started for the question's id before
+    // the deferred request, and a completion once it is answered. Only
+    // the question card renders; the row never shows or spins.
+    let mut app = common::attached_app(false, 60, 16);
+    live(
+        &mut app,
+        9,
+        "run_started",
+        r#"{"run_id":"r2","prompt_id":"p2"}"#,
+    );
+    live(
+        &mut app,
+        10,
+        "tool_call_started",
+        r#"{"run_id":"r2","tool_call_id":"q1","tool_name":"mcp__engrams__ask_user_question","args_summary":"{\"questions\":[]}"}"#,
+    );
+    live(&mut app, 11, "tool_call_requested", QUESTION);
+    let shown = frame(&mut app, 60, 16);
+    assert!(!shown.contains("ask_user_question"), "{shown}");
+    assert!(shown.contains("Which database?"), "{shown}");
+    live(
+        &mut app,
+        12,
+        "tool_call_completed",
+        r#"{"run_id":"r2","tool_call_id":"q1","tool_name":"mcp__engrams__ask_user_question","ok":true,"duration_ms":0,"result_summary":""}"#,
+    );
+    let shown = frame(&mut app, 60, 16);
+    assert!(!shown.contains("ask_user_question"), "{shown}");
+}

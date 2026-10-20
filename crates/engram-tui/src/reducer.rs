@@ -516,6 +516,17 @@ impl Reducer {
                 args_json,
             } => {
                 self.requested.insert(tool_call_id.clone());
+                // A deferred question or plan is represented by its card.
+                // The harness emits a `tool_call_started` for the same id
+                // first (and a completion once it is answered): the tool
+                // row would sit beside the card, so it is withdrawn.
+                if name == "exit_plan_mode" || name == "ask_user_question" {
+                    if let Some(i) = self.open_tools.remove(&tool_call_id) {
+                        if let Some(e) = self.transcript.get_mut(i) {
+                            e.hide();
+                        }
+                    }
+                }
                 if name == "exit_plan_mode" {
                     if let Some(plan) = parse_plan(&args_json) {
                         self.close_active();
