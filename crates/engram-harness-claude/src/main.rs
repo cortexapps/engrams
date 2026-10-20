@@ -8136,22 +8136,36 @@ mod adapter {
         }
 
         async fn write_native_question_fallback_fake_claude(
-            counter: &Path,
+            idle_marker: &Path,
             captured: &Path,
         ) -> String {
             use std::os::unix::fs::PermissionsExt;
             let path =
                 std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
-            // Branch on --resume in argv, NOT on a spawn counter: the engine
-            // SIGINTs the idle generation, which can die before a counter
-            // increment lands (observed flake). The init line carries a
-            // session_id so the engine can build the --resume respawn at all.
+            // Three generations. The first (no --resume yet) takes the
+            // prompt and defers the tool. Its init line carries a
+            // session_id, so EVERY respawn after it runs with --resume:
+            // `--resume` alone cannot tell the idle respawn from the
+            // delivery respawn. The first --resume generation creates
+            // `idle_marker` and stays silent (the idle, parked process the
+            // engine SIGINTs when the result arrives). Only a --resume
+            // generation that finds the marker is the delivery resume.
+            //
+            // The idle generation must say nothing: an unprompted assistant
+            // line opens a background-wake turn, and the result arriving
+            // inside it closes that turn as `RunCompleted { ok: false }`.
+            // The test waits for the marker before it sends the result, so
+            // the idle generation has decided before it can be signaled.
             let body = format!(
                 "#!/bin/sh\n\
                  trap 'exit 0' INT TERM\n\
                  printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-fallback\"}}'\n\
                  case \"$*\" in\n\
                  *--resume*)\n\
+                   if [ ! -e '{idle_marker}' ]; then\n\
+                     : > '{idle_marker}'\n\
+                     while :; do sleep 0.2; done\n\
+                   fi\n\
                    printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-resumed\",\"content\":[{{\"type\":\"text\",\"text\":\"resumed without refire\"}}]}}}}'\n\
                    printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"completed\"}}'\n\
                    IFS= read -r delivered\n\
@@ -8161,21 +8175,14 @@ mod adapter {
                    while IFS= read -r _l; do :; done\n\
                    ;;\n\
                  *)\n\
-                   n=0\n\
-                   if [ -f '{counter}' ]; then n=$(sed -n '1p' '{counter}'); fi\n\
-                   n=$((n + 1))\n\
-                   printf '%s\\n' \"$n\" > '{counter}'\n\
-                   if [ \"$n\" -eq 1 ]; then\n\
-                     IFS= read -r _prompt\n\
-                     sleep 0.3\n\
-                     printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-defer\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_fallback\",\"name\":\"mcp__engrams__save_memory\",\"input\":{{\"text\":\"remember\"}}}}]}}}}'\n\
-                     printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"tool_deferred\"}}'\n\
-                     exit 0\n\
-                   fi\n\
-                   while :; do sleep 0.2; done\n\
+                   IFS= read -r _prompt\n\
+                   sleep 0.3\n\
+                   printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-defer\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_fallback\",\"name\":\"mcp__engrams__save_memory\",\"input\":{{\"text\":\"remember\"}}}}]}}}}'\n\
+                   printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"tool_deferred\"}}'\n\
+                   exit 0\n\
                    ;;\n\
                  esac\n",
-                counter = counter.display(),
+                idle_marker = idle_marker.display(),
                 captured = captured.display(),
             );
             tokio::fs::write(&path, body).await.unwrap();
@@ -8512,9 +8519,9 @@ mod adapter {
         #[tokio::test]
         async fn native_question_abandoned_refire_fallback_emits_completion() {
             let nonce = uuid::Uuid::new_v4();
-            let counter = std::env::temp_dir().join(format!("fake-claude-count-{nonce}"));
+            let idle_marker = std::env::temp_dir().join(format!("fake-claude-idle-{nonce}"));
             let captured = std::env::temp_dir().join(format!("fake-claude-fallback-{nonce}"));
-            let script = write_native_question_fallback_fake_claude(&counter, &captured).await;
+            let script = write_native_question_fallback_fake_claude(&idle_marker, &captured).await;
             let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone());
             cli.tool_manifest = vec![native_question_tool()];
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -8568,6 +8575,15 @@ mod adapter {
             .await
             .expect("the dead deferred process should respawn before result delivery");
             assert_eq!(waiting, ["parked", "parked"]);
+            // The respawned generation is idle only once it has created its
+            // marker; a result sent before that could reach it mid-decision.
+            tokio::time::timeout(SUBPROCESS_TRANSITION_TIMEOUT, async {
+                while !idle_marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the respawned generation never settled idle");
 
             cmd_tx
                 .send(HarnessCommand::ToolResult {
@@ -8634,7 +8650,7 @@ mod adapter {
                 .expect("engine exits")
                 .expect("engine task does not panic");
             let _ = tokio::fs::remove_file(script).await;
-            let _ = tokio::fs::remove_file(counter).await;
+            let _ = tokio::fs::remove_file(idle_marker).await;
             let _ = tokio::fs::remove_file(captured).await;
         }
     }
