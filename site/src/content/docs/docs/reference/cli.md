@@ -243,3 +243,6 @@ Flags and environment:
   labels (`you:`, `agent:`, `tool:`) in place of glyphs.
 - `NO_COLOR` turns color off, syntax highlighting included. State markers carry their
   meaning without it.
+- Secondary text (receipts, hints, the `… N more lines` tails) uses your terminal's dim
+  attribute on your own foreground color, never a fixed grey, so it follows your theme.
+  `ENGRAMS_TUI_NO_DIM=1` turns the attribute off when it is still too faint.

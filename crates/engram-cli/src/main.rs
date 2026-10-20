@@ -594,6 +594,7 @@ fn main() {
                 && !env_on("ENGRAMS_TUI_NO_ALT_SCREEN"),
             color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
             ax,
+            no_dim: env_on("ENGRAMS_TUI_NO_DIM"),
         };
         if let Err(m) = engram_tui::run(clients, opts) {
             eprintln!("engrams: {m}");

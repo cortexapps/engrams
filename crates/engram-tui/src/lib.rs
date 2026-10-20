@@ -54,6 +54,8 @@ pub struct Options {
     pub color: bool,
     /// Screen-reader mode: word gutters, no glyph-only state.
     pub ax: bool,
+    /// No DIM attribute anywhere (`ENGRAMS_TUI_NO_DIM`).
+    pub no_dim: bool,
 }
 
 /// Minimum interval between frames (~120 Hz).
@@ -81,6 +83,9 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
     let mut terminal =
         Terminal::with_options(backend, TerminalOptions { viewport }).map_err(|e| e.to_string())?;
     let mut theme = Theme::new(opts.color);
+    if opts.no_dim {
+        theme = theme.without_dim();
+    }
     theme.ax = opts.ax;
     if opts.color {
         let bg = terminal::probe().bg;
