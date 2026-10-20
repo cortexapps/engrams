@@ -459,6 +459,26 @@ fn issue_1295_crashed_host_vm_is_not_a_live_owner() {
     run(33095501, Profile::Chaos, 5000);
 }
 
+/// Issue #1615: nightly `single-ownership`, one chaos seed per night
+/// from 2026-10-08 (27 seeds, every one the same shape; the same seeds
+/// fail identically on the last green nightly's tree, so the class is
+/// as old as the durable teleport machine and the day-derived seed
+/// windows simply reached it). An admin drain planned a snapshot
+/// teleport; capture held the source paused, the destination restored
+/// and attached, and the release step destroyed the source and entombed
+/// it — while the source host sat in a deferred-effect window, so the
+/// destroy was acked but not yet applied. The world still listed the
+/// paused, tombstoned source beside the running destination and the
+/// oracle counted two owners for a finished, correct move. The fix
+/// aligns the oracle with ADR 0116 A-D5: an entombed sandbox is dead by
+/// decree, and an open teleport's source and destination are one owner
+/// while the row is open. Fired at step 56; the full nightly shape
+/// pins the convergence (the tombstone leg reaps the source).
+#[test]
+fn issue_1615_entombed_teleport_source_is_not_a_live_owner() {
+    run(33194461, Profile::Chaos, 5000);
+}
+
 /// #896 review (HIGH): a budget-exhausted evacuation deliberately leaves
 /// the row Idle WITH its unconfirmed source binding — ownership is never
 /// released on a guess. That residue must stay RECOVERABLE: the resume
