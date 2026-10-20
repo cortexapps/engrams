@@ -32,10 +32,13 @@
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::nbd_release::NbdReleaseGuard;
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::BlobStorage;
@@ -170,6 +173,8 @@ async fn survivor_reconfigure_resumes_parked_io() {
         Some(p) => p,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     // Short dead-conn window so a failure mode (parked read NEVER
     // completing) fails the test in seconds, not the prod 300s.
     std::env::set_var("ENGRAM_NBD_DEAD_CONN_TIMEOUT_SECS", "60");
@@ -374,6 +379,8 @@ async fn reattach_echoes_kernel_identifier_across_manifest_fork() {
         Some(p) => p,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let work = tempfile::tempdir().expect("tempdir");
     let (bytes, manifest, base_ref, cache, store) = identifier_fixture(work.path()).await;
 

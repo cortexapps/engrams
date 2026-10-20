@@ -40,9 +40,9 @@ Kubernetes.
 rule) and the sysctl `vm.unprivileged_userfaultfd = 1`.
 
 **Chunked disks.** The kernel needs the NBD block driver (`CONFIG_BLK_DEV_NBD`, built in on
-Ubuntu cloud images) loaded with enough devices, `modprobe nbd nbds_max=<N>`, and the host
-agent needs `ENGRAM_NBD_DEVICES=/dev/nbd0,/dev/nbd1,...` listing the ones it may use. One
-device serves one running VM.
+Ubuntu cloud images) loaded with enough devices, `modprobe nbd nbds_max=<N>`. The host
+agent uses all of them; `ENGRAM_NBD_MAX_SLOTS` sets a lower limit. A running VM uses one
+device for its disk, and one more when it has swap.
 
 **The guest kernel and the bundles.** Each host stages a guest kernel and the read-only
 bundles for the in-guest daemon, the harnesses, and the skills. The VM boots with

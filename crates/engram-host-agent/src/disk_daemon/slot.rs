@@ -35,7 +35,9 @@
 //! Production builds the pool from the kernel's `nbds_max` via
 //! [`build_from_kernel`]; the chart sets `modprobe nbd
 //! nbds_max=<N>` and the matching `ENGRAM_NBD_MAX_SLOTS` /
-//! `ENGRAM_NBD_WARM_SLOTS`. The FC integration tests build a
+//! `ENGRAM_NBD_WARM_SLOTS`. `ENGRAM_NBD_FIRST_SLOT` moves the start of
+//! the range, so that two host agents on one machine own disjoint
+//! devices (see [`slot_range`]). The FC integration tests build a
 //! restricted pool over one specific device via [`NbdSlotAllocator::from_paths`].
 
 use std::collections::{HashMap, VecDeque};
@@ -447,6 +449,9 @@ pub struct NbdSlotAllocator {
     /// Total universe size — constant after construction, so kept out
     /// of the mutex for a lock-free `capacity()`.
     capacity: usize,
+    /// The device indices of the universe — constant after construction,
+    /// so kept out of the mutex for a lock-free, sync [`Self::owns_device`].
+    members: std::collections::HashSet<u32>,
     claimed: std::sync::atomic::AtomicU32,
     free_check: FreeCheck,
     /// Devices parked by [`NbdSlot::quarantine`] — the allocator's record
@@ -520,6 +525,7 @@ impl NbdSlotAllocator {
             .collect();
         let reserved = vec![false; universe.len()];
         let capacity = universe.len();
+        let members = universe.iter().copied().collect();
         let warm_target = warm_target.min(capacity);
         let me = Arc::new(Self {
             inner: Mutex::new(Inner {
@@ -532,6 +538,7 @@ impl NbdSlotAllocator {
             warm: Mutex::new(VecDeque::with_capacity(warm_target)),
             warm_target,
             capacity,
+            members,
             claimed: std::sync::atomic::AtomicU32::new(0),
             free_check,
             parked: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -547,6 +554,13 @@ impl NbdSlotAllocator {
     /// Total slot count in this pool's universe. Constant; lock-free.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Whether `device` is a `/dev/nbdN` of this pool's universe. Two host
+    /// agents on one machine own disjoint ranges (see [`slot_range`]), and
+    /// each one must leave the other's devices alone.
+    pub fn owns_device(&self, device: &Path) -> bool {
+        parse_nbd_index(device).is_some_and(|idx| self.members.contains(&idx))
     }
 
     /// Claimed slots, including parked devices. Warm slots and the
@@ -812,27 +826,59 @@ pub fn build_from_kernel() -> Option<Arc<NbdSlotAllocator>> {
         return None;
     }
     let kernel = kernel_nbds_max()?;
-    let env_cap = std::env::var("ENGRAM_NBD_MAX_SLOTS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(MAX_SUPPORTED_SLOTS);
-    let max = kernel.min(env_cap).min(MAX_SUPPORTED_SLOTS);
-    if max == 0 {
-        tracing::warn!("kernel nbds_max is 0; NBD daemon off (materialize-to-file)");
+    let env_u32 = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    };
+    let first = env_u32("ENGRAM_NBD_FIRST_SLOT").unwrap_or(0);
+    let range = slot_range(kernel, first, env_u32("ENGRAM_NBD_MAX_SLOTS"));
+    if range.is_empty() {
+        tracing::error!(
+            kernel_nbds_max = kernel,
+            first_slot = first,
+            "no /dev/nbdN device in the configured slot range; NBD daemon off \
+             (materialize-to-file)",
+        );
         return None;
     }
+    let slots = range.len();
     let warm = std::env::var("ENGRAM_NBD_WARM_SLOTS")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_WARM_SLOTS)
-        .clamp(1, max as usize);
+        .clamp(1, slots);
     tracing::info!(
-        slots = max,
+        slots,
+        first_slot = range.start,
         warm_slots = warm,
         kernel_nbds_max = kernel,
         "NBD daemon enabled (ADR 0049 warm-pool allocator); chunked rootfs serves /dev/nbdN",
     );
-    Some(NbdSlotAllocator::with_capacity(max, warm))
+    Some(NbdSlotAllocator::build(
+        range.collect(),
+        warm,
+        Arc::new(device_is_free),
+    ))
+}
+
+/// The device indices this host agent owns: `first..first + count`, where
+/// `count` is the smallest of the devices the kernel has past `first`,
+/// `ENGRAM_NBD_MAX_SLOTS` (when set), and [`MAX_SUPPORTED_SLOTS`].
+///
+/// A production node runs one host agent, which owns every device
+/// (`first = 0`). Two host agents on one machine (the two-host dev and CI
+/// stack) MUST own disjoint ranges: each allocator keeps validated-free
+/// slots warm, and it cannot see a CONNECT by another process. With a
+/// shared range, a slot that one agent validated can be bound by the other
+/// agent before it is used, and the CONNECT then fails `EBUSY` while
+/// another server owns the device.
+fn slot_range(kernel_nbds_max: u32, first: u32, max_slots: Option<u32>) -> std::ops::Range<u32> {
+    let count = kernel_nbds_max
+        .saturating_sub(first)
+        .min(max_slots.unwrap_or(MAX_SUPPORTED_SLOTS))
+        .min(MAX_SUPPORTED_SLOTS);
+    first..first.saturating_add(count)
 }
 
 /// Background populator: keeps the warm pool topped up to
@@ -891,6 +937,34 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::time::Duration;
+
+    /// The slot range starts at `first` and never runs past the kernel's
+    /// devices, the operator cap, or the supported ceiling. A start past the
+    /// last device gives an empty range (the caller turns NBD off).
+    #[test]
+    fn slot_range_is_bounded_by_kernel_cap_and_start() {
+        assert_eq!(slot_range(16, 0, None), 0..16);
+        assert_eq!(slot_range(16, 0, Some(8)), 0..8);
+        assert_eq!(slot_range(16, 8, Some(8)), 8..16);
+        assert_eq!(slot_range(16, 8, None), 8..16);
+        assert_eq!(slot_range(16, 12, Some(8)), 12..16);
+        assert_eq!(slot_range(8192, 0, None), 0..MAX_SUPPORTED_SLOTS);
+        assert!(slot_range(16, 16, None).is_empty());
+        assert!(slot_range(16, 20, Some(4)).is_empty());
+        assert!(slot_range(16, 0, Some(0)).is_empty());
+    }
+
+    /// A pool owns exactly its universe's devices, so a host agent with the
+    /// range 8..16 does not classify a device of the agent with 0..8.
+    #[tokio::test]
+    async fn owns_device_is_the_universe() {
+        let pool = NbdSlotAllocator::build((8..16).collect(), 0, Arc::new(|_| false));
+        assert!(pool.owns_device(Path::new("/dev/nbd8")));
+        assert!(pool.owns_device(Path::new("/dev/nbd15")));
+        assert!(!pool.owns_device(Path::new("/dev/nbd7")));
+        assert!(!pool.owns_device(Path::new("/dev/nbd16")));
+        assert!(!pool.owns_device(Path::new("/dev/sda")));
+    }
 
     /// ADR 0098 P7: the auditable slot FSM. The legal edges match the
     /// allocator's concrete actions; `Warm → Free` (a populator un-warming

@@ -5,5 +5,6 @@
 //! have one home instead of being copy-pasted between test binaries.
 
 pub mod blob_conformance;
+pub mod net;
 pub mod pg;
 pub mod storage;

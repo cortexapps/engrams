@@ -32,10 +32,13 @@
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::nbd_release::NbdReleaseGuard;
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::BlobStorage;
@@ -189,6 +192,8 @@ async fn reattach_verify_on_read_serves_seeded_acked_bytes_not_base() {
         Some(p) => p,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let work = tempfile::tempdir().expect("tempdir");
 
     // A small base image: every 4 KiB block tagged BASE. Small on purpose
@@ -389,6 +394,8 @@ async fn reattach_survives_guest_write_racing_reconfigure() {
         Some(p) => p,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let work = tempfile::tempdir().expect("tempdir");
 
     const BASE_TAG: u64 = 0;

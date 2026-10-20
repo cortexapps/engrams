@@ -56,11 +56,6 @@ const SNI: &str = "engram-stream-test.invalid";
 const CHUNK_ONE: &[u8] = b"CHUNK-ONE-BEFORE-THE-ROLL\n";
 const CHUNK_TWO: &[u8] = b"CHUNK-TWO-AFTER-THE-ROLL\n";
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
-    l.local_addr().expect("local addr").port()
-}
-
 /// A real ClientHello for `SNI`, as raw bytes. The proxy's SNI peek
 /// parses it; the bypass splice replays it to the upstream verbatim.
 fn client_hello_bytes() -> Vec<u8> {
@@ -126,12 +121,10 @@ async fn spawn_daemon(
         None,
         engram_core::HostId::new(),
     );
-    args.proxy_port = free_port();
-    args.dns_port = free_port();
-    args.gateway_port = free_port();
+    [args.proxy_port, args.dns_port, args.gateway_port] = engram_testkit::net::free_tcp_udp_ports();
     args.test_resolves = vec![(SNI.to_string(), upstream)];
     let ports = (args.proxy_port, args.dns_port, args.gateway_port);
-    tokio::spawn(engram_egress_proxyd::run(args));
+    let daemon = tokio::spawn(engram_egress_proxyd::run(args));
     let handle = Arc::new(ProxydHandle::new(
         work_dir.join(engram_egress_proto::CONTROL_SOCK_NAME),
     ));
@@ -141,6 +134,12 @@ async fn spawn_daemon(
             && handle.hello().await.is_ok()
         {
             return (handle, ports.0, ports.1, ports.2);
+        }
+        if daemon.is_finished() {
+            panic!(
+                "egress daemon exited before it was ready: {:?}",
+                daemon.await
+            );
         }
         assert!(
             std::time::Instant::now() < deadline,

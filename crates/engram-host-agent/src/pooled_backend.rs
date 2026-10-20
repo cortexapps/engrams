@@ -1411,10 +1411,20 @@ impl PooledBackend {
             // this sync command's own mkdir marker before the disk capture;
             // the wrapper deliberately tolerates losing its record and the
             // still-attached live stream carries the exact result.
+            //
+            // The wrapper writes its pid files and creates its output files
+            // in that marker while `rm` runs, so one `rm` can fail
+            // `ENOTEMPTY` on its own entry. Each failure needs a new file in
+            // the marker, and the wrapper makes only a few before it waits;
+            // once the marker is gone no create can succeed. So `rm` is
+            // repeated until it succeeds, with a bound that only a guest that
+            // fails `rm` for another reason reaches.
             command: vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "rm -rf /var/lib/engram/execs/* && sync".into(),
+                "n=0; until rm -rf /var/lib/engram/execs/*; do \
+                 n=$((n + 1)); [ \"$n\" -lt 20 ] || exit 1; done; sync"
+                    .into(),
             ],
             stdin: None,
             env: std::collections::HashMap::new(),
@@ -4292,8 +4302,15 @@ impl PooledBackend {
             None => std::collections::HashMap::new(),
         };
 
+        // With no pool (NBD off) every connected device is classified, as
+        // before ranges existed: any binding is then a leftover.
+        let owns = |device: &std::path::Path| {
+            self.nbd_pool
+                .as_ref()
+                .is_none_or(|pool| pool.owns_device(device))
+        };
         let (classification, residue_pairs) =
-            crate::disk_daemon::classify_startup_inventory(kernel, &records, &owners);
+            crate::disk_daemon::classify_startup_inventory(kernel, &records, &owners, &owns);
 
         // Attributed residue: report + await the coordinator's tombstone
         // (existing from the interrupted destroy, or minted by the ADR 0116
@@ -15517,13 +15534,6 @@ mod tests {
             }
         }
 
-        fn free_port() -> u16 {
-            // Bind-then-drop: a small race against other tests, ridden
-            // by the daemon's own bind_with_retry.
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
-            l.local_addr().expect("local addr").port()
-        }
-
         /// Run a REAL egress daemon as an in-process task (ADR 0121)
         /// and return the facade plus its control handle for
         /// assertions. Same data plane the production host-agent
@@ -15545,10 +15555,11 @@ mod tests {
                 None,
                 engram_core::HostId::new(),
             );
-            args.proxy_port = free_port();
-            args.dns_port = free_port();
-            args.gateway_port = free_port();
-            tokio::spawn(engram_egress_proxyd::run(args));
+            // The daemon binds every port for TCP on 0.0.0.0, and the DNS
+            // port for UDP too: pick ports free for all of those binds.
+            [args.proxy_port, args.dns_port, args.gateway_port] =
+                engram_testkit::net::free_tcp_udp_ports();
+            let daemon = tokio::spawn(engram_egress_proxyd::run(args));
             let handle = Arc::new(crate::proxyd_client::ProxydHandle::new(
                 dir.path().join(engram_egress_proto::CONTROL_SOCK_NAME),
             ));
@@ -15560,6 +15571,15 @@ mod tests {
                     && handle.hello().await.is_ok()
                 {
                     break;
+                }
+                // `run` returns only when the daemon gives up (a failed
+                // bind, for example). Say so at once with its exit code,
+                // not as a silent wait to the deadline.
+                if daemon.is_finished() {
+                    panic!(
+                        "in-process egress daemon exited before it was ready: {:?}",
+                        daemon.await
+                    );
                 }
                 assert!(
                     std::time::Instant::now() < deadline,

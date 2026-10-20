@@ -6,6 +6,7 @@
 mod common;
 
 use async_trait::async_trait;
+use common::nbd_release::NbdReleaseGuard;
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::{ChunkStore, Manifest, ManifestKind};
 use engram_core::traits::SandboxBackend;
@@ -157,6 +158,8 @@ async fn exercise_two_devices(final_flush: bool) {
     let Some(devices) = common::postcopy::nbd_devices(2) else {
         return;
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new(&devices);
     let dir = tempfile::tempdir().unwrap();
     let id = SandboxId::new();
     let session = SessionId::new();
@@ -337,6 +340,8 @@ async fn pooled_swap_create_capture_restore_and_fresh_attach() {
     let Some(devices) = common::postcopy::nbd_devices(2) else {
         return;
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new(&devices);
     let dir = tempfile::tempdir().unwrap();
     let id = SandboxId::new();
     let store = ChunkStore::new(Arc::new(LocalBlobStorage::new(dir.path().join("blob"))));

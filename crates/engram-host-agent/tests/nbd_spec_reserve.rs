@@ -27,10 +27,13 @@
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use common::nbd_release::NbdReleaseGuard;
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::{BlobStorage, SandboxBackend};
@@ -127,6 +130,8 @@ async fn never_flushed_survivor_is_reserved_from_spec_and_binding() {
         .with_env_filter("engram_host_agent=debug")
         .try_init();
     let Some(nbd_path) = preflight() else { return };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let work = tempfile::tempdir().expect("tempdir");
 
     // The store holds the survivor's create-time lineage: one zeroed

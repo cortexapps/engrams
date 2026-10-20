@@ -2246,7 +2246,9 @@ mod tests {
         // poll reads an empty file and panics with ParseIntError::Empty.
         let child_pid_path = b.cwd_for(id).join("child.pid");
         let mut child_pid = None;
-        for _ in 0..100 {
+        // Bounds hold under a full-workspace test run; each loop returns
+        // as soon as its condition is true.
+        for _ in 0..1000 {
             child_pid = fs::read_to_string(&child_pid_path)
                 .ok()
                 .and_then(|raw| raw.trim().parse::<i32>().ok());
@@ -2265,7 +2267,7 @@ mod tests {
         assert_eq!(exit, Some(None));
 
         let mut child_alive = true;
-        for _ in 0..100 {
+        for _ in 0..1000 {
             child_alive = std::process::Command::new("kill")
                 .args(["-0", &child_pid.to_string()])
                 .status()
@@ -2509,11 +2511,11 @@ mod tests {
         // existence: `echo $$ > file` opens (creates) the file before the
         // write lands, so an existence check can observe an empty file and
         // the parse below dies with `ParseIntError { kind: Empty }` (flaked
-        // in CI 2026-07-31). Real-world race budgets are tiny here; a few
-        // hundred ms is plenty.
+        // in CI 2026-07-31). The bound holds under a full-workspace test run;
+        // the loop returns as soon as the pid lands.
         let pid_path = b.cwd_for(id).join(pid_file);
         let mut pid_contents = String::new();
-        for _ in 0..50 {
+        for _ in 0..500 {
             pid_contents = fs::read_to_string(&pid_path).unwrap_or_default();
             if !pid_contents.trim().is_empty() {
                 break;
@@ -2725,16 +2727,15 @@ mod tests {
             .await
             .unwrap();
 
-        let started = std::time::Instant::now();
         let mut events = stream.events;
-        let mut first_stdout_at: Option<Duration> = None;
+        let mut first_stdout: Option<Vec<u8>> = None;
         let mut all_stdout = Vec::new();
         let mut exit = None;
         while let Some(ev) = events.next().await {
             match ev {
                 ExecEvent::Stdout(b) => {
-                    if first_stdout_at.is_none() {
-                        first_stdout_at = Some(started.elapsed());
+                    if first_stdout.is_none() {
+                        first_stdout = Some(b.to_vec());
                     }
                     all_stdout.extend_from_slice(&b);
                 }
@@ -2749,13 +2750,15 @@ mod tests {
         assert_eq!(exit, Some(0));
         assert_eq!(String::from_utf8(all_stdout).unwrap(), "chunk-1chunk-2");
 
-        let first = first_stdout_at.expect("at least one stdout chunk arrived");
-        // Child sleeps 500ms between writes. First chunk must arrive
-        // well before the child finishes (1s budget after process spawn).
-        // If we'd buffered to completion this would be ≥500ms.
-        assert!(
-            first < Duration::from_millis(450),
-            "first chunk took {first:?} — streaming would expect it sooner",
+        // The child sleeps 500 ms between its writes. A stream delivers
+        // `chunk-1` alone, before the second write exists; a stream that
+        // buffered to completion delivers both in its first event. This
+        // checks order, not wall time, so a loaded machine cannot fail it.
+        let first = first_stdout.expect("at least one stdout chunk arrived");
+        assert_eq!(
+            String::from_utf8(first).unwrap(),
+            "chunk-1",
+            "the first stdout event must come before the child's second write",
         );
     }
 

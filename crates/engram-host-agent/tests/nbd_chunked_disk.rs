@@ -41,6 +41,8 @@
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,6 +56,8 @@ use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec}
 use engram_host_agent::disk_daemon::{attach_manifest, NbdSlotAllocator};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreMode};
 use engram_storage_local::LocalBlobStorage;
+
+use common::nbd_release::NbdReleaseGuard;
 
 /// Pre-flight: KVM + firecracker + the test rootfs path. Mirrors
 /// the FC crate's `common::fc_preflight` but inlined here so we
@@ -206,6 +210,8 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
         Some(v) => v,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
 
     let work = tempfile::tempdir().expect("tempdir");
 
@@ -387,6 +393,8 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
         Some(v) => v,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
 
     let work = tempfile::tempdir().expect("tempdir");
 
@@ -421,7 +429,7 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
     cfg.restore_mode = RestoreMode::File;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/verify-init.sh".into();
     let inner = Arc::new(FirecrackerBackend::new(work.path(), cfg));
-    let pool = NbdSlotAllocator::from_paths(vec![nbd_path]).expect("slot pool");
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("slot pool");
     let mut cache_cfg = ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 256 * 1024 * 1024;
     let pooled = engram_host_agent::pooled_backend::PooledBackend::new(inner)
@@ -496,6 +504,8 @@ async fn high_offset_write_reads_back_through_the_device() {
         eprintln!("SKIP: {} not present", nbd_path.display());
         return;
     }
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let work = tempfile::tempdir().expect("work");
     let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.path().join("blob")));
     let store = ChunkStore::new(blob);
@@ -627,6 +637,8 @@ async fn forked_attach_first_flush_mints_private_id_and_leaves_base_chain_untouc
         eprintln!("SKIP: {} not present", nbd_path.display());
         return;
     }
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let work = tempfile::tempdir().expect("work");
     let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.path().join("blob")));
     let store = ChunkStore::new(blob);
@@ -662,7 +674,7 @@ async fn forked_attach_first_flush_mints_private_id_and_leaves_base_chain_untouc
         .await
         .expect("put base manifest");
 
-    let pool = NbdSlotAllocator::from_paths(vec![nbd_path]).expect("pool");
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
     let store = Arc::new(store);
     let state = attach_manifest(
         base_ref,

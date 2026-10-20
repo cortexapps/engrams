@@ -551,46 +551,34 @@ if two_hosts and fc_colima_profile:
     fail('ENGRAM_INTEG_TWO_HOSTS is not supported together with ' +
          'ENGRAM_FC_COLIMA_PROFILE yet.')
 
-def _discover_nbd():
-    # (ADR 0024) FC serves the chunked rootfs over /dev/nbdN. The host-agent only
-    # takes the chunked-NBD path (which produces the chunked disk +
-    # memory manifests that `POST /api/enabled-images` REQUIRES — it
-    # 500s on a base snapshot built via the materialize-to-file
-    # fallback) when ENGRAM_NBD_DEVICES is set, so discover the host's
-    # devices and pass them, exactly as the old integration-up.sh did.
-    # VZ/macOS don't use NBD.
-    if sandbox_backend != 'firecracker':
-        return []
-    if fc_colima_profile:
-        # Devices are in the VM. `colima ssh -- ls /dev/nbd*` does NOT work:
-        # colima ssh runs no remote shell, so the glob passes literally,
-        # matches nothing, and ENGRAM_NBD_DEVICES ends up unset — which
-        # silently drops the host-agent onto the materialize-to-file path,
-        # producing base snapshots with no chunked manifest that then fail to
-        # restore ("read fc manifest.json … No such file"). List /dev (a lone
-        # command) and filter for nbdN on the Mac side.
-        listing = str(local(
-            "colima ssh --profile " + fc_colima_profile + " -- ls -1 /dev",
-            echo_off=True, quiet=True)).strip()
-        return ['/dev/' + d.strip() for d in listing.split('\n')
-                if d.strip().startswith('nbd') and d.strip()[3:].isdigit()]
-    listing = str(local("ls -1 /dev/nbd* 2>/dev/null || true",
-                        echo_off=True, quiet=True)).strip()
-    return [d for d in listing.split('\n') if d]
+def _nbd_device_count():
+    # FC serves the chunked disks over /dev/nbdN. The host-agent sizes its
+    # device pool from the kernel's `nbds_max` on its own, so one host-agent
+    # needs no NBD setting here.
+    listing = str(local("ls -1 /dev", echo_off=True, quiet=True)).strip()
+    return len([d for d in listing.split('\n')
+                if d.startswith('nbd') and d[3:].isdigit()])
 
-_nbd = _discover_nbd()
-if two_hosts and len(_nbd) >= 2:
-    # Two host-agents on one box need disjoint device sets.
-    _half = max(1, len(_nbd) // 2)
-    nbd_a = ','.join(_nbd[:_half])
-    nbd_b = ','.join(_nbd[_half:])
-else:
-    nbd_a = ','.join(_nbd)  # single host gets all discovered devices ('' if none)
-    nbd_b = None
-if sandbox_backend == 'firecracker':
-    print('engram dev: NBD devices discovered = %r (two_hosts=%s)' % (_nbd, two_hosts))
+# Two host-agents on one machine MUST own disjoint /dev/nbdN ranges. Each
+# host-agent keeps devices that it validated as free ready to use, and it
+# cannot see a CONNECT by the other process. With a shared range, the second
+# host-agent can CONNECT a device that the first one now serves, and the
+# attach fails with EBUSY (a teleport onto host-agent-b aborted this way).
+# (ENGRAM_INTEG_TWO_HOSTS with ENGRAM_FC_COLIMA_PROFILE fails above, so the
+# devices are on this machine.)
+nbd_a = None
+nbd_b = None
+if two_hosts and sandbox_backend == 'firecracker':
+    _nbd_count = _nbd_device_count()
+    if _nbd_count < 2:
+        fail('engram dev: two host-agents need at least 2 /dev/nbdN devices to split, found %d; load nbd with nbds_max>=2' % _nbd_count)
+    _half = _nbd_count // 2
+    nbd_a = (0, _half)
+    nbd_b = (_half, _nbd_count - _half)
+    print('engram dev: %d NBD devices; host-agent range (first, count) = %r, host-agent-b = %r'
+          % (_nbd_count, nbd_a, nbd_b))
 
-def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port, egress_dns_port, guest_gateway_port):
+def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_range, egress_proxy_port, egress_dns_port, guest_gateway_port):
     env = {
         # `kernel_key` is only non-None for vz/firecracker, both of
         # which force `dev_split`, so this always lands on the
@@ -671,8 +659,9 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
     if env_or('ENGRAM_FC_UFFD_HANDLER_BIN', ''):
         env['ENGRAM_FC_UFFD_HANDLER_BIN'] = env_or('ENGRAM_FC_UFFD_HANDLER_BIN', '')
 
-    if nbd_csv:
-        env['ENGRAM_NBD_DEVICES'] = nbd_csv
+    if nbd_range:
+        env['ENGRAM_NBD_FIRST_SLOT'] = str(nbd_range[0])
+        env['ENGRAM_NBD_MAX_SLOTS'] = str(nbd_range[1])
 
     if fc_colima_profile:
         # ADR 0082: this resource's whole execution model moves into the

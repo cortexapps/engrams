@@ -51,6 +51,8 @@
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +61,7 @@ use async_trait::async_trait;
 use axum::extract::{Path as AxumPath, State};
 use axum::routing::post;
 use axum::{Json, Router};
+use common::nbd_release::NbdReleaseGuard;
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::{BlobStorage, SandboxBackend};
@@ -205,6 +208,8 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
         Some(p) => p,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let index = nbd_index(&nbd_path);
 
     let work = tempfile::tempdir().expect("tempdir");
@@ -441,6 +446,8 @@ async fn run_sigterm_overrun_recovery(recovery_source: Stage1RecoverySource) {
         Some(p) => p,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let index = nbd_index(&nbd_path);
 
     let work = tempfile::tempdir().expect("tempdir");
@@ -691,6 +698,8 @@ async fn sigterm_overrun_aborts_inflight_flush_so_the_spool_stamp_cannot_go_stal
         Some(p) => p,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let index = nbd_index(&nbd_path);
 
     let work = tempfile::tempdir().expect("tempdir");

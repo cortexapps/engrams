@@ -3,6 +3,7 @@
 // Tests drive a live system; wall clock and entropy are inputs (ADR 0098 D1).
 #![allow(clippy::disallowed_methods)]
 mod common;
+use common::nbd_release::NbdReleaseGuard;
 use engram_core::traits::SandboxBackend;
 use engram_core::types::sandbox::{CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec};
 use engram_host_agent::pooled_backend::PooledBackend;
@@ -69,6 +70,8 @@ async fn moves_swapped_guest(live: bool) {
     let Some(devices) = common::postcopy::nbd_devices(if live { 4 } else { 2 }) else {
         return;
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new(&devices);
     let Some(kernel) = std::env::var_os("FC_TEST_KERNEL").map(PathBuf::from) else {
         return;
     };
