@@ -490,9 +490,11 @@ fn paint_src<'e>(
                 // line's first row; wrapped rows are plain.
                 let line_start = lr.row.start == 0
                     || text.as_bytes().get(lr.row.start as usize - 1) == Some(&b'\n');
-                let verb_end = line_start
-                    .then(|| s.find(' ').unwrap_or(s.len()))
-                    .unwrap_or(0);
+                let verb_end = if line_start {
+                    s.find(' ').unwrap_or(s.len())
+                } else {
+                    0
+                };
                 let mut cx = put(
                     buf,
                     body_x + 2,

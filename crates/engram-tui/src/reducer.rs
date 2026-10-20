@@ -265,7 +265,7 @@ impl Reducer {
                     };
                     p.clear();
                     for (j, o) in q.options.iter().enumerate() {
-                        if labels.iter().any(|l| *l == o.label) {
+                        if labels.contains(&o.label) {
                             p.push(j as u16);
                         }
                     }
@@ -732,7 +732,7 @@ impl Reducer {
                                     duration_ms: d,
                                     ..
                                 } => {
-                                    *result = result_summary.map(Into::into);
+                                    *result = result_summary.as_deref().map(trim_result);
                                     *s = state;
                                     *d = duration_ms;
                                 }
@@ -755,7 +755,7 @@ impl Reducer {
                         self.transcript.push(Cell::Tool {
                             name: tool_name.into(),
                             args: "".into(),
-                            result: result_summary.map(Into::into),
+                            result: result_summary.as_deref().map(trim_result),
                             state,
                             duration_ms,
                             expanded: false,
@@ -848,7 +848,11 @@ impl Reducer {
                 let started = self.run_started_unix.take();
                 self.settle_run(ok);
                 // The turn's receipt: how long the agent worked, and how
-                // the turn ended when not by its own choice.
+                // the turn ended when not by its own choice. A turn that
+                // paused on a question or a plan is not over: no receipt.
+                if self.awaiting_decision() {
+                    return;
+                }
                 if let (Some(a), Some(b)) = (started, at) {
                     let took = fmt_secs(b.saturating_sub(a));
                     let text = if interrupted {
@@ -950,6 +954,12 @@ impl Reducer {
         self.open_execs.insert(exec_id.to_string(), i);
         i
     }
+}
+
+/// A result summary without its trailing newlines: they would paint as
+/// empty rows under the cell.
+fn trim_result(s: &str) -> Box<str> {
+    s.trim_end_matches(['\n', '\r']).into()
 }
 
 /// `<1s`, `42s`, `2m 14s`, `1h 03m`.
@@ -1339,5 +1349,35 @@ mod tests {
         assert_eq!(texts(&r).last().unwrap(), "user:?");
         assert_eq!(fmt_secs(0), "<1s");
         assert_eq!(fmt_secs(3_780), "1h 03m");
+    }
+
+    #[test]
+    fn a_turn_paused_on_a_question_gets_no_receipt_and_results_lose_trailing_newlines() {
+        let mut r = Reducer::new();
+        r.apply(ev(
+            "run_started",
+            r#"{"run_id":"r1","prompt_id":"p1","at":"2026-01-01T10:00:00Z"}"#,
+        ));
+        r.apply(ev(
+            "tool_call_started",
+            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Bash","args_summary":"true"}"#,
+        ));
+        r.apply(ev(
+            "tool_call_completed",
+            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Bash","ok":true,"result_summary":"(no output)\n"}"#,
+        ));
+        match &r.transcript.get(1).unwrap().cell {
+            Cell::Tool { result, .. } => assert_eq!(result.as_deref(), Some("(no output)")),
+            other => panic!("{other:?}"),
+        }
+        r.apply(ev(
+            "tool_call_requested",
+            r#"{"tool_call_id":"q1","name":"ask_user_question","args_json":"{\"questions\":[{\"question\":\"A?\",\"header\":\"h\",\"multiSelect\":false,\"options\":[{\"label\":\"x\",\"description\":\"\"}]}]}"}"#,
+        ));
+        r.apply(ev(
+            "run_completed",
+            r#"{"run_id":"r1","ok":true,"at":"2026-01-01T10:00:09Z"}"#,
+        ));
+        assert_eq!(texts(&r).last().unwrap(), "question:false");
     }
 }
