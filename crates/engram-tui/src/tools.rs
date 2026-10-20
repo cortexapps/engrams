@@ -51,9 +51,56 @@ fn first_line(s: &str) -> &str {
 /// The summary of `args` (JSON, or already a summary) for tool `name`.
 pub fn summarize(name: &str, args: &str) -> String {
     let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(args) else {
-        return args.trim().to_string();
+        return salvage(args).unwrap_or_else(|| args.trim().to_string());
     };
     summarize_object(&canonical(name), &obj)
+}
+
+/// The subject of an argument object the server cut short (its summary
+/// has a byte limit, so a long command arrives as broken JSON): the
+/// first string field with a subject-like key, unescaped up to the cut.
+fn salvage(args: &str) -> Option<String> {
+    let args = args.trim_start();
+    if !args.starts_with('{') {
+        return None;
+    }
+    const KEYS: [&str; 6] = [
+        "\"command\":\"",
+        "\"file_path\":\"",
+        "\"path\":\"",
+        "\"pattern\":\"",
+        "\"url\":\"",
+        "\"prompt\":\"",
+    ];
+    let (at, key) = KEYS
+        .iter()
+        .filter_map(|k| args.find(k).map(|i| (i, *k)))
+        .min_by_key(|&(i, _)| i)?;
+    let rest = &args[at + key.len()..];
+    let mut out = String::with_capacity(rest.len());
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('u') => {
+                    // A cut inside an escape: stop at the cut.
+                    let hex: String = chars.by_ref().take(4).collect();
+                    match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        Some(u) => out.push(u),
+                        None => break,
+                    }
+                }
+                Some(other) => out.push(other),
+                None => break,
+            },
+            c => out.push(c),
+        }
+    }
+    let out = out.trim_end().to_string();
+    (!out.is_empty()).then_some(out)
 }
 
 fn summarize_object(name: &str, obj: &Map<String, Value>) -> String {
@@ -169,5 +216,26 @@ mod tests {
         assert_eq!(canonical("mcp__x__ExitPlanMode"), "exit_plan_mode");
         assert!(is_read_only("grep"));
         assert!(!is_read_only("bash"));
+    }
+}
+
+#[cfg(test)]
+mod salvage_tests {
+    use super::summarize;
+
+    #[test]
+    fn a_cut_argument_object_still_yields_its_subject() {
+        // The server's summary limit cut the JSON inside the command.
+        let cut = r#"{"command":"cd /work && cat > /tmp/pr.md <<'EOF'\n## Summary\n\nAdds a `tag` with \"quotes\" and more te"#;
+        assert_eq!(
+            summarize("Bash", cut),
+            "cd /work && cat > /tmp/pr.md <<'EOF'\n## Summary\n\nAdds a `tag` with \"quotes\" and more te"
+        );
+        // A later key is not the subject; the earliest subject key wins.
+        let cut = r#"{"description":"x","file_path":"src/a.rs","content":"fn main() {"#;
+        assert_eq!(summarize("Write", cut), "src/a.rs");
+        // Plain text passes through as before.
+        assert_eq!(summarize("Bash", "  ls -la  "), "ls -la");
+        assert_eq!(summarize("Bash", "{\"other\":1"), "{\"other\":1");
     }
 }
