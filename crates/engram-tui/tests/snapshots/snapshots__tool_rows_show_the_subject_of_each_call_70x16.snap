@@ -3,6 +3,7 @@ source: crates/engram-tui/tests/snapshots.rs
 expression: shot
 ---
 " Add a README                                                         "
+"  and keep the existing introduction intact.                          "
 "· worked for 1m 05s                                                   "
 "· resumed                                                             "
 "                                                                      "
@@ -10,7 +11,6 @@ expression: shot
 "                                                                      "
 "✓ Explored                                                            "
 "  ⎿ Search fn main in src                                             "
-"                                                                      "
 "✗ Bash cd /work && for f in a b c d e f g h i j k l m n o p; do       "
 "    echo "=== $f"                                                     "
 "    cat $f.txt                                                        "

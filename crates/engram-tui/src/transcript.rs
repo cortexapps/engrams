@@ -278,6 +278,40 @@ pub enum Src {
     Option(u16, u16),
     /// A one-line receipt: tool state, exit status, answered.
     Tail,
+    /// The one-line summary of a folded turn (`Ran 6 shell commands`),
+    /// above the group's first cell.
+    Fold,
+}
+
+/// A finished turn's tool calls fold into one row (ADR 0124 PR9): the
+/// group's first entry carries the summary, the rest hide behind it
+/// until the row is opened.
+#[derive(Debug, Default)]
+pub enum Fold {
+    #[default]
+    None,
+    Head {
+        text: Box<str>,
+        /// Cells in the group, this one included.
+        len: usize,
+        expanded: bool,
+    },
+    Member {
+        shown: bool,
+    },
+}
+
+/// Does the cell belong in a turn's fold?
+fn foldable(c: &Cell) -> bool {
+    matches!(
+        c,
+        Cell::Tool { .. } | Cell::Exec { .. } | Cell::Explore { .. } | Cell::Diff { .. }
+    )
+}
+
+fn plural(out: &mut String, n: usize, one: &str, many: &str) {
+    use std::fmt::Write;
+    let _ = write!(out, "{n} {}", if n == 1 { one } else { many });
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -302,6 +336,7 @@ pub const HEAD_LINES: usize = 3;
 pub struct Entry {
     pub cell: Cell,
     layout: Layout,
+    pub fold: Fold,
     /// A blank row above the cell separates it from the one before.
     /// Tool-like cells in a row share one block, as do markers.
     gap: bool,
@@ -309,8 +344,7 @@ pub struct Entry {
 
 /// Does `next` get a blank row after `prev`?
 fn wants_gap(prev: &Cell, next: &Cell) -> bool {
-    let tool_like =
-        |c: &Cell| matches!(c, Cell::Tool { .. } | Cell::Exec { .. } | Cell::Diff { .. });
+    let tool_like = foldable;
     match next {
         Cell::Hidden => false,
         Cell::Marker {
@@ -328,12 +362,31 @@ impl Entry {
         Entry {
             cell,
             layout: Layout::default(),
+            fold: Fold::None,
             gap: false,
         }
     }
 
     fn gap_rows(&self) -> usize {
+        if self.hidden_by_fold() {
+            return 0;
+        }
         usize::from(self.gap)
+    }
+
+    /// Rows the fold summary takes above the cell: one on a fold head.
+    fn fold_rows(&self) -> usize {
+        usize::from(matches!(self.fold, Fold::Head { .. }))
+    }
+
+    /// The entry is inside a closed fold: it has no rows.
+    pub fn hidden_by_fold(&self) -> bool {
+        matches!(self.fold, Fold::Member { shown: false })
+    }
+
+    /// The entry is a fold head, open or closed.
+    pub fn is_fold_head(&self) -> bool {
+        matches!(self.fold, Fold::Head { .. })
     }
 
     /// Drop the cached layout so the next render re-wraps.
@@ -355,6 +408,22 @@ impl Entry {
         if self.layout.width != width {
             self.layout.width = width;
             self.layout.rows.clear();
+            match &self.fold {
+                Fold::Member { shown: false } => return &self.layout,
+                Fold::Head { text, expanded, .. } => {
+                    self.layout.rows.push(LayoutRow {
+                        src: Src::Fold,
+                        row: Row {
+                            start: 0,
+                            end: text.len() as u32,
+                        },
+                    });
+                    if !*expanded {
+                        return &self.layout;
+                    }
+                }
+                _ => {}
+            }
             if let Cell::Assistant { md, .. } | Cell::Plan { md, .. } = &mut self.cell {
                 md.fit(width);
             }
@@ -408,9 +477,10 @@ impl Entry {
         self.layout.rows.get(row.checked_sub(self.gap_rows())?)
     }
 
-    /// The row the cell's text starts on: 1 under a gap, else 0.
+    /// The row the cell's text starts on: under the gap row and the fold
+    /// summary when the entry has them.
     pub fn first_row(&self) -> usize {
-        self.gap_rows()
+        self.gap_rows() + self.fold_rows()
     }
 
     /// Row count at `width`, the gap row included.
@@ -440,7 +510,10 @@ impl Entry {
 
     /// The text a layout row points into.
     pub fn source(&self, src: Src) -> &str {
-        source_of(&self.cell, src)
+        match (&self.fold, src) {
+            (Fold::Head { text, .. }, Src::Fold) => text,
+            _ => source_of(&self.cell, src),
+        }
     }
 
     /// Does any text of the cell contain `needle` (lowercase)?
@@ -817,6 +890,139 @@ impl Transcript {
             self.base += 1;
         }
         self.committed += 1;
+    }
+
+    /// Fold the newest turn's tool calls (ADR 0124 PR9): walking back
+    /// from the end to the turn's prompt, every run of consecutive
+    /// tool-like cells with two or more calls becomes one closed fold.
+    /// Cells already in a fold are left alone.
+    pub fn fold_turn(&mut self) {
+        let mut end = self.entries.len();
+        while end > 0 {
+            let e = &self.entries[end - 1];
+            if matches!(e.cell, Cell::User { .. }) {
+                break;
+            }
+            if !foldable(&e.cell) || !matches!(e.fold, Fold::None) {
+                end -= 1;
+                continue;
+            }
+            let mut start = end;
+            while start > 0
+                && foldable(&self.entries[start - 1].cell)
+                && matches!(self.entries[start - 1].fold, Fold::None)
+            {
+                start -= 1;
+            }
+            self.fold_range(start, end);
+            end = start;
+        }
+    }
+
+    fn fold_range(&mut self, start: usize, end: usize) {
+        let (mut shell, mut tools, mut reads, mut edits) = (0usize, 0usize, 0usize, 0usize);
+        for e in self.entries.range(start..end) {
+            match &e.cell {
+                Cell::Exec { .. } => shell += 1,
+                Cell::Tool { name, .. } => {
+                    if crate::tools::canonical(name) == "bash" {
+                        shell += 1;
+                    } else {
+                        tools += 1;
+                    }
+                }
+                Cell::Explore { items, .. } => reads += items.len(),
+                Cell::Diff { .. } => edits += 1,
+                _ => {}
+            }
+        }
+        if shell + tools + reads + edits < 2 {
+            return;
+        }
+        let mut text = String::new();
+        let part = |text: &mut String, lead: &str, n: usize, one: &str, many: &str| {
+            if n == 0 {
+                return;
+            }
+            if !text.is_empty() {
+                text.push_str(", ");
+            }
+            text.push_str(lead);
+            plural(text, n, one, many);
+        };
+        part(&mut text, "ran ", shell, "shell command", "shell commands");
+        part(&mut text, "called ", tools, "tool", "tools");
+        part(&mut text, "read ", reads, "file", "files");
+        part(&mut text, "edited ", edits, "file", "files");
+        if let Some(c) = text.get(..1) {
+            let up = c.to_ascii_uppercase();
+            text.replace_range(..1, &up);
+        }
+        self.entries[start].fold = Fold::Head {
+            text: text.into(),
+            len: end - start,
+            expanded: false,
+        };
+        self.entries[start].invalidate();
+        for e in self.entries.range_mut(start + 1..end) {
+            e.fold = Fold::Member { shown: false };
+            e.invalidate();
+        }
+    }
+
+    /// Open or close the fold that holds `index`; returns whether there
+    /// was one. A closed fold opens, an open one closes.
+    pub fn toggle_fold(&mut self, index: usize) -> bool {
+        let Some(head) = self.fold_head_of(index) else {
+            return false;
+        };
+        let Some(h) = self.entries.get_mut(head) else {
+            return false;
+        };
+        let Fold::Head { len, expanded, .. } = &mut h.fold else {
+            return false;
+        };
+        *expanded = !*expanded;
+        let (open, len) = (*expanded, *len);
+        h.invalidate();
+        for e in self
+            .entries
+            .range_mut(head + 1..(head + len).min(self.entries.len()))
+        {
+            e.fold = Fold::Member { shown: open };
+            e.invalidate();
+        }
+        true
+    }
+
+    /// Open the fold that hides `index`, if one does.
+    pub fn reveal(&mut self, index: usize) {
+        let local = index.saturating_sub(self.base);
+        let closed = self.entries.get(local).is_some_and(|e| {
+            e.hidden_by_fold()
+                || matches!(
+                    e.fold,
+                    Fold::Head {
+                        expanded: false,
+                        ..
+                    }
+                )
+        });
+        if closed {
+            self.toggle_fold(index);
+        }
+    }
+
+    /// The local index of the fold head whose group holds `index`.
+    fn fold_head_of(&self, index: usize) -> Option<usize> {
+        let local = index.checked_sub(self.base)?;
+        match self.entries.get(local)?.fold {
+            Fold::Head { .. } => Some(local),
+            Fold::Member { .. } => (0..local)
+                .rev()
+                .find(|&i| matches!(self.entries[i].fold, Fold::Head { .. })),
+            Fold::None => None,
+        }
     }
 
     /// Rows from the first row of `index` to the end of the transcript at

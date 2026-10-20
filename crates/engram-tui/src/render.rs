@@ -224,6 +224,29 @@ fn paint_row(
     let first = row == e.first_row();
     let x = area.x;
     let w = area.width;
+    let gw = th.gutter_width();
+    if lr.src == Src::Fold {
+        // The folded turn: `▸ Ran 6 shell commands`; `▾` once opened.
+        let open = matches!(e.fold, crate::transcript::Fold::Head { expanded: true, .. });
+        if th.ax {
+            put(buf, x, y, "tools:", gw, th.dim);
+        } else {
+            put(buf, x, y, if open { "▾" } else { "▸" }, 1, th.dim);
+        }
+        let text = e.source(Src::Fold);
+        let cx = put(buf, x + gw, y, text, w.saturating_sub(gw), th.dim);
+        if !open && !th.ax {
+            put(
+                buf,
+                x + gw + cx,
+                y,
+                "  (click or Ctrl+O)",
+                w.saturating_sub(gw + cx),
+                th.dim,
+            );
+        }
+        return;
+    }
     let (gutter, word, style): (&str, &str, Style) = match &e.cell {
         Cell::User {
             pending, steered, ..
@@ -286,7 +309,6 @@ fn paint_row(
         ),
         Cell::Hidden => return,
     };
-    let gw = th.gutter_width();
     if first {
         if th.ax {
             put(buf, x, y, word, gw, style);
@@ -335,6 +357,8 @@ fn paint_src<'e>(
 ) -> Option<&'e str> {
     let (body_x, body_w, y) = (body.x, body.width, body.y);
     match lr.src {
+        // Painted by `paint_row` before the cell's own gutter.
+        Src::Fold => None,
         Src::Tail => {
             let tail_style = th.dim;
             match &e.cell {
@@ -768,6 +792,11 @@ pub fn draw_transcript(
             }
         }
         break;
+    }
+    a.hits.clear();
+    a.hits_y = area.y;
+    for &(idx, _) in scratch.iter().rev() {
+        a.hits.push(idx);
     }
     // Paint top-down. A short transcript is top-aligned.
     for (y, &(idx, row)) in (area.y..).zip(scratch.iter().rev()) {

@@ -5,7 +5,9 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::commands::{self, Slash};
 use crate::composer::Composer;
@@ -204,6 +206,10 @@ pub struct Attached {
     pub page_rows: u16,
     /// The last scroll-up walk hit the top of memory: load more.
     pub want_older: bool,
+    /// The cell under each transcript row of the last frame, from
+    /// `hits_y` down: a click resolves to a cell through it.
+    pub hits: Vec<usize>,
+    pub hits_y: u16,
     pub search: Option<Search>,
     /// The composer collects feedback for a plan rejection (Tab).
     pub feedback: bool,
@@ -233,6 +239,8 @@ impl Attached {
             run_started_at: None,
             page_rows: 20,
             want_older: false,
+            hits: Vec::new(),
+            hits_y: 0,
             search: None,
             feedback: false,
             shell: None,
@@ -423,6 +431,7 @@ impl Attached {
             return false;
         };
         s.cursor = Some(i);
+        t.reveal(i);
         let rows = t.rows_from(i, width);
         self.scroll_up = rows.saturating_sub(self.page_rows as u32);
         if self.scroll_up == 0 {
@@ -672,7 +681,9 @@ impl App {
         if self.attached.is_some() {
             self.cmds.push(Cmd::Detach);
         }
-        self.attached = Some(Attached::new(session_id.to_string(), title));
+        let mut a = Attached::new(session_id.to_string(), title);
+        a.reducer.fold = !self.inline;
+        self.attached = Some(a);
         self.screen = Screen::Attached;
         self.palette = false;
         self.cmds.push(Cmd::Attach {
@@ -770,6 +781,29 @@ impl App {
         match m.kind {
             MouseEventKind::ScrollUp => Self::scroll(a, 3),
             MouseEventKind::ScrollDown => Self::scroll(a, -3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A click on a folded turn opens it; on a tool call,
+                // toggles its output.
+                let Some(row) = m.row.checked_sub(a.hits_y) else {
+                    return;
+                };
+                let Some(&i) = a.hits.get(row as usize) else {
+                    return;
+                };
+                let t = &mut a.reducer.transcript;
+                if t.toggle_fold(i) {
+                    return;
+                }
+                if let Some(e) = t.get_mut(i) {
+                    if let Cell::Tool { expanded, .. }
+                    | Cell::Exec { expanded, .. }
+                    | Cell::Diff { expanded, .. } = &mut e.cell
+                    {
+                        *expanded = !*expanded;
+                        e.invalidate();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1332,22 +1366,41 @@ impl App {
                 });
             }
             Action::ExpandLast => {
+                // The newest tool-like cell: a folded turn opens first;
+                // an open one toggles the call's output.
                 let t = &mut a.reducer.transcript;
-                for e in t.iter_mut().rev() {
-                    match &mut e.cell {
-                        Cell::Tool { expanded, .. }
+                let newest = (t.first_index()..t.len()).rev().find(|&i| {
+                    t.get(i).is_some_and(|e| {
+                        e.is_fold_head()
+                            || matches!(
+                                e.cell,
+                                Cell::Tool { .. } | Cell::Exec { .. } | Cell::Diff { .. }
+                            )
+                    })
+                });
+                if let Some(i) = newest {
+                    let closed = t
+                        .get(i)
+                        .is_some_and(|e| e.hidden_by_fold() || e.is_fold_head());
+                    if closed && t.toggle_fold(i) {
+                        return;
+                    }
+                    if let Some(e) = t.get_mut(i) {
+                        if let Cell::Tool { expanded, .. }
                         | Cell::Exec { expanded, .. }
-                        | Cell::Diff { expanded, .. } => {
+                        | Cell::Diff { expanded, .. } = &mut e.cell
+                        {
                             *expanded = !*expanded;
                             e.invalidate();
-                            break;
                         }
-                        _ => {}
                     }
                 }
             }
             Action::ExpandAll => {
                 let t = &mut a.reducer.transcript;
+                for i in t.first_index()..t.len() {
+                    t.reveal(i);
+                }
                 let mut any_collapsed = false;
                 for e in t.iter_mut() {
                     if let Cell::Tool { expanded, .. }
@@ -1495,6 +1548,7 @@ impl App {
                     // the live reducer's bookkeeping shifts, nothing is
                     // re-folded, no raw events are retained.
                     let mut older_r = Reducer::new();
+                    older_r.fold = a.reducer.fold;
                     for env in &events {
                         older_r.apply(Event::decode(&env.kind, &env.payload_json));
                     }

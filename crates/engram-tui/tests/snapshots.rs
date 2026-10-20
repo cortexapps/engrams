@@ -314,6 +314,95 @@ fn read_only_calls_fold_into_an_explored_row_60x12() {
     insta::assert_snapshot!(shot);
 }
 
+/// The events of a turn with three calls, then its end.
+fn folded_turn(app: &mut App) {
+    for e in [
+        common::env(
+            9,
+            "run_started",
+            r#"{"run_id":"r2","prompt_id":"p2","at":"2026-01-01T00:00:00Z"}"#,
+        ),
+        common::env(
+            10,
+            "tool_call_started",
+            r#"{"run_id":"r2","tool_call_id":"t2","tool_name":"Bash","args_summary":"{\"command\":\"cargo build\"}"}"#,
+        ),
+        common::env(
+            11,
+            "tool_call_completed",
+            r#"{"run_id":"r2","tool_call_id":"t2","tool_name":"Bash","ok":true,"result_summary":"Finished"}"#,
+        ),
+        common::env(
+            12,
+            "tool_call_started",
+            r#"{"run_id":"r2","tool_call_id":"t3","tool_name":"Bash","args_summary":"{\"command\":\"cargo test\"}"}"#,
+        ),
+        common::env(
+            13,
+            "tool_call_completed",
+            r#"{"run_id":"r2","tool_call_id":"t3","tool_name":"Bash","ok":true,"result_summary":"ok"}"#,
+        ),
+        common::env(
+            14,
+            "tool_call_started",
+            r#"{"run_id":"r2","tool_call_id":"t4","tool_name":"Read","args_summary":"{\"file_path\":\"src/lib.rs\"}"}"#,
+        ),
+        common::env(
+            15,
+            "tool_call_completed",
+            r#"{"run_id":"r2","tool_call_id":"t4","tool_name":"Read","ok":true}"#,
+        ),
+        common::env(
+            16,
+            "agent_message",
+            r#"{"run_id":"r2","message_id":"m3","role":"assistant","text":"Built and tested."}"#,
+        ),
+        common::env(
+            17,
+            "run_completed",
+            r#"{"run_id":"r2","ok":true,"at":"2026-01-01T00:00:09Z"}"#,
+        ),
+    ] {
+        app.update(Msg::Net(NetMsg::Live {
+            session_id: "s-1".into(),
+            envelope: e,
+        }));
+    }
+}
+
+#[test]
+fn a_finished_turn_folds_and_opens_60x14() {
+    let mut app = common::attached_app(false, 60, 14);
+    folded_turn(&mut app);
+    insta::assert_snapshot!("folded_60x14", frame(&mut app, 60, 14));
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )));
+    insta::assert_snapshot!("fold_open_60x14", frame(&mut app, 60, 14));
+}
+
+#[test]
+fn a_click_on_the_fold_row_opens_it() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = common::attached_app(false, 60, 14);
+    folded_turn(&mut app);
+    let shot = frame(&mut app, 60, 14);
+    let y = shot
+        .lines()
+        .position(|l| l.contains("Ran 2 shell commands"))
+        .expect("the fold row") as u16;
+    app.update(Msg::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 3,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    }));
+    let shot = frame(&mut app, 60, 14);
+    assert!(shot.contains("▾ Ran 2 shell commands"), "{shot}");
+    assert!(shot.contains("cargo build"), "{shot}");
+}
+
 /// Draw once at `w`×`h`; returns whether the draw asked for older history.
 fn draw_wants_older(app: &mut App, w: u16, h: u16) -> bool {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();

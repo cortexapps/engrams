@@ -98,7 +98,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "Ctrl+O / Ctrl+E",
         action: Action::ExpandLast,
-        help: "expand the last tool call / all",
+        help: "open the last tool call or folded turn / all",
     },
     Binding {
         keys: "PgUp / PgDn",

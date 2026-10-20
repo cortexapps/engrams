@@ -1,0 +1,18 @@
+---
+source: crates/engram-tui/tests/snapshots.rs
+expression: "frame(&mut app, 60, 14)"
+---
+" Add a README                                               "
+"                                                            "
+"▾ Ran 2 shell commands, read 1 file                         "
+"✓ Bash cargo build                                          "
+"  ⎿ Finished                                                "
+"✓ Bash cargo test                                           "
+"  ⎿ ok                                                      "
+"✓ Explored                                                  "
+"  ⎿ Read src/lib.rs                                         "
+"                                                            "
+"  Built and tested.                                         "
+"· worked for 9s                                             "
+"› message the agent                                         "
+" ○ ready  Ctrl+D sessions · ? keys                          "

@@ -61,6 +61,9 @@ pub struct Reducer {
     run_start_len: usize,
     /// When the open run started (Unix seconds), for its receipt.
     run_started_unix: Option<u64>,
+    /// Fold a finished turn's tool calls into one row. Off in native
+    /// scrollback mode, where finished cells already left memory.
+    pub fold: bool,
     pub mode: String,
     pub status: Option<String>,
     pub waking: bool,
@@ -71,6 +74,7 @@ impl Reducer {
     pub fn new() -> Self {
         Reducer {
             mode: "default".into(),
+            fold: true,
             ..Default::default()
         }
     }
@@ -875,6 +879,9 @@ impl Reducer {
                     };
                     self.push_marker(Marker::Worked, &text);
                 }
+                if self.fold {
+                    self.transcript.fold_turn();
+                }
             }
             Event::HarnessIdle => {
                 self.close_active();
@@ -1296,6 +1303,65 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_finished_turn_folds_its_tool_calls_into_one_row() {
+        let mut r = Reducer::new();
+        r.apply(ev("run_started", r#"{"run_id":"r1","prompt_id":"p1"}"#));
+        let started = |id: &str, name: &str, args: &str| {
+            format!(
+                r#"{{"run_id":"r1","tool_call_id":"{id}","tool_name":"{name}","args_summary":{args}}}"#
+            )
+        };
+        let done = |id: &str, name: &str| {
+            format!(r#"{{"run_id":"r1","tool_call_id":"{id}","tool_name":"{name}","ok":true}}"#)
+        };
+        r.apply(ev("tool_call_started", &started("t1", "Read", r#""a.rs""#)));
+        r.apply(ev("tool_call_completed", &done("t1", "Read")));
+        r.apply(ev("tool_call_started", &started("t2", "Bash", r#""ls""#)));
+        r.apply(ev("tool_call_completed", &done("t2", "Bash")));
+        r.apply(ev(
+            "tool_call_started",
+            &started("t3", "Write", r#""n.md""#),
+        ));
+        r.apply(ev("tool_call_completed", &done("t3", "Write")));
+        r.apply(ev(
+            "file_changed",
+            r#"{"run_id":"r1","tool_call_id":"t3","path":"n.md","change":{"write":{"content":"hi\n"}}}"#,
+        ));
+        r.apply(ev(
+            "agent_message",
+            r#"{"run_id":"r1","message_id":"m1","role":"assistant","text":"Done."}"#,
+        ));
+        r.apply(ev("tool_call_started", &started("t4", "Bash", r#""true""#)));
+        r.apply(ev("tool_call_completed", &done("t4", "Bash")));
+        // The run is open: nothing folds yet.
+        assert!(!r.transcript.get(1).unwrap().is_fold_head());
+        r.apply(ev("run_completed", r#"{"run_id":"r1","ok":true}"#));
+        let t = &mut r.transcript;
+        // The three calls before the reply are one closed fold; the single
+        // call after it stays as it is.
+        let head = t.get(1).unwrap();
+        assert!(head.is_fold_head());
+        assert_eq!(
+            head.source(crate::transcript::Src::Fold),
+            "Ran 1 shell command, read 1 file, edited 1 file"
+        );
+        assert!(t.get(2).unwrap().hidden_by_fold());
+        assert!(t.get(3).unwrap().hidden_by_fold());
+        assert!(!t.get(4).unwrap().is_fold_head());
+        assert!(!t.get(5).unwrap().is_fold_head());
+        // The head: its gap row under the prompt, then the summary row.
+        assert_eq!(t.get_mut(1).unwrap().height(40), 2);
+        assert_eq!(t.get_mut(2).unwrap().height(40), 0);
+        // Opening the fold shows the calls again; a second run does not
+        // re-fold what is folded.
+        assert!(t.toggle_fold(3));
+        assert!(t.get_mut(2).unwrap().height(40) > 0);
+        assert_eq!(t.get(1).unwrap().first_row(), 2);
+        t.fold_turn();
+        assert!(!t.get(2).unwrap().hidden_by_fold());
     }
 
     #[test]
