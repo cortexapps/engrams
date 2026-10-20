@@ -862,8 +862,9 @@ pub fn draw_transcript(
     }
     a.hits.clear();
     a.hits_y = area.y;
-    for &(idx, _) in scratch.iter().rev() {
-        a.hits.push(idx);
+    a.hits_x = area.x;
+    for &(idx, row) in scratch.iter().rev() {
+        a.hits.push((idx, row));
     }
     // Paint top-down. A short transcript is top-aligned.
     for (y, &(idx, row)) in (area.y..).zip(scratch.iter().rev()) {
@@ -871,6 +872,13 @@ pub fn draw_transcript(
             let _ = e.height(width);
             let q = hl.filter(|&(c, _)| c == idx).map(|(_, q)| q);
             paint_row(buf, area, y, e, row as usize, th, q);
+        }
+    }
+    if let Some(sel) = a.selection {
+        highlight_selection(buf, area, a, sel, th);
+        if a.copy_request {
+            a.copy_request = false;
+            a.copied = Some(selection_text(buf, area, a, sel, width, th));
         }
     }
     if a.unseen > 0 && a.scroll_up > 0 && area.height > 0 {
@@ -900,6 +908,143 @@ pub fn draw_transcript(
     }
     // A scroll up that reached the top of memory asks for older history.
     asked && (ran_out || clamped)
+}
+
+/// The columns a selection covers on screen row `k` of the transcript:
+/// from the start column on the first row, to the end column on the last,
+/// never into the gutter, and only up to the row's last character.
+fn selected_cols(
+    buf: &Buffer,
+    area: Rect,
+    y: u16,
+    key: (usize, u16),
+    sel: crate::app::Selection,
+    th: &Theme,
+) -> Option<(u16, u16)> {
+    let ((sc, sr, scol), (ec, er, ecol)) = sel.range();
+    if key < (sc, sr) || key > (ec, er) {
+        return None;
+    }
+    let left = area.x + th.gutter_width();
+    let text_end = (left..area.right())
+        .rev()
+        .find(|&x| buf[(x, y)].symbol().trim() != "")
+        .map_or(left, |x| x + 1);
+    let x0 = if key == (sc, sr) {
+        (area.x + scol).max(left)
+    } else {
+        left
+    };
+    let x1 = if key == (ec, er) {
+        (area.x + ecol + 1).min(text_end)
+    } else {
+        text_end
+    };
+    (x0 < x1).then_some((x0, x1))
+}
+
+/// Mark the selection over what the frame painted.
+fn highlight_selection(
+    buf: &mut Buffer,
+    area: Rect,
+    a: &Attached,
+    sel: crate::app::Selection,
+    th: &Theme,
+) {
+    for (y, &(idx, row)) in (area.y..area.bottom()).zip(&a.hits) {
+        if let Some((x0, x1)) = selected_cols(buf, area, y, (idx, row), sel, th) {
+            for x in x0..x1 {
+                let c = &mut buf[(x, y)];
+                c.set_style(c.style().patch(th.selected));
+            }
+        }
+    }
+}
+
+/// The selected text. Rows on screen are read from the frame, so the
+/// columns are what the user sees; rows that scrolled away are taken from
+/// the cell's text. A row the layout wrapped joins the next with a space;
+/// a real line break stays a newline.
+fn selection_text(
+    buf: &Buffer,
+    area: Rect,
+    a: &mut Attached,
+    sel: crate::app::Selection,
+    width: u16,
+    th: &Theme,
+) -> String {
+    let ((sc, sr, _), (ec, er, _)) = sel.range();
+    let mut out = String::new();
+    let mut prev: Option<(usize, u16)> = None;
+    let mut line = String::new();
+    for i in sc..=ec {
+        let Some(e) = a.reducer.transcript.get_mut(i) else {
+            continue;
+        };
+        let h = e.height(width);
+        if h == 0 {
+            continue;
+        }
+        let from = if i == sc { sr } else { 0 };
+        let to = if i == ec { er } else { h - 1 };
+        for r in from..=to.min(h - 1) {
+            line.clear();
+            let on_screen = a.hits.iter().position(|&k| k == (i, r));
+            match on_screen {
+                Some(k) => {
+                    let y = area.y + k as u16;
+                    if let Some((x0, x1)) = selected_cols(buf, area, y, (i, r), sel, th) {
+                        let mut skip = 0;
+                        for x in x0..x1 {
+                            if skip > 0 {
+                                skip -= 1;
+                                continue;
+                            }
+                            let s = buf[(x, y)].symbol();
+                            skip = display_width(s).saturating_sub(1);
+                            line.push_str(s);
+                        }
+                    }
+                }
+                None => {
+                    if let Some(lr) = e.layout_row(r as usize) {
+                        let src = e.source(lr.src);
+                        if let Some(s) = src.get(lr.row.start as usize..lr.row.end as usize) {
+                            line.push_str(s);
+                        }
+                    }
+                }
+            }
+            let text = line.trim_end();
+            // Does this row continue the previous one (a wrap the layout
+            // made, not a line break in the text)?
+            let soft = prev.is_some_and(|(pi, pr)| {
+                pi == i
+                    && pr + 1 == r
+                    && match (e.layout_row(pr as usize), e.layout_row(r as usize)) {
+                        (Some(p), Some(c)) if p.src == c.src => e
+                            .source(c.src)
+                            .get(p.row.end as usize..c.row.start as usize)
+                            .is_some_and(|between| !between.contains('\n')),
+                        _ => false,
+                    }
+            });
+            if soft {
+                let cont = text.trim_start();
+                if !cont.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                out.push_str(cont);
+            } else {
+                if prev.is_some() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+            prev = Some((i, r));
+        }
+    }
+    out.trim_matches('\n').to_string()
 }
 
 fn draw_queue(buf: &mut Buffer, area: Rect, a: &Attached, th: &Theme) {

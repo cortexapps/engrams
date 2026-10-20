@@ -100,7 +100,42 @@ pub enum Cmd {
         rows: u16,
     },
     ShellClose,
+    /// Ask the terminal to set its clipboard (OSC 52): the runtime writes
+    /// it between frames.
+    CopyToTerminal(String),
     Quit,
+}
+
+/// A mouse selection in the transcript. The ends are (cell, layout row,
+/// column) so the selection stays on its text while the transcript
+/// scrolls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (usize, u16, u16),
+    pub head: (usize, u16, u16),
+    /// The pointer moved since the press: a drag, not a click.
+    pub moved: bool,
+}
+
+impl Selection {
+    /// The ends in transcript order.
+    pub fn range(&self) -> ((usize, u16, u16), (usize, u16, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
+/// How a copy reached the clipboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Copied {
+    /// The platform's clipboard command took it.
+    Native,
+    /// Sent to the terminal (OSC 52); terminals do not confirm it.
+    Terminal,
+    Failed(String),
 }
 
 /// Transcript search (Ctrl+T, fullscreen). `cursor` is the cell of the
@@ -123,6 +158,14 @@ pub enum Msg {
     Focus(bool),
     Tick,
     Net(NetMsg),
+    /// A copy of `chars` characters finished.
+    Copied {
+        chars: usize,
+        how: Copied,
+        /// The text, when the platform command failed and the terminal
+        /// should be asked instead.
+        fallback: Option<String>,
+    },
 }
 
 /// A result of the attached session the user has not seen yet: the
@@ -232,9 +275,17 @@ pub struct Attached {
     pub page_rows: u16,
     /// The last scroll-up walk hit the top of memory: load more.
     pub want_older: bool,
-    /// The cell under each transcript row of the last frame, from
-    /// `hits_y` down: a click resolves to a cell through it.
-    pub hits: Vec<usize>,
+    /// The (cell, layout row) under each transcript row of the last
+    /// frame, from `hits_y` down: a click or a drag resolves through it.
+    pub hits: Vec<(usize, u16)>,
+    /// The left edge of the transcript area of the last frame.
+    pub hits_x: u16,
+    pub selection: Option<Selection>,
+    /// Copy the selection on the next frame: the text is read from what
+    /// the frame shows.
+    pub copy_request: bool,
+    /// The text of the last copy request, for the runtime.
+    pub copied: Option<String>,
     pub hits_y: u16,
     pub search: Option<Search>,
     /// The composer collects feedback for a plan rejection (Tab).
@@ -268,6 +319,10 @@ impl Attached {
             page_rows: 20,
             want_older: false,
             hits: Vec::new(),
+            hits_x: 0,
+            selection: None,
+            copy_request: false,
+            copied: None,
             hits_y: 0,
             search: None,
             feedback: false,
@@ -843,6 +898,24 @@ impl App {
                 }
             }
             Msg::Focus(f) => self.focused = f,
+            Msg::Copied {
+                chars,
+                how,
+                fallback,
+            } => {
+                let unit = if chars == 1 { "char" } else { "chars" };
+                match (how, fallback) {
+                    (Copied::Native, _) => self.note(format!("Copied {chars} {unit} to clipboard")),
+                    (Copied::Terminal, _) => {
+                        self.note(format!("Sent {chars} {unit} to the terminal's clipboard"))
+                    }
+                    // The platform command failed: ask the terminal.
+                    (Copied::Failed(_), Some(text)) => {
+                        self.cmds.push(Cmd::CopyToTerminal(text));
+                    }
+                    (Copied::Failed(e), None) => self.note(format!("copy failed: {e}")),
+                }
+            }
             Msg::Tick => {
                 if let Some((_, at)) = &self.note {
                     if at.elapsed() > Duration::from_secs(4) {
@@ -884,18 +957,51 @@ impl App {
         if self.screen != Screen::Attached {
             return;
         }
+        // The transcript row under the pointer, clamped into the rows
+        // the last frame showed (a drag past the edge keeps selecting).
+        let hit = |a: &Attached, clamp: bool| -> Option<(usize, u16, u16)> {
+            let last = a.hits.len().checked_sub(1)?;
+            let row = m.row.checked_sub(a.hits_y).map(usize::from);
+            let row = match row {
+                Some(r) if r <= last => r,
+                Some(_) if clamp => last,
+                None if clamp => 0,
+                _ => return None,
+            };
+            let (cell, r) = a.hits[row];
+            Some((cell, r, m.column.saturating_sub(a.hits_x)))
+        };
         match m.kind {
             MouseEventKind::ScrollUp => Self::scroll(a, 3),
             MouseEventKind::ScrollDown => Self::scroll(a, -3),
             MouseEventKind::Down(MouseButton::Left) => {
+                a.selection = hit(a, false).map(|at| Selection {
+                    anchor: at,
+                    head: at,
+                    moved: false,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(at) = hit(a, true) {
+                    if let Some(sel) = &mut a.selection {
+                        sel.moved |= at != sel.head;
+                        sel.head = at;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // A drag copies what it selected, and the selection stays
+                // on screen until Esc or a click.
+                if a.selection.is_some_and(|s| s.moved) {
+                    a.copy_request = true;
+                    return;
+                }
+                let Some(sel) = a.selection.take() else {
+                    return;
+                };
                 // A click on a folded turn opens it; on a tool call,
                 // toggles its output.
-                let Some(row) = m.row.checked_sub(a.hits_y) else {
-                    return;
-                };
-                let Some(&i) = a.hits.get(row as usize) else {
-                    return;
-                };
+                let i = sel.anchor.0;
                 let t = &mut a.reducer.transcript;
                 if t.toggle_fold(i) {
                     return;
@@ -1354,6 +1460,20 @@ impl App {
         let Some(a) = &mut self.attached else {
             return;
         };
+        // A selection takes Esc (clear) and Ctrl+C (copy again) first.
+        if a.selection.is_some() {
+            match action {
+                Action::Escape => {
+                    a.selection = None;
+                    return;
+                }
+                Action::CtrlC => {
+                    a.copy_request = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
         if a.can_send() {
             let mut cmds = Vec::new();
             let consumed = a.decision_key(action, &mut cmds);

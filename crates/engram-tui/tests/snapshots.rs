@@ -392,12 +392,18 @@ fn a_click_on_the_fold_row_opens_it() {
         .lines()
         .position(|l| l.contains("Ran 2 shell commands"))
         .expect("the fold row") as u16;
-    app.update(Msg::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 3,
-        row: y,
-        modifiers: KeyModifiers::NONE,
-    }));
+    // A click acts on the release: a press may still become a drag.
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.update(Msg::Mouse(MouseEvent {
+            kind,
+            column: 3,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
     let shot = frame(&mut app, 60, 20);
     assert!(shot.contains("▾ Ran 2 shell commands"), "{shot}");
     assert!(shot.contains("cargo build"), "{shot}");

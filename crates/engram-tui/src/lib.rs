@@ -7,6 +7,7 @@
 //! network task.
 
 pub mod app;
+pub mod clipboard;
 pub mod commands;
 pub mod composer;
 pub mod event;
@@ -34,7 +35,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use crate::app::{App, Cmd, Msg};
+use crate::app::{App, Cmd, Copied, Msg};
 use crate::net::Net;
 use crate::render::Theme;
 use engram_app_client::shell::{Shell, ShellMsg};
@@ -185,6 +186,25 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
                 Cmd::ShellInput(bytes) => net.shell_input(bytes),
                 Cmd::ShellResize { cols, rows } => net.shell_resize(cols, rows),
                 Cmd::ShellClose => net.shell_close(),
+                Cmd::CopyToTerminal(text) => {
+                    let chars = text.chars().count();
+                    let how = match clipboard::osc52(&text) {
+                        Some(seq) => {
+                            let mut out = std::io::stdout();
+                            match out.write_all(&seq).and_then(|()| out.flush()) {
+                                Ok(()) => Copied::Terminal,
+                                Err(e) => Copied::Failed(e.to_string()),
+                            }
+                        }
+                        None => Copied::Failed("too large for the terminal's clipboard".into()),
+                    };
+                    app.update(Msg::Copied {
+                        chars,
+                        how,
+                        fallback: None,
+                    });
+                    dirty = true;
+                }
                 Cmd::EditDraft { text } => {
                     // The editor owns the tty: stop reading input (the
                     // stream's reader thread would steal keystrokes), give
@@ -252,6 +272,12 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
             }
             last_draw = Instant::now();
             dirty = false;
+            // A drag finished, or Ctrl+C on a selection: the frame read
+            // the text; put it on the clipboard.
+            if let Some(text) = app.attached.as_mut().and_then(|a| a.copied.take()) {
+                start_copy(text, &tx, &mut app);
+                dirty = true;
+            }
             // The program status record, the title, an alert: written
             // only when they changed.
             let mut out = std::io::stdout();
@@ -311,6 +337,36 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
 }
 
 type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
+
+/// Copy `text`: the platform's clipboard command off the event loop, or,
+/// when the session runs remotely (or the command fails), OSC 52 from the
+/// loop itself.
+fn start_copy(text: String, tx: &mpsc::UnboundedSender<Msg>, app: &mut App) {
+    if text.is_empty() {
+        return;
+    }
+    if clipboard::remote() {
+        app.cmds.push(Cmd::CopyToTerminal(text));
+        return;
+    }
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let chars = text.chars().count();
+        let msg = match clipboard::copy_native(&text) {
+            Ok(()) => Msg::Copied {
+                chars,
+                how: Copied::Native,
+                fallback: None,
+            },
+            Err(e) => Msg::Copied {
+                chars,
+                how: Copied::Failed(e),
+                fallback: Some(text),
+            },
+        };
+        let _ = tx.send(msg);
+    });
+}
 
 /// The input task: crossterm events → messages. Restartable, because the
 /// editor hand-off drops the stream.

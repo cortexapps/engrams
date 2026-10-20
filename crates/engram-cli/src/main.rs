@@ -585,7 +585,13 @@ fn main() {
         let opts = engram_tui::Options {
             session_id: session_id.clone(),
             inline: ax || *no_alt_screen || env_on("ENGRAMS_TUI_NO_ALT_SCREEN"),
-            mouse: !ax && !*no_mouse && !env_on("ENGRAMS_TUI_NO_MOUSE"),
+            // Native scrollback mode leaves the mouse to the terminal: the
+            // transcript is in its scrollback, where its own selection works.
+            mouse: !ax
+                && !*no_alt_screen
+                && !*no_mouse
+                && !env_on("ENGRAMS_TUI_NO_MOUSE")
+                && !env_on("ENGRAMS_TUI_NO_ALT_SCREEN"),
             color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
             ax,
         };

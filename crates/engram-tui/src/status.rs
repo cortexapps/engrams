@@ -663,6 +663,13 @@ fn text_pair(out: &mut Vec<u8>, key: &[u8], text: &str, max: usize) {
     b64.finish();
 }
 
+/// Append the standard base64 of `bytes` to `out`.
+pub(crate) fn base64_into(out: &mut Vec<u8>, bytes: &[u8]) {
+    let mut b64 = Base64::new(out);
+    b64.push(bytes);
+    b64.finish();
+}
+
 /// Standard base64, streamed: bytes go in, encoded text goes out with no
 /// intermediate buffer.
 struct Base64<'a> {
