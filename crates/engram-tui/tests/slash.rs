@@ -13,6 +13,13 @@ fn key(app: &mut App, code: KeyCode) {
     app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
 }
 
+fn live(app: &mut App, idx: i64, kind: &str, payload: &str) {
+    app.update(Msg::Net(NetMsg::Live {
+        session_id: "s-1".into(),
+        envelope: common::env(idx, kind, payload),
+    }));
+}
+
 fn type_str(app: &mut App, s: &str) {
     for c in s.chars() {
         key(app, KeyCode::Char(c));
@@ -123,4 +130,42 @@ fn dump_is_a_note_in_native_scrollback_mode() {
     key(&mut app, KeyCode::Enter);
     assert!(app.cmds.is_empty());
     assert!(app.note.is_some());
+}
+
+#[test]
+fn plan_toggles_the_mode_the_next_prompt_asks_for() {
+    let mut app = common::attached_app(false, 60, 18);
+    app.cmds.clear();
+    type_str(&mut app, "/plan");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.attached.as_ref().unwrap().composer_mode(), "plan");
+    app.note = None;
+    assert!(frame(&mut app, 60, 18).contains("· plan"));
+    type_str(&mut app, "draft a plan");
+    key(&mut app, KeyCode::Enter);
+    let [Cmd::Send { harness_mode, .. }] = app.cmds.as_slice() else {
+        panic!("expected a send, got {:?}", app.cmds);
+    };
+    assert_eq!(harness_mode.as_deref(), Some("plan"));
+    app.cmds.clear();
+    // The override is spent; the next prompt carries no mode. Once the
+    // session reports plan mode, `/plan` again asks for default.
+    type_str(&mut app, "more");
+    key(&mut app, KeyCode::Enter);
+    let [Cmd::Send { harness_mode, .. }] = app.cmds.as_slice() else {
+        panic!("expected a send, got {:?}", app.cmds);
+    };
+    assert_eq!(harness_mode, &None);
+    app.cmds.clear();
+    live(&mut app, 20, "harness_mode_changed", r#"{"mode":"plan"}"#);
+    assert_eq!(app.attached.as_ref().unwrap().composer_mode(), "plan");
+    type_str(&mut app, "/plan");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.attached.as_ref().unwrap().composer_mode(), "default");
+    type_str(&mut app, "go");
+    key(&mut app, KeyCode::Enter);
+    let [Cmd::Send { harness_mode, .. }] = app.cmds.as_slice() else {
+        panic!("expected a send, got {:?}", app.cmds);
+    };
+    assert_eq!(harness_mode.as_deref(), Some("default"));
 }

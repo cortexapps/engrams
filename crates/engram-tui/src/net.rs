@@ -180,7 +180,13 @@ impl Net {
         });
     }
 
-    pub fn send_prompt(&self, session_id: String, prompt_id: String, text: String) {
+    pub fn send_prompt(
+        &self,
+        session_id: String,
+        prompt_id: String,
+        text: String,
+        harness_mode: Option<String>,
+    ) {
         let c = self.clients.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -189,7 +195,7 @@ impl Net {
                     session_id: session_id.clone(),
                     text,
                     prompt_id: prompt_id.clone(),
-                    harness_mode: None,
+                    harness_mode,
                 })
                 .await;
             if let Err(e) = res {

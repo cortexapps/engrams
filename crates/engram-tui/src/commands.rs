@@ -10,6 +10,8 @@ pub enum Slash {
     Shell,
     Interrupt,
     Resume,
+    /// Toggle plan mode for the next prompt.
+    Plan,
     Transcript,
     Dump,
     Help,
@@ -47,6 +49,11 @@ pub const COMMANDS: &[Command] = &[
         name: "resume",
         slash: Slash::Resume,
         help: "resume an idle session",
+    },
+    Command {
+        name: "plan",
+        slash: Slash::Plan,
+        help: "plan mode on/off for the next prompt (the agent proposes, you approve)",
     },
     Command {
         name: "transcript",

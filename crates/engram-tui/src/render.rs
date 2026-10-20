@@ -878,6 +878,9 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) {
             cx += put(buf, area.x + cx, y, m, 1, st);
             cx += put(buf, area.x + cx, y, " ", 1, st);
             cx += put(buf, area.x + cx, y, s, w.saturating_sub(cx), st);
+            if a.composer_mode() == "plan" {
+                cx += put(buf, area.x + cx, y, " · plan", 7, th.warn);
+            }
             if let Some(n) = a.reconnecting {
                 cx += put(buf, area.x + cx, y, " (", 2, st);
                 cx += put_num(buf, area.x + cx, y, n as u64, st);
