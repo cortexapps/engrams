@@ -43,6 +43,7 @@ render() {
   case "$formula" in
     engrams)
       class=Engrams
+      conflicts=$'\n  conflicts_with "engrams-nightly", because: "both install the engrams binary"\n'
       ;;
     engrams-nightly)
       class=EngramsNightly
