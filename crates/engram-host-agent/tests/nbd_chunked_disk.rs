@@ -131,6 +131,43 @@ fn preflight() -> Option<(PathBuf, PathBuf, PathBuf)> {
     Some((kernel, rootfs, nbd_path))
 }
 
+/// Block until the kernel has released `nbd_path`: no sysfs `pid` and a
+/// zero `size`. Every test in this binary calls this as its last step.
+///
+/// Dropping an `NbdSandboxState` sends the netlink DISCONNECT from a
+/// detached thread. A test that returns at once ends its process, which
+/// can kill that thread before the DISCONNECT runs. The kernel then
+/// keeps the device bound with no server, and the next test process
+/// that uses the same device waits in `NbdSlotAllocator::acquire` until
+/// nextest kills it (CI: `high_offset_write_reads_back_through_the_device`
+/// timed out at 180 s behind a leaked 16-sector binding from
+/// `forked_attach_first_flush_mints_private_id_and_leaves_base_chain_untouched`).
+/// The release is normally done in milliseconds. A device that stays
+/// bound fails the test that bound it, not the next one.
+fn wait_for_kernel_release(nbd_path: &std::path::Path) {
+    let name = nbd_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("nbd device path has a file name");
+    let pid = || std::fs::read_to_string(format!("/sys/block/{name}/pid")).ok();
+    let size = || std::fs::read_to_string(format!("/sys/block/{name}/size")).ok();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let size_now = size();
+        if pid().is_none() && size_now.as_deref().map(str::trim) == Some("0") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} is still bound 10 s after the test released it: sysfs pid {:?}, size {:?}",
+            nbd_path.display(),
+            pid().map(|p| p.trim().to_string()),
+            size_now.map(|s| s.trim().to_string()),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The sentinel only the prepared image carries; the guest's init
 /// keeps the VM alive iff it reads back byte-identical.
 const SENTINEL: &str = "survived-the-host-roll";
@@ -360,6 +397,7 @@ async fn fc_microvm_boots_with_nbd_chunked_rootfs() {
         .await
         .expect("destroy NBD-backed sandbox");
     drop(nbd_state);
+    wait_for_kernel_release(&nbd_path);
     eprintln!("TEARDOWN: VM destroyed + NBD daemon disconnected");
 }
 
@@ -421,7 +459,7 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
     cfg.restore_mode = RestoreMode::File;
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/verify-init.sh".into();
     let inner = Arc::new(FirecrackerBackend::new(work.path(), cfg));
-    let pool = NbdSlotAllocator::from_paths(vec![nbd_path]).expect("slot pool");
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("slot pool");
     let mut cache_cfg = ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 256 * 1024 * 1024;
     let pooled = engram_host_agent::pooled_backend::PooledBackend::new(inner)
@@ -475,6 +513,7 @@ async fn disk_only_cold_boot_via_rootfs_manifest_override() {
         .destroy(sandbox_id)
         .await
         .expect("destroy recovered sandbox");
+    wait_for_kernel_release(&nbd_path);
     eprintln!("TEARDOWN: recovered VM destroyed + NBD daemon disconnected");
 }
 
@@ -605,6 +644,7 @@ async fn high_offset_write_reads_back_through_the_device() {
     );
     drop(f);
     drop(state);
+    wait_for_kernel_release(&nbd_path);
 }
 
 /// Incident 2026-07-10 regression gate: `attach_manifest(fork=true)` —
@@ -662,7 +702,7 @@ async fn forked_attach_first_flush_mints_private_id_and_leaves_base_chain_untouc
         .await
         .expect("put base manifest");
 
-    let pool = NbdSlotAllocator::from_paths(vec![nbd_path]).expect("pool");
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
     let store = Arc::new(store);
     let state = attach_manifest(
         base_ref,
@@ -700,4 +740,5 @@ async fn forked_attach_first_flush_mints_private_id_and_leaves_base_chain_untouc
         "the shared base chain must NOT have been ticked by a forked attach",
     );
     drop(state);
+    wait_for_kernel_release(&nbd_path);
 }
