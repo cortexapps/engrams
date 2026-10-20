@@ -46,11 +46,6 @@ use engram_sandbox_firecracker::{
     FirecrackerBackend, FirecrackerConfig, RestoreMode, ENGRAM_AGENTD_PORT,
 };
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
-    l.local_addr().expect("local addr").port()
-}
-
 /// The node-local daemon (ADR 0121), run as an in-process task over a
 /// real control UDS. It deliberately OUTLIVES both host-agent
 /// generations below — that is the design under test.
@@ -65,10 +60,10 @@ async fn spawn_daemon(work_dir: &Path) -> Arc<ProxydHandle> {
         None,
         engram_core::HostId::new(),
     );
-    args.proxy_port = free_port();
-    args.dns_port = free_port();
-    args.gateway_port = free_port();
-    tokio::spawn(engram_egress_proxyd::run(args));
+    args.proxy_port = engram_testkit::net::free_tcp_udp_port();
+    args.dns_port = engram_testkit::net::free_tcp_udp_port();
+    args.gateway_port = engram_testkit::net::free_tcp_udp_port();
+    let daemon = tokio::spawn(engram_egress_proxyd::run(args));
     let handle = Arc::new(ProxydHandle::new(
         work_dir.join(engram_egress_proto::CONTROL_SOCK_NAME),
     ));
@@ -78,6 +73,12 @@ async fn spawn_daemon(work_dir: &Path) -> Arc<ProxydHandle> {
             && handle.hello().await.is_ok()
         {
             return handle;
+        }
+        if daemon.is_finished() {
+            panic!(
+                "egress daemon exited before it was ready: {:?}",
+                daemon.await
+            );
         }
         assert!(
             std::time::Instant::now() < deadline,

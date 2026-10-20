@@ -15517,13 +15517,6 @@ mod tests {
             }
         }
 
-        fn free_port() -> u16 {
-            // Bind-then-drop: a small race against other tests, ridden
-            // by the daemon's own bind_with_retry.
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
-            l.local_addr().expect("local addr").port()
-        }
-
         /// Run a REAL egress daemon as an in-process task (ADR 0121)
         /// and return the facade plus its control handle for
         /// assertions. Same data plane the production host-agent
@@ -15545,10 +15538,12 @@ mod tests {
                 None,
                 engram_core::HostId::new(),
             );
-            args.proxy_port = free_port();
-            args.dns_port = free_port();
-            args.gateway_port = free_port();
-            tokio::spawn(engram_egress_proxyd::run(args));
+            // The daemon binds every port for TCP on 0.0.0.0, and the DNS
+            // port for UDP too: pick ports free for all of those binds.
+            args.proxy_port = engram_testkit::net::free_tcp_udp_port();
+            args.dns_port = engram_testkit::net::free_tcp_udp_port();
+            args.gateway_port = engram_testkit::net::free_tcp_udp_port();
+            let daemon = tokio::spawn(engram_egress_proxyd::run(args));
             let handle = Arc::new(crate::proxyd_client::ProxydHandle::new(
                 dir.path().join(engram_egress_proto::CONTROL_SOCK_NAME),
             ));
@@ -15560,6 +15555,15 @@ mod tests {
                     && handle.hello().await.is_ok()
                 {
                     break;
+                }
+                // `run` returns only when the daemon gives up (a failed
+                // bind, for example). Say so at once with its exit code,
+                // not as a silent wait to the deadline.
+                if daemon.is_finished() {
+                    panic!(
+                        "in-process egress daemon exited before it was ready: {:?}",
+                        daemon.await
+                    );
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
