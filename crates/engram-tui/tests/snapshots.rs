@@ -262,3 +262,54 @@ fn a_table_refits_when_the_terminal_narrows() {
     let narrow = frame(&mut app, 34, 14);
     insta::assert_snapshot!(format!("{wide}\n{narrow}"));
 }
+
+#[test]
+fn read_only_calls_fold_into_an_explored_row_60x12() {
+    let mut app = common::attached_app(false, 60, 12);
+    for e in [
+        common::env(9, "run_started", r#"{"run_id":"r2","prompt_id":"p2"}"#),
+        common::env(
+            10,
+            "tool_call_started",
+            r#"{"run_id":"r2","tool_call_id":"t2","tool_name":"Read","args_summary":"{\"file_path\":\"src/main.rs\"}"}"#,
+        ),
+        common::env(
+            11,
+            "tool_call_completed",
+            r#"{"run_id":"r2","tool_call_id":"t2","tool_name":"Read","ok":true}"#,
+        ),
+        common::env(
+            12,
+            "tool_call_started",
+            r#"{"run_id":"r2","tool_call_id":"t3","tool_name":"Read","args_summary":"{\"file_path\":\"src/lib.rs\"}"}"#,
+        ),
+        common::env(
+            13,
+            "tool_call_completed",
+            r#"{"run_id":"r2","tool_call_id":"t3","tool_name":"Read","ok":true}"#,
+        ),
+        common::env(
+            14,
+            "tool_call_started",
+            r#"{"run_id":"r2","tool_call_id":"t4","tool_name":"Grep","args_summary":"{\"pattern\":\"fn main\",\"path\":\"src\"}"}"#,
+        ),
+    ] {
+        app.update(Msg::Net(NetMsg::Live {
+            session_id: "s-1".into(),
+            envelope: e,
+        }));
+    }
+    let shot = frame(&mut app, 60, 12);
+    let shot = shot
+        .lines()
+        .map(|l| {
+            if l.contains("working") {
+                "<footer: working>".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(shot);
+}

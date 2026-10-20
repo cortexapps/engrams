@@ -75,19 +75,22 @@ fn big_history() -> Vec<Envelope> {
                 r#"{{"run_id":"r{run}","message_id":"m{run}","role":"assistant","text":"Looking at the module now. The function has three callers and one of them passes a stale handle.\n\nI will read the callers first, then the handle type, and then propose a fix that keeps the public API."}}"#
             ),
         );
+        // Reads and shell calls alternate: a read folds into an
+        // `Explored` row, a shell call keeps its own row and result.
         for t in 0..4 {
+            let tool = if t % 2 == 0 { "Read" } else { "Bash" };
             push(
                 &mut out,
                 "tool_call_started",
                 format!(
-                    r#"{{"run_id":"r{run}","tool_call_id":"t{run}-{t}","tool_name":"Read","args_summary":"crates/example/src/module_{t}.rs"}}"#
+                    r#"{{"run_id":"r{run}","tool_call_id":"t{run}-{t}","tool_name":"{tool}","args_summary":"crates/example/src/module_{t}.rs"}}"#
                 ),
             );
             push(
                 &mut out,
                 "tool_call_completed",
                 format!(
-                    r#"{{"run_id":"r{run}","tool_call_id":"t{run}-{t}","tool_name":"Read","ok":true,"duration_ms":7,"result_summary":"fn handle() -> Handle {{\n    let h = open();\n    h.touch();\n    h\n}}\n\nfn caller_a() {{ handle().use_it(); }}\nfn caller_b() {{ handle().use_it(); }}\nfn caller_c() {{ handle().use_it(); }}"}}"#
+                    r#"{{"run_id":"r{run}","tool_call_id":"t{run}-{t}","tool_name":"{tool}","ok":true,"duration_ms":7,"result_summary":"fn handle() -> Handle {{\n    let h = open();\n    h.touch();\n    h\n}}\n\nfn caller_a() {{ handle().use_it(); }}\nfn caller_b() {{ handle().use_it(); }}\nfn caller_c() {{ handle().use_it(); }}"}}"#
                 ),
             );
         }

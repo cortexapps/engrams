@@ -12,7 +12,7 @@ use crate::app::{shell_pane_rows, App, Attached, NewSession, NewStage, Screen};
 use crate::keymap::BINDINGS;
 use crate::markdown::{flags, Run};
 use crate::sessions::{age, marker};
-use crate::transcript::{Cell, Entry, Marker, Src, ToolState};
+use crate::transcript::{explore_running, Cell, Entry, Marker, Src, ToolState};
 use crate::wrap::{display_width, grapheme_width};
 
 /// The styles, resolved once from `NO_COLOR`.
@@ -246,6 +246,17 @@ fn paint_row(
             },
         ),
         Cell::Diff { .. } => ("±", "edit:", th.tool),
+        Cell::Explore { items, .. } => (
+            if explore_running(items) {
+                "⚙"
+            } else if items.iter().any(|i| i.state == ToolState::Err) {
+                "✗"
+            } else {
+                "✓"
+            },
+            "tool:",
+            th.tool,
+        ),
         Cell::Exec { done, exit, .. } => (
             if !*done {
                 "⚙"
@@ -474,6 +485,33 @@ fn paint_src<'e>(
                 1,
                 th.dim,
             );
+            if let Cell::Explore { .. } = &e.cell {
+                // `Verb targets…`: the verb carries the tool colour on the
+                // line's first row; wrapped rows are plain.
+                let line_start = lr.row.start == 0
+                    || text.as_bytes().get(lr.row.start as usize - 1) == Some(&b'\n');
+                let verb_end = line_start
+                    .then(|| s.find(' ').unwrap_or(s.len()))
+                    .unwrap_or(0);
+                let mut cx = put(
+                    buf,
+                    body_x + 2,
+                    y,
+                    &s[..verb_end],
+                    body_w.saturating_sub(2),
+                    th.tool,
+                );
+                cx += put(
+                    buf,
+                    body_x + 2 + cx,
+                    y,
+                    &s[verb_end..],
+                    body_w.saturating_sub(2 + cx),
+                    th.dim,
+                );
+                let _ = cx;
+                return Some(text);
+            }
             let body_style = match &e.cell {
                 Cell::Diff { .. } => {
                     // The line's first byte says what kind of line it is;
@@ -511,7 +549,7 @@ fn paint_src<'e>(
             let text = e.source(Src::Head);
             let s = &text[lr.row.start as usize..lr.row.end as usize];
             let head_style = match &e.cell {
-                Cell::Diff { .. } => style.add_modifier(Modifier::BOLD),
+                Cell::Diff { .. } | Cell::Explore { .. } => style.add_modifier(Modifier::BOLD),
                 _ => th.dim,
             };
             cx += put(

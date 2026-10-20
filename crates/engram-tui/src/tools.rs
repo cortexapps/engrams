@@ -22,9 +22,19 @@ pub fn canonical(name: &str) -> String {
 }
 
 /// A tool that only reads: consecutive calls fold into one `Explored`
-/// row (ADR 0124 PR9).
+/// row.
 pub fn is_read_only(canonical_name: &str) -> bool {
     matches!(canonical_name, "read" | "glob" | "grep" | "ls")
+}
+
+/// The verb an `Explored` row uses for a read-only tool.
+pub fn explore_verb(canonical_name: &str) -> &'static str {
+    match canonical_name {
+        "read" => "Read",
+        "grep" => "Search",
+        "glob" => "Find",
+        _ => "List",
+    }
 }
 
 fn string<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a str> {

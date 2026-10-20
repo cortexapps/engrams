@@ -28,6 +28,44 @@ pub enum Marker {
     PlanAttempt,
 }
 
+/// One read-only call inside an `Explore` cell.
+#[derive(Debug)]
+pub struct ExploreItem {
+    pub tool_call_id: Box<str>,
+    /// `Read`, `Search`, `Find`, `List`.
+    pub verb: &'static str,
+    pub target: Box<str>,
+    pub state: ToolState,
+}
+
+/// Is any call of the group still running?
+pub fn explore_running(items: &[ExploreItem]) -> bool {
+    items.iter().any(|i| i.state == ToolState::Running)
+}
+
+/// Rebuild the body of an `Explore` cell: one line per run of the same
+/// verb, targets joined with commas, a failed call marked.
+pub fn explore_text(items: &[ExploreItem], out: &mut String) {
+    out.clear();
+    let mut verb = "";
+    for it in items {
+        if it.verb != verb {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(it.verb);
+            out.push(' ');
+            verb = it.verb;
+        } else {
+            out.push_str(", ");
+        }
+        out.push_str(&it.target);
+        if it.state == ToolState::Err {
+            out.push_str(" (failed)");
+        }
+    }
+}
+
 /// One rendered unit of the transcript.
 #[derive(Debug)]
 pub enum Cell {
@@ -63,6 +101,12 @@ pub enum Cell {
         exit: Option<i32>,
         done: bool,
         expanded: bool,
+    },
+    /// Consecutive read-only calls (Read, Grep, Glob, LS) folded into one
+    /// `Explored` row. `text` is rebuilt from `items` on every change.
+    Explore {
+        items: Vec<ExploreItem>,
+        text: String,
     },
     Question {
         tool_call_id: Box<str>,
@@ -138,6 +182,15 @@ fn write_cell(cell: &Cell, out: &mut String) {
             if let Some(r) = result {
                 write_body(r, out);
             }
+            out.push('\n');
+        }
+        Cell::Explore { items, text } => {
+            out.push_str(if explore_running(items) {
+                "… Exploring\n"
+            } else {
+                "✓ Explored\n"
+            });
+            write_body(text, out);
             out.push('\n');
         }
         Cell::Exec {
@@ -365,6 +418,7 @@ impl Entry {
             } => !streaming && !open,
             Cell::Tool { state, .. } => *state != ToolState::Running,
             Cell::Exec { done, .. } => *done,
+            Cell::Explore { items, .. } => !explore_running(items),
             Cell::Question { .. }
             | Cell::Plan { .. }
             | Cell::Diff { .. }
@@ -386,6 +440,7 @@ impl Entry {
             | Cell::Marker { .. }
             | Cell::Plan { .. } => &[Src::Text],
             Cell::Tool { .. } | Cell::Exec { .. } | Cell::Diff { .. } => &[Src::Head, Src::Body],
+            Cell::Explore { .. } => &[Src::Body],
             Cell::Question { questions, .. } => {
                 return questions.iter().any(|q| {
                     crate::render::find_ci(&q.question, needle).is_some()
@@ -426,6 +481,14 @@ fn source_of(cell: &Cell, src: Src) -> &str {
         (Cell::Tool { result, .. }, Src::Body) => result.as_deref().unwrap_or(""),
         (Cell::Exec { command, .. }, Src::Head) => command,
         (Cell::Exec { output, .. }, Src::Body) => output,
+        (Cell::Explore { items, .. }, Src::Head) => {
+            if explore_running(items) {
+                "Exploring"
+            } else {
+                "Explored"
+            }
+        }
+        (Cell::Explore { text, .. }, Src::Body) => text,
         (Cell::Question { questions, .. }, Src::Question(i)) => questions
             .get(i as usize)
             .map(|q| q.question.as_str())
@@ -551,6 +614,16 @@ fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
                 out,
                 &mut scratch,
             );
+        }
+        Cell::Explore { text, .. } => {
+            push_rows(
+                Src::Head,
+                source_of(cell, Src::Head),
+                width,
+                out,
+                &mut scratch,
+            );
+            push_body(text, true, width, out, &mut scratch);
         }
         Cell::Exec {
             command,

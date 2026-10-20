@@ -10,8 +10,10 @@ use crate::event::{
     parse_answers, parse_plan, parse_plan_decision, parse_questions, Answers, Event,
 };
 use crate::markdown::Markdown;
-use crate::tools::{canonical as canonical_tool, summarize};
-use crate::transcript::{Cell, Marker, ToolState, Transcript};
+use crate::tools::{canonical as canonical_tool, explore_verb, is_read_only, summarize};
+use crate::transcript::{
+    explore_running, explore_text, Cell, ExploreItem, Marker, ToolState, Transcript,
+};
 
 /// Session states in which no run can be in flight.
 pub fn is_inactive(status: &str) -> bool {
@@ -271,6 +273,28 @@ impl Reducer {
         e.invalidate();
     }
 
+    /// Add a read-only call to the `Explore` group at the end of the
+    /// transcript, or start one. Returns the group's cell.
+    fn push_explore(&mut self, item: ExploreItem) -> usize {
+        if let Some(i) = self.transcript.last_index() {
+            if let Some(e) = self.transcript.get_mut(i) {
+                if let Cell::Explore { items, text } = &mut e.cell {
+                    items.push(item);
+                    explore_text(items, text);
+                    e.invalidate();
+                    return i;
+                }
+            }
+        }
+        self.close_active();
+        let mut text = String::new();
+        explore_text(std::slice::from_ref(&item), &mut text);
+        self.transcript.push(Cell::Explore {
+            items: vec![item],
+            text,
+        })
+    }
+
     fn push_marker(&mut self, kind: Marker, text: &str) {
         self.close_active();
         self.transcript.push(Cell::Marker {
@@ -323,6 +347,15 @@ impl Reducer {
                     }
                     Cell::Exec { done, .. } if !*done => {
                         *done = true;
+                        e.invalidate();
+                    }
+                    Cell::Explore { items, text } if explore_running(items) => {
+                        for it in items.iter_mut() {
+                            if it.state == ToolState::Running {
+                                it.state = if ok { ToolState::Ok } else { ToolState::Err };
+                            }
+                        }
+                        explore_text(items, text);
                         e.invalidate();
                     }
                     _ => {}
@@ -572,6 +605,18 @@ impl Reducer {
                 if self.decisions.contains_key(&tool_call_id) {
                     return;
                 }
+                let canonical = canonical_tool(&tool_name);
+                if is_read_only(&canonical) {
+                    let item = ExploreItem {
+                        tool_call_id: tool_call_id.as_str().into(),
+                        verb: explore_verb(&canonical),
+                        target: summarize(&tool_name, &args_summary).into(),
+                        state: ToolState::Running,
+                    };
+                    let i = self.push_explore(item);
+                    self.open_tools.insert(tool_call_id, i);
+                    return;
+                }
                 self.close_active();
                 let i = self.transcript.push(Cell::Tool {
                     args: summarize(&tool_name, &args_summary).into(),
@@ -676,16 +721,27 @@ impl Reducer {
                 match self.open_tools.remove(&tool_call_id) {
                     Some(i) => {
                         if let Some(e) = self.transcript.get_mut(i) {
-                            if let Cell::Tool {
-                                result,
-                                state: s,
-                                duration_ms: d,
-                                ..
-                            } = &mut e.cell
-                            {
-                                *result = result_summary.map(Into::into);
-                                *s = state;
-                                *d = duration_ms;
+                            match &mut e.cell {
+                                Cell::Tool {
+                                    result,
+                                    state: s,
+                                    duration_ms: d,
+                                    ..
+                                } => {
+                                    *result = result_summary.map(Into::into);
+                                    *s = state;
+                                    *d = duration_ms;
+                                }
+                                Cell::Explore { items, text } => {
+                                    if let Some(it) = items
+                                        .iter_mut()
+                                        .find(|it| *it.tool_call_id == *tool_call_id)
+                                    {
+                                        it.state = state;
+                                    }
+                                    explore_text(items, text);
+                                }
+                                _ => {}
                             }
                             e.invalidate();
                         }
@@ -892,6 +948,7 @@ mod tests {
                 }
                 Cell::Tool { name, state, .. } => format!("tool:{name}:{state:?}"),
                 Cell::Exec { command, exit, .. } => format!("exec:{command}:{exit:?}"),
+                Cell::Explore { text, .. } => format!("explore:{}", text.replace('\n', "|")),
                 Cell::Question { answered, .. } => format!("question:{answered}"),
                 Cell::Plan { approved, .. } => format!("plan:{approved:?}"),
                 Cell::Diff { path, .. } => format!("diff:{path}"),
@@ -1025,7 +1082,7 @@ mod tests {
         ));
         r.apply(ev(
             "tool_call_started",
-            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Read","args_summary":"a.rs"}"#,
+            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Write","args_summary":"a.rs"}"#,
         ));
         r.apply(ev(
             "tool_call_completed",
@@ -1038,7 +1095,7 @@ mod tests {
         r.apply(ev("run_completed", r#"{"run_id":"r1","ok":true}"#));
         assert_eq!(
             texts(&r),
-            vec!["agent:Looking.", "tool:Read:Ok", "agent:Done."]
+            vec!["agent:Looking.", "tool:Write:Ok", "agent:Done."]
         );
     }
 
@@ -1167,5 +1224,45 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn consecutive_reads_fold_into_one_explored_row() {
+        let mut r = Reducer::new();
+        r.apply(ev("run_started", r#"{"run_id":"r1","prompt_id":"p1"}"#));
+        let started = |id: &str, name: &str, args: &str| {
+            format!(
+                r#"{{"run_id":"r1","tool_call_id":"{id}","tool_name":"{name}","args_summary":{args}}}"#
+            )
+        };
+        let done = |id: &str, name: &str, ok: bool| {
+            format!(r#"{{"run_id":"r1","tool_call_id":"{id}","tool_name":"{name}","ok":{ok}}}"#)
+        };
+        r.apply(ev("tool_call_started", &started("t1", "Read", r#""a.rs""#)));
+        r.apply(ev("tool_call_completed", &done("t1", "Read", true)));
+        r.apply(ev("tool_call_started", &started("t2", "Read", r#""b.rs""#)));
+        r.apply(ev(
+            "tool_call_started",
+            &started("t3", "Grep", r#""{\"pattern\":\"main\",\"path\":\"src\"}""#),
+        ));
+        assert_eq!(
+            texts(&r),
+            vec!["user:?", "explore:Read a.rs, b.rs|Search main in src"]
+        );
+        assert!(!r.transcript.get(1).unwrap().is_final());
+        r.apply(ev("tool_call_completed", &done("t2", "Read", false)));
+        r.apply(ev("tool_call_started", &started("t4", "Bash", r#""ls""#)));
+        r.apply(ev("tool_call_started", &started("t5", "Read", r#""c.rs""#)));
+        r.apply(ev("run_completed", r#"{"run_id":"r1","ok":true}"#));
+        assert_eq!(
+            texts(&r),
+            vec![
+                "user:?",
+                "explore:Read a.rs, b.rs (failed)|Search main in src",
+                "tool:Bash:Ok",
+                "explore:Read c.rs",
+            ]
+        );
+        assert!(r.transcript.get(1).unwrap().is_final());
     }
 }
