@@ -6016,16 +6016,6 @@ mod adapter {
             let _ = tokio::fs::remove_file(&script).await;
         }
 
-        // ADR 0052 Phase 4 (warm mid-turn teleport): a live host-to-host move
-        // drops + re-dials the vsock WHILE a turn is generating (agentd SIGUSR1s
-        // the moved harness → it reconnects). The engine is connection-decoupled
-        // (the `turn`/cmd loop + the persistent claude child outlive any
-        // connection), so the in-flight turn MUST survive the bounce: the
-        // reattach must NOT synthesize an `Idle` mid-turn, and the run that was
-        // open before the bounce is the same one that completes after it —
-        // exactly one RunStarted→RunCompleted, no restart. This is the
-        // engine-side guarantee behind the no-turn-restart-on-teleport promise
-        // (the FC-level pipe survival is proven by the two-host teleport suite).
         #[tokio::test]
         async fn channel_close_reaps_child_and_interrupts_active_run_without_idle() {
             let pidfile = temp_pidfile();
@@ -6069,6 +6059,16 @@ mod adapter {
             let _ = tokio::fs::remove_file(pidfile).await;
         }
 
+        // ADR 0052 Phase 4 (warm mid-turn teleport): a live host-to-host move
+        // drops + re-dials the vsock WHILE a turn is generating (agentd SIGUSR1s
+        // the moved harness → it reconnects). The engine is connection-decoupled
+        // (the `turn`/cmd loop + the persistent claude child outlive any
+        // connection), so the in-flight turn MUST survive the bounce: the
+        // reattach must NOT synthesize an `Idle` mid-turn, and the run that was
+        // open before the bounce is the same one that completes after it —
+        // exactly one RunStarted→RunCompleted, no restart. This is the
+        // engine-side guarantee behind the no-turn-restart-on-teleport promise
+        // (the FC-level pipe survival is proven by the two-host teleport suite).
         #[tokio::test]
         async fn reattach_mid_turn_announces_run_continued() {
             // One turn: sleep 300ms (stays in flight), then one assistant line
