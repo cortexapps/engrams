@@ -494,71 +494,16 @@ jobs:
   # target builds on its own native runner: no cross toolchain, no emulation.
   # The artifact carries `engrams` (linux x64 — what Actions consumers exec)
   # plus `engrams-{linux-arm64,darwin-arm64}` for other hosts; release.yml
-  # attaches all three to the GitHub release.
+  # attaches all three to the GitHub release. The build itself is
+  # build-cli.yml, shared with nightly.yml.
   build-cli-tools:
     needs: detect
     if: needs.detect.outputs.cli_tools == 'true' || github.event_name == 'workflow_dispatch'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: engrams
-            runs-on: blacksmith-4vcpu-ubuntu-2404
-            target: x86_64-unknown-linux-musl
-          - name: engrams-linux-arm64
-            runs-on: blacksmith-4vcpu-ubuntu-2404-arm
-            target: aarch64-unknown-linux-musl
-          - name: engrams-darwin-arm64
-            runs-on: blacksmith-6vcpu-macos-15
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 30
-    concurrency:
-      group: bake-cli-tools-${{ matrix.name }}-${{ github.ref }}
-      cancel-in-progress: true
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Set up Rust (stable + target)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      # engram-app-client/build.rs runs protoc over the app protos. Pin an
-      # exact tag — the action's default semver range hits the GitHub
-      # releases API, which flakes on the shared Blacksmith IP pool.
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "25.9"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Cache cargo build state
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: cli-tools-${{ matrix.name }}
-
-      # musl-tools provides the `<arch>-linux-musl-gcc` linker that
-      # .cargo/config.toml names for the musl targets.
-      - name: Install musl-tools
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
-
-      - name: Build engrams
-        run: |
-          cargo build --profile cli --target "${{ matrix.target }}" -p engram-cli
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/cli/engrams" "dist/${{ matrix.name }}"
-          file "dist/${{ matrix.name }}"
-          "dist/${{ matrix.name }}" --version
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: cli-tools-${{ matrix.name }}
-          path: dist/${{ matrix.name }}
-          retention-days: 1
-          if-no-files-found: error
+    uses: ./.github/workflows/build-cli.yml
+    permissions:
+      contents: read
+    with:
+      ref: ${{ inputs.ref || github.sha }}
 
   publish-cli-tools:
     needs: [detect, build-cli-tools]

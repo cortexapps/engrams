@@ -1,0 +1,111 @@
+name: Build CLI
+
+# The three `engrams` binaries, one job per platform. bake-images.yml calls
+# this for a main push that changes the CLI, and nightly.yml calls it with a
+# prerelease version. Each job uploads its binary as the artifact
+# `cli-tools-<name>`; the caller downloads them with the pattern `cli-tools-*`.
+#
+# The artifact names are an interface: `engrams` is linux x64 (what Actions
+# consumers exec), `engrams-linux-arm64` and `engrams-darwin-arm64` are the
+# other hosts. release.yml and nightly.yml rename `engrams` to
+# `engrams-linux-x64` for the GitHub release.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'The ref to build. Default: the SHA of the calling run.'
+        required: false
+        type: string
+        default: ''
+      version:
+        description: 'The version the binary reports (ENGRAMS_BUILD_VERSION). Empty: the release version in the source.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: engrams
+            runs-on: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-musl
+          - name: engrams-linux-arm64
+            runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-musl
+          - name: engrams-darwin-arm64
+            runs-on: blacksmith-6vcpu-macos-15
+            target: aarch64-apple-darwin
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    # A new push cancels the build of the same platform for the same ref in
+    # the same calling workflow; a nightly and a bake never cancel each other.
+    concurrency:
+      group: build-cli-${{ github.workflow }}-${{ matrix.name }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Rust (stable + target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # engram-app-client/build.rs runs protoc over the app protos. Pin an
+      # exact tag — the action's default semver range hits the GitHub
+      # releases API, which flakes on the shared Blacksmith IP pool.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.9"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo build state
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cli-tools-${{ matrix.name }}
+
+      # musl-tools provides the `<arch>-linux-musl-gcc` linker that
+      # .cargo/config.toml names for the musl targets.
+      - name: Install musl-tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends musl-tools
+
+      # ENGRAMS_BUILD_VERSION is read at compile time (option_env!). It is
+      # exported only when set: an empty value would make the binary report
+      # an empty version.
+      - name: Build engrams
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+          NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$VERSION" ]]; then
+            export ENGRAMS_BUILD_VERSION="$VERSION"
+          fi
+          cargo build --profile cli --target "$TARGET" -p engram-cli
+          mkdir -p dist
+          cp "target/$TARGET/cli/engrams" "dist/$NAME"
+          file "dist/$NAME"
+          got="$("dist/$NAME" --version)"
+          echo "dist/$NAME reports $got"
+          if [[ -n "$VERSION" && "$got" != "$VERSION" ]]; then
+            echo "::error::The build reports version '$got', not '$VERSION'."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-tools-${{ matrix.name }}
+          path: dist/${{ matrix.name }}
+          retention-days: 1
+          if-no-files-found: error
