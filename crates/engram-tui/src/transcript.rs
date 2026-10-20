@@ -917,10 +917,20 @@ impl Transcript {
     /// tool-like cells with two or more calls becomes one closed fold.
     /// Cells already in a fold are left alone.
     pub fn fold_turn(&mut self) {
+        self.fold_back(true);
+    }
+
+    /// Fold every turn still in memory: a history page is finished
+    /// end to end, whether or not its runs ended inside it.
+    pub fn fold_all(&mut self) {
+        self.fold_back(false);
+    }
+
+    fn fold_back(&mut self, stop_at_prompt: bool) {
         let mut end = self.entries.len();
         while end > 0 {
             let e = &self.entries[end - 1];
-            if matches!(e.cell, Cell::User { .. }) {
+            if stop_at_prompt && matches!(e.cell, Cell::User { .. }) {
                 break;
             }
             if !foldable(&e.cell) || !matches!(e.fold, Fold::None) {

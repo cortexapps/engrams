@@ -483,6 +483,11 @@ impl Reducer {
                 }
             }
         }
+        // Everything on an older page is finished, including a run that
+        // ends on the next page and never saw its end here.
+        if self.fold {
+            older.transcript.fold_all();
+        }
         let k = self.transcript.prepend(older.transcript);
         if k == 0 {
             return;
@@ -920,6 +925,12 @@ impl Reducer {
                 };
                 let started = self.run_started_unix.take();
                 self.settle_run(ok);
+                // The run's tool calls fold whether the turn is over or
+                // paused on a decision: the card stays, the calls before
+                // it do not need the room.
+                if self.fold {
+                    self.transcript.fold_turn();
+                }
                 // The turn's receipt: how long the agent worked, and how
                 // the turn ended when not by its own choice. A turn that
                 // paused on a question or a plan is not over: no receipt.
@@ -936,9 +947,6 @@ impl Reducer {
                         format!("failed after {took}")
                     };
                     self.push_marker(Marker::Worked, &text);
-                }
-                if self.fold {
-                    self.transcript.fold_turn();
                 }
             }
             Event::HarnessIdle => {
@@ -1388,6 +1396,55 @@ mod tests {
         };
         assert!(md.text().starts_with("alpha"), "{:?}", md.text());
         assert!(md.text().ends_with("beta"), "{:?}", md.text());
+    }
+
+    #[test]
+    fn a_turn_paused_on_a_question_still_folds_its_calls() {
+        let mut r = Reducer::new();
+        r.apply(ev("run_started", r#"{"run_id":"r1","prompt_id":"p1"}"#));
+        for t in ["t1", "t2"] {
+            r.apply(ev(
+                "tool_call_started",
+                &format!(r#"{{"run_id":"r1","tool_call_id":"{t}","tool_name":"Bash","args_summary":"ls"}}"#),
+            ));
+            r.apply(ev(
+                "tool_call_completed",
+                &format!(r#"{{"run_id":"r1","tool_call_id":"{t}","tool_name":"Bash","ok":true}}"#),
+            ));
+        }
+        r.apply(ev(
+            "tool_call_requested",
+            r#"{"tool_call_id":"q1","name":"ask_user_question","args_json":"{\"questions\":[{\"question\":\"Ship?\",\"header\":\"h\",\"multiSelect\":false,\"options\":[{\"label\":\"yes\",\"description\":\"\"}]}]}"}"#,
+        ));
+        r.apply(ev("run_completed", r#"{"run_id":"r1","ok":true}"#));
+        assert!(r.awaiting_decision());
+        assert!(r.transcript.get(1).unwrap().is_fold_head());
+        assert!(r.transcript.get(2).unwrap().hidden_by_fold());
+        assert!(
+            !r.transcript.get(3).unwrap().hidden_by_fold(),
+            "the card stays"
+        );
+    }
+
+    #[test]
+    fn an_older_page_folds_without_a_run_end() {
+        let mut older = Reducer::new();
+        older.apply(ev("run_started", r#"{"run_id":"r1","prompt_id":"p1"}"#));
+        for t in ["t1", "t2"] {
+            older.apply(ev(
+                "tool_call_started",
+                &format!(r#"{{"run_id":"r1","tool_call_id":"{t}","tool_name":"Bash","args_summary":"ls"}}"#),
+            ));
+            older.apply(ev(
+                "tool_call_completed",
+                &format!(r#"{{"run_id":"r1","tool_call_id":"{t}","tool_name":"Bash","ok":true}}"#),
+            ));
+        }
+        let mut newer = Reducer::new();
+        newer.apply(ev("run_completed", r#"{"run_id":"r1","ok":true}"#));
+        newer.prepend(older);
+        assert!(newer.transcript.get(1).unwrap().is_fold_head());
+        assert!(newer.transcript.get(2).unwrap().hidden_by_fold());
     }
 
     #[test]
