@@ -143,10 +143,7 @@ impl Reducer {
             };
             match &e.cell {
                 Cell::Marker { kind, .. } => {
-                    if !matches!(
-                        kind,
-                        Marker::Resumed | Marker::Snapshot | Marker::Recovered | Marker::Rollback
-                    ) {
+                    if !matches!(kind, Marker::Resumed | Marker::Recovered | Marker::Rollback) {
                         return false;
                     }
                 }
@@ -837,7 +834,6 @@ impl Reducer {
                 self.waking = false;
                 self.push_marker(Marker::Resumed, "resumed");
             }
-            Event::SnapshotTaken => self.push_marker(Marker::Snapshot, "snapshot taken"),
             Event::RecoveredFromCheckpoint => {
                 self.push_marker(Marker::Recovered, "recovered from a checkpoint");
             }

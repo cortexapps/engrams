@@ -21,7 +21,6 @@ pub enum ToolState {
 pub enum Marker {
     Note,
     Resumed,
-    Snapshot,
     Recovered,
     Rollback,
     ResumedFromDisk,

@@ -14,7 +14,7 @@ pub fn env(idx: i64, kind: &str, payload: &str) -> Envelope {
     }
 }
 
-/// A short conversation: a prompt, a reply with a tool call, a snapshot.
+/// A short conversation: a prompt, a reply with a tool call, a resume.
 pub fn scripted() -> Vec<Envelope> {
     vec![
         env(0, "status_changed", r#"{"from":"created","to":"active"}"#),
@@ -45,7 +45,7 @@ pub fn scripted() -> Vec<Envelope> {
             r#"{"run_id":"r1","message_id":"m2","role":"assistant","text":"There is already a README.md. I will extend it with a usage section and keep the existing introduction intact."}"#,
         ),
         env(7, "run_completed", r#"{"run_id":"r1","ok":true}"#),
-        env(8, "snapshot_taken", r#"{"size_bytes":1024}"#),
+        env(8, "resumed", r#"{}"#),
     ]
 }
 

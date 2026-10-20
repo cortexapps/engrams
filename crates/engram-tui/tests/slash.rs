@@ -91,7 +91,7 @@ fn enter_runs_the_named_command() {
     };
     assert!(text.starts_with("› Add a README to the repo.\n\n"));
     assert!(text.contains("✓ Bash ls -la\n    Cargo.toml\n"));
-    assert!(text.contains("· snapshot taken\n"));
+    assert!(text.contains("· resumed\n"));
     app.cmds.clear();
 
     type_str(&mut app, "/transcript");

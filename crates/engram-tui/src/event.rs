@@ -122,7 +122,6 @@ pub enum Event {
     },
     ResumeStarted,
     Resumed,
-    SnapshotTaken,
     RecoveredFromCheckpoint,
     DurabilityRollback,
     ResumedFromDisk,
@@ -449,7 +448,6 @@ impl Event {
             }
             "resume_started" => Some(Event::ResumeStarted),
             "resumed" => Some(Event::Resumed),
-            "snapshot_taken" => Some(Event::SnapshotTaken),
             "recovered_from_checkpoint" => Some(Event::RecoveredFromCheckpoint),
             "durability_rollback" => Some(Event::DurabilityRollback),
             "resumed_from_disk" => Some(Event::ResumedFromDisk),

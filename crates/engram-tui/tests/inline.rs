@@ -70,7 +70,7 @@ fn finalized_cells_land_in_scrollback_once_and_leave_memory() {
     let mut app = common::attached_app(true, 40, 12);
 
     let committed = draw(&mut terminal, &mut app, &theme);
-    // Every scripted cell is final after `run_completed` + the snapshot
+    // Every scripted cell is final after `run_completed` + the resume
     // marker: the prompt, two replies, the tool row and the marker.
     assert_eq!(committed, 5);
     let a = app.attached.as_ref().unwrap();
@@ -88,13 +88,10 @@ fn finalized_cells_land_in_scrollback_once_and_leave_memory() {
     let joined = all.join("\n");
     assert_eq!(joined.matches("Add a README to the repo.").count(), 1);
     assert_eq!(joined.matches("✓ Bash ls -la").count(), 1);
-    assert_eq!(joined.matches("· snapshot taken").count(), 1);
+    assert_eq!(joined.matches("· resumed").count(), 1);
     let prompt_at = all.iter().position(|l| l.contains("Add a README")).unwrap();
     let tool_at = all.iter().position(|l| l.contains("Bash ls -la")).unwrap();
-    let marker_at = all
-        .iter()
-        .position(|l| l.contains("snapshot taken"))
-        .unwrap();
+    let marker_at = all.iter().position(|l| l.contains("· resumed")).unwrap();
     assert!(prompt_at < tool_at && tool_at < marker_at);
 
     // A second draw with nothing new inserts nothing.

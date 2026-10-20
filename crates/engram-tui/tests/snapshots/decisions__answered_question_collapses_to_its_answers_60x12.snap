@@ -3,7 +3,7 @@ source: crates/engram-tui/tests/decisions.rs
 expression: shot
 ---
 " Add a README                                               "
-"· snapshot taken                                            "
+"· resumed                                                   "
 "                                                            "
 "›                                                           "
 "                                                            "
