@@ -15,6 +15,7 @@ import { getTableName } from "drizzle-orm";
 import { z } from "zod";
 import {
   compileSessionCreateInput,
+  droppedIntegrationsPrompt,
   createSessionForExistingTask,
   createTaskWithSession,
   truncatePrompt,
@@ -315,6 +316,25 @@ const inp = await compileSessionCreateInput(
     expect(inp.integrationPolicyJson).toBeUndefined();
     expect(inp.integrationGrants).toEqual([]);
     expect(inp.integrationConnections).toEqual([]);
+  });
+
+  // A launch with no start screen (Slack, automations, the CLI) must still
+  // learn why the integration is off, so the agent can send the person to
+  // their personal credential instead of the healthy org connection.
+  test("a drop tells the session which integration is off and how to turn it on", async () => {
+    const inp = await compileSessionCreateInput(userScopedProfile(), userDeps([]));
+    expect(inp.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toContain(
+      droppedIntegrationsPrompt(["Acme"]),
+    );
+    expect(inp.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toContain("Settings → Credentials");
+  });
+
+  test("a connected credential adds no drop note", async () => {
+    const inp = await compileSessionCreateInput(
+      userScopedProfile(),
+      userDeps([{ provider: "acme", status: "connected" }]),
+    );
+    expect(inp.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT ?? "").not.toContain("turned off");
   });
 
   test("a broken credential disables too (presence is not enough)", async () => {
