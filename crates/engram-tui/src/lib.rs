@@ -116,7 +116,8 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
                     session_id,
                     prompt_id,
                     text,
-                } => net.send_prompt(session_id, prompt_id, text),
+                    harness_mode,
+                } => net.send_prompt(session_id, prompt_id, text, harness_mode),
                 Cmd::Interrupt { session_id } => net.interrupt(session_id),
                 Cmd::Resume { session_id } => net.resume(session_id),
                 Cmd::ViewTranscript { text } => {

@@ -43,6 +43,8 @@ pub enum Cmd {
         session_id: String,
         prompt_id: String,
         text: String,
+        /// Set only when the prompt changes the harness mode (`/plan`).
+        harness_mode: Option<String>,
     },
     Interrupt {
         session_id: String,
@@ -207,6 +209,9 @@ pub struct Attached {
     pub feedback: bool,
     /// The shell pane (Ctrl+`), open until closed or the shell exits.
     pub shell: Option<ShellPane>,
+    /// `/plan`: the mode the next prompt asks for, when it differs from
+    /// the session's current mode (the web's not-yet-sent toggle).
+    pub mode_override: Option<String>,
 }
 
 impl Attached {
@@ -231,6 +236,7 @@ impl Attached {
             search: None,
             feedback: false,
             shell: None,
+            mode_override: None,
         }
     }
 
@@ -447,6 +453,11 @@ impl Attached {
         if self.scroll_up > 0 {
             self.unseen += 1;
         }
+    }
+
+    /// The mode the next prompt runs in: the override, else the session's.
+    pub fn composer_mode(&self) -> &str {
+        self.mode_override.as_deref().unwrap_or(&self.reducer.mode)
     }
 
     pub fn can_send(&self) -> bool {
@@ -985,6 +996,22 @@ impl App {
                     self.note("only an idle session resumes; a prompt wakes it too");
                 }
             }
+            Slash::Plan => {
+                let Some(a) = &mut self.attached else {
+                    return;
+                };
+                let next = if a.composer_mode() == "plan" {
+                    "default"
+                } else {
+                    "plan"
+                };
+                a.mode_override = Some(next.to_string()).filter(|m| *m != a.reducer.mode);
+                self.note(if next == "plan" {
+                    "plan mode: the next prompt asks for a plan to approve"
+                } else {
+                    "plan mode off"
+                });
+            }
             Slash::Transcript => {
                 let Some(a) = &self.attached else {
                     return;
@@ -1214,10 +1241,12 @@ impl App {
                     a.reducer.sent(&prompt_id, text.clone());
                     a.scroll_up = 0;
                     a.unseen = 0;
+                    let harness_mode = a.mode_override.take().filter(|m| *m != a.reducer.mode);
                     self.cmds.push(Cmd::Send {
                         session_id: a.session_id.clone(),
                         prompt_id,
                         text,
+                        harness_mode,
                     });
                 }
             }
