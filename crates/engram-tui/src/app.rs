@@ -156,6 +156,11 @@ pub enum NetMsg {
         session_id: String,
         error: String,
     },
+    /// An older history page could not be loaded: paging may retry.
+    OlderFailed {
+        session_id: String,
+        error: String,
+    },
     SendFailed {
         session_id: String,
         prompt_id: String,
@@ -1449,7 +1454,11 @@ impl App {
                 if !a.composer.move_row(width, false) {
                     // On the first row: pull the newest queued prompt back,
                     // else browse history.
-                    if let Some((prompt_id, _)) = a.reducer.queued.last().cloned() {
+                    if let Some((prompt_id, summary)) = a.reducer.queued.last().cloned() {
+                        // The text comes back into the composer now; the
+                        // harness drops the queued copy.
+                        let text = a.reducer.held_text(&prompt_id).unwrap_or(summary);
+                        a.composer.set_text(&text);
                         self.cmds.push(Cmd::Dequeue {
                             session_id: a.session_id.clone(),
                             prompt_id,
@@ -1646,6 +1655,16 @@ impl App {
                     .as_mut()
                     .filter(|a| a.session_id == session_id)
                 {
+                    a.error = Some(error);
+                }
+            }
+            NetMsg::OlderFailed { session_id, error } => {
+                if let Some(a) = self
+                    .attached
+                    .as_mut()
+                    .filter(|a| a.session_id == session_id)
+                {
+                    a.loading_older = false;
                     a.error = Some(error);
                 }
             }

@@ -174,7 +174,7 @@ impl Net {
                     }));
                 }
                 Err(error) => {
-                    let _ = tx.send(Msg::Net(NetMsg::Failed { session_id, error }));
+                    let _ = tx.send(Msg::Net(NetMsg::OlderFailed { session_id, error }));
                 }
             }
         });

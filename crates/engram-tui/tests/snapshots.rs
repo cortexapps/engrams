@@ -486,3 +486,61 @@ fn a_prompt_row_sits_on_a_band() {
     let y = row_of("There is already");
     assert_eq!(buf.cell((2, y)).unwrap().bg, Color::Reset);
 }
+
+#[test]
+fn a_failed_older_page_does_not_block_the_next_request() {
+    let mut app = common::attached_app(false, 60, 12);
+    {
+        let a = app.attached.as_mut().unwrap();
+        a.exhausted = false;
+        a.oldest_idx = Some(9);
+    }
+    app.cmds.clear();
+    app.request_older();
+    assert!(matches!(
+        app.cmds.as_slice(),
+        [engram_tui::app::Cmd::LoadOlder { .. }]
+    ));
+    app.cmds.clear();
+    app.update(Msg::Net(NetMsg::OlderFailed {
+        session_id: "s-1".into(),
+        error: "Unavailable: try again".into(),
+    }));
+    app.request_older();
+    assert!(
+        matches!(
+            app.cmds.as_slice(),
+            [engram_tui::app::Cmd::LoadOlder { .. }]
+        ),
+        "{:?}",
+        app.cmds
+    );
+}
+
+#[test]
+fn up_pulls_a_queued_prompt_back_into_the_composer() {
+    let mut app = common::attached_app(false, 60, 12);
+    for e in [
+        common::env(9, "run_started", r#"{"run_id":"r2","prompt_id":"p2"}"#),
+        common::env(
+            10,
+            "prompt_queued",
+            r#"{"prompt_id":"q1","summary":"Then add tests for it"}"#,
+        ),
+    ] {
+        app.update(Msg::Net(NetMsg::Live {
+            session_id: "s-1".into(),
+            envelope: e,
+        }));
+    }
+    app.cmds.clear();
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+    assert!(matches!(
+        app.cmds.as_slice(),
+        [engram_tui::app::Cmd::Dequeue { .. }]
+    ));
+    assert_eq!(
+        app.attached.as_ref().unwrap().composer.text(),
+        "Then add tests for it"
+    );
+}
