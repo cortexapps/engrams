@@ -18,6 +18,12 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
   from the repository with `cargo build --profile cli -p engram-cli`; the `cli/` directory and
   its Bun toolchain are gone.
 
+### Added
+
+- An installer for the CLI (`curl -fsSL https://engramsfactory.com/install.sh | sh`), the
+  Homebrew formulae `cortexapps/tap/engrams` and `cortexapps/tap/engrams-nightly`, and a
+  nightly prerelease channel (`v<next>-rc.<n>`) built from `main`.
+
 ### Changed
 
 - The `engrams` CLI moved from Bun to Rust (`crates/engram-cli` on the new

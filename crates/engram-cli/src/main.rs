@@ -19,6 +19,14 @@ use output::{fail, CliError, CliResult};
 /// The release version. `scripts/release-version.sh` rewrites this line.
 const VERSION: &str = "0.11.0";
 
+/// The version the binary reports. A nightly build (nightly.yml) sets
+/// `ENGRAMS_BUILD_VERSION` to its prerelease version, for example
+/// `0.12.0-rc.3`; every other build reports the release version.
+const BUILD_VERSION: &str = match option_env!("ENGRAMS_BUILD_VERSION") {
+    Some(v) => v,
+    None => VERSION,
+};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "engrams",
@@ -511,7 +519,7 @@ fn main() {
         }
     };
     if cli.version {
-        println!("{VERSION}");
+        println!("{BUILD_VERSION}");
         return;
     }
     // The shell owns the terminal and its own runtime, like the TUI.

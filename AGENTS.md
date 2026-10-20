@@ -174,6 +174,16 @@ Only members of the organization can release: the workflow's `authorize` job ref
 other person, and the `release` environment holds the settings-side controls. Do not add a
 second way to publish a version tag (a tag-push trigger, a version tag in `bake-images.yml`).
 
+The CLI has two channels. **stable** is the release above. **nightly** is
+`.github/workflows/nightly.yml`: each night with a new commit on main it builds the CLI
+(`build-cli.yml`, the build that `bake-images.yml` also uses) and publishes the prerelease
+`v<next>-rc.<n>` — `<next>` is the next stable version, `<n>` counts up — with the three
+binaries and `SHA256SUMS`. It publishes prerelease tags only; a tag with no `-rc.` suffix
+comes from the Release workflow and nothing else. Both workflows end by writing the Homebrew
+formula (`scripts/homebrew-tap.sh`: `engrams` stable, `engrams-nightly`) to the tap
+repository with the `HOMEBREW_TAP_TOKEN` secret. The installer at `site/public/install.sh`
+and the site's CLI reference describe the user side.
+
 ## Conventions
 
 **Writing**

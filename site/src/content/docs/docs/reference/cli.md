@@ -10,9 +10,29 @@ uses, and nothing else; the coordinator and the hosts are internal to a deployme
 
 ## Install
 
-The CLI is a single static binary. Each release attaches builds for Linux x86-64, Linux
-arm64 and macOS arm64 to the GitHub release; copy the one for your machine somewhere on your
-`PATH` as `engrams`. To build it from the repository:
+The CLI is a single static binary for Linux x86-64, Linux arm64 and macOS arm64. The
+installer downloads the build for your machine from the GitHub release, checks its
+checksum, and puts it on your `PATH`:
+
+```sh
+curl -fsSL https://engramsfactory.com/install.sh | sh
+```
+
+With Homebrew:
+
+```sh
+brew install cortexapps/tap/engrams
+```
+
+There are two channels. **stable** is the newest release (`0.11.0`, `0.12.0`, …). **nightly**
+is a prerelease built from `main` each night, versioned after the release it precedes
+(`0.12.0-rc.1`, `0.12.0-rc.2`, …). The installer takes `ENGRAMS_CHANNEL=nightly`, or an exact
+version with `ENGRAMS_VERSION=0.12.0-rc.3`; Homebrew has the formula `engrams-nightly`. To
+upgrade, run the installer again or `brew upgrade`.
+
+The installer puts the binary in `/usr/local/bin` when that is writable, else in
+`~/.local/bin`; `ENGRAMS_INSTALL_DIR` sets another directory. Each release also lists the
+binaries and their `SHA256SUMS` on its GitHub page. To build the CLI from the repository:
 
 ```sh
 cargo build --profile cli -p engram-cli   # -> target/cli/engrams
