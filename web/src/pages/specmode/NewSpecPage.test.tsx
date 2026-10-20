@@ -248,10 +248,11 @@ describe("NewSpecPage", () => {
     await user.click(screen.getByRole("menuitem", { name: "High" }));
     await user.click(screen.getByTestId("session-mode-chip"));
 
-    await user.type(
-      await screen.findByLabelText("What is the spec about?"),
-      "Queued prompts are lost after an eviction.",
-    );
+    // One paste, not one keystroke per character: this test asserts the
+    // request, and each keystroke re-renders the whole page (slow enough
+    // under full-suite load to pass the 5 s test timeout).
+    await user.click(await screen.findByLabelText("What is the spec about?"));
+    await user.paste("Queued prompts are lost after an eviction.");
     await user.click(screen.getByRole("button", { name: "Start" }));
 
     await waitFor(() => expect(state.create).toHaveBeenCalledTimes(1));
