@@ -623,6 +623,7 @@ impl Reducer {
                 }
                 self.close_active();
                 let i = self.transcript.push(Cell::Tool {
+                    tool_call_id: tool_call_id.as_str().into(),
                     args: summarize(&tool_name, &args_summary).into(),
                     name: tool_name.into(),
                     result: None,
@@ -674,6 +675,7 @@ impl Reducer {
                 }
                 self.close_active();
                 let i = self.transcript.push(Cell::Tool {
+                    tool_call_id: tool_call_id.as_str().into(),
                     args: summarize(&name, &args_json).into(),
                     name: name.into(),
                     result: None,
@@ -753,6 +755,7 @@ impl Reducer {
                     None => {
                         self.close_active();
                         self.transcript.push(Cell::Tool {
+                            tool_call_id: tool_call_id.as_str().into(),
                             name: tool_name.into(),
                             args: "".into(),
                             result: result_summary.as_deref().map(trim_result),
@@ -784,7 +787,15 @@ impl Reducer {
                 };
                 // The entry stays in `open_tools` so the completion that
                 // follows finds the card (and leaves a diff cell alone).
-                match self.open_tools.get(&tool_call_id).copied() {
+                // The harness can also emit the change after the
+                // completion: then the card is found among the newest
+                // cells by its id.
+                let target = self
+                    .open_tools
+                    .get(&tool_call_id)
+                    .copied()
+                    .or_else(|| self.recent_tool(&tool_call_id));
+                match target {
                     Some(i) if self.transcript.get(i).is_some() => {
                         let e = self.transcript.get_mut(i).expect("checked");
                         e.cell = cell;
@@ -935,6 +946,19 @@ impl Reducer {
             }
             Event::Other => {}
         }
+    }
+
+    /// The tool card for `tool_call_id` among the newest cells (a
+    /// completed call whose `file_changed` arrived after its completion).
+    fn recent_tool(&self, tool_call_id: &str) -> Option<usize> {
+        let end = self.transcript.len();
+        let start = end.saturating_sub(8).max(self.transcript.first_index());
+        (start..end).rev().find(|&i| {
+            matches!(
+                self.transcript.get(i).map(|e| &e.cell),
+                Some(Cell::Tool { tool_call_id: id, .. }) if **id == *tool_call_id
+            )
+        })
     }
 
     /// The exec cell for `exec_id`, or a standalone one when its
@@ -1379,5 +1403,24 @@ mod tests {
             r#"{"run_id":"r1","ok":true,"at":"2026-01-01T10:00:09Z"}"#,
         ));
         assert_eq!(texts(&r).last().unwrap(), "question:false");
+    }
+
+    #[test]
+    fn a_file_change_after_the_completion_still_replaces_the_card() {
+        let mut r = Reducer::new();
+        r.apply(ev("run_started", r#"{"run_id":"r1","prompt_id":"p1"}"#));
+        r.apply(ev(
+            "tool_call_started",
+            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Write","args_summary":"a.txt"}"#,
+        ));
+        r.apply(ev(
+            "tool_call_completed",
+            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Write","ok":true}"#,
+        ));
+        r.apply(ev(
+            "file_changed",
+            r#"{"run_id":"r1","tool_call_id":"t1","path":"a.txt","change":{"write":{"content":"hi\n"}}}"#,
+        ));
+        assert_eq!(texts(&r), vec!["user:?", "diff:a.txt"]);
     }
 }

@@ -90,6 +90,7 @@ pub enum Cell {
         failed: bool,
     },
     Tool {
+        tool_call_id: Box<str>,
         name: Box<str>,
         args: Box<str>,
         result: Option<Box<str>>,
