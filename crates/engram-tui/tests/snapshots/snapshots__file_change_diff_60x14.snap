@@ -3,8 +3,6 @@ source: crates/engram-tui/tests/snapshots.rs
 expression: shot
 ---
 " Add a README                                               "
-"· resumed                                                   "
-"                                                            "
 "›                                                           "
 "                                                            "
 "± Edited README.md  +5 −1                                   "
@@ -14,5 +12,7 @@ expression: shot
 "    +## Usage                                               "
 "    +                                                       "
 "    … 1 more lines (Ctrl+O)                                 "
+"────────────────────────────────────────────────────────────"
 "› type to queue a message · Esc interrupts                  "
+"────────────────────────────────────────────────────────────"
 <footer: working>

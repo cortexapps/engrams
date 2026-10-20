@@ -213,6 +213,20 @@ fn fill(buf: &mut Buffer, area: Rect, style: Style) {
     }
 }
 
+/// A dim rule across `area` (one row, or nothing when it has no height):
+/// the edge of the composer, as in Claude Code.
+fn draw_rule(buf: &mut Buffer, area: Rect, th: &Theme) {
+    if area.height == 0 {
+        return;
+    }
+    for x in area.left()..area.right() {
+        if let Some(c) = buf.cell_mut(Position::new(x, area.y)) {
+            c.set_symbol("─");
+            c.set_style(th.dim);
+        }
+    }
+}
+
 /// Paint one layout row of a cell at `y`. `hl` is a lowercase search
 /// query to highlight in this row.
 fn paint_row(
@@ -1434,8 +1448,16 @@ pub fn draw_fullscreen(
             a.composer.layout(width);
             let composer_rows = a.composer.rows().len().clamp(1, 8) as u16;
             let queue_rows = (a.reducer.queued.len() as u16).min(4);
+            // The composer and its queue sit between two rules when the
+            // screen has the rows for them.
+            let rules = u16::from(body.height >= 8);
+            let rule_below = Rect {
+                y: body.bottom().saturating_sub(1),
+                height: rules,
+                ..body
+            };
             let composer = Rect {
-                y: body.bottom().saturating_sub(composer_rows),
+                y: body.bottom().saturating_sub(rules + composer_rows),
                 height: composer_rows.min(body.height),
                 ..body
             };
@@ -1444,14 +1466,19 @@ pub fn draw_fullscreen(
                 height: queue_rows.min(composer.y - body.y),
                 ..body
             };
+            let rule_above = Rect {
+                y: queue.y.saturating_sub(rules),
+                height: rules,
+                ..body
+            };
             let title_h = u16::from(body.height > 4);
             let shell_rows = if a.shell.is_some() {
-                shell_pane_rows(body.height).min(queue.y.saturating_sub(body.y + title_h))
+                shell_pane_rows(body.height).min(rule_above.y.saturating_sub(body.y + title_h))
             } else {
                 0
             };
             let shell = Rect {
-                y: queue.y.saturating_sub(shell_rows),
+                y: rule_above.y.saturating_sub(shell_rows),
                 height: shell_rows,
                 ..body
             };
@@ -1482,8 +1509,10 @@ pub fn draw_fullscreen(
             if slash.height > 0 {
                 draw_slash(buf, slash, a.composer.text(), th);
             }
+            draw_rule(buf, rule_above, th);
             draw_queue(buf, queue, a, th);
             cursor = Some(draw_composer(buf, composer, a, th));
+            draw_rule(buf, rule_below, th);
             if shell.height > 0 {
                 if let Some(c) = draw_shell(buf, shell, a, th) {
                     cursor = Some(c);
@@ -1576,9 +1605,15 @@ pub fn draw_inline(
                 height: queue_rows.min(composer.y - body.y),
                 ..body
             };
-            let slash_h = slash_rows(a.composer.text()).min(queue.y.saturating_sub(body.y));
+            // One rule above the composer; the viewport is short.
+            let rule_above = Rect {
+                y: queue.y.saturating_sub(1),
+                height: u16::from(body.height >= 4 && queue.y > body.y),
+                ..body
+            };
+            let slash_h = slash_rows(a.composer.text()).min(rule_above.y.saturating_sub(body.y));
             let slash = Rect {
-                y: queue.y.saturating_sub(slash_h),
+                y: rule_above.y.saturating_sub(slash_h),
                 height: slash_h,
                 ..body
             };
@@ -1593,6 +1628,7 @@ pub fn draw_inline(
             if slash.height > 0 {
                 draw_slash(buf, slash, a.composer.text(), th);
             }
+            draw_rule(buf, rule_above, th);
             draw_queue(buf, queue, a, th);
             cursor = Some(draw_composer(buf, composer, a, th));
         }

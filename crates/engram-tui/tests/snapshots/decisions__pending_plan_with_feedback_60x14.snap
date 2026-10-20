@@ -3,8 +3,6 @@ source: crates/engram-tui/tests/decisions.rs
 expression: shot
 ---
 " Add a README                                               "
-"  usage section and keep the existing introduction intact.  "
-"· worked for 1m 05s                                         "
 "· resumed                                                   "
 "                                                            "
 "›                                                           "
@@ -14,5 +12,7 @@ expression: shot
 "  1. add the section                                        "
 "  2. run the tests                                          "
 "  1 approve  2 reject  Tab feedback · Enter confirm         "
+"────────────────────────────────────────────────────────────"
 "› tests                                                     "
+"────────────────────────────────────────────────────────────"
 <footer: needs you>

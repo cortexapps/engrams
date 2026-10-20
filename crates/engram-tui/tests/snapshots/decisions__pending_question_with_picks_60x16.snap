@@ -3,8 +3,6 @@ source: crates/engram-tui/tests/decisions.rs
 expression: shot
 ---
 " Add a README                                               "
-"· worked for 1m 05s                                         "
-"· resumed                                                   "
 "                                                            "
 "›                                                           "
 "                                                            "
@@ -16,5 +14,7 @@ expression: shot
 "    2. [ ] search                                           "
 "    3. [x] export                                           "
 "  1-9 toggle · Enter confirm                                "
+"────────────────────────────────────────────────────────────"
 "› answer above, or type to queue a message                  "
+"────────────────────────────────────────────────────────────"
 <footer: needs you>

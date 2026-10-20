@@ -306,7 +306,9 @@ an explicit `Content-Length: 0` through some front ends.
   reaches the top of memory pages older history in. A prompt sits on a
   band across the row, as in Claude Code. A tool row whose argument JSON
   the server cut short keeps its subject (the first subject-like string
-  field, unescaped up to the cut).
+  field, unescaped up to the cut). The composer sits between two dim
+  rules, as in Claude Code, so the input is set off from the transcript
+  (one rule above it in native scrollback mode, whose viewport is short).
 - **PR8, the budgets.** The RSS gate against a stub orchestrator (D5)
   stays unbuilt; the measured numbers are in the PR texts: 13-16 MB RSS
   attached to a 5k-event session in fullscreen mode, 14 MB in native

@@ -385,9 +385,9 @@ fn a_finished_turn_folds_and_opens_60x14() {
 #[test]
 fn a_click_on_the_fold_row_opens_it() {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-    let mut app = common::attached_app(false, 60, 14);
+    let mut app = common::attached_app(false, 60, 20);
     folded_turn(&mut app);
-    let shot = frame(&mut app, 60, 14);
+    let shot = frame(&mut app, 60, 20);
     let y = shot
         .lines()
         .position(|l| l.contains("Ran 2 shell commands"))
@@ -398,7 +398,7 @@ fn a_click_on_the_fold_row_opens_it() {
         row: y,
         modifiers: KeyModifiers::NONE,
     }));
-    let shot = frame(&mut app, 60, 14);
+    let shot = frame(&mut app, 60, 20);
     assert!(shot.contains("▾ Ran 2 shell commands"), "{shot}");
     assert!(shot.contains("cargo build"), "{shot}");
 }
