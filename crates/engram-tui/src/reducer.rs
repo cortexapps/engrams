@@ -45,6 +45,10 @@ pub struct Reducer {
     active: Option<usize>,
     /// Durable text length of the active cell; chunks append past it.
     stream_base: usize,
+    /// Where the live chunk stream started in its cell: the final message
+    /// replaces from there, even after a boundary closed the cell and
+    /// reset `stream_base` for the next one.
+    stream_from: usize,
     /// The cell a chunk stream is landing in, by message id.
     stream: Option<(String, usize)>,
     open_tools: HashMap<String, usize>,
@@ -322,6 +326,12 @@ impl Reducer {
         }
     }
 
+    /// The full text of a prompt this client sent, while the harness
+    /// still holds it.
+    pub fn held_text(&self, prompt_id: &str) -> Option<String> {
+        self.held.get(prompt_id).cloned()
+    }
+
     fn take_queued(&mut self, prompt_id: &str) -> Option<String> {
         let pos = self.queued.iter().position(|(id, _)| id == prompt_id)?;
         Some(self.queued.remove(pos).1)
@@ -425,7 +435,54 @@ impl Reducer {
     /// the older page's open state is dropped: a run that straddles the
     /// page edge was already settled by the newer fold or the session
     /// status, and an unloaded decision is unknown, not pending.
-    pub fn prepend(&mut self, older: Reducer) {
+    ///
+    /// A tool call that straddles the seam (started on the older page,
+    /// completed on this one) left a bare completed card here and a
+    /// running card there: the older card's args move into this card
+    /// and the older card is hidden.
+    pub fn prepend(&mut self, mut older: Reducer) {
+        let newest = older.transcript.len();
+        let seam_cells = self.transcript.len().min(8);
+        for (id, oi) in older.open_tools.drain() {
+            let Some(ni) = (0..seam_cells).find(|&i| {
+                self.transcript.get(i).is_some_and(
+                    |e| matches!(&e.cell, Cell::Tool { tool_call_id, .. } if **tool_call_id == *id),
+                )
+            }) else {
+                continue;
+            };
+            let Some(oe) = older.transcript.get_mut(oi) else {
+                continue;
+            };
+            let Cell::Tool { args: oargs, .. } = &mut oe.cell else {
+                continue;
+            };
+            let moved = std::mem::take(oargs);
+            oe.hide();
+            if let Some(ne) = self.transcript.get_mut(ni) {
+                if let Cell::Tool { args, .. } = &mut ne.cell {
+                    *args = moved;
+                    ne.invalidate();
+                }
+            }
+        }
+        // A read-only call still running at the end of the older page
+        // completed on this page or was settled: never leave it spinning.
+        for i in 0..newest {
+            if let Some(e) = older.transcript.get_mut(i) {
+                if let Cell::Explore { items, text } = &mut e.cell {
+                    if explore_running(items) {
+                        for it in items.iter_mut() {
+                            if it.state == ToolState::Running {
+                                it.state = ToolState::Ok;
+                            }
+                        }
+                        explore_text(items, text);
+                        e.invalidate();
+                    }
+                }
+            }
+        }
         let k = self.transcript.prepend(older.transcript);
         if k == 0 {
             return;
@@ -537,7 +594,7 @@ impl Reducer {
                             // the final text still belongs there.
                             if let Some(e) = self.transcript.get_mut(i) {
                                 if let Cell::Assistant { md, streaming, .. } = &mut e.cell {
-                                    md.replace_from(self.stream_base, &text);
+                                    md.replace_from(self.stream_from, &text);
                                     *streaming = false;
                                     // Closed and no longer streaming: final.
                                     md.finalize();
@@ -579,6 +636,7 @@ impl Reducer {
                             e.invalidate();
                         }
                         self.stream = Some((message_id, i));
+                        self.stream_from = self.stream_base;
                         i
                     }
                 };
@@ -1303,6 +1361,65 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_boundary_between_a_message_and_its_stream_keeps_the_earlier_text() {
+        let mut r = Reducer::new();
+        r.apply(ev("run_started", r#"{"run_id":"r1","prompt_id":"p1"}"#));
+        r.apply(ev(
+            "agent_message",
+            r#"{"run_id":"r1","message_id":"m1","role":"assistant","text":"alpha"}"#,
+        ));
+        r.apply(ev(
+            "agent_message_chunk",
+            r#"{"run_id":"r1","message_id":"m2","chunk":"be"}"#,
+        ));
+        r.apply(ev(
+            "tool_call_started",
+            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Bash","args_summary":"ls"}"#,
+        ));
+        r.apply(ev(
+            "agent_message",
+            r#"{"run_id":"r1","message_id":"m2","role":"assistant","text":"beta"}"#,
+        ));
+        let Some(Cell::Assistant { md, .. }) = r.transcript.get(1).map(|e| &e.cell) else {
+            panic!("an assistant cell");
+        };
+        assert!(md.text().starts_with("alpha"), "{:?}", md.text());
+        assert!(md.text().ends_with("beta"), "{:?}", md.text());
+    }
+
+    #[test]
+    fn a_tool_call_across_a_page_seam_is_one_card() {
+        // Older page: the call starts. Newer page: it completes.
+        let mut older = Reducer::new();
+        older.apply(ev("run_started", r#"{"run_id":"r1","prompt_id":"p1"}"#));
+        older.apply(ev(
+            "tool_call_started",
+            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Bash","args_summary":"ls -la"}"#,
+        ));
+        older.apply(ev(
+            "tool_call_started",
+            r#"{"run_id":"r1","tool_call_id":"t2","tool_name":"Read","args_summary":"a.rs"}"#,
+        ));
+        let mut newer = Reducer::new();
+        newer.apply(ev(
+            "tool_call_completed",
+            r#"{"run_id":"r1","tool_call_id":"t1","tool_name":"Bash","ok":true,"result_summary":"x"}"#,
+        ));
+        newer.apply(ev("run_completed", r#"{"run_id":"r1","ok":true}"#));
+        newer.prepend(older);
+        let cells = texts(&newer);
+        assert_eq!(
+            cells,
+            vec!["user:?", "hidden", "explore:Read a.rs", "tool:Bash:Ok"],
+            "{cells:?}"
+        );
+        let Some(Cell::Tool { args, .. }) = newer.transcript.get(3).map(|e| &e.cell) else {
+            panic!("the completed card");
+        };
+        assert_eq!(&**args, "ls -la");
     }
 
     #[test]
