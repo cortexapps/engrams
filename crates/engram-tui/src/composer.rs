@@ -49,6 +49,19 @@ impl Composer {
         if self.text.trim().is_empty() {
             return None;
         }
+        let out = self.expanded();
+        self.pastes.clear();
+        self.text.clear();
+        self.push_history(out.clone());
+        self.cursor = 0;
+        self.rows_width = 0;
+        self.browsing = None;
+        Some(out)
+    }
+
+    /// The draft with every `[Pasted text #N …]` placeholder replaced by
+    /// its paste.
+    fn expanded(&self) -> String {
         let mut out = String::with_capacity(self.text.len());
         let mut rest = self.text.as_str();
         while let Some(pos) = rest.find("[Pasted text #") {
@@ -68,19 +81,15 @@ impl Composer {
             }
         }
         out.push_str(rest);
-        self.pastes.clear();
-        self.text.clear();
-        self.push_history(out.clone());
-        self.cursor = 0;
-        self.rows_width = 0;
-        self.browsing = None;
-        Some(out)
+        out
     }
 
-    /// Clear the draft, keeping it in history so `Up` can recall it.
+    /// Clear the draft, keeping it in history so `Up` can recall it. The
+    /// pastes are expanded first: the placeholders die with the draft.
     pub fn clear(&mut self) {
         if !self.text.is_empty() {
-            let t = std::mem::take(&mut self.text);
+            let t = self.expanded();
+            self.text.clear();
             self.push_history(t);
         }
         self.cursor = 0;
@@ -144,9 +153,11 @@ impl Composer {
         let before = &self.text[..self.cursor];
         let trimmed = before.trim_end();
         let base = trimmed.len();
+        // Step over the whole whitespace character: it can be wider than
+        // one byte (an ideographic space), and a cut inside it panics.
         trimmed
             .rfind(|c: char| c.is_whitespace())
-            .map(|i| i + 1)
+            .map(|i| i + trimmed[i..].chars().next().map_or(1, char::len_utf8))
             .unwrap_or(0)
             .min(base)
     }
@@ -290,6 +301,13 @@ impl Composer {
         if self.rows_width != width || self.rows.is_empty() {
             self.rows.clear();
             wrap_into(&self.text, width, &mut self.rows);
+            // The wrapper ends a row at a newline and adds none after a
+            // trailing one; the cursor can sit there, so the composer
+            // keeps that empty row.
+            if self.text.ends_with('\n') {
+                let at = self.text.len() as u32;
+                self.rows.push(crate::wrap::Row { start: at, end: at });
+            }
             self.rows_width = width;
         }
         let mut pos = (0u16, 0u16);
@@ -354,6 +372,42 @@ impl Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_moves_step_over_wide_whitespace() {
+        // An ideographic space is three bytes: a cut one byte in panics.
+        let mut c = Composer::default();
+        c.insert_str("a\u{3000}b");
+        c.kill_word();
+        assert_eq!(c.text(), "a\u{3000}");
+        c.insert_str("b");
+        c.word_left();
+        assert_eq!(c.cursor, "a\u{3000}".len());
+        c.word_left();
+        assert_eq!(c.cursor, 0);
+    }
+
+    #[test]
+    fn a_cleared_draft_recalls_its_pastes() {
+        let mut c = Composer::default();
+        let big = "x".repeat(900);
+        c.paste(&big);
+        assert!(c.text().starts_with("[Pasted text #1"));
+        c.clear();
+        assert!(c.history_prev());
+        assert_eq!(c.text(), big);
+    }
+
+    #[test]
+    fn a_trailing_newline_puts_the_cursor_on_its_own_row() {
+        let mut c = Composer::default();
+        c.insert_str("abc\n");
+        assert_eq!(c.layout(20), (1, 0));
+        assert_eq!(c.rows().len(), 2);
+        // Up moves to the row above instead of recalling history.
+        assert!(c.move_row(20, false));
+        assert_eq!(c.layout(20).0, 0);
+    }
 
     #[test]
     fn edits_and_kills_are_grapheme_aware() {
