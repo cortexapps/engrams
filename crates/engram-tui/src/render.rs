@@ -1154,7 +1154,10 @@ fn draw_sessions(buf: &mut Buffer, area: Rect, app: &App, th: &Theme, title: &st
             },
             style,
         );
-        let mut cx = put(buf, list.x + 1, y, marker(&r.status), 1, style);
+        // A session that waits on the user shows the question mark the
+        // footer uses for a pending decision.
+        let mark = if r.needs_you { "?" } else { marker(&r.status) };
+        let mut cx = put(buf, list.x + 1, y, mark, 1, style);
         cx += put(buf, list.x + 1 + cx, y, " ", 1, style);
         let age_s = age(r.age_secs);
         let title_w = list
@@ -1173,7 +1176,11 @@ fn draw_sessions(buf: &mut Buffer, area: Rect, app: &App, th: &Theme, title: &st
         shown += 1;
     }
     if shown == 0 && !app.sessions.loading {
-        let msg = if app.sessions.rows.is_empty() {
+        let msg = if app.auth_failed {
+            "the API key was refused · run engrams auth login"
+        } else if app.sessions.rows.is_empty() && app.sessions.error.is_some() {
+            "could not load the sessions"
+        } else if app.sessions.rows.is_empty() {
             "no sessions yet · engrams task create --profile <name> --prompt …"
         } else {
             "no match"

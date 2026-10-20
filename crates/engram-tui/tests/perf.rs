@@ -125,6 +125,41 @@ fn frame(
         .unwrap();
 }
 
+/// The program status runs once per drawn frame: when nothing changed it
+/// writes nothing and allocates nothing.
+#[test]
+fn a_steady_program_status_writes_and_allocates_nothing() {
+    let mut app = common::attached_app(false, 80, 24);
+    app.update(Msg::Net(NetMsg::Live {
+        session_id: "s-1".into(),
+        envelope: common::env(9, "run_started", r#"{"run_id":"r2","prompt_id":"p2"}"#),
+    }));
+    app.update(Msg::Net(NetMsg::Live {
+        session_id: "s-1".into(),
+        envelope: common::env(
+            10,
+            "tool_call_started",
+            r#"{"run_id":"r2","tool_call_id":"t9","tool_name":"TodoWrite","args_summary":"{\"todos\":[{\"status\":\"completed\"},{\"status\":\"pending\"}]}"}"#,
+        ),
+    }));
+    let mut reporter = engram_tui::status::Reporter::new(true);
+    let mut out: Vec<u8> = Vec::with_capacity(1024);
+    reporter.frame(&app, &mut out).unwrap();
+    assert!(!out.is_empty(), "the first frame reports");
+
+    let allocs_before = ALLOCS.load(Ordering::Relaxed);
+    for _ in 0..200 {
+        out.clear();
+        reporter.frame(&app, &mut out).unwrap();
+        assert!(out.is_empty());
+    }
+    let allocs = ALLOCS.load(Ordering::Relaxed) - allocs_before;
+    assert_eq!(
+        allocs, 0,
+        "{allocs} allocations over 200 steady status frames"
+    );
+}
+
 #[test]
 fn steady_state_frames_allocate_nothing_and_fit_the_time_budget() {
     let theme = Theme::new(true);

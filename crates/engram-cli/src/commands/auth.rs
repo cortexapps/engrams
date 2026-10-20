@@ -68,7 +68,7 @@ fn hostname() -> String {
     }
 }
 
-pub async fn login(host: &str) -> CliResult {
+pub async fn login(host: &str, status: &crate::status::Status) -> CliResult {
     if env_api_key_set() {
         return fail(
             "ENGRAMS_API_KEY is set — it would shadow any stored login. Unset it to use `auth login`.",
@@ -94,6 +94,10 @@ pub async fn login(host: &str) -> CliResult {
     let url = grant.url().to_string();
     eprintln!("First, copy your one-time code: {}", grant.user_code);
     eprintln!("Then approve the CLI in your browser: {url}");
+    status.needs_sign_in(&format!(
+        "Approve the sign-in in your browser (code {})",
+        grant.user_code
+    ));
     crate::output::eprint_flush("Press Enter to open the browser…");
     let mut line = String::new();
     let _ = std::io::stdin().lock().read_line(&mut line);

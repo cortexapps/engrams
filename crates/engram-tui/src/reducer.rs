@@ -62,6 +62,9 @@ pub struct Reducer {
     /// prompt_id → cell. Consumed by `run_started` / `prompt_steered`.
     sent: HashMap<String, usize>,
     plan_handoff: bool,
+    /// The plan was approved: the run its handoff ends is followed by the
+    /// implementation run.
+    plan_approved: bool,
     run_start_len: usize,
     /// When the open run started (Unix seconds), for its receipt.
     run_started_unix: Option<u64>,
@@ -72,6 +75,29 @@ pub struct Reducer {
     pub status: Option<String>,
     pub waking: bool,
     pub title: Option<String>,
+    /// The agent's task list as (completed, total): the run's progress.
+    pub todos: Option<(u16, u16)>,
+    /// Claude Code's `TaskCreate`/`TaskUpdate` list: (task id, completed).
+    tasks: Vec<(u32, bool)>,
+    /// How the last run ended, for the program status (live events only:
+    /// the app reads it on a running → stopped transition).
+    pub last_run: Option<RunOutcome>,
+    /// The user answered a decision and the run it resumes has not
+    /// started yet: the session is working, not idle.
+    pub resuming: bool,
+    /// Subagents of the open run: (tool_call_id, number, label).
+    pub subagents: Vec<(Box<str>, u32, Box<str>)>,
+    next_agent: u32,
+    /// Bumped whenever `subagents` changes.
+    pub children_rev: u64,
+}
+
+/// How a run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    Ok,
+    Failed,
+    Interrupted,
 }
 
 impl Reducer {
@@ -96,6 +122,23 @@ impl Reducer {
     /// A decision (plan approval, question) is waiting on the user.
     pub fn awaiting_decision(&self) -> bool {
         !self.pending_decisions.is_empty()
+    }
+
+    /// The task list's (completed, total) after a `TaskCreate` or
+    /// `TaskUpdate`.
+    fn count_tasks(&mut self) {
+        let total = u16::try_from(self.tasks.len()).unwrap_or(u16::MAX);
+        let done = self.tasks.iter().filter(|t| t.1).count() as u16;
+        self.todos = (total > 0).then_some((done.min(total), total));
+    }
+
+    /// The cell of the oldest pending decision. Allocates nothing: the
+    /// program status reads it on every frame.
+    pub fn pending_decision_cell(&self) -> Option<usize> {
+        self.pending_decisions
+            .iter()
+            .filter_map(|id| self.decisions.get(id).copied())
+            .min()
     }
 
     /// The oldest pending decision: its cell and tool_call_id.
@@ -125,6 +168,7 @@ impl Reducer {
             }
             e.invalidate();
         }
+        self.resuming = true;
     }
 
     /// The RPC failed: the decision is pending again.
@@ -142,6 +186,7 @@ impl Reducer {
         }
         e.invalidate();
         self.pending_decisions.insert(tool_call_id.to_string());
+        self.resuming = false;
     }
 
     fn tail_awaiting(&self) -> bool {
@@ -380,6 +425,10 @@ impl Reducer {
         }
         self.open_tools.clear();
         self.open_execs.clear();
+        if !self.subagents.is_empty() {
+            self.subagents.clear();
+            self.children_rev += 1;
+        }
         self.stream = None;
         self.active = None;
         self.stream_base = 0;
@@ -520,8 +569,14 @@ impl Reducer {
     /// `status_changed` event). An inactive session has no live run.
     pub fn set_status(&mut self, status: &str) {
         self.status = Some(status.to_string());
-        if is_inactive(status) && self.run_open {
-            self.settle_run(false);
+        if is_inactive(status) {
+            self.resuming = false;
+            if self.run_open {
+                // The session stopped under the run (eviction, a lost
+                // host): no result, so not done and not failed.
+                self.last_run = Some(RunOutcome::Interrupted);
+                self.settle_run(false);
+            }
         }
     }
 
@@ -533,8 +588,14 @@ impl Reducer {
                 at,
             } => {
                 self.waking = false;
+                self.resuming = false;
                 self.run_open = true;
                 self.run_started_unix = at;
+                // A finished list belongs to an earlier turn.
+                if self.todos.is_some_and(|(done, total)| done >= total) {
+                    self.todos = None;
+                    self.tasks.clear();
+                }
                 self.harness_idle = false;
                 self.plan_handoff = false;
                 self.close_active();
@@ -677,6 +738,27 @@ impl Reducer {
                     return;
                 }
                 let canonical = canonical_tool(&tool_name);
+                if let Some(t) = todo_counts(&canonical, &args_summary) {
+                    self.todos = Some(t);
+                } else if canonical == "task_update" {
+                    if let Some((id, status)) = task_update(&args_summary) {
+                        if status == "deleted" {
+                            self.tasks.retain(|t| t.0 != id);
+                        } else if let Some(t) = self.tasks.iter_mut().find(|t| t.0 == id) {
+                            t.1 = status == "completed";
+                        }
+                        self.count_tasks();
+                    }
+                }
+                if canonical == "task" || canonical == "agent" {
+                    self.next_agent += 1;
+                    self.subagents.push((
+                        tool_call_id.as_str().into(),
+                        self.next_agent,
+                        summarize(&tool_name, &args_summary).into(),
+                    ));
+                    self.children_rev += 1;
+                }
                 if is_read_only(&canonical) {
                     let item = ExploreItem {
                         tool_call_id: tool_call_id.as_str().into(),
@@ -760,6 +842,8 @@ impl Reducer {
                 let Some(&i) = self.decisions.get(&tool_call_id) else {
                     return;
                 };
+                // The answer resumes the run; `run_started` follows.
+                self.resuming = true;
                 let Some(e) = self.transcript.get_mut(i) else {
                     return;
                 };
@@ -770,6 +854,7 @@ impl Reducer {
                             self.mode = "default".into();
                         }
                         self.plan_handoff = true;
+                        self.plan_approved = *approved == Some(true);
                         e.invalidate();
                     }
                     Cell::Question { .. } => {
@@ -789,6 +874,18 @@ impl Reducer {
                     || self.plan_attempts.contains(&tool_call_id)
                 {
                     return;
+                }
+                if let Some(pos) = self.subagents.iter().position(|s| *s.0 == *tool_call_id) {
+                    self.subagents.remove(pos);
+                    self.children_rev += 1;
+                }
+                if ok && canonical_tool(&tool_name) == "task_create" {
+                    if let Some(id) = result_summary.as_deref().and_then(created_task_id) {
+                        if !self.tasks.iter().any(|t| t.0 == id) {
+                            self.tasks.push((id, false));
+                            self.count_tasks();
+                        }
+                    }
                 }
                 let state = if ok { ToolState::Ok } else { ToolState::Err };
                 match self.open_tools.remove(&tool_call_id) {
@@ -924,6 +1021,17 @@ impl Reducer {
                     was_interrupt || ok
                 };
                 let started = self.run_started_unix.take();
+                // An approved plan's handoff ends this run and starts the
+                // implementation run: still working in between.
+                self.resuming = was_interrupt && self.plan_handoff && self.plan_approved;
+                self.plan_approved = false;
+                self.last_run = Some(if interrupted {
+                    RunOutcome::Interrupted
+                } else if ok {
+                    RunOutcome::Ok
+                } else {
+                    RunOutcome::Failed
+                });
                 self.settle_run(ok);
                 // The run's tool calls fold whether the turn is over or
                 // paused on a decision: the card stays, the calls before
@@ -1051,6 +1159,47 @@ impl Reducer {
         self.open_execs.insert(exec_id.to_string(), i);
         i
     }
+}
+
+/// The id in a `TaskCreate` result (`Task #3 created successfully: …`).
+fn created_task_id(result: &str) -> Option<u32> {
+    let rest = &result[result.find('#')? + 1..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// A `TaskUpdate` call's (task id, new status), from its arguments.
+fn task_update(args: &str) -> Option<(u32, String)> {
+    let v: serde_json::Value = serde_json::from_str(args).ok()?;
+    let id = match v.get("taskId")? {
+        serde_json::Value::String(s) => s.parse().ok()?,
+        serde_json::Value::Number(n) => u32::try_from(n.as_u64()?).ok()?,
+        _ => return None,
+    };
+    let status = v.get("status")?.as_str()?.to_string();
+    Some((id, status))
+}
+
+/// (completed, total) of a task-list call: Claude's `todo_write`
+/// (`todos`) or Codex's `update_plan` (`plan`), each item with a
+/// `status`. `None` for other tools, for an empty list, and for
+/// arguments the server cut short.
+fn todo_counts(canonical: &str, args: &str) -> Option<(u16, u16)> {
+    let key = match canonical {
+        "todo_write" => "todos",
+        "update_plan" => "plan",
+        _ => return None,
+    };
+    let v: serde_json::Value = serde_json::from_str(args).ok()?;
+    let items = v.get(key)?.as_array()?;
+    let total = u16::try_from(items.len()).ok().filter(|&n| n > 0)?;
+    let done = items
+        .iter()
+        .filter(|i| i.get("status").and_then(serde_json::Value::as_str) == Some("completed"))
+        .count() as u16;
+    Some((done, total))
 }
 
 /// A result summary without its trailing newlines: they would paint as

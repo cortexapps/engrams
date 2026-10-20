@@ -178,35 +178,6 @@ fn plan_choice_then_enter_and_tab_feedback() {
 }
 
 #[test]
-fn unfocused_terminal_gets_an_alert_when_a_decision_waits() {
-    let mut app = common::attached_app(false, 60, 16);
-    app.update(Msg::Focus(false));
-    live(
-        &mut app,
-        9,
-        "run_started",
-        r#"{"run_id":"r2","prompt_id":"p2"}"#,
-    );
-    live(&mut app, 10, "tool_call_requested", QUESTION);
-    assert_eq!(app.alerts, vec!["Add a README: needs you".to_string()]);
-    app.alerts.clear();
-    app.update(Msg::Focus(true));
-    live(
-        &mut app,
-        11,
-        "tool_result_submitted",
-        r#"{"tool_call_id":"q1","result_json":"{}"}"#,
-    );
-    live(
-        &mut app,
-        12,
-        "run_completed",
-        r#"{"run_id":"r2","ok":true}"#,
-    );
-    assert!(app.alerts.is_empty(), "focused: no alert");
-}
-
-#[test]
 fn pending_question_with_picks_60x16() {
     let mut app = with_question();
     key(&mut app, KeyCode::Char('2'));

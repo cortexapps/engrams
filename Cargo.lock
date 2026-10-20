@@ -3253,6 +3253,7 @@ dependencies = [
  "proptest",
  "pulldown-cmark",
  "ratatui",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

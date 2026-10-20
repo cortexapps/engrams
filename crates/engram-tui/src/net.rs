@@ -7,13 +7,13 @@ use std::time::Duration;
 use engram_app_client::proto::*;
 use engram_app_client::shell::{Shell, ShellMsg};
 use engram_app_client::sse::EventStream;
-use engram_app_client::Clients;
+use engram_app_client::{Clients, Code, Error};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::app::{Msg, NetMsg, PAGE};
 use crate::event::Envelope;
-use crate::sessions::{rows_from_profiles, rows_from_tasks};
+use crate::sessions::{rows_from_profiles, rows_from_tasks, RunState};
 
 pub struct Net {
     clients: Clients,
@@ -31,6 +31,60 @@ struct ShellLink {
 enum ShellOut {
     Input(Vec<u8>),
     Resize(u16, u16),
+}
+
+/// Active sessions asked per poll whether a run is in progress.
+const MAX_RUN_CHECKS: usize = 16;
+
+/// The run events, newest first: a start (or continuation) without a
+/// later end is a run in progress.
+const RUN_KINDS: [&str; 4] = [
+    "run_started",
+    "run_continued",
+    "run_completed",
+    "run_interrupted",
+];
+
+/// The session list's deadline, and each run read's.
+const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+const RUN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What `session_id`'s newest run event says. One event read. `None` when
+/// the read failed: unknown, not stopped.
+async fn run_state(c: &Clients, session_id: &str) -> Option<RunState> {
+    let page = c
+        .list_session_events(ListSessionEventsRequest {
+            session_id: session_id.to_string(),
+            after_idx: None,
+            limit: Some(1),
+            before_idx: Some(i64::MAX),
+            kinds: RUN_KINDS.iter().map(|k| k.to_string()).collect(),
+            tool_names: Vec::new(),
+        })
+        .await
+        .ok()?;
+    let Some(e) = page.events.last() else {
+        return Some(RunState::NoRun);
+    };
+    Some(match e.kind.as_str() {
+        "run_started" | "run_continued" => RunState::Running,
+        "run_interrupted" => RunState::Interrupted,
+        _ => RunState::Ended {
+            ok: serde_json::from_str::<serde_json::Value>(&e.payload_json)
+                .ok()
+                .and_then(|v| v.get("ok").and_then(serde_json::Value::as_bool))
+                .unwrap_or(true),
+        },
+    })
+}
+
+/// An RPC error as the line the app shows. A refused API key also tells
+/// the app, which reports that the user has to sign in.
+fn describe(tx: &UnboundedSender<Msg>, e: &Error) -> String {
+    if e.code == Code::Unauthenticated {
+        let _ = tx.send(Msg::Net(NetMsg::AuthFailed));
+    }
+    e.to_string()
 }
 
 fn now_unix() -> u64 {
@@ -54,15 +108,57 @@ impl Net {
         let c = self.clients.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let res = c
-                .list_tasks(ListTasksRequest {
-                    page_size: 200,
-                    ..Default::default()
-                })
-                .await
-                .map(|r| rows_from_tasks(&r.tasks, now_unix()))
-                .map_err(|e| e.to_string());
+            // Your own tasks, admins included: the list is yours, and the
+            // terminal's records say what waits on you, not on others.
+            let list = c.list_tasks(ListTasksRequest {
+                scope: "mine".into(),
+                page_size: 200,
+                ..Default::default()
+            });
+            // A stalled call must not hold the next poll back forever.
+            let res = match tokio::time::timeout(LIST_TIMEOUT, list).await {
+                Ok(res) => res
+                    .map(|r| {
+                        let known = !r.session_state_unavailable;
+                        (rows_from_tasks(&r.tasks, now_unix(), known), known)
+                    })
+                    .map_err(|e| describe(&tx, &e)),
+                Err(_) => Err("the session list timed out".to_string()),
+            };
+            let known = matches!(res, Ok((_, true)));
+            let res = res.map(|(rows, _)| rows);
+            // The list shows now; which active sessions are running
+            // follows.
+            let active: Vec<String> = match &res {
+                Ok(rows) => rows
+                    .iter()
+                    .filter(|r| r.status == "active")
+                    .take(MAX_RUN_CHECKS)
+                    .map(|r| r.session_id.clone())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            let ok = res.is_ok();
             let _ = tx.send(Msg::Net(NetMsg::Sessions(res)));
+            if !ok {
+                return;
+            }
+            let checks = active.into_iter().map(|id| {
+                let c = c.clone();
+                async move {
+                    let run = tokio::time::timeout(RUN_TIMEOUT, run_state(&c, &id))
+                        .await
+                        .ok()
+                        .flatten();
+                    run.map(|run| (id, run))
+                }
+            });
+            let running = futures::future::join_all(checks)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+            let _ = tx.send(Msg::Net(NetMsg::SessionsRunning { running, known }));
         });
     }
 
@@ -165,7 +261,7 @@ impl Net {
         let c = self.clients.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            match list_page(&c, &session_id, before_idx).await {
+            match list_page(&c, &tx, &session_id, before_idx).await {
                 Ok(events) => {
                     let _ = tx.send(Msg::Net(NetMsg::History {
                         session_id,
@@ -305,6 +401,7 @@ fn to_envelopes(events: Vec<SessionEvent>) -> Vec<Envelope> {
 
 async fn list_page(
     c: &Clients,
+    tx: &UnboundedSender<Msg>,
     session_id: &str,
     before_idx: i64,
 ) -> Result<Vec<Envelope>, String> {
@@ -318,7 +415,7 @@ async fn list_page(
     })
     .await
     .map(|r| to_envelopes(r.events))
-    .map_err(|e| e.to_string())
+    .map_err(|e| describe(tx, &e))
 }
 
 async fn attach_task(c: Clients, tx: UnboundedSender<Msg>, session_id: String) {
@@ -342,11 +439,11 @@ async fn attach_task(c: Clients, tx: UnboundedSender<Msg>, session_id: String) {
         }
         Err(e) => send(NetMsg::Failed {
             session_id: session_id.clone(),
-            error: e.to_string(),
+            error: describe(&tx, &e),
         }),
     }
     let mut since: Option<i64> = None;
-    match list_page(&c, &session_id, i64::MAX).await {
+    match list_page(&c, &tx, &session_id, i64::MAX).await {
         Ok(events) => {
             since = events.iter().filter_map(|e| e.idx).max();
             send(NetMsg::History {
@@ -374,7 +471,7 @@ async fn attach_task(c: Clients, tx: UnboundedSender<Msg>, session_id: String) {
                 });
                 send(NetMsg::Failed {
                     session_id: session_id.clone(),
-                    error: e.to_string(),
+                    error: describe(&tx, &e),
                 });
                 tokio::time::sleep(backoff(attempt)).await;
                 continue;

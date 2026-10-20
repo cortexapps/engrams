@@ -10,13 +10,16 @@ pub mod app;
 pub mod commands;
 pub mod composer;
 pub mod event;
+pub mod inbox;
 pub mod keymap;
 pub mod markdown;
 pub mod net;
 pub mod reducer;
+pub mod relay;
 pub mod render;
 pub mod sessions;
 pub mod shell;
+pub mod status;
 pub mod terminal;
 pub mod tools;
 pub mod transcript;
@@ -92,13 +95,18 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
     let mut scratch: Vec<(usize, u16)> = Vec::with_capacity(256);
     let mut last_draw = Instant::now() - FRAME;
     let mut dirty = true;
-    let mut title = String::new();
-    let mut want = String::new();
+    let mut next_poll = Instant::now() + app.poll_interval();
+    let mut status = status::Reporter::new(terminal::probe().program_status);
+    app.program_status = status.enabled;
     // Native scrollback mode shows a focused shell on the alternate
     // screen, through a second terminal; the inline one keeps its state
     // and resumes when the overlay leaves.
     let mut overlay: Option<Term> = None;
     let result = loop {
+        if Instant::now() >= next_poll {
+            app.poll_sessions();
+            next_poll = Instant::now() + app.poll_interval();
+        }
         // Run the commands the last update emitted.
         let mut failed: Option<String> = None;
         let mut edited: Option<Option<String>> = None;
@@ -241,30 +249,11 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
             }
             last_draw = Instant::now();
             dirty = false;
-            // Built into a reused buffer: no allocation on a quiet redraw.
-            want.clear();
-            match app.attached.as_ref() {
-                Some(a) => {
-                    let mark = if a.reducer.awaiting_decision() {
-                        "⚠ needs you · "
-                    } else if a.reducer.is_running() {
-                        "⟳ "
-                    } else {
-                        ""
-                    };
-                    want.push_str(mark);
-                    want.push_str(&a.title);
-                    want.push_str(" · engrams");
-                }
-                None => want.push_str("engrams"),
-            }
-            if want != title {
-                terminal::set_title(&want);
-                title.clear();
-                title.push_str(&want);
-            }
-            for alert in app.alerts.drain(..) {
-                terminal::notify(&alert);
+            // The program status record, the title, an alert: written
+            // only when they changed.
+            let mut out = std::io::stdout();
+            if let Err(e) = status.frame(&app, &mut out).and_then(|()| out.flush()) {
+                break Err(e.to_string());
             }
             // The walk hit the top of memory: page history in.
             if app.attached.as_ref().is_some_and(|a| a.want_older) {
@@ -273,13 +262,16 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
             }
         }
 
-        let frame_wait = if dirty {
+        let mut frame_wait = if dirty {
             FRAME.saturating_sub(last_draw.elapsed())
         } else if app.wants_tick() {
             Duration::from_secs(1)
         } else {
             Duration::from_secs(3600)
         };
+        if app.wants_poll() {
+            frame_wait = frame_wait.min(next_poll.saturating_duration_since(Instant::now()));
+        }
         tokio::select! {
             msg = rx.recv() => {
                 let Some(msg) = msg else { break Ok(()); };

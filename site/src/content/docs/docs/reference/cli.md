@@ -200,8 +200,27 @@ A draft that starts with `/` is a command. Type `/` to list them; Tab completes.
 | `/dump` | Write the loaded transcript to the terminal's scrollback, to read after you leave. |
 | `/help`, `/quit` | The key list; leave. |
 
+The TUI tells your terminal what the session needs from you. A terminal that supports the
+[Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status)
+(OSC 7501) gets one status: `working` during a run (with the agent's task list as a
+percentage), `blocked` when a question, a plan approval or a sign-in waits on you, `done` or
+`error` when a run ends, and `idle` otherwise. A result stays `done` until you press a key,
+paste, click or scroll. Other terminals see the state in the window title. When the terminal
+is not focused, a question, a finished run or a failure also rings the bell and posts a
+desktop notification (OSC 9 and OSC 777).
+
+Beside that status, the terminal gets one entry for each running subagent, for the sandbox
+while it starts, resumes or moves, and for programs in the shell pane that report their own
+status. Your other sessions are there too: each one that waits on you, runs, or finished or
+failed while you were elsewhere. The TUI checks them every 5 seconds while the terminal
+takes these reports or the session list is open, and a finished entry stays until you open
+that session.
+
 Flags and environment:
 
+- `ENGRAMS_PROGRAM_STATUS=1` or `0` turns the status on or off without asking the
+  terminal, for example inside a multiplexer that does not pass the reply through. `0` also
+  turns off the status that `auth login` and `session exec` report while they wait.
 - `--no-alt-screen` (or `ENGRAMS_TUI_NO_ALT_SCREEN=1`) keeps the terminal's own scrollback.
   Finished turns are written into it as they complete and only the composer and footer stay
   live, so your terminal's scroll, search and copy work on the transcript. History older than
