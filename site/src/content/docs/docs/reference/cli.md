@@ -246,3 +246,8 @@ Flags and environment:
 - Secondary text (receipts, hints, the `… N more lines` tails) uses your terminal's dim
   attribute on your own foreground color, never a fixed grey, so it follows your theme.
   `ENGRAMS_TUI_NO_DIM=1` turns the attribute off when it is still too faint.
+- The colors the TUI picks itself (inline code, links, headings, diff and status tones)
+  adapt to your terminal. When the terminal reports its background color, the TUI uses the
+  engrams palette for a light or a dark ground and checks each color for WCAG AA text
+  contrast against that background, moving it toward black or white when it falls short.
+  A terminal that does not answer keeps its own ANSI palette.

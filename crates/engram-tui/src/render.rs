@@ -11,6 +11,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::app::{shell_pane_rows, App, Attached, NewSession, NewStage, Screen};
 use crate::keymap::BINDINGS;
 use crate::markdown::{flags, Run};
+use crate::palette::{is_light, Palette};
 use crate::sessions::{age, marker};
 use crate::transcript::{explore_running, Cell, Entry, Marker, Src, ToolState};
 use crate::wrap::{display_width, grapheme_width};
@@ -114,6 +115,30 @@ impl Theme {
             Tone::Tag => Color::Red,
         };
         Style::new().fg(fg)
+    }
+
+    /// The colours the TUI picks, resolved against the terminal's own
+    /// background `bg` (an `OSC 11` reply): the engrams brand tokens for a
+    /// light or a dark ground, each checked for text contrast on it. The
+    /// palette colours of the user's theme stay for everything else. See
+    /// [`crate::palette`].
+    pub fn adapt(mut self, bg: (u8, u8, u8)) -> Self {
+        if !self.color {
+            return self;
+        }
+        let p = Palette::resolve(bg);
+        let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb(r, g, b);
+        self.code = self.code.fg(rgb(p.terminal));
+        self.tool = self.tool.fg(rgb(p.terminal));
+        self.link = self.link.fg(rgb(p.terminal));
+        self.heading = self.heading.fg(rgb(p.primary));
+        self.accent = self.accent.fg(rgb(p.primary));
+        self.add = self.add.fg(rgb(p.nominal));
+        self.del = self.del.fg(rgb(p.critical));
+        self.err = self.err.fg(rgb(p.critical));
+        self.warn = self.warn.fg(rgb(p.caution));
+        self.band = Style::new().bg(rgb(p.band));
+        self
     }
 
     /// `ENGRAMS_TUI_NO_DIM`: no de-emphasis at all, for terminals where DIM
@@ -279,8 +304,7 @@ pub fn overlay_color(bg: Option<(u8, u8, u8)>) -> Color {
     let Some((r, g, b)) = bg else {
         return Color::Black;
     };
-    let luma = (299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b)) / 1000;
-    let keep = if luma < 128 { 60 } else { 92 };
+    let keep = if is_light((r, g, b)) { 92 } else { 60 };
     let shade = |c: u8| (u32::from(c) * keep / 100) as u8;
     Color::Rgb(shade(r), shade(g), shade(b))
 }

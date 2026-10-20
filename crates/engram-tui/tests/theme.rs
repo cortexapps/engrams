@@ -103,3 +103,115 @@ fn tool_content_is_plain_and_only_affordances_are_dim() {
         );
     }
 }
+
+// ---- Adaptive colours (an `OSC 11` reply) -------------------------------
+
+use engram_tui::palette::{contrast, is_light, Palette, Rgb, DARK, LIGHT, MIN_TEXT_CONTRAST};
+use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
+
+/// The brand grounds from `web/src/index.css`: lab paper and green-black.
+const PAPER: Rgb = (0xf0, 0xf5, 0xec);
+const GREEN_BLACK: Rgb = (0x0b, 0x1d, 0x1e);
+
+#[test]
+fn brand_tokens_read_on_their_own_ground_unchanged() {
+    let light = Palette::resolve(PAPER);
+    assert_eq!(light.primary, LIGHT.primary);
+    assert_eq!(light.terminal, LIGHT.terminal);
+    assert_eq!(light.nominal, LIGHT.nominal);
+    assert_eq!(light.caution, LIGHT.caution);
+    assert_eq!(light.critical, LIGHT.critical);
+    let dark = Palette::resolve(GREEN_BLACK);
+    assert_eq!(dark.primary, DARK.primary);
+    assert_eq!(dark.terminal, DARK.terminal);
+    assert_eq!(dark.nominal, DARK.nominal);
+    assert_eq!(dark.caution, DARK.caution);
+    assert_eq!(dark.critical, DARK.critical);
+    // Pure white and black, the common terminal defaults, keep them too.
+    assert_eq!(Palette::resolve((255, 255, 255)).roles(), light.roles());
+    assert_eq!(Palette::resolve((0, 0, 0)).roles(), dark.roles());
+}
+
+#[test]
+fn ground_picks_the_token_set() {
+    assert!(is_light((0xfd, 0xf6, 0xe3)), "Solarized light");
+    assert!(!is_light((0x00, 0x2b, 0x36)), "Solarized dark");
+    assert!(!is_light((0x28, 0x2c, 0x34)), "One dark");
+    // Lime is a dark-ground token; verdigris is the light primary.
+    assert_eq!(Palette::resolve((0xfd, 0xf6, 0xe3)).primary, LIGHT.primary);
+    assert_eq!(Palette::resolve((0x28, 0x2c, 0x34)).primary, DARK.primary);
+}
+
+#[test]
+fn a_token_short_of_contrast_is_walked_not_dropped() {
+    // Lime on a light grey: the dark-ground token would be unreadable
+    // on a ground that is only just dark.
+    let bg = (0x70, 0x70, 0x70);
+    assert!(!is_light(bg));
+    let p = Palette::resolve(bg);
+    assert_ne!(p.primary, DARK.primary);
+    assert!(contrast(p.primary, bg) >= MIN_TEXT_CONTRAST);
+    // It moved toward white, the better endpoint, and kept its hue order
+    // (green stays the strongest channel).
+    assert!(p.primary.1 >= p.primary.0 && p.primary.1 >= p.primary.2);
+}
+
+#[test]
+fn adapt_sets_every_picked_colour_and_keeps_dim_plain() {
+    let th = Theme::new(true).adapt(PAPER);
+    let p = Palette::resolve(PAPER);
+    let rgb = |(r, g, b): Rgb| Some(Color::Rgb(r, g, b));
+    assert_eq!(th.code.fg, rgb(p.terminal));
+    assert_eq!(th.tool.fg, rgb(p.terminal));
+    assert_eq!(th.link.fg, rgb(p.terminal));
+    assert_eq!(th.heading.fg, rgb(p.primary));
+    assert_eq!(th.accent.fg, rgb(p.primary));
+    assert_eq!(th.add.fg, rgb(p.nominal));
+    assert_eq!(th.del.fg, rgb(p.critical));
+    assert_eq!(th.err.fg, rgb(p.critical));
+    assert_eq!(th.warn.fg, rgb(p.caution));
+    assert_eq!(th.band.bg, rgb(p.band));
+    assert_eq!(th.band.fg, None, "the band keeps the user's foreground");
+    // Modifiers survive the recolour.
+    assert!(th.link.add_modifier.contains(Modifier::UNDERLINED));
+    assert!(th.heading.add_modifier.contains(Modifier::BOLD));
+    assert!(th.accent.add_modifier.contains(Modifier::BOLD));
+    // De-emphasis is still the attribute alone.
+    assert_eq!(th.dim.fg, None);
+    assert_eq!(th.pending.fg, None);
+    // No colour at all under `NO_COLOR`, whatever the terminal said.
+    let plain = Theme::new(false).adapt(PAPER);
+    for st in [
+        plain.code,
+        plain.tool,
+        plain.link,
+        plain.heading,
+        plain.accent,
+        plain.band,
+    ] {
+        assert_eq!(st.fg, None);
+        assert_eq!(st.bg, None);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
+        cases: 1024,
+        ..ProptestConfig::default()
+    })]
+
+    /// Whatever the terminal's background, every colour the TUI picks is
+    /// AA text on it, and the band stays close to the background.
+    #[test]
+    fn every_role_reads_on_any_background(r in any::<u8>(), g in any::<u8>(), b in any::<u8>()) {
+        let bg = (r, g, b);
+        let p = Palette::resolve(bg);
+        for c in p.roles() {
+            let ratio = contrast(c, bg);
+            prop_assert!(ratio >= MIN_TEXT_CONTRAST, "{c:?} on {bg:?} is {ratio:.2}:1");
+        }
+        prop_assert!(contrast(p.band, bg) < 1.6, "the band {:?} is far from {bg:?}", p.band);
+    }
+}

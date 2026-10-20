@@ -16,6 +16,7 @@ pub mod inbox;
 pub mod keymap;
 pub mod markdown;
 pub mod net;
+pub mod palette;
 pub mod reducer;
 pub mod relay;
 pub mod render;
@@ -91,6 +92,9 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
         let bg = terminal::probe().bg;
         theme.overlay = Some(render::overlay_color(bg));
         theme.diff_bg = bg.map(render::diff_backgrounds);
+        if let Some(bg) = bg {
+            theme = theme.adapt(bg);
+        }
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
