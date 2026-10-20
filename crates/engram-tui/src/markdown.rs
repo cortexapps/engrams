@@ -692,10 +692,16 @@ impl Markdown {
         if self.done {
             self.render_all();
         } else {
+            // A durable message was rendered whole (`commit_all`): a re-fit
+            // keeps it whole, not just up to its last blank line.
+            let whole = self.raw_done == self.raw.len();
             self.shown.clear();
             self.raw_done = 0;
             self.shown_done = 0;
             self.sync();
+            if whole {
+                self.commit_all();
+            }
         }
     }
 
@@ -823,6 +829,17 @@ impl Markdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A durable message in an open run is rendered whole; its first
+    /// layout (which fits it to the width) must not drop it to raw text.
+    #[test]
+    fn a_durable_message_stays_rendered_through_its_first_fit() {
+        let mut md = Markdown::default();
+        md.replace_from(0, "```python\ndef greet():\n    return 1\n```");
+        md.commit_all();
+        md.fit(68);
+        assert!(!md.text().contains("```"), "{:?}", md.text());
+    }
 
     fn runs_of(r: &Rendered, f: u8) -> Vec<&str> {
         r.runs
