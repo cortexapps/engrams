@@ -188,13 +188,14 @@ returns to the keys), `n` starts a new session and `r` reloads. In any list or p
 | `Shift+Enter`, `Ctrl+J` | Newline in the draft. |
 | `Esc` | Interrupt the run. On a draft, twice clears it. |
 | `Ctrl+C` | Clear the draft; twice quits. |
-| `Ctrl+D` | Back to the session list; twice quits. |
-| `Ctrl+P`, `Alt+↑/↓` | Switch session. |
-| `Ctrl+N` | New session: pick a profile, type the first prompt. |
+| `Ctrl+D` | On an empty draft, back to the session list; twice quits. |
+| `Ctrl+P`, `Alt+↑/↓` | Switch session (Ctrl+P on an empty draft). |
+| `Ctrl+N` | On an empty draft, a new session: pick a profile, type the first prompt. |
 | `Ctrl+\``, `Ctrl+Space` | A shell in the sandbox below the transcript. The same key hands the keys back to the agent. |
 | `Ctrl+T` | Search the transcript. |
 | `Ctrl+G` | Edit the draft in `$EDITOR`. |
 | `PgUp`, `PgDn`, `Ctrl+Home`, `Ctrl+End` | Scroll. Scrolling to the top loads older history. |
+| `Ctrl+A`/`E`, `Ctrl+B`/`F`, `Ctrl+P`/`N`, `Alt+B`/`F` | In a draft, the editing keys Codex uses: line start/end, character, line up/down, word. `Ctrl+D`, `Ctrl+H`, `Alt+D`, `Alt+Backspace`, `Ctrl+W`, `Ctrl+U`, `Ctrl+K` and `Ctrl+Y` delete and yank. |
 
 A draft that starts with `/` is a command. Type `/` to list them; Tab completes.
 

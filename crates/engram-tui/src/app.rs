@@ -1051,7 +1051,16 @@ impl App {
                 .attached
                 .as_ref()
                 .is_none_or(|a| a.composer.is_empty() && a.search.is_none());
-        let Some(action) = resolve(&key, draft_empty) else {
+        // Does the focused composer hold text? Then Ctrl+D/E/N/P edit it,
+        // as in Codex; on an empty one they keep the TUI's own meaning.
+        let has_text = match &self.new_session {
+            Some(ns) => ns.stage == NewStage::Prompt && !ns.composer.is_empty(),
+            None => self
+                .attached
+                .as_ref()
+                .is_some_and(|a| !a.composer.is_empty() && a.search.is_none()),
+        };
+        let Some(action) = resolve(&key, draft_empty, has_text) else {
             return;
         };
         if action != Action::CtrlC {
@@ -1369,6 +1378,7 @@ impl App {
                 Action::KillToEnd => ns.composer.kill_to_end(),
                 Action::KillToStart => ns.composer.kill_to_start(),
                 Action::KillWord => ns.composer.kill_word(),
+                Action::KillWordForward => ns.composer.kill_word_forward(),
                 Action::Yank => ns.composer.yank(),
                 Action::Up => {
                     ns.composer.move_row(width, false);
@@ -1707,6 +1717,7 @@ impl App {
             Action::KillToEnd => a.composer.kill_to_end(),
             Action::KillToStart => a.composer.kill_to_start(),
             Action::KillWord => a.composer.kill_word(),
+            Action::KillWordForward => a.composer.kill_word_forward(),
             Action::Yank => a.composer.yank(),
             Action::Up => {
                 if !a.composer.move_row(width, false) {
