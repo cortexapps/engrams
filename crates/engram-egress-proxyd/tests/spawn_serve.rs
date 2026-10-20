@@ -93,11 +93,26 @@ async fn spawn_upstream() -> Upstream {
     }
 }
 
-fn free_port() -> u16 {
-    // Bind-then-drop: a small race against other tests, ridden by the
-    // daemon's own bind_with_retry.
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
+/// Three distinct ports free for a TCP listener AND a UDP socket on the
+/// wildcard address — the binds the daemon makes (DNS is TCP + UDP). A
+/// TCP-only probe on `127.0.0.1` cannot see a UDP socket that another
+/// process holds on the same number. Every probe stays open until all
+/// three are picked, so the kernel cannot hand out one port twice.
+fn free_ports() -> [u16; 3] {
+    use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+    let mut held = Vec::new();
+    for _ in 0..192 {
+        if held.len() == 3 {
+            break;
+        }
+        let tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        if let Ok(udp) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)) {
+            held.push((port, tcp, udp));
+        }
+    }
+    assert_eq!(held.len(), 3, "no 3 ports free for both TCP and UDP");
+    [held[0].0, held[1].0, held[2].0]
 }
 
 struct Daemon {
@@ -115,9 +130,7 @@ impl Drop for Daemon {
 
 fn spawn_daemon(upstream_addr: std::net::SocketAddr, ca: &TestCa) -> Daemon {
     let work_dir = tempfile::tempdir().unwrap();
-    let proxy_port = free_port();
-    let dns_port = free_port();
-    let gateway_port = free_port();
+    let [proxy_port, dns_port, gateway_port] = free_ports();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_engram-egress-proxyd"))
         .arg("--work-dir")
         .arg(work_dir.path())

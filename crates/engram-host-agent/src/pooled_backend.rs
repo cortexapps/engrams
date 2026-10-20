@@ -15540,9 +15540,8 @@ mod tests {
             );
             // The daemon binds every port for TCP on 0.0.0.0, and the DNS
             // port for UDP too: pick ports free for all of those binds.
-            args.proxy_port = engram_testkit::net::free_tcp_udp_port();
-            args.dns_port = engram_testkit::net::free_tcp_udp_port();
-            args.gateway_port = engram_testkit::net::free_tcp_udp_port();
+            [args.proxy_port, args.dns_port, args.gateway_port] =
+                engram_testkit::net::free_tcp_udp_ports();
             let daemon = tokio::spawn(engram_egress_proxyd::run(args));
             let handle = Arc::new(crate::proxyd_client::ProxydHandle::new(
                 dir.path().join(engram_egress_proto::CONTROL_SOCK_NAME),

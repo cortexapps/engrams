@@ -60,9 +60,7 @@ async fn spawn_daemon(work_dir: &Path) -> Arc<ProxydHandle> {
         None,
         engram_core::HostId::new(),
     );
-    args.proxy_port = engram_testkit::net::free_tcp_udp_port();
-    args.dns_port = engram_testkit::net::free_tcp_udp_port();
-    args.gateway_port = engram_testkit::net::free_tcp_udp_port();
+    [args.proxy_port, args.dns_port, args.gateway_port] = engram_testkit::net::free_tcp_udp_ports();
     let daemon = tokio::spawn(engram_egress_proxyd::run(args));
     let handle = Arc::new(ProxydHandle::new(
         work_dir.join(engram_egress_proto::CONTROL_SOCK_NAME),

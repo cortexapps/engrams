@@ -14,22 +14,28 @@
 
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 
-/// A port that is free, at the moment of the call, for a TCP listener
-/// AND a UDP socket on the wildcard address — the binds the egress
-/// daemon makes. The probe sockets close before return, so the caller
-/// must bind the port at once.
-pub fn free_tcp_udp_port() -> u16 {
+/// `N` distinct ports that are free, at the moment of the call, for a
+/// TCP listener AND a UDP socket on the wildcard address — the binds the
+/// egress daemon makes. Every probe socket stays open until all `N` ports
+/// are picked, so the kernel cannot hand out one port twice. The probes
+/// close before return, so the caller must bind the ports at once.
+pub fn free_tcp_udp_ports<const N: usize>() -> [u16; N] {
+    let mut held = Vec::with_capacity(N);
     // Each pass takes a new ephemeral port from the kernel. A port whose
     // UDP side is in use is skipped; the bound is a guard against a
     // host with no free pair at all, not a wait.
-    for _ in 0..64 {
+    for _ in 0..64 * N.max(1) {
+        if held.len() == N {
+            break;
+        }
         let tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("ephemeral TCP bind");
         let port = tcp.local_addr().expect("local addr").port();
-        if UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok() {
-            return port;
+        if let Ok(udp) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)) {
+            held.push((port, tcp, udp));
         }
     }
-    panic!("no port free for both TCP and UDP in 64 ephemeral picks");
+    assert_eq!(held.len(), N, "no {N} ports free for both TCP and UDP");
+    std::array::from_fn(|i| held[i].0)
 }
 
 #[cfg(test)]
@@ -37,10 +43,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_port_binds_for_tcp_and_udp_on_the_wildcard_address() {
-        let port = free_tcp_udp_port();
-        let _tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).expect("TCP bind");
-        let _udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).expect("UDP bind");
+    fn the_ports_are_distinct_and_bind_for_tcp_and_udp_on_the_wildcard_address() {
+        let ports: [u16; 3] = free_tcp_udp_ports();
+        assert_eq!(
+            ports.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "ports must be distinct: {ports:?}"
+        );
+        for port in ports {
+            let _tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).expect("TCP bind");
+            let _udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).expect("UDP bind");
+        }
     }
 
     #[test]
@@ -55,7 +68,8 @@ mod tests {
             .map(|s| s.local_addr().expect("local addr").port())
             .collect();
         for _ in 0..256 {
-            assert!(!held_ports.contains(&free_tcp_udp_port()));
+            let [port] = free_tcp_udp_ports();
+            assert!(!held_ports.contains(&port));
         }
     }
 }

@@ -121,9 +121,7 @@ async fn spawn_daemon(
         None,
         engram_core::HostId::new(),
     );
-    args.proxy_port = engram_testkit::net::free_tcp_udp_port();
-    args.dns_port = engram_testkit::net::free_tcp_udp_port();
-    args.gateway_port = engram_testkit::net::free_tcp_udp_port();
+    [args.proxy_port, args.dns_port, args.gateway_port] = engram_testkit::net::free_tcp_udp_ports();
     args.test_resolves = vec![(SNI.to_string(), upstream)];
     let ports = (args.proxy_port, args.dns_port, args.gateway_port);
     let daemon = tokio::spawn(engram_egress_proxyd::run(args));
