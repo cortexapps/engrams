@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use engram_core::traits::Clock as _;
 use engram_core::types::session::{QueueOrigin, SessionState};
-use engram_core::SessionId;
+use engram_core::{SandboxId, SessionId};
 
 use crate::world::SimWorld;
 
@@ -372,33 +372,79 @@ fn placement_accounting(world: &SimWorld) -> Result<(), Violation> {
 /// the coordinator's binding (sessions.sandbox_id) never points at a
 /// sandbox owned by a DIFFERENT session on the world side.
 ///
-/// "Live" means on an UP host. A crashed host keeps its sandbox map as
-/// down-host memory (the owners-agree oracle reads it), but the VMs in
-/// it are dead: `CrashHost` stops the machine, a down host swallows
-/// every effect, and the only way back up (`RestartHost`) clears the map
-/// — the same "down-host sandboxes are dead state" rule oracle #8
-/// (`no_orphan_sandboxes`) applies. Counting them here flagged the
-/// CORRECT recovery as split-brain: crash → lease expiry → HostLost →
-/// settle → Idle → resume on a peer, with the dead host still holding
-/// the old VM's entry because nothing restarted it yet (nightly
-/// `single-ownership`, issue #1295). A host that is UP but unreachable
-/// (heartbeat partition) keeps `up == true` and its VMs stay counted —
-/// that is the real split-brain this oracle guards.
+/// "Live" is world truth narrowed by two explicit coordinator facts:
+///
+/// 1. The host is UP. A crashed host keeps its sandbox map as down-host
+///    memory (the owners-agree oracle reads it), but the VMs in it are
+///    dead: `CrashHost` stops the machine, a down host swallows every
+///    effect, and the only way back up (`RestartHost`) clears the map —
+///    the same "down-host sandboxes are dead state" rule oracle #8
+///    (`no_orphan_sandboxes`) applies. Counting them flagged the
+///    CORRECT recovery as split-brain: crash → lease expiry → HostLost →
+///    settle → Idle → resume on a peer, with the dead host still holding
+///    the old VM's entry because nothing restarted it yet (nightly
+///    `single-ownership`, issue #1295). A host that is UP but unreachable
+///    (heartbeat partition) keeps `up == true` and its VMs stay counted —
+///    that is the real split-brain this oracle guards.
+/// 2. The sandbox is not entombed. A `sandbox_tombstones` row is the
+///    coordinator's durable decree that the VM is dead (ADR 0116 A-D5):
+///    nothing routes to it again (`invalidate_sandbox`), its late
+///    outputs are fenced by the binding epoch, and the host destroys it
+///    on heartbeat consumption even when the destroy RPC's effect was
+///    lost. A finished snapshot teleport is the shape that fires: the
+///    release step destroys the held source and entombs it in the same
+///    breath (ADR 0123 B5/B7), while the destination already runs the
+///    session on another host. Under a deferred-effect window the
+///    source host has acked that destroy but not yet applied it, so the
+///    world still lists the paused source — a doomed VM, not a second
+///    owner (nightly `single-ownership`, issue #1615). Counting it would
+///    make the oracle demand a host-affirmed probe before every release,
+///    which ADR 0123 deliberately does not require: the tombstone owns
+///    the straggler. Quiescence still catches a tombstone that never
+///    lands: an entombed VM left on an up host is unclaimed, and
+///    oracle #8 fails on it.
+///
+/// An OPEN teleport row is the one state in which a session owns two
+/// resident VMs by design: a snapshot move holds the source paused
+/// from capture until release, and the destination runs from attach.
+/// Those two sandboxes — exactly the row's source and destination, no
+/// other — count as one owner while the row is open; `quiescence-open-
+/// teleport` forbids the row to outlive the run.
 fn single_ownership(world: &SimWorld) -> Result<(), Violation> {
     let hosts = world.host_world.hosts.lock();
-    let mut owner_of: std::collections::BTreeMap<SessionId, u32> = Default::default();
-    for host in hosts.values().filter(|host| host.up) {
-        for owner in host.sandboxes.values().flatten() {
-            *owner_of.entry(*owner).or_default() += 1;
+    world.meta.with_db(|db| {
+        let mut owned: BTreeMap<SessionId, Vec<SandboxId>> = BTreeMap::new();
+        for (host_id, host) in hosts.iter().filter(|(_, host)| host.up) {
+            for (sandbox, owner) in &host.sandboxes {
+                let Some(owner) = owner else { continue };
+                if db.sandbox_tombstones.contains_key(&(*host_id, *sandbox)) {
+                    continue;
+                }
+                owned.entry(*owner).or_default().push(*sandbox);
+            }
         }
-    }
-    if let Some((sid, n)) = owner_of.iter().find(|(_, n)| **n > 1) {
-        return Err(Violation {
-            invariant: "single-ownership",
-            detail: format!("session {sid} owns {n} live sandboxes across the fleet"),
-        });
-    }
-    Ok(())
+        for (sid, sandboxes) in owned {
+            let moving: Vec<SandboxId> = db
+                .teleports
+                .values()
+                .filter(|t| t.session_id == sid && !t.phase.is_terminal())
+                .flat_map(|t| std::iter::once(t.source_sandbox_id).chain(t.dest_sandbox_id))
+                .collect();
+            let others = sandboxes.iter().filter(|s| !moving.contains(s)).count();
+            let in_move = usize::from(sandboxes.iter().any(|s| moving.contains(s)));
+            let owners = others + in_move;
+            if owners > 1 {
+                return Err(Violation {
+                    invariant: "single-ownership",
+                    detail: format!(
+                        "session {sid} owns {owners} live sandboxes across the fleet \
+                         ({sandboxes:?})"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    })
 }
 
 /// ADR 0090: a coordinator sandbox binding never names a world sandbox
