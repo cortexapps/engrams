@@ -243,6 +243,21 @@ pub const HEAD_LINES: usize = 3;
 pub struct Entry {
     pub cell: Cell,
     layout: Layout,
+    /// A blank row above the cell separates it from the one before.
+    /// Tool-like cells in a row share one block, as do markers.
+    gap: bool,
+}
+
+/// Does `next` get a blank row after `prev`?
+fn wants_gap(prev: &Cell, next: &Cell) -> bool {
+    let tool_like =
+        |c: &Cell| matches!(c, Cell::Tool { .. } | Cell::Exec { .. } | Cell::Diff { .. });
+    match next {
+        Cell::Hidden => false,
+        Cell::Marker { .. } => !matches!(prev, Cell::Marker { .. }),
+        c if tool_like(c) => !tool_like(prev),
+        _ => true,
+    }
 }
 
 impl Entry {
@@ -250,7 +265,12 @@ impl Entry {
         Entry {
             cell,
             layout: Layout::default(),
+            gap: false,
         }
+    }
+
+    fn gap_rows(&self) -> usize {
+        usize::from(self.gap)
     }
 
     /// Drop the cached layout so the next render re-wraps.
@@ -262,6 +282,7 @@ impl Entry {
     /// Hide the cell (see [`Cell::Hidden`]).
     pub fn hide(&mut self) {
         self.cell = Cell::Hidden;
+        self.gap = false;
         self.invalidate();
     }
 
@@ -315,14 +336,21 @@ impl Entry {
             }));
     }
 
-    /// A cached layout row, if the layout is current.
+    /// A cached layout row, if the layout is current. The gap row (row 0
+    /// of a cell with a gap) has no layout row: it paints blank.
     pub fn layout_row(&self, row: usize) -> Option<&LayoutRow> {
-        self.layout.rows.get(row)
+        self.layout.rows.get(row.checked_sub(self.gap_rows())?)
     }
 
-    /// Row count at `width`.
+    /// The row the cell's text starts on: 1 under a gap, else 0.
+    pub fn first_row(&self) -> usize {
+        self.gap_rows()
+    }
+
+    /// Row count at `width`, the gap row included.
     pub fn height(&mut self, width: u16) -> u16 {
-        self.layout(width).rows.len().min(u16::MAX as usize) as u16
+        let gap = self.gap_rows();
+        (self.layout(width).rows.len() + gap).min(u16::MAX as usize) as u16
     }
 
     /// A cell is final when nothing can change its text: in native
@@ -589,8 +617,20 @@ impl Transcript {
     }
 
     pub fn push(&mut self, cell: Cell) -> usize {
-        self.entries.push_back(Entry::new(cell));
+        let mut e = Entry::new(cell);
+        if let Some(prev) = self.last_visible() {
+            e.gap = wants_gap(&prev.cell, &e.cell);
+        }
+        self.entries.push_back(e);
         self.len() - 1
+    }
+
+    /// The newest entry that still renders.
+    fn last_visible(&self) -> Option<&Entry> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| !matches!(e.cell, Cell::Hidden))
     }
 
     /// Prepend another transcript's cells (a history backfill). Only
@@ -599,6 +639,18 @@ impl Transcript {
     pub fn prepend(&mut self, older: Transcript) -> usize {
         debug_assert_eq!(self.base, 0);
         let n = older.entries.len();
+        if n == 0 {
+            return 0;
+        }
+        // The seam: the newest page's first cell now has a predecessor.
+        let gap = match (older.last_visible(), self.entries.front()) {
+            (Some(prev), Some(first)) => wants_gap(&prev.cell, &first.cell),
+            _ => false,
+        };
+        if let Some(first) = self.entries.front_mut() {
+            first.gap = gap;
+            first.invalidate();
+        }
         for e in older.entries.into_iter().rev() {
             self.entries.push_front(e);
         }

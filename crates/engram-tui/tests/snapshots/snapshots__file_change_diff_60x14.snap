@@ -3,10 +3,10 @@ source: crates/engram-tui/tests/snapshots.rs
 expression: shot
 ---
 " Add a README                                               "
-"  There is already a README.md. I will extend it with a     "
-"  usage section and keep the existing introduction intact.  "
 "· snapshot taken                                            "
+"                                                            "
 "›                                                           "
+"                                                            "
 "± README.md  +5 −1                                          "
 "  ⎿ -# engrams                                              "
 "    +# engrams                                              "

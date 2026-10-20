@@ -3,12 +3,12 @@ source: crates/engram-tui/tests/decisions.rs
 expression: shot
 ---
 " Add a README                                               "
-"    README.md                                               "
-"    … 2 more lines (Ctrl+O)                                 "
-"  There is already a README.md. I will extend it with a     "
 "  usage section and keep the existing introduction intact.  "
+"                                                            "
 "· snapshot taken                                            "
+"                                                            "
 "›                                                           "
+"                                                            "
 "≡ Plan                                                      "
 "                                                            "
 "  1. add the section                                        "

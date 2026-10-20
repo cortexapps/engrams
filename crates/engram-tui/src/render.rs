@@ -221,7 +221,7 @@ fn paint_row(
     let Some(lr) = layout_row else {
         return;
     };
-    let first = row == 0;
+    let first = row == e.first_row();
     let x = area.x;
     let w = area.width;
     let (gutter, word, style): (&str, &str, Style) = match &e.cell {
@@ -462,10 +462,10 @@ fn paint_src<'e>(
         Src::Body => {
             let text = e.source(Src::Body);
             let s = &text[lr.row.start as usize..lr.row.end as usize];
-            let is_first_body = e
-                .layout_row(row.saturating_sub(1))
-                .is_some_and(|p| p.src != Src::Body)
-                || row == 0;
+            let is_first_body = row
+                .checked_sub(1)
+                .and_then(|r| e.layout_row(r))
+                .is_none_or(|p| p.src != Src::Body);
             put(
                 buf,
                 body_x,
