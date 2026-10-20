@@ -313,3 +313,54 @@ fn read_only_calls_fold_into_an_explored_row_60x12() {
         .join("\n");
     insta::assert_snapshot!(shot);
 }
+
+/// Draw once at `w`×`h`; returns whether the draw asked for older history.
+fn draw_wants_older(app: &mut App, w: u16, h: u16) -> bool {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let theme = Theme::new(false);
+    let mut scratch = Vec::new();
+    let mut want = false;
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            want = draw_fullscreen(f.buffer_mut(), area, app, &theme, &mut scratch).1;
+        })
+        .unwrap();
+    want
+}
+
+#[test]
+fn a_scroll_past_the_top_paints_the_top() {
+    let mut app = common::attached_app(false, 60, 12);
+    app.attached.as_mut().unwrap().exhausted = true;
+    // Far past the top of a short transcript: the frame shows the first
+    // cell, the scroll is clamped so that page fills the area, and the
+    // draw asks for older history once.
+    for _ in 0..40 {
+        app.update(Msg::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+    assert!(draw_wants_older(&mut app, 60, 12));
+    let shot = frame(&mut app, 60, 12);
+    assert!(shot.contains("Add a README to the repo."), "{shot}");
+    assert!(shot.contains("✓ Bash ls -la"), "{shot}");
+    let up = app.attached.as_ref().unwrap().scroll_up;
+    assert!(up > 0 && up < 12, "{up}");
+    // A second frame at the clamped scroll paints the same rows and asks
+    // for nothing; the next scroll up asks again.
+    assert_eq!(frame(&mut app, 60, 12), shot);
+    assert!(!draw_wants_older(&mut app, 60, 12));
+    app.update(Msg::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+    assert!(draw_wants_older(&mut app, 60, 12));
+    // A transcript that fits the screen clamps to zero, and a scroll up
+    // still asks for older history.
+    let mut app = common::attached_app(false, 60, 40);
+    app.update(Msg::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+    assert!(draw_wants_older(&mut app, 60, 40));
+    assert_eq!(app.attached.as_ref().unwrap().scroll_up, 0);
+    assert!(!draw_wants_older(&mut app, 60, 40), "no scroll, no page");
+}

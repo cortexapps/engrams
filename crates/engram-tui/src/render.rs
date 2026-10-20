@@ -705,8 +705,8 @@ fn put_num(buf: &mut Buffer, x: u16, y: u16, mut n: u64, style: Style) -> u16 {
 }
 
 /// The rows of the transcript that fit `area`, newest at the bottom,
-/// honoring `scroll_up`. Returns whether the walk ran out of cells while
-/// skipping (the caller may page older history in).
+/// honoring `scroll_up`. Returns whether a scroll up reached the top of
+/// memory (the caller may page older history in).
 pub fn draw_transcript(
     buf: &mut Buffer,
     area: Rect,
@@ -714,45 +714,60 @@ pub fn draw_transcript(
     th: &Theme,
     scratch: &mut Vec<(usize, u16)>,
 ) -> bool {
-    scratch.clear();
     let width = area.width.saturating_sub(th.gutter_width()).max(1);
     let want = area.height as usize;
-    let mut skip = a.scroll_up;
     let hl = a
         .search
         .as_ref()
         .and_then(|s| s.cursor.map(|c| (c, s.lower.as_str())));
     let t = &mut a.reducer.transcript;
     let first = t.first_index();
-    let mut i = t.len();
-    let mut ran_out = true;
-    while i > first {
-        i -= 1;
-        let Some(e) = t.get_mut(i) else {
-            break;
-        };
-        let h = e.height(width);
-        let mut row = h;
-        while row > 0 {
-            row -= 1;
-            if skip > 0 {
-                skip -= 1;
-                continue;
+    // Walk bottom-up, skipping `scroll_up` rows. A scroll past the top of
+    // memory leaves the walk short of a page: clamp so the top of the
+    // transcript fills the area and walk again in the same frame, so it
+    // is painted now and not on some later redraw.
+    let asked = a.scroll_up > 0;
+    let mut clamped = false;
+    let mut ran_out;
+    loop {
+        scratch.clear();
+        let mut skip = a.scroll_up;
+        let mut i = t.len();
+        ran_out = true;
+        while i > first {
+            i -= 1;
+            let Some(e) = t.get_mut(i) else {
+                break;
+            };
+            let h = e.height(width);
+            let mut row = h;
+            while row > 0 {
+                row -= 1;
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                scratch.push((i, row));
+                if scratch.len() >= want {
+                    ran_out = false;
+                    break;
+                }
             }
-            scratch.push((i, row));
             if scratch.len() >= want {
                 ran_out = false;
                 break;
             }
         }
-        if scratch.len() >= want {
-            ran_out = false;
-            break;
+        if ran_out {
+            let total = (a.scroll_up - skip) as usize + scratch.len();
+            let clamp = total.saturating_sub(want) as u32;
+            if a.scroll_up > clamp {
+                a.scroll_up = clamp;
+                clamped = true;
+                continue;
+            }
         }
-    }
-    // The walk stopped above the top: clamp so the next frame is stable.
-    if ran_out && skip > 0 {
-        a.scroll_up -= skip;
+        break;
     }
     // Paint top-down. A short transcript is top-aligned.
     for (y, &(idx, row)) in (area.y..).zip(scratch.iter().rev()) {
@@ -787,7 +802,8 @@ pub fn draw_transcript(
             th.dim,
         );
     }
-    ran_out
+    // A scroll up that reached the top of memory asks for older history.
+    asked && (ran_out || clamped)
 }
 
 fn draw_queue(buf: &mut Buffer, area: Rect, a: &Attached, th: &Theme) {
@@ -1413,7 +1429,7 @@ pub fn draw_fullscreen(
                     th.accent,
                 );
             }
-            want_older = draw_transcript(buf, transcript, a, th, scratch) && a.scroll_up > 0;
+            want_older = draw_transcript(buf, transcript, a, th, scratch);
             if slash.height > 0 {
                 draw_slash(buf, slash, a.composer.text(), th);
             }
