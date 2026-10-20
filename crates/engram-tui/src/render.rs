@@ -39,6 +39,11 @@ pub struct Theme {
     /// The background of overlays (`?`, new session, the palette, the
     /// slash popup); `None` without color.
     pub overlay: Option<Color>,
+    /// Syntax highlighting is drawn (off under `NO_COLOR`).
+    pub color: bool,
+    /// Faint backgrounds for added and removed diff lines, from the
+    /// terminal's own background; `None` when it did not say.
+    pub diff_bg: Option<(Color, Color)>,
 }
 
 /// Width of the gutter column: a glyph and a space, or a word.
@@ -56,6 +61,8 @@ impl Theme {
             del: c(Style::new(), Color::Red),
             ax: false,
             overlay: None,
+            color,
+            diff_bg: None,
             user: Style::new().add_modifier(Modifier::BOLD),
             agent: Style::new(),
             dim: c(Style::new().add_modifier(Modifier::DIM), Color::DarkGray),
@@ -80,6 +87,32 @@ impl Theme {
             GUTTER_AX
         } else {
             GUTTER
+        }
+    }
+
+    /// The color of a syntax highlight tone, from the terminal's palette.
+    pub fn tone(&self, tone: u8) -> Style {
+        use crate::highlight::Tone;
+        if !self.color {
+            return Style::new();
+        }
+        let Some(t) = Tone::from_u8(tone) else {
+            return Style::new();
+        };
+        let fg = match t {
+            Tone::Comment => Color::DarkGray,
+            Tone::String => Color::Green,
+            Tone::Keyword => Color::Magenta,
+            Tone::Number | Tone::Type => Color::Yellow,
+            Tone::Constant => Color::Cyan,
+            Tone::Function => Color::Blue,
+            Tone::Tag => Color::Red,
+        };
+        let st = Style::new().fg(fg);
+        if t == Tone::Comment {
+            st.add_modifier(Modifier::ITALIC)
+        } else {
+            st
         }
     }
 
@@ -138,7 +171,10 @@ fn put_runs(
         let (seg_end, style) = match runs.get(i) {
             Some(r) if (r.start as usize) <= pos => {
                 i += 1;
-                ((r.end as usize).min(end), th.run_style(base, r.flags))
+                (
+                    (r.end as usize).min(end),
+                    th.run_style(base, r.flags).patch(th.tone(r.tone)),
+                )
             }
             Some(r) => ((r.start as usize).min(end), base),
             None => (end, base),
@@ -217,6 +253,16 @@ fn fill(buf: &mut Buffer, area: Rect, style: Style) {
     }
 }
 
+/// Faint green and red backgrounds for added and removed diff lines: the
+/// terminal's background with a little of each mixed in.
+pub fn diff_backgrounds(bg: (u8, u8, u8)) -> (Color, Color) {
+    let mix = |(r, g, b): (u8, u8, u8), (tr, tg, tb): (u8, u8, u8)| {
+        let m = |c: u8, t: u8| ((u32::from(c) * 82 + u32::from(t) * 18) / 100) as u8;
+        Color::Rgb(m(r, tr), m(g, tg), m(b, tb))
+    };
+    (mix(bg, (0, 200, 0)), mix(bg, (220, 0, 0)))
+}
+
 /// The overlay background for a terminal whose own background is `bg`:
 /// a darker shade of it, as Neovim paints floating windows (a light
 /// background darkens less). Black when the terminal did not say.
@@ -256,6 +302,84 @@ fn draw_rule(buf: &mut Buffer, area: Rect, th: &Theme) {
         if let Some(c) = buf.cell_mut(Position::new(x, area.y)) {
             c.set_symbol("─");
             c.set_style(th.dim);
+        }
+    }
+}
+
+/// Where a diff row sits in the diff text.
+#[derive(Clone, Copy)]
+struct DiffRow {
+    start: usize,
+    end: usize,
+    /// The start of the line the row belongs to (its sign).
+    line_start: usize,
+    sign: Option<u8>,
+}
+
+/// One row of a highlighted diff: the sign in the add/remove color, the
+/// code in its tones, an added or removed line on a faint background.
+/// Context lines stay dim.
+fn paint_diff_row(
+    buf: &mut Buffer,
+    area: Rect,
+    text: &str,
+    row: DiffRow,
+    spans: &[crate::highlight::Span],
+    th: &Theme,
+) {
+    let DiffRow {
+        start,
+        end,
+        line_start,
+        sign,
+    } = row;
+    let (base, bg) = match sign {
+        Some(b'+') => (Style::new(), th.diff_bg.map(|b| b.0)),
+        Some(b'-') => (Style::new(), th.diff_bg.map(|b| b.1)),
+        _ => (Style::new().add_modifier(Modifier::DIM), None),
+    };
+    let base = match bg {
+        Some(bg) => base.bg(bg),
+        None => base,
+    };
+    if bg.is_some() {
+        fill(buf, area, base);
+    }
+    let (x, y) = (area.x, area.y);
+    let mut cx = 0u16;
+    let mut pos = start;
+    if start == line_start && end > start {
+        let sign_style = match sign {
+            Some(b'+') => th.add,
+            Some(b'-') => th.del,
+            _ => th.dim,
+        };
+        let w = text[start..].chars().next().map_or(1, char::len_utf8);
+        cx += put(
+            buf,
+            x,
+            y,
+            &text[start..start + w],
+            area.width,
+            base.patch(sign_style),
+        );
+        pos += w;
+    }
+    let mut i = spans.partition_point(|s| (s.end as usize) <= pos);
+    while pos < end && cx < area.width {
+        let (seg_end, style) = match spans.get(i) {
+            Some(s) if (s.start as usize) <= pos => {
+                i += 1;
+                ((s.end as usize).min(end), base.patch(th.tone(s.tone as u8)))
+            }
+            Some(s) => ((s.start as usize).min(end), base),
+            None => (end, base),
+        };
+        if seg_end > pos {
+            cx += put(buf, x + cx, y, &text[pos..seg_end], area.width - cx, style);
+            pos = seg_end;
+        } else {
+            break;
         }
     }
 }
@@ -606,14 +730,35 @@ fn paint_src<'e>(
                 return Some(text);
             }
             let body_style = match &e.cell {
-                Cell::Diff { .. } => {
+                Cell::Diff { hl, .. } => {
                     // The line's first byte says what kind of line it is;
                     // a wrapped continuation row inherits it.
                     let line_start = text[..lr.row.start as usize]
                         .rfind('\n')
                         .map(|p| p + 1)
                         .unwrap_or(0);
-                    match text.as_bytes().get(line_start) {
+                    let sign = text.as_bytes().get(line_start).copied();
+                    if let Some(spans) = hl.as_deref().filter(|h| th.color && !h.is_empty()) {
+                        paint_diff_row(
+                            buf,
+                            Rect {
+                                x: body_x + 2,
+                                width: body_w.saturating_sub(2),
+                                ..body
+                            },
+                            text,
+                            DiffRow {
+                                start: lr.row.start as usize,
+                                end: lr.row.end as usize,
+                                line_start,
+                                sign,
+                            },
+                            spans,
+                            th,
+                        );
+                        return Some(text);
+                    }
+                    match sign {
                         Some(b'+') => th.add,
                         Some(b'-') => th.del,
                         _ => th.dim,

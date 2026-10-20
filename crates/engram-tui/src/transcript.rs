@@ -137,6 +137,8 @@ pub enum Cell {
         added: u32,
         removed: u32,
         expanded: bool,
+        /// Syntax highlight spans of `text`, made on first layout.
+        hl: Option<Box<[crate::highlight::Span]>>,
     },
     Marker {
         kind: Marker,
@@ -426,8 +428,17 @@ impl Entry {
                 }
                 _ => {}
             }
-            if let Cell::Assistant { md, .. } | Cell::Plan { md, .. } = &mut self.cell {
-                md.fit(width);
+            // Highlighting happens here, on the cell's first layout (and
+            // for code that arrived since): never on a steady frame.
+            match &mut self.cell {
+                Cell::Assistant { md, .. } | Cell::Plan { md, .. } => {
+                    md.fit(width);
+                    md.highlight();
+                }
+                Cell::Diff { path, text, hl, .. } if hl.is_none() => {
+                    *hl = Some(crate::highlight::diff(path, text).into_boxed_slice());
+                }
+                _ => {}
             }
             layout_cell(&self.cell, width, &mut self.layout.rows);
         }

@@ -948,6 +948,7 @@ impl Reducer {
                     added,
                     removed,
                     expanded: false,
+                    hl: None,
                 };
                 // The entry stays in `open_tools` so the completion that
                 // follows finds the card (and leaves a diff cell alone).

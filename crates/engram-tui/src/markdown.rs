@@ -34,6 +34,18 @@ pub struct Run {
     pub start: u32,
     pub end: u32,
     pub flags: u8,
+    /// A syntax highlight tone ([`crate::highlight::Tone`]); 0 for none.
+    pub tone: u8,
+}
+
+/// A fenced code block with a language: its code lines (byte ranges of
+/// the display text, without the line prefix), highlighted on first
+/// layout.
+#[derive(Debug, Clone)]
+pub struct CodeBlock {
+    lang: Box<str>,
+    lines: Vec<(u32, u32)>,
+    done: bool,
 }
 
 /// Display text and its sorted, non-overlapping runs. Unstyled text has
@@ -42,6 +54,7 @@ pub struct Run {
 pub struct Rendered {
     pub text: String,
     pub runs: Vec<Run>,
+    pub code: Vec<CodeBlock>,
 }
 
 impl Rendered {
@@ -76,6 +89,21 @@ impl Rendered {
 
     /// Cut the text and every run past `len`.
     pub fn truncate(&mut self, len: usize) {
+        let cut = len as u32;
+        self.code.retain_mut(|b| {
+            let before = b.lines.len();
+            b.lines.retain(|&(s, _)| s < cut);
+            if let Some(last) = b.lines.last_mut() {
+                if last.1 > cut {
+                    last.1 = cut;
+                    b.done = false;
+                }
+            }
+            if b.lines.len() != before {
+                b.done = false;
+            }
+            !b.lines.is_empty()
+        });
         self.text.truncate(len);
         while self.runs.last().is_some_and(|r| r.end as usize > len) {
             let last = self.runs.last_mut().expect("checked");
@@ -95,6 +123,83 @@ impl Rendered {
     pub fn clear(&mut self) {
         self.text.clear();
         self.runs.clear();
+        self.code.clear();
+    }
+
+    /// Highlight the code blocks not highlighted yet. Cheap when there are
+    /// none: a finished block is never parsed again.
+    pub fn highlight(&mut self) {
+        for bi in 0..self.code.len() {
+            if self.code[bi].done {
+                continue;
+            }
+            self.code[bi].done = true;
+            let Some(syntax) = crate::highlight::syntax_for(&self.code[bi].lang) else {
+                continue;
+            };
+            let mut parse = crate::highlight::Lines::new(syntax);
+            let mut spans = Vec::new();
+            // (line start, line end, the line's runs) for each line.
+            let mut lines: Vec<(u32, u32, Vec<Run>)> = Vec::new();
+            for &(s, e) in &self.code[bi].lines {
+                spans.clear();
+                let text = &self.text[s as usize..e as usize];
+                if !parse.line(text, s as usize, &mut spans) {
+                    continue;
+                }
+                // The line's own flags (a quote, say), without the flat
+                // code color: highlighted code is colored by its tones.
+                let at = self.runs.partition_point(|r| r.end <= s);
+                let base = self
+                    .runs
+                    .get(at)
+                    .filter(|r| r.start <= s)
+                    .map_or(0, |r| r.flags & !flags::CODE);
+                let mut runs = Vec::with_capacity(spans.len() * 2 + 1);
+                let mut pos = s;
+                for sp in &spans {
+                    if sp.start > pos {
+                        runs.push(Run {
+                            start: pos,
+                            end: sp.start,
+                            flags: base,
+                            tone: 0,
+                        });
+                    }
+                    runs.push(Run {
+                        start: sp.start,
+                        end: sp.end,
+                        flags: base,
+                        tone: sp.tone as u8,
+                    });
+                    pos = sp.end;
+                }
+                if pos < e {
+                    runs.push(Run {
+                        start: pos,
+                        end: e,
+                        flags: base,
+                        tone: 0,
+                    });
+                }
+                lines.push((s, e, runs));
+            }
+            if lines.is_empty() {
+                continue;
+            }
+            // Swap each highlighted line's runs for the new ones: drop the
+            // old runs that touch a line, add the new, restore the order.
+            let touches = |r: &Run| {
+                let at = lines.partition_point(|l| l.1 <= r.start);
+                lines.get(at).is_some_and(|l| l.0 < r.end)
+            };
+            self.runs.retain(|r| !touches(r));
+            for (_, _, runs) in &mut lines {
+                self.runs
+                    .extend(runs.drain(..).filter(|r| r.flags != 0 || r.tone != 0));
+            }
+            self.runs.sort_unstable_by_key(|r| r.start);
+        }
     }
 }
 
@@ -112,6 +217,8 @@ struct Writer<'r> {
     lists: Vec<Option<u64>>,
     quote: u8,
     code_block: bool,
+    /// The open code block has a language: its lines are recorded.
+    code_lang: bool,
     /// The next block needs a blank line before it.
     pending_blank: bool,
     /// Nothing has been written on the current line yet.
@@ -135,6 +242,7 @@ impl<'r> Writer<'r> {
             lists: Vec::new(),
             quote: 0,
             code_block: false,
+            code_lang: false,
             pending_blank,
             line_start,
             item_fresh: false,
@@ -175,7 +283,12 @@ impl<'r> Writer<'r> {
                 return;
             }
         }
-        self.out.runs.push(Run { start, end, flags });
+        self.out.runs.push(Run {
+            start,
+            end,
+            flags,
+            tone: 0,
+        });
     }
 
     fn newline(&mut self) {
@@ -242,7 +355,19 @@ impl<'r> Writer<'r> {
                     None => (line, false),
                 };
                 self.line_prefix();
+                let start = self.out.text.len() as u32;
                 self.raw(body, f | flags::CODE);
+                let end = self.out.text.len() as u32;
+                if self.code_lang && end > start {
+                    if let Some(block) = self.out.code.last_mut() {
+                        // A line split across text events continues the
+                        // previous piece.
+                        match block.lines.last_mut() {
+                            Some(last) if last.1 == start => last.1 = end,
+                            _ => block.lines.push((start, end)),
+                        }
+                    }
+                }
                 if nl {
                     self.newline();
                 }
@@ -318,6 +443,13 @@ impl<'r> Writer<'r> {
                         self.line_prefix();
                         self.raw(&lang, flags::DIM);
                         self.newline();
+                        // Highlighted when the cell is first laid out.
+                        self.out.code.push(CodeBlock {
+                            lang: lang.as_ref().into(),
+                            lines: Vec::new(),
+                            done: false,
+                        });
+                        self.code_lang = true;
                     }
                 }
                 self.code_block = true;
@@ -413,6 +545,7 @@ impl<'r> Writer<'r> {
             }
             TagEnd::CodeBlock => {
                 self.code_block = false;
+                self.code_lang = false;
                 self.block_end();
             }
             TagEnd::List(_) => {
@@ -717,6 +850,11 @@ impl Markdown {
 
     pub fn runs(&self) -> &[Run] {
         &self.shown.runs
+    }
+
+    /// Highlight the code blocks shown so far (see [`Rendered::highlight`]).
+    pub fn highlight(&mut self) {
+        self.shown.highlight();
     }
 
     /// The markdown source. Empty once finalized.

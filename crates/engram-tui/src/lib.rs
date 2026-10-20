@@ -11,6 +11,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod composer;
 pub mod event;
+pub mod highlight;
 pub mod inbox;
 pub mod keymap;
 pub mod markdown;
@@ -82,7 +83,9 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
     let mut theme = Theme::new(opts.color);
     theme.ax = opts.ax;
     if opts.color {
-        theme.overlay = Some(render::overlay_color(terminal::probe().bg));
+        let bg = terminal::probe().bg;
+        theme.overlay = Some(render::overlay_color(bg));
+        theme.diff_bg = bg.map(render::diff_backgrounds);
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
