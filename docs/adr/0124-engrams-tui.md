@@ -1,6 +1,6 @@
 # ADR 0124: `engrams tui`, a terminal client for sessions
 
-Status: Accepted (2026-10-20); PR4-PR8 implemented in the PR chain listed under Phases.
+Status: Accepted (2026-10-20); PR4-PR9 implemented in the PR chain listed under Phases.
 
 Terms used in this document:
 
@@ -139,8 +139,10 @@ pauses while scrolled up.
 - PR6 (#1649): approvals and questions via `CompleteToolCall`,
   notifications.
 - PR7 (#1650): shell pane (`vt100`) and `engrams session shell`.
-- PR8: new session from the TUI, `/` commands, `/transcript` and `/dump`,
-  docs, status → Accepted.
+- PR8 (#1653): new session from the TUI, `/` commands, `/transcript` and
+  `/dump`, docs, status → Accepted.
+- PR9: the transcript's shape, after the first production sessions were
+  read side by side with Codex's TUI (see the divergence log).
 
 The Rust CLI the TUI rides on landed first (#1644, #1645). One transport
 bug surfaced on the first run against a production deployment and was
@@ -273,6 +275,25 @@ an explicit `Content-Length: 0` through some front ends.
   exits made `session shell` exit 2 with an error (an abrupt end is a
   normal end now); and an empty-body POST needed `Content-Length: 0`
   (#1652, on main). Measured on a 5k-event session: 13-16 MB RSS.
+- **PR9, the transcript's shape.** The first production sessions read as
+  a wall of text next to Codex's TUI, whose `history_cell` module was
+  read for this pass. What changed, each in its own commit: a tool row
+  shows the subject of its call (the command, the path, the pattern),
+  not the argument JSON, and a long command folds to three rows; a blank
+  row separates cells, with tool-like cells and markers sharing a block;
+  a question the harness re-fires after a resume replaces its card
+  instead of adding one, and an answered card keeps only `answer: …`
+  lines; snapshot markers are gone (resumes and the two disk warnings
+  stay); tables are fitted to the width (columns shrink to their longest
+  word, cells wrap, then `header: cell` records), so a finished message
+  with a table keeps its source to re-fit on resize, the one exception to
+  D3's "drop the source"; consecutive Read, Grep, Glob and LS calls fold
+  into one `Explored` row; diff rows lead with `Edited`, `Wrote` or
+  `Patched`; a finished turn ends in `worked for 2m 14s` from the `at`
+  stamps on its run events. Two more production findings: a result
+  summary ends in a newline (now trimmed), and `file_changed` lands after
+  the write's completion (the card keeps its id and is found among the
+  newest cells). The footer lost its `idx` chip, a protocol number.
 - **PR8, the budgets.** The RSS gate against a stub orchestrator (D5)
   stays unbuilt; the measured numbers are in the PR texts: 13-16 MB RSS
   attached to a 5k-event session in fullscreen mode, 14 MB in native
