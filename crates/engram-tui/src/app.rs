@@ -1447,6 +1447,12 @@ impl App {
                     self.quit = true;
                 }
             }
+            // Backspace on an empty filter leaves it, as from Vim's `/`.
+            Action::Backspace
+                if !self.palette && self.sessions.filtering && self.sessions.filter.is_empty() =>
+            {
+                self.sessions.filtering = false;
+            }
             Action::Backspace => {
                 self.sessions.filter.pop();
                 self.sessions.selected = 0;

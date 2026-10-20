@@ -74,6 +74,21 @@ fn slash_filters_and_esc_returns_to_the_keys() {
         .any(|c| matches!(c, Cmd::Attach { session_id } if session_id == "s-1")));
 }
 
+/// As from Vim's `/` prompt: Backspace on an empty filter gives the keys
+/// back.
+#[test]
+fn backspace_out_of_an_empty_filter() {
+    let mut app = list();
+    ch(&mut app, '/');
+    ch(&mut app, 'f');
+    key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    assert!(app.sessions.filtering, "it erased the letter");
+    key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+    assert!(!app.sessions.filtering, "the empty filter is left");
+    ch(&mut app, 'j');
+    assert_eq!(app.sessions.selected, 1);
+}
+
 #[test]
 fn n_opens_a_new_session_and_its_picker_moves_with_ctrl_n() {
     let mut app = list();
