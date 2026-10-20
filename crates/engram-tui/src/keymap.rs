@@ -162,14 +162,15 @@ pub const BINDINGS: &[Binding] = &[
 /// Resolve a key press. `None` for releases and chords with no binding.
 ///
 /// The composer's editing keys are Codex's (`EditorKeymap` defaults):
-/// Ctrl+A/E and Cmd+←/→ line start/end, Ctrl+B/F and Ctrl+P/N by
-/// character and line, Alt+B/F and Alt/Ctrl+←/→ by word, Ctrl+H and
-/// Ctrl+D delete a character, Alt/Ctrl+Backspace, Ctrl+W and Ctrl+Alt+H a
-/// word back, Alt+D and Alt/Ctrl+Delete a word forward, Ctrl+U and
-/// Cmd+Backspace kill to line start, Ctrl+K to line end, Ctrl+Y yanks.
-/// Ctrl+D, Ctrl+E, Ctrl+N and Ctrl+P also have a meaning of their own
-/// here (detach, open every tool call, new session, palette): that one
-/// applies when `has_text` is false, where the editing key does nothing.
+/// Ctrl+A/E and Cmd+←/→ line start/end, Ctrl+B/F by character, Alt+B/F
+/// and Alt/Ctrl+←/→ by word, Ctrl+H and Ctrl+D delete a character,
+/// Alt/Ctrl+Backspace, Ctrl+W and Ctrl+Alt+H a word back, Alt+D and
+/// Alt/Ctrl+Delete a word forward, Ctrl+U and Cmd+Backspace kill to line
+/// start, Ctrl+K to line end, Ctrl+Y yanks. Not Codex's Ctrl+P/N line
+/// moves: those stay the palette and a new session. Ctrl+D and Ctrl+E
+/// also have a meaning of their own here (detach, open every tool call):
+/// that one applies when `has_text` is false, where the editing key does
+/// nothing.
 pub fn resolve(key: &KeyEvent, draft_empty: bool, has_text: bool) -> Option<Action> {
     if key.kind == KeyEventKind::Release {
         return None;
@@ -213,9 +214,7 @@ pub fn resolve(key: &KeyEvent, draft_empty: bool, has_text: bool) -> Option<Acti
             'c' => Action::CtrlC,
             'd' if has_text => Action::Delete,
             'd' => Action::Detach,
-            'p' if has_text => Action::Up,
             'p' => Action::Palette,
-            'n' if has_text => Action::Down,
             'n' => Action::NewSession,
             'e' if has_text => Action::End,
             'e' => Action::ExpandAll,
@@ -270,9 +269,16 @@ mod tests {
         assert_eq!(empty(k(KeyCode::Char('e'), ctrl)), Some(Action::ExpandAll));
         assert_eq!(with_text(k(KeyCode::Char('d'), ctrl)), Some(Action::Delete));
         assert_eq!(empty(k(KeyCode::Char('d'), ctrl)), Some(Action::Detach));
-        assert_eq!(with_text(k(KeyCode::Char('p'), ctrl)), Some(Action::Up));
+        // Ctrl+P / Ctrl+N stay the palette and a new session, text or not.
+        assert_eq!(
+            with_text(k(KeyCode::Char('p'), ctrl)),
+            Some(Action::Palette)
+        );
         assert_eq!(empty(k(KeyCode::Char('p'), ctrl)), Some(Action::Palette));
-        assert_eq!(with_text(k(KeyCode::Char('n'), ctrl)), Some(Action::Down));
+        assert_eq!(
+            with_text(k(KeyCode::Char('n'), ctrl)),
+            Some(Action::NewSession)
+        );
         assert_eq!(empty(k(KeyCode::Char('n'), ctrl)), Some(Action::NewSession));
         assert_eq!(
             with_text(k(KeyCode::Char('d'), alt)),
