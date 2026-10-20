@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use crate::markdown::{Markdown, Run};
-use crate::wrap::{wrap_into, Row};
+use crate::wrap::{display_width, wrap_into, Row};
 
 /// How a tool call ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,6 +329,8 @@ pub struct Layout {
 
 /// Lines of a collapsed tool/exec body before the `… N more lines` row.
 pub const COLLAPSE_LINES: usize = 5;
+/// Columns an option row's prefix takes: indent, number, mark.
+const OPTION_LEAD: u16 = 10;
 /// Rows of a collapsed tool head (a long command) before that row.
 pub const HEAD_LINES: usize = 3;
 
@@ -500,11 +502,10 @@ impl Entry {
             Cell::Tool { state, .. } => *state != ToolState::Running,
             Cell::Exec { done, .. } => *done,
             Cell::Explore { items, .. } => !explore_running(items),
-            Cell::Question { .. }
-            | Cell::Plan { .. }
-            | Cell::Diff { .. }
-            | Cell::Marker { .. }
-            | Cell::Hidden => true,
+            // A pending decision stays in memory: the answer edits it.
+            Cell::Question { answered, .. } => *answered,
+            Cell::Plan { approved, .. } => approved.is_some(),
+            Cell::Diff { .. } | Cell::Marker { .. } | Cell::Hidden => true,
         }
     }
 
@@ -670,11 +671,20 @@ fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
         Cell::Hidden => {}
         Cell::Diff {
             path,
+            verb,
             text,
             expanded,
             ..
         } => {
-            push_rows(Src::Head, path, width, out, &mut scratch);
+            // The verb leads the row: wrap the path in what is left.
+            let lead = display_width(verb) as u16 + 1;
+            push_rows(
+                Src::Head,
+                path,
+                width.saturating_sub(lead).max(1),
+                out,
+                &mut scratch,
+            );
             push_body(text, *expanded, width, out, &mut scratch);
         }
         Cell::Plan { md, .. } => {
@@ -685,12 +695,21 @@ fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
             });
         }
         Cell::Tool {
+            name,
             args,
             result,
             expanded,
             ..
         } => {
-            push_head(args, *expanded, width, out, &mut scratch);
+            // The name leads the first row: wrap the args in what is left.
+            let lead = display_width(name) as u16 + 1;
+            push_head(
+                args,
+                *expanded,
+                width.saturating_sub(lead).max(1),
+                out,
+                &mut scratch,
+            );
             push_body(
                 result.as_deref().unwrap_or(""),
                 *expanded,
@@ -742,10 +761,11 @@ fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
                     if *answered && !picks.get(i).is_some_and(|p| p.contains(&(j as u16))) {
                         continue;
                     }
+                    // `  12. (•) ` or `  answer: ` leads the row.
                     push_rows(
                         Src::Option(i as u16, j as u16),
                         &o.label,
-                        width,
+                        width.saturating_sub(OPTION_LEAD).max(1),
                         out,
                         &mut scratch,
                     );
@@ -1044,5 +1064,60 @@ impl Transcript {
             .iter_mut()
             .map(|e| e.height(width) as u32)
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pending_decision_is_not_final() {
+        let mut q = Entry::new(Cell::Question {
+            tool_call_id: "t".into(),
+            questions: Vec::new(),
+            answered: false,
+            picks: Vec::new(),
+            current: 0,
+        });
+        assert!(!q.is_final());
+        if let Cell::Question { answered, .. } = &mut q.cell {
+            *answered = true;
+        }
+        assert!(q.is_final());
+        let mut p = Entry::new(Cell::Plan {
+            tool_call_id: "t".into(),
+            md: Markdown::default(),
+            approved: None,
+            choice: None,
+        });
+        assert!(!p.is_final());
+        if let Cell::Plan { approved, .. } = &mut p.cell {
+            *approved = Some(false);
+        }
+        assert!(p.is_final());
+    }
+
+    #[test]
+    fn a_tool_head_leaves_room_for_its_name() {
+        // 18 characters at width 20: the `Bash ` lead takes five columns,
+        // so the args wrap into two rows instead of losing their tail.
+        let mut e = Entry::new(Cell::Tool {
+            tool_call_id: "t".into(),
+            name: "Bash".into(),
+            args: "abcdefghijklmnopqr".into(),
+            result: None,
+            state: ToolState::Ok,
+            duration_ms: None,
+            expanded: false,
+        });
+        let rows: Vec<&str> = e
+            .layout(20)
+            .rows
+            .iter()
+            .filter(|r| r.src == Src::Head)
+            .map(|r| &"abcdefghijklmnopqr"[r.row.start as usize..r.row.end as usize])
+            .collect();
+        assert_eq!(rows, vec!["abcdefghijklmno", "pqr"]);
     }
 }
