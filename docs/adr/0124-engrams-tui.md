@@ -257,6 +257,22 @@ an explicit `Content-Length: 0` through some front ends.
   TUI exits (Codex's dump technique). In native scrollback mode `/dump` is
   a note: the transcript is already in the terminal. The export covers
   the loaded window only, not events never paged in.
+- **PR8, `/plan`.** The web's plan chip has a TUI twin: `/plan` toggles
+  the mode the next prompt asks for, and the prompt carries
+  `harness_mode` only when it changes the session's current mode (the
+  reducer's `mode`), as the web does. The footer shows `· plan` while it
+  applies.
+- **PR8, production findings.** Four defects surfaced only against a
+  production deployment and are fixed in this PR: the harness emits a
+  `tool_call_started` for a deferred question before the request, so the
+  row rendered beside the card (now withdrawn when the request lands);
+  the kitty keyboard protocol keeps one flag stack per screen, so the
+  native-scrollback shell overlay (alternate screen) had no flags and
+  Ctrl+` could not hand the keys back (the overlay pushes them too); a
+  front end that ends the TLS session without `close_notify` when the PTY
+  exits made `session shell` exit 2 with an error (an abrupt end is a
+  normal end now); and an empty-body POST needed `Content-Length: 0`
+  (#1652, on main). Measured on a 5k-event session: 13-16 MB RSS.
 - **PR8, the budgets.** The RSS gate against a stub orchestrator (D5)
   stays unbuilt; the measured numbers are in the PR texts: 13-16 MB RSS
   attached to a 5k-event session in fullscreen mode, 14 MB in native
