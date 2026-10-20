@@ -105,7 +105,7 @@ the coordinator's ServiceAccount — no key files.
 | `ENGRAM_SANDBOX_BACKEND=firecracker` | Production backend |
 | `ENGRAM_KERNEL_IMAGE_PATH` | The node-assets-staged vmlinux |
 | `ENGRAM_BLOB_BACKEND` + bucket vars | Must match the coordinator's chunk store |
-| `ENGRAM_NBD_MAX_SLOTS` / `ENGRAM_NBD_WARM_SLOTS` | The NBD slot allocator (module loaded by node-prep with `nbds_max`) |
+| `ENGRAM_NBD_MAX_SLOTS` / `ENGRAM_NBD_WARM_SLOTS` | The NBD slot allocator (module loaded by node-prep with `nbds_max`). `ENGRAM_NBD_FIRST_SLOT` (default 0) is only for two host agents on one machine, which must own disjoint device ranges |
 | `ENGRAM_FC_UFFD_BASE_DIR` (+ the lazy-memory knobs) | The memory substrate tmpfs |
 | `ENGRAM_FC_VM_CGROUP_PARENT` | VMs escape the pod cgroup so rolls don't kill them |
 | `ENGRAM_EGRESS_PROXY_PORT` / `ENGRAM_EGRESS_DNS_PORT` / `ENGRAM_GUEST_GATEWAY_PORT` | Mandatory listeners (non-zero; iptables REDIRECT targets) |

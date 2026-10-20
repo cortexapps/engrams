@@ -2095,9 +2095,10 @@ jobs:
           # the `claude` harness rides the host `current_bundles` stamp).
           #
           # Blacksmith's kernel ships NBD built-in (CONFIG_BLK_DEV_NBD=y),
-          # so the Tiltfile's `ls /dev/nbd*` discovery wires
-          # ENGRAM_NBD_DEVICES and the root host-agent NBD-attaches the
-          # chunked disk. Assert it: a null cow-state here is now a real
+          # so the root host-agent sizes its NBD pool from the kernel and
+          # NBD-attaches the chunked disk (the teleport variant's two
+          # host-agents get disjoint device ranges from the Tiltfile).
+          # Assert it: a null cow-state here is now a real
           # regression, not the old "no nbd.ko" environment gap, so the
           # Phase B chunked-disk tests fail loud instead of skipping.
           ENGRAM_EXPECT_NBD: "1"
