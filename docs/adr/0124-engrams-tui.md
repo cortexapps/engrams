@@ -322,3 +322,9 @@ an explicit `Content-Length: 0` through some front ends.
 - **PR4, cursor-position query.** An inline viewport needs the terminal
   to answer `CSI 6n`. A pseudo-terminal with no emulator behind it never
   does, and start-up blocks in crossterm's query. Real terminals answer.
+- **Later, syntax highlighting (D5).** The allow-list gained `syntect`
+  (parsing only) and `two-face` on the Oniguruma engine, for code blocks
+  and diffs as Codex highlights them. Measured: +1.9 MB (binary 6.0 MB of
+  the 8 MB budget) and about 47 µs a line; the pure-Rust engine was 4x
+  slower and larger. A cell is highlighted on its first layout and keeps
+  its spans, so the steady-frame budgets hold.
