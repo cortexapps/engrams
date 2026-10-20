@@ -601,10 +601,15 @@ pub fn device_has_live_holder(device: &std::path::Path) -> engram_host_core::Dev
 ///
 /// A cold-path scan run once at register time, after the rehydrate passes have
 /// re-served the survivors they cover (those show as self-owned ⇒ `Serving`).
+///
+/// Only devices for which `owns` is true are classified. A second host agent
+/// on the same machine owns a disjoint device range; its devices are not
+/// this agent's residue, survivors or unknowns, even when that agent is dead.
 pub fn classify_startup_inventory(
     kernel: &dyn NbdKernel,
     records: &StartupRecords,
     owners: &std::collections::HashMap<PathBuf, engram_core::SandboxId>,
+    owns: &dyn Fn(&std::path::Path) -> bool,
 ) -> (
     engram_host_core::StartupClassification<PathBuf>,
     Vec<(engram_core::SandboxId, PathBuf)>,
@@ -613,6 +618,7 @@ pub fn classify_startup_inventory(
     let slots: Vec<engram_host_core::StartupSlot<PathBuf>> = kernel
         .connected_devices()
         .into_iter()
+        .filter(|dev| owns(&dev.device))
         .map(|dev| {
             let liveness = if dev.owner_pid == self_pid {
                 engram_host_core::PidLiveness::SelfPid

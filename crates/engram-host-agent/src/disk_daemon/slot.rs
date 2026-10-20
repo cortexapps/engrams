@@ -449,6 +449,9 @@ pub struct NbdSlotAllocator {
     /// Total universe size — constant after construction, so kept out
     /// of the mutex for a lock-free `capacity()`.
     capacity: usize,
+    /// The device indices of the universe — constant after construction,
+    /// so kept out of the mutex for a lock-free, sync [`Self::owns_device`].
+    members: std::collections::HashSet<u32>,
     claimed: std::sync::atomic::AtomicU32,
     free_check: FreeCheck,
     /// Devices parked by [`NbdSlot::quarantine`] — the allocator's record
@@ -522,6 +525,7 @@ impl NbdSlotAllocator {
             .collect();
         let reserved = vec![false; universe.len()];
         let capacity = universe.len();
+        let members = universe.iter().copied().collect();
         let warm_target = warm_target.min(capacity);
         let me = Arc::new(Self {
             inner: Mutex::new(Inner {
@@ -534,6 +538,7 @@ impl NbdSlotAllocator {
             warm: Mutex::new(VecDeque::with_capacity(warm_target)),
             warm_target,
             capacity,
+            members,
             claimed: std::sync::atomic::AtomicU32::new(0),
             free_check,
             parked: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -549,6 +554,13 @@ impl NbdSlotAllocator {
     /// Total slot count in this pool's universe. Constant; lock-free.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Whether `device` is a `/dev/nbdN` of this pool's universe. Two host
+    /// agents on one machine own disjoint ranges (see [`slot_range`]), and
+    /// each one must leave the other's devices alone.
+    pub fn owns_device(&self, device: &Path) -> bool {
+        parse_nbd_index(device).is_some_and(|idx| self.members.contains(&idx))
     }
 
     /// Claimed slots, including parked devices. Warm slots and the
@@ -940,6 +952,18 @@ mod tests {
         assert!(slot_range(16, 16, None).is_empty());
         assert!(slot_range(16, 20, Some(4)).is_empty());
         assert!(slot_range(16, 0, Some(0)).is_empty());
+    }
+
+    /// A pool owns exactly its universe's devices, so a host agent with the
+    /// range 8..16 does not classify a device of the agent with 0..8.
+    #[tokio::test]
+    async fn owns_device_is_the_universe() {
+        let pool = NbdSlotAllocator::build((8..16).collect(), 0, Arc::new(|_| false));
+        assert!(pool.owns_device(Path::new("/dev/nbd8")));
+        assert!(pool.owns_device(Path::new("/dev/nbd15")));
+        assert!(!pool.owns_device(Path::new("/dev/nbd7")));
+        assert!(!pool.owns_device(Path::new("/dev/nbd16")));
+        assert!(!pool.owns_device(Path::new("/dev/sda")));
     }
 
     /// ADR 0098 P7: the auditable slot FSM. The legal edges match the

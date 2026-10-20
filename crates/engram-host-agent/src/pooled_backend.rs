@@ -4302,8 +4302,15 @@ impl PooledBackend {
             None => std::collections::HashMap::new(),
         };
 
+        // With no pool (NBD off) every connected device is classified, as
+        // before ranges existed: any binding is then a leftover.
+        let owns = |device: &std::path::Path| {
+            self.nbd_pool
+                .as_ref()
+                .is_none_or(|pool| pool.owns_device(device))
+        };
         let (classification, residue_pairs) =
-            crate::disk_daemon::classify_startup_inventory(kernel, &records, &owners);
+            crate::disk_daemon::classify_startup_inventory(kernel, &records, &owners, &owns);
 
         // Attributed residue: report + await the coordinator's tombstone
         // (existing from the interrupted destroy, or minted by the ADR 0116

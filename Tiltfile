@@ -570,10 +570,11 @@ nbd_a = None
 nbd_b = None
 if two_hosts and sandbox_backend == 'firecracker':
     _nbd_count = _nbd_device_count()
-    if _nbd_count >= 2:
-        _half = _nbd_count // 2
-        nbd_a = (0, _half)
-        nbd_b = (_half, _nbd_count - _half)
+    if _nbd_count < 2:
+        fail('engram dev: two host-agents need at least 2 /dev/nbdN devices to split, found %d; load nbd with nbds_max>=2' % _nbd_count)
+    _half = _nbd_count // 2
+    nbd_a = (0, _half)
+    nbd_b = (_half, _nbd_count - _half)
     print('engram dev: %d NBD devices; host-agent range (first, count) = %r, host-agent-b = %r'
           % (_nbd_count, nbd_a, nbd_b))
 
