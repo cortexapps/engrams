@@ -469,6 +469,37 @@ async fn auth_status_json_reports_the_env_var_source() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn auth_status_names_the_reason_a_key_could_not_be_verified() {
+    let h = Harness::start().await;
+    // A host that refuses the connection: the key is not "invalid", the
+    // check never ran, and the output must say which.
+    let r = h
+        .run(
+            &["--url", "http://127.0.0.1:1", "auth", "status"],
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+    assert!(
+        r.stdout.contains("could not be verified: Unavailable"),
+        "{}",
+        r.stdout
+    );
+    let j = h
+        .run(
+            &["--url", "http://127.0.0.1:1", "--json", "auth", "status"],
+            &[],
+            None,
+        )
+        .await;
+    assert_eq!(j.code, 1);
+    let body: serde_json::Value = serde_json::from_str(&j.stdout).unwrap();
+    assert_eq!(body["loggedIn"], false);
+    assert!(body.get("user").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn version_and_usage_errors_follow_the_commander_contract() {
     let h = Harness::start().await;
     let v = h.run(&["--version"], &[], None).await;
