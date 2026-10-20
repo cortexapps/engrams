@@ -23,6 +23,10 @@ static MOUSE: AtomicBool = AtomicBool::new(false);
 static KITTY: AtomicBool = AtomicBool::new(false);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// The kitty flags pushed on every screen the TUI draws on.
+const KITTY_FLAGS: KeyboardEnhancementFlags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+    .union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS);
+
 /// Restore the terminal. Idempotent; safe from the panic hook.
 pub fn restore() {
     if !ACTIVE.swap(false, Ordering::SeqCst) {
@@ -108,13 +112,7 @@ fn enter_modes(alt_screen: bool, mouse: bool) -> io::Result<()> {
         MOUSE.store(true, Ordering::SeqCst);
     }
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
-        queue!(
-            out,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-            )
-        )?;
+        queue!(out, PushKeyboardEnhancementFlags(KITTY_FLAGS))?;
         KITTY.store(true, Ordering::SeqCst);
     }
     out.flush()?;
@@ -131,14 +129,27 @@ impl Drop for Guard {
 /// shell pane). The flag keeps [`restore`] exact if the process dies
 /// while the overlay is up.
 pub fn enter_overlay() -> io::Result<()> {
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    let mut out = io::stdout();
+    queue!(out, EnterAlternateScreen)?;
     ALT_SCREEN.store(true, Ordering::SeqCst);
-    Ok(())
+    // The kitty keyboard protocol keeps one flag stack per screen: the
+    // flags pushed on the main screen do not apply on the alternate one.
+    // Without them Ctrl+` reaches the shell as a plain backtick and never
+    // hands the keys back.
+    if KITTY.load(Ordering::SeqCst) {
+        queue!(out, PushKeyboardEnhancementFlags(KITTY_FLAGS))?;
+    }
+    out.flush()
 }
 
 pub fn leave_overlay() {
     if ALT_SCREEN.swap(false, Ordering::SeqCst) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let mut out = io::stdout();
+        if KITTY.load(Ordering::SeqCst) {
+            let _ = queue!(out, PopKeyboardEnhancementFlags);
+        }
+        let _ = queue!(out, LeaveAlternateScreen);
+        let _ = out.flush();
     }
 }
 
