@@ -294,6 +294,19 @@ an explicit `Content-Length: 0` through some front ends.
   summary ends in a newline (now trimmed), and `file_changed` lands after
   the write's completion (the card keeps its id and is found among the
   newest cells). The footer lost its `idx` chip, a protocol number.
+  Last, a finished turn folds its tool calls: each run of consecutive
+  tool cells with two or more calls becomes one dim row (`▸ Ran 6 shell
+  commands, read 3 files`) that a click or Ctrl+O opens, as Claude Code
+  and Codex do. The fold is a property of the entries (the first carries
+  the summary row, the rest have no rows while closed), so indices stay
+  put; native scrollback mode does not fold, its finished cells have
+  already left memory. A scroll past the top of memory used to leave a
+  blank frame until the next event: the walk now clamps so the top page
+  fills the area and runs again in the same frame, and a scroll that
+  reaches the top of memory pages older history in. A prompt sits on a
+  band across the row, as in Claude Code. A tool row whose argument JSON
+  the server cut short keeps its subject (the first subject-like string
+  field, unescaped up to the cut).
 - **PR8, the budgets.** The RSS gate against a stub orchestrator (D5)
   stays unbuilt; the measured numbers are in the PR texts: 13-16 MB RSS
   attached to a 5k-event session in fullscreen mode, 14 MB in native
