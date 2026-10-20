@@ -95,7 +95,7 @@ enum Commands {
         #[command(subcommand)]
         cmd: AdminCmd,
     },
-    /// attach a terminal UI to a session (ADR 0124)
+    /// attach a terminal UI to a session
     Tui {
         /// session to attach to; omit for the session list
         session_id: Option<String>,
@@ -594,4 +594,48 @@ fn main() {
         Err(CliError::Exit(code)) => code,
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    /// Every line of help the CLI can print: about texts and argument
+    /// help, for every subcommand.
+    fn help_texts(cmd: &clap::Command, out: &mut Vec<String>) {
+        for s in [cmd.get_about(), cmd.get_long_about()]
+            .into_iter()
+            .flatten()
+        {
+            out.push(format!("{}: {s}", cmd.get_name()));
+        }
+        for a in cmd.get_arguments() {
+            for s in [a.get_help(), a.get_long_help()].into_iter().flatten() {
+                out.push(format!("{} {}: {s}", cmd.get_name(), a.get_id()));
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            help_texts(sub, out);
+        }
+    }
+
+    /// Help is product surface: it never points at the repository's
+    /// design records or internal documents.
+    #[test]
+    fn help_never_cites_internal_documents() {
+        let mut texts = Vec::new();
+        help_texts(&super::Cli::command(), &mut texts);
+        let bad: Vec<&String> = texts
+            .iter()
+            .filter(|t| {
+                let cites_adr = t.match_indices("ADR").any(|(i, _)| {
+                    t[i + 3..]
+                        .trim_start_matches([' ', '-'])
+                        .starts_with(|c: char| c.is_ascii_digit())
+                });
+                cites_adr || t.contains("docs/adr") || t.contains("DESIGN.md")
+            })
+            .collect();
+        assert!(bad.is_empty(), "help cites internal documents: {bad:#?}");
+    }
 }

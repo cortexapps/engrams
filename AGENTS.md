@@ -197,6 +197,13 @@ and the site's CLI reference describe the user side.
   ADRs, commit messages, or PR text. Describe the case generically ("a private channel the
   app is in", "the first resumed thread in production") and invent neutral fixture names
   (`#ops-private`, `U1`, `s-old`). What a deployment is called belongs in the deploy repo.
+- **The product surface never cites ADRs or internal documents.** Text a user or an
+  agent session can see — CLI help and output, TUI text, web UI copy, error messages,
+  API responses, prompts the orchestrator sends, the site — says what the thing does in
+  plain words. It never says "ADR 0124", "per DESIGN.md", "phase 2", or names a
+  decision record, a PR, or a campaign. Those belong in code comments, commit messages,
+  PR text, and `docs/`. A clap `///` doc comment *is* help text, not a code comment.
+  `engram-cli`'s `help_never_cites_internal_documents` test guards the CLI help.
 
 **Commits & ADRs**
 - One logical change per commit; don't bundle unrelated changes.
