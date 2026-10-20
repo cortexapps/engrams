@@ -90,26 +90,30 @@ end
 FORMULA
 }
 
+TMP=""
+cleanup() { [[ -n "$TMP" ]] && rm -rf "$TMP"; }
+trap cleanup EXIT
+
 publish() {
-  local formula="$1" version="$2" tmp path content sha
+  local formula="$1" version="$2" path content current sha=""
   : "${HOMEBREW_TAP_TOKEN:?HOMEBREW_TAP_TOKEN is needed to write to $TAP_REPO}"
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
-  gh release download "v$version" --repo "$REPO" --pattern SHA256SUMS --dir "$tmp"
-  render "$formula" "$version" "$tmp/SHA256SUMS" > "$tmp/formula.rb"
+  TMP="$(mktemp -d)"
+  gh release download "v$version" --repo "$REPO" --pattern SHA256SUMS --dir "$TMP"
+  render "$formula" "$version" "$TMP/SHA256SUMS" > "$TMP/formula.rb"
   path="Formula/$formula.rb"
   export GH_TOKEN="$HOMEBREW_TAP_TOKEN"
-  # The sha of the file that is there now, if any. The contents API needs it
-  # for an update and refuses an update of a file that changed under us.
-  sha="$(gh api "repos/$TAP_REPO/contents/$path" --jq .sha 2>/dev/null || true)"
-  if [[ -n "$sha" ]]; then
-    gh api "repos/$TAP_REPO/contents/$path" --jq .content | tr -d '\n' | base64 -d > "$tmp/current.rb"
-    if cmp -s "$tmp/current.rb" "$tmp/formula.rb"; then
+  # The file that is there now, if any. The contents API needs its sha for
+  # an update and refuses an update of a file that changed under us. A 404
+  # (gh exits 1) means the first publish of this formula.
+  if current="$(gh api "repos/$TAP_REPO/contents/$path" 2>/dev/null)"; then
+    sha="$(jq -r .sha <<< "$current")"
+    jq -r .content <<< "$current" | tr -d '\n' | base64 -d > "$TMP/current.rb"
+    if cmp -s "$TMP/current.rb" "$TMP/formula.rb"; then
       echo "$TAP_REPO: $path is at $version already"
       return 0
     fi
   fi
-  content="$(base64 < "$tmp/formula.rb" | tr -d '\n')"
+  content="$(base64 < "$TMP/formula.rb" | tr -d '\n')"
   gh api -X PUT "repos/$TAP_REPO/contents/$path" \
     -f message="$formula $version" \
     -f content="$content" \
