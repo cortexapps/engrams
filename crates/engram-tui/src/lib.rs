@@ -18,6 +18,7 @@ pub mod render;
 pub mod sessions;
 pub mod shell;
 pub mod terminal;
+pub mod tools;
 pub mod transcript;
 pub mod wrap;
 

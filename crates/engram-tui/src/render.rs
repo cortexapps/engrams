@@ -328,22 +328,27 @@ fn paint_src<'e>(
             let tail_style = th.dim;
             match &e.cell {
                 Cell::Tool { .. } | Cell::Diff { .. } => {
+                    // A folded head sits at the head's indent; a folded
+                    // body under its `⎿` gutter.
+                    let after_head =
+                        row > 0 && e.layout_row(row - 1).is_some_and(|p| p.src == Src::Head);
+                    let shift = if after_head { 0 } else { 2 };
                     let folded = lr.row.end.saturating_sub(lr.row.start);
                     let mut cx = put(
                         buf,
-                        body_x + 2,
+                        body_x + shift,
                         y,
                         "… ",
-                        body_w.saturating_sub(2),
+                        body_w.saturating_sub(shift),
                         tail_style,
                     );
-                    cx += put_num(buf, body_x + 2 + cx, y, folded as u64, tail_style);
+                    cx += put_num(buf, body_x + shift + cx, y, folded as u64, tail_style);
                     put(
                         buf,
-                        body_x + 2 + cx,
+                        body_x + shift + cx,
                         y,
                         " more lines (Ctrl+O)",
-                        body_w.saturating_sub(2 + cx),
+                        body_w.saturating_sub(shift + cx),
                         tail_style,
                     );
                 }

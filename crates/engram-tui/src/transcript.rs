@@ -236,6 +236,8 @@ pub struct Layout {
 
 /// Lines of a collapsed tool/exec body before the `… N more lines` row.
 pub const COLLAPSE_LINES: usize = 5;
+/// Rows of a collapsed tool head (a long command) before that row.
+pub const HEAD_LINES: usize = 3;
 
 #[derive(Debug)]
 pub struct Entry {
@@ -450,6 +452,38 @@ fn push_body(
     }
 }
 
+/// A head (a tool's arguments) collapses to its first rows unless
+/// expanded, like a body.
+fn push_head(
+    text: &str,
+    expanded: bool,
+    width: u16,
+    out: &mut Vec<LayoutRow>,
+    scratch: &mut Vec<Row>,
+) {
+    scratch.clear();
+    wrap_into(text, width, scratch);
+    let total = scratch.len();
+    let shown = if expanded {
+        total
+    } else {
+        total.min(HEAD_LINES)
+    };
+    out.extend(scratch[..shown].iter().map(|&row| LayoutRow {
+        src: Src::Head,
+        row,
+    }));
+    if shown < total {
+        out.push(LayoutRow {
+            src: Src::Tail,
+            row: Row {
+                start: shown as u32,
+                end: total as u32,
+            },
+        });
+    }
+}
+
 fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
     let mut scratch = Vec::new();
     match cell {
@@ -479,7 +513,7 @@ fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
             expanded,
             ..
         } => {
-            push_rows(Src::Head, args, width, out, &mut scratch);
+            push_head(args, *expanded, width, out, &mut scratch);
             push_body(
                 result.as_deref().unwrap_or(""),
                 *expanded,

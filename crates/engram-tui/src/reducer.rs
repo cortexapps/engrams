@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::event::{parse_plan, parse_plan_decision, parse_questions, Event};
 use crate::markdown::{Markdown, Rendered};
+use crate::tools::{canonical as canonical_tool, summarize};
 use crate::transcript::{Cell, Marker, ToolState, Transcript};
 
 /// Session states in which no run can be in flight.
@@ -501,8 +502,8 @@ impl Reducer {
                 }
                 self.close_active();
                 let i = self.transcript.push(Cell::Tool {
+                    args: summarize(&tool_name, &args_summary).into(),
                     name: tool_name.into(),
-                    args: args_summary.into(),
                     result: None,
                     state: ToolState::Running,
                     duration_ms: None,
@@ -562,8 +563,8 @@ impl Reducer {
                 }
                 self.close_active();
                 let i = self.transcript.push(Cell::Tool {
+                    args: summarize(&name, &args_json).into(),
                     name: name.into(),
-                    args: args_json.into(),
                     result: None,
                     state: ToolState::Running,
                     duration_ms: None,
@@ -823,23 +824,6 @@ impl Reducer {
         self.open_execs.insert(exec_id.to_string(), i);
         i
     }
-}
-
-/// `mcp__x__exit_plan_mode`, `ExitPlanMode`, `exit_plan_mode` → `exit_plan_mode`.
-fn canonical_tool(name: &str) -> String {
-    let base = name.rsplit("__").next().unwrap_or(name);
-    let mut out = String::with_capacity(base.len() + 4);
-    for (i, c) in base.chars().enumerate() {
-        if c.is_ascii_uppercase() {
-            if i > 0 {
-                out.push('_');
-            }
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

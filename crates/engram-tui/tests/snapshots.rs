@@ -193,3 +193,49 @@ fn search_jumps_to_the_hit_60x12() {
     app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
     assert!(app.attached.as_ref().unwrap().search.is_none());
 }
+
+#[test]
+fn tool_rows_show_the_subject_of_each_call_70x16() {
+    let mut app = common::attached_app(false, 70, 16);
+    for e in [
+        common::env(9, "run_started", r#"{"run_id":"r2","prompt_id":"p2"}"#),
+        common::env(
+            10,
+            "tool_call_started",
+            r#"{"run_id":"r2","tool_call_id":"t2","tool_name":"Grep","args_summary":"{\"pattern\":\"fn main\",\"path\":\"src\",\"output_mode\":\"content\"}"}"#,
+        ),
+        common::env(
+            11,
+            "tool_call_completed",
+            r#"{"run_id":"r2","tool_call_id":"t2","tool_name":"Grep","ok":true,"duration_ms":3,"result_summary":"src/main.rs:1:fn main() {"}"#,
+        ),
+        common::env(
+            12,
+            "tool_call_started",
+            r#"{"run_id":"r2","tool_call_id":"t3","tool_name":"Bash","args_summary":"{\"command\":\"cd /work && for f in a b c d e f g h i j k l m n o p; do\\n  echo \\\"=== $f\\\"\\n  cat $f.txt\\ndone\\necho done\\necho again\\necho more\",\"description\":\"Print the files\"}"}"#,
+        ),
+        common::env(
+            13,
+            "tool_call_completed",
+            r#"{"run_id":"r2","tool_call_id":"t3","tool_name":"Bash","ok":false,"duration_ms":30,"result_summary":"cat: a.txt: No such file or directory"}"#,
+        ),
+    ] {
+        app.update(Msg::Net(NetMsg::Live {
+            session_id: "s-1".into(),
+            envelope: e,
+        }));
+    }
+    let shot = frame(&mut app, 70, 16);
+    let shot = shot
+        .lines()
+        .map(|l| {
+            if l.contains("working") {
+                "<footer: working>".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(shot);
+}
