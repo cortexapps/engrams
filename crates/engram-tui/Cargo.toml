@@ -35,6 +35,11 @@ unicode-segmentation = "1"
 vt100 = "0.18"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
+# The start-up probe polls the terminal for its replies with a deadline.
+# Already in the tree through crossterm.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["event"] }
+
 [dev-dependencies]
 insta = "1"
 proptest.workspace = true

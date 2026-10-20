@@ -10,6 +10,25 @@ pub struct SessionRow {
     pub status: String,
     /// Seconds since the last activity, when the timestamp parsed.
     pub age_secs: Option<u64>,
+    /// A question or a plan waits on the user (the task's
+    /// `awaiting_review` status).
+    pub needs_you: bool,
+    /// The session's newest run event. `None` until it was asked (only
+    /// active sessions are), or when the read failed.
+    pub running: Option<RunState>,
+}
+
+/// What a session's newest run event says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunState {
+    /// Started (or continued) and not ended.
+    Running,
+    Ended {
+        ok: bool,
+    },
+    Interrupted,
+    /// No run yet.
+    NoRun,
 }
 
 /// The marker for a session state (ADR 0124: meaning without color).
@@ -28,7 +47,9 @@ pub fn marker(status: &str) -> &'static str {
 }
 
 /// Rows from a task listing, one per task's primary session.
-pub fn rows_from_tasks(tasks: &[Task], now_unix: u64) -> Vec<SessionRow> {
+/// `state_known` is false when the server could not reach the sessions:
+/// a task without one is then unknown, not dead.
+pub fn rows_from_tasks(tasks: &[Task], now_unix: u64, state_known: bool) -> Vec<SessionRow> {
     tasks
         .iter()
         .filter_map(|t| {
@@ -40,9 +61,11 @@ pub fn rows_from_tasks(tasks: &[Task], now_unix: u64) -> Vec<SessionRow> {
                 .filter(|t| !t.is_empty())
                 .or_else(|| session.and_then(|s| s.suggested_title.clone()))
                 .unwrap_or_else(|| s.session_id.clone());
-            let status = session
-                .map(|s| s.status.clone())
-                .unwrap_or_else(|| "dead".to_string());
+            let status = match session {
+                Some(s) => s.status.clone(),
+                None if state_known => "dead".to_string(),
+                None => String::new(),
+            };
             let age_secs = session
                 .and_then(|s| {
                     s.last_event_at
@@ -56,6 +79,8 @@ pub fn rows_from_tasks(tasks: &[Task], now_unix: u64) -> Vec<SessionRow> {
                 title,
                 status,
                 age_secs,
+                needs_you: t.status == "awaiting_review",
+                running: None,
             })
         })
         .collect()

@@ -10,12 +10,22 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::relay::Relay;
+
+/// Each pane and each reopened shell gets its own generation, so the
+/// program status can tell a fresh relay from the one it replaced.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// No scrollback: the pane is a window on the live screen, and a
 /// multiplexer inside the shell owns history if the user wants it.
 const SCROLLBACK: usize = 0;
 
 pub struct ShellPane {
-    parser: vt100::Parser,
+    parser: vt100::Parser<Relay>,
     pub title: String,
     pub cols: u16,
     pub rows: u16,
@@ -26,6 +36,10 @@ pub struct ShellPane {
     /// The server ended the shell (or the dial failed): the reason, shown
     /// until the pane is closed or reopened.
     pub ended: Option<String>,
+    generation: u64,
+    /// The last chunk ended on ESC: a `c` first in the next one is a full
+    /// reset.
+    esc_pending: bool,
 }
 
 impl std::fmt::Debug for ShellPane {
@@ -42,17 +56,25 @@ impl std::fmt::Debug for ShellPane {
 }
 
 impl ShellPane {
-    pub fn new(cols: u16, rows: u16) -> Self {
+    /// `program_status`: the outer terminal takes OSC 7501 reports, so
+    /// the pane answers a program's detection query.
+    pub fn new(cols: u16, rows: u16, program_status: bool) -> Self {
         let (c, r) = nonzero(cols, rows);
         ShellPane {
-            parser: vt100::Parser::new(r, c, SCROLLBACK),
+            parser: vt100::Parser::new_with_callbacks(r, c, SCROLLBACK, Relay::new(program_status)),
             title: String::new(),
             cols: c.get(),
             rows: r.get(),
             focused: true,
             connected: false,
             ended: None,
+            generation: next_generation(),
+            esc_pending: false,
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Resize the screen; true when the size changed (the socket needs a
@@ -68,16 +90,55 @@ impl ShellPane {
         true
     }
 
-    pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+    /// Parse output. Returns the bytes the program asked for (query
+    /// replies), to send back on the socket.
+    pub fn feed(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
+        // A full reset (RIS, `ESC c`) removes every record, and vt100
+        // handles it without a callback: split the chunk at each one. An
+        // ESC ends any string or sequence vte is inside, so the pair is a
+        // reset wherever it appears.
+        let mut start = 0;
+        for i in 0..bytes.len() {
+            let after_esc = if i == 0 {
+                self.esc_pending
+            } else {
+                bytes[i - 1] == 0x1b
+            };
+            if bytes[i] == b'c' && after_esc {
+                self.parser.process(&bytes[start..=i]);
+                self.parser.callbacks_mut().reset();
+                start = i + 1;
+            }
+        }
+        self.parser.process(&bytes[start..]);
+        if let Some(&last) = bytes.last() {
+            self.esc_pending = last == 0x1b;
+        }
+        self.parser.callbacks_mut().take_replies()
+    }
+
+    /// The program status records programs in the shell reported.
+    pub fn relay(&self) -> &Relay {
+        self.parser.callbacks()
+    }
+
+    /// The shell ended: what its programs were working on or blocked on
+    /// is no longer true.
+    pub fn end(&mut self, reason: String) {
+        self.connected = false;
+        self.ended = Some(reason);
+        self.parser.callbacks_mut().drop_transient();
     }
 
     /// Fresh screen for a reopened shell.
     pub fn reset(&mut self) {
         let (c, r) = nonzero(self.cols, self.rows);
-        self.parser = vt100::Parser::new(r, c, SCROLLBACK);
+        let enabled = self.parser.callbacks().enabled;
+        self.parser = vt100::Parser::new_with_callbacks(r, c, SCROLLBACK, Relay::new(enabled));
         self.ended = None;
         self.connected = false;
+        self.generation = next_generation();
+        self.esc_pending = false;
     }
 
     pub fn screen(&self) -> &vt100::Screen {
@@ -324,7 +385,7 @@ mod tests {
 
     #[test]
     fn the_pane_parses_output_and_follows_the_programs_modes() {
-        let mut p = ShellPane::new(10, 3);
+        let mut p = ShellPane::new(10, 3, false);
         p.feed(b"hi\r\n\x1b[1;31mred\x1b[0m");
         let s = p.screen();
         assert_eq!(s.cell(0, 0).unwrap().contents(), "h");
@@ -348,13 +409,13 @@ mod tests {
         assert!(!p.resize(20, 5));
         assert_eq!((p.cols, p.rows), (20, 5));
         // Zero is never a screen size.
-        let z = ShellPane::new(0, 0);
+        let z = ShellPane::new(0, 0, false);
         assert_eq!((z.cols, z.rows), (1, 1));
     }
 
     #[test]
     fn paint_copies_cells_and_skips_wide_continuations() {
-        let mut p = ShellPane::new(6, 2);
+        let mut p = ShellPane::new(6, 2, false);
         p.feed("a日b".as_bytes());
         let area = Rect::new(0, 0, 6, 2);
         let mut buf = Buffer::empty(area);

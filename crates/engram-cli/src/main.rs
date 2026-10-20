@@ -9,6 +9,7 @@
 
 mod commands;
 mod output;
+mod status;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -389,7 +390,12 @@ async fn run(cli: Cli) -> CliResult {
     };
     match command {
         Commands::Auth { cmd } => match cmd {
-            AuthCmd::Login => auth::login(&ctx.host).await,
+            AuthCmd::Login => {
+                let st = status::Status::new("Sign in");
+                let r = auth::login(&ctx.host, &st).await;
+                st.finish(&r, "Signed in", "Sign-in failed");
+                r
+            }
             AuthCmd::Logout => auth::logout(&ctx.host).await,
             AuthCmd::Status => auth::status(&ctx.host, json).await,
         },
@@ -412,7 +418,15 @@ async fn run(cli: Cli) -> CliResult {
                     id,
                     cmd,
                     timeout_secs,
-                } => session::exec(&c, &id, &cmd, timeout_secs, json).await,
+                } => {
+                    // The command line can hold secrets: the record names
+                    // the session, never the command.
+                    let st = status::Status::new("Command");
+                    st.working("Running a command in the session");
+                    let r = session::exec(&c, &id, &cmd, timeout_secs, json).await;
+                    st.finish(&r, "The command exited 0", "The command failed");
+                    r
+                }
                 SessionCmd::Delete { id } => session::remove(&c, &id).await,
                 // Handled before the runtime starts, like `tui`.
                 SessionCmd::Shell { .. } => Ok(()),

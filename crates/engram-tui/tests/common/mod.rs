@@ -64,18 +64,24 @@ pub fn rows() -> Vec<SessionRow> {
             title: "Add a README".into(),
             status: "active".into(),
             age_secs: Some(90),
+            needs_you: false,
+            running: None,
         },
         SessionRow {
             session_id: "s-2".into(),
             title: "Fix the flaky test".into(),
             status: "idle".into(),
             age_secs: Some(7200),
+            needs_you: false,
+            running: None,
         },
         SessionRow {
             session_id: "s-3".into(),
             title: "Migrate the CI".into(),
             status: "parked".into(),
             age_secs: Some(200_000),
+            needs_you: false,
+            running: None,
         },
     ]
 }

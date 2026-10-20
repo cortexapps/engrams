@@ -12,9 +12,10 @@ use crossterm::event::{
 use crate::commands::{self, Slash};
 use crate::composer::Composer;
 use crate::event::{Envelope, Event};
+use crate::inbox::Inbox;
 use crate::keymap::{resolve, Action};
-use crate::reducer::{is_terminal, Reducer};
-use crate::sessions::{fuzzy, ProfileRow, SessionRow};
+use crate::reducer::{is_terminal, Reducer, RunOutcome};
+use crate::sessions::{fuzzy, ProfileRow, RunState, SessionRow};
 use crate::shell::ShellPane;
 use crate::transcript::Cell;
 
@@ -124,9 +125,29 @@ pub enum Msg {
     Net(NetMsg),
 }
 
+/// A result of the attached session the user has not seen yet: the
+/// program status reports it as `done` or `error` until deliberate input
+/// (a key, a paste, a click, a scroll) acknowledges it. Only live events
+/// make one; a history replay never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unseen {
+    Done,
+    RunFailed,
+    SessionFailed,
+}
+
 #[derive(Debug)]
 pub enum NetMsg {
     Sessions(Result<Vec<SessionRow>, String>),
+    /// Which listed sessions have a run in progress (active ones only):
+    /// the end of a session-list load. `known` is false when the server
+    /// could not say what state the sessions are in.
+    SessionsRunning {
+        running: Vec<(String, RunState)>,
+        known: bool,
+    },
+    /// The orchestrator refused the API key: the user has to sign in.
+    AuthFailed,
     Profiles(Result<Vec<ProfileRow>, String>),
     /// The task was created: its primary session id and title.
     Created(Result<(String, String), String>),
@@ -605,9 +626,21 @@ pub struct App {
     pub width: u16,
     pub height: u16,
     pub note: Option<(String, Instant)>,
-    /// Desktop notifications the runtime emits (bell + OSC) when the
-    /// terminal is unfocused.
-    pub alerts: Vec<String>,
+    /// The attached session's result the user has not seen yet.
+    pub unseen: Option<Unseen>,
+    /// The orchestrator refused the API key; cleared by the next success.
+    pub auth_failed: bool,
+    /// Counts attaches, so the program status can tell a new session
+    /// from a state change of the same one.
+    pub attach_seq: u64,
+    /// The terminal takes OSC 7501 reports (set by the runtime).
+    pub program_status: bool,
+    /// The other sessions, for the terminal.
+    pub inbox: Inbox,
+    /// A background session-list poll is in flight.
+    refreshing: bool,
+    /// Session-list loads that failed in a row: the poll backs off.
+    poll_failures: u32,
     pub quit: bool,
     ctrl_c_at: Option<Instant>,
     esc_at: Option<Instant>,
@@ -634,7 +667,13 @@ impl App {
             width,
             height,
             note: None,
-            alerts: Vec::new(),
+            unseen: None,
+            auth_failed: false,
+            attach_seq: 0,
+            program_status: false,
+            inbox: Inbox::default(),
+            refreshing: false,
+            poll_failures: 0,
             quit: false,
             ctrl_c_at: None,
             esc_at: None,
@@ -642,6 +681,35 @@ impl App {
             prompt_seq: 0,
             cmds: vec![Cmd::LoadSessions],
         }
+    }
+
+    /// Poll the session list in the background: it feeds the terminal's
+    /// view of the other sessions and keeps the list live. Skipped while a
+    /// poll is in flight, and when nothing would show the result.
+    pub fn poll_sessions(&mut self) {
+        if self.refreshing || !self.wants_poll() {
+            return;
+        }
+        self.refreshing = true;
+        self.cmds.push(Cmd::LoadSessions);
+    }
+
+    /// How long until the next poll: 5 s while the list or the palette
+    /// is on screen, 15 s for the terminal's records alone, doubled per
+    /// failed load in a row up to a minute.
+    pub fn poll_interval(&self) -> Duration {
+        let base = if self.screen == Screen::Sessions || self.palette {
+            5
+        } else {
+            15
+        };
+        Duration::from_secs((base << self.poll_failures.min(4)).min(60))
+    }
+
+    /// Is anything showing the session list: the terminal's records, the
+    /// list, or the palette?
+    pub fn wants_poll(&self) -> bool {
+        self.program_status || self.screen == Screen::Sessions || self.palette
     }
 
     pub fn note(&mut self, text: impl Into<String>) {
@@ -689,6 +757,9 @@ impl App {
         let mut a = Attached::new(session_id.to_string(), title);
         a.reducer.fold = !self.inline;
         self.attached = Some(a);
+        self.attach_seq += 1;
+        self.unseen = None;
+        self.inbox.opened(session_id);
         self.screen = Screen::Attached;
         self.palette = false;
         self.cmds.push(Cmd::Attach {
@@ -700,6 +771,8 @@ impl App {
         if self.attached.take().is_some() {
             self.cmds.push(Cmd::Detach);
         }
+        self.attach_seq += 1;
+        self.unseen = None;
         self.screen = Screen::Sessions;
         self.sessions.filter.clear();
         self.sessions.loading = true;
@@ -729,6 +802,9 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) {
+        if self.unseen.is_some() && acknowledges(&msg) {
+            self.unseen = None;
+        }
         match msg {
             Msg::Resize(w, h) => {
                 self.width = w;
@@ -976,7 +1052,7 @@ impl App {
         match &mut a.shell {
             Some(sh) => sh.focused = true,
             None => {
-                a.shell = Some(ShellPane::new(cols, rows));
+                a.shell = Some(ShellPane::new(cols, rows, self.program_status));
                 self.cmds.push(Cmd::ShellOpen {
                     session_id: a.session_id.clone(),
                     cols,
@@ -1479,12 +1555,41 @@ impl App {
 
     fn net(&mut self, n: NetMsg) {
         match n {
+            NetMsg::AuthFailed => self.auth_failed = true,
+            NetMsg::SessionsRunning { running, known } => {
+                self.refreshing = false;
+                // Without session state nothing is known to have changed.
+                if !known {
+                    return;
+                }
+                for r in &mut self.sessions.rows {
+                    r.running = running
+                        .iter()
+                        .find(|(id, _)| *id == r.session_id)
+                        .map(|&(_, run)| run);
+                }
+                let attached = self.attached.as_ref().map(|a| a.session_id.as_str());
+                self.inbox.update(&self.sessions.rows, attached);
+            }
             NetMsg::Sessions(res) => {
                 self.sessions.loading = false;
                 match res {
                     Ok(rows) => {
+                        self.auth_failed = false;
+                        self.poll_failures = 0;
+                        // A refresh reorders the list (newest activity
+                        // first): the selection follows its session.
+                        let keep = self.sessions.selected_row().map(|r| r.session_id.clone());
                         self.sessions.rows = rows;
                         self.sessions.error = None;
+                        let pos = keep.and_then(|id| {
+                            self.sessions
+                                .visible()
+                                .position(|i| self.sessions.rows[i].session_id == id)
+                        });
+                        if let Some(pos) = pos {
+                            self.sessions.selected = pos;
+                        }
                         let n = self.sessions.visible().count();
                         if self.sessions.selected >= n {
                             self.sessions.selected = n.saturating_sub(1);
@@ -1500,7 +1605,11 @@ impl App {
                             }
                         }
                     }
-                    Err(e) => self.sessions.error = Some(e),
+                    Err(e) => {
+                        self.refreshing = false;
+                        self.poll_failures = self.poll_failures.saturating_add(1);
+                        self.sessions.error = Some(e);
+                    }
                 }
             }
             NetMsg::Profiles(res) => {
@@ -1586,20 +1695,25 @@ impl App {
                 else {
                     return;
                 };
-                let was_awaiting = a.reducer.awaiting_decision();
                 let was_running = a.reducer.is_running();
+                let was_failed = a.reducer.status.as_deref().is_some_and(is_failed);
                 a.apply_envelope(&envelope);
                 if let Some(t) = a.reducer.title.take() {
                     a.title = t;
                 }
-                let awaiting = a.reducer.awaiting_decision();
                 let running = a.reducer.is_running();
-                if !self.focused {
-                    if awaiting && !was_awaiting {
-                        self.alerts.push(format!("{}: needs you", a.title));
-                    } else if was_running && !running && !awaiting {
-                        self.alerts.push(format!("{}: done", a.title));
-                    }
+                if running {
+                    // A new run supersedes the last result.
+                    self.unseen = None;
+                } else if was_running && !a.reducer.awaiting_decision() && !a.reducer.resuming {
+                    self.unseen = match a.reducer.last_run {
+                        Some(RunOutcome::Failed) => Some(Unseen::RunFailed),
+                        Some(RunOutcome::Interrupted) => None,
+                        _ => Some(Unseen::Done),
+                    };
+                }
+                if !was_failed && a.reducer.status.as_deref().is_some_and(is_failed) {
+                    self.unseen = Some(Unseen::SessionFailed);
                 }
             }
             NetMsg::Status {
@@ -1647,6 +1761,7 @@ impl App {
                 {
                     a.reconnecting = None;
                     a.error = None;
+                    self.auth_failed = false;
                 }
             }
             NetMsg::Failed { session_id, error } => {
@@ -1703,8 +1818,9 @@ impl App {
                 }
             }
             NetMsg::ShellOutput { session_id, bytes } => {
-                if let Some(sh) = self.shell_of(&session_id) {
-                    sh.feed(&bytes);
+                let reply = self.shell_of(&session_id).and_then(|sh| sh.feed(&bytes));
+                if let Some(reply) = reply {
+                    self.cmds.push(Cmd::ShellInput(reply));
                 }
             }
             NetMsg::ShellTitle { session_id, title } => {
@@ -1714,8 +1830,7 @@ impl App {
             }
             NetMsg::ShellEnded { session_id, error } => {
                 if let Some(sh) = self.shell_of(&session_id) {
-                    sh.connected = false;
-                    sh.ended = Some(error.unwrap_or_else(|| "the shell exited".to_string()));
+                    sh.end(error.unwrap_or_else(|| "the shell exited".to_string()));
                 }
             }
         }
@@ -1745,5 +1860,24 @@ impl App {
             session_id: a.session_id.clone(),
             before_idx: before,
         });
+    }
+}
+
+/// A session status that means the session stopped on a failure.
+pub fn is_failed(status: &str) -> bool {
+    matches!(status, "failed" | "dead" | "host_lost")
+}
+
+/// Input that shows the user is at the terminal: a key press, a paste, a
+/// click or a scroll. Mouse movement and focus are not enough.
+fn acknowledges(msg: &Msg) -> bool {
+    match msg {
+        Msg::Key(k) => k.kind != KeyEventKind::Release,
+        Msg::Paste(_) => true,
+        Msg::Mouse(m) => matches!(
+            m.kind,
+            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ),
+        _ => false,
     }
 }
