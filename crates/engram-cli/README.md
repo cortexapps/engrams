@@ -47,10 +47,10 @@ below the transcript; the same key hands the keys back to the agent.
 `engrams session shell <id>` is the same shell in the terminal itself, with
 no UI around it. `NO_COLOR` turns color off. The TUI reports the session's
 state to the terminal over the Program Status Protocol (OSC 7501) when the
-terminal answers its probe (`ENGRAMS_PROGRAM_STATUS=1|0` overrides); that
-terminal presents the alert itself. Elsewhere an unfocused session that needs
-you or finishes posts one desktop notification (OSC 9) where the terminal is
-known to show it, else rings the bell. The crate is `crates/engram-tui`.
+terminal answers its probe (`ENGRAMS_PROGRAM_STATUS=1|0` overrides). An
+unfocused session that needs you or finishes also posts one desktop
+notification (OSC 9) where the terminal is known to show it, else rings the
+bell. The crate is `crates/engram-tui`.
 
 Output contract: default = human tables; `--json` = pretty JSON on stdout
 and nothing else; errors on stderr as `engrams: …` + exit 1. `session exec`

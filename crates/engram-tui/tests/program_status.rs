@@ -388,34 +388,19 @@ fn the_probe_reads_both_replies_and_stops_at_the_sentinel() {
     );
 }
 
-/// A terminal that takes reports gets the record change as its alert and
-/// nothing else: a bell or a notification on top plays a second sound.
-#[test]
-fn a_terminal_that_takes_reports_gets_no_extra_alert() {
-    assert_eq!(Alert::detect(true), Alert::None);
-    let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
-    frame(&mut r, &app);
-    app.update(Msg::Focus(false));
-    start_run(&mut app);
-    frame(&mut r, &app);
-    live(&mut app, 10, "tool_call_requested", QUESTION);
-    let out = frame(&mut r, &app);
-    assert!(out.contains("state=blocked"), "{out:?}");
-    assert!(!out.contains('\x07'), "no bell, no OSC 9: {out:?}");
-}
-
-/// Elsewhere the bell is one byte and nothing else.
+/// The bell is one byte and nothing else, beside the record on a terminal
+/// that takes reports (the record makes its sound, the bell its banner).
 #[test]
 fn the_bell_alert_is_the_bell_alone() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::with_alert(false, Alert::Bell);
+    let mut r = Reporter::with_alert(true, Alert::Bell);
     frame(&mut r, &app);
     app.update(Msg::Focus(false));
     start_run(&mut app);
     frame(&mut r, &app);
     live(&mut app, 10, "tool_call_requested", QUESTION);
     let out = frame(&mut r, &app);
-    assert!(out.starts_with('\x07'), "{out:?}");
+    assert!(out.starts_with("\x07\x1b]7501;state=blocked"), "{out:?}");
+    assert_eq!(out.matches('\x07').count(), 1, "{out:?}");
     assert!(!out.contains("\x1b]9;"), "{out:?}");
 }

@@ -205,10 +205,10 @@ The TUI tells your terminal what the session needs from you. A terminal that sup
 (OSC 7501) gets one status: `working` during a run (with the agent's task list as a
 percentage), `blocked` when a question, a plan approval or a sign-in waits on you, `done` or
 `error` when a run ends, and `idle` otherwise. A result stays `done` until you press a key,
-paste, click or scroll. Such a terminal decides how to tell you about a change, so the TUI
-sends it no other alert. Other terminals see the state in the window title, and when the
-terminal is not focused, a question, a finished run or a failure posts a desktop notification
-(OSC 9) on iTerm2, Ghostty, Kitty, Warp and WezTerm, and rings the bell elsewhere.
+paste, click or scroll. Other terminals see the state in the window title. When the
+terminal is not focused, a question, a finished run or a failure also posts a desktop
+notification (OSC 9) on iTerm2, Ghostty, Kitty, Warp and WezTerm, and rings the bell
+elsewhere.
 
 Beside that status, the terminal gets one entry for each running subagent, for the sandbox
 while it starts, resumes or moves, and for programs in the shell pane that report their own

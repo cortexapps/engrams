@@ -323,10 +323,10 @@ pub struct Reporter {
 }
 
 impl Reporter {
-    /// A reporter for this terminal: the alert follows from `enabled`
-    /// and the environment (see [`Alert::detect`]).
+    /// A reporter for this terminal: the alert follows from the
+    /// environment (see [`Alert::detect`]).
     pub fn new(enabled: bool) -> Self {
-        Self::with_alert(enabled, Alert::detect(enabled))
+        Self::with_alert(enabled, Alert::detect())
     }
 
     pub fn with_alert(enabled: bool, alert: Alert) -> Self {
@@ -482,14 +482,13 @@ pub fn clear_on_exit(out: &mut impl Write) {
     }
 }
 
-/// How an unfocused terminal is told a session needs the user. One
-/// sequence per alert: a terminal that turns several of them into sounds
-/// plays them all.
+/// How an unfocused terminal is told a session needs the user, beside
+/// the OSC 7501 record. One sequence per alert: a terminal that turns
+/// several of them into sounds plays them all. Chosen from the terminal
+/// alone, as Codex does: a terminal that takes reports still shows the
+/// bell's notification (the record's change makes its own sound).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Alert {
-    /// The terminal takes OSC 7501 reports: the record's change is the
-    /// alert, and the terminal decides how to present it.
-    None,
     /// A desktop notification, on terminals known to show one.
     Osc9,
     /// The bell, everywhere else.
@@ -497,14 +496,11 @@ pub enum Alert {
 }
 
 impl Alert {
-    /// The alert for this terminal: none where reports are taken,
-    /// otherwise OSC 9 where it is known to post a notification (iTerm2,
-    /// Ghostty, Kitty, Warp, WezTerm), else the bell. Inside tmux the
-    /// outer terminal is unknown: the bell, which tmux passes on.
-    pub fn detect(program_status: bool) -> Alert {
-        if program_status {
-            return Alert::None;
-        }
+    /// The alert for this terminal: OSC 9 where it is known to post a
+    /// notification (iTerm2, Ghostty, Kitty, Warp, WezTerm), else the
+    /// bell. Inside tmux the outer terminal is unknown: the bell, which
+    /// tmux passes on.
+    pub fn detect() -> Alert {
         let var = |k: &str| std::env::var(k).unwrap_or_default();
         if !var("TMUX").is_empty() {
             return Alert::Bell;
@@ -525,7 +521,6 @@ impl Alert {
 /// Tell an unfocused terminal that a session needs the user.
 fn alert(how: Alert, at: &Attention, out: &mut impl Write) -> io::Result<()> {
     match how {
-        Alert::None => return Ok(()),
         Alert::Bell => return out.write_all(b"\x07"),
         Alert::Osc9 => {}
     }
