@@ -44,11 +44,14 @@
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::nbd_release::NbdReleaseGuard;
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::{BlobStorage, SandboxBackend};
@@ -166,6 +169,8 @@ async fn cancelled_restore_keeps_the_daemon_and_slot() {
         Some(p) => p,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
 
     let work = tempfile::tempdir().expect("tempdir");
 

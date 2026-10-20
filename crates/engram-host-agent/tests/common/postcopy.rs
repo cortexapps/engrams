@@ -158,12 +158,6 @@ pub fn nbd_devices(count: usize) -> Option<Vec<std::path::PathBuf>> {
     Some(devices)
 }
 
-/// The previous test in this binary destroyed its VMs, but the kernel
-/// clears an NBD device's `pid` and zeroes its `size` only once the
-/// daemon's socket is gone, which lags the destroy by a moment. Attaching
-/// before that returns `EBUSY`. Wait for the kernel's free signal (the
-/// same two signals the slot allocator reads) for a bounded time; a
-/// device that stays busy still fails loudly at attach.
 /// Wait for every device in `devices` to read as free (see
 /// [`wait_until_free`]). A test that re-attaches a device it just
 /// released calls this between the destroy and the next attach.
@@ -173,17 +167,16 @@ pub fn wait_devices_free(devices: &[std::path::PathBuf]) {
     }
 }
 
+/// The previous test in this binary destroyed its VMs, but the kernel
+/// clears an NBD device's `pid` and zeroes its `size` only once the
+/// daemon's socket is gone, which lags the destroy by a moment. Attaching
+/// before that returns `EBUSY`. Wait for the kernel's free signal (the
+/// same two signals the slot allocator reads) for a bounded time; a
+/// device that stays busy still fails loudly at attach.
 fn wait_until_free(dev: &std::path::Path) {
-    let Some(name) = dev.file_name().and_then(|n| n.to_str()) else {
-        return;
-    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let pid_absent = !std::path::Path::new(&format!("/sys/block/{name}/pid")).exists();
-        let size_zero = std::fs::read_to_string(format!("/sys/block/{name}/size"))
-            .map(|s| s.trim() == "0")
-            .unwrap_or(true);
-        if pid_absent && size_zero {
+        if super::nbd_release::kernel_released(dev) {
             return;
         }
         if std::time::Instant::now() >= deadline {

@@ -11,6 +11,8 @@
 #![allow(dead_code)]
 
 #[cfg(target_os = "linux")]
+pub mod nbd_release;
+#[cfg(target_os = "linux")]
 pub mod postcopy;
 
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};

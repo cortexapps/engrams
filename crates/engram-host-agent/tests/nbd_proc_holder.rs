@@ -27,9 +27,12 @@
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use common::nbd_release::NbdReleaseGuard;
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::BlobStorage;
@@ -154,6 +157,8 @@ async fn proc_scan_detects_open_fd_on_nbd_device_with_dead_server() {
         Some(p) => p,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let work = tempfile::tempdir().expect("tempdir");
 
     // A minimal 64 KiB single-chunk image — we never read it; it exists only to

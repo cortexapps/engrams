@@ -28,9 +28,12 @@
 #![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use common::nbd_release::{kernel_released, NbdReleaseGuard};
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::BlobStorage;
@@ -41,21 +44,6 @@ use engram_host_agent::disk_daemon::{
 };
 use engram_host_core::NbdKernel;
 use engram_storage_local::LocalBlobStorage;
-
-/// True when the kernel holds no binding on this device: the sysfs `pid` is
-/// absent or empty, and the block device reports zero size.
-fn device_is_free(nbd_path: &std::path::Path) -> bool {
-    let Some(name) = nbd_path.file_name().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    if pid_file(nbd_path).is_some() {
-        return false;
-    }
-    match std::fs::read_to_string(format!("/sys/block/{name}/size")) {
-        Ok(size) => size.trim() == "0",
-        Err(_) => false,
-    }
-}
 
 /// Clear any stale binding from a prior aborted run, then WAIT for the kernel
 /// to release the device (idempotent).
@@ -79,7 +67,7 @@ fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
         return;
     };
     for attempt in 0..40 {
-        if device_is_free(nbd_path) {
+        if kernel_released(nbd_path) {
             return;
         }
         // Re-send only every fourth pass: DISCONNECT is the request, and the
@@ -152,6 +140,8 @@ async fn connected_devices_reflects_kernel_ground_truth() {
         Some(p) => p,
         None => return,
     };
+    // Declared before the NBD state so that it drops after it.
+    let _release = NbdReleaseGuard::new([&nbd_path]);
     let kernel = HostNbdKernel;
 
     // BEFORE: a freshly-cleared device carries no live binding, so the
