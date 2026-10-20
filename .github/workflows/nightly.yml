@@ -1,0 +1,175 @@
+name: Nightly
+
+# Publish a nightly prerelease of the engrams CLI: the git tag
+# `v<next>-rc.<n>`, a GitHub prerelease with the three binaries, and the
+# `engrams-nightly` formula in the Homebrew tap. The `nightly` channel of the
+# installer and the tap is the newest of these.
+#
+# The version. <next> is the version that the next stable release will have:
+# the version in the source when it is above the newest stable tag (a
+# version-bump PR merged, the release did not run yet), else the next minor
+# of the newest stable tag. <n> is one above the highest rc of <next> so far,
+# so nightlies are in order and a nightly is never below the stable release
+# it precedes. A night with no new commit on main publishes nothing: when a
+# tag already points at HEAD (the last nightly, or a stable release), the run
+# stops in `plan`.
+#
+# This workflow publishes prerelease tags only. A tag without a prerelease
+# suffix is made by release.yml and nothing else (AGENTS.md, Releases); the
+# `release` environment holds the settings-side controls for both.
+#
+# Not a PR check: never make this a required status.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Plan and build, publish nothing.'
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      stable: ${{ steps.plan.outputs.stable }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - name: The run is on main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [[ "$REF" != "refs/heads/main" ]]; then
+            echo "::error::A nightly runs on main only, not on $REF."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Choose the version
+        id: plan
+        run: |
+          set -euo pipefail
+          if [[ -n "$(git tag --points-at HEAD)" ]]; then
+            echo "A tag is at HEAD already ($(git tag --points-at HEAD | tr '\n' ' ')): nothing new to publish."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          stable="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          stable="${stable#v}"
+          [[ -n "$stable" ]] || { echo "::error::No stable release tag found."; exit 1; }
+          source="$(sed -nE 's/^appVersion: "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' deploy/helm/engram/Chart.yaml)"
+          [[ -n "$source" ]] || { echo "::error::deploy/helm/engram/Chart.yaml has no appVersion."; exit 1; }
+          if [[ "$(printf '%s\n%s\n' "$stable" "$source" | sort -V | tail -n 1)" != "$stable" ]]; then
+            next="$source"
+          else
+            IFS=. read -r major minor _ <<< "$stable"
+            next="$major.$((minor + 1)).0"
+          fi
+          last="$(git tag -l "v$next-rc.*" | sed -n 's/^.*-rc\.\([0-9][0-9]*\)$/\1/p' | sort -n | tail -n 1)"
+          version="$next-rc.$(( ${last:-0} + 1 ))"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]] || { echo "::error::Bad version '$version'."; exit 1; }
+          if [[ -n "$(git ls-remote --tags origin "refs/tags/v$version")" ]]; then
+            echo "::error::The tag v$version exists."
+            exit 1
+          fi
+          echo "Nightly $version (stable $stable, source $source, last rc ${last:-none})."
+          {
+            echo "version=$version"
+            echo "stable=$stable"
+            echo "publish=true"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    uses: ./.github/workflows/build-cli.yml
+    permissions:
+      contents: read
+    with:
+      version: ${{ needs.plan.outputs.version }}
+
+  release:
+    name: release ${{ needs.plan.outputs.version }}
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write   # create the git tag and the GitHub prerelease
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      STABLE: ${{ needs.plan.outputs.stable }}
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cli-tools-*
+          path: cli
+          merge-multiple: true
+
+      - name: Check the binaries
+        working-directory: cli
+        run: |
+          set -euo pipefail
+          # upload/download-artifact's ZIP drops Unix mode bits.
+          mv engrams engrams-linux-x64
+          chmod +x engrams-*
+          got="$(./engrams-linux-x64 --version)"
+          if [[ "$got" != "$VERSION" ]]; then
+            echo "::error::The CLI build reports version '$got', not '$VERSION'."
+            exit 1
+          fi
+          sha256sum engrams-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Write the release notes
+        run: |
+          set -euo pipefail
+          {
+            echo "Nightly build of \`main\` at ${SHA:0:12}. Changes since v$STABLE: https://github.com/$REPO/compare/v$STABLE...${SHA:0:12}"
+            echo
+            echo "Install it with \`ENGRAMS_CHANNEL=nightly\` on the installer, or \`brew install cortexapps/tap/engrams-nightly\`."
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create the GitHub prerelease
+        if: ${{ env.DRY_RUN != 'true' }}
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" \
+            --target "$SHA" \
+            --title "v$VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --prerelease \
+            cli/engrams-* cli/SHA256SUMS
+          echo "Released https://github.com/$REPO/releases/tag/v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update the Homebrew formula
+        if: ${{ env.DRY_RUN != 'true' }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: scripts/homebrew-tap.sh publish engrams-nightly "$VERSION"
