@@ -7,7 +7,7 @@ mod common;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use engram_tui::app::{App, Cmd, Msg, NetMsg};
 use engram_tui::sessions::RunState;
-use engram_tui::status::Reporter;
+use engram_tui::status::{Alert, Reporter};
 
 fn live(app: &mut App, idx: i64, kind: &str, payload: &str) {
     app.update(Msg::Net(NetMsg::Live {
@@ -69,7 +69,7 @@ fn with_shell() -> App {
 #[test]
 fn a_subagent_is_a_child_while_it_runs() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     live(&mut app, 9, "run_started", r#"{"run_id":"r2"}"#);
     frame(&mut r, &app);
     live(
@@ -103,7 +103,7 @@ fn a_subagent_is_a_child_while_it_runs() {
 #[test]
 fn the_sandbox_is_a_child_while_it_moves() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     frame(&mut r, &app);
     live(
         &mut app,
@@ -132,7 +132,7 @@ fn the_sandbox_is_a_child_while_it_moves() {
 #[test]
 fn a_program_in_the_shell_reports_through_the_pane() {
     let mut app = with_shell();
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     frame(&mut r, &app);
     // "cargo build" from a program in the remote shell, BEL-terminated.
     shell_output(
@@ -168,7 +168,7 @@ fn the_pane_answers_a_programs_queries() {
 #[test]
 fn a_child_beneath_a_cleared_record_is_sent_again() {
     let mut app = with_shell();
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     shell_output(&mut app, b"\x1b]7501;state=working\x07");
     shell_output(&mut app, b"\x1b]7501;state=done:id=test\x07");
     frame(&mut r, &app);
@@ -184,7 +184,7 @@ fn a_child_beneath_a_cleared_record_is_sent_again() {
 #[test]
 fn leaving_the_session_clears_its_children() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     live(&mut app, 9, "run_started", r#"{"run_id":"r2"}"#);
     live(
         &mut app,
@@ -223,7 +223,7 @@ fn poll(app: &mut App, rows: Vec<engram_tui::sessions::SessionRow>, running: &[(
 #[test]
 fn another_session_that_needs_you_is_a_child() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     frame(&mut r, &app);
     let mut rows = common::rows();
     rows[1].needs_you = true;
@@ -244,7 +244,7 @@ fn another_session_that_needs_you_is_a_child() {
 #[test]
 fn another_session_that_finishes_is_done_and_alerts_until_opened() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     let mut rows = common::rows();
     rows[1].status = "active".into();
     poll(&mut app, rows.clone(), &[("s-2", true)]);
@@ -262,7 +262,7 @@ fn another_session_that_finishes_is_done_and_alerts_until_opened() {
 #[test]
 fn a_poll_without_session_state_changes_nothing() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     let mut rows = common::rows();
     rows[1].status = "active".into();
     poll(&mut app, rows.clone(), &[("s-2", true)]);

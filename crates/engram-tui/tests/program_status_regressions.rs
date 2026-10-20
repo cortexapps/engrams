@@ -8,7 +8,7 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use engram_tui::app::{App, Msg, NetMsg};
 use engram_tui::sessions::SessionRow;
-use engram_tui::status::{attention, Reporter, State};
+use engram_tui::status::{attention, Alert, Reporter, State};
 
 const QUESTION: &str = r#"{"run_id":"r2","tool_call_id":"q1","name":"ask_user_question","args_json":"{\"questions\":[{\"question\":\"Which database?\",\"header\":\"db\",\"options\":[{\"label\":\"Postgres\"},{\"label\":\"SQLite\"}]}]}"}"#;
 
@@ -69,7 +69,7 @@ fn a_session_lost_mid_run_is_an_error_not_working() {
 fn a_question_in_the_first_history_is_not_an_alert() {
     let mut app = App::new(false, 60, 16);
     app.update(Msg::Net(NetMsg::Sessions(Ok(common::rows()))));
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     frame(&mut r, &app);
     app.attach("s-1");
     // The loading frame comes before the history.
@@ -91,7 +91,7 @@ fn a_question_in_the_first_history_is_not_an_alert() {
 #[test]
 fn an_approved_plan_works_through_its_handoff() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     start_run(&mut app);
     live(&mut app, 10, "tool_call_requested", PLAN);
     frame(&mut r, &app);
@@ -127,7 +127,7 @@ fn a_session_that_goes_unreachable_mid_run_has_no_result() {
 #[test]
 fn a_full_reset_in_the_shell_clears_its_records() {
     let mut app = with_shell();
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     shell_output(&mut app, b"\x1b]7501;state=error:id=job\x07");
     frame(&mut r, &app);
     // RIS split across two chunks.
@@ -161,7 +161,7 @@ fn the_attached_sessions_children_come_before_other_sessions() {
         running: Vec::new(),
         known: true,
     }));
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     let out = frame(&mut r, &app);
     assert!(
         out.contains("id=shell/job"),

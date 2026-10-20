@@ -316,15 +316,23 @@ pub struct Reporter {
     prev_seq: u64,
     child_key: Option<ChildKey>,
     last_children: Vec<(String, Vec<u8>)>,
+    alert: Alert,
     /// The inbox revision and alert number already handled.
     inbox_rev: u64,
     inbox_alerted: u64,
 }
 
 impl Reporter {
+    /// A reporter for this terminal: the alert follows from `enabled`
+    /// and the environment (see [`Alert::detect`]).
     pub fn new(enabled: bool) -> Self {
+        Self::with_alert(enabled, Alert::detect(enabled))
+    }
+
+    pub fn with_alert(enabled: bool, alert: Alert) -> Self {
         Reporter {
             enabled,
+            alert,
             last: Vec::with_capacity(512),
             next: Vec::with_capacity(512),
             title: String::with_capacity(128),
@@ -354,6 +362,7 @@ impl Reporter {
             top = top.max(e.seq);
             if !app.focused && e.state.alerts() && Some(e.session_id.as_str()) != attached {
                 alert(
+                    self.alert,
                     &Attention {
                         state: e.state,
                         title: &e.title,
@@ -416,7 +425,7 @@ impl Reporter {
             && at.state.alerts()
             && !app.focused
         {
-            alert(&at, out)?;
+            alert(self.alert, &at, out)?;
         }
         self.prev = Some(at.state);
         // Before its history the session has no baseline yet: the first
@@ -473,9 +482,53 @@ pub fn clear_on_exit(out: &mut impl Write) {
     }
 }
 
-/// The bell and a desktop notification (OSC 9, OSC 777). Terminals that
-/// know neither ignore the sequences.
-fn alert(at: &Attention, out: &mut impl Write) -> io::Result<()> {
+/// How an unfocused terminal is told a session needs the user. One
+/// sequence per alert: a terminal that turns several of them into sounds
+/// plays them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alert {
+    /// The terminal takes OSC 7501 reports: the record's change is the
+    /// alert, and the terminal decides how to present it.
+    None,
+    /// A desktop notification, on terminals known to show one.
+    Osc9,
+    /// The bell, everywhere else.
+    Bell,
+}
+
+impl Alert {
+    /// The alert for this terminal: none where reports are taken,
+    /// otherwise OSC 9 where it is known to post a notification (iTerm2,
+    /// Ghostty, Kitty, Warp, WezTerm), else the bell. Inside tmux the
+    /// outer terminal is unknown: the bell, which tmux passes on.
+    pub fn detect(program_status: bool) -> Alert {
+        if program_status {
+            return Alert::None;
+        }
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        if !var("TMUX").is_empty() {
+            return Alert::Bell;
+        }
+        let osc9 = matches!(
+            var("TERM_PROGRAM").as_str(),
+            "iTerm.app" | "ghostty" | "WarpTerminal" | "WezTerm"
+        ) || var("TERM") == "xterm-kitty"
+            || !var("KITTY_WINDOW_ID").is_empty();
+        if osc9 {
+            Alert::Osc9
+        } else {
+            Alert::Bell
+        }
+    }
+}
+
+/// Tell an unfocused terminal that a session needs the user.
+fn alert(how: Alert, at: &Attention, out: &mut impl Write) -> io::Result<()> {
+    match how {
+        Alert::None => return Ok(()),
+        Alert::Bell => return out.write_all(b"\x07"),
+        Alert::Osc9 => {}
+    }
     let mut text = String::with_capacity(at.title.len() + 16);
     push_clean(
         &mut text,
@@ -488,7 +541,7 @@ fn alert(at: &Attention, out: &mut impl Write) -> io::Result<()> {
         State::Error => ": failed",
         _ => ": done",
     });
-    write!(out, "\x07\x1b]9;{text}\x07\x1b]777;notify;{APP};{text}\x07")
+    write!(out, "\x1b]9;{text}\x07")
 }
 
 /// One record as a report carries it.

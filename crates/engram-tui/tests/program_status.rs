@@ -6,7 +6,7 @@ mod common;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use engram_tui::app::{App, Msg, NetMsg};
-use engram_tui::status::{attention, Kind, Note, Reporter, State};
+use engram_tui::status::{attention, Alert, Kind, Note, Reporter, State};
 use engram_tui::terminal::{scan, Probe};
 
 const QUESTION: &str = r#"{"run_id":"r2","tool_call_id":"q1","name":"ask_user_question","args_json":"{\"questions\":[{\"question\":\"Which database?\",\"header\":\"db\",\"options\":[{\"label\":\"Postgres\"},{\"label\":\"SQLite\"}]}]}"}"#;
@@ -79,7 +79,7 @@ fn a_replayed_history_is_idle_not_an_unseen_result() {
 #[test]
 fn a_run_reports_working_then_done_until_a_key() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     let first = frame(&mut r, &app);
     assert!(first.starts_with(&report("idle", "")), "{first:?}");
     assert!(first.contains("\x1b]2;Add a README · engrams\x1b\\"));
@@ -109,7 +109,7 @@ fn a_run_reports_working_then_done_until_a_key() {
 #[test]
 fn a_waiting_question_blocks_and_alerts_an_unfocused_terminal() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     frame(&mut r, &app);
     app.update(Msg::Focus(false));
     start_run(&mut app);
@@ -124,9 +124,12 @@ fn a_waiting_question_blocks_and_alerts_an_unfocused_terminal() {
         )),
         "{out:?}"
     );
-    assert!(out.contains(
-        "\x07\x1b]9;Add a README: needs you\x07\x1b]777;notify;engrams;Add a README: needs you\x07"
-    ));
+    // One sequence per alert: the notification alone.
+    assert!(
+        out.starts_with("\x1b]9;Add a README: needs you\x07\x1b]7501;"),
+        "{out:?}"
+    );
+    assert!(!out.contains("777"));
     // The same state on the next frame: no second alert.
     assert_eq!(frame(&mut r, &app), "");
 }
@@ -144,7 +147,7 @@ fn a_plan_blocks_for_permission() {
 #[test]
 fn a_failed_run_is_an_error_and_alerts() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     start_run(&mut app);
     frame(&mut r, &app);
     app.update(Msg::Focus(false));
@@ -189,7 +192,7 @@ fn the_task_list_is_the_progress() {
     let at = attention(&app);
     assert_eq!(at.progress, Some(40));
     assert_eq!(at.note, Note::Tasks(2, 5));
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     assert!(frame(&mut r, &app).contains(":progress=40:"));
 }
 
@@ -318,7 +321,7 @@ fn the_session_list_says_the_key_was_refused() {
 #[test]
 fn attaching_another_session_is_not_an_alert() {
     let mut app = common::attached_app(false, 60, 16);
-    let mut r = Reporter::new(true);
+    let mut r = Reporter::with_alert(true, Alert::Osc9);
     start_run(&mut app);
     live(&mut app, 10, "tool_call_requested", QUESTION);
     app.update(Msg::Focus(false));
@@ -383,4 +386,36 @@ fn the_probe_reads_both_replies_and_stops_at_the_sentinel() {
             false
         )
     );
+}
+
+/// A terminal that takes reports gets the record change as its alert and
+/// nothing else: a bell or a notification on top plays a second sound.
+#[test]
+fn a_terminal_that_takes_reports_gets_no_extra_alert() {
+    assert_eq!(Alert::detect(true), Alert::None);
+    let mut app = common::attached_app(false, 60, 16);
+    let mut r = Reporter::new(true);
+    frame(&mut r, &app);
+    app.update(Msg::Focus(false));
+    start_run(&mut app);
+    frame(&mut r, &app);
+    live(&mut app, 10, "tool_call_requested", QUESTION);
+    let out = frame(&mut r, &app);
+    assert!(out.contains("state=blocked"), "{out:?}");
+    assert!(!out.contains('\x07'), "no bell, no OSC 9: {out:?}");
+}
+
+/// Elsewhere the bell is one byte and nothing else.
+#[test]
+fn the_bell_alert_is_the_bell_alone() {
+    let mut app = common::attached_app(false, 60, 16);
+    let mut r = Reporter::with_alert(false, Alert::Bell);
+    frame(&mut r, &app);
+    app.update(Msg::Focus(false));
+    start_run(&mut app);
+    frame(&mut r, &app);
+    live(&mut app, 10, "tool_call_requested", QUESTION);
+    let out = frame(&mut r, &app);
+    assert!(out.starts_with('\x07'), "{out:?}");
+    assert!(!out.contains("\x1b]9;"), "{out:?}");
 }
