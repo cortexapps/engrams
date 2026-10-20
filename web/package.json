@@ -18,6 +18,14 @@
   "lint-staged": {
     "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}": "oxfmt --no-error-on-unmatched-pattern"
   },
+  "pnpm": {
+    "overrides": {
+      "prosemirror-model": "1.25.12",
+      "prosemirror-state": "1.4.4",
+      "prosemirror-transform": "1.12.2",
+      "prosemirror-view": "1.42.6"
+    }
+  },
   "dependencies": {
     "@assistant-ui/react": "^0.15.28",
     "@assistant-ui/react-markdown": "^0.14.22",

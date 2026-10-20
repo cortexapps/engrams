@@ -4,6 +4,12 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  prosemirror-model: 1.25.12
+  prosemirror-state: 1.4.4
+  prosemirror-transform: 1.12.2
+  prosemirror-view: 1.42.6
+
 importers:
 
   .:
@@ -2327,9 +2333,9 @@ packages:
     resolution: {integrity: sha512-+kndlSuoUK9sKVRuxbAHXNrbDvyydnG/Y0NFU9XXqaSkI9IRcrjpOf1RGd7NrC9jJXquDqZS96wOQf6eUpP9Dg==}
     engines: {node: '>=16.0.0', npm: '>=8.0.0'}
     peerDependencies:
-      prosemirror-model: ^1.7.1
-      prosemirror-state: ^1.2.3
-      prosemirror-view: ^1.9.10
+      prosemirror-model: 1.25.12
+      prosemirror-state: 1.4.4
+      prosemirror-view: 1.42.6
       y-protocols: ^1.0.1
       yjs: ^13.5.38
 
@@ -3769,9 +3775,6 @@ packages:
   prosemirror-keymap@1.2.3:
     resolution: {integrity: sha512-4HucRlpiLd1IPQQXNqeo81BGtkY8Ai5smHhKW9jjPKRc2wQIxksg7Hl1tTI2IfT2B/LgX6bfYvXxEpJl7aKYKw==}
 
-  prosemirror-model@1.25.11:
-    resolution: {integrity: sha512-QWg9RhnpLlogAmp3p96uEFrE5txQpFynd4vhBAELkwgOCWQs/X0yCzB3/hrHqiPwf91RG5KyWq6553zs9JqIOQ==}
-
   prosemirror-model@1.25.12:
     resolution: {integrity: sha512-Ue2gTmXMa7EhpLNhC7J+h4+ykD8ha12K6rrZFFKKJHBForfIStw5gJ6Zrf1mqqAa9NmpmEB4wp9bKmA4eUVjWg==}
 
@@ -3784,17 +3787,8 @@ packages:
   prosemirror-tables@1.8.5:
     resolution: {integrity: sha512-V/0cDCsHKHe/tfWkeCmthNUcEp1IVO3p6vwN8XtwE9PZQLAZJigbw3QoraAdfJPir4NKJtNvOB8oYGKRl+t0Dw==}
 
-  prosemirror-transform@1.12.0:
-    resolution: {integrity: sha512-GxboyN4AMIsoHNtz5uf2r2Ru551i5hWeCMD6E2Ib4Eogqoub0NflniaBPVQ4MrGE5yZ8JV9tUHg9qcZTTrcN4w==}
-
-  prosemirror-transform@1.12.1:
-    resolution: {integrity: sha512-t4F5615FycnCqsX7ShTUs8+jfnwcf46kuFRvSl/3qFx2QTZ4DjgowesLHQXcFP7G//TjesqZG3WtgL7vdyVJyA==}
-
   prosemirror-transform@1.12.2:
     resolution: {integrity: sha512-PE/aY0HEY4zczvmqrilgkUK/WautF0chvMqkmM/iN5/aPHvwrCWaQZjS6CIZp+K84YrvPFqrL+YArrfJX8xX7g==}
-
-  prosemirror-view@1.42.3:
-    resolution: {integrity: sha512-oTN7EtH+CpwxU9NrwEYWd0UZ4JUx7l048l5A2Xppm4p/60isZYLnth9QVQmC3VRIvdrIWCxwZSd+Uz791G31/w==}
 
   prosemirror-view@1.42.6:
     resolution: {integrity: sha512-3g25f6hKV2bBxo3puH3EcYWmmVNSH0iWmNsMVT7sugDSpA025jgpOLarcDWr39SdzPjYMaiYtRdNtXialPSjEQ==}
@@ -4453,9 +4447,9 @@ packages:
     resolution: {integrity: sha512-NpM99WSdD4Fx4if5xOMDpPtU3oAmTSjlzh5U4353ABbRHl1HtAFUx6HlebLZfyFxXN9jzKMDkVbcRjqOZVkYQg==}
     engines: {node: '>=16.0.0', npm: '>=8.0.0'}
     peerDependencies:
-      prosemirror-model: ^1.7.1
-      prosemirror-state: ^1.2.3
-      prosemirror-view: ^1.9.10
+      prosemirror-model: 1.25.12
+      prosemirror-state: 1.4.4
+      prosemirror-view: 1.42.6
       y-protocols: ^1.0.1
       yjs: ^13.5.38
 
@@ -4807,9 +4801,9 @@ snapshots:
   '@engrams/spec-document@file:../orchestrator/packages/spec-document(prosemirror-state@1.4.4)(prosemirror-view@1.42.6)(y-protocols@1.0.7(yjs@13.6.32))':
     dependencies:
       '@noble/hashes': 2.3.0
-      prosemirror-model: 1.25.11
-      prosemirror-transform: 1.12.0
-      y-prosemirror: 1.3.7(prosemirror-model@1.25.11)(prosemirror-state@1.4.4)(prosemirror-view@1.42.6)(y-protocols@1.0.7(yjs@13.6.32))(yjs@13.6.32)
+      prosemirror-model: 1.25.12
+      prosemirror-transform: 1.12.2
+      y-prosemirror: 1.3.7(prosemirror-model@1.25.12)(prosemirror-state@1.4.4)(prosemirror-view@1.42.6)(y-protocols@1.0.7(yjs@13.6.32))(yjs@13.6.32)
       yjs: 13.6.32
     transitivePeerDependencies:
       - prosemirror-state
@@ -7831,47 +7825,43 @@ snapshots:
 
   prosemirror-changeset@2.4.4:
     dependencies:
-      prosemirror-transform: 1.12.1
+      prosemirror-transform: 1.12.2
 
   prosemirror-commands@1.7.2:
     dependencies:
-      prosemirror-model: 1.25.11
+      prosemirror-model: 1.25.12
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.12.1
+      prosemirror-transform: 1.12.2
 
   prosemirror-dropcursor@1.8.4:
     dependencies:
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.12.1
-      prosemirror-view: 1.42.3
+      prosemirror-transform: 1.12.2
+      prosemirror-view: 1.42.6
 
   prosemirror-gapcursor@1.4.1:
     dependencies:
       prosemirror-keymap: 1.2.3
-      prosemirror-model: 1.25.11
+      prosemirror-model: 1.25.12
       prosemirror-state: 1.4.4
-      prosemirror-view: 1.42.3
+      prosemirror-view: 1.42.6
 
   prosemirror-history@1.5.1:
     dependencies:
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.12.1
-      prosemirror-view: 1.42.3
+      prosemirror-transform: 1.12.2
+      prosemirror-view: 1.42.6
       rope-sequence: 1.3.4
 
   prosemirror-inputrules@1.5.1:
     dependencies:
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.12.1
+      prosemirror-transform: 1.12.2
 
   prosemirror-keymap@1.2.3:
     dependencies:
       prosemirror-state: 1.4.4
       w3c-keyname: 2.2.8
-
-  prosemirror-model@1.25.11:
-    dependencies:
-      orderedmap: 2.1.1
 
   prosemirror-model@1.25.12:
     dependencies:
@@ -7879,9 +7869,9 @@ snapshots:
 
   prosemirror-schema-list@1.5.1:
     dependencies:
-      prosemirror-model: 1.25.11
+      prosemirror-model: 1.25.12
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.12.1
+      prosemirror-transform: 1.12.2
 
   prosemirror-state@1.4.4:
     dependencies:
@@ -7892,28 +7882,14 @@ snapshots:
   prosemirror-tables@1.8.5:
     dependencies:
       prosemirror-keymap: 1.2.3
-      prosemirror-model: 1.25.11
+      prosemirror-model: 1.25.12
       prosemirror-state: 1.4.4
-      prosemirror-transform: 1.12.1
-      prosemirror-view: 1.42.3
-
-  prosemirror-transform@1.12.0:
-    dependencies:
-      prosemirror-model: 1.25.11
-
-  prosemirror-transform@1.12.1:
-    dependencies:
-      prosemirror-model: 1.25.11
+      prosemirror-transform: 1.12.2
+      prosemirror-view: 1.42.6
 
   prosemirror-transform@1.12.2:
     dependencies:
       prosemirror-model: 1.25.12
-
-  prosemirror-view@1.42.3:
-    dependencies:
-      prosemirror-model: 1.25.11
-      prosemirror-state: 1.4.4
-      prosemirror-transform: 1.12.1
 
   prosemirror-view@1.42.6:
     dependencies:
@@ -8444,10 +8420,10 @@ snapshots:
       vega-dataflow: 6.1.3
       vega-expression: 6.2.2
       vega-scale: 8.1.3
-      vega-scenegraph: 5.2.1
+      vega-scenegraph: 5.3.0
       vega-selections: 6.1.5
       vega-statistics: 2.0.0
-      vega-time: 3.2.1
+      vega-time: 3.3.0
       vega-util: 2.1.3
 
   vega-functions@6.2.0:
@@ -8625,9 +8601,9 @@ snapshots:
       d3-timer: 3.0.1
       vega-dataflow: 6.1.3
       vega-format: 2.1.3
-      vega-functions: 6.1.3
+      vega-functions: 6.2.0
       vega-runtime: 7.1.3
-      vega-scenegraph: 5.2.1
+      vega-scenegraph: 5.3.0
       vega-util: 2.1.3
 
   vega-voronoi@5.1.3:
@@ -8758,15 +8734,6 @@ snapshots:
   xml-name-validator@5.0.0: {}
 
   xmlchars@2.2.0: {}
-
-  y-prosemirror@1.3.7(prosemirror-model@1.25.11)(prosemirror-state@1.4.4)(prosemirror-view@1.42.6)(y-protocols@1.0.7(yjs@13.6.32))(yjs@13.6.32):
-    dependencies:
-      lib0: 0.2.117
-      prosemirror-model: 1.25.11
-      prosemirror-state: 1.4.4
-      prosemirror-view: 1.42.6
-      y-protocols: 1.0.7(yjs@13.6.32)
-      yjs: 13.6.32
 
   y-prosemirror@1.3.7(prosemirror-model@1.25.12)(prosemirror-state@1.4.4)(prosemirror-view@1.42.6)(y-protocols@1.0.7(yjs@13.6.32))(yjs@13.6.32):
     dependencies:
