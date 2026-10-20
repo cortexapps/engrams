@@ -303,12 +303,18 @@ pub enum Fold {
     },
 }
 
-/// Does the cell belong in a turn's fold?
+/// Does the cell belong in a turn's fold? Not a file change: edits
+/// stay in view after the turn, as Claude Code shows them.
 fn foldable(c: &Cell) -> bool {
     matches!(
         c,
-        Cell::Tool { .. } | Cell::Exec { .. } | Cell::Explore { .. } | Cell::Diff { .. }
+        Cell::Tool { .. } | Cell::Exec { .. } | Cell::Explore { .. }
     )
+}
+
+/// Tool-like cells in a row share one block (no gap between them).
+fn tool_like(c: &Cell) -> bool {
+    foldable(c) || matches!(c, Cell::Diff { .. })
 }
 
 fn plural(out: &mut String, n: usize, one: &str, many: &str) {
@@ -348,7 +354,7 @@ pub struct Entry {
 
 /// Does `next` get a blank row after `prev`?
 fn wants_gap(prev: &Cell, next: &Cell) -> bool {
-    let tool_like = foldable;
+    let tool_like = tool_like;
     match next {
         Cell::Hidden => false,
         Cell::Marker {
@@ -961,7 +967,7 @@ impl Transcript {
     }
 
     fn fold_range(&mut self, start: usize, end: usize) {
-        let (mut shell, mut tools, mut reads, mut edits) = (0usize, 0usize, 0usize, 0usize);
+        let (mut shell, mut tools, mut reads) = (0usize, 0usize, 0usize);
         for e in self.entries.range(start..end) {
             match &e.cell {
                 Cell::Exec { .. } => shell += 1,
@@ -973,11 +979,10 @@ impl Transcript {
                     }
                 }
                 Cell::Explore { items, .. } => reads += items.len(),
-                Cell::Diff { .. } => edits += 1,
                 _ => {}
             }
         }
-        if shell + tools + reads + edits == 0 {
+        if shell + tools + reads == 0 {
             return;
         }
         let mut text = String::new();
@@ -994,7 +999,6 @@ impl Transcript {
         part(&mut text, "ran ", shell, "shell command", "shell commands");
         part(&mut text, "called ", tools, "tool", "tools");
         part(&mut text, "read ", reads, "file", "files");
-        part(&mut text, "edited ", edits, "file", "files");
         if let Some(c) = text.get(..1) {
             let up = c.to_ascii_uppercase();
             text.replace_range(..1, &up);
