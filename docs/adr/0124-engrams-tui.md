@@ -1,6 +1,7 @@
 # ADR 0124: `engrams tui`, a terminal client for sessions
 
-Status: Accepted (2026-10-20); PR4-PR9 implemented in the PR chain listed under Phases.
+Status: Accepted (2026-10-20); PR4-PR9 implemented in #1658 (one PR, the
+phases as its commit groups; see Phases).
 
 Terms used in this document:
 
@@ -132,17 +133,21 @@ pauses while scrolled up.
 
 ## Phases
 
-- PR4 (#1647): this ADR, the crate core, both screen modes, session list,
+The phases were built as a chain of stacked PRs and landed as one PR,
+#1658, with the chain's commits in order. The phase names below are the
+commit groups.
+
+- PR4: this ADR, the crate core, both screen modes, session list,
   attach, composer, footer, keymap, tests and budgets.
-- PR5 (#1648): markdown writer, tool cells, file-change hunks, transcript
+- PR5: markdown writer, tool cells, file-change hunks, transcript
   search, `$EDITOR`, `NO_COLOR`, screen-reader flattening.
-- PR6 (#1649): approvals and questions via `CompleteToolCall`,
-  notifications.
-- PR7 (#1650): shell pane (`vt100`) and `engrams session shell`.
-- PR8 (#1653): new session from the TUI, `/` commands, `/transcript` and
+- PR6: approvals and questions via `CompleteToolCall`, notifications.
+- PR7: shell pane (`vt100`) and `engrams session shell`.
+- PR8: new session from the TUI, `/` commands, `/transcript` and
   `/dump`, docs, status → Accepted.
 - PR9: the transcript's shape, after the first production sessions were
-  read side by side with Codex's TUI (see the divergence log).
+  read side by side with Codex's TUI (see the divergence log), and the
+  fixes from an adversarial review of the whole chain.
 
 The Rust CLI the TUI rides on landed first (#1644, #1645). One transport
 bug surfaced on the first run against a production deployment and was
