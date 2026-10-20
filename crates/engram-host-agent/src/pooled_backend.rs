@@ -1411,10 +1411,20 @@ impl PooledBackend {
             // this sync command's own mkdir marker before the disk capture;
             // the wrapper deliberately tolerates losing its record and the
             // still-attached live stream carries the exact result.
+            //
+            // The wrapper writes its pid files and creates its output files
+            // in that marker while `rm` runs, so one `rm` can fail
+            // `ENOTEMPTY` on its own entry. Each failure needs a new file in
+            // the marker, and the wrapper makes only a few before it waits;
+            // once the marker is gone no create can succeed. So `rm` is
+            // repeated until it succeeds, with a bound that only a guest that
+            // fails `rm` for another reason reaches.
             command: vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "rm -rf /var/lib/engram/execs/* && sync".into(),
+                "n=0; until rm -rf /var/lib/engram/execs/*; do \
+                 n=$((n + 1)); [ \"$n\" -lt 20 ] || exit 1; done; sync"
+                    .into(),
             ],
             stdin: None,
             env: std::collections::HashMap::new(),
