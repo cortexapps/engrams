@@ -1,0 +1,20 @@
+---
+source: crates/engram-tui/tests/shell_pane.rs
+expression: "frame(&mut app, 60, 16)"
+---
+" Add a README                                               "
+"                                                            "
+"  There is already a README.md. I will extend it with a     "
+"  usage section and keep the existing introduction intact.  "
+"· worked for 1m 05s                                         "
+"· resumed                                                   "
+" shell · bash  Ctrl+` back to the agent                     "
+"$ ls                                                        "
+"Cargo.toml  src  tests                                      "
+"$                                                           "
+"                                                            "
+"                                                            "
+"────────────────────────────────────────────────────────────"
+"› message the agent                                         "
+"────────────────────────────────────────────────────────────"
+" ○ ready  shell has the keys · Ctrl+` back to the agent     "

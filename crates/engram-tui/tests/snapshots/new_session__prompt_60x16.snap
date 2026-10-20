@@ -1,0 +1,20 @@
+---
+source: crates/engram-tui/tests/new_session.rs
+expression: "frame(&mut app, 60, 16)"
+---
+" engrams · sessions                                         "
+" new session · research                                     "
+" › Write the release notes.                                 "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+" new session  Enter create · Shift+Enter newline · Esc back "

@@ -71,6 +71,7 @@ Tasks are the product-level unit of work: a profile plus a prompt.
 | `session list` | List sessions. |
 | `session get <id>` | Print one session. |
 | `session exec <id> <cmd> [--timeout-secs <n>]` | Run a shell command in the sandbox, streaming its output, and exit with its exit code. |
+| `session shell <id>` | An interactive shell in the sandbox, in your terminal. Exit the shell to return. |
 | `session logs <id> [--since <idx>]` | Tail the session's event log. `--since N` replays everything after index N first. Ctrl-C to stop. |
 | `session log <id> [--limit <n>] [--from-start]` | Print the conversation timeline, newest rows first by default. |
 | `session resume <id>` | Resume an idle session from its snapshot. |
@@ -143,3 +144,50 @@ Explicit triggers for things engrams otherwise does on its own schedule.
 | `admin flush <session-id>` | Flush a session's dirty disk chunks now. |
 | `admin evict-idle <session-id>` | Run the idle-eviction pipeline for one session now. The session ends idle. |
 | `admin gc [--apply] [--grace-secs <n>]` | Run the blob garbage-collection sweeps. A report only, unless `--apply`. |
+
+### `tui`
+
+`engrams tui [session-id] [--no-alt-screen] [--no-mouse] [--ax]` opens a terminal
+client. With no session id it shows your sessions; with one it attaches to that session.
+The transcript streams as the agent works, tool calls fold to their first lines
+(Ctrl+O expands the last one), and questions and plan approvals are answered with the
+number keys. `?` lists the keys.
+
+| Key | What it does |
+|---|---|
+| `Enter` | Send the draft. While a run is active it is queued; `Up` pulls it back. |
+| `Shift+Enter`, `Ctrl+J` | Newline in the draft. |
+| `Esc` | Interrupt the run. On a draft, twice clears it. |
+| `Ctrl+C` | Clear the draft; twice quits. |
+| `Ctrl+D` | Back to the session list; twice quits. |
+| `Ctrl+P`, `Alt+↑/↓` | Switch session. |
+| `Ctrl+N` | New session: pick a profile, type the first prompt. |
+| `Ctrl+\``, `Ctrl+Space` | A shell in the sandbox below the transcript. The same key hands the keys back to the agent. |
+| `Ctrl+T` | Search the transcript. |
+| `Ctrl+G` | Edit the draft in `$EDITOR`. |
+| `PgUp`, `PgDn`, `Ctrl+Home`, `Ctrl+End` | Scroll. Scrolling to the top loads older history. |
+
+A draft that starts with `/` is a command. Type `/` to list them; Tab completes.
+
+| Command | What it does |
+|---|---|
+| `/new` | New session (the same as Ctrl+N). |
+| `/sessions` | Back to the session list. |
+| `/shell` | The sandbox shell. |
+| `/interrupt` | Stop the current run. |
+| `/resume` | Resume an idle session without sending a prompt. |
+| `/transcript` | Open the loaded transcript as text in `$EDITOR`. |
+| `/dump` | Write the loaded transcript to the terminal's scrollback, to read after you leave. |
+| `/help`, `/quit` | The key list; leave. |
+
+Flags and environment:
+
+- `--no-alt-screen` (or `ENGRAMS_TUI_NO_ALT_SCREEN=1`) keeps the terminal's own scrollback.
+  Finished turns are written into it as they complete and only the composer and footer stay
+  live, so your terminal's scroll, search and copy work on the transcript. History older than
+  the loaded window is not paged in this mode.
+- `--no-mouse` (or `ENGRAMS_TUI_NO_MOUSE=1`) leaves the mouse to the terminal, for its own
+  text selection.
+- `--ax` (or `ENGRAMS_TUI_AX=1`) is screen-reader mode: native scrollback, no mouse, and word
+  labels (`you:`, `agent:`, `tool:`) in place of glyphs.
+- `NO_COLOR` turns color off. State markers carry their meaning without it.

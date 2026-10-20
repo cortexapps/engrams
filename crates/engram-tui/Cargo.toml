@@ -1,0 +1,40 @@
+[package]
+name = "engram-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "`engrams tui`: a terminal client for engrams sessions (ADR 0124)."
+
+# Not `workspace = true`: the workspace forbids `unsafe_code`, and
+# `tests/perf.rs` needs one `GlobalAlloc` (the allocation counter behind
+# the ADR 0124 D5 budgets). `deny` keeps every other file unsafe-free and
+# lets that one test opt in with a stated reason.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+# ADR 0124 D5: the dependency allow-list. Anything added here needs a
+# stated reason in the PR that adds it.
+[dependencies]
+engram-app-client.workspace = true
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "scrolling-regions"] }
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+futures.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+# The shell pane's terminal emulator (ADR 0124 D5 allow-list): vte + a grid,
+# no I/O, no threads.
+vt100 = "0.18"
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+insta = "1"
+proptest.workspace = true

@@ -87,6 +87,20 @@ enum Commands {
         #[command(subcommand)]
         cmd: AdminCmd,
     },
+    /// attach a terminal UI to a session (ADR 0124)
+    Tui {
+        /// session to attach to; omit for the session list
+        session_id: Option<String>,
+        /// keep the terminal's own scrollback: no alternate screen
+        #[arg(long)]
+        no_alt_screen: bool,
+        /// do not capture the mouse (wheel scrolling off; native selection on)
+        #[arg(long)]
+        no_mouse: bool,
+        /// screen-reader mode: native scrollback, word labels, no mouse
+        #[arg(long)]
+        ax: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -129,6 +143,8 @@ enum SessionCmd {
     },
     /// mark the session completed and tear down its sandbox
     Delete { id: String },
+    /// an interactive shell in the session's sandbox (exit it to return)
+    Shell { id: String },
     /// tail the persistent event log (SSE; Ctrl-C to stop)
     Logs {
         id: String,
@@ -390,6 +406,8 @@ async fn run(cli: Cli) -> CliResult {
                     timeout_secs,
                 } => session::exec(&c, &id, &cmd, timeout_secs, json).await,
                 SessionCmd::Delete { id } => session::remove(&c, &id).await,
+                // Handled before the runtime starts, like `tui`.
+                SessionCmd::Shell { .. } => Ok(()),
                 SessionCmd::Logs { id, since } => session::logs(&c, &id, since).await,
                 SessionCmd::Log {
                     id,
@@ -476,6 +494,8 @@ async fn run(cli: Cli) -> CliResult {
                 AdminCmd::Gc { apply, grace_secs } => admin::gc(&c, apply, grace_secs, json).await,
             }
         }
+        // Dispatched in `main` before the runtime starts.
+        Commands::Tui { .. } => Ok(()),
     }
 }
 
@@ -492,6 +512,65 @@ fn main() {
     };
     if cli.version {
         println!("{VERSION}");
+        return;
+    }
+    // The shell owns the terminal and its own runtime, like the TUI.
+    if let Some(Commands::Session {
+        cmd: SessionCmd::Shell { id },
+    }) = &cli.command
+    {
+        let ctx = Ctx {
+            host: resolve_host(cli.url.as_deref()),
+            json: false,
+        };
+        let clients = match ctx.clients() {
+            Ok(c) => c,
+            Err(CliError::Message(m)) => {
+                eprintln!("engrams: {m}");
+                std::process::exit(1);
+            }
+            Err(CliError::Exit(code)) => std::process::exit(code),
+        };
+        if let Err(m) = engram_tui::shell_passthrough(clients, id) {
+            eprintln!("engrams: {m}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The TUI owns its own runtime and the terminal; it never runs inside
+    // the CLI's runtime below.
+    if let Some(Commands::Tui {
+        session_id,
+        no_alt_screen,
+        no_mouse,
+        ax,
+    }) = &cli.command
+    {
+        let ctx = Ctx {
+            host: resolve_host(cli.url.as_deref()),
+            json: false,
+        };
+        let clients = match ctx.clients() {
+            Ok(c) => c,
+            Err(CliError::Message(m)) => {
+                eprintln!("engrams: {m}");
+                std::process::exit(1);
+            }
+            Err(CliError::Exit(code)) => std::process::exit(code),
+        };
+        let env_on = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty() && v != "0");
+        let ax = *ax || env_on("ENGRAMS_TUI_AX");
+        let opts = engram_tui::Options {
+            session_id: session_id.clone(),
+            inline: ax || *no_alt_screen || env_on("ENGRAMS_TUI_NO_ALT_SCREEN"),
+            mouse: !ax && !*no_mouse && !env_on("ENGRAMS_TUI_NO_MOUSE"),
+            color: std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
+            ax,
+        };
+        if let Err(m) = engram_tui::run(clients, opts) {
+            eprintln!("engrams: {m}");
+            std::process::exit(1);
+        }
         return;
     }
     let rt = tokio::runtime::Builder::new_current_thread()

@@ -1,0 +1,18 @@
+---
+source: crates/engram-tui/tests/decisions.rs
+expression: shot
+---
+" Add a README                                               "
+"· resumed                                                   "
+"                                                            "
+"›                                                           "
+"                                                            "
+"≡ Plan                                                      "
+"                                                            "
+"  1. add the section                                        "
+"  2. run the tests                                          "
+"  1 approve  2 reject  Tab feedback · Enter confirm         "
+"────────────────────────────────────────────────────────────"
+"› tests                                                     "
+"────────────────────────────────────────────────────────────"
+<footer: needs you>

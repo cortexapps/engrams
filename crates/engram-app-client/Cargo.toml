@@ -18,6 +18,10 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
+# The shell WebSocket. `rustls-tls-webpki-roots` is the public feature that
+# unlocks `Connector::Rustls`; the connector itself carries the workspace
+# config from `engram_tls::client_config`, not the bundled roots.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [build-dependencies]

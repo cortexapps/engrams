@@ -1,0 +1,16 @@
+---
+source: crates/engram-tui/tests/snapshots.rs
+expression: "frame(&mut app, 80, 12)"
+---
+" engrams · sessions                                                             "
+" ● Add a README                                                              1m "
+" ○ Fix the flaky test                                                        2h "
+" ‖ Migrate the CI                                                            2d "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+" 3 sessions  type to filter · Enter attach · Esc quit · ? keys                  "

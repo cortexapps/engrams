@@ -1,0 +1,20 @@
+---
+source: crates/engram-tui/tests/snapshots.rs
+expression: shot
+---
+" Add a README                                                         "
+"· resumed                                                             "
+"                                                                      "
+"›                                                                     "
+"                                                                      "
+"✓ Explored                                                            "
+"  ⎿ Search fn main in src                                             "
+"✗ Bash cd /work && for f in a b c d e f g h i j k l m n o p; do       "
+"    echo "=== $f"                                                     "
+"    cat $f.txt                                                        "
+"  … 4 more lines (Ctrl+O)                                             "
+"  ⎿ cat: a.txt: No such file or directory                             "
+"──────────────────────────────────────────────────────────────────────"
+"› type to queue a message · Esc interrupts                            "
+"──────────────────────────────────────────────────────────────────────"
+<footer: working>

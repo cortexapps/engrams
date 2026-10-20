@@ -1,0 +1,16 @@
+---
+source: crates/engram-tui/tests/shell_pane.rs
+expression: terminal.backend().to_string()
+---
+" shell  Ctrl+` back to the agent                            "
+"$ uname                                                     "
+"Linux                                                       "
+"$                                                           "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+" ○ ready  shell has the keys · Ctrl+` back to the agent     "

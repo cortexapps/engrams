@@ -69,6 +69,21 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
 }
 
+/// A rustls client config that verifies servers the way the reqwest
+/// clients here do: the platform trust store, `ring`.
+///
+/// For the one TLS client the workspace does not build through reqwest,
+/// the session shell WebSocket. An `Err` means the platform store could
+/// not be opened, which the caller reports rather than panics on.
+pub fn client_config() -> Result<std::sync::Arc<rustls::ClientConfig>, rustls::Error> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    install_provider();
+    let cfg = rustls::ClientConfig::builder()
+        .with_platform_verifier()?
+        .with_no_client_auth();
+    Ok(std::sync::Arc::new(cfg))
+}
+
 /// A default [`reqwest::Client`], provider installed.
 ///
 /// The stand-in for `reqwest::Client::new()`. Panics on the same conditions

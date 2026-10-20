@@ -57,6 +57,7 @@ members = [
     "crates/engram-blob-client",
     "crates/engram-app-client",
     "crates/engram-cli",
+    "crates/engram-tui",
     "workspace-hack",
 ]
 
@@ -146,6 +147,7 @@ engram-storage-gcs = { path = "crates/engram-storage-gcs" }
 engram-blob-client = { path = "crates/engram-blob-client" }
 engram-app-client = { path = "crates/engram-app-client" }
 engram-cli = { path = "crates/engram-cli" }
+engram-tui = { path = "crates/engram-tui" }
 engram-chunk-store = { path = "crates/engram-chunk-store" }
 engram-telemetry = { path = "crates/engram-telemetry" }
 
@@ -365,6 +367,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 rustls-pemfile = "2"
+rustls-platform-verifier = "0.7"
 webpki-roots = "1"
 tls-parser = "0.12"
 socket2 = "0.6"

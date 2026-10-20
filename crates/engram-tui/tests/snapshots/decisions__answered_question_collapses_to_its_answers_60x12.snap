@@ -1,0 +1,16 @@
+---
+source: crates/engram-tui/tests/decisions.rs
+expression: shot
+---
+" Add a README                                               "
+"›                                                           "
+"                                                            "
+"? Which database?                                           "
+"    answer: SQLite                                          "
+"  Which features?                                           "
+"    answer: auth                                            "
+"    answer: export                                          "
+"────────────────────────────────────────────────────────────"
+"› type to queue a message · Esc interrupts                  "
+"────────────────────────────────────────────────────────────"
+<footer: working>

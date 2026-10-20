@@ -1,0 +1,20 @@
+---
+source: crates/engram-tui/tests/new_session.rs
+expression: "frame(&mut app, 60, 16)"
+---
+" engrams · sessions                                         "
+" new session  /                                             "
+" default  the standard image                                "
+" research  read-only, no git push                           "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+" new session  ↑↓ pick · type to filter · Enter choose · Esc "
