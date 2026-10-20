@@ -57,13 +57,6 @@ fn enter_runs_the_named_command() {
     let mut app = common::attached_app(false, 60, 18);
     app.cmds.clear();
 
-    // `/s` is ambiguous: nothing runs, the draft stays.
-    type_str(&mut app, "/s");
-    key(&mut app, KeyCode::Enter);
-    assert!(app.cmds.is_empty());
-    assert_eq!(app.attached.as_ref().unwrap().composer.text(), "/s");
-    app.attached.as_mut().unwrap().composer.clear();
-
     // `/resume` only on an idle session.
     type_str(&mut app, "/resume");
     key(&mut app, KeyCode::Enter);
@@ -168,4 +161,32 @@ fn plan_toggles_the_mode_the_next_prompt_asks_for() {
         panic!("expected a send, got {:?}", app.cmds);
     };
     assert_eq!(harness_mode.as_deref(), Some("default"));
+}
+
+/// The popup's highlight moves with Ctrl+N / Ctrl+P (and the arrows), and
+/// Enter runs the highlighted command when the prefix names several.
+#[test]
+fn ctrl_n_moves_the_popup_and_enter_runs_the_highlight() {
+    let mut app = common::attached_app(false, 60, 18);
+    app.cmds.clear();
+    // `/s` matches sessions, then shell.
+    type_str(&mut app, "/s");
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('n'),
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(app.attached.as_ref().unwrap().slash_sel, 1);
+    // Wraps back to the first.
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('n'),
+        KeyModifiers::CONTROL,
+    )));
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+    assert_eq!(app.attached.as_ref().unwrap().slash_sel, 1);
+    key(&mut app, KeyCode::Enter);
+    assert!(
+        app.cmds.iter().any(|c| matches!(c, Cmd::ShellOpen { .. })),
+        "{:?}",
+        app.cmds
+    );
 }

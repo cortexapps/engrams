@@ -91,6 +91,11 @@ pub const BINDINGS: &[Binding] = &[
         help: "new session (pick a profile, type the first prompt)",
     },
     Binding {
+        keys: "Ctrl+N/P · j/k/g/G",
+        action: Action::Down,
+        help: "move in a list or popup; session list: / filters, n new",
+    },
+    Binding {
         keys: "Alt+↑ / Alt+↓",
         action: Action::PrevSession,
         help: "previous / next session",

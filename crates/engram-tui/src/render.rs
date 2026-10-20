@@ -1123,7 +1123,11 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) {
                 buf,
                 area.x + cx,
                 y,
-                "  type to filter · Enter attach · Esc quit · ? keys",
+                if app.sessions.filtering {
+                    "  type to filter · Enter attach · Esc done"
+                } else {
+                    "  j/k move · / filter · n new · Enter attach · Esc quit · ? keys"
+                },
                 w.saturating_sub(cx),
                 th.dim,
             );
@@ -1144,7 +1148,7 @@ fn draw_sessions(buf: &mut Buffer, area: Rect, app: &App, th: &Theme, title: &st
         area.width.saturating_sub(1),
         th.accent,
     );
-    if !app.sessions.filter.is_empty() || app.palette {
+    if !app.sessions.filter.is_empty() || app.palette || app.sessions.filtering {
         cx += put(buf, area.x + 1 + cx, y0, "  / ", 4, th.dim);
         put(
             buf,
@@ -1235,19 +1239,21 @@ pub fn slash_rows(draft: &str) -> u16 {
     crate::commands::matches(draft).count().min(6) as u16
 }
 
-/// The slash-command popup: the matching commands, the first one (what
-/// Tab completes to and Enter runs when it is the only match) marked.
-fn draw_slash(buf: &mut Buffer, area: Rect, draft: &str, th: &Theme) {
+/// The slash-command popup: the matching commands, the highlighted one
+/// (what Tab completes to and Enter runs) marked, scrolled into view.
+fn draw_slash(buf: &mut Buffer, area: Rect, draft: &str, sel: usize, th: &Theme) {
     if area.height == 0 {
         return;
     }
     fill(buf, area, Style::new());
+    let top = sel.saturating_sub(area.height as usize - 1);
     for (i, c) in crate::commands::matches(draft)
-        .take(area.height as usize)
         .enumerate()
+        .skip(top)
+        .take(area.height as usize)
     {
-        let y = area.y + i as u16;
-        let style = if i == 0 { th.selected } else { Style::new() };
+        let y = area.y + (i - top) as u16;
+        let style = if i == sel { th.selected } else { Style::new() };
         let line = Rect {
             y,
             height: 1,
@@ -1548,7 +1554,7 @@ pub fn draw_fullscreen(
             }
             want_older = draw_transcript(buf, transcript, a, th, scratch);
             if slash.height > 0 {
-                draw_slash(buf, slash, a.composer.text(), th);
+                draw_slash(buf, slash, a.composer.text(), a.slash_sel, th);
                 shade(buf, slash, th);
             }
             draw_rule(buf, rule_above, th);
@@ -1670,7 +1676,7 @@ pub fn draw_inline(
             a.page_rows = live.height;
             draw_transcript(buf, live, a, th, scratch);
             if slash.height > 0 {
-                draw_slash(buf, slash, a.composer.text(), th);
+                draw_slash(buf, slash, a.composer.text(), a.slash_sel, th);
                 shade(buf, slash, th);
             }
             draw_rule(buf, rule_above, th);

@@ -244,6 +244,8 @@ pub struct Attached {
     /// `/plan`: the mode the next prompt asks for, when it differs from
     /// the session's current mode (the web's not-yet-sent toggle).
     pub mode_override: Option<String>,
+    /// The highlighted command in the slash popup.
+    pub slash_sel: usize,
 }
 
 impl Attached {
@@ -271,6 +273,7 @@ impl Attached {
             feedback: false,
             shell: None,
             mode_override: None,
+            slash_sel: 0,
         }
     }
 
@@ -565,6 +568,9 @@ impl NewSession {
 
 #[derive(Debug, Default)]
 pub struct SessionList {
+    /// Letters type into the filter (after `/`); otherwise they are Vim
+    /// keys. The palette always filters.
+    pub filtering: bool,
     pub rows: Vec<SessionRow>,
     pub selected: usize,
     pub filter: String,
@@ -599,6 +605,25 @@ impl SessionList {
         } else {
             self.selected.saturating_sub(1)
         };
+    }
+
+    fn jump(&mut self, bottom: bool) {
+        self.selected = if bottom {
+            self.visible().count().saturating_sub(1)
+        } else {
+            0
+        };
+    }
+}
+
+/// A key that moves a list selection, as arrows, fzf and Vim completion
+/// do: Down / Ctrl+N / Ctrl+J is the next row, Up / Ctrl+P / Ctrl+K the
+/// previous one. `Some(true)` is down.
+fn list_step(action: Action) -> Option<bool> {
+    match action {
+        Action::Down | Action::NewSession | Action::Newline => Some(true),
+        Action::Up | Action::Palette | Action::KillToEnd => Some(false),
+        _ => None,
     }
 }
 
@@ -1168,8 +1193,7 @@ impl App {
         };
         match ns.stage {
             NewStage::Pick => match action {
-                Action::Up => ns.step(false),
-                Action::Down => ns.step(true),
+                a if list_step(a).is_some() => ns.step(list_step(a) == Some(true)),
                 Action::Send => {
                     if ns.selected_profile().is_some() {
                         ns.stage = NewStage::Prompt;
@@ -1183,7 +1207,7 @@ impl App {
                         ns.selected = 0;
                     }
                 }
-                Action::CtrlC | Action::Detach | Action::NewSession => self.new_session = None,
+                Action::CtrlC | Action::Detach => self.new_session = None,
                 Action::Backspace => {
                     ns.filter.pop();
                     ns.selected = 0;
@@ -1253,10 +1277,32 @@ impl App {
     }
 
     fn list_key(&mut self, action: Action) {
+        if let Some(down) = list_step(action) {
+            self.sessions.step(down);
+            return;
+        }
+        // The session list outside a filter: Vim keys.
+        if !self.palette && !self.sessions.filtering {
+            if let Action::Char(c) = action {
+                match c {
+                    'j' => self.sessions.step(true),
+                    'k' => self.sessions.step(false),
+                    'g' => self.sessions.jump(false),
+                    'G' => self.sessions.jump(true),
+                    '/' => self.sessions.filtering = true,
+                    'n' => self.open_new_session(),
+                    'r' => {
+                        self.sessions.loading = true;
+                        self.cmds.push(Cmd::LoadSessions);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
         match action {
-            Action::Up => self.sessions.step(false),
-            Action::Down => self.sessions.step(true),
             Action::Send => {
+                self.sessions.filtering = false;
                 if let Some(r) = self.sessions.selected_row() {
                     let id = r.session_id.clone();
                     self.attach(&id);
@@ -1266,6 +1312,9 @@ impl App {
                 if self.palette {
                     self.palette = false;
                     self.sessions.filter.clear();
+                } else if self.sessions.filtering {
+                    // Back to the Vim keys; the filter stays.
+                    self.sessions.filtering = false;
                 } else if !self.sessions.filter.is_empty() {
                     self.sessions.filter.clear();
                     self.sessions.selected = 0;
@@ -1282,14 +1331,6 @@ impl App {
                     self.quit = true;
                 }
             }
-            Action::Palette => {
-                if self.palette {
-                    self.palette = false;
-                } else {
-                    self.sessions.loading = true;
-                    self.cmds.push(Cmd::LoadSessions);
-                }
-            }
             Action::Backspace => {
                 self.sessions.filter.pop();
                 self.sessions.selected = 0;
@@ -1299,7 +1340,6 @@ impl App {
                 self.sessions.selected = 0;
             }
             Action::Help => self.help = true,
-            Action::NewSession => self.open_new_session(),
             Action::Char(c) if !c.is_control() => {
                 self.sessions.filter.push(c);
                 self.sessions.selected = 0;
@@ -1322,10 +1362,29 @@ impl App {
                 return;
             }
         }
+        // The slash popup is open: list keys move its selection.
+        let popup = commands::matches(a.composer.text()).count();
+        if popup > 0 {
+            if let Some(down) = list_step(action) {
+                a.slash_sel = if down {
+                    (a.slash_sel + 1) % popup
+                } else {
+                    (a.slash_sel + popup - 1) % popup
+                };
+                return;
+            }
+        }
+        if !matches!(action, Action::Send | Action::Char('\t')) {
+            a.slash_sel = 0;
+        }
         match action {
             Action::Send if commands::prefix(a.composer.text()).is_some() => {
                 let draft = a.composer.text().to_string();
-                match commands::resolve(&draft) {
+                // An exact or unique name, else the highlighted command.
+                let cmd = commands::resolve(&draft)
+                    .or_else(|| commands::matches(&draft).nth(a.slash_sel).map(|c| c.slash));
+                a.slash_sel = 0;
+                match cmd {
                     Some(cmd) => {
                         a.composer.clear();
                         self.slash(cmd);
@@ -1334,7 +1393,10 @@ impl App {
                 }
             }
             Action::Char('\t') if commands::prefix(a.composer.text()).is_some() => {
-                let name = commands::matches(a.composer.text()).next().map(|c| c.name);
+                let name = commands::matches(a.composer.text())
+                    .nth(a.slash_sel)
+                    .map(|c| c.name);
+                a.slash_sel = 0;
                 if let Some(name) = name {
                     let mut t = String::with_capacity(name.len() + 1);
                     t.push('/');
