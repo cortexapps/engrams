@@ -283,6 +283,22 @@ export interface SessionCompileOpts {
  *  selects one (the canonical built-in). */
 const DEFAULT_HARNESS = "claude";
 
+/** The session's note about integrations the profile runs with the user's
+ *  personal credential, turned off because that credential is not connected.
+ *  Empty when nothing was turned off. */
+export function droppedIntegrationsPrompt(names: readonly string[]): string {
+  if (names.length === 0) return "";
+  const list = names.join(", ");
+  const verb = names.length === 1 ? "is" : "are";
+  return (
+    `${list} ${verb} turned off in this session. This profile uses each person's own ` +
+    `${list} credential, and the person who started this session has not connected one. ` +
+    `The organization's ${list} connection is not the cause, and it does not need a change. ` +
+    `If the task needs ${list}, tell the person to connect their personal credential under ` +
+    `Settings → Credentials in engrams, then start a new session.`
+  );
+}
+
 /**
  * Compile a CreateSession request from an active profile. Throws
  * `FailedPrecondition` if the profile's image is no longer enabled.
@@ -509,6 +525,19 @@ export async function compileSessionCreateInput(
   const grantAvailable = ({ grant, connection }: (typeof resolvedEffectiveGrants)[number]) =>
     !(grant.credentialScope === "user" && unavailableUserProviders.has(connection.provider));
   const activeResolvedGrants = resolvedEffectiveGrants.filter(grantAvailable);
+  // Only the web start screen shows the drop. A Slack, automation, or CLI
+  // launch has no such screen, so the session itself must know which
+  // integrations are off and why, or it reports them as "not connected" and
+  // sends the person to the org connection, which is healthy.
+  const droppedIntegrations = [...unavailableUserProviders].map(
+    (provider) => registry.get(provider)?.display.name ?? provider,
+  );
+  if (droppedIntegrations.length > 0) {
+    log.info(
+      { providers: [...unavailableUserProviders] },
+      "task-create: user-scoped integrations disabled (no connected personal credential)",
+    );
+  }
   const capabilities = grantsToCapabilities(activeResolvedGrants);
   // A capability override is the complete session authority and therefore
   // also owns its CLI/tool surface. Without one, preserve the narrower
@@ -592,6 +621,7 @@ export async function compileSessionCreateInput(
   harness.ENGRAM_APPEND_SYSTEM_PROMPT = [
     harness.ENGRAM_APPEND_SYSTEM_PROMPT,
     systemPromptForTaskType(opts.taskType, opts.specTemplate),
+    droppedIntegrationsPrompt(droppedIntegrations),
   ]
     .filter(Boolean)
     .join("\n\n");
