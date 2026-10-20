@@ -18,7 +18,7 @@ pub fn marker(status: &str) -> &'static str {
         "active" => "●",
         "pending" | "queued" | "created" | "evacuating" => "◐",
         "idle" => "○",
-        "parked" => "❚",
+        "parked" => "‖",
         "failed" | "dead" | "host_lost" => "✕",
         "evicting" => "⤓",
         "unreachable" => "…",

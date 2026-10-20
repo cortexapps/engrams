@@ -13,4 +13,4 @@ expression: terminal.backend().to_string()
 "                                                            "
 "                                                            "
 "                                                            "
-" ● ready  Ctrl+` back to the agent             idx 8        "
+" ○ ready  shell has the keys · Ctrl+` back to the agent     "

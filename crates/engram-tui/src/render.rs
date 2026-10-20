@@ -818,6 +818,25 @@ fn status_word(a: &Attached) -> &'static str {
     }
 }
 
+/// The footer's state glyph: one of five marks that read without colour.
+fn status_glyph(a: &Attached) -> &'static str {
+    if a.reducer.waking || a.reconnecting.is_some() {
+        return "◐";
+    }
+    if a.reducer.awaiting_decision() {
+        return "?";
+    }
+    if a.reducer.is_running() {
+        return "●";
+    }
+    match a.reducer.status.as_deref() {
+        Some("failed") | Some("dead") | Some("host_lost") => "✕",
+        Some("completed") => "✓",
+        Some("pending") | Some("queued") | Some("created") | Some("evacuating") => "◐",
+        _ => "○",
+    }
+}
+
 fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) {
     let y = area.y;
     let w = area.width;
@@ -865,7 +884,6 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) {
     }
     match (&app.attached, app.screen) {
         (Some(a), Screen::Attached) => {
-            let m = marker(a.reducer.status.as_deref().unwrap_or(""));
             let s = status_word(a);
             let st = if a.reducer.awaiting_decision() {
                 th.warn
@@ -875,7 +893,7 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) {
                 th.dim
             };
             cx += put(buf, area.x + cx, y, " ", 1, st);
-            cx += put(buf, area.x + cx, y, m, 1, st);
+            cx += put(buf, area.x + cx, y, status_glyph(a), 1, st);
             cx += put(buf, area.x + cx, y, " ", 1, st);
             cx += put(buf, area.x + cx, y, s, w.saturating_sub(cx), st);
             if a.composer_mode() == "plan" {
@@ -910,19 +928,11 @@ fn draw_footer(buf: &mut Buffer, area: Rect, app: &App, th: &Theme) {
             } else {
                 "  Ctrl+D sessions · ? keys"
             };
-            let right_w = 14u16;
-            let avail = w.saturating_sub(cx + right_w);
+            let avail = w.saturating_sub(cx + 1);
             if avail as usize >= hints.len() {
-                cx += put(buf, area.x + cx, y, hints, avail, th.dim);
+                put(buf, area.x + cx, y, hints, avail, th.dim);
             } else if avail as usize >= short.len() {
-                cx += put(buf, area.x + cx, y, short, avail, th.dim);
-            }
-            let _ = cx;
-            if let Some(idx) = a.newest_idx {
-                let rx = area.right().saturating_sub(right_w);
-                let mut rc = put(buf, rx, y, " idx ", 5, th.dim);
-                rc += put_num(buf, rx + rc, y, idx.max(0) as u64, th.dim);
-                let _ = rc;
+                put(buf, area.x + cx, y, short, avail, th.dim);
             }
         }
         _ => {
