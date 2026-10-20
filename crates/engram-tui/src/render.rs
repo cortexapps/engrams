@@ -1118,7 +1118,8 @@ fn selection_text(
     width: u16,
     th: &Theme,
 ) -> String {
-    let ((sc, sr, _), (ec, er, _)) = sel.range();
+    let ((sc, sr, scol), (ec, er, ecol)) = sel.range();
+    let gw = th.gutter_width();
     let mut out = String::new();
     let mut prev: Option<(usize, u16)> = None;
     let mut line = String::new();
@@ -1152,31 +1153,46 @@ fn selection_text(
                     }
                 }
                 None => {
+                    // Scrolled away: the row's own text, cut at the
+                    // selection's columns on its first and last row.
                     if let Some(lr) = e.layout_row(r as usize) {
                         let src = e.source(lr.src);
                         if let Some(s) = src.get(lr.row.start as usize..lr.row.end as usize) {
-                            line.push_str(s);
+                            // Where the row's text starts on screen.
+                            let lead = gw + if lr.src == Src::Body { 2 } else { 0 };
+                            let to_byte = |col: u16| byte_at_col(s, col.saturating_sub(lead));
+                            let from = if (i, r) == (sc, sr) { to_byte(scol) } else { 0 };
+                            let to = if (i, r) == (ec, er) {
+                                to_byte(ecol + 1)
+                            } else {
+                                s.len()
+                            };
+                            line.push_str(s.get(from..to.max(from)).unwrap_or(""));
                         }
                     }
                 }
             }
             let text = line.trim_end();
             // Does this row continue the previous one (a wrap the layout
-            // made, not a line break in the text)?
-            let soft = prev.is_some_and(|(pi, pr)| {
-                pi == i
-                    && pr + 1 == r
-                    && match (e.layout_row(pr as usize), e.layout_row(r as usize)) {
-                        (Some(p), Some(c)) if p.src == c.src => e
-                            .source(c.src)
-                            .get(p.row.end as usize..c.row.start as usize)
-                            .is_some_and(|between| !between.contains('\n')),
-                        _ => false,
-                    }
+            // made, not a line break in the text)? Then the text between
+            // the two rows is what joins them: the space the wrap took,
+            // or nothing when a long word was cut.
+            let soft = prev.and_then(|(pi, pr)| {
+                if pi != i || pr + 1 != r {
+                    return None;
+                }
+                match (e.layout_row(pr as usize), e.layout_row(r as usize)) {
+                    (Some(p), Some(c)) if p.src == c.src => e
+                        .source(c.src)
+                        .get(p.row.end as usize..c.row.start as usize)
+                        .filter(|between| !between.contains('\n'))
+                        .map(|between| !between.is_empty()),
+                    _ => None,
+                }
             });
-            if soft {
+            if let Some(spaced) = soft {
                 let cont = text.trim_start();
-                if !cont.is_empty() && !out.ends_with(' ') {
+                if spaced && !cont.is_empty() && !out.ends_with(' ') {
                     out.push(' ');
                 }
                 out.push_str(cont);
@@ -1190,6 +1206,19 @@ fn selection_text(
         }
     }
     out.trim_matches('\n').to_string()
+}
+
+/// The byte offset in `s` where display column `col` falls (the end of
+/// `s` past its width), never inside a character.
+fn byte_at_col(s: &str, col: u16) -> usize {
+    let mut w = 0u16;
+    for (i, c) in s.char_indices() {
+        if w >= col {
+            return i;
+        }
+        w += display_width(c.encode_utf8(&mut [0; 4])) as u16;
+    }
+    s.len()
 }
 
 fn draw_queue(buf: &mut Buffer, area: Rect, a: &Attached, th: &Theme) {

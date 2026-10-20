@@ -97,6 +97,35 @@ fn a_reply_draws_its_code_in_palette_colors() {
     assert_eq!(fg_of(&plain, "def"), Color::Reset);
 }
 
+/// A streaming chunk that completes a code block highlights it: the
+/// chunk path re-lays out only the tail and skips the full layout.
+#[test]
+fn a_block_completed_by_a_chunk_is_highlighted() {
+    let mut app = common::attached_app(false, W, H);
+    live(
+        &mut app,
+        9,
+        "run_started",
+        r#"{"run_id":"r2","prompt_id":"p2"}"#,
+    );
+    live(
+        &mut app,
+        10,
+        "agent_message_chunk",
+        r#"{"run_id":"r2","message_id":"m9","chunk":"Here:\n\n"}"#,
+    );
+    let theme = Theme::new(true);
+    draw(&mut app, &theme);
+    live(
+        &mut app,
+        11,
+        "agent_message_chunk",
+        r#"{"run_id":"r2","message_id":"m9","chunk":"```python\ndef greet():\n    pass\n```\n\nmore"}"#,
+    );
+    let buf = draw(&mut app, &theme);
+    assert_eq!(fg_of(&buf, "def"), Color::Magenta);
+}
+
 #[test]
 fn a_diff_is_highlighted_with_its_sign_kept() {
     let mut app = common::attached_app(false, W, H);

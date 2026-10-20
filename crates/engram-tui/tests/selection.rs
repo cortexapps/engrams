@@ -118,6 +118,120 @@ fn a_click_still_opens_a_tool_call_and_esc_clears_a_selection() {
     assert!(a.selection.is_none(), "Esc clears the selection first");
 }
 
+/// A long word the layout cut across rows copies back whole, with no
+/// space where the cut was.
+#[test]
+fn a_cut_word_copies_without_a_space() {
+    let mut app = common::attached_app(false, W, H);
+    let word = "x".repeat(80);
+    app.update(Msg::Net(engram_tui::app::NetMsg::Live {
+        session_id: "s-1".into(),
+        envelope: common::env(
+            9,
+            "agent_message",
+            &format!(
+                r#"{{"run_id":"r1","message_id":"m9","role":"assistant","text":"see {word} end"}}"#
+            ),
+        ),
+    }));
+    let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+    let rows = frame(&mut term, &mut app);
+    // The layout puts the long word on rows of its own.
+    let start = find(&rows, "see");
+    let end = find(&rows, "x end");
+    drag(&mut app, start, (end.0 + 4, end.1));
+    frame(&mut term, &mut app);
+    let text = app.attached.as_mut().unwrap().copied.take().unwrap();
+    assert_eq!(text, format!("see {word} end"));
+}
+
+/// The ends of a selection whose row scrolled away still cut the row at
+/// the selected columns.
+#[test]
+fn a_selection_scrolled_away_keeps_its_columns() {
+    let mut app = common::attached_app(false, W, H);
+    // Enough text below to scroll the selected row away.
+    // JSON newlines, escaped.
+    let lines: String = (0..30).map(|i| format!(r"line {i}\n\n")).collect();
+    app.update(Msg::Net(engram_tui::app::NetMsg::Live {
+        session_id: "s-1".into(),
+        envelope: common::env(
+            9,
+            "agent_message",
+            &format!(
+                r#"{{"run_id":"r1","message_id":"m9","role":"assistant","text":"pick this row\n\n{lines}"}}"#
+            ),
+        ),
+    }));
+    let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+    // Scroll so the reply's first line is on screen.
+    for _ in 0..20 {
+        mouse(&mut app, MouseEventKind::ScrollUp, (0, 2));
+    }
+    let rows = frame(&mut term, &mut app);
+    let at = find(&rows, "pick this row");
+    // "this" only.
+    drag(&mut app, (at.0 + 5, at.1), (at.0 + 8, at.1));
+    frame(&mut term, &mut app);
+    app.attached.as_mut().unwrap().copied = None;
+    // Scroll the row off the screen, then copy again.
+    for _ in 0..20 {
+        mouse(&mut app, MouseEventKind::ScrollDown, (0, 2));
+    }
+    let rows = frame(&mut term, &mut app);
+    assert!(!rows.iter().any(|r| r.contains("pick this row")));
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    )));
+    frame(&mut term, &mut app);
+    assert_eq!(
+        app.attached.as_mut().unwrap().copied.take().as_deref(),
+        Some("this")
+    );
+}
+
+/// Older history shifts every cell, and a resize re-wraps every row: a
+/// selection would name other text, so it goes.
+#[test]
+fn older_history_or_a_resize_drops_the_selection() {
+    let mut app = common::attached_app(false, W, H);
+    let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+    let rows = frame(&mut term, &mut app);
+    let at = find(&rows, "look at the layout");
+    drag(&mut app, at, (at.0 + 3, at.1));
+    app.update(Msg::Net(engram_tui::app::NetMsg::History {
+        session_id: "s-1".into(),
+        events: vec![common::env(
+            -1,
+            "agent_message",
+            r#"{"run_id":"r0","message_id":"m0","role":"assistant","text":"older"}"#,
+        )],
+        older: true,
+    }));
+    assert!(app.attached.as_ref().unwrap().selection.is_none());
+    drag(&mut app, at, (at.0 + 3, at.1));
+    app.update(Msg::Resize(40, H));
+    assert!(app.attached.as_ref().unwrap().selection.is_none());
+}
+
+/// A copy's result arrives after a newer copy was asked for: it is
+/// dropped, and its fallback never puts the older text back.
+#[test]
+fn a_stale_copy_result_is_dropped() {
+    let mut app = common::attached_app(false, W, H);
+    app.copy_seq = 2;
+    app.cmds.clear();
+    app.update(Msg::Copied {
+        seq: 1,
+        chars: 3,
+        how: engram_tui::app::Copied::Failed("no clipboard".into()),
+        fallback: Some("old".into()),
+    });
+    assert!(app.cmds.is_empty(), "{:?}", app.cmds);
+    assert!(app.note.is_none());
+}
+
 #[test]
 fn ctrl_c_on_a_selection_copies_it_again() {
     let mut app = common::attached_app(false, W, H);

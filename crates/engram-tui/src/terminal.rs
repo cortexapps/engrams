@@ -295,6 +295,7 @@ fn run_probe() -> Probe {
     Probe {
         kitty: false,
         program_status: program_status_override().unwrap_or(false),
+        bg: None,
     }
 }
 

@@ -101,8 +101,11 @@ pub enum Cmd {
     },
     ShellClose,
     /// Ask the terminal to set its clipboard (OSC 52): the runtime writes
-    /// it between frames.
-    CopyToTerminal(String),
+    /// it between frames. `seq` is the copy it belongs to.
+    CopyToTerminal {
+        seq: u64,
+        text: String,
+    },
     Quit,
 }
 
@@ -160,6 +163,8 @@ pub enum Msg {
     Net(NetMsg),
     /// A copy of `chars` characters finished.
     Copied {
+        /// The copy this answers: a result for an older copy is dropped.
+        seq: u64,
         chars: usize,
         how: Copied,
         /// The text, when the platform command failed and the terminal
@@ -715,6 +720,8 @@ pub struct App {
     pub attach_seq: u64,
     /// The terminal takes OSC 7501 reports (set by the runtime).
     pub program_status: bool,
+    /// The newest copy asked for; results for older ones are dropped.
+    pub copy_seq: u64,
     /// The other sessions, for the terminal.
     pub inbox: Inbox,
     /// A background session-list poll is in flight.
@@ -751,6 +758,7 @@ impl App {
             auth_failed: false,
             attach_seq: 0,
             program_status: false,
+            copy_seq: 0,
             inbox: Inbox::default(),
             refreshing: false,
             poll_failures: 0,
@@ -889,6 +897,11 @@ impl App {
             Msg::Resize(w, h) => {
                 self.width = w;
                 self.height = h;
+                // The rows re-wrap: a selection's (row, column) ends would
+                // name other text.
+                if let Some(a) = &mut self.attached {
+                    a.selection = None;
+                }
                 let (cols, rows) = self.shell_geometry();
                 if let Some(a) = &mut self.attached {
                     a.reducer.transcript.invalidate_all();
@@ -899,10 +912,16 @@ impl App {
             }
             Msg::Focus(f) => self.focused = f,
             Msg::Copied {
+                seq,
                 chars,
                 how,
                 fallback,
             } => {
+                // A newer copy was asked for since: this one's result (and
+                // its fallback) would put older text back.
+                if seq != self.copy_seq {
+                    return;
+                }
                 let unit = if chars == 1 { "char" } else { "chars" };
                 match (how, fallback) {
                     (Copied::Native, _) => self.note(format!("Copied {chars} {unit} to clipboard")),
@@ -911,7 +930,7 @@ impl App {
                     }
                     // The platform command failed: ask the terminal.
                     (Copied::Failed(_), Some(text)) => {
-                        self.cmds.push(Cmd::CopyToTerminal(text));
+                        self.cmds.push(Cmd::CopyToTerminal { seq, text });
                     }
                     (Copied::Failed(e), None) => self.note(format!("copy failed: {e}")),
                 }
@@ -1855,6 +1874,10 @@ impl App {
                 if older {
                     a.loading_older = false;
                     a.want_older = false;
+                    // Prepending shifts every cell index: a selection (and
+                    // the last frame's hit map) would name other cells.
+                    a.selection = None;
+                    a.hits.clear();
                     if (events.len() as i64) < PAGE {
                         a.exhausted = true;
                     }

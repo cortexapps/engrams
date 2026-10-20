@@ -459,6 +459,11 @@ impl Entry {
         if self.layout.rows.is_empty() {
             return;
         }
+        // A chunk can complete a code block: highlight it now, as the
+        // full layout would (only blocks not done yet are parsed).
+        if let Cell::Assistant { md, .. } = &mut self.cell {
+            md.highlight();
+        }
         let width = self.layout.width;
         let text = source_of(&self.cell, Src::Text);
         let offset = offset.min(text.len());

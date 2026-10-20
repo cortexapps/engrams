@@ -103,6 +103,8 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
     let mut last_draw = Instant::now() - FRAME;
     let mut dirty = true;
     let mut next_poll = Instant::now() + app.poll_interval();
+    // The clipboard worker, started on the first copy.
+    let mut copier: Option<std::sync::mpsc::Sender<(u64, String)>> = None;
     let mut status = status::Reporter::new(terminal::probe().program_status);
     app.program_status = status.enabled;
     // Native scrollback mode shows a focused shell on the alternate
@@ -189,7 +191,7 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
                 Cmd::ShellInput(bytes) => net.shell_input(bytes),
                 Cmd::ShellResize { cols, rows } => net.shell_resize(cols, rows),
                 Cmd::ShellClose => net.shell_close(),
-                Cmd::CopyToTerminal(text) => {
+                Cmd::CopyToTerminal { seq, text } => {
                     let chars = text.chars().count();
                     let how = match clipboard::osc52(&text) {
                         Some(seq) => {
@@ -202,6 +204,7 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
                         None => Copied::Failed("too large for the terminal's clipboard".into()),
                     };
                     app.update(Msg::Copied {
+                        seq,
                         chars,
                         how,
                         fallback: None,
@@ -278,7 +281,7 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
             // A drag finished, or Ctrl+C on a selection: the frame read
             // the text; put it on the clipboard.
             if let Some(text) = app.attached.as_mut().and_then(|a| a.copied.take()) {
-                start_copy(text, &tx, &mut app);
+                start_copy(text, &tx, &mut copier, &mut app);
                 dirty = true;
             }
             // The program status record, the title, an alert: written
@@ -343,32 +346,53 @@ type Term = Terminal<CrosstermBackend<std::io::Stdout>>;
 
 /// Copy `text`: the platform's clipboard command off the event loop, or,
 /// when the session runs remotely (or the command fails), OSC 52 from the
-/// loop itself.
-fn start_copy(text: String, tx: &mpsc::UnboundedSender<Msg>, app: &mut App) {
+/// loop itself. Copies go through one worker thread in order, so the
+/// newest always lands last; each carries a number, and the app drops a
+/// result (or a fallback) for a copy that is no longer the newest. The
+/// worker is a plain thread: exiting never waits for a stuck command.
+fn start_copy(
+    text: String,
+    tx: &mpsc::UnboundedSender<Msg>,
+    copier: &mut Option<std::sync::mpsc::Sender<(u64, String)>>,
+    app: &mut App,
+) {
     if text.is_empty() {
         return;
     }
+    app.copy_seq += 1;
+    let seq = app.copy_seq;
     if clipboard::remote() {
-        app.cmds.push(Cmd::CopyToTerminal(text));
+        app.cmds.push(Cmd::CopyToTerminal { seq, text });
         return;
     }
-    let tx = tx.clone();
-    tokio::task::spawn_blocking(move || {
-        let chars = text.chars().count();
-        let msg = match clipboard::copy_native(&text) {
-            Ok(()) => Msg::Copied {
-                chars,
-                how: Copied::Native,
-                fallback: None,
-            },
-            Err(e) => Msg::Copied {
-                chars,
-                how: Copied::Failed(e),
-                fallback: Some(text),
-            },
-        };
-        let _ = tx.send(msg);
+    let worker = copier.get_or_insert_with(|| {
+        let (jobs, rx) = std::sync::mpsc::channel::<(u64, String)>();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for (seq, text) in rx {
+                let chars = text.chars().count();
+                let msg = match clipboard::copy_native(&text) {
+                    Ok(()) => Msg::Copied {
+                        seq,
+                        chars,
+                        how: Copied::Native,
+                        fallback: None,
+                    },
+                    Err(e) => Msg::Copied {
+                        seq,
+                        chars,
+                        how: Copied::Failed(e),
+                        fallback: Some(text),
+                    },
+                };
+                if tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        jobs
     });
+    let _ = worker.send((seq, text));
 }
 
 /// The input task: crossterm events → messages. Restartable, because the
