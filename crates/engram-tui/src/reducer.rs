@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use crate::event::{
     parse_answers, parse_plan, parse_plan_decision, parse_questions, Answers, Event,
 };
-use crate::markdown::{Markdown, Rendered};
+use crate::markdown::Markdown;
 use crate::tools::{canonical as canonical_tool, summarize};
 use crate::transcript::{Cell, Marker, ToolState, Transcript};
 
@@ -605,7 +605,7 @@ impl Reducer {
                         self.close_active();
                         let i = self.transcript.push(Cell::Plan {
                             tool_call_id: tool_call_id.as_str().into(),
-                            text: Rendered::render(&plan),
+                            md: Markdown::finalized(&plan),
                             approved: None,
                             choice: None,
                         });

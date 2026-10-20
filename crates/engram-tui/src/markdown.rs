@@ -1,11 +1,18 @@
 //! Markdown → display text plus style runs (ADR 0124, PR5). The writer
 //! walks `pulldown-cmark` events once and produces the text the wrapper
 //! lays out, with non-overlapping runs that carry inline flags. Tables
-//! are buffered until closed so their columns can be padded.
+//! are buffered until closed so their columns can be fitted to the
+//! width: the only block whose shape depends on it.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-use crate::wrap::display_width;
+use crate::wrap::{display_width, wrap_into, Row};
+
+/// The width tables are fitted to before a layout names one.
+pub const DEFAULT_WIDTH: u16 = 80;
+/// A table column never shrinks under its longest word, up to this many
+/// cells; when even that does not fit, the table is written as records.
+const TABLE_MAX_FLOOR: usize = 12;
 
 /// Inline flags a run carries. They combine (`BOLD | CODE`).
 pub mod flags {
@@ -37,15 +44,27 @@ pub struct Rendered {
 
 impl Rendered {
     pub fn render(md: &str) -> Rendered {
+        Rendered::render_at(md, DEFAULT_WIDTH).0
+    }
+
+    /// Render `md` with tables fitted to `width`; the flag says whether
+    /// the source holds a table (and so renders differently elsewhere).
+    pub fn render_at(md: &str, width: u16) -> (Rendered, bool) {
         let mut r = Rendered::default();
-        r.append(md);
-        r
+        let table = r.append_at(md, width);
+        (r, table)
     }
 
     /// Render `md` and append it after a block separator.
     pub fn append(&mut self, md: &str) {
-        let mut w = Writer::new(self);
+        self.append_at(md, DEFAULT_WIDTH);
+    }
+
+    /// `append` with tables fitted to `width`; returns whether one was seen.
+    pub fn append_at(&mut self, md: &str, width: u16) -> bool {
+        let mut w = Writer::new(self, width);
         w.run(md);
+        w.saw_table
     }
 
     /// Append raw text with no styling (a streaming tail).
@@ -99,10 +118,13 @@ struct Writer<'r> {
     item_fresh: bool,
     table: Option<TableBuf>,
     link: Option<(String, usize)>,
+    /// Cells available to a table (the line prefix is taken off it).
+    width: usize,
+    saw_table: bool,
 }
 
 impl<'r> Writer<'r> {
-    fn new(out: &'r mut Rendered) -> Self {
+    fn new(out: &'r mut Rendered, width: u16) -> Self {
         let line_start = out.text.is_empty() || out.text.ends_with('\n');
         let pending_blank = !out.text.is_empty();
         Writer {
@@ -116,6 +138,8 @@ impl<'r> Writer<'r> {
             item_fresh: false,
             table: None,
             link: None,
+            width: usize::from(width.max(1)),
+            saw_table: false,
         }
     }
 
@@ -340,6 +364,7 @@ impl<'r> Writer<'r> {
             }
             Tag::Table(align) => {
                 self.block_start();
+                self.saw_table = true;
                 self.table = Some(TableBuf {
                     align,
                     rows: Vec::new(),
@@ -447,39 +472,92 @@ impl<'r> Writer<'r> {
         }
     }
 
+    /// Write a closed table. Columns take their natural width when the
+    /// grid fits; otherwise the widest columns give up cells one at a
+    /// time (never under their longest word, see `TABLE_MAX_FLOOR`) and
+    /// cell text wraps inside its column. When even that cannot fit,
+    /// each body row is written as `header: cell` records.
     fn write_table(&mut self, t: TableBuf) {
         let cols = t.rows.iter().map(Vec::len).max().unwrap_or(0);
         if cols == 0 {
             return;
         }
         let mut widths = vec![0usize; cols];
+        let mut floors = vec![1usize; cols];
         for row in &t.rows {
             for (i, c) in row.iter().enumerate() {
                 widths[i] = widths[i].max(display_width(c));
+                let word = c
+                    .split_whitespace()
+                    .map(display_width)
+                    .max()
+                    .unwrap_or(0)
+                    .min(TABLE_MAX_FLOOR);
+                floors[i] = floors[i].max(word);
             }
         }
+        let prefix = self.quote as usize * 2 + self.lists.len() * 2;
+        let avail = self
+            .width
+            .saturating_sub(prefix)
+            .saturating_sub(3 * (cols - 1));
+        let mut sum: usize = widths.iter().sum();
+        while sum > avail {
+            let widest = widths
+                .iter()
+                .enumerate()
+                .filter(|&(i, &w)| w > floors[i])
+                .max_by_key(|(_, &w)| w)
+                .map(|(i, _)| i);
+            let Some(i) = widest else {
+                break;
+            };
+            widths[i] -= 1;
+            sum -= 1;
+        }
+        if sum > avail {
+            self.write_records(&t);
+            return;
+        }
+        let mut wrapped: Vec<Vec<Row>> = vec![Vec::new(); cols];
         for (ri, row) in t.rows.iter().enumerate() {
-            self.line_prefix();
+            let mut height = 1;
             for (i, w) in widths.iter().enumerate() {
-                if i > 0 {
-                    self.raw(" │ ", flags::DIM);
-                }
+                wrapped[i].clear();
                 let c = row.get(i).map(String::as_str).unwrap_or("");
-                let pad = w.saturating_sub(display_width(c));
-                let (left, right) = match t.align.get(i) {
-                    Some(Alignment::Right) => (pad, 0),
-                    Some(Alignment::Center) => (pad / 2, pad - pad / 2),
-                    _ => (0, pad),
-                };
-                for _ in 0..left {
-                    self.out.text.push(' ');
-                }
-                self.raw(c, if ri == 0 { flags::BOLD } else { 0 });
-                for _ in 0..right {
-                    self.out.text.push(' ');
-                }
+                wrap_into(c, *w as u16, &mut wrapped[i]);
+                height = height.max(wrapped[i].len());
             }
-            self.newline();
+            for line in 0..height {
+                self.line_prefix();
+                for (i, w) in widths.iter().enumerate() {
+                    if i > 0 {
+                        self.raw(" │ ", flags::DIM);
+                    }
+                    let c = row.get(i).map(String::as_str).unwrap_or("");
+                    let seg = wrapped[i]
+                        .get(line)
+                        .map(|r| &c[r.start as usize..r.end as usize])
+                        .unwrap_or("");
+                    let pad = w.saturating_sub(display_width(seg));
+                    let last = i + 1 == cols;
+                    let (left, right) = match t.align.get(i) {
+                        Some(Alignment::Right) => (pad, 0),
+                        Some(Alignment::Center) => (pad / 2, pad - pad / 2),
+                        // The last column needs no padding on its right.
+                        _ if last => (0, 0),
+                        _ => (0, pad),
+                    };
+                    for _ in 0..left {
+                        self.out.text.push(' ');
+                    }
+                    self.raw(seg, if ri == 0 { flags::BOLD } else { 0 });
+                    for _ in 0..right {
+                        self.out.text.push(' ');
+                    }
+                }
+                self.newline();
+            }
             if ri == 0 {
                 self.line_prefix();
                 for (i, w) in widths.iter().enumerate() {
@@ -489,6 +567,33 @@ impl<'r> Writer<'r> {
                     let bar: String = "─".repeat(*w);
                     self.raw(&bar, flags::DIM);
                 }
+                self.newline();
+            }
+        }
+    }
+
+    /// A table too wide for its columns: one `header: cell` line per
+    /// cell, a blank line between rows.
+    fn write_records(&mut self, t: &TableBuf) {
+        let Some((header, body)) = t.rows.split_first() else {
+            return;
+        };
+        let rows: &[Vec<String>] = if body.is_empty() {
+            std::slice::from_ref(header)
+        } else {
+            body
+        };
+        for (ri, row) in rows.iter().enumerate() {
+            if ri > 0 {
+                self.newline();
+            }
+            for (i, c) in row.iter().enumerate() {
+                self.line_prefix();
+                if let Some(h) = header.get(i).filter(|h| !h.is_empty() && !body.is_empty()) {
+                    self.raw(h, flags::BOLD);
+                    self.raw(": ", flags::DIM);
+                }
+                self.raw(c, 0);
                 self.newline();
             }
         }
@@ -533,12 +638,66 @@ pub struct Markdown {
     /// Bytes of `raw` rendered into `shown[..shown_done]`.
     raw_done: usize,
     shown_done: usize,
+    /// The width tables were fitted to (0: none named yet).
+    width: u16,
+    /// Finalized. The source is kept past this point only when it holds
+    /// a table, so a new width can re-fit it.
+    done: bool,
 }
 
 impl Markdown {
+    /// A finished message (a plan): rendered now, re-fitted on resize.
+    pub fn finalized(md: &str) -> Markdown {
+        let mut m = Markdown {
+            raw: md.to_string(),
+            ..Markdown::default()
+        };
+        m.finalize();
+        m
+    }
+
     /// The display text.
     pub fn text(&self) -> &str {
         &self.shown.text
+    }
+
+    fn fit_width(&self) -> u16 {
+        if self.width == 0 {
+            DEFAULT_WIDTH
+        } else {
+            self.width
+        }
+    }
+
+    /// Fit tables to `width`. Nothing happens unless the width changed
+    /// and the source is still held (streaming, or finalized with a
+    /// table in it): a finished prose message is width-independent.
+    pub fn fit(&mut self, width: u16) {
+        if self.width == width {
+            return;
+        }
+        self.width = width;
+        if self.raw.is_empty() {
+            return;
+        }
+        if self.done {
+            self.render_all();
+        } else {
+            self.shown.clear();
+            self.raw_done = 0;
+            self.shown_done = 0;
+            self.sync();
+        }
+    }
+
+    fn render_all(&mut self) {
+        let (shown, table) = Rendered::render_at(&self.raw, self.fit_width());
+        self.shown = shown;
+        if !table {
+            self.raw = String::new();
+        }
+        self.raw_done = self.raw.len();
+        self.shown_done = self.shown.text.len();
     }
 
     pub fn runs(&self) -> &[Run] {
@@ -554,6 +713,7 @@ impl Markdown {
     /// replacing its chunk stream). Returns the display offset from which
     /// the text changed.
     pub fn replace_from(&mut self, base: usize, text: &str) -> usize {
+        self.done = false;
         self.raw.truncate(base.min(self.raw.len()));
         if !self.raw.is_empty() {
             self.raw.push_str("\n\n");
@@ -565,6 +725,7 @@ impl Markdown {
     /// Append a chunk. Returns the display offset from which the text
     /// changed.
     pub fn push(&mut self, chunk: &str) -> usize {
+        self.done = false;
         self.raw.push_str(chunk);
         self.sync()
     }
@@ -578,21 +739,20 @@ impl Markdown {
         }
         let from = self.shown_done;
         self.shown.truncate(self.shown_done);
-        self.shown.append(&self.raw[self.raw_done..]);
+        let width = self.fit_width();
+        self.shown.append_at(&self.raw[self.raw_done..], width);
         self.raw_done = self.raw.len();
         self.shown_done = self.shown.text.len();
         from
     }
 
-    /// Render everything and drop the source.
+    /// Render everything and drop the source (kept only for a table).
     pub fn finalize(&mut self) {
-        if self.raw.is_empty() {
+        if self.raw.is_empty() || self.done {
             return;
         }
-        self.shown = Rendered::render(&self.raw);
-        self.raw = String::new();
-        self.raw_done = 0;
-        self.shown_done = self.shown.text.len();
+        self.done = true;
+        self.render_all();
     }
 
     fn sync(&mut self) -> usize {
@@ -607,7 +767,9 @@ impl Markdown {
         if boundary > self.raw_done {
             changed_from = self.shown_done;
             self.shown.truncate(self.shown_done);
-            self.shown.append(&self.raw[self.raw_done..boundary]);
+            let width = self.fit_width();
+            self.shown
+                .append_at(&self.raw[self.raw_done..boundary], width);
             self.raw_done = boundary;
             self.shown_done = self.shown.text.len();
         } else {
@@ -694,6 +856,41 @@ mod tests {
             runs_of(&r, flags::LINK),
             vec!["docs", "https://example.com"]
         );
+    }
+
+    #[test]
+    fn a_wide_table_wraps_its_cells_or_becomes_records() {
+        let md = "| Rule | Violation |\n|---|---|\n| be brief | the long sentence that explains why the rule was broken |\n| be kind | ok |";
+        let (r, table) = Rendered::render_at(md, 40);
+        assert!(table);
+        assert_eq!(
+            r.text,
+            "Rule     │ Violation\n─────────┼──────────────────────────────\nbe brief │ the long sentence that\n         │ explains why the rule was\n         │ broken\nbe kind  │ ok"
+        );
+        assert!(r.text.lines().all(|l| display_width(l) <= 40));
+        let (r, _) = Rendered::render_at(md, 12);
+        assert_eq!(
+            r.text,
+            "Rule: be brief\nViolation: the long sentence that explains why the rule was broken\n\nRule: be kind\nViolation: ok"
+        );
+        assert_eq!(
+            runs_of(&r, flags::BOLD),
+            vec!["Rule", "Violation", "Rule", "Violation"]
+        );
+    }
+
+    #[test]
+    fn a_finished_message_refits_its_table_but_drops_plain_prose() {
+        let mut m = Markdown::finalized("| a | b |\n|---|---|\n| one two three | x |");
+        assert!(!m.raw().is_empty(), "the source stays for a re-fit");
+        let wide = m.text().to_string();
+        m.fit(7);
+        assert_ne!(m.text(), wide);
+        assert!(m.text().contains("a: one two three"), "{}", m.text());
+        let mut p = Markdown::finalized("plain *prose*");
+        assert!(p.raw().is_empty());
+        p.fit(12);
+        assert_eq!(p.text(), "plain prose");
     }
 
     #[test]

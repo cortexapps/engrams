@@ -239,3 +239,26 @@ fn tool_rows_show_the_subject_of_each_call_70x16() {
         .join("\n");
     insta::assert_snapshot!(shot);
 }
+
+#[test]
+fn a_table_refits_when_the_terminal_narrows() {
+    let mut app = common::attached_app(false, 60, 14);
+    for e in [
+        common::env(9, "run_started", r#"{"run_id":"r2","prompt_id":"p2"}"#),
+        common::env(
+            10,
+            "agent_message",
+            r#"{"run_id":"r2","message_id":"m3","role":"assistant","text":"Budgets:\n\n| Metric | Budget | Note |\n|---|---|---|\n| RSS attached | 40 MB | with ten thousand events loaded |\n| binary | 8 MB | stripped, linux-musl |"}"#,
+        ),
+        common::env(11, "run_completed", r#"{"run_id":"r2","ok":true}"#),
+    ] {
+        app.update(Msg::Net(NetMsg::Live {
+            session_id: "s-1".into(),
+            envelope: e,
+        }));
+    }
+    let wide = frame(&mut app, 60, 14);
+    app.update(Msg::Resize(34, 14));
+    let narrow = frame(&mut app, 34, 14);
+    insta::assert_snapshot!(format!("{wide}\n{narrow}"));
+}

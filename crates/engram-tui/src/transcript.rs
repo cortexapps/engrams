@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use crate::markdown::{Markdown, Rendered, Run};
+use crate::markdown::{Markdown, Run};
 use crate::wrap::{wrap_into, Row};
 
 /// How a tool call ended.
@@ -75,7 +75,7 @@ pub enum Cell {
     },
     Plan {
         tool_call_id: Box<str>,
-        text: Rendered,
+        md: Markdown,
         approved: Option<bool>,
         /// The user's highlighted choice before Enter confirms it.
         choice: Option<bool>,
@@ -172,13 +172,13 @@ fn write_cell(cell: &Cell, out: &mut String) {
             }
             out.push('\n');
         }
-        Cell::Plan { text, approved, .. } => {
+        Cell::Plan { md, approved, .. } => {
             out.push_str(match approved {
                 Some(true) => "plan (approved)\n",
                 Some(false) => "plan (rejected)\n",
                 None => "plan\n",
             });
-            write_body(&text.text, out);
+            write_body(md.text(), out);
             out.push('\n');
         }
         Cell::Diff {
@@ -291,6 +291,9 @@ impl Entry {
         if self.layout.width != width {
             self.layout.width = width;
             self.layout.rows.clear();
+            if let Cell::Assistant { md, .. } | Cell::Plan { md, .. } = &mut self.cell {
+                md.fit(width);
+            }
             layout_cell(&self.cell, width, &mut self.layout.rows);
         }
         &self.layout
@@ -405,7 +408,7 @@ impl Entry {
     pub fn runs(&self) -> &[Run] {
         match &self.cell {
             Cell::Assistant { md, .. } => md.runs(),
-            Cell::Plan { text, .. } => &text.runs,
+            Cell::Plan { md, .. } => md.runs(),
             _ => &[],
         }
     }
@@ -416,7 +419,7 @@ fn source_of(cell: &Cell, src: Src) -> &str {
         (Cell::User { text, .. }, Src::Text) => text,
         (Cell::Assistant { md, .. }, Src::Text) => md.text(),
         (Cell::Marker { text, .. }, Src::Text) => text,
-        (Cell::Plan { text, .. }, Src::Text) => &text.text,
+        (Cell::Plan { md, .. }, Src::Text) => md.text(),
         (Cell::Diff { path, .. }, Src::Head) => path,
         (Cell::Diff { text, .. }, Src::Body) => text,
         (Cell::Tool { args, .. }, Src::Head) => args,
@@ -527,8 +530,8 @@ fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
             push_rows(Src::Head, path, width, out, &mut scratch);
             push_body(text, *expanded, width, out, &mut scratch);
         }
-        Cell::Plan { text, .. } => {
-            push_rows(Src::Text, &text.text, width, out, &mut scratch);
+        Cell::Plan { md, .. } => {
+            push_rows(Src::Text, md.text(), width, out, &mut scratch);
             out.push(LayoutRow {
                 src: Src::Tail,
                 row: Row { start: 0, end: 0 },
