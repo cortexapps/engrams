@@ -93,6 +93,7 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
     let mut last_draw = Instant::now() - FRAME;
     let mut dirty = true;
     let mut title = String::new();
+    let mut want = String::new();
     // Native scrollback mode shows a focused shell on the alternate
     // screen, through a second terminal; the inline one keeps its state
     // and resumes when the overlay leaves.
@@ -240,10 +241,10 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
             }
             last_draw = Instant::now();
             dirty = false;
-            let want = app
-                .attached
-                .as_ref()
-                .map(|a| {
+            // Built into a reused buffer: no allocation on a quiet redraw.
+            want.clear();
+            match app.attached.as_ref() {
+                Some(a) => {
                     let mark = if a.reducer.awaiting_decision() {
                         "⚠ needs you · "
                     } else if a.reducer.is_running() {
@@ -251,12 +252,16 @@ async fn run_async(clients: Clients, opts: Options) -> Result<(), String> {
                     } else {
                         ""
                     };
-                    format!("{mark}{} · engrams", a.title)
-                })
-                .unwrap_or_else(|| "engrams".to_string());
+                    want.push_str(mark);
+                    want.push_str(&a.title);
+                    want.push_str(" · engrams");
+                }
+                None => want.push_str("engrams"),
+            }
             if want != title {
                 terminal::set_title(&want);
-                title = want;
+                title.clear();
+                title.push_str(&want);
             }
             for alert in app.alerts.drain(..) {
                 terminal::notify(&alert);
@@ -457,7 +462,7 @@ fn draw(
                 let Some((_, e)) = t.next_committable() else {
                     break;
                 };
-                let h = e.height(width.saturating_sub(2).max(1));
+                let h = e.height(width.saturating_sub(theme.gutter_width()).max(1));
                 if h > 0 {
                     terminal.insert_before(h, |buf| render::paint_cell(buf, e, theme))?;
                 }

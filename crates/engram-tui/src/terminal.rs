@@ -59,7 +59,11 @@ impl Guard {
     /// terminal reports support; `event-types` is left out because several
     /// terminals mis-handle key releases with it.
     pub fn enter(alt_screen: bool, mouse: bool) -> io::Result<Guard> {
-        enter_modes(alt_screen, mouse)?;
+        if let Err(e) = enter_modes(alt_screen, mouse) {
+            // Raw mode may be on already: leave the terminal as found.
+            restore();
+            return Err(e);
+        }
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore();

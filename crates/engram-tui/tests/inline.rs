@@ -24,7 +24,7 @@ fn draw(terminal: &mut Terminal<TestBackend>, app: &mut App, theme: &Theme) -> u
             let Some((_, e)) = t.next_committable() else {
                 break;
             };
-            let h = e.height(width.saturating_sub(2).max(1));
+            let h = e.height(width.saturating_sub(theme.gutter_width()).max(1));
             if h > 0 {
                 terminal
                     .insert_before(h, |buf| paint_cell(buf, e, theme))
