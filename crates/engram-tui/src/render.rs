@@ -11,6 +11,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::app::{shell_pane_rows, App, Attached, NewSession, NewStage, Screen};
 use crate::keymap::BINDINGS;
 use crate::markdown::{flags, Run};
+use crate::palette::{is_light, Palette};
 use crate::sessions::{age, marker};
 use crate::transcript::{explore_running, Cell, Entry, Marker, Src, ToolState};
 use crate::wrap::{display_width, grapheme_width};
@@ -65,13 +66,18 @@ impl Theme {
             diff_bg: None,
             user: Style::new().add_modifier(Modifier::BOLD),
             agent: Style::new(),
-            dim: c(Style::new().add_modifier(Modifier::DIM), Color::DarkGray),
+            // De-emphasis is the DIM attribute alone, never a colour: the
+            // terminal renders it relative to the user's own foreground and
+            // background, and a terminal without DIM shows plain text. A
+            // grey (ANSI 8) is close to the background in many themes, and
+            // DIM on top of it is unreadable.
+            dim: Style::new().add_modifier(Modifier::DIM),
             tool: c(Style::new(), Color::Cyan),
             err: c(Style::new(), Color::Red),
             warn: c(Style::new(), Color::Yellow),
             accent: c(Style::new().add_modifier(Modifier::BOLD), Color::Green),
             selected: Style::new().add_modifier(Modifier::REVERSED),
-            pending: c(Style::new().add_modifier(Modifier::DIM), Color::DarkGray),
+            pending: Style::new().add_modifier(Modifier::DIM),
             band: if color {
                 Style::new().bg(Color::DarkGray)
             } else {
@@ -100,7 +106,7 @@ impl Theme {
             return Style::new();
         };
         let fg = match t {
-            Tone::Comment => Color::DarkGray,
+            Tone::Comment => return self.dim.add_modifier(Modifier::ITALIC),
             Tone::String => Color::Green,
             Tone::Keyword => Color::Magenta,
             Tone::Number | Tone::Type => Color::Yellow,
@@ -108,12 +114,40 @@ impl Theme {
             Tone::Function => Color::Blue,
             Tone::Tag => Color::Red,
         };
-        let st = Style::new().fg(fg);
-        if t == Tone::Comment {
-            st.add_modifier(Modifier::ITALIC)
-        } else {
-            st
+        Style::new().fg(fg)
+    }
+
+    /// The colours the TUI picks, resolved against the terminal's own
+    /// background `bg` (an `OSC 11` reply): the engrams brand tokens for a
+    /// light or a dark ground, each checked for text contrast on it. The
+    /// palette colours of the user's theme stay for everything else. See
+    /// [`crate::palette`].
+    pub fn adapt(mut self, bg: (u8, u8, u8)) -> Self {
+        if !self.color {
+            return self;
         }
+        let p = Palette::resolve(bg);
+        let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb(r, g, b);
+        self.code = self.code.fg(rgb(p.terminal));
+        self.tool = self.tool.fg(rgb(p.terminal));
+        self.link = self.link.fg(rgb(p.terminal));
+        self.heading = self.heading.fg(rgb(p.primary));
+        self.accent = self.accent.fg(rgb(p.primary));
+        self.add = self.add.fg(rgb(p.nominal));
+        self.del = self.del.fg(rgb(p.critical));
+        self.err = self.err.fg(rgb(p.critical));
+        self.warn = self.warn.fg(rgb(p.caution));
+        self.band = Style::new().bg(rgb(p.band));
+        self
+    }
+
+    /// `ENGRAMS_TUI_NO_DIM`: no de-emphasis at all, for terminals where DIM
+    /// is still too faint and for low vision. The layout and the markers
+    /// stay the same; only the attribute goes.
+    pub fn without_dim(mut self) -> Self {
+        self.dim = Style::new();
+        self.pending = Style::new();
+        self
     }
 
     /// The style of a markdown run.
@@ -270,8 +304,7 @@ pub fn overlay_color(bg: Option<(u8, u8, u8)>) -> Color {
     let Some((r, g, b)) = bg else {
         return Color::Black;
     };
-    let luma = (299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b)) / 1000;
-    let keep = if luma < 128 { 60 } else { 92 };
+    let keep = if is_light((r, g, b)) { 92 } else { 60 };
     let shade = |c: u8| (u32::from(c) * keep / 100) as u8;
     Color::Rgb(shade(r), shade(g), shade(b))
 }
@@ -336,7 +369,7 @@ fn paint_diff_row(
     let (base, bg) = match sign {
         Some(b'+') => (Style::new(), th.diff_bg.map(|b| b.0)),
         Some(b'-') => (Style::new(), th.diff_bg.map(|b| b.1)),
-        _ => (Style::new().add_modifier(Modifier::DIM), None),
+        _ => (th.dim, None),
     };
     let base = match bg {
         Some(bg) => base.bg(bg),
@@ -412,7 +445,7 @@ fn paint_row(
             put(buf, x, y, if open { "▾" } else { "▸" }, 1, th.dim);
         }
         let text = e.source(Src::Fold);
-        let cx = put(buf, x + gw, y, text, w.saturating_sub(gw), th.dim);
+        let cx = put(buf, x + gw, y, text, w.saturating_sub(gw), Style::new());
         if !open && !th.ax {
             put(
                 buf,
@@ -724,7 +757,7 @@ fn paint_src<'e>(
                     y,
                     &s[verb_end..],
                     body_w.saturating_sub(2 + cx),
-                    th.dim,
+                    Style::new(),
                 );
                 let _ = cx;
                 return Some(text);
@@ -761,10 +794,12 @@ fn paint_src<'e>(
                     match sign {
                         Some(b'+') => th.add,
                         Some(b'-') => th.del,
-                        _ => th.dim,
+                        _ => Style::new(),
                     }
                 }
-                _ => th.dim,
+                // The result is the content: the user's foreground. The
+                // `⎿` gutter and the `… N more lines` tail are the dim parts.
+                _ => Style::new(),
             };
             put(buf, body_x + 2, y, s, body_w.saturating_sub(2), body_style);
             Some(text)
@@ -792,7 +827,7 @@ fn paint_src<'e>(
             let s = &text[lr.row.start as usize..lr.row.end as usize];
             let head_style = match &e.cell {
                 Cell::Diff { .. } | Cell::Explore { .. } => style.add_modifier(Modifier::BOLD),
-                _ => th.dim,
+                _ => Style::new(),
             };
             cx += put(
                 buf,
