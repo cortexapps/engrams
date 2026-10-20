@@ -31,6 +31,9 @@ pub struct QuestionOption {
     pub description: String,
 }
 
+/// Answers to a question card: question text → the labels picked.
+pub type Answers = std::collections::HashMap<String, Vec<String>>;
+
 /// A decoded event. `Other` carries every kind the transcript does not
 /// render; the footer still sees the kind name.
 #[derive(Debug, Clone)]
@@ -114,6 +117,8 @@ pub enum Event {
     },
     QuestionAnswered {
         tool_call_id: String,
+        /// Question text → the labels picked.
+        answers: Answers,
     },
     ResumeStarted,
     Resumed,
@@ -272,10 +277,6 @@ struct ToolRequestedP {
     args_json: String,
 }
 #[derive(Deserialize)]
-struct ToolCallIdP {
-    tool_call_id: String,
-}
-#[derive(Deserialize)]
 struct ToolResultP {
     tool_call_id: String,
     #[serde(default)]
@@ -332,6 +333,12 @@ struct UserQuestionP {
     tool_call_id: String,
     #[serde(default)]
     questions: Vec<Question>,
+}
+#[derive(Deserialize)]
+struct QuestionAnsweredP {
+    tool_call_id: String,
+    #[serde(default)]
+    answers: Answers,
 }
 #[derive(Deserialize)]
 struct TitleP {
@@ -434,9 +441,12 @@ impl Event {
                 tool_call_id: v.tool_call_id,
                 questions: v.questions,
             }),
-            "question_answered" => p::<ToolCallIdP>(payload).map(|v| Event::QuestionAnswered {
-                tool_call_id: v.tool_call_id,
-            }),
+            "question_answered" => {
+                p::<QuestionAnsweredP>(payload).map(|v| Event::QuestionAnswered {
+                    tool_call_id: v.tool_call_id,
+                    answers: v.answers,
+                })
+            }
             "resume_started" => Some(Event::ResumeStarted),
             "resumed" => Some(Event::Resumed),
             "snapshot_taken" => Some(Event::SnapshotTaken),
@@ -471,6 +481,11 @@ pub fn parse_questions(args_json: &str) -> Option<Vec<Question>> {
     p::<Args>(args_json)
         .map(|a| a.questions)
         .filter(|q| !q.is_empty())
+}
+
+/// The answers in an `ask_user_question` result: `{question: [labels]}`.
+pub fn parse_answers(result_json: &str) -> Option<Answers> {
+    p::<Answers>(result_json)
 }
 
 /// The decision in an `exit_plan_mode` result: `{"decision":"approve"|"reject"}`.

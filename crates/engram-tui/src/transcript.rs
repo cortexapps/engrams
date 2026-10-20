@@ -563,7 +563,14 @@ fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
                 row: Row { start: 0, end: 0 },
             });
         }
-        Cell::Question { questions, .. } => {
+        Cell::Question {
+            questions,
+            answered,
+            picks,
+            ..
+        } => {
+            // An answered card keeps each question and only the options
+            // picked; the open card lists every option and a key hint.
             for (i, q) in questions.iter().enumerate().take(u16::MAX as usize) {
                 push_rows(
                     Src::Question(i as u16),
@@ -573,6 +580,9 @@ fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
                     &mut scratch,
                 );
                 for (j, o) in q.options.iter().enumerate().take(u16::MAX as usize) {
+                    if *answered && !picks.get(i).is_some_and(|p| p.contains(&(j as u16))) {
+                        continue;
+                    }
                     push_rows(
                         Src::Option(i as u16, j as u16),
                         &o.label,
@@ -582,10 +592,12 @@ fn layout_cell(cell: &Cell, width: u16, out: &mut Vec<LayoutRow>) {
                     );
                 }
             }
-            out.push(LayoutRow {
-                src: Src::Tail,
-                row: Row { start: 0, end: 0 },
-            });
+            if !*answered {
+                out.push(LayoutRow {
+                    src: Src::Tail,
+                    row: Row { start: 0, end: 0 },
+                });
+            }
         }
     }
 }

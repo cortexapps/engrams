@@ -572,7 +572,16 @@ fn paint_src<'e>(
                 ),
                 _ => (false, false, false, false),
             };
-            if lr.row.start == 0 {
+            if lr.row.start == 0 && !live {
+                cx = put(
+                    buf,
+                    body_x + 2,
+                    y,
+                    "answer: ",
+                    body_w.saturating_sub(2),
+                    th.dim,
+                );
+            } else if lr.row.start == 0 {
                 cx = put_num(buf, body_x + 2, y, j as u64 + 1, th.dim);
                 cx += put(buf, body_x + 2 + cx, y, ". ", body_w, th.dim);
                 if live || picked {
@@ -593,7 +602,9 @@ fn paint_src<'e>(
                     );
                 }
             }
-            let os = if picked {
+            let os = if !live {
+                th.accent
+            } else if picked {
                 style.add_modifier(Modifier::BOLD)
             } else if live && !current {
                 th.dim

@@ -286,3 +286,26 @@ fn the_tool_row_behind_a_deferred_question_is_withdrawn() {
     let shown = frame(&mut app, 60, 16);
     assert!(!shown.contains("ask_user_question"), "{shown}");
 }
+
+#[test]
+fn answered_question_collapses_to_its_answers_60x12() {
+    let mut app = with_question();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('1'));
+    key(&mut app, KeyCode::Char('3'));
+    key(&mut app, KeyCode::Enter);
+    let shot = frame(&mut app, 60, 12);
+    let shot = shot
+        .lines()
+        .map(|l| {
+            if l.contains("working") {
+                "<footer: working>".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(shot);
+}

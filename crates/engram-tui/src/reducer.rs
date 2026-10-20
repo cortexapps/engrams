@@ -6,7 +6,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::event::{parse_plan, parse_plan_decision, parse_questions, Event};
+use crate::event::{
+    parse_answers, parse_plan, parse_plan_decision, parse_questions, Answers, Event,
+};
 use crate::markdown::{Markdown, Rendered};
 use crate::tools::{canonical as canonical_tool, summarize};
 use crate::transcript::{Cell, Marker, ToolState, Transcript};
@@ -197,6 +199,79 @@ impl Reducer {
         self.active = Some(i);
         self.stream_base = 0;
         i
+    }
+
+    /// A question card. A request the harness re-fires (the same
+    /// tool_call_id after a resume) replaces its earlier card, keeping
+    /// the user's picks, so one card sits by the composer.
+    fn push_question(&mut self, tool_call_id: String, questions: Vec<crate::event::Question>) {
+        let mut picks = vec![Vec::new(); questions.len()];
+        let mut current = 0;
+        let mut answered = false;
+        if let Some(old) = self.decisions.get(&tool_call_id).copied() {
+            if let Some(e) = self.transcript.get_mut(old) {
+                if let Cell::Question {
+                    picks: p,
+                    current: c,
+                    answered: a,
+                    ..
+                } = &mut e.cell
+                {
+                    if p.len() == picks.len() {
+                        picks = std::mem::take(p);
+                    }
+                    current = *c;
+                    answered = *a;
+                }
+                e.hide();
+            }
+        }
+        self.close_active();
+        let i = self.transcript.push(Cell::Question {
+            tool_call_id: tool_call_id.as_str().into(),
+            questions,
+            answered,
+            picks,
+            current,
+        });
+        self.decisions.insert(tool_call_id.clone(), i);
+        if !answered {
+            self.pending_decisions.insert(tool_call_id);
+        }
+    }
+
+    /// Lock a question card with the answers the harness recorded.
+    fn answer_question(&mut self, tool_call_id: &str, answers: Option<Answers>) {
+        self.pending_decisions.remove(tool_call_id);
+        let Some(&i) = self.decisions.get(tool_call_id) else {
+            return;
+        };
+        let Some(e) = self.transcript.get_mut(i) else {
+            return;
+        };
+        if let Cell::Question {
+            answered,
+            questions,
+            picks,
+            ..
+        } = &mut e.cell
+        {
+            *answered = true;
+            if let Some(answers) = answers {
+                for (q, p) in questions.iter().zip(picks.iter_mut()) {
+                    let Some(labels) = answers.get(&q.question) else {
+                        continue;
+                    };
+                    p.clear();
+                    for (j, o) in q.options.iter().enumerate() {
+                        if labels.iter().any(|l| *l == o.label) {
+                            p.push(j as u16);
+                        }
+                    }
+                }
+            }
+        }
+        e.invalidate();
     }
 
     fn push_marker(&mut self, kind: Marker, text: &str) {
@@ -544,17 +619,7 @@ impl Reducer {
                 }
                 if name == "ask_user_question" {
                     if let Some(questions) = parse_questions(&args_json) {
-                        self.close_active();
-                        let picks = vec![Vec::new(); questions.len()];
-                        let i = self.transcript.push(Cell::Question {
-                            tool_call_id: tool_call_id.as_str().into(),
-                            questions,
-                            answered: false,
-                            picks,
-                            current: 0,
-                        });
-                        self.decisions.insert(tool_call_id.clone(), i);
-                        self.pending_decisions.insert(tool_call_id);
+                        self.push_question(tool_call_id, questions);
                     }
                     return;
                 }
@@ -577,21 +642,25 @@ impl Reducer {
                 result_json,
             } => {
                 self.pending_decisions.remove(&tool_call_id);
-                if let Some(&i) = self.decisions.get(&tool_call_id) {
-                    if let Some(e) = self.transcript.get_mut(i) {
-                        match &mut e.cell {
-                            Cell::Plan { approved, .. } => {
-                                *approved = parse_plan_decision(&result_json);
-                                if *approved == Some(true) {
-                                    self.mode = "default".into();
-                                }
-                                self.plan_handoff = true;
-                            }
-                            Cell::Question { answered, .. } => *answered = true,
-                            _ => {}
+                let Some(&i) = self.decisions.get(&tool_call_id) else {
+                    return;
+                };
+                let Some(e) = self.transcript.get_mut(i) else {
+                    return;
+                };
+                match &mut e.cell {
+                    Cell::Plan { approved, .. } => {
+                        *approved = parse_plan_decision(&result_json);
+                        if *approved == Some(true) {
+                            self.mode = "default".into();
                         }
+                        self.plan_handoff = true;
                         e.invalidate();
                     }
+                    Cell::Question { .. } => {
+                        self.answer_question(&tool_call_id, parse_answers(&result_json));
+                    }
+                    _ => {}
                 }
             }
             Event::ToolCallCompleted {
@@ -758,30 +827,11 @@ impl Reducer {
             Event::UserQuestion {
                 tool_call_id,
                 questions,
-            } => {
-                self.close_active();
-                let picks = vec![Vec::new(); questions.len()];
-                let i = self.transcript.push(Cell::Question {
-                    tool_call_id: tool_call_id.as_str().into(),
-                    questions,
-                    answered: false,
-                    picks,
-                    current: 0,
-                });
-                self.decisions.insert(tool_call_id.clone(), i);
-                self.pending_decisions.insert(tool_call_id);
-            }
-            Event::QuestionAnswered { tool_call_id } => {
-                self.pending_decisions.remove(&tool_call_id);
-                if let Some(&i) = self.decisions.get(&tool_call_id) {
-                    if let Some(e) = self.transcript.get_mut(i) {
-                        if let Cell::Question { answered, .. } = &mut e.cell {
-                            *answered = true;
-                        }
-                        e.invalidate();
-                    }
-                }
-            }
+            } => self.push_question(tool_call_id, questions),
+            Event::QuestionAnswered {
+                tool_call_id,
+                answers,
+            } => self.answer_question(&tool_call_id, Some(answers)),
             Event::ResumeStarted => self.waking = true,
             Event::Resumed => {
                 self.waking = false;
@@ -1084,5 +1134,42 @@ mod tests {
         assert_eq!(canonical_tool("ExitPlanMode"), "exit_plan_mode");
         assert_eq!(canonical_tool("mcp__x__exit_plan_mode"), "exit_plan_mode");
         assert_eq!(canonical_tool("Read"), "read");
+    }
+
+    #[test]
+    fn a_refired_question_replaces_its_card_and_keeps_the_picks() {
+        let mut r = Reducer::new();
+        let req = r#"{"tool_call_id":"q1","name":"ask_user_question","args_json":"{\"questions\":[{\"question\":\"A?\",\"header\":\"h\",\"multiSelect\":false,\"options\":[{\"label\":\"x\",\"description\":\"\"},{\"label\":\"y\",\"description\":\"\"}]}]}"}"#;
+        r.apply(ev("tool_call_requested", req));
+        if let Some(e) = r.transcript.get_mut(0) {
+            if let Cell::Question { picks, .. } = &mut e.cell {
+                picks[0].push(1);
+            }
+        }
+        r.apply(ev("resumed", "{}"));
+        r.apply(ev("tool_call_requested", req));
+        assert_eq!(
+            texts(&r),
+            vec!["hidden", "marker:resumed", "question:false"]
+        );
+        assert_eq!(r.pending_decision(), Some((2, "q1".to_string())));
+        match &r.transcript.get(2).unwrap().cell {
+            Cell::Question { picks, .. } => assert_eq!(picks, &vec![vec![1u16]]),
+            other => panic!("{other:?}"),
+        }
+        r.apply(ev(
+            "tool_result_submitted",
+            r#"{"tool_call_id":"q1","result_json":"{\"A?\":[\"x\"]}"}"#,
+        ));
+        assert!(!r.awaiting_decision());
+        match &r.transcript.get(2).unwrap().cell {
+            Cell::Question {
+                picks, answered, ..
+            } => {
+                assert!(*answered);
+                assert_eq!(picks, &vec![vec![0u16]]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
