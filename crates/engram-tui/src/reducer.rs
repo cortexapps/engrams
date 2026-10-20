@@ -1515,7 +1515,7 @@ mod tests {
         r.apply(ev("run_completed", r#"{"run_id":"r1","ok":true}"#));
         let t = &mut r.transcript;
         // The three calls before the reply are one closed fold; the single
-        // call after it stays as it is.
+        // call after it is a fold of its own.
         let head = t.get(1).unwrap();
         assert!(head.is_fold_head());
         assert_eq!(
@@ -1525,7 +1525,11 @@ mod tests {
         assert!(t.get(2).unwrap().hidden_by_fold());
         assert!(t.get(3).unwrap().hidden_by_fold());
         assert!(!t.get(4).unwrap().is_fold_head());
-        assert!(!t.get(5).unwrap().is_fold_head());
+        assert!(t.get(5).unwrap().is_fold_head());
+        assert_eq!(
+            t.get(5).unwrap().source(crate::transcript::Src::Fold),
+            "Ran 1 shell command"
+        );
         // The head: its gap row under the prompt, then the summary row.
         assert_eq!(t.get_mut(1).unwrap().height(40), 2);
         assert_eq!(t.get_mut(2).unwrap().height(40), 0);

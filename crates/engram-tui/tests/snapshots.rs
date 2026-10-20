@@ -436,7 +436,7 @@ fn a_scroll_past_the_top_paints_the_top() {
     assert!(draw_wants_older(&mut app, 60, 12));
     let shot = frame(&mut app, 60, 12);
     assert!(shot.contains("Add a README to the repo."), "{shot}");
-    assert!(shot.contains("✓ Bash ls -la"), "{shot}");
+    assert!(shot.contains("▸ Ran 1 shell command"), "{shot}");
     let up = app.attached.as_ref().unwrap().scroll_up;
     assert!(up > 0 && up < 12, "{up}");
     // A second frame at the clamped scroll paints the same rows and asks

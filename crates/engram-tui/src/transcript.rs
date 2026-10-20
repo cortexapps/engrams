@@ -914,8 +914,8 @@ impl Transcript {
 
     /// Fold the newest turn's tool calls (ADR 0124 PR9): walking back
     /// from the end to the turn's prompt, every run of consecutive
-    /// tool-like cells with two or more calls becomes one closed fold.
-    /// Cells already in a fold are left alone.
+    /// tool-like cells becomes one closed fold. Cells already in a fold
+    /// are left alone.
     pub fn fold_turn(&mut self) {
         self.fold_back(true);
     }
@@ -966,7 +966,7 @@ impl Transcript {
                 _ => {}
             }
         }
-        if shell + tools + reads + edits < 2 {
+        if shell + tools + reads + edits == 0 {
             return;
         }
         let mut text = String::new();
