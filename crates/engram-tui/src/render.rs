@@ -27,6 +27,8 @@ pub struct Theme {
     pub accent: Style,
     pub selected: Style,
     pub pending: Style,
+    /// The band behind a prompt: the row is filled with it edge to edge.
+    pub band: Style,
     pub code: Style,
     pub heading: Style,
     pub link: Style,
@@ -59,6 +61,11 @@ impl Theme {
             accent: c(Style::new().add_modifier(Modifier::BOLD), Color::Green),
             selected: Style::new().add_modifier(Modifier::REVERSED),
             pending: c(Style::new().add_modifier(Modifier::DIM), Color::DarkGray),
+            band: if color {
+                Style::new().bg(Color::DarkGray)
+            } else {
+                Style::new()
+            },
         }
     }
 }
@@ -309,6 +316,19 @@ fn paint_row(
         ),
         Cell::Hidden => return,
     };
+    // A prompt sits on a band across the row, as in Claude Code.
+    if matches!(e.cell, Cell::User { .. }) {
+        fill(
+            buf,
+            Rect {
+                x,
+                y,
+                width: w,
+                height: 1,
+            },
+            th.band,
+        );
+    }
     if first {
         if th.ax {
             put(buf, x, y, word, gw, style);

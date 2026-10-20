@@ -453,3 +453,36 @@ fn a_scroll_past_the_top_paints_the_top() {
     assert_eq!(app.attached.as_ref().unwrap().scroll_up, 0);
     assert!(!draw_wants_older(&mut app, 60, 40), "no scroll, no page");
 }
+
+#[test]
+fn a_prompt_row_sits_on_a_band() {
+    use ratatui::style::Color;
+    let mut app = common::attached_app(false, 60, 30);
+    let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+    let theme = Theme::new(true);
+    let mut scratch = Vec::new();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            draw_fullscreen(f.buffer_mut(), area, &mut app, &theme, &mut scratch);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let row_of = |needle: &str| {
+        (0..buf.area.height)
+            .find(|&y| {
+                let line: String = (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol())
+                    .collect();
+                line.contains(needle)
+            })
+            .expect(needle)
+    };
+    let y = row_of("Add a README to the repo.");
+    // Edge to edge, past the end of the text.
+    for x in [0u16, 10, 59] {
+        assert_eq!(buf.cell((x, y)).unwrap().bg, Color::DarkGray, "x={x}");
+    }
+    let y = row_of("There is already");
+    assert_eq!(buf.cell((2, y)).unwrap().bg, Color::Reset);
+}
