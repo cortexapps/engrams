@@ -21,7 +21,7 @@ use engram_app_client::config::{
 };
 use engram_app_client::device_flow::{poll_token, request_grant, GrantError, PollError};
 use engram_app_client::proto::*;
-use engram_app_client::{Auth, Clients, Transport};
+use engram_app_client::{Auth, Clients, Error, Transport};
 
 use crate::output::{fail, print_json, CliError, CliResult};
 
@@ -118,12 +118,16 @@ pub async fn login(host: &str) -> CliResult {
         })
         .await?;
 
-    // Who did we just become? (Also sanity-proves the minted key works.)
-    let me = whoami(host, &minted.key).await;
-    let email = me
-        .as_ref()
-        .map(|m| m.email.clone())
-        .filter(|e| !e.is_empty());
+    // Who did we just become? This also proves the minted key works. The
+    // key is stored either way (it was minted), but a failure is said out
+    // loud: a silent "(unknown)" hid a transport bug for a whole release.
+    let email = match whoami(host, &minted.key).await {
+        Ok(m) => Some(m.email).filter(|e| !e.is_empty()),
+        Err(e) => {
+            eprintln!("warning: the new key could not be verified: {e}");
+            None
+        }
+    };
     store_credential(
         host,
         HostCredential {
@@ -144,11 +148,10 @@ pub async fn login(host: &str) -> CliResult {
 /// better-auth's GET /api/auth/get-session: in prod that HTTP route stays
 /// behind the login wall (it's the SPA's session bootstrap), while /rpc/* is
 /// routed for keyed callers.
-async fn whoami(host: &str, api_key: &str) -> Option<WhoAmIResponse> {
+async fn whoami(host: &str, api_key: &str) -> Result<WhoAmIResponse, Error> {
     Clients::new(Transport::new(host, Auth::ApiKey(api_key.to_string())))
         .who_am_i(WhoAmIRequest {})
         .await
-        .ok()
 }
 
 pub async fn logout(host: &str) -> CliResult {
@@ -211,11 +214,12 @@ pub async fn status(host: &str, json: bool) -> CliResult {
     };
     let me = whoami(host, &key).await;
     if json {
+        let me = me.as_ref().ok();
         print_json(&StatusJson {
             host,
             logged_in: me.is_some(),
-            user: me.as_ref().map(|m| m.email.clone()),
-            role: me.as_ref().map(|m| m.role.clone()),
+            user: me.map(|m| m.email.clone()),
+            role: me.map(|m| m.role.clone()),
             source: Some(source),
         });
         return if me.is_some() {
@@ -224,9 +228,14 @@ pub async fn status(host: &str, json: bool) -> CliResult {
             Err(CliError::Exit(1))
         };
     }
-    let Some(me) = me else {
-        println!("{host}: stored credential is invalid or revoked (from {source})");
-        return Err(CliError::Exit(1));
+    let me = match me {
+        Ok(me) => me,
+        Err(e) => {
+            // The reason matters: an invalid key and an unreachable host or
+            // a transport fault read the same without it.
+            println!("{host}: the stored credential could not be verified: {e} (from {source})");
+            return Err(CliError::Exit(1));
+        }
     };
     println!(
         "{host}: logged in as {} ({}) via {source}",
