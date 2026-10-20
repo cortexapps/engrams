@@ -1,7 +1,16 @@
 import { afterEach } from "vitest";
 import { cleanup } from "@testing-library/react";
+import { notifyManager } from "@tanstack/react-query";
 
 afterEach(() => cleanup());
+
+// TanStack Query delivers observer notifications in a batch on a system
+// `setTimeout(0)`. A batch queued in the last moments of a test file can run
+// after vitest has torn down that file's jsdom environment, and React then
+// reads `window` and throws "window is not defined". Vitest reports it as an
+// unhandled error and fails the run although every test passed. A microtask
+// runs before the test's teardown, so no notification can outlive its test.
+notifyManager.setScheduler(queueMicrotask);
 
 if (!window.matchMedia) {
   window.matchMedia = (query: string) =>
