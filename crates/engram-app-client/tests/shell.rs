@@ -26,6 +26,13 @@ async fn shell_route(
 }
 
 async fn serve(mut socket: WebSocket, id: &str) {
+    if id == "s-abrupt" {
+        // The PTY ended and the server dropped the socket with no close
+        // frame (a TCP FIN only).
+        let _ = socket.recv().await;
+        drop(socket);
+        return;
+    }
     if id == "s-gone" {
         let _ = socket
             .send(Message::Close(Some(CloseFrame {
@@ -126,4 +133,12 @@ fn a_non_http_host_is_refused() {
         .err()
         .map(|e| e.code);
     assert_eq!(code, Some(Code::InvalidArgument));
+}
+
+#[tokio::test]
+async fn a_socket_dropped_without_a_close_frame_is_a_normal_end() {
+    let url = start_stub().await;
+    let t = Transport::new(&url, Auth::ApiKey("k-1".into()));
+    let mut shell = Shell::open(&t, "s-abrupt", 120, 40).await.unwrap();
+    assert!(matches!(shell.next().await, Ok(None)));
 }
