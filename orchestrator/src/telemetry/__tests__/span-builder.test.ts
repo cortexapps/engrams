@@ -117,6 +117,7 @@ describe("span-builder", () => {
                   endTimeUnixNano: "1786788020000000000",
                   attributes: [
                     { key: "gen_ai.operation.name", value: { stringValue: "chat" } },
+                    { key: "gen_ai.conversation.id", value: { stringValue: SESSION } },
                     // Claude harness: 12 uncached + 6789 cache reads + 42 cache writes.
                     { key: "gen_ai.usage.input_tokens", value: { intValue: "6843" } },
                     { key: "gen_ai.usage.output_tokens", value: { intValue: "345" } },
@@ -140,6 +141,7 @@ describe("span-builder", () => {
                   endTimeUnixNano: "1786788030000000000",
                   attributes: [
                     { key: "gen_ai.operation.name", value: { stringValue: "execute_tool" } },
+                    { key: "gen_ai.conversation.id", value: { stringValue: SESSION } },
                     { key: "gen_ai.tool.name", value: { stringValue: "Bash" } },
                     { key: "gen_ai.tool.call.id", value: { stringValue: "toolu_1" } },
                   ],
@@ -155,6 +157,7 @@ describe("span-builder", () => {
                   endTimeUnixNano: "1786788040000000000",
                   attributes: [
                     { key: "gen_ai.operation.name", value: { stringValue: "execute_tool" } },
+                    { key: "gen_ai.conversation.id", value: { stringValue: SESSION } },
                     { key: "gen_ai.tool.name", value: { stringValue: "Read" } },
                     { key: "gen_ai.tool.call.id", value: { stringValue: "toolu_2" } },
                   ],

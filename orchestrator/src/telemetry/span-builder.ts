@@ -260,6 +260,7 @@ export function buildRunSpans(opts: {
         const genEnd = toUnixNano(ev.at) ?? endNano;
         const attributes: OtlpAttribute[] = [
           strAttr("gen_ai.operation.name", "chat"),
+          strAttr("gen_ai.conversation.id", sessionId),
           intAttr("gen_ai.usage.input_tokens", totalInputTokens(ev, identity?.harness ?? null)),
           intAttr("gen_ai.usage.output_tokens", ev.outputTokens),
           intAttr("gen_ai.usage.cache_read.input_tokens", ev.cacheReadTokens),
@@ -296,6 +297,7 @@ export function buildRunSpans(opts: {
             : toolEnd;
         const attributes: OtlpAttribute[] = [
           strAttr("gen_ai.operation.name", "execute_tool"),
+          strAttr("gen_ai.conversation.id", sessionId),
           strAttr("gen_ai.tool.name", ev.toolName),
           strAttr("gen_ai.tool.call.id", ev.toolCallId),
         ];

@@ -82,8 +82,8 @@ project's API keys.
 |---|---|---|
 | `agent_session` (the trace root) | the task's lifetime, at its end | `session.id`, `user.id`, `engrams.task.id`, `engrams.harness`, `engrams.profile_id`, the outcome; ERROR when the task failed |
 | `agent_turn` | a run's start to its completion or interruption | `gen_ai.operation.name=invoke_agent`, `engrams.prompt_id`, `engrams.cost_usd` when the harness reports cost; ERROR on failure or interrupt |
-| `chat <model>` | a generation event, one per API call for Claude Code and one per turn for Codex | `gen_ai.request.model`, `gen_ai.usage.input_tokens` (all input tokens, cached tokens included), `output_tokens`, `cache_read.input_tokens`, `cache_creation.input_tokens`, `gen_ai.response.id` |
-| `execute_tool <name>` | a tool call's completion, with its start derived from the harness's own duration | `gen_ai.tool.name`, `gen_ai.tool.call.id`; ERROR when the tool reported an error |
+| `chat <model>` | a generation event, one per API call for Claude Code and one per turn for Codex | `gen_ai.conversation.id` (the session), `gen_ai.request.model`, `gen_ai.usage.input_tokens` (all input tokens, cached tokens included), `output_tokens`, `cache_read.input_tokens`, `cache_creation.input_tokens`, `gen_ai.response.id` |
+| `execute_tool <name>` | a tool call's completion, with its start derived from the harness's own duration | `gen_ai.conversation.id`, `gen_ai.tool.name`, `gen_ai.tool.call.id`; ERROR when the tool reported an error |
 
 The trace id derives from the root task, so a tree of sub-sessions shares one trace.
 Timestamps are stamped by the coordinator and include the transit from the VM, so treat
