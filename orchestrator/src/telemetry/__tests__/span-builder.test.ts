@@ -117,11 +117,12 @@ describe("span-builder", () => {
                   endTimeUnixNano: "1786788020000000000",
                   attributes: [
                     { key: "gen_ai.operation.name", value: { stringValue: "chat" } },
-                    { key: "gen_ai.usage.input_tokens", value: { intValue: "12" } },
+                    // Claude harness: 12 uncached + 6789 cache reads + 42 cache writes.
+                    { key: "gen_ai.usage.input_tokens", value: { intValue: "6843" } },
                     { key: "gen_ai.usage.output_tokens", value: { intValue: "345" } },
-                    { key: "gen_ai.usage.cache_read_input_tokens", value: { intValue: "6789" } },
+                    { key: "gen_ai.usage.cache_read.input_tokens", value: { intValue: "6789" } },
                     {
-                      key: "gen_ai.usage.cache_creation_input_tokens",
+                      key: "gen_ai.usage.cache_creation.input_tokens",
                       value: { intValue: "42" },
                     },
                     { key: "gen_ai.request.model", value: { stringValue: "claude-sonnet-5" } },
@@ -239,6 +240,22 @@ describe("span-builder", () => {
     }
     // The token counts stay either way.
     expect(metadataOnly).toContain('"345"');
+  });
+
+  test("input tokens: the Codex harness count already includes cache reads", () => {
+    const usage = (harness: string | null) => {
+      const [chat] = buildRunSpans({
+        sessionId: SESSION,
+        identity: { ...IDENTITY, harness },
+        run: fixtureRun(),
+        captureContent: false,
+        fallbackMs: 0,
+      });
+      return Object.fromEntries((chat!.attributes ?? []).map((a) => [a.key, a.value]));
+    };
+    expect(usage("codex")["gen_ai.usage.input_tokens"]).toEqual({ intValue: "12" });
+    // A session with no known harness uses the default harness, Claude.
+    expect(usage(null)["gen_ai.usage.input_tokens"]).toEqual({ intValue: "6843" });
   });
 
   test("interrupted / not-ok runs get ERROR status and the interrupted marker", () => {
