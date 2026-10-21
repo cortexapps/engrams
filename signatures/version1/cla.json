@@ -15,6 +15,14 @@
       "created_at": "2026-10-06T17:04:03Z",
       "repoId": 1223008200,
       "pullRequestNo": 1594
+    },
+    {
+      "name": "akwirick",
+      "id": 502214,
+      "comment_id": 6327556664,
+      "created_at": "2026-10-21T22:04:07Z",
+      "repoId": 1223008200,
+      "pullRequestNo": 1675
     }
   ]
 }
