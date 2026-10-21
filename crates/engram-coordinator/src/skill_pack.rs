@@ -295,7 +295,7 @@ fn extract_zip_into(payload: &[u8], dest: &Path, budget: &mut u64) -> Result<usi
         let Some(name) = entry.enclosed_name() else {
             return Err(PackError::Invalid(format!(
                 "unsafe zip path: {}",
-                entry.name()
+                String::from_utf8_lossy(entry.name_raw())
             )));
         };
         let safe = sanitize_rel(&name)?;
