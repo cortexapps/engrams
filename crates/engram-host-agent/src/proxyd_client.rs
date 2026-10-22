@@ -535,10 +535,18 @@ async fn await_exit(process: &mut ProxydProcess) {
                         self.0
                     }
                 }
-                match tokio::io::unix::AsyncFd::with_interest(
-                    RawFdWrap(pidfd.as_raw_fd()),
-                    tokio::io::Interest::READABLE,
-                ) {
+                // SAFETY: `RawFdWrap` only borrows the integer fd; the
+                // `pidfd` it comes from owns the `OwnedFd` and outlives
+                // `afd` (which is dropped at the end of this match arm),
+                // so the fd stays valid and open for the full `AsyncFd`
+                // lifetime.
+                let afd = unsafe {
+                    tokio::io::unix::AsyncFd::register_with_interest(
+                        RawFdWrap(pidfd.as_raw_fd()),
+                        tokio::io::Interest::READABLE,
+                    )
+                };
+                match afd {
                     Ok(afd) => {
                         let _ = afd.readable().await;
                     }

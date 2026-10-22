@@ -670,7 +670,11 @@ impl AsyncRawFdStream {
             }
         }
         Ok(Self {
-            inner: tokio::io::unix::AsyncFd::new(fd)?,
+            // SAFETY: `fd` is a valid, open `OwnedFd` we just set to
+            // non-blocking. `register` takes ownership of it (moving it
+            // into the `AsyncFd`), which keeps it open and referring to
+            // the same socket for the whole `AsyncFd` lifetime.
+            inner: unsafe { tokio::io::unix::AsyncFd::register(fd)? },
         })
     }
 }
