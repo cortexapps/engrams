@@ -260,10 +260,11 @@ export function buildRunSpans(opts: {
         const genEnd = toUnixNano(ev.at) ?? endNano;
         const attributes: OtlpAttribute[] = [
           strAttr("gen_ai.operation.name", "chat"),
-          intAttr("gen_ai.usage.input_tokens", ev.inputTokens),
+          strAttr("gen_ai.conversation.id", sessionId),
+          intAttr("gen_ai.usage.input_tokens", totalInputTokens(ev, identity?.harness ?? null)),
           intAttr("gen_ai.usage.output_tokens", ev.outputTokens),
-          intAttr("gen_ai.usage.cache_read_input_tokens", ev.cacheReadTokens),
-          intAttr("gen_ai.usage.cache_creation_input_tokens", ev.cacheCreationTokens),
+          intAttr("gen_ai.usage.cache_read.input_tokens", ev.cacheReadTokens),
+          intAttr("gen_ai.usage.cache_creation.input_tokens", ev.cacheCreationTokens),
         ];
         if (ev.model) attributes.push(strAttr("gen_ai.request.model", ev.model));
         if (ev.messageId) attributes.push(strAttr("gen_ai.response.id", ev.messageId));
@@ -296,6 +297,7 @@ export function buildRunSpans(opts: {
             : toolEnd;
         const attributes: OtlpAttribute[] = [
           strAttr("gen_ai.operation.name", "execute_tool"),
+          strAttr("gen_ai.conversation.id", sessionId),
           strAttr("gen_ai.tool.name", ev.toolName),
           strAttr("gen_ai.tool.call.id", ev.toolCallId),
         ];
@@ -402,6 +404,23 @@ export function buildSessionSpan(opts: {
       ? { status: outcome === "failed" ? { code: STATUS_ERROR } : { code: STATUS_OK } }
       : {}),
   };
+}
+
+/**
+ * The input token count that the GenAI semantic conventions specify: all
+ * input tokens, cache reads and cache writes included. A generation event
+ * carries the native count of the provider. The Codex harness sends the
+ * OpenAI count, which includes cache reads. The Claude harness sends the
+ * Anthropic count, which does not include cache reads or cache writes. A
+ * session with no known harness uses the default harness, Claude.
+ */
+function totalInputTokens(
+  ev: Extract<RunEvent, { type: "generation" }>,
+  harness: string | null,
+): number {
+  return harness === "codex"
+    ? ev.inputTokens
+    : ev.inputTokens + ev.cacheReadTokens + ev.cacheCreationTokens;
 }
 
 function firstEventNano(events: RunEvent[]): string | undefined {
