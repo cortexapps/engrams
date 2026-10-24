@@ -1563,7 +1563,7 @@ dependencies = [
  "document-features",
  "futures-core",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustix",
  "signal-hook",
  "signal-hook-mio",
@@ -1779,9 +1779,9 @@ dependencies = [
  "cfg-if",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "lock_api",
+ "lock_api 0.4.14",
  "once_cell",
- "parking_lot_core",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -2198,7 +2198,7 @@ dependencies = [
  "futures",
  "metrics",
  "nix 0.31.3",
- "parking_lot",
+ "parking_lot 0.13.0",
  "proptest",
  "serde",
  "serde_json",
@@ -2334,7 +2334,7 @@ dependencies = [
  "http-body-util",
  "metrics",
  "metrics-exporter-prometheus",
- "parking_lot",
+ "parking_lot 0.13.0",
  "proptest",
  "prost",
  "prost-types",
@@ -2414,7 +2414,7 @@ dependencies = [
  "engram-protocol",
  "engram-secrets-dev",
  "engram-sim",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
  "serde_json",
@@ -2451,7 +2451,7 @@ dependencies = [
  "engram-testkit",
  "futures-util",
  "hex",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
  "serde_json",
@@ -2477,7 +2477,7 @@ dependencies = [
  "engram-host-core",
  "engram-sim",
  "engram-storage-local",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
  "serde",
@@ -2515,7 +2515,7 @@ dependencies = [
  "hex",
  "hickory-proto",
  "http 1.5.0",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rcgen",
  "rustls",
  "rustls-pemfile",
@@ -2568,7 +2568,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "engram-core",
- "parking_lot",
+ "parking_lot 0.13.0",
  "serde_json",
  "tokio",
  "workspace-hack",
@@ -2583,7 +2583,7 @@ dependencies = [
  "engram-core",
  "engram-tls",
  "jsonwebtoken 11.1.0",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rand_core 0.6.4",
  "reqwest",
  "rsa",
@@ -2732,7 +2732,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "nix 0.31.3",
- "parking_lot",
+ "parking_lot 0.13.0",
  "reqwest",
  "rustls",
  "serde",
@@ -2854,7 +2854,7 @@ dependencies = [
  "hex",
  "http 1.5.0",
  "oci-client",
- "parking_lot",
+ "parking_lot 0.13.0",
  "reqwest",
  "serde",
  "serde_json",
@@ -2880,7 +2880,7 @@ dependencies = [
  "engram-crypto",
  "engram-oci",
  "gcp_auth",
- "parking_lot",
+ "parking_lot 0.13.0",
  "serde",
  "serde_json",
  "tokio",
@@ -2963,7 +2963,7 @@ dependencies = [
  "hex",
  "http 1.5.0",
  "mkext4",
- "parking_lot",
+ "parking_lot 0.13.0",
  "proptest",
  "serde",
  "serde_json",
@@ -3002,7 +3002,7 @@ dependencies = [
  "hex",
  "libc",
  "metrics",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rcgen",
  "rtnetlink",
  "rustls",
@@ -3034,7 +3034,7 @@ dependencies = [
  "flate2",
  "futures",
  "nix 0.31.3",
- "parking_lot",
+ "parking_lot 0.13.0",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -3067,7 +3067,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-virtualization",
- "parking_lot",
+ "parking_lot 0.13.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -3102,7 +3102,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "engram-core",
- "parking_lot",
+ "parking_lot 0.13.0",
  "tempfile",
  "tokio",
  "tracing",
@@ -3151,7 +3151,7 @@ dependencies = [
  "engram-postgres",
  "engram-testkit",
  "futures",
- "parking_lot",
+ "parking_lot 0.13.0",
  "serde_json",
  "sqlx",
  "tokio",
@@ -3604,8 +3604,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d930c203dd0b6ff06e0201a4a2fe9149b43c684fd4420555b26d21b1a02956f"
 dependencies = [
  "futures-core",
- "lock_api",
- "parking_lot",
+ "lock_api 0.4.14",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -4773,7 +4773,7 @@ dependencies = [
  "json-patch",
  "k8s-openapi",
  "kube-client",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project",
  "serde",
  "serde_json",
@@ -4897,6 +4897,15 @@ name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
 dependencies = [
  "scopeguard",
 ]
@@ -5777,8 +5786,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.4.14",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -5790,6 +5809,18 @@ dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link",
 ]
@@ -6515,6 +6546,15 @@ name = "redox_syscall"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f450ad9c3b1da563fb6948a8e0fb0fb9269711c9c73d9ea1de5058c79c8d643a"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
+name = "redox_syscall"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
 dependencies = [
  "bitflags 2.13.2",
 ]
@@ -7265,7 +7305,7 @@ version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 dependencies = [
- "lock_api",
+ "lock_api 0.4.14",
 ]
 
 [[package]]
@@ -7658,7 +7698,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9048a889effe34a5cddee0af7f53285198b16dca3be510858d38dfdb3e62a04e"
 dependencies = [
  "bitflags 2.13.2",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustix",
  "signal-hook",
  "windows-sys 0.61.2",
@@ -7906,7 +7946,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
