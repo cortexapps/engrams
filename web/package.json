@@ -64,7 +64,7 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "diff": "^9.0.0",
-    "flint-chart": "^0.5.1",
+    "flint-chart": "^1.0.0",
     "framer-motion": "^14.5.0",
     "ghostty-web": "^0.4.0",
     "lucide-react": "^1.61.0",
