@@ -126,8 +126,8 @@ importers:
         specifier: ^9.0.0
         version: 9.0.0
       flint-chart:
-        specifier: ^0.5.1
-        version: 0.5.1(vega-lite@6.4.3(vega@6.3.1))(vega@6.3.1)
+        specifier: ^1.0.0
+        version: 1.0.1(react@19.3.1)(vega-lite@6.4.3(vega@6.3.1))(vega-tooltip@1.1.0)(vega@6.3.1)
       framer-motion:
         specifier: ^14.5.0
         version: 14.5.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
@@ -3050,15 +3050,18 @@ packages:
       picomatch:
         optional: true
 
-  flint-chart@0.5.1:
-    resolution: {integrity: sha512-2JWtwM/rj86SXGZYgNsFzya/VUy5SsG4X+nEeGVndr88MmY+yN0zACi1MotHOSpZ9MZY9R0D/xQiGSTuhQngvQ==}
+  flint-chart@1.0.1:
+    resolution: {integrity: sha512-8buLTEwj+DLAufo/2/QZEBU8v+78shKWjj8sWW0tGXQ92UlE7zJoOvJ+CxCO77MY5bRM86ohUrcl/5CMoh3GuQ==}
     engines: {node: '>=18'}
     peerDependencies:
       chart.js: ^4.0.0
       echarts: ^5.0.0 || ^6.0.0
       plotly.js: ^2.0.0 || ^3.0.0
+      plotly.js-dist-min: ^2.0.0 || ^3.0.0
+      react: '>=18'
       vega: ^5.0.0 || ^6.0.0
       vega-lite: ^5.0.0 || ^6.0.0
+      vega-tooltip: ^1.0.0
     peerDependenciesMeta:
       chart.js:
         optional: true
@@ -3066,9 +3069,15 @@ packages:
         optional: true
       plotly.js:
         optional: true
+      plotly.js-dist-min:
+        optional: true
+      react:
+        optional: true
       vega:
         optional: true
       vega-lite:
+        optional: true
+      vega-tooltip:
         optional: true
 
   framer-motion@14.5.0:
@@ -6888,10 +6897,16 @@ snapshots:
     optionalDependencies:
       picomatch: 4.0.7
 
-  flint-chart@0.5.1(vega-lite@6.4.3(vega@6.3.1))(vega@6.3.1):
+  flint-chart@1.0.1(react@19.3.1)(vega-lite@6.4.3(vega@6.3.1))(vega-tooltip@1.1.0)(vega@6.3.1):
+    dependencies:
+      '@floating-ui/dom': 1.8.0
+      d3-time: 3.1.0
+      d3-time-format: 4.1.0
     optionalDependencies:
+      react: 19.3.1
       vega: 6.3.1
       vega-lite: 6.4.3(vega@6.3.1)
+      vega-tooltip: 1.1.0
 
   framer-motion@14.5.0(react-dom@19.3.1(react@19.3.1))(react@19.3.1):
     dependencies:
@@ -8276,10 +8291,10 @@ snapshots:
       vega-dataflow: 6.1.3
       vega-expression: 6.2.2
       vega-scale: 8.1.3
-      vega-scenegraph: 5.2.1
+      vega-scenegraph: 5.3.0
       vega-selections: 6.1.5
       vega-statistics: 2.0.0
-      vega-time: 3.2.1
+      vega-time: 3.3.0
       vega-util: 2.1.3
 
   vega-functions@6.2.0:
@@ -8457,9 +8472,9 @@ snapshots:
       d3-timer: 3.0.1
       vega-dataflow: 6.1.3
       vega-format: 2.1.3
-      vega-functions: 6.1.3
+      vega-functions: 6.2.0
       vega-runtime: 7.1.3
-      vega-scenegraph: 5.2.1
+      vega-scenegraph: 5.3.0
       vega-util: 2.1.3
 
   vega-voronoi@5.1.3:
