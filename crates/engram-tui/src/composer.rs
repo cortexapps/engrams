@@ -309,10 +309,14 @@ impl Composer {
         if self.rows_width != width || self.rows.is_empty() {
             self.rows.clear();
             wrap_into(&self.text, width, &mut self.rows);
-            // The wrapper ends a row at a newline and adds none after a
-            // trailing one; the cursor can sit there, so the composer
-            // keeps that empty row.
-            if self.text.ends_with('\n') {
+            // The wrapper adds no row after a trailing newline or a
+            // trailing break space; the cursor can sit there, so the
+            // composer keeps that empty row.
+            if self
+                .rows
+                .last()
+                .is_some_and(|r| (r.end as usize) < self.text.len())
+            {
                 let at = self.text.len() as u32;
                 self.rows.push(crate::wrap::Row { start: at, end: at });
             }
@@ -415,6 +419,20 @@ mod tests {
         // Up moves to the row above instead of recalling history.
         assert!(c.move_row(20, false));
         assert_eq!(c.layout(20).0, 0);
+    }
+
+    #[test]
+    fn a_space_at_the_wrap_column_puts_the_cursor_on_the_next_row() {
+        let mut c = Composer::default();
+        c.insert_str("abcde ");
+        assert_eq!(c.layout(5), (1, 0));
+        assert_eq!(c.rows().len(), 2);
+        c.insert_str("f");
+        assert_eq!(c.layout(5), (1, 1));
+        // A taller draft: the cursor stays on the last row.
+        let mut c = Composer::default();
+        c.insert_str(&"abcd ".repeat(12));
+        assert_eq!(c.layout(4), (12, 0));
     }
 
     #[test]
