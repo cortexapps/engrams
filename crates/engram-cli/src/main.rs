@@ -18,7 +18,7 @@ use engram_app_client::{Auth, Clients, Transport};
 use output::{fail, CliError, CliResult};
 
 /// The release version. `scripts/release-version.sh` rewrites this line.
-const VERSION: &str = "0.11.0";
+const VERSION: &str = "0.12.0";
 
 /// The version the binary reports. A nightly build (nightly.yml) sets
 /// `ENGRAMS_BUILD_VERSION` to its prerelease version, for example
