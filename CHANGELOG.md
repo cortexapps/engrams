@@ -10,28 +10,67 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-26
+
 ### Upgrade notes
 
+- **The server upgrade changes only the images.** This release has no database migrations, no
+  chart value changes, no Terraform changes, and no change to the host wire version. Run
+  `helm upgrade` on both releases in the usual sequence. You can roll back to 0.11.0.
 - **The `engrams` CLI is a Rust binary.** The release assets keep their names
   (`engrams-linux-x64`, `engrams-linux-arm64`, `engrams-darwin-arm64`), and the commands,
   flags, `--json` shapes, `hosts.json` credential file, and exit codes do not change. Build it
   from the repository with `cargo build --profile cli -p engram-cli`; the `cli/` directory and
-  its Bun toolchain are gone.
+  its Bun toolchain are gone. ([#1642], [#1644], [#1645])
+- **The token usage attributes on chat spans changed.** They now use the GenAI semantic
+  convention keys. If a dashboard or a query reads the old keys, change it:
+  - `gen_ai.usage.cache_read_input_tokens` is now `gen_ai.usage.cache_read.input_tokens`.
+  - `gen_ai.usage.cache_creation_input_tokens` is now
+    `gen_ai.usage.cache_creation.input_tokens`.
+  - `gen_ai.usage.input_tokens` is now the total input, including cache tokens. For the
+    Claude harness, it was the uncached input only. ([#1675])
 
 ### Added
 
+- **`engrams tui`**, a terminal client for sessions. It shows the session list and the
+  transcript with Markdown, tables, diffs, and syntax highlighting. You can send prompts,
+  answer questions, approve plans, search the transcript (`Ctrl+T`), edit a draft in
+  `$EDITOR` (`Ctrl+G`), and select text to copy it. Use `--no-alt-screen` to keep the
+  terminal scrollback and `--ax` for screen readers. ([#1658], [#1664])
+- The TUI and the CLI report the session state to the terminal through the Program Status
+  Protocol (OSC 7501): working, waiting for you, done, or failed. The TUI also reports your
+  other sessions. `ENGRAMS_PROGRAM_STATUS=0` turns it off. ([#1663])
 - An installer for the CLI (`curl -fsSL https://engramsfactory.com/install.sh | sh`), the
   Homebrew formulae `cortexapps/tap/engrams` and `cortexapps/tap/engrams-nightly`, and a
-  nightly prerelease channel (`v<next>-rc.<n>`) built from `main`.
+  nightly prerelease channel (`v<next>-rc.<n>`) built from `main`. ([#1660], [#1661])
+- Chat and tool spans carry `gen_ai.conversation.id` (the session id). ([#1675])
 
 ### Changed
 
 - The `engrams` CLI moved from Bun to Rust (`crates/engram-cli` on the new
   `crates/engram-app-client` library). The binary is 3 MB and uses about 8 MB of memory.
+  ([#1644])
+- The TUI colours adapt to the terminal background and pass WCAG AA contrast. De-emphasized
+  text uses the terminal DIM attribute, not a grey colour; `ENGRAMS_TUI_NO_DIM=1` turns it
+  off. ([#1670])
+- When a session starts without an integration because the person has not connected their
+  personal credential, the agent is told which integration is off and how to connect it.
+  Before, only the web start screen showed this. ([#1671])
+- Updates to the AWS SDK, parking_lot 0.13, zip 9, `@hookform/resolvers` 6, and other
+  dependencies.
 
 ### Fixed
 
+- A warm base capture could fail with `pre-capture guest sync exited Some(1)` when a command
+  in the guest wrote its output while the capture cleared the exec journal. ([#1672])
+- The CLI sends `Content-Length` on every request. Without it, a front end that requires the
+  header refused requests with no fields (HTTP 411), for example `auth status` and
+  `task list`. ([#1652])
+- `engrams auth login` and `engrams auth status` show why a key could not be verified.
+  ([#1654])
 - `engrams session logs` printed the event-stream envelope instead of the event payload.
+  ([#1644])
+- The CLI help no longer refers to a design record. ([#1662])
 
 ## [0.11.0] - 2026-10-19
 
@@ -152,7 +191,8 @@ starts with **Upgrade notes**: read them before you upgrade. The upgrade procedu
 The first tagged release. See the
 [release notes](https://github.com/cortexapps/engrams/releases/tag/v0.10.0).
 
-[Unreleased]: https://github.com/cortexapps/engrams/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/cortexapps/engrams/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/cortexapps/engrams/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/cortexapps/engrams/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/cortexapps/engrams/releases/tag/v0.10.0
 [#1471]: https://github.com/cortexapps/engrams/pull/1471
@@ -191,3 +231,18 @@ The first tagged release. See the
 [#1614]: https://github.com/cortexapps/engrams/pull/1614
 [#1617]: https://github.com/cortexapps/engrams/pull/1617
 [#1619]: https://github.com/cortexapps/engrams/pull/1619
+[#1642]: https://github.com/cortexapps/engrams/pull/1642
+[#1644]: https://github.com/cortexapps/engrams/pull/1644
+[#1645]: https://github.com/cortexapps/engrams/pull/1645
+[#1652]: https://github.com/cortexapps/engrams/pull/1652
+[#1654]: https://github.com/cortexapps/engrams/pull/1654
+[#1658]: https://github.com/cortexapps/engrams/pull/1658
+[#1660]: https://github.com/cortexapps/engrams/pull/1660
+[#1661]: https://github.com/cortexapps/engrams/pull/1661
+[#1662]: https://github.com/cortexapps/engrams/pull/1662
+[#1663]: https://github.com/cortexapps/engrams/pull/1663
+[#1664]: https://github.com/cortexapps/engrams/pull/1664
+[#1670]: https://github.com/cortexapps/engrams/pull/1670
+[#1671]: https://github.com/cortexapps/engrams/pull/1671
+[#1672]: https://github.com/cortexapps/engrams/pull/1672
+[#1675]: https://github.com/cortexapps/engrams/pull/1675
