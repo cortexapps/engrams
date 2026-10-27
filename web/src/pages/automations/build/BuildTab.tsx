@@ -142,15 +142,25 @@ const KNOWN_OUTPUTS: Record<string, readonly string[]> = {
   review_close_pass: ["review_id", "outcome"],
   review_record_post: ["review_id", "recorded", "github_review_id"],
   resolve_user: ["found", "user_id"],
-  relay_session: ["session_id", "installed", "handler_state"],
+  relay_session: ["session_id", "installed", "created", "mention_ts"],
   relay_close: ["posted", "rendered_as"],
+  run_agent: [
+    "session_id",
+    "web_url",
+    "started",
+    "delivered",
+    "prompt",
+    "task_id",
+    "relayed",
+    "mention_ts",
+  ],
 };
 
 function sessionSourcesFor(definition: AutomationDefinition, selectedId: string | null): string[] {
   const ids: string[] = [];
   for (const block of walkBlocks(definition.blocks)) {
     if (block.id === selectedId) break;
-    if (block.type === "create_session") ids.push(block.id);
+    if (block.type === "create_session" || block.type === "run_agent") ids.push(block.id);
   }
   return ids;
 }

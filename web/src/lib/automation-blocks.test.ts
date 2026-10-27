@@ -181,6 +181,7 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
       "resolve_user",
       "relay_session",
       "relay_close",
+      "run_agent",
     ]) {
       const spec = blockKind(kind);
       expect(spec.description).not.toBe("Unknown block kind.");

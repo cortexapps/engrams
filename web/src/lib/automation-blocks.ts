@@ -9,6 +9,7 @@
 
 import type { LucideIcon } from "lucide-react";
 import {
+  Bot,
   Braces,
   CircleStop,
   Database,
@@ -322,6 +323,79 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       promptTemplate: "",
       includeEventContext: false,
     }),
+  },
+  {
+    kind: "run_agent",
+    label: "Run agent",
+    description:
+      "Deliver this event to the workstream's standing agent session, or start one. Optionally relay the session into the Slack thread the event came from.",
+    icon: Bot,
+    fields: [
+      { type: "profile", key: "profileId", label: "Profile" },
+      {
+        type: "template",
+        key: "promptTemplate",
+        label: "Prompt",
+        multiline: true,
+        help: "Sent to the standing session on every event.",
+      },
+      {
+        type: "template",
+        key: "openingPromptTemplate",
+        label: "Opening prompt",
+        multiline: true,
+        help: "The first prompt of a new session; defaults to the prompt above.",
+      },
+      {
+        type: "select",
+        key: "reuse",
+        label: "Session",
+        options: ["workstream", "never"],
+        help: "workstream: continue the workstream's kept session when it is alive · never: always start one",
+      },
+      {
+        type: "template",
+        key: "relay.team",
+        label: "Relay team id",
+        help: "${{ event.raw.team_id }}",
+      },
+      {
+        type: "template",
+        key: "relay.channel",
+        label: "Relay channel id",
+        help: "${{ event.raw.event.channel }} — leave every relay field empty for no relay.",
+      },
+      {
+        type: "template",
+        key: "relay.threadTs",
+        label: "Relay thread ts",
+        help: "${{ event.raw.event.thread_ts | default: event.raw.event.ts }}",
+      },
+      {
+        type: "template",
+        key: "relay.mentionTs",
+        label: "Relay mention ts",
+        help: "${{ event.raw.event.ts }}",
+      },
+      {
+        type: "template",
+        key: "relay.userId",
+        label: "Relay author id",
+        help: "${{ event.raw.event.user }}",
+      },
+      {
+        type: "template",
+        key: "relay.eventId",
+        label: "Relay event id",
+        help: "${{ event.raw.event_id }}",
+      },
+    ],
+    summary: (c) => {
+      const profile = str(c["profileId"]);
+      const prompt = truncate(str(c["promptTemplate"]).split("\n")[0] ?? "", 48);
+      return profile ? `${profile}${prompt ? ` · ${prompt}` : ""}` : "No profile selected";
+    },
+    defaults: () => ({ profileId: "", promptTemplate: "", reuse: "workstream" }),
   },
   {
     kind: "send_prompt",
@@ -875,6 +949,7 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       "Post the closing message of a relayed session (✅ with the last reply and assets, ❌ with the error, or a neutral note). Meant for settings.onFinalize hooks.",
     icon: CircleStop,
     fields: [
+      { type: "session_ref", key: "session", label: "Session", help: "The relayed session." },
       { type: "template", key: "status", label: "Run status", help: "Usually ${{ run.status }}." },
       {
         type: "template",
@@ -885,7 +960,7 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       },
     ],
     summary: () => "Post the closing message",
-    defaults: () => ({ status: "${{ run.status }}" }),
+    defaults: () => ({ session: {}, status: "${{ run.status }}" }),
   },
   {
     kind: "integration_action",
