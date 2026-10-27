@@ -45,6 +45,7 @@ export interface SamplePickerProps {
 }
 
 const PASTE = "__paste__";
+const LATEST = "__latest__";
 
 /** A `datetime-local` input speaks the browser's wall clock; the stored
  * `scheduledFor` is a UTC instant. Display must convert back to local, or
@@ -96,7 +97,13 @@ export function SamplePicker({ timed, samples, loading, value, onChange, now }: 
   }
 
   const selectValue =
-    value.kind === "sample" ? value.sampleId : value.kind === "payload" ? PASTE : "";
+    value.kind === "sample"
+      ? value.sampleId
+      : value.kind === "payload"
+        ? PASTE
+        : value.kind === "latest"
+          ? LATEST
+          : "";
 
   return (
     <div className="flex flex-col gap-2" data-testid="sample-picker">
@@ -115,7 +122,7 @@ export function SamplePicker({ timed, samples, loading, value, onChange, now }: 
               return;
             }
             setPasting(false);
-            onChange({ kind: "sample", sampleId: next });
+            onChange(next === LATEST ? { kind: "latest" } : { kind: "sample", sampleId: next });
           }}
         >
           <SelectTrigger id="test-sample" className="h-8 w-80" aria-label="Sample">
@@ -130,6 +137,7 @@ export function SamplePicker({ timed, samples, loading, value, onChange, now }: 
             />
           </SelectTrigger>
           <SelectContent>
+            <SelectItem value={LATEST}>Latest delivery</SelectItem>
             {samples.map((s) => (
               <SelectItem key={s.id} value={s.id}>
                 <span className="font-mono text-xs">{s.eventKey}</span>
