@@ -21,13 +21,15 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { FieldError } from "@/components/ui/field";
 import { Switch } from "@/components/ui/switch";
-import { useRunList } from "@/hooks/useAutomationRuns";
+import { useRun, useRunList } from "@/hooks/useAutomationRuns";
+import { replayMap } from "@/lib/run-replay";
 import { relativeTime } from "@/lib/relative-time";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   useCreateAutomationV2,
   useDuplicateAutomation,
+  useAutomationVersions,
   useEditorAutomation,
   useSaveVersionV2,
   useSetAutomationEnabledV2,
@@ -39,6 +41,7 @@ import {
   MAIN_ENTRYPOINT_ID,
   entrypointIds,
   applyOverrides,
+  blockTypesOf,
   diffOverrides,
   EMPTY_DEFINITION,
   parseBlockErrors,
@@ -85,7 +88,7 @@ export function AutomationEditor({
   const params = useParams({ strict: false });
   const id = mode === "edit" ? (params as { id?: string }).id : undefined;
   const navigate = useNavigate();
-  const search = useSearch({ strict: false }) as { tab?: string };
+  const search = useSearch({ strict: false }) as { tab?: string; run?: string };
   const tab: EditorTab = isEditorTab(search.tab) ? search.tab : "build";
 
   const existing = useEditorAutomation(id);
@@ -318,6 +321,51 @@ export function AutomationEditor({
   // The Activity tab's count: what the ledger holds (it lists up to 50).
   const activity = useRunList(automation?.id, { limit: 50 });
   const activityCount = activity.data?.runs.length;
+  // ?run= on the Build tab replays that run on the canvas, drawn on the
+  // version it executed (the current one needs no second fetch).
+  const replayQuery = useRun(tab === "build" && mode === "edit" ? search.run : undefined);
+  const replayRun = replayQuery.data?.run;
+  const replayVersion = replayRun?.brief?.version;
+  const needsOldVersion =
+    replayVersion !== undefined &&
+    automation !== undefined &&
+    replayVersion !== automation.currentVersion;
+  const versions = useAutomationVersions(needsOldVersion ? automation?.id : undefined);
+  const replay = useMemo(() => {
+    if (!replayRun?.brief || !automation) return undefined;
+    const ran = replayRun.brief.version;
+    const old = needsOldVersion
+      ? versions.data?.versions.find((v) => v.number === ran)?.definitionJson
+      : undefined;
+    const definition =
+      old !== undefined
+        ? applyOverrides(parseDefinition(old), parseOverrides(automation.blockOverridesJson))
+        : effective;
+    const types = blockTypesOf(definition);
+    const versionNote = needsOldVersion
+      ? old !== undefined
+        ? `drawn on version ${ran}; the current version is ${automation.currentVersion}`
+        : `ran on version ${ran}, drawn on the current version ${automation.currentVersion}`
+      : undefined;
+    return {
+      definition,
+      run: replayRun.brief,
+      map: replayMap(replayRun.steps, (id) => types.get(id)),
+      triggerJson: replayRun.triggerJson,
+      ...(versionNote !== undefined ? { versionNote } : {}),
+      now: Date.now(),
+      onExit: () => {
+        void navigate({
+          to: ".",
+          search: (prev: Record<string, unknown>) => {
+            const { run: _run, ...rest } = prev;
+            return rest;
+          },
+          replace: true,
+        });
+      },
+    };
+  }, [replayRun, automation, needsOldVersion, versions.data, effective, navigate]);
   // Try it: render the draft, saved or not, against the latest delivery, and
   // open the drawer that shows what each block would do.
   const [testOpen, setTestOpen] = useState(false);
@@ -529,7 +577,7 @@ export function AutomationEditor({
 
         <TabsContent value="build" className="flex min-h-0 flex-1 flex-col">
           <BuildTab
-            definition={draft}
+            definition={replay ? replay.definition : draft}
             entrypointId={effectiveEntrypointId}
             onSelectEntrypoint={setEntrypointId}
             onChange={setDraft}
@@ -541,6 +589,7 @@ export function AutomationEditor({
             variableValues={liveValues}
             testOpen={testOpen}
             onTestOpenChange={setTestOpen}
+            {...(replay ? { replay } : {})}
           />
         </TabsContent>
         <TabsContent value="inputs" className="min-h-0 flex-1 overflow-y-auto p-6">

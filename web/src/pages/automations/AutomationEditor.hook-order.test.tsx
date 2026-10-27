@@ -36,6 +36,7 @@ vi.mock("@/hooks/useAutomationEditor", async (orig) => {
     useSetAutomationEnabledV2: () => ({ mutate: vi.fn(), isPending: false }),
     useDuplicateAutomation: () => ({ mutateAsync: vi.fn(), isPending: false }),
     useEventCatalog: () => ({ data: undefined }),
+    useAutomationVersions: () => ({ data: undefined }),
     useActionCatalog: () => ({ data: undefined }),
     useEditorWebhookRegistrations: () => ({ data: { registrations: [] } }),
   };
@@ -91,6 +92,7 @@ import { AutomationEditor } from "./AutomationEditor";
 
 vi.mock("@/hooks/useAutomationRuns", () => ({
   useRunList: () => ({ data: undefined, isPending: false, error: null }),
+  useRun: () => ({ data: undefined, isPending: false, error: null }),
 }));
 
 const loaded = {

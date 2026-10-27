@@ -56,6 +56,10 @@ export interface CanvasNodeProps {
   /** The second line, when the owner can say it better than the kind's
    * summary (a profile's name for its id). */
   summary?: string;
+  /** Replay: this node was not on the run's path. */
+  dimmed?: boolean;
+  /** Replay: how many times the block ran (a loop's iterations), when >1. */
+  count?: number;
 }
 
 export function CanvasNode({
@@ -77,6 +81,8 @@ export function CanvasNode({
   onFocusStep,
   nodeRef,
   summary: ownerSummary,
+  dimmed,
+  count,
 }: CanvasNodeProps) {
   const spec = block ? blockKind(block.type) : null;
   const Icon = spec?.icon ?? Zap;
@@ -111,6 +117,7 @@ export function CanvasNode({
       role="button"
       tabIndex={0}
       data-testid={block ? `block-row-${block.id}` : "block-row-trigger"}
+      data-dimmed={dimmed ? "true" : undefined}
       aria-current={selected ? "true" : undefined}
       onClick={onSelect}
       onKeyDown={onKeyDown}
@@ -132,9 +139,18 @@ export function CanvasNode({
             : "bg-card shadow-[0_1px_2px_oklch(0_0_0/.06)]",
         selected && "outline-2 outline-offset-1 outline-ring",
         !selected && !trigger && "hover:border-ring/40",
+        dimmed && "opacity-40",
       )}
     >
       {statusChip}
+      {count !== undefined && count > 1 && (
+        <span
+          className="absolute -top-2 left-3 rounded-sm bg-secondary px-1 font-mono text-2xs text-muted-foreground"
+          aria-label={`ran ${count} times`}
+        >
+          ×{count}
+        </span>
+      )}
       <div className="flex items-center gap-2">
         <Icon
           className={cn(

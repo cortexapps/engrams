@@ -15,7 +15,16 @@ function laneLabel(group: LayoutGroup): string {
   return group.kind === "loop" ? "repeat until …" : group.kind;
 }
 
-export function EdgeLayer({ layout }: { layout: CanvasLayout }) {
+const TAKEN_STROKE = "var(--color-ring)";
+
+export function EdgeLayer({
+  layout,
+  taken,
+}: {
+  layout: CanvasLayout;
+  /** Replay: the edges the run travelled; every other edge fades. */
+  taken?: (edgeId: string) => boolean;
+}) {
   return (
     <>
       <svg
@@ -38,16 +47,23 @@ export function EdgeLayer({ layout }: { layout: CanvasLayout }) {
             strokeDasharray="4 4"
           />
         ))}
-        {layout.edges.map((edge) => (
-          <path
-            key={edge.id}
-            d={roundedOrthPath(edge.points)}
-            stroke={EDGE_STROKE}
-            strokeWidth={1.5}
-            strokeDasharray={edge.kind === "tail" || edge.kind === "loop-back" ? "4 4" : undefined}
-            fill="none"
-          />
-        ))}
+        {layout.edges.map((edge) => {
+          const on = taken ? taken(edge.id) : undefined;
+          return (
+            <path
+              key={edge.id}
+              d={roundedOrthPath(edge.points)}
+              stroke={on ? TAKEN_STROKE : EDGE_STROKE}
+              strokeWidth={on ? 2.25 : 1.5}
+              strokeDasharray={
+                edge.kind === "tail" || edge.kind === "loop-back" ? "4 4" : undefined
+              }
+              opacity={on === false ? 0.35 : 1}
+              fill="none"
+              data-taken={on ? "true" : undefined}
+            />
+          );
+        })}
       </svg>
       {/* The lane's label sits on a small `--background` tab over the lane's
           top-left corner, so it reads as the bracket's caption rather than as
