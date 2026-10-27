@@ -84,77 +84,12 @@ function variablePathsFor(definition: AutomationDefinition, selectedId: string |
   }
   for (const block of walkBlocks(definition.blocks)) {
     if (block.id === selectedId) break;
-    const spec = blockKind(block.type);
-    const outputs = KNOWN_OUTPUTS[spec.kind] ?? [];
-    for (const out of outputs) paths.push(`steps.${block.id}.${out}`);
+    for (const out of blockKind(block.type).outputs ?? []) {
+      paths.push(`steps.${block.id}.${out}`);
+    }
   }
   return paths;
 }
-
-const KNOWN_OUTPUTS: Record<string, readonly string[]> = {
-  create_session: ["session_id", "web_url", "task_id"],
-  send_prompt: ["outcome", "signal"],
-  wait_session: ["outcome"],
-  wait_event: ["event", "event_key"],
-  run_command: ["exit_status", "stdout", "stderr"],
-  write_files: ["files"],
-  code: ["value"],
-  branch: ["taken"],
-  loop: ["iterations"],
-  end_session: ["ended"],
-  session_status: [
-    "found",
-    "status",
-    "last_active_at",
-    "last_event_at",
-    "idle_seconds",
-    "owner_run_live",
-  ],
-  state_get: ["found", "value", "version"],
-  state_set: ["ok", "version", "current_version", "current_value"],
-  state_delete: ["ok", "deleted"],
-  state_list: ["entries", "count", "truncated"],
-  lookup_pr_session: ["found", "session_id", "task_id", "head_branch", "url", "title"],
-  lookup_instance_session: ["found", "session_id", "web_url", "run_id", "reason"],
-  instance_close: ["closed", "not_instanced"],
-  claim_handle: ["claimed", "handle", "reclaimed"],
-  review_open_pass: [
-    "review_id",
-    "task_id",
-    "target_id",
-    "head_sha",
-    "base_sha",
-    "pr_url",
-    "superseded_review_id",
-    "deduplicated",
-  ],
-  review_stage: ["phase", "prompt", "merge_base"],
-  review_settle: [
-    "review_id",
-    "repo",
-    "pr_number",
-    "commit_id",
-    "summary_md",
-    "comments",
-    "to_post_count",
-    "ui_only_count",
-  ],
-  review_close_pass: ["review_id", "outcome"],
-  review_record_post: ["review_id", "recorded", "github_review_id"],
-  resolve_user: ["found", "user_id"],
-  relay_session: ["session_id", "installed", "created", "mention_ts"],
-  relay_close: ["posted", "rendered_as"],
-  run_agent: [
-    "session_id",
-    "web_url",
-    "started",
-    "delivered",
-    "prompt",
-    "task_id",
-    "relayed",
-    "mention_ts",
-  ],
-};
 
 function sessionSourcesFor(definition: AutomationDefinition, selectedId: string | null): string[] {
   const ids: string[] = [];
