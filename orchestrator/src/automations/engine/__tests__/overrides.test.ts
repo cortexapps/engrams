@@ -162,8 +162,6 @@ describe("previewDefinition — code blocks run (the editor's Test with sample)"
   const inputs = (channels: Record<string, string>) => ({
     channels,
     default_profile: "",
-    idle_timeout: 600,
-    max_turns: 5,
   });
 
   test("a code block's value feeds the filter after it; the row shows the value, not the source", async () => {
@@ -182,16 +180,14 @@ describe("previewDefinition — code blocks run (the editor's Test with sample)"
     expect(facts.value["profile_id"]).toBe("prof-a");
     expect(JSON.stringify(facts)).not.toContain("export default");
     expect(byId["admit"]!.filterPass).toBe(true);
-    // The walk went on past the filter and rendered the session prompt.
-    expect(byId["session"]).toBeDefined();
-    expect(JSON.stringify(byId["session"]!.rendered)).toContain("summarize the incident");
-    // The only gaps left are EXECUTING blocks' outputs (the identity block
-    // resolves the user at run time; the session link exists once the session
-    // does) — reported on the field, as documented.
-    expect(res.errors.map((e) => `${e.blockId}.${e.field}`)).toEqual([
-      "session.ownerUserId",
-      "started.params.text",
-    ]);
+    // The walk went on past the filter and rendered the agent's prompt.
+    expect(byId["agent"]).toBeDefined();
+    expect(JSON.stringify(byId["agent"]!.rendered)).toContain("summarize the incident");
+    // The only gap left is an EXECUTING block's output (the identity block
+    // resolves the user at run time) — reported on the field, as documented.
+    // The session-link post sits behind `steps.agent.started`, which the
+    // preview cannot know, so its arm is not walked.
+    expect(res.errors.map((e) => `${e.blockId}.${e.field}`)).toEqual(["agent.ownerUserId"]);
   });
 
   test("an unflagged channel is a real fail at the filter, not a missing value", async () => {
@@ -206,7 +202,7 @@ describe("previewDefinition — code blocks run (the editor's Test with sample)"
     const byId = Object.fromEntries(res.blocks.map((b) => [b.blockId, b]));
     expect((byId["facts"]!.rendered as { value: unknown }).value).toBeNull();
     expect(byId["admit"]!.filterPass).toBe(false);
-    expect(byId["session"]).toBeUndefined();
+    expect(byId["agent"]).toBeUndefined();
   });
 
   test("without a runtime the code block is inert and reports a null value", async () => {
