@@ -42,6 +42,8 @@ export interface CanvasProps {
   nodeStatus?: Readonly<Record<string, CanvasNodeStatus>>;
   /** "fit" (default) scales down to the column; a number is an explicit zoom. */
   zoom?: number | "fit";
+  /** A node's second line, when the owner can resolve it (profile names). */
+  summaryFor?: (block: BlockDef) => string | undefined;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -63,6 +65,7 @@ export function Canvas({
   ghostIds,
   nodeStatus,
   zoom = "fit",
+  summaryFor,
 }: CanvasProps) {
   void trigger; // the trigger node's title is `triggerSummary`
   const layout = useMemo(() => layoutCanvas(blocks), [blocks]);
@@ -141,6 +144,7 @@ export function Canvas({
                   locked={locked}
                   ghost={block ? ghostIds?.has(node.id) : false}
                   status={block ? nodeStatus?.[node.id] : undefined}
+                  summary={block ? summaryFor?.(block) : undefined}
                   canMoveUp={node.index !== undefined && node.index > 0}
                   canMoveDown={
                     node.index !== undefined &&

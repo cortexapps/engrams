@@ -38,6 +38,7 @@ import {
 } from "@/pages/sessions/SessionHarnessControls";
 
 import { asFilterGroup, ConditionEditor } from "./fields/ConditionEditor";
+import { AgentInspector } from "./inspectors/AgentInspector";
 import { CodeInspector } from "./inspectors/CodeInspector";
 import { DecideInspector } from "./inspectors/DecideInspector";
 import { GenericField } from "./fields/GenericField";
@@ -97,6 +98,8 @@ export function BlockInspector(props: BlockInspectorProps) {
 
       {spec.inspector === "readonly" ? (
         <ReadOnlyView block={block} />
+      ) : spec.inspector === "agent" ? (
+        <AgentInspector {...props} />
       ) : spec.inspector === "create_session" ? (
         <CreateSessionInspector {...props} />
       ) : spec.inspector === "filter" ||

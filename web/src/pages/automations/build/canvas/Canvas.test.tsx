@@ -119,6 +119,14 @@ describe("Canvas", () => {
     expect(h.onInsert).toHaveBeenCalledWith({ root: true }, 0, "run_command");
   });
 
+  it("a node's second line comes from the owner when it can resolve it", async () => {
+    mount(false, {
+      summaryFor: (block) => (block.id === "launch" ? "PR reviewer · hi" : undefined),
+    });
+    const launch = await screen.findByTestId("block-row-launch");
+    expect(launch.textContent).toContain("PR reviewer · hi");
+  });
+
   it("locked: no insert or node actions, and the lock notice shows", async () => {
     mount(true);
     await screen.findByTestId("block-row-launch");
