@@ -27,9 +27,18 @@ canvas while you watch. The draft lands disabled. You edit it by hand, and the a
 can edit at the same time.
 
 **Build it.** The builder is a canvas: the trigger is the first node, a plus sign on any edge
-inserts a block, and an inspector on the right edits the selected block's fields. Nothing
-here is JSON in disguise; when the server rejects a definition, the error points at the
-block and the field.
+inserts a block, and an inspector on the right edits the selected block's fields. The block
+menu is grouped by purpose, with the Agent block first and the engine's internals under
+Advanced. In any text field, type `${{` and the field completes the variables the block can
+read: the trigger, the inputs, the event's fields, and the outputs of the steps above, each
+with a preview from the latest delivery. Nothing here is JSON in disguise; when the server
+rejects a definition, the error points at the block and the field.
+
+**Try it.** The Try it button in the header renders the draft as it is on screen, unsaved
+edits included, against the latest delivery the trigger would see, and shows what each block
+would do, which filters pass, and which fields did not render. Nothing runs. A new
+automation can be tried before it is created. Dry run goes further on a saved automation: a
+real run that boots no session and posts nothing.
 
 Every save is a new version. Runs that are in flight finish on the version they started with,
 and the Settings tab shows the version history with a diff.
@@ -53,6 +62,13 @@ open. That is how a reply in a Slack thread reaches the run that owns the thread
 starts a second one.
 
 ## Blocks
+
+**Agent.** The Agent block hands the event to the automation's agent: it continues the
+workstream's kept session when one is alive, else it starts one from the profile with the
+prompt, and it can reply in the Slack thread the event came from. One trigger, one filter,
+and one Agent block is the shape of a standing agent: a bot that answers in a channel, a
+reviewer that follows a pull request across pushes, a helper that keeps one session per
+ticket. The Slack threads built-in is this shape.
 
 **Sessions.** Create session starts an agent from a profile with a prompt, and can override
 the harness, model, effort, network policy, and capabilities the profile grants. Send prompt
