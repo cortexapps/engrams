@@ -73,6 +73,9 @@ export interface BuildTabProps {
   testPanel?: ReactNode;
   /** Live variable values keyed by path for the selected sample. */
   variableValues?: Readonly<Record<string, string>>;
+  /** The test drawer, open or closed; the header's Try it opens it. */
+  testOpen?: boolean;
+  onTestOpenChange?: (open: boolean) => void;
 }
 
 /** The trigger's event, as the catalog describes it: the first declared key
@@ -179,6 +182,8 @@ export function BuildTab({
   test,
   testPanel,
   variableValues,
+  testOpen,
+  onTestOpenChange,
 }: BuildTabProps) {
   const ways = entrypointIds(definition);
   const active = projectEntrypoint(definition, entrypointId);
@@ -422,7 +427,12 @@ export function BuildTab({
               )}
             </div>
           </div>
-          <TestDrawer test={test} panel={testPanel} />
+          <TestDrawer
+            test={test}
+            panel={testPanel}
+            open={testOpen}
+            onOpenChange={onTestOpenChange}
+          />
         </div>
       </ResizablePanel>
 
@@ -565,8 +575,24 @@ export function BuildTab({
 /** The test-with-sample surface as a bottom drawer: a 44px bar that says what
  * the last sample did and offers the two actions, opening to ~40% of the
  * canvas for the full panel. */
-function TestDrawer({ test, panel }: { test?: AutomationTestState; panel?: ReactNode }) {
-  const [open, setOpen] = useState(false);
+function TestDrawer({
+  test,
+  panel,
+  open: controlledOpen,
+  onOpenChange,
+}: {
+  test?: AutomationTestState;
+  panel?: ReactNode;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}) {
+  const [localOpen, setLocalOpen] = useState(false);
+  const open = controlledOpen ?? localOpen;
+  const setOpen = (next: boolean | ((prev: boolean) => boolean)) => {
+    const value = typeof next === "function" ? next(open) : next;
+    setLocalOpen(value);
+    onOpenChange?.(value);
+  };
   if (!test && !panel) return null;
   const readout = !test
     ? ""
@@ -574,7 +600,9 @@ function TestDrawer({ test, panel }: { test?: AutomationTestState; panel?: React
       ? `${test.latest.blocks.length} block${test.latest.blocks.length === 1 ? "" : "s"} rendered`
       : test.sample.kind === "none"
         ? "no sample picked"
-        : "sample picked";
+        : test.sample.kind === "latest"
+          ? "the latest delivery"
+          : "sample picked";
   const canRun = !!test && (test.sample.kind !== "none" || test.isTimed) && !test.running;
   return (
     <div

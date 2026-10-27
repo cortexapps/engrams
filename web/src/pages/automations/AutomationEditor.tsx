@@ -11,7 +11,7 @@
 
 import { ConnectError } from "@connectrpc/connect";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { Copy, Lock } from "lucide-react";
+import { Beaker, Copy, Lock } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
@@ -318,6 +318,14 @@ export function AutomationEditor({
   // The Activity tab's count: what the ledger holds (it lists up to 50).
   const activity = useRunList(automation?.id, { limit: 50 });
   const activityCount = activity.data?.runs.length;
+  // Try it: render the draft, saved or not, against the latest delivery, and
+  // open the drawer that shows what each block would do.
+  const [testOpen, setTestOpen] = useState(false);
+  const tryIt = () => {
+    setTestOpen(true);
+    if (tab !== "build") setTab("build");
+    void test.runOnce().catch((error: unknown) => fail(error));
+  };
 
   if (mode === "edit" && existing.isPending) {
     return (
@@ -466,6 +474,18 @@ export function AutomationEditor({
               <Copy aria-hidden /> Duplicate
             </Button>
           )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={tryIt}
+            disabled={test.running}
+            data-testid="try-it-button"
+            title="Render every block against the latest delivery, with nothing run"
+          >
+            <Beaker aria-hidden />
+            {test.running ? "Trying…" : "Try it"}
+          </Button>
           {mode === "edit" && automation && (
             // A dry run executes the SAVED definition; unsaved edits would
             // mislead, so it waits for a clean editor.
@@ -516,9 +536,11 @@ export function AutomationEditor({
             builtin={builtin}
             errors={errors}
             triggerSummaryFor={triggerSummaryFor}
-            test={automation ? test : undefined}
+            test={test}
             testPanel={testPanel}
             variableValues={liveValues}
+            testOpen={testOpen}
+            onTestOpenChange={setTestOpen}
           />
         </TabsContent>
         <TabsContent value="inputs" className="min-h-0 flex-1 overflow-y-auto p-6">

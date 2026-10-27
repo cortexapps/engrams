@@ -40,17 +40,18 @@ vi.mock("@/hooks/useAutomationEditor", () => ({
 }));
 // 3.4: the shell instantiates the test-with-sample state; the shell tests
 // exercise save paths, not rendering, so the hook is inert here.
+const runOnce = vi.hoisted(() => vi.fn(async () => null));
 vi.mock("@/hooks/useAutomationTest", () => ({
   useAutomationTest: () => ({
     isTimed: false,
     samples: [],
     samplesLoading: false,
-    sample: { kind: "none" },
+    sample: { kind: "latest" },
     setSample: vi.fn(),
     latest: null,
     tally: null,
     running: false,
-    runOnce: vi.fn(),
+    runOnce,
     runAcrossSamples: vi.fn(),
     variableValues: {},
   }),
@@ -120,6 +121,7 @@ function automation(kind: "user" | "builtin") {
 describe("AutomationEditor", () => {
   beforeEach(() => {
     saveVersion.mockClear();
+    runOnce.mockClear();
     setOverrides.mockClear();
     updateMeta.mockClear();
     navigate.mockClear();
@@ -377,5 +379,25 @@ describe("AutomationEditor", () => {
     expect(sent.blocks[0].config.promptTemplate).toBe("Changed.");
     expect(sent.blocks[0].id).toBe("finder");
     expect(setOverrides).not.toHaveBeenCalled();
+  });
+
+  it("Try it renders the draft, unsaved edits and all, and opens the test drawer", async () => {
+    automationHolder.value = { automation: automation("user") };
+    render(<AutomationEditor mode="edit" />);
+    fireEvent.click(screen.getByTestId("block-row-finder"));
+    const prompt = screen.getByTestId("field-promptTemplate").querySelector("textarea")!;
+    fireEvent.change(prompt, { target: { value: "Changed." } });
+    expect(screen.getByTestId("test-drawer").getAttribute("data-state")).toBe("closed");
+    fireEvent.click(screen.getByTestId("try-it-button"));
+    await waitFor(() => expect(runOnce).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("test-drawer").getAttribute("data-state")).toBe("open");
+    // Nothing was saved to try it.
+    expect(saveVersion).not.toHaveBeenCalled();
+  });
+
+  it("a new automation can be tried before it is created", async () => {
+    render(<AutomationEditor mode="create" />);
+    fireEvent.click(screen.getByTestId("try-it-button"));
+    await waitFor(() => expect(runOnce).toHaveBeenCalledTimes(1));
   });
 });
