@@ -8,7 +8,7 @@
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
-import type { CuratedEvent, TerminalOutcome } from "../../control-plane/session-events.ts";
+import type { TerminalOutcome } from "../../control-plane/session-events.ts";
 
 export const AUTOMATION_TOPIC = "automation";
 
@@ -24,10 +24,7 @@ export type AutomationInbox =
       receivedAt: string;
     }
   | { kind: "stop"; reason?: string }
-  | { kind: "supersede"; byRunId: string }
-  /** A curated session event, forwarded only for sessions bound with
-   * `relay: true` (an installed handler consumes them; nothing else does). */
-  | { kind: "session_event"; sessionId: string; event: CuratedEvent };
+  | { kind: "supersede"; byRunId: string };
 
 export interface AutomationSender {
   send(runId: string, message: AutomationInbox, idempotencyKey: string): Promise<void>;
@@ -53,8 +50,6 @@ export const inboxKeys = {
   sessionIdle: (sessionId: string, eventIdx: bigint | number): string =>
     `autorun:${sessionId}:idle:${eventIdx}`,
   sessionEnded: (sessionId: string): string => `autorun:${sessionId}:terminal`,
-  sessionEvent: (sessionId: string, eventIdx: bigint | number): string =>
-    `autorun:${sessionId}:event:${eventIdx}`,
   // Destination-qualified (like joinedEvent): DBOS notifications dedupe on a
   // GLOBAL message_uuid, so one signal fanning out to N runs needs N distinct
   // keys — a shared key silently drops every destination after the first.

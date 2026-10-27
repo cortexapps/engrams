@@ -599,12 +599,6 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
 
   const seen = new Set<string>();
   let count = 0;
-  /** Contract 3: one message handler per RUN — a run walks one entrypoint,
-   * so the installer list resets per entrypoint. Several blocks may carry it
-   * as long as they are the SAME type — a later one (a loop body re-pointing
-   * the Slack relay at a new turn) is a re-point of the installed handler,
-   * never a second install (the interpreter enforces the same executor). */
-  let installers: Array<{ id: string; type: string }> = [];
   const checkBlock = (block: BlockDef, hook: boolean): void => {
     count += 1;
     if (count > MAX_BLOCKS) {
@@ -644,27 +638,6 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
     if (block.type !== "loop" && block.body) {
       throw new DefinitionError(block.id, "body", `only loop blocks nest a body`);
     }
-    if (executor.onMessage !== undefined) {
-      // Contract 3: an installed message handler rides the run's single recv
-      // loop, so exactly one may exist, and a finalize hook (which runs after
-      // the loop is over) can never install one.
-      if (hook) {
-        throw new DefinitionError(
-          block.id,
-          "type",
-          `block type "${block.type}" installs a message handler; not allowed in a finalize hook`,
-        );
-      }
-      const first = installers[0];
-      if (first !== undefined && first.type !== block.type) {
-        throw new DefinitionError(
-          block.id,
-          "type",
-          `only one message-handler type per automation (already: "${first.id}" of type "${first.type}")`,
-        );
-      }
-      installers.push({ id: block.id, type: block.type });
-    }
     if (hook) {
       // A finalize hook runs inside the finalize step: nothing may park on
       // the mailbox there, and control flow has no graph to branch into.
@@ -699,7 +672,6 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
     entrypointIds.add(entrypoint.id);
     // Block ids stay unique across ALL entrypoints (`seen` is shared): a
     // step path addresses one automation-wide namespace.
-    installers = [];
     for (const block of walkBlocks(entrypoint.blocks)) checkBlock(block, false);
   }
   if (entrypoints.filter((entrypoint) => entrypoint.trigger.kind === "cron").length > 1) {
@@ -709,7 +681,6 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
       "at most one cron trigger per automation (the scheduler tracks one next_fire_at per row)",
     );
   }
-  installers = [];
   for (const hook of definition.settings.onFinalize ?? []) checkBlock(hook.block, true);
 
   if (definition.settings.concurrency) {

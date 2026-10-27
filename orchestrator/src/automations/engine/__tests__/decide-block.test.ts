@@ -94,7 +94,6 @@ function harness(
   const unused = () => Promise.reject(new Error("unused"));
   const sessions: EngineSessionOps = {
     createSession: unused,
-    setSessionRelay: async () => {},
     sendPrompt: unused,
     endSession: unused,
     exec: unused,

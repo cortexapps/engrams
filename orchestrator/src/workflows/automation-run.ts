@@ -48,6 +48,7 @@ import { makeAutomationStateStore } from "../db/automation-state.ts";
 import { makePrRefStore } from "../db/pr-refs.ts";
 import { makeIntegrationActionRuntime } from "../automations/actions/runtime.ts";
 import { makeAutomationInstanceStore } from "../db/automation-instances.ts";
+import { makeSessionRelayStore } from "../db/session-relays.ts";
 import { isRouterConnected } from "../model-routers/connected.ts";
 import { getOpenRouterDecisions } from "../integrations/openrouter.ts";
 import { loadProfileCards } from "../automations/profile-cards.ts";
@@ -218,10 +219,6 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
       }
     },
 
-    async setSessionRelay(sessionId, relay) {
-      await store().setSessionRelay(sessionId, relay);
-    },
-
     async sendPrompt(sessionId, promptId, text, harnessMode) {
       // ADR 0107: a mid-run prompt may select a harness mode (e.g. "plan");
       // SendPromptRequest carries it as an optional field.
@@ -301,6 +298,7 @@ function productionEngineDeps(): EngineDeps {
       closeInstance: (input) => makeAutomationInstanceStore().closeInstance(input),
       recordInstanceHandle: (input) => makeAutomationInstanceStore().recordInstanceHandle(input),
     },
+    relays: makeSessionRelayStore(),
     async startQueuedRun(runId) {
       const run = await store.getRun(runId);
       if (!run) return;
@@ -323,7 +321,7 @@ export async function automationRunWorkflowImpl(
   // ADR 0119 D2: bump on ANY change to step naming, step order, recv
   // semantics, or finalize position anywhere in the engine. The literal lives
   // in this registered body so the bump rotates the DBOS application version.
-  const ENGINE_STEP_CONTRACT = 4;
+  const ENGINE_STEP_CONTRACT = 5;
   const engine = deps.engine ?? productionEngineDeps();
   return interpretAutomation(
     { runId: input.runId, automationId: input.automationId, contract: ENGINE_STEP_CONTRACT },

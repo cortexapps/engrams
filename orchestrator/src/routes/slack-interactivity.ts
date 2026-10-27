@@ -7,12 +7,13 @@
  * click, an "Answer…" click (→ open the answer modal), or the modal submission.
  * Verifies every request with the SDK's `isValidSlackRequest` over the raw form
  * body, classifies the `payload` field via the Block Kit contract, and:
- *   - answer    → a `slack_answer` signal on the automation run whose relay
- *                 posted the question (idempotent on tool_call_id, so a
- *                 double-click delivers once);
+ *   - answer to a session's question (the route carries `sessionId`, contract
+ *     5) → completes the session's tool call through the session relay;
+ *   - answer to a run's `slack_choice` card (the route carries `runId`) → a
+ *     `slack_answer` signal on that run (idempotent on the answer id);
  *   - open_modal → `views.open` with the trigger id (must be within ~3s).
  *
- * Routing never reads `payload.channel`/`payload.message` — the run id rides
+ * Routing never reads `payload.channel`/`payload.message` — the address rides
  * the Block Kit value (and the modal's private_metadata), so a
  * view_submission (which has no channel) routes too. The DBOS/Slack
  * side-effects are injected so the handler is unit-testable without the engine.
@@ -32,7 +33,7 @@ import {
   assertIdempotencyKey,
   type AutomationInbox,
 } from "../automations/engine/inbox.ts";
-import { SLACK_ANSWER_SIGNAL } from "../automations/engine/blocks/relay.ts";
+import { CHOICE_ID_PREFIX, SLACK_ANSWER_SIGNAL, deliverSessionAnswer } from "../automations/session-relay.ts";
 
 export interface SlackInteractivityDeps {
   signingSecret?: () => Promise<string>;
@@ -43,17 +44,23 @@ export interface SlackInteractivityDeps {
   openModal?: (triggerId: string, view: ModalView) => Promise<void>;
 }
 
-/** Which mailbox an answer belongs to. A question posted by an automation
- *  run's relay carries `runId` in its Block Kit route; its answer is a
- *  `slack_answer` signal on that run. A card without one predates the engine
- *  (the thread workflow retired in ADR 0119 phase 4.8): nothing can take its
+/** Where an answer goes. A `slack_choice` card (answer id prefixed
+ *  `choice:`) is the RUN's: its click is a `slack_answer` signal on
+ *  `autorun:<runId>`. Any other question card was posted by a SESSION relay
+ *  (contract 5): its answer completes the session's deferred tool call. A
+ *  card with neither address predates the engine: nothing can take its
  *  answer. Pure, so the split is testable without DBOS. */
 export function answerDelivery(
   route: ThreadRoute,
   answer: SourceAnswer,
 ):
   | { kind: "automation"; runId: string; message: AutomationInbox; idempotencyKey: string }
+  | { kind: "session"; sessionId: string }
   | { kind: "unrouted" } {
+  const choice = answer.toolCallId.startsWith(CHOICE_ID_PREFIX);
+  if (!choice && route.sessionId) {
+    return { kind: "session", sessionId: route.sessionId };
+  }
   if (route.runId) {
     return {
       kind: "automation",
@@ -75,8 +82,18 @@ async function defaultDeliverAnswer(route: ThreadRoute, answer: SourceAnswer): P
   if (delivery.kind === "unrouted") {
     log.warn(
       { toolCallId: answer.toolCallId, channel: route.channel, thread: route.threadRoot },
-      "slack: answer to a question card with no run — ignored",
+      "slack: answer to a question card with no address — ignored",
     );
+    return;
+  }
+  if (delivery.kind === "session") {
+    const result = await deliverSessionAnswer(delivery.sessionId, answer);
+    if (result === "no_relay") {
+      log.warn(
+        { toolCallId: answer.toolCallId, sessionId: delivery.sessionId },
+        "slack: answer for a session with no relay — ignored",
+      );
+    }
     return;
   }
   assertIdempotencyKey(delivery.idempotencyKey);

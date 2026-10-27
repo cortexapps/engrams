@@ -247,40 +247,6 @@ describe("entrypoints (ADR 0119 D9)", () => {
       DefinitionError,
     );
   });
-
-  test("a message-handler cap is per entrypoint, not per definition", () => {
-    // Two entrypoints may EACH carry a handler type; a run walks only one.
-    const relay = (id: string) => ({
-      id,
-      type: "relay_session",
-      config: { session: { blockId: "launch" }, team: "T1", channel: "C1", threadTs: "1.0" },
-    });
-    const ep = (id: string, blocks: unknown[]) => ({ id, trigger: { kind: "manual" }, blocks });
-    expect(
-      validateDefinition(withEntrypoints([ep("a", [relay("ra")]), ep("b", [relay("rb")])])).entrypoints,
-    ).toHaveLength(2);
-    // The same handler type twice in one entrypoint is a re-point (allowed);
-    // a SECOND handler type in the same entrypoint is refused.
-    expect(validateDefinition(withEntrypoints([ep("a", [relay("ra"), relay("rb")])])).entrypoints).toHaveLength(1);
-    registerBlock({
-      type: "test_other_handler",
-      configSchema: z.object({}),
-      async execute() {
-        return { kind: "ok", outputs: {} };
-      },
-      async onMessage() {
-        return { verdict: "pass" };
-      },
-    });
-    try {
-      const other = { id: "other", type: "test_other_handler", config: {} };
-      expect(() => validateDefinition(withEntrypoints([ep("a", [relay("ra"), other])]))).toThrow(
-        /only one message-handler type/,
-      );
-    } finally {
-      unregisterBlockForTest("test_other_handler");
-    }
-  });
 });
 
 describe("settings.instance (ADR 0120)", () => {

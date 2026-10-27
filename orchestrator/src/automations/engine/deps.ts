@@ -8,6 +8,7 @@
 
 import type { AutomationInbox } from "./inbox.ts";
 import type { RunSnapshot } from "./context.ts";
+import type { SessionRelayStore } from "../../db/session-relays.ts";
 import type { DecisionsRequest, DecisionsResponse } from "../../integrations/openrouter-decisions.ts";
 import type { ProfileCard } from "../profile-cards.ts";
 
@@ -121,8 +122,6 @@ export interface EngineSessionOps {
     appendSystemPrompt?: string;
   }): Promise<EngineCreateSessionResult>;
   sendPrompt(sessionId: string, promptId: string, text: string, harnessMode?: string): Promise<void>;
-  /** Contract 3: a relay block asks for this session's curated events. */
-  setSessionRelay(sessionId: string, relay: boolean): Promise<void>;
   /** Read-only probe (`session_status`). Not-found is a value, never an
    * error — a swept-away session is a normal answer for a sweep. */
   getSession(sessionId: string): Promise<
@@ -277,6 +276,9 @@ export interface EngineDeps {
   state?: EngineStateStore;
   /** ADR 0120: instance_close's seam. */
   instances?: EngineInstanceOps;
+  /** Contract 5: the session relay rows (`relay_session`, `run_agent`,
+   * `relay_close`). Absent = the blocks report the relay store unavailable. */
+  relays?: SessionRelayStore;
   prRefs?: EnginePrRefLookup;
   code?: CodeBlockRuntime;
   integrationActions?: IntegrationActionRuntime;

@@ -5,13 +5,13 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 
-import type { CuratedEvent } from "../../../control-plane/session-events.ts";
 import { coerceFieldValue, validateFieldValue } from "../../../connectors/field-schema.ts";
 import { findAction } from "../../actions/execute.ts";
 import { makeCodeBlockRuntime } from "../../code/runtime.ts";
 import { makeReplayRunner, type ReplayRunner, type ReplayScript } from "../../engine/__tests__/replay-step.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
-import { setSlackRelayDeps } from "../../engine/blocks/relay.ts";
+import { setSlackPolicyFactoryForTest } from "../../../integrations/slack-policy.ts";
+import { makeFakeRelayStore, type FakeRelayStore } from "../../engine/__tests__/fake-relay-store.ts";
 import { setResolveUserDeps } from "../../engine/blocks/resolve-user.ts";
 import { NO_USER_MSG } from "../../../integrations/slack-identity.ts";
 import type { RunSnapshot } from "../../engine/context.ts";
@@ -81,12 +81,6 @@ interface ThreadMessage {
   text: string;
 }
 
-/** A curated session event as the automation consumer forwards it. */
-function curated(n: number, kind: string, payload: unknown, sessionId = "s-1"): AutomationInbox {
-  const event: CuratedEvent = { idx: BigInt(n), kind, payloadJson: JSON.stringify(payload) };
-  return { kind: "session_event", sessionId, event };
-}
-
 interface Harness {
   deps: EngineDeps;
   /** Set when the harness was built with `replay`. */
@@ -106,7 +100,9 @@ interface Harness {
   /** Slack user ids the identity gate was asked about. */
   resolved: string[];
   prompts: Array<{ sessionId: string; text: string }>;
-  relayFlags: Array<{ sessionId: string; relay: boolean }>;
+  /** The session relays the run installed (contract 5: the consumer
+   * renders them; the run only installs and re-points). */
+  relays: FakeRelayStore;
   policyCalls: string[];
   ended: string[];
   finalized: Array<{ status: string; error?: string }>;
@@ -125,8 +121,6 @@ function harness(options: {
   replay?: ReplayScript;
   /** Slack user → engrams user (default: U1 → user-1; everyone else unlinked). */
   linkedUsers?: Record<string, string>;
-  /** Make every relay-step ledger write throw (the row is observability). */
-  failRelayLedger?: boolean;
   /** The thread as Slack holds it, for `list_replies`. Default: the opening
    * mention as the root plus every mention the test delivers through `recv`
    * (what a thread of mentions alone looks like). */
@@ -148,7 +142,7 @@ function harness(options: {
   const records: Harness["records"] = [];
   const sessions: Harness["sessions"] = [];
   const prompts: Harness["prompts"] = [];
-  const relayFlags: Harness["relayFlags"] = [];
+  const relays = makeFakeRelayStore();
   const policyCalls: string[] = [];
   const ended: string[] = [];
   const finalized: Harness["finalized"] = [];
@@ -195,11 +189,7 @@ function harness(options: {
     async onNeutralClose(_m, message) { policyCalls.push(`neutral:${message}`); },
     async onDeliveryError() { policyCalls.push("delivery-error"); },
   };
-  setSlackRelayDeps({
-    policy: () => policy,
-    completeToolCall: async () => {},
-    sessionWebUrl: (id: string) => `https://engrams.test/sessions/${id}`,
-  });
+  setSlackPolicyFactoryForTest(() => policy);
   setResolveUserDeps({
     resolveUser: async (_provider: string, externalUserId: string) => {
       resolved.push(externalUserId);
@@ -246,7 +236,6 @@ function harness(options: {
       runSessions.push({ sessionId: id, keep: input.keep });
       return { sessionId: id, taskId: `t-${id}` };
     },
-    async setSessionRelay(sessionId, relay) { relayFlags.push({ sessionId, relay }); },
     async sendPrompt(sessionId, _promptId, text) { prompts.push({ sessionId, text }); },
     async endSession(sessionId) { ended.push(sessionId); },
     async exec() { return { exitStatus: 0, stdout: "", stderr: "" }; },
@@ -267,7 +256,6 @@ function harness(options: {
       async loadSnapshot() { return snapshot; },
       async markRunning() {},
       async recordStep(_r, path, attempt, record) {
-        if (options.failRelayLedger && path.endsWith(".__relay__")) throw new Error("ledger down");
         records.push({ path, attempt, record });
       },
       async finalizeRun(_r, status, error) { finalized.push({ status, ...(error !== undefined ? { error } : {}) }); },
@@ -289,6 +277,7 @@ function harness(options: {
       async getSessionBinding() { return null; },
     },
     sessions: sessionOps,
+    relays,
     clock: { nowMs: () => (clock += options.clockStepMs ?? 1000) },
     code: makeCodeBlockRuntime(),
     instances: {
@@ -331,11 +320,11 @@ function harness(options: {
     },
   };
 
-  return { deps, runner, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized, resolved, actions, closed, decisionRequests, choices };
+  return { deps, runner, names, records, sessions, prompts, relays, policyCalls, ended, finalized, resolved, actions, closed, decisionRequests, choices };
 }
 
 afterEach(() => {
-  setSlackRelayDeps(null);
+  setSlackPolicyFactoryForTest(null);
   setResolveUserDeps(null);
 });
 
@@ -388,8 +377,11 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.names.indexOf("step:has_previous.started:0")).toBeLessThan(h.names.indexOf("step:relay:0"));
     // No earlier run of this workstream kept a session: a fresh one.
     expect(h.names).toContain("step:previous:0");
-    // The relay was installed on that session (consumer will forward curated events).
-    expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
+    // The relay was installed on that session (the consumer renders its
+    // events from here on, with no run live).
+    expect([...h.relays.rows.keys()]).toEqual(["s-1"]);
+    // … and re-pointed at the follow-up: the next ⏳/✅ land on its ts.
+    expect(h.relays.rows.get("s-1")!.target).toMatchObject({ channel: "C1", threadRoot: "100.1", ts: "100.2" });
     // The follow-up became the second prompt, mention stripped.
     expect(h.prompts).toEqual([{ sessionId: "s-1", text: "and what about the root cause?" }]);
     // Sessions are kept: nothing ended.
@@ -456,9 +448,6 @@ describe("Slack thread brain through the interpreter", () => {
       previousSession: { sessionId: "s-old", runId: "r-old", alive: true },
       recv: [
         // The resumed session's run (the opening fold as its prompt) ends.
-        curated(1, "run_started", {}, "s-old"),
-        curated(2, "agent_message", { role: "assistant", text: "picking up where we left off" }, "s-old"),
-        curated(3, "run_completed", { ok: true }, "s-old"),
         // The resumed session's turn ends (the Nth idle ↔ the Nth prompt,
         // counted per session within THIS run).
         { kind: "session_idle", sessionId: "s-old" },
@@ -471,14 +460,13 @@ describe("Slack thread brain through the interpreter", () => {
     // No new session; the kept one was prompted (send_prompt adopted it).
     expect(h.sessions).toEqual([]);
     expect(h.prompts).toEqual([{ sessionId: "s-old", text: "summarize the incident" }]);
-    expect(h.relayFlags).toEqual([{ sessionId: "s-old", relay: true }]);
+    expect([...h.relays.rows.keys()]).toEqual(["s-old"]);
     expect(h.names).toContain("step:opening_turn.resume_turn:0");
     expect(h.names).not.toContain("step:has_previous.session:0");
     expect(h.names).not.toContain("step:has_previous.started:0");
     // A resume is silent: the thread carries the session link from its first
     // run, and the conversation simply continues.
     expect(h.actions.filter((a) => a.actionId === "post_message")).toEqual([]);
-    expect(h.policyCalls).toContain("msg:picking up where we left off");
   });
 
   test("(a5') a resumed session is prompted with what it has not seen: the replies after our last answer, never its own earlier turns", async () => {
@@ -570,69 +558,13 @@ describe("Slack thread brain through the interpreter", () => {
     expect(previous?.record.outputs).toMatchObject({ found: false, reason: "gone", session_id: "s-old" });
   });
 
-  test("(a') the relay survives a pod restart: its state rides the checkpointed step outputs, not process memory", async () => {
-    // Pass 1: the relay renders three messages into one bubble, then the pod
-    // dies while waiting. Pass 2 (recovery): DBOS replays the recorded step
-    // outputs WITHOUT re-running their closures and re-delivers the recv'd
-    // messages, then the run goes live: message 4 must append to the SAME
-    // bubble (the state the dead pod built), and the ✅ recap must carry the
-    // last message. With state in a module map both would be lost — the
-    // relay would answer "pass" forever and the recap would post nothing.
-    const h = harness({
-      replay: [
-        curated(1, "run_started", {}),
-        curated(2, "agent_message", { role: "assistant", text: "one" }),
-        curated(3, "agent_message", { role: "assistant", text: "two" }),
-        "crash",
-        curated(4, "agent_message", { role: "assistant", text: "three" }),
-        curated(5, "run_completed", { ok: true }),
-        { kind: "session_idle", sessionId: "s-1" },
-        null,
-        null,
-      ],
-    });
-    const runner = h.runner!;
-    // The dying pod: its interpretAutomation never settles (recv hangs).
-    void interpretAutomation(RUN, h.deps).catch(() => {});
-    // Let pass 1 run up to the hang.
-    for (let i = 0; i < 50 && !h.policyCalls.includes("msg:one\n\ntwo"); i += 1) {
-      await new Promise((r) => setTimeout(r, 1));
-    }
-    expect(h.policyCalls).toEqual(["working:100.1", "msg:one", "msg:one\n\ntwo"]);
-    const liveBeforeCrash = runner.executed.length;
-    expect(liveBeforeCrash).toBeGreaterThan(0);
-
-    runner.restart();
-    const result = await interpretAutomation(RUN, h.deps);
-
-    expect(result.status).toBe("completed");
-    // Recovery replayed the recorded relay steps (their closures did not
-    // run again: no duplicate "msg:one"/"working" through the policy) …
-    expect(h.policyCalls.filter((c) => c === "msg:one")).toHaveLength(1);
-    expect(h.policyCalls.filter((c) => c === "working:100.1")).toHaveLength(1);
-    expect(new Set(runner.executed).size).toBe(runner.executed.length);
-    expect(runner.executed.length).toBeGreaterThan(liveBeforeCrash);
-    // … then message 4 appended to the bubble the dead pod opened (the
-    // relay's state came back through the checkpointed outputs) …
-    expect(h.policyCalls).toContain("msg:one\n\ntwo\n\nthree");
-    expect(h.policyCalls).toContain("idle:100.1");
-    // … and the idle exit posted no recap (a pause, not an end).
-    expect(h.policyCalls.filter((c) => c.startsWith("complete:"))).toEqual([]);
-    // The relay's step names are unchanged across passes (contract stays 4).
-    const relaySteps = h.names.filter((n) => n.includes(".__relay__:"));
-    expect(relaySteps.slice(0, 3)).toEqual(relaySteps.slice(0, 3).map((n, i) => `step:relay.__relay__:${i + 1}`));
-    // Only one install: recovery re-seeded the state, it did not re-bind.
-    expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
-    expect(h.sessions).toHaveLength(1);
-  });
-
   test("(a'') an author with no engrams user gets the legacy \"log in first\" message and no session", async () => {
     const h = harness({ linkedUsers: {} });
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("filtered");
     expect(h.resolved).toEqual(["U1"]);
     expect(h.sessions).toEqual([]);
-    expect(h.relayFlags).toEqual([]);
+    expect(h.relays.rows.size).toBe(0);
     // The legacy message, posted into the thread by an ordinary Slack action
     // (the graph's decision, not the identity block's).
     expect(h.policyCalls).toEqual([]);
@@ -649,47 +581,11 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.closed).toEqual([]);
   });
 
-  test("(a3) recovery still rebuilds the relay state when every ledger write fails", async () => {
-    // Same crash/restart script as (a'), with the observability row never
-    // landing: the checkpointed step outputs alone carry the state.
-    const h = harness({
-      failRelayLedger: true,
-      replay: [
-        curated(1, "run_started", {}),
-        curated(2, "agent_message", { role: "assistant", text: "one" }),
-        curated(3, "agent_message", { role: "assistant", text: "two" }),
-        "crash",
-        curated(4, "agent_message", { role: "assistant", text: "three" }),
-        curated(5, "run_completed", { ok: true }),
-        { kind: "session_idle", sessionId: "s-1" },
-        null,
-        null,
-      ],
-    });
-    const runner = h.runner!;
-    void interpretAutomation(RUN, h.deps).catch(() => {});
-    for (let i = 0; i < 50 && !h.policyCalls.includes("msg:one\n\ntwo"); i += 1) {
-      await new Promise((r) => setTimeout(r, 1));
-    }
-    runner.restart();
-    const result = await interpretAutomation(RUN, h.deps);
-    expect(result.status).toBe("completed");
-    expect(h.policyCalls).toContain("msg:one\n\ntwo\n\nthree");
-    expect(h.policyCalls.filter((c) => c.startsWith("complete:"))).toEqual([]);
-    expect(h.records.filter((r) => r.path.endsWith(".__relay__"))).toEqual([]);
-  });
-
-  test("(a4) each accepted turn re-points the relay: ⏳/✅ land on the reply that started it", async () => {
+  test("(a4) each accepted turn re-points the relay at the reply that started it", async () => {
     const h = harness({
       recv: [
-        curated(1, "run_started", {}),
-        curated(2, "agent_message", { role: "assistant", text: "first answer" }),
-        curated(3, "run_completed", { ok: true }),
         { kind: "session_idle", sessionId: "s-1" },
         joined("<@UBOT> and then?", "100.2"),
-        curated(4, "run_started", {}),
-        curated(5, "agent_message", { role: "assistant", text: "second answer" }),
-        curated(6, "run_completed", { ok: true }),
         { kind: "session_idle", sessionId: "s-1" },
         null,
         null,
@@ -697,26 +593,19 @@ describe("Slack thread brain through the interpreter", () => {
     });
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("completed");
-    // Turn 1 reacts on the opening mention; turn 2 on the follow-up's ts.
-    expect(h.policyCalls.filter((c) => c.startsWith("working:"))).toEqual(["working:100.1", "working:100.2"]);
-    expect(h.policyCalls.filter((c) => c.startsWith("idle:"))).toEqual(["idle:100.1", "idle:100.2"]);
-    // The second answer opened a fresh bubble (no append onto the first).
-    expect(h.policyCalls.filter((c) => c.startsWith("msg:"))).toEqual(["msg:first answer", "msg:second answer"]);
-    // The re-point ran inside the loop body, before the turn's prompt, and
-    // was NOT a second install.
+    // One install (the opening mention), one re-point (the follow-up): the
+    // consumer's next ⏳/✅ land on the reply's ts.
+    expect(h.relays.writes).toEqual(["install", "repoint"]);
+    expect(h.relays.rows.get("s-1")!.target).toMatchObject({ ts: "100.2", threadRoot: "100.1" });
+    // The re-point ran inside the loop body, before the turn's prompt.
     const body = h.names.filter((n) => n.startsWith("step:thread[0].has_event.has_turn."));
     expect(body.indexOf("step:thread[0].has_event.has_turn.repoint:0")).toBeLessThan(
       body.indexOf("step:thread[0].has_event.has_turn.turn:0"),
     );
-    expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
-    // Relay step names keep the FIRST install's path and a single counter
-    // across the re-point (every mailbox message is offered: 6 curated
-    // events, 2 idles, 1 joined event).
-    expect(h.names.filter((n) => n.includes(".__relay__:"))).toEqual(
-      [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `step:relay.__relay__:${n}`),
-    );
-    // The idle exit posts no recap; the last policy call is the turn's ✅.
-    expect(h.policyCalls.at(-1)).toBe("idle:100.2");
+    // The idle exit posts no recap and leaves the relay in place: the
+    // session's own end closes it.
+    expect(h.policyCalls).toEqual([]);
+    expect(h.relays.rows.size).toBe(1);
   });
 
   test("(b) a top-level channel message (no thread_ts) is filtered, never a session", async () => {

@@ -7,6 +7,7 @@ import {
   automationInstance as instanceTable,
   automationRun as automationRunTable,
   automationSession as automationSessionTable,
+  automationSessionRelay as relayTable,
   automationStepRun as stepRunTable,
   automationVersion as versionTable,
   task as taskTable,
@@ -435,11 +436,11 @@ export interface AutomationEngineStore extends EngineRunStore {
     prompt: string;
     title: string | null;
   }): Promise<void>;
+  /** The run a session's events route to, and whether a session relay row
+   * exists for it (contract 5: the consumer renders relayed sessions). */
   findSessionBinding(
     sessionId: string,
   ): Promise<{ runId: string; blockId: string; role: string; relay: boolean } | null>;
-  /** Flip curated-event forwarding for a bound session (the relay block). */
-  setSessionRelay(sessionId: string, relay: boolean): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1808,19 +1809,14 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
           runId: automationSessionTable.runId,
           blockId: automationSessionTable.blockId,
           role: automationSessionTable.role,
-          relay: automationSessionTable.relay,
+          relaySessionId: relayTable.sessionId,
         })
         .from(automationSessionTable)
+        .leftJoin(relayTable, eq(relayTable.sessionId, automationSessionTable.sessionId))
         .where(eq(automationSessionTable.sessionId, sessionId))
         .limit(1);
-      return row ?? null;
-    },
-
-    async setSessionRelay(sessionId, relay) {
-      await db
-        .update(automationSessionTable)
-        .set({ relay })
-        .where(eq(automationSessionTable.sessionId, sessionId));
+      if (!row) return null;
+      return { runId: row.runId, blockId: row.blockId, role: row.role, relay: row.relaySessionId !== null };
     },
   };
 }
