@@ -64,7 +64,7 @@ starts a second one.
 ## Blocks
 
 **Agent.** The Agent block hands the event to the automation's agent: it continues the
-workstream's kept session when one is alive, else it starts one from the profile with the
+agent's kept session when one is alive, else it starts one from the profile with the
 prompt, and it can reply in the Slack thread the event came from. One trigger, one filter,
 and one Agent block is the shape of a standing agent: a bot that answers in a channel, a
 reviewer that follows a pull request across pushes, a helper that keeps one session per
@@ -106,7 +106,7 @@ you branch on rather than an error.
 
 **Routing.** Look up PR session maps a pull request to the session that authored it, so
 review feedback can go back to the agent that wrote the code. Claim handle binds an external
-identifier to the current workstream so later events route to it.
+identifier to the current agent so later events route to it.
 
 Text fields are templates with `${{ … }}` placeholders and a small set of filters. Every block
 can see the inputs, the trigger, the event, and the outputs of earlier blocks by id. A block
@@ -140,10 +140,12 @@ arrives, and a policy for what happens when a run with that key is already activ
 **Finalize hooks** run one block when a run ends in a status you choose. They can post a recap
 or flip a status comment, and they can never change the run's outcome.
 
-**Workstreams** give a long-lived thing, such as a Linear project or a support thread, a
-durable identity that many short runs contribute to. The Workstreams tab lists each one with
-its runs and the handles it has claimed, and a recent-drops list explains why a delivery did
-not start a run.
+**Scoped agents** give a long-lived thing, such as a pull request, a Slack thread or a
+support ticket, a durable identity that many short runs contribute to: one agent per key,
+with one kept session. The Agents tab lists each one, titled by the place it owns
+(`owner/repo#123`, `#channel · thread`), with its last run and a Close action; a
+recent-drops list explains why a delivery did not start a run. The automations list shows
+the scope as a badge ("per PR", "per thread").
 
 ## Inputs
 
