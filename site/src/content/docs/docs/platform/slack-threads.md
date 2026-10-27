@@ -68,7 +68,7 @@ Slack threads is an ordinary automation with its structure locked. Its trigger i
 app mention event. Every mention is one short run: it admits the author, folds the thread
 replies since the previous turn into the message, and hands the turn to the thread's
 session. The first mention in a thread starts the session; a later mention continues it
-through the Agent block. The thread is the automation's workstream, so one session serves
+through the Agent block. The thread is the automation's scoped agent, so one session serves
 the whole thread, and the queue policy keeps its turns in order. The session's relay posts
 the agent's output into the thread on its own, with no run open. Smart routing is three
 blocks in the graph: List profiles, Decide, and Slack choice, and it runs only when a thread
