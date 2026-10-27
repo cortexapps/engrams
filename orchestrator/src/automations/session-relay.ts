@@ -221,7 +221,10 @@ export async function renderSessionEvent(
   return "rendered";
 }
 
-/** The session ended: post the closing message and remove the relay. */
+/** The session ended: post the closing message and remove the relay. A
+ * NEUTRAL end (the sandbox reclaimed — a kept thread session swept after
+ * days of quiet) posts nothing: to the people in the thread nothing
+ * happened, and the next mention starts a fresh session there. */
 export async function closeSessionRelay(
   sessionId: string,
   outcome: TerminalOutcome,
@@ -236,8 +239,6 @@ export async function closeSessionRelay(
       await pol.onComplete(facts.mention, facts.session, facts.summary);
     } else if (outcome === "failed") {
       await pol.onFail(facts.mention, "The session hit an error and the thread cannot continue.");
-    } else {
-      await pol.onNeutralClose(facts.mention, `This thread's session ended (${outcome}).`);
     }
   } catch (err) {
     log.error({ sessionId, outcome, err }, "session relay: failed to post the closing message");
