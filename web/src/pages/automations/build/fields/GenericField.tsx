@@ -22,7 +22,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useProfiles } from "@/hooks/useProfiles";
 import type { FieldSpec } from "@/lib/automation-blocks";
 
-import { VariablePicker } from "./VariablePicker";
+import { TemplateField } from "./TemplateField";
 
 export interface GenericFieldProps {
   spec: FieldSpec;
@@ -33,7 +33,7 @@ export interface GenericFieldProps {
   error?: string;
   /** Block ids above this one whose session_id output can be referenced. */
   sessionSources: readonly string[];
-  /** Static variable paths the picker offers (3.4 adds live values). */
+  /** Every path the inline completion offers. */
   variablePaths: readonly string[];
   variableValues?: Readonly<Record<string, string>>;
 }
@@ -84,28 +84,14 @@ export function GenericField(props: GenericFieldProps) {
     case "template":
       return (
         <Shell spec={spec} pinned={pinned} error={error}>
-          {spec.multiline ? (
-            <Textarea
-              value={asString(value)}
-              onChange={(e) => onChange(e.target.value)}
-              disabled={disabled}
-              rows={5}
-              className="font-mono text-sm"
-            />
-          ) : (
-            <Input
-              value={asString(value)}
-              onChange={(e) => onChange(e.target.value)}
-              disabled={disabled}
-            />
-          )}
-          {!disabled && (
-            <VariablePicker
-              paths={variablePaths}
-              values={variableValues}
-              onInsert={(path) => onChange(`${asString(value)}\${{ ${path} }}`)}
-            />
-          )}
+          <TemplateField
+            value={asString(value)}
+            onChange={onChange}
+            multiline={spec.multiline === true}
+            disabled={disabled}
+            paths={variablePaths}
+            values={variableValues}
+          />
         </Shell>
       );
     case "string":
