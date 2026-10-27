@@ -98,7 +98,7 @@ export function draftPatterns(): Record<string, unknown> {
       "Runs are SHORT and stateless. Waits inside a run cap at 24h and stuck runs are swept at 48h - never design a run to live for a day.",
       "A workflow that spans days = multiple ENTRYPOINTS (one per way in: an integration event, a cron tick, a manual kick) sharing the automation's inputs, settings, and state. Each run enters through one entrypoint, does one step of the lifecycle, and exits.",
       "A TEMPLATED workflow (the same lifecycle per project/customer/case) declares settings.instance and becomes one automation with many WORKSTREAMS - see the instances section; never duplicate an automation per project.",
-      "Conversations (hours, every event carries the same key) are the ONE long-lived-run shape: a workstream per conversation (settings.instance keyed on the thread) whose opening event's run holds the conversation, plus a reply entrypoint with continueOnly + admit require that JOINS that run — like the Slack threads built-in.",
+      "A standing agent (a conversation, an agent per PR, an SRE per incident channel) is ONE block: run_agent. Every event is a short run that ends right after run_agent delivers; the durable thing is the kept session plus the open workstream (settings.instance keyed on the thread / PR / channel). run_agent continues the workstream's kept session when it is alive, else starts one with the opening prompt, and with `relay` set it mirrors the session into the Slack thread (replies, questions, ⏳/✅) with no run live. Never hold a conversation in a loop of waits.",
       "At most one cron trigger per automation.",
       "ONE template contract everywhere: every rendered string uses ${{ ... }} (Liquid) - session {template} refs included. Plain {{ ... }} NEVER renders (it flows through as a literal) and save refuses it; code block source is JS, not a template.",
     ],
@@ -126,7 +126,7 @@ export function draftPatterns(): Record<string, unknown> {
       "There is no lock block and no cross-block transaction on purpose; put facts that must change together in one document.",
     ],
     kept_sessions: [
-      'Sessions are kept by default and outlive their runs. Record a long-lived session id in state (e.g. state["pm"].session_id).',
+      'Sessions are kept by default and outlive their runs. Inside a workstream, run_agent finds the kept session for you; outside one, record a long-lived session id in state (e.g. state["pm"].session_id).',
       "A later run reaches a kept session with a {template} session ref: resolving it ADOPTS the session (re-binds its event routing to this run) - allowed only within the same automation and only when the owning run finished, so adoption never steals from a live waiting run.",
       "Probe before you prompt: session_status is read-only, never re-binds, and reports found/status/idle_seconds/owner_run_live as VALUES a filter can branch on - the cheap look for a sweep entrypoint.",
       'For an agent inside a session to talk back to the run waiting on it, the session uses its signal_automation tool and the run waits with send_prompt waitFor {kind: "signal", name} or wait_session.',

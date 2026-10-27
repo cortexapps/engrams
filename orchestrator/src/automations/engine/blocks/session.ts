@@ -90,7 +90,8 @@ export type EndSessionConfig = z.infer<typeof endSessionConfigSchema>;
 
 const DEFAULT_WAIT_DEADLINE_S = 7200;
 
-async function executeCreateSession(
+/** Shared with `run_agent`: the create half of a session. */
+export async function executeCreateSession(
   config: CreateSessionConfig,
   ctx: RunContext,
 ): Promise<BlockOutcome> {
