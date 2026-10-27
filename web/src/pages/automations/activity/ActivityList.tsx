@@ -32,6 +32,8 @@ export interface ActivityListProps {
   nameOf?: (automationId: string) => string | undefined;
   /** Workstream names by instance id, for the chip on a bound run. */
   workstreamLabelOf?: (instanceId: string) => string | undefined;
+  /** A block's kind in an automation, so a step row can say what it did. */
+  blockTypeOf?: (automationId: string, blockId: string) => string | undefined;
   /** Show the Superseded filter (per-automation surfaces). */
   superseded?: boolean;
   /** Extra controls on the filter row (an automation picker). */
@@ -58,6 +60,7 @@ export function ActivityList({
   onIncludeFilteredChange,
   nameOf,
   workstreamLabelOf,
+  blockTypeOf,
   superseded = false,
   controls,
   openRunId,
@@ -118,6 +121,9 @@ export function ActivityList({
                 automationName={nameOf?.(row.run.automationId)}
                 workstreamLabel={
                   row.run.instanceId !== "" ? workstreamLabelOf?.(row.run.instanceId) : undefined
+                }
+                blockTypeOf={
+                  blockTypeOf ? (blockId) => blockTypeOf(row.run.automationId, blockId) : undefined
                 }
                 defaultOpen={openRunId === row.run.id}
               />

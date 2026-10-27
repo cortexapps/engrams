@@ -1088,6 +1088,18 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
 
 const BY_KIND = new Map(BLOCK_KINDS.map((spec) => [spec.kind, spec]));
 
+/** Every block's kind by id, across main and every other way in: what an
+ * activity trace needs to say what a step did. Ids are unique automation-wide. */
+export function blockTypesOf(definition: AutomationDefinition): Map<string, string> {
+  const types = new Map<string, string>();
+  const collect = (blocks: readonly BlockDef[]) => {
+    for (const block of walkBlocks(blocks)) types.set(block.id, block.type);
+  };
+  collect(definition.blocks);
+  for (const ep of definition.entrypoints ?? []) collect(ep.blocks);
+  return types;
+}
+
 /** The profile a block runs on, when it runs one: the canvas shows the
  * profile's name in place of its id. */
 export function blockProfileId(block: BlockDef): string | undefined {

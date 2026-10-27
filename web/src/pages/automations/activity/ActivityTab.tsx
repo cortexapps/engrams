@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useSearch } from "@tanstack/react-router";
 
+import { useEditorAutomation } from "@/hooks/useAutomationEditor";
 import { useRunList } from "@/hooks/useAutomationRuns";
 import { useInstanceList } from "@/hooks/useInstances";
+import { blockTypesOf, parseDefinition } from "@/lib/automation-blocks";
 
 import { ActivityList } from "./ActivityList";
 
@@ -37,6 +39,12 @@ export function ActivityTab({
     (instances.data?.instances ?? []).map((instance) => [instance.id, instance.key]),
   );
 
+  // The current version's block kinds name what each step did. A run on an
+  // older version whose block is gone falls back to the generic readout.
+  const automation = useEditorAutomation(automationId);
+  const definitionJson = automation.data?.automation?.version?.definitionJson;
+  const blockTypes = useMemo(() => blockTypesOf(parseDefinition(definitionJson)), [definitionJson]);
+
   return (
     <ActivityList
       runs={runs.data?.runs ?? []}
@@ -47,6 +55,7 @@ export function ActivityTab({
       includeFiltered={includeFiltered}
       onIncludeFilteredChange={setIncludeFiltered}
       workstreamLabelOf={instanceId === undefined ? (id) => keyById.get(id) : undefined}
+      blockTypeOf={(_automationId, blockId) => blockTypes.get(blockId)}
       superseded
       openRunId={search.run}
     />
