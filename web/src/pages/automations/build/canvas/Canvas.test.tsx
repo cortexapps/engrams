@@ -135,6 +135,36 @@ describe("Canvas", () => {
     expect(screen.getByText(/structure set by the built-in/)).toBeTruthy();
   });
 
+  it("replay: the run's path lights up with what each block did, the rest fades, editing is off", async () => {
+    const step = (blockId: string, status: string, sentence: string) => ({
+      blockId,
+      frames: [],
+      latest: { path: blockId, blockId, depth: 0, attempt: 0, attempts: [], latest: {} },
+      status,
+      sentence,
+      duration: "1s",
+    });
+    const map = new Map([
+      ["launch", step("launch", "ok", "Started session se-abcde")],
+      ["gate", step("gate", "ok", "Took the then branch")],
+      ["hot", step("hot", "failed", "the session was gone")],
+    ]);
+    mount(false, { replay: { map: map as never, onPath: true } });
+    const launch = await screen.findByTestId("block-row-launch");
+    expect(launch.textContent).toContain("Started session se-abcde");
+    expect(launch.querySelector('[aria-label="step ok"]')).not.toBeNull();
+    expect(
+      screen.getByTestId("block-row-hot").querySelector('[aria-label="step failed"]'),
+    ).not.toBeNull();
+    // The loop never ran: faded, and the trigger carried the run.
+    expect(screen.getByTestId("block-row-poll").getAttribute("data-dimmed")).toBe("true");
+    expect(screen.getByTestId("block-row-trigger").getAttribute("data-dimmed")).toBeNull();
+    expect(screen.queryByLabelText("Insert block here")).toBeNull();
+    expect(screen.queryByLabelText("Actions for hot")).toBeNull();
+    // The edge into the failed step is the travelled one; the tail is not.
+    expect(document.querySelectorAll('path[data-taken="true"]').length).toBeGreaterThan(0);
+  });
+
   it("ghosts render dashed and run status renders a chip (future consumers)", async () => {
     mount(false, {
       ghostIds: new Set(["tick"]),

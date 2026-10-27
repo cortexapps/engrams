@@ -217,6 +217,10 @@ describe("ActivityTab", () => {
     // The collapsed row carries the reason a failed run failed.
     expect(screen.getByTestId("entry-reason").textContent).toBe("verifier exited 1");
     expect(within(trace).getByRole("button", { name: "Retry" })).toBeTruthy();
+    // Every run can be replayed on the canvas it ran through.
+    expect(within(trace).getByTestId("replay-link").getAttribute("href")).toBe(
+      "/automations/auto-1?tab=build&run=run-bad",
+    );
     expect(
       within(trace)
         .getByRole("link", { name: /open session/i })

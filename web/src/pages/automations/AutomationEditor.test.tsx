@@ -11,7 +11,7 @@ import { AutomationEditor } from "./AutomationEditor";
 const automationHolder = vi.hoisted(() => ({
   value: undefined as undefined | { automation: unknown },
 }));
-const searchHolder = vi.hoisted(() => ({ value: {} as { tab?: string } }));
+const searchHolder = vi.hoisted(() => ({ value: {} as { tab?: string; run?: string } }));
 const navigate = vi.hoisted(() => vi.fn());
 const saveVersion = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "a1" } }));
 const setOverrides = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "b1" } }));
@@ -20,8 +20,14 @@ const duplicate = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id:
 
 // 3.5: the header's DryRun button uses a connect-query mutation; this suite
 // renders without a QueryClient, so stub it like every other hook here.
+const runHolder = vi.hoisted(() => ({ value: undefined as unknown }));
 vi.mock("@/hooks/useAutomationRuns", () => ({
   useRunList: () => ({ data: undefined, isPending: false, error: null }),
+  useRun: (id: string | undefined) => ({
+    data: id ? runHolder.value : undefined,
+    isPending: false,
+    error: null,
+  }),
 }));
 vi.mock("@/hooks/useAutomationCode", () => ({
   useDryRun: () => ({ mutate: vi.fn(), isPending: false }),
@@ -35,6 +41,7 @@ vi.mock("@/hooks/useAutomationEditor", () => ({
   useSetAutomationEnabledV2: () => ({ mutate: vi.fn(), isPending: false }),
   useDuplicateAutomation: () => ({ mutateAsync: duplicate, isPending: false }),
   useEventCatalog: () => ({ data: undefined }),
+  useAutomationVersions: () => ({ data: undefined }),
   useActionCatalog: () => ({ data: undefined }),
   useEditorWebhookRegistrations: () => ({ data: { registrations: [] } }),
 }));
@@ -393,6 +400,54 @@ describe("AutomationEditor", () => {
     expect(screen.getByTestId("test-drawer").getAttribute("data-state")).toBe("open");
     // Nothing was saved to try it.
     expect(saveVersion).not.toHaveBeenCalled();
+  });
+
+  it("?run= on the Build tab replays that run: the banner, the step's sentence, its inputs", async () => {
+    searchHolder.value = { tab: "build", run: "run-7" };
+    runHolder.value = {
+      run: {
+        brief: {
+          id: "run-7",
+          automationId: "a1",
+          version: 1,
+          status: "failed",
+          error: "no host had capacity",
+          triggerSource: "manual",
+          dryRun: false,
+          createdAt: new Date().toISOString(),
+          startedAt: new Date().toISOString(),
+          instanceId: "",
+        },
+        triggerJson: JSON.stringify({ kind: "manual" }),
+        steps: [
+          {
+            blockId: "finder",
+            attempt: 0,
+            status: "failed",
+            error: "no host had capacity",
+            inputsJson: JSON.stringify({ promptTemplate: "Review it." }),
+            outputsJson: "{}",
+          },
+        ],
+        sessionIds: [],
+      },
+    };
+    automationHolder.value = { automation: automation("user") };
+    render(<AutomationEditor mode="edit" />);
+    expect((await screen.findByTestId("replay-banner")).textContent).toContain(
+      "no host had capacity",
+    );
+    // The failed step is selected and its details are in the inspector.
+    const details = await screen.findByTestId("step-details");
+    expect(details.textContent).toContain("Review it.");
+    expect(screen.getByTestId("block-row-finder").textContent).toContain("no host had capacity");
+    expect(screen.queryByLabelText("Insert block here")).toBeNull();
+    // Leaving the replay drops ?run= and keeps the tab.
+    fireEvent.click(screen.getByTestId("replay-exit"));
+    const call = navigate.mock.calls.at(-1)![0] as {
+      search: (p: Record<string, unknown>) => unknown;
+    };
+    expect(call.search({ tab: "build", run: "run-7" })).toEqual({ tab: "build" });
   });
 
   it("a new automation can be tried before it is created", async () => {

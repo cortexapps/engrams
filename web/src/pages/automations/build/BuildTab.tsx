@@ -9,7 +9,9 @@
  * column's way in for the inspector. */
 
 import { ChevronDown, ChevronUp, MoreHorizontal, Plus, Trash2, X } from "lucide-react";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+
+import type { AutomationRunBrief } from "@/gen/engram/app/v1/automation_pb";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -48,7 +50,14 @@ import {
   type TriggerSpec,
 } from "@/lib/automation-blocks";
 import { mergePaths, schemaPaths } from "@/lib/event-paths";
+import { relativeAge } from "@/lib/relative-time";
+import { wayOnPath, type ReplayMap } from "@/lib/run-replay";
 import { cn } from "@/lib/utils";
+
+import { entryTitle } from "../activity/activity-format";
+import { RunStatusDot } from "../runs/RunStatusDot";
+import { formatDuration, parseJsonObject } from "../runs/run-format";
+import { StepDetails } from "../runs/StepDetails";
 
 import { BlockInspector } from "./BlockInspector";
 import { Canvas, TRIGGER_ROW_ID } from "./canvas/Canvas";
@@ -56,8 +65,21 @@ import { MAX_SCALE, MIN_SCALE } from "./canvas/layout";
 import { TestPanel } from "./test/TestPanel";
 import { TriggerInspector } from "./TriggerInspector";
 
+/** A past run to draw on the canvas instead of editing it. */
+export interface RunReplay {
+  run: AutomationRunBrief;
+  map: ReplayMap;
+  /** The delivery that started the run, for the trigger node's details. */
+  triggerJson: string;
+  /** Set when the run executed a version other than the one drawn. */
+  versionNote?: string;
+  now: number;
+  onExit: () => void;
+}
+
 export interface BuildTabProps {
-  /** The whole automation, every way in included. */
+  /** The whole automation, every way in included. In replay, the version
+   * the run executed. */
   definition: AutomationDefinition;
   /** The way in the inspector edits. */
   entrypointId: string;
@@ -76,6 +98,9 @@ export interface BuildTabProps {
   /** The test drawer, open or closed; the header's Try it opens it. */
   testOpen?: boolean;
   onTestOpenChange?: (open: boolean) => void;
+  /** Replay a run on the canvas: nodes say what they did, the untravelled
+   * parts fade, a node click shows its inputs and outputs. */
+  replay?: RunReplay;
 }
 
 /** The trigger's event, as the catalog describes it: the first declared key
@@ -184,6 +209,7 @@ export function BuildTab({
   variableValues,
   testOpen,
   onTestOpenChange,
+  replay,
 }: BuildTabProps) {
   const ways = entrypointIds(definition);
   const active = projectEntrypoint(definition, entrypointId);
@@ -195,6 +221,27 @@ export function BuildTab({
   // Read once: `defaultSize` is only consulted on mount, and every later width
   // belongs to the library and the store, not to a render.
   const [storedInspectorWidth] = useState(readInspectorWidth);
+  // Replay opens on the step that matters: the one that failed or stopped
+  // the run, else the last one. A looped block shows the frame picked here.
+  const [framePath, setFramePath] = useState<string | null>(null);
+  const replayRunId = replay?.run.id;
+  useEffect(() => {
+    if (!replay) return;
+    const nodes = [...replay.map.values()];
+    const focus =
+      nodes.find((n) => n.status === "failed" || n.status === "skipped") ?? nodes.at(-1);
+    setFramePath(null);
+    if (focus) {
+      const way = ways.find((w) =>
+        [...walkBlocks(projectEntrypoint(definition, w).blocks)].some(
+          (b) => b.id === focus.blockId,
+        ),
+      );
+      if (way && way !== entrypointId) onSelectEntrypoint(way);
+      setSelectedId(focus.blockId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only a new run re-focuses.
+  }, [replayRunId]);
 
   const selected = selectedId === TRIGGER_ROW_ID ? null : findBlock(active.blocks, selectedId);
   // A removed block leaves a dangling selection; fall back to the trigger.
@@ -299,11 +346,16 @@ export function BuildTab({
     return blockKind(block.type).summary({ ...block.config, profileId: name });
   };
 
+  const replayNode = replay && selected ? replay.map.get(selected.id) : undefined;
+  const replayStep =
+    replayNode && (replayNode.frames.find((f) => f.path === framePath) ?? replayNode.latest);
+
   return (
     <ResizablePanelGroup
       orientation="horizontal"
       className="min-h-0 flex-1"
       data-testid="build-tab"
+      data-replay={replay ? replay.run.id : undefined}
       // `onLayoutChanged` (past tense) fires once the pointer is released
       // rather than on every drag frame — upstream's guidance for writing to a
       // storage API. Only remember a genuine split; a degenerate reading would
@@ -315,6 +367,43 @@ export function BuildTab({
     >
       <ResizablePanel id="build-canvas" minSize={CANVAS_MIN_WIDTH} className="min-w-0">
         <div className="relative flex h-full min-h-0 min-w-0 flex-col">
+          {replay && (
+            <div
+              className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b bg-card px-4 py-2 text-xs"
+              data-testid="replay-banner"
+            >
+              <RunStatusDot status={replay.run.status} />
+              <span className="font-semibold">
+                Replaying {entryTitle(replay.run).toLowerCase()}
+              </span>
+              <span className="text-muted-foreground">
+                {relativeAge(replay.run.createdAt, replay.now)} ago ·{" "}
+                {replay.run.status.replaceAll("_", " ")} ·{" "}
+                <span className="font-mono tabular-nums">
+                  {formatDuration(replay.run.startedAt, replay.run.endedAt, replay.now)}
+                </span>
+              </span>
+              {replay.run.error && (
+                <span className="min-w-0 truncate text-foreground">
+                  {replay.run.error.split("\n")[0]}
+                </span>
+              )}
+              {replay.versionNote && (
+                <span className="text-muted-foreground" data-testid="replay-version">
+                  {replay.versionNote}
+                </span>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                className="ml-auto h-7"
+                onClick={replay.onExit}
+                data-testid="replay-exit"
+              >
+                Back to editing
+              </Button>
+            </div>
+          )}
           {/* The canvas ground: a dot grid in ink at 14%, 20px. */}
           <div
             className="relative flex min-h-0 flex-1 flex-col"
@@ -367,11 +456,22 @@ export function BuildTab({
                       onRemove={(id) => onRemove(way, id)}
                       zoom={zoom}
                       summaryFor={summaryFor}
+                      {...(replay
+                        ? {
+                            replay: {
+                              map: replay.map,
+                              onPath: wayOnPath(
+                                replay.map,
+                                [...walkBlocks(projected.blocks)].map((b) => b.id),
+                              ),
+                            },
+                          }
+                        : {})}
                     />
                   </div>
                 );
               })}
-              {!builtin && (
+              {!builtin && !replay && (
                 <div className={cn("flex shrink-0 flex-col", adding ? "w-[264px]" : "w-auto")}>
                   {adding ? (
                     <form
@@ -427,12 +527,14 @@ export function BuildTab({
               )}
             </div>
           </div>
-          <TestDrawer
-            test={test}
-            panel={testPanel}
-            open={testOpen}
-            onOpenChange={onTestOpenChange}
-          />
+          {!replay && (
+            <TestDrawer
+              test={test}
+              panel={testPanel}
+              open={testOpen}
+              onOpenChange={onTestOpenChange}
+            />
+          )}
         </div>
       </ResizablePanel>
 
@@ -500,7 +602,33 @@ export function BuildTab({
             )}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-[18px] pb-4">
-            {effectiveId === TRIGGER_ROW_ID ? (
+            {replay ? (
+              effectiveId === TRIGGER_ROW_ID ? (
+                <section className="flex flex-col gap-1" data-testid="replay-delivery">
+                  <h4 className="text-xs font-semibold text-muted-foreground">
+                    The delivery that started this run
+                  </h4>
+                  <pre className="max-h-96 overflow-auto rounded-md bg-secondary p-3 font-mono text-xs">
+                    {(() => {
+                      const parsed = parseJsonObject(replay.triggerJson);
+                      return parsed ? JSON.stringify(parsed, null, 2) : replay.triggerJson || "—";
+                    })()}
+                  </pre>
+                </section>
+              ) : replayNode && replayStep ? (
+                <StepDetails
+                  step={replayStep}
+                  blockType={selected?.type}
+                  sentence={replayNode.sentence}
+                  frames={replayNode.frames}
+                  onPickFrame={setFramePath}
+                />
+              ) : (
+                <p className="text-sm text-muted-foreground" data-testid="replay-off-path">
+                  This block was not on the path of that run.
+                </p>
+              )
+            ) : effectiveId === TRIGGER_ROW_ID ? (
               <TriggerInspector
                 trigger={active.trigger}
                 onChange={updateTrigger}
@@ -520,7 +648,7 @@ export function BuildTab({
               />
             ) : null}
           </div>
-          {!builtin && (
+          {!builtin && !replay && (
             <div className="flex items-center gap-1 border-t px-3 py-2">
               {selected && position ? (
                 <>

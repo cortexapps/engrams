@@ -231,6 +231,16 @@ function InlineTrace({
             {run.status === "completed" ? "Run again" : "Retry"}
           </Button>
         )}
+        <Button asChild variant="ghost" size="sm">
+          <Link
+            to="/automations/$id"
+            params={{ id: run.automationId }}
+            search={{ tab: "build", run: run.id }}
+            data-testid="replay-link"
+          >
+            Replay on canvas
+          </Link>
+        </Button>
         {sessionIds.map((id) => (
           <Button key={id} asChild variant="ghost" size="sm">
             <Link to="/sessions/$id" params={{ id }}>

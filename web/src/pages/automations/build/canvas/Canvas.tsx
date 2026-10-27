@@ -10,6 +10,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { DropdownMenu, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import type { BlockDef, ListPath, TriggerSpec } from "@/lib/automation-blocks";
+import type { ReplayMap } from "@/lib/run-replay";
 
 import { BlockKindMenu } from "./BlockKindMenu";
 import { CanvasNode, type CanvasNodeStatus } from "./CanvasNode";
@@ -38,8 +39,12 @@ export interface CanvasProps {
   onRemove: (id: string) => void;
   /** AI drafting (phase 3): render these blocks as ghosts. */
   ghostIds?: ReadonlySet<string>;
-  /** Run replay (later): per-block status chips. */
+  /** Per-block status chips (the test-with-sample readout). */
   nodeStatus?: Readonly<Record<string, CanvasNodeStatus>>;
+  /** A past run drawn on this way in: its blocks light up with what they
+   * did, the rest fade, and the edges it travelled thicken. `onPath` says
+   * whether this way in carried the run at all. Editing is off. */
+  replay?: { map: ReplayMap; onPath: boolean };
   /** "fit" (default) scales down to the column; a number is an explicit zoom. */
   zoom?: number | "fit";
   /** A node's second line, when the owner can resolve it (profile names). */
@@ -64,9 +69,19 @@ export function Canvas({
   onRemove,
   ghostIds,
   nodeStatus,
+  replay,
   zoom = "fit",
   summaryFor,
 }: CanvasProps) {
+  const editable = !locked && !replay;
+  const edgeTaken = (edgeId: string): boolean => {
+    if (!replay) return false;
+    const edge = layout.edges.find((e) => e.id === edgeId);
+    if (!edge || edge.kind === "tail") return false;
+    const fromOn = edge.from === TRIGGER_ROW_ID ? replay.onPath : replay.map.has(edge.from);
+    const toOn = edge.to === null ? true : replay.map.has(edge.to);
+    return fromOn && toOn;
+  };
   void trigger; // the trigger node's title is `triggerSummary`
   const layout = useMemo(() => layoutCanvas(blocks), [blocks]);
   const blocksById = useMemo(() => {
@@ -129,9 +144,10 @@ export function Canvas({
               transformOrigin: "top left",
             }}
           >
-            <EdgeLayer layout={layout} />
+            <EdgeLayer layout={layout} {...(replay ? { taken: edgeTaken } : {})} />
             {layout.nodes.map((node) => {
               const block = node.id === TRIGGER_ROW_ID ? undefined : blocksById.get(node.id);
+              const replayed = block ? replay?.map.get(node.id) : undefined;
               return (
                 <CanvasNode
                   key={node.id}
@@ -141,10 +157,22 @@ export function Canvas({
                   triggerDetail={entrypointId}
                   selected={selectedId === (block ? node.id : TRIGGER_ROW_ID)}
                   errored={erroredIds.has(block ? node.id : TRIGGER_ROW_ID)}
-                  locked={locked}
+                  locked={locked || !!replay}
                   ghost={block ? ghostIds?.has(node.id) : false}
-                  status={block ? nodeStatus?.[node.id] : undefined}
-                  summary={block ? summaryFor?.(block) : undefined}
+                  status={
+                    replay
+                      ? block
+                        ? replayed?.status
+                        : replay.onPath
+                          ? "ok"
+                          : undefined
+                      : block
+                        ? nodeStatus?.[node.id]
+                        : undefined
+                  }
+                  summary={replayed ? replayed.sentence : block ? summaryFor?.(block) : undefined}
+                  dimmed={replay ? (block ? !replayed : !replay.onPath) : false}
+                  count={replayed?.frames.length}
                   canMoveUp={node.index !== undefined && node.index > 0}
                   canMoveDown={
                     node.index !== undefined &&
@@ -171,7 +199,7 @@ export function Canvas({
                 />
               );
             })}
-            {!locked &&
+            {editable &&
               layout.edges
                 .filter((edge) => edge.insert && edge.kind !== "tail")
                 .map((edge) => (
@@ -184,7 +212,7 @@ export function Canvas({
                     onInsert={onInsert}
                   />
                 ))}
-            {!locked && tail?.insert && (
+            {editable && tail?.insert && (
               <AddStepNode
                 x={tail.points.at(-1)!.x}
                 y={tail.points.at(-1)!.y}
