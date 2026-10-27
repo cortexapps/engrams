@@ -822,7 +822,8 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     });
   }
 
-  /** Resolve the sample a TestRender/DryRun/RunNow should use. */
+  /** Resolve the sample a TestRender/DryRun/RunNow should use, for the
+   * trigger the run will see: the draft's for a preview, the row's for a run. */
   async function resolveSample(
     trigger: AutomationDefinition["trigger"],
     sample: { case: "sampleId"; value: string } | { case: "payloadJson"; value: string } | { case: undefined },
@@ -1308,7 +1309,16 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
 
     async testRender(req, ctx) {
       await requireAdmin(ctx, getSession);
-      const row = await requireAutomation(req.automationId);
+      // A draft that is not saved yet previews with no row: the definition
+      // and the inputs come with the request, and the sample resolves for
+      // the draft's trigger (a stored sample id needs no row either).
+      const row = req.automationId.trim() === "" ? null : await requireAutomation(req.automationId);
+      if (row === null && req.draftDefinitionJson === undefined) {
+        throw new ConnectError(
+          "draft_definition_json is required when there is no automation_id",
+          Code.InvalidArgument,
+        );
+      }
       let definition: AutomationDefinition;
       if (req.draftDefinitionJson !== undefined) {
         const parsed = parseJson(req.draftDefinitionJson, "draft_definition_json", DEFINITION_MAX_CHARS);
@@ -1320,10 +1330,12 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           throw error;
         }
       } else {
-        definition = effectiveDefinition(row.version, row.blockOverrides);
+        definition = effectiveDefinition(row!.version, row!.blockOverrides);
       }
       const inputValues =
-        req.inputsJson !== undefined ? parseObjectJson(req.inputsJson, "inputs_json") : row.inputs;
+        req.inputsJson !== undefined
+          ? parseObjectJson(req.inputsJson, "inputs_json")
+          : (row?.inputs ?? {});
       const previewEntrypoint =
         req.entrypointId !== undefined && req.entrypointId !== ""
           ? entrypointOf(definition, req.entrypointId)
@@ -1339,8 +1351,8 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const result = await previewDefinition({
         definition,
         inputs: resolveAutomationInputs(definition.inputsSchema, inputValues),
-        automationId: row.id,
-        automationName: row.name,
+        automationId: row?.id ?? "",
+        automationName: row?.name ?? "Draft",
         entrypointId: previewEntrypoint.id,
         trigger: {
           kind: previewEntrypoint.trigger.kind,
