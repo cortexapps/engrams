@@ -40,8 +40,8 @@ export interface ActivityEntryProps {
   now: number;
   /** Cross-automation ledger: name the automation on the row. */
   automationName?: string;
-  /** The workstream's rendered name, when the run is bound to one. */
-  workstreamLabel?: string;
+  /** The agent's rendered name, when the run is bound to one. */
+  agentLabel?: string;
   /** The kind of a block in this run's automation, for the step sentences. */
   blockTypeOf?: (blockId: string) => string | undefined;
   defaultOpen?: boolean;
@@ -58,7 +58,7 @@ export function ActivityEntry({
   run,
   now,
   automationName,
-  workstreamLabel,
+  agentLabel,
   blockTypeOf,
   defaultOpen = false,
 }: ActivityEntryProps) {
@@ -102,7 +102,7 @@ export function ActivityEntry({
           </span>
           <span className="block truncate text-xs text-muted-foreground">
             {entryVia(run)}
-            {workstreamLabel && ` · ${workstreamLabel}`}
+            {agentLabel && ` · ${agentLabel}`}
             {run.dryRun && " · dry run"}
             {" · "}
             <span className="font-mono tabular-nums">

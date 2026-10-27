@@ -8,7 +8,7 @@ import { blockTypesOf, parseDefinition } from "@/lib/automation-blocks";
 
 import { ActivityList } from "./ActivityList";
 
-// One automation's activity (the editor's Activity tab), or one workstream's
+// One automation's activity (the editor's Activity tab), or one agent's
 // timeline when `instanceId` narrows it. A `?run=` in the URL opens that
 // entry's trace — the destination the old run page's links now land on.
 export function ActivityTab({
@@ -29,7 +29,7 @@ export function ActivityTab({
   });
   const tick = now();
 
-  // Name the workstream on a bound run — fetched only once one is visible.
+  // Name the agent on a bound run — fetched only once one is visible.
   const anyBound = (runs.data?.runs ?? []).some((run) => run.instanceId !== "");
   const instances = useInstanceList(automationId, {
     includeClosed: true,
@@ -54,7 +54,7 @@ export function ActivityTab({
       now={tick}
       includeFiltered={includeFiltered}
       onIncludeFilteredChange={setIncludeFiltered}
-      workstreamLabelOf={instanceId === undefined ? (id) => keyById.get(id) : undefined}
+      agentLabelOf={instanceId === undefined ? (id) => keyById.get(id) : undefined}
       blockTypeOf={(_automationId, blockId) => blockTypes.get(blockId)}
       superseded
       openRunId={search.run}

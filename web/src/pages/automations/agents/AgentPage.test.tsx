@@ -5,7 +5,7 @@ import { createRouterTransport } from "@connectrpc/connect";
 import { AutomationRunService, AutomationService } from "@/gen/engram/app/v1/automation_pb";
 import { renderWithProviders } from "@/test-utils";
 
-import { WorkstreamPage } from "./WorkstreamPage";
+import { AgentPage } from "./AgentPage";
 
 const NOW = "2026-08-25T12:00:00Z";
 const INSTANCE = {
@@ -87,19 +87,18 @@ function transport() {
   });
 }
 
-describe("WorkstreamPage", () => {
-  it("renders the routing map, timeline, memory, and task action from wire data", async () => {
-    renderWithProviders(<WorkstreamPage />, {
+describe("AgentPage", () => {
+  it("titles the agent by the place it owns, with its timeline and session", async () => {
+    renderWithProviders(<AgentPage />, {
       transport: transport(),
-      initialPath: "/automations/workstreams/instance-1",
+      initialPath: "/automations/agents/instance-1",
     });
 
-    expect(await screen.findByRole("heading", { name: "project ENG 42" })).toBeTruthy();
-    expect(screen.getByText("Routing map")).toBeTruthy();
-    expect(screen.getByText("pull_request.opened")).toBeTruthy();
-    expect(screen.getAllByText("engrams/engrams#42").length).toBeGreaterThan(0);
-    expect(screen.getByText("ENG-42")).toBeTruthy();
-    expect(await screen.findByRole("link", { name: "Open task ↗" })).toBeTruthy();
-    expect(screen.queryByText(/workstream state/i)).toBeNull();
+    expect(await screen.findByRole("heading", { name: "engrams/engrams#42" })).toBeTruthy();
+    expect(screen.getByText("project-ENG_42")).toBeTruthy();
+    expect(screen.getByText("Timeline")).toBeTruthy();
+    expect(screen.queryByText("Routing map")).toBeNull();
+    expect(await screen.findByRole("link", { name: "Open session ↗" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
   });
 });

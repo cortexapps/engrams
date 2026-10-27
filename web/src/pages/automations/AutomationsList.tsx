@@ -25,7 +25,7 @@ import {
   useDuplicateAutomation,
   useSetAutomationEnabled,
 } from "@/hooks/useAutomations";
-import { parseDefinition } from "@/lib/automation-blocks";
+import { parseDefinition, scopeLabel } from "@/lib/automation-blocks";
 import { automationStatusLabel } from "@/lib/automations";
 import { errorMessage } from "@/lib/errors";
 import { relativeTime } from "@/lib/relative-time";
@@ -84,9 +84,7 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
   const paused = !automation.enabled;
   const failed = summary.lastRun?.status === "failed";
   const trigger = summary.triggerSummary || "Trigger not configured";
-  const hasWorkstreams = Boolean(
-    parseDefinition(automation.version?.definitionJson).settings?.instance,
-  );
+  const scope = scopeLabel(parseDefinition(automation.version?.definitionJson));
   const fadedCell = paused && "opacity-60";
   const lastRun = summary.lastRun;
   const duration =
@@ -142,9 +140,9 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
                 built-in
               </Badge>
             )}
-            {hasWorkstreams && (
+            {scope && (
               <Badge variant="secondary" className="shrink-0 rounded-sm">
-                workstreams
+                {scope}
               </Badge>
             )}
           </span>

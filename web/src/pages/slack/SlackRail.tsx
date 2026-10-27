@@ -21,7 +21,7 @@ import { SLACK_BRAIN_BUILTIN_KEY } from "./SlackThreads";
 import { channelNames, describeThread, threadChannelIds } from "./slack-format";
 
 // The persistent Slack rail: a switcher over the OPEN threads engrams is in.
-// Each row is one thread workstream and navigates to its workstream page.
+// Each row is one thread agent and navigates to its page.
 export function SlackRail() {
   const now = useNow();
   const builtin = useBuiltinAutomation(SLACK_BRAIN_BUILTIN_KEY);
@@ -65,7 +65,7 @@ export function SlackRail() {
                     <SidebarMenuItem key={thread.id}>
                       <SidebarMenuButton asChild className="h-auto items-start gap-2.5 py-1.5">
                         <Link
-                          to="/automations/workstreams/$id"
+                          to="/automations/agents/$id"
                           params={{ id: thread.id }}
                           title={thread.key}
                         >

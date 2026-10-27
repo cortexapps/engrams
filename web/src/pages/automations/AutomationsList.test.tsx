@@ -50,7 +50,7 @@ function summary(
     startedAt?: string;
     endedAt?: string;
     failedToday?: number;
-    workstreams?: boolean;
+    scoped?: boolean;
   } = {},
 ): AutomationSummary {
   return create(AutomationSummarySchema, {
@@ -60,7 +60,7 @@ function summary(
       kind: opts.kind ?? "user",
       enabled: opts.enabled ?? true,
       currentVersion: 1,
-      ...(opts.workstreams
+      ...(opts.scoped
         ? {
             version: create(AutomationVersionSchema, {
               automationId: id,
@@ -70,7 +70,10 @@ function summary(
                 trigger: { kind: "manual" },
                 blocks: [],
                 inputsSchema: [],
-                settings: { endSessionsOnFinish: false, instance: { keyTemplate: "{{pr}}" } },
+                settings: {
+                  endSessionsOnFinish: false,
+                  instance: { keyTemplate: "${{ event.raw.pull_request.number }}" },
+                },
               }),
             }),
           }
@@ -117,7 +120,7 @@ beforeEach(() => {
       startedAt: "2026-08-21T10:00:00Z",
       endedAt: "2026-08-21T10:02:00Z",
       failedToday: 3,
-      workstreams: true,
+      scoped: true,
     }),
     summary("a-alpha", "Alpha triage", { enabled: false }),
   ];
@@ -149,7 +152,7 @@ describe("AutomationsList", () => {
     expect(rows).toHaveLength(3);
     expect(rows[0]!.getAttribute("data-kind")).toBe("builtin");
     expect(within(rows[0]!).getByText("built-in")).toBeTruthy();
-    expect(within(rows[0]!).getByText("workstreams")).toBeTruthy();
+    expect(within(rows[0]!).getByText("per PR")).toBeTruthy();
     expect(screen.queryByRole("button", { name: /archive/i })).toBeNull();
     expect(screen.getByRole("button", { name: "Duplicate PR review" })).toBeTruthy();
   });

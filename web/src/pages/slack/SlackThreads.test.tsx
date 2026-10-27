@@ -38,6 +38,7 @@ vi.mock("../../hooks/useInstances", () => ({
   useInstanceList: () => ({ data: { instances: state.instances }, isPending: false }),
   useRecentDrops: () => ({ data: { drops: [] } }),
   useInstance: () => ({ data: undefined }),
+  useCloseInstance: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 vi.mock("../../hooks/useAutomationRuns", () => ({
   useRunList: () => ({ data: { runs: [] } }),
