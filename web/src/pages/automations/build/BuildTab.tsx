@@ -20,7 +20,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
-import type { AutomationTestState } from "@/hooks/useAutomationTest";
+import { useEventCatalog } from "@/hooks/useAutomationEditor";
+import { flattenScope, type AutomationTestState } from "@/hooks/useAutomationTest";
 import {
   addEntrypoint,
   blockIdsOutsideEntrypoint,
@@ -44,6 +45,7 @@ import {
   type ListPath,
   type TriggerSpec,
 } from "@/lib/automation-blocks";
+import { mergePaths, schemaPaths } from "@/lib/event-paths";
 import { cn } from "@/lib/utils";
 
 import { BlockInspector } from "./BlockInspector";
@@ -69,6 +71,16 @@ export interface BuildTabProps {
   testPanel?: ReactNode;
   /** Live variable values keyed by path for the selected sample. */
   variableValues?: Readonly<Record<string, string>>;
+}
+
+/** The trigger's event, as the catalog describes it: the first declared key
+ * of an integration trigger. */
+function catalogEventFor(trigger: TriggerSpec): { provider: string; key: string } | null {
+  if (trigger.kind !== "integration") return null;
+  const provider = typeof trigger["provider"] === "string" ? trigger["provider"] : "";
+  const keys = Array.isArray(trigger["eventKeys"]) ? (trigger["eventKeys"] as string[]) : [];
+  const key = keys[0];
+  return provider && key ? { provider, key } : null;
 }
 
 /** Static variable paths available to a block: trigger/inputs/event roots
@@ -238,9 +250,30 @@ export function BuildTab({
     setSelectedId(TRIGGER_ROW_ID);
   };
 
+  // The event's fields come from the connector's catalog: its curated schema
+  // names the paths, its newest sample previews them before any test runs.
+  const catalogEvent = catalogEventFor(active.trigger);
+  const catalog = useEventCatalog(catalogEvent?.provider);
+  const catalogEntry = catalog.data?.events.find((event) => event.key === catalogEvent?.key);
+  const eventPaths = useMemo(
+    () => schemaPaths(catalogEntry?.schemaJson ?? ""),
+    [catalogEntry?.schemaJson],
+  );
+  const previewValues = useMemo(() => {
+    const values: Record<string, string> = {};
+    if (catalogEntry?.sampleJson) {
+      try {
+        flattenScope({ event: { raw: JSON.parse(catalogEntry.sampleJson) as unknown } }, values);
+      } catch {
+        // a sample that does not parse previews nothing
+      }
+    }
+    return { ...values, ...variableValues };
+  }, [catalogEntry?.sampleJson, variableValues]);
   const variablePaths = useMemo(
-    () => variablePathsFor(active, selected?.id ?? null),
-    [active, selected?.id],
+    () =>
+      mergePaths([...variablePathsFor(active, selected?.id ?? null), ...eventPaths], previewValues),
+    [active, selected?.id, eventPaths, previewValues],
   );
   const sessionSources = useMemo(
     () => sessionSourcesFor(active, selected?.id ?? null),
@@ -460,7 +493,7 @@ export function BuildTab({
                 errors={blockErrors}
                 sessionSources={sessionSources}
                 variablePaths={variablePaths}
-                variableValues={variableValues}
+                variableValues={previewValues}
               />
             ) : null}
           </div>

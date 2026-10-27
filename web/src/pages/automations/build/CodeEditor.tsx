@@ -8,6 +8,12 @@
  * The theme maps straight onto the paper/ink CSS variables from
  * web/src/index.css, so it follows the light/dark theme for free. */
 
+import {
+  autocompletion,
+  completionKeymap,
+  type CompletionContext,
+  type CompletionResult,
+} from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { javascript } from "@codemirror/lang-javascript";
 import { bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
@@ -28,6 +34,9 @@ export interface CodeEditorProps {
   "aria-label"?: string;
   /** Test id for the host element. */
   testId?: string;
+  /** Dotted paths (`event.raw.issue.title`, `steps.gate.value`) offered as
+   * completions while typing a path. */
+  completions?: readonly string[];
 }
 
 const paperTheme = EditorView.theme({
@@ -99,12 +108,30 @@ function readOnlyExtensions(readOnly: boolean) {
   return [EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)];
 }
 
+/** Complete a dotted path from the word before the cursor: `event.raw.is`
+ * offers `event.raw.issue` and everything under it. Nothing is offered for
+ * an empty word, so ordinary typing stays quiet. */
+function pathCompletions(paths: readonly string[]) {
+  return (context: CompletionContext): CompletionResult | null => {
+    const word = context.matchBefore(/[A-Za-z_][\w.]*/);
+    if (!word || word.text === "") return null;
+    const needle = word.text.toLowerCase();
+    const options = paths
+      .filter((path) => path.toLowerCase().startsWith(needle) && path !== word.text)
+      .slice(0, 50)
+      .map((path) => ({ label: path, type: "variable" }));
+    if (options.length === 0) return null;
+    return { from: word.from, options, validFor: /^[\w.]*$/ };
+  };
+}
+
 export default function CodeEditor(props: CodeEditorProps) {
   const host = useRef<HTMLDivElement | null>(null);
   const view = useRef<EditorView | null>(null);
   const onChangeRef = useRef(props.onChange);
   onChangeRef.current = props.onChange;
   const readOnly = useRef(new Compartment());
+  const completions = useRef(new Compartment());
 
   useEffect(() => {
     if (!host.current) return;
@@ -117,7 +144,10 @@ export default function CodeEditor(props: CodeEditorProps) {
         indentOnInput(),
         javascript(),
         syntaxHighlighting(inkHighlight),
-        keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
+        keymap.of([...defaultKeymap, ...historyKeymap, ...completionKeymap, indentWithTab]),
+        completions.current.of(
+          autocompletion({ override: [pathCompletions(props.completions ?? [])] }),
+        ),
         lintGutter(),
         paperTheme,
         readOnly.current.of(readOnlyExtensions(props.readOnly === true)),
@@ -153,6 +183,16 @@ export default function CodeEditor(props: CodeEditorProps) {
       effects: readOnly.current.reconfigure(readOnlyExtensions(props.readOnly === true)),
     });
   }, [props.readOnly]);
+
+  useEffect(() => {
+    const v = view.current;
+    if (!v) return;
+    v.dispatch({
+      effects: completions.current.reconfigure(
+        autocompletion({ override: [pathCompletions(props.completions ?? [])] }),
+      ),
+    });
+  }, [props.completions]);
 
   useEffect(() => {
     // Push the EvalCode error (or its clearing) as diagnostics — no linter

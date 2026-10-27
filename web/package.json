@@ -31,6 +31,7 @@
     "@assistant-ui/react-markdown": "^0.14.23",
     "@bufbuild/protobuf": "^2.16.0",
     "@casl/ability": "^7.0.2",
+    "@codemirror/autocomplete": "^6.20.3",
     "@codemirror/commands": "^6.11.1",
     "@codemirror/lang-javascript": "^6.2.5",
     "@codemirror/language": "^6.13.1",

@@ -20,7 +20,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
 import { useActionCatalog } from "@/hooks/useAutomationEditor";
 import { useHarnessCatalog } from "@/hooks/useHarnessCatalog";
 import { useProfiles } from "@/hooks/useProfiles";
@@ -42,7 +41,7 @@ import { asFilterGroup, ConditionEditor } from "./fields/ConditionEditor";
 import { CodeInspector } from "./inspectors/CodeInspector";
 import { DecideInspector } from "./inspectors/DecideInspector";
 import { GenericField } from "./fields/GenericField";
-import { VariablePicker } from "./fields/VariablePicker";
+import { TemplateField } from "./fields/TemplateField";
 
 export interface BlockInspectorProps {
   block: BlockDef;
@@ -52,7 +51,7 @@ export interface BlockInspectorProps {
   errors: readonly BlockErrorRef[];
   /** Block ids above this one that expose a session_id output. */
   sessionSources: readonly string[];
-  /** Static variable paths for pickers and condition rows. */
+  /** Every path the inline completion and the condition rows offer. */
   variablePaths: readonly string[];
   /** 3.4: live preview values keyed by path. */
   variableValues?: Readonly<Record<string, string>>;
@@ -501,27 +500,14 @@ function IntegrationActionInspector(props: BlockInspectorProps) {
                 data-testid={`field-params.${key}`}
               >
                 <FieldLabel>{label}</FieldLabel>
-                {key === "body" || key === "summary" || key === "text" ? (
-                  <Textarea
-                    value={text}
-                    rows={4}
-                    className="font-mono text-sm"
-                    onChange={(e) => setParam(key, e.target.value)}
-                    disabled={paramsPinned}
-                  />
-                ) : (
-                  <Input
-                    value={text}
-                    onChange={(e) => setParam(key, e.target.value)}
-                    disabled={paramsPinned}
-                  />
-                )}
-                {!paramsPinned && (
-                  <VariablePicker
-                    paths={variablePaths}
-                    onInsert={(p) => setParam(key, `${text}\${{ ${p} }}`)}
-                  />
-                )}
+                <TemplateField
+                  value={text}
+                  onChange={(next) => setParam(key, next)}
+                  multiline={key === "body" || key === "summary" || key === "text"}
+                  disabled={paramsPinned}
+                  paths={variablePaths}
+                  values={props.variableValues}
+                />
                 {error && <FieldError>{error}</FieldError>}
               </Field>
             );
@@ -608,14 +594,7 @@ function NumericParamField({
   return (
     <Field data-invalid={error || invalid ? true : undefined} data-testid={testId}>
       <FieldLabel>{label}</FieldLabel>
-      <Input
-        inputMode={integer ? "numeric" : "decimal"}
-        value={text}
-        onChange={(e) => apply(e.target.value)}
-        disabled={pinned}
-        aria-invalid={invalid || undefined}
-      />
-      {!pinned && <VariablePicker paths={variablePaths} onInsert={(p) => apply(`\${{ ${p} }}`)} />}
+      <TemplateField value={text} onChange={apply} disabled={pinned} paths={variablePaths} />
       {invalid && <FieldError>{integer ? "Enter a whole number" : "Enter a number"}</FieldError>}
       {error && <FieldError>{error}</FieldError>}
     </Field>
