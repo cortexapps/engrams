@@ -3,7 +3,11 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRouterTransport } from "@connectrpc/connect";
 
-import { AutomationRunService, type ListRunsRequest } from "@/gen/engram/app/v1/automation_pb";
+import {
+  AutomationRunService,
+  AutomationService,
+  type ListRunsRequest,
+} from "@/gen/engram/app/v1/automation_pb";
 import { renderWithProviders } from "@/test-utils";
 import { ActivityTab } from "./ActivityTab";
 import {
@@ -47,8 +51,28 @@ type ListImpl = (req: ListRunsRequest) => {
   filtered: Array<{ count: number; firstAt: string; lastAt: string; beforeRunId: string }>;
 };
 
+const DEFINITION = {
+  engine: 1,
+  trigger: { kind: "integration", provider: "github", eventKeys: ["pull_request.opened"] },
+  blocks: [
+    { id: "clone", type: "run_command", config: {} },
+    { id: "verify", type: "send_prompt", config: {} },
+  ],
+  inputsSchema: [],
+  settings: { endSessionsOnFinish: false },
+};
+
 function transportWith(listRuns: ListImpl, steps: Record<string, unknown>[] = []) {
   return createRouterTransport((router) => {
+    router.service(AutomationService, {
+      getAutomation: () => ({
+        automation: {
+          id: "auto-1",
+          name: "Pull request review",
+          version: { definitionJson: JSON.stringify(DEFINITION) },
+        },
+      }),
+    });
     router.service(AutomationRunService, {
       listRuns,
       getRun: (req) => ({
@@ -154,7 +178,7 @@ describe("ActivityTab", () => {
 
   it("unfolds a step trace inline with the failed step tinted, its error, and the actions", async () => {
     const listRuns = vi.fn<ListImpl>(() => ({
-      runs: [brief("run-bad", "failed", 60)],
+      runs: [brief("run-bad", "failed", 60, { error: "verifier exited 1" })],
       filtered: [],
     }));
     const steps = [
@@ -188,13 +212,44 @@ describe("ActivityTab", () => {
     expect(rows).toHaveLength(2);
     expect(rows[1]!.getAttribute("data-status")).toBe("failed");
     expect(within(rows[1]!).getByText("verifier exited 1")).toBeTruthy();
-    expect(within(rows[0]!).getByText(/exit_status 0/)).toBeTruthy();
+    // A step says what its block did, in the words of its kind.
+    expect(within(rows[0]!).getByText("Exited 0")).toBeTruthy();
+    // The collapsed row carries the reason a failed run failed.
+    expect(screen.getByTestId("entry-reason").textContent).toBe("verifier exited 1");
     expect(within(trace).getByRole("button", { name: "Retry" })).toBeTruthy();
     expect(
       within(trace)
         .getByRole("link", { name: /open session/i })
         .getAttribute("href"),
     ).toBe("/sessions/se-finder-1");
+  });
+
+  it("a step row opens the details drawer with the rendered inputs and outputs", async () => {
+    const listRuns = vi.fn<ListImpl>(() => ({
+      runs: [brief("run-bad", "failed", 60)],
+      filtered: [],
+    }));
+    const steps = [
+      {
+        blockId: "clone",
+        attempt: 0,
+        status: "succeeded",
+        inputsJson: JSON.stringify({ commandTemplate: "git clone" }),
+        outputsJson: JSON.stringify({ exit_status: 0, stdout: "Cloning into repo" }),
+        startedAt: new Date(NOW - 60 * 60_000).toISOString(),
+        endedAt: new Date(NOW - 60 * 60_000 + 9_000).toISOString(),
+      },
+    ];
+    renderWithProviders(<ActivityTab automationId="auto-1" now={() => NOW} />, {
+      transport: transportWith(listRuns, steps),
+    });
+    await userEvent.click(await screen.findByRole("button", { expanded: false }));
+    await userEvent.click(await screen.findByRole("button", { name: "Details for clone" }));
+    const drawer = await screen.findByRole("dialog");
+    expect(within(drawer).getByText("run_command")).toBeTruthy();
+    expect(within(drawer).getByText(/git clone/)).toBeTruthy();
+    // stdout shows in the outputs JSON and again as its own block.
+    expect(within(drawer).getAllByText(/Cloning into repo/).length).toBeGreaterThan(0);
   });
 
   it("refetches with include_filtered when the switch flips", async () => {

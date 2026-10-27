@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import { useAutomations } from "@/hooks/useAutomations";
 import { useAllRuns } from "@/hooks/useAutomationRuns";
 import { useNow } from "@/hooks/useNow";
 import { PageHeading } from "@/components/page-heading";
+import { blockTypesOf, parseDefinition } from "@/lib/automation-blocks";
 import {
   Select,
   SelectContent,
@@ -34,6 +35,18 @@ export function ActivityPage() {
     .filter((id) => picked === ANY || id === picked);
   const all = useAllRuns(ids, { includeFiltered, limit: 25 });
   const today = countToday(all.runs, now);
+  // Each automation's current block kinds, for the step sentences.
+  const blockTypes = useMemo(() => {
+    const byAutomation = new Map<string, Map<string, string>>();
+    for (const s of list) {
+      if (!s.automation) continue;
+      byAutomation.set(
+        s.automation.id,
+        blockTypesOf(parseDefinition(s.automation.version?.definitionJson)),
+      );
+    }
+    return byAutomation;
+  }, [list]);
 
   return (
     <div className="space-y-6">
@@ -47,6 +60,7 @@ export function ActivityPage() {
         includeFiltered={includeFiltered}
         onIncludeFilteredChange={setIncludeFiltered}
         nameOf={nameOf}
+        blockTypeOf={(automationId, blockId) => blockTypes.get(automationId)?.get(blockId)}
         controls={
           <Select value={picked} onValueChange={setPicked}>
             <SelectTrigger size="sm" className="h-7 w-[200px]" aria-label="Automation">
