@@ -230,7 +230,13 @@ async function bumpVersion(
     deps.log ?? log,
     builtin.key,
   );
-  const mergedInputs: Record<string, unknown> = { ...existing.inputs };
+  //    A key the shipped schema no longer declares is dropped: the value
+  //    meant something to a graph that is gone.
+  const shippedKeys = new Set(shipped.inputsSchema.map((field) => field.key));
+  const mergedInputs: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(existing.inputs)) {
+    if (shippedKeys.has(key)) mergedInputs[key] = value;
+  }
   for (const field of shipped.inputsSchema) {
     if (!(field.key in mergedInputs) && field.key in defaults) {
       mergedInputs[field.key] = defaults[field.key];
