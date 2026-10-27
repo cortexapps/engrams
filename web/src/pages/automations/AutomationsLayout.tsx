@@ -6,7 +6,7 @@ import { AutomationsRail } from "./AutomationsRail";
 
 // The /automations section: a spine product, not a settings page. The rail is a
 // persistent switcher over automations (AutomationsRail); the list, the
-// composer, the workstreams and the activity ledger render into a padded,
+// composer, the agents and the activity ledger render into a padded,
 // scrolling sheet. The Builder is the exception: it is a fixed-height frame
 // whose canvas pans, so the editor routes get the bare sheet.
 // The whole section is admin-gated at the route layer (see router.tsx).
@@ -16,7 +16,7 @@ import { AutomationsRail } from "./AutomationsRail";
 // changing. The rail is drag-resizable and remembers it per browser.
 const RAIL_WIDTH_STORAGE_KEY = "engrams.automationsRailWidth";
 
-const SECTION_PAGES = new Set(["new", "workstreams", "activity"]);
+const SECTION_PAGES = new Set(["new", "agents", "activity"]);
 
 /** `/automations/$id` and `/automations/new/manual` are the Builder. */
 export function isBuilderPath(pathname: string): boolean {

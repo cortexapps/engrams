@@ -1,5 +1,5 @@
 /** The Agent block's inspector: who runs (the profile), what it gets on
- * every event (the prompt), whether the workstream keeps one session, and
+ * every event (the prompt), whether the agent keeps one session, and
  * where it talks back. The common case is three controls; the relay's six
  * templates and the session's finer settings sit behind disclosures. */
 
@@ -99,15 +99,15 @@ const MORE_FIELDS: FieldSpec[] = [
     type: "boolean",
     key: "keepOnFinish",
     label: "Keep the session when the run ends",
-    help: "Kept by default; a session the workstream continues must be kept.",
+    help: "Kept by default; a session the agent continues must be kept.",
   },
 ];
 
 const SESSION_MODES: Array<{ value: "workstream" | "never"; label: string; help: string }> = [
   {
     value: "workstream",
-    label: "One session per workstream",
-    help: "Continues the workstream's kept session when it is alive; starts one when it is not.",
+    label: "One session per agent",
+    help: "Continues the agent's kept session when it is alive; starts one when it is not.",
   },
   {
     value: "never",

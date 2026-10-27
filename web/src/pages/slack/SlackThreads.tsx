@@ -61,8 +61,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { WorkstreamDrops } from "@/pages/automations/workstreams/WorkstreamDrops";
-import { WorkstreamsTable } from "@/pages/automations/workstreams/WorkstreamsTable";
+import { AgentDrops } from "@/pages/automations/agents/AgentDrops";
+import { AgentsTable } from "@/pages/automations/agents/AgentsTable";
 
 import {
   channelLabel,
@@ -85,7 +85,7 @@ export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 // enrollment was the ADR 0119 window's gate and is gone. The switch is the
 // Slack threads automation's own enabled flag; the default profile is its
 // `default_profile` input; a channel override is one entry of its `channels`
-// map. Every thread it answers in is a workstream of that automation, and
+// map. Every thread it answers in is an agent of that automation, and
 // every mention's run is on its Activity tab; the product is the front of the
 // platform, the links below open the back.
 export function SlackThreads() {
@@ -173,7 +173,7 @@ export function SlackThreads() {
         ) : (
           "Slack threads automation"
         )}
-        . Every thread it answers in is a workstream; every mention is a run.
+        . Every thread it answers in is an agent; every mention is a run.
       </p>
 
       {builtin.error && (
@@ -528,8 +528,8 @@ function EnrollChannelDialog({
   );
 }
 
-/** The threads: the automation's workstreams, open first. The table is the
- * platform's own workstream table — the same rows an admin sees under
+/** The threads: the automation's agents, open first. The table is the
+ * platform's own agent table — the same rows an admin sees under
  * Automations, which is the point. */
 function ThreadsSection({ automationId }: { automationId: string }) {
   const [status, setStatus] = useState<"open" | "closed">("open");
@@ -583,7 +583,7 @@ function ThreadsSection({ automationId }: { automationId: string }) {
             : "No closed threads."}
         </EmptyState>
       ) : (
-        <WorkstreamsTable
+        <AgentsTable
           instances={rows}
           automations={[]}
           showAutomation={false}
@@ -592,7 +592,7 @@ function ThreadsSection({ automationId }: { automationId: string }) {
           handleLabel={(handle) => threadHandleLabel(handle, names)}
         />
       )}
-      <WorkstreamDrops
+      <AgentDrops
         drops={drops.data?.drops ?? []}
         now={now}
         describeDetail={(drop) => {

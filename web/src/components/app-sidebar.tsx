@@ -73,7 +73,7 @@ const DESTS: Dest[] = [
     label: "Slack",
     icon: MessageSquare,
     // Admin for now: enrolling a channel is org config, and the thread list
-    // reads the workstream RPCs, which are admin-gated.
+    // reads the agent RPCs, which are admin-gated.
     adminOnly: true,
     match: (p) => p.startsWith("/slack"),
   },

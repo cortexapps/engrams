@@ -74,7 +74,7 @@ export interface AutomationDefinition {
     };
     runDeadlineSeconds?: number;
     endSessionsOnFinish: boolean;
-    /** ADR 0120: present = the automation has workstreams. */
+    /** ADR 0120: present = the automation has scoped agents. */
     instance?: {
       keyTemplate: string;
       inputs?: Record<string, string>;
@@ -356,7 +356,7 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     kind: "run_agent",
     label: "Agent",
     description:
-      "Hand this event to the automation's agent: continue the workstream's kept session, or start one. It can reply in the Slack thread the event came from.",
+      "Hand this event to the automation's agent: continue the agent's kept session, or start one. It can reply in the Slack thread the event came from.",
     icon: Bot,
     group: "agent",
     outputs: [
@@ -672,32 +672,32 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     kind: "lookup_instance_session",
     group: "advanced",
     outputs: ["found", "session_id", "web_url", "run_id", "reason"],
-    label: "Look up workstream session",
+    label: "Look up the agent's session",
     description:
-      "The kept session an earlier run of this workstream created, so a new run continues it (found: false when none, gone, or unbound).",
+      "The kept session an earlier run of this agent created, so a new run continues it (found: false when none, gone, or unbound).",
     icon: Repeat,
     fields: [],
-    summary: () => "This workstream's kept session",
+    summary: () => "This agent's kept session",
     defaults: () => ({}),
   },
   {
     kind: "instance_close",
     group: "advanced",
     outputs: ["closed", "not_instanced"],
-    label: "Close workstream",
-    description: "Close the run's own workstream; later events for it are dropped (audited).",
+    label: "Close agent",
+    description: "Close the run's own agent; later events for it are dropped (audited).",
     icon: SquareCheck,
     fields: [
       {
         type: "template",
         key: "reason",
         label: "Reason",
-        help: "Kept on the workstream for the audit trail.",
+        help: "Kept on the agent for the audit trail.",
       },
     ],
     summary: (c) => {
       const reason = str(c["reason"]);
-      return reason ? truncate(reason, 40) : "Close this workstream";
+      return reason ? truncate(reason, 40) : "Close this agent";
     },
     defaults: () => ({}),
   },
@@ -707,7 +707,7 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     outputs: ["claimed", "handle", "reclaimed"],
     label: "Claim handle",
     description:
-      "Route an external identifier to this workstream (a channel, a ticket id). Posts and PRs bind automatically.",
+      "Route an external identifier to this agent (a channel, a ticket id). Posts and PRs bind automatically.",
     icon: Link2,
     fields: [
       {
@@ -1087,6 +1087,22 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
 ];
 
 const BY_KIND = new Map(BLOCK_KINDS.map((spec) => [spec.kind, spec]));
+
+/** The scope badge for an automation with scoped agents: what one agent is
+ * per, read off the key template ("per PR", "per thread"). Undefined when
+ * every event gets a fresh session. */
+export function scopeLabel(definition: AutomationDefinition): string | undefined {
+  const template = definition.settings.instance?.keyTemplate;
+  if (template === undefined) return undefined;
+  const key = template.toLowerCase();
+  if (/thread/.test(key)) return "per thread";
+  if (/\bpr\b|pull/.test(key)) return "per PR";
+  if (/issue/.test(key)) return "per issue";
+  if (/channel/.test(key)) return "per channel";
+  if (/repo/.test(key)) return "per repo";
+  if (/\$\{\{|\{\{/.test(key)) return "per key";
+  return "one agent";
+}
 
 /** Every block's kind by id, across main and every other way in: what an
  * activity trace needs to say what a step did. Ids are unique automation-wide. */

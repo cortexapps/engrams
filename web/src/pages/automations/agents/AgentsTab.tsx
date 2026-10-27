@@ -7,26 +7,26 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useInstanceList, useRecentDrops } from "@/hooks/useInstances";
 import type { InputFieldSpec } from "@/lib/automation-inputs";
-import { OpenWorkstreamDialog } from "@/pages/automations/workstreams/OpenWorkstreamDialog";
-import { WorkstreamDrops } from "@/pages/automations/workstreams/WorkstreamDrops";
-import { WorkstreamsTable } from "@/pages/automations/workstreams/WorkstreamsTable";
+import { StartAgentDialog } from "@/pages/automations/agents/StartAgentDialog";
+import { AgentDrops } from "@/pages/automations/agents/AgentDrops";
+import { AgentsTable } from "@/pages/automations/agents/AgentsTable";
 
-export interface WorkstreamsTabProps {
+export interface AgentsTabProps {
   automationId: string;
-  /** The current version's input schema for a new workstream. */
+  /** The current version's input schema for a new agent. */
   inputsSchema: InputFieldSpec[];
-  /** The automation's values become the defaults for a new workstream. */
+  /** The automation's values become the defaults for a new agent. */
   defaultInputs: unknown;
   /** Tests inject one stable clock for all relative times. */
   now?: () => number;
 }
 
-export function WorkstreamsTab({
+export function AgentsTab({
   automationId,
   inputsSchema,
   defaultInputs,
   now = Date.now,
-}: WorkstreamsTabProps) {
+}: AgentsTabProps) {
   const [status, setStatus] = useState<"open" | "closed">("open");
   const [dialogOpen, setDialogOpen] = useState(false);
   const list = useInstanceList(automationId, { includeClosed: true });
@@ -38,10 +38,10 @@ export function WorkstreamsTab({
   const rows = status === "open" ? open : closed;
 
   return (
-    <section className="flex flex-col gap-3" aria-label="Workstreams">
+    <section className="flex flex-col gap-3" aria-label="Agents">
       <div className="flex flex-wrap items-center gap-3">
         <Tabs value={status} onValueChange={(value) => setStatus(value as "open" | "closed")}>
-          <TabsList aria-label="Workstream status">
+          <TabsList aria-label="Agent status">
             <TabsTrigger value="open">Open</TabsTrigger>
             <TabsTrigger value="closed">
               Closed
@@ -53,14 +53,14 @@ export function WorkstreamsTab({
         </Tabs>
         <Button type="button" size="sm" className="ml-auto" onClick={() => setDialogOpen(true)}>
           <PlusIcon className="size-3.5" aria-hidden />
-          Open a workstream
+          Start an agent
         </Button>
       </div>
 
       {list.error ? (
-        <EmptyState tone="error">Couldn’t load workstreams. {String(list.error)}</EmptyState>
+        <EmptyState tone="error">Couldn’t load agents. {String(list.error)}</EmptyState>
       ) : list.isPending ? (
-        <div className="rounded-lg border bg-card px-4" data-testid="workstreams-loading">
+        <div className="rounded-lg border bg-card px-4" data-testid="agents-loading">
           <SkeletonRows
             rows={3}
             columns={["minmax(0,1.5fr)", "minmax(0,1.3fr)", "130px", "90px"]}
@@ -69,15 +69,15 @@ export function WorkstreamsTab({
       ) : rows.length === 0 ? (
         <EmptyState>
           {status === "open"
-            ? "No open workstreams. Open one or wait for a matching event."
-            : "No closed workstreams."}
+            ? "No open agents. Start one or wait for a matching event."
+            : "No closed agents."}
         </EmptyState>
       ) : (
-        <WorkstreamsTable instances={rows} automations={[]} showAutomation={false} now={tick} />
+        <AgentsTable instances={rows} automations={[]} showAutomation={false} now={tick} />
       )}
 
-      <WorkstreamDrops drops={drops.data?.drops ?? []} now={tick} />
-      <OpenWorkstreamDialog
+      <AgentDrops drops={drops.data?.drops ?? []} now={tick} />
+      <StartAgentDialog
         automations={[{ id: automationId, name: "This automation", inputsSchema, defaultInputs }]}
         instances={all}
         fixedAutomationId={automationId}

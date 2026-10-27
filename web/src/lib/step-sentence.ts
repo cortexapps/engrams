@@ -127,16 +127,16 @@ const SENTENCES: Record<string, Sentence> = {
       : "No session for this PR",
   lookup_instance_session: ({ outputs }) => {
     if (outputs["found"] === true)
-      return `Found the workstream's session ${short(str(outputs["session_id"]))}`;
+      return `Found the agent's session ${short(str(outputs["session_id"]))}`;
     const reason = str(outputs["reason"]);
     return reason ? `No kept session (${reason.replaceAll("_", " ")})` : "No kept session";
   },
   instance_close: ({ outputs }) =>
     outputs["not_instanced"] === true
-      ? "No workstream to close"
+      ? "No agent to close"
       : outputs["closed"] === true
-        ? "Closed the workstream"
-        : "The workstream was already closed",
+        ? "Closed the agent"
+        : "The agent was already closed",
   claim_handle: ({ outputs }) => {
     const handle = str(outputs["handle"]);
     if (outputs["claimed"] === false)

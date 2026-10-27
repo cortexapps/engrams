@@ -20,7 +20,7 @@ import { isActiveRunStatus } from "@/pages/automations/runs/run-format";
 export interface RunListOptions {
   includeFiltered?: boolean;
   limit?: number;
-  /** ADR 0120: only runs bound to this workstream. */
+  /** ADR 0120: only runs bound to this agent. */
   instanceId?: string;
 }
 

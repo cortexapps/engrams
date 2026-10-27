@@ -3,17 +3,17 @@ import { useState } from "react";
 import type { AutomationDropBrief } from "@/gen/engram/app/v1/automation_pb";
 import { relativeAge } from "@/lib/relative-time";
 
-export type WorkstreamDrop = AutomationDropBrief & { automationId?: string };
+export type AgentDrop = AutomationDropBrief & { automationId?: string };
 
-export function WorkstreamDrops({
+export function AgentDrops({
   drops,
   now,
   describeDetail = (drop) => drop.detail,
 }: {
-  drops: readonly WorkstreamDrop[];
+  drops: readonly AgentDrop[];
   now: number;
   /** The drop's detail (a key or a handle) as the page's reader knows it. */
-  describeDetail?: (drop: WorkstreamDrop) => string;
+  describeDetail?: (drop: AgentDrop) => string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const recent = drops.filter((drop) => {
@@ -36,8 +36,7 @@ export function WorkstreamDrops({
         <span>
           <span className="font-mono tabular-nums">{recent.length}</span> events did not fire in the
           last day — <span className="font-mono tabular-nums">{closed}</span> arrived for closed
-          workstreams, <span className="font-mono tabular-nums">{unmatched}</span> matched no open
-          workstream
+          agents, <span className="font-mono tabular-nums">{unmatched}</span> matched no open agent
         </span>
         <button
           type="button"

@@ -53,10 +53,10 @@ import { useAutomationTest } from "@/hooks/useAutomationTest";
 import { BuildTab } from "./build/BuildTab";
 import { parseInputsJson, parseInputsSchema } from "@/lib/automation-inputs";
 import { InputsTab } from "./inputs/InputsTab";
-import { WorkstreamsTab } from "./instances/WorkstreamsTab";
+import { AgentsTab } from "./agents/AgentsTab";
 import { DryRunButton } from "./build/DryRunButton";
 
-export const EDITOR_TABS = ["build", "inputs", "workstreams", "activity", "settings"] as const;
+export const EDITOR_TABS = ["build", "inputs", "agents", "activity", "settings"] as const;
 export type EditorTab = (typeof EDITOR_TABS)[number];
 
 export function isEditorTab(value: unknown): value is EditorTab {
@@ -355,7 +355,7 @@ export function AutomationEditor({
   const triggerSummaryFor = (way: string) =>
     existingSummary(automation?.id, projectEntrypoint(draft, way));
   const liveValues = variableValues ?? test.variableValues;
-  const hasWorkstreams = draft.settings.instance !== undefined;
+  const hasAgents = draft.settings.instance !== undefined;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="automation-editor">
@@ -432,9 +432,9 @@ export function AutomationEditor({
             <TabsTrigger value="inputs" disabled={mode === "create"}>
               Inputs
             </TabsTrigger>
-            {hasWorkstreams && (
-              <TabsTrigger value="workstreams" disabled={mode === "create"}>
-                Workstreams
+            {hasAgents && (
+              <TabsTrigger value="agents" disabled={mode === "create"}>
+                Agents
               </TabsTrigger>
             )}
             <TabsTrigger value="activity" disabled={mode === "create"}>
@@ -546,9 +546,9 @@ export function AutomationEditor({
         <TabsContent value="inputs" className="min-h-0 flex-1 overflow-y-auto p-6">
           {inputsTab ?? <InputsTab automationId={id} />}
         </TabsContent>
-        {hasWorkstreams && id !== undefined && (
-          <TabsContent value="workstreams" className="min-h-0 flex-1 overflow-y-auto p-6">
-            <WorkstreamsTab
+        {hasAgents && id !== undefined && (
+          <TabsContent value="agents" className="min-h-0 flex-1 overflow-y-auto p-6">
+            <AgentsTab
               automationId={id}
               inputsSchema={parseInputsSchema(draft.inputsSchema)}
               defaultInputs={parseInputsJson(automation?.inputsJson)}

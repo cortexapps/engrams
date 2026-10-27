@@ -1,6 +1,6 @@
 import type { AutomationInstance } from "@/gen/engram/app/v1/automation_pb";
 
-/** A Slack thread workstream's key is `team:channel:thread_ts`. */
+/** A Slack thread agent's key is `team:channel:thread_ts`. */
 export interface ThreadKey {
   team: string;
   channel: string;
@@ -48,7 +48,7 @@ export function threadLabel(
   return { channel: channelLabel(names, parsed.channel), thread: parsed.threadTs };
 }
 
-/** A thread row: the opening mention's text as the title (the workstream's
+/** A thread row: the opening mention's text as the title (the agent's
  * label, rendered at open), the place as the subtitle. */
 export function describeThread(
   instance: Pick<AutomationInstance, "key" | "label">,

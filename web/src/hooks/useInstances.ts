@@ -1,4 +1,4 @@
-/** Workstream (ADR 0120 instance) queries + lifecycle mutations. */
+/** Agent (ADR 0120 instance) queries + lifecycle mutations. */
 
 import {
   createConnectQueryKey,
@@ -34,7 +34,7 @@ export function useInstanceList(
   );
 }
 
-/** Every automation's workstreams in one list (the service lists per
+/** Every automation's agents in one list (the service lists per
  * automation). Open ones first, then by opened-at, newest first. */
 export function useAllInstances(
   automationIds: readonly string[],
@@ -129,7 +129,7 @@ export function useCloseInstance() {
   });
 }
 
-/** Invalidate workstream lists after a kickoff (RunNow with instance_key). */
+/** Invalidate agent lists after a kickoff (RunNow with instance_key). */
 export function useInvalidateInstances() {
   const queryClient = useQueryClient();
   return () =>

@@ -78,8 +78,7 @@ import {
 } from "./pages/automations/AutomationEditor";
 import { ActivityTab } from "./pages/automations/activity/ActivityTab";
 import { ActivityPage } from "./pages/automations/activity/ActivityPage";
-import { WorkstreamsPage } from "./pages/automations/workstreams/WorkstreamsPage";
-import { WorkstreamPage } from "./pages/automations/workstreams/WorkstreamPage";
+import { AgentPage } from "./pages/automations/agents/AgentPage";
 import { SettingsTab } from "./pages/automations/settings/SettingsTab";
 
 export interface RouterContext {
@@ -271,7 +270,7 @@ const legacyOperatorRoutes = Object.entries(LEGACY_OPERATOR).map(([path, to]) =>
 
 // /slack — the Slack threads product: enrolled channels and the threads
 // engrams is in. Enrollment is a write to the Slack threads automation (its
-// `channels` input); the threads are its workstreams.
+// `channels` input); the threads are its agents.
 const slackLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
   path: "/slack",
@@ -542,7 +541,12 @@ export interface AutomationEditorSearch {
 /** `?tab=` plus `?run=` (opens that entry's trace on the Activity tab). The
  * retired `runs` tab name still resolves, to Activity. */
 const editorSearch = (search: Record<string, unknown>): AutomationEditorSearch => {
-  const raw = search["tab"] === "runs" ? "activity" : search["tab"];
+  const raw =
+    search["tab"] === "runs"
+      ? "activity"
+      : search["tab"] === "workstreams"
+        ? "agents"
+        : search["tab"];
   return {
     ...(isEditorTab(raw) ? { tab: raw } : {}),
     ...(typeof search["run"] === "string" ? { run: search["run"] } : {}),
@@ -584,17 +588,28 @@ function AutomationEditorPage() {
     />
   );
 }
-// The section pages: every open workstream across automations, and every
-// automation's activity in one ledger. Static segments, so they outrank `$id`.
-const workstreamsRoute = createRoute({
+// The section pages: one scoped agent, and every automation's activity in
+// one ledger. Static segments, so they outrank `$id`.
+const agentRoute = createRoute({
+  getParentRoute: () => automationsLayoutRoute,
+  path: "agents/$id",
+  component: AgentPage,
+});
+// Retired: the Workstreams section and its pages. A scoped agent lives on
+// its automation's Agents tab and at /agents/$id.
+const legacyWorkstreamsRoute = createRoute({
   getParentRoute: () => automationsLayoutRoute,
   path: "workstreams",
-  component: WorkstreamsPage,
+  beforeLoad: () => {
+    throw redirect({ to: "/automations", replace: true });
+  },
 });
-const workstreamRoute = createRoute({
+const legacyWorkstreamRoute = createRoute({
   getParentRoute: () => automationsLayoutRoute,
   path: "workstreams/$id",
-  component: WorkstreamPage,
+  beforeLoad: ({ params }) => {
+    throw redirect({ to: "/automations/agents/$id", params: { id: params.id }, replace: true });
+  },
 });
 const activityRoute = createRoute({
   getParentRoute: () => automationsLayoutRoute,
@@ -604,7 +619,7 @@ const activityRoute = createRoute({
 const automationEditRoute = createRoute({
   getParentRoute: () => automationsLayoutRoute,
   path: "$id",
-  // ?tab=build|inputs|workstreams|activity|settings; anything else → build.
+  // ?tab=build|inputs|agents|activity|settings; anything else → build.
   validateSearch: editorSearch,
   component: AutomationEditorPage,
 });
@@ -698,8 +713,9 @@ export const routeTree = rootRoute.addChildren([
       automationsIndexRoute,
       automationsNewRoute,
       automationsNewManualRoute,
-      workstreamsRoute,
-      workstreamRoute,
+      agentRoute,
+      legacyWorkstreamsRoute,
+      legacyWorkstreamRoute,
       activityRoute,
       automationEditRoute,
       automationRunRoute,

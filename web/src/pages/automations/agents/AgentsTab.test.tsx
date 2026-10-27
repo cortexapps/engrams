@@ -11,7 +11,7 @@ import {
 import type { InputFieldSpec } from "@/lib/automation-inputs";
 import { renderWithProviders } from "@/test-utils";
 
-import { WorkstreamsTab } from "./WorkstreamsTab";
+import { AgentsTab } from "./AgentsTab";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
@@ -71,7 +71,7 @@ const SCHEMA: InputFieldSpec[] = [{ key: "project", label: "Project", type: "str
 
 function renderTab(impl: Impl) {
   return renderWithProviders(
-    <WorkstreamsTab
+    <AgentsTab
       automationId="auto-1"
       inputsSchema={SCHEMA}
       defaultInputs={{ project: "default" }}
@@ -81,8 +81,8 @@ function renderTab(impl: Impl) {
   );
 }
 
-describe("WorkstreamsTab", () => {
-  it("renders a human name and keeps the exact key, then shows closed workstreams on their tab", async () => {
+describe("AgentsTab", () => {
+  it("renders a human name and keeps the exact key, then shows closed agents on their tab", async () => {
     renderTab({
       instances: [
         instance("ai_one", "project-ENG_1", "open"),
@@ -113,21 +113,32 @@ describe("WorkstreamsTab", () => {
       ],
     });
 
-    const row = await screen.findByTestId("workstream-row");
-    expect(await within(row).findByText("#C1 · thread")).toBeTruthy();
-    expect(within(row).getByRole("link", { name: "project ENG 1" }).getAttribute("href")).toBe(
-      "/automations/workstreams/ai_one",
-    );
+    const row = await screen.findByTestId("agent-row");
+    // The place it owns is both its title and its chip.
+    const link = await within(row).findByRole("link", { name: "#C1 · thread" });
+    expect(link.getAttribute("href")).toBe("/automations/agents/ai_one");
+    expect(within(row).getAllByText("#C1 · thread")).toHaveLength(2);
+    expect(within(row).getByText("project-ENG-1")).toBeTruthy();
   });
 
-  it("keeps close controls on the detail page instead of expanding rows", async () => {
-    renderTab({ instances: [instance("ai_one", "project-ENG-1", "open")] });
-    expect(await screen.findByText("project ENG 1")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Close workstream" })).toBeNull();
-    expect(screen.queryByTestId("workstream-detail")).toBeNull();
+  it("titles a row by the place it owns and closes it from the row", async () => {
+    renderTab({
+      instances: [instance("ai_one", "project-ENG-1", "open")],
+      handles: [
+        {
+          handle: "github:acme/widgets#42",
+          writtenBy: "run:open",
+          createdAt: new Date(NOW).toISOString(),
+        },
+      ],
+    });
+    const row = await screen.findByTestId("agent-row");
+    expect(await within(row).findByRole("link", { name: "acme/widgets#42" })).toBeTruthy();
+    await userEvent.click(within(row).getByRole("button", { name: "Close" }));
+    expect(await screen.findByRole("heading", { name: "Close acme/widgets#42?" })).toBeTruthy();
   });
 
-  it("opens a workstream with its name and input snapshot", async () => {
+  it("starts an agent with its name and input snapshot", async () => {
     const requests: RunNowRequest[] = [];
     renderTab({
       instances: [],
@@ -136,14 +147,14 @@ describe("WorkstreamsTab", () => {
         return { runId: "autorun:auto-1:main:i-ai_new:manual:1" };
       },
     });
-    expect(await screen.findByText(/No open workstreams/)).toBeTruthy();
-    await userEvent.click(screen.getByRole("button", { name: "Open a workstream" }));
-    const form = await screen.findByTestId("open-workstream-form");
-    await userEvent.type(screen.getByRole("textbox", { name: "workstream name" }), "ENG-9");
+    expect(await screen.findByText(/No open agents/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Start an agent" }));
+    const form = await screen.findByTestId("start-agent-form");
+    await userEvent.type(screen.getByRole("textbox", { name: "agent name" }), "ENG-9");
     const projectField = within(form).getByRole("textbox", { name: "Project" });
     await userEvent.clear(projectField);
     await userEvent.type(projectField, "ENG-9");
-    await userEvent.click(within(form).getByRole("button", { name: "Open a workstream" }));
+    await userEvent.click(within(form).getByRole("button", { name: "Start an agent" }));
 
     await waitFor(() => expect(requests).toHaveLength(1));
     expect(requests[0]).toMatchObject({ automationId: "auto-1", instanceKey: "ENG-9" });
@@ -161,15 +172,15 @@ describe("WorkstreamsTab", () => {
       },
     });
     expect(await screen.findByText("ENG 1")).toBeTruthy();
-    await userEvent.click(screen.getByRole("button", { name: "Open a workstream" }));
-    const form = await screen.findByTestId("open-workstream-form");
-    await userEvent.type(screen.getByRole("textbox", { name: "workstream name" }), "ENG-1");
+    await userEvent.click(screen.getByRole("button", { name: "Start an agent" }));
+    const form = await screen.findByTestId("start-agent-form");
+    await userEvent.type(screen.getByRole("textbox", { name: "agent name" }), "ENG-1");
 
-    expect((await screen.findByTestId("open-workstream-join-hint")).textContent).toBe(
+    expect((await screen.findByTestId("start-agent-join-hint")).textContent).toBe(
       "ENG-1 is already open — this opens its next run",
     );
     expect(within(form).queryByRole("textbox", { name: "Project" })).toBeNull();
-    await userEvent.click(within(form).getByRole("button", { name: "Open a workstream" }));
+    await userEvent.click(within(form).getByRole("button", { name: "Start an agent" }));
 
     await waitFor(() => expect(requests).toHaveLength(1));
     expect(requests[0]).toMatchObject({ automationId: "auto-1", instanceKey: "ENG-1" });

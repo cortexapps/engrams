@@ -17,7 +17,7 @@ import {
 } from "./activity-format";
 
 // The activity ledger shared by the per-automation tab, the cross-automation
-// page, and a workstream's timeline: pill filters, the "show filtered" switch,
+// page, and an agent's timeline: pill filters, the "show filtered" switch,
 // and one entry per run with the filtered deliveries folded into a quiet row.
 
 export interface ActivityListProps {
@@ -30,8 +30,8 @@ export interface ActivityListProps {
   onIncludeFilteredChange: (next: boolean) => void;
   /** Cross-automation: name each entry's automation. */
   nameOf?: (automationId: string) => string | undefined;
-  /** Workstream names by instance id, for the chip on a bound run. */
-  workstreamLabelOf?: (instanceId: string) => string | undefined;
+  /** Agent names by instance id, for the chip on a bound run. */
+  agentLabelOf?: (instanceId: string) => string | undefined;
   /** A block's kind in an automation, so a step row can say what it did. */
   blockTypeOf?: (automationId: string, blockId: string) => string | undefined;
   /** Show the Superseded filter (per-automation surfaces). */
@@ -59,7 +59,7 @@ export function ActivityList({
   includeFiltered,
   onIncludeFilteredChange,
   nameOf,
-  workstreamLabelOf,
+  agentLabelOf,
   blockTypeOf,
   superseded = false,
   controls,
@@ -119,8 +119,8 @@ export function ActivityList({
                 run={row.run}
                 now={now}
                 automationName={nameOf?.(row.run.automationId)}
-                workstreamLabel={
-                  row.run.instanceId !== "" ? workstreamLabelOf?.(row.run.instanceId) : undefined
+                agentLabel={
+                  row.run.instanceId !== "" ? agentLabelOf?.(row.run.instanceId) : undefined
                 }
                 blockTypeOf={
                   blockTypeOf ? (blockId) => blockTypeOf(row.run.automationId, blockId) : undefined
