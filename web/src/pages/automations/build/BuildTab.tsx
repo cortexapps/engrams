@@ -21,11 +21,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { useEventCatalog } from "@/hooks/useAutomationEditor";
+import { useProfiles } from "@/hooks/useProfiles";
 import { flattenScope, type AutomationTestState } from "@/hooks/useAutomationTest";
 import {
   addEntrypoint,
   blockIdsOutsideEntrypoint,
   blockKind,
+  blockProfileId,
   entrypointIdError,
   entrypointIds,
   findBlock,
@@ -282,6 +284,16 @@ export function BuildTab({
   const position = selected ? locateBlock(active.blocks, selected.id) : null;
   const draftWayError = draftWay === "" ? null : entrypointIdError(definition, draftWay);
 
+  // A node names its profile, not the profile's id.
+  const profiles = useProfiles();
+  const summaryFor = (block: BlockDef): string | undefined => {
+    const id = blockProfileId(block);
+    if (id === undefined) return undefined;
+    const name = profiles.data?.profiles.find((p) => p.id === id)?.name;
+    if (name === undefined) return undefined;
+    return blockKind(block.type).summary({ ...block.config, profileId: name });
+  };
+
   return (
     <ResizablePanelGroup
       orientation="horizontal"
@@ -349,6 +361,7 @@ export function BuildTab({
                       onMove={(at, from, to) => onMove(way, at, from, to)}
                       onRemove={(id) => onRemove(way, id)}
                       zoom={zoom}
+                      summaryFor={summaryFor}
                     />
                   </div>
                 );

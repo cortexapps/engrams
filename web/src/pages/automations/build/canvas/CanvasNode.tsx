@@ -53,6 +53,9 @@ export interface CanvasNodeProps {
   /** Arrow-key roving focus, owned by Canvas. */
   onFocusStep: (delta: 1 | -1) => void;
   nodeRef: (el: HTMLDivElement | null) => void;
+  /** The second line, when the owner can say it better than the kind's
+   * summary (a profile's name for its id). */
+  summary?: string;
 }
 
 export function CanvasNode({
@@ -73,10 +76,11 @@ export function CanvasNode({
   onRemove,
   onFocusStep,
   nodeRef,
+  summary: ownerSummary,
 }: CanvasNodeProps) {
   const spec = block ? blockKind(block.type) : null;
   const Icon = spec?.icon ?? Zap;
-  const summary = block ? spec!.summary(block.config) : "";
+  const summary = block ? (ownerSummary ?? spec!.summary(block.config)) : "";
 
   const onKeyDown = (e: KeyboardEvent) => {
     if (e.key === "Enter" || e.key === " ") {

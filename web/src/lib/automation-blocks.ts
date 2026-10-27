@@ -233,6 +233,7 @@ export interface BlockKindSpec {
   fields?: FieldSpec[];
   /** Custom inspector id — resolved by BlockInspector. */
   inspector?:
+    | "agent"
     | "create_session"
     | "branch"
     | "loop"
@@ -353,6 +354,10 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "run_agent",
+    label: "Agent",
+    description:
+      "Hand this event to the automation's agent: continue the workstream's kept session, or start one. It can reply in the Slack thread the event came from.",
+    icon: Bot,
     group: "agent",
     outputs: [
       "session_id",
@@ -364,70 +369,7 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       "relayed",
       "mention_ts",
     ],
-    label: "Run agent",
-    description:
-      "Deliver this event to the workstream's standing agent session, or start one. Optionally relay the session into the Slack thread the event came from.",
-    icon: Bot,
-    fields: [
-      { type: "profile", key: "profileId", label: "Profile" },
-      {
-        type: "template",
-        key: "promptTemplate",
-        label: "Prompt",
-        multiline: true,
-        help: "Sent to the standing session on every event.",
-      },
-      {
-        type: "template",
-        key: "openingPromptTemplate",
-        label: "Opening prompt",
-        multiline: true,
-        help: "The first prompt of a new session; defaults to the prompt above.",
-      },
-      {
-        type: "select",
-        key: "reuse",
-        label: "Session",
-        options: ["workstream", "never"],
-        help: "workstream: continue the workstream's kept session when it is alive · never: always start one",
-      },
-      {
-        type: "template",
-        key: "relay.team",
-        label: "Relay team id",
-        help: "${{ event.raw.team_id }}",
-      },
-      {
-        type: "template",
-        key: "relay.channel",
-        label: "Relay channel id",
-        help: "${{ event.raw.event.channel }} — leave every relay field empty for no relay.",
-      },
-      {
-        type: "template",
-        key: "relay.threadTs",
-        label: "Relay thread ts",
-        help: "${{ event.raw.event.thread_ts | default: event.raw.event.ts }}",
-      },
-      {
-        type: "template",
-        key: "relay.mentionTs",
-        label: "Relay mention ts",
-        help: "${{ event.raw.event.ts }}",
-      },
-      {
-        type: "template",
-        key: "relay.userId",
-        label: "Relay author id",
-        help: "${{ event.raw.event.user }}",
-      },
-      {
-        type: "template",
-        key: "relay.eventId",
-        label: "Relay event id",
-        help: "${{ event.raw.event_id }}",
-      },
-    ],
+    inspector: "agent",
     summary: (c) => {
       const profile = str(c["profileId"]);
       const prompt = truncate(str(c["promptTemplate"]).split("\n")[0] ?? "", 48);
@@ -1145,6 +1087,14 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
 ];
 
 const BY_KIND = new Map(BLOCK_KINDS.map((spec) => [spec.kind, spec]));
+
+/** The profile a block runs on, when it runs one: the canvas shows the
+ * profile's name in place of its id. */
+export function blockProfileId(block: BlockDef): string | undefined {
+  if (block.type !== "create_session" && block.type !== "run_agent") return undefined;
+  const id = block.config["profileId"];
+  return typeof id === "string" && id !== "" ? id : undefined;
+}
 
 /** Resolve a block kind. An unknown kind (a definition saved by a newer
  * server, say) renders read-only. */
