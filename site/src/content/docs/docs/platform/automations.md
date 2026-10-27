@@ -121,8 +121,11 @@ one quiet row so noise does not bury the runs that did work. A failed run shows 
 the row. An entry unfolds in place into its step trace; each step says what its block did in
 a sentence ("Exited 0", "Started session se-abcde, relayed to the thread"), with its duration
 and the error verbatim when it failed. A click on a step opens its details: the rendered
-inputs, the outputs, and the command output. The Activity page in the Automations section
-shows every automation's entries in one ledger.
+inputs, the outputs, and the command output. Replay on canvas draws the run on the Build
+canvas: the way in it came through and the blocks it ran light up with what they did, the
+rest fades, and a click on a block shows its inputs and outputs for that run. A run on an
+older version is drawn on that version. The Activity page in the Automations section shows
+every automation's entries in one ledger.
 
 Retry starts a fresh run with the same trigger payload. Stop asks a run to halt at its next
 checkpoint. A run deadline, up to 48 hours, ends a run that outlived its usefulness.
