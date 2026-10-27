@@ -7,7 +7,7 @@ sidebar:
 
 Slack threads is the built-in automation that turns a mention into a session. Mention the bot
 in a channel it is a member of, and engrams starts a session as you, relays the agent's work
-back into the thread, and keeps the same session for every reply until the thread goes quiet.
+back into the thread, and keeps the same session for the whole thread.
 
 ## What a person sees
 
@@ -18,9 +18,10 @@ in progress and the agent's first message lands in the thread. From there:
 - When the agent asks a question, it arrives as a Slack form; answering it continues the
   session.
 - Each turn gets a reaction while it runs and another when it ends.
-- Replies in the thread go to the same session. Nobody has to mention the bot again.
-- When the thread has been quiet for the idle timeout, the run ends and posts a recap. The
-  session is kept, so someone can pick it up in the dashboard later with the full history.
+- Mention the bot again in the thread to send the next turn. The replies people wrote in
+  the thread since the previous turn go with it, so the agent sees the conversation.
+- The session is kept for as long as the thread needs it, so someone can pick it up in the
+  dashboard later with the full history.
 
 The session runs as the person who wrote the mention: their harness credential, their git
 identity, and their personal integration connections where the profile asks for them. A
@@ -40,8 +41,6 @@ manifest and the three URLs. Then open Settings → Automations → Slack thread
 | `smart_profiles` | The profiles smart routing chooses between. Empty means every active profile. |
 | `smart_min_confidence` | Smart routing picks a profile on its own at or above this confidence, from 0 to 1. Below it, it asks in the thread. 0.8 by default. |
 | `ask_timeout` | How long the profile question waits for a click before smart routing takes its best pick. Ten minutes by default. |
-| `idle_timeout` | How long a thread may go quiet before its run ends. One minute to a day; an hour by default. |
-| `max_turns` | The most replies one thread's run will take before it ends. Fifty by default. |
 
 Enable the automation. The bot must be a member of a channel to see messages in it: it can
 join a public channel on its own, and a private channel needs a person to invite it.
@@ -66,9 +65,13 @@ removed, threads use the default profile, exactly as with `default` routing.
 ## How it works
 
 Slack threads is an ordinary automation with its structure locked. Its trigger is the Slack
-app mention event. A mention in a thread that already has a run joins that run; it never
-starts a second one. Its concurrency key is the thread, with the join policy, which is what
-keeps one run per thread. Smart routing is three blocks in the graph: List profiles, Decide,
-and Slack choice. The Activity tab under the automation lists each thread's run with its step
-trace, and Duplicate gives you an editable copy if you want a different flow. See
+app mention event. Every mention is one short run: it admits the author, folds the thread
+replies since the previous turn into the message, and hands the turn to the thread's
+session. The first mention in a thread starts the session; a later mention continues it
+through the Agent block. The thread is the automation's workstream, so one session serves
+the whole thread, and the queue policy keeps its turns in order. The session's relay posts
+the agent's output into the thread on its own, with no run open. Smart routing is three
+blocks in the graph: List profiles, Decide, and Slack choice, and it runs only when a thread
+has no session yet. The Activity tab under the automation lists each turn's run with its
+step trace, and Duplicate gives you an editable copy if you want a different flow. See
 [Automations](../automations/) for the model.

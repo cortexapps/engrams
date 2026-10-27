@@ -50,8 +50,7 @@ marked connected. Reconnect from that page at any time forces a fresh consent.
 Mentions do nothing until a channel is mapped to a profile. Open Settings → Automations →
 Slack threads → Inputs and add the channel to the `channels` map, choosing the profile
 its sessions run on. A channel that is not in the map is never answered. The other inputs
-are `default_profile`, `idle_timeout` (how long a thread may go quiet before its run ends,
-one minute to a day, an hour by default), and `max_turns`. Then enable the automation.
+are `default_profile` and the smart routing settings. Then enable the automation.
 
 The bot must be a member of a channel to see messages in it. Public channels can be joined
 by the automation; a private channel needs a person to invite the bot.
@@ -62,9 +61,9 @@ Mention the bot in a channel or a thread. engrams checks that the author is a li
 starts a session on the channel's profile as that person, with their credentials and git
 identity, and replies in the thread as the agent works: messages arrive as the agent
 produces them, questions from the agent become Slack forms, and a reaction marks each turn
-as in progress and then done. Replies in the thread continue the same session; the run ends
-when the thread goes quiet for the idle timeout, and the session is kept so someone can pick
-it up in the dashboard later.
+as in progress and then done. Mention the bot again in the thread to send the next turn to
+the same session; the replies people wrote in between go with it. The session is kept so
+someone can pick it up in the dashboard later.
 
 ## Personal Slack credentials
 
