@@ -14,7 +14,6 @@ import { draftAutomation } from "@/gen/engram/app/v1/automation-AutomationServic
 import { useEditorAutomation } from "@/hooks/useAutomationEditor";
 import { useBuiltinAutomation, useDuplicateAutomation } from "@/hooks/useAutomations";
 import { useSessionEvents } from "@/hooks/useSessionEvents";
-import { AUTOMATION_TEMPLATES } from "@/lib/automation-templates";
 import { errorMessage } from "@/lib/errors";
 
 const SUGGESTIONS = [
@@ -157,42 +156,9 @@ export function ComposePage() {
 
       {automation?.draftSessionId && <DraftingThread sessionId={automation.draftSessionId} />}
 
-      <section className="space-y-2" aria-labelledby="start-from-heading">
-        <h2 id="start-from-heading" className="text-sm font-semibold">
-          Start from
-        </h2>
-        <p className="text-xs text-muted-foreground">
-          A ready shape that opens in the builder, prefilled and editable: pick the profile, change
-          the prompt, turn it on.
-        </p>
-        <ul className="grid gap-2 sm:grid-cols-2" data-testid="template-gallery">
-          {AUTOMATION_TEMPLATES.map((template) => (
-            <li key={template.id}>
-              <Link
-                to="/automations/new/manual"
-                search={{ template: template.id }}
-                className="flex h-full flex-col gap-1 rounded-lg border bg-card px-3 py-2.5 text-sm outline-none hover:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring/50 aria-disabled:pointer-events-none aria-disabled:opacity-50"
-                aria-disabled={isDrafting || undefined}
-                data-testid={`template-${template.id}`}
-              >
-                <span className="flex items-center gap-2 font-semibold">
-                  {template.name}
-                  {template.scope && (
-                    <span className="rounded-sm bg-secondary px-1.5 py-0.5 text-2xs font-normal text-muted-foreground">
-                      {template.scope}
-                    </span>
-                  )}
-                </span>
-                <span className="text-xs text-muted-foreground">{template.description}</span>
-              </Link>
-            </li>
-          ))}
-        </ul>
-      </section>
-
       <section className="space-y-2" aria-labelledby="starting-points-heading">
         <h2 id="starting-points-heading" className="text-sm font-semibold">
-          Or describe it
+          Starting points
         </h2>
         <div>
           {SUGGESTIONS.map((suggestion) => (

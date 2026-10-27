@@ -77,8 +77,6 @@ export interface AutomationDefinition {
     /** ADR 0120: present = the automation has scoped agents. */
     instance?: {
       keyTemplate: string;
-      /** The agent's title as a person reads it, rendered when it opens. */
-      labelTemplate?: string;
       inputs?: Record<string, string>;
       entrypoints?: Record<string, { admit: "open" | "require" | "handle_match" }>;
     };

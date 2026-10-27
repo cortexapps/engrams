@@ -574,9 +574,6 @@ const automationsNewRoute = createRoute({
 const automationsNewManualRoute = createRoute({
   getParentRoute: () => automationsLayoutRoute,
   path: "new/manual",
-  // ?template=<id> opens the editor prefilled from that starting point.
-  validateSearch: (search: Record<string, unknown>): { template?: string } =>
-    typeof search["template"] === "string" ? { template: search["template"] } : {},
   component: () => <AutomationEditor mode="create" />,
 });
 /** The editor with the sibling tabs mounted. Tab components read `$id`

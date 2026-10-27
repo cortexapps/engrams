@@ -155,16 +155,6 @@ describe("ComposePage", () => {
     );
   });
 
-  it("offers the templates as links into the prefilled builder", () => {
-    render(<ComposePage />);
-    const gallery = screen.getByTestId("template-gallery");
-    expect(gallery.querySelectorAll("li")).toHaveLength(5);
-    const card = screen.getByTestId("template-slack-answer-bot");
-    expect(card.getAttribute("href")).toBe("/automations/new/manual");
-    expect(card.textContent).toContain("Slack answer bot");
-    expect(card.textContent).toContain("per thread");
-  });
-
   it("offers the build-by-hand peer action", () => {
     render(<ComposePage />);
     expect(screen.getByTestId("build-by-hand").textContent).toBe("Build by hand");

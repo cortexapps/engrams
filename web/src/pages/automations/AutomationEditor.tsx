@@ -52,7 +52,6 @@ import { useAutomationTest } from "@/hooks/useAutomationTest";
 
 import { BuildTab } from "./build/BuildTab";
 import { parseInputsJson, parseInputsSchema } from "@/lib/automation-inputs";
-import { automationTemplate } from "@/lib/automation-templates";
 import { InputsTab } from "./inputs/InputsTab";
 import { AgentsTab } from "./agents/AgentsTab";
 import { DryRunButton } from "./build/DryRunButton";
@@ -86,11 +85,8 @@ export function AutomationEditor({
   const params = useParams({ strict: false });
   const id = mode === "edit" ? (params as { id?: string }).id : undefined;
   const navigate = useNavigate();
-  const search = useSearch({ strict: false }) as { tab?: string; template?: string };
+  const search = useSearch({ strict: false }) as { tab?: string };
   const tab: EditorTab = isEditorTab(search.tab) ? search.tab : "build";
-  // A new automation can start from a template: its name, description and
-  // definition land in the editor, every field editable.
-  const template = mode === "create" ? automationTemplate(search.template) : undefined;
 
   const existing = useEditorAutomation(id);
   const automation = existing.data?.automation;
@@ -110,11 +106,9 @@ export function AutomationEditor({
     [automation, shipped],
   );
 
-  const [name, setName] = useState(template?.name ?? "");
-  const [description, setDescription] = useState(template?.description ?? "");
-  const [draft, setDraft] = useState<AutomationDefinition>(
-    template?.definition ?? EMPTY_DEFINITION,
-  );
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [draft, setDraft] = useState<AutomationDefinition>(EMPTY_DEFINITION);
   const [errors, setErrors] = useState<BlockErrorRef[]>([]);
   const [loadedVersion, setLoadedVersion] = useState<string | null>(null);
 

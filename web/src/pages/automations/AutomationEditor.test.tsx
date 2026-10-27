@@ -11,7 +11,7 @@ import { AutomationEditor } from "./AutomationEditor";
 const automationHolder = vi.hoisted(() => ({
   value: undefined as undefined | { automation: unknown },
 }));
-const searchHolder = vi.hoisted(() => ({ value: {} as { tab?: string; template?: string } }));
+const searchHolder = vi.hoisted(() => ({ value: {} as { tab?: string } }));
 const navigate = vi.hoisted(() => vi.fn());
 const saveVersion = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "a1" } }));
 const setOverrides = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "b1" } }));
@@ -27,12 +27,7 @@ vi.mock("@/hooks/useAutomationCode", () => ({
   useDryRun: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 vi.mock("@/hooks/useAutomationEditor", () => ({
-  // Disabled with no id (create mode), as the real hook is.
-  useEditorAutomation: (id: string | undefined) => ({
-    data: id === undefined ? undefined : automationHolder.value,
-    isPending: false,
-    error: null,
-  }),
+  useEditorAutomation: () => ({ data: automationHolder.value, isPending: false, error: null }),
   useCreateAutomationV2: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useSaveVersionV2: () => ({ mutateAsync: saveVersion, isPending: false }),
   useSetBlockOverrides: () => ({ mutateAsync: setOverrides, isPending: false }),
@@ -398,16 +393,6 @@ describe("AutomationEditor", () => {
     expect(screen.getByTestId("test-drawer").getAttribute("data-state")).toBe("open");
     // Nothing was saved to try it.
     expect(saveVersion).not.toHaveBeenCalled();
-  });
-
-  it("a new automation starts from a template, prefilled and editable", () => {
-    searchHolder.value = { template: "docs-reconciler" };
-    render(<AutomationEditor mode="create" />);
-    const name = screen.getByLabelText("Automation name") as HTMLInputElement;
-    expect(name.value).toBe("Docs reconciler");
-    fireEvent.change(name, { target: { value: "Docs sweep" } });
-    expect(name.value).toBe("Docs sweep");
-    expect(screen.getByTestId("automation-editor").textContent).toContain("Agent");
   });
 
   it("a new automation can be tried before it is created", async () => {
