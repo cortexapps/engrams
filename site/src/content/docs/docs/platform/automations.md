@@ -117,7 +117,7 @@ arrives, and a policy for what happens when a run with that key is already activ
 | `queue` | Waits, and starts when the current run finishes. |
 | `supersede` | Takes over; the current run ends as superseded. Pull request review uses this, keyed on the PR, so a new push cancels the review in flight. |
 | `skip` | Is recorded as a filtered run and dropped. |
-| `join` | Is delivered into the active run, where a Wait for event block receives it. One run per Slack thread works this way. |
+| `join` | Is delivered into the active run, where a Wait for event block receives it. |
 
 **Finalize hooks** run one block when a run ends in a status you choose. They can post a recap
 or flip a status comment, and they can never change the run's outcome.
@@ -156,13 +156,13 @@ posts them as a single GitHub review, and updates the acknowledgment with the co
 push supersedes the review in flight. Each repository is `auto`, which reviews every pull
 request, or `on_request`, which reviews when someone comments `@<handle> review`.
 
-**Slack threads** answers mentions in the channels you map to profiles. A mention opens one
-run for the thread; the author must be a linked engrams user, and the session runs as that
-person. The run relays the agent's output into the thread as it streams, round-trips the
-agent's questions as Slack forms, marks each turn with a reaction, and loops on thread
-replies until the thread goes quiet for the idle timeout you set. The session is kept when
-the run ends, so a person can pick it up later. [Slack threads](../slack-threads/) has the
-setup.
+**Slack threads** answers mentions in the channels you map to profiles. Every mention is one
+short run: the author must be a linked engrams user, and the thread's session runs as that
+person. The first mention starts the session, and each later mention hands it the next turn
+together with the thread replies written in between. The session relays the agent's output
+into the thread as it streams, round-trips the agent's questions as Slack forms, and marks
+each turn with a reaction. The session is kept, so a person can pick it up later.
+[Slack threads](../slack-threads/) has the setup.
 
 ## Custom webhooks
 
