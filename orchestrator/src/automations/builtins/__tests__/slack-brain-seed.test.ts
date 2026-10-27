@@ -127,6 +127,30 @@ describe("seedBuiltinAutomations — slack_brain", () => {
     expect(h.rows.get(id)!.name).toBe("Ops helper");
   });
 
+  test("a bump drops an input the shipped schema no longer declares and keeps the rest", async () => {
+    const h = harness();
+    await seedBuiltinAutomations({ ...h.deps, builtins: [SLACK_BRAIN_BUILTIN] });
+    const id = `auto-${SLACK_BRAIN_BUILTIN_KEY}`;
+    // An org row from a version whose graph took an idle timeout, and
+    // whose stored blocks differ from the shipped ones (so the seed bumps).
+    const row = h.rows.get(id)!;
+    h.rows.set(id, {
+      ...row,
+      inputs: { ...row.inputs, default_profile: "p-1", idle_timeout: 3600 },
+      version: { ...row.version, blocks: [] },
+    });
+    const result = await seedBuiltinAutomations({ ...h.deps, builtins: [SLACK_BRAIN_BUILTIN] });
+    expect(result.bumped).toEqual([{ key: SLACK_BRAIN_BUILTIN_KEY, from: 1, to: 2 }]);
+    expect(h.rows.get(id)!.inputs).toEqual({
+      channels: {},
+      default_profile: "p-1",
+      routing: "default",
+      smart_profiles: [],
+      smart_min_confidence: 0.8,
+      ask_timeout: 600,
+    });
+  });
+
   test("re-run is a no-op", async () => {
     const h = harness();
     await seedBuiltinAutomations({ ...h.deps, builtins: [SLACK_BRAIN_BUILTIN] });
