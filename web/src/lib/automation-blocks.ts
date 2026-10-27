@@ -9,6 +9,7 @@
 
 import type { LucideIcon } from "lucide-react";
 import {
+  Bot,
   Braces,
   CircleStop,
   Database,
@@ -203,11 +204,29 @@ export type FieldSpec =
   | { type: "secret_ref"; key: string; label: string; help?: string }
   | { type: "json"; key: string; label: string; help?: string };
 
+/** Where a kind sits in the insert menu. `advanced` kinds live in a submenu:
+ * the engine and built-in internals a hand-built automation rarely needs. */
+export type BlockGroup = "agent" | "flow" | "sessions" | "integrations" | "advanced";
+
+export const BLOCK_GROUPS: ReadonlyArray<{ id: BlockGroup; label: string }> = [
+  { id: "agent", label: "Agent" },
+  { id: "flow", label: "Flow" },
+  { id: "sessions", label: "Sessions" },
+  { id: "integrations", label: "Integrations" },
+  { id: "advanced", label: "Advanced" },
+];
+
 export interface BlockKindSpec {
   kind: string;
   label: string;
   description: string;
   icon: LucideIcon;
+  group: BlockGroup;
+  /** The outputs the block exposes as `steps.<id>.<output>`; the variable
+   * completion offers them to every block below. */
+  outputs?: readonly string[];
+  /** false: a kind only a built-in places (it renders, it is never offered). */
+  insertable?: false;
   /** One-line row summary from the block config. */
   summary(config: BlockConfig): string;
   /** Generic-form fields. Absent when a custom inspector owns the block. */
@@ -258,6 +277,7 @@ const WAIT_DEADLINE_FIELD: FieldSpec = {
 export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   {
     kind: "filter",
+    group: "flow",
     label: "Filter",
     description: "Continue only when the conditions hold; otherwise the run ends as filtered.",
     icon: Filter,
@@ -271,6 +291,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "branch",
+    group: "flow",
+    outputs: ["taken"],
     label: "Branch",
     description: "Run the then-list when the conditions hold, else the else-list.",
     icon: GitBranch,
@@ -285,6 +307,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "loop",
+    group: "advanced",
+    outputs: ["iterations"],
     label: "Loop",
     description: "Repeat the body until a condition holds or the iteration cap is reached.",
     icon: Repeat,
@@ -296,6 +320,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "code",
+    group: "flow",
+    outputs: ["value"],
     label: "Code",
     description: "Run JavaScript in the sandbox to compute a value or a yes/no.",
     icon: Braces,
@@ -308,6 +334,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "create_session",
+    group: "agent",
+    outputs: ["session_id", "web_url", "task_id"],
     label: "Create session",
     description: "Start a session from a profile with an initial prompt.",
     icon: Play,
@@ -324,7 +352,93 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     }),
   },
   {
+    kind: "run_agent",
+    group: "agent",
+    outputs: [
+      "session_id",
+      "web_url",
+      "started",
+      "delivered",
+      "prompt",
+      "task_id",
+      "relayed",
+      "mention_ts",
+    ],
+    label: "Run agent",
+    description:
+      "Deliver this event to the workstream's standing agent session, or start one. Optionally relay the session into the Slack thread the event came from.",
+    icon: Bot,
+    fields: [
+      { type: "profile", key: "profileId", label: "Profile" },
+      {
+        type: "template",
+        key: "promptTemplate",
+        label: "Prompt",
+        multiline: true,
+        help: "Sent to the standing session on every event.",
+      },
+      {
+        type: "template",
+        key: "openingPromptTemplate",
+        label: "Opening prompt",
+        multiline: true,
+        help: "The first prompt of a new session; defaults to the prompt above.",
+      },
+      {
+        type: "select",
+        key: "reuse",
+        label: "Session",
+        options: ["workstream", "never"],
+        help: "workstream: continue the workstream's kept session when it is alive · never: always start one",
+      },
+      {
+        type: "template",
+        key: "relay.team",
+        label: "Relay team id",
+        help: "${{ event.raw.team_id }}",
+      },
+      {
+        type: "template",
+        key: "relay.channel",
+        label: "Relay channel id",
+        help: "${{ event.raw.event.channel }} — leave every relay field empty for no relay.",
+      },
+      {
+        type: "template",
+        key: "relay.threadTs",
+        label: "Relay thread ts",
+        help: "${{ event.raw.event.thread_ts | default: event.raw.event.ts }}",
+      },
+      {
+        type: "template",
+        key: "relay.mentionTs",
+        label: "Relay mention ts",
+        help: "${{ event.raw.event.ts }}",
+      },
+      {
+        type: "template",
+        key: "relay.userId",
+        label: "Relay author id",
+        help: "${{ event.raw.event.user }}",
+      },
+      {
+        type: "template",
+        key: "relay.eventId",
+        label: "Relay event id",
+        help: "${{ event.raw.event_id }}",
+      },
+    ],
+    summary: (c) => {
+      const profile = str(c["profileId"]);
+      const prompt = truncate(str(c["promptTemplate"]).split("\n")[0] ?? "", 48);
+      return profile ? `${profile}${prompt ? ` · ${prompt}` : ""}` : "No profile selected";
+    },
+    defaults: () => ({ profileId: "", promptTemplate: "", reuse: "workstream" }),
+  },
+  {
     kind: "send_prompt",
+    group: "sessions",
+    outputs: ["outcome", "signal"],
     label: "Send prompt",
     description: "Send a prompt to a session and optionally wait for it to finish.",
     icon: Send,
@@ -375,6 +489,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "wait_session",
+    group: "sessions",
+    outputs: ["outcome"],
     label: "Wait for session",
     description: "Park until the session goes idle or ends.",
     icon: Hourglass,
@@ -393,6 +509,15 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "session_status",
+    group: "sessions",
+    outputs: [
+      "found",
+      "status",
+      "last_active_at",
+      "last_event_at",
+      "idle_seconds",
+      "owner_run_live",
+    ],
     label: "Session status",
     description: "Probe a session read-only: status, idle time, and whether a live run owns it.",
     icon: HeartPulse,
@@ -402,6 +527,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "wait_event",
+    group: "advanced",
+    outputs: ["event", "event_key"],
     label: "Wait for event",
     description: "Receive the next delivery joined into this run (join concurrency).",
     icon: MailOpen,
@@ -422,6 +549,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "end_session",
+    group: "sessions",
+    outputs: ["ended"],
     label: "End session",
     description: "Tear down a session this run created.",
     icon: CircleStop,
@@ -431,6 +560,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "run_command",
+    group: "sessions",
+    outputs: ["exit_status", "stdout", "stderr"],
     label: "Run command",
     description: "Run a shell command inside a session and capture its output.",
     icon: Terminal,
@@ -460,6 +591,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "write_files",
+    group: "sessions",
+    outputs: ["files"],
     label: "Write files",
     description: "Write rendered files into a session's filesystem.",
     icon: FilePlus2,
@@ -482,6 +615,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "state_get",
+    group: "advanced",
+    outputs: ["found", "value", "version"],
     label: "Read state",
     description: "Read one entry from this automation's shared state.",
     icon: Database,
@@ -498,6 +633,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "state_set",
+    group: "advanced",
+    outputs: ["ok", "version", "current_version", "current_value"],
     label: "Write state",
     description: "Write one entry; an expected version turns the write into a compare-and-swap.",
     icon: Database,
@@ -527,6 +664,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "state_delete",
+    group: "advanced",
+    outputs: ["ok", "deleted"],
     label: "Delete state",
     description: "Delete one entry (idempotent); an expected version makes it conditional.",
     icon: Eraser,
@@ -539,6 +678,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "state_list",
+    group: "advanced",
+    outputs: ["entries", "count", "truncated"],
     label: "List state",
     description: "List entries by key prefix (up to 500), oldest key first.",
     icon: List,
@@ -559,6 +700,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "lookup_pr_session",
+    group: "advanced",
+    outputs: ["found", "session_id", "task_id", "head_branch", "url", "title"],
     label: "Look up PR session",
     description: "Map a pull request to the session that authored it (the pr_ref ledger).",
     icon: GitPullRequest,
@@ -585,6 +728,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "lookup_instance_session",
+    group: "advanced",
+    outputs: ["found", "session_id", "web_url", "run_id", "reason"],
     label: "Look up workstream session",
     description:
       "The kept session an earlier run of this workstream created, so a new run continues it (found: false when none, gone, or unbound).",
@@ -595,6 +740,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "instance_close",
+    group: "advanced",
+    outputs: ["closed", "not_instanced"],
     label: "Close workstream",
     description: "Close the run's own workstream; later events for it are dropped (audited).",
     icon: SquareCheck,
@@ -614,6 +761,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "claim_handle",
+    group: "advanced",
+    outputs: ["claimed", "handle", "reclaimed"],
     label: "Claim handle",
     description:
       "Route an external identifier to this workstream (a channel, a ticket id). Posts and PRs bind automatically.",
@@ -634,6 +783,17 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "review_open_pass",
+    group: "advanced",
+    outputs: [
+      "review_id",
+      "task_id",
+      "target_id",
+      "head_sha",
+      "base_sha",
+      "pr_url",
+      "superseded_review_id",
+      "deduplicated",
+    ],
     label: "Open review pass",
     description:
       "Start a review pass on a pull request in the engrams review ledger (it shows on the Reviews page). Resolves the heads from GitHub when the trigger carries no SHAs.",
@@ -687,6 +847,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "review_stage",
+    group: "advanced",
+    outputs: ["phase", "prompt", "merge_base"],
     label: "Stage review worker",
     description:
       "Write the reviewer brief, prior findings, and candidates into a session for one phase, and compose that phase's prompt (the prompt output feeds send_prompt).",
@@ -736,6 +898,17 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "review_settle",
+    group: "advanced",
+    outputs: [
+      "review_id",
+      "repo",
+      "pr_number",
+      "commit_id",
+      "summary_md",
+      "comments",
+      "to_post_count",
+      "ui_only_count",
+    ],
     label: "Settle review",
     description:
       "Apply the category and severity policy to the pass's findings, settle them in the ledger, and emit the parameters for github.post_pr_review.",
@@ -759,6 +932,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "review_close_pass",
+    group: "advanced",
+    outputs: ["review_id", "outcome"],
     label: "Close review pass",
     description:
       "Mark a pass failed or halted (sticky status comment + activity event) or tear a superseded pass down. Meant for settings.onFinalize hooks.",
@@ -789,6 +964,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "review_record_post",
+    group: "advanced",
+    outputs: ["review_id", "recorded", "github_review_id"],
     label: "Record posted review",
     description:
       "Write the GitHub review id that github.post_pr_review returned onto the pass, so the Reviews page links to the posted review.",
@@ -812,6 +989,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "resolve_user",
+    group: "integrations",
+    outputs: ["found", "user_id"],
     label: "Resolve user",
     description:
       "Map a provider identity (a Slack user id) to an engrams user. Outputs found + user_id; pass user_id to create_session as the owner.",
@@ -833,6 +1012,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "relay_session",
+    group: "integrations",
+    outputs: ["session_id", "installed", "created", "mention_ts"],
     label: "Relay session",
     description:
       "Mirror a session into a Slack thread: streamed replies as bubbles, questions as Block Kit, ⏳/✅ on the message that started the turn. Run it again to re-point at a follow-up.",
@@ -870,11 +1051,14 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "relay_close",
+    group: "advanced",
+    outputs: ["posted", "rendered_as"],
     label: "Close relay",
     description:
       "Post the closing message of a relayed session (✅ with the last reply and assets, ❌ with the error, or a neutral note). Meant for settings.onFinalize hooks.",
     icon: CircleStop,
     fields: [
+      { type: "session_ref", key: "session", label: "Session", help: "The relayed session." },
       { type: "template", key: "status", label: "Run status", help: "Usually ${{ run.status }}." },
       {
         type: "template",
@@ -885,10 +1069,11 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       },
     ],
     summary: () => "Post the closing message",
-    defaults: () => ({ status: "${{ run.status }}" }),
+    defaults: () => ({ session: {}, status: "${{ run.status }}" }),
   },
   {
     kind: "integration_action",
+    group: "integrations",
     label: "Integration action",
     description: "Call a catalog action on a connected integration with org credentials.",
     icon: Zap,
@@ -904,6 +1089,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "decide",
+    group: "flow",
+    outputs: ["decided", "answers"],
     label: "Decide",
     description:
       "Ask a decision model (Jev, through OpenRouter) typed questions about a state: pick an option, rate on levels, or yes / no. Answers carry a calibrated confidence a branch can gate on. Without OpenRouter it outputs decided: false.",
@@ -924,6 +1111,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "list_profiles",
+    group: "advanced",
+    outputs: ["profiles", "options"],
     label: "List profiles",
     description:
       "The org's active profiles as capability cards, plus options a Decide choice question takes directly (value = profile id).",
@@ -940,6 +1129,19 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       Array.isArray(c["ids"]) ? `${c["ids"].length} chosen profiles` : "Every active profile",
     defaults: () => ({}),
   },
+  {
+    kind: "slack_choice",
+    label: "Slack choice",
+    description:
+      "Ask a question in the Slack thread as buttons and wait for the click; the built-in uses it to confirm a routed profile.",
+    icon: MailOpen,
+    group: "advanced",
+    insertable: false,
+    outputs: ["answered", "value", "label", "timed_out"],
+    inspector: "readonly",
+    summary: (c) => truncate(str(c["question"]), 48) || "Ask in the thread",
+    defaults: () => ({}),
+  },
 ];
 
 const BY_KIND = new Map(BLOCK_KINDS.map((spec) => [spec.kind, spec]));
@@ -954,20 +1156,36 @@ export function blockKind(kind: string): BlockKindSpec {
     label: kind,
     description: "Unknown block kind.",
     icon: Lock,
+    group: "advanced",
     inspector: "readonly",
     summary: () => "Unknown block kind",
     defaults: () => ({}),
   };
 }
 
-/** Kinds a user may insert: every kind, except one whose model router has
- * no key (`connectedRouters` = the routers that have one). */
+/** Kinds a user may insert: every kind a hand-built automation may place,
+ * except one whose model router has no key (`connectedRouters` = the routers
+ * that have one). */
 export function insertableBlockKinds(
   connectedRouters: ReadonlySet<string>,
 ): readonly BlockKindSpec[] {
   return BLOCK_KINDS.filter(
-    (spec) => spec.requiresRouter === undefined || connectedRouters.has(spec.requiresRouter),
+    (spec) =>
+      spec.insertable !== false &&
+      (spec.requiresRouter === undefined || connectedRouters.has(spec.requiresRouter)),
   );
+}
+
+/** The insert menu's shape: the insertable kinds by group, in group order,
+ * empty groups left out. */
+export function groupedBlockKinds(
+  connectedRouters: ReadonlySet<string>,
+): ReadonlyArray<{ id: BlockGroup; label: string; kinds: readonly BlockKindSpec[] }> {
+  const kinds = insertableBlockKinds(connectedRouters);
+  return BLOCK_GROUPS.map((group) => ({
+    ...group,
+    kinds: kinds.filter((spec) => spec.group === group.id),
+  })).filter((group) => group.kinds.length > 0);
 }
 
 // ---------------------------------------------------------------------------

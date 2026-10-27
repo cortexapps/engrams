@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   blockKind,
+  groupedBlockKinds,
   insertableBlockKinds,
   removeEntrypoint,
   projectEntrypoint,
@@ -186,6 +187,32 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
       expect(spec.description).not.toBe("Unknown block kind.");
       expect(insertableBlockKinds(new Set()).some((s) => s.kind === kind)).toBe(true);
     }
+  });
+
+  it("a built-in-only kind renders with its own label and is never offered", () => {
+    expect(blockKind("slack_choice").label).toBe("Slack choice");
+    expect(blockKind("slack_choice").inspector).toBe("readonly");
+    expect(insertableBlockKinds(new Set()).some((s) => s.kind === "slack_choice")).toBe(false);
+  });
+
+  it("groups the insertable kinds: the agent first, the internals under Advanced", () => {
+    const groups = groupedBlockKinds(new Set(["openrouter"]));
+    expect(groups.map((g) => g.id)).toEqual([
+      "agent",
+      "flow",
+      "sessions",
+      "integrations",
+      "advanced",
+    ]);
+    expect(groups[0]!.kinds.map((k) => k.kind)).toEqual(["create_session", "run_agent"]);
+    const advanced = groups.find((g) => g.id === "advanced")!.kinds.map((k) => k.kind);
+    for (const kind of ["loop", "wait_event", "state_get", "review_open_pass", "relay_close"]) {
+      expect(advanced).toContain(kind);
+    }
+    // Every insertable kind is in exactly one group.
+    const all = groups.flatMap((g) => g.kinds.map((k) => k.kind));
+    expect(new Set(all).size).toBe(all.length);
+    expect(all.length).toBe(insertableBlockKinds(new Set(["openrouter"])).length);
   });
 
   it("a router-backed kind is insertable only while its router has a key", () => {

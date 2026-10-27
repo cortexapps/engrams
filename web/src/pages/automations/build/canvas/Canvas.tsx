@@ -8,20 +8,10 @@
 import { Lock, Plus } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { useConnectedRouters } from "@/hooks/useConnectedRouters";
-import {
-  insertableBlockKinds,
-  type BlockDef,
-  type ListPath,
-  type TriggerSpec,
-} from "@/lib/automation-blocks";
+import { DropdownMenu, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import type { BlockDef, ListPath, TriggerSpec } from "@/lib/automation-blocks";
 
+import { BlockKindMenu } from "./BlockKindMenu";
 import { CanvasNode, type CanvasNodeStatus } from "./CanvasNode";
 import { EdgeLayer } from "./EdgeLayer";
 import { InsertMenu } from "./InsertMenu";
@@ -227,7 +217,6 @@ function AddStepNode({
   index: number;
   onInsert: (at: ListPath, index: number, kind: string) => void;
 }) {
-  const connectedRouters = useConnectedRouters();
   return (
     <div
       className="absolute z-20 -translate-x-1/2 -translate-y-1/2"
@@ -245,14 +234,7 @@ function AddStepNode({
             Add step
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="center">
-          {insertableBlockKinds(connectedRouters).map((spec) => (
-            <DropdownMenuItem key={spec.kind} onSelect={() => onInsert(at, index, spec.kind)}>
-              <spec.icon className="size-4" aria-hidden />
-              {spec.label}
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuContent>
+        <BlockKindMenu onPick={(kind) => onInsert(at, index, kind)} />
       </DropdownMenu>
     </div>
   );
