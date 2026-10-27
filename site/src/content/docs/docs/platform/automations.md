@@ -26,12 +26,6 @@ your existing automations, asks when a decision is yours, and assembles a draft 
 canvas while you watch. The draft lands disabled. You edit it by hand, and the agent and you
 can edit at the same time.
 
-**Start from a template.** New automation also offers five ready shapes: a Slack answer
-bot, a PR reviewer, a standing SRE, a docs reconciler and a weekly digest. Each opens in the
-builder prefilled and editable, with a way in and the Agent block already wired; you pick
-the profile, change the prompt and turn it on. The two built-ins stay as the org's own
-instances of those shapes.
-
 **Build it.** The builder is a canvas: the trigger is the first node, a plus sign on any edge
 inserts a block, and an inspector on the right edits the selected block's fields. The block
 menu is grouped by purpose, with the Agent block first and the engine's internals under
