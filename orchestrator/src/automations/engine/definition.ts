@@ -724,7 +724,7 @@ export class DefinitionError extends Error {
   }
 }
 
-function* walkBlocks(blocks: BlockDef[]): Generator<BlockDef> {
+export function* walkBlocks(blocks: BlockDef[]): Generator<BlockDef> {
   for (const block of blocks) {
     yield block;
     if (block.then) yield* walkBlocks(block.then);
