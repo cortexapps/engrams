@@ -641,3 +641,43 @@ two sites to forget. Peeking into streaming requests (Exec, WriteFile) for
 a session id — the reconcile covers them, and neither carries a prompt.
 Dropping the row on park and re-registering on resume — the row is the
 lease and the terminal marker; dormancy keeps both.
+
+## Amendment (2026-10-27): the session relay leaves the run (contract 5)
+
+**What was wrong.** The Slack relay was a message handler installed in a
+run (contract 3): every curated session event was forwarded into the run's
+mailbox and rendered inside a `__relay__` step, with the render state
+threaded through checkpointed step outputs. A relay therefore lived only as
+long as its run, so the Slack built-in held each thread's conversation in
+one long run (`loop → wait_event → send_prompt`, 24 h wait slices under a
+48 h ceiling) — the one standing exception to D9. Users who copied the
+house pattern by hand needed a `lookup → filter → send_prompt | create →
+relay` chain per entrypoint.
+
+**Decision.** (1) **The relay binds to the session.** One
+`automation_session_relay` row per relayed session holds the place it
+mirrors into and the render state; `relay_session` installs or re-points
+it inside one checkpointed step and the run goes on or ends. (2) **The
+automation consumer renders.** With no run live, the session listener's
+consumer renders every curated event straight into the place through the
+unchanged `CommunicationPolicy`, and the session's end posts the closing
+message and removes the row. Every write CASes on the row's `version`, so
+a re-point racing a render never loses state. (3) **Answers route to the
+session.** A question card carries the session id; the interactivity route
+completes the deferred tool call directly. A `slack_choice` card still
+carries the run id: its click is the run's. (4) **`run_agent` is the
+composite.** Lookup the workstream's kept session → adopt and prompt, else
+create with the opening prompt → install or re-point the relay. Every event
+is a short run; the "durable workflow parked at one step" is the kept
+session plus the open workstream. (5) **Retired.** `session_event` in the
+inbox, `onMessage`/`HandlerResult` on executors, `handlerState`,
+`relayStepName`, the `relay` flag on `automation_session` and
+`setSessionRelay`. `ENGINE_STEP_CONTRACT` is 5: a run checkpointed under
+contract 4 that is recovered now would miss the `__relay__` steps it
+expects, and the rows it rendered from no longer exist.
+
+**Consequences.** The Slack built-in (definition 13) keeps its graph for
+now — `relay` reads `mention_ts` from the re-point step instead of the
+retired `handler_state`, and the recap hook names its session — and moves
+onto short runs in the follow-up that ADR 0120 named. The `relay_close`
+hook posts nothing when the run never reached a session (a filtered run).
