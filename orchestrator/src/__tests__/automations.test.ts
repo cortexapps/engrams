@@ -887,6 +887,28 @@ describe("AutomationService v2", () => {
     expect(broken.errors[0]).toMatchObject({ blockId: "launch", field: "promptTemplate" });
   });
 
+  test("TestRender previews an unsaved draft with no automation row", async () => {
+    const { automations } = clients(adminDeps());
+    const draft = cronDefinition({
+      trigger: { kind: "manual" },
+      inputsSchema: [{ key: "mention", label: "Mention", type: "string", default: "@engrams" }],
+      blocks: [
+        { id: "launch", type: "create_session", config: { profileId: "profile-1", promptTemplate: "Hi ${{ inputs.mention }}" } },
+      ],
+    });
+    const rendered = await automations.testRender({
+      automationId: "",
+      draftDefinitionJson: JSON.stringify(draft),
+      sample: { case: undefined },
+    });
+    expect(rendered.errors).toEqual([]);
+    expect(JSON.parse(rendered.blocks[0]!.renderedJson)).toMatchObject({ promptTemplate: "Hi @engrams" });
+
+    await expect(
+      automations.testRender({ automationId: "", sample: { case: undefined } }),
+    ).rejects.toThrow(/draft_definition_json is required/);
+  });
+
   test("DryRun and RunNow admit through dispatch; DryRun flags the run", async () => {
     const starts: string[] = [];
     const deps = adminDeps({ workflowStarter: { async start(_i, id) { starts.push(id); } } });
