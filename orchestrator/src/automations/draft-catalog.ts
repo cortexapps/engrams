@@ -47,6 +47,13 @@ function jsonSchemaOf(schema: z.ZodType): unknown {
  * `connectedRouters` are the model routers with a key; a block that needs
  * another router is left out, so the agent never drafts one that cannot
  * decide anything. */
+/** The condition group a filter or a branch takes. Its zod schema is an
+ * opaque refinement, so the JSON schema says nothing; this note does. */
+const CONDITIONS_NOTE =
+  'conditions is a group {mode: "all" | "any", conditions: [...]} whose items are {path, op, value?} or a nested group. ' +
+  'path is a scope path ("event.raw.pull_request.user.type", "steps.facts.value.ok"); op is one of equals, not_equals, contains, matches, in, is_empty, gt, lt, is_true, is_false. ' +
+  'Example: {"mode":"all","conditions":[{"path":"event.raw.pull_request.user.type","op":"not_equals","value":"Bot"}]}.';
+
 export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Set()): Record<string, unknown> {
   registerEngineBlocks();
   const blocks = listBlockTypes()
@@ -62,6 +69,7 @@ export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Se
         type,
         config_schema: jsonSchemaOf(executor.configSchema as z.ZodType),
         ...(executor.outputs ? { outputs: executor.outputs } : {}),
+        ...(type === "branch" || type === "filter" ? { config_notes: CONDITIONS_NOTE } : {}),
         ...(type === "branch" ? { nests: "branch (children in then/else)" } : {}),
         ...(type === "loop" ? { nests: "loop (children in body)" } : {}),
       };
@@ -88,6 +96,10 @@ export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Se
       "agent.scope: {kind:'event'} = a fresh session per event. {kind:'automation'} = one standing agent for the whole automation. {kind:'key', keyTemplate, labelTemplate?} = one standing agent per rendered key — a Slack thread ('${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: \"thread_ts\", \"ts\" }}'), a channel, a pull request ('${{ event.raw.repository.full_name }}#${{ event.raw | coalesce: \"pull_request.number\", \"issue.number\" }}'), an issue. The engine derives settings.instance from it: never declare both.",
       "A way in's role: 'start' (default) opens the agent when none exists, then delivers; 'reach' delivers only to an agent that exists (routed by handle or by key; otherwise the event drops); 'close' ends the agent (the close_agent step: it closes the relay with a message, ends the kept session and closes the workstream); 'none' runs the blocks only. Inside a way in, `steps.agent.*` is not available (the agent runs last); settings.onFinalize hooks can read steps.agent.session_id / started / delivered.",
       "agent.relay (Slack) makes the agent talk back where the event came from: {provider:'slack', team, channel, threadTs, mentionTs?, userId?, eventId?} as templates over the event; a new session's link is posted there, and the session's replies, questions and ⏳/✅ follow with no run live.",
+      "The main trigger IS the first way in. Never repeat it as an entrypoint on the same event: each copy would run (and start the agent) once more per event.",
+      "A key-scoped agent renders its key from the event of EVERY way in: pick events whose payload carries it (coalesce across shapes: a pull_request.* event has pull_request.number, an issue_comment.* event has issue.number), or route by handle (a Slack way in with agent.relay set). A manual trigger renders no key: use it only with automation scope, or give it role 'none'.",
+      "A Slack message reaches a per-channel or per-thread agent only when agent.relay points there (the relay is the handle the route follows) or the key renders from the message itself. The bot's own posts come back as message events: a filter on event.raw.event.bot_id (is_empty) before the agent keeps them out; a code block that returns null does not stop the run.",
+      "Templates are Liquid without {% if %} or {% for %}: no conditionals, no loops. To make the prompt depend on the way in, write `${{ trigger.eventKey }}` into it and let the agent read it.",
       "Block ids are unique across ALL entrypoints; ids match ^[a-z][a-z0-9_]*$.",
       "branch children live in then/else; loop children in body; nothing else nests.",
       'Prose fields render Liquid with ${{ }}; structured values use {"$ref": "steps.<id>.<output>"}.',
