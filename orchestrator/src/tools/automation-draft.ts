@@ -138,18 +138,26 @@ async function checkProfiles(
   profiles: Pick<ProfileStore, "getActive">,
 ): Promise<Array<z.infer<typeof ProposeError>>> {
   const errors: Array<z.infer<typeof ProposeError>> = [];
-  const lists = [definition.blocks, ...(definition.entrypoints ?? []).map((e) => e.blocks)];
-  for (const block of lists.flatMap((list) => walkBlocks(list))) {
-    if (block.type !== "create_session") continue;
-    const profileId = block.config["profileId"];
-    if (typeof profileId !== "string" || profileId === "") continue;
+  // A templated profile id (`${{ inputs.profile }}`) resolves per run; the
+  // live check covers a literal one, as the save path does.
+  const check = async (blockId: string, profileId: unknown): Promise<void> => {
+    if (typeof profileId !== "string" || profileId === "" || profileId.includes("${{")) return;
     if (!(await profiles.getActive(profileId))) {
       errors.push({
-        block_id: block.id,
+        block_id: blockId,
         field: "profileId",
         message: `"${profileId}" is not an active profile (read part "profiles")`,
       });
     }
+  };
+  // The agent names its profile like a create_session block does, and a
+  // model that skipped part "profiles" writes the profile's NAME there: the
+  // save path refuses that, so the draft tool must too.
+  if (definition.agent !== undefined) await check("__agent__", definition.agent.profileId);
+  const lists = [definition.blocks, ...(definition.entrypoints ?? []).map((e) => e.blocks)];
+  for (const block of lists.flatMap((list) => walkBlocks(list))) {
+    if (block.type !== "create_session") continue;
+    await check(block.id, block.config["profileId"]);
   }
   return errors;
 }

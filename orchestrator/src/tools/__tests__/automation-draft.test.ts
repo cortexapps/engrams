@@ -231,6 +231,35 @@ describe("automation draft tools", () => {
     expect(result.errors?.[0]).toMatchObject({ block_id: "launch", field: "profileId" });
   });
 
+  test("an unknown agent profile is a soft refusal addressed to the agent", async () => {
+    const h = harness(row(definition()));
+    const result = (await call(h.deps, "automation_propose", {
+      definition_json: JSON.stringify(
+        definition({
+          agent: { scope: { kind: "automation" }, profileId: "CI", promptTemplate: "go" },
+        }),
+      ),
+      expected_version: 1,
+    })) as { applied: boolean; errors?: Array<{ block_id: string; field: string }> };
+    expect(result.applied).toBe(false);
+    expect(result.errors?.[0]).toMatchObject({ block_id: "__agent__", field: "profileId" });
+  });
+
+  test("a templated agent profile resolves per run and passes the draft check", async () => {
+    const h = harness(row(definition()));
+    const result = (await call(h.deps, "automation_propose", {
+      definition_json: JSON.stringify(
+        definition({
+          agent: { scope: { kind: "event" }, profileId: "${{ inputs.profile }}", promptTemplate: "go" },
+          inputsSchema: [{ key: "profile", type: "string", label: "Profile", required: true }],
+        }),
+      ),
+      expected_version: 1,
+    })) as { applied: boolean; errors?: Array<{ block_id: string; field: string }> };
+    expect(result.errors ?? []).toEqual([]);
+    expect(result.applied).toBe(true);
+  });
+
   test("the version fence returns the live definition instead of clobbering", async () => {
     const h = harness(row(definition(), 4));
     const result = (await call(h.deps, "automation_propose", {

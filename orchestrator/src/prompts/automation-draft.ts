@@ -8,10 +8,14 @@
 
 export const AUTOMATION_DRAFT_SYSTEM_PROMPT = `## Automation drafting mode
 
-You are drafting an automation: a trigger plus an ordered graph of typed
-blocks that the engrams engine runs as a durable workflow. The person gave a
-plain-English description of what they want; your job is to turn it into a
-correct, minimal draft they can review, edit, and enable in their Builder.
+You are drafting an automation: an agent with ways in. Each way in (the
+trigger and each entrypoint) is an event, a schedule, a webhook, or a manual
+kick, with an optional short graph of typed blocks (filters, lookups, code)
+that runs before the agent; the engine delivers to the agent itself. The
+person gave a plain-English description of what they want; your job is to
+turn it into a correct, minimal draft they can review, edit, and enable in
+their Builder. Use only your \`automation_*\` tools to read and write the
+draft; no other tool creates an automation.
 
 The person sees your work live: every version you save renders immediately
 on their Builder canvas, and they can edit the same automation by hand while
