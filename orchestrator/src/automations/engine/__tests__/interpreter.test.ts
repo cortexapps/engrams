@@ -456,9 +456,15 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 5)
     expect(hot.names).toEqual([
       "step:__snapshot__:0",
       "step:gate.__cond__:0",
+      // The decision has a ledger row (the run page shows which arm ran).
+      "step:gate:0:ledger",
       "step:gate.hot_path:0",
       "step:__finalize__:0",
     ]);
+    expect(hot.stepRecords.find((r) => r.framePath === "gate")?.record).toMatchObject({
+      status: "succeeded",
+      outputs: { taken: "then" },
+    });
 
     const cold = makeHarness(definition, { inputs: { hot: false } });
     await interpretAutomation(RUN, cold.deps);
@@ -495,8 +501,14 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 5)
       "step:poll.__bound__:0",
       "step:poll[0].tick:0",
       "step:poll[0].__until__:0",
+      // The loop's ledger row: how far it went.
+      "step:poll:0:ledger",
       "step:__finalize__:0",
     ]);
+    expect(h.stepRecords.find((r) => r.framePath === "poll")?.record).toMatchObject({
+      status: "succeeded",
+      outputs: { iterations: 1, exhausted: false },
+    });
     expect(h.execs[0]!.execId).toBe(`exec:auto:${RUN.runId}:poll[0].tick:a0`);
   });
 

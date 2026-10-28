@@ -907,7 +907,8 @@ describe("Slack thread brain — smart routing", () => {
     const h = harness({ recv: [{ kind: "session_idle", sessionId: "s-1" }, null, null] });
     await interpretAutomation(RUN, h.deps);
     const routing = h.names.filter((n) => n.includes("smart_route"));
-    expect(routing).toEqual(["step:has_previous.smart_route.__cond__:0"]);
+    // The decision and its ledger row; no model call, no profile list.
+    expect(routing).toEqual(["step:has_previous.smart_route.__cond__:0", "step:has_previous.smart_route:0:ledger"]);
   });
 
   test("(r11) every chosen profile gone: no model call, the default profile serves", async () => {

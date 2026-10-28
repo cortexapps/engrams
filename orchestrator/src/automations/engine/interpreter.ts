@@ -469,7 +469,11 @@ export async function interpretAutomation(
         conditionStepName(frames),
         (block.config as { conditions: unknown }).conditions,
       );
-      recordStepOutputs(ctx, block.id, path, { taken: taken ? "then" : "else" });
+      const taken_ = { taken: taken ? "then" : "else" };
+      recordStepOutputs(ctx, block.id, path, taken_);
+      await deps.step(async () => {
+        await deps.store.recordStep(input.runId, path, 0, { status: "succeeded", outputs: taken_ });
+      }, `${stepName(frames, 0)}:ledger`);
       const list = taken ? (block.then ?? []) : (block.else ?? []);
       for (const child of list) await runBlock(child, [...frames, { blockId: child.id }]);
       return;
@@ -503,7 +507,11 @@ export async function interpretAutomation(
           }
         }
       }
-      recordStepOutputs(ctx, block.id, path, { iterations, exhausted });
+      const walked = { iterations, exhausted };
+      recordStepOutputs(ctx, block.id, path, walked);
+      await deps.step(async () => {
+        await deps.store.recordStep(input.runId, path, 0, { status: "succeeded", outputs: walked });
+      }, `${stepName(frames, 0)}:ledger`);
       return;
     }
 
