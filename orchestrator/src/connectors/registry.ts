@@ -261,7 +261,7 @@ export interface OauthFacet {
    * `service_account` signs a JWT with a sealed service-account key and
    * exchanges it (RFC 7523, Google), acting as one principal named at
    * connect time. A service-account connector always declares the user
-   * flow too (ADR 0125 D1): `authorizeUrl` and the client refs serve the
+   * flow too: `authorizeUrl` and the client refs serve the
    * personal consent, never the org grant. */
   grant: "authorization_code" | "client_credentials" | "service_account";
   /** Org secret holding the service-account JSON key; required for (and only

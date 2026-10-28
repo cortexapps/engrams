@@ -75,7 +75,7 @@ export function clientCredentialsSpec(connector: Connector): ClientCredentialsSp
   });
 }
 
-/** The wire spec for a service-account grant (ADR 0125 D2). `subject` is
+/** The wire spec for a service-account grant (RFC 7523). `subject` is
  * the principal the platform acts as; empty lets the coordinator keep the
  * one in the sealed refresh spec (a re-grant from the integration page). */
 export function serviceAccountSpec(connector: Connector, subject: string): ServiceAccountSpec {
