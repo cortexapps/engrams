@@ -20,6 +20,7 @@
 #   bin/glab                  fetched static Go binary (GitLab CLI)
 #   bin/stripe                fetched static Go binary (Stripe CLI)
 #   bin/pup                   fetched glibc Rust binary (broad Datadog API CLI)
+#   bin/gws                   fetched glibc Rust binary (Google Workspace CLI)
 #   bin/datadog               engrams-owned Datadog REST + profiling MCP client
 #   bin/gcloud                wrapper for the pinned Google Cloud CLI archive
 #   bin/engram-tunnel         guest client for session-authorized host tunnels
@@ -42,6 +43,7 @@ GH_VERSION="${GH_VERSION:-2.62.0}"
 PUP_VERSION="${PUP_VERSION:-1.4.0}"
 GLAB_VERSION="${GLAB_VERSION:-1.105.0}"
 STRIPE_VERSION="${STRIPE_VERSION:-1.43.2}"
+GWS_VERSION="${GWS_VERSION:-0.22.5}"
 GCLOUD_VERSION="${GCLOUD_VERSION:-577.0.0}"
 # Build-container base, pinned by digest (multi-arch index, amd64+arm64).
 # The bundle COPIES this image's Python runtime and shared libraries into the
@@ -71,6 +73,7 @@ build_tree() {
     docker run --name "$cname" \
         -e GH_VERSION="$GH_VERSION" \
         -e PUP_VERSION="$PUP_VERSION" \
+        -e GWS_VERSION="$GWS_VERSION" \
         -e GLAB_VERSION="$GLAB_VERSION" \
         -e STRIPE_VERSION="$STRIPE_VERSION" \
         -e GCLOUD_VERSION="$GCLOUD_VERSION" \
@@ -84,8 +87,8 @@ build_tree() {
 
         ARCH="$(dpkg --print-architecture)"   # amd64 | arm64
         case "$ARCH" in
-            amd64) GH_ARCH=amd64; PUP_ARCH=x86_64; GLAB_ARCH=amd64; STRIPE_ARCH=x86_64; GCLOUD_ARCH=x86_64; GCLOUD_SHA256=0b32d330446ce7b0f57f253e7efab4636c18fb1f87a3ac31c6c3f2a2a697525e ;;
-            arm64) GH_ARCH=arm64; PUP_ARCH=arm64;  GLAB_ARCH=arm64; STRIPE_ARCH=arm64; GCLOUD_ARCH=arm; GCLOUD_SHA256=dbac26bdf80d72b5d13538e3a215dcbfe2781edfd2d69723effbeef3839cffb8 ;;
+            amd64) GH_ARCH=amd64; PUP_ARCH=x86_64; GLAB_ARCH=amd64; STRIPE_ARCH=x86_64; GCLOUD_ARCH=x86_64; GCLOUD_SHA256=0b32d330446ce7b0f57f253e7efab4636c18fb1f87a3ac31c6c3f2a2a697525e; GWS_TARGET=x86_64-unknown-linux-gnu; GWS_SHA256=de78ecdbd2f1a84cca0063a7ecbc440240fc14b6ebccbb17f4646b792a8c5c1f ;;
+            arm64) GH_ARCH=arm64; PUP_ARCH=arm64;  GLAB_ARCH=arm64; STRIPE_ARCH=arm64; GCLOUD_ARCH=arm; GCLOUD_SHA256=dbac26bdf80d72b5d13538e3a215dcbfe2781edfd2d69723effbeef3839cffb8; GWS_TARGET=aarch64-unknown-linux-gnu; GWS_SHA256=94490295d9580e1e88574e715a0a162991747d12d62f8c7b8dcc8268b6c1cea0 ;;
             *) echo "unsupported arch $ARCH" >&2; exit 1 ;;
         esac
 
@@ -129,6 +132,18 @@ build_tree() {
             | tar -xz -C /tmp/stripe
         cp "$(find /tmp/stripe -type f -name stripe | head -1)" /out/bin/stripe
         chmod 0755 /out/bin/stripe
+
+        # 4b) Google Workspace CLI (gws) — the Discovery-driven Workspace CLI
+        #     from Google, a glibc Rust binary on GitHub releases; the tarball holds a
+        #     single `gws` executable at its root. The release is pre-1.0, so the
+        #     archive checksum is pinned with the version (manifest.toml).
+        mkdir -p /tmp/gws
+        curl -fsSL "https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/google-workspace-cli-${GWS_TARGET}.tar.gz" \
+            -o /tmp/gws.tar.gz
+        echo "$GWS_SHA256  /tmp/gws.tar.gz" | sha256sum -c -
+        tar -xzf /tmp/gws.tar.gz -C /tmp/gws
+        cp "$(find /tmp/gws -type f -name gws | head -1)" /out/bin/gws
+        chmod 0755 /out/bin/gws
 
         # 5) Google Cloud CLI. The versioned archive is a
         # self-contained SDK tree, so the wrapper can locate it relative to the

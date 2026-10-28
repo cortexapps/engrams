@@ -1978,3 +1978,112 @@ describe("the shipped rippling connector", () => {
     for (const p of paths) expect(p).not.toMatch(/^\/(agents|functions|packages|sandboxes|listing|sites|metadata)/);
   });
 });
+
+describe("the shipped google_workspace connector", () => {
+  const G = "https://www.googleapis.com/auth/";
+
+  test("grants as a service account for the directory and lets members consent for the rest", () => {
+    const c = connectorRegistry().get("google_workspace")!;
+    expect(c.hosts[0]).toBe("admin.googleapis.com");
+    expect(c.oauth?.grant).toBe("service_account");
+    expect(c.oauth?.serviceAccountKeyRef).toBe("google_workspace.service_account_key");
+    expect(c.oauth?.tokenUrl).toBe("https://oauth2.googleapis.com/token");
+    expect(c.oauth?.authorizeUrl).toBe("https://accounts.google.com/o/oauth2/v2/auth");
+    // The organization token can reach the directory and nothing else.
+    for (const scope of c.oauth!.scopes) expect(scope).toMatch(/\/auth\/admin\.(directory|reports)\..*readonly$/);
+    const user = c.userCredential?.oauth;
+    expect(user).not.toBe(true);
+    if (user !== undefined && user !== true) {
+      expect(user.scopes).toContain(G + "gmail.readonly");
+      expect(user.scopes).toContain(G + "drive");
+      expect(user.scopes?.some((s) => s.includes("admin."))).toBe(false);
+      expect(user.authorizeParams).toEqual({ access_type: "offline", prompt: "consent" });
+    }
+    expect(c.credential?.source).toBe("inject");
+    expect(c.cli?.bins).toEqual(["gws"]);
+    expect(c.cli?.dummyEnv?.GOOGLE_WORKSPACE_CLI_TOKEN).toBe("x-engrams-managed");
+    expect(c.test?.path).toBe("/admin/directory/v1/customers/my_customer");
+    expect(c.webhook).toBeUndefined();
+  });
+
+  test("the directory is read-only and the personal areas split into read and write", () => {
+    const c = connectorRegistry().get("google_workspace")!;
+    const byGrant = new Map<string, string[]>();
+    for (const op of c.operations) {
+      const m = op.match as { method: string; path: string };
+      for (const g of op.grants) byGrant.set(g, [...(byGrant.get(g) ?? []), `${m.method} ${m.path}`]);
+    }
+    expect(byGrant.has("directory:write")).toBe(false);
+    expect(byGrant.get("directory:read")?.every((o) => o.startsWith("GET "))).toBe(true);
+    expect(byGrant.get("directory:read")).toContain("GET /admin/directory/v1/users*");
+    expect(byGrant.get("gmail:read")?.every((o) => o.startsWith("GET "))).toBe(true);
+    expect(byGrant.get("gmail:write")).toContain("POST /gmail/v1/users/*");
+    expect(byGrant.get("drive:write")).toContain("POST /upload/drive/v3/*");
+    expect(byGrant.get("docs:read")).toContain("GET /v1/documents*");
+  });
+});
+
+describe("the service_account grant facet", () => {
+  const base = {
+    provider: "sa",
+    protocol: "http",
+    display: { name: "SA", category: "Productivity", blurb: "x", icon: { mono: "SA", color: "#000000" } },
+    credential: { source: "inject", injects: [{ header: "Authorization", template: "Bearer {}" }] },
+    hosts: ["api.sa.example", "oauth.sa.example"],
+    operations: [{ grants: ["all:read"], match: { method: "GET", path: "/v1/*" } }],
+    userCredential: { oauth: { scopes: ["personal"] } },
+    oauth: {
+      grant: "service_account",
+      serviceAccountKeyRef: "sa.key",
+      tokenUrl: "https://oauth.sa.example/token",
+      scopes: ["directory.readonly"],
+      scopeDelimiter: " ",
+      authorizeUrl: "https://accounts.sa.example/auth",
+      acquisitionHosts: ["accounts.sa.example"],
+      clientIdRef: "sa.client_id",
+      clientSecretRef: "sa.client_secret",
+    },
+  };
+
+  test("parses with the key ref and the user flow's authorize URL", () => {
+    const c = parseConnector(base, "sa");
+    expect(c.oauth?.grant).toBe("service_account");
+    expect(c.oauth?.serviceAccountKeyRef).toBe("sa.key");
+    expect(c.oauth?.authorizeUrl).toBe("https://accounts.sa.example/auth");
+  });
+
+  test("needs the key ref, the user flow, and no browser extras", () => {
+    const without = (key: string) => {
+      const o = { ...base.oauth } as Record<string, unknown>;
+      delete o[key];
+      return { ...base, oauth: o };
+    };
+    expect(() => parseConnector(without("serviceAccountKeyRef"), "sa")).toThrow(/serviceAccountKeyRef/);
+    expect(() => parseConnector({ ...base, userCredential: undefined }, "sa")).toThrow(/userCredential\.oauth/);
+    expect(() => parseConnector({ ...base, oauth: { ...base.oauth, pkce: true } }, "sa")).toThrow(/pkce/);
+    expect(() =>
+      parseConnector({ ...base, oauth: { ...base.oauth, extraAuthorizeParams: { a: "b" } } }, "sa"),
+    ).toThrow(/extraAuthorizeParams/);
+    expect(() =>
+      parseConnector({ ...base, oauth: { ...base.oauth, grant: "authorization_code" } }, "sa"),
+    ).toThrow(/serviceAccountKeyRef/);
+  });
+
+  test("a client_credentials connector cannot offer a user consent flow", () => {
+    expect(() =>
+      parseConnector(
+        {
+          ...base,
+          oauth: {
+            grant: "client_credentials",
+            tokenUrl: "https://oauth.sa.example/token",
+            scopes: ["all"],
+            clientIdRef: "sa.client_id",
+            clientSecretRef: "sa.client_secret",
+          },
+        },
+        "sa",
+      ),
+    ).toThrow(/consent screen/);
+  });
+});

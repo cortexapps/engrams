@@ -32,6 +32,7 @@
         "bin/cortex",
         "bin/vanta",
         "bin/rippling",
+        "bin/gws",
         "bin/gcloud",
         "bin/engram-tunnel"
       ],
