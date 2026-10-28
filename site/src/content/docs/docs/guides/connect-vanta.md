@@ -46,16 +46,20 @@ no writes there. `resources:write` lets a session push its own evidence to Vanta
 custom integration.
 
 The `vanta` command is on the PATH in every session whose profile grants at least one Vanta
-power. Run `vanta` with no arguments for the command list, or `engrams-integrations` for
-every connected tool. List commands follow every page and print one JSON array.
+power. It is a generic client over the whole API: every resource is reached through `list`,
+`get`, `create`, `update`, and `delete`, `resources` prints the resource table with the verbs
+each supports, and `api` reaches any other route, such as the action endpoints. Query fields
+pass straight through as the API's filters, and `list` follows every page and prints one JSON
+array. Run `vanta` with no arguments for the command list, or `engrams-integrations` for every
+connected tool.
 
 ```bash
-vanta people-tasks OVERDUE
-vanta people-tasks DUE_SOON ACCEPT_POLICIES COMPLETE_TRAININGS
-vanta failing-tests
-vanta issues-due 2026-11-15
-vanta person 64f1c2
-vanta set-control-owner 64f1c3 64f1c4
+vanta list people tasksSummaryStatusMatchesAny=OVERDUE
+vanta list people taskTypeMatchesAny=ACCEPT_POLICIES,COMPLETE_TRAININGS taskStatusMatchesAny=DUE_SOON
+vanta list tests statusFilter=NEEDS_ATTENTION
+vanta list issues statusMatchesAny=NOT_STARTED,IN_PROGRESS dueBeforeDate=2026-11-15T23:59:59Z
+vanta get people <id>
+vanta api POST controls/<id>/set-owner '{"userId":"<user-id>"}'
 ```
 
 ## Receive Vanta events

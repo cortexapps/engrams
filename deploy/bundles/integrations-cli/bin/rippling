@@ -1,5 +1,5 @@
 #!/bin/sh
-# engrams Rippling CLI: a thin wrapper over the Rippling REST API.
+# engrams Rippling CLI: a thin, generic wrapper over the Rippling REST API.
 #
 # Auth is brokered: this carries only the `RIPPLING_API_TOKEN` placeholder;
 # the egress proxy injects the organization's real API token as
@@ -7,13 +7,16 @@
 # strips any token you supply. There is NOTHING to log in to; do not set a
 # real token.
 #
-# Each subcommand needs the matching power on your profile (rippling:workers:read,
-# rippling:org:read, rippling:leave:read, ...); a path your profile did not
-# grant is denied at the network boundary, not authenticated.
+# Every resource of the API is reached through the same five verbs (list,
+# get, create, update, delete) plus `api` for the routes that do not fit
+# them. `rippling resources` prints the resource table. Each resource needs
+# the matching power on your profile (rippling:workers:read,
+# rippling:org:write, ...); a path your profile did not grant is denied at
+# the network boundary, not authenticated.
 #
-# List commands follow every page (limit 100, cursor) and print one JSON
-# array when jq is present; without jq they print the first page as the API
-# returns it. The API version is the one the token was created with; set
+# `list` follows every page (limit 100, cursor) and prints one JSON array
+# when jq is present; without jq it prints the first page as the API returns
+# it. The API version is the one the token was created with; set
 # RIPPLING_API_VERSION (YYYY-MM-DD) to ask for another.
 set -eu
 
@@ -26,29 +29,125 @@ usage() {
 engrams Rippling CLI: auth is brokered by the platform (no token to set).
 
 Usage:
-  rippling me                                     The caller's own user
-  rippling company | rippling legal-entities      The company and its legal entities
-  rippling workers [field=value ...]              Workers (filter=, expand=, order_by=)
-  rippling worker <id>                            One worker with user and manager embedded
-  rippling worker-by-email <email>                The worker whose work email matches
-  rippling manager <worker-id>                    The worker's manager, or null
-  rippling reports-to <worker-id>                 Workers whose manager is that worker
-  rippling users | rippling user <id>             User accounts
-  rippling worker-changes [field=value ...]       Changes to worker records
-  rippling departments | teams | locations | titles | levels | employment-types
-  rippling custom-fields                          Custom field definitions
-  rippling leave-requests [field=value ...] | rippling leave-balances | rippling leave-types
-  rippling time-entries [field=value ...] | rippling time-cards [field=value ...]
-  rippling devices                                Managed devices
-  rippling activity-log [field=value ...]         Audit events of the last 90 days
-  rippling custom-objects | rippling records <object-api-name> [field=value ...]
-  rippling report <id> | rippling run-report <id> [json]
-  rippling get <path> [field=value ...]           Raw GET (one page)
-  rippling list <path> [field=value ...]          Raw GET, every page, as one array
-  rippling api <METHOD> <path> [json-body]        Raw call with an explicit method
+  rippling resources                              Every resource, its verbs, and its extra routes
+  rippling list <resource> [field=value ...]      Every page of a collection, as one array
+  rippling get <resource> <id> [field=value ...]  One record
+  rippling create <resource> <json>               Create a record
+  rippling update <resource> <id> <json>          Change a record (PATCH)
+  rippling delete <resource> <id>                 Delete a record
+  rippling me                                     The caller's own user (sso-me)
+  rippling api <METHOD> <path> [json-body]        Any route, with an explicit method and body
 
-Filters use Rippling's syntax: filter="status eq 'ACTIVE'"; expand=user,manager.
-Responses are JSON. Fields the token cannot read are listed under __meta.redacted_fields.
+<resource> is a path segment such as workers, departments, or leave-requests;
+it may carry a sub-path, such as custom-objects/<api-name>/records.
+
+Query fields pass straight to the API. Rippling's own syntax:
+  filter="status eq 'ACTIVE'"        operators: eq ne gt gte lt lte in and or
+  filter="work_email eq 'a@b.com'"   strings in single quotes
+  expand=user,manager                embed related records (depth 2, up to 10 fields)
+  order_by=start_date                sort; prefix with - for descending
+
+Examples:
+  rippling list workers "filter=work_email eq 'a@example.com'" expand=user,manager
+  rippling get workers <id> expand=manager,manager.user
+  rippling list workers "filter=manager_id eq '<id>'" expand=user
+  rippling list worker-changes "filter=updated_at gt '2026-10-01T00:00:00Z'"
+  rippling list custom-objects/<api-name>/records
+  rippling api POST custom-objects/<api-name>/records/query '{"query":"SELECT * FROM ..."}'
+  rippling create report-runs '{"report_id":"<id>"}'
+
+Responses are JSON. Fields the token cannot read are listed under
+__meta.redacted_fields.
+EOF
+}
+
+resources() {
+    cat <<'EOF'
+resource                              verbs                            extra routes (use: rippling api)
+activity-log                          list get
+app-users                             list get
+background-check-candidates           list get create update delete
+bill-payments                         list get
+break-policies                        list get
+break-types                           list get
+business-partner-groups               list get create delete
+business-partners                     list get create delete
+business-structure-paths              list get create delete
+candidate-applications                list
+candidates                            list
+card-transactions                     list get
+companies                             list
+company-legal-entities                list get
+company-legal-entity-workers          list get
+compensation-bands-details            list get
+compensations                         list get
+custom-fields                         list
+custom-objects                        list get create update delete    <name>/fields, <name>/list-views, <name>/records (list get create update delete), <name>/records/query, <name>/records/bulk, <name>/records/bulk-delete, <name>/records/external_id/<id>
+departments                           list get create update
+device-orders                         list get
+devices                               list get
+draft-hires                           create
+draft-transitions                     get create
+earning-types                         list
+earnings-inputs                       list create delete
+employee-documents                    create
+employment-types                      list get
+entitlements                          list
+files                                 get create
+headcount-positions                   list get
+headcount-priorities                  list get
+hire-requirements                     list
+hires                                 create
+job-assignments                       list get create update delete    <id>/change-log
+job-codes                             list get create update delete    <id>/change-log
+job-dimensions                        list get create update delete
+job-functions                         list get
+job-pay-rate-exceptions               list get                         <id>/change-log
+job-requisitions                      list
+job-requisitions-write                create
+kiosk-badges                          list get create update delete
+leave-accruals                        list get create
+leave-balances                        list get
+leave-program-evaluations             create
+leave-requests                        list get create update
+leave-types                           list get
+legal-entities                        list get
+levels                                list get create update delete
+location-factors                      list get
+object-categories                     list get create update delete
+payroll-payment-mode-changes          create
+payroll-runs                          list get                         off-cycle (POST), <id>/worker-payroll-records
+platform-capabilities                 list
+reimbursements                        list get
+report-runs                           get create
+reports                               get                              <id>/available-filters
+scheduled-job-assignments             list get delete
+schedules                             list get create update
+shift-inputs                          list get create update delete
+shiftassignments                      list get create update           <id>/customfields (PATCH)
+software-deployments                  list get create update delete
+spend-categories                      list get
+spend-vendors                         list get
+sso-me                                list
+supergroups                           list get                         <id>/members, <id>/inclusion-members (GET PATCH), <id>/exclusion-members (GET PATCH)
+teams                                 list get create update delete
+time-cards                            list get
+time-entries                          list get create update delete
+titles                                list get create update delete
+tracks                                list get create update delete
+unassignedshifts                      list get create update           <id>/assign (POST), <id>/customfields (PATCH)
+users                                 list get
+variable-compensation-payout-labels   list get create update
+variable-compensation-payout-types    list get create update delete
+variable-compensation-payout-writes   create
+variable-compensation-payouts         list get create
+work-locations                        list get create update delete
+worker-change-fields                  list
+worker-changes                        list get
+worker-time-splits                    list get create update delete
+workers                               list get
+workflow-action-executions            create
+workflows                             list get create update delete    <id>/executions (POST), <id>/executions/<execution-id>
 EOF
 }
 
@@ -58,17 +157,7 @@ pretty() {
     if have_jq; then jq .; else cat; fi
 }
 
-# json_str <value>: a JSON string literal, quotes included.
-json_str() {
-    if have_jq; then
-        printf '%s' "$1" | jq -Rs .
-    else
-        esc=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
-        printf '"%s"' "$esc"
-    fi
-}
-
-# Rippling paths end with a slash.
+# Rippling paths start and end with a slash.
 norm_path() {
     p="$1"
     case "$p" in
@@ -118,7 +207,7 @@ get() {
     fetch "$@" | pretty
 }
 
-# list <path> [field=value ...]: every page of a list, one array.
+# list <path> [field=value ...]: every page of a collection, one array.
 list() {
     p="$1"
     shift
@@ -135,7 +224,7 @@ list() {
             exit 1
         fi
         if ! printf '%s' "$page" | jq -e '.results' >/dev/null 2>&1; then
-            # Not a list envelope (an error, or a single object): show it as is.
+            # Not a collection envelope (an error, or a single object): show it as is.
             printf '%s\n' "$page" | pretty
             exit 1
         fi
@@ -159,69 +248,35 @@ cmd="${1:-}"
 [ "$#" -gt 0 ] && shift || true
 
 case "$cmd" in
-me) get /sso-me ;;
-company) list /companies ;;
-legal-entities) list /legal-entities ;;
-workers) list /workers "$@" ;;
-worker) get "/workers/${1:?usage: rippling worker <id>}" "expand=user,manager" ;;
-worker-by-email)
-    email="${1:?usage: rippling worker-by-email <email>}"
-    list /workers "filter=work_email eq '$email'" "expand=user,manager"
-    ;;
-manager)
-    id="${1:?usage: rippling manager <worker-id>}"
-    if have_jq; then
-        fetch "/workers/$id" "expand=manager,manager.user" | jq '.manager // null'
-    else
-        get "/workers/$id" "expand=manager"
-    fi
-    ;;
-reports-to)
-    id="${1:?usage: rippling reports-to <worker-id>}"
-    list /workers "filter=manager_id eq '$id'" "expand=user"
-    ;;
-users) list /users "$@" ;;
-user) get "/users/${1:?usage: rippling user <id>}" ;;
-worker-changes) list /worker-changes "$@" ;;
-departments) list /departments "$@" ;;
-teams) list /teams "$@" ;;
-locations) list /work-locations "$@" ;;
-titles) list /titles "$@" ;;
-levels) list /levels "$@" ;;
-employment-types) list /employment-types "$@" ;;
-custom-fields) list /custom-fields "$@" ;;
-leave-requests) list /leave-requests "$@" ;;
-leave-balances) list /leave-balances "$@" ;;
-leave-types) list /leave-types "$@" ;;
-time-entries) list /time-entries "$@" ;;
-time-cards) list /time-cards "$@" ;;
-devices) list /devices "$@" ;;
-activity-log) list /activity-log "$@" ;;
-custom-objects) list /custom-objects "$@" ;;
-records)
-    name="${1:?usage: rippling records <object-api-name> [field=value ...]}"
+resources) resources ;;
+list)
+    r="${1:?usage: rippling list <resource> [field=value ...]}"
     shift
-    list "/custom-objects/$name/records" "$@"
-    ;;
-report) get "/reports/${1:?usage: rippling report <id>}" ;;
-run-report)
-    id="${1:?usage: rippling run-report <id> [json]}"
-    body="${2:-{\}}"
-    if have_jq; then
-        body=$(printf '%s' "$body" | jq -c --arg id "$id" '. + {report_id: $id}')
-    fi
-    send POST /report-runs "$body"
+    list "$r" "$@"
     ;;
 get)
-    p="${1:?usage: rippling get <path> [field=value ...]}"
-    shift
-    get "$p" "$@"
+    r="${1:?usage: rippling get <resource> <id> [field=value ...]}"
+    id="${2:?usage: rippling get <resource> <id> [field=value ...]}"
+    shift 2
+    get "$r/$id" "$@"
     ;;
-list)
-    p="${1:?usage: rippling list <path> [field=value ...]}"
-    shift
-    list "$p" "$@"
+create)
+    r="${1:?usage: rippling create <resource> <json>}"
+    body="${2:?usage: rippling create <resource> <json>}"
+    send POST "$r" "$body"
     ;;
+update)
+    r="${1:?usage: rippling update <resource> <id> <json>}"
+    id="${2:?usage: rippling update <resource> <id> <json>}"
+    body="${3:?usage: rippling update <resource> <id> <json>}"
+    send PATCH "$r/$id" "$body"
+    ;;
+delete)
+    r="${1:?usage: rippling delete <resource> <id>}"
+    id="${2:?usage: rippling delete <resource> <id>}"
+    request DELETE "$r/$id" | pretty
+    ;;
+me) get sso-me ;;
 api)
     m="${1:?usage: rippling api <METHOD> <path> [json-body]}"
     p="${2:?usage: rippling api <METHOD> <path> [json-body]}"

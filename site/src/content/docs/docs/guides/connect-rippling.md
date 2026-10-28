@@ -38,21 +38,24 @@ A profile grants Rippling powers by area, each split into read and write: `worke
 activity log are read-only because the API offers no writes there.
 
 The `rippling` command is on the PATH in every session whose profile grants at least one
-Rippling power. Run `rippling` with no arguments for the command list, or
-`engrams-integrations` for every connected tool. List commands follow every page and print
-one JSON array.
+Rippling power. It is a generic client over the whole API: every resource is reached through
+`list`, `get`, `create`, `update`, and `delete`, `resources` prints the resource table with
+the verbs each supports, and `api` reaches any other route. Query fields pass straight
+through in Rippling's own `filter`, `expand`, and `order_by` syntax, and `list` follows every
+page and prints one JSON array. Run `rippling` with no arguments for the command list, or
+`engrams-integrations` for every connected tool.
 
 ```bash
-rippling worker-by-email someone@example.com
-rippling manager 64f1c2
-rippling reports-to 64f1c2
-rippling workers "filter=status eq 'ACTIVE'" expand=user,department
-rippling worker-changes "filter=updated_at gt '2026-10-01T00:00:00Z'"
-rippling leave-requests "filter=status eq 'PENDING'"
+rippling list workers "filter=work_email eq 'someone@example.com'" expand=user,manager
+rippling list workers "filter=manager_id eq '<worker-id>'" expand=user
+rippling list worker-changes "filter=updated_at gt '2026-10-01T00:00:00Z'"
+rippling get departments <id>
+rippling create leave-requests '{"worker_id":"<id>","leave_type_id":"<id>","start_date":"2026-11-02","end_date":"2026-11-03"}'
+rippling api POST custom-objects/<api-name>/records/query '{"query":"SELECT * FROM ..."}'
 ```
 
 Rippling sends customer webhooks only for custom-object records, so an automation that
-reacts to HR changes runs on a schedule and reads `rippling worker-changes` for the window
+reacts to HR changes runs on a schedule and reads `rippling list worker-changes` for the window
 since its last run.
 
 The developer-platform surfaces (apps, functions, packages, sandboxes, listings, and sites)
