@@ -388,6 +388,123 @@
         "method": "GET",
         "path": "/v1/contactGroups*"
       }
+    },
+    {
+      "grants": [
+        "gmail:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/gmail/*"
+      }
+    },
+    {
+      "grants": [
+        "gmail:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/gmail/*"
+      }
+    },
+    {
+      "grants": [
+        "calendar:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/calendar/*"
+      }
+    },
+    {
+      "grants": [
+        "calendar:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/calendar/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/drive/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/drive/*"
+      }
+    },
+    {
+      "grants": [
+        "docs:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/docs/*"
+      }
+    },
+    {
+      "grants": [
+        "docs:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/docs/*"
+      }
+    },
+    {
+      "grants": [
+        "sheets:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/sheets/*"
+      }
+    },
+    {
+      "grants": [
+        "sheets:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/sheets/*"
+      }
+    },
+    {
+      "grants": [
+        "slides:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/slides/*"
+      }
+    },
+    {
+      "grants": [
+        "slides:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/slides/*"
+      }
+    },
+    {
+      "grants": [
+        "contacts:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/people/*"
+      }
     }
   ],
   "cli": {

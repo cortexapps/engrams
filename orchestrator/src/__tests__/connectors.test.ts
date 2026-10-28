@@ -2022,6 +2022,11 @@ describe("the shipped google_workspace connector", () => {
     expect(byGrant.get("gmail:write")).toContain("POST /gmail/v1/users/*");
     expect(byGrant.get("drive:write")).toContain("POST /upload/drive/v3/*");
     expect(byGrant.get("docs:read")).toContain("GET /v1/documents*");
+    // gws reads each API's Discovery document first; a power opens only its own.
+    expect(byGrant.get("drive:read")).toContain("GET /discovery/v1/apis/drive/*");
+    expect(byGrant.get("drive:write")).toContain("GET /discovery/v1/apis/drive/*");
+    expect(byGrant.get("contacts:read")).toContain("GET /discovery/v1/apis/people/*");
+    expect(byGrant.get("directory:read")?.some((o) => o.includes("/discovery/"))).toBe(false);
   });
 });
 
