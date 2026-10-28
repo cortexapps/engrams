@@ -795,6 +795,24 @@ describe("dispatchIntegrationEvent + instances (ADR 0120)", () => {
     expect(i.rows.size).toBe(1);
   });
 
+  test("a key that does not render for the event is a drop, not a failed delivery", async () => {
+    const target = { automation: meta(), definition: instancedDefinition() };
+    const h = makeHarness([target]);
+    const i = fakeInstances();
+    // A payload with no pull_request: the key template's path is
+    // undefined. The provider's retry would fail the same way, so the
+    // delivery succeeds and the miss is audited.
+    const result = await dispatchIntegrationEvent(
+      input({ payload: { repository: { full_name: "engrams/engrams" }, issue: { number: 7 } } }),
+      instanceDeps(h, i),
+    );
+    expect(result).toMatchObject({ matched: 1, started: 0, dropped: 1, failed: 0 });
+    expect(i.rows.size).toBe(0);
+    expect(h.runs.size).toBe(0);
+    expect(i.drops.at(-1)).toMatchObject({ entrypointId: "main", reason: "render_failed" });
+    expect(i.drops.at(-1)!.detail).toContain("pull_request");
+  });
+
   test("the admission prelude runs BEFORE the workstream opens: a filtered delivery creates no workstream", async () => {
     // Review-shaped: facts + admit, then a session; a workstream per PR.
     const target = {

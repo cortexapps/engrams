@@ -1,17 +1,25 @@
-/** Stream fallback for automation runs (ADR 0119 D3).
+/** Stream fallback for automation runs (ADR 0119 D3) and the session relay
+ * renderer (contract 5).
  *
- * Mirrors the review consumer: run completion or interruption becomes `session_idle` and a
- * terminal session becomes `session_ended`, both routed to the owning run's
- * mailbox through the automation_session binding. The in-band
- * `signal_automation` tool stays authoritative; this consumer is the backstop
- * that keeps `send_prompt {waitFor: run_end}` and `wait_session` honest when
- * a session never emits a signal.
+ * Mirrors the review consumer: run completion or interruption becomes
+ * `session_idle` and a terminal session becomes `session_ended`, both routed
+ * to the owning run's mailbox through the automation_session binding. The
+ * in-band `signal_automation` tool stays authoritative; this consumer is the
+ * backstop that keeps `send_prompt {waitFor: run_end}` and `wait_session`
+ * honest when a session never emits a signal.
+ *
+ * A RELAYED session (an `automation_session_relay` row exists) is also
+ * rendered here, event by event, into its place — with no run live. That is
+ * what lets a run install the relay and end: the conversation is the
+ * session's, not a run's.
  */
 
 import { DBOS, Error as DBOSErrors } from "@dbos-inc/dbos-sdk";
 
 import { makeAutomationEngineStore } from "../db/automations.ts";
 import { log as rootLog } from "../log.ts";
+import type { CuratedEvent, TerminalOutcome } from "../control-plane/session-events.ts";
+import { closeSessionRelay, renderSessionEvent } from "../automations/session-relay.ts";
 import {
   AUTOMATION_TOPIC,
   assertIdempotencyKey,
@@ -22,7 +30,7 @@ import type { SessionConsumer } from "./consumer.ts";
 
 export interface AutomationSessionBindingRef {
   runId: string;
-  /** The session's run has an installed relay wanting curated events. */
+  /** A session relay row exists: the consumer renders this session's events. */
   relay?: boolean;
 }
 
@@ -33,9 +41,16 @@ export type AutomationMailboxSend = (
   idempotencyKey: string,
 ) => Promise<void>;
 
+/** The session relay's two entry points, injectable for tests. */
+export interface AutomationRelayRenderer {
+  render(sessionId: string, event: CuratedEvent): Promise<unknown>;
+  close(sessionId: string, outcome: TerminalOutcome): Promise<unknown>;
+}
+
 export interface AutomationConsumerDeps {
   findSessionBinding(sessionId: string): Promise<AutomationSessionBindingRef | null>;
   send: AutomationMailboxSend;
+  relay?: AutomationRelayRenderer;
 }
 
 /** `ok:false` marks a harness run that ERRORED; a malformed or absent flag is
@@ -85,6 +100,17 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
     }
   };
 
+  // The relay renders into Slack; a failure there is logged inside the
+  // relay and must never pin the listener's cursor on the event.
+  const render = async (sessionId: string, event: CuratedEvent): Promise<void> => {
+    if (!deps.relay) return;
+    try {
+      await deps.relay.render(sessionId, event);
+    } catch (error) {
+      log.error({ sessionId, kind: event.kind, err: error }, "session relay render threw; event dropped");
+    }
+  };
+
   return {
     name: "automation",
     interestedIn: () => true,
@@ -96,21 +122,13 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
     },
     async handle(event, ctx) {
       // Re-read per event: the run that owns the session (adoption moves it)
-      // and the relay flag (it flips AFTER the session exists, when the
-      // relay block installs).
+      // and whether a relay exists (it is installed AFTER the session exists).
       const live = await destination(ctx.sessionId);
       if (live === null) return;
-      // Contract 3: a relay-bound session forwards EVERY curated event so an
-      // installed handler can render the conversation (idle still rides the
-      // dedicated arm below, so wait matchers keep working unchanged).
-      if (live.relay === true) {
-        await deliver(
-          live.runId,
-          { kind: "session_event", sessionId: ctx.sessionId, event },
-          AUTOMATION_TOPIC,
-          inboxKeys.sessionEvent(ctx.sessionId, event.idx),
-        );
-      }
+      // Contract 5: a relayed session is rendered into its place, here,
+      // with no run live (idle still rides the dedicated arm below, so wait
+      // matchers keep working unchanged).
+      if (live.relay === true) await render(ctx.sessionId, event);
       // Unlike a review worker, an automation session can go idle once per
       // prompt turn (a kept session takes follow-ups), so the idempotency key
       // carries the event idx — each turn's idle is its own message.
@@ -130,6 +148,13 @@ export function makeAutomationConsumer(deps: AutomationConsumerDeps): SessionCon
     async onTerminal(outcome, ctx) {
       const live = await destination(ctx.sessionId);
       if (live === null) return;
+      if (live.relay === true && deps.relay) {
+        try {
+          await deps.relay.close(ctx.sessionId, outcome);
+        } catch (error) {
+          log.error({ sessionId: ctx.sessionId, outcome, err: error }, "session relay close threw");
+        }
+      }
       await deliver(
         live.runId,
         { kind: "session_ended", sessionId: ctx.sessionId, outcome },
@@ -150,6 +175,10 @@ export function makeProductionAutomationConsumer(): SessionConsumer {
     send: async (destinationId, message, topic, idempotencyKey) => {
       assertIdempotencyKey(idempotencyKey);
       await DBOS.send<AutomationInbox>(destinationId, message, topic, idempotencyKey);
+    },
+    relay: {
+      render: (sessionId, event) => renderSessionEvent(sessionId, event),
+      close: (sessionId, outcome) => closeSessionRelay(sessionId, outcome),
     },
   });
 }

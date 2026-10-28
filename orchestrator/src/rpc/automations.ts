@@ -73,6 +73,7 @@ import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
 import {
   entrypointsOf,
   entrypointOf,
+  instanceSettingsOf,
   MAIN_ENTRYPOINT_ID,
   applyBlockOverrides,
   BlockOverrideError,
@@ -692,52 +693,61 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
    * catalog.
    */
   async function validateSessionBlocks(definition: AutomationDefinition): Promise<void> {
-    const walk = async (blocks: AutomationDefinition["blocks"]): Promise<void> => {
-      for (const block of blocks) {
-        if (block.type === "create_session") {
-          const config = block.config as {
-            profileId?: unknown;
-            harness?: unknown;
-            model?: unknown;
-            modelRouter?: unknown;
-            effort?: unknown;
-          };
-          const profileId = typeof config.profileId === "string" ? config.profileId : "";
-          const profile = await profiles().getActive(profileId);
-          if (!profile) {
+    // A templated profile id (`${{ inputs.profile }}`) resolves per run: the
+    // live check only covers a literal one.
+    const literal = (value: unknown): value is string =>
+      typeof value === "string" && !value.includes("${{");
+    const pin = async (where: string, config: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      {
+        {
+          const profileId = typeof config["profileId"] === "string" ? config["profileId"] : "";
+          const profile = literal(profileId) ? await profiles().getActive(profileId) : null;
+          if (!profile && literal(profileId)) {
             throw new BlockValidationError([
-              blockError(block.id, "profileId", "unknown_profile", "profileId is not an active profile"),
+              blockError(where, "profileId", "unknown_profile", "profileId is not an active profile"),
             ]);
           }
           const hasOverride =
-            config.harness !== undefined ||
-            config.model !== undefined ||
-            config.modelRouter !== undefined ||
-            config.effort !== undefined;
+            config["harness"] !== undefined ||
+            config["model"] !== undefined ||
+            config["modelRouter"] !== undefined ||
+            config["effort"] !== undefined;
           if (hasOverride) {
-            const harness = typeof config.harness === "string" ? config.harness : profile.harness;
+            if (typeof config["harness"] !== "string" && profile === null) {
+              // The profile resolves per run, so its harness is unknown
+              // here: the override has nothing to validate against.
+              throw new BlockValidationError([
+                blockError(where, "harness", "harness_required", "set the harness: a model or effort override on a templated profile cannot follow the profile's harness"),
+              ]);
+            }
+            const harness =
+              typeof config["harness"] === "string"
+                ? config["harness"]
+                : profile?.harness ?? "";
             const { harnesses } = await harnessCatalog().listHarnesses({});
             const descriptor = harnesses.find((h) => h.name === harness)?.descriptor;
             if (!descriptor) {
               throw new BlockValidationError([
-                blockError(block.id, "harness", "unknown_harness", `harness "${harness}" is not in the catalog`),
+                blockError(where, "harness", "unknown_harness", `harness "${harness}" is not in the catalog`),
               ]);
             }
-            const model = typeof config.model === "string" ? config.model : undefined;
+            const model = typeof config["model"] === "string" ? config["model"] : undefined;
             const routerId =
-              typeof config.modelRouter === "string" && config.modelRouter !== "" ? config.modelRouter : undefined;
-            const effort = typeof config.effort === "string" ? config.effort : undefined;
+              typeof config["modelRouter"] === "string" && config["modelRouter"] !== ""
+                ? config["modelRouter"]
+                : undefined;
+            const effort = typeof config["effort"] === "string" ? config["effort"] : undefined;
             if (routerId !== undefined) {
               const router = getModelRouterDefinition(routerId);
               if (!router) {
                 throw new BlockValidationError([
-                  blockError(block.id, "modelRouter", "unknown_router", `model router "${routerId}" is not registered`),
+                  blockError(where, "modelRouter", "unknown_router", `model router "${routerId}" is not registered`),
                 ]);
               }
               if (!selectRouterProtocol(router, descriptor.routerProtocols ?? [])) {
                 throw new BlockValidationError([
                   blockError(
-                    block.id,
+                    where,
                     "modelRouter",
                     "unsupported_router",
                     `harness "${harness}" does not support model router "${router.id}"`,
@@ -746,24 +756,30 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
               }
               if (model !== undefined && !(await modelRouters().getModel(router.id, model))) {
                 throw new BlockValidationError([
-                  blockError(block.id, "model", "unknown_model", `model "${model}" is not in router "${router.id}"`),
+                  blockError(where, "model", "unknown_model", `model "${model}" is not in router "${router.id}"`),
                 ]);
               }
             } else if (model !== undefined && !(descriptor.models ?? []).some((m) => m.id === model)) {
               throw new BlockValidationError([
-                blockError(block.id, "model", "unknown_model", `model "${model}" is not valid for harness "${harness}"`),
+                blockError(where, "model", "unknown_model", `model "${model}" is not valid for harness "${harness}"`),
               ]);
             }
             if (effort !== undefined && !(descriptor.effort ?? []).some((e) => e.id === effort)) {
               throw new BlockValidationError([
-                blockError(block.id, "effort", "unknown_effort", `effort "${effort}" is not valid for harness "${harness}"`),
+                blockError(where, "effort", "unknown_effort", `effort "${effort}" is not valid for harness "${harness}"`),
               ]);
             }
             // Pin the effective harness so "follow the profile" can never
             // silently mean "keep a foreign model id".
-            block.config = { ...block.config, harness };
+            return { ...config, harness };
           }
         }
+      }
+      return config;
+    };
+    const walk = async (blocks: AutomationDefinition["blocks"]): Promise<void> => {
+      for (const block of blocks) {
+        if (block.type === "create_session") block.config = await pin(block.id, block.config);
         if (block.then) await walk(block.then);
         if (block.else) await walk(block.else);
         if (block.body) await walk(block.body);
@@ -771,6 +787,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     };
     await walk(definition.blocks);
     for (const entrypoint of definition.entrypoints ?? []) await walk(entrypoint.blocks);
+    if (definition.agent !== undefined) {
+      const { scope, ...config } = definition.agent;
+      definition.agent = { ...(await pin("__agent__", config)), scope } as AutomationDefinition["agent"];
+    }
   }
 
   async function requireAutomation(id: string): Promise<AutomationRow> {
@@ -804,10 +824,9 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
 
   /** Resolve the sample a TestRender/DryRun/RunNow should use. */
   async function resolveSample(
-    row: AutomationRow,
+    trigger: AutomationDefinition["trigger"],
     sample: { case: "sampleId"; value: string } | { case: "payloadJson"; value: string } | { case: undefined },
   ): Promise<{ payload: Record<string, unknown>; eventKey?: string; receivedAt: Date; aliases: WebhookAliasMapping[] }> {
-    const trigger = row.version.trigger;
     let payload: Record<string, unknown> = {};
     let eventKey: string | undefined;
     let receivedAt = now();
@@ -899,10 +918,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     // Dry runs stay unbound: an editor preview must never open a real
     // workstream.
     let instanceId = "";
-    if (definition.settings.instance !== undefined && !input.dryRun) {
+    const instanceSettings = instanceSettingsOf(definition);
+    if (instanceSettings !== undefined && !input.dryRun) {
       if (input.instanceKey !== undefined) {
-        const admit =
-          definition.settings.instance.entrypoints?.[entrypoint.id]?.admit ?? "open";
+        const admit = instanceSettings.entrypoints?.[entrypoint.id]?.admit ?? "open";
         const existing = await instances.getOpenInstanceByKey(row.id, input.instanceKey);
         if (existing) {
           if (input.instanceInputs !== undefined && Object.keys(input.instanceInputs).length > 0) {
@@ -924,6 +943,12 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           if (admit === "handle_match") {
             throw new ConnectError(
               "this entrypoint routes only by handles; a manual kickoff cannot name one",
+              Code.FailedPrecondition,
+            );
+          }
+          if (admit === "optional") {
+            throw new ConnectError(
+              `no open workstream for key "${input.instanceKey}" (this entrypoint never opens one; it runs unbound without a key)`,
               Code.FailedPrecondition,
             );
           }
@@ -1299,7 +1324,6 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       }
       const inputValues =
         req.inputsJson !== undefined ? parseObjectJson(req.inputsJson, "inputs_json") : row.inputs;
-      const sample = await resolveSample(row, req.sample);
       const previewEntrypoint =
         req.entrypointId !== undefined && req.entrypointId !== ""
           ? entrypointOf(definition, req.entrypointId)
@@ -1310,6 +1334,8 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           Code.InvalidArgument,
         );
       }
+      // The sample is the previewed way in's: its stored events, its fixture.
+      const sample = await resolveSample(previewEntrypoint.trigger, req.sample);
       const result = await previewDefinition({
         definition,
         inputs: resolveAutomationInputs(definition.inputsSchema, inputValues),
@@ -1342,7 +1368,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       await requireAdmin(ctx, getSession);
       const row = await requireAutomation(req.automationId);
       if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
-      const sample = await resolveSample(row, req.sample);
+      const sample = await resolveSample(row.version.trigger, req.sample);
       const runId = await startAdHocRun(row, {
         source: "manual",
         payload: sample.payload,
@@ -1360,10 +1386,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       await requireAdmin(ctx, getSession);
       const row = await requireAutomation(req.automationId);
       if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
-      const instanced = row.version.settings.instance !== undefined;
+      const instanced = instanceSettingsOf(definitionOf(row.version)) !== undefined;
       if (!instanced && (req.instanceKey !== undefined || req.instanceInputsJson !== undefined)) {
         throw new ConnectError(
-          "this automation has no workstreams (settings.instance is not declared)",
+          "this automation has no scoped agents or workstreams",
           Code.InvalidArgument,
         );
       }
@@ -1398,7 +1424,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const sample =
         req.payloadJson !== undefined
           ? { payload, eventKey: refreshed.version.trigger.kind === "integration" ? refreshed.version.trigger.eventKeys[0] : undefined }
-          : await resolveSample(refreshed, { case: undefined });
+          : await resolveSample(refreshed.version.trigger, { case: undefined });
       const instanceInputs =
         req.instanceInputsJson !== undefined
           ? parseObjectJson(req.instanceInputsJson, "instance_inputs_json")

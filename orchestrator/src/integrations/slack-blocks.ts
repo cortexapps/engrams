@@ -50,10 +50,12 @@ export interface ThreadRoute {
   team: string;
   channel: string;
   threadRoot: string;
-  /** ADR 0119 phase 4.5: present when the question was posted by an
-   * automation run's relay. The interactivity route then delivers the answer
-   * to `autorun:<runId>` instead of the legacy thread workflow. */
+  /** Present when the card was posted by a RUN (a `slack_choice` card):
+   * the interactivity route delivers the click to `autorun:<runId>`. */
   runId?: string;
+  /** Present when the card was posted by a SESSION relay (contract 5, an
+   * agent's question): the route completes the session's tool call. */
+  sessionId?: string;
 }
 
 /** A question, compacted for carriage in a Slack value/private_metadata (option

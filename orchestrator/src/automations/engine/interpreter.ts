@@ -23,13 +23,10 @@
  *   - finalize hooks (contract 2): for a run ending in a hook's `when`, the
  *     hook block runs as `step:__finalize__.<blockId>:0` BEFORE the finalize
  *     step, in definition order; outcomes never change the terminal status;
- *   - installed message handlers (contract 3): a block whose executor has
- *     `onMessage` is INSTALLED once its execute step succeeds; from then until
- *     the run ends, every received mailbox message is offered to it first —
- *     inside `step:<relayPath>.__relay__:<n>` (n = per-relay counter, a pure
- *     function of the recv sequence) — BEFORE stop/supersede handling and the
- *     active wait's matcher. "consumed" swallows the message. At most one
- *     installed handler per run (validation);
+ *   - session relays (contract 5) are NOT the run's business: a block installs
+ *     one on a session and the automation consumer renders the session's
+ *     events with no run live, so no run ever parks to keep a conversation
+ *     going;
  *   - finalize runs exactly once, from every exit path.
  */
 
@@ -56,13 +53,13 @@ import {
   conditionStepName,
   framePath,
   loopBoundStepName,
-  relayStepName,
   stepName,
   untilStepName,
   FINALIZE_STEP,
   SNAPSHOT_STEP,
   type Frame,
 } from "./step-name.ts";
+import { errorMessage } from "./errors.ts";
 
 const log = rootLog.child({ component: "automation-interpreter" });
 
@@ -120,10 +117,6 @@ function shouldRetry(outcome: Extract<BlockOutcome, { kind: "error" }>, retryOn:
   return outcome.retryable;
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 /** `{ "$ref": "steps.x.y" }` → the JSON value at that scope path. Liquid can
  * only produce strings; structured values from earlier blocks (an array of
  * review comments, a PR-context object) pass by reference. */
@@ -137,8 +130,17 @@ function asValueRef(value: unknown): string | null {
 
 /** Which config fields the interpreter leaves UNRENDERED: a wait block's
  * session reference is resolved by the block (it reads its own outputs), a
- * code block's source is JS not a template, and condition groups are data. */
-const UNRENDERED_FIELDS = new Set(["session", "source", "conditions", "until", "waitFor"]);
+ * code block's source is JS not a template, condition groups are data, and
+ * an agent's opening prompt is rendered by the block only when a session
+ * starts (a reach event's payload may lack the fields it reads). */
+const UNRENDERED_FIELDS = new Set([
+  "session",
+  "source",
+  "conditions",
+  "until",
+  "waitFor",
+  "openingPromptTemplate",
+]);
 
 async function resolveBlockConfig(
   config: Record<string, unknown>,
@@ -211,7 +213,7 @@ export async function interpretAutomation(
     // promotes a queued successor). Without this a queue|join|skip key
     // stays held by a dead run forever. No sessions and no finalize hooks
     // exist yet, so finalize is only the status + the release.
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     const promoted = await deps.step(async () => {
       await deps.store.finalizeRun(input.runId, "failed", message);
       return await deps.store.releaseConcurrency(input.runId);
@@ -241,95 +243,6 @@ export async function interpretAutomation(
   const ledger: TurnLedger = { started: new Map(), idleSeen: new Map() };
   /** Sessions an end_session block already ended (see finalize). */
   const endedByBlock = new Set<string>();
-  /** The one installed message handler (contract 3), once its block ran.
-   * `state` is the handler's threaded state — ALWAYS a value that came out of
-   * a checkpointed step (the install step's `outputs.handler_state`, then
-   * each handler step's recorded `state`), so recovery rebuilds it from the
-   * replayed outputs. Never module memory. */
-  let installed:
-    | {
-        blockId: string;
-        path: string;
-        executor: BlockExecutor<never>;
-        config: never;
-        count: number;
-        state: Record<string, unknown> | undefined;
-      }
-    | null = null;
-
-  /** Offer a fresh message to the installed handler (if any) inside its own
-   * checkpointed step. The step's recorded output is `{verdict, state}`; on
-   * recovery DBOS replays that output without running the closure, which is
-   * exactly why the state must ride the output and not a closure-local. */
-  const recordRelayLedgerBestEffort = async (
-    stepPath: string,
-    count: number,
-    state: Record<string, unknown> | undefined,
-  ): Promise<void> => {
-    const record = {
-      status: "succeeded" as const,
-      ...(state !== undefined ? { outputs: { handler_state: state } } : {}),
-    };
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        await deps.store.recordStep(input.runId, stepPath, count, record);
-        return;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    log.warn(
-      { runId: input.runId, path: stepPath, attempt: count, err: lastError },
-      "relay step ledger write failed; the checkpointed step result stands",
-    );
-  };
-
-  const offerToInstalled = async (msg: AutomationInbox): Promise<boolean> => {
-    if (installed === null) return false;
-    const relay = installed;
-    relay.count += 1;
-    const stepPath = `${relay.path}.__relay__`;
-    const result = await deps.step(async (): Promise<{
-      verdict: "consumed" | "pass";
-      state?: Record<string, unknown>;
-    }> => {
-      ctx.handlerState = relay.state;
-      let r: { verdict: "consumed" | "pass"; state?: Record<string, unknown> };
-      try {
-        r = await relay.executor.onMessage!(msg, relay.config, ctx);
-      } catch (error) {
-        // A relay's delivery failure is recorded on its step and never fails
-        // the run (the legacy thread loop's "drop it, keep the thread alive").
-        // State is unchanged: the next call sees what this one saw.
-        await deps.store.recordStep(input.runId, stepPath, relay.count, {
-          status: "failed",
-          error: errorMessage(error),
-        });
-        return { verdict: "pass" as const };
-      }
-      // The step's RETURN VALUE ({verdict, state}) is the checkpointed,
-      // durable truth of this step; the `automation_step_run` row is
-      // observability only. `deps.step` is DBOS.runStep with no retries and
-      // the run's catch turns a throw into a failed run, so the ledger write
-      // is best-effort (one bounded retry): on persistent failure it is
-      // logged and the REAL result is still returned. The state is never
-      // discarded and the run never dies because of the ledger.
-      await recordRelayLedgerBestEffort(stepPath, relay.count, r.state);
-      return r;
-    }, relayStepName(relay.path, relay.count));
-    if (result.state !== undefined) {
-      relay.state = result.state;
-      // Mirror the latest state onto the relay block's own outputs so a
-      // later block (the closing recap) reads checkpointed data, not memory.
-      recordStepOutputs(ctx, relay.blockId, relay.path, {
-        ...(ctx.steps[relay.blockId] ?? {}),
-        handler_state: result.state,
-      });
-    }
-    return result.verdict === "consumed";
-  };
-
   /** Stamp a freshly received message with its turn bookkeeping. */
   const annotate = (msg: AutomationInbox): BufferedEntry => {
     if (msg.kind === "session_idle") {
@@ -428,10 +341,6 @@ export async function interpretAutomation(
           }
           return null;
         }
-        continue;
-      }
-      if (await offerToInstalled(msg)) {
-        await checkpointClock(frames);
         continue;
       }
       const entry = annotate(msg);
@@ -566,7 +475,11 @@ export async function interpretAutomation(
         conditionStepName(frames),
         (block.config as { conditions: unknown }).conditions,
       );
-      recordStepOutputs(ctx, block.id, path, { taken: taken ? "then" : "else" });
+      const taken_ = { taken: taken ? "then" : "else" };
+      recordStepOutputs(ctx, block.id, path, taken_);
+      await deps.step(async () => {
+        await deps.store.recordStep(input.runId, path, 0, { status: "succeeded", outputs: taken_ });
+      }, `${stepName(frames, 0)}:ledger`);
       const list = taken ? (block.then ?? []) : (block.else ?? []);
       for (const child of list) await runBlock(child, [...frames, { blockId: child.id }]);
       return;
@@ -600,7 +513,11 @@ export async function interpretAutomation(
           }
         }
       }
-      recordStepOutputs(ctx, block.id, path, { iterations, exhausted });
+      const walked = { iterations, exhausted };
+      recordStepOutputs(ctx, block.id, path, walked);
+      await deps.step(async () => {
+        await deps.store.recordStep(input.runId, path, 0, { status: "succeeded", outputs: walked });
+      }, `${stepName(frames, 0)}:ledger`);
       return;
     }
 
@@ -611,10 +528,6 @@ export async function interpretAutomation(
     let lastError: Extract<BlockOutcome, { kind: "error" }> | null = null;
     for (let attempt = 0; attempt < policy.attempts; attempt += 1) {
       ctx.currentAttempt = attempt;
-      // A re-executed installed block (re-point) must see the threaded
-      // state so it can carry it forward into its new handler_state output.
-      ctx.handlerState =
-        installed !== null && installed.executor === executor ? installed.state : undefined;
       const name = stepName(frames, attempt);
       const outcome: BlockOutcome = await deps.step(async () => {
         // A block that carries product side effects (review rows, Slack
@@ -647,37 +560,6 @@ export async function interpretAutomation(
 
       recordStepOutputs(ctx, block.id, path, outcome.outputs);
       lastError = null;
-
-      // Contract 3: a block with an onMessage handler is installed for the
-      // rest of the run once its execute step succeeded. Validation allows
-      // one per definition, so a second install is an engine invariant.
-      if (executor.onMessage) {
-        if (installed !== null && installed.executor !== executor) {
-          throw new RunEnd("failed", `block "${block.id}": a message handler is already installed`);
-        }
-        // The install/re-point execute step's output carries the handler's
-        // state (`handler_state`) — checkpointed, so recovery seeds it too.
-        const seeded = outcome.outputs["handler_state"];
-        const seededState =
-          typeof seeded === "object" && seeded !== null && !Array.isArray(seeded)
-            ? (seeded as Record<string, unknown>)
-            : undefined;
-        if (installed === null) {
-          installed = {
-            blockId: block.id,
-            path,
-            executor,
-            config: block.config as never,
-            count: 0,
-            state: seededState,
-          };
-        } else {
-          // The same block re-executed (e.g. a loop body re-pointing a relay
-          // at a new turn): refresh its config and state, keep the counter.
-          installed.config = block.config as never;
-          if (seededState !== undefined) installed.state = seededState;
-        }
-      }
 
       // Turn ledger: count the prompts this run sends per session, from
       // checkpointed step outputs only (replay-deterministic).

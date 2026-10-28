@@ -10,6 +10,7 @@ import {
 import { draftBlockCatalog } from "../../automations/draft-catalog.ts";
 import { AUTOMATION_DRAFT_TASK_TYPE } from "../../automations/draft.ts";
 import { registerEngineBlocks, V1_BLOCK_TYPES } from "../../automations/engine/blocks/index.ts";
+import { AGENT_BLOCK_TYPE, AGENT_CLOSE_BLOCK_TYPE } from "../../automations/engine/definition.ts";
 import { SaveVersionConflictError } from "../../db/automations.ts";
 import type { AutomationRow } from "../../db/automations.ts";
 import type { AutomationDefinition } from "../../automations/engine/definition.ts";
@@ -63,6 +64,9 @@ function row(def: AutomationDefinition, version = 1): AutomationRow {
       trigger: def.trigger,
       blocks: def.blocks,
       entrypoints: def.entrypoints ?? [],
+      agent: def.agent ?? null,
+      role: def.role ?? null,
+      promptTemplate: def.promptTemplate ?? null,
       inputsSchema: def.inputsSchema,
       settings: def.settings,
       createdByUserId: null,
@@ -228,6 +232,35 @@ describe("automation draft tools", () => {
     expect(result.errors?.[0]).toMatchObject({ block_id: "launch", field: "profileId" });
   });
 
+  test("an unknown agent profile is a soft refusal addressed to the agent", async () => {
+    const h = harness(row(definition()));
+    const result = (await call(h.deps, "automation_propose", {
+      definition_json: JSON.stringify(
+        definition({
+          agent: { scope: { kind: "automation" }, profileId: "CI", promptTemplate: "go" },
+        }),
+      ),
+      expected_version: 1,
+    })) as { applied: boolean; errors?: Array<{ block_id: string; field: string }> };
+    expect(result.applied).toBe(false);
+    expect(result.errors?.[0]).toMatchObject({ block_id: "__agent__", field: "profileId" });
+  });
+
+  test("a templated agent profile resolves per run and passes the draft check", async () => {
+    const h = harness(row(definition()));
+    const result = (await call(h.deps, "automation_propose", {
+      definition_json: JSON.stringify(
+        definition({
+          agent: { scope: { kind: "event" }, profileId: "${{ inputs.profile }}", promptTemplate: "go" },
+          inputsSchema: [{ key: "profile", type: "string", label: "Profile", required: true }],
+        }),
+      ),
+      expected_version: 1,
+    })) as { applied: boolean; errors?: Array<{ block_id: string; field: string }> };
+    expect(result.errors ?? []).toEqual([]);
+    expect(result.applied).toBe(true);
+  });
+
   test("the version fence returns the live definition instead of clobbering", async () => {
     const h = harness(row(definition(), 4));
     const result = (await call(h.deps, "automation_propose", {
@@ -351,7 +384,12 @@ describe("draftBlockCatalog", () => {
       blocks: Array<{ type: string; config_schema: unknown }>;
     };
     // A registry change (new block, renamed type) must be a visible diff here.
-    expect(catalog.blocks.map((b) => b.type).sort()).toEqual([...V1_BLOCK_TYPES].sort());
+    // The agent step's executor is registered but is not a block the agent
+    // may write: the definition's `agent` stands for it.
+    expect(catalog.blocks.map((b) => b.type).sort()).toEqual(
+      V1_BLOCK_TYPES.filter((type) => type !== AGENT_BLOCK_TYPE && type !== AGENT_CLOSE_BLOCK_TYPE).sort(),
+    );
+    expect(catalog).toHaveProperty("agent_schema");
     for (const block of catalog.blocks) {
       const schema = block.config_schema as { type?: string; description?: string };
       expect(

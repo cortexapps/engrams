@@ -18,11 +18,20 @@ import type {
 import type { AutomationRunTrigger, InputFieldSpec } from "../db/schema.ts";
 import type { DispatchTarget } from "../db/automations.ts";
 import { resolveAutomationInputs } from "../db/automations.ts";
-import type { InstanceAdmitPolicy, TriggerSpec } from "./engine/definition.ts";
+import {
+  instanceSettingsOf,
+  type InstanceAdmitPolicy,
+  type TriggerSpec,
+} from "./engine/definition.ts";
 import { extractHandleCandidates } from "./handles.ts";
-import { renderAutomationTemplateInScope } from "./template.ts";
+import { AutomationTemplateError, renderAutomationTemplateInScope } from "./template.ts";
 
-export type InstanceDropReason = "closed_instance" | "no_handle_match" | "no_open_instance";
+export type InstanceDropReason =
+  | "closed_instance"
+  | "no_handle_match"
+  | "no_open_instance"
+  /** The key template did not render for this event (a path its payload lacks). */
+  | "render_failed";
 
 export type InstanceResolution =
   /** Not an instanced automation: everything stays byte-identical. */
@@ -101,7 +110,7 @@ export async function resolveInstance(
   input: ResolveInstanceInput,
   deps: ResolveInstanceDeps,
 ): Promise<InstanceResolution> {
-  const settings = input.target.definition.settings.instance;
+  const settings = instanceSettingsOf(input.target.definition);
   if (!settings) return { kind: "none" };
   const automationId = input.target.automation.id;
   const admit: InstanceAdmitPolicy =
@@ -147,14 +156,25 @@ export async function resolveInstance(
     };
   }
 
-  // Tier 2 — the identity key template.
+  // Tier 2 — the identity key template. A key that does not render for
+  // THIS event (a way in whose payload lacks the path the template reads)
+  // is deterministic: the provider's retry fails the same way. It is a drop
+  // the automation's activity shows, never a failed delivery.
   const scope = admissionScope(input.target, input.trigger);
-  const key = await renderAutomationTemplateInScope(settings.keyTemplate, scope);
+  let key: string;
+  try {
+    key = await renderAutomationTemplateInScope(settings.keyTemplate, scope);
+  } catch (error) {
+    if (!(error instanceof AutomationTemplateError)) throw error;
+    return { kind: "drop", reason: "render_failed", detail: error.message };
+  }
   const existing = await deps.instances.getOpenInstanceByKey(automationId, key);
   if (existing) return { kind: "bound", instance: existing, via: "key" };
   if (admit === "require") {
     return { kind: "drop", reason: "no_open_instance", detail: key };
   }
+  // A way in that never opens a workstream runs unbound when none is open.
+  if (admit === "optional") return { kind: "none" };
   const inputs = await renderInstanceInputs(
     settings.inputs ?? {},
     input.target.definition.inputsSchema,

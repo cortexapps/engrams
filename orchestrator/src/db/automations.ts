@@ -7,6 +7,7 @@ import {
   automationInstance as instanceTable,
   automationRun as automationRunTable,
   automationSession as automationSessionTable,
+  automationSessionRelay as relayTable,
   automationStepRun as stepRunTable,
   automationVersion as versionTable,
   task as taskTable,
@@ -26,6 +27,8 @@ import {
   cronEntrypointOf,
   ENGINE_VERSION,
   type AutomationDefinition,
+  type AgentSpec,
+  type EntrypointRole,
   type AutomationEntrypoint,
   type BlockOverrides,
 } from "../automations/engine/definition.ts";
@@ -73,6 +76,9 @@ export interface AutomationVersionRow {
   trigger: AutomationTrigger;
   blocks: BlockDef[];
   entrypoints: AutomationEntrypoint[];
+  agent: AgentSpec | null;
+  role: EntrypointRole | null;
+  promptTemplate: string | null;
   inputsSchema: InputFieldSpec[];
   settings: AutomationSettings;
   createdByUserId: string | null;
@@ -435,11 +441,11 @@ export interface AutomationEngineStore extends EngineRunStore {
     prompt: string;
     title: string | null;
   }): Promise<void>;
+  /** The run a session's events route to, and whether a session relay row
+   * exists for it (contract 5: the consumer renders relayed sessions). */
   findSessionBinding(
     sessionId: string,
   ): Promise<{ runId: string; blockId: string; role: string; relay: boolean } | null>;
-  /** Flip curated-event forwarding for a bound session (the relay block). */
-  setSessionRelay(sessionId: string, relay: boolean): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +481,9 @@ function versionRow(row: typeof versionTable.$inferSelect): AutomationVersionRow
     trigger: row.trigger,
     blocks: row.blocks,
     entrypoints: row.entrypoints,
+    agent: row.agent ?? null,
+    role: row.role ?? null,
+    promptTemplate: row.promptTemplate ?? null,
     inputsSchema: row.inputsSchema,
     settings: row.settings,
     createdByUserId: row.createdByUserId ?? null,
@@ -486,8 +495,11 @@ export function definitionOf(version: AutomationVersionRow): AutomationDefinitio
   return {
     engine: ENGINE_VERSION,
     trigger: version.trigger,
+    ...(version.role !== null ? { role: version.role } : {}),
+    ...(version.promptTemplate !== null ? { promptTemplate: version.promptTemplate } : {}),
     blocks: version.blocks,
     ...(version.entrypoints.length > 0 ? { entrypoints: version.entrypoints } : {}),
+    ...(version.agent !== null ? { agent: version.agent } : {}),
     inputsSchema: version.inputsSchema,
     settings: version.settings,
   };
@@ -755,6 +767,9 @@ export function makeAutomationStore(
           trigger: definition.trigger,
           blocks: definition.blocks,
           entrypoints: definition.entrypoints ?? [],
+          agent: definition.agent ?? null,
+          role: definition.role ?? null,
+          promptTemplate: definition.promptTemplate ?? null,
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId,
@@ -787,6 +802,9 @@ export function makeAutomationStore(
           trigger: definition.trigger,
           blocks: definition.blocks,
           entrypoints: definition.entrypoints ?? [],
+          agent: definition.agent ?? null,
+          role: definition.role ?? null,
+          promptTemplate: definition.promptTemplate ?? null,
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId,
@@ -1316,6 +1334,9 @@ export function makeAutomationStore(
           trigger: definition.trigger,
           blocks: definition.blocks,
           entrypoints: definition.entrypoints ?? [],
+          agent: definition.agent ?? null,
+          role: definition.role ?? null,
+          promptTemplate: definition.promptTemplate ?? null,
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId: null,
@@ -1639,7 +1660,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         .where(
           and(
             eq(automationRunTable.instanceId, instanceId),
-            ne(automationRunTable.id, excludeRunId),
+            ...(excludeRunId !== undefined ? [ne(automationRunTable.id, excludeRunId)] : []),
             eq(automationSessionTable.keep, true),
           ),
         )
@@ -1808,19 +1829,14 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
           runId: automationSessionTable.runId,
           blockId: automationSessionTable.blockId,
           role: automationSessionTable.role,
-          relay: automationSessionTable.relay,
+          relaySessionId: relayTable.sessionId,
         })
         .from(automationSessionTable)
+        .leftJoin(relayTable, eq(relayTable.sessionId, automationSessionTable.sessionId))
         .where(eq(automationSessionTable.sessionId, sessionId))
         .limit(1);
-      return row ?? null;
-    },
-
-    async setSessionRelay(sessionId, relay) {
-      await db
-        .update(automationSessionTable)
-        .set({ relay })
-        .where(eq(automationSessionTable.sessionId, sessionId));
+      if (!row) return null;
+      return { runId: row.runId, blockId: row.blockId, role: row.role, relay: row.relaySessionId !== null };
     },
   };
 }

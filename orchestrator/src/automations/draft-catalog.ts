@@ -11,7 +11,11 @@
 import { z } from "zod";
 
 import {
+  AGENT_BLOCK_TYPE,
+  AGENT_CLOSE_BLOCK_TYPE,
+  agentSpecSchema,
   ENGINE_VERSION,
+  entrypointRoleSchema,
   entrypointSchema,
   inputFieldSchema,
   MAX_BLOCKS,
@@ -44,10 +48,20 @@ function jsonSchemaOf(schema: z.ZodType): unknown {
  * `connectedRouters` are the model routers with a key; a block that needs
  * another router is left out, so the agent never drafts one that cannot
  * decide anything. */
+/** The condition group a filter or a branch takes. Its zod schema is an
+ * opaque refinement, so the JSON schema says nothing; this note does. */
+const CONDITIONS_NOTE =
+  'conditions is a group {mode: "all" | "any", conditions: [...]} whose items are {path, op, value?} or a nested group. ' +
+  'path is a scope path ("event.raw.pull_request.user.type", "steps.facts.value.ok"); op is one of equals, not_equals, contains, matches, in, is_empty, gt, lt, is_true, is_false. ' +
+  'Example: {"mode":"all","conditions":[{"path":"event.raw.pull_request.user.type","op":"not_equals","value":"Bot"}]}.';
+
 export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Set()): Record<string, unknown> {
   registerEngineBlocks();
   const blocks = listBlockTypes()
     .filter((type) => {
+      // The agent is a part of the definition, never a block in a list;
+      // its close step comes from a way in's `close` role.
+      if (type === AGENT_BLOCK_TYPE || type === AGENT_CLOSE_BLOCK_TYPE) return false;
       const router = getBlock(type)!.requiresRouter;
       return router === undefined || connectedRouters.has(router);
     })
@@ -57,6 +71,7 @@ export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Se
         type,
         config_schema: jsonSchemaOf(executor.configSchema as z.ZodType),
         ...(executor.outputs ? { outputs: executor.outputs } : {}),
+        ...(type === "branch" || type === "filter" ? { config_notes: CONDITIONS_NOTE } : {}),
         ...(type === "branch" ? { nests: "branch (children in then/else)" } : {}),
         ...(type === "loop" ? { nests: "loop (children in body)" } : {}),
       };
@@ -70,8 +85,25 @@ export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Se
     settings_schema: jsonSchemaOf(settingsSchema),
     input_field_schema: jsonSchemaOf(inputFieldSchema),
     entrypoint_schema: jsonSchemaOf(entrypointSchema),
+    agent_schema: {
+      ...(jsonSchemaOf(agentSpecSchema) as Record<string, unknown>),
+      description:
+        "The agent the ways in deliver to. Every field of the run_agent executor's config except reuse (the scope decides it): profileId, promptTemplate, openingPromptTemplate?, titleTemplate?, includeEventContext?, appendSystemPrompt?, harness overrides, relay?.",
+      session_config_schema: jsonSchemaOf(getBlock(AGENT_BLOCK_TYPE)!.configSchema as z.ZodType),
+    },
+    entrypoint_role_schema: jsonSchemaOf(entrypointRoleSchema),
     notes: [
-      "A definition is {engine, trigger, blocks, entrypoints?, inputsSchema, settings}.",
+      "A definition is {engine, trigger, role?, promptTemplate?, blocks, entrypoints?, agent?, inputsSchema, settings}.",
+      "AN AUTOMATION IS AN AGENT WITH WAYS IN. Set `agent` ({scope, profileId, promptTemplate, openingPromptTemplate?, relay?, ...}) and every way in (the main trigger and each entrypoint) ends on the agent: its blocks run first (filters, code, lookups), then the engine appends the `agent` step itself. Never write a run_agent block; never put create_session/send_prompt after the agent.",
+      "agent.scope: {kind:'event'} = a fresh session per event. {kind:'automation'} = one standing agent for the whole automation. {kind:'key', keyTemplate, labelTemplate?} = one standing agent per rendered key — a Slack thread ('${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: \"thread_ts\", \"ts\" }}'), a channel, a pull request ('${{ event.raw.repository.full_name }}#${{ event.raw | coalesce: \"pull_request.number\", \"issue.number\" }}'), an issue. The engine derives settings.instance from it: never declare both.",
+      "A way in that starts or reaches the agent may carry its own promptTemplate: the message it tells the agent, a template over the event and THAT way in's steps.* (absent = agent.promptTemplate, which every way in shares and which therefore must not name a step that only one way in has). Prefer a per-way-in message when the ways in differ in what they have to say; a 'close' or 'none' way in has none.",
+      "A way in's role: 'start' (default) opens the agent when none exists, then delivers; 'reach' delivers only to an agent that exists (routed by handle or by key; otherwise the event drops); 'close' ends the agent (the close_agent step: it closes the relay with a message, ends the kept session and closes the workstream); 'none' runs the blocks only. Inside a way in, `steps.agent.*` is not available (the agent runs last); settings.onFinalize hooks can read steps.agent.session_id / started / delivered.",
+      "agent.relay (Slack) makes the agent talk back where the event came from: {provider:'slack', team, channel, threadTs, mentionTs?, userId?, eventId?} as templates over the event; a new session's link is posted there, and the session's replies, questions and ⏳/✅ follow with no run live.",
+      "The main trigger IS the first way in. Never repeat it as an entrypoint on the same event: each copy would run (and start the agent) once more per event.",
+      "A key-scoped agent renders its key from the event of EVERY way in: pick events whose payload carries it (coalesce across shapes: a pull_request.* event has pull_request.number, an issue_comment.* event has issue.number), or route by handle (a Slack way in with agent.relay set). A manual trigger renders no key: use it only with automation scope, or give it role 'none'.",
+      "A Slack message reaches a per-channel or per-thread agent only when agent.relay points there (the relay is the handle the route follows) or the key renders from the message itself. The bot's own posts come back as message events: a filter on event.raw.event.bot_id (is_empty) before the agent keeps them out; a code block that returns null does not stop the run.",
+      "Templates are Liquid without {% if %} or {% for %}: no conditionals, no loops. To make the prompt depend on the way in, write `${{ trigger.event }}` (the event key, e.g. pull_request.synchronize) into it and let the agent read it.",
+      "promptTemplate is what the agent gets on EVERY event, so it says what is new (the event, in a line or two). openingPromptTemplate is the first prompt of a NEW session: standing instructions go there (or in the profile), never in promptTemplate, or a continued session gets them again on every event and learns nothing about the event.",
       "Block ids are unique across ALL entrypoints; ids match ^[a-z][a-z0-9_]*$.",
       "branch children live in then/else; loop children in body; nothing else nests.",
       'Prose fields render Liquid with ${{ }}; structured values use {"$ref": "steps.<id>.<output>"}.',
@@ -97,14 +129,14 @@ export function draftPatterns(): Record<string, unknown> {
     core_model: [
       "Runs are SHORT and stateless. Waits inside a run cap at 24h and stuck runs are swept at 48h - never design a run to live for a day.",
       "A workflow that spans days = multiple ENTRYPOINTS (one per way in: an integration event, a cron tick, a manual kick) sharing the automation's inputs, settings, and state. Each run enters through one entrypoint, does one step of the lifecycle, and exits.",
-      "A TEMPLATED workflow (the same lifecycle per project/customer/case) declares settings.instance and becomes one automation with many WORKSTREAMS - see the instances section; never duplicate an automation per project.",
-      "Conversations (hours, every event carries the same key) are the ONE long-lived-run shape: a workstream per conversation (settings.instance keyed on the thread) whose opening event's run holds the conversation, plus a reply entrypoint with continueOnly + admit require that JOINS that run — like the Slack threads built-in.",
+      "A TEMPLATED workflow (the same lifecycle per project/customer/case) is an agent with scope kind 'key' - or, for a block automation with no agent, declares settings.instance - and becomes one automation with many WORKSTREAMS; see the instances section. Never duplicate an automation per project.",
+      "A standing agent (a conversation, an agent per PR, an SRE per incident channel) is the definition's `agent` with a scope: every event is a short run whose way in ends on the agent step; the durable thing is the kept session plus the open workstream (the scope's key: the thread / PR / channel). The agent step continues the kept session when it is alive, else starts one with the opening prompt, and with `relay` set it mirrors the session into the Slack thread (replies, questions, ⏳/✅) with no run live. Never hold a conversation in a loop of waits.",
       "At most one cron trigger per automation.",
       "ONE template contract everywhere: every rendered string uses ${{ ... }} (Liquid) - session {template} refs included. Plain {{ ... }} NEVER renders (it flows through as a literal) and save refuses it; code block source is JS, not a template.",
     ],
     instances: [
       "settings.instance = {keyTemplate, inputs?, entrypoints?} turns the automation into a TEMPLATE: one open workstream per rendered key (e.g. keyTemplate 'project-${{ inputs.linear_project_id }}'), each with its OWN input snapshot, state, sessions, and cron ticks. The author makes ONE decision - the key; isolation and routing follow.",
-      "Admission per entrypoint: admit 'open' (default - render the key, open or join), 'require' (join an open workstream or DROP - use for mid-lifecycle events that make no sense without a kickoff), 'handle_match' (route ONLY by accumulated external identifiers - use for reply/reaction/review entrypoints).",
+      "Admission per entrypoint: admit 'open' (default - render the key, open or join), 'require' (join an open workstream or DROP - use for mid-lifecycle events that make no sense without a kickoff), 'handle_match' (route ONLY by accumulated external identifiers - use for reply/reaction/review entrypoints), 'optional' (join an open workstream or run unbound; never opens one).",
       "Handles are automatic: slack.post_message binds the thread it posts into (and its own ts), a session that opens a PR binds github:<repo>#<n>. A Slack reply or a PR review then routes to the RIGHT workstream with zero routing blocks - do not hand-roll thread:<ts> state keys for routing any more.",
       "A workstream can own a whole Slack CHANNEL: claim_handle with 'slack:${{ steps.<post>.channel }}' (use the post block's OUTPUT channel - it is the channel ID; the input may be a #name). Then EVERY channel message - top-level messages included, which thread binding alone never sees - routes to the workstream, and the general brain stands down channel-wide (explicit @-mentions included: the workstream IS the channel's interface). A thread another workstream owns still wins over the channel (most specific open owner). Join first with the slack.join_channel action - message events only flow where the bot is a channel member (public channels; private ones need a human /invite).",
       "Claiming a handle another OPEN workstream holds is a hard error - never rebind live routing. A handle whose holder is CLOSED is taken over by the claim (outputs.reclaimed = true): channels outlive workstreams, so next quarter's workstream claims the same channel cleanly. When every workstream bound in a channel has closed, the brain resumes answering there.",
@@ -126,7 +158,7 @@ export function draftPatterns(): Record<string, unknown> {
       "There is no lock block and no cross-block transaction on purpose; put facts that must change together in one document.",
     ],
     kept_sessions: [
-      'Sessions are kept by default and outlive their runs. Record a long-lived session id in state (e.g. state["pm"].session_id).',
+      'Sessions are kept by default and outlive their runs. An agent automation finds its kept session for you; a block automation outside a workstream records a long-lived session id in state (e.g. state["pm"].session_id).',
       "A later run reaches a kept session with a {template} session ref: resolving it ADOPTS the session (re-binds its event routing to this run) - allowed only within the same automation and only when the owning run finished, so adoption never steals from a live waiting run.",
       "Probe before you prompt: session_status is read-only, never re-binds, and reports found/status/idle_seconds/owner_run_live as VALUES a filter can branch on - the cheap look for a sweep entrypoint.",
       'For an agent inside a session to talk back to the run waiting on it, the session uses its signal_automation tool and the run waits with send_prompt waitFor {kind: "signal", name} or wait_session.',

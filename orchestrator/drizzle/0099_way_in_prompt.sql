@@ -1,0 +1,1 @@
+ALTER TABLE "automation_version" ADD COLUMN "prompt_template" text;

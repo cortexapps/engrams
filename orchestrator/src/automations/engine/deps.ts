@@ -8,6 +8,8 @@
 
 import type { AutomationInbox } from "./inbox.ts";
 import type { RunSnapshot } from "./context.ts";
+import type { SessionRelayStore } from "../../db/session-relays.ts";
+import type { SourceMention } from "../../workflows/communication-policy.ts";
 import type { DecisionsRequest, DecisionsResponse } from "../../integrations/openrouter-decisions.ts";
 import type { ProfileCard } from "../profile-cards.ts";
 
@@ -46,14 +48,16 @@ export interface EngineRunStore {
   ): Promise<void>;
   /** Sessions the run created, with their keep flags (automation_session). */
   listRunSessions(runId: string): Promise<Array<{ sessionId: string; keep: boolean }>>;
-  /** ADR 0120 + D8: the newest KEPT session an earlier run of this
-   * workstream created (`automation_session` through `automation_run`),
-   * excluding the asking run — what a new run in the same workstream resumes
-   * (a Slack thread's session outlives the run that went quiet). Null when
-   * no earlier run kept one. */
+  /** ADR 0120 + D8: the newest KEPT session a run of this workstream holds
+   * (`automation_session` through `automation_run`) — what a new run in the
+   * same workstream resumes (a Slack thread's session outlives the run that
+   * went quiet). `excludeRunId` leaves the asking run's own sessions out
+   * (the lookup block wants an EARLIER run's); the agent step passes none,
+   * so a re-executed step finds the session it already adopted or started.
+   * Null when no run kept one. */
   latestKeptInstanceSession(
     instanceId: string,
-    excludeRunId: string,
+    excludeRunId?: string,
   ): Promise<{ sessionId: string; runId: string } | null>;
   /** Release this run's concurrency claim; returns the promoted successor run
    * id when the policy is queue and a pending run waits, else null. The whole
@@ -121,8 +125,6 @@ export interface EngineSessionOps {
     appendSystemPrompt?: string;
   }): Promise<EngineCreateSessionResult>;
   sendPrompt(sessionId: string, promptId: string, text: string, harnessMode?: string): Promise<void>;
-  /** Contract 3: a relay block asks for this session's curated events. */
-  setSessionRelay(sessionId: string, relay: boolean): Promise<void>;
   /** Read-only probe (`session_status`). Not-found is a value, never an
    * error — a swept-away session is a normal answer for a sweep. */
   getSession(sessionId: string): Promise<
@@ -226,6 +228,9 @@ export interface EngineStateStore {
  * (instance_close). Implemented over the instance store. */
 export interface EngineInstanceOps {
   closeInstance(input: { instanceId: string; reason?: string }): Promise<boolean>;
+  /** Whether the workstream is still open: the agent step starts no
+   * replacement session for a closed one. */
+  isOpen(instanceId: string): Promise<boolean>;
   /** The claim_handle block's writer (same contract as every writer:
    * already_ours converges a replay; an OPEN holder's conflict never
    * rebinds). The claim path alone may pass `allowTakeoverFromClosed` to
@@ -277,6 +282,13 @@ export interface EngineDeps {
   state?: EngineStateStore;
   /** ADR 0120: instance_close's seam. */
   instances?: EngineInstanceOps;
+  /** Contract 5: the session relay rows (`relay_session`, `run_agent`,
+   * `relay_close`). Absent = the blocks report the relay store unavailable. */
+  relays?: SessionRelayStore;
+  /** Tell the relayed place a NEW session started (the link into the
+   * thread). The agent step calls it once per session it starts. Absent =
+   * silent. */
+  announceStarted?(sessionId: string, target: SourceMention): Promise<void>;
   prRefs?: EnginePrRefLookup;
   code?: CodeBlockRuntime;
   integrationActions?: IntegrationActionRuntime;

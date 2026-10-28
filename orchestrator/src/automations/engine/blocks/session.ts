@@ -90,10 +90,13 @@ export type EndSessionConfig = z.infer<typeof endSessionConfigSchema>;
 
 const DEFAULT_WAIT_DEADLINE_S = 7200;
 
-async function executeCreateSession(
-  config: CreateSessionConfig,
+/** The prompt a session block sends: the template, plus the redacted
+ * event payload when `includeEventContext` asks for it. Shared with
+ * `run_agent`, which sends the opening prompt after the relay is on. */
+export async function renderSessionPrompt(
+  config: Pick<CreateSessionConfig, "promptTemplate" | "includeEventContext">,
   ctx: RunContext,
-): Promise<BlockOutcome> {
+): Promise<{ kind: "ok"; prompt: string } | Extract<BlockOutcome, { kind: "error" }>> {
   let prompt = await ctx.render(config.promptTemplate);
   // ADR 0102 parity: includeEventContext appends the redacted payload with
   // the untrusted-data disclaimer, exactly as renderAutomationAction did on
@@ -114,6 +117,17 @@ async function executeCreateSession(
       };
     }
   }
+  return { kind: "ok", prompt };
+}
+
+/** Shared with `run_agent`: the create half of a session. */
+export async function executeCreateSession(
+  config: CreateSessionConfig,
+  ctx: RunContext,
+): Promise<BlockOutcome> {
+  const rendered = await renderSessionPrompt(config, ctx);
+  if (rendered.kind === "error") return rendered;
+  const prompt = rendered.prompt;
   const title = config.titleTemplate !== undefined ? await ctx.render(config.titleTemplate) : null;
   // Profile and capability strings may be templated (`${{ inputs.profile }}`,
   // `github:contents:read@${{ event.repository.full_name }}`).

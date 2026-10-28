@@ -641,3 +641,103 @@ two sites to forget. Peeking into streaming requests (Exec, WriteFile) for
 a session id — the reconcile covers them, and neither carries a prompt.
 Dropping the row on park and re-registering on resume — the row is the
 lease and the terminal marker; dormancy keeps both.
+
+## Amendment (2026-10-27): the session relay leaves the run (contract 5)
+
+**What was wrong.** The Slack relay was a message handler installed in a
+run (contract 3): every curated session event was forwarded into the run's
+mailbox and rendered inside a `__relay__` step, with the render state
+threaded through checkpointed step outputs. A relay therefore lived only as
+long as its run, so the Slack built-in held each thread's conversation in
+one long run (`loop → wait_event → send_prompt`, 24 h wait slices under a
+48 h ceiling) — the one standing exception to D9. Users who copied the
+house pattern by hand needed a `lookup → filter → send_prompt | create →
+relay` chain per entrypoint.
+
+**Decision.** (1) **The relay binds to the session.** One
+`automation_session_relay` row per relayed session holds the place it
+mirrors into and the render state; `relay_session` installs or re-points
+it inside one checkpointed step and the run goes on or ends. (2) **The
+automation consumer renders.** With no run live, the session listener's
+consumer renders every curated event straight into the place through the
+unchanged `CommunicationPolicy`, and the session's end posts the closing
+message and removes the row. Every write CASes on the row's `version`; a
+render that loses the race re-reads the row and puts what it changed on
+top of the winner's state (a re-point's closed bubble stays closed, a
+sibling render's question card stays known), so a re-point racing a
+render never loses state. (3) **Answers route to the session.** A question card carries the session id; the interactivity route
+completes the deferred tool call directly. A `slack_choice` card still
+carries the run id: its click is the run's. (4) **`run_agent` is the
+composite.** Lookup the workstream's kept session (live: the control plane
+holds it and it is not over; a session already bound to the asking run
+counts, so a step re-executed after a crash converges on it) → adopt it,
+else start a session with no prompt → install or re-point the relay →
+send the prompt (the opening one to a new session). The relay goes on
+before the prompt, so a session's first output finds its place and a
+continued session's turn lands under the new mention. Every event is a
+short run; the "durable workflow parked at one step" is the kept session
+plus the open workstream. (5) **Retired.** `session_event` in the
+inbox, `onMessage`/`HandlerResult` on executors, `handlerState`,
+`relayStepName`, the `relay` flag on `automation_session` and
+`setSessionRelay`. `ENGINE_STEP_CONTRACT` is 5: a run checkpointed under
+contract 4 that is recovered now would miss the `__relay__` steps it
+expects, and the rows it rendered from no longer exist.
+
+**Consequences.** The Slack built-in (definition 13) keeps its graph for
+now — `relay` reads `mention_ts` from the re-point step instead of the
+retired `handler_state`, and the recap hook names its session — and moves
+onto short runs in the follow-up that ADR 0120 named. The `relay_close`
+hook posts nothing when the run never reached a session (a filtered run).
+
+## Amendment (2026-10-27): an automation is an agent with ways in
+
+**What was wrong.** The product exposed the engine's primitives. The
+standing agent of contract 5 was a block (`run_agent`) at the end of
+every entrypoint, each with its own copy of the profile, the prompt and
+the relay; the workstream scope was a settings object of templates and
+per-entrypoint admit policies the author had to keep in step with those
+blocks. Three ways in meant three agent configs that drifted apart, and no
+view could show the one agent they all delivered to.
+
+**Decision.** (1) **The agent is a part of the definition.** `agent:
+{scope, profileId, promptTemplate, openingPromptTemplate?, relay?, ...}`
+holds, once, every field of the `run_agent` executor's config except
+`reuse`, which the scope decides. (2) **Every way in ends on the agent
+step.** `entrypointsOf` appends one step per way in by its **role**:
+`start` (the default) and `reach` end on the step `agent` of type
+`run_agent`; `close` ends on `agent_close` of type `close_agent`, which
+posts the closing message into the agent's relayed place and removes the
+relay, ends the kept session and closes the workstream; `none` ends on
+nothing. The stored definition never carries these steps;
+the interpreter, the preview and the validator all read the appended
+view. The ids `agent` and `agent_close` are reserved in an agent
+automation, and `run_agent` and `close_agent` are refused in any block
+list, finalize hooks included. (3) **The workstream settings derive.**
+`instanceSettingsOf` maps scope `event` to no workstream (a fresh session
+per event), scope `automation` to one workstream keyed `agent`, and scope
+`key` to one workstream per rendered key; a `reach` or `close` way in
+admits with `require`, a `none` way in with `optional` (it joins an open
+workstream or runs unbound; it never opens one). The concurrency derives
+too: an agent that keeps a session runs one run at a time per workstream
+(`concurrencySettingsOf`: policy `queue` on the key `agent`, scoped by
+the instance prefix) unless the definition declares its own, so two
+events for one agent never race for its session. An agent automation
+that also declares `settings.instance` is refused, as is
+`endSessionsOnFinish: true` with a kept scope; a block automation keeps
+declaring both. A schedule with role `start` to an agent scoped to the
+whole automation opens the agent's workstream on its first tick (the key
+is fixed; no event renders it); a `reach` schedule, or a key scope, fans
+out over open workstreams only. (4) **A new session is announced.** The
+agent step calls `announceStarted` when it creates the relay row for a
+session, so the link lands in the place before any output and a
+re-executed step (the row exists) says nothing twice. (5)
+**Storage.** `automation_version` gains `agent` (jsonb) and `role`
+(text), both null for a block automation.
+
+**Consequences.** The composer's catalog lists no `run_agent` block and
+carries the agent schema and the roles instead. The Slack built-in
+becomes one agent (scope per thread, relay into the thread) and one way
+in; its `started` block goes, since the step announces. The editor draws
+the ways in converging on one agent node and reads the scope from the
+agent, not from settings. A block automation (the PR review graph) is
+unchanged.

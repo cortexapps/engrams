@@ -18,7 +18,8 @@ import { z } from "zod";
 
 import { MAX_WAIT_DEADLINE_S } from "../definition.ts";
 import type { RunContext } from "../context.ts";
-import { CHOICE_ID_PREFIX, slackRelayPolicy, SLACK_ANSWER_SIGNAL } from "./relay.ts";
+import { CHOICE_ID_PREFIX, SLACK_ANSWER_SIGNAL } from "../../session-relay.ts";
+import { slackRelayPolicy } from "./relay.ts";
 import { registerBlock } from "./registry.ts";
 
 export const SLACK_CHOICE_TYPE = "slack_choice";

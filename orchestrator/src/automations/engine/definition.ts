@@ -11,6 +11,7 @@ import { z } from "zod";
 import { validateAutomationTemplate } from "../template.ts";
 import { parseFilterGroup, type FilterGroup } from "./conditions.ts";
 import { getBlock } from "./blocks/registry.ts";
+import { errorMessage } from "./errors.ts";
 
 export const ENGINE_VERSION = 1;
 export const MAX_BLOCKS = 64;
@@ -111,8 +112,9 @@ export type RetryPolicy = z.infer<typeof retryPolicySchema>;
  * `require` joins an existing open instance or DROPS the event (the
  * instance-level continueOnly); `handle_match` routes ONLY through the
  * handle ledger (facet-declared candidate handles), dropping unbound
- * events before a run boots. */
-const instanceAdmitSchema = z.enum(["open", "require", "handle_match"]);
+ * events before a run boots; `optional` joins an open instance when one
+ * exists and otherwise runs unbound (a way in that never opens one). */
+const instanceAdmitSchema = z.enum(["open", "require", "handle_match", "optional"]);
 
 const instanceSettingsSchema = z.object({
   /** The identity template (e.g. `project-${{ inputs.linear_project_id }}`),
@@ -409,6 +411,92 @@ export const settingsSchema = settingsBaseSchema.extend({
 export type AutomationSettings = z.infer<typeof settingsSchema>;
 
 // ---------------------------------------------------------------------------
+// The agent: an automation is an agent with ways in
+// ---------------------------------------------------------------------------
+
+/** The step every way in that starts or reaches the agent ends on. Reserved
+ * when the automation has an agent: no user block takes this id, so
+ * `steps.agent.*` (session_id, started, delivered) is the agent's, always. */
+export const AGENT_STEP_ID = "agent";
+/** The step a `close` way in ends on. */
+export const AGENT_CLOSE_STEP_ID = "agent_close";
+/** The executors the agent steps run. Not user blocks: the agent is a part
+ * of the definition, and validation refuses the types in a block list. */
+export const AGENT_BLOCK_TYPE = "run_agent";
+export const AGENT_CLOSE_BLOCK_TYPE = "close_agent";
+const AGENT_BLOCK_TYPES: readonly string[] = [AGENT_BLOCK_TYPE, AGENT_CLOSE_BLOCK_TYPE];
+
+/** What one agent is responsible for. `event`: a fresh session per event.
+ * `automation`: one standing agent for the whole automation. `key`: one
+ * agent per rendered key (a thread, a channel, a pull request, an issue) —
+ * the workstream of ADR 0120; the template renders in the admission scope
+ * ({trigger, event.raw, inputs}), the one template contract. */
+export const agentScopeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("event") }),
+  z.object({ kind: z.literal("automation") }),
+  z.object({
+    kind: z.literal("key"),
+    keyTemplate: z.string().min(1),
+    /** The human title of one agent, rendered once when it opens. */
+    labelTemplate: z.string().min(1).optional(),
+  }),
+]);
+export type AgentScope = z.infer<typeof agentScopeSchema>;
+
+/** The agent every way in delivers to: the session it runs (the
+ * `run_agent` executor's config, minus `reuse`, which the scope decides)
+ * and its scope. The field set is the executor's: validation parses the
+ * derived step config against the executor's schema, so a new session
+ * field reaches the agent with no change here. */
+export const agentSpecSchema = z
+  .object({
+    scope: agentScopeSchema,
+    // Lenient here: the executor's schema is the one that speaks, and
+    // validation addresses its findings to the agent.
+    profileId: z.string(),
+    promptTemplate: z.string(),
+  })
+  .passthrough();
+export interface AgentSpec {
+  scope: AgentScope;
+  profileId: string;
+  promptTemplate: string;
+  [field: string]: unknown;
+}
+
+/** What a way in does to the agent. `start` (the default): open the
+ * agent's workstream when none is open, then deliver. `reach`: deliver
+ * only to an agent that exists (by handle or by key); otherwise the event
+ * drops, audited. `close`: end the agent's workstream. `none`: run the
+ * blocks and nothing more. */
+export const entrypointRoleSchema = z.enum(["start", "reach", "close", "none"]);
+export type EntrypointRole = z.infer<typeof entrypointRoleSchema>;
+
+/** The `run_agent` step config the agent spec stands for. */
+export function agentStepConfig(
+  agent: AgentSpec,
+  entrypoint?: Pick<AutomationEntrypoint, "promptTemplate">,
+): Record<string, unknown> {
+  const { scope, ...config } = agent;
+  return {
+    ...config,
+    // The way in's own message to the agent, when it has one, rendered in
+    // that way in's scope (its steps); else the agent's prompt on every event.
+    ...(entrypoint?.promptTemplate !== undefined ? { promptTemplate: entrypoint.promptTemplate } : {}),
+    // The agent's session outlives the run that reached it: the run ends
+    // right after the prompt, and the agent works on. Never ended at finalize.
+    keepOnFinish: true,
+    reuse: scope.kind === "event" ? "never" : "workstream",
+  };
+}
+
+/** Whether the agent keeps a standing session between events (scope
+ * `automation` or `key`), as opposed to a fresh one per event. */
+export function agentKeepsSession(agent: AgentSpec): boolean {
+  return agent.scope.kind !== "event";
+}
+
+// ---------------------------------------------------------------------------
 // Entrypoints (ADR 0119 D9)
 // ---------------------------------------------------------------------------
 
@@ -433,24 +521,41 @@ export const entrypointSchema = z.object({
     .max(64)
     .refine((id) => id !== MAIN_ENTRYPOINT_ID, `"${MAIN_ENTRYPOINT_ID}" names the implicit top-level entrypoint`),
   trigger: entrypointTriggerSchema,
+  role: entrypointRoleSchema.optional(),
+  promptTemplate: z.string().min(1).optional(),
   blocks: z.array(blockDefSchema),
 });
 
 export interface AutomationEntrypoint {
   id: string;
   trigger: TriggerSpec;
+  /** With an agent: what this way in does to it (absent = `start`). */
+  role?: EntrypointRole;
+  /** With an agent it starts or reaches: what this way in tells it, a
+   * template over the event and this way in's steps. Absent = the agent's
+   * prompt on every event. */
+  promptTemplate?: string;
   blocks: BlockDef[];
 }
 
 export const definitionSchema = z.object({
   engine: z.literal(ENGINE_VERSION),
   trigger: triggerSpecSchema,
+  /** The main way in's role (see `EntrypointRole`). */
+  role: entrypointRoleSchema.optional(),
+  /** The main way in's message to the agent (see `AutomationEntrypoint`). */
+  promptTemplate: z.string().min(1).optional(),
   blocks: z.array(blockDefSchema),
   /** Additional named ways into the SAME automation (shared inputs,
    * settings, and automation_state). Each run enters through exactly one
    * entrypoint and walks only its blocks. Absent = the classic
    * single-entrypoint automation, byte-identical to the pre-D9 shape. */
   entrypoints: z.array(entrypointSchema).max(MAX_ENTRYPOINTS).optional(),
+  /** The agent the ways in deliver to. Present = an agent automation: every
+   * way in ends on the agent step unless its role says otherwise, and
+   * `settings.instance` is derived from the scope (never stored). Absent =
+   * a block automation (the advanced shape): the blocks are the whole run. */
+  agent: agentSpecSchema.optional(),
   inputsSchema: z.array(inputFieldSchema),
   settings: settingsSchema,
 });
@@ -458,19 +563,126 @@ export const definitionSchema = z.object({
 export interface AutomationDefinition {
   engine: typeof ENGINE_VERSION;
   trigger: TriggerSpec;
+  role?: EntrypointRole;
+  promptTemplate?: string;
   blocks: BlockDef[];
   entrypoints?: AutomationEntrypoint[];
+  agent?: AgentSpec;
   inputsSchema: InputFieldSpec[];
   settings: AutomationSettings;
 }
 
-/** Every way in, main first. The one view dispatch, validation, and the
- * interpreter share. */
-export function entrypointsOf(definition: AutomationDefinition): AutomationEntrypoint[] {
+/** Every way in as written, main first: the blocks the author declared,
+ * without the agent step. The editor's view, and the reserved-id check's. */
+export function declaredEntrypointsOf(definition: AutomationDefinition): AutomationEntrypoint[] {
   return [
-    { id: MAIN_ENTRYPOINT_ID, trigger: definition.trigger, blocks: definition.blocks },
+    {
+      id: MAIN_ENTRYPOINT_ID,
+      trigger: definition.trigger,
+      ...(definition.role !== undefined ? { role: definition.role } : {}),
+      ...(definition.promptTemplate !== undefined
+        ? { promptTemplate: definition.promptTemplate }
+        : {}),
+      blocks: definition.blocks,
+    },
     ...(definition.entrypoints ?? []),
   ];
+}
+
+export function roleOf(entrypoint: Pick<AutomationEntrypoint, "role">): EntrypointRole {
+  return entrypoint.role ?? "start";
+}
+
+/** Where a schema issue in the top-level definition belongs: a path under
+ * `agent` is the agent's (`__agent__.<field>`), the main way in's `role`
+ * is the trigger's, a path under `entrypoints` is the ways in's. */
+function definitionIssueError(issuePath: readonly PropertyKey[], message: string): DefinitionError {
+  const path = issuePath.map(String);
+  const [head, ...rest] = path;
+  if (head === "agent") return new DefinitionError("__agent__", rest.join(".") || "scope", message);
+  if (head === "role" || head === "promptTemplate") {
+    return new DefinitionError("__trigger__", head, message);
+  }
+  if (head === "entrypoints") {
+    // `entrypoints.1.role` → the ways in's `role`: the index is no field.
+    return new DefinitionError("__entrypoints__", rest.filter((p) => !/^\d+$/.test(p)).join(".") || "id", message);
+  }
+  return new DefinitionError(null, path.join(".") || "definition", message);
+}
+
+/** The step a way in ends on because of its role. */
+function agentStepsOf(agent: AgentSpec, entrypoint: AutomationEntrypoint): BlockDef[] {
+  switch (roleOf(entrypoint)) {
+    case "start":
+    case "reach":
+      return [
+        { id: AGENT_STEP_ID, type: AGENT_BLOCK_TYPE, config: agentStepConfig(agent, entrypoint) },
+      ];
+    case "close":
+      return [
+        {
+          id: AGENT_CLOSE_STEP_ID,
+          type: AGENT_CLOSE_BLOCK_TYPE,
+          config: { reason: `closed by the "${entrypoint.id}" way in` },
+        },
+      ];
+    case "none":
+      return [];
+  }
+}
+
+/** Every way in, main first, as the run walks it: with an agent, each way
+ * in ends on the step its role names. The one view dispatch, validation,
+ * and the interpreter share. */
+export function entrypointsOf(definition: AutomationDefinition): AutomationEntrypoint[] {
+  const declared = declaredEntrypointsOf(definition);
+  const agent = definition.agent;
+  if (agent === undefined) return declared;
+  return declared.map((entrypoint) => ({
+    ...entrypoint,
+    blocks: [...entrypoint.blocks, ...agentStepsOf(agent, entrypoint)],
+  }));
+}
+
+/** The workstream settings the run system reads. A block automation
+ * declares them; an agent automation derives them from the agent's scope
+ * and the ways in's roles (`reach` and `close` only find an open agent;
+ * `none` never opens one). */
+export function instanceSettingsOf(definition: AutomationDefinition): InstanceSettings | undefined {
+  const agent = definition.agent;
+  if (agent === undefined) return definition.settings.instance;
+  const scope = agent.scope;
+  if (scope.kind === "event") return undefined;
+  const entrypoints: Record<string, { admit: InstanceAdmitPolicy }> = {};
+  for (const entrypoint of declaredEntrypointsOf(definition)) {
+    const role = roleOf(entrypoint);
+    if (role === "reach" || role === "close") entrypoints[entrypoint.id] = { admit: "require" };
+    if (role === "none") entrypoints[entrypoint.id] = { admit: "optional" };
+  }
+  return {
+    keyTemplate: scope.kind === "automation" ? AGENT_STEP_ID : scope.keyTemplate,
+    ...(scope.kind === "key" && scope.labelTemplate !== undefined
+      ? { labelTemplate: scope.labelTemplate }
+      : {}),
+    ...(Object.keys(entrypoints).length > 0 ? { entrypoints } : {}),
+  };
+}
+
+/** The concurrency the run system admits against. A block automation
+ * declares it; an agent that keeps a session runs one run at a time per
+ * workstream (`queue`, keyed inside the workstream by `instanceConcurrencyKey`)
+ * unless the definition says otherwise, so two events for one agent never
+ * race for its session. */
+export function concurrencySettingsOf(
+  definition: AutomationDefinition,
+): AutomationSettings["concurrency"] {
+  const agent = definition.agent;
+  // With an agent the policy is the scope's (validation refuses a written
+  // one): one run at a time per kept agent, else none.
+  if (agent !== undefined) {
+    return agentKeepsSession(agent) ? { keyTemplate: AGENT_STEP_ID, policy: "queue" } : undefined;
+  }
+  return definition.settings.concurrency;
 }
 
 export function entrypointOf(
@@ -562,7 +774,7 @@ function validateTemplatesIn(blockId: string, value: unknown, field: string): vo
       throw new DefinitionError(
         blockId,
         field,
-        error instanceof Error ? error.message : String(error),
+        errorMessage(error),
       );
     }
     return;
@@ -589,22 +801,98 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
   const parsed = definitionSchema.safeParse(raw);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
-    throw new DefinitionError(
-      null,
-      issue ? issue.path.join(".") : "definition",
-      issue ? issue.message : "invalid definition",
-    );
+    if (!issue) throw new DefinitionError(null, "definition", "invalid definition");
+    throw definitionIssueError(issue.path, issue.message);
   }
   const definition = parsed.data as AutomationDefinition;
 
+  const agent = definition.agent;
+  if (agent !== undefined) {
+    if (definition.settings.instance !== undefined) {
+      throw new DefinitionError(
+        "__agent__",
+        "scope",
+        "settings.instance is derived from the agent's scope; remove it",
+      );
+    }
+    const executor = getBlock(AGENT_BLOCK_TYPE);
+    if (!executor) throw new DefinitionError("__agent__", "profileId", "the agent executor is not registered");
+    const config = saveTimeConfigParse(executor.configSchema, agentStepConfig(agent));
+    if (!config.success) {
+      const issue = config.error.issues[0];
+      throw new DefinitionError(
+        "__agent__",
+        issue ? issue.path.join(".") : "profileId",
+        issue ? issue.message : "invalid agent",
+      );
+    }
+    validateTemplatesIn("__agent__", agentStepConfig(agent), "");
+    if (agent.keepOnFinish === false) {
+      throw new DefinitionError(
+        "__agent__",
+        "keepOnFinish",
+        "the agent's session outlives the run that reached it; keepOnFinish cannot be false",
+      );
+    }
+    if (definition.settings.concurrency !== undefined) {
+      throw new DefinitionError(
+        "__settings__",
+        "concurrency",
+        "concurrency is derived from the agent's scope (one run at a time per kept agent); remove it",
+      );
+    }
+    if (agentKeepsSession(agent) && definition.settings.endSessionsOnFinish) {
+      throw new DefinitionError(
+        "__settings__",
+        "endSessionsOnFinish",
+        "an agent scoped to the automation or to a key keeps its session between events; endSessionsOnFinish must be false",
+      );
+    }
+    if (agent.scope.kind === "key") {
+      validateTemplatesIn("__agent__", agent.scope.keyTemplate, "scope.keyTemplate");
+      if (agent.scope.labelTemplate !== undefined) {
+        validateTemplatesIn("__agent__", agent.scope.labelTemplate, "scope.labelTemplate");
+      }
+    }
+  }
+  for (const entrypoint of declaredEntrypointsOf(definition)) {
+    const where = entrypoint.id === MAIN_ENTRYPOINT_ID ? "__trigger__" : "__entrypoints__";
+    if (entrypoint.role !== undefined && agent === undefined) {
+      throw new DefinitionError(
+        where,
+        "role",
+        `way in "${entrypoint.id}" has a role but the automation has no agent`,
+      );
+    }
+    const role = roleOf(entrypoint);
+    if (agent?.scope.kind === "event" && (role === "reach" || role === "close")) {
+      throw new DefinitionError(
+        where,
+        "role",
+        `way in "${entrypoint.id}" cannot ${role} an agent scoped to each event (there is no standing agent to find)`,
+      );
+    }
+    if (entrypoint.promptTemplate !== undefined) {
+      if (agent === undefined) {
+        throw new DefinitionError(
+          where,
+          "promptTemplate",
+          `way in "${entrypoint.id}" has a message to the agent but the automation has no agent`,
+        );
+      }
+      if (role === "close" || role === "none") {
+        throw new DefinitionError(
+          where,
+          "promptTemplate",
+          `way in "${entrypoint.id}" has a message to the agent but its role is "${role}"`,
+        );
+      }
+      validateTemplatesIn(where, entrypoint.promptTemplate, "promptTemplate");
+    }
+  }
+
   const seen = new Set<string>();
   let count = 0;
-  /** Contract 3: one message handler per RUN — a run walks one entrypoint,
-   * so the installer list resets per entrypoint. Several blocks may carry it
-   * as long as they are the SAME type — a later one (a loop body re-pointing
-   * the Slack relay at a new turn) is a re-point of the installed handler,
-   * never a second install (the interpreter enforces the same executor). */
-  let installers: Array<{ id: string; type: string }> = [];
   const checkBlock = (block: BlockDef, hook: boolean): void => {
     count += 1;
     if (count > MAX_BLOCKS) {
@@ -614,6 +902,16 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
       throw new DefinitionError(block.id, "id", `duplicate block id "${block.id}"`);
     }
     seen.add(block.id);
+    if (AGENT_BLOCK_TYPES.includes(block.type)) {
+      throw new DefinitionError(
+        block.id,
+        "type",
+        `"${block.type}" is not a block; set the automation's agent and the way in's role`,
+      );
+    }
+    if (agent !== undefined && (block.id === AGENT_STEP_ID || block.id === AGENT_CLOSE_STEP_ID)) {
+      throw new DefinitionError(block.id, "id", `block id "${block.id}" is the agent step's`);
+    }
 
     const executor = getBlock(block.type);
     if (!executor) {
@@ -643,27 +941,6 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
     }
     if (block.type !== "loop" && block.body) {
       throw new DefinitionError(block.id, "body", `only loop blocks nest a body`);
-    }
-    if (executor.onMessage !== undefined) {
-      // Contract 3: an installed message handler rides the run's single recv
-      // loop, so exactly one may exist, and a finalize hook (which runs after
-      // the loop is over) can never install one.
-      if (hook) {
-        throw new DefinitionError(
-          block.id,
-          "type",
-          `block type "${block.type}" installs a message handler; not allowed in a finalize hook`,
-        );
-      }
-      const first = installers[0];
-      if (first !== undefined && first.type !== block.type) {
-        throw new DefinitionError(
-          block.id,
-          "type",
-          `only one message-handler type per automation (already: "${first.id}" of type "${first.type}")`,
-        );
-      }
-      installers.push({ id: block.id, type: block.type });
     }
     if (hook) {
       // A finalize hook runs inside the finalize step: nothing may park on
@@ -697,9 +974,12 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
       );
     }
     entrypointIds.add(entrypoint.id);
-    // Block ids stay unique across ALL entrypoints (`seen` is shared): a
-    // step path addresses one automation-wide namespace.
-    installers = [];
+  }
+  // Block ids stay unique across ALL entrypoints (`seen` is shared): a step
+  // path addresses one automation-wide namespace. The walk is over the
+  // blocks as written: the agent step every way in ends on is one step,
+  // validated once above, under its reserved id.
+  for (const entrypoint of declaredEntrypointsOf(definition)) {
     for (const block of walkBlocks(entrypoint.blocks)) checkBlock(block, false);
   }
   if (entrypoints.filter((entrypoint) => entrypoint.trigger.kind === "cron").length > 1) {
@@ -709,13 +989,12 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
       "at most one cron trigger per automation (the scheduler tracks one next_fire_at per row)",
     );
   }
-  installers = [];
   for (const hook of definition.settings.onFinalize ?? []) checkBlock(hook.block, true);
 
   if (definition.settings.concurrency) {
     validateTemplatesIn("__settings__", definition.settings.concurrency.keyTemplate, "concurrency.keyTemplate");
   }
-  const instance = definition.settings.instance;
+  const instance = instanceSettingsOf(definition);
   if (instance) {
     validateTemplatesIn("__settings__", instance.keyTemplate, "instance.keyTemplate");
     if (instance.labelTemplate !== undefined) {
@@ -766,7 +1045,7 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
         );
       }
     }
-    if (definition.settings.concurrency?.policy !== "join") {
+    if (concurrencySettingsOf(definition)?.policy !== "join") {
       throw new DefinitionError(
         "__trigger__",
         "continueOnly",
@@ -787,7 +1066,7 @@ export function parseBlockConditions(blockId: string, raw: unknown): FilterGroup
     throw new DefinitionError(
       blockId,
       "conditions",
-      error instanceof Error ? error.message : String(error),
+      errorMessage(error),
     );
   }
 }

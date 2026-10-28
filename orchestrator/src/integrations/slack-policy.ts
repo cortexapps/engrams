@@ -75,7 +75,7 @@ export interface SlackPolicyDeps {
   client?: () => Promise<SlackPolicyClient>;
   /** Extra route fields stamped into every Block Kit value this policy posts
    * (the automation relay sets `{runId}` so answers route to its run). */
-  routeExtras?: Partial<Pick<ThreadRoute, "runId">>;
+  routeExtras?: Partial<Pick<ThreadRoute, "runId" | "sessionId">>;
   /** Fetch a shared artifact's bytes (injectable for tests). */
   fetchArtifact?: FetchArtifactFn;
 }
@@ -127,8 +127,20 @@ function synthesizeFilename(mediaType: string): string {
   return `engram-artifact.${EXT_BY_MEDIA[mediaType] ?? "bin"}`;
 }
 
+let policyOverride: ((deps: SlackPolicyDeps) => CommunicationPolicy) | null = null;
+
+/** Test seam: every consumer of the Slack policy (the session relay, the
+ * `relay_close` recap, the `slack_choice` card) builds it here, so one
+ * override serves them all. Null restores production. */
+export function setSlackPolicyFactoryForTest(
+  factory: ((deps: SlackPolicyDeps) => CommunicationPolicy) | null,
+): void {
+  policyOverride = factory;
+}
+
 /** Build the production Slack CommunicationPolicy (client injectable for tests). */
 export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy {
+  if (policyOverride) return policyOverride(deps);
   const getClient =
     deps.client ?? (async () => (await getSlackClient()) as unknown as SlackPolicyClient);
   const fetchArtifact: FetchArtifactFn =

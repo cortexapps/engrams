@@ -12,6 +12,7 @@ import { MAX_WAIT_DEADLINE_S } from "../definition.ts";
 
 import { evaluateFilter, parseFilterGroup } from "../conditions.ts";
 import { registerBlock } from "./registry.ts";
+import { errorMessage } from "../errors.ts";
 
 const conditionGroup = z.unknown().superRefine((value, ctx) => {
   try {
@@ -19,7 +20,7 @@ const conditionGroup = z.unknown().superRefine((value, ctx) => {
   } catch (error) {
     ctx.addIssue({
       code: "custom",
-      message: error instanceof Error ? error.message : String(error),
+      message: errorMessage(error),
       path: ["conditions"],
     });
   }

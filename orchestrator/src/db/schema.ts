@@ -1251,6 +1251,8 @@ export const profile = pgTable(
 // import is type-only, so no runtime cycle exists.
 import type {
   AutomationSettings,
+  AgentSpec,
+  EntrypointRole,
   AutomationEntrypoint,
   BlockDef,
   InputFieldSpec,
@@ -1433,6 +1435,12 @@ export const automationVersion = pgTable(
     /** ADR 0119 D9: additional named entrypoints ({id, trigger, blocks});
      * `[]` = the classic single-entrypoint automation. */
     entrypoints: jsonb("entrypoints").$type<AutomationEntrypoint[]>().notNull().default([]),
+    /** The agent the ways in deliver to; null = a block automation. */
+    agent: jsonb("agent").$type<AgentSpec>(),
+    /** The main way in's role toward the agent; null = `start`. */
+    role: text("role").$type<EntrypointRole>(),
+    /** The main way in's message to the agent; null = the agent's prompt. */
+    promptTemplate: text("prompt_template"),
     inputsSchema: jsonb("inputs_schema").$type<InputFieldSpec[]>().notNull().default([]),
     settings: jsonb("settings").$type<AutomationSettings>().notNull(),
     createdByUserId: text("created_by_user_id"),
@@ -1542,14 +1550,35 @@ export const automationSession = pgTable(
     role: text("role").notNull().default("primary"),
     /** ADR 0119 D8: finalize ends only keep=false sessions. */
     keep: boolean("keep").notNull().default(true),
-    /** Contract 3: an installed relay wants this session's CURATED events
-     * forwarded to the run mailbox (not just idle/terminal). Set by the relay
-     * block when it installs; the automation consumer gates on it. */
-    relay: boolean("relay").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index("automation_session_run_idx").on(t.runId)],
 );
+
+/** A session mirrored into a place (a Slack thread), bound to the SESSION,
+ * not to a run (ADR 0119 contract 5). The row is the relay: present = the
+ * automation consumer renders every curated event of the session into
+ * `target` and keeps the render state here; absent = nothing is relayed.
+ * A run installs or re-points it (`relay_session`, `run_agent`) and ends
+ * long before the conversation does; the session's end removes it. */
+export const automationSessionRelay = pgTable("automation_session_relay", {
+  sessionId: text("session_id")
+    .primaryKey()
+    .references(() => automationSession.sessionId, { onDelete: "cascade" }),
+  automationId: text("automation_id")
+    .notNull()
+    .references(() => automation.id, { onDelete: "cascade" }),
+  provider: text("provider").notNull(),
+  /** The place: for Slack the `SourceMention` (team, channel, thread root,
+   * the mention the current turn reacts on). */
+  target: jsonb("target").$type<Record<string, unknown>>().notNull(),
+  /** The render state (open bubble, posted questions, assets, last text). */
+  state: jsonb("state").$type<Record<string, unknown>>().notNull(),
+  /** Optimistic-concurrency version: every write CASes on it. */
+  version: bigint("version", { mode: "number" }).notNull().default(1),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 /** Concurrency claim (ADR 0119 D4): a PG leasing row, INSERT ON CONFLICT +
  * CAS + DELETE — never an advisory lock. */

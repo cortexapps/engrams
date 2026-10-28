@@ -4,7 +4,12 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import { Cron } from "croner";
 import { hostname } from "node:os";
 
-import { makeAutomationStore, type AutomationCronStore, type DueCronAutomation } from "../db/automations.ts";
+import {
+  makeAutomationStore,
+  resolveAutomationInputs,
+  type AutomationCronStore,
+  type DueCronAutomation,
+} from "../db/automations.ts";
 import type { AutomationInstanceStore } from "../db/automation-instances.ts";
 import { defaultInstanceStoreLazy } from "./dispatch.ts";
 import { makeIntegrationEventStore } from "../db/integration-events.ts";
@@ -12,6 +17,7 @@ import { log as rootLog } from "../log.ts";
 import { automationRunWorkflow, type AutomationRunWorkflowInput } from "../workflows/automation-run.ts";
 import { admitClaimedCronRun, automationRunId, cronDeliveryKey } from "./dispatch.ts";
 import { defaultAutomationSender, type AutomationSender } from "./engine/inbox.ts";
+import { AGENT_STEP_ID, MAIN_ENTRYPOINT_ID, instanceSettingsOf, roleOf } from "./engine/definition.ts";
 
 const log = rootLog.child({ component: "automation-scheduler" });
 
@@ -29,8 +35,9 @@ export interface AutomationSchedulerTickDeps {
   workflowStarter: AutomationWorkflowStarter;
   /** Mailbox sender for join/supersede policies; defaults to DBOS. */
   sender?: AutomationSender;
-  /** ADR 0120: the fan-out enumeration for instanced automations. */
-  instances?: Pick<AutomationInstanceStore, "listOpenInstances">;
+  /** ADR 0120: the fan-out enumeration for instanced automations, and the
+   * open for a standing agent's first tick. */
+  instances?: Pick<AutomationInstanceStore, "listOpenInstances" | "openInstance">;
   now: () => Date;
   onError?: (automation: DueCronAutomation, error: unknown) => void;
 }
@@ -53,6 +60,17 @@ export function automationCronWorkflowId(
   instanceId = "",
 ): string {
   return automationRunId(automationId, cronDeliveryKey(scheduledFor), entrypointId, instanceId);
+}
+
+/** Whether the due schedule is a `start` way in to an agent scoped to the
+ * whole automation: the one case where a tick with no open workstream must
+ * open one instead of staying quiet. A key-scoped agent has no key to
+ * render from a tick, and a `reach` schedule finds an agent or nothing. */
+function startsStandingAgent(due: DueCronAutomation): boolean {
+  const definition = due.definition;
+  if (definition.agent?.scope.kind !== "automation") return false;
+  const way = due.entrypointId === MAIN_ENTRYPOINT_ID ? definition : definition.entrypoints?.find((e) => e.id === due.entrypointId);
+  return way !== undefined && roleOf(way) === "start";
 }
 
 /** ADR 0120: how many open workstreams one cron tick fans out to, per
@@ -192,11 +210,26 @@ export async function runSchedulerTick(
       // re-check).
       let fired = false;
       let anyHeld = false;
-      if (dueAutomation.definition.settings.instance !== undefined) {
-        const open = await instances.listOpenInstances(
+      if (instanceSettingsOf(dueAutomation.definition) !== undefined) {
+        let open = await instances.listOpenInstances(
           automation.id,
           CRON_FANOUT_MAX_INSTANCES,
         );
+        if (open.length === 0 && startsStandingAgent(dueAutomation)) {
+          // A schedule that starts the automation's one standing agent is
+          // its kickoff: the first tick opens the agent's workstream (the
+          // key is fixed, no event renders it), the way an event's
+          // admission would, and fans out to it.
+          open = [
+            await instances.openInstance({
+              automationId: automation.id,
+              key: AGENT_STEP_ID,
+              label: null,
+              inputs: resolveAutomationInputs(dueAutomation.definition.inputsSchema, automation.inputs),
+              openedBy: `cron:${cronDeliveryKey(scheduledFor)}`,
+            }),
+          ];
+        }
         if (open.length === CRON_FANOUT_MAX_INSTANCES) {
           log.warn(
             { automationId: automation.id, cap: CRON_FANOUT_MAX_INSTANCES },

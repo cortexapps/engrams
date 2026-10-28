@@ -4,10 +4,14 @@ import { describe, expect, test } from "bun:test";
 import { registerEngineBlocks } from "../blocks/index.ts";
 import { registerBlock, unregisterBlockForTest } from "../blocks/registry.ts";
 import {
+  agentStepConfig,
+  concurrencySettingsOf,
   cronEntrypointOf,
+  declaredEntrypointsOf,
   DefinitionError,
   entrypointOf,
   entrypointsOf,
+  instanceSettingsOf,
   validateDefinition,
   type AutomationDefinition,
 } from "../definition.ts";
@@ -247,40 +251,6 @@ describe("entrypoints (ADR 0119 D9)", () => {
       DefinitionError,
     );
   });
-
-  test("a message-handler cap is per entrypoint, not per definition", () => {
-    // Two entrypoints may EACH carry a handler type; a run walks only one.
-    const relay = (id: string) => ({
-      id,
-      type: "relay_session",
-      config: { session: { blockId: "launch" }, team: "T1", channel: "C1", threadTs: "1.0" },
-    });
-    const ep = (id: string, blocks: unknown[]) => ({ id, trigger: { kind: "manual" }, blocks });
-    expect(
-      validateDefinition(withEntrypoints([ep("a", [relay("ra")]), ep("b", [relay("rb")])])).entrypoints,
-    ).toHaveLength(2);
-    // The same handler type twice in one entrypoint is a re-point (allowed);
-    // a SECOND handler type in the same entrypoint is refused.
-    expect(validateDefinition(withEntrypoints([ep("a", [relay("ra"), relay("rb")])])).entrypoints).toHaveLength(1);
-    registerBlock({
-      type: "test_other_handler",
-      configSchema: z.object({}),
-      async execute() {
-        return { kind: "ok", outputs: {} };
-      },
-      async onMessage() {
-        return { verdict: "pass" };
-      },
-    });
-    try {
-      const other = { id: "other", type: "test_other_handler", config: {} };
-      expect(() => validateDefinition(withEntrypoints([ep("a", [relay("ra"), other])]))).toThrow(
-        /only one message-handler type/,
-      );
-    } finally {
-      unregisterBlockForTest("test_other_handler");
-    }
-  });
 });
 
 describe("settings.instance (ADR 0120)", () => {
@@ -345,6 +315,284 @@ describe("settings.instance (ADR 0120)", () => {
     expect(() =>
       validateDefinition(instanced({ keyTemplate: "${{ unclosed" })),
     ).toThrow();
+  });
+});
+
+describe("the agent: an automation is an agent with ways in", () => {
+  const THREAD_KEY =
+    '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}';
+  const slack = (eventKeys: string[]) => ({
+    kind: "integration",
+    provider: "slack",
+    connectionId: "c1",
+    eventKeys,
+  });
+  const admit = {
+    id: "admit",
+    type: "filter",
+    config: { conditions: { mode: "all", conditions: [{ path: "event.raw.event.text", op: "is_true" }] } },
+  };
+  /** A Slack answer bot: a mention starts the thread's agent, a reply
+   * reaches it, a reaction closes it. */
+  const bot = (extra: Record<string, unknown> = {}) =>
+    def({
+      trigger: slack(["app_mention"]),
+      blocks: [admit],
+      entrypoints: [
+        { id: "reply", trigger: slack(["message"]), role: "reach", blocks: [] },
+        { id: "done", trigger: slack(["reaction_added"]), role: "close", blocks: [] },
+      ],
+      agent: {
+        scope: { kind: "key", keyTemplate: THREAD_KEY, labelTemplate: "${{ event.raw.event.text }}" },
+        profileId: "${{ inputs.profile }}",
+        promptTemplate: "${{ event.raw.event.text }}",
+        openingPromptTemplate: "The thread so far: ${{ event.raw.event.text }}",
+      },
+      ...extra,
+    } as Partial<AutomationDefinition>);
+
+  test("every way in ends on the agent step its role names; the editor sees only what was written", () => {
+    const parsed = validateDefinition(bot());
+    const ways = entrypointsOf(parsed);
+    expect(ways.map((w) => w.blocks.map((b) => `${b.id}:${b.type}`))).toEqual([
+      ["admit:filter", "agent:run_agent"],
+      ["agent:run_agent"],
+      ["agent_close:close_agent"],
+    ]);
+    // The scope decides reuse; the opening prompt rides along.
+    expect(ways[0]!.blocks[1]!.config).toMatchObject({
+      reuse: "workstream",
+      profileId: "${{ inputs.profile }}",
+      openingPromptTemplate: "The thread so far: ${{ event.raw.event.text }}",
+    });
+    expect(ways[0]!.blocks[1]!.config).not.toHaveProperty("scope");
+    expect(declaredEntrypointsOf(parsed).map((w) => w.blocks.length)).toEqual([1, 0, 0]);
+    expect(entrypointOf(parsed, "reply")?.blocks[0]?.id).toBe("agent");
+  });
+
+  test("the workstream settings derive from the scope and the roles", () => {
+    const parsed = validateDefinition(bot());
+    expect(parsed.settings.instance).toBeUndefined();
+    expect(instanceSettingsOf(parsed)).toEqual({
+      keyTemplate: THREAD_KEY,
+      labelTemplate: "${{ event.raw.event.text }}",
+      entrypoints: { reply: { admit: "require" }, done: { admit: "require" } },
+    });
+    const whole = validateDefinition(
+      def({
+        agent: { scope: { kind: "automation" }, profileId: "p1", promptTemplate: "go" },
+      } as Partial<AutomationDefinition>),
+    );
+    expect(instanceSettingsOf(whole)).toEqual({ keyTemplate: "agent" });
+    const each = validateDefinition(
+      def({ agent: { scope: { kind: "event" }, profileId: "p1", promptTemplate: "go" } } as Partial<AutomationDefinition>),
+    );
+    expect(instanceSettingsOf(each)).toBeUndefined();
+    expect(entrypointsOf(each)[0]!.blocks.at(-1)!.config).toMatchObject({ reuse: "never" });
+  });
+
+  test("a block automation keeps its declared workstream settings", () => {
+    const parsed = validateDefinition(
+      def({
+        settings: { endSessionsOnFinish: false, instance: { keyTemplate: "k" } },
+      } as Partial<AutomationDefinition>),
+    );
+    expect(instanceSettingsOf(parsed)).toEqual({ keyTemplate: "k" });
+    expect(entrypointsOf(parsed)[0]!.blocks.map((b) => b.id)).toEqual(["launch"]);
+  });
+
+  test("the agent's config validates as the executor's, addressed to the agent", () => {
+    expect(() =>
+      validateDefinition(bot({ agent: { scope: { kind: "event" }, profileId: "", promptTemplate: "x" } })),
+    ).toThrow(DefinitionError);
+    try {
+      validateDefinition(bot({ agent: { scope: { kind: "event" }, profileId: "", promptTemplate: "x" } }));
+    } catch (error) {
+      expect(error).toMatchObject({ blockId: "__agent__", field: "profileId" });
+    }
+    expect(() =>
+      validateDefinition(
+        bot({
+          agent: { scope: { kind: "key", keyTemplate: "${{ unclosed" }, profileId: "p", promptTemplate: "x" },
+        }),
+      ),
+    ).toThrow();
+    expect(() =>
+      validateDefinition(
+        bot({ agent: { scope: { kind: "key", keyTemplate: "k" }, profileId: "p", promptTemplate: "{{ nope }}" } }),
+      ),
+    ).toThrow(/never rendered/);
+  });
+
+  test("a way in with no role never opens the agent's workstream, and the agent's runs queue per workstream", () => {
+    const parsed = validateDefinition(
+      bot({
+        entrypoints: [
+          { id: "reply", trigger: slack(["message"]), role: "reach", blocks: [] },
+          { id: "log", trigger: slack(["reaction_added"]), role: "none", blocks: [{ ...admit, id: "log_admit" }] },
+        ],
+      }),
+    );
+    expect(instanceSettingsOf(parsed)?.entrypoints).toEqual({
+      reply: { admit: "require" },
+      log: { admit: "optional" },
+    });
+    expect(entrypointOf(parsed, "log")?.blocks.map((b) => b.id)).toEqual(["log_admit"]);
+    // One run at a time per thread: the scope decides, never the settings.
+    expect(concurrencySettingsOf(parsed)).toEqual({ keyTemplate: "agent", policy: "queue" });
+    expect(
+      concurrencySettingsOf(
+        validateDefinition(def({ agent: { scope: { kind: "event" }, profileId: "p1", promptTemplate: "go" } } as Partial<AutomationDefinition>)),
+      ),
+    ).toBeUndefined();
+  });
+
+  test("an agent that keeps its session refuses endSessionsOnFinish", () => {
+    expect(() => validateDefinition(bot({ settings: { endSessionsOnFinish: true } }))).toThrow(
+      /keeps its session between events/,
+    );
+    try {
+      validateDefinition(bot({ settings: { endSessionsOnFinish: true } }));
+    } catch (error) {
+      expect(error).toMatchObject({ blockId: "__settings__", field: "endSessionsOnFinish" });
+    }
+    // A session per event may end with the run.
+    const each = validateDefinition(
+      def({
+        agent: { scope: { kind: "event" }, profileId: "p1", promptTemplate: "go" },
+        settings: { endSessionsOnFinish: true },
+      } as Partial<AutomationDefinition>),
+    );
+    expect(each.settings.endSessionsOnFinish).toBe(true);
+  });
+
+  test("a schema issue in the agent or a role is addressed to the agent or the way in", () => {
+    const expectError = (raw: unknown, where: { blockId: string | null; field: string }) => {
+      try {
+        validateDefinition(raw);
+        throw new Error("validated");
+      } catch (error) {
+        expect(error).toMatchObject(where);
+      }
+    };
+    expectError(
+      bot({ agent: { scope: { kind: "key", keyTemplate: "" }, profileId: "p", promptTemplate: "x" } }),
+      { blockId: "__agent__", field: "scope.keyTemplate" },
+    );
+    expectError(bot({ agent: { scope: { kind: "nope" }, profileId: "p", promptTemplate: "x" } }), {
+      blockId: "__agent__",
+      field: "scope.kind",
+    });
+    expectError(bot({ role: "sometimes" as unknown as AutomationDefinition["role"] }), { blockId: "__trigger__", field: "role" });
+    expectError(
+      bot({ entrypoints: [{ id: "reply", trigger: slack(["message"]), role: "sometimes", blocks: [] }] }),
+      { blockId: "__entrypoints__", field: "role" },
+    );
+  });
+
+  test("the agent's session is never ended at finalize: keepOnFinish false is refused, true is forced", () => {
+    const agent = validateDefinition(bot()).agent!;
+    expect(() => validateDefinition(bot({ agent: { ...agent, keepOnFinish: false } }))).toThrow(
+      /keepOnFinish cannot be false/,
+    );
+    expect(agentStepConfig(agent)["keepOnFinish"]).toBe(true);
+  });
+
+  test("an agent automation never also declares concurrency: the scope derives it", () => {
+    expect(() =>
+      validateDefinition(
+        bot({ settings: { endSessionsOnFinish: false, concurrency: { keyTemplate: "k", policy: "join" } } }),
+      ),
+    ).toThrow(/derived from the agent's scope/);
+    expect(concurrencySettingsOf(validateDefinition(bot()))).toEqual({ keyTemplate: "agent", policy: "queue" });
+    expect(
+      concurrencySettingsOf(
+        validateDefinition(
+          def({ agent: { scope: { kind: "event" }, profileId: "p1", promptTemplate: "go" } } as Partial<AutomationDefinition>),
+        ),
+      ),
+    ).toBeUndefined();
+  });
+
+  test("an agent automation never also declares settings.instance", () => {
+    expect(() =>
+      validateDefinition(
+        bot({ settings: { endSessionsOnFinish: false, instance: { keyTemplate: "k" } } }),
+      ),
+    ).toThrow(/derived from the agent's scope/);
+  });
+
+  test("run_agent is not a block, and the agent step's ids are reserved", () => {
+    expect(() =>
+      validateDefinition(
+        def({ blocks: [{ id: "a", type: "run_agent", config: { profileId: "p", promptTemplate: "x" } }] }),
+      ),
+    ).toThrow(/is not a block/);
+    expect(() =>
+      validateDefinition(
+        bot({ blocks: [{ id: "agent", type: "filter", config: { conditions: { mode: "all", conditions: [] } } }] }),
+      ),
+    ).toThrow(/is the agent step's/);
+    // Without an agent the id is an ordinary one.
+    expect(
+      validateDefinition(
+        def({ blocks: [{ id: "agent", type: "filter", config: { conditions: { mode: "all", conditions: [] } } }] }),
+      ).blocks[0]!.id,
+    ).toBe("agent");
+    // A finalize hook is held to the same rules.
+    const hook = (block: Record<string, unknown>) =>
+      bot({ settings: { endSessionsOnFinish: false, onFinalize: [{ when: ["failed"], block }] } });
+    expect(() =>
+      validateDefinition(hook({ id: "h", type: "close_agent", config: {} })),
+    ).toThrow(/is not a block/);
+    expect(() =>
+      validateDefinition(hook({ id: "agent_close", type: "state_delete", config: { key: "k" } })),
+    ).toThrow(/is the agent step's/);
+  });
+
+  test("a role needs an agent, and reach/close need a standing one", () => {
+    expect(() => validateDefinition(def({ role: "reach" } as Partial<AutomationDefinition>))).toThrow(
+      /has a role but the automation has no agent/,
+    );
+    expect(() =>
+      validateDefinition(
+        bot({ agent: { scope: { kind: "event" }, profileId: "p", promptTemplate: "x" } }),
+      ),
+    ).toThrow(/cannot reach an agent scoped to each event/);
+  });
+
+  test("a way in's own message to the agent is the step's prompt; it needs an agent it tells", () => {
+    const parsed = validateDefinition(
+      bot({
+        promptTemplate: "Main says: ${{ event.raw.text }}",
+        entrypoints: [
+          {
+            id: "nudge",
+            trigger: { kind: "manual" },
+            promptTemplate: "Nudge from ${{ trigger.automation.name }}",
+            blocks: [],
+          },
+          { id: "quiet", trigger: { kind: "manual" }, blocks: [] },
+        ],
+      } as Partial<AutomationDefinition>),
+    );
+    const prompts = Object.fromEntries(
+      entrypointsOf(parsed).map((e) => [e.id, e.blocks.at(-1)!.config["promptTemplate"]]),
+    );
+    expect(prompts).toEqual({
+      main: "Main says: ${{ event.raw.text }}",
+      nudge: "Nudge from ${{ trigger.automation.name }}",
+      quiet: "${{ event.raw.event.text }}",
+    });
+    expect(() =>
+      validateDefinition(def({ promptTemplate: "x" } as Partial<AutomationDefinition>)),
+    ).toThrow(/has a message to the agent but the automation has no agent/);
+    expect(() =>
+      validateDefinition(bot({ role: "none", promptTemplate: "x" } as Partial<AutomationDefinition>)),
+    ).toThrow(/but its role is "none"/);
+    expect(() =>
+      validateDefinition(bot({ promptTemplate: "{{ event.raw.text }}" } as Partial<AutomationDefinition>)),
+    ).toThrow(/never rendered/);
   });
 });
 

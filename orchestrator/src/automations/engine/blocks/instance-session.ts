@@ -6,7 +6,8 @@
  * workstream — resumes that session.
  *
  * Read-only. "not found" is a value a branch acts on: no earlier run kept a
- * session (`none`), the kept session is gone (`gone` — swept, deleted), or
+ * session (`none`), the kept session is gone (`gone` — swept, deleted,
+ * ended), or
  * the run is not bound to a workstream (`unbound`). A `send_prompt` or a
  * relay with a `{template}` session ref adopts the found session (D11): the
  * binding row moves to this run because its owner is terminal and in the
@@ -16,6 +17,7 @@
 import { z } from "zod";
 
 import { sessionWebUrl } from "../../../links.ts";
+import { sessionIsLive } from "./agent.ts";
 import { registerBlock } from "./registry.ts";
 
 export const LOOKUP_INSTANCE_SESSION_TYPE = "lookup_instance_session";
@@ -36,9 +38,9 @@ export function registerInstanceSessionLookupBlock(): void {
         return { kind: "ok", outputs: { found: false, reason: "unbound" } };
       const previous = await ctx.deps.store.latestKeptInstanceSession(ctx.instanceId, ctx.runId);
       if (previous === null) return { kind: "ok", outputs: { found: false, reason: "none" } };
-      // The row says kept; the control plane says whether it still exists.
-      const probe = await ctx.deps.sessions.getSession(previous.sessionId);
-      if (!probe.found) {
+      // The row says kept; the control plane says whether it still exists
+      // and is not over (a completed or failed session takes no prompt).
+      if (!(await sessionIsLive(ctx, previous.sessionId))) {
         return {
           kind: "ok",
           outputs: {

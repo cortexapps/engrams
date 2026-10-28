@@ -67,7 +67,7 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 12;
+export const SLACK_BRAIN_DEFINITION_VERSION = 13;
 
 export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
 export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
@@ -247,7 +247,7 @@ const OPENING_TEXT_SOURCE = foldSource({
 const NEXT_TEXT_SOURCE = foldSource({
   replies: "steps.thread_replies.messages",
   trigger: "steps.next?.event?.event?.ts",
-  since: 'String(steps.repoint?.handler_state?.mention?.ts ?? facts.mention_ts ?? "")',
+  since: 'String(steps.repoint?.mention_ts ?? facts.mention_ts ?? "")',
   eventText: "steps.next?.event?.event?.text",
   eventUser: "steps.next?.event?.event?.user",
   fromBot:
@@ -322,7 +322,7 @@ const admit: BlockDef[] = [
  * `steps.repoint` is the previous iteration's re-point; before any re-point
  * it is the opening mention. (`default:` tolerates the missing path; its
  * argument, the facts, is always present.) */
-const PREVIOUS_MENTION_TS = `\${{ steps.repoint.handler_state.mention.ts | default: ${F}.mention_ts }}`;
+const PREVIOUS_MENTION_TS = `\${{ steps.repoint.mention_ts | default: ${F}.mention_ts }}`;
 
 /** The thread as Slack holds it, for the fold. `oldest` bounds the read to
  * the tail since the previous turn (inclusive — the fold drops the boundary
@@ -931,7 +931,7 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
         block: {
           id: "recap",
           type: RELAY_CLOSE_TYPE,
-          config: { status: "${{ run.status }}" },
+          config: { session: SESSION_REF, status: "${{ run.status }}" },
         },
       },
       // Only an explicit end closes the workstream: a quiet thread's run

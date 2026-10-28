@@ -1,3 +1,4 @@
+import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "bun:test";
 
 import type {
@@ -70,7 +71,8 @@ function makeHarness(
     promote?: string | null;
     failExec?: boolean;
     /** Fake integration-action runtime: records calls; throws when asked. */
-    failActions?: boolean;
+    /** `"connect"`: the throw is a ConnectError (a control-plane refusal). */
+    failActions?: boolean | "connect";
     dryRun?: boolean;
     /** Seed the fake state store: key -> {value, version, writer}. */
     stateEntries?: Record<string, { value: unknown; version: number; writer: string }>;
@@ -91,6 +93,9 @@ function makeHarness(
     >;
     /** ADR 0120: bind the run to a workstream (state auto-scopes). */
     instanceId?: string;
+    /** The workstream's latest kept session (run_agent continues it when
+     * `probes` says it is live). */
+    keptSession?: { sessionId: string; runId: string };
     /** Pre-owned handles for claim_handle conflict cases. */
     handleOwners?: Record<string, string>;
     /** Instances the fake treats as CLOSED (claim takeover cases). */
@@ -153,7 +158,9 @@ function makeHarness(
     async finalizeRun(_runId, status, error) {
       finalized.push({ status, ...(error !== undefined ? { error } : {}) });
     },
-    async latestKeptInstanceSession() { return null; },
+    async latestKeptInstanceSession() {
+      return options.keptSession ?? null;
+    },
     async listRunSessions() {
       return runSessions;
     },
@@ -190,7 +197,6 @@ function makeHarness(
       runSessions.push({ sessionId, keep: input.keep });
       return { sessionId, taskId: `t-${input.blockId}` };
     },
-    async setSessionRelay() {},
     async sendPrompt(sessionId, promptId, text) {
       prompts.push({ sessionId, promptId, text });
     },
@@ -285,6 +291,9 @@ function makeHarness(
     },
     integrationActions: {
       async execute(input) {
+        if (options.failActions === "connect") {
+          throw new ConnectError("policy secret ANTHROPIC_API_KEY is not configured", Code.Internal);
+        }
         if (options.failActions) throw new Error("provider down");
         actions.push({ actionId: input.actionId, stepPath: input.stepPath, params: input.params });
         return { comment_id: 7 };
@@ -294,6 +303,7 @@ function makeHarness(
 
   if (!options.noStateStore) deps.state = fakeState;
   deps.instances = {
+    isOpen: async (instanceId) => !closedInstances.has(instanceId),
     async closeInstance(input) {
       closes.push(input);
       const first = !closedInstances.has(input.instanceId);
@@ -330,7 +340,7 @@ const RUN = { runId: "autorun:auto-1:manual:x", automationId: "auto-1" };
 
 // ---------------------------------------------------------------------------
 
-describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 4)", () => {
+describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 5)", () => {
   test("linear graph: filter → create_session → send_prompt(wait) → end_session", async () => {
     const definition = makeDefinition([
       {
@@ -383,6 +393,41 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 4)
     expect(h.finalized).toEqual([{ status: "completed" }]);
   });
 
+  test("an agent automation: the way in's blocks run, then the agent step the engine appends", async () => {
+    const definition: AutomationDefinition = {
+      ...makeDefinition([
+        {
+          id: "check",
+          type: "filter",
+          config: { conditions: { mode: "all", conditions: [{ path: "inputs.on", op: "is_true" }] } },
+        },
+      ]),
+      agent: { scope: { kind: "event" }, profileId: "p", promptTemplate: "go" },
+    };
+    const h = makeHarness(definition, { inputs: { on: true } });
+
+    const result = await interpretAutomation(RUN, h.deps);
+
+    expect(result.status).toBe("completed");
+    expect(h.names).toEqual([
+      "step:__snapshot__:0",
+      "step:check:0",
+      "step:check:0:ledger",
+      "step:agent:0",
+      "step:__finalize__:0",
+    ]);
+    expect(h.created).toEqual(["s-agent"]);
+    // The session starts empty; the opening prompt follows once the relay
+    // (none here) is on, under the step's own prompt id.
+    expect(h.createdInputs[0]).toMatchObject({ profileId: "p", prompt: "", keep: true });
+    expect(h.prompts).toEqual([{ sessionId: "s-agent", promptId: `autorun:${RUN.runId}:agent:s-agent`, text: "go" }]);
+    const agentStep = h.stepRecords.filter((r) => r.framePath === "agent").at(-1);
+    expect(agentStep?.record).toMatchObject({
+      status: "succeeded",
+      outputs: { session_id: "s-agent", started: true, delivered: true },
+    });
+  });
+
   test("filter miss ends the run as filtered", async () => {
     const definition = makeDefinition([
       {
@@ -422,9 +467,15 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 4)
     expect(hot.names).toEqual([
       "step:__snapshot__:0",
       "step:gate.__cond__:0",
+      // The decision has a ledger row (the run page shows which arm ran).
+      "step:gate:0:ledger",
       "step:gate.hot_path:0",
       "step:__finalize__:0",
     ]);
+    expect(hot.stepRecords.find((r) => r.framePath === "gate")?.record).toMatchObject({
+      status: "succeeded",
+      outputs: { taken: "then" },
+    });
 
     const cold = makeHarness(definition, { inputs: { hot: false } });
     await interpretAutomation(RUN, cold.deps);
@@ -461,8 +512,14 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 4)
       "step:poll.__bound__:0",
       "step:poll[0].tick:0",
       "step:poll[0].__until__:0",
+      // The loop's ledger row: how far it went.
+      "step:poll:0:ledger",
       "step:__finalize__:0",
     ]);
+    expect(h.stepRecords.find((r) => r.framePath === "poll")?.record).toMatchObject({
+      status: "succeeded",
+      outputs: { iterations: 1, exhausted: false },
+    });
     expect(h.execs[0]!.execId).toBe(`exec:auto:${RUN.runId}:poll[0].tick:a0`);
   });
 
@@ -792,6 +849,43 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     expect(next.record.outputs).toMatchObject({ event_key: "app_mention" });
   });
 
+  test("run_agent renders the opening prompt only when a session starts", async () => {
+    // A reach event (an issue comment) continues the workstream's session.
+    // Its payload has no pull_request, which only the OPENING prompt reads:
+    // the step must not fail on a prompt it does not send.
+    const definition = makeDefinition([
+      {
+        id: "agent",
+        type: "run_agent",
+        config: {
+          profileId: "p1",
+          promptTemplate: "new: ${{ trigger.event }}",
+          openingPromptTemplate: "start PR #${{ event.raw.pull_request.number }}",
+        },
+      },
+    ]);
+    const continued = makeHarness(definition, {
+      instanceId: "i1",
+      payload: { issue: { number: 7 } },
+      keptSession: { sessionId: "s-old", runId: "autorun:old" },
+      bindings: {
+        "s-old": { automationId: "auto-1", runId: "autorun:old", ownerTerminal: true, instanceId: "i1" },
+      },
+      probes: { "s-old": { status: "idle", lastActiveAt: "2026-08-21T00:00:00Z", lastEventAt: null } },
+    });
+    const result = await interpretAutomation(RUN, continued.deps);
+    expect(result.status).toBe("completed");
+    expect(continued.created).toEqual([]);
+    expect(continued.prompts.map((p) => p.text)).toEqual(["new: test.event"]);
+
+    // No live session: the opening prompt IS needed, and its miss fails the
+    // step with the field named.
+    const fresh = makeHarness(definition, { instanceId: "i1", payload: { issue: { number: 7 } } });
+    const freshResult = await interpretAutomation(RUN, fresh.deps);
+    expect(freshResult.status).toBe("failed");
+    expect(fresh.finalized.at(-1)?.error).toContain("pull_request");
+  });
+
   test("a $ref-bound wait deadline is clamped into the schema's range, never refused", async () => {
     // inputs.idle_timeout = 200000 (> 24 h) must shorten the wait to the
     // ceiling instead of failing the block with config_render_failed —
@@ -1091,6 +1185,24 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     expect(h.names.at(-1)).toBe("step:__finalize__:0");
   });
 
+  test("a block that throws a ConnectError records its text, not the code in brackets", async () => {
+    const definition = makeDefinition([
+      {
+        id: "comment",
+        type: "integration_action",
+        config: { provider: "github", actionId: "create_issue_comment", params: {} },
+      },
+    ]);
+    const h = makeHarness(definition, { failActions: "connect" });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("failed");
+    const step = h.stepRecords.filter((r) => r.framePath === "comment").at(-1)!;
+    expect(step.record.error).toBe(
+      "integration_action_failed: policy secret ANTHROPIC_API_KEY is not configured",
+    );
+    expect(result.error).not.toContain("[internal]");
+  });
+
   test("phase-2 stubs return typed unavailable failures", async () => {
     const definition = makeDefinition([
       { id: "transform", type: "code", config: { source: "export default () => 1", mode: "value" } },
@@ -1102,161 +1214,6 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
   });
 });
 
-
-// ---------------------------------------------------------------------------
-// Contract 3: installed message handlers
-// ---------------------------------------------------------------------------
-
-
-describe("interpretAutomation — installed message handlers (contract 3)", () => {
-  const TYPE = "test_relay";
-
-  const relayDefinition = (config: Record<string, unknown>): AutomationDefinition => ({
-    engine: 1,
-    trigger: { kind: "manual" },
-    blocks: [
-      { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
-      { id: "relay", type: TYPE, config },
-      {
-        id: "turn",
-        type: "send_prompt",
-        config: {
-          session: { blockId: "launch" },
-          promptTemplate: "ping",
-          waitFor: { kind: "run_end" },
-          deadlineSeconds: 600,
-        },
-      },
-    ],
-    inputsSchema: [],
-    settings: { endSessionsOnFinish: false },
-  });
-
-  test("every message after install is offered to the handler first, in its own step; consumed ones never reach the wait", async () => {
-    const seen: AutomationInbox[] = [];
-    registerBlock<{ consume: string[] }>({
-      type: TYPE,
-      configSchema: z.object({ consume: z.array(z.string()) }),
-      async execute() {
-        return { kind: "ok", outputs: { installed: true } };
-      },
-      async onMessage(msg, config) {
-        seen.push(msg);
-        return { verdict: config.consume.includes(msg.kind) ? "consumed" : "pass" };
-      },
-    });
-    try {
-      // Two curated events (consumed by the relay) interleave with the two
-      // idles the wait needs (create turn = stale, prompt turn = match).
-      const curated = (n: number): AutomationInbox => ({
-        kind: "session_event",
-        sessionId: "s-launch",
-        event: { idx: BigInt(n), kind: "agent_message", payloadJson: "{}" },
-      });
-      const h = makeHarness(relayDefinition({ consume: ["session_event"] }), {
-        recv: [
-          curated(1),
-          { kind: "session_idle", sessionId: "s-launch" },
-          curated(2),
-          { kind: "session_idle", sessionId: "s-launch" },
-        ],
-      });
-      const result = await interpretAutomation(RUN, h.deps);
-      expect(result.status).toBe("completed");
-      expect(h.names).toEqual([
-        "step:__snapshot__:0",
-        "step:launch:0",
-        "step:relay:0",
-        "step:turn:0",
-        "step:relay.__relay__:1",
-        "step:turn:clock:1",
-        "step:relay.__relay__:2",
-        "step:turn:clock:2",
-        "step:relay.__relay__:3",
-        "step:turn:clock:3",
-        "step:relay.__relay__:4",
-        "step:turn:0:wait",
-        "step:__finalize__:0",
-      ]);
-      // The handler saw all four; it consumed the curated two and passed the
-      // idles through to the wait (stale first, then the match).
-      expect(seen.map((m) => m.kind)).toEqual([
-        "session_event",
-        "session_idle",
-        "session_event",
-        "session_idle",
-      ]);
-    } finally {
-      unregisterBlockForTest(TYPE);
-    }
-  });
-
-  test("a ledger blip AFTER a successful handler call never loses the result: state carries, the run continues", async () => {
-    // `deps.step` is DBOS.runStep with no retries, and the run's catch turns
-    // a throw into a failed run — so the ledger row is best-effort
-    // observability; the step's return value is the durable truth.
-    let calls = 0;
-    const seenStates: unknown[] = [];
-    registerBlock<Record<string, never>>({
-      type: TYPE,
-      configSchema: z.object({}),
-      async execute() {
-        return { kind: "ok", outputs: { handler_state: { n: 0 } } };
-      },
-      async onMessage(_msg, _config, ctx) {
-        calls += 1;
-        seenStates.push(ctx.handlerState);
-        return { verdict: "pass", state: { n: calls } };
-      },
-    });
-    try {
-      const h = makeHarness(relayDefinition({}), {
-        recv: [
-          { kind: "session_idle", sessionId: "s-launch" },
-          { kind: "session_idle", sessionId: "s-launch" },
-        ],
-        failRecordStepFor: ["relay.__relay__"],
-      });
-      const result = await interpretAutomation(RUN, h.deps);
-      expect(result.status).toBe("completed");
-      expect(calls).toBe(2);
-      // The second call saw the state the first one returned: nothing was
-      // discarded by the ledger failure.
-      expect(seenStates).toEqual([{ n: 0 }, { n: 1 }]);
-      expect(h.stepRecords.filter((r) => r.framePath === "relay.__relay__")).toEqual([]);
-    } finally {
-      unregisterBlockForTest(TYPE);
-    }
-  });
-
-  test("a throwing handler is recorded on its relay step and never fails the run", async () => {
-    registerBlock<Record<string, never>>({
-      type: TYPE,
-      configSchema: z.object({}),
-      async execute() {
-        return { kind: "ok", outputs: {} };
-      },
-      async onMessage() {
-        throw new Error("slack exploded");
-      },
-    });
-    try {
-      const h = makeHarness(relayDefinition({}), {
-        recv: [
-          { kind: "session_idle", sessionId: "s-launch" },
-          { kind: "session_idle", sessionId: "s-launch" },
-        ],
-      });
-      const result = await interpretAutomation(RUN, h.deps);
-      expect(result.status).toBe("completed");
-      const relayRows = h.stepRecords.filter((r) => r.framePath === "relay.__relay__");
-      expect(relayRows.length).toBe(2);
-      expect(relayRows.every((r) => r.record.status === "failed")).toBe(true);
-    } finally {
-      unregisterBlockForTest(TYPE);
-    }
-  });
-});
 
 describe("state blocks (ADR 0119 D10)", () => {
   test("set - get - list - delete round trip; keys template and values take $refs", async () => {

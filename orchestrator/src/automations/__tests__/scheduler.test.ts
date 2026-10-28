@@ -363,6 +363,10 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
   function fanoutFixture(input: {
     open: string[];
     settings?: AutomationDefinition["settings"];
+    /** The automation's agent (an agent automation derives its workstream). */
+    agent?: AutomationDefinition["agent"];
+    /** The main way in's role. */
+    role?: AutomationDefinition["role"];
     /** Rows already claimed with a LIVE lease held by another pod. */
     leaseHeld?: string[];
     /** Rows whose workflow already started and is still RUNNING. */
@@ -373,6 +377,17 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
       instance: { keyTemplate: "k" },
     };
     let automation = dueAutomation(NOW, settings);
+    if (input.agent !== undefined) {
+      automation = {
+        ...automation,
+        definition: {
+          ...automation.definition,
+          agent: input.agent,
+          ...(input.role !== undefined ? { role: input.role } : {}),
+          settings: { endSessionsOnFinish: false },
+        },
+      };
+    }
     const runs = new Map<string, AutomationRunRow>();
     for (const instanceId of input.leaseHeld ?? []) {
       const id = automationCronWorkflowId("automation-1", NOW, "main", instanceId);
@@ -433,7 +448,23 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
         return true;
       },
     };
+    const opened: string[] = [];
     const instances = {
+      async openInstance(open: { key: string }) {
+        opened.push(open.key);
+        return {
+          id: `ai_${open.key}`,
+          automationId: "automation-1",
+          key: open.key,
+          label: null,
+          status: "open" as const,
+          inputs: {},
+          openedBy: "",
+          openedAt: NOW,
+          closedAt: null,
+          closeReason: null,
+        };
+      },
       async listOpenInstances() {
         return input.open.map((id) => ({
           id,
@@ -449,7 +480,7 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
         }));
       },
     };
-    return { store, instances, advances, runs };
+    return { store, instances, advances, runs, opened };
   }
 
   test("one tick claims one occurrence per open workstream and advances ONCE", async () => {
@@ -555,6 +586,45 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
     expect(f.advances).toEqual([{ fired: true }]);
   });
 
+  test("a schedule that starts the automation's standing agent opens its workstream on the first tick", async () => {
+    const agent = { scope: { kind: "automation" as const }, profileId: "p", promptTemplate: "go" };
+    const f = fanoutFixture({ open: [], agent });
+    const starter = recordingStarter();
+    const result = await runSchedulerTick({
+      owner: "pod-a",
+      store: f.store,
+      instances: f.instances,
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+    expect(f.opened).toEqual(["agent"]);
+    expect(result).toMatchObject({ claimed: 1, started: 1 });
+    expect(starter.starts.map((s) => s.workflowId)).toEqual([
+      automationCronWorkflowId("automation-1", NOW, "main", "ai_agent"),
+    ]);
+    expect(f.advances).toEqual([{ fired: true }]);
+  });
+
+  test("a schedule that only reaches the standing agent, or a key-scoped agent, stays quiet with none open", async () => {
+    for (const input of [
+      { agent: { scope: { kind: "automation" as const }, profileId: "p", promptTemplate: "go" }, role: "reach" as const },
+      { agent: { scope: { kind: "key" as const, keyTemplate: "${{ inputs.k }}" }, profileId: "p", promptTemplate: "go" } },
+    ]) {
+      const f = fanoutFixture({ open: [], ...input });
+      const starter = recordingStarter();
+      const result = await runSchedulerTick({
+        owner: "pod-a",
+        store: f.store,
+        instances: f.instances,
+        workflowStarter: starter,
+        now: () => NOW,
+      });
+      expect(f.opened).toEqual([]);
+      expect(result).toMatchObject({ claimed: 0, started: 0 });
+      expect(f.advances).toEqual([{ fired: false }]);
+    }
+  });
+
   test("a non-instanced automation never touches the instance store", async () => {
     const f = fanoutFixture({
       open: [],
@@ -566,6 +636,9 @@ describe("cron fan-out over open workstreams (ADR 0120)", () => {
       store: f.store,
       instances: {
         async listOpenInstances(): Promise<never[]> {
+          throw new Error("must not be called for a non-instanced automation");
+        },
+        async openInstance(): Promise<never> {
           throw new Error("must not be called for a non-instanced automation");
         },
       },

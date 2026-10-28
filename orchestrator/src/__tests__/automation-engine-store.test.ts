@@ -23,6 +23,7 @@ import {
   automationSession as automationSessionTable,
 } from "../db/schema.ts";
 import type { AutomationRunTrigger } from "../db/schema.ts";
+import { makeSessionRelayStore } from "../db/session-relays.ts";
 import { interpretAutomation } from "../automations/engine/interpreter.ts";
 import type { EngineDeps } from "../automations/engine/deps.ts";
 
@@ -225,7 +226,6 @@ describe("automation engine store (live PG)", () => {
         store: engine,
         sessions: {
           createSession: () => Promise.reject(new Error("unused")),
-          setSessionRelay: () => Promise.reject(new Error("unused")),
           sendPrompt: () => Promise.reject(new Error("unused")),
           endSession: () => Promise.reject(new Error("unused")),
           exec: () => Promise.reject(new Error("unused")),
@@ -468,9 +468,25 @@ describe("automation engine store (live PG)", () => {
       relay: false,
     });
     expect(await engine.listRunSessions(runId)).toEqual([{ sessionId, keep: false }]);
-    // Contract 3: the relay block flips curated-event forwarding on.
-    await engine.setSessionRelay(sessionId, true);
+    // Contract 5: a session relay row is what marks the session relayed.
+    const relays = makeSessionRelayStore({ db: getDb() });
+    const installed = await relays.install({
+      sessionId,
+      automationId: id,
+      provider: "slack",
+      target: { channel: "C1" },
+      state: { seq: 0 },
+    });
+    expect(installed.created).toBe(true);
     expect((await engine.findSessionBinding(sessionId))?.relay).toBe(true);
+    // A second install keeps the row; a CAS write advances it; a stale
+    // version is refused; remove clears the flag.
+    expect((await relays.install({ sessionId, automationId: id, provider: "slack", target: {}, state: {} })).created).toBe(false);
+    expect(await relays.update(sessionId, 1, { state: { seq: 1 } })).toBe(true);
+    expect(await relays.update(sessionId, 1, { state: { seq: 2 } })).toBe(false);
+    expect((await relays.get(sessionId))?.state).toEqual({ seq: 1 });
+    expect(await relays.remove(sessionId)).toBe(true);
+    expect((await engine.findSessionBinding(sessionId))?.relay).toBe(false);
   });
 
   test.skipIf(!dbReachable)("latestKeptInstanceSession: the newest KEPT session of the workstream's other runs", async () => {
