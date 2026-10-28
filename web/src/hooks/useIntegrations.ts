@@ -8,7 +8,8 @@
  */
 
 import { useMutation, useQuery, createConnectQueryKey } from "@connectrpc/connect-query";
-import { useQueryClient } from "@tanstack/react-query";
+import { useMutation as useReactMutation, useQueryClient } from "@tanstack/react-query";
+import { API_BASE } from "../lib/base";
 import {
   listConnectors,
   upsertConnector,
@@ -114,6 +115,30 @@ export function useSetConnectorSettings() {
  * credential before sealing; empty tests the stored one. Returns {ok, message}. */
 export function useTestConnector() {
   return useMutation(testConnector);
+}
+
+/** The client-credentials grant (Vanta): the server posts the sealed client
+ * id and secret to the provider and seals the token. No redirect, so the
+ * connector lists refresh here. Repeating it is the reconnect. */
+export function useGrantClientCredentials() {
+  const invalidateConnectors = useInvalidateConnectors();
+  const invalidateCatalog = useInvalidateCatalog();
+  return useReactMutation({
+    mutationFn: async ({ provider }: { provider: string }) => {
+      const res = await fetch(
+        `${API_BASE}/integrations/${encodeURIComponent(provider)}/oauth/grant`,
+        { method: "POST", credentials: "include" },
+      );
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; message?: string };
+      if (!res.ok || body.ok !== true) {
+        throw new Error(body.message ?? `grant → ${res.status}`);
+      }
+    },
+    onSuccess: () => {
+      invalidateConnectors();
+      invalidateCatalog();
+    },
+  });
 }
 
 export function useIntegrationConnections() {

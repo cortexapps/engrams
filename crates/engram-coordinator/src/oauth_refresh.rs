@@ -1,6 +1,8 @@
 //! ADR 0106 addendum: proactive refresh for rotating connector OAuth
 //! credentials (Linear: 24 h access tokens, mandatory rotating refresh
-//! tokens), plus the one resolution seam every delivery consumer calls.
+//! tokens; Vanta: 1 h client-credentials tokens granted again from the
+//! sealed client id and secret), plus the one resolution seam every
+//! delivery consumer calls.
 //!
 //! Two rails share one refresh function:
 //! - the background scanner (`spawn_connector_refresh` wrapping
@@ -18,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use engram_core::types::connector_oauth::{ConnectorOAuthBundle, ConnectorOAuthRefreshSpec};
+use engram_core::types::connector_oauth::{ConnectorOAuthBundle, ConnectorOAuthKind};
 use engram_core::types::oauth::{OAuthCredentialKey, OAuthSubjectKind, SealedOAuthCredential};
 
 use crate::oauth::{OAuthManager, OAuthServiceError, ValidatedOAuthBundle};
@@ -84,25 +86,46 @@ impl OAuthManager {
         let payload = self.open(row).await?;
         let bundle = ConnectorOAuthBundle::from_json(&payload)
             .map_err(|_| OAuthServiceError::InvalidBundle)?;
-        let (Some(refresh_token), Some(refresh)) = (&bundle.refresh_token, &bundle.refresh) else {
+        if !bundle.refreshable() {
             return Ok(RefreshOutcome::Row(Box::new(row.clone())));
-        };
+        }
+        let refresh = bundle
+            .refresh
+            .as_ref()
+            .expect("a refreshable bundle carries its refresh spec");
         let client_id = self.resolve_refresh_secret(&refresh.client_id_ref).await?;
         let client_secret = self
             .resolve_refresh_secret(&refresh.client_secret_ref)
             .await?;
-        let form: Vec<(&str, String)> = vec![
-            ("grant_type", "refresh_token".into()),
-            ("refresh_token", refresh_token.clone()),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-        ];
-        let delimiter = ",";
+        let mut form: Vec<(&str, String)> =
+            vec![("client_id", client_id), ("client_secret", client_secret)];
+        let delimiter = match bundle.kind {
+            // No refresh token exists: the grant runs again, with the scope
+            // it was first granted (the provider returns none otherwise).
+            ConnectorOAuthKind::Oauth2ClientCredentials => {
+                form.push(("grant_type", "client_credentials".into()));
+                if let Some(scope) = &refresh.scope {
+                    form.push(("scope", scope.clone()));
+                }
+                " "
+            }
+            ConnectorOAuthKind::Oauth2AuthorizationCode | ConnectorOAuthKind::StaticToken => {
+                form.push(("grant_type", "refresh_token".into()));
+                form.push((
+                    "refresh_token",
+                    bundle
+                        .refresh_token
+                        .clone()
+                        .expect("a refreshable authorization-code bundle carries a refresh token"),
+                ));
+                ","
+            }
+        };
         // Refresh grants read from the response ROOT even when the initial
         // grant lived under a dot-path: providers that nest the first grant
         // (Slack `authed_user`) return refreshed tokens top-level.
         match self
-            .token_grant(&refresh.token_url, &form, delimiter, "")
+            .token_grant(&refresh.token_url, &form, delimiter, "", refresh.body)
             .await
         {
             Ok(grant) => {
@@ -113,15 +136,11 @@ impl OAuthManager {
                     token_type: grant.token_type,
                     // Rotation: adopt the new refresh token; a provider that
                     // does not rotate keeps the old one.
-                    refresh_token: grant.refresh_token.or_else(|| Some(refresh_token.clone())),
-                    scope: grant.scope.or(bundle.scope),
+                    refresh_token: grant.refresh_token.or_else(|| bundle.refresh_token.clone()),
+                    scope: grant.scope.or(bundle.scope.clone()),
                     obtained_at: self.clock.now_utc(),
                     expires_at: grant.expires_at,
-                    refresh: Some(ConnectorOAuthRefreshSpec {
-                        token_url: refresh.token_url.clone(),
-                        client_id_ref: refresh.client_id_ref.clone(),
-                        client_secret_ref: refresh.client_secret_ref.clone(),
-                    }),
+                    refresh: Some(refresh.clone()),
                 };
                 let payload = new_bundle
                     .to_json()
@@ -450,7 +469,7 @@ pub fn spawn_connector_refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engram_core::types::connector_oauth::ConnectorOAuthKind;
+    use engram_core::types::connector_oauth::{ConnectorOAuthKind, ConnectorOAuthRefreshSpec};
 
     fn bundle(obtained: &str, expires: Option<&str>) -> ConnectorOAuthBundle {
         ConnectorOAuthBundle {
@@ -472,6 +491,8 @@ mod tests {
                 token_url: "https://x/token".into(),
                 client_id_ref: "a".into(),
                 client_secret_ref: "b".into(),
+                scope: None,
+                body: Default::default(),
             }),
         }
     }

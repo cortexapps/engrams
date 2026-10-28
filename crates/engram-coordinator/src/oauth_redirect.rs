@@ -22,7 +22,7 @@ use base64::Engine as _;
 use engram_core::traits::SecretContext;
 use engram_core::types::connector_oauth::{
     normalize_scope, ConnectorOAuthBundle, ConnectorOAuthKind, ConnectorOAuthRefreshSpec,
-    CONNECTOR_OAUTH_BUNDLE_VERSION,
+    TokenRequestBody, CONNECTOR_OAUTH_BUNDLE_VERSION,
 };
 use engram_core::types::oauth::{
     OAuthAccountMetadata, OAuthCredentialKey, OAuthFlow, OAuthFlowStatus, SealedOAuthCredential,
@@ -43,7 +43,7 @@ use crate::oauth::{
 const REDIRECT_FLOW_TTL: chrono::Duration = chrono::Duration::minutes(15);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROBE_RESPONSE: usize = 256 * 1024;
-const MAX_SCOPES: usize = 50;
+pub(crate) const MAX_SCOPES: usize = 50;
 const MAX_EXTRA_PARAMS: usize = 16;
 const MAX_PARAM_LEN: usize = 200;
 const MAX_PROBE_REQUEST_BODY: usize = 4096;
@@ -198,10 +198,18 @@ impl RedirectOauthSpec {
         {
             return Err("grant_path must be a short dot-path".into());
         }
-        for (field, path) in &self.metadata.from_token_response {
+        self.metadata.validate()
+    }
+}
+
+impl RedirectMetadataSpec {
+    /// Shared by the redirect and client-credentials families: the mapped
+    /// fields are bounded dot-paths, the probe a bounded request.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        for (field, path) in &self.from_token_response {
             validate_metadata_mapping(field, path)?;
         }
-        if let Some(probe) = &self.metadata.probe {
+        if let Some(probe) = &self.probe {
             if !matches!(probe.method.as_str(), "GET" | "POST") {
                 return Err("probe method must be GET or POST".into());
             }
@@ -223,7 +231,7 @@ impl RedirectOauthSpec {
     }
 }
 
-fn validate_https_url(raw: &str, what: &str) -> Result<(), String> {
+pub(crate) fn validate_https_url(raw: &str, what: &str) -> Result<(), String> {
     let url = reqwest::Url::parse(raw).map_err(|e| format!("invalid {what}: {e}"))?;
     let Some(host) = url.host_str() else {
         return Err(format!("{what} must be an absolute URL"));
@@ -309,7 +317,7 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
-fn extract_mapped(
+pub(crate) fn extract_mapped(
     map: &BTreeMap<String, String>,
     json: &Value,
     out: &mut BTreeMap<String, String>,
@@ -360,7 +368,7 @@ fn pkce_challenge(verifier: &str) -> String {
 }
 
 impl OAuthManager {
-    async fn resolve_org_secret(&self, name: &str) -> Result<String, OAuthServiceError> {
+    pub(crate) async fn resolve_org_secret(&self, name: &str) -> Result<String, OAuthServiceError> {
         let ctx = SecretContext {
             repo: "",
             image_tag: "",
@@ -540,7 +548,13 @@ impl OAuthManager {
             ));
         }
         let grant = self
-            .token_grant(&spec.token_url, &form, spec.delimiter(), &spec.grant_path)
+            .token_grant(
+                &spec.token_url,
+                &form,
+                spec.delimiter(),
+                &spec.grant_path,
+                TokenRequestBody::Form,
+            )
             .await?;
 
         let mut fields = BTreeMap::new();
@@ -569,6 +583,8 @@ impl OAuthManager {
                 token_url: spec.token_url.clone(),
                 client_id_ref: spec.client_id_ref.clone(),
                 client_secret_ref: spec.client_secret_ref.clone(),
+                scope: None,
+                body: TokenRequestBody::Form,
             });
         let bundle = ConnectorOAuthBundle {
             v: CONNECTOR_OAUTH_BUNDLE_VERSION,
@@ -606,12 +622,15 @@ impl OAuthManager {
     /// `grant_path` selects the object the grant fields are read from
     /// (ADR 0115: Slack's user token lives under `authed_user`); empty means
     /// the response root. Metadata dot-paths always see the full response.
+    /// `body` is the request encoding: the RFC form, or a JSON object with
+    /// the same fields for providers that take one (Vanta).
     pub(crate) async fn token_grant(
         &self,
         token_url: &str,
         form: &[(&str, String)],
         scope_delimiter: &str,
         grant_path: &str,
+        body: TokenRequestBody,
     ) -> Result<TokenGrant, OAuthServiceError> {
         let http = engram_tls::client_builder()
             .user_agent("engram-connector-oauth")
@@ -619,9 +638,18 @@ impl OAuthManager {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| driver_err("http_client", e.to_string()))?;
-        let resp = http
-            .post(token_url)
-            .form(form)
+        let request = http.post(token_url);
+        let request = match body {
+            TokenRequestBody::Form => request.form(form),
+            TokenRequestBody::Json => {
+                let object: serde_json::Map<String, Value> = form
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), Value::String(v.clone())))
+                    .collect();
+                request.json(&object)
+            }
+        };
+        let resp = request
             .send()
             .await
             .map_err(|e| driver_err("exchange_failed", format!("token request failed: {e}")))?;
@@ -701,7 +729,7 @@ impl OAuthManager {
     /// One bounded identity probe with the fresh token. A failing probe
     /// fails the completion: if the provider cannot answer "who am I", the
     /// token is not usable and retrying the flow is cheap.
-    async fn run_probe(
+    pub(crate) async fn run_probe(
         &self,
         probe: &RedirectMetadataProbe,
         access_token: &str,

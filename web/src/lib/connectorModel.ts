@@ -196,6 +196,9 @@ export interface ParsedCli {
 /** OAuth acquisition facet — the app-credential org secrets the "Add to X" flow
  * seeds before redirecting (the access token itself is obtained server-side). */
 export interface ParsedOauth {
+  /** `authorization_code` sends the admin through a consent screen;
+   * `client_credentials` grants from the client id and secret alone. */
+  grant: "authorization_code" | "client_credentials";
   clientIdRef: string;
   clientSecretRef: string;
   /** Bot scopes the token exchange requests — drives the Slack app manifest (ADR 0060). */
@@ -294,15 +297,18 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
   const credentialSource: "mint" | "inject" = cred.source === "mint" ? "mint" : "inject";
   const oauthRaw = raw.oauth as
     | {
+        grant?: unknown;
         clientIdRef?: string;
         clientSecretRef?: string;
         signingSecretRef?: unknown;
         scopes?: unknown;
       }
     | undefined;
-  const oauth =
+  const oauth: ParsedOauth | undefined =
     oauthRaw?.clientIdRef && oauthRaw?.clientSecretRef
       ? {
+          grant:
+            oauthRaw.grant === "client_credentials" ? "client_credentials" : "authorization_code",
           clientIdRef: oauthRaw.clientIdRef,
           clientSecretRef: oauthRaw.clientSecretRef,
           scopes: Array.isArray(oauthRaw.scopes)

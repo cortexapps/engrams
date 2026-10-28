@@ -33,6 +33,7 @@ import { MintFieldKind } from "@/gen/engram/app/v1/mint_pb";
 import {
   useConnectors,
   useDeleteConnector,
+  useGrantClientCredentials,
   useMintKinds,
   useSetConnectorSettings,
   useTestConnector,
@@ -108,6 +109,7 @@ function DetailBody({ view }: { view: ConnectorView }) {
   const mintKinds = useMintKinds();
   const del = useDeleteConnector();
   const test = useTestConnector();
+  const grant = useGrantClientCredentials();
   const [replacing, setReplacing] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [testState, setTestState] = useState<"idle" | "ok" | "fail">("idle");
@@ -151,8 +153,20 @@ function DetailBody({ view }: { view: ConnectorView }) {
   });
 
   // A fresh consent round-trip. `force=1` re-prompts even when the provider
-  // would otherwise silently re-issue the existing grant.
+  // would otherwise silently re-issue the existing grant. A client-credentials
+  // connector has no consent screen: the server runs the grant again from the
+  // sealed secrets, in place.
   const reconnect = () => {
+    if (cfg?.oauth?.grant === "client_credentials") {
+      grant.mutate(
+        { provider: view.provider },
+        {
+          onSuccess: () => toast.success(`${view.name} reconnected`),
+          onError: (e) => toast.error(e instanceof Error ? e.message : String(e)),
+        },
+      );
+      return;
+    }
     window.location.href = `/api/v1/integrations/${encodeURIComponent(view.provider)}/oauth/authorize?force=1`;
   };
 

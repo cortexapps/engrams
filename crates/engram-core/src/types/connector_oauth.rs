@@ -16,14 +16,43 @@ use serde::{Deserialize, Serialize};
 /// unknown fields inside a known version are tolerated.
 pub const CONNECTOR_OAUTH_BUNDLE_VERSION: u32 = 1;
 
-/// How to run `grant_type=refresh_token` against the provider. Absent for
-/// providers whose access tokens do not expire.
+/// How the token request is encoded. RFC 6749 says a form; some providers
+/// (Vanta) take a JSON object instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenRequestBody {
+    #[default]
+    Form,
+    Json,
+}
+
+impl TokenRequestBody {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "" | "form" => Some(Self::Form),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
+/// How to obtain the next access token from the provider: a
+/// `grant_type=refresh_token` exchange for the authorization-code family,
+/// or a fresh `grant_type=client_credentials` grant. Absent for providers
+/// whose access tokens do not expire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorOAuthRefreshSpec {
     pub token_url: String,
     /// Org-secret refs for the BYO app's client credentials.
     pub client_id_ref: String,
     pub client_secret_ref: String,
+    /// The joined scope a client-credentials grant asks for again. The
+    /// refresh-token family never sends one (the grant keeps its scope).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Request encoding; bundles sealed before this field read as form.
+    #[serde(default)]
+    pub body: TokenRequestBody,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +75,10 @@ pub struct ConnectorOAuthBundle {
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorOAuthKind {
     Oauth2AuthorizationCode,
+    /// A client-credentials grant (RFC 6749 section 4.4): no user, no
+    /// refresh token. Expiry is met by running the grant again from the
+    /// sealed refresh spec.
+    Oauth2ClientCredentials,
     /// ADR 0115: a user-entered personal access token. No expiry, no
     /// refresh spec — structurally invisible to the refresh sweep and
     /// never marked broken.
@@ -73,10 +106,16 @@ impl ConnectorOAuthBundle {
         serde_json::from_slice(bytes).map_err(|e| format!("connector OAuth bundle: {e}"))
     }
 
-    /// A bundle refreshes iff the provider issued a refresh token AND the
-    /// exchange recorded how to use it.
+    /// A bundle refreshes iff the exchange recorded how, and the grant
+    /// family can run again: a refresh token for the authorization-code
+    /// family, or the client credentials themselves.
     pub fn refreshable(&self) -> bool {
-        self.refresh_token.is_some() && self.refresh.is_some()
+        match self.kind {
+            ConnectorOAuthKind::Oauth2ClientCredentials => self.refresh.is_some(),
+            ConnectorOAuthKind::Oauth2AuthorizationCode | ConnectorOAuthKind::StaticToken => {
+                self.refresh_token.is_some() && self.refresh.is_some()
+            }
+        }
     }
 }
 
@@ -121,8 +160,61 @@ mod tests {
                 token_url: "https://api.linear.app/oauth/token".into(),
                 client_id_ref: "linear.client_id".into(),
                 client_secret_ref: "linear.client_secret".into(),
+                scope: None,
+                body: TokenRequestBody::Form,
             }),
         }
+    }
+
+    /// A refresh spec sealed before `scope`/`body` existed reads as a form
+    /// grant with no scope: old bundles keep refreshing after an upgrade.
+    #[test]
+    fn refresh_spec_without_the_newer_fields_reads_as_form() {
+        let json = serde_json::json!({
+            "token_url": "https://x/token",
+            "client_id_ref": "a",
+            "client_secret_ref": "b",
+        });
+        let spec: ConnectorOAuthRefreshSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.scope, None);
+        assert_eq!(spec.body, TokenRequestBody::Form);
+        let value = serde_json::to_value(&spec).unwrap();
+        assert!(value.get("scope").is_none());
+        assert_eq!(value["body"], "form");
+    }
+
+    #[test]
+    fn client_credentials_refresh_without_a_refresh_token() {
+        let b = ConnectorOAuthBundle {
+            kind: ConnectorOAuthKind::Oauth2ClientCredentials,
+            refresh_token: None,
+            refresh: Some(ConnectorOAuthRefreshSpec {
+                token_url: "https://api.vanta.com/oauth/token".into(),
+                client_id_ref: "vanta.client_id".into(),
+                client_secret_ref: "vanta.client_secret".into(),
+                scope: Some("vanta-api.all:read vanta-api.all:write".into()),
+                body: TokenRequestBody::Json,
+            }),
+            ..bundle()
+        };
+        assert!(b.refreshable());
+        let parsed = ConnectorOAuthBundle::from_json(&b.to_json().unwrap()).unwrap();
+        assert_eq!(parsed, b);
+        assert!(!ConnectorOAuthBundle { refresh: None, ..b }.refreshable());
+    }
+
+    #[test]
+    fn token_request_body_parses_the_wire_names() {
+        assert_eq!(TokenRequestBody::parse(""), Some(TokenRequestBody::Form));
+        assert_eq!(
+            TokenRequestBody::parse("form"),
+            Some(TokenRequestBody::Form)
+        );
+        assert_eq!(
+            TokenRequestBody::parse("json"),
+            Some(TokenRequestBody::Json)
+        );
+        assert_eq!(TokenRequestBody::parse("xml"), None);
     }
 
     #[test]

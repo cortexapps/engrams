@@ -254,10 +254,19 @@ export interface ConnectorTest {
  * NEVER compiled into the session egress policy.
  */
 export interface OauthFacet {
-  authorizeUrl: string;
+  /** The grant family. `authorization_code` sends an admin through the
+   * provider's consent screen; `client_credentials` posts the client id and
+   * secret to the token URL with no browser round trip (Vanta), and the
+   * platform runs the grant again before the token expires. */
+  grant: "authorization_code" | "client_credentials";
+  /** The consent screen; required for (and only for) `authorization_code`. */
+  authorizeUrl?: string;
   /** Authorize-only hosts (browser redirect surface). Never opened to sessions. */
   acquisitionHosts?: string[];
   tokenUrl: string;
+  /** How a `client_credentials` grant is sent: the RFC form (default) or a
+   * JSON object body (Vanta). */
+  tokenRequestBody?: "form" | "json";
   scopes: string[];
   /** Scope-join delimiter; defaults to `,` (Slack, Linear). */
   scopeDelimiter?: "," | " ";
@@ -1211,6 +1220,31 @@ const OAUTH_METADATA_SEGMENT_RE = /^[A-Za-z0-9_]{1,64}$/;
  * never compiled into the session egress policy. */
 function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
   if (typeof raw !== "object" || raw === null) fail(where, '"oauth" must be an object');
+  const o0 = raw as Record<string, unknown>;
+  let grant: OauthFacet["grant"] = "authorization_code";
+  if (o0.grant !== undefined) {
+    if (o0.grant !== "authorization_code" && o0.grant !== "client_credentials") {
+      fail(where, '"oauth.grant" must be "authorization_code" or "client_credentials"');
+    }
+    grant = o0.grant;
+  }
+  const clientCredentials = grant === "client_credentials";
+  if (clientCredentials) {
+    for (const field of ["authorizeUrl", "acquisitionHosts", "extraAuthorizeParams", "pkce"]) {
+      if (o0[field] !== undefined) {
+        fail(where, `"oauth.${field}" does not apply to a client_credentials grant`);
+      }
+    }
+  } else if (o0.tokenRequestBody !== undefined) {
+    fail(where, '"oauth.tokenRequestBody" applies to a client_credentials grant only');
+  }
+  let tokenRequestBody: "form" | "json" | undefined;
+  if (o0.tokenRequestBody !== undefined) {
+    if (o0.tokenRequestBody !== "form" && o0.tokenRequestBody !== "json") {
+      fail(where, '"oauth.tokenRequestBody" must be "form" or "json"');
+    }
+    tokenRequestBody = o0.tokenRequestBody;
+  }
   const o = raw as Record<string, unknown>;
 
   let acquisitionHosts: string[] | undefined;
@@ -1238,10 +1272,9 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     return v as string;
   };
 
-  const authorizeUrl = httpsUrlOn("authorizeUrl", o.authorizeUrl, [
-    ...hosts,
-    ...(acquisitionHosts ?? []),
-  ]);
+  const authorizeUrl = clientCredentials
+    ? undefined
+    : httpsUrlOn("authorizeUrl", o.authorizeUrl, [...hosts, ...(acquisitionHosts ?? [])]);
   // Strict: the token exchange carries the client secret.
   const tokenUrl = httpsUrlOn("tokenUrl", o.tokenUrl, hosts);
 
@@ -1372,9 +1405,11 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
   }
 
   return {
-    authorizeUrl,
+    grant,
+    ...(authorizeUrl !== undefined ? { authorizeUrl } : {}),
     ...(acquisitionHosts !== undefined ? { acquisitionHosts } : {}),
     tokenUrl,
+    ...(tokenRequestBody !== undefined ? { tokenRequestBody } : {}),
     scopes,
     ...(scopeDelimiter !== undefined ? { scopeDelimiter } : {}),
     ...(extraAuthorizeParams !== undefined ? { extraAuthorizeParams } : {}),

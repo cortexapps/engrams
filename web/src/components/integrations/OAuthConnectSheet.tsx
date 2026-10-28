@@ -4,6 +4,9 @@
  * admin registers their own OAuth app (BYO), pastes its client id + secret (sealed
  * as org secrets), and is redirected to the provider's consent screen. The access
  * token is obtained + stored server-side on the callback.
+ *
+ * A `client_credentials` facet (Vanta) has no consent screen: the sheet seals
+ * the same two secrets and asks the server to run the grant, then closes.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -15,6 +18,7 @@ import { EmptyState } from "@/components/empty-state";
 import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
+import { useGrantClientCredentials } from "@/hooks/useIntegrations";
 import { usePutOrgSecret } from "@/hooks/useOrgSecrets";
 import type { ParsedOauth } from "@/lib/connectorModel";
 import { buildSlackManifest } from "@/lib/slackManifest";
@@ -26,12 +30,18 @@ export function OAuthConnectSheet({
   view,
   oauth,
   onClose,
+  onConnected,
 }: {
   view: ConnectorView;
   oauth: ParsedOauth;
   onClose: () => void;
+  /** A client-credentials grant finishes in place; the redirect family lands
+   * on the integration page instead and never calls this. */
+  onConnected?: (provider: string) => void;
 }) {
   const putSecret = usePutOrgSecret();
+  const grant = useGrantClientCredentials();
+  const clientCredentials = oauth.grant === "client_credentials";
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
   const [signingSecret, setSigningSecret] = useState("");
@@ -74,6 +84,14 @@ export function OAuthConnectSheet({
       if (oauth.signingSecretRef && signingSecret.trim()) {
         await putSecret.mutateAsync({ name: oauth.signingSecretRef, value: signingSecret.trim() });
       }
+      if (clientCredentials) {
+        // No consent screen: the server posts the grant and seals the token.
+        await grant.mutateAsync({ provider: view.provider });
+        setBusy(false);
+        onConnected?.(view.provider);
+        onClose();
+        return;
+      }
       // Leave the SPA for the provider's consent screen; the callback redirects back.
       window.location.href = `/api/v1/integrations/${encodeURIComponent(view.provider)}/oauth/authorize`;
     } catch (e) {
@@ -97,59 +115,65 @@ export function OAuthConnectSheet({
           <div className="flex gap-3 rounded-lg border bg-secondary p-3">
             <LockIcon className="mt-0.5 size-4 shrink-0 text-instrument-nominal" />
             <div>
-              <div className="text-sm font-semibold">Bring your own {view.name} app</div>
+              <div className="text-sm font-semibold">
+                {clientCredentials
+                  ? `Bring your own ${view.name} API credentials`
+                  : `Bring your own ${view.name} app`}
+              </div>
               <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-                Create an app in {view.name}, add this redirect URL, then paste its client
-                credentials below. You'll approve access on {view.name}; the workspace token is
-                obtained and sealed server-side — it never reaches the browser.
+                {clientCredentials
+                  ? `Create API credentials in ${view.name} and paste the client id and secret below. The token is obtained and sealed server-side, and obtained again before it expires — it never reaches the browser.`
+                  : `Create an app in ${view.name}, add this redirect URL, then paste its client credentials below. You'll approve access on ${view.name}; the workspace token is obtained and sealed server-side — it never reaches the browser.`}
               </div>
             </div>
           </div>
 
-          <div className="flex flex-col gap-1.5">
-            <Text variant="label">Redirect URL (add this to your {view.name} app)</Text>
-            <code className="select-all rounded-md border bg-card px-3 py-2 font-mono text-xs break-all">
-              {redirectUri}
-            </code>
-            <div className="mt-1 flex flex-wrap gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => copy("url", redirectUri)}
-              >
-                {copied === "url" ? (
-                  <CheckIcon className="size-3.5 text-instrument-nominal" />
-                ) : (
-                  <CopyIcon className="size-3.5" />
-                )}
-                Copy redirect URL
-              </Button>
-              {isSlack && (
+          {!clientCredentials && (
+            <div className="flex flex-col gap-1.5">
+              <Text variant="label">Redirect URL (add this to your {view.name} app)</Text>
+              <code className="select-all rounded-md border bg-card px-3 py-2 font-mono text-xs break-all">
+                {redirectUri}
+              </code>
+              <div className="mt-1 flex flex-wrap gap-2">
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
-                  onClick={() =>
-                    copy(
-                      "manifest",
-                      buildSlackManifest({
-                        origin: API_ORIGIN || window.location.origin,
-                        scopes: oauth.scopes,
-                      }),
-                    )
-                  }
+                  onClick={() => copy("url", redirectUri)}
                 >
-                  {copied === "manifest" ? (
+                  {copied === "url" ? (
                     <CheckIcon className="size-3.5 text-instrument-nominal" />
                   ) : (
                     <CopyIcon className="size-3.5" />
                   )}
-                  Copy app manifest
+                  Copy redirect URL
                 </Button>
-              )}
+                {isSlack && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      copy(
+                        "manifest",
+                        buildSlackManifest({
+                          origin: API_ORIGIN || window.location.origin,
+                          scopes: oauth.scopes,
+                        }),
+                      )
+                    }
+                  >
+                    {copied === "manifest" ? (
+                      <CheckIcon className="size-3.5 text-instrument-nominal" />
+                    ) : (
+                      <CopyIcon className="size-3.5" />
+                    )}
+                    Copy app manifest
+                  </Button>
+                )}
+              </div>
             </div>
-          </div>
+          )}
 
           <label className="flex flex-col gap-1.5">
             <span className="flex items-baseline gap-2">
@@ -209,8 +233,8 @@ export function OAuthConnectSheet({
             Cancel
           </Button>
           <Button onClick={connect} disabled={!filled || busy}>
-            {busy ? "Redirecting…" : `Add ${view.name}`}
-            <ArrowUpRightIcon className="size-3.5" />
+            {busy ? (clientCredentials ? "Connecting…" : "Redirecting…") : `Add ${view.name}`}
+            {!clientCredentials && <ArrowUpRightIcon className="size-3.5" />}
           </Button>
         </footer>
       </SheetContent>

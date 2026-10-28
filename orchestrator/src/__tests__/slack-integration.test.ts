@@ -17,7 +17,11 @@ import {
   ResolvedCredentialSchema,
 } from "../gen/engram/app/v1/integration_op_pb.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
-import type { BeginRedirectFlowRequest, CompleteRedirectFlowRequest } from "../gen/engram/app/v1/oauth_pb.ts";
+import type {
+  BeginRedirectFlowRequest,
+  CompleteRedirectFlowRequest,
+  GrantClientCredentialsRequest,
+} from "../gen/engram/app/v1/oauth_pb.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 
 const emptySource = { list: async () => [] };
@@ -60,6 +64,36 @@ describe("oauth facet parse", () => {
   test("accepts a well-formed oauth facet", () => {
     const c = parseConnector({ ...base, oauth }, "x");
     expect(c.oauth?.clientIdRef).toBe("slack.client_id");
+    expect(c.oauth?.grant).toBe("authorization_code");
+  });
+
+  test("a client_credentials facet has no consent screen and may post JSON", () => {
+    const cc = {
+      grant: "client_credentials",
+      tokenUrl: "https://slack.com/oauth/token",
+      tokenRequestBody: "json",
+      scopes: ["all:read"],
+      scopeDelimiter: " ",
+      clientIdRef: "x.client_id",
+      clientSecretRef: "x.client_secret",
+    };
+    const c = parseConnector({ ...base, oauth: cc }, "x");
+    expect(c.oauth?.grant).toBe("client_credentials");
+    expect(c.oauth?.authorizeUrl).toBeUndefined();
+    expect(c.oauth?.tokenRequestBody).toBe("json");
+    // The consent-screen fields have no meaning on this grant.
+    expect(() =>
+      parseConnector({ ...base, oauth: { ...cc, authorizeUrl: "https://slack.com/authorize" } }, "x"),
+    ).toThrow(/does not apply/);
+    expect(() => parseConnector({ ...base, oauth: { ...cc, pkce: true } }, "x")).toThrow(/does not apply/);
+    expect(() => parseConnector({ ...base, oauth: { ...cc, tokenRequestBody: "xml" } }, "x")).toThrow(
+      /"form" or "json"/,
+    );
+    // And the JSON body is a client-credentials affordance only.
+    expect(() => parseConnector({ ...base, oauth: { ...oauth, tokenRequestBody: "json" } }, "x")).toThrow(
+      /client_credentials grant only/,
+    );
+    expect(() => parseConnector({ ...base, oauth: { ...oauth, grant: "device" } }, "x")).toThrow(/oauth.grant/);
   });
 
   test("rejects a non-https endpoint", () => {
@@ -203,18 +237,28 @@ describe("oauth facet parse", () => {
 function fakeRedirectClient(opts?: {
   completeError?: ConnectError;
   lookupError?: ConnectError;
+  grantFails?: boolean;
   flowSubject?: { kind: OauthSubjectKind; id: string };
 }) {
   const calls: {
     begin: BeginRedirectFlowRequest[];
     complete: CompleteRedirectFlowRequest[];
     lookup: Array<{ flowId: string }>;
+    grant: GrantClientCredentialsRequest[];
   } = {
     begin: [],
     complete: [],
     lookup: [],
+    grant: [],
   };
   const client = {
+    grantClientCredentials: async (req: GrantClientCredentialsRequest) => {
+      calls.grant.push(req);
+      if (opts?.grantFails) {
+        throw new ConnectError("token grant rejected (HTTP 401): invalid_client", Code.FailedPrecondition);
+      }
+      return { credential: { provider: req.provider, status: "active", expiresAt: "2026-01-01T01:00:00Z" } };
+    },
     beginRedirectFlow: async (req: BeginRedirectFlowRequest) => {
       calls.begin.push(req);
       return {
@@ -249,6 +293,91 @@ const connectionIdFor = async () => "conn-slack-default";
 
 describe("integration oauth route", () => {
   beforeEach(() => invalidateRegistry());
+
+  // A custom connector that grants by client credentials (the Vanta shape).
+  const clientCredentialsSource = {
+    list: async () => [
+      {
+        provider: "acme",
+        config: {
+          provider: "acme",
+          protocol: "http",
+          display: { name: "Acme", category: "Security", blurb: "x", icon: { mono: "AC", color: "#000000" } },
+          credential: { source: "inject", injects: [{ header: "Authorization", template: "Bearer {}" }] },
+          hosts: ["api.acme.example"],
+          operations: [{ grants: ["all:read"], match: { method: "GET", path: "/v1/*" } }],
+          oauth: {
+            grant: "client_credentials",
+            tokenUrl: "https://api.acme.example/oauth/token",
+            tokenRequestBody: "json",
+            scopes: ["acme.all:read", "acme.all:write"],
+            scopeDelimiter: " ",
+            clientIdRef: "acme.client_id",
+            clientSecretRef: "acme.client_secret",
+          },
+        },
+      },
+    ],
+  };
+
+  test("grant: admin → the coordinator runs the client-credentials grant and the route answers JSON", async () => {
+    const { client, calls } = fakeRedirectClient();
+    const app = makeIntegrationOauthRoute({
+      connectors: clientCredentialsSource,
+      oauthCredential: client as never,
+      connectionIdFor: async () => "conn-acme-default",
+      getSession: adminSession,
+    });
+    const res = await app.request("/api/v1/integrations/acme/oauth/grant", { method: "POST" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, status: "active" });
+    expect(calls.grant).toHaveLength(1);
+    const grant = calls.grant[0]!;
+    expect(grant.provider).toBe("acme");
+    expect(grant.subject?.id).toBe("conn-acme-default");
+    expect(grant.spec?.tokenUrl).toBe("https://api.acme.example/oauth/token");
+    expect(grant.spec?.tokenRequestBody).toBe("json");
+    expect(grant.spec?.scopes).toEqual(["acme.all:read", "acme.all:write"]);
+    expect(grant.spec?.scopeDelimiter).toBe(" ");
+    expect(grant.spec?.clientSecretRef).toBe("acme.client_secret");
+    // The consent route has nothing to redirect to for this grant.
+    const authorize = await app.request("/api/v1/integrations/acme/oauth/authorize");
+    expect(authorize.status).toBe(404);
+    expect(calls.begin).toHaveLength(0);
+  });
+
+  test("grant: a redirect connector has no grant route; a non-admin is refused", async () => {
+    const { client, calls } = fakeRedirectClient();
+    const app = makeIntegrationOauthRoute({
+      connectors: emptySource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: adminSession,
+    });
+    const res = await app.request("/api/v1/integrations/slack/oauth/grant", { method: "POST" });
+    expect(res.status).toBe(404);
+    expect(calls.grant).toHaveLength(0);
+    const member = makeIntegrationOauthRoute({
+      connectors: clientCredentialsSource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: async () => ({ user: { id: "u2", role: "user" } }),
+    });
+    expect((await member.request("/api/v1/integrations/acme/oauth/grant", { method: "POST" })).status).toBe(403);
+  });
+
+  test("grant: a coordinator rejection answers 502 with the reason", async () => {
+    const { client } = fakeRedirectClient({ grantFails: true });
+    const app = makeIntegrationOauthRoute({
+      connectors: clientCredentialsSource,
+      oauthCredential: client as never,
+      connectionIdFor: async () => "conn-acme-default",
+      getSession: adminSession,
+    });
+    const res = await app.request("/api/v1/integrations/acme/oauth/grant", { method: "POST" });
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ ok: false, message: "token grant rejected (HTTP 401): invalid_client" });
+  });
 
   test("authorize: admin → 302 to the coordinator-assembled authorize URL", async () => {
     const { client, calls } = fakeRedirectClient();

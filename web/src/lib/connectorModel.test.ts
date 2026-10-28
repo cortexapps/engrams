@@ -257,6 +257,7 @@ describe("parseConnectorConfig", () => {
     });
     const c = parseConnectorConfig(raw, "slack");
     expect(c.oauth).toEqual({
+      grant: "authorization_code",
       clientIdRef: "slack.client_id",
       clientSecretRef: "slack.client_secret",
       signingSecretRef: "slack.signing_secret",
@@ -274,6 +275,21 @@ describe("parseConnectorConfig", () => {
     const c = parseConnectorConfig(raw, "x");
     expect(c.oauth?.scopes).toEqual([]);
     expect(c.oauth?.signingSecretRef).toBeUndefined();
+    expect(c.oauth?.grant).toBe("authorization_code");
+  });
+
+  test("a client_credentials facet keeps its grant", () => {
+    const raw = JSON.stringify({
+      provider: "vanta",
+      hosts: ["api.vanta.com"],
+      operations: [],
+      oauth: {
+        grant: "client_credentials",
+        clientIdRef: "vanta.client_id",
+        clientSecretRef: "vanta.client_secret",
+      },
+    });
+    expect(parseConnectorConfig(raw, "vanta").oauth?.grant).toBe("client_credentials");
   });
 });
 
