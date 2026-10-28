@@ -12,13 +12,17 @@ objects, and reports, plus the writes Rippling exposes on those records.
 
 ## Create an API token
 
-Rippling's REST API is part of the Rippling API product; the token is created by an admin.
+Rippling's REST API is part of the Rippling API subscription, and the token is created by an
+admin in the API Tokens app. If the app shows "Permission denied", your company has no API
+subscription, the app is not installed, or your admin role lacks the permission to manage
+tokens; a Rippling account owner resolves that in Rippling.
 
-1. In Rippling, open the API credentials app (Settings → Developer → API credentials) and
-   create a new token. Choose the scopes the sessions need; each read command below names
-   the scope family it uses, such as `workers.read` or `departments.read`.
-2. Copy the token. Rippling revokes a token that is unused for 30 days or whose owner leaves,
-   so create it under a service admin where you can.
+1. In Rippling, open the API Tokens app (`app.rippling.com/api-tokens`, or search for it from
+   the dashboard) and create a new token. Give it a name, pick the API version, and choose
+   the scopes the sessions need; each read command below names the scope family it uses,
+   such as `workers.read` or `departments.read`.
+2. Copy the token; Rippling shows it once. Rippling revokes a token that is unused for 30
+   days or whose owner leaves, so create it under a service admin where you can.
 
 ## Connect it
 
