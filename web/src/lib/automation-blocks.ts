@@ -9,7 +9,6 @@
 
 import type { LucideIcon } from "lucide-react";
 import {
-  Bot,
   Braces,
   CircleStop,
   Database,
@@ -53,10 +52,34 @@ export interface TriggerSpec {
   [key: string]: unknown;
 }
 
+/** What a way in does with the automation's agent once its blocks ran:
+ * `start` reaches the agent and starts it when it is not running; `reach`
+ * reaches it only when it is; `close` closes it; `none` runs its own blocks
+ * and no agent. Absent = `start`. */
+export type EntrypointRole = "start" | "reach" | "close" | "none";
+
 export interface AutomationEntrypoint {
   id: string;
   trigger: TriggerSpec;
   blocks: BlockDef[];
+  role?: EntrypointRole;
+}
+
+/** How many agents an automation has: one per event, one per rendered key
+ * (a thread, a pull request, an issue), or one for the whole automation. */
+export type AgentScope =
+  | { kind: "event" }
+  | { kind: "automation" }
+  | { kind: "key"; keyTemplate: string; labelTemplate?: string };
+
+/** The automation's agent: who runs, what it gets, where it talks back. The
+ * other fields mirror the server's agent step config (session settings,
+ * the relay, the harness override). */
+export interface AgentSpec {
+  scope: AgentScope;
+  profileId: string;
+  promptTemplate: string;
+  [field: string]: unknown;
 }
 
 export interface AutomationDefinition {
@@ -66,6 +89,11 @@ export interface AutomationDefinition {
   /** ADR 0119 D9: additional named ways in. The top-level trigger + blocks
    * are the implicit "main" entrypoint. */
   entrypoints?: AutomationEntrypoint[];
+  /** The main way in's role; absent = `start`. */
+  role?: EntrypointRole;
+  /** The automation's agent. Every way in ends on it (by its role); the
+   * agent's scope is what makes the automation's agents durable. */
+  agent?: AgentSpec;
   inputsSchema: unknown[];
   settings: {
     concurrency?: {
@@ -74,7 +102,8 @@ export interface AutomationDefinition {
     };
     runDeadlineSeconds?: number;
     endSessionsOnFinish: boolean;
-    /** ADR 0120: present = the automation has scoped agents. */
+    /** ADR 0120: scoped workstreams on an automation WITHOUT an agent (the
+     * engine derives this from the agent's scope when there is one). */
     instance?: {
       keyTemplate: string;
       inputs?: Record<string, string>;
@@ -156,6 +185,147 @@ export function removeEntrypoint(
   return rest.length > 0 ? { ...base, entrypoints: rest } : base;
 }
 
+/** The role of one way in. */
+export function roleOf(definition: AutomationDefinition, entrypointId: string): EntrypointRole {
+  if (entrypointId === MAIN_ENTRYPOINT_ID) return definition.role ?? "start";
+  return definition.entrypoints?.find((ep) => ep.id === entrypointId)?.role ?? "start";
+}
+
+/** Set one way in's role; `start` (the default) is stored as no field. */
+export function setRole(
+  definition: AutomationDefinition,
+  entrypointId: string,
+  role: EntrypointRole,
+): AutomationDefinition {
+  const put = <T extends { role?: EntrypointRole }>(target: T): T => {
+    const { role: _old, ...rest } = target;
+    return (role === "start" ? rest : { ...rest, role }) as T;
+  };
+  if (entrypointId === MAIN_ENTRYPOINT_ID) return put(definition);
+  return {
+    ...definition,
+    entrypoints: (definition.entrypoints ?? []).map((ep) =>
+      ep.id === entrypointId ? put(ep) : ep,
+    ),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The agent: one per automation, every way in ends on it
+// ---------------------------------------------------------------------------
+
+/** The canvas node and error address of the automation's agent. */
+export const AGENT_NODE_ID = "__agent__";
+/** The step ids the engine appends to a way in: the agent step and the
+ * close step. A run's ledger names them; the canvas maps both onto the
+ * agent node. */
+export const AGENT_STEP_ID = "agent";
+export const AGENT_CLOSE_STEP_ID = "agent_close";
+/** The engine's type of the agent step, for the step sentences. */
+export const AGENT_STEP_TYPE = "run_agent";
+
+export interface ScopePreset {
+  id: string;
+  label: string;
+  help: string;
+  scope: AgentScope;
+}
+
+/** The key of a Slack thread: team, channel, thread root (the opening
+ * message is its own root). `coalesce` falls back across the two fields. */
+export const SLACK_THREAD_KEY =
+  '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}';
+
+/** The scopes the inspector offers by name. A key template that matches
+ * none of them is a custom key. */
+export const SCOPE_PRESETS: readonly ScopePreset[] = [
+  {
+    id: "event",
+    label: "Each event",
+    help: "A new session for every event; nothing is kept between them.",
+    scope: { kind: "event" },
+  },
+  {
+    id: "slack_thread",
+    label: "Each Slack thread",
+    help: "One agent per thread: the first mention starts it, later mentions reach it.",
+    scope: {
+      kind: "key",
+      keyTemplate: SLACK_THREAD_KEY,
+      labelTemplate: "${{ event.raw.event.text | strip_mentions | truncate: 80 }}",
+    },
+  },
+  {
+    id: "slack_channel",
+    label: "Each Slack channel",
+    help: "One agent per channel; every message in it reaches the same session.",
+    scope: {
+      kind: "key",
+      keyTemplate: "${{ event.raw.team_id }}:${{ event.raw.event.channel }}",
+    },
+  },
+  {
+    id: "pull_request",
+    label: "Each pull request",
+    help: "One agent per pull request, across pushes and review comments.",
+    scope: {
+      kind: "key",
+      keyTemplate: "${{ event.raw.repository.full_name }}#${{ event.raw.pull_request.number }}",
+      labelTemplate: "${{ event.raw.pull_request.title }}",
+    },
+  },
+  {
+    id: "linear_issue",
+    label: "Each Linear issue",
+    help: "One agent per issue, across its updates and comments.",
+    scope: {
+      kind: "key",
+      keyTemplate: "${{ event.raw.data.identifier }}",
+      labelTemplate: "${{ event.raw.data.title }}",
+    },
+  },
+  {
+    id: "automation",
+    label: "The whole automation",
+    help: "One standing agent; every event from every way in reaches it.",
+    scope: { kind: "automation" },
+  },
+];
+
+export const CUSTOM_SCOPE_ID = "custom";
+
+/** Which preset a scope is, else `custom`. */
+export function scopePresetOf(scope: AgentScope): string {
+  for (const preset of SCOPE_PRESETS) {
+    if (preset.scope.kind !== scope.kind) continue;
+    if (scope.kind !== "key" || preset.scope.kind !== "key") return preset.id;
+    if (preset.scope.keyTemplate === scope.keyTemplate) return preset.id;
+  }
+  return CUSTOM_SCOPE_ID;
+}
+
+/** The scope a new agent gets for a trigger: a thread for a Slack trigger,
+ * a pull request for a GitHub one, an issue for Linear; a session per event
+ * otherwise. */
+export function defaultScopeFor(trigger: TriggerSpec): AgentScope {
+  const preset = (id: string) => SCOPE_PRESETS.find((p) => p.id === id)!.scope;
+  if (trigger.kind !== "integration") return preset("event");
+  switch (trigger["provider"]) {
+    case "slack":
+      return preset("slack_thread");
+    case "github":
+      return preset("pull_request");
+    case "linear":
+      return preset("linear_issue");
+    default:
+      return preset("event");
+  }
+}
+
+export function defaultAgent(trigger: TriggerSpec): AgentSpec {
+  return { scope: defaultScopeFor(trigger), profileId: "", promptTemplate: "" };
+}
+
 /** Block ids OUTSIDE one entrypoint — the reserved set for nextBlockId
  * (server validation holds ids unique across ALL entrypoints). */
 export function blockIdsOutsideEntrypoint(
@@ -206,10 +376,9 @@ export type FieldSpec =
 
 /** Where a kind sits in the insert menu. `advanced` kinds live in a submenu:
  * the engine and built-in internals a hand-built automation rarely needs. */
-export type BlockGroup = "agent" | "flow" | "sessions" | "integrations" | "advanced";
+export type BlockGroup = "flow" | "sessions" | "integrations" | "advanced";
 
 export const BLOCK_GROUPS: ReadonlyArray<{ id: BlockGroup; label: string }> = [
-  { id: "agent", label: "Agent" },
   { id: "flow", label: "Flow" },
   { id: "sessions", label: "Sessions" },
   { id: "integrations", label: "Integrations" },
@@ -233,7 +402,6 @@ export interface BlockKindSpec {
   fields?: FieldSpec[];
   /** Custom inspector id — resolved by BlockInspector. */
   inspector?:
-    | "agent"
     | "create_session"
     | "branch"
     | "loop"
@@ -335,7 +503,7 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "create_session",
-    group: "agent",
+    group: "sessions",
     outputs: ["session_id", "web_url", "task_id"],
     label: "Create session",
     description: "Start a session from a profile with an initial prompt.",
@@ -351,31 +519,6 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       promptTemplate: "",
       includeEventContext: false,
     }),
-  },
-  {
-    kind: "run_agent",
-    label: "Agent",
-    description:
-      "Hand this event to the automation's agent: continue the agent's kept session, or start one. It can reply in the Slack thread the event came from.",
-    icon: Bot,
-    group: "agent",
-    outputs: [
-      "session_id",
-      "web_url",
-      "started",
-      "delivered",
-      "prompt",
-      "task_id",
-      "relayed",
-      "mention_ts",
-    ],
-    inspector: "agent",
-    summary: (c) => {
-      const profile = str(c["profileId"]);
-      const prompt = truncate(str(c["promptTemplate"]).split("\n")[0] ?? "", 48);
-      return profile ? `${profile}${prompt ? ` · ${prompt}` : ""}` : "No profile selected";
-    },
-    defaults: () => ({ profileId: "", promptTemplate: "", reuse: "workstream" }),
   },
   {
     kind: "send_prompt",
@@ -1092,8 +1235,22 @@ const BY_KIND = new Map(BLOCK_KINDS.map((spec) => [spec.kind, spec]));
  * per, read off the key template ("per PR", "per thread"). Undefined when
  * every event gets a fresh session. */
 export function scopeLabel(definition: AutomationDefinition): string | undefined {
-  const template = definition.settings.instance?.keyTemplate;
+  const scope = definition.agent?.scope;
+  if (scope?.kind === "event") return undefined;
+  if (scope?.kind === "automation") return "one agent";
+  const template =
+    scope?.kind === "key" ? scope.keyTemplate : definition.settings.instance?.keyTemplate;
   if (template === undefined) return undefined;
+  switch (scopePresetOf({ kind: "key", keyTemplate: template })) {
+    case "slack_thread":
+      return "per thread";
+    case "slack_channel":
+      return "per channel";
+    case "pull_request":
+      return "per PR";
+    case "linear_issue":
+      return "per issue";
+  }
   const key = template.toLowerCase();
   if (/thread/.test(key)) return "per thread";
   if (/\bpr\b|pull/.test(key)) return "per PR";
@@ -1102,6 +1259,12 @@ export function scopeLabel(definition: AutomationDefinition): string | undefined
   if (/repo/.test(key)) return "per repo";
   if (/\$\{\{|\{\{/.test(key)) return "per key";
   return "one agent";
+}
+
+/** Whether the automation keeps agents between runs (the Agents tab). */
+export function hasScopedAgents(definition: AutomationDefinition): boolean {
+  if (definition.agent) return definition.agent.scope.kind !== "event";
+  return definition.settings.instance !== undefined;
 }
 
 /** Every block's kind by id, across main and every other way in: what an
@@ -1113,13 +1276,17 @@ export function blockTypesOf(definition: AutomationDefinition): Map<string, stri
   };
   collect(definition.blocks);
   for (const ep of definition.entrypoints ?? []) collect(ep.blocks);
+  if (definition.agent) {
+    types.set(AGENT_STEP_ID, AGENT_STEP_TYPE);
+    types.set(AGENT_CLOSE_STEP_ID, "instance_close");
+  }
   return types;
 }
 
 /** The profile a block runs on, when it runs one: the canvas shows the
  * profile's name in place of its id. */
 export function blockProfileId(block: BlockDef): string | undefined {
-  if (block.type !== "create_session" && block.type !== "run_agent") return undefined;
+  if (block.type !== "create_session") return undefined;
   const id = block.config["profileId"];
   return typeof id === "string" && id !== "" ? id : undefined;
 }
@@ -1375,11 +1542,17 @@ export interface BlockErrorRef {
 }
 
 /** The server joins BlockErrors into the ConnectError message as
- * `blockId.field: message; …` (definition-level: `field: message`). Parse
- * that back into addressable errors; anything unparseable is a form error. */
+ * `blockId.field: message; …` (definition-level: `field: message`; the
+ * agent's: `__agent__.field: message`). Parse that back into addressable
+ * errors; anything unparseable is a form error. */
 export function parseBlockErrors(message: string): BlockErrorRef[] {
   const out: BlockErrorRef[] = [];
   for (const part of message.split("; ")) {
+    const a = /^__agent__\.([A-Za-z0-9_.[\]]+): (.*)$/.exec(part);
+    if (a) {
+      out.push({ blockId: AGENT_NODE_ID, field: a[1]!, message: a[2]! });
+      continue;
+    }
     const m = /^([a-z][a-z0-9_]*)\.([A-Za-z0-9_.[\]]+): (.*)$/.exec(part);
     if (m) {
       // `trigger.<field>` is definition-level: the trigger row owns it.

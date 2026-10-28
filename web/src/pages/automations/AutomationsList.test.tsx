@@ -70,10 +70,16 @@ function summary(
                 trigger: { kind: "manual" },
                 blocks: [],
                 inputsSchema: [],
-                settings: {
-                  endSessionsOnFinish: false,
-                  instance: { keyTemplate: "${{ event.raw.pull_request.number }}" },
+                agent: {
+                  scope: {
+                    kind: "key",
+                    keyTemplate:
+                      "${{ event.raw.repository.full_name }}#${{ event.raw.pull_request.number }}",
+                  },
+                  profileId: "p",
+                  promptTemplate: "go",
                 },
+                settings: { endSessionsOnFinish: false },
               }),
             }),
           }

@@ -1,12 +1,13 @@
-/** The Build tab: the canvas (one column per way in) with the inspector as a
- * side sheet on the right and the test drawer along the bottom. The seam
- * between the canvas and the inspector is a drag handle, because the inspector
- * holds the code editor and a fixed 360px is too narrow to read code in.
+/** The Build tab: the canvas (one column per way in, every column ending on
+ * the automation's one Agent node) with the inspector as a side sheet on
+ * the right and the test drawer along the bottom. The seam between the
+ * canvas and the inspector is a drag handle, because the inspector holds the
+ * code editor and a fixed 360px is too narrow to read code in.
  *
  * Owns nothing durable — the shell holds the draft definition and passes
  * change callbacks down; this component is layout + selection. Block ids are
  * unique automation-wide, so selecting a node in any column also selects that
- * column's way in for the inspector. */
+ * column's way in for the inspector; the agent node selects the agent. */
 
 import { ChevronDown, ChevronUp, MoreHorizontal, Plus, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
@@ -27,9 +28,13 @@ import { useProfiles } from "@/hooks/useProfiles";
 import { flattenScope, type AutomationTestState } from "@/hooks/useAutomationTest";
 import {
   addEntrypoint,
+  AGENT_CLOSE_STEP_ID,
+  AGENT_NODE_ID,
+  AGENT_STEP_ID,
   blockIdsOutsideEntrypoint,
   blockKind,
   blockProfileId,
+  defaultAgent,
   entrypointIdError,
   entrypointIds,
   findBlock,
@@ -42,7 +47,11 @@ import {
   removeBlock,
   removeEntrypoint,
   replaceBlock,
+  roleOf,
+  scopeLabel,
+  setRole,
   walkBlocks,
+  type AgentSpec,
   type AutomationDefinition,
   type BlockDef,
   type BlockErrorRef,
@@ -60,8 +69,10 @@ import { formatDuration, parseJsonObject } from "../runs/run-format";
 import { StepDetails } from "../runs/StepDetails";
 
 import { BlockInspector } from "./BlockInspector";
+import { AddAgentNode, AgentBus, AgentNode, AgentStub } from "./canvas/AgentNode";
 import { Canvas, TRIGGER_ROW_ID } from "./canvas/Canvas";
 import { MAX_SCALE, MIN_SCALE } from "./canvas/layout";
+import { AgentInspector } from "./inspectors/AgentInspector";
 import { TestPanel } from "./test/TestPanel";
 import { TriggerInspector } from "./TriggerInspector";
 
@@ -137,9 +148,25 @@ function sessionSourcesFor(definition: AutomationDefinition, selectedId: string 
   const ids: string[] = [];
   for (const block of walkBlocks(definition.blocks)) {
     if (block.id === selectedId) break;
-    if (block.type === "create_session" || block.type === "run_agent") ids.push(block.id);
+    if (block.type === "create_session") ids.push(block.id);
   }
   return ids;
+}
+
+/** The agent without its ways in's roles: what removing it leaves. */
+function withoutAgent(definition: AutomationDefinition): AutomationDefinition {
+  const { agent: _agent, role: _role, ...rest } = definition;
+  return {
+    ...rest,
+    ...(rest.entrypoints
+      ? {
+          entrypoints: rest.entrypoints.map((ep) => {
+            const { role: _epRole, ...way } = ep;
+            return way;
+          }),
+        }
+      : {}),
+  };
 }
 
 /**
@@ -231,7 +258,9 @@ export function BuildTab({
     const focus =
       nodes.find((n) => n.status === "failed" || n.status === "skipped") ?? nodes.at(-1);
     setFramePath(null);
-    if (focus) {
+    if (focus && (focus.blockId === AGENT_STEP_ID || focus.blockId === AGENT_CLOSE_STEP_ID)) {
+      setSelectedId(AGENT_NODE_ID);
+    } else if (focus) {
       const way = ways.find((w) =>
         [...walkBlocks(projectEntrypoint(definition, w).blocks)].some(
           (b) => b.id === focus.blockId,
@@ -243,9 +272,15 @@ export function BuildTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only a new run re-focuses.
   }, [replayRunId]);
 
-  const selected = selectedId === TRIGGER_ROW_ID ? null : findBlock(active.blocks, selectedId);
+  const agent = definition.agent;
+  const agentSelected = selectedId === AGENT_NODE_ID && agent !== undefined;
+  const selected =
+    selectedId === TRIGGER_ROW_ID || selectedId === AGENT_NODE_ID
+      ? null
+      : findBlock(active.blocks, selectedId);
   // A removed block leaves a dangling selection; fall back to the trigger.
-  const effectiveId = selectedId === TRIGGER_ROW_ID || selected ? selectedId : TRIGGER_ROW_ID;
+  const effectiveId =
+    selectedId === TRIGGER_ROW_ID || selected || agentSelected ? selectedId : TRIGGER_ROW_ID;
 
   const erroredIds = useMemo(() => {
     const ids = new Set<string>();
@@ -254,6 +289,7 @@ export function BuildTab({
   }, [errors]);
   const blockErrors = errors.filter((e) => e.blockId === effectiveId);
   const triggerErrors = errors.filter((e) => e.blockId === "");
+  const agentErrors = errors.filter((e) => e.blockId === AGENT_NODE_ID);
 
   const changeWay = (way: string, next: AutomationDefinition) =>
     onChange(mergeEntrypoint(definition, way, next));
@@ -261,6 +297,15 @@ export function BuildTab({
   const updateBlock = (next: BlockDef) =>
     changeWay(entrypointId, { ...active, blocks: replaceBlock(active.blocks, next.id, next) });
   const updateTrigger = (trigger: TriggerSpec) => changeWay(entrypointId, { ...active, trigger });
+  const updateAgent = (next: AgentSpec) => onChange({ ...definition, agent: next });
+  const addAgent = () => {
+    onChange({ ...definition, agent: defaultAgent(definition.trigger) });
+    setSelectedId(AGENT_NODE_ID);
+  };
+  const removeAgent = () => {
+    onChange(withoutAgent(definition));
+    setSelectedId(TRIGGER_ROW_ID);
+  };
 
   const select = (way: string, id: string) => {
     if (way !== entrypointId) onSelectEntrypoint(way);
@@ -346,9 +391,34 @@ export function BuildTab({
     return blockKind(block.type).summary({ ...block.config, profileId: name });
   };
 
-  const replayNode = replay && selected ? replay.map.get(selected.id) : undefined;
+  const replayAgent = replay
+    ? (replay.map.get(AGENT_STEP_ID) ?? replay.map.get(AGENT_CLOSE_STEP_ID))
+    : undefined;
+  const replayNode = replay
+    ? selected
+      ? replay.map.get(selected.id)
+      : agentSelected
+        ? replayAgent
+        : undefined
+    : undefined;
   const replayStep =
     replayNode && (replayNode.frames.find((f) => f.path === framePath) ?? replayNode.latest);
+  // A way in carried the run when one of its blocks ran, or when the run
+  // names it (a way in with no blocks of its own runs only the agent step).
+  const wayCarried = (way: string, blocks: readonly BlockDef[]): boolean =>
+    !!replay &&
+    (replay.run.entrypointId === way ||
+      wayOnPath(
+        replay.map,
+        [...walkBlocks(blocks)].map((b) => b.id),
+      ));
+  const agentSummary = (() => {
+    if (!agent) return "";
+    const name = profiles.data?.profiles.find((p) => p.id === agent.profileId)?.name;
+    const who = name ?? (agent.profileId ? agent.profileId : "No profile selected");
+    const scope = scopeLabel(definition) ?? "a session per event";
+    return `${who} · ${scope}`;
+  })();
 
   return (
     <ResizablePanelGroup
@@ -437,40 +507,62 @@ export function BuildTab({
               </Button>
             </div>
             <div className="flex min-h-0 flex-1 gap-6 overflow-x-auto p-6 pt-12">
-              {ways.map((way) => {
-                const projected =
-                  way === entrypointId ? active : projectEntrypoint(definition, way);
-                return (
-                  <div key={way} className="flex min-h-0 min-w-[240px] flex-1 flex-col">
-                    <Canvas
-                      trigger={projected.trigger}
-                      triggerSummary={triggerSummaryFor(way)}
-                      entrypointId={ways.length > 1 || way !== MAIN_ENTRYPOINT_ID ? way : undefined}
-                      blocks={projected.blocks}
-                      selectedId={way === entrypointId ? effectiveId : null}
-                      onSelect={(id) => select(way, id)}
-                      erroredIds={way === entrypointId ? erroredIds : new Set()}
-                      locked={builtin}
-                      onInsert={(at, index, kind) => onInsert(way, at, index, kind)}
-                      onMove={(at, from, to) => onMove(way, at, from, to)}
-                      onRemove={(id) => onRemove(way, id)}
-                      zoom={zoom}
-                      summaryFor={summaryFor}
-                      {...(replay
-                        ? {
-                            replay: {
-                              map: replay.map,
-                              onPath: wayOnPath(
-                                replay.map,
-                                [...walkBlocks(projected.blocks)].map((b) => b.id),
-                              ),
-                            },
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+                <div className="flex min-h-0 flex-1 gap-6">
+                  {ways.map((way) => {
+                    const projected =
+                      way === entrypointId ? active : projectEntrypoint(definition, way);
+                    const carried = wayCarried(way, projected.blocks);
+                    return (
+                      <div key={way} className="flex min-h-0 min-w-[240px] flex-1 flex-col">
+                        <Canvas
+                          trigger={projected.trigger}
+                          triggerSummary={triggerSummaryFor(way)}
+                          entrypointId={
+                            ways.length > 1 || way !== MAIN_ENTRYPOINT_ID ? way : undefined
                           }
-                        : {})}
+                          blocks={projected.blocks}
+                          selectedId={way === entrypointId ? effectiveId : null}
+                          onSelect={(id) => select(way, id)}
+                          erroredIds={way === entrypointId ? erroredIds : new Set()}
+                          locked={builtin}
+                          onInsert={(at, index, kind) => onInsert(way, at, index, kind)}
+                          onMove={(at, from, to) => onMove(way, at, from, to)}
+                          onRemove={(id) => onRemove(way, id)}
+                          zoom={zoom}
+                          summaryFor={summaryFor}
+                          {...(replay ? { replay: { map: replay.map, onPath: carried } } : {})}
+                        />
+                        {agent && (
+                          <AgentStub
+                            role={roleOf(definition, way)}
+                            dimmed={replay ? !carried : false}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                {agent ? (
+                  <AgentBus columns={ways.length}>
+                    <AgentNode
+                      summary={agentSummary}
+                      selected={agentSelected}
+                      errored={agentErrors.length > 0}
+                      {...(replayAgent ? { status: replayAgent.status } : {})}
+                      dimmed={replay ? !replayAgent : false}
+                      onSelect={() => setSelectedId(AGENT_NODE_ID)}
                     />
-                  </div>
-                );
-              })}
+                  </AgentBus>
+                ) : (
+                  !builtin &&
+                  !replay && (
+                    <div className="flex shrink-0 justify-center pt-4">
+                      <AddAgentNode onAdd={addAgent} />
+                    </div>
+                  )
+                )}
+              </div>
               {!builtin && !replay && (
                 <div className={cn("flex shrink-0 flex-col", adding ? "w-[264px]" : "w-auto")}>
                   {adding ? (
@@ -557,14 +649,24 @@ export function BuildTab({
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <h3 className="truncate text-sm font-semibold">
-                  {selected ? blockKind(selected.type).label : "Trigger"}
+                  {selected ? blockKind(selected.type).label : agentSelected ? "Agent" : "Trigger"}
                 </h3>
                 <span className="rounded-sm bg-secondary px-1.5 py-px font-mono text-2xs text-muted-foreground">
-                  {selected ? selected.type : ways.length > 1 ? entrypointId : "way in"}
+                  {selected
+                    ? selected.type
+                    : agentSelected
+                      ? "agent"
+                      : ways.length > 1
+                        ? entrypointId
+                        : "way in"}
                 </span>
               </div>
               <div className="font-mono text-2xs text-muted-foreground">
-                {selected ? selected.id : triggerSummaryFor(entrypointId)}
+                {selected
+                  ? selected.id
+                  : agentSelected
+                    ? agentSummary
+                    : triggerSummaryFor(entrypointId)}
               </div>
             </div>
             {selected && !builtin && position && (
@@ -618,14 +720,19 @@ export function BuildTab({
               ) : replayNode && replayStep ? (
                 <StepDetails
                   step={replayStep}
-                  blockType={selected?.type}
+                  blockType={
+                    selected?.type ??
+                    (replayNode.blockId === AGENT_CLOSE_STEP_ID ? "instance_close" : "run_agent")
+                  }
                   sentence={replayNode.sentence}
                   frames={replayNode.frames}
                   onPickFrame={setFramePath}
                 />
               ) : (
                 <p className="text-sm text-muted-foreground" data-testid="replay-off-path">
-                  This block was not on the path of that run.
+                  {agentSelected
+                    ? "That run never reached the agent."
+                    : "This block was not on the path of that run."}
                 </p>
               )
             ) : effectiveId === TRIGGER_ROW_ID ? (
@@ -634,6 +741,21 @@ export function BuildTab({
                 onChange={updateTrigger}
                 builtin={builtin}
                 errors={triggerErrors}
+                {...(agent
+                  ? {
+                      role: roleOf(definition, entrypointId),
+                      onRoleChange: (role) => onChange(setRole(definition, entrypointId, role)),
+                    }
+                  : {})}
+              />
+            ) : agentSelected && agent ? (
+              <AgentInspector
+                agent={agent}
+                onChange={updateAgent}
+                builtin={builtin}
+                errors={agentErrors}
+                variablePaths={variablePaths}
+                variableValues={previewValues}
               />
             ) : selected ? (
               <BlockInspector
@@ -681,6 +803,16 @@ export function BuildTab({
                     <Trash2 aria-hidden /> Remove
                   </Button>
                 </>
+              ) : agentSelected ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="ml-auto text-destructive hover:text-destructive"
+                  onClick={removeAgent}
+                  aria-label="Remove the agent"
+                >
+                  <X aria-hidden /> Remove the agent
+                </Button>
               ) : entrypointId !== MAIN_ENTRYPOINT_ID ? (
                 <Button
                   variant="ghost"

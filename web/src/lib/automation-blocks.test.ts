@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  AGENT_CLOSE_STEP_ID,
+  AGENT_NODE_ID,
+  AGENT_STEP_ID,
   blockKind,
+  blockTypesOf,
+  defaultAgent,
+  hasScopedAgents,
+  roleOf,
+  scopeLabel,
+  scopePresetOf,
+  setRole,
   groupedBlockKinds,
   insertableBlockKinds,
   removeEntrypoint,
@@ -195,16 +205,10 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
     expect(insertableBlockKinds(new Set()).some((s) => s.kind === "slack_choice")).toBe(false);
   });
 
-  it("groups the insertable kinds: the agent first, the internals under Advanced", () => {
+  it("groups the insertable kinds by purpose, the internals under Advanced; the agent is not a block", () => {
     const groups = groupedBlockKinds(new Set(["openrouter"]));
-    expect(groups.map((g) => g.id)).toEqual([
-      "agent",
-      "flow",
-      "sessions",
-      "integrations",
-      "advanced",
-    ]);
-    expect(groups[0]!.kinds.map((k) => k.kind)).toEqual(["create_session", "run_agent"]);
+    expect(groups.map((g) => g.id)).toEqual(["flow", "sessions", "integrations", "advanced"]);
+    expect(groups.flatMap((g) => g.kinds.map((k) => k.kind))).not.toContain("run_agent");
     const advanced = groups.find((g) => g.id === "advanced")!.kinds.map((k) => k.kind);
     for (const kind of ["loop", "wait_event", "state_get", "review_open_pass", "relay_close"]) {
       expect(advanced).toContain(kind);
@@ -293,5 +297,82 @@ describe("entrypoint projection (ADR 0119 D9)", () => {
       "create_session",
     );
     expect(nextBlockId([], "create_session", ["create_session"])).toBe("create_session_2");
+  });
+});
+
+describe("the agent with ways in", () => {
+  const base = (): AutomationDefinition => ({
+    engine: 1,
+    trigger: {
+      kind: "integration",
+      provider: "slack",
+      connectionId: "c",
+      eventKeys: ["app_mention"],
+    },
+    blocks: [],
+    entrypoints: [{ id: "done", trigger: { kind: "manual" }, blocks: [] }],
+    inputsSchema: [],
+    settings: { endSessionsOnFinish: false },
+  });
+
+  it("a new agent is scoped by the trigger: a thread for Slack, a PR for GitHub, a session per event otherwise", () => {
+    expect(scopePresetOf(defaultAgent(base().trigger).scope)).toBe("slack_thread");
+    expect(
+      scopePresetOf(
+        defaultAgent({ kind: "integration", provider: "github", connectionId: "c", eventKeys: [] })
+          .scope,
+      ),
+    ).toBe("pull_request");
+    expect(defaultAgent({ kind: "cron", schedule: "* * * * *", timezone: "UTC" }).scope).toEqual({
+      kind: "event",
+    });
+  });
+
+  it("the scope badge reads the agent's scope; a session per event has none", () => {
+    const d = base();
+    expect(scopeLabel({ ...d, agent: defaultAgent(d.trigger) })).toBe("per thread");
+    expect(
+      scopeLabel({ ...d, agent: { ...defaultAgent(d.trigger), scope: { kind: "automation" } } }),
+    ).toBe("one agent");
+    expect(
+      scopeLabel({ ...d, agent: { ...defaultAgent(d.trigger), scope: { kind: "event" } } }),
+    ).toBeUndefined();
+    expect(
+      scopeLabel({
+        ...d,
+        agent: { ...defaultAgent(d.trigger), scope: { kind: "key", keyTemplate: "${{ x }}" } },
+      }),
+    ).toBe("per key");
+    expect(hasScopedAgents({ ...d, agent: defaultAgent(d.trigger) })).toBe(true);
+    expect(
+      hasScopedAgents({ ...d, agent: { ...defaultAgent(d.trigger), scope: { kind: "event" } } }),
+    ).toBe(false);
+  });
+
+  it("a role is read and written per way in; start is stored as no field", () => {
+    let d = base();
+    expect(roleOf(d, "main")).toBe("start");
+    d = setRole(d, "done", "close");
+    expect(roleOf(d, "done")).toBe("close");
+    d = setRole(setRole(d, "main", "reach"), "main", "start");
+    expect("role" in d).toBe(false);
+    expect(d.entrypoints?.[0]?.role).toBe("close");
+  });
+
+  it("the ledger's agent steps take the agent's types, so their sentences read", () => {
+    const d = { ...base(), agent: defaultAgent(base().trigger) };
+    const types = blockTypesOf(d);
+    expect(types.get(AGENT_STEP_ID)).toBe("run_agent");
+    expect(types.get(AGENT_CLOSE_STEP_ID)).toBe("instance_close");
+    expect(blockTypesOf(base()).has(AGENT_STEP_ID)).toBe(false);
+  });
+
+  it("an agent error is addressed to the agent node", () => {
+    expect(
+      parseBlockErrors("__agent__.profileId: pick a profile; admit.conditions: empty"),
+    ).toEqual([
+      { blockId: AGENT_NODE_ID, field: "profileId", message: "pick a profile" },
+      { blockId: "admit", field: "conditions", message: "empty" },
+    ]);
   });
 });

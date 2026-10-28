@@ -18,7 +18,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { useEditorWebhookRegistrations, useEventCatalog } from "@/hooks/useAutomationEditor";
-import type { BlockErrorRef, TriggerSpec } from "@/lib/automation-blocks";
+import type { BlockErrorRef, EntrypointRole, TriggerSpec } from "@/lib/automation-blocks";
 
 const PROVIDERS = ["github", "slack", "linear"] as const;
 const KINDS: ReadonlyArray<{ kind: TriggerSpec["kind"]; label: string; help: string }> = [
@@ -36,6 +36,30 @@ const KINDS: ReadonlyArray<{ kind: TriggerSpec["kind"]; label: string; help: str
   { kind: "manual", label: "Manual", help: "Only runs from the Run now button." },
 ];
 
+/** What a way in does with the agent once its blocks ran. */
+export const ROLES: ReadonlyArray<{ role: EntrypointRole; label: string; help: string }> = [
+  {
+    role: "start",
+    label: "Starts the agent",
+    help: "Reaches the agent, and starts it when it is not running.",
+  },
+  {
+    role: "reach",
+    label: "Reaches the agent when it is running",
+    help: "An event with no running agent is dropped; nothing starts.",
+  },
+  {
+    role: "close",
+    label: "Closes the agent",
+    help: "The agent's session is kept; later events for it are dropped.",
+  },
+  {
+    role: "none",
+    label: "Runs its own steps",
+    help: "No agent; only the steps on this way in run.",
+  },
+];
+
 export interface TriggerInspectorProps {
   trigger: TriggerSpec;
   onChange: (next: TriggerSpec) => void;
@@ -43,6 +67,9 @@ export interface TriggerInspectorProps {
    * Inputs tab when the scope reads from an input). */
   builtin: boolean;
   errors: readonly BlockErrorRef[];
+  /** The way in's role, when the automation has an agent. */
+  role?: EntrypointRole;
+  onRoleChange?: (role: EntrypointRole) => void;
 }
 
 function errorFor(errors: readonly BlockErrorRef[], field: string): string | undefined {
@@ -57,7 +84,14 @@ function Pinned() {
   );
 }
 
-export function TriggerInspector({ trigger, onChange, builtin, errors }: TriggerInspectorProps) {
+export function TriggerInspector({
+  trigger,
+  onChange,
+  builtin,
+  errors,
+  role,
+  onRoleChange,
+}: TriggerInspectorProps) {
   const defaultFor = (kind: TriggerSpec["kind"]): TriggerSpec => {
     switch (kind) {
       case "integration":
@@ -107,6 +141,35 @@ export function TriggerInspector({ trigger, onChange, builtin, errors }: Trigger
       )}
       {trigger.kind === "webhook" && (
         <WebhookTrigger trigger={trigger} onChange={onChange} builtin={builtin} errors={errors} />
+      )}
+
+      {role !== undefined && onRoleChange && (
+        <Field data-testid="field-role">
+          <FieldLabel className="flex items-center gap-1.5">
+            After its steps {builtin && <Pinned />}
+          </FieldLabel>
+          <Select
+            value={role}
+            onValueChange={(next) => onRoleChange(next as EntrypointRole)}
+            disabled={builtin}
+          >
+            <SelectTrigger aria-label="After its steps">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {ROLES.map((r) => (
+                <SelectItem key={r.role} value={r.role}>
+                  {r.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {errorFor(errors, "role") ? (
+            <FieldError>{errorFor(errors, "role")}</FieldError>
+          ) : (
+            <FieldDescription>{ROLES.find((r) => r.role === role)?.help}</FieldDescription>
+          )}
+        </Field>
       )}
     </div>
   );

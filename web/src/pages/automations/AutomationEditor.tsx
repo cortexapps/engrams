@@ -42,6 +42,7 @@ import {
   entrypointIds,
   applyOverrides,
   blockTypesOf,
+  hasScopedAgents,
   diffOverrides,
   EMPTY_DEFINITION,
   parseBlockErrors,
@@ -403,7 +404,7 @@ export function AutomationEditor({
   const triggerSummaryFor = (way: string) =>
     existingSummary(automation?.id, projectEntrypoint(draft, way));
   const liveValues = variableValues ?? test.variableValues;
-  const hasAgents = draft.settings.instance !== undefined;
+  const hasAgents = hasScopedAgents(draft);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="automation-editor">

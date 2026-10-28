@@ -86,4 +86,27 @@ describe("TriggerInspector", () => {
       expect.objectContaining({ scope: { values: ["acme/repo", "acme/other"] } }),
     );
   });
+
+  it("offers the way in's role only when the automation has an agent", async () => {
+    const onRoleChange = vi.fn();
+    const { unmount } = renderWithProviders(
+      <TriggerInspector trigger={reviewTrigger} onChange={vi.fn()} builtin={false} errors={[]} />,
+    );
+    await screen.findByTestId("field-trigger.scope");
+    expect(screen.queryByTestId("field-role")).toBeNull();
+    unmount();
+
+    renderWithProviders(
+      <TriggerInspector
+        trigger={reviewTrigger}
+        onChange={vi.fn()}
+        builtin={false}
+        errors={[]}
+        role="reach"
+        onRoleChange={onRoleChange}
+      />,
+    );
+    const role = await screen.findByTestId("field-role");
+    expect(role.textContent).toContain("An event with no running agent is dropped");
+  });
 });

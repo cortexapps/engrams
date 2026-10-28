@@ -63,59 +63,6 @@ function mount(
 }
 
 describe("BlockInspector", () => {
-  it("the Agent block: a Slack reply switch writes the thread relay, the session mode writes reuse", async () => {
-    const { onChange } = mount(
-      {
-        id: "agent",
-        type: "run_agent",
-        config: { profileId: "pr_reviewer", promptTemplate: "Answer it.", reuse: "workstream" },
-      },
-      false,
-    );
-    await screen.findByTestId("agent-inspector");
-    // Off by default: no relay in the config.
-    const relay = screen.getByRole("switch", {
-      name: /reply in the slack thread/i,
-    }) as HTMLButtonElement;
-    expect(relay.getAttribute("aria-checked")).toBe("false");
-    fireEvent.click(relay);
-    expect(onChange).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        config: expect.objectContaining({
-          relay: expect.objectContaining({
-            provider: "slack",
-            channel: "${{ event.raw.event.channel }}",
-            threadTs: "${{ event.raw.event.thread_ts | default: event.raw.event.ts }}",
-          }),
-        }),
-      }),
-    );
-    // The six templates stay behind a disclosure until asked for.
-    expect(screen.queryByTestId("field-relay.channel")).toBeNull();
-  });
-
-  it("the Agent block: a relay already set shows on, and off removes it", async () => {
-    const { onChange } = mount(
-      {
-        id: "agent",
-        type: "run_agent",
-        config: {
-          profileId: "pr_reviewer",
-          promptTemplate: "Answer it.",
-          relay: { provider: "slack", team: "${{ event.raw.team_id }}", channel: "C1" },
-        },
-      },
-      false,
-    );
-    const relay = await screen.findByRole("switch", { name: /reply in the slack thread/i });
-    expect(relay.getAttribute("aria-checked")).toBe("true");
-    fireEvent.click(screen.getByText("Where the relay reads the thread from"));
-    expect(await screen.findByTestId("field-relay.channel")).toBeTruthy();
-    fireEvent.click(relay);
-    const last = onChange.mock.calls.at(-1)![0] as BlockDef;
-    expect("relay" in last.config).toBe(false);
-  });
-
   it("dispatches a generic-form kind and writes dotted config paths", async () => {
     const { onChange } = mount(
       {

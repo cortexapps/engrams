@@ -1,7 +1,8 @@
-/** The Agent block's inspector: who runs (the profile), what it gets on
- * every event (the prompt), whether the agent keeps one session, and
- * where it talks back. The common case is three controls; the relay's six
- * templates and the session's finer settings sit behind disclosures. */
+/** The agent's inspector: who runs (the profile), what it gets on every
+ * event (the prompt), how many agents there are (the scope), and where it
+ * talks back (the relay). The common case is three controls; the relay's
+ * templates, a custom key, and the session's finer settings sit behind
+ * disclosures. Edits land on the definition's `agent`, not on a block. */
 
 import { ChevronDown, Lock } from "lucide-react";
 import { useMemo, useState } from "react";
@@ -19,10 +20,13 @@ import { Switch } from "@/components/ui/switch";
 import { useHarnessCatalog } from "@/hooks/useHarnessCatalog";
 import { useProfiles } from "@/hooks/useProfiles";
 import {
+  CUSTOM_SCOPE_ID,
   getPath,
-  isTunable,
+  SCOPE_PRESETS,
+  scopePresetOf,
   setPath,
-  type BlockDef,
+  type AgentScope,
+  type AgentSpec,
   type BlockErrorRef,
   type FieldSpec,
 } from "@/lib/automation-blocks";
@@ -35,11 +39,11 @@ import {
 import { GenericField } from "../fields/GenericField";
 
 export interface AgentInspectorProps {
-  block: BlockDef;
-  onChange: (next: BlockDef) => void;
+  agent: AgentSpec;
+  onChange: (next: AgentSpec) => void;
+  /** Built-in: the agent is set by the built-in; every field is pinned. */
   builtin: boolean;
   errors: readonly BlockErrorRef[];
-  sessionSources: readonly string[];
   variablePaths: readonly string[];
   variableValues?: Readonly<Record<string, string>>;
 }
@@ -75,6 +79,21 @@ const RELAY_FIELDS: FieldSpec[] = [
   { type: "template", key: "relay.eventId", label: "Event id" },
 ];
 
+const KEY_FIELDS: FieldSpec[] = [
+  {
+    type: "template",
+    key: "scope.keyTemplate",
+    label: "Key",
+    help: "Rendered from the event; events that render the same key reach the same agent.",
+  },
+  {
+    type: "template",
+    key: "scope.labelTemplate",
+    label: "Name",
+    help: "What the agent is called on the Agents tab; empty means the key.",
+  },
+];
+
 const MORE_FIELDS: FieldSpec[] = [
   {
     type: "template",
@@ -103,19 +122,6 @@ const MORE_FIELDS: FieldSpec[] = [
   },
 ];
 
-const SESSION_MODES: Array<{ value: "workstream" | "never"; label: string; help: string }> = [
-  {
-    value: "workstream",
-    label: "One session per agent",
-    help: "Continues the agent's kept session when it is alive; starts one when it is not.",
-  },
-  {
-    value: "never",
-    label: "A new session every time",
-    help: "Every event starts its own session.",
-  },
-];
-
 function errorFor(errors: readonly BlockErrorRef[], field: string): string | undefined {
   return errors.find((e) => e.field === field || e.field.startsWith(`${field}.`))?.message;
 }
@@ -132,12 +138,14 @@ function Disclosure({
   label,
   children,
   testId,
+  defaultOpen = false,
 }: {
   label: string;
   children: React.ReactNode;
   testId: string;
+  defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
   return (
     <Collapsible open={open} onOpenChange={setOpen} data-testid={testId}>
       <CollapsibleTrigger asChild>
@@ -162,48 +170,60 @@ function Disclosure({
 }
 
 export function AgentInspector(props: AgentInspectorProps) {
-  const { block, onChange, builtin, errors } = props;
+  const { agent, onChange, builtin, errors } = props;
   const profiles = useProfiles();
   const harnesses = useHarnessCatalog();
-  const profile = profiles.data?.profiles.find((p) => p.id === block.config["profileId"]);
-  const editable = (key: string) => (builtin ? isTunable(block, key) : true);
-  const set = (key: string, value: unknown) =>
-    onChange({ ...block, config: setPath(block.config, key, value) });
+  const profile = profiles.data?.profiles.find((p) => p.id === agent.profileId);
+  const pinned = builtin;
+  const set = (key: string, value: unknown) => onChange(setPath(agent, key, value) as AgentSpec);
 
   const field = (spec: FieldSpec) => (
     <GenericField
       key={spec.key}
       spec={spec}
-      value={getPath(block.config, spec.key)}
+      value={getPath(agent, spec.key)}
       onChange={(value) => set(spec.key, value)}
-      pinned={!editable(spec.key)}
+      pinned={pinned}
       error={errorFor(errors, spec.key)}
-      sessionSources={props.sessionSources}
+      sessionSources={[]}
       variablePaths={props.variablePaths}
       variableValues={props.variableValues}
     />
   );
 
-  const reuse = block.config["reuse"] === "never" ? "never" : "workstream";
-  const relay = block.config["relay"];
+  const preset = scopePresetOf(agent.scope);
+  const setScope = (id: string) => {
+    let scope: AgentScope;
+    if (id === CUSTOM_SCOPE_ID) {
+      scope = agent.scope.kind === "key" ? agent.scope : { kind: "key", keyTemplate: "" };
+    } else {
+      scope = SCOPE_PRESETS.find((p) => p.id === id)!.scope;
+    }
+    onChange({ ...agent, scope });
+  };
+  const scopeHelp =
+    preset === CUSTOM_SCOPE_ID
+      ? "One agent per rendered key."
+      : SCOPE_PRESETS.find((p) => p.id === preset)!.help;
+
+  const relay = agent["relay"];
   const relayOn =
     typeof relay === "object" &&
     relay !== null &&
     Object.values(relay as Record<string, unknown>).some((v) => typeof v === "string" && v !== "");
-  const relayPinned = !editable("relay");
 
   const override: HarnessOverride = useMemo(
     () => ({
-      harness: (block.config["harness"] as string | undefined) ?? null,
-      model: (block.config["model"] as string | undefined) ?? null,
-      modelRouter: (block.config["modelRouter"] as string | undefined) ?? null,
-      effort: (block.config["effort"] as string | undefined) ?? null,
-      mode: (block.config["harnessMode"] as string | undefined) ?? null,
+      harness: (agent["harness"] as string | undefined) ?? null,
+      model: (agent["model"] as string | undefined) ?? null,
+      modelRouter: (agent["modelRouter"] as string | undefined) ?? null,
+      effort: (agent["effort"] as string | undefined) ?? null,
+      mode: (agent["harnessMode"] as string | undefined) ?? null,
     }),
-    [block.config],
+    [agent],
   );
   const setOverride = (next: HarnessOverride) => {
-    let config = block.config;
+    let config: Record<string, unknown> = agent;
     const assign = (key: string, value: string | null | undefined) => {
       config = setPath(config, key, value ?? undefined);
     };
@@ -212,9 +232,8 @@ export function AgentInspector(props: AgentInspectorProps) {
     assign("modelRouter", next.modelRouter === null ? undefined : next.modelRouter);
     assign("effort", next.effort);
     assign("harnessMode", next.mode);
-    onChange({ ...block, config });
+    onChange(config as AgentSpec);
   };
-  const harnessPinned = !editable("harness");
 
   return (
     <div className="flex flex-col gap-4" data-testid="agent-inspector">
@@ -227,40 +246,51 @@ export function AgentInspector(props: AgentInspectorProps) {
         help: "What the agent gets on every event. A continued session keeps its history, so say what is new.",
       })}
 
-      <Field data-testid="field-reuse">
+      <Field data-testid="field-scope">
         <FieldLabel className="flex items-center gap-1.5">
-          Session
-          {!editable("reuse") && <Pinned />}
+          One agent for
+          {pinned && <Pinned />}
         </FieldLabel>
-        <Select
-          value={reuse}
-          onValueChange={(next) => set("reuse", next)}
-          disabled={!editable("reuse")}
-        >
-          <SelectTrigger aria-label="Session">
+        <Select value={preset} onValueChange={setScope} disabled={pinned}>
+          <SelectTrigger aria-label="One agent for">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            {SESSION_MODES.map((mode) => (
-              <SelectItem key={mode.value} value={mode.value}>
-                {mode.label}
+            {SCOPE_PRESETS.map((option) => (
+              <SelectItem key={option.id} value={option.id}>
+                {option.label}
               </SelectItem>
             ))}
+            <SelectItem value={CUSTOM_SCOPE_ID}>A key of your own</SelectItem>
           </SelectContent>
         </Select>
-        <FieldDescription>{SESSION_MODES.find((m) => m.value === reuse)!.help}</FieldDescription>
+        <FieldDescription>{scopeHelp}</FieldDescription>
+        {errorFor(errors, "scope") && (
+          <p className="text-xs text-[var(--instrument-critical-ink)]">
+            {errorFor(errors, "scope")}
+          </p>
+        )}
+        {agent.scope.kind === "key" && (
+          <Disclosure
+            label="The key"
+            testId="scope-fields"
+            defaultOpen={preset === CUSTOM_SCOPE_ID}
+          >
+            {KEY_FIELDS.map(field)}
+          </Disclosure>
+        )}
       </Field>
 
       <Field data-testid="field-relay">
         <div className="flex items-center justify-between gap-3">
-          <FieldLabel htmlFor={`${block.id}-relay`} className="flex items-center gap-1.5">
+          <FieldLabel htmlFor="agent-relay" className="flex items-center gap-1.5">
             Reply in the Slack thread the event came from
-            {relayPinned && <Pinned />}
+            {pinned && <Pinned />}
           </FieldLabel>
           <Switch
-            id={`${block.id}-relay`}
+            id="agent-relay"
             checked={relayOn}
-            disabled={relayPinned}
+            disabled={pinned}
             onCheckedChange={(on) => set("relay", on ? { ...SLACK_THREAD_RELAY } : undefined)}
           />
         </div>
@@ -286,7 +316,7 @@ export function AgentInspector(props: AgentInspectorProps) {
         <Field>
           <FieldLabel className="flex items-center gap-1.5">
             Harness override
-            {harnessPinned && <Pinned />}
+            {pinned && <Pinned />}
           </FieldLabel>
           <SessionHarnessControls
             harnesses={harnesses.data}
@@ -294,7 +324,7 @@ export function AgentInspector(props: AgentInspectorProps) {
             profileModel={profile?.model || undefined}
             value={override}
             onChange={setOverride}
-            disabled={harnessPinned}
+            disabled={pinned}
             audience="programmatic"
           />
           <FieldDescription>
