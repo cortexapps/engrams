@@ -12,6 +12,7 @@ import { z } from "zod";
 
 import { makeSlackPolicy } from "../../../integrations/slack-policy.ts";
 import type { CommunicationPolicy, SourceMention } from "../../../workflows/communication-policy.ts";
+import { canonicalHandle } from "../../handles.ts";
 import { installSessionRelay } from "../../session-relay.ts";
 import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
@@ -70,6 +71,23 @@ export async function installRelayForSession(
     { sessionId, automationId: ctx.automationId, target: mention },
     { store },
   );
+  // The place the session talks into is the workstream's: the handle
+  // ledger routes later events for the thread to it and the UI names the
+  // workstream by it (what the retired "Started a session" post recorded
+  // through the action runtime). Idempotent (`already_ours` on a replay);
+  // a conflict (another workstream holds the thread) is reported, never a
+  // rebind and never a failed turn.
+  let handle: string | undefined;
+  if (ctx.instanceId !== "" && ctx.deps.instances?.recordInstanceHandle) {
+    handle = canonicalHandle("slack", `slack:${mention.channel}:${mention.threadRoot}`);
+    const result = await ctx.deps.instances.recordInstanceHandle({
+      automationId: ctx.automationId,
+      handle,
+      instanceId: ctx.instanceId,
+      writtenBy: `${ctx.runId}:${ctx.currentPath ?? ctx.currentBlockId ?? ""}`,
+    });
+    if (result.kind === "conflict") handle = undefined;
+  }
   return {
     kind: "ok",
     outputs: {
@@ -77,6 +95,7 @@ export async function installRelayForSession(
       installed: true,
       created,
       mention_ts: mention.ts,
+      ...(handle !== undefined ? { handle } : {}),
       // The target a re-point replaced; the agent step restores it when
       // the turn fails to reach the session.
       ...(previous !== undefined ? { previous_target: previous } : {}),

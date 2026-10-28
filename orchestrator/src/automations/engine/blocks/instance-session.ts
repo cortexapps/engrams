@@ -28,7 +28,7 @@ export type LookupInstanceSessionConfig = z.infer<typeof lookupInstanceSessionCo
 export function registerInstanceSessionLookupBlock(): void {
   registerBlock<LookupInstanceSessionConfig>({
     type: LOOKUP_INSTANCE_SESSION_TYPE,
-    outputs: ["found", "session_id", "web_url", "run_id", "reason"],
+    outputs: ["found", "session_id", "web_url", "run_id", "reason", "mention_ts"],
     configSchema: lookupInstanceSessionConfigSchema,
     async execute(_config, ctx) {
       // A dry run binds to no workstream and must not read live rows as
@@ -51,6 +51,12 @@ export function registerInstanceSessionLookupBlock(): void {
           },
         };
       }
+      // Where the session's relay points: the mention of its latest turn.
+      // The Slack brain's fold starts after it (the boundary of what the
+      // session has seen), so a mention that was never a turn (dropped at
+      // admission) never moves the boundary.
+      const relay = ctx.deps.relays ? await ctx.deps.relays.get(previous.sessionId) : null;
+      const mentionTs = typeof relay?.target["ts"] === "string" ? relay.target["ts"] : undefined;
       return {
         kind: "ok",
         outputs: {
@@ -58,6 +64,7 @@ export function registerInstanceSessionLookupBlock(): void {
           session_id: previous.sessionId,
           web_url: sessionWebUrl(previous.sessionId),
           run_id: previous.runId,
+          ...(mentionTs !== undefined ? { mention_ts: mentionTs } : {}),
         },
       };
     },
