@@ -160,7 +160,8 @@ describe("AutomationsList", () => {
     expect(within(rows[0]!).getByText("built-in")).toBeTruthy();
     expect(within(rows[0]!).getByText("per PR")).toBeTruthy();
     expect(screen.queryByRole("button", { name: /archive/i })).toBeNull();
-    expect(screen.getByRole("button", { name: "Duplicate PR review" })).toBeTruthy();
+    // Duplicate lives on a built-in's own editor, not on the list.
+    expect(screen.queryByRole("button", { name: /duplicate/i })).toBeNull();
   });
 
   it("encodes the last run as an instrument-toned status dot", async () => {
@@ -193,29 +194,12 @@ describe("AutomationsList", () => {
     expect(links[0]!.querySelector("svg[role=img]")).not.toBeNull();
   });
 
-  it("shows the empty state with 'Duplicate PR review' only when the built-in exists", async () => {
+  it("shows the empty state with New automation as the one way to start", async () => {
     state.automations = [];
-    state.builtin = null;
     renderWithProviders(<AutomationsList />);
     expect(await screen.findByText(/no automations yet/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /duplicate/i })).toBeNull();
     // Header action + the empty-state call to action.
     expect(screen.getAllByRole("link", { name: /new automation/i })).toHaveLength(2);
-  });
-
-  it("duplicates the built-in from the masthead and the empty state", async () => {
-    const user = userEvent.setup();
-    state.automations = [];
-    state.builtin = create(AutomationSchema, {
-      id: "builtin-pr",
-      name: "PR review",
-      kind: "builtin",
-      builtinKey: "pr_review",
-    });
-    renderWithProviders(<AutomationsList />);
-    const buttons = await screen.findAllByRole("button", { name: "Duplicate PR review" });
-    expect(buttons).toHaveLength(2);
-    await user.click(buttons[0]!);
-    await waitFor(() => expect(duplicate).toHaveBeenCalledWith({ automationId: "builtin-pr" }));
   });
 });
