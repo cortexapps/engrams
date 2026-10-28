@@ -91,6 +91,9 @@ function makeHarness(
     >;
     /** ADR 0120: bind the run to a workstream (state auto-scopes). */
     instanceId?: string;
+    /** The workstream's latest kept session (run_agent continues it when
+     * `probes` says it is live). */
+    keptSession?: { sessionId: string; runId: string };
     /** Pre-owned handles for claim_handle conflict cases. */
     handleOwners?: Record<string, string>;
     /** Instances the fake treats as CLOSED (claim takeover cases). */
@@ -153,7 +156,9 @@ function makeHarness(
     async finalizeRun(_runId, status, error) {
       finalized.push({ status, ...(error !== undefined ? { error } : {}) });
     },
-    async latestKeptInstanceSession() { return null; },
+    async latestKeptInstanceSession() {
+      return options.keptSession ?? null;
+    },
     async listRunSessions() {
       return runSessions;
     },
@@ -836,6 +841,43 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     expect(result.status).toBe("completed");
     const next = h.stepRecords.filter((r) => r.framePath === "next").at(-1)!;
     expect(next.record.outputs).toMatchObject({ event_key: "app_mention" });
+  });
+
+  test("run_agent renders the opening prompt only when a session starts", async () => {
+    // A reach event (an issue comment) continues the workstream's session.
+    // Its payload has no pull_request, which only the OPENING prompt reads:
+    // the step must not fail on a prompt it does not send.
+    const definition = makeDefinition([
+      {
+        id: "agent",
+        type: "run_agent",
+        config: {
+          profileId: "p1",
+          promptTemplate: "new: ${{ trigger.event }}",
+          openingPromptTemplate: "start PR #${{ event.raw.pull_request.number }}",
+        },
+      },
+    ]);
+    const continued = makeHarness(definition, {
+      instanceId: "i1",
+      payload: { issue: { number: 7 } },
+      keptSession: { sessionId: "s-old", runId: "autorun:old" },
+      bindings: {
+        "s-old": { automationId: "auto-1", runId: "autorun:old", ownerTerminal: true, instanceId: "i1" },
+      },
+      probes: { "s-old": { status: "idle", lastActiveAt: "2026-08-21T00:00:00Z", lastEventAt: null } },
+    });
+    const result = await interpretAutomation(RUN, continued.deps);
+    expect(result.status).toBe("completed");
+    expect(continued.created).toEqual([]);
+    expect(continued.prompts.map((p) => p.text)).toEqual(["new: test.event"]);
+
+    // No live session: the opening prompt IS needed, and its miss fails the
+    // step with the field named.
+    const fresh = makeHarness(definition, { instanceId: "i1", payload: { issue: { number: 7 } } });
+    const freshResult = await interpretAutomation(RUN, fresh.deps);
+    expect(freshResult.status).toBe("failed");
+    expect(fresh.finalized.at(-1)?.error).toContain("pull_request");
   });
 
   test("a $ref-bound wait deadline is clamped into the schema's range, never refused", async () => {

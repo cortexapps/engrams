@@ -1572,14 +1572,15 @@ export type AutomationDropBrief = Message<"engram.app.v1.AutomationDropBrief"> &
   eventKey: string;
 
   /**
-   * "closed_instance" | "no_handle_match" | "no_open_instance"
+   * "closed_instance" | "no_handle_match" | "no_open_instance" | "render_failed"
    *
    * @generated from field: string reason = 3;
    */
   reason: string;
 
   /**
-   * The candidate handle or rendered key that failed to route.
+   * The candidate handle or rendered key that failed to route; for
+   * render_failed, the template error.
    *
    * @generated from field: string detail = 4;
    */

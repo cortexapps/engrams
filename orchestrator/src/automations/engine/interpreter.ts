@@ -133,8 +133,17 @@ function asValueRef(value: unknown): string | null {
 
 /** Which config fields the interpreter leaves UNRENDERED: a wait block's
  * session reference is resolved by the block (it reads its own outputs), a
- * code block's source is JS not a template, and condition groups are data. */
-const UNRENDERED_FIELDS = new Set(["session", "source", "conditions", "until", "waitFor"]);
+ * code block's source is JS not a template, condition groups are data, and
+ * an agent's opening prompt is rendered by the block only when a session
+ * starts (a reach event's payload may lack the fields it reads). */
+const UNRENDERED_FIELDS = new Set([
+  "session",
+  "source",
+  "conditions",
+  "until",
+  "waitFor",
+  "openingPromptTemplate",
+]);
 
 async function resolveBlockConfig(
   config: Record<string, unknown>,

@@ -492,9 +492,10 @@ message CloseInstanceResponse {
 message AutomationDropBrief {
   string entrypoint_id = 1;
   string event_key = 2;
-  // "closed_instance" | "no_handle_match" | "no_open_instance"
+  // "closed_instance" | "no_handle_match" | "no_open_instance" | "render_failed"
   string reason = 3;
-  // The candidate handle or rendered key that failed to route.
+  // The candidate handle or rendered key that failed to route; for
+  // render_failed, the template error.
   string detail = 4;
   string dropped_at = 5;
 }
