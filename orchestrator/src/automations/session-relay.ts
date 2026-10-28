@@ -63,10 +63,23 @@ export interface RelayRenderState extends Record<string, unknown> {
   assets: AssetSummary[];
   bubble: { ts: string; text: string } | null;
   lastAssistantText: string | null;
+  /** The session is on a turn (⏳ sits on the mention). */
+  working: boolean;
+  /** Mentions a re-point left mid-turn, still wearing ⏳: the next idle
+   * settles them (✅) along with the current mention. */
+  settle: string[];
 }
 
 export function freshRelayState(): RelayRenderState {
-  return { questionTs: {}, questionProtocols: {}, assets: [], bubble: null, lastAssistantText: null };
+  return {
+    questionTs: {},
+    questionProtocols: {},
+    assets: [],
+    bubble: null,
+    lastAssistantText: null,
+    working: false,
+    settle: [],
+  };
 }
 
 function stateOf(row: SessionRelayRow): RelayRenderState {
@@ -77,6 +90,8 @@ function stateOf(row: SessionRelayRow): RelayRenderState {
     assets: [...(s.assets ?? [])],
     bubble: s.bubble ?? null,
     lastAssistantText: s.lastAssistantText ?? null,
+    working: s.working ?? false,
+    settle: [...(s.settle ?? [])],
   };
 }
 
@@ -136,7 +151,9 @@ export interface InstallSessionRelayInput {
 /** Install the relay on a session, or re-point an installed one at a new
  * mention. A re-point keeps the questions, assets and last text (the
  * conversation continues) and closes the open bubble: the next response
- * opens a fresh message under the new mention. Idempotent per mention. */
+ * opens a fresh message under the new mention. A mention left mid-turn
+ * keeps its ⏳ until the session next goes idle, which settles it.
+ * Idempotent per mention. */
 export async function installSessionRelay(
   input: InstallSessionRelayInput,
   deps: Pick<SessionRelayDeps, "store"> = sessionRelayDeps(),
@@ -160,7 +177,12 @@ export async function installSessionRelay(
     }
     const ok = await deps.store.update(row.sessionId, row.version, {
       target,
-      state: { ...state, bubble: null },
+      state: {
+        ...state,
+        bubble: null,
+        working: false,
+        settle: state.working ? [...state.settle, mentionOf(row).ts] : state.settle,
+      },
     });
     if (ok) return { created: false };
     row = await deps.store.get(input.sessionId);
@@ -222,7 +244,7 @@ export async function renderSessionEvent(
     // this render changed goes on top of the row as it is now, never over
     // it — a re-point's closed bubble stays closed, a sibling's question
     // card stays known.
-    st = mergeRenderState(stateOf(row), before, st, mentionOf(row).ts === mention.ts);
+    st = mergeRenderState(stateOf(row), before, st, mention, mentionOf(row).ts === mention.ts);
   }
   log.warn({ sessionId }, "session relay: render state write lost every CAS race; the next event re-reads");
   return "rendered";
@@ -238,9 +260,14 @@ function mergeRenderState(
   base: RelayRenderState,
   before: RelayRenderState,
   after: RelayRenderState,
+  mention: SourceMention,
   sameMention: boolean,
 ): RelayRenderState {
   const addedAssets = after.assets.slice(before.assets.length);
+  // A turn that began under a mention the row no longer points at wears
+  // its ⏳ there: the next idle must settle it.
+  const settle =
+    !sameMention && after.working && !before.working ? [...base.settle, mention.ts] : base.settle;
   return {
     questionTs: { ...base.questionTs, ...after.questionTs },
     questionProtocols: { ...base.questionProtocols, ...after.questionProtocols },
@@ -248,6 +275,8 @@ function mergeRenderState(
     bubble: sameMention ? after.bubble : base.bubble,
     lastAssistantText:
       after.lastAssistantText !== before.lastAssistantText ? after.lastAssistantText : base.lastAssistantText,
+    working: sameMention ? after.working : base.working,
+    settle: sameMention ? after.settle : settle,
   };
 }
 
@@ -262,6 +291,7 @@ export async function closeSessionRelay(
   const pol = deps.policy(sessionId);
   const facts = relayFactsOf(row, deps);
   try {
+    await settleMentions(pol, facts.mention, stateOf(row));
     if (outcome === "completed") {
       await pol.onComplete(facts.mention, facts.session, facts.summary);
     } else if (outcome === "failed") {
@@ -320,6 +350,12 @@ export function relayFactsOf(row: SessionRelayRow, deps: Pick<SessionRelayDeps, 
   };
 }
 
+/** Settle the mentions a re-point left mid-turn: each gets its ✅. */
+async function settleMentions(pol: CommunicationPolicy, m: SourceMention, st: RelayRenderState): Promise<void> {
+  for (const ts of st.settle) await pol.onIdle({ ...m, ts });
+  st.settle = [];
+}
+
 /** The legacy `dispatchSessionEvent`, verbatim in effect. */
 async function dispatch(
   pol: CommunicationPolicy,
@@ -343,10 +379,13 @@ async function dispatch(
     }
     case "working":
       st.bubble = null;
+      st.working = true;
       await pol.onWorking(m);
       break;
     case "idle":
       st.bubble = null;
+      st.working = false;
+      await settleMentions(pol, m, st);
       await pol.onIdle(m);
       break;
     case "question": {

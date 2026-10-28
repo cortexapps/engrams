@@ -290,6 +290,20 @@ describe("session relay (contract 5)", () => {
     expect(row.state["lastAssistantText"]).toBe("one");
   });
 
+  test("a mention left mid-turn by a re-point settles when the session next goes idle", async () => {
+    const h = harness();
+    await h.install();
+    await h.render(ev("run_started", {}));
+    expect(h.store.rows.get(SESSION)!.state["working"]).toBe(true);
+    // The next mention arrives while the turn runs: the relay re-points.
+    expect(await h.install({ ...MENTION, ts: "200.0", eventId: "E2" })).toEqual({ created: false });
+    expect(h.store.rows.get(SESSION)!.state).toMatchObject({ working: false, settle: ["100.0"] });
+    await h.render(ev("run_completed", { ok: true }));
+    // Both mentions get their ✅: the one the turn ran under, then the new one.
+    expect(h.policy.calls.onIdle.map((c) => (c[0] as { ts: string }).ts)).toEqual(["100.0", "200.0"]);
+    expect(h.store.rows.get(SESSION)!.state["settle"]).toEqual([]);
+  });
+
   test("a re-point keeps the conversation and opens a fresh bubble under the new mention", async () => {
     const h = harness();
     await h.install();
