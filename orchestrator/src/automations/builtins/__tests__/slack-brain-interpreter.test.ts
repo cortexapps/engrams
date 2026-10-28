@@ -146,7 +146,7 @@ function harness(options: {
   let clock = 1_000_000;
 
   const policy: CommunicationPolicy = {
-    async onStarted() { policyCalls.push("started"); },
+    async onStarted(_m, session) { policyCalls.push(`started:${session.id}`); },
     async onWorking(m) { policyCalls.push(`working:${m.ts}`); },
     async onIdle(m) { policyCalls.push(`idle:${m.ts}`); },
     async onAssistantMessage(_m, text) { policyCalls.push(`msg:${text}`); return "b1"; },
@@ -263,6 +263,8 @@ function harness(options: {
     },
     sessions: sessionOps,
     relays,
+    announceStarted: async (sessionId, target) =>
+      policy.onStarted(target, { id: sessionId, webUrl: `${config.baseUrl}/sessions/${sessionId}` }),
     clock: { nowMs: () => (clock += options.clockStepMs ?? 1000) },
     code: makeCodeBlockRuntime(),
     decisions: {
@@ -322,26 +324,27 @@ describe("Slack thread brain through the interpreter", () => {
     // The Slack flavor rides the session's system prompt (ADR 0060 Decision
     // 8): chat-friendly replies, mrkdwn, questions through the tool.
     expect(h.sessions[0]!.appendSystemPrompt).toContain("Conform to slack markdown");
-    // The thread got the session link (legacy `onStarted`), by an ordinary
-    // Slack action templated on the agent step's `web_url`.
-    expect(posts(h)).toEqual([`Started a session — ${config.baseUrl}/sessions/s-1`]);
+    // The thread got the session link (legacy `onStarted`): the agent step
+    // announces a session it started through the relay's policy.
+    expect(posts(h)).toEqual([]);
+    expect(h.policyCalls).toEqual(["started:s-1"]);
     // The thread page was read once for the fold.
     expect(h.actions.filter((a) => a.actionId === "list_replies").map((a) => a.params)).toEqual([
       { channel: "C1", threadTs: "100.1" },
     ]);
     // No earlier turn kept a session: a fresh one, looked up first.
     expect(h.names).toContain("step:previous:0");
-    expect(h.names.indexOf("step:previous:0")).toBeLessThan(h.names.indexOf("step:has_turn.agent:0"));
+    expect(h.names.indexOf("step:previous:0")).toBeLessThan(h.names.indexOf("step:agent:0"));
+    expect(h.names.at(-2)).toBe("step:agent:0");
     // The relay was installed on the session under the mention: the
     // consumer renders its events from here on, with no run live.
     expect([...h.relays.rows.keys()]).toEqual(["s-1"]);
     expect(h.relays.rows.get("s-1")!.target).toMatchObject({ team: "T1", channel: "C1", threadRoot: "100.1", ts: "100.1", user: "U1", eventId: "Ev1" });
     // NOTHING waited: no wait step, no prompt beyond the opening one, no
-    // session ended, nothing posted through the policy.
+    // session ended.
     expect(h.names.some((n) => n.endsWith(":wait"))).toBe(false);
     expect(h.prompts).toEqual([]);
     expect(h.ended).toEqual([]);
-    expect(h.policyCalls).toEqual([]);
     expect(h.finalized).toEqual([{ status: "completed" }]);
   });
 
@@ -419,7 +422,7 @@ describe("Slack thread brain through the interpreter", () => {
     // A continued thread is silent: it carries the session link from its
     // first turn, and the conversation simply goes on. Nothing routed.
     expect(posts(h)).toEqual([]);
-    expect(h.names).not.toContain("step:has_turn.new_session.started:0");
+    expect(h.policyCalls).toEqual([]);
     expect(h.names.some((n) => n.includes("smart_route.candidates"))).toBe(false);
   });
 
@@ -484,7 +487,7 @@ describe("Slack thread brain through the interpreter", () => {
     expect(result.status).toBe("completed");
     expect(h.sessions.map((s) => s.id)).toEqual(["s-1"]);
     expect(h.prompts).toEqual([]);
-    expect(posts(h)).toEqual([`Started a session — ${config.baseUrl}/sessions/s-1`]);
+    expect(h.policyCalls).toEqual(["started:s-1"]);
     const previous = h.records.filter((r) => r.path === "previous").at(-1);
     expect(previous?.record.outputs).toMatchObject({ found: false, reason: "gone", session_id: "s-old" });
     // The new session got its own relay.
@@ -506,7 +509,7 @@ describe("Slack thread brain through the interpreter", () => {
     ]);
     expect(h.names).toContain("step:identity:0");
     expect(h.names).toContain("step:unlinked.login_notice:0");
-    expect(h.names).not.toContain("step:has_turn.agent:0");
+    expect(h.names).not.toContain("step:agent:0");
     expect(h.finalized).toHaveLength(1);
     expect(h.finalized[0]).toMatchObject({ status: "filtered" });
   });
@@ -543,7 +546,7 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.sessions).toEqual([]);
   });
 
-  test("(d') a bare `@bot` is not a turn: no prompt, no routing, no failure, and the thread's relay stays", async () => {
+  test("(d') a bare `@bot` is not a turn: the run ends filtered, no prompt, no routing, no failure, and the thread's relay stays", async () => {
     const h = harness({
       payload: followUpPayload("<@UBOT>", "100.2"),
       previousSession: { sessionId: "s-old", runId: "r-old", alive: true },
@@ -553,14 +556,15 @@ describe("Slack thread brain through the interpreter", () => {
       ],
     });
     const result = await interpretAutomation(RUN, h.deps);
-    expect(result.status).toBe("completed");
+    expect(result.status).toBe("filtered");
     expect(h.prompts).toEqual([]);
     expect(h.sessions).toEqual([]);
-    expect(h.names).not.toContain("step:has_turn.agent:0");
+    expect(h.names).not.toContain("step:agent:0");
+    expect(h.names.some((n) => n.includes("smart_route"))).toBe(false);
     expect(h.relays.writes).toEqual([]);
     expect(h.relays.rows.get("s-old")!.target).toMatchObject({ ts: "100.1" });
     expect(h.policyCalls).toEqual([]);
-    expect(h.finalized).toEqual([{ status: "completed" }]);
+    expect(h.finalized).toMatchObject([{ status: "filtered" }]);
   });
 
   test("(d'') a bot-authored app_mention is rejected at admission", async () => {
@@ -607,7 +611,7 @@ describe("Slack thread brain — smart routing", () => {
     ask_timeout: 600,
   };
   const QUESTION = "Which profile should handle this thread?";
-  const ASK_ID = `choice:${RUN.runId}:has_turn.has_previous.smart_route.unsure.ask`;
+  const ASK_ID = `choice:${RUN.runId}:has_previous.smart_route.unsure.ask`;
   const answer = (profile: string, confidence: number, wants = 0.02): DecisionsResponse => ({
     model: "typesafe/jev-1.13-20260917",
     answers: {
@@ -640,9 +644,9 @@ describe("Slack thread brain — smart routing", () => {
     expect(Object.keys(h.decisionRequests[0]!.questions)).toEqual(["profile", "wants_choice"]);
     expect(h.choices).toEqual([]);
     expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-infra" })]);
-    expect(posts(h)).toEqual([
-      `Started a session on *Infra* (routed by Jev, 91% confident) — ${config.baseUrl}/sessions/s-1`,
-    ]);
+    // The verdict is a line in the thread, then the session's link.
+    expect(posts(h)).toEqual(["Profile: *Infra* (routed by Jev, 91% confident)"]);
+    expect(h.policyCalls).toEqual(["started:s-1"]);
   });
 
   test("(r2) an unsure pick asks in the thread; the click decides and the card shows it", async () => {
@@ -661,6 +665,8 @@ describe("Slack thread brain — smart routing", () => {
     expect(h.actions.filter((a) => a.actionId === "update_message").map((a) => a.params)).toEqual([
       { channel: "C1", ts: "c1", text: "Profile: *Web* (picked in the thread)" },
     ]);
+    // The card carries the verdict; no second line.
+    expect(posts(h)).toEqual([]);
   });
 
   test("(r2b) a click on a label the card never offered is ignored", async () => {
@@ -711,7 +717,8 @@ describe("Slack thread brain — smart routing", () => {
     await interpretAutomation(RUN, h.deps);
     expect(h.decisionRequests).toEqual([]);
     expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-web" })]);
-    expect(posts(h)).toEqual([`Started a session — ${config.baseUrl}/sessions/s-1`]);
+    expect(posts(h)).toEqual([]);
+    expect(h.policyCalls).toEqual(["started:s-1"]);
   });
 
   test("(r6) without an OpenRouter key smart routing is default routing", async () => {
@@ -720,7 +727,9 @@ describe("Slack thread brain — smart routing", () => {
     expect(h.decisionRequests).toEqual([]);
     expect(h.choices).toEqual([]);
     expect(h.sessions).toEqual([expect.objectContaining({ profileId: "p-d" })]);
-    expect(posts(h)).toEqual([`Started a session — ${config.baseUrl}/sessions/s-1`]);
+    // No key: no verdict line, only the link.
+    expect(posts(h)).toEqual([]);
+    expect(h.policyCalls).toEqual(["started:s-1"]);
   });
 
   test("(r7) no key and no default: the mention is not answered, as before", async () => {
@@ -749,10 +758,7 @@ describe("Slack thread brain — smart routing", () => {
     await interpretAutomation(RUN, h.deps);
     const routing = h.names.filter((n) => n.includes("smart_route"));
     // The decision and its ledger row; no model call, no profile list.
-    expect(routing).toEqual([
-      "step:has_turn.has_previous.smart_route.__cond__:0",
-      "step:has_turn.has_previous.smart_route:0:ledger",
-    ]);
+    expect(routing).toEqual(["step:has_previous.smart_route.__cond__:0", "step:has_previous.smart_route:0:ledger"]);
   });
 
   test("(r11) every chosen profile gone: no model call, the default profile serves", async () => {

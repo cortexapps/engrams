@@ -2,7 +2,12 @@ import { describe, expect, test } from "bun:test";
 
 import { matchesIntegrationTrigger } from "../../dispatch.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
-import { validateDefinition, walkBlocks } from "../../engine/definition.ts";
+import {
+  entrypointsOf,
+  instanceSettingsOf,
+  validateDefinition,
+  walkBlocks,
+} from "../../engine/definition.ts";
 import { evaluateCode } from "../../code/sandbox.ts";
 import {
   SLACK_BRAIN_BUILTIN,
@@ -15,7 +20,7 @@ import {
 registerEngineBlocks();
 
 describe("Slack thread brain built-in — definition", () => {
-  test("validates and is one short run per mention: admit, fold, hand the turn to the standing agent", () => {
+  test("validates and is an agent with one way in: admit, fold, route, and the engine's agent step", () => {
     const parsed = validateDefinition(SLACK_BRAIN_DEFINITION);
     expect(parsed.blocks.map((b) => b.id)).toEqual([
       "facts",
@@ -27,6 +32,7 @@ describe("Slack thread brain built-in — definition", () => {
       "replies",
       "turn",
       "has_turn",
+      "has_previous",
     ]);
     // Nothing waits: no loop, no wait block anywhere in the graph. The
     // conversation lives in the kept session and its relay, not in a run.
@@ -36,19 +42,19 @@ describe("Slack thread brain built-in — definition", () => {
     expect(types.has("wait_session")).toBe(false);
     expect(types.has("send_prompt")).toBe(false);
     expect(types.has("create_session")).toBe(false);
-    expect(types.has("run_agent")).toBe(true);
-    // A bare mention is not a turn: routing and the agent sit behind the gate.
-    const gate = parsed.blocks.find((b) => b.id === "has_turn")!;
-    expect(gate.then!.map((b) => b.id)).toEqual(["has_previous", "agent", "new_session"]);
+    expect(types.has("run_agent")).toBe(false);
+    // A bare mention is not a turn: the gate ends the run before routing.
+    expect(parsed.blocks.find((b) => b.id === "has_turn")!.type).toBe("filter");
     // Only a NEW session is routed.
-    const routing = gate.then!.find((b) => b.id === "has_previous")!;
+    const routing = parsed.blocks.find((b) => b.id === "has_previous")!;
     expect(routing.then).toEqual([]);
     expect(routing.else!.map((b) => b.id)).toEqual(["smart_route"]);
-    // The agent continues the thread's kept session and relays into the thread.
-    const agent = gate.then!.find((b) => b.id === "agent")!;
-    expect(agent.config["reuse"]).toBe("workstream");
-    expect(agent.config["keepOnFinish"]).toBe(true);
-    expect((agent.config["relay"] as Record<string, unknown>)["provider"]).toBe("slack");
+    // The agent is the definition's: scoped to the thread, it continues the
+    // thread's kept session and relays into the thread. The way in ends on
+    // its step.
+    expect(parsed.agent).toMatchObject({ scope: { kind: "key" }, keepOnFinish: true, relay: { provider: "slack" } });
+    const way = entrypointsOf(parsed)[0]!;
+    expect(way.blocks.at(-1)).toMatchObject({ id: "agent", type: "run_agent", config: { reuse: "workstream" } });
     // Only a failed run posts into the thread; a completed or filtered run
     // leaves the session's relay alone.
     expect(parsed.settings.onFinalize?.map((h) => [h.block.type, h.when])).toEqual([["relay_close", ["failed"]]]);
@@ -65,10 +71,13 @@ describe("Slack thread brain built-in — definition", () => {
     // kept session.
     expect(parsed.trigger).toMatchObject({ eventKeys: ["app_mention"] });
     expect(parsed.entrypoints ?? []).toEqual([]);
-    expect(parsed.settings.instance?.keyTemplate).toBe(parsed.settings.concurrency?.keyTemplate);
-    expect(parsed.settings.instance?.keyTemplate).toContain('coalesce: "thread_ts", "ts"');
+    // The workstream derives from the agent's scope; nothing is declared.
+    expect(parsed.settings.instance).toBeUndefined();
+    const instance = instanceSettingsOf(parsed)!;
+    expect(instance.keyTemplate).toBe(parsed.settings.concurrency!.keyTemplate);
+    expect(instance.keyTemplate).toContain('coalesce: "thread_ts", "ts"');
     // The Slack page shows the opening mention's text as the thread's title.
-    expect(parsed.settings.instance?.labelTemplate).toBe("${{ event.raw.event.text | strip_mentions | truncate: 80 }}");
+    expect(instance.labelTemplate).toBe("${{ event.raw.event.text | strip_mentions | truncate: 80 }}");
   });
 
   test("no channel scope: a mention anywhere the app is a member matches; a plain message matches nothing", () => {

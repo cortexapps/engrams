@@ -64,12 +64,12 @@ removed, threads use the default profile, exactly as with `default` routing.
 
 ## How it works
 
-Slack threads is an ordinary automation with its structure locked. Its trigger is the Slack
-app mention event. Every mention is one short run: it admits the author, folds the thread
-replies since the previous turn into the message, and hands the turn to the thread's
-session. The first mention in a thread starts the session; a later mention continues it
-through the Agent block. The thread is the automation's workstream, so one session serves
-the whole thread, and the queue policy keeps its turns in order. The session's relay posts
+Slack threads is an ordinary automation with its structure locked: an agent with one way
+in. The way in is the Slack app mention event. Every mention is one short run: it admits
+the author, folds the thread replies since the previous turn into the message, and ends on
+the agent. The agent's scope is the thread, so the first mention in a thread starts its
+session and a later mention continues it. One session serves the whole thread, and the
+queue policy keeps its turns in order. The session's relay posts
 the agent's output into the thread on its own, with no run open. Smart routing is three
 blocks in the graph: List profiles, Decide, and Slack choice, and it runs only when a thread
 has no session yet. The Activity tab under the automation lists each turn's run with its

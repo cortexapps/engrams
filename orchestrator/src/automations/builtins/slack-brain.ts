@@ -1,14 +1,14 @@
 /** The Slack thread-brain built-in automation (ADR 0119 D7; a workstream
  * per thread since 2026-09-29, ADR 0120; one short run per mention since
- * contract 5).
+ * contract 5; an agent with one way in since the 2026-10-27 amendment).
  *
- * The conversation-shaped built-in, expressed as data on the engine: every
- * mention of the bot in a thread is ONE short run that admits the mention,
- * folds the thread into a prompt, and hands it to the thread's standing
- * agent through `run_agent` — which continues the thread's kept session when
- * it is alive, or starts one — and ends. Nothing waits. The durable thing is
- * the kept session plus the open workstream; the relay that mirrors the
- * session into the thread is bound to the session, so the agent's replies,
+ * The conversation-shaped built-in, expressed as data on the engine: an
+ * AGENT scoped to the Slack thread, with one way in — a mention. Every
+ * mention is ONE short run that admits it, folds the thread into a prompt,
+ * and ends on the agent step, which continues the thread's kept session
+ * when it is alive or starts one. Nothing waits. The durable thing is the
+ * kept session plus the open workstream; the relay that mirrors the session
+ * into the thread is bound to the session, so the agent's replies,
  * questions and ⏳/✅ reach the thread with no run live.
  *
  * Every block here is a catalog block: this built-in is an example an
@@ -36,9 +36,13 @@
  * continues on its own profile.
  */
 
-import { MAX_WAIT_DEADLINE_S, type AutomationDefinition, type BlockDef } from "../engine/definition.ts";
+import {
+  MAX_WAIT_DEADLINE_S,
+  type AgentSpec,
+  type AutomationDefinition,
+  type BlockDef,
+} from "../engine/definition.ts";
 import type { BuiltinAutomation } from "../engine/builtins.ts";
-import { RUN_AGENT_TYPE } from "../engine/blocks/agent.ts";
 import { RELAY_CLOSE_TYPE } from "../engine/blocks/relay-close.ts";
 import { LOOKUP_INSTANCE_SESSION_TYPE } from "../engine/blocks/instance-session.ts";
 import { RESOLVE_USER_TYPE } from "../engine/blocks/resolve-user.ts";
@@ -50,7 +54,7 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 14;
+export const SLACK_BRAIN_DEFINITION_VERSION = 15;
 
 /** Smart routing routes without asking at or above this confidence. */
 /** From a routing benchmark against real history: at 0.8 the model routes
@@ -361,7 +365,10 @@ const resolveProfile: BlockDef = {
 };
 
 /** The card becomes the outcome line (its buttons go), so the thread shows
- * what was decided, answered or not. */
+ * what was decided, answered or not. When nobody was asked, the verdict is
+ * posted as a line of its own, so the thread still says which profile
+ * answers and why (an empty verdict — no key, default routing — posts
+ * nothing). */
 const closeCard: BlockDef = {
   id: "asked",
   type: "branch",
@@ -383,7 +390,34 @@ const closeCard: BlockDef = {
       },
     },
   ],
-  else: [],
+  else: [
+    {
+      id: "has_verdict",
+      type: "branch",
+      config: {
+        conditions: {
+          mode: "all",
+          conditions: [{ path: "steps.resolve.value.card", op: "not_equals", value: "" }],
+        },
+      },
+      then: [
+        {
+          id: "verdict",
+          type: "integration_action",
+          config: {
+            provider: "slack",
+            actionId: "post_message",
+            params: {
+              channel: `\${{ ${F}.channel }}`,
+              threadTs: `\${{ ${F}.thread_ts }}`,
+              text: "${{ steps.resolve.value.card }}",
+            },
+          },
+        },
+      ],
+      else: [],
+    },
+  ],
 };
 
 const routed: BlockDef = {
@@ -485,77 +519,56 @@ const routeUnlessContinued: BlockDef = {
   else: [smartRoute],
 };
 
-/** The thread's standing agent: the kept session gets the turn as a prompt;
- * a new session starts with it. Either way the relay is (re-)pointed at
- * this mention, so ⏳/✅ and the replies land under it. */
-const agent: BlockDef = {
-  id: "agent",
-  type: RUN_AGENT_TYPE,
-  tunable: ["promptTemplate"],
-  config: {
-    // Smart routing's verdict, else the facts' (override or default).
-    profileId: `\${{ steps.resolve.value.profile_id | default: ${F}.profile_id }}`,
-    promptTemplate: "${{ steps.turn.value.text }}",
-    titleTemplate: `\${{ ${F}.title }}`,
-    role: "primary",
-    // The session is the asking user's: their credentials and attribution
-    // (never the programmatic org credential a stranger could borrow).
-    ownerUserId: "${{ steps.identity.user_id }}",
-    // D8 + the thread model: the session outlives every run.
-    keepOnFinish: true,
-    appendSystemPrompt: SLACK_SYSTEM_PROMPT_APPEND,
-    reuse: "workstream",
-    relay: {
-      provider: "slack",
-      team: `\${{ ${F}.team }}`,
-      channel: `\${{ ${F}.channel }}`,
-      threadTs: `\${{ ${F}.thread_ts }}`,
-      mentionTs: `\${{ ${F}.mention_ts }}`,
-      userId: `\${{ ${F}.user_id }}`,
-      eventId: `\${{ ${F}.event_id }}`,
-    },
-  },
-};
-
-/** The legacy `onStarted` message: the thread gets the session link as
- * soon as a NEW session exists, before any agent output arrives. A
- * continued session is silent: the thread already carries its link. An
- * ordinary Slack action, so Duplicate lets a user reword or remove it. */
-const startedNotice: BlockDef = {
-  id: "new_session",
-  type: "branch",
-  config: {
-    conditions: { mode: "all", conditions: [{ path: "steps.agent.started", op: "is_true" }] },
-  },
-  then: [
-    {
-      id: "started",
-      type: "integration_action",
-      tunable: ["params"],
-      config: {
-        provider: "slack",
-        actionId: "post_message",
-        params: {
-          channel: `\${{ ${F}.channel }}`,
-          threadTs: `\${{ ${F}.thread_ts }}`,
-          text: "Started a session${{ steps.resolve.value.label | default: '' }} — ${{ steps.agent.web_url }}",
-        },
-      },
-    },
-  ],
-  else: [],
-};
-
-/** The turn gate: a bare `@bot` leaves no text and is not a turn — no
- * routing, no prompt, no failure; the thread simply goes on. */
+/** The turn gate: a bare `@bot` leaves no text and is not a turn — the run
+ * ends filtered before routing or the agent; no prompt, no failure; the
+ * thread simply goes on. */
 const hasTurn: BlockDef = {
   id: "has_turn",
-  type: "branch",
+  type: "filter",
   config: {
     conditions: { mode: "all", conditions: [{ path: "steps.turn.value.has_text", op: "is_true" }] },
   },
-  then: [routeUnlessContinued, agent, startedNotice],
-  else: [],
+};
+
+/** The thread's standing agent. The way in ends on it: the kept session
+ * gets the turn as a prompt; a new session starts with it. Either way the
+ * relay is (re-)pointed at this mention, so ⏳/✅ and the replies land
+ * under it, and a new session's link is posted into the thread first. */
+const THREAD_KEY =
+  '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}';
+
+const agent: AgentSpec = {
+  // ADR 0120: a Slack thread is a WORKSTREAM. The first mention opens it; a
+  // later mention in the same thread renders the same key, binds to the
+  // open workstream, and its run finds the thread's kept session.
+  // (`coalesce`, not `default:` — default's fallback argument is strict.)
+  // The thread's title on the Slack page and the rail: the opening
+  // mention's text, as a human reads it.
+  scope: {
+    kind: "key",
+    keyTemplate: THREAD_KEY,
+    labelTemplate: "${{ event.raw.event.text | strip_mentions | truncate: 80 }}",
+  },
+  // Smart routing's verdict, else the facts' (override or default).
+  profileId: `\${{ steps.resolve.value.profile_id | default: ${F}.profile_id }}`,
+  promptTemplate: "${{ steps.turn.value.text }}",
+  titleTemplate: `\${{ ${F}.title }}`,
+  role: "primary",
+  // The session is the asking user's: their credentials and attribution
+  // (never the programmatic org credential a stranger could borrow).
+  ownerUserId: "${{ steps.identity.user_id }}",
+  // D8 + the thread model: the session outlives every run.
+  keepOnFinish: true,
+  appendSystemPrompt: SLACK_SYSTEM_PROMPT_APPEND,
+  relay: {
+    provider: "slack",
+    team: `\${{ ${F}.team }}`,
+    channel: `\${{ ${F}.channel }}`,
+    threadTs: `\${{ ${F}.thread_ts }}`,
+    mentionTs: `\${{ ${F}.mention_ts }}`,
+    userId: `\${{ ${F}.user_id }}`,
+    eventId: `\${{ ${F}.event_id }}`,
+  },
 };
 
 export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
@@ -570,11 +583,11 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     // per-channel map only overrides the profile per channel.)
     eventKeys: ["app_mention"],
   },
-  blocks: [...admit, previous, replies, turn, hasTurn],
-  // ADR 0120: a Slack thread is a WORKSTREAM. The first mention opens it; a
-  // later mention in the same thread renders the same key, binds to the
-  // open workstream, and its run finds the thread's kept session.
+  blocks: [...admit, previous, replies, turn, hasTurn, routeUnlessContinued],
+  // One way in. The thread's agent is the definition's: every mention's
+  // run ends on it.
   entrypoints: [],
+  agent,
   inputsSchema: [
     {
       key: "channels",
@@ -628,22 +641,11 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
     },
   ],
   settings: {
-    instance: {
-      // One workstream per thread: team, channel, thread root. A reply
-      // carries thread_ts; the opening mention only has ts. (`coalesce`, not
-      // `default:` — default's fallback argument is strict.)
-      keyTemplate:
-        '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}',
-      // The thread's title on the Slack page and the rail: the opening
-      // mention's text, as a human reads it.
-      labelTemplate: "${{ event.raw.event.text | strip_mentions | truncate: 80 }}",
-    },
     concurrency: {
       // One run at a time per thread: two mentions in quick succession
       // deliver their turns in order, and a turn never finds the thread's
       // session owned by a live run.
-      keyTemplate:
-        '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}',
+      keyTemplate: THREAD_KEY,
       policy: "queue",
     },
     endSessionsOnFinish: false,
