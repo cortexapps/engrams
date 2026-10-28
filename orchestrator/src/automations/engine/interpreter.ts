@@ -59,6 +59,7 @@ import {
   SNAPSHOT_STEP,
   type Frame,
 } from "./step-name.ts";
+import { errorMessage } from "./errors.ts";
 
 const log = rootLog.child({ component: "automation-interpreter" });
 
@@ -114,10 +115,6 @@ function shouldRetry(outcome: Extract<BlockOutcome, { kind: "error" }>, retryOn:
   if (retryOn === "never") return false;
   if (retryOn === "always") return true;
   return outcome.retryable;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /** `{ "$ref": "steps.x.y" }` → the JSON value at that scope path. Liquid can
@@ -216,7 +213,7 @@ export async function interpretAutomation(
     // promotes a queued successor). Without this a queue|join|skip key
     // stays held by a dead run forever. No sessions and no finalize hooks
     // exist yet, so finalize is only the status + the release.
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorMessage(error);
     const promoted = await deps.step(async () => {
       await deps.store.finalizeRun(input.runId, "failed", message);
       return await deps.store.releaseConcurrency(input.runId);

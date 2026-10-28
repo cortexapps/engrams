@@ -11,6 +11,7 @@ import { z } from "zod";
 import { validateAutomationTemplate } from "../template.ts";
 import { parseFilterGroup, type FilterGroup } from "./conditions.ts";
 import { getBlock } from "./blocks/registry.ts";
+import { errorMessage } from "./errors.ts";
 
 export const ENGINE_VERSION = 1;
 export const MAX_BLOCKS = 64;
@@ -743,7 +744,7 @@ function validateTemplatesIn(blockId: string, value: unknown, field: string): vo
       throw new DefinitionError(
         blockId,
         field,
-        error instanceof Error ? error.message : String(error),
+        errorMessage(error),
       );
     }
     return;
@@ -1004,7 +1005,7 @@ export function parseBlockConditions(blockId: string, raw: unknown): FilterGroup
     throw new DefinitionError(
       blockId,
       "conditions",
-      error instanceof Error ? error.message : String(error),
+      errorMessage(error),
     );
   }
 }

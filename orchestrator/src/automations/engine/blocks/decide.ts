@@ -38,6 +38,7 @@ import type {
   DecisionText,
 } from "../../../integrations/openrouter-decisions.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
+import { errorMessage } from "../errors.ts";
 
 /** Pinned so a model release never silently changes a graph's thresholds;
  * an author opts into a newer one through `model`. */
@@ -252,7 +253,7 @@ function isRetryable(error: unknown): boolean {
 }
 
 function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return errorMessage(error);
 }
 
 export function registerDecideBlock(): void {

@@ -1,3 +1,4 @@
+import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "bun:test";
 
 import type {
@@ -70,7 +71,8 @@ function makeHarness(
     promote?: string | null;
     failExec?: boolean;
     /** Fake integration-action runtime: records calls; throws when asked. */
-    failActions?: boolean;
+    /** `"connect"`: the throw is a ConnectError (a control-plane refusal). */
+    failActions?: boolean | "connect";
     dryRun?: boolean;
     /** Seed the fake state store: key -> {value, version, writer}. */
     stateEntries?: Record<string, { value: unknown; version: number; writer: string }>;
@@ -289,6 +291,9 @@ function makeHarness(
     },
     integrationActions: {
       async execute(input) {
+        if (options.failActions === "connect") {
+          throw new ConnectError("policy secret ANTHROPIC_API_KEY is not configured", Code.Internal);
+        }
         if (options.failActions) throw new Error("provider down");
         actions.push({ actionId: input.actionId, stepPath: input.stepPath, params: input.params });
         return { comment_id: 7 };
@@ -1177,6 +1182,24 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     expect(hookStep.record.error).toContain("provider down");
     // Finalize still ran after the hook.
     expect(h.names.at(-1)).toBe("step:__finalize__:0");
+  });
+
+  test("a block that throws a ConnectError records its text, not the code in brackets", async () => {
+    const definition = makeDefinition([
+      {
+        id: "comment",
+        type: "integration_action",
+        config: { provider: "github", actionId: "create_issue_comment", params: {} },
+      },
+    ]);
+    const h = makeHarness(definition, { failActions: "connect" });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("failed");
+    const step = h.stepRecords.filter((r) => r.framePath === "comment").at(-1)!;
+    expect(step.record.error).toBe(
+      "integration_action_failed: policy secret ANTHROPIC_API_KEY is not configured",
+    );
+    expect(result.error).not.toContain("[internal]");
   });
 
   test("phase-2 stubs return typed unavailable failures", async () => {

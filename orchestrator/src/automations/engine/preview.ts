@@ -29,6 +29,7 @@ import type { AutomationDefinition, BlockDef } from "./definition.ts";
 import { entrypointOf, MAIN_ENTRYPOINT_ID } from "./definition.ts";
 import type { CodeBlockRuntime, EngineDeps } from "./deps.ts";
 import { AutomationTemplateError } from "../template.ts";
+import { errorMessage } from "./errors.ts";
 
 export interface PreviewBlockResult {
   blockId: string;
@@ -175,7 +176,7 @@ export async function previewDefinition(input: PreviewInput): Promise<PreviewRes
         blockId,
         field,
         code: "render_failed",
-        message: error instanceof Error ? error.message : String(error),
+        message: errorMessage(error),
       });
     }
   };

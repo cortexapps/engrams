@@ -40,6 +40,7 @@ import type { RunContext } from "../context.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
 import { installRelayForSession, mentionFromRelayConfig, slackRelayConfigSchema } from "./relay.ts";
 import { createSessionConfigSchema, executeCreateSession, renderSessionPrompt } from "./session.ts";
+import { errorMessage } from "../errors.ts";
 
 export const RUN_AGENT_TYPE = "run_agent";
 export const CLOSE_AGENT_TYPE = "close_agent";
@@ -116,7 +117,7 @@ async function execute(config: RunAgentConfig, ctx: RunContext): Promise<BlockOu
       return {
         kind: "error",
         code: "agent_session_busy",
-        message: error instanceof Error ? error.message : String(error),
+        message: errorMessage(error),
         retryable: true,
       };
     }

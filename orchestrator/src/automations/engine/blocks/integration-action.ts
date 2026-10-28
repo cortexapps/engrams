@@ -6,6 +6,7 @@
 import { z } from "zod";
 
 import { registerBlock } from "./registry.ts";
+import { errorMessage } from "../errors.ts";
 
 export const integrationActionConfigSchema = z.object({
   provider: z.string().min(1),
@@ -86,7 +87,7 @@ export function registerIntegrationActionBlock(): void {
         return {
           kind: "error",
           code: "integration_action_failed",
-          message: error instanceof Error ? error.message : String(error),
+          message: errorMessage(error),
           retryable: isTransientActionError(error),
         };
       }
