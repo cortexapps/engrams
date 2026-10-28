@@ -198,11 +198,19 @@ describe("AgentsTab", () => {
           detail: "slack:C1:999",
           droppedAt: new Date(NOW - 120_000).toISOString(),
         },
+        {
+          entrypointId: "comment",
+          eventKey: "issue_comment.created",
+          reason: "render_failed",
+          detail: "undefined variable: event.raw.pull_request",
+          droppedAt: new Date(NOW - 60_000).toISOString(),
+        },
       ],
     });
-    expect((await screen.findByTestId("recent-drops-summary")).textContent).toContain(
-      "1 events did not fire in the last day",
-    );
+    const summary = (await screen.findByTestId("recent-drops-summary")).textContent;
+    expect(summary).toContain("2 events did not fire in the last day");
+    expect(summary).toContain("1 matched no open agent");
+    expect(summary).toContain("1 had no key for the event");
     await userEvent.click(screen.getByRole("button", { name: "Show them →" }));
     const drops = screen.getByTestId("recent-drops");
     expect(within(drops).getByText(/slack:C1:999/)).toBeTruthy();
