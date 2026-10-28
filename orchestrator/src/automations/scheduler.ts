@@ -12,6 +12,7 @@ import { log as rootLog } from "../log.ts";
 import { automationRunWorkflow, type AutomationRunWorkflowInput } from "../workflows/automation-run.ts";
 import { admitClaimedCronRun, automationRunId, cronDeliveryKey } from "./dispatch.ts";
 import { defaultAutomationSender, type AutomationSender } from "./engine/inbox.ts";
+import { instanceSettingsOf } from "./engine/definition.ts";
 
 const log = rootLog.child({ component: "automation-scheduler" });
 
@@ -192,7 +193,7 @@ export async function runSchedulerTick(
       // re-check).
       let fired = false;
       let anyHeld = false;
-      if (dueAutomation.definition.settings.instance !== undefined) {
+      if (instanceSettingsOf(dueAutomation.definition) !== undefined) {
         const open = await instances.listOpenInstances(
           automation.id,
           CRON_FANOUT_MAX_INSTANCES,

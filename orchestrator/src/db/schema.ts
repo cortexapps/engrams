@@ -1251,6 +1251,8 @@ export const profile = pgTable(
 // import is type-only, so no runtime cycle exists.
 import type {
   AutomationSettings,
+  AgentSpec,
+  EntrypointRole,
   AutomationEntrypoint,
   BlockDef,
   InputFieldSpec,
@@ -1433,6 +1435,10 @@ export const automationVersion = pgTable(
     /** ADR 0119 D9: additional named entrypoints ({id, trigger, blocks});
      * `[]` = the classic single-entrypoint automation. */
     entrypoints: jsonb("entrypoints").$type<AutomationEntrypoint[]>().notNull().default([]),
+    /** The agent the ways in deliver to; null = a block automation. */
+    agent: jsonb("agent").$type<AgentSpec>(),
+    /** The main way in's role toward the agent; null = `start`. */
+    role: text("role").$type<EntrypointRole>(),
     inputsSchema: jsonb("inputs_schema").$type<InputFieldSpec[]>().notNull().default([]),
     settings: jsonb("settings").$type<AutomationSettings>().notNull(),
     createdByUserId: text("created_by_user_id"),

@@ -60,6 +60,8 @@ function harness(options: { failSession?: boolean } = {}): Harness {
       trigger: input.definition.trigger,
       blocks: input.definition.blocks,
       entrypoints: [],
+      agent: input.definition.agent ?? null,
+      role: input.definition.role ?? null,
       inputsSchema: input.definition.inputsSchema,
       settings: input.definition.settings,
       createdByUserId: null,

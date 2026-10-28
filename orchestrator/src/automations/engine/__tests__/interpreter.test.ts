@@ -382,6 +382,38 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 5)
     expect(h.finalized).toEqual([{ status: "completed" }]);
   });
 
+  test("an agent automation: the way in's blocks run, then the agent step the engine appends", async () => {
+    const definition: AutomationDefinition = {
+      ...makeDefinition([
+        {
+          id: "check",
+          type: "filter",
+          config: { conditions: { mode: "all", conditions: [{ path: "inputs.on", op: "is_true" }] } },
+        },
+      ]),
+      agent: { scope: { kind: "event" }, profileId: "p", promptTemplate: "go" },
+    };
+    const h = makeHarness(definition, { inputs: { on: true } });
+
+    const result = await interpretAutomation(RUN, h.deps);
+
+    expect(result.status).toBe("completed");
+    expect(h.names).toEqual([
+      "step:__snapshot__:0",
+      "step:check:0",
+      "step:check:0:ledger",
+      "step:agent:0",
+      "step:__finalize__:0",
+    ]);
+    expect(h.created).toEqual(["s-agent"]);
+    expect(h.createdInputs[0]).toMatchObject({ profileId: "p", prompt: "go", keep: true });
+    const agentStep = h.stepRecords.filter((r) => r.framePath === "agent").at(-1);
+    expect(agentStep?.record).toMatchObject({
+      status: "succeeded",
+      outputs: { session_id: "s-agent", started: true, delivered: true },
+    });
+  });
+
   test("filter miss ends the run as filtered", async () => {
     const definition = makeDefinition([
       {

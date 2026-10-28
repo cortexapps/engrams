@@ -687,6 +687,13 @@
       "when": 1793137484368,
       "tag": "0097_session_relay",
       "breakpoints": true
+    },
+    {
+      "idx": 98,
+      "version": "7",
+      "when": 1793145900555,
+      "tag": "0098_agent",
+      "breakpoints": true
     }
   ]
 }

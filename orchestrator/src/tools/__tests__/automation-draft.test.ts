@@ -10,6 +10,7 @@ import {
 import { draftBlockCatalog } from "../../automations/draft-catalog.ts";
 import { AUTOMATION_DRAFT_TASK_TYPE } from "../../automations/draft.ts";
 import { registerEngineBlocks, V1_BLOCK_TYPES } from "../../automations/engine/blocks/index.ts";
+import { AGENT_BLOCK_TYPE } from "../../automations/engine/definition.ts";
 import { SaveVersionConflictError } from "../../db/automations.ts";
 import type { AutomationRow } from "../../db/automations.ts";
 import type { AutomationDefinition } from "../../automations/engine/definition.ts";
@@ -63,6 +64,8 @@ function row(def: AutomationDefinition, version = 1): AutomationRow {
       trigger: def.trigger,
       blocks: def.blocks,
       entrypoints: def.entrypoints ?? [],
+      agent: def.agent ?? null,
+      role: def.role ?? null,
       inputsSchema: def.inputsSchema,
       settings: def.settings,
       createdByUserId: null,
@@ -351,7 +354,12 @@ describe("draftBlockCatalog", () => {
       blocks: Array<{ type: string; config_schema: unknown }>;
     };
     // A registry change (new block, renamed type) must be a visible diff here.
-    expect(catalog.blocks.map((b) => b.type).sort()).toEqual([...V1_BLOCK_TYPES].sort());
+    // The agent step's executor is registered but is not a block the agent
+    // may write: the definition's `agent` stands for it.
+    expect(catalog.blocks.map((b) => b.type).sort()).toEqual(
+      V1_BLOCK_TYPES.filter((type) => type !== AGENT_BLOCK_TYPE).sort(),
+    );
+    expect(catalog).toHaveProperty("agent_schema");
     for (const block of catalog.blocks) {
       const schema = block.config_schema as { type?: string; description?: string };
       expect(

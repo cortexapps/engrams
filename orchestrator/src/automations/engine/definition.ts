@@ -409,6 +409,72 @@ export const settingsSchema = settingsBaseSchema.extend({
 export type AutomationSettings = z.infer<typeof settingsSchema>;
 
 // ---------------------------------------------------------------------------
+// The agent: an automation is an agent with ways in
+// ---------------------------------------------------------------------------
+
+/** The step every way in that starts or reaches the agent ends on. Reserved
+ * when the automation has an agent: no user block takes this id, so
+ * `steps.agent.*` (session_id, started, delivered) is the agent's, always. */
+export const AGENT_STEP_ID = "agent";
+/** The step a `close` way in ends on. */
+export const AGENT_CLOSE_STEP_ID = "agent_close";
+/** The executor the agent step runs. Not a user block: the agent is a part
+ * of the definition, and validation refuses the type in a block list. */
+export const AGENT_BLOCK_TYPE = "run_agent";
+
+/** What one agent is responsible for. `event`: a fresh session per event.
+ * `automation`: one standing agent for the whole automation. `key`: one
+ * agent per rendered key (a thread, a channel, a pull request, an issue) —
+ * the workstream of ADR 0120; the template renders in the admission scope
+ * ({trigger, event.raw, inputs}), the one template contract. */
+export const agentScopeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("event") }),
+  z.object({ kind: z.literal("automation") }),
+  z.object({
+    kind: z.literal("key"),
+    keyTemplate: z.string().min(1),
+    /** The human title of one agent, rendered once when it opens. */
+    labelTemplate: z.string().min(1).optional(),
+  }),
+]);
+export type AgentScope = z.infer<typeof agentScopeSchema>;
+
+/** The agent every way in delivers to: the session it runs (the
+ * `run_agent` executor's config, minus `reuse`, which the scope decides)
+ * and its scope. The field set is the executor's: validation parses the
+ * derived step config against the executor's schema, so a new session
+ * field reaches the agent with no change here. */
+export const agentSpecSchema = z
+  .object({
+    scope: agentScopeSchema,
+    // Lenient here: the executor's schema is the one that speaks, and
+    // validation addresses its findings to the agent.
+    profileId: z.string(),
+    promptTemplate: z.string(),
+  })
+  .passthrough();
+export interface AgentSpec {
+  scope: AgentScope;
+  profileId: string;
+  promptTemplate: string;
+  [field: string]: unknown;
+}
+
+/** What a way in does to the agent. `start` (the default): open the
+ * agent's workstream when none is open, then deliver. `reach`: deliver
+ * only to an agent that exists (by handle or by key); otherwise the event
+ * drops, audited. `close`: end the agent's workstream. `none`: run the
+ * blocks and nothing more. */
+export const entrypointRoleSchema = z.enum(["start", "reach", "close", "none"]);
+export type EntrypointRole = z.infer<typeof entrypointRoleSchema>;
+
+/** The `run_agent` step config the agent spec stands for. */
+export function agentStepConfig(agent: AgentSpec): Record<string, unknown> {
+  const { scope, ...config } = agent;
+  return { ...config, reuse: scope.kind === "event" ? "never" : "workstream" };
+}
+
+// ---------------------------------------------------------------------------
 // Entrypoints (ADR 0119 D9)
 // ---------------------------------------------------------------------------
 
@@ -433,24 +499,34 @@ export const entrypointSchema = z.object({
     .max(64)
     .refine((id) => id !== MAIN_ENTRYPOINT_ID, `"${MAIN_ENTRYPOINT_ID}" names the implicit top-level entrypoint`),
   trigger: entrypointTriggerSchema,
+  role: entrypointRoleSchema.optional(),
   blocks: z.array(blockDefSchema),
 });
 
 export interface AutomationEntrypoint {
   id: string;
   trigger: TriggerSpec;
+  /** With an agent: what this way in does to it (absent = `start`). */
+  role?: EntrypointRole;
   blocks: BlockDef[];
 }
 
 export const definitionSchema = z.object({
   engine: z.literal(ENGINE_VERSION),
   trigger: triggerSpecSchema,
+  /** The main way in's role (see `EntrypointRole`). */
+  role: entrypointRoleSchema.optional(),
   blocks: z.array(blockDefSchema),
   /** Additional named ways into the SAME automation (shared inputs,
    * settings, and automation_state). Each run enters through exactly one
    * entrypoint and walks only its blocks. Absent = the classic
    * single-entrypoint automation, byte-identical to the pre-D9 shape. */
   entrypoints: z.array(entrypointSchema).max(MAX_ENTRYPOINTS).optional(),
+  /** The agent the ways in deliver to. Present = an agent automation: every
+   * way in ends on the agent step unless its role says otherwise, and
+   * `settings.instance` is derived from the scope (never stored). Absent =
+   * a block automation (the advanced shape): the blocks are the whole run. */
+  agent: agentSpecSchema.optional(),
   inputsSchema: z.array(inputFieldSchema),
   settings: settingsSchema,
 });
@@ -458,19 +534,84 @@ export const definitionSchema = z.object({
 export interface AutomationDefinition {
   engine: typeof ENGINE_VERSION;
   trigger: TriggerSpec;
+  role?: EntrypointRole;
   blocks: BlockDef[];
   entrypoints?: AutomationEntrypoint[];
+  agent?: AgentSpec;
   inputsSchema: InputFieldSpec[];
   settings: AutomationSettings;
 }
 
-/** Every way in, main first. The one view dispatch, validation, and the
- * interpreter share. */
-export function entrypointsOf(definition: AutomationDefinition): AutomationEntrypoint[] {
+/** Every way in as written, main first: the blocks the author declared,
+ * without the agent step. The editor's view, and the reserved-id check's. */
+export function declaredEntrypointsOf(definition: AutomationDefinition): AutomationEntrypoint[] {
   return [
-    { id: MAIN_ENTRYPOINT_ID, trigger: definition.trigger, blocks: definition.blocks },
+    {
+      id: MAIN_ENTRYPOINT_ID,
+      trigger: definition.trigger,
+      ...(definition.role !== undefined ? { role: definition.role } : {}),
+      blocks: definition.blocks,
+    },
     ...(definition.entrypoints ?? []),
   ];
+}
+
+export function roleOf(entrypoint: Pick<AutomationEntrypoint, "role">): EntrypointRole {
+  return entrypoint.role ?? "start";
+}
+
+/** The step a way in ends on because of its role. */
+function agentStepsOf(agent: AgentSpec, entrypoint: AutomationEntrypoint): BlockDef[] {
+  switch (roleOf(entrypoint)) {
+    case "start":
+    case "reach":
+      return [{ id: AGENT_STEP_ID, type: AGENT_BLOCK_TYPE, config: agentStepConfig(agent) }];
+    case "close":
+      return [
+        {
+          id: AGENT_CLOSE_STEP_ID,
+          type: "instance_close",
+          config: { reason: `closed by the "${entrypoint.id}" way in` },
+        },
+      ];
+    case "none":
+      return [];
+  }
+}
+
+/** Every way in, main first, as the run walks it: with an agent, each way
+ * in ends on the step its role names. The one view dispatch, validation,
+ * and the interpreter share. */
+export function entrypointsOf(definition: AutomationDefinition): AutomationEntrypoint[] {
+  const declared = declaredEntrypointsOf(definition);
+  const agent = definition.agent;
+  if (agent === undefined) return declared;
+  return declared.map((entrypoint) => ({
+    ...entrypoint,
+    blocks: [...entrypoint.blocks, ...agentStepsOf(agent, entrypoint)],
+  }));
+}
+
+/** The workstream settings the run system reads. A block automation
+ * declares them; an agent automation derives them from the agent's scope
+ * and the ways in's roles (`reach` and `close` only find an open agent). */
+export function instanceSettingsOf(definition: AutomationDefinition): InstanceSettings | undefined {
+  const agent = definition.agent;
+  if (agent === undefined) return definition.settings.instance;
+  const scope = agent.scope;
+  if (scope.kind === "event") return undefined;
+  const entrypoints: Record<string, { admit: InstanceAdmitPolicy }> = {};
+  for (const entrypoint of declaredEntrypointsOf(definition)) {
+    const role = roleOf(entrypoint);
+    if (role === "reach" || role === "close") entrypoints[entrypoint.id] = { admit: "require" };
+  }
+  return {
+    keyTemplate: scope.kind === "automation" ? AGENT_STEP_ID : scope.keyTemplate,
+    ...(scope.kind === "key" && scope.labelTemplate !== undefined
+      ? { labelTemplate: scope.labelTemplate }
+      : {}),
+    ...(Object.keys(entrypoints).length > 0 ? { entrypoints } : {}),
+  };
 }
 
 export function entrypointOf(
@@ -597,6 +738,65 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
   }
   const definition = parsed.data as AutomationDefinition;
 
+  const agent = definition.agent;
+  if (agent !== undefined) {
+    if (definition.settings.instance !== undefined) {
+      throw new DefinitionError(
+        "__agent__",
+        "scope",
+        "settings.instance is derived from the agent's scope; remove it",
+      );
+    }
+    const executor = getBlock(AGENT_BLOCK_TYPE);
+    if (!executor) throw new DefinitionError("__agent__", "profileId", "the agent executor is not registered");
+    const config = saveTimeConfigParse(executor.configSchema, agentStepConfig(agent));
+    if (!config.success) {
+      const issue = config.error.issues[0];
+      throw new DefinitionError(
+        "__agent__",
+        issue ? issue.path.join(".") : "profileId",
+        issue ? issue.message : "invalid agent",
+      );
+    }
+    validateTemplatesIn("__agent__", agentStepConfig(agent), "");
+    if (agent.scope.kind === "key") {
+      validateTemplatesIn("__agent__", agent.scope.keyTemplate, "scope.keyTemplate");
+      if (agent.scope.labelTemplate !== undefined) {
+        validateTemplatesIn("__agent__", agent.scope.labelTemplate, "scope.labelTemplate");
+      }
+    }
+  }
+  for (const entrypoint of declaredEntrypointsOf(definition)) {
+    const where = entrypoint.id === MAIN_ENTRYPOINT_ID ? "__trigger__" : "__entrypoints__";
+    if (entrypoint.role !== undefined && agent === undefined) {
+      throw new DefinitionError(
+        where,
+        "role",
+        `way in "${entrypoint.id}" has a role but the automation has no agent`,
+      );
+    }
+    const role = roleOf(entrypoint);
+    if (agent?.scope.kind === "event" && (role === "reach" || role === "close")) {
+      throw new DefinitionError(
+        where,
+        "role",
+        `way in "${entrypoint.id}" cannot ${role} an agent scoped to each event (there is no standing agent to find)`,
+      );
+    }
+    for (const block of walkBlocks(entrypoint.blocks)) {
+      if (block.type === AGENT_BLOCK_TYPE) {
+        throw new DefinitionError(
+          block.id,
+          "type",
+          `"${AGENT_BLOCK_TYPE}" is not a block; set the automation's agent and the way in's role`,
+        );
+      }
+      if (agent !== undefined && (block.id === AGENT_STEP_ID || block.id === AGENT_CLOSE_STEP_ID)) {
+        throw new DefinitionError(block.id, "id", `block id "${block.id}" is the agent step's`);
+      }
+    }
+  }
+
   const seen = new Set<string>();
   let count = 0;
   const checkBlock = (block: BlockDef, hook: boolean): void => {
@@ -670,8 +870,12 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
       );
     }
     entrypointIds.add(entrypoint.id);
-    // Block ids stay unique across ALL entrypoints (`seen` is shared): a
-    // step path addresses one automation-wide namespace.
+  }
+  // Block ids stay unique across ALL entrypoints (`seen` is shared): a step
+  // path addresses one automation-wide namespace. The walk is over the
+  // blocks as written: the agent step every way in ends on is one step,
+  // validated once above, under its reserved id.
+  for (const entrypoint of declaredEntrypointsOf(definition)) {
     for (const block of walkBlocks(entrypoint.blocks)) checkBlock(block, false);
   }
   if (entrypoints.filter((entrypoint) => entrypoint.trigger.kind === "cron").length > 1) {
@@ -686,7 +890,7 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
   if (definition.settings.concurrency) {
     validateTemplatesIn("__settings__", definition.settings.concurrency.keyTemplate, "concurrency.keyTemplate");
   }
-  const instance = definition.settings.instance;
+  const instance = instanceSettingsOf(definition);
   if (instance) {
     validateTemplatesIn("__settings__", instance.keyTemplate, "instance.keyTemplate");
     if (instance.labelTemplate !== undefined) {

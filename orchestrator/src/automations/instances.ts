@@ -18,7 +18,11 @@ import type {
 import type { AutomationRunTrigger, InputFieldSpec } from "../db/schema.ts";
 import type { DispatchTarget } from "../db/automations.ts";
 import { resolveAutomationInputs } from "../db/automations.ts";
-import type { InstanceAdmitPolicy, TriggerSpec } from "./engine/definition.ts";
+import {
+  instanceSettingsOf,
+  type InstanceAdmitPolicy,
+  type TriggerSpec,
+} from "./engine/definition.ts";
 import { extractHandleCandidates } from "./handles.ts";
 import { renderAutomationTemplateInScope } from "./template.ts";
 
@@ -101,7 +105,7 @@ export async function resolveInstance(
   input: ResolveInstanceInput,
   deps: ResolveInstanceDeps,
 ): Promise<InstanceResolution> {
-  const settings = input.target.definition.settings.instance;
+  const settings = instanceSettingsOf(input.target.definition);
   if (!settings) return { kind: "none" };
   const automationId = input.target.automation.id;
   const admit: InstanceAdmitPolicy =

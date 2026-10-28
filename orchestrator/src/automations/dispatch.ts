@@ -44,6 +44,7 @@ import {
 } from "./engine/inbox.ts";
 import {
   entrypointsOf,
+  instanceSettingsOf,
   MAIN_ENTRYPOINT_ID,
   type AutomationEntrypoint,
   type TriggerSpec,
@@ -711,7 +712,7 @@ export async function dispatchWebhookOccurrence(
   const providerHint = input.registration.providerHint;
   // The facet is only consulted for handle candidates, which only instanced
   // automations use — never load the registry for a pre-instance dispatch.
-  const anyInstanced = targets.some((t) => t.definition.settings.instance !== undefined);
+  const anyInstanced = targets.some((t) => instanceSettingsOf(t.definition) !== undefined);
   const facet =
     anyInstanced && providerHint !== null ? await facets(providerHint) : undefined;
 
@@ -895,7 +896,7 @@ export async function dispatchIntegrationEvent(
   // instanced automation exists for the provider at all, the ledger is
   // never consulted (the no-instances world stays DB-free).
   const anyInstancedForProvider = providerTargets.some(
-    (target) => target.definition.settings.instance !== undefined,
+    (target) => instanceSettingsOf(target.definition) !== undefined,
   );
   const targets = providerTargets.flatMap((target) => {
     // D9: a delivery matches per ENTRYPOINT — the same event may open (or
@@ -932,7 +933,7 @@ export async function dispatchIntegrationEvent(
 
   // Only consulted for handle candidates — never load the registry when no
   // matched target is instanced (every pre-instance dispatch, unit tests).
-  const anyInstanced = targets.some((t) => t.target.definition.settings.instance !== undefined);
+  const anyInstanced = targets.some((t) => instanceSettingsOf(t.target.definition) !== undefined);
   const facet = anyInstanced ? await facets(input.provider) : undefined;
   const trigger: AutomationRunTrigger = {
     source: "integration",

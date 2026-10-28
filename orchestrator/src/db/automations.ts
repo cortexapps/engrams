@@ -27,6 +27,8 @@ import {
   cronEntrypointOf,
   ENGINE_VERSION,
   type AutomationDefinition,
+  type AgentSpec,
+  type EntrypointRole,
   type AutomationEntrypoint,
   type BlockOverrides,
 } from "../automations/engine/definition.ts";
@@ -74,6 +76,8 @@ export interface AutomationVersionRow {
   trigger: AutomationTrigger;
   blocks: BlockDef[];
   entrypoints: AutomationEntrypoint[];
+  agent: AgentSpec | null;
+  role: EntrypointRole | null;
   inputsSchema: InputFieldSpec[];
   settings: AutomationSettings;
   createdByUserId: string | null;
@@ -476,6 +480,8 @@ function versionRow(row: typeof versionTable.$inferSelect): AutomationVersionRow
     trigger: row.trigger,
     blocks: row.blocks,
     entrypoints: row.entrypoints,
+    agent: row.agent ?? null,
+    role: row.role ?? null,
     inputsSchema: row.inputsSchema,
     settings: row.settings,
     createdByUserId: row.createdByUserId ?? null,
@@ -487,8 +493,10 @@ export function definitionOf(version: AutomationVersionRow): AutomationDefinitio
   return {
     engine: ENGINE_VERSION,
     trigger: version.trigger,
+    ...(version.role !== null ? { role: version.role } : {}),
     blocks: version.blocks,
     ...(version.entrypoints.length > 0 ? { entrypoints: version.entrypoints } : {}),
+    ...(version.agent !== null ? { agent: version.agent } : {}),
     inputsSchema: version.inputsSchema,
     settings: version.settings,
   };
@@ -756,6 +764,8 @@ export function makeAutomationStore(
           trigger: definition.trigger,
           blocks: definition.blocks,
           entrypoints: definition.entrypoints ?? [],
+          agent: definition.agent ?? null,
+          role: definition.role ?? null,
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId,
@@ -788,6 +798,8 @@ export function makeAutomationStore(
           trigger: definition.trigger,
           blocks: definition.blocks,
           entrypoints: definition.entrypoints ?? [],
+          agent: definition.agent ?? null,
+          role: definition.role ?? null,
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId,
@@ -1317,6 +1329,8 @@ export function makeAutomationStore(
           trigger: definition.trigger,
           blocks: definition.blocks,
           entrypoints: definition.entrypoints ?? [],
+          agent: definition.agent ?? null,
+          role: definition.role ?? null,
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId: null,
