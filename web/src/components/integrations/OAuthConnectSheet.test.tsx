@@ -162,7 +162,7 @@ describe("OAuthConnectSheet service account", () => {
     grant.mockClear();
     const onClose = vi.fn();
     render(<OAuthConnectSheet view={view("acme")} oauth={sa} onClose={onClose} />);
-    expect(screen.queryByRole("button", { name: /copy redirect url/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /copy redirect url/i })).toBeTruthy();
     const add = screen.getByRole("button", { name: /add acme/i });
     fireEvent.change(screen.getByLabelText(/service account key/i), {
       target: { value: '{"client_email":"sa@x","private_key":"k"}' },

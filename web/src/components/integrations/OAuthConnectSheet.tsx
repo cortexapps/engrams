@@ -190,9 +190,15 @@ export function OAuthConnectSheet({
             </>
           )}
 
-          {!serverSide && (
+          {/* A service-account connector still needs the redirect URL: its
+              OAuth client serves each member's own consent. */}
+          {!clientCredentials && (
             <div className="flex flex-col gap-1.5">
-              <Text variant="label">Redirect URL (add this to your {view.name} app)</Text>
+              <Text variant="label">
+                {serviceAccount
+                  ? `Redirect URL (add this to your ${view.name} OAuth client)`
+                  : `Redirect URL (add this to your ${view.name} app)`}
+              </Text>
               <code className="select-all rounded-md border bg-card px-3 py-2 font-mono text-xs break-all">
                 {redirectUri}
               </code>
