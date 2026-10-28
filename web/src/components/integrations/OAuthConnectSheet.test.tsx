@@ -148,3 +148,39 @@ describe("OAuthConnectSheet signing secret", () => {
     );
   });
 });
+
+describe("OAuthConnectSheet service account", () => {
+  const sa: ParsedOauth = {
+    grant: "service_account",
+    serviceAccountKeyRef: "acme.service_account_key",
+    clientIdRef: "acme.client_id",
+    clientSecretRef: "acme.client_secret",
+    scopes: ["directory.readonly"],
+  };
+
+  it("seals the key and the client, then grants as the principal", async () => {
+    grant.mockClear();
+    const onClose = vi.fn();
+    render(<OAuthConnectSheet view={view("acme")} oauth={sa} onClose={onClose} />);
+    expect(screen.queryByRole("button", { name: /copy redirect url/i })).toBeNull();
+    const add = screen.getByRole("button", { name: /add acme/i });
+    fireEvent.change(screen.getByLabelText(/service account key/i), {
+      target: { value: '{"client_email":"sa@x","private_key":"k"}' },
+    });
+    fireEvent.change(screen.getByLabelText(/client id/i), { target: { value: "cid" } });
+    fireEvent.change(screen.getByLabelText(/client secret/i), { target: { value: "csec" } });
+    expect((add as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText(/acts as/i), { target: { value: "bot@acme.test" } });
+    expect((add as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(add);
+    await waitFor(() =>
+      expect(grant).toHaveBeenCalledWith({ provider: "acme", subject: "bot@acme.test" }),
+    );
+    expect(putSecret).toHaveBeenCalledWith({
+      name: "acme.service_account_key",
+      value: '{"client_email":"sa@x","private_key":"k"}',
+    });
+    expect(putSecret).toHaveBeenCalledWith({ name: "acme.client_id", value: "cid" });
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+});

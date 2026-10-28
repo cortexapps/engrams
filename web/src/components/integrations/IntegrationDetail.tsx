@@ -154,10 +154,11 @@ function DetailBody({ view }: { view: ConnectorView }) {
 
   // A fresh consent round-trip. `force=1` re-prompts even when the provider
   // would otherwise silently re-issue the existing grant. A client-credentials
-  // connector has no consent screen: the server runs the grant again from the
-  // sealed secrets, in place.
+  // or service-account connector has no consent screen: the server runs the
+  // grant again from the sealed secrets, in place.
   const reconnect = () => {
-    if (cfg?.oauth?.grant === "client_credentials") {
+    const grantKind = cfg?.oauth?.grant;
+    if (grantKind === "client_credentials" || grantKind === "service_account") {
       grant.mutate(
         { provider: view.provider },
         {

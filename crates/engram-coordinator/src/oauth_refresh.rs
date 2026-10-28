@@ -93,13 +93,44 @@ impl OAuthManager {
             .refresh
             .as_ref()
             .expect("a refreshable bundle carries its refresh spec");
-        let client_id = self.resolve_refresh_secret(&refresh.client_id_ref).await?;
-        let client_secret = self
-            .resolve_refresh_secret(&refresh.client_secret_ref)
-            .await?;
-        let mut form: Vec<(&str, String)> =
-            vec![("client_id", client_id), ("client_secret", client_secret)];
+        let mut form: Vec<(&str, String)> = Vec::new();
+        if bundle.kind != ConnectorOAuthKind::Oauth2JwtBearer {
+            form.push((
+                "client_id",
+                self.resolve_refresh_secret(&refresh.client_id_ref).await?,
+            ));
+            form.push((
+                "client_secret",
+                self.resolve_refresh_secret(&refresh.client_secret_ref)
+                    .await?,
+            ));
+        }
         let delimiter = match bundle.kind {
+            ConnectorOAuthKind::Oauth2JwtBearer => {
+                let assertion = self
+                    .service_account_assertion(
+                        &refresh.token_url,
+                        refresh
+                            .assertion_key_ref
+                            .as_deref()
+                            .ok_or(OAuthServiceError::InvalidBundle)?,
+                        refresh
+                            .subject
+                            .as_deref()
+                            .ok_or(OAuthServiceError::InvalidBundle)?,
+                        refresh
+                            .scope
+                            .as_deref()
+                            .ok_or(OAuthServiceError::InvalidBundle)?,
+                    )
+                    .await?;
+                form.push((
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:jwt-bearer".into(),
+                ));
+                form.push(("assertion", assertion));
+                " "
+            }
             // No refresh token exists: the grant runs again, with the scope
             // it was first granted (the provider returns none otherwise).
             ConnectorOAuthKind::Oauth2ClientCredentials => {
@@ -136,7 +167,11 @@ impl OAuthManager {
                     token_type: grant.token_type,
                     // Rotation: adopt the new refresh token; a provider that
                     // does not rotate keeps the old one.
-                    refresh_token: grant.refresh_token.or_else(|| bundle.refresh_token.clone()),
+                    refresh_token: if bundle.kind == ConnectorOAuthKind::Oauth2JwtBearer {
+                        None
+                    } else {
+                        grant.refresh_token.or_else(|| bundle.refresh_token.clone())
+                    },
                     scope: grant.scope.or(bundle.scope.clone()),
                     obtained_at: self.clock.now_utc(),
                     expires_at: grant.expires_at,
@@ -491,6 +526,8 @@ mod tests {
                 token_url: "https://x/token".into(),
                 client_id_ref: "a".into(),
                 client_secret_ref: "b".into(),
+                assertion_key_ref: None,
+                subject: None,
                 scope: None,
                 body: Default::default(),
             }),

@@ -77,6 +77,14 @@ export const completeRedirectFlow = OAuthCredentialService.method.completeRedire
 export const grantClientCredentials = OAuthCredentialService.method.grantClientCredentials;
 
 /**
+ * Service-account JWT-bearer grant for connector subjects. The coordinator
+ * signs a new assertion from the sealed key ref and principal before expiry.
+ *
+ * @generated from rpc engram.app.v1.OAuthCredentialService.GrantServiceAccount
+ */
+export const grantServiceAccount = OAuthCredentialService.method.grantServiceAccount;
+
+/**
  * Internal credential-control operations. Callers must additionally present
  * the session's broker token; the coordinator derives subject/provider from
  * the session binding and never accepts them from the harness.

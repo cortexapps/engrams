@@ -197,8 +197,12 @@ export interface ParsedCli {
  * seeds before redirecting (the access token itself is obtained server-side). */
 export interface ParsedOauth {
   /** `authorization_code` sends the admin through a consent screen;
-   * `client_credentials` grants from the client id and secret alone. */
-  grant: "authorization_code" | "client_credentials";
+   * `client_credentials` grants from the client id and secret alone;
+   * `service_account` signs with a sealed service-account key as one
+   * principal (the client refs then serve the personal flow only). */
+  grant: "authorization_code" | "client_credentials" | "service_account";
+  /** Org secret the connect sheet seals the service-account key under. */
+  serviceAccountKeyRef?: string;
   clientIdRef: string;
   clientSecretRef: string;
   /** Bot scopes the token exchange requests — drives the Slack app manifest (ADR 0060). */
@@ -304,6 +308,7 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
         clientSecretRef?: string;
         signingSecretRef?: unknown;
         signingSecretHint?: unknown;
+        serviceAccountKeyRef?: unknown;
         scopes?: unknown;
       }
     | undefined;
@@ -311,7 +316,13 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
     oauthRaw?.clientIdRef && oauthRaw?.clientSecretRef
       ? {
           grant:
-            oauthRaw.grant === "client_credentials" ? "client_credentials" : "authorization_code",
+            oauthRaw.grant === "client_credentials" || oauthRaw.grant === "service_account"
+              ? oauthRaw.grant
+              : "authorization_code",
+          ...(oauthRaw.grant === "service_account" &&
+          typeof oauthRaw.serviceAccountKeyRef === "string"
+            ? { serviceAccountKeyRef: oauthRaw.serviceAccountKeyRef }
+            : {}),
           clientIdRef: oauthRaw.clientIdRef,
           clientSecretRef: oauthRaw.clientSecretRef,
           scopes: Array.isArray(oauthRaw.scopes)

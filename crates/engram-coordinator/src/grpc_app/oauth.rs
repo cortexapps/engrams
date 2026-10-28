@@ -14,6 +14,7 @@ use super::auth;
 use crate::oauth::{OAuthServiceError, MAX_OAUTH_BUNDLE_BYTES};
 use crate::oauth_client_credentials::ClientCredentialsSpec;
 use crate::oauth_redirect::{RedirectMetadataProbe, RedirectMetadataSpec, RedirectOauthSpec};
+use crate::oauth_service_account::ServiceAccountSpec;
 use crate::state::SharedState;
 use engram_core::types::connector_oauth::TokenRequestBody;
 
@@ -143,6 +144,20 @@ fn client_credentials_spec_from_proto(
         client_id_ref: spec.client_id_ref,
         client_secret_ref: spec.client_secret_ref,
         body,
+        metadata: metadata_from_proto(spec.metadata),
+    })
+}
+
+fn service_account_spec_from_proto(
+    spec: Option<app::ServiceAccountSpec>,
+) -> Result<ServiceAccountSpec, &'static str> {
+    let spec = spec.ok_or("spec is required")?;
+    Ok(ServiceAccountSpec {
+        token_url: spec.token_url,
+        scopes: spec.scopes,
+        scope_delimiter: spec.scope_delimiter,
+        key_ref: spec.key_ref,
+        subject: (!spec.subject.is_empty()).then_some(spec.subject),
         metadata: metadata_from_proto(spec.metadata),
     })
 }
@@ -331,6 +346,30 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             .await
             .map_err(oauth_status)?;
         Ok(Response::new(app::GrantClientCredentialsResponse {
+            credential: Some(credential_to_proto(
+                row,
+                self.state.services.clock.now_utc(),
+            )),
+        }))
+    }
+
+    async fn grant_service_account(
+        &self,
+        req: Request<app::GrantServiceAccountRequest>,
+    ) -> Result<Response<app::GrantServiceAccountResponse>, Status> {
+        self.auth.check(&req)?;
+        let req = req.into_inner();
+        let spec = service_account_spec_from_proto(req.spec).map_err(Status::invalid_argument)?;
+        let row = self
+            .state
+            .oauth
+            .grant_service_account(
+                &key(req.subject, req.provider).map_err(Status::invalid_argument)?,
+                &spec,
+            )
+            .await
+            .map_err(oauth_status)?;
+        Ok(Response::new(app::GrantServiceAccountResponse {
             credential: Some(credential_to_proto(
                 row,
                 self.state.services.clock.now_utc(),

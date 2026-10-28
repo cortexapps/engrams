@@ -120,14 +120,26 @@ export function useTestConnector() {
 /** The client-credentials grant (Vanta): the server posts the sealed client
  * id and secret to the provider and seals the token. No redirect, so the
  * connector lists refresh here. Repeating it is the reconnect. */
+/** Run a connector's server-side grant (client credentials, or a service
+ * account acting as `subject`; omitted on a re-grant, the server keeps the
+ * sealed principal). */
 export function useGrantClientCredentials() {
   const invalidateConnectors = useInvalidateConnectors();
   const invalidateCatalog = useInvalidateCatalog();
   return useReactMutation({
-    mutationFn: async ({ provider }: { provider: string }) => {
+    mutationFn: async ({ provider, subject }: { provider: string; subject?: string }) => {
       const res = await fetch(
         `${API_BASE}/integrations/${encodeURIComponent(provider)}/oauth/grant`,
-        { method: "POST", credentials: "include" },
+        {
+          method: "POST",
+          credentials: "include",
+          ...(subject !== undefined
+            ? {
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ subject }),
+              }
+            : {}),
+        },
       );
       const body = (await res.json().catch(() => ({}))) as { ok?: boolean; message?: string };
       if (!res.ok || body.ok !== true) {

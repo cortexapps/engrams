@@ -36,6 +36,7 @@ pub mod oauth;
 pub mod oauth_client_credentials;
 pub mod oauth_redirect;
 pub mod oauth_refresh;
+pub mod oauth_service_account;
 pub mod org_secrets;
 pub mod outbox_delivery;
 pub mod pg_listener;

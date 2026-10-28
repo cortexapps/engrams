@@ -109,11 +109,12 @@ The OAuth facet's `grant` gains the value `service_account`:
 Parse rules in the orchestrator registry:
 
 - `serviceAccountKeyRef` is required for, and only for, `service_account`.
-- `authorizeUrl`, `clientIdRef`, and `clientSecretRef` are required when the
-  connector declares `userCredential.oauth`, and forbidden otherwise, because
-  a service-account connector has no other use for them.
-- `tokenRequestBody`, `acquisitionHosts`, `extraAuthorizeParams`, and `pkce`
-  follow the client-credentials rules: the org grant has no browser leg.
+- A service-account connector always declares `userCredential.oauth`; the
+  facet's `authorizeUrl`, `acquisitionHosts`, `clientIdRef`, and
+  `clientSecretRef` serve that personal flow and nothing else. Keeping the
+  client refs required leaves every consumer of the facet unchanged.
+- `tokenRequestBody`, `extraAuthorizeParams`, and `pkce` do not apply: the
+  org grant has no browser leg and posts a form.
 
 The coordinator gains `GrantServiceAccount` next to `GrantClientCredentials`.
 The spec carries the token URL, the scopes, the key ref, the principal, and
@@ -127,11 +128,14 @@ refresh sweep re-runs the grant without the connector catalog, as it does
 for client credentials. The fields default on deserialization; bundles sealed
 before this change are unchanged.
 
+The connector lists no metadata mapping: Google's token response names no
+account, and the directory probe would fail under a member's token. The
+coordinator fills `display_name` with the principal for the org grant.
+
 The principal is an input of the grant request, entered once in the connect
 sheet. Reconnect from the integration page re-runs the grant; when the
 request names no principal the coordinator takes it from the sealed spec.
-The metadata `display_name` is the principal, so the integration page shows
-who the organization acts as.
+The integration page shows the principal as the connection's display name.
 
 Rejected: a dedicated bot Google user signed in through the consent screen.
 It needs a super-admin seat whose refresh token any password or policy

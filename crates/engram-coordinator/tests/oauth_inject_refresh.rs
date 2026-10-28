@@ -222,6 +222,8 @@ async fn refresh_route_refreshes_an_expired_bundle_against_the_provider() {
                 token_url: format!("http://127.0.0.1:{}/oauth/token", addr.port()),
                 client_id_ref: "linear.client_id".into(),
                 client_secret_ref: "linear.client_secret".into(),
+                assertion_key_ref: None,
+                subject: None,
                 scope: None,
                 body: TokenRequestBody::Form,
             }),
