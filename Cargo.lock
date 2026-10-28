@@ -9334,7 +9334,6 @@ dependencies = [
  "rand 0.10.2",
  "rand 0.8.7",
  "rand 0.9.4",
- "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "regex",
  "regex-automata",

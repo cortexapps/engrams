@@ -251,6 +251,12 @@ updates:
       #          0.8.6 -> 0.9.1          `rsa` 0.9.10 requires ^0.8, and rsa is
       #                                  the only consumer, so 0.9 is
       #                                  unreachable while rsa stays at 0.9.
+      #   #1683  itertools 0.14 -> 0.15  Hakari-only. The generated file pins
+      #                                  ^0.14; prost-build, prost-derive,
+      #                                  ratatui and unicode-truncate all hold
+      #                                  ^0.14, so 0.15 is unreachable and the
+      #                                  bump collapses to an empty diff under
+      #                                  `generate --diff`.
       #
       # NOT added here: `sha2`, `base64`, `jsonwebtoken`. Dependabot read the
       # OLD generation from the generated file (0.10 / 0.22 / 10) and proposed
@@ -291,6 +297,7 @@ updates:
       - dependency-name: "axum-core"
       - dependency-name: "der"
       - dependency-name: "hashbrown"
+      - dependency-name: "itertools"
       - dependency-name: "num-bigint"
       - dependency-name: "num-bigint-dig"
       - dependency-name: "phf_shared"
