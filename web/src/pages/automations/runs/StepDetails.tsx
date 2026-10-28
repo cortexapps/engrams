@@ -50,7 +50,6 @@ export function StepDetails({ step, blockType, sentence, frames, onPickFrame }: 
   const sessionId =
     latest.sessionId ??
     (typeof outputs?.["session_id"] === "string" ? (outputs["session_id"] as string) : undefined);
-  const failed = latest.status === "failed" || latest.status === "deadline";
 
   return (
     <div className="flex flex-col gap-4" data-testid="step-details">
@@ -103,7 +102,7 @@ export function StepDetails({ step, blockType, sentence, frames, onPickFrame }: 
           {latest.error}
         </p>
       )}
-      {!failed && sessionId && (
+      {sessionId && (
         <Link
           to="/sessions/$id"
           params={{ id: sessionId }}

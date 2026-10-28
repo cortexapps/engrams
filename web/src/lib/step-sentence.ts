@@ -42,6 +42,13 @@ export function outputsReadout(outputs: Record<string, unknown>): string | undef
 
 type Sentence = (facts: StepFacts) => string | undefined;
 
+const closeSentence: Sentence = ({ outputs }) =>
+  outputs["not_instanced"] === true
+    ? "No agent to close"
+    : outputs["closed"] === true
+      ? "Closed the agent"
+      : "The agent was already closed";
+
 const SENTENCES: Record<string, Sentence> = {
   filter: ({ status, outputs }) =>
     outputs["pass"] === false || status === "skipped"
@@ -92,6 +99,7 @@ const SENTENCES: Record<string, Sentence> = {
     return outcome ? `Waited; the session is ${outcome.replaceAll("_", " ")}` : undefined;
   },
   wait_event: ({ outputs }) => {
+    if (outputs["outcome"] === "deadline") return "No event arrived in time";
     const key = str(outputs["event_key"]);
     return key ? `Received ${key.replaceAll("_", " ")}` : "Received an event";
   },
@@ -131,12 +139,8 @@ const SENTENCES: Record<string, Sentence> = {
     const reason = str(outputs["reason"]);
     return reason ? `No kept session (${reason.replaceAll("_", " ")})` : "No kept session";
   },
-  instance_close: ({ outputs }) =>
-    outputs["not_instanced"] === true
-      ? "No agent to close"
-      : outputs["closed"] === true
-        ? "Closed the agent"
-        : "The agent was already closed",
+  instance_close: closeSentence,
+  close_agent: closeSentence,
   claim_handle: ({ outputs }) => {
     const handle = str(outputs["handle"]);
     if (outputs["claimed"] === false)
@@ -168,7 +172,7 @@ const SENTENCES: Record<string, Sentence> = {
   },
   slack_choice: ({ outputs }) => {
     const label = str(outputs["label"]);
-    if (outputs["outcome"] === "timed_out") return "Nobody clicked in time";
+    if (outputs["outcome"] === "deadline") return "Nobody clicked in time";
     return label ? `Picked ${label}` : undefined;
   },
   resolve_user: ({ outputs }) =>

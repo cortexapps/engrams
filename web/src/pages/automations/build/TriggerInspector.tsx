@@ -18,7 +18,12 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { useEditorWebhookRegistrations, useEventCatalog } from "@/hooks/useAutomationEditor";
-import type { BlockErrorRef, EntrypointRole, TriggerSpec } from "@/lib/automation-blocks";
+import type {
+  AgentScope,
+  BlockErrorRef,
+  EntrypointRole,
+  TriggerSpec,
+} from "@/lib/automation-blocks";
 
 const PROVIDERS = ["github", "slack", "linear"] as const;
 const KINDS: ReadonlyArray<{ kind: TriggerSpec["kind"]; label: string; help: string }> = [
@@ -70,6 +75,8 @@ export interface TriggerInspectorProps {
   /** The way in's role, when the automation has an agent. */
   role?: EntrypointRole;
   onRoleChange?: (role: EntrypointRole) => void;
+  /** The agent's scope: a session per event offers no reach or close. */
+  scopeKind?: AgentScope["kind"];
 }
 
 function errorFor(errors: readonly BlockErrorRef[], field: string): string | undefined {
@@ -91,7 +98,13 @@ export function TriggerInspector({
   errors,
   role,
   onRoleChange,
+  scopeKind,
 }: TriggerInspectorProps) {
+  // A session per event has no running agent to reach or close: those
+  // roles are offered only for a kept scope (a stale one still shows).
+  const roles = ROLES.filter(
+    (r) => scopeKind !== "event" || r.role === "start" || r.role === "none" || r.role === role,
+  );
   const defaultFor = (kind: TriggerSpec["kind"]): TriggerSpec => {
     switch (kind) {
       case "integration":
@@ -157,7 +170,7 @@ export function TriggerInspector({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {ROLES.map((r) => (
+              {roles.map((r) => (
                 <SelectItem key={r.role} value={r.role}>
                   {r.label}
                 </SelectItem>

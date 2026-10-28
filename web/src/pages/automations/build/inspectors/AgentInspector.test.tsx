@@ -54,7 +54,7 @@ vi.mock("@/components/ui/select", () => ({
   ),
 }));
 
-function mount(agent: AgentSpec, builtin = false) {
+function mount(agent: AgentSpec, builtin = false, slackTrigger = true) {
   const onChange = vi.fn();
   renderWithProviders(
     <AgentInspector
@@ -63,6 +63,7 @@ function mount(agent: AgentSpec, builtin = false) {
       builtin={builtin}
       errors={[]}
       variablePaths={["trigger.kind", "event.raw"]}
+      slackTrigger={slackTrigger}
     />,
   );
   return { onChange };
@@ -108,6 +109,19 @@ describe("AgentInspector", () => {
     fireEvent.click(relay);
     const last = onChange.mock.calls.at(-1)![0] as AgentSpec;
     expect("relay" in last).toBe(false);
+  });
+
+  it("without a Slack way in the relay switch is hidden unless a relay is set", async () => {
+    mount(base, false, false);
+    await screen.findByTestId("field-scope");
+    expect(screen.queryByTestId("field-relay")).toBeNull();
+  });
+
+  it("the session is kept by default: an absent keepOnFinish reads as on", async () => {
+    mount(base);
+    fireEvent.click(await screen.findByText("More"));
+    const keep = await screen.findByTestId("field-keepOnFinish");
+    expect(keep.querySelector('[role="switch"]')?.getAttribute("aria-checked")).toBe("true");
   });
 
   it("the scope is a named preset; a preset writes its key, a custom key shows the templates", async () => {

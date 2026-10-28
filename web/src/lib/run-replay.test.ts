@@ -22,6 +22,7 @@ const TYPES: Record<string, string> = {
   agent: "run_agent",
   poll: "loop",
   check: "session_status",
+  gate: "branch",
 };
 
 describe("replayMap", () => {
@@ -52,6 +53,24 @@ describe("replayMap", () => {
     const check = map.get("check")!;
     expect(check.frames.map((f) => f.path)).toEqual(["poll[0].check", "poll[1].check"]);
     expect(check.sentence).toBe("The session is idle");
+  });
+
+  it("a branch and a loop fold their own ledger row with the children's", () => {
+    const map = replayMap(
+      [
+        row("gate", "succeeded", { outputsJson: JSON.stringify({ taken: "else" }) }),
+        row("gate.poll", "succeeded", {
+          outputsJson: JSON.stringify({ iterations: 2, exhausted: false }),
+        }),
+        row("gate.poll[0].check", "succeeded"),
+        row("gate.poll[1].check", "succeeded"),
+      ],
+      (id) => TYPES[id],
+      NOW,
+    );
+    expect(map.get("gate")).toMatchObject({ status: "ok", sentence: "Took the else branch" });
+    expect(map.get("poll")).toMatchObject({ status: "ok", sentence: "Ran 2 iterations" });
+    expect(map.get("check")?.frames).toHaveLength(2);
   });
 
   it("names the way in that carried the run", () => {

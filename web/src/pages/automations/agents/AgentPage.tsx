@@ -10,6 +10,7 @@ import { useRun, useRunList } from "@/hooks/useAutomationRuns";
 import { useAutomations } from "@/hooks/useAutomations";
 import { useInstance } from "@/hooks/useInstances";
 import { useNow } from "@/hooks/useNow";
+import { hasScopedAgents, parseDefinition } from "@/lib/automation-blocks";
 import { relativeAge } from "@/lib/relative-time";
 
 import { ActivityTab } from "../activity/ActivityTab";
@@ -75,7 +76,13 @@ export function AgentPage() {
           <Link
             to="/automations/$id"
             params={{ id: automation.id }}
-            search={{ tab: "agents" }}
+            search={{
+              // The Agents tab exists only while the automation keeps agents;
+              // a closed-out one lands on its activity.
+              tab: hasScopedAgents(parseDefinition(automation.version?.definitionJson))
+                ? "agents"
+                : "activity",
+            }}
             className="underline-offset-4 hover:underline"
           >
             {automation.name}

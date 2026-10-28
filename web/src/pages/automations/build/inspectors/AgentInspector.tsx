@@ -46,6 +46,9 @@ export interface AgentInspectorProps {
   errors: readonly BlockErrorRef[];
   variablePaths: readonly string[];
   variableValues?: Readonly<Record<string, string>>;
+  /** A way in is a Slack event: the thread relay has a thread to read. The
+   * switch shows only then (or when a relay is already set). */
+  slackTrigger: boolean;
 }
 
 /** The relay that answers in the Slack thread an event came from: every
@@ -177,11 +180,16 @@ export function AgentInspector(props: AgentInspectorProps) {
   const pinned = builtin;
   const set = (key: string, value: unknown) => onChange(setPath(agent, key, value) as AgentSpec);
 
+  // `keepOnFinish` is kept when absent: the switch reads the default.
+  const valueOf = (key: string) => {
+    const value = getPath(agent, key);
+    return key === "keepOnFinish" && value === undefined ? true : value;
+  };
   const field = (spec: FieldSpec) => (
     <GenericField
       key={spec.key}
       spec={spec}
-      value={getPath(agent, spec.key)}
+      value={valueOf(spec.key)}
       onChange={(value) => set(spec.key, value)}
       pinned={pinned}
       error={errorFor(errors, spec.key)}
@@ -281,35 +289,37 @@ export function AgentInspector(props: AgentInspectorProps) {
         )}
       </Field>
 
-      <Field data-testid="field-relay">
-        <div className="flex items-center justify-between gap-3">
-          <FieldLabel htmlFor="agent-relay" className="flex items-center gap-1.5">
-            Reply in the Slack thread the event came from
-            {pinned && <Pinned />}
-          </FieldLabel>
-          <Switch
-            id="agent-relay"
-            checked={relayOn}
-            disabled={pinned}
-            onCheckedChange={(on) => set("relay", on ? { ...SLACK_THREAD_RELAY } : undefined)}
-          />
-        </div>
-        <FieldDescription>
-          {relayOn
-            ? "The agent's replies land in the thread as it works, its questions arrive as Slack forms, and the message gets a reaction while a turn runs."
-            : "Off: the session runs without a relay. Turn it on for a Slack mention or message trigger."}
-        </FieldDescription>
-        {errorFor(errors, "relay") && (
-          <p className="text-xs text-[var(--instrument-critical-ink)]">
-            {errorFor(errors, "relay")}
-          </p>
-        )}
-        {relayOn && (
-          <Disclosure label="Where the relay reads the thread from" testId="relay-fields">
-            {RELAY_FIELDS.map(field)}
-          </Disclosure>
-        )}
-      </Field>
+      {(relayOn || props.slackTrigger) && (
+        <Field data-testid="field-relay">
+          <div className="flex items-center justify-between gap-3">
+            <FieldLabel htmlFor="agent-relay" className="flex items-center gap-1.5">
+              Reply in the Slack thread the event came from
+              {pinned && <Pinned />}
+            </FieldLabel>
+            <Switch
+              id="agent-relay"
+              checked={relayOn}
+              disabled={pinned}
+              onCheckedChange={(on) => set("relay", on ? { ...SLACK_THREAD_RELAY } : undefined)}
+            />
+          </div>
+          <FieldDescription>
+            {relayOn
+              ? "The agent's replies land in the thread as it works, its questions arrive as Slack forms, and the message gets a reaction while a turn runs."
+              : "Off: the session runs without a relay. Turn it on for a Slack mention or message trigger."}
+          </FieldDescription>
+          {errorFor(errors, "relay") && (
+            <p className="text-xs text-[var(--instrument-critical-ink)]">
+              {errorFor(errors, "relay")}
+            </p>
+          )}
+          {relayOn && (
+            <Disclosure label="Where the relay reads the thread from" testId="relay-fields">
+              {RELAY_FIELDS.map(field)}
+            </Disclosure>
+          )}
+        </Field>
+      )}
 
       <Disclosure label="More" testId="agent-more">
         {MORE_FIELDS.map(field)}

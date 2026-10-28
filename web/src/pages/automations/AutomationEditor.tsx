@@ -401,6 +401,12 @@ export function AutomationEditor({
   }
 
   const nameError = errors.find((e) => e.blockId === "" && e.field === "name")?.message;
+  // The Build tab shows the replayed version's ways in: a way in the run
+  // took that the draft has since removed still opens, instead of snapping
+  // to main.
+  const shownEntrypointId = entrypointIds(replay ? replay.definition : draft).includes(entrypointId)
+    ? entrypointId
+    : MAIN_ENTRYPOINT_ID;
   const triggerSummaryFor = (way: string) =>
     existingSummary(automation?.id, projectEntrypoint(draft, way));
   const liveValues = variableValues ?? test.variableValues;
@@ -579,7 +585,7 @@ export function AutomationEditor({
         <TabsContent value="build" className="flex min-h-0 flex-1 flex-col">
           <BuildTab
             definition={replay ? replay.definition : draft}
-            entrypointId={effectiveEntrypointId}
+            entrypointId={shownEntrypointId}
             onSelectEntrypoint={setEntrypointId}
             onChange={setDraft}
             builtin={builtin}

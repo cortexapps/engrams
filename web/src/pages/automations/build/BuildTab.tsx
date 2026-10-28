@@ -34,10 +34,10 @@ import {
   blockIdsOutsideEntrypoint,
   blockKind,
   blockProfileId,
-  defaultAgent,
   entrypointIdError,
   entrypointIds,
   findBlock,
+  hasSlackTrigger,
   insertBlock,
   MAIN_ENTRYPOINT_ID,
   mergeEntrypoint,
@@ -51,6 +51,7 @@ import {
   scopeLabel,
   setRole,
   walkBlocks,
+  withAgent,
   type AgentSpec,
   type AutomationDefinition,
   type BlockDef,
@@ -299,7 +300,7 @@ export function BuildTab({
   const updateTrigger = (trigger: TriggerSpec) => changeWay(entrypointId, { ...active, trigger });
   const updateAgent = (next: AgentSpec) => onChange({ ...definition, agent: next });
   const addAgent = () => {
-    onChange({ ...definition, agent: defaultAgent(definition.trigger) });
+    onChange(withAgent(definition));
     setSelectedId(AGENT_NODE_ID);
   };
   const removeAgent = () => {
@@ -669,7 +670,7 @@ export function BuildTab({
                     : triggerSummaryFor(entrypointId)}
               </div>
             </div>
-            {selected && !builtin && position && (
+            {selected && !builtin && !replay && position && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button variant="ghost" size="icon-xs" aria-label={`Actions for ${selected.id}`}>
@@ -745,6 +746,7 @@ export function BuildTab({
                   ? {
                       role: roleOf(definition, entrypointId),
                       onRoleChange: (role) => onChange(setRole(definition, entrypointId, role)),
+                      scopeKind: agent.scope.kind,
                     }
                   : {})}
               />
@@ -756,6 +758,7 @@ export function BuildTab({
                 errors={agentErrors}
                 variablePaths={variablePaths}
                 variableValues={previewValues}
+                slackTrigger={hasSlackTrigger(definition)}
               />
             ) : selected ? (
               <BlockInspector

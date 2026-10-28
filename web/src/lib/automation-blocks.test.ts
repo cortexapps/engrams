@@ -8,6 +8,7 @@ import {
   blockTypesOf,
   defaultAgent,
   hasScopedAgents,
+  hasSlackTrigger,
   roleOf,
   scopeLabel,
   scopePresetOf,
@@ -31,6 +32,7 @@ import {
   parseBlockErrors,
   removeBlock,
   setPath,
+  withAgent,
   type AutomationDefinition,
   type BlockDef,
 } from "./automation-blocks";
@@ -363,7 +365,7 @@ describe("the agent with ways in", () => {
     const d = { ...base(), agent: defaultAgent(base().trigger) };
     const types = blockTypesOf(d);
     expect(types.get(AGENT_STEP_ID)).toBe("run_agent");
-    expect(types.get(AGENT_CLOSE_STEP_ID)).toBe("instance_close");
+    expect(types.get(AGENT_CLOSE_STEP_ID)).toBe("close_agent");
     expect(blockTypesOf(base()).has(AGENT_STEP_ID)).toBe(false);
   });
 
@@ -374,5 +376,45 @@ describe("the agent with ways in", () => {
       { blockId: AGENT_NODE_ID, field: "profileId", message: "pick a profile" },
       { blockId: "admit", field: "conditions", message: "empty" },
     ]);
+  });
+
+  it("a way in's role error lands on its trigger row", () => {
+    expect(
+      parseBlockErrors("__trigger__.role: needs an agent; __entrypoints__.role: needs an agent"),
+    ).toEqual([
+      { blockId: "", field: "role", message: "needs an agent" },
+      { blockId: "", field: "role", message: "needs an agent" },
+    ]);
+  });
+
+  it("adding an agent turns the ways in's scope into the agent's key", () => {
+    const d: AutomationDefinition = {
+      ...def([]),
+      settings: {
+        endSessionsOnFinish: false,
+        instance: { keyTemplate: "${{ event.raw.data.id }}" },
+      },
+    };
+    const next = withAgent(d);
+    expect(next.agent?.scope).toEqual({ kind: "key", keyTemplate: "${{ event.raw.data.id }}" });
+    expect(next.settings.instance).toBeUndefined();
+    expect(withAgent(base()).agent?.scope).toEqual(defaultAgent(base().trigger).scope);
+  });
+
+  it("knows when a way in is a Slack event", () => {
+    expect(hasSlackTrigger(base())).toBe(true);
+    expect(hasSlackTrigger(def([]))).toBe(false);
+    expect(
+      hasSlackTrigger({
+        ...def([]),
+        entrypoints: [
+          {
+            id: "mention",
+            trigger: { kind: "integration", provider: "slack", connectionId: "", eventKeys: [] },
+            blocks: [],
+          },
+        ],
+      }),
+    ).toBe(true);
   });
 });

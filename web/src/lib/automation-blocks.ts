@@ -107,7 +107,7 @@ export interface AutomationDefinition {
     instance?: {
       keyTemplate: string;
       inputs?: Record<string, string>;
-      entrypoints?: Record<string, { admit: "open" | "require" | "handle_match" }>;
+      entrypoints?: Record<string, { admit: "open" | "require" | "handle_match" | "optional" }>;
     };
   };
 }
@@ -223,6 +223,7 @@ export const AGENT_STEP_ID = "agent";
 export const AGENT_CLOSE_STEP_ID = "agent_close";
 /** The engine's type of the agent step, for the step sentences. */
 export const AGENT_STEP_TYPE = "run_agent";
+export const AGENT_CLOSE_STEP_TYPE = "close_agent";
 
 export interface ScopePreset {
   id: string;
@@ -268,20 +269,25 @@ export const SCOPE_PRESETS: readonly ScopePreset[] = [
     id: "pull_request",
     label: "Each pull request",
     help: "One agent per pull request, across pushes and review comments.",
+    // A review comment carries the number under `issue`, a push under
+    // `pull_request`; `coalesce` reads whichever the event has.
     scope: {
       kind: "key",
-      keyTemplate: "${{ event.raw.repository.full_name }}#${{ event.raw.pull_request.number }}",
-      labelTemplate: "${{ event.raw.pull_request.title }}",
+      keyTemplate:
+        '${{ event.raw.repository.full_name }}#${{ event.raw | coalesce: "pull_request.number", "issue.number" }}',
+      labelTemplate: '${{ event.raw | coalesce: "pull_request.title", "issue.title" }}',
     },
   },
   {
     id: "linear_issue",
     label: "Each Linear issue",
     help: "One agent per issue, across its updates and comments.",
+    // An issue event carries the identifier on `data`; a comment event on
+    // `data.issue`.
     scope: {
       kind: "key",
-      keyTemplate: "${{ event.raw.data.identifier }}",
-      labelTemplate: "${{ event.raw.data.title }}",
+      keyTemplate: '${{ event.raw | coalesce: "data.identifier", "data.issue.identifier" }}',
+      labelTemplate: '${{ event.raw | coalesce: "data.title", "data.issue.title" }}',
     },
   },
   {
@@ -324,6 +330,27 @@ export function defaultScopeFor(trigger: TriggerSpec): AgentScope {
 
 export function defaultAgent(trigger: TriggerSpec): AgentSpec {
   return { scope: defaultScopeFor(trigger), profileId: "", promptTemplate: "" };
+}
+
+/** The agent an automation gets when one is added: a scope its ways in
+ * already had (`settings.instance`, which the engine now derives from the
+ * agent) becomes the agent's key, so adding an agent keeps the workstreams. */
+export function withAgent(definition: AutomationDefinition): AutomationDefinition {
+  const { instance, ...settings } = definition.settings;
+  const agent = defaultAgent(definition.trigger);
+  if (instance !== undefined) {
+    agent.scope = { kind: "key", keyTemplate: instance.keyTemplate };
+  }
+  return { ...definition, agent, settings };
+}
+
+/** Whether any way in is a Slack event: the only trigger a Slack thread
+ * relay can read its thread from. */
+export function hasSlackTrigger(definition: AutomationDefinition): boolean {
+  return entrypointIds(definition).some((way) => {
+    const trigger = projectEntrypoint(definition, way).trigger;
+    return trigger.kind === "integration" && trigger["provider"] === "slack";
+  });
 }
 
 /** Block ids OUTSIDE one entrypoint — the reserved set for nextBlockId
@@ -613,7 +640,7 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   {
     kind: "wait_event",
     group: "advanced",
-    outputs: ["event", "event_key"],
+    outputs: ["outcome", "event", "event_key"],
     label: "Wait for event",
     description: "Receive the next delivery joined into this run (join concurrency).",
     icon: MailOpen,
@@ -1222,7 +1249,7 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
     icon: MailOpen,
     group: "advanced",
     insertable: false,
-    outputs: ["answered", "value", "label", "timed_out"],
+    outputs: ["outcome", "value", "label", "message_ts"],
     inspector: "readonly",
     summary: (c) => truncate(str(c["question"]), 48) || "Ask in the thread",
     defaults: () => ({}),
@@ -1278,7 +1305,7 @@ export function blockTypesOf(definition: AutomationDefinition): Map<string, stri
   for (const ep of definition.entrypoints ?? []) collect(ep.blocks);
   if (definition.agent) {
     types.set(AGENT_STEP_ID, AGENT_STEP_TYPE);
-    types.set(AGENT_CLOSE_STEP_ID, "instance_close");
+    types.set(AGENT_CLOSE_STEP_ID, AGENT_CLOSE_STEP_TYPE);
   }
   return types;
 }
@@ -1543,14 +1570,22 @@ export interface BlockErrorRef {
 
 /** The server joins BlockErrors into the ConnectError message as
  * `blockId.field: message; …` (definition-level: `field: message`; the
- * agent's: `__agent__.field: message`). Parse that back into addressable
- * errors; anything unparseable is a form error. */
+ * agent's: `__agent__.field: message`; a way in's role:
+ * `__trigger__.role` for main, `__entrypoints__.role` for another way in).
+ * Parse that back into addressable errors; anything unparseable is a form
+ * error. */
 export function parseBlockErrors(message: string): BlockErrorRef[] {
   const out: BlockErrorRef[] = [];
   for (const part of message.split("; ")) {
     const a = /^__agent__\.([A-Za-z0-9_.[\]]+): (.*)$/.exec(part);
     if (a) {
       out.push({ blockId: AGENT_NODE_ID, field: a[1]!, message: a[2]! });
+      continue;
+    }
+    // A way in's own field (its role) sits on the trigger row.
+    const w = /^__(?:trigger|entrypoints)__\.([A-Za-z0-9_.[\]]+): (.*)$/.exec(part);
+    if (w) {
+      out.push({ blockId: "", field: w[1]!, message: w[2]! });
       continue;
     }
     const m = /^([a-z][a-z0-9_]*)\.([A-Za-z0-9_.[\]]+): (.*)$/.exec(part);
