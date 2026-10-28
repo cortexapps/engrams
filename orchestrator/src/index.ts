@@ -19,6 +19,7 @@ import slackEventsRoute from "./routes/slack-events.ts";
 import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 import githubEventsRoute from "./routes/github-events.ts";
 import linearEventsRoute from "./routes/linear-events.ts";
+import vantaEventsRoute from "./routes/vanta-events.ts";
 import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
 import { makeGoogleOidcRoute } from "./routes/google-oidc.ts";
@@ -449,6 +450,8 @@ app.route("/", slackInteractivityRoute);
 app.route("/", githubEventsRoute);
 // Linear webhook ingress (ADR 0119 D5) — new with the integration-event ledger.
 app.route("/", linearEventsRoute);
+// Vanta webhook ingress: Svix-signed deliveries.
+app.route("/", vantaEventsRoute);
 // ADR 0102: dynamically registered webhooks verify their own registration
 // secret and dispatch one-shot AutomationRunWorkflow occurrences.
 app.route("/", hooksRoute);

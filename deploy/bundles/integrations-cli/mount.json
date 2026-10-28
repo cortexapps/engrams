@@ -30,6 +30,7 @@
         "bin/discord",
         "bin/shopify",
         "bin/cortex",
+        "bin/vanta",
         "bin/gcloud",
         "bin/engram-tunnel"
       ],

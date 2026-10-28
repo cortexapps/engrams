@@ -438,7 +438,7 @@ export interface WebhookEventSpec {
 /** Provider-owned ingress (ADR 0119 D5): how the integration event route
  * verifies deliveries and which sealed org secret signs them. */
 export interface WebhookIngressSpec {
-  scheme: "github_hmac_sha256" | "slack_v0" | "linear_hmac_sha256";
+  scheme: "github_hmac_sha256" | "slack_v0" | "linear_hmac_sha256" | "svix_hmac_sha256";
   secretRef: string;
 }
 
@@ -1441,6 +1441,7 @@ const INGRESS_SCHEMES: ReadonlySet<WebhookIngressSpec["scheme"]> = new Set([
   "github_hmac_sha256",
   "slack_v0",
   "linear_hmac_sha256",
+  "svix_hmac_sha256",
 ]);
 const MAX_EVENT_DESCRIPTION_LENGTH = 300;
 const FIELD_SCHEMA_MAX_DEPTH = 8;
@@ -1706,7 +1707,10 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
       typeof i.scheme !== "string" ||
       !INGRESS_SCHEMES.has(i.scheme as WebhookIngressSpec["scheme"])
     ) {
-      fail(where, '"webhook.ingress.scheme" must be "github_hmac_sha256", "slack_v0", or "linear_hmac_sha256"');
+      fail(
+        where,
+        '"webhook.ingress.scheme" must be "github_hmac_sha256", "slack_v0", "linear_hmac_sha256", or "svix_hmac_sha256"',
+      );
     }
     if (typeof i.secretRef !== "string" || !/^\S+$/.test(i.secretRef)) {
       fail(where, '"webhook.ingress.secretRef" must be a non-empty org-secret name');

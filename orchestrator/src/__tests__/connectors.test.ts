@@ -8,6 +8,7 @@
 
 import { expect, test, describe, beforeEach } from "bun:test";
 
+import { loadEventSample } from "../connectors/samples.ts";
 import {
   parseConnector,
   buildRegistry,
@@ -1884,5 +1885,57 @@ describe("the shipped cortex connector", () => {
     });
     expect(plan.settingsEnv).toEqual({ CORTEX_API_HOST: "api.eu.cortex.io" });
     expect(plan.enabled.map((e) => e.provider)).toEqual(["cortex"]);
+  });
+});
+
+describe("the shipped vanta connector", () => {
+  test("grants by client credentials with a JSON token request and a CLI", () => {
+    const c = connectorRegistry().get("vanta")!;
+    expect(c.hosts).toEqual(["api.vanta.com"]);
+    expect(c.oauth?.grant).toBe("client_credentials");
+    expect(c.oauth?.authorizeUrl).toBeUndefined();
+    expect(c.oauth?.tokenUrl).toBe("https://api.vanta.com/oauth/token");
+    expect(c.oauth?.tokenRequestBody).toBe("json");
+    expect(c.oauth?.scopeDelimiter).toBe(" ");
+    expect(c.oauth?.scopes).toEqual(["vanta-api.all:read", "vanta-api.all:write"]);
+    expect(c.oauth?.signingSecretRef).toBe("vanta.webhook_secret");
+    // The token is OAuth-sealed: the inject names no org secret of its own.
+    expect(c.credential?.injects.map((i) => i.secretRef)).toEqual([undefined]);
+    expect(c.cli?.bins).toEqual(["vanta"]);
+    expect(c.cli?.dummyEnv).toEqual({ VANTA_API_TOKEN: "x-engrams-managed" });
+    expect(c.test?.path).toBe("/v1/organization");
+  });
+
+  test("webhooks verify with the Svix scheme and every event has a fixture", () => {
+    const c = connectorRegistry().get("vanta")!;
+    expect(c.webhook?.ingress).toEqual({ scheme: "svix_hmac_sha256", secretRef: "vanta.webhook_secret" });
+    const keys = c.webhook!.events.map((e) => e.key);
+    expect(keys).toContain("questionnaire.status-changed");
+    expect(keys).toContain("trust-center.access-request.received");
+    expect(keys).toContain("vendor.decision.created");
+    for (const event of c.webhook!.events) {
+      expect(event.key, event.key).not.toMatch(/^v1\./);
+      expect(event.handleCandidates?.length ?? 0, event.key).toBeGreaterThan(0);
+      expect(loadEventSample("vanta", event.key), event.key).not.toBeNull();
+    }
+  });
+
+  test("reads and writes are separate powers, and issues and policies are read-only", () => {
+    const c = connectorRegistry().get("vanta")!;
+    const byGrant = new Map<string, string[]>();
+    for (const op of c.operations) {
+      const m = op.match as { method: string; path: string };
+      for (const g of op.grants) byGrant.set(g, [...(byGrant.get(g) ?? []), `${m.method} ${m.path}`]);
+    }
+    for (const [grant, ops] of byGrant) {
+      if (grant.endsWith(":read")) {
+        expect(ops.every((o) => o.startsWith("GET ")), grant).toBe(true);
+      }
+    }
+    expect(byGrant.has("issues:write")).toBe(false);
+    expect(byGrant.has("policies:write")).toBe(false);
+    expect(byGrant.get("people:read")).toContain("GET /v1/people*");
+    expect(byGrant.get("people:write")).toContain("POST /v1/people/*");
+    expect(byGrant.get("tests:read")).toContain("GET /v1/tests*");
   });
 });

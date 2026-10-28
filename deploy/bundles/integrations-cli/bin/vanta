@@ -1,0 +1,276 @@
+#!/bin/sh
+# engrams Vanta CLI: a thin wrapper over the Manage Vanta API (/v1).
+#
+# Auth is brokered: this carries only the `VANTA_API_TOKEN` placeholder; the
+# egress proxy injects the organization's real Vanta token as
+# `Authorization: Bearer` on every request to api.vanta.com and strips any
+# token you supply. There is NOTHING to log in to; do not set a real token.
+#
+# Each subcommand needs the matching power on your profile (vanta:people:read,
+# vanta:tests:read, vanta:issues:read, ...); a path your profile did not grant
+# is denied at the network boundary, not authenticated.
+#
+# List commands follow every page (pageSize 100, pageCursor) and print one
+# JSON array when jq is present; without jq they print the first page as the
+# API returns it. Vanta allows 50 requests a minute.
+set -eu
+
+BASE="https://api.vanta.com"
+TOKEN="${VANTA_API_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<EOF
+engrams Vanta CLI: auth is brokered by the platform (no token to set).
+
+Usage:
+  vanta org                                       The connected organization
+  vanta users | vanta user <id>                   Vanta user accounts
+  vanta people [field=value ...]                  People (employmentStatus=CURRENT, emailAndNameFilter=, groupIdsMatchesAny=)
+  vanta person <id>                               One person with their task summary
+  vanta people-tasks <STATUS> [taskType ...]      People whose tasks are OVERDUE, DUE_SOON, COMPLETE, or NONE
+  vanta offboard <person-id> <acknowledger-id>    Offboard one person
+  vanta set-leave <person-id> <start> [end]       Record leave (ISO dates); no end = indefinite
+  vanta groups | vanta group-people <group-id>    Groups and their members
+  vanta tests [field=value ...]                   Tests (statusFilter=NEEDS_ATTENTION, frameworkFilter=, ownerFilter=)
+  vanta failing-tests                             Tests that need attention
+  vanta test <id> | vanta test-entities <id>      One test, or the entities it evaluates
+  vanta deactivate-entity <test-id> <entity-id> <reason> [until]
+  vanta controls [field=value ...] | vanta control <id>
+  vanta control-tests <id> | vanta control-documents <id>
+  vanta set-control-owner <control-id> <user-id>
+  vanta frameworks | vanta framework <id> | vanta framework-controls <id>
+  vanta policies | vanta policy <id>
+  vanta documents [field=value ...] | vanta document <id>
+  vanta set-document-owner <document-id> <user-id>
+  vanta issues [field=value ...] | vanta issue <id>
+  vanta issues-due <YYYY-MM-DD>                   Open issues due on or before that date
+  vanta vendors [field=value ...] | vanta vendor <id>
+  vanta vendor-findings <id> | vanta vendor-reviews <id> | vanta vendor-documents <id>
+  vanta risks [field=value ...] | vanta risk <id>
+  vanta vulnerabilities [field=value ...] | vanta vulnerability <id>
+  vanta vulnerable-assets [field=value ...]
+  vanta integrations | vanta integration <id> | vanta monitored-computers
+  vanta trust-center <slug> | vanta access-requests <slug>
+  vanta questionnaires [field=value ...] | vanta questionnaire <id>
+  vanta event-logs [startDate=YYYY-MM-DD]
+  vanta get <path> [field=value ...]              Raw GET under /v1 (one page)
+  vanta list <path> [field=value ...]             Raw GET under /v1, every page, as one array
+  vanta api <METHOD> <path> [json-body]           Raw call with an explicit method
+
+Paths that do not start with /v1 are prefixed with /v1/. Responses are JSON.
+EOF
+}
+
+have_jq() { command -v jq >/dev/null 2>&1; }
+
+pretty() {
+    if have_jq; then jq .; else cat; fi
+}
+
+# json_str <value>: a JSON string literal, quotes included.
+json_str() {
+    if have_jq; then
+        printf '%s' "$1" | jq -Rs .
+    else
+        esc=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        printf '"%s"' "$esc"
+    fi
+}
+
+norm_path() {
+    case "$1" in
+    /v1/*) printf '%s' "$1" ;;
+    /*) printf '/v1%s' "$1" ;;
+    *) printf '/v1/%s' "$1" ;;
+    esac
+}
+
+# request <METHOD> <path> [curl-args...]
+request() {
+    m="$1"
+    p="$2"
+    shift 2
+    curl -sS -X "$m" "$BASE$(norm_path "$p")" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Accept: application/json" \
+        "$@"
+}
+
+# fetch <path> [field=value ...]: one GET; each field=value is a query param.
+fetch() {
+    p="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    request GET "$p" -G "$@"
+}
+
+get() {
+    fetch "$@" | pretty
+}
+
+# list <path> [field=value ...]: every page of a paginated list, one array.
+list() {
+    p="$1"
+    shift
+    if ! have_jq; then
+        get "$p" "pageSize=100" "$@"
+        return
+    fi
+    pages=$(mktemp)
+    trap 'rm -f "$pages"' EXIT
+    cursor=""
+    while :; do
+        if ! page=$(fetch "$p" "pageSize=100" ${cursor:+"pageCursor=$cursor"} "$@"); then
+            echo "vanta: could not reach $BASE" >&2
+            exit 1
+        fi
+        if ! printf '%s' "$page" | jq -e '.results.data' >/dev/null 2>&1; then
+            # Not a paginated envelope (an error, or a single object): show it as is.
+            printf '%s\n' "$page" | pretty
+            exit 1
+        fi
+        printf '%s\n' "$page" >>"$pages"
+        more=$(printf '%s' "$page" | jq -r '.results.pageInfo.hasNextPage')
+        cursor=$(printf '%s' "$page" | jq -r '.results.pageInfo.endCursor // empty')
+        [ "$more" = "true" ] && [ -n "$cursor" ] || break
+    done
+    jq -s '[.[].results.data[]]' "$pages"
+}
+
+# send <METHOD> <path> <json-body>
+send() {
+    request "$1" "$2" -H "Content-Type: application/json" --data-binary "$3" | pretty
+}
+
+# csv <a> [b ...]: join arguments with commas.
+csv() {
+    out=""
+    for a in "$@"; do out="${out:+$out,}$a"; done
+    printf '%s' "$out"
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+org) get /organization ;;
+users) list /users "$@" ;;
+user) get "/users/${1:?usage: vanta user <id>}" ;;
+people) list /people "$@" ;;
+person) get "/people/${1:?usage: vanta person <id>}" ;;
+people-tasks)
+    status="${1:?usage: vanta people-tasks <OVERDUE|DUE_SOON|COMPLETE|NONE> [taskType ...]}"
+    shift
+    if [ "$#" -gt 0 ]; then
+        list /people "taskStatusMatchesAny=$status" "taskTypeMatchesAny=$(csv "$@")"
+    else
+        list /people "tasksSummaryStatusMatchesAny=$status"
+    fi
+    ;;
+offboard)
+    id="${1:?usage: vanta offboard <person-id> <acknowledger-id>}"
+    ack="${2:?usage: vanta offboard <person-id> <acknowledger-id>}"
+    send POST /people/offboard \
+        "$(printf '{"updates":[{"id":%s,"acknowledgerId":%s}]}' "$(json_str "$id")" "$(json_str "$ack")")"
+    ;;
+set-leave)
+    id="${1:?usage: vanta set-leave <person-id> <start> [end]}"
+    start="${2:?usage: vanta set-leave <person-id> <start> [end]}"
+    if [ -n "${3:-}" ]; then end="$(json_str "$3")"; else end="null"; fi
+    send POST "/people/$id/set-leave" \
+        "$(printf '{"startDate":%s,"endDate":%s}' "$(json_str "$start")" "$end")"
+    ;;
+groups) list /groups "$@" ;;
+group-people) list "/groups/${1:?usage: vanta group-people <group-id>}/people" ;;
+tests) list /tests "$@" ;;
+failing-tests) list /tests "statusFilter=NEEDS_ATTENTION" ;;
+test) get "/tests/${1:?usage: vanta test <id>}" ;;
+test-entities) list "/tests/${1:?usage: vanta test-entities <id>}/entities" ;;
+deactivate-entity)
+    t="${1:?usage: vanta deactivate-entity <test-id> <entity-id> <reason> [until]}"
+    e="${2:?usage: vanta deactivate-entity <test-id> <entity-id> <reason> [until]}"
+    reason="${3:?usage: vanta deactivate-entity <test-id> <entity-id> <reason> [until]}"
+    if [ -n "${4:-}" ]; then
+        body="$(printf '{"deactivateReason":%s,"deactivateUntilDate":%s}' "$(json_str "$reason")" "$(json_str "$4")")"
+    else
+        body="$(printf '{"deactivateReason":%s}' "$(json_str "$reason")")"
+    fi
+    send POST "/tests/$t/entities/$e/deactivate" "$body"
+    ;;
+controls) list /controls "$@" ;;
+control) get "/controls/${1:?usage: vanta control <id>}" ;;
+control-tests) list "/controls/${1:?usage: vanta control-tests <id>}/tests" ;;
+control-documents) list "/controls/${1:?usage: vanta control-documents <id>}/documents" ;;
+set-control-owner)
+    c="${1:?usage: vanta set-control-owner <control-id> <user-id>}"
+    u="${2:?usage: vanta set-control-owner <control-id> <user-id>}"
+    send POST "/controls/$c/set-owner" "$(printf '{"userId":%s}' "$(json_str "$u")")"
+    ;;
+frameworks) list /frameworks "$@" ;;
+framework) get "/frameworks/${1:?usage: vanta framework <id>}" ;;
+framework-controls) list "/frameworks/${1:?usage: vanta framework-controls <id>}/controls" ;;
+policies) list /policies "$@" ;;
+policy) get "/policies/${1:?usage: vanta policy <id>}" ;;
+documents) list /documents "$@" ;;
+document) get "/documents/${1:?usage: vanta document <id>}" ;;
+set-document-owner)
+    d="${1:?usage: vanta set-document-owner <document-id> <user-id>}"
+    u="${2:?usage: vanta set-document-owner <document-id> <user-id>}"
+    send POST "/documents/$d/set-owner" "$(printf '{"userId":%s}' "$(json_str "$u")")"
+    ;;
+issues) list /issues "$@" ;;
+issue) get "/issues/${1:?usage: vanta issue <id>}" ;;
+issues-due)
+    day="${1:?usage: vanta issues-due <YYYY-MM-DD>}"
+    list /issues "statusMatchesAny=NOT_STARTED,IN_PROGRESS" "dueBeforeDate=${day}T23:59:59.999Z"
+    ;;
+vendors) list /vendors "$@" ;;
+vendor) get "/vendors/${1:?usage: vanta vendor <id>}" ;;
+vendor-findings) list "/vendors/${1:?usage: vanta vendor-findings <id>}/findings" ;;
+vendor-reviews) list "/vendors/${1:?usage: vanta vendor-reviews <id>}/security-reviews" ;;
+vendor-documents) list "/vendors/${1:?usage: vanta vendor-documents <id>}/documents" ;;
+risks) list /risk-scenarios "$@" ;;
+risk) get "/risk-scenarios/${1:?usage: vanta risk <id>}" ;;
+vulnerabilities) list /vulnerabilities "$@" ;;
+vulnerability) get "/vulnerabilities/${1:?usage: vanta vulnerability <id>}" ;;
+vulnerable-assets) list /vulnerable-assets "$@" ;;
+integrations) list /integrations "$@" ;;
+integration) get "/integrations/${1:?usage: vanta integration <id>}" ;;
+monitored-computers) list /monitored-computers "$@" ;;
+trust-center) get "/trust-centers/${1:?usage: vanta trust-center <slug>}" ;;
+access-requests) list "/trust-centers/${1:?usage: vanta access-requests <slug>}/access-requests" ;;
+questionnaires) list /customer-trust/questionnaires "$@" ;;
+questionnaire) get "/customer-trust/questionnaires/${1:?usage: vanta questionnaire <id>}" ;;
+event-logs) list /event-logs "$@" ;;
+get)
+    p="${1:?usage: vanta get <path> [field=value ...]}"
+    shift
+    get "$p" "$@"
+    ;;
+list)
+    p="${1:?usage: vanta list <path> [field=value ...]}"
+    shift
+    list "$p" "$@"
+    ;;
+api)
+    m="${1:?usage: vanta api <METHOD> <path> [json-body]}"
+    p="${2:?usage: vanta api <METHOD> <path> [json-body]}"
+    if [ -n "${3:-}" ]; then
+        send "$m" "$p" "$3"
+    else
+        request "$m" "$p" | pretty
+    fi
+    ;;
+"" | -h | --help | help) usage ;;
+*)
+    echo "vanta: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

@@ -97,6 +97,46 @@ export function verifyHexHmacSha256(
   return timingSafeHeader(sha256Signature(secret, rawBody), actual);
 }
 
+export interface SvixSignatureInput {
+  /** The endpoint secret as the dashboard shows it (`whsec_<base64>`); a bare
+   * base64 secret is accepted too. */
+  secret: string;
+  rawBody: Uint8Array;
+  id: string | null;
+  /** Unix seconds, as the `svix-timestamp` header carries it. */
+  timestamp: string | null;
+  /** One or more space-separated `v1,<base64>` entries. */
+  signature: string | null;
+  /** Unix milliseconds. */
+  now: number;
+  toleranceMs: number;
+}
+
+/** The Svix webhook signature (Vanta): HMAC-SHA256 over
+ * `${id}.${timestamp}.${body}` under the base64-decoded secret, base64
+ * encoded, compared against every `v1,` entry of the header (a rotation
+ * sends the old and the new). A timestamp outside the tolerance is a
+ * replay. Timing-safe per entry. */
+export function verifySvixSignature(input: SvixSignatureInput): boolean {
+  if (!input.id || !input.timestamp || !input.signature) return false;
+  if (!/^\d{1,12}$/.test(input.timestamp)) return false;
+  const sentMs = Number(input.timestamp) * 1000;
+  if (Math.abs(input.now - sentMs) > input.toleranceMs) return false;
+  const encoded = input.secret.startsWith("whsec_") ? input.secret.slice("whsec_".length) : input.secret;
+  const key = Buffer.from(encoded, "base64");
+  if (key.length === 0) return false;
+  const expected = createHmac("sha256", key)
+    .update(`${input.id}.${input.timestamp}.`)
+    .update(input.rawBody)
+    .digest("base64");
+  for (const entry of input.signature.split(" ")) {
+    const [version, value] = entry.split(",", 2);
+    if (version !== "v1" || value === undefined) continue;
+    if (timingSafeHeader(expected, value)) return true;
+  }
+  return false;
+}
+
 /** Custom-registration verification: the generic scheme only. Provider
  * schemes retired with ADR 0119 D5 — GitHub/Slack/Linear deliveries arrive on
  * the integration ingress routes and verify with the connection's secret. */
