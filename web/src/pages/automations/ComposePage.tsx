@@ -1,19 +1,17 @@
-/** The new-automation front door. The drafting conversation stays beside the
- * request until the agent saves the first editable version. */
+/** The new-automation front door: the request goes to a drafting agent, and
+ * the page hands over to the Builder as soon as the draft exists. The
+ * conversation continues there, in the Builder's drafting pane. */
 import { useMutation } from "@connectrpc/connect-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { Sparkles } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { TaskComposer, type TaskComposerState } from "@/components/composer/TaskComposer";
-import { SessionThread } from "@/components/session-thread/SessionThread";
 import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
 import { draftAutomation } from "@/gen/engram/app/v1/automation-AutomationService_connectquery";
 import { useEditorAutomation } from "@/hooks/useAutomationEditor";
 import { useBuiltinAutomation, useDuplicateAutomation } from "@/hooks/useAutomations";
-import { useSessionEvents } from "@/hooks/useSessionEvents";
 import { errorMessage } from "@/lib/errors";
 
 const SUGGESTIONS = [
@@ -21,33 +19,6 @@ const SUGGESTIONS = [
   "Triage nightly CI failures into a session that files issues",
   "Post a Slack digest of merged PRs at 9:00 every weekday",
 ];
-
-function DraftingThread({ sessionId }: { sessionId: string }) {
-  const { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx, opening } =
-    useSessionEvents(sessionId);
-
-  return (
-    <section
-      className="overflow-hidden rounded-lg border bg-card"
-      data-testid="drafting-thread"
-      aria-label="Drafting agent conversation"
-    >
-      <div className="flex items-center gap-2 border-b px-3 py-2 text-xs font-medium text-muted-foreground">
-        <Sparkles className="size-3.5" aria-hidden />
-        Drafting agent
-      </div>
-      <div className="max-h-[520px] overflow-y-auto px-3">
-        <SessionThread
-          sessionId={sessionId}
-          events={events}
-          status={undefined}
-          streamingText={streamingText}
-          transcriptWindow={{ hasMore, loadingOlder, loadOlder, oldestIdx, opening }}
-        />
-      </div>
-    </section>
-  );
-}
 
 export function ComposePage() {
   const navigate = useNavigate();
@@ -73,8 +44,11 @@ export function ComposePage() {
   const [idempotencyKey, setIdempotencyKey] = useState(() => crypto.randomUUID());
   useEffect(() => setIdempotencyKey(crypto.randomUUID()), [signature]);
 
+  // The draft row is created at version 1 (an empty seed) before the agent
+  // writes anything, so the row's arrival is the hand-off: the Builder shows
+  // the agent at work and the first real version landing on the canvas.
   useEffect(() => {
-    if (!automationId || !automation || automation.currentVersion <= 0) return;
+    if (!automationId || !automation) return;
     void navigate({
       to: "/automations/$id",
       params: { id: automationId },
@@ -144,8 +118,8 @@ export function ComposePage() {
 
       <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
         <p className="text-xs text-muted-foreground">
-          An agent reads the repo and your existing automations, then assembles a draft you can
-          watch, edit and turn on. Nothing runs until you turn it on.
+          An agent reads the repo and your existing automations, then assembles a draft you watch,
+          talk to and edit in the Builder. Nothing runs until you turn it on.
         </p>
         <Button variant="outline" asChild className="shrink-0">
           <Link to="/automations/new/manual" data-testid="build-by-hand">
@@ -153,8 +127,6 @@ export function ComposePage() {
           </Link>
         </Button>
       </div>
-
-      {automation?.draftSessionId && <DraftingThread sessionId={automation.draftSessionId} />}
 
       <section className="space-y-2" aria-labelledby="starting-points-heading">
         <h2 id="starting-points-heading" className="text-sm font-semibold">

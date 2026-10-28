@@ -117,7 +117,7 @@ export function ReviewRepositories() {
         ) : (
           "PR review automation"
         )}
-        . Every pull request it touches is a workstream; every pass is a run.
+        . Every pull request it touches is an agent; every pass is a run.
       </p>
 
       <section className="flex flex-col gap-3" aria-label="Reviewer profile">

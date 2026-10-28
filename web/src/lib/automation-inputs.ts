@@ -440,6 +440,13 @@ export function inputsEqual(a: InputValues, b: InputValues): boolean {
   return JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
 }
 
+/** JSON with object keys in sorted order: two values that differ only in
+ * key order (one parsed from the server, one assembled by edits) compare
+ * equal as strings. */
+export function stableJson(value: unknown): string {
+  return JSON.stringify(sortKeys(value));
+}
+
 function sortKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeys);
   if (!isRecord(value)) return value;

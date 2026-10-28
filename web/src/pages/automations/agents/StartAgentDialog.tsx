@@ -33,30 +33,35 @@ import {
 
 import { InputsForm } from "../inputs/InputsForm";
 
-export interface WorkstreamAutomationOption {
+export interface AgentAutomationOption {
   id: string;
   name: string;
   inputsSchema: InputFieldSpec[];
   defaultInputs: unknown;
 }
 
-export function OpenWorkstreamDialog({
+export function StartAgentDialog({
   automations,
   instances,
   fixedAutomationId,
+  fixedKey,
   open,
   onOpenChange,
 }: {
-  automations: readonly WorkstreamAutomationOption[];
+  automations: readonly AgentAutomationOption[];
   instances: readonly AutomationInstance[];
   fixedAutomationId?: string;
+  /** The automation keys its one agent itself (automation scope): no name
+   * is asked for, and the start joins that agent when it is already open. */
+  fixedKey?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const runNow = useRunNow();
   const invalidateInstances = useInvalidateInstances();
   const [pickedAutomationId, setPickedAutomationId] = useState(fixedAutomationId ?? "");
-  const [name, setName] = useState("");
+  const [typedName, setName] = useState("");
+  const name = fixedKey ?? typedName;
   const [values, setValues] = useState<InputValues | null>(null);
   const [errors, setErrors] = useState<InputFieldError[]>([]);
   const automationId = fixedAutomationId ?? pickedAutomationId;
@@ -86,7 +91,7 @@ export function OpenWorkstreamDialog({
       return;
     }
     if (name.trim() === "") {
-      toast.error("Name the workstream");
+      toast.error("Name the agent");
       return;
     }
     if (!joining) {
@@ -101,13 +106,21 @@ export function OpenWorkstreamDialog({
       await runNow.mutateAsync({
         automationId,
         instanceKey: name.trim(),
-        // The open workstream owns its original input snapshot, so a join must not replace it.
+        // The open agent owns its original input snapshot, so a join must not replace it.
         ...(joining
           ? {}
           : { instanceInputsJson: buildInputsPayload(automation.inputsSchema, current) }),
       });
       await invalidateInstances();
-      toast.success(joining ? `Opened the next run for ${name.trim()}` : `Opened ${name.trim()}`);
+      toast.success(
+        fixedKey
+          ? joining
+            ? "Opened the agent's next run"
+            : "Started the agent"
+          : joining
+            ? `Opened the next run for ${name.trim()}`
+            : `Opened ${name.trim()}`,
+      );
       onOpenChange(false);
       reset();
     } catch (error) {
@@ -125,14 +138,16 @@ export function OpenWorkstreamDialog({
     >
       <DialogContent className="max-w-lg">
         <DialogHeader>
-          <DialogTitle>Open a workstream</DialogTitle>
+          <DialogTitle>{fixedKey ? "Start the agent" : "Start an agent"}</DialogTitle>
           <DialogDescription>
-            Name an ongoing case. Matching events continue its activity until you close it.
+            {fixedKey
+              ? "This automation keeps one standing agent. Matching events continue its activity until you close it."
+              : "Name an ongoing case. Matching events continue its activity until you close it."}
           </DialogDescription>
         </DialogHeader>
         <form
           className="flex flex-col gap-4"
-          data-testid="open-workstream-form"
+          data-testid="start-agent-form"
           onSubmit={(event) => {
             event.preventDefault();
             void submit();
@@ -162,19 +177,23 @@ export function OpenWorkstreamDialog({
               </Select>
             </Field>
           )}
-          <Field>
-            <FieldLabel>Name</FieldLabel>
-            <Input
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="ENG-42"
-              aria-label="workstream name"
-              autoFocus={!!fixedAutomationId}
-            />
-          </Field>
+          {!fixedKey && (
+            <Field>
+              <FieldLabel>Name</FieldLabel>
+              <Input
+                value={typedName}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="ENG-42"
+                aria-label="agent name"
+                autoFocus={!!fixedAutomationId}
+              />
+            </Field>
+          )}
           {joining ? (
-            <p className="text-sm text-muted-foreground" data-testid="open-workstream-join-hint">
-              {name.trim()} is already open — this opens its next run
+            <p className="text-sm text-muted-foreground" data-testid="start-agent-join-hint">
+              {fixedKey
+                ? "The agent is already open — this opens its next run"
+                : `${name.trim()} is already open — this opens its next run`}
             </p>
           ) : automation ? (
             <InputsForm
@@ -190,7 +209,7 @@ export function OpenWorkstreamDialog({
           ) : null}
           <DialogFooter>
             <Button type="submit" disabled={runNow.isPending || automations.length === 0}>
-              {runNow.isPending ? "Opening…" : "Open a workstream"}
+              {runNow.isPending ? "Opening…" : fixedKey ? "Start the agent" : "Start an agent"}
             </Button>
           </DialogFooter>
         </form>

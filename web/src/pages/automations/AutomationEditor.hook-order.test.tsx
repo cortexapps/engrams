@@ -36,6 +36,7 @@ vi.mock("@/hooks/useAutomationEditor", async (orig) => {
     useSetAutomationEnabledV2: () => ({ mutate: vi.fn(), isPending: false }),
     useDuplicateAutomation: () => ({ mutateAsync: vi.fn(), isPending: false }),
     useEventCatalog: () => ({ data: undefined }),
+    useAutomationVersions: () => ({ data: undefined }),
     useActionCatalog: () => ({ data: undefined }),
     useEditorWebhookRegistrations: () => ({ data: { registrations: [] } }),
   };
@@ -71,12 +72,38 @@ vi.mock("@/hooks/useProfiles", () => ({
   useProfiles: () => ({ data: { profiles: [] } }),
 }));
 vi.mock("@/hooks/useHarnessCatalog", () => ({ useHarnessCatalog: () => ({ data: [] }) }));
+vi.mock("@/hooks/useAutomations", () => ({
+  useRunNow: () => ({ mutateAsync: vi.fn(), isPending: false }),
+}));
+// The drafting pane opens a session stream; the shell tests exercise the
+// hand-off (toggle, banner), not the thread.
+const draftingHolder = vi.hoisted(() => ({ value: undefined as { working: boolean } | undefined }));
+vi.mock("./build/DraftingPane", () => ({
+  useDrafting: (sessionId: string | undefined) =>
+    sessionId && draftingHolder.value
+      ? { sessionId, working: draftingHolder.value.working }
+      : undefined,
+  DraftingPane: ({
+    drafting,
+    onClose,
+  }: {
+    drafting: { sessionId: string };
+    onClose: () => void;
+  }) => (
+    <div data-testid="drafting-pane" data-session-id={drafting.sessionId}>
+      <button type="button" onClick={onClose}>
+        hide
+      </button>
+    </div>
+  ),
+}));
 vi.mock("@/hooks/useModelRouters", () => ({
   useModelRouters: () => ({ data: { routers: [] } }),
 }));
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
   useNavigate: () => vi.fn(),
+  useBlocker: () => ({ status: "idle", proceed: vi.fn(), reset: vi.fn() }),
   useParams: () => ({ id: "a1" }),
   useSearch: () => ({ tab: "build" }),
   Link: ({ children }: { children: React.ReactNode }) => <a>{children}</a>,
@@ -91,6 +118,7 @@ import { AutomationEditor } from "./AutomationEditor";
 
 vi.mock("@/hooks/useAutomationRuns", () => ({
   useRunList: () => ({ data: undefined, isPending: false, error: null }),
+  useRun: () => ({ data: undefined, isPending: false, error: null }),
 }));
 
 const loaded = {

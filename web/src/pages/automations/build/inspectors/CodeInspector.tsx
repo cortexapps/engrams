@@ -161,6 +161,7 @@ export function CodeInspector(props: CodeInspectorProps) {
           value={source}
           onChange={(next) => onChange({ ...block, config: setPath(block.config, "source", next) })}
           readOnly={sourcePinned}
+          completions={props.variablePaths}
           {...(runError?.line !== undefined
             ? { errorLine: runError.line, errorMessage: `${runError.name}: ${runError.message}` }
             : {})}

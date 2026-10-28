@@ -149,6 +149,15 @@ describe("SamplePicker", () => {
     expect(input.value).toBe(local);
   });
 
+  it("the latest delivery is the first choice and counts as a sample to run", async () => {
+    const latest = state({ sample: { kind: "latest" } });
+    renderWithProviders(<TestPanel test={latest} now={NOW} />);
+    expect(((await runButton()) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByRole("combobox", { name: "Sample" }).textContent).toContain(
+      "Latest delivery",
+    );
+  });
+
   it("lists stored samples for event triggers", async () => {
     const s = state();
     renderWithProviders(

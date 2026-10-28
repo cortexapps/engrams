@@ -1,5 +1,5 @@
 /** The reusable inputs form (ADR 0120): the per-field editors extracted
- * from the Inputs tab so the workstream kickoff dialog renders the SAME
+ * from the Inputs tab so the start-agent dialog renders the SAME
  * form over the same schema/validation stack. `InputsForm` is the bare
  * field list — the surrounding chrome (save buttons, dirty tracking) stays
  * with each caller. */

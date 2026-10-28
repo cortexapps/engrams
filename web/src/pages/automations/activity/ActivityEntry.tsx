@@ -1,58 +1,71 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { ChevronRightIcon } from "lucide-react";
 import { toast } from "sonner";
 
-import type { AutomationRunBrief, AutomationStepRun } from "@/gen/engram/app/v1/automation_pb";
+import type { AutomationRunBrief } from "@/gen/engram/app/v1/automation_pb";
 import { useRetryRun, useRun, useStopRun } from "@/hooks/useAutomationRuns";
 import { errorMessage } from "@/lib/errors";
 import { relativeAge } from "@/lib/relative-time";
 import { runStatusTone } from "@/lib/automations";
+import { stepSentence } from "@/lib/step-sentence";
 import { Button } from "@/components/ui/button";
 import { SkeletonRows } from "@/components/skeleton-rows";
 import { cn } from "@/lib/utils";
 
 import { RunStatusDot } from "../runs/RunStatusDot";
+import { StepRunDrawer } from "../runs/StepRunDrawer";
 import {
   buildTimeline,
+  findTimelineStep,
   formatDuration,
   isActiveRunStatus,
   parseJsonObject,
-  runStatusLabel,
   type TimelineNode,
   type TimelineStep,
 } from "../runs/run-format";
-import { ACTIVE, entryTitle, entryVia, pointsAtFleet } from "./activity-format";
+import { ACTIVE, entryTitle, entryVia, filteredReason, pointsAtFleet } from "./activity-format";
 
 // One activity entry = one run. Collapsed, it is a single line a person can
-// scan: age · dot · what happened / how it got in · how long it took. Expanded,
-// the step trace unfolds inline (no page hop): one 28px row per step with the
-// failed step tinted and its error verbatim, then the actions that fit the
-// outcome — retry, stop, the session it opened, and a related cause when the
-// error points at the fleet.
+// scan: age · dot · what happened / how it got in · how long it took, and the
+// reason when it failed. Expanded, the step trace unfolds inline (no page
+// hop): one row per step that says what the block did, in words; the failed
+// step tinted with its error verbatim; a click on a row opens the details
+// (rendered inputs, outputs, stdout) in a drawer; then the actions that fit
+// the outcome — retry, stop, the session it opened, and a related cause when
+// the error points at the fleet.
 
 export interface ActivityEntryProps {
   run: AutomationRunBrief;
   now: number;
   /** Cross-automation ledger: name the automation on the row. */
   automationName?: string;
-  /** The workstream's rendered name, when the run is bound to one. */
-  workstreamLabel?: string;
+  /** The agent's rendered name, when the run is bound to one. */
+  agentLabel?: string;
+  /** The kind of a block in this run's automation, for the step sentences. */
+  blockTypeOf?: (blockId: string) => string | undefined;
   defaultOpen?: boolean;
 }
 
 const QUIET = new Set(["filtered", "superseded", "halted", "skipped"]);
 
+function firstLine(text: string, max = 120): string {
+  const line = text.split("\n")[0] ?? "";
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
 export function ActivityEntry({
   run,
   now,
   automationName,
-  workstreamLabel,
+  agentLabel,
+  blockTypeOf,
   defaultOpen = false,
 }: ActivityEntryProps) {
   const [open, setOpen] = useState(defaultOpen);
   const tone = runStatusTone(run.status);
   const active = ACTIVE.has(run.status);
+  const filtered = filteredReason(run);
   return (
     <li
       data-testid="activity-entry"
@@ -90,13 +103,27 @@ export function ActivityEntry({
           </span>
           <span className="block truncate text-xs text-muted-foreground">
             {entryVia(run)}
-            {workstreamLabel && ` · ${workstreamLabel}`}
+            {agentLabel && ` · ${agentLabel}`}
             {run.dryRun && " · dry run"}
-            {" · "}
-            <span className="font-mono tabular-nums">
-              {formatDuration(run.startedAt, run.endedAt, now)}
-            </span>
+            {run.startedAt && (
+              <>
+                {" · "}
+                <span className="font-mono tabular-nums">
+                  {formatDuration(run.startedAt, run.endedAt, now)}
+                </span>
+              </>
+            )}
           </span>
+          {tone === "critical" && run.error && (
+            <span className="block truncate text-xs text-foreground" data-testid="entry-reason">
+              {firstLine(run.error)}
+            </span>
+          )}
+          {filtered && (
+            <span className="block truncate text-xs" data-testid="entry-reason">
+              {filtered}
+            </span>
+          )}
         </span>
         <span className="inline-flex items-center justify-end gap-1 pt-0.5 text-xs text-muted-foreground">
           steps
@@ -106,7 +133,7 @@ export function ActivityEntry({
           />
         </span>
       </button>
-      {open && <InlineTrace run={run} now={now} />}
+      {open && <InlineTrace run={run} now={now} blockTypeOf={blockTypeOf} />}
     </li>
   );
 }
@@ -124,31 +151,28 @@ function flatten(nodes: readonly TimelineNode[], out: (TimelineStep | string)[] 
   return out;
 }
 
-/** The step's one-line outcome: the error verbatim, else a compact readout of
- * its outputs, else the status word. */
-function outcomeText(step: AutomationStepRun): string {
-  if (step.error) return step.error;
-  const outputs = parseJsonObject(step.outputsJson);
-  if (outputs) {
-    const parts = Object.entries(outputs)
-      .filter(([, v]) => typeof v === "string" || typeof v === "number" || typeof v === "boolean")
-      .slice(0, 3)
-      .map(([k, v]) => `${k} ${String(v).slice(0, 40)}`);
-    if (parts.length > 0) return parts.join(" · ");
-  }
-  return runStatusLabel(step.status);
-}
-
-function InlineTrace({ run, now }: { run: AutomationRunBrief; now: number }) {
+function InlineTrace({
+  run,
+  now,
+  blockTypeOf,
+}: {
+  run: AutomationRunBrief;
+  now: number;
+  blockTypeOf?: (blockId: string) => string | undefined;
+}) {
   const query = useRun(run.id);
   const stop = useStopRun();
   const retry = useRetryRun();
   const steps = query.data?.run?.steps ?? [];
   const sessionIds = query.data?.run?.sessionIds ?? [];
-  const rows = flatten(buildTimeline(steps));
+  const tree = useMemo(() => buildTimeline(steps), [steps]);
+  const rows = flatten(tree);
   const active = isActiveRunStatus(run.status);
   const failedStep = steps.find((s) => s.status === "failed" || s.status === "deadline");
   const fleetCause = pointsAtFleet(run.error ?? failedStep?.error);
+  // The details drawer follows a step by its path, so it tracks each poll.
+  const [detailsPath, setDetailsPath] = useState<string | null>(null);
+  const details = detailsPath === null ? null : findTimelineStep(tree, detailsPath);
 
   const onStop = async () => {
     try {
@@ -181,7 +205,13 @@ function InlineTrace({ run, now }: { run: AutomationRunBrief; now: number }) {
                 {row}
               </li>
             ) : (
-              <StepRow key={row.path} step={row} now={now} />
+              <StepRow
+                key={row.path}
+                step={row}
+                blockType={blockTypeOf?.(row.blockId)}
+                now={now}
+                onDetails={() => setDetailsPath(row.path)}
+              />
             ),
           )}
         </ol>
@@ -211,6 +241,16 @@ function InlineTrace({ run, now }: { run: AutomationRunBrief; now: number }) {
             {run.status === "completed" ? "Run again" : "Retry"}
           </Button>
         )}
+        <Button asChild variant="ghost" size="sm">
+          <Link
+            to="/automations/$id"
+            params={{ id: run.automationId }}
+            search={{ tab: "build", run: run.id }}
+            data-testid="replay-link"
+          >
+            Replay on canvas
+          </Link>
+        </Button>
         {sessionIds.map((id) => (
           <Button key={id} asChild variant="ghost" size="sm">
             <Link to="/sessions/$id" params={{ id }}>
@@ -224,14 +264,35 @@ function InlineTrace({ run, now }: { run: AutomationRunBrief; now: number }) {
           </Button>
         )}
       </div>
+      <StepRunDrawer
+        step={details}
+        blockType={details ? blockTypeOf?.(details.blockId) : undefined}
+        onClose={() => setDetailsPath(null)}
+      />
     </div>
   );
 }
 
-function StepRow({ step, now }: { step: TimelineStep; now: number }) {
+function StepRow({
+  step,
+  blockType,
+  now,
+  onDetails,
+}: {
+  step: TimelineStep;
+  blockType: string | undefined;
+  now: number;
+  onDetails: () => void;
+}) {
   const { latest } = step;
   const failed = latest.status === "failed" || latest.status === "deadline";
   const skipped = latest.status === "skipped";
+  const sentence = stepSentence(blockType, {
+    status: latest.status,
+    ...(latest.error !== undefined ? { error: latest.error } : {}),
+    inputs: parseJsonObject(latest.inputsJson) ?? {},
+    outputs: parseJsonObject(latest.outputsJson) ?? {},
+  });
   return (
     <li
       data-testid="trace-step"
@@ -242,26 +303,30 @@ function StepRow({ step, now }: { step: TimelineStep; now: number }) {
           ? "color-mix(in oklch, var(--color-instrument-critical) 8%, transparent)"
           : undefined,
       }}
-      className={cn(
-        "grid min-h-7 grid-cols-[14px_160px_minmax(0,1fr)_70px] items-start gap-x-3 rounded-[6px] px-2 py-1",
-        skipped && "opacity-50",
-      )}
+      className={cn("rounded-[6px]", skipped && "opacity-50")}
     >
-      <span className="pt-1">
-        <RunStatusDot status={latest.status} size={6} />
-      </span>
-      <span className="truncate font-mono text-xs">{step.blockId}</span>
-      <span className={cn("text-xs", failed ? "text-foreground" : "text-muted-foreground")}>
-        {outcomeText(latest)}
-        {step.attempts.length > 1 && (
-          <span className="ml-2 font-mono text-2xs text-muted-foreground">
-            {step.attempts.length} attempts
-          </span>
-        )}
-      </span>
-      <span className="text-right font-mono text-2xs tabular-nums text-muted-foreground">
-        {formatDuration(latest.startedAt, latest.endedAt, now)}
-      </span>
+      <button
+        type="button"
+        onClick={onDetails}
+        aria-label={`Details for ${step.blockId}`}
+        className="grid min-h-7 w-full grid-cols-[14px_160px_minmax(0,1fr)_70px] items-start gap-x-3 rounded-[6px] px-2 py-1 text-left hover:bg-accent/60"
+      >
+        <span className="pt-1">
+          <RunStatusDot status={latest.status} size={6} />
+        </span>
+        <span className="truncate font-mono text-xs">{step.blockId}</span>
+        <span className={cn("text-xs", failed ? "text-foreground" : "text-muted-foreground")}>
+          {sentence}
+          {step.attempts.length > 1 && (
+            <span className="ml-2 font-mono text-2xs text-muted-foreground">
+              {step.attempts.length} attempts
+            </span>
+          )}
+        </span>
+        <span className="text-right font-mono text-2xs tabular-nums text-muted-foreground">
+          {formatDuration(latest.startedAt, latest.endedAt, now)}
+        </span>
+      </button>
     </li>
   );
 }

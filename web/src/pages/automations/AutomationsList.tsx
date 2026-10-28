@@ -1,14 +1,7 @@
 /** The automation list. Built-ins pin to the top; every automation keeps its
  * trigger, latest activity, seven-day history, and enabled state in one row. */
-import { Link, useNavigate } from "@tanstack/react-router";
-import {
-  Clock3Icon,
-  CopyPlusIcon,
-  LockIcon,
-  PlusIcon,
-  RadioTowerIcon,
-  WebhookIcon,
-} from "lucide-react";
+import { Link } from "@tanstack/react-router";
+import { Clock3Icon, LockIcon, PlusIcon, RadioTowerIcon, WebhookIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/empty-state";
@@ -19,13 +12,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import type { AutomationSummary } from "@/gen/engram/app/v1/automation_pb";
-import {
-  useAutomations,
-  useBuiltinAutomation,
-  useDuplicateAutomation,
-  useSetAutomationEnabled,
-} from "@/hooks/useAutomations";
-import { parseDefinition } from "@/lib/automation-blocks";
+import { useAutomations, useSetAutomationEnabled } from "@/hooks/useAutomations";
+import { parseDefinition, scopeLabel } from "@/lib/automation-blocks";
 import { automationStatusLabel } from "@/lib/automations";
 import { errorMessage } from "@/lib/errors";
 import { relativeTime } from "@/lib/relative-time";
@@ -84,9 +72,7 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
   const paused = !automation.enabled;
   const failed = summary.lastRun?.status === "failed";
   const trigger = summary.triggerSummary || "Trigger not configured";
-  const hasWorkstreams = Boolean(
-    parseDefinition(automation.version?.definitionJson).settings?.instance,
-  );
+  const scope = scopeLabel(parseDefinition(automation.version?.definitionJson));
   const fadedCell = paused && "opacity-60";
   const lastRun = summary.lastRun;
   const duration =
@@ -142,9 +128,9 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
                 built-in
               </Badge>
             )}
-            {hasWorkstreams && (
+            {scope && (
               <Badge variant="secondary" className="shrink-0 rounded-sm">
-                workstreams
+                {scope}
               </Badge>
             )}
           </span>
@@ -225,38 +211,6 @@ function AutomationRow({ summary }: { summary: AutomationSummary }) {
   );
 }
 
-function DuplicatePrReviewButton() {
-  const builtin = useBuiltinAutomation(PR_REVIEW_BUILTIN_KEY);
-  const duplicate = useDuplicateAutomation();
-  const navigate = useNavigate();
-  const source = builtin.data?.automation;
-  if (!source) return null;
-
-  const onClick = async () => {
-    try {
-      const result = await duplicate.mutateAsync({ automationId: source.id });
-      toast.success("Duplicated — edit the copy freely");
-      const id = result.automation?.id;
-      if (id) {
-        await navigate({
-          to: "/automations/$id",
-          params: { id },
-          search: { tab: "build" },
-        });
-      }
-    } catch (error) {
-      toast.error(errorMessage(error));
-    }
-  };
-
-  return (
-    <Button variant="outline" size="sm" onClick={onClick} disabled={duplicate.isPending}>
-      <CopyPlusIcon className="size-3.5" />
-      Duplicate PR review
-    </Button>
-  );
-}
-
 export function AutomationsList() {
   const automations = useAutomations();
   const rows = orderAutomations(automations.data?.automations ?? []);
@@ -267,15 +221,12 @@ export function AutomationsList() {
         title="Automations"
         count={String(rows.length)}
         actions={
-          <>
-            <DuplicatePrReviewButton />
-            <Button asChild size="sm">
-              <Link to="/automations/new">
-                <PlusIcon className="size-3.5" />
-                New automation
-              </Link>
-            </Button>
-          </>
+          <Button asChild size="sm">
+            <Link to="/automations/new">
+              <PlusIcon className="size-3.5" />
+              New automation
+            </Link>
+          </Button>
         }
       />
 
@@ -301,15 +252,13 @@ export function AutomationsList() {
         {!automations.isPending && !automations.error && rows.length === 0 && (
           <EmptyState
             action={
-              <div className="flex flex-wrap justify-center gap-2">
-                <DuplicatePrReviewButton />
-                <Button asChild>
-                  <Link to="/automations/new">New automation</Link>
-                </Button>
-              </div>
+              <Button asChild>
+                <Link to="/automations/new">New automation</Link>
+              </Button>
             }
           >
-            No automations yet. Start from the built-in review pipeline or from scratch.
+            No automations yet. Describe one and the drafting agent builds it, or build it on the
+            canvas.
           </EmptyState>
         )}
         {!automations.isPending && !automations.error && rows.length > 0 && (

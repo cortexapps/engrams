@@ -10,24 +10,37 @@
  * as overrides (SetBlockOverrides) — its structure is never sent. */
 
 import { ConnectError } from "@connectrpc/connect";
-import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { Copy, Lock } from "lucide-react";
+import { Link, useBlocker, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { Beaker, Copy, Lock, Play, Sparkles } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton-rows";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { useRunNow } from "@/hooks/useAutomations";
 import { FieldError } from "@/components/ui/field";
 import { Switch } from "@/components/ui/switch";
-import { useRunList } from "@/hooks/useAutomationRuns";
+import { useRun, useRunList } from "@/hooks/useAutomationRuns";
+import { replayMap } from "@/lib/run-replay";
 import { relativeTime } from "@/lib/relative-time";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   useCreateAutomationV2,
   useDuplicateAutomation,
+  useAutomationVersions,
   useEditorAutomation,
   useSaveVersionV2,
   useSetAutomationEnabledV2,
@@ -39,6 +52,8 @@ import {
   MAIN_ENTRYPOINT_ID,
   entrypointIds,
   applyOverrides,
+  blockTypesOf,
+  hasScopedAgents,
   diffOverrides,
   EMPTY_DEFINITION,
   parseBlockErrors,
@@ -51,12 +66,13 @@ import {
 import { useAutomationTest } from "@/hooks/useAutomationTest";
 
 import { BuildTab } from "./build/BuildTab";
-import { parseInputsJson, parseInputsSchema } from "@/lib/automation-inputs";
+import { DraftingPane, useDrafting } from "./build/DraftingPane";
+import { parseInputsJson, parseInputsSchema, stableJson } from "@/lib/automation-inputs";
 import { InputsTab } from "./inputs/InputsTab";
-import { WorkstreamsTab } from "./instances/WorkstreamsTab";
+import { AgentsTab } from "./agents/AgentsTab";
 import { DryRunButton } from "./build/DryRunButton";
 
-export const EDITOR_TABS = ["build", "inputs", "workstreams", "activity", "settings"] as const;
+export const EDITOR_TABS = ["build", "inputs", "agents", "activity", "settings"] as const;
 export type EditorTab = (typeof EDITOR_TABS)[number];
 
 export function isEditorTab(value: unknown): value is EditorTab {
@@ -85,7 +101,7 @@ export function AutomationEditor({
   const params = useParams({ strict: false });
   const id = mode === "edit" ? (params as { id?: string }).id : undefined;
   const navigate = useNavigate();
-  const search = useSearch({ strict: false }) as { tab?: string };
+  const search = useSearch({ strict: false }) as { tab?: string; run?: string };
   const tab: EditorTab = isEditorTab(search.tab) ? search.tab : "build";
 
   const existing = useEditorAutomation(id);
@@ -127,11 +143,18 @@ export function AutomationEditor({
     draftJson: string;
   } | null>(null);
 
+  // The drafting agent's session, when this automation was drafted: its
+  // conversation sits beside the canvas, and the canvas says what the
+  // agent is doing to it.
+  const drafting = useDrafting(automation?.draftSessionId);
+  const [draftingOpen, setDraftingOpen] = useState(true);
+
   const create = useCreateAutomationV2();
   const saveVersion = useSaveVersionV2();
   const setOverrides = useSetBlockOverrides();
   const updateMeta = useUpdateAutomationMetaV2();
   const setEnabled = useSetAutomationEnabledV2();
+  const runNow = useRunNow();
   const duplicate = useDuplicateAutomation();
   const saving =
     create.isPending || saveVersion.isPending || setOverrides.isPending || updateMeta.isPending;
@@ -145,13 +168,29 @@ export function AutomationEditor({
     (automation !== undefined &&
       (name !== automation.name ||
         description !== automation.description ||
-        JSON.stringify(comparable(draft)) !== JSON.stringify(comparable(effective))));
+        stableJson(comparable(draft)) !== stableJson(comparable(effective))));
 
   const userDirty =
     baseline !== null &&
     (name !== baseline.name ||
       description !== baseline.description ||
-      JSON.stringify(comparable(draft)) !== baseline.draftJson);
+      stableJson(comparable(draft)) !== baseline.draftJson);
+
+  // Unsaved edits survive a tab change (the same page) but not a move to
+  // another page: the router asks first, and the browser asks before the tab
+  // closes. A stray key that fires a global shortcut can no longer lose them.
+  // A draft that Create just saved is not unsaved: the move to its editor
+  // must not ask.
+  const [created, setCreated] = useState(false);
+  const unsaved =
+    mode === "create"
+      ? !created && (name !== "" || stableJson(draft) !== stableJson(EMPTY_DEFINITION))
+      : userDirty;
+  const leave = useBlocker({
+    shouldBlockFn: ({ current, next }) => unsaved && current.pathname !== next.pathname,
+    enableBeforeUnload: () => unsaved,
+    withResolver: true,
+  });
 
   const adoptCurrent = () => {
     if (!automation) return;
@@ -164,7 +203,7 @@ export function AutomationEditor({
     setBaseline({
       name: automation.name,
       description: automation.description,
-      draftJson: JSON.stringify(comparable(effective)),
+      draftJson: stableJson(comparable(effective)),
     });
     setErrors([]);
     setStaleVersion(null);
@@ -185,7 +224,7 @@ export function AutomationEditor({
       const matchesScreen =
         automation.name === name &&
         automation.description === description &&
-        JSON.stringify(comparable(effective)) === JSON.stringify(comparable(draft));
+        stableJson(comparable(effective)) === stableJson(comparable(draft));
       if (!matchesScreen) {
         setStaleVersion(key);
         return;
@@ -198,7 +237,7 @@ export function AutomationEditor({
     setBaseline({
       name: automation.name,
       description: automation.description,
-      draftJson: JSON.stringify(comparable(effective)),
+      draftJson: stableJson(comparable(effective)),
     });
     setErrors([]);
     setStaleVersion(null);
@@ -244,6 +283,7 @@ export function AutomationEditor({
           inputsJson: "{}",
         });
         toast.success("Automation created");
+        setCreated(true);
         void navigate({
           to: "/automations/$id",
           params: { id: created.automation!.id },
@@ -318,6 +358,69 @@ export function AutomationEditor({
   // The Activity tab's count: what the ledger holds (it lists up to 50).
   const activity = useRunList(automation?.id, { limit: 50 });
   const activityCount = activity.data?.runs.length;
+  // ?run= on the Build tab replays that run on the canvas, drawn on the
+  // version it executed (the current one needs no second fetch).
+  const replayQuery = useRun(tab === "build" && mode === "edit" ? search.run : undefined);
+  const replayRun = replayQuery.data?.run;
+  const replayVersion = replayRun?.brief?.version;
+  const needsOldVersion =
+    replayVersion !== undefined &&
+    automation !== undefined &&
+    replayVersion !== automation.currentVersion;
+  const versions = useAutomationVersions(needsOldVersion ? automation?.id : undefined);
+  const replay = useMemo(() => {
+    if (!replayRun?.brief || !automation) return undefined;
+    const ran = replayRun.brief.version;
+    const old = needsOldVersion
+      ? versions.data?.versions.find((v) => v.number === ran)?.definitionJson
+      : undefined;
+    const definition =
+      old !== undefined
+        ? applyOverrides(parseDefinition(old), parseOverrides(automation.blockOverridesJson))
+        : effective;
+    const types = blockTypesOf(definition);
+    const versionNote = needsOldVersion
+      ? old !== undefined
+        ? `drawn on version ${ran}; the current version is ${automation.currentVersion}`
+        : `ran on version ${ran}, drawn on the current version ${automation.currentVersion}`
+      : undefined;
+    return {
+      definition,
+      run: replayRun.brief,
+      map: replayMap(replayRun.steps, (id) => types.get(id)),
+      triggerJson: replayRun.triggerJson,
+      ...(versionNote !== undefined ? { versionNote } : {}),
+      now: Date.now(),
+      onExit: () => {
+        void navigate({
+          to: ".",
+          search: (prev: Record<string, unknown>) => {
+            const { run: _run, ...rest } = prev;
+            return rest;
+          },
+          replace: true,
+        });
+      },
+    };
+  }, [replayRun, automation, needsOldVersion, versions.data, effective, navigate]);
+  // Try it: render the draft, saved or not, against the latest delivery, and
+  const runNowClick = async () => {
+    if (!automation) return;
+    try {
+      await runNow.mutateAsync({ automationId: automation.id });
+      toast.success("Run started");
+      setTab("activity");
+    } catch (error) {
+      fail(error);
+    }
+  };
+  // open the drawer that shows what each block would do.
+  const [testOpen, setTestOpen] = useState(false);
+  const tryIt = () => {
+    setTestOpen(true);
+    if (tab !== "build") setTab("build");
+    void test.runOnce().catch((error: unknown) => fail(error));
+  };
 
   if (mode === "edit" && existing.isPending) {
     return (
@@ -344,10 +447,16 @@ export function AutomationEditor({
   }
 
   const nameError = errors.find((e) => e.blockId === "" && e.field === "name")?.message;
+  // The Build tab shows the replayed version's ways in: a way in the run
+  // took that the draft has since removed still opens, instead of snapping
+  // to main.
+  const shownEntrypointId = entrypointIds(replay ? replay.definition : draft).includes(entrypointId)
+    ? entrypointId
+    : MAIN_ENTRYPOINT_ID;
   const triggerSummaryFor = (way: string) =>
     existingSummary(automation?.id, projectEntrypoint(draft, way));
   const liveValues = variableValues ?? test.variableValues;
-  const hasWorkstreams = draft.settings.instance !== undefined;
+  const hasAgents = hasScopedAgents(draft);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="automation-editor">
@@ -424,9 +533,9 @@ export function AutomationEditor({
             <TabsTrigger value="inputs" disabled={mode === "create"}>
               Inputs
             </TabsTrigger>
-            {hasWorkstreams && (
-              <TabsTrigger value="workstreams" disabled={mode === "create"}>
-                Workstreams
+            {hasAgents && (
+              <TabsTrigger value="agents" disabled={mode === "create"}>
+                Agents
               </TabsTrigger>
             )}
             <TabsTrigger value="activity" disabled={mode === "create"}>
@@ -466,6 +575,48 @@ export function AutomationEditor({
               <Copy aria-hidden /> Duplicate
             </Button>
           )}
+          {drafting && (
+            <Button
+              type="button"
+              variant={draftingOpen ? "secondary" : "outline"}
+              size="sm"
+              onClick={() => setDraftingOpen((open) => !open)}
+              aria-pressed={draftingOpen}
+              data-testid="drafting-toggle"
+              title={draftingOpen ? "Hide the drafting agent" : "Show the drafting agent"}
+            >
+              <Sparkles aria-hidden />
+              Drafting agent
+            </Button>
+          )}
+          {mode === "edit" && automation && draft.trigger.kind === "manual" && (
+            // The manual trigger's one way in. It runs the SAVED definition,
+            // so it waits for a clean editor, as Dry run does.
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={runNowClick}
+              disabled={runNow.isPending || dirty}
+              data-testid="run-now-button"
+              title={dirty ? "Save first: Run now starts the saved definition" : "Start a run"}
+            >
+              <Play aria-hidden />
+              {runNow.isPending ? "Starting…" : "Run now"}
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={tryIt}
+            disabled={test.running}
+            data-testid="try-it-button"
+            title="Render every block against the latest delivery, with nothing run"
+          >
+            <Beaker aria-hidden />
+            {test.running ? "Trying…" : "Try it"}
+          </Button>
           {mode === "edit" && automation && (
             // A dry run executes the SAVED definition; unsaved edits would
             // mislead, so it waits for a clean editor.
@@ -485,6 +636,25 @@ export function AutomationEditor({
             {mode === "create" ? "Create" : "Save"}
           </Button>
         </header>
+
+        <AlertDialog open={leave.status === "blocked"}>
+          <AlertDialogContent data-testid="leave-dialog">
+            <AlertDialogHeader>
+              <AlertDialogTitle>Leave without saving?</AlertDialogTitle>
+              <AlertDialogDescription>
+                This automation has edits that are not saved. Leaving discards them.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel onClick={() => leave.status === "blocked" && leave.reset()}>
+                Keep editing
+              </AlertDialogCancel>
+              <AlertDialogAction onClick={() => leave.status === "blocked" && leave.proceed()}>
+                Discard and leave
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
 
         {staleVersion !== null && (
           <div
@@ -509,27 +679,50 @@ export function AutomationEditor({
 
         <TabsContent value="build" className="flex min-h-0 flex-1 flex-col">
           <BuildTab
-            definition={draft}
-            entrypointId={effectiveEntrypointId}
+            definition={replay ? replay.definition : draft}
+            entrypointId={shownEntrypointId}
             onSelectEntrypoint={setEntrypointId}
             onChange={setDraft}
             builtin={builtin}
             errors={errors}
             triggerSummaryFor={triggerSummaryFor}
-            test={automation ? test : undefined}
+            test={test}
             testPanel={testPanel}
             variableValues={liveValues}
+            testOpen={testOpen}
+            onTestOpenChange={setTestOpen}
+            {...(replay ? { replay } : {})}
+            {...(drafting && draftingOpen
+              ? {
+                  aside: (
+                    <DraftingPane drafting={drafting} onClose={() => setDraftingOpen(false)} />
+                  ),
+                }
+              : {})}
+            {...(drafting
+              ? {
+                  drafting: {
+                    working: drafting.working,
+                    empty:
+                      !userDirty &&
+                      effective.blocks.length === 0 &&
+                      effective.agent === undefined &&
+                      effective.trigger.kind === "manual",
+                  },
+                }
+              : {})}
           />
         </TabsContent>
         <TabsContent value="inputs" className="min-h-0 flex-1 overflow-y-auto p-6">
           {inputsTab ?? <InputsTab automationId={id} />}
         </TabsContent>
-        {hasWorkstreams && id !== undefined && (
-          <TabsContent value="workstreams" className="min-h-0 flex-1 overflow-y-auto p-6">
-            <WorkstreamsTab
+        {hasAgents && id !== undefined && (
+          <TabsContent value="agents" className="min-h-0 flex-1 overflow-y-auto p-6">
+            <AgentsTab
               automationId={id}
               inputsSchema={parseInputsSchema(draft.inputsSchema)}
               defaultInputs={parseInputsJson(automation?.inputsJson)}
+              {...(draft.agent?.scope.kind === "automation" ? { agentScope: "automation" } : {})}
             />
           </TabsContent>
         )}

@@ -22,7 +22,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useProfiles } from "@/hooks/useProfiles";
 import type { FieldSpec } from "@/lib/automation-blocks";
 
-import { VariablePicker } from "./VariablePicker";
+import { TemplateField } from "./TemplateField";
 
 export interface GenericFieldProps {
   spec: FieldSpec;
@@ -33,7 +33,7 @@ export interface GenericFieldProps {
   error?: string;
   /** Block ids above this one whose session_id output can be referenced. */
   sessionSources: readonly string[];
-  /** Static variable paths the picker offers (3.4 adds live values). */
+  /** Every path the inline completion offers. */
   variablePaths: readonly string[];
   variableValues?: Readonly<Record<string, string>>;
 }
@@ -84,28 +84,14 @@ export function GenericField(props: GenericFieldProps) {
     case "template":
       return (
         <Shell spec={spec} pinned={pinned} error={error}>
-          {spec.multiline ? (
-            <Textarea
-              value={asString(value)}
-              onChange={(e) => onChange(e.target.value)}
-              disabled={disabled}
-              rows={5}
-              className="font-mono text-sm"
-            />
-          ) : (
-            <Input
-              value={asString(value)}
-              onChange={(e) => onChange(e.target.value)}
-              disabled={disabled}
-            />
-          )}
-          {!disabled && (
-            <VariablePicker
-              paths={variablePaths}
-              values={variableValues}
-              onInsert={(path) => onChange(`${asString(value)}\${{ ${path} }}`)}
-            />
-          )}
+          <TemplateField
+            value={asString(value)}
+            onChange={onChange}
+            multiline={spec.multiline === true}
+            disabled={disabled}
+            paths={variablePaths}
+            values={variableValues}
+          />
         </Shell>
       );
     case "string":
@@ -138,11 +124,15 @@ export function GenericField(props: GenericFieldProps) {
     case "boolean":
       return (
         <Shell spec={spec} pinned={pinned} error={error}>
-          <Switch
-            checked={value === true}
-            onCheckedChange={(checked) => onChange(checked)}
-            disabled={disabled}
-          />
+          {/* The field stretches every direct child to its width; a switch
+              is a fixed 36px control, so it sits in a row of its own. */}
+          <div className="flex items-center">
+            <Switch
+              checked={value === true}
+              onCheckedChange={(checked) => onChange(checked)}
+              disabled={disabled}
+            />
+          </div>
         </Shell>
       );
     case "select":
@@ -218,20 +208,32 @@ export function GenericField(props: GenericFieldProps) {
 
 function ProfileField({ spec, value, onChange, pinned, error }: GenericFieldProps) {
   const profiles = useProfiles();
+  const current = asString(value);
+  const list = profiles.data?.profiles ?? [];
+  // A profile chosen per run (a template such as `${{ inputs.profile }}`, as
+  // a built-in's input is) is not one of the org's profiles: the select
+  // still names it instead of showing nothing.
+  const templated = current !== "" && !list.some((profile) => profile.id === current);
   return (
     <Shell spec={spec} pinned={pinned} error={error}>
-      <Select value={asString(value)} onValueChange={(next) => onChange(next)} disabled={pinned}>
+      <Select value={current} onValueChange={(next) => onChange(next)} disabled={pinned}>
         <SelectTrigger data-testid="profile-select">
           <SelectValue placeholder="Choose a profile…" />
         </SelectTrigger>
         <SelectContent>
-          {(profiles.data?.profiles ?? []).map((profile) => (
+          {templated && (
+            <SelectItem value={current} className="font-mono text-xs">
+              {current}
+            </SelectItem>
+          )}
+          {list.map((profile) => (
             <SelectItem key={profile.id} value={profile.id}>
               {profile.name}
             </SelectItem>
           ))}
         </SelectContent>
       </Select>
+      {templated && <FieldDescription>Chosen per run from the template above.</FieldDescription>}
     </Shell>
   );
 }

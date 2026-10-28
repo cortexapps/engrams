@@ -18,7 +18,13 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { useEditorWebhookRegistrations, useEventCatalog } from "@/hooks/useAutomationEditor";
-import type { BlockErrorRef, TriggerSpec } from "@/lib/automation-blocks";
+import { TemplateField } from "./fields/TemplateField";
+import type {
+  AgentScope,
+  BlockErrorRef,
+  EntrypointRole,
+  TriggerSpec,
+} from "@/lib/automation-blocks";
 
 const PROVIDERS = ["github", "slack", "linear"] as const;
 const KINDS: ReadonlyArray<{ kind: TriggerSpec["kind"]; label: string; help: string }> = [
@@ -36,6 +42,33 @@ const KINDS: ReadonlyArray<{ kind: TriggerSpec["kind"]; label: string; help: str
   { kind: "manual", label: "Manual", help: "Only runs from the Run now button." },
 ];
 
+/** What a way in does with the agent once its blocks ran. `tell` covers
+ * the `start` and `reach` roles: the difference (start the agent when it is
+ * not running, or not) is a switch under it. */
+export type AfterSteps = "tell" | "close" | "none";
+
+export const AFTER_STEPS: ReadonlyArray<{ value: AfterSteps; label: string; help: string }> = [
+  {
+    value: "tell",
+    label: "Tells the agent",
+    help: "The agent gets the message below, or its own prompt, with this event and these steps' outputs.",
+  },
+  {
+    value: "close",
+    label: "Closes the agent",
+    help: "The agent's session is kept; later events for it are dropped.",
+  },
+  {
+    value: "none",
+    label: "Nothing",
+    help: "Only the steps on this way in run.",
+  },
+];
+
+export function afterStepsOf(role: EntrypointRole): AfterSteps {
+  return role === "start" || role === "reach" ? "tell" : role;
+}
+
 export interface TriggerInspectorProps {
   trigger: TriggerSpec;
   onChange: (next: TriggerSpec) => void;
@@ -43,6 +76,18 @@ export interface TriggerInspectorProps {
    * Inputs tab when the scope reads from an input). */
   builtin: boolean;
   errors: readonly BlockErrorRef[];
+  /** The way in's role, when the automation has an agent. */
+  role?: EntrypointRole;
+  onRoleChange?: (role: EntrypointRole) => void;
+  /** The agent's scope: a session per event offers no reach or close. */
+  scopeKind?: AgentScope["kind"];
+  /** The way in's message to the agent (a template over the event and this
+   * way in's steps); undefined = the agent's prompt. */
+  message?: string | undefined;
+  onMessageChange?: (message: string | undefined) => void;
+  /** The paths the message's completion offers, with live previews. */
+  variablePaths?: readonly string[];
+  variableValues?: Readonly<Record<string, string>>;
 }
 
 function errorFor(errors: readonly BlockErrorRef[], field: string): string | undefined {
@@ -57,7 +102,26 @@ function Pinned() {
   );
 }
 
-export function TriggerInspector({ trigger, onChange, builtin, errors }: TriggerInspectorProps) {
+export function TriggerInspector({
+  trigger,
+  onChange,
+  builtin,
+  errors,
+  role,
+  onRoleChange,
+  scopeKind,
+  message,
+  onMessageChange,
+  variablePaths,
+  variableValues,
+}: TriggerInspectorProps) {
+  // A session per event has no running agent to reach or close: those
+  // are offered only for a kept scope (a stale one still shows).
+  const kept = scopeKind !== "event";
+  const after = role === undefined ? undefined : afterStepsOf(role);
+  const afterOptions = AFTER_STEPS.filter((a) => kept || a.value !== "close" || a.value === after);
+  const onAfterChange = (next: AfterSteps) =>
+    onRoleChange?.(next === "tell" ? (role === "reach" ? "reach" : "start") : next);
   const defaultFor = (kind: TriggerSpec["kind"]): TriggerSpec => {
     switch (kind) {
       case "integration":
@@ -107,6 +171,87 @@ export function TriggerInspector({ trigger, onChange, builtin, errors }: Trigger
       )}
       {trigger.kind === "webhook" && (
         <WebhookTrigger trigger={trigger} onChange={onChange} builtin={builtin} errors={errors} />
+      )}
+
+      {role !== undefined && after !== undefined && onRoleChange && (
+        <>
+          <Field data-testid="field-role">
+            <FieldLabel className="flex items-center gap-1.5">
+              After its steps {builtin && <Pinned />}
+            </FieldLabel>
+            <Select
+              value={after}
+              onValueChange={(next) => onAfterChange(next as AfterSteps)}
+              disabled={builtin}
+            >
+              <SelectTrigger aria-label="After its steps">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {afterOptions.map((a) => (
+                  <SelectItem key={a.value} value={a.value}>
+                    {a.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {errorFor(errors, "role") ? (
+              <FieldError>{errorFor(errors, "role")}</FieldError>
+            ) : (
+              <FieldDescription>
+                {AFTER_STEPS.find((a) => a.value === after)?.help}
+              </FieldDescription>
+            )}
+          </Field>
+          {after === "tell" && (kept || role === "reach") && (
+            <Field orientation="horizontal" data-testid="field-only-running">
+              <Switch
+                id="trigger-only-running"
+                checked={role === "reach"}
+                onCheckedChange={(on) => onRoleChange(on ? "reach" : "start")}
+                disabled={builtin}
+                aria-label="Only when the agent is already running"
+              />
+              <div className="flex flex-col gap-0.5">
+                <FieldLabel htmlFor="trigger-only-running">
+                  Only when the agent is already running
+                </FieldLabel>
+                <FieldDescription>
+                  {role === "reach"
+                    ? "An event with no running agent is dropped; nothing starts."
+                    : "Off: the agent starts when it is not running."}
+                </FieldDescription>
+              </div>
+            </Field>
+          )}
+          {after === "tell" && onMessageChange && (
+            <Field
+              data-testid="field-message"
+              data-invalid={errorFor(errors, "promptTemplate") ? true : undefined}
+            >
+              <FieldLabel htmlFor="trigger-message">Message to the agent</FieldLabel>
+              <TemplateField
+                id="trigger-message"
+                aria-label="Message to the agent"
+                multiline
+                value={message ?? ""}
+                onChange={(next) => onMessageChange(next === "" ? undefined : next)}
+                disabled={builtin}
+                paths={variablePaths ?? []}
+                values={variableValues}
+                placeholder="The agent's prompt, with this event"
+              />
+              {errorFor(errors, "promptTemplate") ? (
+                <FieldError>{errorFor(errors, "promptTemplate")}</FieldError>
+              ) : (
+                <FieldDescription>
+                  A template over the event and this way in's steps. Empty: the agent gets its own
+                  prompt with this event.
+                </FieldDescription>
+              )}
+            </Field>
+          )}
+        </>
       )}
     </div>
   );

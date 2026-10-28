@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  AGENT_CLOSE_STEP_ID,
+  AGENT_NODE_ID,
+  AGENT_STEP_ID,
   blockKind,
+  blockTypesOf,
+  defaultAgent,
+  hasScopedAgents,
+  hasSlackTrigger,
+  messageOf,
+  roleOf,
+  scopeLabel,
+  scopePresetOf,
+  setMessage,
+  setRole,
+  groupedBlockKinds,
   insertableBlockKinds,
   removeEntrypoint,
   projectEntrypoint,
@@ -20,6 +34,7 @@ import {
   parseBlockErrors,
   removeBlock,
   setPath,
+  withAgent,
   type AutomationDefinition,
   type BlockDef,
 } from "./automation-blocks";
@@ -188,6 +203,26 @@ describe("state + probe blocks in the palette (ADR 0119 D10/D11)", () => {
     }
   });
 
+  it("a built-in-only kind renders with its own label and is never offered", () => {
+    expect(blockKind("slack_choice").label).toBe("Slack choice");
+    expect(blockKind("slack_choice").inspector).toBe("readonly");
+    expect(insertableBlockKinds(new Set()).some((s) => s.kind === "slack_choice")).toBe(false);
+  });
+
+  it("groups the insertable kinds by purpose, the internals under Advanced; the agent is not a block", () => {
+    const groups = groupedBlockKinds(new Set(["openrouter"]));
+    expect(groups.map((g) => g.id)).toEqual(["flow", "sessions", "integrations", "advanced"]);
+    expect(groups.flatMap((g) => g.kinds.map((k) => k.kind))).not.toContain("run_agent");
+    const advanced = groups.find((g) => g.id === "advanced")!.kinds.map((k) => k.kind);
+    for (const kind of ["loop", "wait_event", "state_get", "review_open_pass", "relay_close"]) {
+      expect(advanced).toContain(kind);
+    }
+    // Every insertable kind is in exactly one group.
+    const all = groups.flatMap((g) => g.kinds.map((k) => k.kind));
+    expect(new Set(all).size).toBe(all.length);
+    expect(all.length).toBe(insertableBlockKinds(new Set(["openrouter"])).length);
+  });
+
   it("a router-backed kind is insertable only while its router has a key", () => {
     expect(insertableBlockKinds(new Set()).some((s) => s.kind === "decide")).toBe(false);
     expect(insertableBlockKinds(new Set(["openrouter"])).some((s) => s.kind === "decide")).toBe(
@@ -266,5 +301,151 @@ describe("entrypoint projection (ADR 0119 D9)", () => {
       "create_session",
     );
     expect(nextBlockId([], "create_session", ["create_session"])).toBe("create_session_2");
+  });
+});
+
+describe("the agent with ways in", () => {
+  const base = (): AutomationDefinition => ({
+    engine: 1,
+    trigger: {
+      kind: "integration",
+      provider: "slack",
+      connectionId: "c",
+      eventKeys: ["app_mention"],
+    },
+    blocks: [],
+    entrypoints: [{ id: "done", trigger: { kind: "manual" }, blocks: [] }],
+    inputsSchema: [],
+    settings: { endSessionsOnFinish: false },
+  });
+
+  it("a new agent is scoped by the trigger: a thread for Slack, a PR for GitHub, a session per event otherwise", () => {
+    expect(scopePresetOf(defaultAgent(base().trigger).scope)).toBe("slack_thread");
+    expect(
+      scopePresetOf(
+        defaultAgent({ kind: "integration", provider: "github", connectionId: "c", eventKeys: [] })
+          .scope,
+      ),
+    ).toBe("pull_request");
+    expect(defaultAgent({ kind: "cron", schedule: "* * * * *", timezone: "UTC" }).scope).toEqual({
+      kind: "event",
+    });
+  });
+
+  it("the scope badge reads the agent's scope; a session per event has none", () => {
+    const d = base();
+    expect(scopeLabel({ ...d, agent: defaultAgent(d.trigger) })).toBe("per thread");
+    expect(
+      scopeLabel({ ...d, agent: { ...defaultAgent(d.trigger), scope: { kind: "automation" } } }),
+    ).toBe("one agent");
+    expect(
+      scopeLabel({ ...d, agent: { ...defaultAgent(d.trigger), scope: { kind: "event" } } }),
+    ).toBeUndefined();
+    expect(
+      scopeLabel({
+        ...d,
+        agent: { ...defaultAgent(d.trigger), scope: { kind: "key", keyTemplate: "${{ x }}" } },
+      }),
+    ).toBe("per key");
+    expect(hasScopedAgents({ ...d, agent: defaultAgent(d.trigger) })).toBe(true);
+    expect(
+      hasScopedAgents({ ...d, agent: { ...defaultAgent(d.trigger), scope: { kind: "event" } } }),
+    ).toBe(false);
+  });
+
+  it("a role is read and written per way in; start is stored as no field", () => {
+    let d = base();
+    expect(roleOf(d, "main")).toBe("start");
+    d = setRole(d, "done", "close");
+    expect(roleOf(d, "done")).toBe("close");
+    d = setRole(setRole(d, "main", "reach"), "main", "start");
+    expect("role" in d).toBe(false);
+    expect(d.entrypoints?.[0]?.role).toBe("close");
+    // The message rides along with a telling role and goes with a closing one.
+    d = setRole(setMessage(d, "main", "Hi"), "main", "reach");
+    expect(d.promptTemplate).toBe("Hi");
+    d = setRole(d, "main", "close");
+    expect("promptTemplate" in d).toBe(false);
+    d = setRole(setMessage(setRole(d, "done", "start"), "done", "Bye"), "done", "none");
+    expect(d.entrypoints?.[0] && "promptTemplate" in d.entrypoints[0]).toBe(false);
+  });
+
+  it("a way in's message to the agent is read and written per way in; empty is no field", () => {
+    let d = base();
+    expect(messageOf(d, "main")).toBeUndefined();
+    d = setMessage(d, "done", "Closing: ${{ event.raw.text }}");
+    expect(messageOf(d, "done")).toBe("Closing: ${{ event.raw.text }}");
+    d = setMessage(setMessage(d, "main", "Hi"), "main", "");
+    expect("promptTemplate" in d).toBe(false);
+    expect(d.entrypoints?.[0]?.promptTemplate).toBe("Closing: ${{ event.raw.text }}");
+  });
+
+  it("with an agent the menu offers no wait blocks: waiting is the agent's session", () => {
+    const all = groupedBlockKinds(new Set()).flatMap((g) => g.kinds.map((k) => k.kind));
+    expect(all).toContain("wait_session");
+    expect(all).toContain("wait_event");
+    const withAgent = groupedBlockKinds(new Set(), { withAgent: true }).flatMap((g) =>
+      g.kinds.map((k) => k.kind),
+    );
+    expect(withAgent).not.toContain("wait_session");
+    expect(withAgent).not.toContain("wait_event");
+    expect(withAgent).toContain("create_session");
+  });
+
+  it("the ledger's agent steps take the agent's types, so their sentences read", () => {
+    const d = { ...base(), agent: defaultAgent(base().trigger) };
+    const types = blockTypesOf(d);
+    expect(types.get(AGENT_STEP_ID)).toBe("run_agent");
+    expect(types.get(AGENT_CLOSE_STEP_ID)).toBe("close_agent");
+    expect(blockTypesOf(base()).has(AGENT_STEP_ID)).toBe(false);
+  });
+
+  it("an agent error is addressed to the agent node", () => {
+    expect(
+      parseBlockErrors("__agent__.profileId: pick a profile; admit.conditions: empty"),
+    ).toEqual([
+      { blockId: AGENT_NODE_ID, field: "profileId", message: "pick a profile" },
+      { blockId: "admit", field: "conditions", message: "empty" },
+    ]);
+  });
+
+  it("a way in's role error lands on its trigger row", () => {
+    expect(
+      parseBlockErrors("__trigger__.role: needs an agent; __entrypoints__.role: needs an agent"),
+    ).toEqual([
+      { blockId: "", field: "role", message: "needs an agent" },
+      { blockId: "", field: "role", message: "needs an agent" },
+    ]);
+  });
+
+  it("adding an agent turns the ways in's scope into the agent's key", () => {
+    const d: AutomationDefinition = {
+      ...def([]),
+      settings: {
+        endSessionsOnFinish: false,
+        instance: { keyTemplate: "${{ event.raw.data.id }}" },
+      },
+    };
+    const next = withAgent(d);
+    expect(next.agent?.scope).toEqual({ kind: "key", keyTemplate: "${{ event.raw.data.id }}" });
+    expect(next.settings.instance).toBeUndefined();
+    expect(withAgent(base()).agent?.scope).toEqual(defaultAgent(base().trigger).scope);
+  });
+
+  it("knows when a way in is a Slack event", () => {
+    expect(hasSlackTrigger(base())).toBe(true);
+    expect(hasSlackTrigger(def([]))).toBe(false);
+    expect(
+      hasSlackTrigger({
+        ...def([]),
+        entrypoints: [
+          {
+            id: "mention",
+            trigger: { kind: "integration", provider: "slack", connectionId: "", eventKeys: [] },
+            blocks: [],
+          },
+        ],
+      }),
+    ).toBe(true);
   });
 });

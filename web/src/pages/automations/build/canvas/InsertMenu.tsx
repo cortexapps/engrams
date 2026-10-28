@@ -5,14 +5,10 @@
 
 import { Plus } from "lucide-react";
 
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { useConnectedRouters } from "@/hooks/useConnectedRouters";
-import { insertableBlockKinds, type ListPath } from "@/lib/automation-blocks";
+import { DropdownMenu, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import type { ListPath } from "@/lib/automation-blocks";
+
+import { BlockKindMenu } from "./BlockKindMenu";
 
 export interface InsertMenuProps {
   x: number;
@@ -20,10 +16,10 @@ export interface InsertMenuProps {
   at: ListPath;
   index: number;
   onInsert: (at: ListPath, index: number, kind: string) => void;
+  withAgent?: boolean;
 }
 
-export function InsertMenu({ x, y, at, index, onInsert }: InsertMenuProps) {
-  const connectedRouters = useConnectedRouters();
+export function InsertMenu({ x, y, at, index, onInsert, withAgent }: InsertMenuProps) {
   return (
     <div
       className="group/insert absolute z-20 flex size-8 -translate-x-1/2 -translate-y-1/2 items-center justify-center"
@@ -39,14 +35,7 @@ export function InsertMenu({ x, y, at, index, onInsert }: InsertMenuProps) {
             <Plus className="size-3.5" aria-hidden />
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="center">
-          {insertableBlockKinds(connectedRouters).map((spec) => (
-            <DropdownMenuItem key={spec.kind} onSelect={() => onInsert(at, index, spec.kind)}>
-              <spec.icon className="size-4" aria-hidden />
-              {spec.label}
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuContent>
+        <BlockKindMenu onPick={(kind) => onInsert(at, index, kind)} withAgent={withAgent} />
       </DropdownMenu>
     </div>
   );

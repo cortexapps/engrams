@@ -8,20 +8,11 @@
 import { Lock, Plus } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { useConnectedRouters } from "@/hooks/useConnectedRouters";
-import {
-  insertableBlockKinds,
-  type BlockDef,
-  type ListPath,
-  type TriggerSpec,
-} from "@/lib/automation-blocks";
+import { DropdownMenu, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import type { BlockDef, ListPath, TriggerSpec } from "@/lib/automation-blocks";
+import type { ReplayMap } from "@/lib/run-replay";
 
+import { BlockKindMenu } from "./BlockKindMenu";
 import { CanvasNode, type CanvasNodeStatus } from "./CanvasNode";
 import { EdgeLayer } from "./EdgeLayer";
 import { InsertMenu } from "./InsertMenu";
@@ -48,10 +39,18 @@ export interface CanvasProps {
   onRemove: (id: string) => void;
   /** AI drafting (phase 3): render these blocks as ghosts. */
   ghostIds?: ReadonlySet<string>;
-  /** Run replay (later): per-block status chips. */
+  /** Per-block status chips (the test-with-sample readout). */
   nodeStatus?: Readonly<Record<string, CanvasNodeStatus>>;
+  /** A past run drawn on this way in: its blocks light up with what they
+   * did, the rest fade, and the edges it travelled thicken. `onPath` says
+   * whether this way in carried the run at all. Editing is off. */
+  replay?: { map: ReplayMap; onPath: boolean };
   /** "fit" (default) scales down to the column; a number is an explicit zoom. */
   zoom?: number | "fit";
+  /** A node's second line, when the owner can resolve it (profile names). */
+  summaryFor?: (block: BlockDef) => string | undefined;
+  /** The automation has an agent: the insert menus offer no wait blocks. */
+  withAgent?: boolean;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -72,8 +71,20 @@ export function Canvas({
   onRemove,
   ghostIds,
   nodeStatus,
+  replay,
   zoom = "fit",
+  summaryFor,
+  withAgent,
 }: CanvasProps) {
+  const editable = !locked && !replay;
+  const edgeTaken = (edgeId: string): boolean => {
+    if (!replay) return false;
+    const edge = layout.edges.find((e) => e.id === edgeId);
+    if (!edge || edge.kind === "tail") return false;
+    const fromOn = edge.from === TRIGGER_ROW_ID ? replay.onPath : replay.map.has(edge.from);
+    const toOn = edge.to === null ? true : replay.map.has(edge.to);
+    return fromOn && toOn;
+  };
   void trigger; // the trigger node's title is `triggerSummary`
   const layout = useMemo(() => layoutCanvas(blocks), [blocks]);
   const blocksById = useMemo(() => {
@@ -118,7 +129,7 @@ export function Canvas({
 
   return (
     <div
-      className="flex h-full min-w-0 flex-col"
+      className="flex min-h-0 min-w-0 shrink flex-col"
       data-testid={entrypointId ? `entrypoint-canvas-${entrypointId}` : "block-canvas"}
     >
       <div
@@ -136,9 +147,10 @@ export function Canvas({
               transformOrigin: "top left",
             }}
           >
-            <EdgeLayer layout={layout} />
+            <EdgeLayer layout={layout} {...(replay ? { taken: edgeTaken } : {})} />
             {layout.nodes.map((node) => {
               const block = node.id === TRIGGER_ROW_ID ? undefined : blocksById.get(node.id);
+              const replayed = block ? replay?.map.get(node.id) : undefined;
               return (
                 <CanvasNode
                   key={node.id}
@@ -148,9 +160,22 @@ export function Canvas({
                   triggerDetail={entrypointId}
                   selected={selectedId === (block ? node.id : TRIGGER_ROW_ID)}
                   errored={erroredIds.has(block ? node.id : TRIGGER_ROW_ID)}
-                  locked={locked}
+                  locked={locked || !!replay}
                   ghost={block ? ghostIds?.has(node.id) : false}
-                  status={block ? nodeStatus?.[node.id] : undefined}
+                  status={
+                    replay
+                      ? block
+                        ? replayed?.status
+                        : replay.onPath
+                          ? "ok"
+                          : undefined
+                      : block
+                        ? nodeStatus?.[node.id]
+                        : undefined
+                  }
+                  summary={replayed ? replayed.sentence : block ? summaryFor?.(block) : undefined}
+                  dimmed={replay ? (block ? !replayed : !replay.onPath) : false}
+                  count={replayed?.frames.length}
                   canMoveUp={node.index !== undefined && node.index > 0}
                   canMoveDown={
                     node.index !== undefined &&
@@ -177,7 +202,7 @@ export function Canvas({
                 />
               );
             })}
-            {!locked &&
+            {editable &&
               layout.edges
                 .filter((edge) => edge.insert && edge.kind !== "tail")
                 .map((edge) => (
@@ -188,15 +213,17 @@ export function Canvas({
                     at={edge.insert!.at}
                     index={edge.insert!.index}
                     onInsert={onInsert}
+                    withAgent={withAgent}
                   />
                 ))}
-            {!locked && tail?.insert && (
+            {editable && tail?.insert && (
               <AddStepNode
                 x={tail.points.at(-1)!.x}
                 y={tail.points.at(-1)!.y}
                 at={tail.insert.at}
                 index={tail.insert.index}
                 onInsert={onInsert}
+                withAgent={withAgent}
               />
             )}
           </div>
@@ -220,14 +247,15 @@ function AddStepNode({
   at,
   index,
   onInsert,
+  withAgent,
 }: {
   x: number;
   y: number;
   at: ListPath;
   index: number;
   onInsert: (at: ListPath, index: number, kind: string) => void;
+  withAgent?: boolean;
 }) {
-  const connectedRouters = useConnectedRouters();
   return (
     <div
       className="absolute z-20 -translate-x-1/2 -translate-y-1/2"
@@ -245,14 +273,7 @@ function AddStepNode({
             Add step
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="center">
-          {insertableBlockKinds(connectedRouters).map((spec) => (
-            <DropdownMenuItem key={spec.kind} onSelect={() => onInsert(at, index, spec.kind)}>
-              <spec.icon className="size-4" aria-hidden />
-              {spec.label}
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuContent>
+        <BlockKindMenu onPick={(kind) => onInsert(at, index, kind)} withAgent={withAgent} />
       </DropdownMenu>
     </div>
   );

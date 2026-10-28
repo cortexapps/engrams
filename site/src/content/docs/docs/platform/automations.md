@@ -1,20 +1,26 @@
 ---
 title: Automations
-description: Trigger-driven pipelines of agent sessions, with durable runs, typed inputs, and a visual builder.
+description: An agent with ways in, with durable runs, typed inputs, and a visual builder.
 sidebar:
   order: 2
 ---
 
-An automation is a small program that starts agent sessions in response to something
-happening: a pull request opening, a Slack mention, a schedule, a webhook from a system you
-run. It is the part of engrams that turns "an agent I can talk to" into work that happens
+An automation is an agent with ways in. The agent is a profile and a prompt. A way in is
+something that happens: a pull request opening, a Slack mention, a schedule, a webhook from
+a system you run. When it happens, the way in's steps run, and then the event reaches the
+agent. It is the part of engrams that turns "an agent I can talk to" into work that happens
 without anyone typing a prompt.
 
-An automation has one trigger, an ordered tree of blocks, a typed set of inputs, and a few
-settings. The blocks create sessions, send them prompts, wait for them, run commands inside
-them, post to Slack or GitHub, branch, loop, and read and write a small key-value store.
-Every run is durable: it survives a server restart and picks up where it was, and a run can
-wait hours for an event without holding anything open.
+The agent's **scope** says how many agents there are. One agent for each event starts a
+fresh session every time. One agent for each Slack thread, pull request, or Linear issue
+keeps one session per thread, pull request, or issue, and every later event for the same
+one reaches that session. One agent for the whole automation is a standing agent that
+every event reaches. Each way in says what it does with the agent: starts it, reaches it
+only when it is already running, closes it, or runs its own steps and no agent.
+
+Every run is short and durable: it runs the way in's steps, hands the event to the agent,
+and ends. The agent's session outlives the run. A run survives a server restart and picks
+up where it was.
 
 ![The automation builder, with a schedule trigger and a create-session block on the canvas](../../../../assets/screenshots/automation-builder.png)
 
@@ -26,10 +32,24 @@ your existing automations, asks when a decision is yours, and assembles a draft 
 canvas while you watch. The draft lands disabled. You edit it by hand, and the agent and you
 can edit at the same time.
 
-**Build it.** The builder is a canvas: the trigger is the first node, a plus sign on any edge
-inserts a block, and an inspector on the right edits the selected block's fields. Nothing
-here is JSON in disguise; when the server rejects a definition, the error points at the
-block and the field.
+**Build it.** The builder is a canvas: one column per way in, with its trigger as the first
+node and its steps below, and the automation's one Agent node under every column. A plus
+sign on any edge inserts a step, and an inspector on the right edits the selected node. The
+Agent node's inspector holds the profile, the prompt, the scope as a dropdown (each event,
+each Slack thread, each Slack channel, each pull request, each Linear issue, the whole
+automation, or a key of your own), and the Slack reply switch. The trigger's inspector
+holds what the way in does with the agent. The step menu is grouped by purpose, with the
+engine's internals under Advanced. In any text field, type `${{` and the field completes
+the variables the step can read: the trigger, the inputs, the event's fields, and the
+outputs of the steps above, each with a preview from the latest delivery. Nothing here is
+JSON in disguise; when the server rejects a definition, the error points at the node and
+the field.
+
+**Try it.** The Try it button in the header renders the draft as it is on screen, unsaved
+edits included, against the latest delivery the trigger would see, and shows what each block
+would do, which filters pass, and which fields did not render. Nothing runs. A new
+automation can be tried before it is created. Dry run goes further on a saved automation: a
+real run that boots no session and posts nothing.
 
 Every save is a new version. Runs that are in flight finish on the version they started with,
 and the Settings tab shows the version history with a diff.
@@ -52,7 +72,22 @@ some event keys as continue-only: they never open a run, they only join one that
 open. That is how a reply in a Slack thread reaches the run that owns the thread and never
 starts a second one.
 
-## Blocks
+## The agent
+
+The agent gets the event at the end of every way in that starts or reaches it: it
+continues the agent's kept session when one is alive, else it starts one from the profile
+with the prompt, and it posts the new session's link where the agent talks back. It can
+reply in the Slack thread the event came from: the agent's replies land in the thread as
+it works, its questions arrive as Slack forms, and the message gets a reaction while a turn
+runs. One way in, one filter, and the agent is the shape of a standing agent: a bot that
+answers in a channel, a reviewer that follows a pull request across pushes, a helper that
+keeps one session per ticket. The Slack threads built-in is this shape.
+
+## Steps
+
+A way in's steps run before the event reaches the agent. Most ways in need none, or a
+filter. The steps below are for the automations that need more than one session, or work
+that is not a conversation.
 
 **Sessions.** Create session starts an agent from a profile with a prompt, and can override
 the harness, model, effort, network policy, and capabilities the profile grants. Send prompt
@@ -90,7 +125,7 @@ you branch on rather than an error.
 
 **Routing.** Look up PR session maps a pull request to the session that authored it, so
 review feedback can go back to the agent that wrote the code. Claim handle binds an external
-identifier to the current workstream so later events route to it.
+identifier to the current agent so later events route to it.
 
 Text fields are templates with `${{ … }}` placeholders and a small set of filters. Every block
 can see the inputs, the trigger, the event, and the outputs of earlier blocks by id. A block
@@ -101,10 +136,15 @@ can retry up to five times on transient errors.
 A run is `completed`, `filtered` (a filter or a boolean code block ended it on purpose),
 `failed`, `superseded`, `halted` (stopped by a person), or `deadline`. The Activity tab lists
 each run as an entry with the trigger that started it, and consecutive filtered runs fold into
-one quiet row so noise does not bury the runs that did work. An entry unfolds in place into
-its step trace; each step shows its outcome, its duration, and the error verbatim when it
-failed. The Activity page in the Automations section shows every automation's entries in one
-ledger.
+one quiet row so noise does not bury the runs that did work. A failed run shows its reason on
+the row. An entry unfolds in place into its step trace; each step says what its block did in
+a sentence ("Exited 0", "Started session se-abcde, relayed to the thread"), with its duration
+and the error verbatim when it failed. A click on a step opens its details: the rendered
+inputs, the outputs, and the command output. Replay on canvas draws the run on the Build
+canvas: the way in it came through and the blocks it ran light up with what they did, the
+rest fades, and a click on a block shows its inputs and outputs for that run. A run on an
+older version is drawn on that version. The Activity page in the Automations section shows
+every automation's entries in one ledger.
 
 Retry starts a fresh run with the same trigger payload. Stop asks a run to halt at its next
 checkpoint. A run deadline, up to 48 hours, ends a run that outlived its usefulness.
@@ -122,10 +162,12 @@ arrives, and a policy for what happens when a run with that key is already activ
 **Finalize hooks** run one block when a run ends in a status you choose. They can post a recap
 or flip a status comment, and they can never change the run's outcome.
 
-**Workstreams** give a long-lived thing, such as a Linear project or a support thread, a
-durable identity that many short runs contribute to. The Workstreams tab lists each one with
-its runs and the handles it has claimed, and a recent-drops list explains why a delivery did
-not start a run.
+**Agents** are what a scope keeps: one agent per thread, pull request, or issue, with one
+kept session, that many short runs contribute to. The Agents tab lists each one, titled by
+the place it owns (`owner/repo#123`, `#channel · thread`), with its last run and a Close
+action; a recent-drops list explains why a delivery did not start a run. A way in that
+closes the agent (a pull request closing, say) ends it; its session stays. The automations
+list shows the scope as a badge ("per PR", "per thread").
 
 ## Inputs
 

@@ -52,10 +52,37 @@ export interface TriggerSpec {
   [key: string]: unknown;
 }
 
+/** What a way in does with the automation's agent once its blocks ran:
+ * `start` reaches the agent and starts it when it is not running; `reach`
+ * reaches it only when it is; `close` closes it; `none` runs its own blocks
+ * and no agent. Absent = `start`. */
+export type EntrypointRole = "start" | "reach" | "close" | "none";
+
 export interface AutomationEntrypoint {
   id: string;
   trigger: TriggerSpec;
   blocks: BlockDef[];
+  role?: EntrypointRole;
+  /** What this way in tells the agent: a template over the event and this
+   * way in's steps. Absent = the agent's prompt on every event. */
+  promptTemplate?: string;
+}
+
+/** How many agents an automation has: one per event, one per rendered key
+ * (a thread, a pull request, an issue), or one for the whole automation. */
+export type AgentScope =
+  | { kind: "event" }
+  | { kind: "automation" }
+  | { kind: "key"; keyTemplate: string; labelTemplate?: string };
+
+/** The automation's agent: who runs, what it gets, where it talks back. The
+ * other fields mirror the server's agent step config (session settings,
+ * the relay, the harness override). */
+export interface AgentSpec {
+  scope: AgentScope;
+  profileId: string;
+  promptTemplate: string;
+  [field: string]: unknown;
 }
 
 export interface AutomationDefinition {
@@ -65,6 +92,13 @@ export interface AutomationDefinition {
   /** ADR 0119 D9: additional named ways in. The top-level trigger + blocks
    * are the implicit "main" entrypoint. */
   entrypoints?: AutomationEntrypoint[];
+  /** The main way in's role; absent = `start`. */
+  role?: EntrypointRole;
+  /** The main way in's message to the agent (see `AutomationEntrypoint`). */
+  promptTemplate?: string;
+  /** The automation's agent. Every way in ends on it (by its role); the
+   * agent's scope is what makes the automation's agents durable. */
+  agent?: AgentSpec;
   inputsSchema: unknown[];
   settings: {
     concurrency?: {
@@ -73,11 +107,12 @@ export interface AutomationDefinition {
     };
     runDeadlineSeconds?: number;
     endSessionsOnFinish: boolean;
-    /** ADR 0120: present = the automation has workstreams. */
+    /** ADR 0120: scoped workstreams on an automation WITHOUT an agent (the
+     * engine derives this from the agent's scope when there is one). */
     instance?: {
       keyTemplate: string;
       inputs?: Record<string, string>;
-      entrypoints?: Record<string, { admit: "open" | "require" | "handle_match" }>;
+      entrypoints?: Record<string, { admit: "open" | "require" | "handle_match" | "optional" }>;
     };
   };
 }
@@ -155,6 +190,206 @@ export function removeEntrypoint(
   return rest.length > 0 ? { ...base, entrypoints: rest } : base;
 }
 
+/** The role of one way in. */
+export function roleOf(definition: AutomationDefinition, entrypointId: string): EntrypointRole {
+  if (entrypointId === MAIN_ENTRYPOINT_ID) return definition.role ?? "start";
+  return definition.entrypoints?.find((ep) => ep.id === entrypointId)?.role ?? "start";
+}
+
+/** Set one way in's role; `start` (the default) is stored as no field. */
+export function setRole(
+  definition: AutomationDefinition,
+  entrypointId: string,
+  role: EntrypointRole,
+): AutomationDefinition {
+  const put = <T extends { role?: EntrypointRole; promptTemplate?: string }>(target: T): T => {
+    const { role: _old, promptTemplate, ...rest } = target;
+    // A way in that closes the agent or runs alone tells it nothing: its
+    // message goes with the role (the engine refuses one on those roles).
+    const tells = role === "start" || role === "reach";
+    const message = tells && promptTemplate !== undefined ? { promptTemplate } : {};
+    return (role === "start" ? { ...rest, ...message } : { ...rest, ...message, role }) as T;
+  };
+  if (entrypointId === MAIN_ENTRYPOINT_ID) return put(definition);
+  return {
+    ...definition,
+    entrypoints: (definition.entrypoints ?? []).map((ep) =>
+      ep.id === entrypointId ? put(ep) : ep,
+    ),
+  };
+}
+
+/** One way in's message to the agent; undefined = the agent's prompt. */
+export function messageOf(
+  definition: AutomationDefinition,
+  entrypointId: string,
+): string | undefined {
+  if (entrypointId === MAIN_ENTRYPOINT_ID) return definition.promptTemplate;
+  return definition.entrypoints?.find((ep) => ep.id === entrypointId)?.promptTemplate;
+}
+
+/** Set one way in's message; empty (or undefined) is stored as no field. */
+export function setMessage(
+  definition: AutomationDefinition,
+  entrypointId: string,
+  message: string | undefined,
+): AutomationDefinition {
+  const put = <T extends { promptTemplate?: string }>(target: T): T => {
+    const { promptTemplate: _old, ...rest } = target;
+    return (message ? { ...rest, promptTemplate: message } : rest) as T;
+  };
+  if (entrypointId === MAIN_ENTRYPOINT_ID) return put(definition);
+  return {
+    ...definition,
+    entrypoints: (definition.entrypoints ?? []).map((ep) =>
+      ep.id === entrypointId ? put(ep) : ep,
+    ),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The agent: one per automation, every way in ends on it
+// ---------------------------------------------------------------------------
+
+/** The canvas node and error address of the automation's agent. */
+export const AGENT_NODE_ID = "__agent__";
+/** The step ids the engine appends to a way in: the agent step and the
+ * close step. A run's ledger names them; the canvas maps both onto the
+ * agent node. */
+export const AGENT_STEP_ID = "agent";
+export const AGENT_CLOSE_STEP_ID = "agent_close";
+/** The engine's type of the agent step, for the step sentences. */
+export const AGENT_STEP_TYPE = "run_agent";
+export const AGENT_CLOSE_STEP_TYPE = "close_agent";
+
+export interface ScopePreset {
+  id: string;
+  label: string;
+  help: string;
+  scope: AgentScope;
+}
+
+/** The key of a Slack thread: team, channel, thread root (the opening
+ * message is its own root). `coalesce` falls back across the two fields. */
+export const SLACK_THREAD_KEY =
+  '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}';
+
+/** The scopes the inspector offers by name. A key template that matches
+ * none of them is a custom key. */
+export const SCOPE_PRESETS: readonly ScopePreset[] = [
+  {
+    id: "event",
+    label: "Each event",
+    help: "A new session for every event; nothing is kept between them.",
+    scope: { kind: "event" },
+  },
+  {
+    id: "slack_thread",
+    label: "Each Slack thread",
+    help: "One agent per thread: the first mention starts it, later mentions reach it.",
+    scope: {
+      kind: "key",
+      keyTemplate: SLACK_THREAD_KEY,
+      labelTemplate: "${{ event.raw.event.text | strip_mentions | truncate: 80 }}",
+    },
+  },
+  {
+    id: "slack_channel",
+    label: "Each Slack channel",
+    help: "One agent per channel; every message in it reaches the same session.",
+    scope: {
+      kind: "key",
+      keyTemplate: "${{ event.raw.team_id }}:${{ event.raw.event.channel }}",
+    },
+  },
+  {
+    id: "pull_request",
+    label: "Each pull request",
+    help: "One agent per pull request, across pushes and review comments.",
+    // A review comment carries the number under `issue`, a push under
+    // `pull_request`; `coalesce` reads whichever the event has.
+    scope: {
+      kind: "key",
+      keyTemplate:
+        '${{ event.raw.repository.full_name }}#${{ event.raw | coalesce: "pull_request.number", "issue.number" }}',
+      labelTemplate: '${{ event.raw | coalesce: "pull_request.title", "issue.title" }}',
+    },
+  },
+  {
+    id: "linear_issue",
+    label: "Each Linear issue",
+    help: "One agent per issue, across its updates and comments.",
+    // An issue event carries the identifier on `data`; a comment event on
+    // `data.issue`.
+    scope: {
+      kind: "key",
+      keyTemplate: '${{ event.raw | coalesce: "data.identifier", "data.issue.identifier" }}',
+      labelTemplate: '${{ event.raw | coalesce: "data.title", "data.issue.title" }}',
+    },
+  },
+  {
+    id: "automation",
+    label: "The whole automation",
+    help: "One standing agent; every event from every way in reaches it.",
+    scope: { kind: "automation" },
+  },
+];
+
+export const CUSTOM_SCOPE_ID = "custom";
+
+/** Which preset a scope is, else `custom`. */
+export function scopePresetOf(scope: AgentScope): string {
+  for (const preset of SCOPE_PRESETS) {
+    if (preset.scope.kind !== scope.kind) continue;
+    if (scope.kind !== "key" || preset.scope.kind !== "key") return preset.id;
+    if (preset.scope.keyTemplate === scope.keyTemplate) return preset.id;
+  }
+  return CUSTOM_SCOPE_ID;
+}
+
+/** The scope a new agent gets for a trigger: a thread for a Slack trigger,
+ * a pull request for a GitHub one, an issue for Linear; a session per event
+ * otherwise. */
+export function defaultScopeFor(trigger: TriggerSpec): AgentScope {
+  const preset = (id: string) => SCOPE_PRESETS.find((p) => p.id === id)!.scope;
+  if (trigger.kind !== "integration") return preset("event");
+  switch (trigger["provider"]) {
+    case "slack":
+      return preset("slack_thread");
+    case "github":
+      return preset("pull_request");
+    case "linear":
+      return preset("linear_issue");
+    default:
+      return preset("event");
+  }
+}
+
+export function defaultAgent(trigger: TriggerSpec): AgentSpec {
+  return { scope: defaultScopeFor(trigger), profileId: "", promptTemplate: "" };
+}
+
+/** The agent an automation gets when one is added: a scope its ways in
+ * already had (`settings.instance`, which the engine now derives from the
+ * agent) becomes the agent's key, so adding an agent keeps the workstreams. */
+export function withAgent(definition: AutomationDefinition): AutomationDefinition {
+  const { instance, ...settings } = definition.settings;
+  const agent = defaultAgent(definition.trigger);
+  if (instance !== undefined) {
+    agent.scope = { kind: "key", keyTemplate: instance.keyTemplate };
+  }
+  return { ...definition, agent, settings };
+}
+
+/** Whether any way in is a Slack event: the only trigger a Slack thread
+ * relay can read its thread from. */
+export function hasSlackTrigger(definition: AutomationDefinition): boolean {
+  return entrypointIds(definition).some((way) => {
+    const trigger = projectEntrypoint(definition, way).trigger;
+    return trigger.kind === "integration" && trigger["provider"] === "slack";
+  });
+}
+
 /** Block ids OUTSIDE one entrypoint — the reserved set for nextBlockId
  * (server validation holds ids unique across ALL entrypoints). */
 export function blockIdsOutsideEntrypoint(
@@ -203,11 +438,28 @@ export type FieldSpec =
   | { type: "secret_ref"; key: string; label: string; help?: string }
   | { type: "json"; key: string; label: string; help?: string };
 
+/** Where a kind sits in the insert menu. `advanced` kinds live in a submenu:
+ * the engine and built-in internals a hand-built automation rarely needs. */
+export type BlockGroup = "flow" | "sessions" | "integrations" | "advanced";
+
+export const BLOCK_GROUPS: ReadonlyArray<{ id: BlockGroup; label: string }> = [
+  { id: "flow", label: "Flow" },
+  { id: "sessions", label: "Sessions" },
+  { id: "integrations", label: "Integrations" },
+  { id: "advanced", label: "Advanced" },
+];
+
 export interface BlockKindSpec {
   kind: string;
   label: string;
   description: string;
   icon: LucideIcon;
+  group: BlockGroup;
+  /** The outputs the block exposes as `steps.<id>.<output>`; the variable
+   * completion offers them to every block below. */
+  outputs?: readonly string[];
+  /** false: a kind only a built-in places (it renders, it is never offered). */
+  insertable?: false;
   /** One-line row summary from the block config. */
   summary(config: BlockConfig): string;
   /** Generic-form fields. Absent when a custom inspector owns the block. */
@@ -258,6 +510,7 @@ const WAIT_DEADLINE_FIELD: FieldSpec = {
 export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   {
     kind: "filter",
+    group: "flow",
     label: "Filter",
     description: "Continue only when the conditions hold; otherwise the run ends as filtered.",
     icon: Filter,
@@ -271,6 +524,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "branch",
+    group: "flow",
+    outputs: ["taken"],
     label: "Branch",
     description: "Run the then-list when the conditions hold, else the else-list.",
     icon: GitBranch,
@@ -285,6 +540,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "loop",
+    group: "advanced",
+    outputs: ["iterations"],
     label: "Loop",
     description: "Repeat the body until a condition holds or the iteration cap is reached.",
     icon: Repeat,
@@ -296,6 +553,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "code",
+    group: "flow",
+    outputs: ["value"],
     label: "Code",
     description: "Run JavaScript in the sandbox to compute a value or a yes/no.",
     icon: Braces,
@@ -308,6 +567,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "create_session",
+    group: "sessions",
+    outputs: ["session_id", "web_url", "task_id"],
     label: "Create session",
     description: "Start a session from a profile with an initial prompt.",
     icon: Play,
@@ -325,6 +586,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "send_prompt",
+    group: "sessions",
+    outputs: ["outcome", "signal"],
     label: "Send prompt",
     description: "Send a prompt to a session and optionally wait for it to finish.",
     icon: Send,
@@ -375,6 +638,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "wait_session",
+    group: "sessions",
+    outputs: ["outcome"],
     label: "Wait for session",
     description: "Park until the session goes idle or ends.",
     icon: Hourglass,
@@ -393,6 +658,15 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "session_status",
+    group: "sessions",
+    outputs: [
+      "found",
+      "status",
+      "last_active_at",
+      "last_event_at",
+      "idle_seconds",
+      "owner_run_live",
+    ],
     label: "Session status",
     description: "Probe a session read-only: status, idle time, and whether a live run owns it.",
     icon: HeartPulse,
@@ -402,6 +676,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "wait_event",
+    group: "advanced",
+    outputs: ["outcome", "event", "event_key"],
     label: "Wait for event",
     description: "Receive the next delivery joined into this run (join concurrency).",
     icon: MailOpen,
@@ -422,6 +698,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "end_session",
+    group: "sessions",
+    outputs: ["ended"],
     label: "End session",
     description: "Tear down a session this run created.",
     icon: CircleStop,
@@ -431,6 +709,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "run_command",
+    group: "sessions",
+    outputs: ["exit_status", "stdout", "stderr"],
     label: "Run command",
     description: "Run a shell command inside a session and capture its output.",
     icon: Terminal,
@@ -460,6 +740,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "write_files",
+    group: "sessions",
+    outputs: ["files"],
     label: "Write files",
     description: "Write rendered files into a session's filesystem.",
     icon: FilePlus2,
@@ -482,6 +764,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "state_get",
+    group: "advanced",
+    outputs: ["found", "value", "version"],
     label: "Read state",
     description: "Read one entry from this automation's shared state.",
     icon: Database,
@@ -498,6 +782,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "state_set",
+    group: "advanced",
+    outputs: ["ok", "version", "current_version", "current_value"],
     label: "Write state",
     description: "Write one entry; an expected version turns the write into a compare-and-swap.",
     icon: Database,
@@ -527,6 +813,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "state_delete",
+    group: "advanced",
+    outputs: ["ok", "deleted"],
     label: "Delete state",
     description: "Delete one entry (idempotent); an expected version makes it conditional.",
     icon: Eraser,
@@ -539,6 +827,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "state_list",
+    group: "advanced",
+    outputs: ["entries", "count", "truncated"],
     label: "List state",
     description: "List entries by key prefix (up to 500), oldest key first.",
     icon: List,
@@ -559,6 +849,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "lookup_pr_session",
+    group: "advanced",
+    outputs: ["found", "session_id", "task_id", "head_branch", "url", "title"],
     label: "Look up PR session",
     description: "Map a pull request to the session that authored it (the pr_ref ledger).",
     icon: GitPullRequest,
@@ -585,38 +877,44 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "lookup_instance_session",
-    label: "Look up workstream session",
+    group: "advanced",
+    outputs: ["found", "session_id", "web_url", "run_id", "reason"],
+    label: "Look up the agent's session",
     description:
-      "The kept session an earlier run of this workstream created, so a new run continues it (found: false when none, gone, or unbound).",
+      "The kept session an earlier run of this agent created, so a new run continues it (found: false when none, gone, or unbound).",
     icon: Repeat,
     fields: [],
-    summary: () => "This workstream's kept session",
+    summary: () => "This agent's kept session",
     defaults: () => ({}),
   },
   {
     kind: "instance_close",
-    label: "Close workstream",
-    description: "Close the run's own workstream; later events for it are dropped (audited).",
+    group: "advanced",
+    outputs: ["closed", "not_instanced"],
+    label: "Close agent",
+    description: "Close the run's own agent; later events for it are dropped (audited).",
     icon: SquareCheck,
     fields: [
       {
         type: "template",
         key: "reason",
         label: "Reason",
-        help: "Kept on the workstream for the audit trail.",
+        help: "Kept on the agent for the audit trail.",
       },
     ],
     summary: (c) => {
       const reason = str(c["reason"]);
-      return reason ? truncate(reason, 40) : "Close this workstream";
+      return reason ? truncate(reason, 40) : "Close this agent";
     },
     defaults: () => ({}),
   },
   {
     kind: "claim_handle",
+    group: "advanced",
+    outputs: ["claimed", "handle", "reclaimed"],
     label: "Claim handle",
     description:
-      "Route an external identifier to this workstream (a channel, a ticket id). Posts and PRs bind automatically.",
+      "Route an external identifier to this agent (a channel, a ticket id). Posts and PRs bind automatically.",
     icon: Link2,
     fields: [
       {
@@ -634,6 +932,17 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "review_open_pass",
+    group: "advanced",
+    outputs: [
+      "review_id",
+      "task_id",
+      "target_id",
+      "head_sha",
+      "base_sha",
+      "pr_url",
+      "superseded_review_id",
+      "deduplicated",
+    ],
     label: "Open review pass",
     description:
       "Start a review pass on a pull request in the engrams review ledger (it shows on the Reviews page). Resolves the heads from GitHub when the trigger carries no SHAs.",
@@ -687,6 +996,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "review_stage",
+    group: "advanced",
+    outputs: ["phase", "prompt", "merge_base"],
     label: "Stage review worker",
     description:
       "Write the reviewer brief, prior findings, and candidates into a session for one phase, and compose that phase's prompt (the prompt output feeds send_prompt).",
@@ -736,6 +1047,17 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "review_settle",
+    group: "advanced",
+    outputs: [
+      "review_id",
+      "repo",
+      "pr_number",
+      "commit_id",
+      "summary_md",
+      "comments",
+      "to_post_count",
+      "ui_only_count",
+    ],
     label: "Settle review",
     description:
       "Apply the category and severity policy to the pass's findings, settle them in the ledger, and emit the parameters for github.post_pr_review.",
@@ -759,6 +1081,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "review_close_pass",
+    group: "advanced",
+    outputs: ["review_id", "outcome"],
     label: "Close review pass",
     description:
       "Mark a pass failed or halted (sticky status comment + activity event) or tear a superseded pass down. Meant for settings.onFinalize hooks.",
@@ -789,6 +1113,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "review_record_post",
+    group: "advanced",
+    outputs: ["review_id", "recorded", "github_review_id"],
     label: "Record posted review",
     description:
       "Write the GitHub review id that github.post_pr_review returned onto the pass, so the Reviews page links to the posted review.",
@@ -812,6 +1138,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "resolve_user",
+    group: "integrations",
+    outputs: ["found", "user_id"],
     label: "Resolve user",
     description:
       "Map a provider identity (a Slack user id) to an engrams user. Outputs found + user_id; pass user_id to create_session as the owner.",
@@ -833,6 +1161,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "relay_session",
+    group: "integrations",
+    outputs: ["session_id", "installed", "created", "mention_ts"],
     label: "Relay session",
     description:
       "Mirror a session into a Slack thread: streamed replies as bubbles, questions as Block Kit, ⏳/✅ on the message that started the turn. Run it again to re-point at a follow-up.",
@@ -870,11 +1200,14 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "relay_close",
+    group: "advanced",
+    outputs: ["posted", "rendered_as"],
     label: "Close relay",
     description:
       "Post the closing message of a relayed session (✅ with the last reply and assets, ❌ with the error, or a neutral note). Meant for settings.onFinalize hooks.",
     icon: CircleStop,
     fields: [
+      { type: "session_ref", key: "session", label: "Session", help: "The relayed session." },
       { type: "template", key: "status", label: "Run status", help: "Usually ${{ run.status }}." },
       {
         type: "template",
@@ -885,10 +1218,11 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       },
     ],
     summary: () => "Post the closing message",
-    defaults: () => ({ status: "${{ run.status }}" }),
+    defaults: () => ({ session: {}, status: "${{ run.status }}" }),
   },
   {
     kind: "integration_action",
+    group: "integrations",
     label: "Integration action",
     description: "Call a catalog action on a connected integration with org credentials.",
     icon: Zap,
@@ -904,6 +1238,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "decide",
+    group: "flow",
+    outputs: ["decided", "answers"],
     label: "Decide",
     description:
       "Ask a decision model (Jev, through OpenRouter) typed questions about a state: pick an option, rate on levels, or yes / no. Answers carry a calibrated confidence a branch can gate on. Without OpenRouter it outputs decided: false.",
@@ -924,6 +1260,8 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
   },
   {
     kind: "list_profiles",
+    group: "advanced",
+    outputs: ["profiles", "options"],
     label: "List profiles",
     description:
       "The org's active profiles as capability cards, plus options a Decide choice question takes directly (value = profile id).",
@@ -940,9 +1278,82 @@ export const BLOCK_KINDS: readonly BlockKindSpec[] = [
       Array.isArray(c["ids"]) ? `${c["ids"].length} chosen profiles` : "Every active profile",
     defaults: () => ({}),
   },
+  {
+    kind: "slack_choice",
+    label: "Slack choice",
+    description:
+      "Ask a question in the Slack thread as buttons and wait for the click; the built-in uses it to confirm a routed profile.",
+    icon: MailOpen,
+    group: "advanced",
+    insertable: false,
+    outputs: ["outcome", "value", "label", "message_ts"],
+    inspector: "readonly",
+    summary: (c) => truncate(str(c["question"]), 48) || "Ask in the thread",
+    defaults: () => ({}),
+  },
 ];
 
 const BY_KIND = new Map(BLOCK_KINDS.map((spec) => [spec.kind, spec]));
+
+/** The scope badge for an automation with scoped agents: what one agent is
+ * per, read off the key template ("per PR", "per thread"). Undefined when
+ * every event gets a fresh session. */
+export function scopeLabel(definition: AutomationDefinition): string | undefined {
+  const scope = definition.agent?.scope;
+  if (scope?.kind === "event") return undefined;
+  if (scope?.kind === "automation") return "one agent";
+  const template =
+    scope?.kind === "key" ? scope.keyTemplate : definition.settings.instance?.keyTemplate;
+  if (template === undefined) return undefined;
+  switch (scopePresetOf({ kind: "key", keyTemplate: template })) {
+    case "slack_thread":
+      return "per thread";
+    case "slack_channel":
+      return "per channel";
+    case "pull_request":
+      return "per PR";
+    case "linear_issue":
+      return "per issue";
+  }
+  const key = template.toLowerCase();
+  if (/thread/.test(key)) return "per thread";
+  if (/\bpr\b|pull/.test(key)) return "per PR";
+  if (/issue/.test(key)) return "per issue";
+  if (/channel/.test(key)) return "per channel";
+  if (/repo/.test(key)) return "per repo";
+  if (/\$\{\{|\{\{/.test(key)) return "per key";
+  return "one agent";
+}
+
+/** Whether the automation keeps agents between runs (the Agents tab). */
+export function hasScopedAgents(definition: AutomationDefinition): boolean {
+  if (definition.agent) return definition.agent.scope.kind !== "event";
+  return definition.settings.instance !== undefined;
+}
+
+/** Every block's kind by id, across main and every other way in: what an
+ * activity trace needs to say what a step did. Ids are unique automation-wide. */
+export function blockTypesOf(definition: AutomationDefinition): Map<string, string> {
+  const types = new Map<string, string>();
+  const collect = (blocks: readonly BlockDef[]) => {
+    for (const block of walkBlocks(blocks)) types.set(block.id, block.type);
+  };
+  collect(definition.blocks);
+  for (const ep of definition.entrypoints ?? []) collect(ep.blocks);
+  if (definition.agent) {
+    types.set(AGENT_STEP_ID, AGENT_STEP_TYPE);
+    types.set(AGENT_CLOSE_STEP_ID, AGENT_CLOSE_STEP_TYPE);
+  }
+  return types;
+}
+
+/** The profile a block runs on, when it runs one: the canvas shows the
+ * profile's name in place of its id. */
+export function blockProfileId(block: BlockDef): string | undefined {
+  if (block.type !== "create_session") return undefined;
+  const id = block.config["profileId"];
+  return typeof id === "string" && id !== "" ? id : undefined;
+}
 
 /** Resolve a block kind. An unknown kind (a definition saved by a newer
  * server, say) renders read-only. */
@@ -954,20 +1365,44 @@ export function blockKind(kind: string): BlockKindSpec {
     label: kind,
     description: "Unknown block kind.",
     icon: Lock,
+    group: "advanced",
     inspector: "readonly",
     summary: () => "Unknown block kind",
     defaults: () => ({}),
   };
 }
 
-/** Kinds a user may insert: every kind, except one whose model router has
- * no key (`connectedRouters` = the routers that have one). */
+/** Kinds a user may insert: every kind a hand-built automation may place,
+ * except one whose model router has no key (`connectedRouters` = the routers
+ * that have one). */
 export function insertableBlockKinds(
   connectedRouters: ReadonlySet<string>,
 ): readonly BlockKindSpec[] {
   return BLOCK_KINDS.filter(
-    (spec) => spec.requiresRouter === undefined || connectedRouters.has(spec.requiresRouter),
+    (spec) =>
+      spec.insertable !== false &&
+      (spec.requiresRouter === undefined || connectedRouters.has(spec.requiresRouter)),
   );
+}
+
+/** With an agent, every event is one short run that reaches the agent and
+ * ends; waiting is the agent's kept session, not a step. These kinds are
+ * offered only to an automation without one. */
+const WAIT_KINDS: ReadonlySet<string> = new Set(["wait_session", "wait_event"]);
+
+/** The insert menu's shape: the insertable kinds by group, in group order,
+ * empty groups left out. */
+export function groupedBlockKinds(
+  connectedRouters: ReadonlySet<string>,
+  options: { withAgent?: boolean } = {},
+): ReadonlyArray<{ id: BlockGroup; label: string; kinds: readonly BlockKindSpec[] }> {
+  const kinds = insertableBlockKinds(connectedRouters).filter(
+    (spec) => !options.withAgent || !WAIT_KINDS.has(spec.kind),
+  );
+  return BLOCK_GROUPS.map((group) => ({
+    ...group,
+    kinds: kinds.filter((spec) => spec.group === group.id),
+  })).filter((group) => group.kinds.length > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,11 +1614,25 @@ export interface BlockErrorRef {
 }
 
 /** The server joins BlockErrors into the ConnectError message as
- * `blockId.field: message; …` (definition-level: `field: message`). Parse
- * that back into addressable errors; anything unparseable is a form error. */
+ * `blockId.field: message; …` (definition-level: `field: message`; the
+ * agent's: `__agent__.field: message`; a way in's role:
+ * `__trigger__.role` for main, `__entrypoints__.role` for another way in).
+ * Parse that back into addressable errors; anything unparseable is a form
+ * error. */
 export function parseBlockErrors(message: string): BlockErrorRef[] {
   const out: BlockErrorRef[] = [];
   for (const part of message.split("; ")) {
+    const a = /^__agent__\.([A-Za-z0-9_.[\]]+): (.*)$/.exec(part);
+    if (a) {
+      out.push({ blockId: AGENT_NODE_ID, field: a[1]!, message: a[2]! });
+      continue;
+    }
+    // A way in's own field (its role) sits on the trigger row.
+    const w = /^__(?:trigger|entrypoints)__\.([A-Za-z0-9_.[\]]+): (.*)$/.exec(part);
+    if (w) {
+      out.push({ blockId: "", field: w[1]!, message: w[2]! });
+      continue;
+    }
     const m = /^([a-z][a-z0-9_]*)\.([A-Za-z0-9_.[\]]+): (.*)$/.exec(part);
     if (m) {
       // `trigger.<field>` is definition-level: the trigger row owns it.

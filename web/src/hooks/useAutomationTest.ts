@@ -14,9 +14,12 @@ import { useEventSamples } from "@/hooks/useAutomations";
 import { MAIN_ENTRYPOINT_ID, projectEntrypoint } from "@/lib/automation-blocks";
 import type { AutomationDefinition, BlockErrorRef } from "@/lib/automation-blocks";
 
-/** What the current trigger can be tested against. */
+/** What the current trigger can be tested against. `latest` is the default:
+ * the newest delivery the trigger would see (the server picks it), or now
+ * for a schedule. */
 export type TestSample =
   | { kind: "none" }
+  | { kind: "latest" }
   | { kind: "sample"; sampleId: string }
   | { kind: "payload"; payloadJson: string }
   | { kind: "scheduled"; scheduledFor: string };
@@ -147,7 +150,7 @@ export function useAutomationTest({
   const samples = useEventSamples(isTimed ? undefined : automationId, 20);
   const sampleList: EventSample[] = samples.data?.samples ?? [];
 
-  const [sample, setSample] = useState<TestSample>({ kind: "none" });
+  const [sample, setSample] = useState<TestSample>({ kind: "latest" });
   const [latest, setLatest] = useState<TestRenderResult | null>(null);
   const [tally, setTally] = useState<FilterTally[] | null>(null);
   const render = useMutation(testRender);
@@ -168,16 +171,16 @@ export function useAutomationTest({
     [automationId, definition, entrypointId, inputsJson],
   );
 
-  /** Render the draft against the selected sample. */
+  /** Render the draft against the selected sample. An unsaved draft renders
+   * too: the request carries the definition, and no row is needed. */
   const runOnce = useCallback(async (): Promise<TestRenderResult | null> => {
-    if (!automationId) return null;
     const response = await render.mutateAsync(requestFor(sample));
     const result = toResult(response);
     setLatest(result);
     setTally(null);
     onErrors?.(result.errors);
     return result;
-  }, [automationId, render, requestFor, sample, onErrors]);
+  }, [render, requestFor, sample, onErrors]);
 
   /** Render across the stored samples and tally each filter/branch verdict —
    * the "14/20 pass" affordance. The latest single render is replaced by the

@@ -50,7 +50,7 @@ function summary(
     startedAt?: string;
     endedAt?: string;
     failedToday?: number;
-    workstreams?: boolean;
+    scoped?: boolean;
   } = {},
 ): AutomationSummary {
   return create(AutomationSummarySchema, {
@@ -60,7 +60,7 @@ function summary(
       kind: opts.kind ?? "user",
       enabled: opts.enabled ?? true,
       currentVersion: 1,
-      ...(opts.workstreams
+      ...(opts.scoped
         ? {
             version: create(AutomationVersionSchema, {
               automationId: id,
@@ -70,7 +70,16 @@ function summary(
                 trigger: { kind: "manual" },
                 blocks: [],
                 inputsSchema: [],
-                settings: { endSessionsOnFinish: false, instance: { keyTemplate: "{{pr}}" } },
+                agent: {
+                  scope: {
+                    kind: "key",
+                    keyTemplate:
+                      "${{ event.raw.repository.full_name }}#${{ event.raw.pull_request.number }}",
+                  },
+                  profileId: "p",
+                  promptTemplate: "go",
+                },
+                settings: { endSessionsOnFinish: false },
               }),
             }),
           }
@@ -117,7 +126,7 @@ beforeEach(() => {
       startedAt: "2026-08-21T10:00:00Z",
       endedAt: "2026-08-21T10:02:00Z",
       failedToday: 3,
-      workstreams: true,
+      scoped: true,
     }),
     summary("a-alpha", "Alpha triage", { enabled: false }),
   ];
@@ -149,9 +158,10 @@ describe("AutomationsList", () => {
     expect(rows).toHaveLength(3);
     expect(rows[0]!.getAttribute("data-kind")).toBe("builtin");
     expect(within(rows[0]!).getByText("built-in")).toBeTruthy();
-    expect(within(rows[0]!).getByText("workstreams")).toBeTruthy();
+    expect(within(rows[0]!).getByText("per PR")).toBeTruthy();
     expect(screen.queryByRole("button", { name: /archive/i })).toBeNull();
-    expect(screen.getByRole("button", { name: "Duplicate PR review" })).toBeTruthy();
+    // Duplicate lives on a built-in's own editor, not on the list.
+    expect(screen.queryByRole("button", { name: /duplicate/i })).toBeNull();
   });
 
   it("encodes the last run as an instrument-toned status dot", async () => {
@@ -184,29 +194,12 @@ describe("AutomationsList", () => {
     expect(links[0]!.querySelector("svg[role=img]")).not.toBeNull();
   });
 
-  it("shows the empty state with 'Duplicate PR review' only when the built-in exists", async () => {
+  it("shows the empty state with New automation as the one way to start", async () => {
     state.automations = [];
-    state.builtin = null;
     renderWithProviders(<AutomationsList />);
     expect(await screen.findByText(/no automations yet/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /duplicate/i })).toBeNull();
     // Header action + the empty-state call to action.
     expect(screen.getAllByRole("link", { name: /new automation/i })).toHaveLength(2);
-  });
-
-  it("duplicates the built-in from the masthead and the empty state", async () => {
-    const user = userEvent.setup();
-    state.automations = [];
-    state.builtin = create(AutomationSchema, {
-      id: "builtin-pr",
-      name: "PR review",
-      kind: "builtin",
-      builtinKey: "pr_review",
-    });
-    renderWithProviders(<AutomationsList />);
-    const buttons = await screen.findAllByRole("button", { name: "Duplicate PR review" });
-    expect(buttons).toHaveLength(2);
-    await user.click(buttons[0]!);
-    await waitFor(() => expect(duplicate).toHaveBeenCalledWith({ automationId: "builtin-pr" }));
   });
 });
