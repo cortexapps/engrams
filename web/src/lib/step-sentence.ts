@@ -65,9 +65,11 @@ const SENTENCES: Record<string, Sentence> = {
   },
   code: ({ inputs, outputs }) => {
     if (inputs["mode"] === "boolean") {
-      return outputs["value"] === false
-        ? "Returned false; the run ended here as filtered"
-        : "Returned true";
+      // A false predicate ends the run; the ledger records the step as
+      // succeeded with no outputs (only a true one carries `value`).
+      return outputs["value"] === true
+        ? "Returned true"
+        : "Returned false; the run ended here as filtered";
     }
     const value = outputs["value"];
     if (value === undefined) return undefined;

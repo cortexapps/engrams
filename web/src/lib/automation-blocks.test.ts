@@ -361,6 +361,13 @@ describe("the agent with ways in", () => {
     d = setRole(setRole(d, "main", "reach"), "main", "start");
     expect("role" in d).toBe(false);
     expect(d.entrypoints?.[0]?.role).toBe("close");
+    // The message rides along with a telling role and goes with a closing one.
+    d = setRole(setMessage(d, "main", "Hi"), "main", "reach");
+    expect(d.promptTemplate).toBe("Hi");
+    d = setRole(d, "main", "close");
+    expect("promptTemplate" in d).toBe(false);
+    d = setRole(setMessage(setRole(d, "done", "start"), "done", "Bye"), "done", "none");
+    expect(d.entrypoints?.[0] && "promptTemplate" in d.entrypoints[0]).toBe(false);
   });
 
   it("a way in's message to the agent is read and written per way in; empty is no field", () => {

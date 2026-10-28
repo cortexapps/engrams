@@ -17,6 +17,13 @@ const saveVersion = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { i
 const setOverrides = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "b1" } }));
 const updateMeta = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "a1" } }));
 const duplicate = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "copy" } }));
+const createAutomation = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ automation: { id: "new-1" } }),
+);
+/** What the editor last told the router's blocker. */
+const blockerHolder = vi.hoisted(() => ({
+  opts: undefined as { enableBeforeUnload?: () => boolean } | undefined,
+}));
 
 // 3.5: the header's DryRun button uses a connect-query mutation; this suite
 // renders without a QueryClient, so stub it like every other hook here.
@@ -34,7 +41,7 @@ vi.mock("@/hooks/useAutomationCode", () => ({
 }));
 vi.mock("@/hooks/useAutomationEditor", () => ({
   useEditorAutomation: () => ({ data: automationHolder.value, isPending: false, error: null }),
-  useCreateAutomationV2: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useCreateAutomationV2: () => ({ mutateAsync: createAutomation, isPending: false }),
   useSaveVersionV2: () => ({ mutateAsync: saveVersion, isPending: false }),
   useSetBlockOverrides: () => ({ mutateAsync: setOverrides, isPending: false }),
   useUpdateAutomationMetaV2: () => ({ mutateAsync: updateMeta, isPending: false }),
@@ -100,7 +107,10 @@ vi.mock("@/hooks/useModelRouters", () => ({
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
   useNavigate: () => navigate,
-  useBlocker: () => ({ status: "idle", proceed: vi.fn(), reset: vi.fn() }),
+  useBlocker: (opts: { enableBeforeUnload?: () => boolean }) => {
+    blockerHolder.opts = opts;
+    return { status: "idle", proceed: vi.fn(), reset: vi.fn() };
+  },
   useParams: () => ({ id: "a1" }),
   useSearch: () => searchHolder.value,
   Link: ({ children }: { children: React.ReactNode }) => <a>{children}</a>,
@@ -551,6 +561,22 @@ describe("AutomationEditor", () => {
       search: (p: Record<string, unknown>) => unknown;
     };
     expect(call.search({ tab: "build", run: "run-7" })).toEqual({ tab: "build" });
+  });
+
+  it("a created automation is saved: the move to its editor is not blocked as unsaved", async () => {
+    render(<AutomationEditor mode="create" />);
+    fireEvent.change(screen.getByPlaceholderText("Name your automation"), {
+      target: { value: "Nightly" },
+    });
+    expect(blockerHolder.opts?.enableBeforeUnload?.()).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(createAutomation).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(navigate).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "/automations/$id", params: { id: "new-1" } }),
+      ),
+    );
+    expect(blockerHolder.opts?.enableBeforeUnload?.()).toBe(false);
   });
 
   it("a new automation can be tried before it is created", async () => {

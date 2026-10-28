@@ -102,9 +102,12 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
   const builtin = automation?.kind === "builtin";
   const definition = parseDefinition(automation?.version?.definitionJson);
   const settings = definition.settings;
-  // With an agent, the engine derives how runs overlap and how long they
-  // take from the agent's scope: there is nothing to set here.
+  // With an agent, the engine derives how runs overlap from the agent's
+  // scope and keeps its session (a written concurrency is refused): those
+  // controls go. A run deadline the version carries is still honoured, so
+  // it stays editable until cleared.
   const withAgent = definition.agent !== undefined;
+  const showDeadline = !withAgent || settings.runDeadlineSeconds !== undefined;
 
   const [description, setDescription] = useState("");
   const [policy, setPolicy] = useState<string>(NONE);
@@ -149,7 +152,14 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
       endSessionsOnFinish !== settings.endSessionsOnFinish);
 
   const save = async () => {
-    const parsed = settingsFromDraft({ policy, keyTemplate, deadlineMinutes, endSessionsOnFinish });
+    // With an agent the scope decides concurrency (the engine refuses a
+    // written one): a save never carries it.
+    const parsed = settingsFromDraft({
+      policy: withAgent ? NONE : policy,
+      keyTemplate,
+      deadlineMinutes,
+      endSessionsOnFinish,
+    });
     if (parsed.error) {
       setError(parsed.error);
       return;
@@ -243,93 +253,98 @@ export function SettingsTab({ automationId }: SettingsTabProps) {
       </section>
       <section className="flex max-w-xl flex-col gap-4" aria-label="run settings">
         <h3 className="text-sm font-semibold">Run settings</h3>
-        {withAgent ? (
+        {withAgent && (
           <p className="text-muted-foreground text-sm" data-testid="settings-derived">
             This automation has an agent. Each event is one short run that reaches the agent, so the
             agent's scope sets how runs overlap and the agent's session outlives every run.
           </p>
-        ) : (
-          <>
-            <Field>
-              <FieldLabel htmlFor="settings-policy">Concurrency</FieldLabel>
-              <Select value={policy} onValueChange={setPolicy} disabled={builtin}>
-                <SelectTrigger id="settings-policy" data-testid="settings-policy">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value={NONE}>None — every delivery runs</SelectItem>
-                  {POLICIES.map((p) => (
-                    <SelectItem key={p.value} value={p.value}>
-                      {p.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {lockedHint ?? (
-                <FieldDescription>
-                  {POLICIES.find((p) => p.value === policy)?.help ??
-                    "Runs never wait on one another."}
-                </FieldDescription>
-              )}
-            </Field>
-            {policy !== NONE && (
-              <Field>
-                <FieldLabel htmlFor="settings-key">Concurrency key</FieldLabel>
-                <Input
-                  id="settings-key"
-                  value={keyTemplate}
-                  onChange={(e) => setKeyTemplate(e.target.value)}
-                  placeholder="${{ event.pull_request.html_url }}"
-                  disabled={builtin}
-                />
-                {lockedHint ?? (
-                  <FieldDescription>
-                    A template rendered from the trigger; runs with the same key share the policy.
-                  </FieldDescription>
-                )}
-              </Field>
-            )}
-            <Field>
-              <FieldLabel htmlFor="settings-deadline">Run deadline (minutes)</FieldLabel>
-              <Input
-                id="settings-deadline"
-                inputMode="numeric"
-                value={deadlineMinutes}
-                onChange={(e) => setDeadlineMinutes(e.target.value)}
-                placeholder="No deadline"
-                disabled={builtin}
-              />
-              {lockedHint ?? (
-                <FieldDescription>
-                  The whole run ends with status “deadline” when this elapses.
-                </FieldDescription>
-              )}
-            </Field>
-            <Field orientation="horizontal">
-              <Switch
-                id="settings-end-sessions"
-                checked={endSessionsOnFinish}
-                onCheckedChange={setEndSessionsOnFinish}
-                disabled={builtin}
-              />
-              <FieldLabel htmlFor="settings-end-sessions">
-                End sessions when the run finishes
-              </FieldLabel>
-            </Field>
-            {!builtin && (
+        )}
+        {!withAgent && (
+          <Field>
+            <FieldLabel htmlFor="settings-policy">Concurrency</FieldLabel>
+            <Select value={policy} onValueChange={setPolicy} disabled={builtin}>
+              <SelectTrigger id="settings-policy" data-testid="settings-policy">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NONE}>None — every delivery runs</SelectItem>
+                {POLICIES.map((p) => (
+                  <SelectItem key={p.value} value={p.value}>
+                    {p.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {lockedHint ?? (
               <FieldDescription>
-                Off keeps every session the run created so a person can pick it up.
+                {POLICIES.find((p) => p.value === policy)?.help ??
+                  "Runs never wait on one another."}
               </FieldDescription>
             )}
-            {error && <FieldError>{error}</FieldError>}
-            {!builtin && (
-              <div>
-                <Button onClick={() => void save()} disabled={!dirty || updateMeta.isPending}>
-                  Save settings
-                </Button>
-              </div>
+          </Field>
+        )}
+        {!withAgent && policy !== NONE && (
+          <Field>
+            <FieldLabel htmlFor="settings-key">Concurrency key</FieldLabel>
+            <Input
+              id="settings-key"
+              value={keyTemplate}
+              onChange={(e) => setKeyTemplate(e.target.value)}
+              placeholder="${{ event.pull_request.html_url }}"
+              disabled={builtin}
+            />
+            {lockedHint ?? (
+              <FieldDescription>
+                A template rendered from the trigger; runs with the same key share the policy.
+              </FieldDescription>
             )}
-          </>
+          </Field>
+        )}
+        {showDeadline && (
+          <Field>
+            <FieldLabel htmlFor="settings-deadline">Run deadline (minutes)</FieldLabel>
+            <Input
+              id="settings-deadline"
+              inputMode="numeric"
+              value={deadlineMinutes}
+              onChange={(e) => setDeadlineMinutes(e.target.value)}
+              placeholder="No deadline"
+              disabled={builtin}
+            />
+            {lockedHint ?? (
+              <FieldDescription>
+                {withAgent
+                  ? "Set by hand. The engine still ends a run with status “deadline” when it elapses; clear it to let runs end on their own."
+                  : "The whole run ends with status “deadline” when this elapses."}
+              </FieldDescription>
+            )}
+          </Field>
+        )}
+        {!withAgent && (
+          <Field orientation="horizontal">
+            <Switch
+              id="settings-end-sessions"
+              checked={endSessionsOnFinish}
+              onCheckedChange={setEndSessionsOnFinish}
+              disabled={builtin}
+            />
+            <FieldLabel htmlFor="settings-end-sessions">
+              End sessions when the run finishes
+            </FieldLabel>
+          </Field>
+        )}
+        {!withAgent && !builtin && (
+          <FieldDescription>
+            Off keeps every session the run created so a person can pick it up.
+          </FieldDescription>
+        )}
+        {error && <FieldError>{error}</FieldError>}
+        {!builtin && (!withAgent || showDeadline) && (
+          <div>
+            <Button onClick={() => void save()} disabled={!dirty || updateMeta.isPending}>
+              Save settings
+            </Button>
+          </div>
         )}
       </section>
 

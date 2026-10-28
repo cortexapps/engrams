@@ -202,9 +202,13 @@ export function setRole(
   entrypointId: string,
   role: EntrypointRole,
 ): AutomationDefinition {
-  const put = <T extends { role?: EntrypointRole }>(target: T): T => {
-    const { role: _old, ...rest } = target;
-    return (role === "start" ? rest : { ...rest, role }) as T;
+  const put = <T extends { role?: EntrypointRole; promptTemplate?: string }>(target: T): T => {
+    const { role: _old, promptTemplate, ...rest } = target;
+    // A way in that closes the agent or runs alone tells it nothing: its
+    // message goes with the role (the engine refuses one on those roles).
+    const tells = role === "start" || role === "reach";
+    const message = tells && promptTemplate !== undefined ? { promptTemplate } : {};
+    return (role === "start" ? { ...rest, ...message } : { ...rest, ...message, role }) as T;
   };
   if (entrypointId === MAIN_ENTRYPOINT_ID) return put(definition);
   return {

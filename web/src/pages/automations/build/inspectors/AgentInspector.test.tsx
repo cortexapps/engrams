@@ -117,11 +117,10 @@ describe("AgentInspector", () => {
     expect(screen.queryByTestId("field-relay")).toBeNull();
   });
 
-  it("the session is kept by default: an absent keepOnFinish reads as on", async () => {
+  it("the session is always kept: More offers no keep switch", async () => {
     mount(base);
     fireEvent.click(await screen.findByText("More"));
-    const keep = await screen.findByTestId("field-keepOnFinish");
-    expect(keep.querySelector('[role="switch"]')?.getAttribute("aria-checked")).toBe("true");
+    expect(screen.queryByTestId("field-keepOnFinish")).toBeNull();
   });
 
   it("the scope is a named preset; a preset writes its key, a custom key shows the templates", async () => {

@@ -18,9 +18,13 @@ describe("stepSentence", () => {
     expect(stepSentence("loop", facts({ outputs: { iterations: 3, exhausted: true } }))).toBe(
       "Ran 3 iterations and hit the cap",
     );
+    // A false predicate ends the run: the ledger has no `value` for it.
+    expect(stepSentence("code", facts({ inputs: { mode: "boolean" }, outputs: {} }))).toBe(
+      "Returned false; the run ended here as filtered",
+    );
     expect(
-      stepSentence("code", facts({ inputs: { mode: "boolean" }, outputs: { value: false } })),
-    ).toBe("Returned false; the run ended here as filtered");
+      stepSentence("code", facts({ inputs: { mode: "boolean" }, outputs: { value: true } })),
+    ).toBe("Returned true");
     expect(
       stepSentence("create_session", facts({ outputs: { session_id: "se-abcdef12-x" } })),
     ).toBe("Started session se-abcde");

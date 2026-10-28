@@ -157,15 +157,28 @@ describe("SettingsTab", () => {
     });
   });
 
-  it("with an agent the run settings are derived: no fields, one sentence", async () => {
+  it("with an agent the run settings are derived: one sentence, and a deadline only until cleared", async () => {
     const withAgent = { scope: { kind: "event" }, profileId: "p1", promptTemplate: "Hi" };
+    const updateAutomationMeta = vi.fn<MetaImpl>(() => ({
+      automation: automation("user", withAgent),
+    }));
     renderWithProviders(<SettingsTab automationId="auto-1" />, {
-      transport: transportFor("user", {}, withAgent),
+      transport: transportFor("user", { updateAutomationMeta }, withAgent),
     });
     expect((await screen.findByTestId("settings-derived")).textContent).toContain("has an agent");
-    expect(screen.queryByLabelText(/run deadline/i)).toBeNull();
     expect(screen.queryByTestId("settings-policy")).toBeNull();
-    expect(screen.queryByRole("button", { name: /save settings/i })).toBeNull();
+    expect(screen.queryByLabelText(/end sessions when the run finishes/i)).toBeNull();
+    // A deadline the version carries is still honoured: it stays until cleared.
+    const deadline = screen.getByLabelText(/run deadline/i) as HTMLInputElement;
+    expect(deadline.value).toBe("10");
+    expect(screen.getByText(/set by hand/i)).toBeTruthy();
+    const user = userEvent.setup();
+    await user.clear(deadline);
+    await user.click(screen.getByRole("button", { name: /save settings/i }));
+    await waitFor(() => expect(updateAutomationMeta).toHaveBeenCalled());
+    expect(JSON.parse(updateAutomationMeta.mock.calls[0]![0].settingsJson!)).toEqual({
+      endSessionsOnFinish: true,
+    });
     expect(screen.getByRole("button", { name: /^archive$/i })).toBeTruthy();
   });
 

@@ -179,9 +179,12 @@ export function AutomationEditor({
   // Unsaved edits survive a tab change (the same page) but not a move to
   // another page: the router asks first, and the browser asks before the tab
   // closes. A stray key that fires a global shortcut can no longer lose them.
+  // A draft that Create just saved is not unsaved: the move to its editor
+  // must not ask.
+  const [created, setCreated] = useState(false);
   const unsaved =
     mode === "create"
-      ? name !== "" || stableJson(draft) !== stableJson(EMPTY_DEFINITION)
+      ? !created && (name !== "" || stableJson(draft) !== stableJson(EMPTY_DEFINITION))
       : userDirty;
   const leave = useBlocker({
     shouldBlockFn: ({ current, next }) => unsaved && current.pathname !== next.pathname,
@@ -280,6 +283,7 @@ export function AutomationEditor({
           inputsJson: "{}",
         });
         toast.success("Automation created");
+        setCreated(true);
         void navigate({
           to: "/automations/$id",
           params: { id: created.automation!.id },

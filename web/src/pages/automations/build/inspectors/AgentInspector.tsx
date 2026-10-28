@@ -129,12 +129,6 @@ const MORE_FIELDS: FieldSpec[] = [
     label: "Append event context",
     help: "Adds the redacted trigger payload to the prompt, marked as untrusted data.",
   },
-  {
-    type: "boolean",
-    key: "keepOnFinish",
-    label: "Keep the session when the run ends",
-    help: "Kept by default; a session the agent continues must be kept.",
-  },
 ];
 
 function errorFor(errors: readonly BlockErrorRef[], field: string): string | undefined {
@@ -192,11 +186,7 @@ export function AgentInspector(props: AgentInspectorProps) {
   const pinned = builtin;
   const set = (key: string, value: unknown) => onChange(setPath(agent, key, value) as AgentSpec);
 
-  // `keepOnFinish` is kept when absent: the switch reads the default.
-  const valueOf = (key: string) => {
-    const value = getPath(agent, key);
-    return key === "keepOnFinish" && value === undefined ? true : value;
-  };
+  const valueOf = (key: string) => getPath(agent, key);
   const field = (spec: FieldSpec) => (
     <GenericField
       key={spec.key}
