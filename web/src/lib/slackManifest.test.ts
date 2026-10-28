@@ -21,12 +21,21 @@ describe("buildSlackManifest", () => {
     expect(m.oauth_config.scopes.bot).toEqual(scopes);
   });
 
-  test("subscribes app_mention to the events request URL (ADR 0060)", () => {
+  test("subscribes the catalog's events to the events request URL (ADR 0060)", () => {
     const m = parse();
     expect(m.settings.event_subscriptions.request_url).toBe(
       "https://engrams.example.com/api/v1/integrations/slack/events",
     );
-    expect(m.settings.event_subscriptions.bot_events).toContain("app_mention");
+    // The mention, a message in every conversation kind the bot can be in
+    // (so a direct-message reply reaches an automation), and a reaction.
+    expect(m.settings.event_subscriptions.bot_events).toEqual([
+      "app_mention",
+      "message.channels",
+      "message.groups",
+      "message.im",
+      "message.mpim",
+      "reaction_added",
+    ]);
   });
 
   test("enables interactivity at the interactivity request URL (ADR 0060)", () => {

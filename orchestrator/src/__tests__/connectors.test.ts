@@ -1322,6 +1322,19 @@ describe("cli facet (ADR 0058)", () => {
     }
   });
 
+  test("the slack seed can open direct messages and private channels", () => {
+    const slack = connectorRegistry().get("slack")!;
+    // conversations.open needs im:write (a DM) and mpim:write (a group DM);
+    // a private channel needs groups:write on top of channels:manage.
+    for (const s of ["im:write", "mpim:write", "groups:write"]) {
+      expect(slack.oauth!.scopes).toContain(s);
+    }
+    const open = slack.operations.find(
+      (o) => o.match && !isGraphqlMatch(o.match) && o.match.path === "/api/conversations.open",
+    );
+    expect(open?.grants).toEqual(["im:write"]);
+  });
+
   test("granting a slack power enables the slack CLI + the shared bundle", () => {
     const plan = compileCliIntegrations(["slack:chat:write"], connectorRegistry());
     const slack = plan.enabled.find((e) => e.provider === "slack");

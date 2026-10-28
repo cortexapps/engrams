@@ -20,9 +20,9 @@ You bring your own Slack app. The dashboard writes its manifest for you.
    Copy app manifest button.
 2. At api.slack.com/apps, create an app from a manifest and paste what you copied. The
    manifest names the app `engrams`, requests the bot scopes engrams needs, sets the OAuth
-   redirect URL, subscribes to `app_mention` events at the events URL, and enables
-   interactivity at the interactivity URL. The three URLs are all under your deployment's
-   public origin:
+   redirect URL, subscribes to the mention, message, and reaction events at the events URL,
+   and enables interactivity at the interactivity URL. The three URLs are all under your
+   deployment's public origin:
 
    ```
    <origin>/api/v1/integrations/slack/oauth/callback
@@ -64,6 +64,17 @@ produces them, questions from the agent become Slack forms, and a reaction marks
 as in progress and then done. Mention the bot again in the thread to send the next turn to
 the same session; the replies people wrote in between go with it. The session is kept so
 someone can pick it up in the dashboard later.
+
+## Direct messages
+
+The bot can open a direct message or a group direct message (`slack open`), find a member by
+email (`slack lookup`), and create a private channel (`slack create <name> private`). A
+message in a conversation the bot is in, including a direct message, arrives as the
+`message` event with `event.channel_type` set to `channel`, `group`, `im`, or `mpim`, so an
+automation can answer inside the conversation it opened.
+
+An app installed before these scopes existed needs its manifest updated and a Reconnect from
+the integration page, which runs Slack's consent screen again with the new scopes.
 
 ## Personal Slack credentials
 

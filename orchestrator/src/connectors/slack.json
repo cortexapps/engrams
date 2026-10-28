@@ -120,7 +120,7 @@
       {
         "key": "message",
         "label": "Message posted (incl. thread replies)",
-        "description": "A message was posted in a channel or thread the app can see.",
+        "description": "A message was posted in a channel, a thread, or a direct message the app can see. `event.channel_type` is channel, group, im, or mpim.",
         "schema": {
           "type": "object",
           "properties": {
@@ -392,6 +392,14 @@
     },
     {
       "grants": [
+        "im:write"
+      ],
+      "match": {
+        "path": "/api/conversations.open"
+      }
+    },
+    {
+      "grants": [
         "users:read"
       ],
       "match": {
@@ -571,6 +579,7 @@
         "chat:write",
         "channels:read",
         "channels:manage",
+        "im:write",
         "users:read",
         "files:read",
         "files:write",
@@ -598,7 +607,7 @@
       "SLACK_TOKEN": "x-engrams-managed"
     },
     "credentialDelivery": "inject",
-    "doc": "Use `slack` to interact with Slack from this session \u2014 post and manage messages, browse channels and history, react, pin, upload files, and read users. Authentication is automatic: the egress proxy injects the workspace bot token on requests to slack.com; `SLACK_TOKEN` is a managed placeholder. Do NOT set a real token or run any login. Slack always replies HTTP 200 with JSON `{\"ok\":true,\u2026}` or `{\"ok\":false,\"error\":\u2026}`.\n\n<channel> is a channel ID (e.g. C0123456789) or #name; the bot must be in the channel (or the app needs chat:write.public).\n\nMessaging (needs `chat:write`):\n  slack post <channel> <text...>        Post a message (chat.postMessage)\n  slack reply <channel> <thread-ts> <text...>  Reply in a thread (chat.postMessage with thread_ts)\n  slack dm <user-id> <text...>          DM a user by ID\nReading channels (needs `channels:read`):\n  slack channels [field=value ...]      List conversations (conversations.list)\n  slack history <channel> [field=value] List recent messages (conversations.history)\n  slack replies <channel> <ts>          List a thread (conversations.replies)\nManaging channels (needs `channels:manage`): create/invite/archive/rename/join \u2014 via `slack api conversations.<method> \u2026`.\nUsers (needs `users:read`):\n  slack users [field=value ...]         List members (users.list)\nFiles: `slack upload <channel> <file> [title]` needs `files:write`; `slack api files.list` needs `files:read`.\nReactions (needs `reactions:write`):\n  slack react <channel> <ts> <emoji>    Add a reaction (reactions.add)\nPins (needs `pins:write`):\n  slack pin <channel> <ts>              Pin a message (pins.add)\nIdentity: `slack whoami` (auth.test). Other Web API methods: `slack api <method> field=value \u2026` (e.g. `slack api conversations.create name=proj-x`). Bookmarks (`bookmarks:*`), usergroups (`usergroups:read`), modals/App Home (`views:write`), and team/emoji (`team:read`) are reachable via `slack api`. A method whose power your profile didn't grant is denied at the network boundary, not authenticated."
+    "doc": "Use `slack` to interact with Slack from this session \u2014 post and manage messages, browse channels and history, react, pin, upload files, and read users. Authentication is automatic: the egress proxy injects the workspace bot token on requests to slack.com; `SLACK_TOKEN` is a managed placeholder. Do NOT set a real token or run any login. Slack always replies HTTP 200 with JSON `{\"ok\":true,\u2026}` or `{\"ok\":false,\"error\":\u2026}`.\n\n<channel> is a channel ID (e.g. C0123456789) or #name; the bot must be in the channel (or the app needs chat:write.public).\n\nMessaging (needs `chat:write`):\n  slack post <channel> <text...>        Post a message (chat.postMessage)\n  slack reply <channel> <thread-ts> <text...>  Reply in a thread (chat.postMessage with thread_ts)\n  slack dm <user-id> <text...>          DM a user by ID\n  slack open <user-id>[,<user-id>...]   Open a DM or a group DM and print its channel id (conversations.open; needs `im:write`)\nReading channels (needs `channels:read`):\n  slack channels [field=value ...]      List conversations (conversations.list)\n  slack history <channel> [field=value] List recent messages (conversations.history)\n  slack replies <channel> <ts>          List a thread (conversations.replies)\nManaging channels (needs `channels:manage`):\n  slack create <name> [private]         Create a channel, private when asked (conversations.create)\n  slack invite <channel> <user-id>[,...]  Invite members to a channel (conversations.invite)\n  archive/rename/join \u2014 via `slack api conversations.<method> \u2026`.\nUsers (needs `users:read`):\n  slack users [field=value ...]         List members (users.list)\n  slack lookup <email>                  Find a member by email (users.lookupByEmail)\nFiles: `slack upload <channel> <file> [title]` needs `files:write`; `slack api files.list` needs `files:read`.\nReactions (needs `reactions:write`):\n  slack react <channel> <ts> <emoji>    Add a reaction (reactions.add)\nPins (needs `pins:write`):\n  slack pin <channel> <ts>              Pin a message (pins.add)\nIdentity: `slack whoami` (auth.test). Other Web API methods: `slack api <method> field=value \u2026` (e.g. `slack api conversations.create name=proj-x`). Bookmarks (`bookmarks:*`), usergroups (`usergroups:read`), modals/App Home (`views:write`), and team/emoji (`team:read`) are reachable via `slack api`. A method whose power your profile didn't grant is denied at the network boundary, not authenticated."
   },
   "oauth": {
     "authorizeUrl": "https://slack.com/oauth/v2/authorize",
@@ -611,9 +620,12 @@
       "channels:manage",
       "groups:read",
       "groups:history",
+      "groups:write",
       "im:read",
       "im:history",
+      "im:write",
       "mpim:read",
+      "mpim:write",
       "users:read",
       "users:read.email",
       "files:read",

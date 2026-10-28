@@ -7,7 +7,8 @@
 # to log in to — do not set a real token or run any `login`.
 #
 # Each subcommand needs the matching power on your profile (slack:chat:write,
-# slack:channels:read, slack:users:read, slack:files:write); calls to a path your
+# slack:channels:read, slack:channels:manage, slack:im:write, slack:users:read,
+# slack:files:write); calls to a path your
 # profile didn't grant are denied at the network boundary, not authenticated.
 set -eu
 
@@ -22,10 +23,14 @@ Usage:
   slack post <channel> <text...>          Post a message (chat.postMessage)
   slack reply <channel> <thread-ts> <text...>   Reply in a thread (chat.postMessage thread_ts)
   slack dm <user-id> <text...>            DM a user by ID (chat.postMessage)
+  slack open <user-id>[,<user-id>...]     Open a DM or a group DM; prints its channel id (conversations.open)
   slack channels [field=value ...]        List conversations (conversations.list)
   slack history <channel> [field=value]   List recent messages (conversations.history)
   slack replies <channel> <ts>            List a thread's replies (conversations.replies)
   slack users [field=value ...]           List members (users.list)
+  slack lookup <email>                    Find a member by email (users.lookupByEmail)
+  slack create <name> [private]           Create a channel, private when asked (conversations.create)
+  slack invite <channel> <user-id>[,...]  Invite members to a channel (conversations.invite)
   slack upload <channel> <file> [title]   Upload a file (files.upload)
   slack react <channel> <ts> <emoji>      Add a reaction (reactions.add)
   slack pin <channel> <ts>                Pin a message (pins.add)
@@ -69,6 +74,27 @@ dm)
     user="${1:?usage: slack dm <user-id> <text...>}"
     shift
     api chat.postMessage --data-urlencode "channel=$user" --data-urlencode "text=$*"
+    ;;
+open)
+    users="${1:?usage: slack open <user-id>[,<user-id>...]}"
+    api conversations.open --data-urlencode "users=$users"
+    ;;
+lookup)
+    email="${1:?usage: slack lookup <email>}"
+    api users.lookupByEmail --data-urlencode "email=$email"
+    ;;
+create)
+    name="${1:?usage: slack create <name> [private]}"
+    if [ "${2:-}" = "private" ]; then
+        api conversations.create --data-urlencode "name=$name" --data-urlencode "is_private=true"
+    else
+        api conversations.create --data-urlencode "name=$name"
+    fi
+    ;;
+invite)
+    ch="${1:?usage: slack invite <channel> <user-id>[,...]}"
+    users="${2:?usage: slack invite <channel> <user-id>[,...]}"
+    api conversations.invite --data-urlencode "channel=$ch" --data-urlencode "users=$users"
     ;;
 channels)
     # Translate each field=value into a --data-urlencode pair (POSIX-safe, no arrays).

@@ -13,6 +13,22 @@
 /** The Slack app the admin creates represents engrams in their workspace. */
 const APP_NAME = "engrams";
 
+/**
+ * The events the connector's catalog declares (`slack.json` webhook events):
+ * the mention, a message in any conversation the bot is in (a channel, a
+ * private channel, a direct message, a group direct message), and a
+ * reaction. An event the manifest does not subscribe to never arrives, so
+ * this list and the catalog move together.
+ */
+const BOT_EVENTS = [
+  "app_mention",
+  "message.channels",
+  "message.groups",
+  "message.im",
+  "message.mpim",
+  "reaction_added",
+];
+
 export interface SlackManifestInput {
   /** `window.location.origin` — the public base URL the webhook routes live under. */
   origin: string;
@@ -34,7 +50,7 @@ export function buildSlackManifest({ origin, scopes }: SlackManifestInput): stri
     settings: {
       event_subscriptions: {
         request_url: `${base}/events`,
-        bot_events: ["app_mention"],
+        bot_events: BOT_EVENTS,
       },
       interactivity: {
         is_enabled: true,
