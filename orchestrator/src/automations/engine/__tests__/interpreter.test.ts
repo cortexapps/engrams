@@ -406,7 +406,10 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 5)
       "step:__finalize__:0",
     ]);
     expect(h.created).toEqual(["s-agent"]);
-    expect(h.createdInputs[0]).toMatchObject({ profileId: "p", prompt: "go", keep: true });
+    // The session starts empty; the opening prompt follows once the relay
+    // (none here) is on, under the step's own prompt id.
+    expect(h.createdInputs[0]).toMatchObject({ profileId: "p", prompt: "", keep: true });
+    expect(h.prompts).toEqual([{ sessionId: "s-agent", promptId: `autorun:${RUN.runId}:agent:s-agent`, text: "go" }]);
     const agentStep = h.stepRecords.filter((r) => r.framePath === "agent").at(-1);
     expect(agentStep?.record).toMatchObject({
       status: "succeeded",

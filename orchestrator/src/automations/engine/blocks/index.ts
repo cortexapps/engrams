@@ -83,6 +83,7 @@ export const V1_BLOCK_TYPES = [
   "list_profiles",
   "slack_choice",
   "run_agent",
+  "close_agent",
 ] as const;
 
 /** Boot assertion (next to assertSweepPoliciesExhaustive): every v1 type is

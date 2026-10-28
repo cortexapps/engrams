@@ -1654,7 +1654,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         .where(
           and(
             eq(automationRunTable.instanceId, instanceId),
-            ne(automationRunTable.id, excludeRunId),
+            ...(excludeRunId !== undefined ? [ne(automationRunTable.id, excludeRunId)] : []),
             eq(automationSessionTable.keep, true),
           ),
         )
