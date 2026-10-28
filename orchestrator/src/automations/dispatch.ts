@@ -43,6 +43,7 @@ import {
   type AutomationSender,
 } from "./engine/inbox.ts";
 import {
+  concurrencySettingsOf,
   entrypointsOf,
   instanceSettingsOf,
   MAIN_ENTRYPOINT_ID,
@@ -190,7 +191,7 @@ export async function admitClaimedCronRun(
   },
 ): Promise<Exclude<AdmitOutcome, "filtered">> {
   const { target, run, trigger } = input;
-  const concurrency = target.definition.settings.concurrency;
+  const concurrency = concurrencySettingsOf(target.definition);
   if (!concurrency) return "started";
   const automationId = target.automation.id;
   const key = instanceConcurrencyKey(
@@ -407,7 +408,7 @@ export async function admitAutomationRun(
   const { target, runId, deliveryKey, trigger } = input;
   const automationId = target.automation.id;
   const instanceId = input.instanceId ?? "";
-  const concurrency = target.definition.settings.concurrency;
+  const concurrency = concurrencySettingsOf(target.definition);
   const entrypoint = input.entrypoint ?? {
     id: MAIN_ENTRYPOINT_ID,
     trigger: target.definition.trigger,

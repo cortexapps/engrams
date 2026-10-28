@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { registerEngineBlocks } from "../blocks/index.ts";
 import { registerBlock, unregisterBlockForTest } from "../blocks/registry.ts";
 import {
+  concurrencySettingsOf,
   cronEntrypointOf,
   declaredEntrypointsOf,
   DefinitionError,
@@ -355,7 +356,7 @@ describe("the agent: an automation is an agent with ways in", () => {
     expect(ways.map((w) => w.blocks.map((b) => `${b.id}:${b.type}`))).toEqual([
       ["admit:filter", "agent:run_agent"],
       ["agent:run_agent"],
-      ["agent_close:instance_close"],
+      ["agent_close:close_agent"],
     ]);
     // The scope decides reuse; the opening prompt rides along.
     expect(ways[0]!.blocks[1]!.config).toMatchObject({
@@ -422,6 +423,77 @@ describe("the agent: an automation is an agent with ways in", () => {
     ).toThrow(/never rendered/);
   });
 
+  test("a way in with no role never opens the agent's workstream, and the agent's runs queue per workstream", () => {
+    const parsed = validateDefinition(
+      bot({
+        entrypoints: [
+          { id: "reply", trigger: slack(["message"]), role: "reach", blocks: [] },
+          { id: "log", trigger: slack(["reaction_added"]), role: "none", blocks: [{ ...admit, id: "log_admit" }] },
+        ],
+      }),
+    );
+    expect(instanceSettingsOf(parsed)?.entrypoints).toEqual({
+      reply: { admit: "require" },
+      log: { admit: "optional" },
+    });
+    expect(entrypointOf(parsed, "log")?.blocks.map((b) => b.id)).toEqual(["log_admit"]);
+    // One run at a time per thread, unless the definition says otherwise.
+    expect(concurrencySettingsOf(parsed)).toEqual({ keyTemplate: "agent", policy: "queue" });
+    expect(
+      concurrencySettingsOf(
+        validateDefinition(bot({ settings: { endSessionsOnFinish: false, concurrency: { keyTemplate: "k", policy: "skip" } } })),
+      ),
+    ).toEqual({ keyTemplate: "k", policy: "skip" });
+    expect(
+      concurrencySettingsOf(
+        validateDefinition(def({ agent: { scope: { kind: "event" }, profileId: "p1", promptTemplate: "go" } } as Partial<AutomationDefinition>)),
+      ),
+    ).toBeUndefined();
+  });
+
+  test("an agent that keeps its session refuses endSessionsOnFinish", () => {
+    expect(() => validateDefinition(bot({ settings: { endSessionsOnFinish: true } }))).toThrow(
+      /keeps its session between events/,
+    );
+    try {
+      validateDefinition(bot({ settings: { endSessionsOnFinish: true } }));
+    } catch (error) {
+      expect(error).toMatchObject({ blockId: "__settings__", field: "endSessionsOnFinish" });
+    }
+    // A session per event may end with the run.
+    const each = validateDefinition(
+      def({
+        agent: { scope: { kind: "event" }, profileId: "p1", promptTemplate: "go" },
+        settings: { endSessionsOnFinish: true },
+      } as Partial<AutomationDefinition>),
+    );
+    expect(each.settings.endSessionsOnFinish).toBe(true);
+  });
+
+  test("a schema issue in the agent or a role is addressed to the agent or the way in", () => {
+    const expectError = (raw: unknown, where: { blockId: string | null; field: string }) => {
+      try {
+        validateDefinition(raw);
+        throw new Error("validated");
+      } catch (error) {
+        expect(error).toMatchObject(where);
+      }
+    };
+    expectError(
+      bot({ agent: { scope: { kind: "key", keyTemplate: "" }, profileId: "p", promptTemplate: "x" } }),
+      { blockId: "__agent__", field: "scope.keyTemplate" },
+    );
+    expectError(bot({ agent: { scope: { kind: "nope" }, profileId: "p", promptTemplate: "x" } }), {
+      blockId: "__agent__",
+      field: "scope.kind",
+    });
+    expectError(bot({ role: "sometimes" as unknown as AutomationDefinition["role"] }), { blockId: "__trigger__", field: "role" });
+    expectError(
+      bot({ entrypoints: [{ id: "reply", trigger: slack(["message"]), role: "sometimes", blocks: [] }] }),
+      { blockId: "__entrypoints__", field: "role" },
+    );
+  });
+
   test("an agent automation never also declares settings.instance", () => {
     expect(() =>
       validateDefinition(
@@ -447,6 +519,15 @@ describe("the agent: an automation is an agent with ways in", () => {
         def({ blocks: [{ id: "agent", type: "filter", config: { conditions: { mode: "all", conditions: [] } } }] }),
       ).blocks[0]!.id,
     ).toBe("agent");
+    // A finalize hook is held to the same rules.
+    const hook = (block: Record<string, unknown>) =>
+      bot({ settings: { endSessionsOnFinish: false, onFinalize: [{ when: ["failed"], block }] } });
+    expect(() =>
+      validateDefinition(hook({ id: "h", type: "close_agent", config: {} })),
+    ).toThrow(/is not a block/);
+    expect(() =>
+      validateDefinition(hook({ id: "agent_close", type: "state_delete", config: { key: "k" } })),
+    ).toThrow(/is the agent step's/);
   });
 
   test("a role needs an agent, and reach/close need a standing one", () => {

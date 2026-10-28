@@ -111,8 +111,9 @@ export type RetryPolicy = z.infer<typeof retryPolicySchema>;
  * `require` joins an existing open instance or DROPS the event (the
  * instance-level continueOnly); `handle_match` routes ONLY through the
  * handle ledger (facet-declared candidate handles), dropping unbound
- * events before a run boots. */
-const instanceAdmitSchema = z.enum(["open", "require", "handle_match"]);
+ * events before a run boots; `optional` joins an open instance when one
+ * exists and otherwise runs unbound (a way in that never opens one). */
+const instanceAdmitSchema = z.enum(["open", "require", "handle_match", "optional"]);
 
 const instanceSettingsSchema = z.object({
   /** The identity template (e.g. `project-${{ inputs.linear_project_id }}`),
@@ -418,9 +419,11 @@ export type AutomationSettings = z.infer<typeof settingsSchema>;
 export const AGENT_STEP_ID = "agent";
 /** The step a `close` way in ends on. */
 export const AGENT_CLOSE_STEP_ID = "agent_close";
-/** The executor the agent step runs. Not a user block: the agent is a part
- * of the definition, and validation refuses the type in a block list. */
+/** The executors the agent steps run. Not user blocks: the agent is a part
+ * of the definition, and validation refuses the types in a block list. */
 export const AGENT_BLOCK_TYPE = "run_agent";
+export const AGENT_CLOSE_BLOCK_TYPE = "close_agent";
+const AGENT_BLOCK_TYPES: readonly string[] = [AGENT_BLOCK_TYPE, AGENT_CLOSE_BLOCK_TYPE];
 
 /** What one agent is responsible for. `event`: a fresh session per event.
  * `automation`: one standing agent for the whole automation. `key`: one
@@ -472,6 +475,12 @@ export type EntrypointRole = z.infer<typeof entrypointRoleSchema>;
 export function agentStepConfig(agent: AgentSpec): Record<string, unknown> {
   const { scope, ...config } = agent;
   return { ...config, reuse: scope.kind === "event" ? "never" : "workstream" };
+}
+
+/** Whether the agent keeps a standing session between events (scope
+ * `automation` or `key`), as opposed to a fresh one per event. */
+export function agentKeepsSession(agent: AgentSpec): boolean {
+  return agent.scope.kind !== "event";
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +569,21 @@ export function roleOf(entrypoint: Pick<AutomationEntrypoint, "role">): Entrypoi
   return entrypoint.role ?? "start";
 }
 
+/** Where a schema issue in the top-level definition belongs: a path under
+ * `agent` is the agent's (`__agent__.<field>`), the main way in's `role`
+ * is the trigger's, a path under `entrypoints` is the ways in's. */
+function definitionIssueError(issuePath: readonly PropertyKey[], message: string): DefinitionError {
+  const path = issuePath.map(String);
+  const [head, ...rest] = path;
+  if (head === "agent") return new DefinitionError("__agent__", rest.join(".") || "scope", message);
+  if (head === "role") return new DefinitionError("__trigger__", "role", message);
+  if (head === "entrypoints") {
+    // `entrypoints.1.role` → the ways in's `role`: the index is no field.
+    return new DefinitionError("__entrypoints__", rest.filter((p) => !/^\d+$/.test(p)).join(".") || "id", message);
+  }
+  return new DefinitionError(null, path.join(".") || "definition", message);
+}
+
 /** The step a way in ends on because of its role. */
 function agentStepsOf(agent: AgentSpec, entrypoint: AutomationEntrypoint): BlockDef[] {
   switch (roleOf(entrypoint)) {
@@ -570,7 +594,7 @@ function agentStepsOf(agent: AgentSpec, entrypoint: AutomationEntrypoint): Block
       return [
         {
           id: AGENT_CLOSE_STEP_ID,
-          type: "instance_close",
+          type: AGENT_CLOSE_BLOCK_TYPE,
           config: { reason: `closed by the "${entrypoint.id}" way in` },
         },
       ];
@@ -594,7 +618,8 @@ export function entrypointsOf(definition: AutomationDefinition): AutomationEntry
 
 /** The workstream settings the run system reads. A block automation
  * declares them; an agent automation derives them from the agent's scope
- * and the ways in's roles (`reach` and `close` only find an open agent). */
+ * and the ways in's roles (`reach` and `close` only find an open agent;
+ * `none` never opens one). */
 export function instanceSettingsOf(definition: AutomationDefinition): InstanceSettings | undefined {
   const agent = definition.agent;
   if (agent === undefined) return definition.settings.instance;
@@ -604,6 +629,7 @@ export function instanceSettingsOf(definition: AutomationDefinition): InstanceSe
   for (const entrypoint of declaredEntrypointsOf(definition)) {
     const role = roleOf(entrypoint);
     if (role === "reach" || role === "close") entrypoints[entrypoint.id] = { admit: "require" };
+    if (role === "none") entrypoints[entrypoint.id] = { admit: "optional" };
   }
   return {
     keyTemplate: scope.kind === "automation" ? AGENT_STEP_ID : scope.keyTemplate,
@@ -612,6 +638,20 @@ export function instanceSettingsOf(definition: AutomationDefinition): InstanceSe
       : {}),
     ...(Object.keys(entrypoints).length > 0 ? { entrypoints } : {}),
   };
+}
+
+/** The concurrency the run system admits against. A block automation
+ * declares it; an agent that keeps a session runs one run at a time per
+ * workstream (`queue`, keyed inside the workstream by `instanceConcurrencyKey`)
+ * unless the definition says otherwise, so two events for one agent never
+ * race for its session. */
+export function concurrencySettingsOf(
+  definition: AutomationDefinition,
+): AutomationSettings["concurrency"] {
+  if (definition.settings.concurrency !== undefined) return definition.settings.concurrency;
+  const agent = definition.agent;
+  if (agent === undefined || !agentKeepsSession(agent)) return undefined;
+  return { keyTemplate: AGENT_STEP_ID, policy: "queue" };
 }
 
 export function entrypointOf(
@@ -730,11 +770,8 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
   const parsed = definitionSchema.safeParse(raw);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
-    throw new DefinitionError(
-      null,
-      issue ? issue.path.join(".") : "definition",
-      issue ? issue.message : "invalid definition",
-    );
+    if (!issue) throw new DefinitionError(null, "definition", "invalid definition");
+    throw definitionIssueError(issue.path, issue.message);
   }
   const definition = parsed.data as AutomationDefinition;
 
@@ -759,6 +796,13 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
       );
     }
     validateTemplatesIn("__agent__", agentStepConfig(agent), "");
+    if (agentKeepsSession(agent) && definition.settings.endSessionsOnFinish) {
+      throw new DefinitionError(
+        "__settings__",
+        "endSessionsOnFinish",
+        "an agent scoped to the automation or to a key keeps its session between events; endSessionsOnFinish must be false",
+      );
+    }
     if (agent.scope.kind === "key") {
       validateTemplatesIn("__agent__", agent.scope.keyTemplate, "scope.keyTemplate");
       if (agent.scope.labelTemplate !== undefined) {
@@ -783,18 +827,6 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
         `way in "${entrypoint.id}" cannot ${role} an agent scoped to each event (there is no standing agent to find)`,
       );
     }
-    for (const block of walkBlocks(entrypoint.blocks)) {
-      if (block.type === AGENT_BLOCK_TYPE) {
-        throw new DefinitionError(
-          block.id,
-          "type",
-          `"${AGENT_BLOCK_TYPE}" is not a block; set the automation's agent and the way in's role`,
-        );
-      }
-      if (agent !== undefined && (block.id === AGENT_STEP_ID || block.id === AGENT_CLOSE_STEP_ID)) {
-        throw new DefinitionError(block.id, "id", `block id "${block.id}" is the agent step's`);
-      }
-    }
   }
 
   const seen = new Set<string>();
@@ -808,6 +840,16 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
       throw new DefinitionError(block.id, "id", `duplicate block id "${block.id}"`);
     }
     seen.add(block.id);
+    if (AGENT_BLOCK_TYPES.includes(block.type)) {
+      throw new DefinitionError(
+        block.id,
+        "type",
+        `"${block.type}" is not a block; set the automation's agent and the way in's role`,
+      );
+    }
+    if (agent !== undefined && (block.id === AGENT_STEP_ID || block.id === AGENT_CLOSE_STEP_ID)) {
+      throw new DefinitionError(block.id, "id", `block id "${block.id}" is the agent step's`);
+    }
 
     const executor = getBlock(block.type);
     if (!executor) {
@@ -941,7 +983,7 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
         );
       }
     }
-    if (definition.settings.concurrency?.policy !== "join") {
+    if (concurrencySettingsOf(definition)?.policy !== "join") {
       throw new DefinitionError(
         "__trigger__",
         "continueOnly",

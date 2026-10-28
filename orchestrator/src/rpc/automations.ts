@@ -713,6 +713,13 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
             config["modelRouter"] !== undefined ||
             config["effort"] !== undefined;
           if (hasOverride) {
+            if (typeof config["harness"] !== "string" && profile === null) {
+              // The profile resolves per run, so its harness is unknown
+              // here: the override has nothing to validate against.
+              throw new BlockValidationError([
+                blockError(where, "harness", "harness_required", "set the harness: a model or effort override on a templated profile cannot follow the profile's harness"),
+              ]);
+            }
             const harness =
               typeof config["harness"] === "string"
                 ? config["harness"]
@@ -817,10 +824,9 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
 
   /** Resolve the sample a TestRender/DryRun/RunNow should use. */
   async function resolveSample(
-    row: AutomationRow,
+    trigger: AutomationDefinition["trigger"],
     sample: { case: "sampleId"; value: string } | { case: "payloadJson"; value: string } | { case: undefined },
   ): Promise<{ payload: Record<string, unknown>; eventKey?: string; receivedAt: Date; aliases: WebhookAliasMapping[] }> {
-    const trigger = row.version.trigger;
     let payload: Record<string, unknown> = {};
     let eventKey: string | undefined;
     let receivedAt = now();
@@ -937,6 +943,12 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           if (admit === "handle_match") {
             throw new ConnectError(
               "this entrypoint routes only by handles; a manual kickoff cannot name one",
+              Code.FailedPrecondition,
+            );
+          }
+          if (admit === "optional") {
+            throw new ConnectError(
+              `no open workstream for key "${input.instanceKey}" (this entrypoint never opens one; it runs unbound without a key)`,
               Code.FailedPrecondition,
             );
           }
@@ -1312,7 +1324,6 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       }
       const inputValues =
         req.inputsJson !== undefined ? parseObjectJson(req.inputsJson, "inputs_json") : row.inputs;
-      const sample = await resolveSample(row, req.sample);
       const previewEntrypoint =
         req.entrypointId !== undefined && req.entrypointId !== ""
           ? entrypointOf(definition, req.entrypointId)
@@ -1323,6 +1334,8 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           Code.InvalidArgument,
         );
       }
+      // The sample is the previewed way in's: its stored events, its fixture.
+      const sample = await resolveSample(previewEntrypoint.trigger, req.sample);
       const result = await previewDefinition({
         definition,
         inputs: resolveAutomationInputs(definition.inputsSchema, inputValues),
@@ -1355,7 +1368,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       await requireAdmin(ctx, getSession);
       const row = await requireAutomation(req.automationId);
       if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
-      const sample = await resolveSample(row, req.sample);
+      const sample = await resolveSample(row.version.trigger, req.sample);
       const runId = await startAdHocRun(row, {
         source: "manual",
         payload: sample.payload,
@@ -1411,7 +1424,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const sample =
         req.payloadJson !== undefined
           ? { payload, eventKey: refreshed.version.trigger.kind === "integration" ? refreshed.version.trigger.eventKeys[0] : undefined }
-          : await resolveSample(refreshed, { case: undefined });
+          : await resolveSample(refreshed.version.trigger, { case: undefined });
       const instanceInputs =
         req.instanceInputsJson !== undefined
           ? parseObjectJson(req.instanceInputsJson, "instance_inputs_json")

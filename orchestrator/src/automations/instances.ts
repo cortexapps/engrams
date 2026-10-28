@@ -159,6 +159,8 @@ export async function resolveInstance(
   if (admit === "require") {
     return { kind: "drop", reason: "no_open_instance", detail: key };
   }
+  // A way in that never opens a workstream runs unbound when none is open.
+  if (admit === "optional") return { kind: "none" };
   const inputs = await renderInstanceInputs(
     settings.inputs ?? {},
     input.target.definition.inputsSchema,
