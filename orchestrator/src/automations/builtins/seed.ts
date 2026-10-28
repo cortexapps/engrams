@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 
 import { makeAutomationStore, type AutomationRow, type AutomationStore } from "../../db/automations.ts";
+import { defaultAutomationSender, inboxKeys } from "../engine/inbox.ts";
 import { makeIntegrationConnectionStore } from "../../db/integration-connections.ts";
 import { isUniqueViolation } from "../../db/pg-errors.ts";
 import { log as rootLog } from "../../log.ts";
@@ -46,6 +47,16 @@ export interface BuiltinSeedDeps {
   store: BuiltinSeedStore;
   connections: {
     ensureDefault(provider: string, displayName: string): Promise<{ id: string }>;
+  };
+  /** The runs of the version a bump replaces that are still going. They
+   * hold their sessions and their concurrency claims under the old graph
+   * (a loop parked on a wait, say), where a run of the new version cannot
+   * reach them: a turn would find the session owned and fail. The seed
+   * stops them; their kept sessions stay, and the next event's run (the
+   * new version) continues them. Absent in tests that have no runs. */
+  runs?: {
+    listActive(automationId: string): Promise<Array<{ id: string; version: number }>>;
+    stop(runId: string, reason: string): Promise<void>;
   };
   builtins?: BuiltinAutomation[];
   log?: { info(b: Record<string, unknown>, m: string): void; warn(b: Record<string, unknown>, m: string): void };
@@ -217,6 +228,17 @@ async function seedOne(
     { key: builtin.key, from: existing.currentVersion, to: existing.currentVersion + 1 },
     "built-in automation bumped to the shipped definition",
   );
+  if (deps.runs !== undefined) {
+    const active = await deps.runs.listActive(existing.id);
+    for (const run of active) {
+      if (run.version > existing.currentVersion) continue;
+      await deps.runs.stop(
+        run.id,
+        `${builtin.key} was upgraded; this run of the old version ends and the next event continues on the new one`,
+      );
+      logger.info({ key: builtin.key, runId: run.id, version: run.version }, "built-in bump stopped a run of the old version");
+    }
+  }
 }
 
 async function bumpVersion(
@@ -294,8 +316,15 @@ export function registerShippedBuiltins(): void {
 
 /** Production wiring; fire-and-forget at boot next to the reviewer-profile seed. */
 export function productionBuiltinSeedDeps(): BuiltinSeedDeps {
+  const store = makeAutomationStore();
   return {
-    store: makeAutomationStore(),
+    store,
     connections: makeIntegrationConnectionStore(),
+    runs: {
+      listActive: async (automationId) =>
+        (await store.listActiveRuns(automationId)).map((run) => ({ id: run.id, version: run.version })),
+      stop: (runId, reason) =>
+        defaultAutomationSender.send(runId, { kind: "stop", reason }, inboxKeys.stop(runId, crypto.randomUUID())),
+    },
   };
 }

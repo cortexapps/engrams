@@ -12,6 +12,8 @@ function harness(
   options: {
     existing?: { definition: AutomationDefinition; inputs: Record<string, unknown>; overrides: Record<string, Record<string, unknown>> };
     raceOnCreate?: boolean;
+    /** Runs of the automation still going when the seed runs. */
+    activeRuns?: Array<{ id: string; version: number }>;
   } = {},
 ) {
   const rows = new Map<string, AutomationRow>();
@@ -110,12 +112,21 @@ function harness(
     },
   };
 
+  const stopped: Array<{ runId: string; reason: string }> = [];
   const deps = {
     store,
     connections: { async ensureDefault() { return { id: "conn-github" }; } },
     log: { info() {}, warn() {} },
+    runs: {
+      async listActive() {
+        return options.activeRuns ?? [];
+      },
+      async stop(runId: string, reason: string) {
+        stopped.push({ runId, reason });
+      },
+    },
   };
-  return { store, rows, versions, calls, deps };
+  return { store, rows, versions, calls, deps, stopped };
 }
 
 describe("seedBuiltinAutomations", () => {
@@ -211,6 +222,37 @@ describe("seedBuiltinAutomations", () => {
       find: { deadlineSeconds: 900 },
       report_failure: { reason: "custom: ${{ run.error }}" },
     });
+  });
+
+  test("a bump stops the runs of the version it replaces; a run of the new version goes on", async () => {
+    const stored = structuredClone(PR_REVIEW_BUILTIN.definition);
+    if (stored.trigger.kind === "integration") stored.trigger.connectionId = "conn-github";
+    const h = harness({
+      existing: { definition: stored, inputs: {}, overrides: {} },
+      activeRuns: [
+        { id: "autorun:old-loop", version: 1 },
+        { id: "autorun:already-new", version: 2 },
+      ],
+    });
+    const shipped: BuiltinAutomation = {
+      ...PR_REVIEW_BUILTIN,
+      definition: (() => {
+        const d = structuredClone(PR_REVIEW_BUILTIN.definition);
+        d.inputsSchema.push({ key: "new_knob", label: "New knob", type: "string", default: "x" });
+        return d;
+      })(),
+      async defaultInputs() {
+        return { ...(await PR_REVIEW_BUILTIN.defaultInputs()), new_knob: "x" };
+      },
+    };
+    const result = await seedBuiltinAutomations({ ...h.deps, builtins: [shipped] });
+    expect(result.bumped).toEqual([{ key: PR_REVIEW_BUILTIN_KEY, from: 1, to: 2 }]);
+    expect(h.stopped.map((s) => s.runId)).toEqual(["autorun:old-loop"]);
+    expect(h.stopped[0]!.reason).toContain("upgraded");
+    // Unchanged: nothing stops.
+    const again = await seedBuiltinAutomations({ ...h.deps, builtins: [shipped] });
+    expect(again.bumped).toEqual([]);
+    expect(h.stopped).toHaveLength(1);
   });
 
   test("content hash covers the extra entrypoints", () => {

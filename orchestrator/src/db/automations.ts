@@ -257,6 +257,8 @@ export interface AutomationStore {
     limit: number,
     opts?: { instanceId?: string },
   ): Promise<AutomationRunRow[]>;
+  /** The runs not yet over (pending, running, waiting), oldest first. */
+  listActiveRuns(automationId: string): Promise<AutomationRunRow[]>;
   getRun(id: string): Promise<AutomationRunRow | null>;
   listStepRuns(runId: string): Promise<AutomationStepRunRow[]>;
   listRunSessionIds(runId: string): Promise<Array<{ sessionId: string; blockId: string }>>;
@@ -951,6 +953,20 @@ export function makeAutomationStore(
         )
         .orderBy(desc(automationRunTable.createdAt))
         .limit(limit);
+      return rows.map(runRow);
+    },
+
+    async listActiveRuns(automationId) {
+      const rows = await db
+        .select()
+        .from(automationRunTable)
+        .where(
+          and(
+            eq(automationRunTable.automationId, automationId),
+            sql`${automationRunTable.status} in ('pending', 'running', 'waiting')`,
+          ),
+        )
+        .orderBy(asc(automationRunTable.createdAt));
       return rows.map(runRow);
     },
 
