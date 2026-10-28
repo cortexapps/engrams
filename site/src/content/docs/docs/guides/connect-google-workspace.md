@@ -84,15 +84,17 @@ and `reports:read`. The personal areas are `gmail:read`, `gmail:write`, `calenda
 `calendar:write`, `drive:read`, `drive:write`, `docs:read`, `docs:write`, `sheets:read`,
 `sheets:write`, `slides:read`, `slides:write`, and `contacts:read`.
 
-The `gws` command, Google's Workspace CLI, is on the PATH in every session whose profile
-grants at least one Google Workspace power. Its commands follow Google's API reference for
-every service, so `gws admin users list`, `gws drive files export`, and `gws gmail users
-messages list` all take the same `--params` JSON that the API documents. Run `gws --help`, or
+Two commands are on the PATH in every session whose profile grants at least one Google
+Workspace power. `google` is a generic REST client for the directory and the audit reports;
+its `list` follows every page and prints one JSON array. `gws`, Google's Workspace CLI,
+covers Gmail, Calendar, Drive, Docs, Sheets, Slides, and contacts, and takes the same
+`--params` JSON that each API documents. Run either with `--help`, or
 `engrams-integrations` for every connected tool.
 
 ```bash
-gws admin users get --params '{"userKey":"someone@example.com","projection":"full"}'
-gws admin members list --params '{"groupKey":"team@example.com"}'
+google list directory/users customer=my_customer
+google get directory/users/someone@example.com projection=full
+google list directory/groups/team@example.com/members
 gws drive files export --params '{"fileId":"<id>","mimeType":"text/plain"}'
 gws calendar events list --params '{"calendarId":"primary","timeMin":"2026-11-01T00:00:00Z"}'
 ```

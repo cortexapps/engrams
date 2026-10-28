@@ -2000,7 +2000,7 @@ describe("the shipped google_workspace connector", () => {
       expect(user.authorizeParams).toEqual({ access_type: "offline", prompt: "consent" });
     }
     expect(c.credential?.source).toBe("inject");
-    expect(c.cli?.bins).toEqual(["gws"]);
+    expect(c.cli?.bins).toEqual(["gws", "google"]);
     expect(c.cli?.dummyEnv?.GOOGLE_WORKSPACE_CLI_TOKEN).toBe("x-engrams-managed");
     expect(c.test?.path).toBe("/admin/directory/v1/customers/my_customer");
     expect(c.webhook).toBeUndefined();

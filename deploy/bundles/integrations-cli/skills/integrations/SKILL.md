@@ -1,6 +1,6 @@
 ---
 name: integrations
-description: Integration CLIs (e.g. cortex for Cortex, gh for GitHub, glab for GitLab, stripe for Stripe, pup and datadog for Datadog, linear for Linear, slack for Slack, vanta for Vanta, rippling for Rippling, gws for Google Workspace, gcloud for Google Cloud) are available in this session, authenticated automatically by the engrams platform. Use when you need to interact with a connected service from the command line. Run `engrams-integrations` to see which are enabled and how to use each.
+description: Integration CLIs (e.g. cortex for Cortex, gh for GitHub, glab for GitLab, stripe for Stripe, pup and datadog for Datadog, linear for Linear, slack for Slack, vanta for Vanta, rippling for Rippling, gws and google for Google Workspace, gcloud for Google Cloud) are available in this session, authenticated automatically by the engrams platform. Use when you need to interact with a connected service from the command line. Run `engrams-integrations` to see which are enabled and how to use each.
 ---
 
 # Integration CLIs
@@ -8,7 +8,7 @@ description: Integration CLIs (e.g. cortex for Cortex, gh for GitHub, glab for G
 This session has command-line tools for the services your profile connected —
 for example `cortex` (Cortex), `gh` (GitHub),
 `glab` (GitLab), `stripe` (Stripe), `pup` and `datadog` (Datadog), `linear`
-(Linear), `slack` (Slack), `vanta` (Vanta), `rippling` (Rippling), `gws` (Google Workspace), and `gcloud`
+(Linear), `slack` (Slack), `vanta` (Vanta), `rippling` (Rippling), `gws` and `google` (Google Workspace), and `gcloud`
 (Google Cloud). **You never handle real
 credentials**: each tool carries a harmless placeholder token, and the engrams
 egress proxy injects the real, capability-scoped credential on the wire. Do not
