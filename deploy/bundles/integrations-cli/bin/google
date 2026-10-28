@@ -1,0 +1,160 @@
+#!/bin/sh
+# engrams Google API CLI: a thin, generic REST client for the Google Workspace
+# APIs that `gws` does not cover, chiefly the Admin SDK Directory API (people,
+# managers, groups, members, organizational units).
+#
+# Auth is brokered: this carries only the `GOOGLE_WORKSPACE_CLI_TOKEN`
+# placeholder; the egress proxy injects the real token as
+# `Authorization: Bearer` on every permitted request and strips any token you
+# supply. There is NOTHING to log in to; do not set a real token.
+#
+# A target is a full https URL on a Google API host, or a short form:
+#   directory/<path>   https://admin.googleapis.com/admin/directory/v1/<path>
+#   reports/<path>     https://admin.googleapis.com/admin/reports/v1/<path>
+#
+# `list` follows every page (nextPageToken) and prints one JSON array of the
+# collection's items when jq is present; without jq it prints the first page.
+set -eu
+
+TOKEN="${GOOGLE_WORKSPACE_CLI_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<EOF
+engrams Google API CLI: auth is brokered by the platform (no token to set).
+
+Usage:
+  google list <target> [field=value ...]     Every page of a collection, as one array
+  google get <target> [field=value ...]      One GET; query fields pass straight through
+  google api <METHOD> <target> [json-body]   Any request, with an explicit method and body
+
+<target> is a full https URL on a Google API host, or a short form:
+  directory/<path>   the Admin SDK Directory API (admin/directory/v1)
+  reports/<path>     the Admin SDK Reports API (admin/reports/v1)
+
+Use \`gws\` for Gmail, Calendar, Drive, Docs, Sheets, Slides, and People;
+use \`google\` for the directory and for any route \`gws\` does not offer.
+
+Examples:
+  google list directory/users customer=my_customer orderBy=email
+  google get directory/users/someone@example.com projection=full
+  google list directory/groups customer=my_customer
+  google list directory/groups/team@example.com/members
+  google list directory/customer/my_customer/orgunits type=all
+  google list reports/activity/users/all/applications/login maxResults=100
+  google get directory/users/someone@example.com projection=full \\
+    | jq -r '.relations[]? | select(.type=="manager") | .value'     the manager's email
+EOF
+}
+
+have_jq() { command -v jq >/dev/null 2>&1; }
+
+pretty() {
+    if have_jq; then jq .; else cat; fi
+}
+
+url_of() {
+    case "$1" in
+    https://*) printf '%s' "$1" ;;
+    directory/*) printf 'https://admin.googleapis.com/admin/directory/v1/%s' "${1#directory/}" ;;
+    reports/*) printf 'https://admin.googleapis.com/admin/reports/v1/%s' "${1#reports/}" ;;
+    *)
+        echo "google: '$1' is not an https URL or a directory/ or reports/ path" >&2
+        exit 2
+        ;;
+    esac
+}
+
+# request <METHOD> <target> [curl-args...]
+request() {
+    m="$1"
+    u=$(url_of "$2")
+    shift 2
+    curl -sS -X "$m" "$u" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Accept: application/json" \
+        "$@"
+}
+
+# fetch <target> [field=value ...]: one GET; each field=value is a query param.
+fetch() {
+    t="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    request GET "$t" -G "$@"
+}
+
+get() {
+    fetch "$@" | pretty
+}
+
+# list <target> [field=value ...]: every page, one array of the items. A
+# Google collection names its array after the resource (users, groups,
+# members, items, ...); the items are every array-valued top-level field.
+list() {
+    t="$1"
+    shift
+    if ! have_jq; then
+        get "$t" "$@"
+        return
+    fi
+    pages=$(mktemp)
+    trap 'rm -f "$pages"' EXIT
+    token=""
+    while :; do
+        if ! page=$(fetch "$t" ${token:+"pageToken=$token"} "$@"); then
+            echo "google: could not reach $(url_of "$t")" >&2
+            exit 1
+        fi
+        if printf '%s' "$page" | jq -e '.error' >/dev/null 2>&1; then
+            printf '%s\n' "$page" | pretty
+            exit 1
+        fi
+        printf '%s\n' "$page" >>"$pages"
+        token=$(printf '%s' "$page" | jq -r '.nextPageToken // empty')
+        [ -n "$token" ] || break
+    done
+    jq -s '[.[] | to_entries[] | select(.value | type == "array") | .value[]]' "$pages"
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+# Check the target here, outside any pipe, so a bad one exits non-zero.
+case "$cmd" in
+list | get) [ -z "${1:-}" ] || url_of "$1" >/dev/null ;;
+api) [ -z "${2:-}" ] || url_of "$2" >/dev/null ;;
+esac
+
+case "$cmd" in
+list)
+    t="${1:?usage: google list <target> [field=value ...]}"
+    shift
+    list "$t" "$@"
+    ;;
+get)
+    t="${1:?usage: google get <target> [field=value ...]}"
+    shift
+    get "$t" "$@"
+    ;;
+api)
+    m="${1:?usage: google api <METHOD> <target> [json-body]}"
+    t="${2:?usage: google api <METHOD> <target> [json-body]}"
+    if [ -n "${3:-}" ]; then
+        request "$m" "$t" -H "Content-Type: application/json" --data-binary "$3" | pretty
+    else
+        request "$m" "$t" | pretty
+    fi
+    ;;
+"" | -h | --help | help) usage ;;
+*)
+    echo "google: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

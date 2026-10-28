@@ -37,6 +37,7 @@ import type { Connector } from "../connectors/registry.ts";
 import {
   clientCredentialsSpec,
   redirectOauthSpec,
+  serviceAccountSpec,
   userRedirectOauthSpec,
 } from "../connectors/oauth-spec.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
@@ -47,7 +48,11 @@ import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 
 type OauthCredentialClient = Pick<
   typeof defaultOauthCredential,
-  "beginRedirectFlow" | "completeRedirectFlow" | "lookupRedirectFlow" | "grantClientCredentials"
+  | "beginRedirectFlow"
+  | "completeRedirectFlow"
+  | "lookupRedirectFlow"
+  | "grantClientCredentials"
+  | "grantServiceAccount"
 >;
 
 type GetSession = (
@@ -179,25 +184,45 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     return c.redirect(authorizeUrl);
   });
 
-  // A client-credentials connector: the admin sealed the client id and
-  // secret as org secrets (the facet's refs); the coordinator runs the grant
+  // A server-side grant: the admin sealed the facet's org secrets (a client
+  // id and secret, or a service-account key); the coordinator runs the grant
   // and seals the token. Repeating the call re-grants (a reconnect, or new
-  // secrets). The response is JSON: the sheet stays on the page.
+  // secrets). A service-account grant takes the principal to act as in the
+  // JSON body (`{ subject }`); omitted, the coordinator keeps the sealed one.
+  // The response is JSON: the sheet stays on the page.
   app.post("/api/v1/integrations/:provider/oauth/grant", async (c) => {
     await requireAdmin(c.req.raw.headers);
     const provider = c.req.param("provider");
     const connector = await oauthConnector(provider);
-    if (connector.oauth?.grant !== "client_credentials") {
+    const grant = connector.oauth?.grant;
+    if (grant !== "client_credentials" && grant !== "service_account") {
       throw new HTTPException(404, {
-        message: `connector "${provider}" has no client-credentials grant`,
+        message: `connector "${provider}" has no server-side grant`,
       });
     }
+    let subject = "";
+    if (grant === "service_account") {
+      const body = (await c.req.json().catch(() => ({}))) as { subject?: unknown };
+      if (body.subject !== undefined) {
+        if (typeof body.subject !== "string" || body.subject.length > 320 || /\s/.test(body.subject)) {
+          throw new HTTPException(400, { message: "subject must be an email address" });
+        }
+        subject = body.subject;
+      }
+    }
     try {
-      const { credential } = await oauthCredential.grantClientCredentials({
-        subject: await subjectFor(connector),
-        provider,
-        spec: clientCredentialsSpec(connector),
-      });
+      const { credential } =
+        grant === "service_account"
+          ? await oauthCredential.grantServiceAccount({
+              subject: await subjectFor(connector),
+              provider,
+              spec: serviceAccountSpec(connector, subject),
+            })
+          : await oauthCredential.grantClientCredentials({
+              subject: await subjectFor(connector),
+              provider,
+              spec: clientCredentialsSpec(connector),
+            });
       return c.json({
         ok: true,
         status: credential?.status ?? "",

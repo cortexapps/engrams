@@ -1,0 +1,523 @@
+{
+  "provider": "google_workspace",
+  "protocol": "http",
+  "display": {
+    "name": "Google Workspace",
+    "category": "Productivity",
+    "blurb": "Read your Google Workspace directory (people, managers, groups, org units, audit reports) as the organization, and let members reach their own Gmail, Calendar, Drive, Docs, and Sheets. Tokens are obtained and brokered at the egress proxy, never seen by the agent.",
+    "icon": {
+      "mono": "GW",
+      "color": "#4285f4"
+    }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      {
+        "header": "Authorization",
+        "template": "Bearer {}"
+      }
+    ]
+  },
+  "userCredential": {
+    "oauth": {
+      "scopes": [
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/documents",
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/presentations",
+        "https://www.googleapis.com/auth/contacts.readonly"
+      ],
+      "authorizeParams": {
+        "access_type": "offline",
+        "prompt": "consent"
+      }
+    }
+  },
+  "hosts": [
+    "admin.googleapis.com",
+    "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "gmail.googleapis.com",
+    "docs.googleapis.com",
+    "sheets.googleapis.com",
+    "slides.googleapis.com",
+    "people.googleapis.com"
+  ],
+  "oauth": {
+    "grant": "service_account",
+    "serviceAccountKeyRef": "google_workspace.service_account_key",
+    "tokenUrl": "https://oauth2.googleapis.com/token",
+    "scopes": [
+      "https://www.googleapis.com/auth/admin.directory.user.readonly",
+      "https://www.googleapis.com/auth/admin.directory.group.readonly",
+      "https://www.googleapis.com/auth/admin.directory.group.member.readonly",
+      "https://www.googleapis.com/auth/admin.directory.orgunit.readonly",
+      "https://www.googleapis.com/auth/admin.directory.domain.readonly",
+      "https://www.googleapis.com/auth/admin.reports.audit.readonly"
+    ],
+    "scopeDelimiter": " ",
+    "authorizeUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+    "acquisitionHosts": [
+      "accounts.google.com"
+    ],
+    "clientIdRef": "google_workspace.client_id",
+    "clientSecretRef": "google_workspace.client_secret"
+  },
+  "test": {
+    "path": "/admin/directory/v1/users?customer=my_customer&maxResults=1"
+  },
+  "operations": [
+    {
+      "grants": [
+        "directory:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/admin/directory/v1/users*"
+      }
+    },
+    {
+      "grants": [
+        "directory:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/admin/directory/v1/groups*"
+      }
+    },
+    {
+      "grants": [
+        "directory:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/admin/directory/v1/customer/*/orgunits*"
+      }
+    },
+    {
+      "grants": [
+        "directory:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/admin/directory/v1/customers/*"
+      }
+    },
+    {
+      "grants": [
+        "directory:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/admin/directory/v1/customer/*/domains*"
+      }
+    },
+    {
+      "grants": [
+        "reports:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/admin/reports/v1/*"
+      }
+    },
+    {
+      "grants": [
+        "gmail:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/gmail/v1/users/*"
+      }
+    },
+    {
+      "grants": [
+        "gmail:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/gmail/v1/users/*"
+      }
+    },
+    {
+      "grants": [
+        "gmail:write"
+      ],
+      "match": {
+        "method": "PUT",
+        "path": "/gmail/v1/users/*"
+      }
+    },
+    {
+      "grants": [
+        "gmail:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/gmail/v1/users/*"
+      }
+    },
+    {
+      "grants": [
+        "gmail:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/gmail/v1/users/*"
+      }
+    },
+    {
+      "grants": [
+        "gmail:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/upload/gmail/v1/users/*"
+      }
+    },
+    {
+      "grants": [
+        "calendar:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/calendar/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "calendar:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/calendar/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "calendar:write"
+      ],
+      "match": {
+        "method": "PUT",
+        "path": "/calendar/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "calendar:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/calendar/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "calendar:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/calendar/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/drive/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/drive/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:write"
+      ],
+      "match": {
+        "method": "PUT",
+        "path": "/drive/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/drive/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/drive/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/upload/drive/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:write"
+      ],
+      "match": {
+        "method": "PUT",
+        "path": "/upload/drive/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/upload/drive/v3/*"
+      }
+    },
+    {
+      "grants": [
+        "docs:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/v1/documents*"
+      }
+    },
+    {
+      "grants": [
+        "docs:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/v1/documents*"
+      }
+    },
+    {
+      "grants": [
+        "sheets:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/v4/spreadsheets*"
+      }
+    },
+    {
+      "grants": [
+        "sheets:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/v4/spreadsheets*"
+      }
+    },
+    {
+      "grants": [
+        "sheets:write"
+      ],
+      "match": {
+        "method": "PUT",
+        "path": "/v4/spreadsheets*"
+      }
+    },
+    {
+      "grants": [
+        "slides:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/v1/presentations*"
+      }
+    },
+    {
+      "grants": [
+        "slides:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/v1/presentations*"
+      }
+    },
+    {
+      "grants": [
+        "contacts:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/v1/people*"
+      }
+    },
+    {
+      "grants": [
+        "contacts:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/v1/otherContacts*"
+      }
+    },
+    {
+      "grants": [
+        "contacts:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/v1/contactGroups*"
+      }
+    },
+    {
+      "grants": [
+        "gmail:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/gmail/*"
+      }
+    },
+    {
+      "grants": [
+        "gmail:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/gmail/*"
+      }
+    },
+    {
+      "grants": [
+        "calendar:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/calendar/*"
+      }
+    },
+    {
+      "grants": [
+        "calendar:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/calendar/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/drive/*"
+      }
+    },
+    {
+      "grants": [
+        "drive:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/drive/*"
+      }
+    },
+    {
+      "grants": [
+        "docs:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/docs/*"
+      }
+    },
+    {
+      "grants": [
+        "docs:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/docs/*"
+      }
+    },
+    {
+      "grants": [
+        "sheets:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/sheets/*"
+      }
+    },
+    {
+      "grants": [
+        "sheets:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/sheets/*"
+      }
+    },
+    {
+      "grants": [
+        "slides:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/slides/*"
+      }
+    },
+    {
+      "grants": [
+        "slides:write"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/slides/*"
+      }
+    },
+    {
+      "grants": [
+        "contacts:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/discovery/v1/apis/people/*"
+      }
+    }
+  ],
+  "cli": {
+    "bins": [
+      "gws",
+      "google"
+    ],
+    "binSource": "bundled",
+    "dummyEnv": {
+      "GOOGLE_WORKSPACE_CLI_TOKEN": "x-engrams-managed",
+      "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": "/tmp/gws"
+    },
+    "credentialDelivery": "inject",
+    "doc": "Two commands reach Google Workspace from this session. Authentication is automatic for both: `GOOGLE_WORKSPACE_CLI_TOKEN` is a managed placeholder that the egress proxy replaces with the real token on permitted requests. Do NOT run `gws auth login`, `gws auth setup`, or set a real token. A path your profile did not grant is denied at the network boundary, not authenticated.\n\nWhich identity you act as depends on the profile: the organization connection reads the directory as one designated account (read only); a member's own connection reaches their Gmail, Calendar, Drive, Docs, Sheets, Slides, and contacts as them. A call outside the token's scopes gets a 403 from Google.\n\nDirectory and audit reports: `google`, a generic REST client (powers directory:read, reports:read). `list` follows every page and prints one JSON array.\n  google list directory/users customer=my_customer orderBy=email\n  google get directory/users/someone@example.com projection=full        relations[type=manager].value is the manager's email\n  google list directory/groups customer=my_customer\n  google list directory/groups/team@example.com/members\n  google list directory/customer/my_customer/orgunits type=all\n  google list reports/activity/users/all/applications/login maxResults=100\n  google api <METHOD> <https URL> [json]                                 any other Google API route\n\nPersonal data: `gws`, Google's Workspace CLI (powers gmail:*, calendar:*, drive:*, docs:*, sheets:*, slides:*, contacts:read). Its commands come from Google's API Discovery documents: `gws <service> <resource> <method> [--params '<json>'] [--json '<body>']`. Run `gws --help` or `gws <service> --help`.\n  gws gmail users messages list --params '{\"userId\":\"me\",\"q\":\"newer_than:7d is:unread\",\"maxResults\":50}'\n  gws gmail users messages get --params '{\"userId\":\"me\",\"id\":\"<id>\",\"format\":\"full\"}'\n  gws calendar events list --params '{\"calendarId\":\"primary\",\"timeMin\":\"2026-11-01T00:00:00Z\",\"singleEvents\":true,\"orderBy\":\"startTime\"}'\n  gws drive files list --params '{\"q\":\"name contains \\\"roadmap\\\"\",\"fields\":\"files(id,name,mimeType,modifiedTime)\"}'\n  gws drive files export --params '{\"fileId\":\"<id>\",\"mimeType\":\"text/plain\"}'                  a Doc as text; text/csv for a Sheet\n  gws docs documents get --params '{\"documentId\":\"<id>\"}'\n  gws sheets spreadsheets values get --params '{\"spreadsheetId\":\"<id>\",\"range\":\"Sheet1!A1:D50\"}'\n  gws people people connections list --params '{\"resourceName\":\"people/me\",\"personFields\":\"names,emailAddresses\"}'\n\nPagination for gws: pass the response's nextPageToken back as pageToken. Dates are RFC 3339. Google applies per-minute quotas per service; retry a 429 after the Retry-After delay.\n"
+  }
+}

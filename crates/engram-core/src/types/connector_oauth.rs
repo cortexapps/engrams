@@ -38,15 +38,21 @@ impl TokenRequestBody {
 
 /// How to obtain the next access token from the provider: a
 /// `grant_type=refresh_token` exchange for the authorization-code family,
-/// or a fresh `grant_type=client_credentials` grant. Absent for providers
+/// a fresh client-credentials grant, or a signed JWT-bearer grant. Absent for providers
 /// whose access tokens do not expire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorOAuthRefreshSpec {
     pub token_url: String,
-    /// Org-secret refs for the BYO app's client credentials.
+    /// Org-secret refs for the BYO app's client credentials. Empty for JWT-bearer grants.
     pub client_id_ref: String,
     pub client_secret_ref: String,
-    /// The joined scope a client-credentials grant asks for again. The
+    /// Org-secret ref of the service-account JSON key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assertion_key_ref: Option<String>,
+    /// The principal to act as, sent in the JWT `sub` claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// The joined scope a client-credentials or JWT-bearer grant asks for again. The
     /// refresh-token family never sends one (the grant keeps its scope).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
@@ -79,6 +85,9 @@ pub enum ConnectorOAuthKind {
     /// refresh token. Expiry is met by running the grant again from the
     /// sealed refresh spec.
     Oauth2ClientCredentials,
+    /// A service-account JWT-bearer grant (RFC 7523). No refresh token;
+    /// expiry is met by signing and posting a new assertion from the sealed refresh spec.
+    Oauth2JwtBearer,
     /// ADR 0115: a user-entered personal access token. No expiry, no
     /// refresh spec — structurally invisible to the refresh sweep and
     /// never marked broken.
@@ -108,10 +117,12 @@ impl ConnectorOAuthBundle {
 
     /// A bundle refreshes iff the exchange recorded how, and the grant
     /// family can run again: a refresh token for the authorization-code
-    /// family, or the client credentials themselves.
+    /// family, or a sealed spec for a new client-credentials or JWT-bearer grant.
     pub fn refreshable(&self) -> bool {
         match self.kind {
-            ConnectorOAuthKind::Oauth2ClientCredentials => self.refresh.is_some(),
+            ConnectorOAuthKind::Oauth2ClientCredentials | ConnectorOAuthKind::Oauth2JwtBearer => {
+                self.refresh.is_some()
+            }
             ConnectorOAuthKind::Oauth2AuthorizationCode | ConnectorOAuthKind::StaticToken => {
                 self.refresh_token.is_some() && self.refresh.is_some()
             }
@@ -160,6 +171,8 @@ mod tests {
                 token_url: "https://api.linear.app/oauth/token".into(),
                 client_id_ref: "linear.client_id".into(),
                 client_secret_ref: "linear.client_secret".into(),
+                assertion_key_ref: None,
+                subject: None,
                 scope: None,
                 body: TokenRequestBody::Form,
             }),
@@ -184,6 +197,29 @@ mod tests {
     }
 
     #[test]
+    fn bundle_sealed_before_service_account_fields_deserializes() {
+        let bytes = br#"{
+            "v":1,"kind":"oauth2_client_credentials","access_token":"at",
+            "token_type":"bearer","refresh_token":null,"scope":"read",
+            "obtained_at":"2026-08-03T00:00:00Z","expires_at":null,
+            "refresh":{"token_url":"https://example.com/token",
+                "client_id_ref":"client.id","client_secret_ref":"client.secret",
+                "scope":"read","body":"json"}
+        }"#;
+        let bundle = ConnectorOAuthBundle::from_json(bytes).unwrap();
+        assert!(bundle.refreshable());
+        let refresh = bundle.refresh.as_ref().unwrap();
+        assert_eq!(refresh.assertion_key_ref, None);
+        assert_eq!(refresh.subject, None);
+        let round_trip: serde_json::Value =
+            serde_json::from_slice(&bundle.to_json().unwrap()).unwrap();
+        assert_eq!(
+            round_trip,
+            serde_json::from_slice::<serde_json::Value>(bytes).unwrap()
+        );
+    }
+
+    #[test]
     fn client_credentials_refresh_without_a_refresh_token() {
         let b = ConnectorOAuthBundle {
             kind: ConnectorOAuthKind::Oauth2ClientCredentials,
@@ -192,6 +228,8 @@ mod tests {
                 token_url: "https://api.vanta.com/oauth/token".into(),
                 client_id_ref: "vanta.client_id".into(),
                 client_secret_ref: "vanta.client_secret".into(),
+                assertion_key_ref: None,
+                subject: None,
                 scope: Some("vanta-api.all:read vanta-api.all:write".into()),
                 body: TokenRequestBody::Json,
             }),

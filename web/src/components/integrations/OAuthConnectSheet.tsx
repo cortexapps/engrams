@@ -7,6 +7,10 @@
  *
  * A `client_credentials` facet (Vanta) has no consent screen: the sheet seals
  * the same two secrets and asks the server to run the grant, then closes.
+ *
+ * A `service_account` facet (Google Workspace) seals a service-account key
+ * and runs the grant as a named principal; the client id and secret it also
+ * collects serve each member's personal consent, not the org grant.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -42,6 +46,10 @@ export function OAuthConnectSheet({
   const putSecret = usePutOrgSecret();
   const grant = useGrantClientCredentials();
   const clientCredentials = oauth.grant === "client_credentials";
+  const serviceAccount = oauth.grant === "service_account";
+  const serverSide = clientCredentials || serviceAccount;
+  const [serviceAccountKey, setServiceAccountKey] = useState("");
+  const [principal, setPrincipal] = useState("");
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
   const [signingSecret, setSigningSecret] = useState("");
@@ -60,7 +68,10 @@ export function OAuthConnectSheet({
   );
 
   const redirectUri = `${window.location.origin}/api/v1/integrations/${view.provider}/oauth/callback`;
-  const filled = clientId.trim().length > 0 && clientSecret.trim().length > 0;
+  const filled =
+    clientId.trim().length > 0 &&
+    clientSecret.trim().length > 0 &&
+    (!serviceAccount || (serviceAccountKey.trim().length > 0 && principal.trim().length > 0));
   const isSlack = view.provider === "slack";
 
   const copy = (what: "url" | "manifest", text: string) => {
@@ -84,9 +95,18 @@ export function OAuthConnectSheet({
       if (oauth.signingSecretRef && signingSecret.trim()) {
         await putSecret.mutateAsync({ name: oauth.signingSecretRef, value: signingSecret.trim() });
       }
-      if (clientCredentials) {
+      if (serviceAccount && oauth.serviceAccountKeyRef) {
+        await putSecret.mutateAsync({
+          name: oauth.serviceAccountKeyRef,
+          value: serviceAccountKey.trim(),
+        });
+      }
+      if (serverSide) {
         // No consent screen: the server posts the grant and seals the token.
-        await grant.mutateAsync({ provider: view.provider });
+        await grant.mutateAsync({
+          provider: view.provider,
+          ...(serviceAccount ? { subject: principal.trim() } : {}),
+        });
         setBusy(false);
         onConnected?.(view.provider);
         onClose();
@@ -116,21 +136,69 @@ export function OAuthConnectSheet({
             <LockIcon className="mt-0.5 size-4 shrink-0 text-instrument-nominal" />
             <div>
               <div className="text-sm font-semibold">
-                {clientCredentials
-                  ? `Bring your own ${view.name} API credentials`
-                  : `Bring your own ${view.name} app`}
+                {serviceAccount
+                  ? `Bring your own ${view.name} service account and app`
+                  : clientCredentials
+                    ? `Bring your own ${view.name} API credentials`
+                    : `Bring your own ${view.name} app`}
               </div>
               <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-                {clientCredentials
-                  ? `Create API credentials in ${view.name} and paste the client id and secret below. The token is obtained and sealed server-side, and obtained again before it expires — it never reaches the browser.`
-                  : `Create an app in ${view.name}, add this redirect URL, then paste its client credentials below. You'll approve access on ${view.name}; the workspace token is obtained and sealed server-side — it never reaches the browser.`}
+                {serviceAccount
+                  ? `Paste the service account's JSON key and the account it acts as for the organization. The token is obtained and sealed server-side, and obtained again before it expires — it never reaches the browser. The OAuth client below is for members who connect their own ${view.name} account.`
+                  : clientCredentials
+                    ? `Create API credentials in ${view.name} and paste the client id and secret below. The token is obtained and sealed server-side, and obtained again before it expires — it never reaches the browser.`
+                    : `Create an app in ${view.name}, add this redirect URL, then paste its client credentials below. You'll approve access on ${view.name}; the workspace token is obtained and sealed server-side — it never reaches the browser.`}
               </div>
             </div>
           </div>
 
+          {serviceAccount && (
+            <>
+              <label className="flex flex-col gap-1.5">
+                <span className="flex items-baseline gap-2">
+                  <Text variant="label">Service account key (JSON)</Text>
+                  <code className="font-mono text-2xs text-muted-foreground">
+                    {oauth.serviceAccountKeyRef}
+                  </code>
+                </span>
+                <textarea
+                  className="min-h-28 rounded-md border bg-card px-3 py-2 font-mono text-xs"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={serviceAccountKey}
+                  onChange={(e) => setServiceAccountKey(e.target.value)}
+                />
+                <span className="text-xs text-muted-foreground">
+                  The key file Google downloads when you create a key for the service account.
+                </span>
+              </label>
+              <label className="flex flex-col gap-1.5">
+                <Text variant="label">Acts as (account email)</Text>
+                <Input
+                  className="font-mono"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={principal}
+                  onChange={(e) => setPrincipal(e.target.value)}
+                />
+                <span className="text-xs text-muted-foreground">
+                  The one account in your domain the organization connection acts as, through
+                  domain-wide delegation. Delegate only the directory scopes to the service account;
+                  it can then read the directory and nothing else.
+                </span>
+              </label>
+            </>
+          )}
+
+          {/* A service-account connector still needs the redirect URL: its
+              OAuth client serves each member's own consent. */}
           {!clientCredentials && (
             <div className="flex flex-col gap-1.5">
-              <Text variant="label">Redirect URL (add this to your {view.name} app)</Text>
+              <Text variant="label">
+                {serviceAccount
+                  ? `Redirect URL (add this to your ${view.name} OAuth client)`
+                  : `Redirect URL (add this to your ${view.name} app)`}
+              </Text>
               <code className="select-all rounded-md border bg-card px-3 py-2 font-mono text-xs break-all">
                 {redirectUri}
               </code>
@@ -233,8 +301,8 @@ export function OAuthConnectSheet({
             Cancel
           </Button>
           <Button onClick={connect} disabled={!filled || busy}>
-            {busy ? (clientCredentials ? "Connecting…" : "Redirecting…") : `Add ${view.name}`}
-            {!clientCredentials && <ArrowUpRightIcon className="size-3.5" />}
+            {busy ? (serverSide ? "Connecting…" : "Redirecting…") : `Add ${view.name}`}
+            {!serverSide && <ArrowUpRightIcon className="size-3.5" />}
           </Button>
         </footer>
       </SheetContent>

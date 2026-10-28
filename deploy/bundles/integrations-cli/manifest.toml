@@ -14,7 +14,7 @@
 # symlinks onto PATH. Auth is brokered: each CLI carries a harmless placeholder
 # and the egress proxy injects the real credential host-side (ADR 0056/0057).
 name = "integrations-cli"
-description = "Integration CLIs, including the engrams-owned Datadog profiler client, gcloud, and the credential-free Cloud SQL relay; binaries run on the base image's glibc."
+description = "Integration CLIs, including the engrams-owned Datadog profiler client, gcloud, gws, and the credential-free Cloud SQL relay; binaries run on the base image's glibc."
 
 [versions]
 # GitHub CLI — a static Go binary (no glibc deps).
@@ -27,6 +27,9 @@ pup = "1.4.0"
 glab = "1.105.0"
 # Stripe CLI — a static Go binary from github.com/stripe/stripe-cli releases.
 stripe = "1.43.2"
+# Google Workspace CLI (gws) — github.com/googleworkspace/cli, a glibc Rust
+# binary. Pre-1.0: build.sh pins the archive checksum next to the version.
+gws = "0.22.5"
 # Google Cloud CLI versioned archive.
 gcloud = "577.0.0"
 # Build-container base (debian:bookworm-slim), pinned by digest — the bundle

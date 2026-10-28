@@ -257,8 +257,16 @@ export interface OauthFacet {
   /** The grant family. `authorization_code` sends an admin through the
    * provider's consent screen; `client_credentials` posts the client id and
    * secret to the token URL with no browser round trip (Vanta), and the
-   * platform runs the grant again before the token expires. */
-  grant: "authorization_code" | "client_credentials";
+   * platform runs the grant again before the token expires;
+   * `service_account` signs a JWT with a sealed service-account key and
+   * exchanges it (RFC 7523, Google), acting as one principal named at
+   * connect time. A service-account connector always declares the user
+   * flow too: `authorizeUrl` and the client refs serve the
+   * personal consent, never the org grant. */
+  grant: "authorization_code" | "client_credentials" | "service_account";
+  /** Org secret holding the service-account JSON key; required for (and only
+   * for) `service_account`. */
+  serviceAccountKeyRef?: string;
   /** The consent screen; required for (and only for) `authorization_code`. */
   authorizeUrl?: string;
   /** Authorize-only hosts (browser redirect surface). Never opened to sessions. */
@@ -1226,12 +1234,20 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
   const o0 = raw as Record<string, unknown>;
   let grant: OauthFacet["grant"] = "authorization_code";
   if (o0.grant !== undefined) {
-    if (o0.grant !== "authorization_code" && o0.grant !== "client_credentials") {
-      fail(where, '"oauth.grant" must be "authorization_code" or "client_credentials"');
+    if (
+      o0.grant !== "authorization_code" &&
+      o0.grant !== "client_credentials" &&
+      o0.grant !== "service_account"
+    ) {
+      fail(
+        where,
+        '"oauth.grant" must be "authorization_code", "client_credentials", or "service_account"',
+      );
     }
     grant = o0.grant;
   }
   const clientCredentials = grant === "client_credentials";
+  const serviceAccount = grant === "service_account";
   if (clientCredentials) {
     for (const field of ["authorizeUrl", "acquisitionHosts", "extraAuthorizeParams", "pkce"]) {
       if (o0[field] !== undefined) {
@@ -1240,6 +1256,20 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     }
   } else if (o0.tokenRequestBody !== undefined) {
     fail(where, '"oauth.tokenRequestBody" applies to a client_credentials grant only');
+  }
+  if (serviceAccount) {
+    // The org grant has no browser leg; `authorizeUrl` and `acquisitionHosts`
+    // stay because the user flow needs them.
+    for (const field of ["extraAuthorizeParams", "pkce"]) {
+      if (o0[field] !== undefined) {
+        fail(where, `"oauth.${field}" does not apply to a service_account grant`);
+      }
+    }
+    if (o0.serviceAccountKeyRef === undefined) {
+      fail(where, '"oauth.serviceAccountKeyRef" is required for a service_account grant');
+    }
+  } else if (o0.serviceAccountKeyRef !== undefined) {
+    fail(where, '"oauth.serviceAccountKeyRef" applies to a service_account grant only');
   }
   let tokenRequestBody: "form" | "json" | undefined;
   if (o0.tokenRequestBody !== undefined) {
@@ -1439,6 +1469,9 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
       ? { signingSecretRef: secretRef("signingSecretRef", o.signingSecretRef) }
       : {}),
     ...(signingSecretHint !== undefined ? { signingSecretHint } : {}),
+    ...(serviceAccount
+      ? { serviceAccountKeyRef: secretRef("serviceAccountKeyRef", o.serviceAccountKeyRef) }
+      : {}),
     ...(metadata !== undefined ? { metadata } : {}),
   };
 }
@@ -2337,6 +2370,9 @@ export function parseConnector(
     if (userOauth !== undefined && credential.source === "inject" && oauth === undefined) {
       fail(uw, '"oauth" requires the connector\'s top-level "oauth" facet');
     }
+    if (userOauth !== undefined && oauth?.grant === "client_credentials") {
+      fail(uw, '"oauth" has no consent screen to reuse on a client_credentials connector');
+    }
     let userInject: { header: string; template: string } | undefined;
     if (uc.inject !== undefined) {
       if (typeof uc.inject !== "object" || uc.inject === null) fail(uw, '"inject" must be an object');
@@ -2400,6 +2436,13 @@ export function parseConnector(
           builtin: opts.builtin === true,
         })
       : undefined;
+
+  if (oauth?.grant === "service_account" && userCredential?.oauth === undefined) {
+    fail(
+      where,
+      'a service_account grant requires "userCredential.oauth": the authorize URL and client refs serve the personal flow',
+    );
+  }
 
   return {
     provider: o.provider,

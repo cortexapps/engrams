@@ -17,6 +17,7 @@ name = "engram-coordinator"
 path = "src/main.rs"
 
 [dependencies]
+jsonwebtoken.workspace = true
 engram-tls.workspace = true
 engram-core.workspace = true
 engram-protocol.workspace = true
@@ -84,6 +85,8 @@ tempfile = "3"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+rsa.workspace = true
+rand_core06.workspace = true
 # ADR 0099 H3: the event-stream ordering property. Example tests all
 # published bus events in ascending order and so missed the out-of-order
 # interleaving two publishers can produce (ADR 0105); a property over

@@ -146,6 +146,8 @@ impl OAuthManager {
                 token_url: spec.token_url.clone(),
                 client_id_ref: spec.client_id_ref.clone(),
                 client_secret_ref: spec.client_secret_ref.clone(),
+                assertion_key_ref: None,
+                subject: None,
                 scope,
                 body: spec.body,
             }),

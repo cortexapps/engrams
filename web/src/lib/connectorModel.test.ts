@@ -280,6 +280,24 @@ describe("parseConnectorConfig", () => {
     expect(c.oauth?.grant).toBe("authorization_code");
   });
 
+  test("a service_account facet keeps its grant and key ref", () => {
+    const raw = JSON.stringify({
+      provider: "google_workspace",
+      hosts: ["admin.googleapis.com"],
+      operations: [],
+      oauth: {
+        grant: "service_account",
+        serviceAccountKeyRef: "google_workspace.service_account_key",
+        clientIdRef: "google_workspace.client_id",
+        clientSecretRef: "google_workspace.client_secret",
+        scopes: ["a"],
+      },
+    });
+    const c = parseConnectorConfig(raw, "google_workspace");
+    expect(c.oauth?.grant).toBe("service_account");
+    expect(c.oauth?.serviceAccountKeyRef).toBe("google_workspace.service_account_key");
+  });
+
   test("a client_credentials facet keeps its grant", () => {
     const raw = JSON.stringify({
       provider: "vanta",

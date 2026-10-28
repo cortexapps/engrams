@@ -13,9 +13,11 @@ import {
   RedirectMetadataProbeSchema,
   RedirectMetadataSpecSchema,
   RedirectOauthSpecSchema,
+  ServiceAccountSpecSchema,
   type ClientCredentialsSpec,
   type RedirectMetadataSpec,
   type RedirectOauthSpec,
+  type ServiceAccountSpec,
 } from "../gen/engram/app/v1/oauth_pb.ts";
 
 const FIELD_WIRE_NAMES: Record<OauthMetadataField, string> = {
@@ -73,13 +75,33 @@ export function clientCredentialsSpec(connector: Connector): ClientCredentialsSp
   });
 }
 
+/** The wire spec for a service-account grant (RFC 7523). `subject` is
+ * the principal the platform acts as; empty lets the coordinator keep the
+ * one in the sealed refresh spec (a re-grant from the integration page). */
+export function serviceAccountSpec(connector: Connector, subject: string): ServiceAccountSpec {
+  const oauth = connector.oauth;
+  if (!oauth || oauth.grant !== "service_account" || oauth.serviceAccountKeyRef === undefined) {
+    throw new Error(`connector "${connector.provider}" has no service-account grant`);
+  }
+  return create(ServiceAccountSpecSchema, {
+    tokenUrl: oauth.tokenUrl,
+    scopes: [...oauth.scopes],
+    scopeDelimiter: oauth.scopeDelimiter ?? "",
+    keyRef: oauth.serviceAccountKeyRef,
+    subject,
+    metadata: wireMetadata(connector),
+  });
+}
+
+/** The redirect family. A `service_account` facet carries an authorize URL
+ * for its user flow only; the org route refuses it before reaching here. */
 export function redirectOauthSpec(
   connector: Connector,
   extraParams?: Record<string, string>,
 ): RedirectOauthSpec {
   const oauth = connector.oauth;
   if (!oauth) throw new Error(`connector "${connector.provider}" has no oauth facet`);
-  if (oauth.grant !== "authorization_code" || oauth.authorizeUrl === undefined) {
+  if (oauth.grant === "client_credentials" || oauth.authorizeUrl === undefined) {
     throw new Error(`connector "${connector.provider}" has no authorization-code flow`);
   }
   const metadata = wireMetadata(connector);

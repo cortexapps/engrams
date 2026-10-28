@@ -21,6 +21,7 @@ import type {
   BeginRedirectFlowRequest,
   CompleteRedirectFlowRequest,
   GrantClientCredentialsRequest,
+  GrantServiceAccountRequest,
 } from "../gen/engram/app/v1/oauth_pb.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 
@@ -245,13 +246,19 @@ function fakeRedirectClient(opts?: {
     complete: CompleteRedirectFlowRequest[];
     lookup: Array<{ flowId: string }>;
     grant: GrantClientCredentialsRequest[];
+    grantSa: GrantServiceAccountRequest[];
   } = {
     begin: [],
     complete: [],
     lookup: [],
     grant: [],
+    grantSa: [],
   };
   const client = {
+    grantServiceAccount: async (req: GrantServiceAccountRequest) => {
+      calls.grantSa.push(req);
+      return { credential: { provider: req.provider, status: "active", expiresAt: "2026-01-01T01:00:00Z" } };
+    },
     grantClientCredentials: async (req: GrantClientCredentialsRequest) => {
       calls.grant.push(req);
       if (opts?.grantFails) {
@@ -344,6 +351,69 @@ describe("integration oauth route", () => {
     const authorize = await app.request("/api/v1/integrations/acme/oauth/authorize");
     expect(authorize.status).toBe(404);
     expect(calls.begin).toHaveLength(0);
+  });
+
+  const serviceAccountSource = {
+    list: async () => [
+      {
+        provider: "gws",
+        config: {
+          provider: "gws",
+          protocol: "http",
+          display: { name: "GWS", category: "Productivity", blurb: "x", icon: { mono: "GW", color: "#000000" } },
+          credential: { source: "inject", injects: [{ header: "Authorization", template: "Bearer {}" }] },
+          hosts: ["api.gws.example", "oauth.gws.example"],
+          operations: [{ grants: ["all:read"], match: { method: "GET", path: "/v1/*" } }],
+          userCredential: { oauth: { scopes: ["personal"] } },
+          oauth: {
+            grant: "service_account",
+            serviceAccountKeyRef: "gws.key",
+            tokenUrl: "https://oauth.gws.example/token",
+            scopes: ["directory.readonly"],
+            scopeDelimiter: " ",
+            authorizeUrl: "https://accounts.gws.example/auth",
+            acquisitionHosts: ["accounts.gws.example"],
+            clientIdRef: "gws.client_id",
+            clientSecretRef: "gws.client_secret",
+          },
+        },
+      },
+    ],
+  };
+
+  test("grant: a service-account connector posts the principal; a re-grant may omit it", async () => {
+    const { client, calls } = fakeRedirectClient();
+    const app = makeIntegrationOauthRoute({
+      connectors: serviceAccountSource,
+      oauthCredential: client as never,
+      connectionIdFor: async () => "conn-gws-default",
+      getSession: adminSession,
+    });
+    const res = await app.request("/api/v1/integrations/gws/oauth/grant", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ subject: "bot@gws.example" }),
+    });
+    expect(res.status).toBe(200);
+    expect(calls.grantSa).toHaveLength(1);
+    expect(calls.grant).toHaveLength(0);
+    const grant = calls.grantSa[0]!;
+    expect(grant.subject?.id).toBe("conn-gws-default");
+    expect(grant.spec?.keyRef).toBe("gws.key");
+    expect(grant.spec?.subject).toBe("bot@gws.example");
+    expect(grant.spec?.scopes).toEqual(["directory.readonly"]);
+    const again = await app.request("/api/v1/integrations/gws/oauth/grant", { method: "POST" });
+    expect(again.status).toBe(200);
+    expect(calls.grantSa[1]?.spec?.subject).toBe("");
+    const bad = await app.request("/api/v1/integrations/gws/oauth/grant", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ subject: "not an email" }),
+    });
+    expect(bad.status).toBe(400);
+    // The org consent route stays closed; the authorize URL is for members.
+    const authorize = await app.request("/api/v1/integrations/gws/oauth/authorize");
+    expect(authorize.status).toBe(404);
   });
 
   test("grant: a redirect connector has no grant route; a non-admin is refused", async () => {
