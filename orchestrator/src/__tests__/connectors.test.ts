@@ -2002,7 +2002,9 @@ describe("the shipped google_workspace connector", () => {
     expect(c.credential?.source).toBe("inject");
     expect(c.cli?.bins).toEqual(["gws", "google"]);
     expect(c.cli?.dummyEnv?.GOOGLE_WORKSPACE_CLI_TOKEN).toBe("x-engrams-managed");
-    expect(c.test?.path).toBe("/admin/directory/v1/customers/my_customer");
+    // The probe needs only a delegated scope (users.list: user.readonly);
+    // customers.get would need the undelegated customer scope and answer 403.
+    expect(c.test?.path).toBe("/admin/directory/v1/users?customer=my_customer&maxResults=1");
     expect(c.webhook).toBeUndefined();
   });
 

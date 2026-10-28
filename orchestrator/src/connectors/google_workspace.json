@@ -71,7 +71,7 @@
     "clientSecretRef": "google_workspace.client_secret"
   },
   "test": {
-    "path": "/admin/directory/v1/customers/my_customer"
+    "path": "/admin/directory/v1/users?customer=my_customer&maxResults=1"
   },
   "operations": [
     {
