@@ -206,6 +206,8 @@ export interface ParsedOauth {
   /** Org secret for the app's webhook-signing secret, when the provider has an inbound
    * webhook surface (ADR 0060 Slack triggers). Present → the connect flow seals it. */
   signingSecretRef?: string;
+  /** Provider copy under the signing-secret field: where the admin finds it. */
+  signingSecretHint?: string;
 }
 
 export interface ParsedConnectorConfig {
@@ -301,6 +303,7 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
         clientIdRef?: string;
         clientSecretRef?: string;
         signingSecretRef?: unknown;
+        signingSecretHint?: unknown;
         scopes?: unknown;
       }
     | undefined;
@@ -316,6 +319,9 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
             : [],
           ...(typeof oauthRaw.signingSecretRef === "string"
             ? { signingSecretRef: oauthRaw.signingSecretRef }
+            : {}),
+          ...(typeof oauthRaw.signingSecretHint === "string"
+            ? { signingSecretHint: oauthRaw.signingSecretHint }
             : {}),
         }
       : undefined;

@@ -283,6 +283,9 @@ export interface OauthFacet {
    * inbound webhooks with one (ADR 0060 Slack triggers). Admin-entered like the client
    * creds; absent for providers without an inbound webhook surface. */
   signingSecretRef?: string;
+  /** Where the admin finds the signing secret, shown under the connect sheet's
+   * field. Provider copy lives with the provider, not in the web component. */
+  signingSecretHint?: string;
   /** Declarative account-metadata extraction — no per-provider server code. */
   metadata?: OauthMetadataSpec;
 }
@@ -1404,6 +1407,22 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     }
   }
 
+  let signingSecretHint: string | undefined;
+  if (o.signingSecretHint !== undefined) {
+    if (o.signingSecretRef === undefined) {
+      fail(where, '"oauth.signingSecretHint" needs "oauth.signingSecretRef"');
+    }
+    if (
+      typeof o.signingSecretHint !== "string" ||
+      !o.signingSecretHint.trim() ||
+      o.signingSecretHint.length > MAX_DISPLAY_BLURB ||
+      /[\x00-\x1f\x7f]/.test(o.signingSecretHint)
+    ) {
+      fail(where, `"oauth.signingSecretHint" must be a control-free string of at most ${MAX_DISPLAY_BLURB} characters`);
+    }
+    signingSecretHint = o.signingSecretHint;
+  }
+
   return {
     grant,
     ...(authorizeUrl !== undefined ? { authorizeUrl } : {}),
@@ -1419,6 +1438,7 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     ...(o.signingSecretRef !== undefined
       ? { signingSecretRef: secretRef("signingSecretRef", o.signingSecretRef) }
       : {}),
+    ...(signingSecretHint !== undefined ? { signingSecretHint } : {}),
     ...(metadata !== undefined ? { metadata } : {}),
   };
 }

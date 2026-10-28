@@ -209,8 +209,8 @@ export function OAuthConnectSheet({
               </span>
               <SecretField value={signingSecret} onChange={setSigningSecret} placeholder="••••••" />
               <span className="text-xs text-muted-foreground">
-                Optional — needed only to receive {view.name} events (e.g. @mention triggers). Find
-                it under your app's Basic Information → App Credentials.
+                {oauth.signingSecretHint ??
+                  `Optional — needed only to receive ${view.name} events; you can seal it later under Secrets.`}
               </span>
             </label>
           )}

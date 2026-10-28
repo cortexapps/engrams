@@ -252,6 +252,7 @@ describe("parseConnectorConfig", () => {
         clientIdRef: "slack.client_id",
         clientSecretRef: "slack.client_secret",
         signingSecretRef: "slack.signing_secret",
+        signingSecretHint: "Under App Credentials.",
         scopes: ["chat:write", "app_mentions:read"],
       },
     });
@@ -261,6 +262,7 @@ describe("parseConnectorConfig", () => {
       clientIdRef: "slack.client_id",
       clientSecretRef: "slack.client_secret",
       signingSecretRef: "slack.signing_secret",
+      signingSecretHint: "Under App Credentials.",
       scopes: ["chat:write", "app_mentions:read"],
     });
   });

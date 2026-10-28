@@ -1899,6 +1899,7 @@ describe("the shipped vanta connector", () => {
     expect(c.oauth?.scopeDelimiter).toBe(" ");
     expect(c.oauth?.scopes).toEqual(["vanta-api.all:read", "vanta-api.all:write"]);
     expect(c.oauth?.signingSecretRef).toBe("vanta.webhook_secret");
+    expect(c.oauth?.signingSecretHint).toMatch(/Webhooks/);
     // The token is OAuth-sealed: the inject names no org secret of its own.
     expect(c.credential?.source).toBe("inject");
     if (c.credential?.source === "inject") expect(c.credential.injects.map((i) => i.secretRef)).toEqual([undefined]);

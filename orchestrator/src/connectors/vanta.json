@@ -34,6 +34,7 @@
     "clientIdRef": "vanta.client_id",
     "clientSecretRef": "vanta.client_secret",
     "signingSecretRef": "vanta.webhook_secret",
+    "signingSecretHint": "Optional — needed only to receive Vanta webhooks. Vanta shows it under Settings → Webhooks for the endpoint you add; you can seal it later under Secrets.",
     "metadata": {
       "probe": {
         "path": "/v1/organization",

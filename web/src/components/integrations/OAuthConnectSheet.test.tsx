@@ -112,6 +112,20 @@ describe("OAuthConnectSheet signing secret", () => {
     expect(screen.getByLabelText(/signing secret/i)).toBeTruthy();
   });
 
+  it("shows the facet's own signing-secret hint, with a generic fallback", () => {
+    const { unmount } = render(
+      <OAuthConnectSheet
+        view={view()}
+        oauth={{ ...oauth, signingSecretHint: "Under App Credentials." }}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByText("Under App Credentials.")).toBeTruthy();
+    unmount();
+    render(<OAuthConnectSheet view={view()} oauth={oauth} onClose={() => {}} />);
+    expect(screen.getByText(/needed only to receive Slack events/)).toBeTruthy();
+  });
+
   it("omits the signing-secret field when the facet has none", () => {
     render(
       <OAuthConnectSheet
