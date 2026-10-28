@@ -661,15 +661,22 @@ it inside one checkpointed step and the run goes on or ends. (2) **The
 automation consumer renders.** With no run live, the session listener's
 consumer renders every curated event straight into the place through the
 unchanged `CommunicationPolicy`, and the session's end posts the closing
-message and removes the row. Every write CASes on the row's `version`, so
-a re-point racing a render never loses state. (3) **Answers route to the
-session.** A question card carries the session id; the interactivity route
+message and removes the row. Every write CASes on the row's `version`; a
+render that loses the race re-reads the row and puts what it changed on
+top of the winner's state (a re-point's closed bubble stays closed, a
+sibling render's question card stays known), so a re-point racing a
+render never loses state. (3) **Answers route to the session.** A question card carries the session id; the interactivity route
 completes the deferred tool call directly. A `slack_choice` card still
 carries the run id: its click is the run's. (4) **`run_agent` is the
-composite.** Lookup the workstream's kept session → adopt and prompt, else
-create with the opening prompt → install or re-point the relay. Every event
-is a short run; the "durable workflow parked at one step" is the kept
-session plus the open workstream. (5) **Retired.** `session_event` in the
+composite.** Lookup the workstream's kept session (live: the control plane
+holds it and it is not over; a session already bound to the asking run
+counts, so a step re-executed after a crash converges on it) → adopt it,
+else start a session with no prompt → install or re-point the relay →
+send the prompt (the opening one to a new session). The relay goes on
+before the prompt, so a session's first output finds its place and a
+continued session's turn lands under the new mention. Every event is a
+short run; the "durable workflow parked at one step" is the kept session
+plus the open workstream. (5) **Retired.** `session_event` in the
 inbox, `onMessage`/`HandlerResult` on executors, `handlerState`,
 `relayStepName`, the `relay` flag on `automation_session` and
 `setSessionRelay`. `ENGINE_STEP_CONTRACT` is 5: a run checkpointed under
@@ -698,19 +705,32 @@ holds, once, every field of the `run_agent` executor's config except
 `reuse`, which the scope decides. (2) **Every way in ends on the agent
 step.** `entrypointsOf` appends one step per way in by its **role**:
 `start` (the default) and `reach` end on the step `agent` of type
-`run_agent`; `close` ends on `agent_close` of type `instance_close`;
-`none` ends on nothing. The stored definition never carries these steps;
+`run_agent`; `close` ends on `agent_close` of type `close_agent`, which
+posts the closing message into the agent's relayed place and removes the
+relay, ends the kept session and closes the workstream; `none` ends on
+nothing. The stored definition never carries these steps;
 the interpreter, the preview and the validator all read the appended
 view. The ids `agent` and `agent_close` are reserved in an agent
-automation, and `run_agent` is refused in any block list. (3) **The
-workstream settings derive.** `instanceSettingsOf` maps scope `event` to
-no workstream (a fresh session per event), scope `automation` to one
-workstream keyed `agent`, and scope `key` to one workstream per rendered
-key; a `reach` or `close` way in admits with `require`. An agent
-automation that also declares `settings.instance` is refused; a block
-automation keeps declaring it. (4) **A new session is announced.** The
-agent step calls `announceStarted` after it installs a relay on a session
-it started, so the link lands in the place before any output. (5)
+automation, and `run_agent` and `close_agent` are refused in any block
+list, finalize hooks included. (3) **The workstream settings derive.**
+`instanceSettingsOf` maps scope `event` to no workstream (a fresh session
+per event), scope `automation` to one workstream keyed `agent`, and scope
+`key` to one workstream per rendered key; a `reach` or `close` way in
+admits with `require`, a `none` way in with `optional` (it joins an open
+workstream or runs unbound; it never opens one). The concurrency derives
+too: an agent that keeps a session runs one run at a time per workstream
+(`concurrencySettingsOf`: policy `queue` on the key `agent`, scoped by
+the instance prefix) unless the definition declares its own, so two
+events for one agent never race for its session. An agent automation
+that also declares `settings.instance` is refused, as is
+`endSessionsOnFinish: true` with a kept scope; a block automation keeps
+declaring both. A schedule with role `start` to an agent scoped to the
+whole automation opens the agent's workstream on its first tick (the key
+is fixed; no event renders it); a `reach` schedule, or a key scope, fans
+out over open workstreams only. (4) **A new session is announced.** The
+agent step calls `announceStarted` when it creates the relay row for a
+session, so the link lands in the place before any output and a
+re-executed step (the row exists) says nothing twice. (5)
 **Storage.** `automation_version` gains `agent` (jsonb) and `role`
 (text), both null for a block automation.
 
