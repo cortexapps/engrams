@@ -269,6 +269,7 @@ function harness(options: {
               options.closed!.push(input);
               return true;
             },
+            isOpen: async () => true,
           },
         }
       : {}),

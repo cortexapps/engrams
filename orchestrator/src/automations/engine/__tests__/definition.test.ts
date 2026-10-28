@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { registerEngineBlocks } from "../blocks/index.ts";
 import { registerBlock, unregisterBlockForTest } from "../blocks/registry.ts";
 import {
+  agentStepConfig,
   concurrencySettingsOf,
   cronEntrypointOf,
   declaredEntrypointsOf,
@@ -437,13 +438,8 @@ describe("the agent: an automation is an agent with ways in", () => {
       log: { admit: "optional" },
     });
     expect(entrypointOf(parsed, "log")?.blocks.map((b) => b.id)).toEqual(["log_admit"]);
-    // One run at a time per thread, unless the definition says otherwise.
+    // One run at a time per thread: the scope decides, never the settings.
     expect(concurrencySettingsOf(parsed)).toEqual({ keyTemplate: "agent", policy: "queue" });
-    expect(
-      concurrencySettingsOf(
-        validateDefinition(bot({ settings: { endSessionsOnFinish: false, concurrency: { keyTemplate: "k", policy: "skip" } } })),
-      ),
-    ).toEqual({ keyTemplate: "k", policy: "skip" });
     expect(
       concurrencySettingsOf(
         validateDefinition(def({ agent: { scope: { kind: "event" }, profileId: "p1", promptTemplate: "go" } } as Partial<AutomationDefinition>)),
@@ -492,6 +488,30 @@ describe("the agent: an automation is an agent with ways in", () => {
       bot({ entrypoints: [{ id: "reply", trigger: slack(["message"]), role: "sometimes", blocks: [] }] }),
       { blockId: "__entrypoints__", field: "role" },
     );
+  });
+
+  test("the agent's session is never ended at finalize: keepOnFinish false is refused, true is forced", () => {
+    const agent = validateDefinition(bot()).agent!;
+    expect(() => validateDefinition(bot({ agent: { ...agent, keepOnFinish: false } }))).toThrow(
+      /keepOnFinish cannot be false/,
+    );
+    expect(agentStepConfig(agent)["keepOnFinish"]).toBe(true);
+  });
+
+  test("an agent automation never also declares concurrency: the scope derives it", () => {
+    expect(() =>
+      validateDefinition(
+        bot({ settings: { endSessionsOnFinish: false, concurrency: { keyTemplate: "k", policy: "join" } } }),
+      ),
+    ).toThrow(/derived from the agent's scope/);
+    expect(concurrencySettingsOf(validateDefinition(bot()))).toEqual({ keyTemplate: "agent", policy: "queue" });
+    expect(
+      concurrencySettingsOf(
+        validateDefinition(
+          def({ agent: { scope: { kind: "event" }, profileId: "p1", promptTemplate: "go" } } as Partial<AutomationDefinition>),
+        ),
+      ),
+    ).toBeUndefined();
   });
 
   test("an agent automation never also declares settings.instance", () => {

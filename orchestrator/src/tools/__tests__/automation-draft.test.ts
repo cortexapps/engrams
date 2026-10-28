@@ -10,7 +10,7 @@ import {
 import { draftBlockCatalog } from "../../automations/draft-catalog.ts";
 import { AUTOMATION_DRAFT_TASK_TYPE } from "../../automations/draft.ts";
 import { registerEngineBlocks, V1_BLOCK_TYPES } from "../../automations/engine/blocks/index.ts";
-import { AGENT_BLOCK_TYPE } from "../../automations/engine/definition.ts";
+import { AGENT_BLOCK_TYPE, AGENT_CLOSE_BLOCK_TYPE } from "../../automations/engine/definition.ts";
 import { SaveVersionConflictError } from "../../db/automations.ts";
 import type { AutomationRow } from "../../db/automations.ts";
 import type { AutomationDefinition } from "../../automations/engine/definition.ts";
@@ -387,7 +387,7 @@ describe("draftBlockCatalog", () => {
     // The agent step's executor is registered but is not a block the agent
     // may write: the definition's `agent` stands for it.
     expect(catalog.blocks.map((b) => b.type).sort()).toEqual(
-      V1_BLOCK_TYPES.filter((type) => type !== AGENT_BLOCK_TYPE).sort(),
+      V1_BLOCK_TYPES.filter((type) => type !== AGENT_BLOCK_TYPE && type !== AGENT_CLOSE_BLOCK_TYPE).sort(),
     );
     expect(catalog).toHaveProperty("agent_schema");
     for (const block of catalog.blocks) {

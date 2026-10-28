@@ -303,6 +303,7 @@ function makeHarness(
 
   if (!options.noStateStore) deps.state = fakeState;
   deps.instances = {
+    isOpen: async (instanceId) => !closedInstances.has(instanceId),
     async closeInstance(input) {
       closes.push(input);
       const first = !closedInstances.has(input.instanceId);

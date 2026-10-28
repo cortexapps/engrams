@@ -285,6 +285,7 @@ function harness(options: {
         closed.push(input);
         return true;
       },
+      isOpen: async () => true,
     },
     decisions: {
       connected: async () => options.decisions?.connected ?? true,

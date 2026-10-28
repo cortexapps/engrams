@@ -228,6 +228,9 @@ export interface EngineStateStore {
  * (instance_close). Implemented over the instance store. */
 export interface EngineInstanceOps {
   closeInstance(input: { instanceId: string; reason?: string }): Promise<boolean>;
+  /** Whether the workstream is still open: the agent step starts no
+   * replacement session for a closed one. */
+  isOpen(instanceId: string): Promise<boolean>;
   /** The claim_handle block's writer (same contract as every writer:
    * already_ours converges a replay; an OPEN holder's conflict never
    * rebinds). The claim path alone may pass `allowTakeoverFromClosed` to

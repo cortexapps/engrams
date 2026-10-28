@@ -483,6 +483,9 @@ export function agentStepConfig(
     // The way in's own message to the agent, when it has one, rendered in
     // that way in's scope (its steps); else the agent's prompt on every event.
     ...(entrypoint?.promptTemplate !== undefined ? { promptTemplate: entrypoint.promptTemplate } : {}),
+    // The agent's session outlives the run that reached it: the run ends
+    // right after the prompt, and the agent works on. Never ended at finalize.
+    keepOnFinish: true,
     reuse: scope.kind === "event" ? "never" : "workstream",
   };
 }
@@ -673,10 +676,13 @@ export function instanceSettingsOf(definition: AutomationDefinition): InstanceSe
 export function concurrencySettingsOf(
   definition: AutomationDefinition,
 ): AutomationSettings["concurrency"] {
-  if (definition.settings.concurrency !== undefined) return definition.settings.concurrency;
   const agent = definition.agent;
-  if (agent === undefined || !agentKeepsSession(agent)) return undefined;
-  return { keyTemplate: AGENT_STEP_ID, policy: "queue" };
+  // With an agent the policy is the scope's (validation refuses a written
+  // one): one run at a time per kept agent, else none.
+  if (agent !== undefined) {
+    return agentKeepsSession(agent) ? { keyTemplate: AGENT_STEP_ID, policy: "queue" } : undefined;
+  }
+  return definition.settings.concurrency;
 }
 
 export function entrypointOf(
@@ -821,6 +827,20 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
       );
     }
     validateTemplatesIn("__agent__", agentStepConfig(agent), "");
+    if (agent.keepOnFinish === false) {
+      throw new DefinitionError(
+        "__agent__",
+        "keepOnFinish",
+        "the agent's session outlives the run that reached it; keepOnFinish cannot be false",
+      );
+    }
+    if (definition.settings.concurrency !== undefined) {
+      throw new DefinitionError(
+        "__settings__",
+        "concurrency",
+        "concurrency is derived from the agent's scope (one run at a time per kept agent); remove it",
+      );
+    }
     if (agentKeepsSession(agent) && definition.settings.endSessionsOnFinish) {
       throw new DefinitionError(
         "__settings__",

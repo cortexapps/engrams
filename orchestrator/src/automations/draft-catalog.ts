@@ -12,6 +12,7 @@ import { z } from "zod";
 
 import {
   AGENT_BLOCK_TYPE,
+  AGENT_CLOSE_BLOCK_TYPE,
   agentSpecSchema,
   ENGINE_VERSION,
   entrypointRoleSchema,
@@ -58,8 +59,9 @@ export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Se
   registerEngineBlocks();
   const blocks = listBlockTypes()
     .filter((type) => {
-      // The agent is a part of the definition, never a block in a list.
-      if (type === AGENT_BLOCK_TYPE) return false;
+      // The agent is a part of the definition, never a block in a list;
+      // its close step comes from a way in's `close` role.
+      if (type === AGENT_BLOCK_TYPE || type === AGENT_CLOSE_BLOCK_TYPE) return false;
       const router = getBlock(type)!.requiresRouter;
       return router === undefined || connectedRouters.has(router);
     })

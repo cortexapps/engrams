@@ -23,6 +23,10 @@ function harness(options: {
    * default), `runId` which run holds its binding. */
   previous?: { sessionId: string; alive: boolean; owner?: "terminal" | "live"; status?: string; runId?: string };
   dryRun?: boolean;
+  /** The workstream was closed before this run's agent step. */
+  instanceClosed?: boolean;
+  /** The control plane refuses the prompt. */
+  promptFails?: boolean;
 } = {}) {
   const store = makeFakeRelayStore();
   const announced: Array<{ sessionId: string; ts: string }> = [];
@@ -39,6 +43,7 @@ function harness(options: {
       return { sessionId: `s-new-${created.length}`, taskId: "t" };
     },
     sendPrompt: async (sessionId, promptId, text) => {
+      if (options.promptFails) throw new Error("session refused the prompt");
       prompts.push({ sessionId, promptId, text, relayed: store.rows.has(sessionId) });
     },
     endSession: async (sessionId) => {
@@ -83,6 +88,7 @@ function harness(options: {
         closed.push(input);
         return true;
       },
+      isOpen: async () => !options.instanceClosed,
     },
   };
   const snapshot: RunSnapshot = {
@@ -175,10 +181,39 @@ describe("run_agent", () => {
     // starting a second session for the workstream, under the same prompt
     // id, so the outbox dedupes a prompt that already went in.
     const h = harness({ instanceId: "ai_thread1", previous: { sessionId: "s-old", alive: true, runId: RUN_ID } });
-    const out = await h.run(BASE);
-    expect(out).toMatchObject({ kind: "ok", outputs: { session_id: "s-old", started: false } });
+    const out = await h.run({ ...BASE, openingPromptTemplate: "whole thread: hi" });
+    // It is the START replayed: the opening prompt again, never the
+    // follow-up (the outbox drops the duplicate; a lost one is the opening).
+    expect(out).toMatchObject({
+      kind: "ok",
+      outputs: { session_id: "s-old", started: true, prompt: "whole thread: hi" },
+    });
     expect(h.created).toEqual([]);
     expect(h.prompts.map((p) => p.promptId)).toEqual([`autorun:${RUN_ID}:agent:s-old`]);
+  });
+
+  test("a closed workstream starts no replacement: a run queued behind the close ends filtered", async () => {
+    const h = harness({ instanceId: "ai_thread1", instanceClosed: true });
+    const out = await h.run(BASE);
+    expect(out).toMatchObject({ kind: "end_run", status: "filtered" });
+    expect(h.created).toEqual([]);
+    expect(h.prompts).toEqual([]);
+  });
+
+  test("a turn that cannot reach the session puts the relay back on the previous mention", async () => {
+    const h = harness({ instanceId: "ai_thread1", previous: { sessionId: "s-old", alive: true }, promptFails: true });
+    await h.store.install({
+      sessionId: "s-old",
+      automationId: "auto-1",
+      provider: "slack",
+      target: { ...RELAY, threadRoot: "100.0", ts: "100.0" },
+      state: { bubble: null, lastAssistantText: "earlier", assets: [], questionTs: {}, questionProtocols: {} },
+    });
+    await expect(h.run({ ...BASE, relay: { ...RELAY, mentionTs: "200.0", eventId: "E2" } })).rejects.toThrow(
+      /refused the prompt/,
+    );
+    // The next turn's context starts after the mention the session really heard.
+    expect(h.store.rows.get("s-old")!.target).toMatchObject({ ts: "100.0", eventId: "E1" });
   });
 
   test("reuse: never always starts a session", async () => {

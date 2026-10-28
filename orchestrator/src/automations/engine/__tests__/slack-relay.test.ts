@@ -22,8 +22,11 @@ import { makeFakeRelayStore } from "./fake-relay-store.ts";
 
 registerEngineBlocks();
 
-const ev = (kind: string, payload: unknown, idx = 0n): CuratedEvent => ({
-  idx,
+/** Each event is a new log entry (its idx counts up, as the log's do)
+ * unless the test replays one by passing its idx. */
+let nextIdx = 1n;
+const ev = (kind: string, payload: unknown, idx?: bigint): CuratedEvent => ({
+  idx: idx ?? nextIdx++,
   kind,
   payloadJson: JSON.stringify(payload),
 });
@@ -107,6 +110,20 @@ function harness() {
 }
 
 describe("session relay (contract 5)", () => {
+  test("an event replayed after a crash (same idx) renders nothing twice", async () => {
+    const h = harness();
+    await h.install();
+    const hello = ev("agent_message", { role: "assistant", text: "hello" }, 7n);
+    expect(await h.render(hello)).toBe("rendered");
+    const after = h.store.rows.get(SESSION)!.state as { lastIdx: string; lastAssistantText: string | null };
+    expect(after.lastIdx).toBe("7");
+    const posts = h.policy.calls.onAssistantMessage.length;
+    expect(await h.render(hello)).toBe("rendered");
+    expect(h.policy.calls.onAssistantMessage.length).toBe(posts);
+    expect(await h.render(ev("agent_message", { role: "assistant", text: "more" }, 8n))).toBe("rendered");
+    expect(h.policy.calls.onAssistantMessage.length).toBeGreaterThan(posts);
+  });
+
   test("install creates the row with a fresh render state; the same mention again is a no-op", async () => {
     const h = harness();
     expect(await h.install()).toEqual({ created: true });
@@ -114,7 +131,7 @@ describe("session relay (contract 5)", () => {
     expect(row.provider).toBe("slack");
     expect(row.target).toMatchObject({ channel: "C1", ts: "100.0" });
     expect(row.state).toMatchObject({ bubble: null, lastAssistantText: null, assets: [] });
-    expect(await h.install()).toEqual({ created: false });
+    expect(await h.install()).toMatchObject({ created: false });
     expect(h.store.writes).toEqual(["install"]);
   });
 
@@ -296,7 +313,7 @@ describe("session relay (contract 5)", () => {
     await h.render(ev("run_started", {}));
     expect(h.store.rows.get(SESSION)!.state["working"]).toBe(true);
     // The next mention arrives while the turn runs: the relay re-points.
-    expect(await h.install({ ...MENTION, ts: "200.0", eventId: "E2" })).toEqual({ created: false });
+    expect(await h.install({ ...MENTION, ts: "200.0", eventId: "E2" })).toMatchObject({ created: false });
     expect(h.store.rows.get(SESSION)!.state).toMatchObject({ working: false, settle: ["100.0"] });
     await h.render(ev("run_completed", { ok: true }));
     // Both mentions get their ✅: the one the turn ran under, then the new one.
@@ -308,7 +325,7 @@ describe("session relay (contract 5)", () => {
     const h = harness();
     await h.install();
     await h.render(ev("agent_message", { role: "assistant", text: "one" }));
-    expect(await h.install({ ...MENTION, ts: "200.0", eventId: "E2" })).toEqual({ created: false });
+    expect(await h.install({ ...MENTION, ts: "200.0", eventId: "E2" })).toMatchObject({ created: false });
     await h.render(ev("agent_message", { role: "assistant", text: "two" }));
     // Fresh bubble (no ref) after the re-point, reacting on the new mention.
     expect(h.policy.calls.onAssistantMessage[1]![2]).toBeUndefined();

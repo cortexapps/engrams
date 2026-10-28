@@ -297,6 +297,8 @@ function productionEngineDeps(): EngineDeps {
     profileCards: () => loadProfileCards(),
     instances: {
       closeInstance: (input) => makeAutomationInstanceStore().closeInstance(input),
+      isOpen: async (instanceId) =>
+        (await makeAutomationInstanceStore().getInstance(instanceId))?.status === "open",
       recordInstanceHandle: (input) => makeAutomationInstanceStore().recordInstanceHandle(input),
     },
     relays: makeSessionRelayStore(),

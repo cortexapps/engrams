@@ -66,11 +66,22 @@ export async function installRelayForSession(
   if (!store) {
     return { kind: "error", code: "relay_store_unavailable", message: "the session relay store is not installed", retryable: false };
   }
-  const { created } = await installSessionRelay(
+  const { created, previous } = await installSessionRelay(
     { sessionId, automationId: ctx.automationId, target: mention },
     { store },
   );
-  return { kind: "ok", outputs: { session_id: sessionId, installed: true, created, mention_ts: mention.ts } };
+  return {
+    kind: "ok",
+    outputs: {
+      session_id: sessionId,
+      installed: true,
+      created,
+      mention_ts: mention.ts,
+      // The target a re-point replaced; the agent step restores it when
+      // the turn fails to reach the session.
+      ...(previous !== undefined ? { previous_target: previous } : {}),
+    },
+  };
 }
 
 /** A run-addressed Slack policy for the `slack_choice` card: its click is

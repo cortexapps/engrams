@@ -68,6 +68,11 @@ export interface RelayRenderState extends Record<string, unknown> {
   /** Mentions a re-point left mid-turn, still wearing ⏳: the next idle
    * settles them (✅) along with the current mention. */
   settle: string[];
+  /** The log index of the last event rendered (a decimal string: the
+   * state is JSON). The listener commits its cursor after the render, so
+   * a crash between the two replays the event; the index drops the replay
+   * instead of rendering it twice. */
+  lastIdx: string | null;
 }
 
 export function freshRelayState(): RelayRenderState {
@@ -79,6 +84,7 @@ export function freshRelayState(): RelayRenderState {
     lastAssistantText: null,
     working: false,
     settle: [],
+    lastIdx: null,
   };
 }
 
@@ -91,6 +97,7 @@ function stateOf(row: SessionRelayRow): RelayRenderState {
     bubble: s.bubble ?? null,
     lastAssistantText: s.lastAssistantText ?? null,
     working: s.working ?? false,
+    lastIdx: s.lastIdx ?? null,
     settle: [...(s.settle ?? [])],
   };
 }
@@ -157,7 +164,7 @@ export interface InstallSessionRelayInput {
 export async function installSessionRelay(
   input: InstallSessionRelayInput,
   deps: Pick<SessionRelayDeps, "store"> = sessionRelayDeps(),
-): Promise<{ created: boolean }> {
+): Promise<{ created: boolean; previous?: SourceMention }> {
   const target: Record<string, unknown> = { ...input.target };
   const installed = await deps.store.install({
     sessionId: input.sessionId,
@@ -184,7 +191,7 @@ export async function installSessionRelay(
         settle: state.working ? [...state.settle, mentionOf(row).ts] : state.settle,
       },
     });
-    if (ok) return { created: false };
+    if (ok) return { created: false, previous: mentionOf(row) };
     row = await deps.store.get(input.sessionId);
   }
   if (row === null) {
@@ -228,7 +235,9 @@ export async function renderSessionEvent(
   const session: StartedSession = { id: sessionId, webUrl: deps.sessionWebUrl(sessionId) };
   const mention = mentionOf(row);
   const before = stateOf(row);
+  if (before.lastIdx !== null && event.idx <= BigInt(before.lastIdx)) return "rendered";
   let st = stateOf(row);
+  st.lastIdx = String(event.idx);
   try {
     await dispatch(pol, mention, st, event, session);
   } catch (err) {
@@ -277,6 +286,10 @@ function mergeRenderState(
       after.lastAssistantText !== before.lastAssistantText ? after.lastAssistantText : base.lastAssistantText,
     working: sameMention ? after.working : base.working,
     settle: sameMention ? after.settle : settle,
+    lastIdx:
+      base.lastIdx === null || (after.lastIdx !== null && BigInt(after.lastIdx) > BigInt(base.lastIdx))
+        ? after.lastIdx
+        : base.lastIdx,
   };
 }
 

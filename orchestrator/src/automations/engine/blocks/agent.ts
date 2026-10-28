@@ -34,7 +34,7 @@ import { z } from "zod";
 import { terminalOutcomeForStatus } from "../../../control-plane/session-events.ts";
 import { makeSlackPolicy } from "../../../integrations/slack-policy.ts";
 import { sessionWebUrl } from "../../../links.ts";
-import { relayFactsOf } from "../../session-relay.ts";
+import { installSessionRelay, relayFactsOf, type InstallSessionRelayInput } from "../../session-relay.ts";
 import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
@@ -86,14 +86,15 @@ export async function sessionIsLive(ctx: RunContext, sessionId: string): Promise
 }
 
 /** The workstream's kept session, if it is still live. A session already
- * bound to THIS run counts: a step re-executed after a crash (the adopt or
- * the start happened, the checkpoint did not) converges on it instead of
- * starting a second session for the same workstream. */
-async function keptSession(ctx: RunContext): Promise<string | null> {
+ * bound to THIS run counts (`ownRun`): a step re-executed after a crash
+ * (the adopt or the start happened, the checkpoint did not) converges on
+ * it instead of starting a second session for the same workstream. */
+async function keptSession(ctx: RunContext): Promise<{ sessionId: string; ownRun: boolean } | null> {
   if (ctx.instanceId === "") return null;
   const previous = await ctx.deps.store.latestKeptInstanceSession(ctx.instanceId);
   if (previous === null) return null;
-  return (await sessionIsLive(ctx, previous.sessionId)) ? previous.sessionId : null;
+  if (!(await sessionIsLive(ctx, previous.sessionId))) return null;
+  return { sessionId: previous.sessionId, ownRun: previous.runId === ctx.runId };
 }
 
 async function execute(config: RunAgentConfig, ctx: RunContext): Promise<BlockOutcome> {
@@ -110,7 +111,7 @@ async function execute(config: RunAgentConfig, ctx: RunContext): Promise<BlockOu
     // run of this workstream is still delivering; the derived `queue`
     // concurrency serializes the runs of one workstream, so this is a
     // retryable error for the rare overlap, never a steal.
-    const ref = sessionRefSchema.parse({ template: existing });
+    const ref = sessionRefSchema.parse({ template: existing.sessionId });
     try {
       sessionId = await ctx.resolveSession(ref);
     } catch (error) {
@@ -121,9 +122,31 @@ async function execute(config: RunAgentConfig, ctx: RunContext): Promise<BlockOu
         retryable: true,
       };
     }
-    started = false;
-    text = await ctx.render(create.promptTemplate);
+    // A session this run itself started (a replay of the start) gets the
+    // opening prompt again, under the same prompt id: the outbox dedupes
+    // a prompt that already went in, and one that did not is the opening
+    // one, never the follow-up. The event context rides along either way,
+    // as it does on a start.
+    started = existing.ownRun;
+    const rendered = await renderSessionPrompt(
+      {
+        ...create,
+        promptTemplate: existing.ownRun
+          ? (openingPromptTemplate ?? create.promptTemplate)
+          : create.promptTemplate,
+      },
+      ctx,
+    );
+    if (rendered.kind === "error") return rendered;
+    text = rendered.prompt;
   } else {
+    // A closed workstream starts no replacement: a run admitted and queued
+    // behind the close (the close ran first) ends here, filtered.
+    if (ctx.instanceId !== "" && !ctx.dryRun && ctx.deps.instances !== undefined) {
+      if (!(await ctx.deps.instances.isOpen(ctx.instanceId))) {
+        return { kind: "end_run", status: "filtered", reason: "the agent is closed" };
+      }
+    }
     // Start the session with no opening prompt: the relay must be on it
     // before its first output, so the prompt goes in after the relay.
     const opening = await executeCreateSession(
@@ -146,10 +169,14 @@ async function execute(config: RunAgentConfig, ctx: RunContext): Promise<BlockOu
   }
 
   let relayOutputs: Record<string, unknown> = {};
+  // Where the relay pointed before this turn re-pointed it (a continued
+  // session): a turn that fails to reach the agent puts it back.
+  let repointedFrom: InstallSessionRelayInput["target"] | undefined;
   if (relay !== undefined) {
     const installed = await installRelayForSession(sessionId, relay, ctx);
     if (installed.kind !== "ok") return installed;
     relayOutputs = { relayed: installed.outputs["installed"] === true, mention_ts: installed.outputs["mention_ts"] };
+    repointedFrom = installed.outputs["previous_target"] as InstallSessionRelayInput["target"] | undefined;
     // The link goes into the place the moment the relay is created for a
     // session, before any output. A re-executed step finds the relay
     // installed (same mention) and says nothing twice; a continued
@@ -164,7 +191,20 @@ async function execute(config: RunAgentConfig, ctx: RunContext): Promise<BlockOu
   const promptId = `autorun:${ctx.runId}:${ctx.currentPath ?? ctx.currentBlockId ?? ""}:${sessionId}`;
   const delivered = text.length > 0;
   if (delivered && !ctx.dryRun) {
-    await ctx.deps.sessions.sendPrompt(sessionId, promptId, text, create.harnessMode);
+    try {
+      await ctx.deps.sessions.sendPrompt(sessionId, promptId, text, create.harnessMode);
+    } catch (error) {
+      // The turn did not reach the agent. The relay goes back to the
+      // mention the session last heard, so the next turn's context starts
+      // after what it really got, never after this mention.
+      if (repointedFrom !== undefined && ctx.deps.relays !== undefined) {
+        await installSessionRelay(
+          { sessionId, automationId: ctx.automationId, target: repointedFrom },
+          { store: ctx.deps.relays },
+        );
+      }
+      throw error;
+    }
   }
 
   return {
