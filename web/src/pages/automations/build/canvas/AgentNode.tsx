@@ -32,17 +32,22 @@ export const ROLE_CAPTION: Record<EntrypointRole, string> = {
   none: "no agent",
 };
 
-/** The connector under one way in's column. */
+/** The connector under one way in's column. The stem grows to span the
+ * space between the column's last node and the bus, so a short column still
+ * reads as one path from its trigger to the agent. */
 export function AgentStub({ role, dimmed }: { role: EntrypointRole; dimmed?: boolean }) {
   return (
     <div
-      className={cn("flex shrink-0 flex-col items-center", dimmed && "opacity-40")}
+      className={cn(
+        "flex min-h-0 flex-1 flex-col items-center justify-end",
+        dimmed && "opacity-40",
+      )}
       data-testid="agent-stub"
       data-role={role}
     >
       <div
         className={cn(
-          "h-5 w-px",
+          "min-h-5 w-px flex-1",
           role === "none" ? "border-l border-dashed border-foreground/30" : "bg-foreground/45",
         )}
       />

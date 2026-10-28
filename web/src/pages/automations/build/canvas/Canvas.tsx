@@ -126,7 +126,7 @@ export function Canvas({
 
   return (
     <div
-      className="flex h-full min-w-0 flex-col"
+      className="flex min-h-0 min-w-0 shrink flex-col"
       data-testid={entrypointId ? `entrypoint-canvas-${entrypointId}` : "block-canvas"}
     >
       <div

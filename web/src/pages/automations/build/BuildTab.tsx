@@ -551,18 +551,21 @@ export function BuildTab({
                 Fit
               </Button>
             </div>
-            <div className="flex min-h-0 flex-1 gap-6 overflow-x-auto p-6 pt-12">
+            <div className="flex min-h-0 flex-1 gap-6 overflow-auto p-6 pt-12">
               {/* Fit: every column shrinks and its canvas scales down, so the
                   whole row is in view. An explicit zoom keeps each column at
                   its canvas width and the row scrolls, so a later column is
-                  never painted under the "add" control beside the row. */}
+                  never painted under the "add" control beside the row.
+                  The row is as tall as its tallest column and the agent sits
+                  right under it: the diagram scrolls as a whole, so a stem
+                  never spans an empty viewport. */}
               <div
                 className={cn(
-                  "flex min-h-0 flex-1 flex-col",
+                  "flex flex-1 flex-col self-start",
                   zoom === "fit" ? "min-w-0" : "min-w-max",
                 )}
               >
-                <div className="flex min-h-0 flex-1 gap-6">
+                <div className="flex gap-6">
                   {ways.map((way) => {
                     const projected =
                       way === entrypointId ? active : projectEntrypoint(definition, way);
