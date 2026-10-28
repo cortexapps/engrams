@@ -383,6 +383,7 @@ function toProtoRunBrief(row: AutomationRunRow): ProtoRunBrief {
     version: row.version,
     status: row.status,
     instanceId: row.instanceId,
+    entrypointId: row.entrypointId,
     ...(row.error !== null ? { error: row.error } : {}),
     triggerSource: row.trigger.source,
     ...(row.trigger.eventKey !== undefined ? { eventKey: row.trigger.eventKey } : {}),

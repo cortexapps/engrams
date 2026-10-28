@@ -153,6 +153,8 @@ message AutomationRunBrief {
   string created_at = 12;
   // ADR 0120: the bound workstream ("" = unbound).
   string instance_id = 13;
+  // The way in the run entered through ("main" for the top-level one).
+  string entrypoint_id = 14;
 }
 
 message DayRunCount {
