@@ -393,14 +393,12 @@ impl Reducer {
                         open,
                         streaming,
                         failed,
-                    } => {
-                        if *open || *streaming {
-                            *open = false;
-                            *streaming = false;
-                            *failed = !ok;
-                            md.finalize();
-                            e.invalidate();
-                        }
+                    } if *open || *streaming => {
+                        *open = false;
+                        *streaming = false;
+                        *failed = !ok;
+                        md.finalize();
+                        e.invalidate();
                     }
                     Cell::Tool { state, .. } if *state == ToolState::Running => {
                         *state = if ok { ToolState::Ok } else { ToolState::Err };
