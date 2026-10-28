@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 
 import { matchesIntegrationTrigger } from "../../dispatch.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
-import { validateDefinition } from "../../engine/definition.ts";
+import {
+  concurrencySettingsOf,
+  entrypointsOf,
+  instanceSettingsOf,
+  validateDefinition,
+  walkBlocks,
+} from "../../engine/definition.ts";
 import { evaluateCode } from "../../code/sandbox.ts";
 import {
   SLACK_BRAIN_BUILTIN,
@@ -15,7 +21,7 @@ import {
 registerEngineBlocks();
 
 describe("Slack thread brain built-in — definition", () => {
-  test("validates ($ref loop bound, finalize hook) and every block is a palette block", () => {
+  test("validates and is an agent with one way in: admit, fold, route, and the engine's agent step", () => {
     const parsed = validateDefinition(SLACK_BRAIN_DEFINITION);
     expect(parsed.blocks.map((b) => b.id)).toEqual([
       "facts",
@@ -25,45 +31,56 @@ describe("Slack thread brain built-in — definition", () => {
       "linked",
       "previous",
       "replies",
-      "opening",
+      "turn",
+      "has_turn",
       "has_previous",
-      "pick",
-      "relay",
-      "opening_turn",
-      "thread",
     ]);
-    // The idle exit (completed) neither posts nor closes the workstream; only
-    // an explicit end closes it, so the next mention resumes the session.
-    const hooks = parsed.settings.onFinalize!;
-    expect(hooks.find((h) => h.block.type === "relay_close")!.when).not.toContain("completed");
-    // Nothing time-based fails a thread: the run ceiling is a pause too.
-    expect(hooks.find((h) => h.block.type === "relay_close")!.when).not.toContain("deadline");
-    expect(hooks.find((h) => h.block.type === "instance_close")!.when).not.toContain("deadline");
-    expect(hooks.find((h) => h.block.type === "instance_close")!.when).toEqual(["halted", "superseded"]);
-    expect(parsed.settings.concurrency?.policy).toBe("join");
+    // Nothing waits: no loop, no wait block anywhere in the graph. The
+    // conversation lives in the kept session and its relay, not in a run.
+    const types = new Set([...walkBlocks(parsed.blocks)].map((b) => b.type));
+    expect(types.has("loop")).toBe(false);
+    expect(types.has("wait_event")).toBe(false);
+    expect(types.has("wait_session")).toBe(false);
+    expect(types.has("send_prompt")).toBe(false);
+    expect(types.has("create_session")).toBe(false);
+    expect(types.has("run_agent")).toBe(false);
+    // A bare mention is not a turn: the gate ends the run before routing.
+    expect(parsed.blocks.find((b) => b.id === "has_turn")!.type).toBe("filter");
+    // Only a NEW session is routed.
+    const routing = parsed.blocks.find((b) => b.id === "has_previous")!;
+    expect(routing.then).toEqual([]);
+    expect(routing.else!.map((b) => b.id)).toEqual(["smart_route"]);
+    // The agent is the definition's: scoped to the thread, it continues the
+    // thread's kept session and relays into the thread. The way in ends on
+    // its step.
+    expect(parsed.agent).toMatchObject({ scope: { kind: "key" }, keepOnFinish: true, relay: { provider: "slack" } });
+    const way = entrypointsOf(parsed)[0]!;
+    expect(way.blocks.at(-1)).toMatchObject({ id: "agent", type: "run_agent", config: { reuse: "workstream" } });
+    // Only a failed run posts into the thread (a plain line that says why);
+    // the session's relay is never touched by a run's end.
+    expect(parsed.settings.onFinalize?.map((h) => [h.block.type, h.when])).toEqual([["integration_action", ["failed"]]]);
+    expect(parsed.settings.onFinalize?.[0]?.block.config).toMatchObject({ actionId: "post_message" });
+    // One run at a time per thread: derived from the kept scope.
+    expect(parsed.settings.concurrency).toBeUndefined();
+    expect(concurrencySettingsOf(parsed)).toEqual({ keyTemplate: "agent", policy: "queue" });
+    expect(parsed.settings.runDeadlineSeconds).toBeUndefined();
     expect(parsed.settings.endSessionsOnFinish).toBe(false);
-    expect(parsed.settings.onFinalize?.map((h) => h.block.type)).toEqual(["relay_close", "instance_close"]);
   });
 
-  test("is a workstream per thread (ADR 0120): a mention opens it, a later mention in the thread joins it", () => {
+  test("is a workstream per thread (ADR 0120): every mention in the thread is a run of the same workstream", () => {
     const parsed = validateDefinition(SLACK_BRAIN_DEFINITION);
     // Only a mention is an event the brain acts on (the legacy model): the
     // one trigger, no reply entrypoint. A mention in the thread renders the
-    // same workstream key as the opening one, so it binds and joins.
+    // same workstream key as the opening one, so its run finds the thread's
+    // kept session.
     expect(parsed.trigger).toMatchObject({ eventKeys: ["app_mention"] });
     expect(parsed.entrypoints ?? []).toEqual([]);
-    expect(parsed.settings.instance?.keyTemplate).toBe(parsed.settings.concurrency?.keyTemplate);
-    expect(parsed.settings.instance?.keyTemplate).toContain('coalesce: "thread_ts", "ts"');
+    // The workstream derives from the agent's scope; nothing is declared.
+    expect(parsed.settings.instance).toBeUndefined();
+    const instance = instanceSettingsOf(parsed)!;
+    expect(instance.keyTemplate).toContain('coalesce: "thread_ts", "ts"');
     // The Slack page shows the opening mention's text as the thread's title.
-    expect(parsed.settings.instance?.labelTemplate).toBe("${{ event.raw.event.text | strip_mentions | truncate: 80 }}");
-    // The loop's wait consumes mentions only; a plain reply is folded into
-    // the next mention's prompt by the list_replies + code pair.
-    const thread = parsed.blocks.find((b) => b.id === "thread")!;
-    const next = thread.body!.find((b) => b.id === "next")!;
-    expect(next.config["eventKeys"]).toEqual(["app_mention"]);
-    expect(thread.body!.map((b) => b.id)).toEqual(["next", "has_event"]);
-    const onEvent = thread.body!.find((b) => b.id === "has_event")!;
-    expect(onEvent.then!.map((b) => b.id)).toEqual(["thread_replies", "turn_text", "has_turn"]);
+    expect(instance.labelTemplate).toBe("${{ event.raw.event.text | strip_mentions | truncate: 80 }}");
   });
 
   test("no channel scope: a mention anywhere the app is a member matches; a plain message matches nothing", () => {
@@ -96,8 +113,6 @@ describe("Slack thread brain built-in — definition", () => {
       smart_profiles: [],
       smart_min_confidence: 0.8,
       ask_timeout: 600,
-      idle_timeout: 3600,
-      max_turns: 50,
     });
   });
 });

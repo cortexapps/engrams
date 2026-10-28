@@ -1,20 +1,18 @@
-/** The Slack thread-brain built-in automation (ADR 0119 D7, phase 4.6; a
- * workstream per thread since 2026-09-29, ADR 0120).
+/** The Slack thread-brain built-in automation (ADR 0119 D7; a workstream
+ * per thread since 2026-09-29, ADR 0120; one short run per mention since
+ * contract 5; an agent with one way in since the 2026-10-27 amendment).
  *
- * ADR 0060's per-thread DBOS workflow (retired in phase 4.8), expressed as
- * data on the engine. It is the conversation-shaped built-in: one run per Slack
- * thread, kept alive across turns by `join` concurrency (a later message in
- * the thread is delivered into the active run's mailbox instead of starting
- * a new run) and a loop of wait_event → send_prompt until the thread goes
- * quiet. The session is KEPT when the run ends — a thread's session lives on
- * for a human to pick up.
+ * The conversation-shaped built-in, expressed as data on the engine: an
+ * AGENT scoped to the Slack thread, with one way in — a mention. Every
+ * mention is ONE short run that admits it, folds the thread into a prompt,
+ * and ends on the agent step, which continues the thread's kept session
+ * when it is alive or starts one. Nothing waits. The durable thing is the
+ * kept session plus the open workstream; the relay that mirrors the session
+ * into the thread is bound to the session, so the agent's replies,
+ * questions and ⏳/✅ reach the thread with no run live.
  *
- * The relay (`relay_session`, phase 4.5) streams agent messages into the
- * thread as coalesced bubbles, round-trips AskUserQuestion as Block Kit,
- * sets the ⏳/✅ reactions, and answers arrive as the `slack_answer` signal
- * it consumes itself. Every block here is a catalog block: this built-in is
- * an example an ordinary user could have built, and Duplicate gives them an
- * editable copy.
+ * Every block here is a catalog block: this built-in is an example an
+ * ordinary user could have built, and Duplicate gives them an editable copy.
  *
  * The first block is a Code block for the same reason as the review
  * built-in: admission reads a MAP input keyed by a dynamic payload value
@@ -26,17 +24,7 @@
  * next mention's prompt as `<thread context>` (every message since the
  * previous turn, bots skipped, mentions stripped), with the mention's text
  * as the directive underneath — the legacy `foldReplies`, as a `list_replies`
- * Slack action plus a Code block. An in-thread mention reaches the thread's
- * run by the workstream key (join), so the automation has one trigger and no
- * reply entrypoint.
- *
- * The thread outlives any one run (D8 + ADR 0120). A run ends when the
- * thread goes quiet (the idle wait's deadline), silently — no "Session
- * complete" post for a pause — and the workstream stays OPEN: the next
- * mention in the thread binds to it, starts a new run, and
- * `lookup_instance_session` finds the kept session so the conversation
- * continues in it (a fresh session only when none exists or it is gone).
- * Only an explicit end (halted, superseded) closes the workstream.
+ * Slack action plus a Code block.
  *
  * Routing: a channel override always decides. Otherwise `routing` picks:
  * `default` runs every thread on `default_profile`; `smart` lets a decision
@@ -45,19 +33,17 @@
  * model is not confident or the person asks to choose. Without an
  * OpenRouter key, smart routing falls back to the default profile — the
  * same behavior as `default`. Only a NEW session is routed; a kept session
- * resumes on its own profile.
+ * continues on its own profile.
  */
 
 import {
-  MAX_LOOP_ITERATIONS,
   MAX_WAIT_DEADLINE_S,
+  type AgentSpec,
   type AutomationDefinition,
   type BlockDef,
 } from "../engine/definition.ts";
 import type { BuiltinAutomation } from "../engine/builtins.ts";
-import { RELAY_CLOSE_TYPE } from "../engine/blocks/relay-close.ts";
 import { LOOKUP_INSTANCE_SESSION_TYPE } from "../engine/blocks/instance-session.ts";
-import { RELAY_SESSION_TYPE } from "../engine/blocks/relay.ts";
 import { RESOLVE_USER_TYPE } from "../engine/blocks/resolve-user.ts";
 import { SLACK_CHOICE_LABEL_MAX, SLACK_CHOICE_TYPE } from "../engine/blocks/slack-choice.ts";
 import { profileRouteQuestions } from "../profile-cards.ts";
@@ -67,10 +53,8 @@ import { DEFAULT_CONNECTION_PLACEHOLDER } from "./pr-review.ts";
 export const SLACK_BRAIN_BUILTIN_KEY = "slack_brain";
 
 /** Bump on any graph or inputs-schema change. */
-export const SLACK_BRAIN_DEFINITION_VERSION = 13;
+export const SLACK_BRAIN_DEFINITION_VERSION = 15;
 
-export const SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S = 3600;
-export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
 /** Smart routing routes without asking at or above this confidence. */
 /** From a routing benchmark against real history: at 0.8 the model routes
  * about 60% of new threads alone and is right ~82-89% of the time on those;
@@ -78,25 +62,15 @@ export const SLACK_BRAIN_DEFAULT_MAX_TURNS = 50;
 export const SLACK_BRAIN_DEFAULT_MIN_CONFIDENCE = 0.8;
 /** How long the profile card waits for a click before the model's pick. */
 export const SLACK_BRAIN_DEFAULT_ASK_TIMEOUT_S = 600;
-/** A turn — the harness working on one prompt — has NO deadline: a task
- * may run for hours, and nothing time-based may fail a thread. A wait has
- * an engine ceiling, so a turn is waited for in slices of that length,
- * each slice's deadline a normal outcome, until the session goes idle. */
-const TURN_SLICE_S = MAX_WAIT_DEADLINE_S;
-/** The engine's run ceiling. A run ending here is silent, like the idle
- * exit: the workstream stays open and the next mention resumes the kept
- * session (its relay re-installs). The per-wait idle timeout is the real
- * end of a run (settings cannot reference inputs). */
-const RUN_DEADLINE_S = 48 * 3600;
 
 const F = "steps.facts.value";
 
 /** Appended to the agent's system prompt when the thread's session is
  * created (ADR 0060 Decision 8): how to behave in a chat thread, and
  * Slack's mrkdwn instead of Markdown. The same text ADR 0060's thread
- * workflow appended; it rides `create_session.appendSystemPrompt` (the
- * harness's ENGRAM_APPEND_SYSTEM_PROMPT), so a resumed session keeps the
- * flavor it was created with. */
+ * workflow appended; it rides `appendSystemPrompt` (the harness's
+ * ENGRAM_APPEND_SYSTEM_PROMPT), so a continued session keeps the flavor it
+ * was created with. */
 export const SLACK_SYSTEM_PROMPT_APPEND = `You are running inside an engrams session triggered from a Slack thread.
 Keep replies concise and chat-friendly.
 
@@ -116,10 +90,9 @@ export default ({ event, inputs, trigger }) => {
   const key = trigger.event ?? "";
   const channel = String(ev.channel ?? "");
   if (!channel) return null;
-  // Bots (including ourselves) never open a brain thread.
+  // Bots (including ourselves) never open or continue a brain thread.
   if (ev.bot_id || ev.subtype === "bot_message") return null;
-  // Only a mention opens a thread. A reply reaches the thread's run through
-  // the reply entrypoint (joined into this run's mailbox), never here.
+  // Only a mention is a turn. A plain reply rides the next mention's fold.
   if (key !== "app_mention") return null;
   const channels = inputs.channels ?? {};
   const override = channels[channel] ?? "";
@@ -146,58 +119,64 @@ export default ({ event, inputs, trigger }) => {
     title: text.slice(0, 80) || "Slack thread",
     user_id: str(ev.user),
     event_id: str(raw.event_id),
-    // The app's own bot user: the fold tells our posts from other bots' by it.
+    // The app's own bot user: the fold tells our posts (and the mentions
+    // of us) from other bots' by it.
     bot_user_id: str((raw.authorizations ?? [])[0]?.user_id),
   };
 };
 `.trim();
 
-/** The turn prompt: the legacy `foldReplies` in the QuickJS cage. `messages`
- * is the thread page the `list_replies` action read; `since` is exclusive
- * (the previous turn's mention — everything up to and including it was
- * already delivered); the message whose ts is `trigger` is the directive
- * and goes at the bottom, every other kept message is prior context in
- * `<thread context>`. Messages newer than the trigger are left for the NEXT
- * turn (they arrived after the ask; the next mention's fold carries them).
- * Bot-authored messages never feed the prompt (the agent must not read its
- * own posts) EXCEPT the thread root, which is the subject of the thread.
- * Mentions are stripped. When the page does not carry the trigger yet
- * (Slack lag), the event's own text is the directive.
- * `has_text` is the turn gate: a bare `@bot` is not a prompt — send_prompt
- * refuses an empty prompt, and that refusal would fail the whole run. */
-function foldSource(args: {
-  replies: string;
-  trigger: string;
-  since: string;
-  eventText: string;
-  eventUser: string;
-  fromBot: string;
-}): string {
-  return `
+/** The turn prompt: the legacy `foldReplies` in the QuickJS cage.
+ * `messages` is the thread page the `list_replies` action read; the
+ * message whose ts is the mention is the directive and goes at the bottom,
+ * every other kept message is prior context in `<thread context>`.
+ *
+ * A NEW session gets the whole thread so far: a mention in the middle of a
+ * human conversation brings that conversation along. A CONTINUED session
+ * already saw everything up to the previous turn, so the fold starts after
+ * the previous turn's mention — the one the session's relay points at (a
+ * mention the brain dropped at admission was no turn and moves nothing);
+ * with no relay, the newest human message before this one that mentions
+ * the bot (any mention when the payload does not say who we are; our own
+ * newest reply as the last resort). Messages newer than the mention are
+ * left for
+ * the NEXT turn (they arrived after the ask; the next mention's fold
+ * carries them). Bot-authored messages never feed the prompt (the agent
+ * must not read its own posts) EXCEPT the thread root, which is the subject
+ * of the thread. Mentions are stripped. When the page does not carry the
+ * mention yet (Slack lag), the event's own text is the directive.
+ * `has_text` is the turn gate: a bare `@bot` is not a prompt. */
+export const SLACK_TURN_SOURCE = `
 export default ({ steps }) => {
   const facts = steps.facts?.value ?? {};
-  const messages = ${args.replies} ?? [];
-  const trigger = String(${args.trigger} ?? "");
+  const messages = steps.replies?.messages ?? [];
+  const trigger = String(facts.mention_ts ?? "");
   const root = String(facts.thread_ts ?? "");
-  const num = (ts) => Number.parseFloat(String(ts ?? "")) || 0;
-  // The newest reply of ours in the page: everything up to it was already
-  // delivered to the session (as a directive or as context) by an earlier
-  // turn. A bot post with no \`user\` counts as ours; a post by a different
-  // bot user does not.
+  const continued = Boolean(steps.previous?.found);
   const ownBot = String(facts.bot_user_id ?? "");
-  let lastOwn = "";
-  for (const m of messages) {
-    const ts = String(m.ts ?? "");
-    if (ts === root) continue;
-    const isBot = Boolean(m.bot_id || m.subtype === "bot_message");
-    const ours = isBot && (!ownBot || !m.user || m.user === ownBot);
-    if (ours && num(ts) > num(lastOwn)) lastOwn = ts;
-  }
-  const since = ${args.since};
+  const num = (ts) => Number.parseFloat(String(ts ?? "")) || 0;
   const strip = (t) => String(t ?? "")
     .replace(/<@[^>]+>/g, " ")
     .replace(/[^\\S\\n]+/g, " ")
     .trim();
+  // The previous turn's mention, and our newest reply as the stand-in. A
+  // bot post with no \`user\` counts as ours; a post by a different bot
+  // user does not.
+  let previousMention = "";
+  let lastOwn = "";
+  for (const m of messages) {
+    const ts = String(m.ts ?? "");
+    if (!ts || num(ts) >= num(trigger)) continue;
+    const isBot = Boolean(m.bot_id || m.subtype === "bot_message");
+    if (isBot) {
+      const ours = !ownBot || !m.user || m.user === ownBot;
+      if (ours && ts !== root && num(ts) > num(lastOwn)) lastOwn = ts;
+    } else if (String(m.text ?? "").includes(ownBot ? "<@" + ownBot + ">" : "<@")) {
+      if (num(ts) > num(previousMention)) previousMention = ts;
+    }
+  }
+  const relayMention = String(steps.previous?.mention_ts ?? "");
+  const since = continued ? relayMention || previousMention || lastOwn : "";
   const kept = [];
   for (const m of messages) {
     const ts = String(m.ts ?? "");
@@ -209,50 +188,16 @@ export default ({ steps }) => {
     if (text) kept.push({ ts, text });
   }
   const idx = kept.findIndex((k) => k.ts === trigger);
-  const directive = idx >= 0 ? kept[idx].text : strip(${args.eventText});
+  const directive = idx >= 0 ? kept[idx].text : strip(facts.text);
   const context = kept.filter((_, i) => i !== idx).map((k) => k.text);
   const text = !directive
     ? ""
     : context.length
       ? "<thread context>\\n" + context.join("\\n") + "\\n</thread context>\\n\\n" + directive
       : directive;
-  const fromBot = Boolean(${args.fromBot});
-  return {
-    text,
-    has_text: !fromBot && text.length > 0,
-    mention_ts: trigger,
-    user_id: String(${args.eventUser} ?? ""),
-  };
+  return { text, has_text: text.length > 0, continued };
 };
 `.trim();
-}
-
-/** The opening turn: the whole thread so far (a mention in the middle of a
- * human conversation brings that conversation along), the mention as the
- * directive. When the thread's kept session is resumed, only what arrived
- * after our last reply is new to it — the earlier turns were its own. */
-const OPENING_TEXT_SOURCE = foldSource({
-  replies: "steps.replies.messages",
-  trigger: "facts.mention_ts",
-  since: "steps.previous?.found ? lastOwn : null",
-  eventText: "facts.text",
-  eventUser: "facts.user_id",
-  fromBot: "false",
-});
-
-/** A follow-up turn: everything since the previous turn's mention (the last
- * re-point's mention — block outputs are keyed by id, so `steps.repoint` is
- * the previous iteration's — or the opening mention before any re-point),
- * the new mention as the directive. */
-const NEXT_TEXT_SOURCE = foldSource({
-  replies: "steps.thread_replies.messages",
-  trigger: "steps.next?.event?.event?.ts",
-  since: 'String(steps.repoint?.mention_ts ?? facts.mention_ts ?? "")',
-  eventText: "steps.next?.event?.event?.text",
-  eventUser: "steps.next?.event?.event?.user",
-  fromBot:
-    'steps.next?.event?.event?.bot_id || steps.next?.event?.event?.subtype === "bot_message"',
-});
 
 const admit: BlockDef[] = [
   {
@@ -317,44 +262,30 @@ const admit: BlockDef[] = [
   },
 ];
 
-/** The previous turn's mention ts: the fold's exclusive `since` and the
- * read's inclusive `oldest`. Block outputs are keyed by id, so
- * `steps.repoint` is the previous iteration's re-point; before any re-point
- * it is the opening mention. (`default:` tolerates the missing path; its
- * argument, the facts, is always present.) */
-const PREVIOUS_MENTION_TS = `\${{ steps.repoint.mention_ts | default: ${F}.mention_ts }}`;
-
-/** The thread as Slack holds it, for the fold. `oldest` bounds the read to
- * the tail since the previous turn (inclusive — the fold drops the boundary
- * message itself); the opening read is unbounded because a mention in the
- * middle of a human thread brings the whole thread along. */
-function listReplies(id: string, oldest?: string): BlockDef {
-  return {
-    id,
-    type: "integration_action",
-    config: {
-      provider: "slack",
-      actionId: "list_replies",
-      params: {
-        channel: `\${{ ${F}.channel }}`,
-        threadTs: `\${{ ${F}.thread_ts }}`,
-        ...(oldest !== undefined ? { oldest } : {}),
-      },
-    },
-  };
-}
-
-/** The thread's kept session from an earlier run of this workstream, if any:
- * the thread went quiet, its run ended, the next mention is this run. Looked
- * up before the fold, which keeps a resumed session's earlier turns out of
- * its prompt. */
+/** The thread's kept session from an earlier turn, if any. Looked up before
+ * the fold (a continued session's earlier turns stay out of its prompt) and
+ * before routing (a continued session is never re-routed). */
 const previous: BlockDef = { id: "previous", type: LOOKUP_INSTANCE_SESSION_TYPE, config: {} };
 
-const opening: BlockDef[] = [
-  previous,
-  listReplies("replies"),
-  { id: "opening", type: "code", config: { source: OPENING_TEXT_SOURCE, mode: "value" } },
-];
+/** The thread as Slack holds it, for the fold. A continued session reads
+ * only what came after its previous turn (the page is capped; a long
+ * thread must not push the new messages off it); a new one reads the
+ * whole thread. */
+const replies: BlockDef = {
+  id: "replies",
+  type: "integration_action",
+  config: {
+    provider: "slack",
+    actionId: "list_replies",
+    params: {
+      channel: `\${{ ${F}.channel }}`,
+      threadTs: `\${{ ${F}.thread_ts }}`,
+      oldest: "${{ steps.previous.mention_ts | default: '' }}",
+    },
+  },
+};
+
+const turn: BlockDef = { id: "turn", type: "code", config: { source: SLACK_TURN_SOURCE, mode: "value" } };
 
 /** Smart routing's verdict on the model's answer: ask the person when the
  * model is not confident or the person asks to choose, with the model's
@@ -440,7 +371,10 @@ const resolveProfile: BlockDef = {
 };
 
 /** The card becomes the outcome line (its buttons go), so the thread shows
- * what was decided, answered or not. */
+ * what was decided, answered or not. When nobody was asked, the verdict is
+ * posted as a line of its own, so the thread still says which profile
+ * answers and why (an empty verdict — no key, default routing — posts
+ * nothing). */
 const closeCard: BlockDef = {
   id: "asked",
   type: "branch",
@@ -462,7 +396,34 @@ const closeCard: BlockDef = {
       },
     },
   ],
-  else: [],
+  else: [
+    {
+      id: "has_verdict",
+      type: "branch",
+      config: {
+        conditions: {
+          mode: "all",
+          conditions: [{ path: "steps.resolve.value.card", op: "not_equals", value: "" }],
+        },
+      },
+      then: [
+        {
+          id: "verdict",
+          type: "integration_action",
+          config: {
+            provider: "slack",
+            actionId: "post_message",
+            params: {
+              channel: `\${{ ${F}.channel }}`,
+              threadTs: `\${{ ${F}.thread_ts }}`,
+              text: "${{ steps.resolve.value.card }}",
+            },
+          },
+        },
+      ],
+      else: [],
+    },
+  ],
 };
 
 const routed: BlockDef = {
@@ -476,7 +437,7 @@ const routed: BlockDef = {
   },
 };
 
-/** Smart routing, on the create arm only: the candidates, the model's
+/** Smart routing, for a NEW session only: the candidates, the model's
  * answer, a card for the person when it is unsure, and the verdict. Default
  * routing skips all of it (one condition step), so it adds nothing to a
  * thread's first reply. */
@@ -506,7 +467,7 @@ const smartRoute: BlockDef = {
           config: {
             // The opening fold: the thread so far plus the mention, the same
             // text the session will get as its first prompt.
-            state: { message: "${{ steps.opening.value.text }}" },
+            state: { message: "${{ steps.turn.value.text }}" },
             questions: profileRouteQuestions({ $ref: "steps.candidates.options" }),
             // A model outage must never cost the thread its answer.
             onError: "undecided",
@@ -550,78 +511,62 @@ const smartRoute: BlockDef = {
   else: [],
 };
 
-const session: BlockDef = {
-  id: "session",
-  type: "create_session",
-  tunable: ["promptTemplate"],
-  config: {
-    // Smart routing's verdict, else the facts' (override or default).
-    profileId: `\${{ steps.resolve.value.profile_id | default: ${F}.profile_id }}`,
-    promptTemplate: "${{ steps.opening.value.text }}",
-    titleTemplate: `\${{ ${F}.title }}`,
-    role: "primary",
-    // The session is the asking user's: their credentials and attribution
-    // (never the programmatic org credential a stranger could borrow).
-    ownerUserId: "${{ steps.identity.user_id }}",
-    // D8 + the thread model: the session outlives the run.
-    keepOnFinish: true,
-    appendSystemPrompt: SLACK_SYSTEM_PROMPT_APPEND,
-  },
-};
-
-/** The legacy `onStarted` message: the thread gets the session link as
- * soon as the session exists, before any agent output arrives. An ordinary
- * Slack action, so Duplicate lets a user reword or remove it. */
-const started: BlockDef = {
-  id: "started",
-  type: "integration_action",
-  tunable: ["params"],
-  config: {
-    provider: "slack",
-    actionId: "post_message",
-    params: {
-      channel: `\${{ ${F}.channel }}`,
-      threadTs: `\${{ ${F}.thread_ts }}`,
-      text: "Started a session${{ steps.resolve.value.label | default: '' }} — ${{ steps.session.web_url }}",
-    },
-  },
-};
-
-/** The session this run talks to: the resumed one, else the one it created. */
-const PICK_SOURCE = `
-export default ({ steps }) => ({
-  session_id: steps.previous?.found ? String(steps.previous.session_id ?? "") : String(steps.session?.session_id ?? ""),
-  resumed: Boolean(steps.previous?.found),
-});
-`.trim();
-
-/** Create the thread's session unless a kept one resumes. A resume is
- * silent: the thread already carries the session link from its first run,
- * and to the people in it the conversation simply continues. (`is_true`
+/** Route a NEW session only. A continued session keeps its profile. (`is_true`
  * with an empty then-arm, not `is_false`: the editor's preview cannot run
  * the lookup, and a missing value is not false — the preview must still
- * walk the create arm.) */
-const sessionUnlessResumed: BlockDef = {
+ * walk the routing arm.) */
+const routeUnlessContinued: BlockDef = {
   id: "has_previous",
   type: "branch",
   config: {
     conditions: { mode: "all", conditions: [{ path: "steps.previous.found", op: "is_true" }] },
   },
   then: [],
-  else: [smartRoute, session, started],
+  else: [smartRoute],
 };
 
-const pick: BlockDef = { id: "pick", type: "code", config: { source: PICK_SOURCE, mode: "value" } };
-
-/** Every later block's session ref: adoption (D11) moves a resumed session's
- * binding to this run; a created one is already ours. */
-const SESSION_REF = { template: "${{ steps.pick.value.session_id }}" } as const;
-
-const relay: BlockDef = {
-  id: "relay",
-  type: RELAY_SESSION_TYPE,
+/** The turn gate: a bare `@bot` leaves no text and is not a turn — the run
+ * ends filtered before routing or the agent; no prompt, no failure; the
+ * thread simply goes on. */
+const hasTurn: BlockDef = {
+  id: "has_turn",
+  type: "filter",
   config: {
-    session: SESSION_REF,
+    conditions: { mode: "all", conditions: [{ path: "steps.turn.value.has_text", op: "is_true" }] },
+  },
+};
+
+/** The thread's standing agent. The way in ends on it: the kept session
+ * gets the turn as a prompt; a new session starts with it. Either way the
+ * relay is (re-)pointed at this mention, so ⏳/✅ and the replies land
+ * under it, and a new session's link is posted into the thread first. */
+const THREAD_KEY =
+  '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}';
+
+const agent: AgentSpec = {
+  // ADR 0120: a Slack thread is a WORKSTREAM. The first mention opens it; a
+  // later mention in the same thread renders the same key, binds to the
+  // open workstream, and its run finds the thread's kept session.
+  // (`coalesce`, not `default:` — default's fallback argument is strict.)
+  // The thread's title on the Slack page and the rail: the opening
+  // mention's text, as a human reads it.
+  scope: {
+    kind: "key",
+    keyTemplate: THREAD_KEY,
+    labelTemplate: "${{ event.raw.event.text | strip_mentions | truncate: 80 }}",
+  },
+  // Smart routing's verdict, else the facts' (override or default).
+  profileId: `\${{ steps.resolve.value.profile_id | default: ${F}.profile_id }}`,
+  promptTemplate: "${{ steps.turn.value.text }}",
+  titleTemplate: `\${{ ${F}.title }}`,
+  role: "primary",
+  // The session is the asking user's: their credentials and attribution
+  // (never the programmatic org credential a stranger could borrow).
+  ownerUserId: "${{ steps.identity.user_id }}",
+  // D8 + the thread model: the session outlives every run.
+  keepOnFinish: true,
+  appendSystemPrompt: SLACK_SYSTEM_PROMPT_APPEND,
+  relay: {
     provider: "slack",
     team: `\${{ ${F}.team }}`,
     channel: `\${{ ${F}.channel }}`,
@@ -632,199 +577,23 @@ const relay: BlockDef = {
   },
 };
 
-/** Wait for the session to go idle, however long its turn takes: one
- * wait_session slice per iteration, the slice's deadline a normal outcome
- * (`onDeadline: continue`), the loop ending on anything but a deadline —
- * idle (the turn is done), or the session ending. A hundred slices of a day
- * each before the loop's own bound; the run ceiling comes first. */
-function untilIdle(id: string): BlockDef {
-  const slice = `${id}_slice`;
-  return {
-    id,
-    type: "loop",
-    config: {
-      maxIterations: MAX_LOOP_ITERATIONS,
-      until: {
-        mode: "all",
-        conditions: [{ path: `steps.${slice}.outcome`, op: "not_equals", value: "deadline" }],
-      },
-    },
-    body: [
-      {
-        id: slice,
-        type: "wait_session",
-        config: {
-          session: SESSION_REF,
-          until: "idle",
-          deadlineSeconds: TURN_SLICE_S,
-          onDeadline: "continue",
-        },
-      },
-    ],
-  };
-}
-
-/** The first turn. A created session got the fold as its initial prompt, so
- * the run only waits for it to go idle. A resumed session is prompted with
- * the fold (send_prompt adopts it) and waited on the same way; a resumed
- * session with nothing to say to (a bare mention) is only waited on. */
-const firstTurn: BlockDef = {
-  id: "opening_turn",
-  type: "branch",
-  config: {
-    conditions: {
-      mode: "all",
-      conditions: [
-        { path: "steps.previous.found", op: "is_true" },
-        { path: "steps.opening.value.has_text", op: "is_true" },
-      ],
-    },
-  },
-  then: [
-    {
-      id: "resume_turn",
-      type: "send_prompt",
-      tunable: ["promptTemplate"],
-      config: {
-        session: SESSION_REF,
-        promptTemplate: "${{ steps.opening.value.text }}",
-        waitFor: { kind: "none" },
-      },
-    },
-    untilIdle("resume_wait"),
-  ],
-  else: [untilIdle("first_turn")],
-};
-
-const conversation: BlockDef = {
-  id: "thread",
-  type: "loop",
-  config: {
-    maxIterations: { $ref: "inputs.max_turns" },
-    // The thread went quiet: the last wait_event hit its idle deadline.
-    until: {
-      mode: "all",
-      conditions: [{ path: "steps.next.outcome", op: "equals", value: "deadline" }],
-    },
-  },
-  body: [
-    {
-      id: "next",
-      type: "wait_event",
-      config: {
-        // Only an explicit mention in the thread is a turn (the legacy
-        // model). A plain reply is never delivered here; the next mention's
-        // fold carries it as thread context.
-        eventKeys: ["app_mention"],
-        // Bots never continue a thread either (the opening admission has the
-        // same rule): an `app_mention` authored by a bot — including our own
-        // bubbles when they quote the handle — reaches the mailbox, so the
-        // wait refuses it here and keeps listening.
-        conditions: {
-          mode: "all",
-          conditions: [
-            { path: "event.event.bot_id", op: "is_empty" },
-            { path: "event.event.subtype", op: "is_empty" },
-          ],
-        },
-        // Typed-through at run time: the wait half reads the execute step's
-        // resolved config (see BlockOutcome.resolvedConfig).
-        deadlineSeconds: { $ref: "inputs.idle_timeout" },
-        // The thread going quiet is how a conversation ENDS, not a failure:
-        // the loop's `until` reads outcome=deadline and exits; the run
-        // completes and the recap posts ✅.
-        onDeadline: "continue",
-      },
-    },
-    // A quiet thread leaves outcome=deadline and no event: nothing to read
-    // or fold (the loop's `until` exits). Only a mention goes on.
-    {
-      id: "has_event",
-      type: "branch",
-      config: {
-        conditions: {
-          mode: "all",
-          conditions: [{ path: "steps.next.outcome", op: "equals", value: "event" }],
-        },
-      },
-      then: [
-        listReplies("thread_replies", PREVIOUS_MENTION_TS),
-        {
-          id: "turn_text",
-          type: "code",
-          config: { source: NEXT_TEXT_SOURCE, mode: "value" },
-        },
-        // The turn gate: a bare mention leaves no text, and send_prompt must not
-        // fire on it (an empty prompt is a render failure that would end the
-        // run), so the branch requires text.
-        {
-          id: "has_turn",
-          type: "branch",
-          config: {
-            conditions: {
-              mode: "all",
-              conditions: [{ path: "steps.turn_text.value.has_text", op: "is_true" }],
-            },
-          },
-          then: [
-            // Re-point the relay at the accepted follow-up BEFORE its prompt is
-            // sent: ⏳ lands on the reply, its responses open a fresh bubble and
-            // ✅ seals on the reply — the legacy per-turn mention ownership.
-            {
-              id: "repoint",
-              type: RELAY_SESSION_TYPE,
-              config: {
-                session: SESSION_REF,
-                provider: "slack",
-                team: `\${{ ${F}.team }}`,
-                channel: `\${{ ${F}.channel }}`,
-                threadTs: `\${{ ${F}.thread_ts }}`,
-                mentionTs: "${{ steps.turn_text.value.mention_ts }}",
-                userId: "${{ steps.turn_text.value.user_id }}",
-                eventId: "${{ steps.next.delivery_key }}",
-              },
-            },
-            {
-              id: "turn",
-              type: "send_prompt",
-              tunable: ["promptTemplate"],
-              config: {
-                session: SESSION_REF,
-                promptTemplate: "${{ steps.turn_text.value.text }}",
-                waitFor: { kind: "none" },
-              },
-            },
-            untilIdle("turn_wait"),
-          ],
-          else: [],
-        },
-      ],
-      else: [],
-    },
-  ],
-};
-
 export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
   engine: 1,
   trigger: {
     kind: "integration",
     provider: "slack",
     connectionId: DEFAULT_CONNECTION_PLACEHOLDER,
-    // A mention opens a thread. Replies come in through the `reply`
-    // entrypoint below. No channel scope: the brain answers wherever the
-    // Slack app is a member and gets mentioned, as the legacy workflow did.
-    // (The per-channel map was the ADR 0119 parallel-window gate; enabling
-    // the automation is the switch now, and the map only overrides the
-    // profile per channel.)
+    // A mention is a turn; a plain reply is thread context on the next
+    // mention. No channel scope: the brain answers wherever the Slack app
+    // is a member and gets mentioned, as the legacy workflow did. (The
+    // per-channel map only overrides the profile per channel.)
     eventKeys: ["app_mention"],
   },
-  blocks: [...admit, ...opening, sessionUnlessResumed, pick, relay, firstTurn, conversation],
-  // ADR 0120: a Slack thread is a WORKSTREAM. The first mention opens it; a
-  // later mention in the same thread renders the same key, so it binds to
-  // the open workstream and JOINS the thread's live run (the mailbox event
-  // the loop's wait consumes). No reply entrypoint: a plain reply is not an
-  // event the brain acts on.
+  blocks: [...admit, previous, replies, turn, hasTurn, routeUnlessContinued],
+  // One way in. The thread's agent is the definition's: every mention's
+  // run ends on it.
   entrypoints: [],
+  agent,
   inputsSchema: [
     {
       key: "channels",
@@ -876,79 +645,34 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       min: 30,
       max: MAX_WAIT_DEADLINE_S,
     },
-    {
-      key: "idle_timeout",
-      label: "Idle timeout (seconds)",
-      type: "number",
-      help: "How long a thread may go quiet before the run ends (the session is kept). 60 s to 24 h.",
-      default: SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S,
-      // The wait_event that consumes this through `$ref` has a 24 h schema
-      // ceiling; the bound here keeps a saved value always runnable (the
-      // interpreter also clamps, as a second line).
-      min: 60,
-      max: MAX_WAIT_DEADLINE_S,
-    },
-    {
-      key: "max_turns",
-      label: "Max turns",
-      type: "number",
-      help: "Upper bound on follow-up messages one run answers.",
-      default: SLACK_BRAIN_DEFAULT_MAX_TURNS,
-      min: 1,
-      max: MAX_LOOP_ITERATIONS,
-    },
   ],
+  // One run at a time per thread (the engine derives `queue` from the
+  // kept scope): two mentions in quick succession deliver their turns in
+  // order, and a turn never finds the thread's session owned by a live run.
   settings: {
-    instance: {
-      // One workstream per thread: team, channel, thread root. A reply
-      // carries thread_ts; the opening mention only has ts. (`coalesce`, not
-      // `default:` — default's fallback argument is strict.)
-      keyTemplate:
-        '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}',
-      // The thread's title on the Slack page and the rail: the opening
-      // mention's text, as a human reads it.
-      labelTemplate: "${{ event.raw.event.text | strip_mentions | truncate: 80 }}",
-    },
-    concurrency: {
-      // One run per thread, instance-scoped: the same template as the
-      // workstream key, so a reply's claim lands on the mention's run.
-      keyTemplate:
-        '${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: "thread_ts", "ts" }}',
-      policy: "join",
-    },
-    runDeadlineSeconds: RUN_DEADLINE_S,
     endSessionsOnFinish: false,
     onFinalize: [
-      // No post on `completed`: that is the idle exit — a pause, not an
-      // end. The ✅ on the last mention already says the turn is done, and
-      // the next mention continues the same session. No post on `deadline`
-      // either: no wait in this graph fails on time, so `deadline` can only
-      // be the engine's run ceiling under a turn still running — a pause
-      // too, never a thread's fault (the next mention re-installs the
-      // relay on the same session).
+      // A run that fails (the thread page could not be read, the prompt
+      // could not be delivered) tells the thread ❌ and why. The session's
+      // relay stays: the session is fine, this turn did not reach it, and
+      // the next mention is a new turn on it. No post on `completed` (the
+      // session's own ✅ already says the turn is done), nor on `filtered`
+      // (an unlinked author, a bare mention).
       {
-        when: ["failed", "halted", "superseded", "filtered"],
+        when: ["failed"],
         block: {
           id: "recap",
-          type: RELAY_CLOSE_TYPE,
-          config: { session: SESSION_REF, status: "${{ run.status }}" },
-        },
-      },
-      // Only an explicit end closes the workstream: a quiet thread's run
-      // completes (and a failed or deadline-hit one ends) with the workstream
-      // OPEN, so the next mention binds to it, starts a new run, and resumes
-      // the kept session. Halted (`@stop`) and superseded are the ends.
-      //
-      // NOT on `filtered` either: an unlinked author's mention posts the
-      // "log in first" notice through the Slack post_message action, which
-      // binds the thread's handle to this workstream; closing would silence
-      // the thread for the linked colleague who mentions the bot next.
-      {
-        when: ["halted", "superseded"],
-        block: {
-          id: "close",
-          type: "instance_close",
-          config: { reason: "thread run ended: ${{ run.status }}" },
+          type: "integration_action",
+          tunable: ["params"],
+          config: {
+            provider: "slack",
+            actionId: "post_message",
+            params: {
+              channel: `\${{ ${F}.channel }}`,
+              threadTs: `\${{ ${F}.thread_ts }}`,
+              text: "❌ This turn failed: ${{ run.error }}",
+            },
+          },
         },
       },
     ],
@@ -971,8 +695,6 @@ export const SLACK_BRAIN_BUILTIN: BuiltinAutomation = {
       smart_profiles: [],
       smart_min_confidence: SLACK_BRAIN_DEFAULT_MIN_CONFIDENCE,
       ask_timeout: SLACK_BRAIN_DEFAULT_ASK_TIMEOUT_S,
-      idle_timeout: SLACK_BRAIN_DEFAULT_IDLE_TIMEOUT_S,
-      max_turns: SLACK_BRAIN_DEFAULT_MAX_TURNS,
     };
   },
 };

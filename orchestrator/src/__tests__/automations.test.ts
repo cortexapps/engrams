@@ -267,6 +267,12 @@ function fakeStore(seed?: {
         .sort((x, y) => y.createdAt.getTime() - x.createdAt.getTime())
         .slice(0, limit);
     },
+    async listActiveRuns(automationId) {
+      return [...runs.values()]
+        .filter((r) => r.automationId === automationId)
+        .filter((r) => r.status === "pending" || r.status === "running" || r.status === "waiting")
+        .sort((x, y) => x.createdAt.getTime() - y.createdAt.getTime());
+    },
     async getRun(id) {
       return runs.get(id) ?? null;
     },

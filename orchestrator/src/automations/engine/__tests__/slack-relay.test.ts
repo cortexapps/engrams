@@ -347,9 +347,11 @@ describe("session relay (contract 5)", () => {
     await h.install();
     await closeSessionRelay(SESSION, "failed", h.deps);
     expect(h.policy.calls.onFail).toHaveLength(1);
+    // A neutral end (the sandbox reclaimed, a kept session swept) is
+    // silent: the relay goes, the thread hears nothing.
     await h.install();
-    await closeSessionRelay(SESSION, "neutral", h.deps);
-    expect(h.policy.calls.onNeutralClose[0]![1]).toMatch(/neutral/);
+    expect(await closeSessionRelay(SESSION, "neutral", h.deps)).toBe("closed");
+    expect(h.policy.calls.onNeutralClose).toEqual([]);
     expect(h.store.rows.size).toBe(0);
   });
 });
