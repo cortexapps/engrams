@@ -1,18 +1,21 @@
-/** `run_agent` — deliver this run's event to a standing agent session, or
- * start one (ADR 0119 D9 + contract 5).
+/** `run_agent` — the agent step: deliver this run's event to the
+ * automation's agent session, or start one (ADR 0119 D9 + contract 5).
  *
- * The composite every "durable agent" automation spelled out by hand:
+ * Not a user block. The definition's `agent` is the config; every way in
+ * whose role starts or reaches the agent ends on one step of this type
+ * (`entrypointsOf` appends it). What it does:
  *
  *   lookup the workstream's kept session
  *     → found and alive: adopt it, send the prompt (no wait)
  *     → otherwise: create a session with the opening prompt
- *   then install (or re-point) the relay, if the agent talks back somewhere.
+ *   then install (or re-point) the relay, if the agent talks back somewhere,
+ *   and announce a new session there.
  *
  * Every event is a SHORT run (the house pattern): the durable thing is the
  * kept session plus the open workstream, never a run parked in a loop. The
- * workstream scope comes from `settings.instance` (per key) — on a run that
- * is not bound to one, `reuse: "workstream"` degrades to a fresh session per
- * event, so one template serves both shapes.
+ * workstream is the agent's scope (`instanceSettingsOf`) — on a run that is
+ * not bound to one, `reuse: "workstream"` degrades to a fresh session per
+ * event, so one config serves every scope.
  */
 
 import { z } from "zod";
@@ -21,7 +24,7 @@ import { sessionWebUrl } from "../../../links.ts";
 import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import { registerBlock, type BlockOutcome } from "./registry.ts";
-import { installRelayForSession, slackRelayConfigSchema } from "./relay.ts";
+import { installRelayForSession, mentionFromRelayConfig, slackRelayConfigSchema } from "./relay.ts";
 import { createSessionConfigSchema, executeCreateSession } from "./session.ts";
 
 export const RUN_AGENT_TYPE = "run_agent";
@@ -109,6 +112,11 @@ async function execute(config: RunAgentConfig, ctx: RunContext): Promise<BlockOu
     const installed = await installRelayForSession(sessionId, relay, ctx);
     if (installed.kind !== "ok") return installed;
     relayOutputs = { relayed: installed.outputs["installed"] === true, mention_ts: installed.outputs["mention_ts"] };
+    // A new session's link goes into the place as soon as it exists, before
+    // any output; a continued session's place already carries it.
+    if (started && installed.outputs["installed"] === true) {
+      await ctx.deps.announceStarted?.(sessionId, mentionFromRelayConfig(relay));
+    }
   }
 
   return {

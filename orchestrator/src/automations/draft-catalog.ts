@@ -11,7 +11,10 @@
 import { z } from "zod";
 
 import {
+  AGENT_BLOCK_TYPE,
+  agentSpecSchema,
   ENGINE_VERSION,
+  entrypointRoleSchema,
   entrypointSchema,
   inputFieldSchema,
   MAX_BLOCKS,
@@ -48,6 +51,8 @@ export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Se
   registerEngineBlocks();
   const blocks = listBlockTypes()
     .filter((type) => {
+      // The agent is a part of the definition, never a block in a list.
+      if (type === AGENT_BLOCK_TYPE) return false;
       const router = getBlock(type)!.requiresRouter;
       return router === undefined || connectedRouters.has(router);
     })
@@ -70,8 +75,19 @@ export function draftBlockCatalog(connectedRouters: ReadonlySet<string> = new Se
     settings_schema: jsonSchemaOf(settingsSchema),
     input_field_schema: jsonSchemaOf(inputFieldSchema),
     entrypoint_schema: jsonSchemaOf(entrypointSchema),
+    agent_schema: {
+      ...(jsonSchemaOf(agentSpecSchema) as Record<string, unknown>),
+      description:
+        "The agent the ways in deliver to. Every field of the run_agent executor's config except reuse (the scope decides it): profileId, promptTemplate, openingPromptTemplate?, titleTemplate?, includeEventContext?, appendSystemPrompt?, harness overrides, relay?.",
+      session_config_schema: jsonSchemaOf(getBlock(AGENT_BLOCK_TYPE)!.configSchema as z.ZodType),
+    },
+    entrypoint_role_schema: jsonSchemaOf(entrypointRoleSchema),
     notes: [
-      "A definition is {engine, trigger, blocks, entrypoints?, inputsSchema, settings}.",
+      "A definition is {engine, trigger, role?, blocks, entrypoints?, agent?, inputsSchema, settings}.",
+      "AN AUTOMATION IS AN AGENT WITH WAYS IN. Set `agent` ({scope, profileId, promptTemplate, openingPromptTemplate?, relay?, ...}) and every way in (the main trigger and each entrypoint) ends on the agent: its blocks run first (filters, code, lookups), then the engine appends the `agent` step itself. Never write a run_agent block; never put create_session/send_prompt after the agent.",
+      "agent.scope: {kind:'event'} = a fresh session per event. {kind:'automation'} = one standing agent for the whole automation. {kind:'key', keyTemplate, labelTemplate?} = one standing agent per rendered key — a Slack thread ('${{ event.raw.team_id }}:${{ event.raw.event.channel }}:${{ event.raw.event | coalesce: \"thread_ts\", \"ts\" }}'), a channel, a pull request ('${{ event.raw.repository.full_name }}#${{ event.raw | coalesce: \"pull_request.number\", \"issue.number\" }}'), an issue. The engine derives settings.instance from it: never declare both.",
+      "A way in's role: 'start' (default) opens the agent when none exists, then delivers; 'reach' delivers only to an agent that exists (routed by handle or by key; otherwise the event drops); 'close' ends the agent's workstream (the instance_close step); 'none' runs the blocks only. Inside a way in, `steps.agent.*` is not available (the agent runs last); settings.onFinalize hooks can read steps.agent.session_id / started / delivered.",
+      "agent.relay (Slack) makes the agent talk back where the event came from: {provider:'slack', team, channel, threadTs, mentionTs?, userId?, eventId?} as templates over the event; a new session's link is posted there, and the session's replies, questions and ⏳/✅ follow with no run live.",
       "Block ids are unique across ALL entrypoints; ids match ^[a-z][a-z0-9_]*$.",
       "branch children live in then/else; loop children in body; nothing else nests.",
       'Prose fields render Liquid with ${{ }}; structured values use {"$ref": "steps.<id>.<output>"}.',
@@ -97,8 +113,8 @@ export function draftPatterns(): Record<string, unknown> {
     core_model: [
       "Runs are SHORT and stateless. Waits inside a run cap at 24h and stuck runs are swept at 48h - never design a run to live for a day.",
       "A workflow that spans days = multiple ENTRYPOINTS (one per way in: an integration event, a cron tick, a manual kick) sharing the automation's inputs, settings, and state. Each run enters through one entrypoint, does one step of the lifecycle, and exits.",
-      "A TEMPLATED workflow (the same lifecycle per project/customer/case) declares settings.instance and becomes one automation with many WORKSTREAMS - see the instances section; never duplicate an automation per project.",
-      "A standing agent (a conversation, an agent per PR, an SRE per incident channel) is ONE block: run_agent. Every event is a short run that ends right after run_agent delivers; the durable thing is the kept session plus the open workstream (settings.instance keyed on the thread / PR / channel). run_agent continues the workstream's kept session when it is alive, else starts one with the opening prompt, and with `relay` set it mirrors the session into the Slack thread (replies, questions, ⏳/✅) with no run live. Never hold a conversation in a loop of waits.",
+      "A TEMPLATED workflow (the same lifecycle per project/customer/case) is an agent with scope kind 'key' - or, for a block automation with no agent, declares settings.instance - and becomes one automation with many WORKSTREAMS; see the instances section. Never duplicate an automation per project.",
+      "A standing agent (a conversation, an agent per PR, an SRE per incident channel) is the definition's `agent` with a scope: every event is a short run whose way in ends on the agent step; the durable thing is the kept session plus the open workstream (the scope's key: the thread / PR / channel). The agent step continues the kept session when it is alive, else starts one with the opening prompt, and with `relay` set it mirrors the session into the Slack thread (replies, questions, ⏳/✅) with no run live. Never hold a conversation in a loop of waits.",
       "At most one cron trigger per automation.",
       "ONE template contract everywhere: every rendered string uses ${{ ... }} (Liquid) - session {template} refs included. Plain {{ ... }} NEVER renders (it flows through as a literal) and save refuses it; code block source is JS, not a template.",
     ],
@@ -126,7 +142,7 @@ export function draftPatterns(): Record<string, unknown> {
       "There is no lock block and no cross-block transaction on purpose; put facts that must change together in one document.",
     ],
     kept_sessions: [
-      'Sessions are kept by default and outlive their runs. Inside a workstream, run_agent finds the kept session for you; outside one, record a long-lived session id in state (e.g. state["pm"].session_id).',
+      'Sessions are kept by default and outlive their runs. An agent automation finds its kept session for you; a block automation outside a workstream records a long-lived session id in state (e.g. state["pm"].session_id).',
       "A later run reaches a kept session with a {template} session ref: resolving it ADOPTS the session (re-binds its event routing to this run) - allowed only within the same automation and only when the owning run finished, so adoption never steals from a live waiting run.",
       "Probe before you prompt: session_status is read-only, never re-binds, and reports found/status/idle_seconds/owner_run_live as VALUES a filter can branch on - the cheap look for a sweep entrypoint.",
       'For an agent inside a session to talk back to the run waiting on it, the session uses its signal_automation tool and the run waits with send_prompt waitFor {kind: "signal", name} or wait_session.',

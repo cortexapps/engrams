@@ -22,6 +22,7 @@ function harness(options: {
   dryRun?: boolean;
 } = {}) {
   const store = makeFakeRelayStore();
+  const announced: Array<{ sessionId: string; ts: string }> = [];
   const created: Array<{ profileId: string; prompt: string; keep: boolean }> = [];
   const prompts: Array<{ sessionId: string; promptId: string; text: string }> = [];
   const adopted: string[] = [];
@@ -64,6 +65,9 @@ function harness(options: {
     sessions,
     clock: { nowMs: () => 0 },
     relays: store,
+    announceStarted: async (sessionId, target) => {
+      announced.push({ sessionId, ts: target.ts });
+    },
   };
   const snapshot: RunSnapshot = {
     definition: { engine: 1, trigger: { kind: "manual" }, blocks: [], inputsSchema: [], settings: { endSessionsOnFinish: false } },
@@ -83,7 +87,7 @@ function harness(options: {
   // Parsed as the interpreter parses it: the schema's defaults apply.
   const run = (config: Record<string, unknown>) =>
     getBlock(RUN_AGENT_TYPE)!.execute!(runAgentConfigSchema.parse(config) as never, ctx);
-  return { store, created, prompts, adopted, ctx, run };
+  return { store, created, prompts, adopted, announced, ctx, run };
 }
 
 const BASE = { profileId: "prof-a", promptTemplate: "new message: hi" };
@@ -148,6 +152,8 @@ describe("run_agent", () => {
     const out = await fresh.run({ ...BASE, relay: RELAY });
     expect(out).toMatchObject({ kind: "ok", outputs: { session_id: "s-new-1", relayed: true, mention_ts: "100.0" } });
     expect(fresh.store.rows.get("s-new-1")!.target).toMatchObject({ channel: "C1", ts: "100.0" });
+    // The new session's link goes into the thread at once.
+    expect(fresh.announced).toEqual([{ sessionId: "s-new-1", ts: "100.0" }]);
 
     const continued = harness({ instanceId: "ai_thread1", previous: { sessionId: "s-old", alive: true } });
     await continued.store.install({
@@ -164,6 +170,14 @@ describe("run_agent", () => {
     // The conversation continues (last text kept); the bubble closes so the
     // next answer opens under the new mention.
     expect(row.state).toMatchObject({ bubble: null, lastAssistantText: "earlier" });
+    // A continued session's thread already carries its link.
+    expect(continued.announced).toEqual([]);
+  });
+
+  test("without a relay a new session is announced nowhere", async () => {
+    const h = harness();
+    await h.run(BASE);
+    expect(h.announced).toEqual([]);
   });
 
   test("a dry run boots nothing, sends nothing and installs no relay", async () => {

@@ -9,6 +9,7 @@
 import type { AutomationInbox } from "./inbox.ts";
 import type { RunSnapshot } from "./context.ts";
 import type { SessionRelayStore } from "../../db/session-relays.ts";
+import type { SourceMention } from "../../workflows/communication-policy.ts";
 import type { DecisionsRequest, DecisionsResponse } from "../../integrations/openrouter-decisions.ts";
 import type { ProfileCard } from "../profile-cards.ts";
 
@@ -279,6 +280,10 @@ export interface EngineDeps {
   /** Contract 5: the session relay rows (`relay_session`, `run_agent`,
    * `relay_close`). Absent = the blocks report the relay store unavailable. */
   relays?: SessionRelayStore;
+  /** Tell the relayed place a NEW session started (the link into the
+   * thread). The agent step calls it once per session it starts. Absent =
+   * silent. */
+  announceStarted?(sessionId: string, target: SourceMention): Promise<void>;
   prRefs?: EnginePrRefLookup;
   code?: CodeBlockRuntime;
   integrationActions?: IntegrationActionRuntime;

@@ -49,6 +49,7 @@ import { makePrRefStore } from "../db/pr-refs.ts";
 import { makeIntegrationActionRuntime } from "../automations/actions/runtime.ts";
 import { makeAutomationInstanceStore } from "../db/automation-instances.ts";
 import { makeSessionRelayStore } from "../db/session-relays.ts";
+import { sessionRelayDeps } from "../automations/session-relay.ts";
 import { isRouterConnected } from "../model-routers/connected.ts";
 import { getOpenRouterDecisions } from "../integrations/openrouter.ts";
 import { loadProfileCards } from "../automations/profile-cards.ts";
@@ -299,6 +300,10 @@ function productionEngineDeps(): EngineDeps {
       recordInstanceHandle: (input) => makeAutomationInstanceStore().recordInstanceHandle(input),
     },
     relays: makeSessionRelayStore(),
+    async announceStarted(sessionId, target) {
+      const deps = sessionRelayDeps();
+      await deps.policy(sessionId).onStarted(target, { id: sessionId, webUrl: deps.sessionWebUrl(sessionId) });
+    },
     async startQueuedRun(runId) {
       const run = await store.getRun(runId);
       if (!run) return;
