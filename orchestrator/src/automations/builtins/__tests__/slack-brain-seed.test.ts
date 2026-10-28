@@ -28,6 +28,7 @@ function harness() {
         entrypoints: input.definition.entrypoints ?? [],
         agent: input.definition.agent ?? null,
         role: input.definition.role ?? null,
+        promptTemplate: input.definition.promptTemplate ?? null,
         inputsSchema: input.definition.inputsSchema,
         settings: input.definition.settings,
         createdByUserId: null,

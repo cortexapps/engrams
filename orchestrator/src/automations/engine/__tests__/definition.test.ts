@@ -540,6 +540,40 @@ describe("the agent: an automation is an agent with ways in", () => {
       ),
     ).toThrow(/cannot reach an agent scoped to each event/);
   });
+
+  test("a way in's own message to the agent is the step's prompt; it needs an agent it tells", () => {
+    const parsed = validateDefinition(
+      bot({
+        promptTemplate: "Main says: ${{ event.raw.text }}",
+        entrypoints: [
+          {
+            id: "nudge",
+            trigger: { kind: "manual" },
+            promptTemplate: "Nudge from ${{ trigger.automation.name }}",
+            blocks: [],
+          },
+          { id: "quiet", trigger: { kind: "manual" }, blocks: [] },
+        ],
+      } as Partial<AutomationDefinition>),
+    );
+    const prompts = Object.fromEntries(
+      entrypointsOf(parsed).map((e) => [e.id, e.blocks.at(-1)!.config["promptTemplate"]]),
+    );
+    expect(prompts).toEqual({
+      main: "Main says: ${{ event.raw.text }}",
+      nudge: "Nudge from ${{ trigger.automation.name }}",
+      quiet: "${{ event.raw.event.text }}",
+    });
+    expect(() =>
+      validateDefinition(def({ promptTemplate: "x" } as Partial<AutomationDefinition>)),
+    ).toThrow(/has a message to the agent but the automation has no agent/);
+    expect(() =>
+      validateDefinition(bot({ role: "none", promptTemplate: "x" } as Partial<AutomationDefinition>)),
+    ).toThrow(/but its role is "none"/);
+    expect(() =>
+      validateDefinition(bot({ promptTemplate: "{{ event.raw.text }}" } as Partial<AutomationDefinition>)),
+    ).toThrow(/never rendered/);
+  });
 });
 
 describe("the {{ }} delimiter guard", () => {

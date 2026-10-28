@@ -473,9 +473,18 @@ export const entrypointRoleSchema = z.enum(["start", "reach", "close", "none"]);
 export type EntrypointRole = z.infer<typeof entrypointRoleSchema>;
 
 /** The `run_agent` step config the agent spec stands for. */
-export function agentStepConfig(agent: AgentSpec): Record<string, unknown> {
+export function agentStepConfig(
+  agent: AgentSpec,
+  entrypoint?: Pick<AutomationEntrypoint, "promptTemplate">,
+): Record<string, unknown> {
   const { scope, ...config } = agent;
-  return { ...config, reuse: scope.kind === "event" ? "never" : "workstream" };
+  return {
+    ...config,
+    // The way in's own message to the agent, when it has one, rendered in
+    // that way in's scope (its steps); else the agent's prompt on every event.
+    ...(entrypoint?.promptTemplate !== undefined ? { promptTemplate: entrypoint.promptTemplate } : {}),
+    reuse: scope.kind === "event" ? "never" : "workstream",
+  };
 }
 
 /** Whether the agent keeps a standing session between events (scope
@@ -510,6 +519,7 @@ export const entrypointSchema = z.object({
     .refine((id) => id !== MAIN_ENTRYPOINT_ID, `"${MAIN_ENTRYPOINT_ID}" names the implicit top-level entrypoint`),
   trigger: entrypointTriggerSchema,
   role: entrypointRoleSchema.optional(),
+  promptTemplate: z.string().min(1).optional(),
   blocks: z.array(blockDefSchema),
 });
 
@@ -518,6 +528,10 @@ export interface AutomationEntrypoint {
   trigger: TriggerSpec;
   /** With an agent: what this way in does to it (absent = `start`). */
   role?: EntrypointRole;
+  /** With an agent it starts or reaches: what this way in tells it, a
+   * template over the event and this way in's steps. Absent = the agent's
+   * prompt on every event. */
+  promptTemplate?: string;
   blocks: BlockDef[];
 }
 
@@ -526,6 +540,8 @@ export const definitionSchema = z.object({
   trigger: triggerSpecSchema,
   /** The main way in's role (see `EntrypointRole`). */
   role: entrypointRoleSchema.optional(),
+  /** The main way in's message to the agent (see `AutomationEntrypoint`). */
+  promptTemplate: z.string().min(1).optional(),
   blocks: z.array(blockDefSchema),
   /** Additional named ways into the SAME automation (shared inputs,
    * settings, and automation_state). Each run enters through exactly one
@@ -545,6 +561,7 @@ export interface AutomationDefinition {
   engine: typeof ENGINE_VERSION;
   trigger: TriggerSpec;
   role?: EntrypointRole;
+  promptTemplate?: string;
   blocks: BlockDef[];
   entrypoints?: AutomationEntrypoint[];
   agent?: AgentSpec;
@@ -560,6 +577,9 @@ export function declaredEntrypointsOf(definition: AutomationDefinition): Automat
       id: MAIN_ENTRYPOINT_ID,
       trigger: definition.trigger,
       ...(definition.role !== undefined ? { role: definition.role } : {}),
+      ...(definition.promptTemplate !== undefined
+        ? { promptTemplate: definition.promptTemplate }
+        : {}),
       blocks: definition.blocks,
     },
     ...(definition.entrypoints ?? []),
@@ -577,7 +597,9 @@ function definitionIssueError(issuePath: readonly PropertyKey[], message: string
   const path = issuePath.map(String);
   const [head, ...rest] = path;
   if (head === "agent") return new DefinitionError("__agent__", rest.join(".") || "scope", message);
-  if (head === "role") return new DefinitionError("__trigger__", "role", message);
+  if (head === "role" || head === "promptTemplate") {
+    return new DefinitionError("__trigger__", head, message);
+  }
   if (head === "entrypoints") {
     // `entrypoints.1.role` → the ways in's `role`: the index is no field.
     return new DefinitionError("__entrypoints__", rest.filter((p) => !/^\d+$/.test(p)).join(".") || "id", message);
@@ -590,7 +612,9 @@ function agentStepsOf(agent: AgentSpec, entrypoint: AutomationEntrypoint): Block
   switch (roleOf(entrypoint)) {
     case "start":
     case "reach":
-      return [{ id: AGENT_STEP_ID, type: AGENT_BLOCK_TYPE, config: agentStepConfig(agent) }];
+      return [
+        { id: AGENT_STEP_ID, type: AGENT_BLOCK_TYPE, config: agentStepConfig(agent, entrypoint) },
+      ];
     case "close":
       return [
         {
@@ -827,6 +851,23 @@ export function validateDefinition(raw: unknown): AutomationDefinition {
         "role",
         `way in "${entrypoint.id}" cannot ${role} an agent scoped to each event (there is no standing agent to find)`,
       );
+    }
+    if (entrypoint.promptTemplate !== undefined) {
+      if (agent === undefined) {
+        throw new DefinitionError(
+          where,
+          "promptTemplate",
+          `way in "${entrypoint.id}" has a message to the agent but the automation has no agent`,
+        );
+      }
+      if (role === "close" || role === "none") {
+        throw new DefinitionError(
+          where,
+          "promptTemplate",
+          `way in "${entrypoint.id}" has a message to the agent but its role is "${role}"`,
+        );
+      }
+      validateTemplatesIn(where, entrypoint.promptTemplate, "promptTemplate");
     }
   }
 

@@ -117,7 +117,7 @@ function fakeStore(seed?: {
     trigger: d.trigger,
     entrypoints: d.entrypoints ?? [],
     agent: d.agent ?? null,
-    role: d.role ?? null,
+    role: d.role ?? null, promptTemplate: d.promptTemplate ?? null,
     blocks: d.blocks,
     inputsSchema: d.inputsSchema,
     settings: d.settings,
@@ -476,7 +476,7 @@ function builtinStored(id = "builtin-1"): Stored {
       updatedAt: NOW,
       archivedAt: null,
     },
-    versions: new Map([[1, { automationId: id, version: 1, trigger: d.trigger, blocks: d.blocks, entrypoints: d.entrypoints ?? [], agent: d.agent ?? null, role: d.role ?? null, inputsSchema: d.inputsSchema, settings: d.settings, createdByUserId: null, createdAt: NOW }]]),
+    versions: new Map([[1, { automationId: id, version: 1, trigger: d.trigger, blocks: d.blocks, entrypoints: d.entrypoints ?? [], agent: d.agent ?? null, role: d.role ?? null, promptTemplate: d.promptTemplate ?? null, inputsSchema: d.inputsSchema, settings: d.settings, createdByUserId: null, createdAt: NOW }]]),
   };
 }
 

@@ -66,6 +66,7 @@ function row(def: AutomationDefinition, version = 1): AutomationRow {
       entrypoints: def.entrypoints ?? [],
       agent: def.agent ?? null,
       role: def.role ?? null,
+      promptTemplate: def.promptTemplate ?? null,
       inputsSchema: def.inputsSchema,
       settings: def.settings,
       createdByUserId: null,

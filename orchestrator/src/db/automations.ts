@@ -78,6 +78,7 @@ export interface AutomationVersionRow {
   entrypoints: AutomationEntrypoint[];
   agent: AgentSpec | null;
   role: EntrypointRole | null;
+  promptTemplate: string | null;
   inputsSchema: InputFieldSpec[];
   settings: AutomationSettings;
   createdByUserId: string | null;
@@ -482,6 +483,7 @@ function versionRow(row: typeof versionTable.$inferSelect): AutomationVersionRow
     entrypoints: row.entrypoints,
     agent: row.agent ?? null,
     role: row.role ?? null,
+    promptTemplate: row.promptTemplate ?? null,
     inputsSchema: row.inputsSchema,
     settings: row.settings,
     createdByUserId: row.createdByUserId ?? null,
@@ -494,6 +496,7 @@ export function definitionOf(version: AutomationVersionRow): AutomationDefinitio
     engine: ENGINE_VERSION,
     trigger: version.trigger,
     ...(version.role !== null ? { role: version.role } : {}),
+    ...(version.promptTemplate !== null ? { promptTemplate: version.promptTemplate } : {}),
     blocks: version.blocks,
     ...(version.entrypoints.length > 0 ? { entrypoints: version.entrypoints } : {}),
     ...(version.agent !== null ? { agent: version.agent } : {}),
@@ -766,6 +769,7 @@ export function makeAutomationStore(
           entrypoints: definition.entrypoints ?? [],
           agent: definition.agent ?? null,
           role: definition.role ?? null,
+          promptTemplate: definition.promptTemplate ?? null,
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId,
@@ -800,6 +804,7 @@ export function makeAutomationStore(
           entrypoints: definition.entrypoints ?? [],
           agent: definition.agent ?? null,
           role: definition.role ?? null,
+          promptTemplate: definition.promptTemplate ?? null,
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId,
@@ -1331,6 +1336,7 @@ export function makeAutomationStore(
           entrypoints: definition.entrypoints ?? [],
           agent: definition.agent ?? null,
           role: definition.role ?? null,
+          promptTemplate: definition.promptTemplate ?? null,
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
           createdByUserId: null,

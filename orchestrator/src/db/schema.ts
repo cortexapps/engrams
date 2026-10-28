@@ -1439,6 +1439,8 @@ export const automationVersion = pgTable(
     agent: jsonb("agent").$type<AgentSpec>(),
     /** The main way in's role toward the agent; null = `start`. */
     role: text("role").$type<EntrypointRole>(),
+    /** The main way in's message to the agent; null = the agent's prompt. */
+    promptTemplate: text("prompt_template"),
     inputsSchema: jsonb("inputs_schema").$type<InputFieldSpec[]>().notNull().default([]),
     settings: jsonb("settings").$type<AutomationSettings>().notNull(),
     createdByUserId: text("created_by_user_id"),
