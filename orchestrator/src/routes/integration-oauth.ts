@@ -11,6 +11,9 @@
  *
  *   GET /api/v1/integrations/:provider/oauth/authorize  (admin) → 302 to the IdP
  *   GET /api/v1/integrations/:provider/oauth/callback           → exchange + 302 back
+ *   POST /api/v1/integrations/:provider/oauth/grant     (admin) → client-credentials
+ *       grant, no browser round trip: the coordinator posts the sealed client
+ *       id and secret to the token URL and seals the token (Vanta).
  *   GET /api/v1/me/connector-credentials/:provider/oauth/authorize
  *       (any member, ADR 0115) → 302 to the IdP with a user_connector subject
  *
@@ -31,7 +34,11 @@ import { abilityFor } from "../authz/ability.ts";
 import { config } from "../config.ts";
 import { loadRegistry } from "../connectors/registry.ts";
 import type { Connector } from "../connectors/registry.ts";
-import { redirectOauthSpec, userRedirectOauthSpec } from "../connectors/oauth-spec.ts";
+import {
+  clientCredentialsSpec,
+  redirectOauthSpec,
+  userRedirectOauthSpec,
+} from "../connectors/oauth-spec.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
 import { getDb } from "../db/client.ts";
@@ -40,7 +47,7 @@ import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 
 type OauthCredentialClient = Pick<
   typeof defaultOauthCredential,
-  "beginRedirectFlow" | "completeRedirectFlow" | "lookupRedirectFlow"
+  "beginRedirectFlow" | "completeRedirectFlow" | "lookupRedirectFlow" | "grantClientCredentials"
 >;
 
 type GetSession = (
@@ -127,6 +134,11 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     await requireAdmin(c.req.raw.headers);
     const provider = c.req.param("provider");
     const connector = await oauthConnector(provider);
+    if (connector.oauth?.grant !== "authorization_code") {
+      throw new HTTPException(404, {
+        message: `connector "${provider}" grants by client credentials; use the grant route`,
+      });
+    }
     // Reconnect after revocation: force the provider's consent screen so a
     // fresh grant is issued (providers ignore unknown params otherwise).
     const force = c.req.query("force") === "1";
@@ -165,6 +177,36 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
       redirectUri: redirectUri(provider),
     });
     return c.redirect(authorizeUrl);
+  });
+
+  // A client-credentials connector: the admin sealed the client id and
+  // secret as org secrets (the facet's refs); the coordinator runs the grant
+  // and seals the token. Repeating the call re-grants (a reconnect, or new
+  // secrets). The response is JSON: the sheet stays on the page.
+  app.post("/api/v1/integrations/:provider/oauth/grant", async (c) => {
+    await requireAdmin(c.req.raw.headers);
+    const provider = c.req.param("provider");
+    const connector = await oauthConnector(provider);
+    if (connector.oauth?.grant !== "client_credentials") {
+      throw new HTTPException(404, {
+        message: `connector "${provider}" has no client-credentials grant`,
+      });
+    }
+    try {
+      const { credential } = await oauthCredential.grantClientCredentials({
+        subject: await subjectFor(connector),
+        provider,
+        spec: clientCredentialsSpec(connector),
+      });
+      return c.json({
+        ok: true,
+        status: credential?.status ?? "",
+        expiresAt: credential?.expiresAt ?? "",
+      });
+    } catch (err) {
+      const message = err instanceof ConnectError ? err.rawMessage : "the grant failed";
+      return c.json({ ok: false, message }, 502);
+    }
   });
 
   app.get("/api/v1/integrations/:provider/oauth/callback", async (c) => {

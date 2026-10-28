@@ -1,0 +1,295 @@
+#!/bin/sh
+# engrams Rippling CLI: a thin, generic wrapper over the Rippling REST API.
+#
+# Auth is brokered: this carries only the `RIPPLING_API_TOKEN` placeholder;
+# the egress proxy injects the organization's real API token as
+# `Authorization: Bearer` on every request to rest.ripplingapis.com and
+# strips any token you supply. There is NOTHING to log in to; do not set a
+# real token.
+#
+# Every resource of the API is reached through the same five verbs (list,
+# get, create, update, delete) plus `api` for the routes that do not fit
+# them. `rippling resources` prints the resource table. Each resource needs
+# the matching power on your profile (rippling:workers:read,
+# rippling:org:write, ...); a path your profile did not grant is denied at
+# the network boundary, not authenticated.
+#
+# `list` follows every page (limit 100, cursor) and prints one JSON array
+# when jq is present; without jq it prints the first page as the API returns
+# it. The API version is the one the token was created with; set
+# RIPPLING_API_VERSION (YYYY-MM-DD) to ask for another.
+set -eu
+
+BASE="https://rest.ripplingapis.com"
+TOKEN="${RIPPLING_API_TOKEN:-x-engrams-managed}"
+VERSION="${RIPPLING_API_VERSION:-}"
+
+usage() {
+    cat <<EOF
+engrams Rippling CLI: auth is brokered by the platform (no token to set).
+
+Usage:
+  rippling resources                              Every resource, its verbs, and its extra routes
+  rippling list <resource> [field=value ...]      Every page of a collection, as one array
+  rippling get <resource> <id> [field=value ...]  One record
+  rippling create <resource> <json>               Create a record
+  rippling update <resource> <id> <json>          Change a record (PATCH)
+  rippling delete <resource> <id>                 Delete a record
+  rippling me                                     The caller's own user (sso-me)
+  rippling api <METHOD> <path> [json-body]        Any route, with an explicit method and body
+
+<resource> is a path segment such as workers, departments, or leave-requests;
+it may carry a sub-path, such as custom-objects/<api-name>/records.
+
+Query fields pass straight to the API. Rippling's own syntax:
+  filter="status eq 'ACTIVE'"        operators: eq ne gt gte lt lte in and or
+  filter="work_email eq 'a@b.com'"   strings in single quotes
+  expand=user,manager                embed related records (depth 2, up to 10 fields)
+  order_by=start_date                sort; prefix with - for descending
+
+Examples:
+  rippling list workers "filter=work_email eq 'a@example.com'" expand=user,manager
+  rippling get workers <id> expand=manager,manager.user
+  rippling list workers "filter=manager_id eq '<id>'" expand=user
+  rippling list worker-changes "filter=updated_at gt '2026-10-01T00:00:00Z'"
+  rippling list custom-objects/<api-name>/records
+  rippling api POST custom-objects/<api-name>/records/query '{"query":"SELECT * FROM ..."}'
+  rippling create report-runs '{"report_id":"<id>"}'
+
+Responses are JSON. Fields the token cannot read are listed under
+__meta.redacted_fields.
+EOF
+}
+
+resources() {
+    cat <<'EOF'
+resource                              verbs                            extra routes (use: rippling api)
+activity-log                          list get
+app-users                             list get
+background-check-candidates           list get create update delete
+bill-payments                         list get
+break-policies                        list get
+break-types                           list get
+business-partner-groups               list get create delete
+business-partners                     list get create delete
+business-structure-paths              list get create delete
+candidate-applications                list
+candidates                            list
+card-transactions                     list get
+companies                             list
+company-legal-entities                list get
+company-legal-entity-workers          list get
+compensation-bands-details            list get
+compensations                         list get
+custom-fields                         list
+custom-objects                        list get create update delete    <name>/fields, <name>/list-views, <name>/records (list get create update delete), <name>/records/query, <name>/records/bulk, <name>/records/bulk-delete, <name>/records/external_id/<id>
+departments                           list get create update
+device-orders                         list get
+devices                               list get
+draft-hires                           create
+draft-transitions                     get create
+earning-types                         list
+earnings-inputs                       list create delete
+employee-documents                    create
+employment-types                      list get
+entitlements                          list
+files                                 get create
+headcount-positions                   list get
+headcount-priorities                  list get
+hire-requirements                     list
+hires                                 create
+job-assignments                       list get create update delete    <id>/change-log
+job-codes                             list get create update delete    <id>/change-log
+job-dimensions                        list get create update delete
+job-functions                         list get
+job-pay-rate-exceptions               list get                         <id>/change-log
+job-requisitions                      list
+job-requisitions-write                create
+kiosk-badges                          list get create update delete
+leave-accruals                        list get create
+leave-balances                        list get
+leave-program-evaluations             create
+leave-requests                        list get create update
+leave-types                           list get
+legal-entities                        list get
+levels                                list get create update delete
+location-factors                      list get
+object-categories                     list get create update delete
+payroll-payment-mode-changes          create
+payroll-runs                          list get                         off-cycle (POST), <id>/worker-payroll-records
+platform-capabilities                 list
+reimbursements                        list get
+report-runs                           get create
+reports                               get                              <id>/available-filters
+scheduled-job-assignments             list get delete
+schedules                             list get create update
+shift-inputs                          list get create update delete
+shiftassignments                      list get create update           <id>/customfields (PATCH)
+software-deployments                  list get create update delete
+spend-categories                      list get
+spend-vendors                         list get
+sso-me                                list
+supergroups                           list get                         <id>/members, <id>/inclusion-members (GET PATCH), <id>/exclusion-members (GET PATCH)
+teams                                 list get create update delete
+time-cards                            list get
+time-entries                          list get create update delete
+titles                                list get create update delete
+tracks                                list get create update delete
+unassignedshifts                      list get create update           <id>/assign (POST), <id>/customfields (PATCH)
+users                                 list get
+variable-compensation-payout-labels   list get create update
+variable-compensation-payout-types    list get create update delete
+variable-compensation-payout-writes   create
+variable-compensation-payouts         list get create
+work-locations                        list get create update delete
+worker-change-fields                  list
+worker-changes                        list get
+worker-time-splits                    list get create update delete
+workers                               list get
+workflow-action-executions            create
+workflows                             list get create update delete    <id>/executions (POST), <id>/executions/<execution-id>
+EOF
+}
+
+have_jq() { command -v jq >/dev/null 2>&1; }
+
+pretty() {
+    if have_jq; then jq .; else cat; fi
+}
+
+# Rippling paths start and end with a slash.
+norm_path() {
+    p="$1"
+    case "$p" in
+    /*) ;;
+    *) p="/$p" ;;
+    esac
+    case "$p" in
+    */ | *\?*) printf '%s' "$p" ;;
+    *) printf '%s/' "$p" ;;
+    esac
+}
+
+# request <METHOD> <path> [curl-args...]
+request() {
+    m="$1"
+    p="$2"
+    shift 2
+    if [ -n "$VERSION" ]; then
+        curl -sS -X "$m" "$BASE$(norm_path "$p")" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/json" \
+            -H "Rippling-Api-Version: $VERSION" \
+            "$@"
+    else
+        curl -sS -X "$m" "$BASE$(norm_path "$p")" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/json" \
+            "$@"
+    fi
+}
+
+# fetch <path> [field=value ...]: one GET; each field=value is a query param.
+fetch() {
+    p="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    request GET "$p" -G "$@"
+}
+
+get() {
+    fetch "$@" | pretty
+}
+
+# list <path> [field=value ...]: every page of a collection, one array.
+list() {
+    p="$1"
+    shift
+    if ! have_jq; then
+        get "$p" "limit=100" "$@"
+        return
+    fi
+    pages=$(mktemp)
+    trap 'rm -f "$pages"' EXIT
+    cursor=""
+    while :; do
+        if ! page=$(fetch "$p" "limit=100" ${cursor:+"cursor=$cursor"} "$@"); then
+            echo "rippling: could not reach $BASE" >&2
+            exit 1
+        fi
+        if ! printf '%s' "$page" | jq -e '.results' >/dev/null 2>&1; then
+            # Not a collection envelope (an error, or a single object): show it as is.
+            printf '%s\n' "$page" | pretty
+            exit 1
+        fi
+        printf '%s\n' "$page" >>"$pages"
+        next=$(printf '%s' "$page" | jq -r '.next_link // empty')
+        [ -n "$next" ] || break
+        # The next page is a URL carrying the cursor; take the cursor alone so
+        # the request stays on the same path and headers.
+        cursor=$(printf '%s' "$next" | sed -n 's/.*[?&]cursor=\([^&]*\).*/\1/p')
+        [ -n "$cursor" ] || break
+    done
+    jq -s '[.[].results[]]' "$pages"
+}
+
+# send <METHOD> <path> <json-body>
+send() {
+    request "$1" "$2" -H "Content-Type: application/json" --data-binary "$3" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+resources) resources ;;
+list)
+    r="${1:?usage: rippling list <resource> [field=value ...]}"
+    shift
+    list "$r" "$@"
+    ;;
+get)
+    r="${1:?usage: rippling get <resource> <id> [field=value ...]}"
+    id="${2:?usage: rippling get <resource> <id> [field=value ...]}"
+    shift 2
+    get "$r/$id" "$@"
+    ;;
+create)
+    r="${1:?usage: rippling create <resource> <json>}"
+    body="${2:?usage: rippling create <resource> <json>}"
+    send POST "$r" "$body"
+    ;;
+update)
+    r="${1:?usage: rippling update <resource> <id> <json>}"
+    id="${2:?usage: rippling update <resource> <id> <json>}"
+    body="${3:?usage: rippling update <resource> <id> <json>}"
+    send PATCH "$r/$id" "$body"
+    ;;
+delete)
+    r="${1:?usage: rippling delete <resource> <id>}"
+    id="${2:?usage: rippling delete <resource> <id>}"
+    request DELETE "$r/$id" | pretty
+    ;;
+me) get sso-me ;;
+api)
+    m="${1:?usage: rippling api <METHOD> <path> [json-body]}"
+    p="${2:?usage: rippling api <METHOD> <path> [json-body]}"
+    if [ -n "${3:-}" ]; then
+        send "$m" "$p" "$3"
+    else
+        request "$m" "$p" | pretty
+    fi
+    ;;
+"" | -h | --help | help) usage ;;
+*)
+    echo "rippling: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

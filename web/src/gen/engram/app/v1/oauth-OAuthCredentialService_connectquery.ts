@@ -66,6 +66,17 @@ export const beginRedirectFlow = OAuthCredentialService.method.beginRedirectFlow
 export const completeRedirectFlow = OAuthCredentialService.method.completeRedirectFlow;
 
 /**
+ * Client-credentials grant for connector subjects (a provider whose API
+ * credentials are a client id and secret with no user consent, such as
+ * Vanta). No browser round trip: the coordinator posts the grant to the
+ * token URL, seals the obtained token, and runs the grant again before
+ * expiry through the same refresh sweep the redirect family uses.
+ *
+ * @generated from rpc engram.app.v1.OAuthCredentialService.GrantClientCredentials
+ */
+export const grantClientCredentials = OAuthCredentialService.method.grantClientCredentials;
+
+/**
  * Internal credential-control operations. Callers must additionally present
  * the session's broker token; the coordinator derives subject/provider from
  * the session binding and never accepts them from the harness.

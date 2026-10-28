@@ -76,6 +76,20 @@ describe("the ingress spine", () => {
     expect(ingress.dispatched.map((d) => [d.eventKey, d.scopeValue])).toEqual([["app_mention", "C1"]]);
   });
 
+  test("a message in a group direct message is ledgered with its conversation as the scope", async () => {
+    const ingress = fakeIngress();
+    const app = makeSlackEventsRoute({ signingSecret: async () => SECRET, ingress: ingress.deps });
+    const body = JSON.stringify({
+      type: "event_callback",
+      team_id: "T1",
+      event_id: "Ev-mpim",
+      event: { type: "message", channel: "G1", channel_type: "mpim", user: "U1", ts: "100.3", text: "done" },
+    });
+    const res = await app.request(PATH, { method: "POST", body, headers: signed(body) });
+    expect(res.status).toBe(200);
+    expect(ingress.dispatched.map((d) => [d.eventKey, d.scopeValue])).toEqual([["message", "G1"]]);
+  });
+
   test("a bot message subtype is skipped by the spine and still acked 200", async () => {
     const ingress = fakeIngress();
     const app = makeSlackEventsRoute({ signingSecret: async () => SECRET, ingress: ingress.deps });

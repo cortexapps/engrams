@@ -1107,16 +1107,22 @@ impl App {
         let Some(a) = &mut self.attached else {
             return;
         };
+        if a.search.is_none() {
+            return;
+        }
+        // Stepping the match needs the whole pane, not just the query, so it
+        // runs before the query is borrowed below.
+        if matches!(action, Action::Send | Action::Down) {
+            if !a.search_next(width) {
+                self.note("no match");
+            }
+            return;
+        }
         let Some(s) = &mut a.search else {
             return;
         };
         match action {
             Action::Escape | Action::Search | Action::CtrlC => a.search = None,
-            Action::Send | Action::Down => {
-                if !a.search_next(width) {
-                    self.note("no match");
-                }
-            }
             Action::Backspace => {
                 s.query.pop();
                 s.cursor = None;
@@ -1328,11 +1334,7 @@ impl App {
         match ns.stage {
             NewStage::Pick => match action {
                 a if list_step(a).is_some() => ns.step(list_step(a) == Some(true)),
-                Action::Send => {
-                    if ns.selected_profile().is_some() {
-                        ns.stage = NewStage::Prompt;
-                    }
-                }
+                Action::Send if ns.selected_profile().is_some() => ns.stage = NewStage::Prompt,
                 Action::Escape => {
                     if ns.filter.is_empty() {
                         self.new_session = None;

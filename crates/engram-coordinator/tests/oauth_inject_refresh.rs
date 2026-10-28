@@ -12,7 +12,7 @@ use axum::http::{Method, Request, StatusCode};
 use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
 use engram_core::traits::{Clock, MetadataStore};
 use engram_core::types::connector_oauth::{
-    ConnectorOAuthBundle, ConnectorOAuthKind, ConnectorOAuthRefreshSpec,
+    ConnectorOAuthBundle, ConnectorOAuthKind, ConnectorOAuthRefreshSpec, TokenRequestBody,
 };
 use engram_core::types::oauth::{
     NewSealedOAuthCredential, OAuthAccountMetadata, OAuthCredentialKey, OAuthSubjectKind,
@@ -222,6 +222,8 @@ async fn refresh_route_refreshes_an_expired_bundle_against_the_provider() {
                 token_url: format!("http://127.0.0.1:{}/oauth/token", addr.port()),
                 client_id_ref: "linear.client_id".into(),
                 client_secret_ref: "linear.client_secret".into(),
+                scope: None,
+                body: TokenRequestBody::Form,
             }),
         },
     )

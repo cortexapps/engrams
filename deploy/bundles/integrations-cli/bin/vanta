@@ -1,0 +1,227 @@
+#!/bin/sh
+# engrams Vanta CLI: a thin, generic wrapper over the Manage Vanta API (/v1).
+#
+# Auth is brokered: this carries only the `VANTA_API_TOKEN` placeholder; the
+# egress proxy injects the organization's real Vanta token as
+# `Authorization: Bearer` on every request to api.vanta.com and strips any
+# token you supply. There is NOTHING to log in to; do not set a real token.
+#
+# Every resource of the API is reached through the same five verbs (list,
+# get, create, update, delete) plus `api` for the routes that do not fit
+# them. `vanta resources` prints the resource table. Each resource needs the
+# matching power on your profile (vanta:people:read, vanta:tests:read,
+# vanta:controls:write, ...); a path your profile did not grant is denied at
+# the network boundary, not authenticated.
+#
+# `list` follows every page (pageSize 100, pageCursor) and prints one JSON
+# array when jq is present; without jq it prints the first page as the API
+# returns it. Vanta allows 50 requests a minute.
+set -eu
+
+BASE="https://api.vanta.com"
+TOKEN="${VANTA_API_TOKEN:-x-engrams-managed}"
+
+usage() {
+    cat <<EOF
+engrams Vanta CLI: auth is brokered by the platform (no token to set).
+
+Usage:
+  vanta resources                                 Every resource, its verbs, and its extra routes
+  vanta list <resource> [field=value ...]         Every page of a collection, as one array
+  vanta get <resource> [id] [field=value ...]     One record, or a singleton such as organization
+  vanta create <resource> <json>                  Create a record
+  vanta update <resource> <id> <json>             Change a record (PATCH)
+  vanta delete <resource> <id>                    Delete a record
+  vanta api <METHOD> <path> [json-body]           Any route, with an explicit method and body
+
+<resource> is a path segment such as people, tests, or issues; it may carry a
+sub-path, such as tests/<id>/entities or trust-centers/<slug>/access-requests.
+
+Query fields pass straight to the API as filters, for example:
+  people   employmentStatus=CURRENT  tasksSummaryStatusMatchesAny=OVERDUE
+           taskTypeMatchesAny=ACCEPT_POLICIES,COMPLETE_TRAININGS taskStatusMatchesAny=OVERDUE,DUE_SOON
+  tests    statusFilter=NEEDS_ATTENTION  frameworkFilter=  ownerFilter=
+  issues   statusMatchesAny=NOT_STARTED,IN_PROGRESS  severityMatchesAny=HIGH  dueBeforeDate=2026-11-15T23:59:59Z
+  vendors  statusMatchesAny=MANAGED,IN_PROCUREMENT
+Dates are ISO 8601. Paths that do not start with /v1 are prefixed with /v1/.
+
+Examples:
+  vanta get organization
+  vanta list people tasksSummaryStatusMatchesAny=OVERDUE
+  vanta list tests statusFilter=NEEDS_ATTENTION
+  vanta list tests/<id>/entities
+  vanta get people <id>
+  vanta api POST controls/<id>/set-owner '{"userId":"<user-id>"}'
+  vanta api POST people/offboard '{"updates":[{"id":"<person-id>","acknowledgerId":"<user-id>"}]}'
+EOF
+}
+
+resources() {
+    cat <<'EOF'
+resource                        verbs                          extra routes (use: vanta api)
+business-units                  list get
+contracts                       list get create delete
+controls                        list get create update delete  add-from-library (POST), controls-library, deactivated-controls, <id>/tests (GET), <id>/documents (GET), <id>/add-test-to-control (POST), <id>/add-document-to-control (POST), <id>/tests/<id> (DELETE), <id>/documents/<id> (DELETE), <id>/set-owner (POST)
+custom-assets                   list
+customer-trust                                                 accounts (list get create update delete), deletion-requests (POST), questionnaires (list get update delete), questionnaires/file (POST), questionnaires/website (POST), questionnaires/exports (POST), questionnaires/exports/<id>, questionnaires/assignable-users, questionnaires/<id>/approve (POST), questionnaires/<id>/complete (POST), questionnaires/<id>/responses (list get update), questionnaires/<id>/responses/<id>/owner (PATCH), tag-categories (list get), tag-categories/<id>/product-contexts (POST, DELETE <id>)
+discovered-vendors              list                           <id>/accounts (GET), <id>/add-to-managed (POST)
+documents                       list get create delete         <id>/controls, <id>/links (GET POST, DELETE <id>), <id>/uploads (GET POST, DELETE <id>), <id>/uploads/<id>/media, <id>/set-owner (POST), <id>/submit (POST)
+event-logs                      list                           startDate=
+frameworks                      list get delete                exports (POST), exports/<id>, <id>/controls, <id>/snooze (POST), <id>/reactivate (POST), <id>/variants (PUT)
+groups                          list get create update delete  <id>/people (GET POST, DELETE <id>), <id>/add-people (POST), <id>/remove-people (POST), import-from-idp (POST), importable-idp-groups
+integrations                    list get                       <id>/resource-kinds, <id>/resource-kinds/<kind>, <id>/resource-kinds/<kind>/resources (GET PATCH), <id>/resource-kinds/<kind>/resources/<id> (GET PATCH)
+issues                          list get
+knowledge-base                                                 answer-library (list get create update delete), answer-library/<id>/verify (POST), resources (list get delete), resources/documents (POST, PATCH <id>, <id>/upload POST), resources/webpages (POST, PATCH <id>), resources/<id>/verify (POST)
+monitored-computers             list get
+organization                    get
+people                          list get update                offboard (POST), mark-as-people (POST), mark-as-not-people (POST), <id>/set-leave (POST), <id>/clear-leave (POST)
+personnel-notification-settings get                            (PATCH)
+policies                        list get
+program-scopes                  list get
+resources                                                      <type>?resourceId= (GET PUT): push a custom integration's resources
+risk-scenarios                  list get create update         <id>/controls (GET POST, PATCH/DELETE <id>), <id>/mappings/{accounts,custom-assets,integrations,issues,vendor-findings} (GET POST DELETE), <id>/mappings/enterprise-risk, <id>/submit-for-approval (POST), <id>/cancel-approval-request (POST)
+tests                           list get                       <id>/entities, <id>/entities/<id>/deactivate (POST), <id>/entities/<id>/reactivate (POST)
+trust-centers                   get update                     <slug>/access-requests (list get; <id>/approve, <id>/deny POST), <slug>/historical-access-requests, <slug>/activity, <slug>/chatbot/conversations, <slug>/compliance-frameworks, <slug>/control-categories, <slug>/controls, <slug>/data-collected, <slug>/faq-categories, <slug>/faqs, <slug>/favicon, <slug>/resource-categories, <slug>/resources, <slug>/subprocessors, <slug>/subscriber-groups, <slug>/subscribers, <slug>/updates, <slug>/videos, <slug>/viewers
+users                           list get
+vendor-assessment-types         list get
+vendor-categories               list get create update delete
+vendor-risk-attributes          list
+vendors                         list get create update delete  <id>/assessments (list get), <id>/documents (GET POST), <id>/findings (GET POST, PATCH/DELETE <id>), <id>/security-reviews (list get), <id>/security-reviews/<id>/documents (GET POST, DELETE <id>), <id>/set-status (POST), <id>/engagement-relationship/<id> (PUT DELETE)
+vulnerabilities                 list get                       deactivate (POST), reactivate (POST)
+vulnerability-remediations      list                           acknowledge-sla-miss (POST)
+vulnerable-assets               list get
+EOF
+}
+
+have_jq() { command -v jq >/dev/null 2>&1; }
+
+pretty() {
+    if have_jq; then jq .; else cat; fi
+}
+
+norm_path() {
+    case "$1" in
+    /v1/*) printf '%s' "$1" ;;
+    /*) printf '/v1%s' "$1" ;;
+    *) printf '/v1/%s' "$1" ;;
+    esac
+}
+
+# request <METHOD> <path> [curl-args...]
+request() {
+    m="$1"
+    p="$2"
+    shift 2
+    curl -sS -X "$m" "$BASE$(norm_path "$p")" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Accept: application/json" \
+        "$@"
+}
+
+# fetch <path> [field=value ...]: one GET; each field=value is a query param.
+fetch() {
+    p="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    request GET "$p" -G "$@"
+}
+
+get() {
+    fetch "$@" | pretty
+}
+
+# list <path> [field=value ...]: every page of a collection, one array.
+list() {
+    p="$1"
+    shift
+    if ! have_jq; then
+        get "$p" "pageSize=100" "$@"
+        return
+    fi
+    pages=$(mktemp)
+    trap 'rm -f "$pages"' EXIT
+    cursor=""
+    while :; do
+        if ! page=$(fetch "$p" "pageSize=100" ${cursor:+"pageCursor=$cursor"} "$@"); then
+            echo "vanta: could not reach $BASE" >&2
+            exit 1
+        fi
+        if ! printf '%s' "$page" | jq -e '.results.data' >/dev/null 2>&1; then
+            # Not a collection envelope (an error, or a single object): show it as is.
+            printf '%s\n' "$page" | pretty
+            exit 1
+        fi
+        printf '%s\n' "$page" >>"$pages"
+        more=$(printf '%s' "$page" | jq -r '.results.pageInfo.hasNextPage')
+        cursor=$(printf '%s' "$page" | jq -r '.results.pageInfo.endCursor // empty')
+        [ "$more" = "true" ] && [ -n "$cursor" ] || break
+    done
+    jq -s '[.[].results.data[]]' "$pages"
+}
+
+# send <METHOD> <path> <json-body>
+send() {
+    request "$1" "$2" -H "Content-Type: application/json" --data-binary "$3" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+resources) resources ;;
+list)
+    r="${1:?usage: vanta list <resource> [field=value ...]}"
+    shift
+    list "$r" "$@"
+    ;;
+get)
+    r="${1:?usage: vanta get <resource> [id] [field=value ...]}"
+    shift
+    # A second bare word (no `=`) is the record id; the rest are query fields.
+    case "${1:-}" in
+    "" | *=*) get "$r" "$@" ;;
+    *)
+        id="$1"
+        shift
+        get "$r/$id" "$@"
+        ;;
+    esac
+    ;;
+create)
+    r="${1:?usage: vanta create <resource> <json>}"
+    body="${2:?usage: vanta create <resource> <json>}"
+    send POST "$r" "$body"
+    ;;
+update)
+    r="${1:?usage: vanta update <resource> <id> <json>}"
+    id="${2:?usage: vanta update <resource> <id> <json>}"
+    body="${3:?usage: vanta update <resource> <id> <json>}"
+    send PATCH "$r/$id" "$body"
+    ;;
+delete)
+    r="${1:?usage: vanta delete <resource> <id>}"
+    id="${2:?usage: vanta delete <resource> <id>}"
+    request DELETE "$r/$id" | pretty
+    ;;
+api)
+    m="${1:?usage: vanta api <METHOD> <path> [json-body]}"
+    p="${2:?usage: vanta api <METHOD> <path> [json-body]}"
+    if [ -n "${3:-}" ]; then
+        send "$m" "$p" "$3"
+    else
+        request "$m" "$p" | pretty
+    fi
+    ;;
+"" | -h | --help | help) usage ;;
+*)
+    echo "vanta: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

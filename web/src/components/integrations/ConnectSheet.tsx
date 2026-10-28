@@ -107,7 +107,14 @@ export function ConnectSheet({
   // OAuth connectors (e.g. Slack) take a dedicated "Add to {provider}" flow: the
   // credential is obtained by consent + stored server-side, not hand-entered.
   if (cfg?.oauth) {
-    return <OAuthConnectSheet view={view} oauth={cfg.oauth} onClose={onClose} />;
+    return (
+      <OAuthConnectSheet
+        view={view}
+        oauth={cfg.oauth}
+        onClose={onClose}
+        onConnected={onConnected}
+      />
+    );
   }
 
   const credentialFilled = isMint

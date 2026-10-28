@@ -8,6 +8,10 @@ const putSecret = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 vi.mock("@/hooks/useOrgSecrets", () => ({
   usePutOrgSecret: () => ({ mutateAsync: putSecret, isPending: false }),
 }));
+const grant = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock("@/hooks/useIntegrations", () => ({
+  useGrantClientCredentials: () => ({ mutateAsync: grant, isPending: false }),
+}));
 
 const writeText = vi.fn().mockResolvedValue(undefined);
 beforeEach(() => {
@@ -33,6 +37,7 @@ const view = (provider = "slack"): ConnectorView => ({
 });
 
 const oauth: ParsedOauth = {
+  grant: "authorization_code",
   clientIdRef: "slack.client_id",
   clientSecretRef: "slack.client_secret",
   signingSecretRef: "slack.signing_secret",
@@ -68,10 +73,57 @@ describe("OAuthConnectSheet copy buttons", () => {
   });
 });
 
+describe("OAuthConnectSheet client credentials", () => {
+  const cc: ParsedOauth = {
+    grant: "client_credentials",
+    clientIdRef: "vanta.client_id",
+    clientSecretRef: "vanta.client_secret",
+    scopes: ["vanta-api.all:read"],
+  };
+
+  it("shows no redirect URL and runs the grant in place", async () => {
+    grant.mockClear();
+    const onClose = vi.fn();
+    const onConnected = vi.fn();
+    render(
+      <OAuthConnectSheet
+        view={view("vanta")}
+        oauth={cc}
+        onClose={onClose}
+        onConnected={onConnected}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /copy redirect url/i })).toBeNull();
+    expect(screen.getByText(/Bring your own Acme API credentials/i)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText(/client id/i), { target: { value: "vci_1" } });
+    fireEvent.change(screen.getByLabelText(/client secret/i), { target: { value: "vcs_1" } });
+    fireEvent.click(screen.getByRole("button", { name: /add acme/i }));
+    await waitFor(() => expect(grant).toHaveBeenCalledWith({ provider: "vanta" }));
+    expect(putSecret).toHaveBeenCalledWith({ name: "vanta.client_id", value: "vci_1" });
+    expect(putSecret).toHaveBeenCalledWith({ name: "vanta.client_secret", value: "vcs_1" });
+    await waitFor(() => expect(onConnected).toHaveBeenCalledWith("vanta"));
+    expect(onClose).toHaveBeenCalled();
+  });
+});
+
 describe("OAuthConnectSheet signing secret", () => {
   it("renders a signing-secret field when the facet declares one", () => {
     render(<OAuthConnectSheet view={view()} oauth={oauth} onClose={() => {}} />);
     expect(screen.getByLabelText(/signing secret/i)).toBeTruthy();
+  });
+
+  it("shows the facet's own signing-secret hint, with a generic fallback", () => {
+    const { unmount } = render(
+      <OAuthConnectSheet
+        view={view()}
+        oauth={{ ...oauth, signingSecretHint: "Under App Credentials." }}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByText("Under App Credentials.")).toBeTruthy();
+    unmount();
+    render(<OAuthConnectSheet view={view()} oauth={oauth} onClose={() => {}} />);
+    expect(screen.getByText(/needed only to receive Slack events/)).toBeTruthy();
   });
 
   it("omits the signing-secret field when the facet has none", () => {

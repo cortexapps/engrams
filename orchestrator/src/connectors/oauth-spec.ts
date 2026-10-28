@@ -9,9 +9,12 @@
 import { create } from "@bufbuild/protobuf";
 import type { Connector, OauthMetadataField } from "./registry.ts";
 import {
+  ClientCredentialsSpecSchema,
   RedirectMetadataProbeSchema,
   RedirectMetadataSpecSchema,
   RedirectOauthSpecSchema,
+  type ClientCredentialsSpec,
+  type RedirectMetadataSpec,
   type RedirectOauthSpec,
 } from "../gen/engram/app/v1/oauth_pb.ts";
 
@@ -35,26 +38,51 @@ function wireMap(
 /** Build the wire spec for a connector's oauth facet. `extraParams` lets a
  * caller append flow extras (e.g. `prompt: "consent"` on a reconnect); facet
  * params win on collision so a connector's declared behavior is stable. */
+function wireMetadata(connector: Connector): RedirectMetadataSpec | undefined {
+  const oauth = connector.oauth;
+  if (!oauth?.metadata) return undefined;
+  return create(RedirectMetadataSpecSchema, {
+    fromTokenResponse: wireMap(oauth.metadata.fromTokenResponse),
+    probe: oauth.metadata.probe
+      ? create(RedirectMetadataProbeSchema, {
+          method: oauth.metadata.probe.method ?? "GET",
+          host: oauth.metadata.probe.host ?? connector.hosts[0] ?? "",
+          path: oauth.metadata.probe.path,
+          body: oauth.metadata.probe.body ?? "",
+          map: wireMap(oauth.metadata.probe.map),
+        })
+      : undefined,
+  });
+}
+
+/** The wire spec for a connector whose facet grants by client credentials
+ * (no consent screen; the coordinator posts the grant and seals the token). */
+export function clientCredentialsSpec(connector: Connector): ClientCredentialsSpec {
+  const oauth = connector.oauth;
+  if (!oauth || oauth.grant !== "client_credentials") {
+    throw new Error(`connector "${connector.provider}" has no client-credentials grant`);
+  }
+  return create(ClientCredentialsSpecSchema, {
+    tokenUrl: oauth.tokenUrl,
+    scopes: [...oauth.scopes],
+    scopeDelimiter: oauth.scopeDelimiter ?? "",
+    clientIdRef: oauth.clientIdRef,
+    clientSecretRef: oauth.clientSecretRef,
+    tokenRequestBody: oauth.tokenRequestBody ?? "",
+    metadata: wireMetadata(connector),
+  });
+}
+
 export function redirectOauthSpec(
   connector: Connector,
   extraParams?: Record<string, string>,
 ): RedirectOauthSpec {
   const oauth = connector.oauth;
   if (!oauth) throw new Error(`connector "${connector.provider}" has no oauth facet`);
-  const metadata = oauth.metadata
-    ? create(RedirectMetadataSpecSchema, {
-        fromTokenResponse: wireMap(oauth.metadata.fromTokenResponse),
-        probe: oauth.metadata.probe
-          ? create(RedirectMetadataProbeSchema, {
-              method: oauth.metadata.probe.method ?? "GET",
-              host: oauth.metadata.probe.host ?? connector.hosts[0] ?? "",
-              path: oauth.metadata.probe.path,
-              body: oauth.metadata.probe.body ?? "",
-              map: wireMap(oauth.metadata.probe.map),
-            })
-          : undefined,
-      })
-    : undefined;
+  if (oauth.grant !== "authorization_code" || oauth.authorizeUrl === undefined) {
+    throw new Error(`connector "${connector.provider}" has no authorization-code flow`);
+  }
+  const metadata = wireMetadata(connector);
   return create(RedirectOauthSpecSchema, {
     authorizeUrl: oauth.authorizeUrl,
     tokenUrl: oauth.tokenUrl,

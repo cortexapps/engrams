@@ -1,0 +1,11 @@
+{
+  "trustCenter": {
+    "slugId": "123"
+  },
+  "accessRequest": {
+    "id": "123"
+  },
+  "viewer": {
+    "id": "123"
+  }
+}

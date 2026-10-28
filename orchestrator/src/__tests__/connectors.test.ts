@@ -8,6 +8,7 @@
 
 import { expect, test, describe, beforeEach } from "bun:test";
 
+import { loadEventSample } from "../connectors/samples.ts";
 import {
   parseConnector,
   buildRegistry,
@@ -1322,6 +1323,19 @@ describe("cli facet (ADR 0058)", () => {
     }
   });
 
+  test("the slack seed can open direct messages and private channels", () => {
+    const slack = connectorRegistry().get("slack")!;
+    // conversations.open needs im:write (a DM) and mpim:write (a group DM);
+    // a private channel needs groups:write on top of channels:manage.
+    for (const s of ["im:write", "mpim:write", "groups:write"]) {
+      expect(slack.oauth!.scopes).toContain(s);
+    }
+    const open = slack.operations.find(
+      (o) => o.match && !isGraphqlMatch(o.match) && o.match.path === "/api/conversations.open",
+    );
+    expect(open?.grants).toEqual(["im:write"]);
+  });
+
   test("granting a slack power enables the slack CLI + the shared bundle", () => {
     const plan = compileCliIntegrations(["slack:chat:write"], connectorRegistry());
     const slack = plan.enabled.find((e) => e.provider === "slack");
@@ -1871,5 +1885,96 @@ describe("the shipped cortex connector", () => {
     });
     expect(plan.settingsEnv).toEqual({ CORTEX_API_HOST: "api.eu.cortex.io" });
     expect(plan.enabled.map((e) => e.provider)).toEqual(["cortex"]);
+  });
+});
+
+describe("the shipped vanta connector", () => {
+  test("grants by client credentials with a JSON token request and a CLI", () => {
+    const c = connectorRegistry().get("vanta")!;
+    expect(c.hosts).toEqual(["api.vanta.com"]);
+    expect(c.oauth?.grant).toBe("client_credentials");
+    expect(c.oauth?.authorizeUrl).toBeUndefined();
+    expect(c.oauth?.tokenUrl).toBe("https://api.vanta.com/oauth/token");
+    expect(c.oauth?.tokenRequestBody).toBe("json");
+    expect(c.oauth?.scopeDelimiter).toBe(" ");
+    expect(c.oauth?.scopes).toEqual(["vanta-api.all:read", "vanta-api.all:write"]);
+    expect(c.oauth?.signingSecretRef).toBe("vanta.webhook_secret");
+    expect(c.oauth?.signingSecretHint).toMatch(/Webhooks/);
+    // The token is OAuth-sealed: the inject names no org secret of its own.
+    expect(c.credential?.source).toBe("inject");
+    if (c.credential?.source === "inject") expect(c.credential.injects.map((i) => i.secretRef)).toEqual([undefined]);
+    expect(c.cli?.bins).toEqual(["vanta"]);
+    expect(c.cli?.dummyEnv).toEqual({ VANTA_API_TOKEN: "x-engrams-managed" });
+    expect(c.test?.path).toBe("/v1/organization");
+  });
+
+  test("webhooks verify with the Svix scheme and every event has a fixture", () => {
+    const c = connectorRegistry().get("vanta")!;
+    expect(c.webhook?.ingress).toEqual({ scheme: "svix_hmac_sha256", secretRef: "vanta.webhook_secret" });
+    const keys = c.webhook!.events.map((e) => e.key);
+    expect(keys).toContain("questionnaire.status-changed");
+    expect(keys).toContain("trust-center.access-request.received");
+    expect(keys).toContain("vendor.decision.created");
+    for (const event of c.webhook!.events) {
+      expect(event.key, event.key).not.toMatch(/^v1\./);
+      expect(event.handleCandidates?.length ?? 0, event.key).toBeGreaterThan(0);
+      expect(loadEventSample("vanta", event.key), event.key).not.toBeNull();
+    }
+  });
+
+  test("reads and writes are separate powers, and issues and policies are read-only", () => {
+    const c = connectorRegistry().get("vanta")!;
+    const byGrant = new Map<string, string[]>();
+    for (const op of c.operations) {
+      const m = op.match as { method: string; path: string };
+      for (const g of op.grants) byGrant.set(g, [...(byGrant.get(g) ?? []), `${m.method} ${m.path}`]);
+    }
+    for (const [grant, ops] of byGrant) {
+      if (grant.endsWith(":read")) {
+        expect(ops.every((o) => o.startsWith("GET ")), grant).toBe(true);
+      }
+    }
+    expect(byGrant.has("issues:write")).toBe(false);
+    expect(byGrant.has("policies:write")).toBe(false);
+    expect(byGrant.get("people:read")).toContain("GET /v1/people*");
+    expect(byGrant.get("people:write")).toContain("POST /v1/people/*");
+    expect(byGrant.get("tests:read")).toContain("GET /v1/tests*");
+  });
+});
+
+describe("the shipped rippling connector", () => {
+  test("injects a static API token on the REST host, with a CLI and no webhooks", () => {
+    const c = connectorRegistry().get("rippling")!;
+    expect(c.hosts).toEqual(["rest.ripplingapis.com"]);
+    expect(c.oauth).toBeUndefined();
+    expect(c.webhook).toBeUndefined();
+    expect(c.credential?.source).toBe("inject");
+    if (c.credential?.source === "inject") expect(c.credential.injects).toEqual([
+      { header: "Authorization", template: "Bearer {}", secretRef: "rippling.api_token" },
+    ]);
+    expect(c.cli?.bins).toEqual(["rippling"]);
+    expect(c.cli?.dummyEnv).toEqual({ RIPPLING_API_TOKEN: "x-engrams-managed" });
+    expect(c.test?.path).toBe("/companies/");
+  });
+
+  test("reads are GET-only powers; workers and the activity log have no write", () => {
+    const c = connectorRegistry().get("rippling")!;
+    const byGrant = new Map<string, string[]>();
+    for (const op of c.operations) {
+      const m = op.match as { method: string; path: string };
+      for (const g of op.grants) byGrant.set(g, [...(byGrant.get(g) ?? []), `${m.method} ${m.path}`]);
+    }
+    for (const [grant, ops] of byGrant) {
+      if (grant.endsWith(":read")) {
+        expect(ops.every((o) => o.startsWith("GET ") || o === "POST /custom-objects/*/records/query/"), grant).toBe(true);
+      }
+    }
+    expect(byGrant.has("workers:write")).toBe(false);
+    expect(byGrant.has("activity-log:write")).toBe(false);
+    expect(byGrant.get("workers:read")).toContain("GET /workers/*");
+    expect(byGrant.get("org:write")).toContain("PATCH /departments/*");
+    // The developer platform stays out.
+    const paths = c.operations.map((op) => (op.match as { path: string }).path);
+    for (const p of paths) expect(p).not.toMatch(/^\/(agents|functions|packages|sandboxes|listing|sites|metadata)/);
   });
 });

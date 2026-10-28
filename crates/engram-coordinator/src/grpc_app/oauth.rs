@@ -12,8 +12,10 @@ use tonic::{Code, Request, Response, Status};
 
 use super::auth;
 use crate::oauth::{OAuthServiceError, MAX_OAUTH_BUNDLE_BYTES};
+use crate::oauth_client_credentials::ClientCredentialsSpec;
 use crate::oauth_redirect::{RedirectMetadataProbe, RedirectMetadataSpec, RedirectOauthSpec};
 use crate::state::SharedState;
+use engram_core::types::connector_oauth::TokenRequestBody;
 
 pub struct AppOAuthCredentialService {
     pub state: SharedState,
@@ -95,11 +97,24 @@ fn credential_to_proto(
     }
 }
 
+fn metadata_from_proto(metadata: Option<app::RedirectMetadataSpec>) -> RedirectMetadataSpec {
+    let metadata = metadata.unwrap_or_default();
+    RedirectMetadataSpec {
+        from_token_response: metadata.from_token_response.into_iter().collect(),
+        probe: metadata.probe.map(|probe| RedirectMetadataProbe {
+            method: probe.method,
+            host: probe.host,
+            path: probe.path,
+            body: probe.body,
+            map: probe.map.into_iter().collect(),
+        }),
+    }
+}
+
 fn redirect_spec_from_proto(
     spec: Option<app::RedirectOauthSpec>,
 ) -> Result<RedirectOauthSpec, &'static str> {
     let spec = spec.ok_or("spec is required")?;
-    let metadata = spec.metadata.unwrap_or_default();
     Ok(RedirectOauthSpec {
         authorize_url: spec.authorize_url,
         token_url: spec.token_url,
@@ -111,16 +126,24 @@ fn redirect_spec_from_proto(
         pkce: spec.pkce,
         scopes_param: spec.scopes_param,
         grant_path: spec.grant_path,
-        metadata: RedirectMetadataSpec {
-            from_token_response: metadata.from_token_response.into_iter().collect(),
-            probe: metadata.probe.map(|probe| RedirectMetadataProbe {
-                method: probe.method,
-                host: probe.host,
-                path: probe.path,
-                body: probe.body,
-                map: probe.map.into_iter().collect(),
-            }),
-        },
+        metadata: metadata_from_proto(spec.metadata),
+    })
+}
+
+fn client_credentials_spec_from_proto(
+    spec: Option<app::ClientCredentialsSpec>,
+) -> Result<ClientCredentialsSpec, &'static str> {
+    let spec = spec.ok_or("spec is required")?;
+    let body = TokenRequestBody::parse(&spec.token_request_body)
+        .ok_or("token_request_body must be \"form\" or \"json\"")?;
+    Ok(ClientCredentialsSpec {
+        token_url: spec.token_url,
+        scopes: spec.scopes,
+        scope_delimiter: spec.scope_delimiter,
+        client_id_ref: spec.client_id_ref,
+        client_secret_ref: spec.client_secret_ref,
+        body,
+        metadata: metadata_from_proto(spec.metadata),
     })
 }
 
@@ -283,6 +306,31 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             .await
             .map_err(oauth_status)?;
         Ok(Response::new(app::CompleteRedirectFlowResponse {
+            credential: Some(credential_to_proto(
+                row,
+                self.state.services.clock.now_utc(),
+            )),
+        }))
+    }
+
+    async fn grant_client_credentials(
+        &self,
+        req: Request<app::GrantClientCredentialsRequest>,
+    ) -> Result<Response<app::GrantClientCredentialsResponse>, Status> {
+        self.auth.check(&req)?;
+        let req = req.into_inner();
+        let spec =
+            client_credentials_spec_from_proto(req.spec).map_err(Status::invalid_argument)?;
+        let row = self
+            .state
+            .oauth
+            .grant_client_credentials(
+                &key(req.subject, req.provider).map_err(Status::invalid_argument)?,
+                &spec,
+            )
+            .await
+            .map_err(oauth_status)?;
+        Ok(Response::new(app::GrantClientCredentialsResponse {
             credential: Some(credential_to_proto(
                 row,
                 self.state.services.clock.now_utc(),

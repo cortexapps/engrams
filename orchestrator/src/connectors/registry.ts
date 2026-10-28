@@ -254,10 +254,19 @@ export interface ConnectorTest {
  * NEVER compiled into the session egress policy.
  */
 export interface OauthFacet {
-  authorizeUrl: string;
+  /** The grant family. `authorization_code` sends an admin through the
+   * provider's consent screen; `client_credentials` posts the client id and
+   * secret to the token URL with no browser round trip (Vanta), and the
+   * platform runs the grant again before the token expires. */
+  grant: "authorization_code" | "client_credentials";
+  /** The consent screen; required for (and only for) `authorization_code`. */
+  authorizeUrl?: string;
   /** Authorize-only hosts (browser redirect surface). Never opened to sessions. */
   acquisitionHosts?: string[];
   tokenUrl: string;
+  /** How a `client_credentials` grant is sent: the RFC form (default) or a
+   * JSON object body (Vanta). */
+  tokenRequestBody?: "form" | "json";
   scopes: string[];
   /** Scope-join delimiter; defaults to `,` (Slack, Linear). */
   scopeDelimiter?: "," | " ";
@@ -274,6 +283,9 @@ export interface OauthFacet {
    * inbound webhooks with one (ADR 0060 Slack triggers). Admin-entered like the client
    * creds; absent for providers without an inbound webhook surface. */
   signingSecretRef?: string;
+  /** Where the admin finds the signing secret, shown under the connect sheet's
+   * field. Provider copy lives with the provider, not in the web component. */
+  signingSecretHint?: string;
   /** Declarative account-metadata extraction — no per-provider server code. */
   metadata?: OauthMetadataSpec;
 }
@@ -429,7 +441,7 @@ export interface WebhookEventSpec {
 /** Provider-owned ingress (ADR 0119 D5): how the integration event route
  * verifies deliveries and which sealed org secret signs them. */
 export interface WebhookIngressSpec {
-  scheme: "github_hmac_sha256" | "slack_v0" | "linear_hmac_sha256";
+  scheme: "github_hmac_sha256" | "slack_v0" | "linear_hmac_sha256" | "svix_hmac_sha256";
   secretRef: string;
 }
 
@@ -1211,6 +1223,31 @@ const OAUTH_METADATA_SEGMENT_RE = /^[A-Za-z0-9_]{1,64}$/;
  * never compiled into the session egress policy. */
 function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
   if (typeof raw !== "object" || raw === null) fail(where, '"oauth" must be an object');
+  const o0 = raw as Record<string, unknown>;
+  let grant: OauthFacet["grant"] = "authorization_code";
+  if (o0.grant !== undefined) {
+    if (o0.grant !== "authorization_code" && o0.grant !== "client_credentials") {
+      fail(where, '"oauth.grant" must be "authorization_code" or "client_credentials"');
+    }
+    grant = o0.grant;
+  }
+  const clientCredentials = grant === "client_credentials";
+  if (clientCredentials) {
+    for (const field of ["authorizeUrl", "acquisitionHosts", "extraAuthorizeParams", "pkce"]) {
+      if (o0[field] !== undefined) {
+        fail(where, `"oauth.${field}" does not apply to a client_credentials grant`);
+      }
+    }
+  } else if (o0.tokenRequestBody !== undefined) {
+    fail(where, '"oauth.tokenRequestBody" applies to a client_credentials grant only');
+  }
+  let tokenRequestBody: "form" | "json" | undefined;
+  if (o0.tokenRequestBody !== undefined) {
+    if (o0.tokenRequestBody !== "form" && o0.tokenRequestBody !== "json") {
+      fail(where, '"oauth.tokenRequestBody" must be "form" or "json"');
+    }
+    tokenRequestBody = o0.tokenRequestBody;
+  }
   const o = raw as Record<string, unknown>;
 
   let acquisitionHosts: string[] | undefined;
@@ -1238,10 +1275,9 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     return v as string;
   };
 
-  const authorizeUrl = httpsUrlOn("authorizeUrl", o.authorizeUrl, [
-    ...hosts,
-    ...(acquisitionHosts ?? []),
-  ]);
+  const authorizeUrl = clientCredentials
+    ? undefined
+    : httpsUrlOn("authorizeUrl", o.authorizeUrl, [...hosts, ...(acquisitionHosts ?? [])]);
   // Strict: the token exchange carries the client secret.
   const tokenUrl = httpsUrlOn("tokenUrl", o.tokenUrl, hosts);
 
@@ -1371,10 +1407,28 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     }
   }
 
+  let signingSecretHint: string | undefined;
+  if (o.signingSecretHint !== undefined) {
+    if (o.signingSecretRef === undefined) {
+      fail(where, '"oauth.signingSecretHint" needs "oauth.signingSecretRef"');
+    }
+    if (
+      typeof o.signingSecretHint !== "string" ||
+      !o.signingSecretHint.trim() ||
+      o.signingSecretHint.length > MAX_DISPLAY_BLURB ||
+      /[\x00-\x1f\x7f]/.test(o.signingSecretHint)
+    ) {
+      fail(where, `"oauth.signingSecretHint" must be a control-free string of at most ${MAX_DISPLAY_BLURB} characters`);
+    }
+    signingSecretHint = o.signingSecretHint;
+  }
+
   return {
-    authorizeUrl,
+    grant,
+    ...(authorizeUrl !== undefined ? { authorizeUrl } : {}),
     ...(acquisitionHosts !== undefined ? { acquisitionHosts } : {}),
     tokenUrl,
+    ...(tokenRequestBody !== undefined ? { tokenRequestBody } : {}),
     scopes,
     ...(scopeDelimiter !== undefined ? { scopeDelimiter } : {}),
     ...(extraAuthorizeParams !== undefined ? { extraAuthorizeParams } : {}),
@@ -1384,6 +1438,7 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     ...(o.signingSecretRef !== undefined
       ? { signingSecretRef: secretRef("signingSecretRef", o.signingSecretRef) }
       : {}),
+    ...(signingSecretHint !== undefined ? { signingSecretHint } : {}),
     ...(metadata !== undefined ? { metadata } : {}),
   };
 }
@@ -1406,6 +1461,7 @@ const INGRESS_SCHEMES: ReadonlySet<WebhookIngressSpec["scheme"]> = new Set([
   "github_hmac_sha256",
   "slack_v0",
   "linear_hmac_sha256",
+  "svix_hmac_sha256",
 ]);
 const MAX_EVENT_DESCRIPTION_LENGTH = 300;
 const FIELD_SCHEMA_MAX_DEPTH = 8;
@@ -1671,7 +1727,10 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
       typeof i.scheme !== "string" ||
       !INGRESS_SCHEMES.has(i.scheme as WebhookIngressSpec["scheme"])
     ) {
-      fail(where, '"webhook.ingress.scheme" must be "github_hmac_sha256", "slack_v0", or "linear_hmac_sha256"');
+      fail(
+        where,
+        '"webhook.ingress.scheme" must be "github_hmac_sha256", "slack_v0", "linear_hmac_sha256", or "svix_hmac_sha256"',
+      );
     }
     if (typeof i.secretRef !== "string" || !/^\S+$/.test(i.secretRef)) {
       fail(where, '"webhook.ingress.secretRef" must be a non-empty org-secret name');

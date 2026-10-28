@@ -33,6 +33,7 @@ pub mod integration_ops;
 pub mod integrations;
 pub mod metrics;
 pub mod oauth;
+pub mod oauth_client_credentials;
 pub mod oauth_redirect;
 pub mod oauth_refresh;
 pub mod org_secrets;
