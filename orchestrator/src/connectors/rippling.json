@@ -1,0 +1,1626 @@
+{
+  "provider": "rippling",
+  "protocol": "http",
+  "display": {
+    "name": "Rippling",
+    "category": "HR & people",
+    "blurb": "Read your Rippling HR system from a session: workers and their managers, departments, teams, locations, leave, time, devices, and the activity log, plus custom objects and reports. Authenticated with an API token brokered at the egress proxy, never seen by the agent.",
+    "icon": {
+      "mono": "RP",
+      "color": "#fcb315"
+    }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      {
+        "header": "Authorization",
+        "template": "Bearer {}",
+        "secretRef": "rippling.api_token"
+      }
+    ]
+  },
+  "hosts": [
+    "rest.ripplingapis.com"
+  ],
+  "test": {
+    "path": "/companies/"
+  },
+  "operations": [
+    {
+      "grants": [
+        "company:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/companies/*"
+      }
+    },
+    {
+      "grants": [
+        "company:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/legal-entities/*"
+      }
+    },
+    {
+      "grants": [
+        "company:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/company-legal-entities/*"
+      }
+    },
+    {
+      "grants": [
+        "company:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/entitlements/*"
+      }
+    },
+    {
+      "grants": [
+        "company:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/sso-me/*"
+      }
+    },
+    {
+      "grants": [
+        "company:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/platform-capabilities/*"
+      }
+    },
+    {
+      "grants": [
+        "workers:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/workers/*"
+      }
+    },
+    {
+      "grants": [
+        "workers:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/users/*"
+      }
+    },
+    {
+      "grants": [
+        "workers:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/worker-changes/*"
+      }
+    },
+    {
+      "grants": [
+        "workers:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/worker-change-fields/*"
+      }
+    },
+    {
+      "grants": [
+        "workers:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/company-legal-entity-workers/*"
+      }
+    },
+    {
+      "grants": [
+        "workers:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/app-users/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/departments/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/teams/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/work-locations/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/employment-types/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/titles/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/levels/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/tracks/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/job-functions/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/job-dimensions/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/job-codes/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/job-assignments/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/scheduled-job-assignments/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/supergroups/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/custom-fields/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/business-partners/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/business-partner-groups/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/business-structure-paths/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/headcount-positions/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/headcount-priorities/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/hire-requirements/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/job-requisitions/*"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/location-factors/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/departments/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/departments/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/teams/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/teams/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/teams/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/work-locations/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/work-locations/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/work-locations/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/titles/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/titles/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/titles/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/levels/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/levels/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/levels/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/tracks/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/tracks/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/tracks/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/job-dimensions/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/job-dimensions/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/job-dimensions/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/job-codes/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/job-codes/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/job-codes/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/job-assignments/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/job-assignments/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/job-assignments/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/business-partners/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/business-partners/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/business-partners/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/business-partner-groups/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/business-partner-groups/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/business-partner-groups/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/business-structure-paths/"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/business-structure-paths/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/business-structure-paths/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/scheduled-job-assignments/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/supergroups/*"
+      }
+    },
+    {
+      "grants": [
+        "org:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/job-requisitions-write/"
+      }
+    },
+    {
+      "grants": [
+        "hiring:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/candidates/*"
+      }
+    },
+    {
+      "grants": [
+        "hiring:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/candidate-applications/*"
+      }
+    },
+    {
+      "grants": [
+        "hiring:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/background-check-candidates/*"
+      }
+    },
+    {
+      "grants": [
+        "hiring:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/draft-transitions/*"
+      }
+    },
+    {
+      "grants": [
+        "hiring:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/background-check-candidates/"
+      }
+    },
+    {
+      "grants": [
+        "hiring:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/background-check-candidates/*"
+      }
+    },
+    {
+      "grants": [
+        "hiring:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/background-check-candidates/*"
+      }
+    },
+    {
+      "grants": [
+        "hiring:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/draft-hires/"
+      }
+    },
+    {
+      "grants": [
+        "hiring:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/hires/"
+      }
+    },
+    {
+      "grants": [
+        "hiring:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/draft-transitions/"
+      }
+    },
+    {
+      "grants": [
+        "compensation:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/compensations/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/compensation-bands-details/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/variable-compensation-payouts/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/variable-compensation-payout-types/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/variable-compensation-payout-labels/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/earning-types/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/earnings-inputs/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/job-pay-rate-exceptions/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/worker-time-splits/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/variable-compensation-payout-types/"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/variable-compensation-payout-types/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/variable-compensation-payout-types/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/worker-time-splits/"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/worker-time-splits/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/worker-time-splits/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/variable-compensation-payout-labels/"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/variable-compensation-payout-labels/*"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/variable-compensation-payouts/"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/variable-compensation-payout-writes/"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/earnings-inputs/"
+      }
+    },
+    {
+      "grants": [
+        "compensation:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/earnings-inputs/*"
+      }
+    },
+    {
+      "grants": [
+        "payroll:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/payroll-runs/*"
+      }
+    },
+    {
+      "grants": [
+        "payroll:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/reimbursements/*"
+      }
+    },
+    {
+      "grants": [
+        "payroll:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/bill-payments/*"
+      }
+    },
+    {
+      "grants": [
+        "payroll:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/card-transactions/*"
+      }
+    },
+    {
+      "grants": [
+        "payroll:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/spend-categories/*"
+      }
+    },
+    {
+      "grants": [
+        "payroll:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/spend-vendors/*"
+      }
+    },
+    {
+      "grants": [
+        "payroll:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/payroll-runs/off-cycle/"
+      }
+    },
+    {
+      "grants": [
+        "payroll:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/payroll-payment-mode-changes/"
+      }
+    },
+    {
+      "grants": [
+        "leave:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/leave-requests/*"
+      }
+    },
+    {
+      "grants": [
+        "leave:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/leave-types/*"
+      }
+    },
+    {
+      "grants": [
+        "leave:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/leave-balances/*"
+      }
+    },
+    {
+      "grants": [
+        "leave:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/leave-accruals/*"
+      }
+    },
+    {
+      "grants": [
+        "leave:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/leave-requests/"
+      }
+    },
+    {
+      "grants": [
+        "leave:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/leave-requests/*"
+      }
+    },
+    {
+      "grants": [
+        "leave:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/leave-accruals/"
+      }
+    },
+    {
+      "grants": [
+        "leave:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/leave-program-evaluations/"
+      }
+    },
+    {
+      "grants": [
+        "time:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/time-entries/*"
+      }
+    },
+    {
+      "grants": [
+        "time:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/time-cards/*"
+      }
+    },
+    {
+      "grants": [
+        "time:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/schedules/*"
+      }
+    },
+    {
+      "grants": [
+        "time:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/shiftassignments/*"
+      }
+    },
+    {
+      "grants": [
+        "time:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/unassignedshifts/*"
+      }
+    },
+    {
+      "grants": [
+        "time:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/shift-inputs/*"
+      }
+    },
+    {
+      "grants": [
+        "time:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/break-policies/*"
+      }
+    },
+    {
+      "grants": [
+        "time:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/break-types/*"
+      }
+    },
+    {
+      "grants": [
+        "time:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/kiosk-badges/*"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/time-entries/"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/time-entries/*"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/time-entries/*"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/shift-inputs/"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/shift-inputs/*"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/shift-inputs/*"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/kiosk-badges/"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/kiosk-badges/*"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/kiosk-badges/*"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/schedules/"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/schedules/*"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/shiftassignments/"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/shiftassignments/*"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/unassignedshifts/"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/unassignedshifts/*"
+      }
+    },
+    {
+      "grants": [
+        "time:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/unassignedshifts/*/assign/"
+      }
+    },
+    {
+      "grants": [
+        "devices:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/devices/*"
+      }
+    },
+    {
+      "grants": [
+        "devices:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/device-orders/*"
+      }
+    },
+    {
+      "grants": [
+        "devices:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/software-deployments/*"
+      }
+    },
+    {
+      "grants": [
+        "devices:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/software-deployments/"
+      }
+    },
+    {
+      "grants": [
+        "devices:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/software-deployments/*"
+      }
+    },
+    {
+      "grants": [
+        "devices:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/software-deployments/*"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/custom-objects/*"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/object-categories/*"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/record-details/*"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/record-detail-related-records/*"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/record-detail-reference-options/*"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:read"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/custom-objects/*/records/query/"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/custom-objects/"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/custom-objects/*"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/custom-objects/*"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/object-categories/"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/object-categories/*"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/object-categories/*"
+      }
+    },
+    {
+      "grants": [
+        "custom-objects:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/custom-objects/*"
+      }
+    },
+    {
+      "grants": [
+        "reports:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/reports/*"
+      }
+    },
+    {
+      "grants": [
+        "reports:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/report-runs/*"
+      }
+    },
+    {
+      "grants": [
+        "reports:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/report-runs/"
+      }
+    },
+    {
+      "grants": [
+        "files:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/files/*"
+      }
+    },
+    {
+      "grants": [
+        "files:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/files/"
+      }
+    },
+    {
+      "grants": [
+        "files:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/employee-documents/"
+      }
+    },
+    {
+      "grants": [
+        "activity-log:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/activity-log/*"
+      }
+    },
+    {
+      "grants": [
+        "workflows:read"
+      ],
+      "match": {
+        "method": "GET",
+        "path": "/workflows/*"
+      }
+    },
+    {
+      "grants": [
+        "workflows:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/workflows/"
+      }
+    },
+    {
+      "grants": [
+        "workflows:write"
+      ],
+      "match": {
+        "method": "PATCH",
+        "path": "/workflows/*"
+      }
+    },
+    {
+      "grants": [
+        "workflows:write"
+      ],
+      "match": {
+        "method": "DELETE",
+        "path": "/workflows/*"
+      }
+    },
+    {
+      "grants": [
+        "workflows:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/workflows/*/executions/"
+      }
+    },
+    {
+      "grants": [
+        "workflows:write"
+      ],
+      "match": {
+        "method": "POST",
+        "path": "/workflow-action-executions/"
+      }
+    }
+  ],
+  "cli": {
+    "bins": [
+      "rippling"
+    ],
+    "binSource": "bundled",
+    "dummyEnv": {
+      "RIPPLING_API_TOKEN": "x-engrams-managed"
+    },
+    "credentialDelivery": "inject",
+    "doc": "Use `rippling` to read your Rippling HR system from this session: workers and their managers, users, departments, teams, locations, titles and levels, employment types, legal entities, leave, time, devices, worker changes, and the activity log, plus custom objects, reports, and the writes Rippling exposes. Authentication is automatic: the egress proxy injects the organization's API token as `Authorization: Bearer` on requests to rest.ripplingapis.com; `RIPPLING_API_TOKEN` is a managed placeholder. Do NOT set a real token or run any login. A path your profile did not grant is denied at the network boundary, not authenticated. Fields the token is not entitled to come back redacted and are listed under `__meta.redacted_fields`.\n\nList commands follow every page (limit 100, cursor) and print one JSON array. Filters use Rippling's syntax: `filter=status eq 'ACTIVE'`, `filter=updated_at gt '2026-10-01T00:00:00Z'`, operators eq ne gt gte lt lte in and or; `expand=user,manager` embeds related records (depth 2); `order_by=start_date`.\n\nCommands and the power each needs:\n  rippling me                                     The caller's own user (company:read)\n  rippling company | rippling legal-entities      The company and its legal entities (company:read)\n  rippling workers [field=value ...]              Workers; filter=, expand=, order_by= (workers:read)\n  rippling worker <id>                            One worker with user and manager embedded (workers:read)\n  rippling worker-by-email <email>                The worker whose work email matches (workers:read)\n  rippling manager <worker-id>                    The worker's manager as a worker, or null (workers:read)\n  rippling reports-to <worker-id>                 Workers whose manager is that worker (workers:read)\n  rippling users | rippling user <id>             User accounts (workers:read)\n  rippling worker-changes [field=value ...]       Changes to worker records; filter=, order_by= (workers:read)\n  rippling departments | rippling teams | rippling locations | rippling titles | rippling levels | rippling employment-types   (org:read)\n  rippling custom-fields                          Custom field definitions (org:read)\n  rippling leave-requests [field=value ...] | rippling leave-balances | rippling leave-types   (leave:read)\n  rippling time-entries [field=value ...] | rippling time-cards [field=value ...]   (time:read)\n  rippling devices                                Managed devices (devices:read)\n  rippling activity-log [field=value ...]         Audit events of the last 90 days (activity-log:read)\n  rippling custom-objects | rippling records <object-api-name> [field=value ...]   (custom-objects:read)\n  rippling report <id> | rippling run-report <id> [json]   Report definitions and runs (reports:read, reports:write)\n  rippling get <path> [field=value ...]           Raw GET (one page)\n  rippling list <path> [field=value ...]          Raw GET, every page, as one array\n  rippling api <METHOD> <path> [json-body]        Raw call with an explicit method and JSON body\n"
+  }
+}

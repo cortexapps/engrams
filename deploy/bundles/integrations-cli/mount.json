@@ -31,6 +31,7 @@
         "bin/shopify",
         "bin/cortex",
         "bin/vanta",
+        "bin/rippling",
         "bin/gcloud",
         "bin/engram-tunnel"
       ],

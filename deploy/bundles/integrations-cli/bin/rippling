@@ -1,0 +1,240 @@
+#!/bin/sh
+# engrams Rippling CLI: a thin wrapper over the Rippling REST API.
+#
+# Auth is brokered: this carries only the `RIPPLING_API_TOKEN` placeholder;
+# the egress proxy injects the organization's real API token as
+# `Authorization: Bearer` on every request to rest.ripplingapis.com and
+# strips any token you supply. There is NOTHING to log in to; do not set a
+# real token.
+#
+# Each subcommand needs the matching power on your profile (rippling:workers:read,
+# rippling:org:read, rippling:leave:read, ...); a path your profile did not
+# grant is denied at the network boundary, not authenticated.
+#
+# List commands follow every page (limit 100, cursor) and print one JSON
+# array when jq is present; without jq they print the first page as the API
+# returns it. The API version is the one the token was created with; set
+# RIPPLING_API_VERSION (YYYY-MM-DD) to ask for another.
+set -eu
+
+BASE="https://rest.ripplingapis.com"
+TOKEN="${RIPPLING_API_TOKEN:-x-engrams-managed}"
+VERSION="${RIPPLING_API_VERSION:-}"
+
+usage() {
+    cat <<EOF
+engrams Rippling CLI: auth is brokered by the platform (no token to set).
+
+Usage:
+  rippling me                                     The caller's own user
+  rippling company | rippling legal-entities      The company and its legal entities
+  rippling workers [field=value ...]              Workers (filter=, expand=, order_by=)
+  rippling worker <id>                            One worker with user and manager embedded
+  rippling worker-by-email <email>                The worker whose work email matches
+  rippling manager <worker-id>                    The worker's manager, or null
+  rippling reports-to <worker-id>                 Workers whose manager is that worker
+  rippling users | rippling user <id>             User accounts
+  rippling worker-changes [field=value ...]       Changes to worker records
+  rippling departments | teams | locations | titles | levels | employment-types
+  rippling custom-fields                          Custom field definitions
+  rippling leave-requests [field=value ...] | rippling leave-balances | rippling leave-types
+  rippling time-entries [field=value ...] | rippling time-cards [field=value ...]
+  rippling devices                                Managed devices
+  rippling activity-log [field=value ...]         Audit events of the last 90 days
+  rippling custom-objects | rippling records <object-api-name> [field=value ...]
+  rippling report <id> | rippling run-report <id> [json]
+  rippling get <path> [field=value ...]           Raw GET (one page)
+  rippling list <path> [field=value ...]          Raw GET, every page, as one array
+  rippling api <METHOD> <path> [json-body]        Raw call with an explicit method
+
+Filters use Rippling's syntax: filter="status eq 'ACTIVE'"; expand=user,manager.
+Responses are JSON. Fields the token cannot read are listed under __meta.redacted_fields.
+EOF
+}
+
+have_jq() { command -v jq >/dev/null 2>&1; }
+
+pretty() {
+    if have_jq; then jq .; else cat; fi
+}
+
+# json_str <value>: a JSON string literal, quotes included.
+json_str() {
+    if have_jq; then
+        printf '%s' "$1" | jq -Rs .
+    else
+        esc=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        printf '"%s"' "$esc"
+    fi
+}
+
+# Rippling paths end with a slash.
+norm_path() {
+    p="$1"
+    case "$p" in
+    /*) ;;
+    *) p="/$p" ;;
+    esac
+    case "$p" in
+    */ | *\?*) printf '%s' "$p" ;;
+    *) printf '%s/' "$p" ;;
+    esac
+}
+
+# request <METHOD> <path> [curl-args...]
+request() {
+    m="$1"
+    p="$2"
+    shift 2
+    if [ -n "$VERSION" ]; then
+        curl -sS -X "$m" "$BASE$(norm_path "$p")" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/json" \
+            -H "Rippling-Api-Version: $VERSION" \
+            "$@"
+    else
+        curl -sS -X "$m" "$BASE$(norm_path "$p")" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/json" \
+            "$@"
+    fi
+}
+
+# fetch <path> [field=value ...]: one GET; each field=value is a query param.
+fetch() {
+    p="$1"
+    shift
+    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    OLD_IFS=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $flags
+    IFS=$OLD_IFS
+    request GET "$p" -G "$@"
+}
+
+get() {
+    fetch "$@" | pretty
+}
+
+# list <path> [field=value ...]: every page of a list, one array.
+list() {
+    p="$1"
+    shift
+    if ! have_jq; then
+        get "$p" "limit=100" "$@"
+        return
+    fi
+    pages=$(mktemp)
+    trap 'rm -f "$pages"' EXIT
+    cursor=""
+    while :; do
+        if ! page=$(fetch "$p" "limit=100" ${cursor:+"cursor=$cursor"} "$@"); then
+            echo "rippling: could not reach $BASE" >&2
+            exit 1
+        fi
+        if ! printf '%s' "$page" | jq -e '.results' >/dev/null 2>&1; then
+            # Not a list envelope (an error, or a single object): show it as is.
+            printf '%s\n' "$page" | pretty
+            exit 1
+        fi
+        printf '%s\n' "$page" >>"$pages"
+        next=$(printf '%s' "$page" | jq -r '.next_link // empty')
+        [ -n "$next" ] || break
+        # The next page is a URL carrying the cursor; take the cursor alone so
+        # the request stays on the same path and headers.
+        cursor=$(printf '%s' "$next" | sed -n 's/.*[?&]cursor=\([^&]*\).*/\1/p')
+        [ -n "$cursor" ] || break
+    done
+    jq -s '[.[].results[]]' "$pages"
+}
+
+# send <METHOD> <path> <json-body>
+send() {
+    request "$1" "$2" -H "Content-Type: application/json" --data-binary "$3" | pretty
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+me) get /sso-me ;;
+company) list /companies ;;
+legal-entities) list /legal-entities ;;
+workers) list /workers "$@" ;;
+worker) get "/workers/${1:?usage: rippling worker <id>}" "expand=user,manager" ;;
+worker-by-email)
+    email="${1:?usage: rippling worker-by-email <email>}"
+    list /workers "filter=work_email eq '$email'" "expand=user,manager"
+    ;;
+manager)
+    id="${1:?usage: rippling manager <worker-id>}"
+    if have_jq; then
+        fetch "/workers/$id" "expand=manager,manager.user" | jq '.manager // null'
+    else
+        get "/workers/$id" "expand=manager"
+    fi
+    ;;
+reports-to)
+    id="${1:?usage: rippling reports-to <worker-id>}"
+    list /workers "filter=manager_id eq '$id'" "expand=user"
+    ;;
+users) list /users "$@" ;;
+user) get "/users/${1:?usage: rippling user <id>}" ;;
+worker-changes) list /worker-changes "$@" ;;
+departments) list /departments "$@" ;;
+teams) list /teams "$@" ;;
+locations) list /work-locations "$@" ;;
+titles) list /titles "$@" ;;
+levels) list /levels "$@" ;;
+employment-types) list /employment-types "$@" ;;
+custom-fields) list /custom-fields "$@" ;;
+leave-requests) list /leave-requests "$@" ;;
+leave-balances) list /leave-balances "$@" ;;
+leave-types) list /leave-types "$@" ;;
+time-entries) list /time-entries "$@" ;;
+time-cards) list /time-cards "$@" ;;
+devices) list /devices "$@" ;;
+activity-log) list /activity-log "$@" ;;
+custom-objects) list /custom-objects "$@" ;;
+records)
+    name="${1:?usage: rippling records <object-api-name> [field=value ...]}"
+    shift
+    list "/custom-objects/$name/records" "$@"
+    ;;
+report) get "/reports/${1:?usage: rippling report <id>}" ;;
+run-report)
+    id="${1:?usage: rippling run-report <id> [json]}"
+    body="${2:-{\}}"
+    if have_jq; then
+        body=$(printf '%s' "$body" | jq -c --arg id "$id" '. + {report_id: $id}')
+    fi
+    send POST /report-runs "$body"
+    ;;
+get)
+    p="${1:?usage: rippling get <path> [field=value ...]}"
+    shift
+    get "$p" "$@"
+    ;;
+list)
+    p="${1:?usage: rippling list <path> [field=value ...]}"
+    shift
+    list "$p" "$@"
+    ;;
+api)
+    m="${1:?usage: rippling api <METHOD> <path> [json-body]}"
+    p="${2:?usage: rippling api <METHOD> <path> [json-body]}"
+    if [ -n "${3:-}" ]; then
+        send "$m" "$p" "$3"
+    else
+        request "$m" "$p" | pretty
+    fi
+    ;;
+"" | -h | --help | help) usage ;;
+*)
+    echo "rippling: unknown command '$cmd'" >&2
+    usage
+    exit 2
+    ;;
+esac

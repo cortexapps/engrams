@@ -1900,7 +1900,8 @@ describe("the shipped vanta connector", () => {
     expect(c.oauth?.scopes).toEqual(["vanta-api.all:read", "vanta-api.all:write"]);
     expect(c.oauth?.signingSecretRef).toBe("vanta.webhook_secret");
     // The token is OAuth-sealed: the inject names no org secret of its own.
-    expect(c.credential?.injects.map((i) => i.secretRef)).toEqual([undefined]);
+    expect(c.credential?.source).toBe("inject");
+    if (c.credential?.source === "inject") expect(c.credential.injects.map((i) => i.secretRef)).toEqual([undefined]);
     expect(c.cli?.bins).toEqual(["vanta"]);
     expect(c.cli?.dummyEnv).toEqual({ VANTA_API_TOKEN: "x-engrams-managed" });
     expect(c.test?.path).toBe("/v1/organization");
@@ -1937,5 +1938,42 @@ describe("the shipped vanta connector", () => {
     expect(byGrant.get("people:read")).toContain("GET /v1/people*");
     expect(byGrant.get("people:write")).toContain("POST /v1/people/*");
     expect(byGrant.get("tests:read")).toContain("GET /v1/tests*");
+  });
+});
+
+describe("the shipped rippling connector", () => {
+  test("injects a static API token on the REST host, with a CLI and no webhooks", () => {
+    const c = connectorRegistry().get("rippling")!;
+    expect(c.hosts).toEqual(["rest.ripplingapis.com"]);
+    expect(c.oauth).toBeUndefined();
+    expect(c.webhook).toBeUndefined();
+    expect(c.credential?.source).toBe("inject");
+    if (c.credential?.source === "inject") expect(c.credential.injects).toEqual([
+      { header: "Authorization", template: "Bearer {}", secretRef: "rippling.api_token" },
+    ]);
+    expect(c.cli?.bins).toEqual(["rippling"]);
+    expect(c.cli?.dummyEnv).toEqual({ RIPPLING_API_TOKEN: "x-engrams-managed" });
+    expect(c.test?.path).toBe("/companies/");
+  });
+
+  test("reads are GET-only powers; workers and the activity log have no write", () => {
+    const c = connectorRegistry().get("rippling")!;
+    const byGrant = new Map<string, string[]>();
+    for (const op of c.operations) {
+      const m = op.match as { method: string; path: string };
+      for (const g of op.grants) byGrant.set(g, [...(byGrant.get(g) ?? []), `${m.method} ${m.path}`]);
+    }
+    for (const [grant, ops] of byGrant) {
+      if (grant.endsWith(":read")) {
+        expect(ops.every((o) => o.startsWith("GET ") || o === "POST /custom-objects/*/records/query/"), grant).toBe(true);
+      }
+    }
+    expect(byGrant.has("workers:write")).toBe(false);
+    expect(byGrant.has("activity-log:write")).toBe(false);
+    expect(byGrant.get("workers:read")).toContain("GET /workers/*");
+    expect(byGrant.get("org:write")).toContain("PATCH /departments/*");
+    // The developer platform stays out.
+    const paths = c.operations.map((op) => (op.match as { path: string }).path);
+    for (const p of paths) expect(p).not.toMatch(/^\/(agents|functions|packages|sandboxes|listing|sites|metadata)/);
   });
 });
