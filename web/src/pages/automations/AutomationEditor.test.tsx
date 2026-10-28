@@ -71,6 +71,28 @@ vi.mock("@/hooks/useProfiles", () => ({
 vi.mock("@/hooks/useHarnessCatalog", () => ({ useHarnessCatalog: () => ({ data: [] }) }));
 const runNow = { mutateAsync: vi.fn(async () => ({ runId: "run-manual" })), isPending: false };
 vi.mock("@/hooks/useAutomations", () => ({ useRunNow: () => runNow }));
+// The drafting pane opens a session stream; the shell tests exercise the
+// hand-off (toggle, banner), not the thread.
+const draftingHolder = vi.hoisted(() => ({ value: undefined as { working: boolean } | undefined }));
+vi.mock("./build/DraftingPane", () => ({
+  useDrafting: (sessionId: string | undefined) =>
+    sessionId && draftingHolder.value
+      ? { sessionId, working: draftingHolder.value.working }
+      : undefined,
+  DraftingPane: ({
+    drafting,
+    onClose,
+  }: {
+    drafting: { sessionId: string };
+    onClose: () => void;
+  }) => (
+    <div data-testid="drafting-pane" data-session-id={drafting.sessionId}>
+      <button type="button" onClick={onClose}>
+        hide
+      </button>
+    </div>
+  ),
+}));
 vi.mock("@/hooks/useModelRouters", () => ({
   useModelRouters: () => ({ data: { routers: [] } }),
   useRouterModels: () => ({ data: { models: [] } }),
@@ -136,6 +158,69 @@ describe("AutomationEditor", () => {
     updateMeta.mockClear();
     navigate.mockClear();
     searchHolder.value = {};
+    draftingHolder.value = undefined;
+  });
+
+  it("a drafted automation shows the drafting agent beside the canvas, and says what it is doing", () => {
+    draftingHolder.value = { working: true };
+    const seed = { ...definition, blocks: [] };
+    automationHolder.value = {
+      automation: {
+        ...automation("user"),
+        draftSessionId: "draft-sess-1",
+        version: {
+          automationId: "x",
+          number: 1,
+          definitionJson: JSON.stringify(seed),
+          createdAt: "",
+        },
+      },
+    };
+    const view = render(<AutomationEditor mode="edit" />);
+    // The pane is open by default and carries the drafting session.
+    expect(screen.getByTestId("drafting-pane").getAttribute("data-session-id")).toBe(
+      "draft-sess-1",
+    );
+    // The seed (manual trigger, no steps, no agent) while the agent works.
+    expect(screen.getByTestId("drafting-banner").getAttribute("data-working")).toBe("true");
+
+    // The agent goes idle without saving: the banner says so.
+    draftingHolder.value = { working: false };
+    view.rerender(<AutomationEditor mode="edit" />);
+    expect(screen.getByTestId("drafting-banner").getAttribute("data-working")).toBe("false");
+
+    // The pane's own close hides it; the header toggle brings it back.
+    fireEvent.click(screen.getByText("hide"));
+    expect(screen.queryByTestId("drafting-pane")).toBeNull();
+    expect(screen.getByTestId("drafting-toggle").getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(screen.getByTestId("drafting-toggle"));
+    expect(screen.getByTestId("drafting-pane")).toBeTruthy();
+
+    // A real version lands: the banner goes, the pane stays.
+    automationHolder.value = {
+      automation: {
+        ...automation("user"),
+        draftSessionId: "draft-sess-1",
+        currentVersion: 2,
+        version: {
+          automationId: "x",
+          number: 2,
+          definitionJson: JSON.stringify(definition),
+          createdAt: "",
+        },
+      },
+    };
+    view.rerender(<AutomationEditor mode="edit" />);
+    expect(screen.queryByTestId("drafting-banner")).toBeNull();
+    expect(screen.getByTestId("drafting-pane")).toBeTruthy();
+  });
+
+  it("an automation built by hand has no drafting agent", () => {
+    automationHolder.value = { automation: automation("user") };
+    render(<AutomationEditor mode="edit" />);
+    expect(screen.queryByTestId("drafting-toggle")).toBeNull();
+    expect(screen.queryByTestId("drafting-pane")).toBeNull();
+    expect(screen.queryByTestId("drafting-banner")).toBeNull();
   });
 
   it("drafting (Builder v2): rail when bound; agent versions adopt when clean, banner when dirty", async () => {
@@ -156,9 +241,6 @@ describe("AutomationEditor", () => {
     };
     automationHolder.value = { automation: base };
     const view = render(<AutomationEditor mode="edit" />);
-    // The drafting conversation lives on the compose page now; the Builder
-    // shows only the agent's versions landing.
-    expect(screen.queryByTestId("draft-rail")).toBeNull();
     expect(screen.queryByTestId("draft-stale-banner")).toBeNull();
 
     // CLEAN editor: the agent saves v2 → the editor adopts silently.

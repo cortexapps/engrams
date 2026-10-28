@@ -43,21 +43,6 @@ vi.mock("@/hooks/useAutomations", () => ({
       : { data: undefined },
   useDuplicateAutomation: () => ({ mutateAsync: duplicate, isPending: false }),
 }));
-vi.mock("@/hooks/useSessionEvents", () => ({
-  useSessionEvents: () => ({
-    events: [{ idx: 1 }],
-    streamingText: "Drafting",
-    hasMore: false,
-    loadingOlder: false,
-    loadOlder: vi.fn(),
-    oldestIdx: 1,
-  }),
-}));
-vi.mock("@/components/session-thread/SessionThread", () => ({
-  SessionThread: ({ sessionId }: { sessionId: string }) => (
-    <div data-testid="session-thread-stub" data-session-id={sessionId} />
-  ),
-}));
 // The real composer loads profiles, images, and harness catalogs. This stub
 // keeps the page test on request mapping and draft lifecycle behavior.
 vi.mock("@/components/composer/TaskComposer", () => ({
@@ -114,7 +99,7 @@ describe("ComposePage", () => {
     duplicate.mockResolvedValue({ automation: { id: "copy-1" } });
   });
 
-  it("keeps drafting on the page and opens the Builder only after the first version lands", async () => {
+  it("locks the composer while the draft starts and opens the Builder once the row exists", async () => {
     const view = render(<ComposePage />);
     expect(screen.getByTestId("composer-stub").textContent).toBe("Draft it");
     fireEvent.click(screen.getByTestId("composer-stub"));
@@ -130,13 +115,11 @@ describe("ComposePage", () => {
     );
     expect(navigate).not.toHaveBeenCalled();
 
-    editorState.automation = { draftSessionId: "s1", currentVersion: 0 };
-    view.rerender(<ComposePage />);
-    expect(await screen.findByTestId("drafting-thread")).toBeTruthy();
-    expect(screen.getByTestId("session-thread-stub").getAttribute("data-session-id")).toBe("s1");
-    expect(screen.getByTestId("composer-stub").getAttribute("data-disabled")).toBe("true");
-    expect(navigate).not.toHaveBeenCalled();
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("composer-stub").getAttribute("data-disabled")).toBe("true"),
+    );
 
+    // The seed row (version 1, nothing drafted yet) is enough to hand over.
     editorState.automation = { draftSessionId: "s1", currentVersion: 1 };
     view.rerender(<ComposePage />);
     await vi.waitFor(() => expect(navigate).toHaveBeenCalledTimes(1));

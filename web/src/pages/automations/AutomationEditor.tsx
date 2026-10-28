@@ -11,7 +11,7 @@
 
 import { ConnectError } from "@connectrpc/connect";
 import { Link, useBlocker, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { Beaker, Copy, Lock, Play } from "lucide-react";
+import { Beaker, Copy, Lock, Play, Sparkles } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
@@ -66,6 +66,7 @@ import {
 import { useAutomationTest } from "@/hooks/useAutomationTest";
 
 import { BuildTab } from "./build/BuildTab";
+import { DraftingPane, useDrafting } from "./build/DraftingPane";
 import { parseInputsJson, parseInputsSchema, stableJson } from "@/lib/automation-inputs";
 import { InputsTab } from "./inputs/InputsTab";
 import { AgentsTab } from "./agents/AgentsTab";
@@ -141,6 +142,12 @@ export function AutomationEditor({
     description: string;
     draftJson: string;
   } | null>(null);
+
+  // The drafting agent's session, when this automation was drafted: its
+  // conversation sits beside the canvas, and the canvas says what the
+  // agent is doing to it.
+  const drafting = useDrafting(automation?.draftSessionId);
+  const [draftingOpen, setDraftingOpen] = useState(true);
 
   const create = useCreateAutomationV2();
   const saveVersion = useSaveVersionV2();
@@ -564,6 +571,20 @@ export function AutomationEditor({
               <Copy aria-hidden /> Duplicate
             </Button>
           )}
+          {drafting && (
+            <Button
+              type="button"
+              variant={draftingOpen ? "secondary" : "outline"}
+              size="sm"
+              onClick={() => setDraftingOpen((open) => !open)}
+              aria-pressed={draftingOpen}
+              data-testid="drafting-toggle"
+              title={draftingOpen ? "Hide the drafting agent" : "Show the drafting agent"}
+            >
+              <Sparkles aria-hidden />
+              Drafting agent
+            </Button>
+          )}
           {mode === "edit" && automation && draft.trigger.kind === "manual" && (
             // The manual trigger's one way in. It runs the SAVED definition,
             // so it waits for a clean editor, as Dry run does.
@@ -667,6 +688,25 @@ export function AutomationEditor({
             testOpen={testOpen}
             onTestOpenChange={setTestOpen}
             {...(replay ? { replay } : {})}
+            {...(drafting && draftingOpen
+              ? {
+                  aside: (
+                    <DraftingPane drafting={drafting} onClose={() => setDraftingOpen(false)} />
+                  ),
+                }
+              : {})}
+            {...(drafting
+              ? {
+                  drafting: {
+                    working: drafting.working,
+                    empty:
+                      !userDirty &&
+                      effective.blocks.length === 0 &&
+                      effective.agent === undefined &&
+                      effective.trigger.kind === "manual",
+                  },
+                }
+              : {})}
           />
         </TabsContent>
         <TabsContent value="inputs" className="min-h-0 flex-1 overflow-y-auto p-6">

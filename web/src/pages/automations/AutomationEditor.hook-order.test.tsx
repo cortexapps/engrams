@@ -75,6 +75,28 @@ vi.mock("@/hooks/useHarnessCatalog", () => ({ useHarnessCatalog: () => ({ data: 
 vi.mock("@/hooks/useAutomations", () => ({
   useRunNow: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
+// The drafting pane opens a session stream; the shell tests exercise the
+// hand-off (toggle, banner), not the thread.
+const draftingHolder = vi.hoisted(() => ({ value: undefined as { working: boolean } | undefined }));
+vi.mock("./build/DraftingPane", () => ({
+  useDrafting: (sessionId: string | undefined) =>
+    sessionId && draftingHolder.value
+      ? { sessionId, working: draftingHolder.value.working }
+      : undefined,
+  DraftingPane: ({
+    drafting,
+    onClose,
+  }: {
+    drafting: { sessionId: string };
+    onClose: () => void;
+  }) => (
+    <div data-testid="drafting-pane" data-session-id={drafting.sessionId}>
+      <button type="button" onClick={onClose}>
+        hide
+      </button>
+    </div>
+  ),
+}));
 vi.mock("@/hooks/useModelRouters", () => ({
   useModelRouters: () => ({ data: { routers: [] } }),
 }));

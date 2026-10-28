@@ -14,6 +14,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 import type { AutomationRunBrief } from "@/gen/engram/app/v1/automation_pb";
 
+import { StatusDot } from "@/components/status-dot";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -113,6 +114,11 @@ export interface BuildTabProps {
   /** Replay a run on the canvas: nodes say what they did, the untravelled
    * parts fade, a node click shows its inputs and outputs. */
   replay?: RunReplay;
+  /** A pane before the canvas: the drafting agent's conversation. */
+  aside?: ReactNode;
+  /** The drafting agent's state, for the strip over the canvas: `working`
+   * while a turn is in flight, `empty` while nothing has been drafted. */
+  drafting?: { working: boolean; empty: boolean };
 }
 
 /** The trigger's event, as the catalog describes it: the first declared key
@@ -184,6 +190,8 @@ const INSPECTOR_DEFAULT_WIDTH = "360px";
  * column plus its padding on the left, a readable form/code field on the
  * right. The canvas floor is also what caps the inspector. */
 const CANVAS_MIN_WIDTH = "280px";
+const ASIDE_DEFAULT_WIDTH = "360px";
+const ASIDE_MIN_WIDTH = "280px";
 const INSPECTOR_MIN_WIDTH = "320px";
 
 function readInspectorWidth(): number | null {
@@ -238,6 +246,8 @@ export function BuildTab({
   testOpen,
   onTestOpenChange,
   replay,
+  aside,
+  drafting,
 }: BuildTabProps) {
   const ways = entrypointIds(definition);
   const active = projectEntrypoint(definition, entrypointId);
@@ -436,8 +446,42 @@ export function BuildTab({
         if (canvas > 1 && inspector > 1) writeInspectorWidth(inspector);
       }}
     >
+      {aside && (
+        <>
+          <ResizablePanel
+            id="build-aside"
+            defaultSize={ASIDE_DEFAULT_WIDTH}
+            minSize={ASIDE_MIN_WIDTH}
+            className="min-w-0"
+          >
+            {aside}
+          </ResizablePanel>
+          <ResizableHandle />
+        </>
+      )}
       <ResizablePanel id="build-canvas" minSize={CANVAS_MIN_WIDTH} className="min-w-0">
         <div className="relative flex h-full min-h-0 min-w-0 flex-col">
+          {drafting && !replay && (drafting.working || drafting.empty) && (
+            // What the agent is doing to this canvas, so an empty seed never
+            // reads as a finished automation with a bare manual trigger.
+            <div
+              className="flex shrink-0 items-center gap-2 border-b bg-card px-4 py-2 text-xs"
+              data-testid="drafting-banner"
+              data-working={drafting.working ? "true" : "false"}
+            >
+              <StatusDot tone={drafting.working ? "active" : "caution"} />
+              {drafting.working ? (
+                <span>
+                  The drafting agent is working. The canvas fills in as it saves a version.
+                </span>
+              ) : (
+                <span>
+                  The drafting agent has not saved a version. Answer it or ask it in the pane, or
+                  build the automation here.
+                </span>
+              )}
+            </div>
+          )}
           {replay && (
             <div
               className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b bg-card px-4 py-2 text-xs"
