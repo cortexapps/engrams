@@ -24,7 +24,7 @@ import {
   type TimelineNode,
   type TimelineStep,
 } from "../runs/run-format";
-import { ACTIVE, entryTitle, entryVia, pointsAtFleet } from "./activity-format";
+import { ACTIVE, entryTitle, entryVia, filteredReason, pointsAtFleet } from "./activity-format";
 
 // One activity entry = one run. Collapsed, it is a single line a person can
 // scan: age · dot · what happened / how it got in · how long it took, and the
@@ -65,6 +65,7 @@ export function ActivityEntry({
   const [open, setOpen] = useState(defaultOpen);
   const tone = runStatusTone(run.status);
   const active = ACTIVE.has(run.status);
+  const filtered = filteredReason(run);
   return (
     <li
       data-testid="activity-entry"
@@ -104,14 +105,23 @@ export function ActivityEntry({
             {entryVia(run)}
             {agentLabel && ` · ${agentLabel}`}
             {run.dryRun && " · dry run"}
-            {" · "}
-            <span className="font-mono tabular-nums">
-              {formatDuration(run.startedAt, run.endedAt, now)}
-            </span>
+            {run.startedAt && (
+              <>
+                {" · "}
+                <span className="font-mono tabular-nums">
+                  {formatDuration(run.startedAt, run.endedAt, now)}
+                </span>
+              </>
+            )}
           </span>
           {tone === "critical" && run.error && (
             <span className="block truncate text-xs text-foreground" data-testid="entry-reason">
               {firstLine(run.error)}
+            </span>
+          )}
+          {filtered && (
+            <span className="block truncate text-xs" data-testid="entry-reason">
+              {filtered}
             </span>
           )}
         </span>

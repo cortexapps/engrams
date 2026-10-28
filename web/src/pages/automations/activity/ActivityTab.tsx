@@ -3,7 +3,7 @@ import { useSearch } from "@tanstack/react-router";
 
 import { useEditorAutomation } from "@/hooks/useAutomationEditor";
 import { useRunList } from "@/hooks/useAutomationRuns";
-import { useInstanceList } from "@/hooks/useInstances";
+import { useInstanceList, useRecentDrops } from "@/hooks/useInstances";
 import { blockTypesOf, parseDefinition } from "@/lib/automation-blocks";
 
 import { ActivityList } from "./ActivityList";
@@ -28,6 +28,10 @@ export function ActivityTab({
     ...(instanceId !== undefined ? { instanceId } : {}),
   });
   const tick = now();
+  // A delivery that could not fire has no run row; the ledger shows it in
+  // its place in time. An agent's own timeline has none (a drop belongs to
+  // no agent).
+  const drops = useRecentDrops(automationId, instanceId === undefined);
 
   // Name the agent on a bound run — fetched only once one is visible.
   const anyBound = (runs.data?.runs ?? []).some((run) => run.instanceId !== "");
@@ -49,6 +53,7 @@ export function ActivityTab({
     <ActivityList
       runs={runs.data?.runs ?? []}
       windows={(runs.data?.filtered ?? []).map((w) => ({ ...w, automationId }))}
+      drops={drops.data?.drops ?? []}
       isPending={runs.isPending}
       error={runs.error}
       now={tick}

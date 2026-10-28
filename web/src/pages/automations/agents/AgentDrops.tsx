@@ -35,9 +35,10 @@ export function AgentDrops({
         data-testid="recent-drops-summary"
       >
         <span>
-          <span className="font-mono tabular-nums">{recent.length}</span> events did not fire in the
-          last day — <span className="font-mono tabular-nums">{closed}</span> arrived for closed
-          agents, <span className="font-mono tabular-nums">{unmatched}</span> matched no open agent
+          <span className="font-mono tabular-nums">{recent.length}</span>{" "}
+          {recent.length === 1 ? "event" : "events"} did not fire in the last day —{" "}
+          <span className="font-mono tabular-nums">{closed}</span> arrived for closed agents,{" "}
+          <span className="font-mono tabular-nums">{unmatched}</span> matched no open agent
           {unrendered > 0 && (
             <>
               , <span className="font-mono tabular-nums">{unrendered}</span> had no key for the

@@ -97,14 +97,26 @@ const KEY_FIELDS: FieldSpec[] = [
   },
 ];
 
-const MORE_FIELDS: FieldSpec[] = [
+/** The two prompts, side by side so nobody puts the standing instructions in
+ * the one that goes in on every event. */
+const PROMPT_FIELDS: FieldSpec[] = [
+  {
+    type: "template",
+    key: "promptTemplate",
+    label: "Prompt on every event",
+    multiline: true,
+    help: "What the agent gets each time an event reaches it. A continued session keeps its history, so say what is new.",
+  },
   {
     type: "template",
     key: "openingPromptTemplate",
-    label: "Opening prompt",
+    label: "Opening prompt, for a new session",
     multiline: true,
-    help: "The first prompt of a new session; empty means the prompt above.",
+    help: "The first prompt when a session starts; put the standing instructions here. Empty means the prompt above.",
   },
+];
+
+const MORE_FIELDS: FieldSpec[] = [
   {
     type: "template",
     key: "titleTemplate",
@@ -246,13 +258,7 @@ export function AgentInspector(props: AgentInspectorProps) {
   return (
     <div className="flex flex-col gap-4" data-testid="agent-inspector">
       {field({ type: "profile", key: "profileId", label: "Profile" })}
-      {field({
-        type: "template",
-        key: "promptTemplate",
-        label: "Prompt",
-        multiline: true,
-        help: "What the agent gets on every event. A continued session keeps its history, so say what is new.",
-      })}
+      {PROMPT_FIELDS.map(field)}
 
       <Field data-testid="field-scope">
         <FieldLabel className="flex items-center gap-1.5">

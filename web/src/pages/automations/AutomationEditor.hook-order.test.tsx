@@ -72,12 +72,16 @@ vi.mock("@/hooks/useProfiles", () => ({
   useProfiles: () => ({ data: { profiles: [] } }),
 }));
 vi.mock("@/hooks/useHarnessCatalog", () => ({ useHarnessCatalog: () => ({ data: [] }) }));
+vi.mock("@/hooks/useAutomations", () => ({
+  useRunNow: () => ({ mutateAsync: vi.fn(), isPending: false }),
+}));
 vi.mock("@/hooks/useModelRouters", () => ({
   useModelRouters: () => ({ data: { routers: [] } }),
 }));
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
   useNavigate: () => vi.fn(),
+  useBlocker: () => ({ status: "idle", proceed: vi.fn(), reset: vi.fn() }),
   useParams: () => ({ id: "a1" }),
   useSearch: () => ({ tab: "build" }),
   Link: ({ children }: { children: React.ReactNode }) => <a>{children}</a>,

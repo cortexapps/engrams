@@ -69,6 +69,8 @@ vi.mock("@/hooks/useProfiles", () => ({
   }),
 }));
 vi.mock("@/hooks/useHarnessCatalog", () => ({ useHarnessCatalog: () => ({ data: [] }) }));
+const runNow = { mutateAsync: vi.fn(async () => ({ runId: "run-manual" })), isPending: false };
+vi.mock("@/hooks/useAutomations", () => ({ useRunNow: () => runNow }));
 vi.mock("@/hooks/useModelRouters", () => ({
   useModelRouters: () => ({ data: { routers: [] } }),
   useRouterModels: () => ({ data: { models: [] } }),
@@ -76,6 +78,7 @@ vi.mock("@/hooks/useModelRouters", () => ({
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
   useNavigate: () => navigate,
+  useBlocker: () => ({ status: "idle", proceed: vi.fn(), reset: vi.fn() }),
   useParams: () => ({ id: "a1" }),
   useSearch: () => searchHolder.value,
   Link: ({ children }: { children: React.ReactNode }) => <a>{children}</a>,
@@ -386,6 +389,24 @@ describe("AutomationEditor", () => {
     expect(sent.blocks[0].config.promptTemplate).toBe("Changed.");
     expect(sent.blocks[0].id).toBe("finder");
     expect(setOverrides).not.toHaveBeenCalled();
+  });
+
+  it("a manual trigger has a Run now button that starts a run and lands on Activity", async () => {
+    automationHolder.value = { automation: automation("user") };
+    render(<AutomationEditor mode="edit" />);
+    const button = screen.getByTestId("run-now-button");
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(button);
+    await waitFor(() => expect(runNow.mutateAsync).toHaveBeenCalledWith({ automationId: "a1" }));
+    const landed = navigate.mock.calls.at(-1)![0] as {
+      search: (prev: Record<string, unknown>) => Record<string, unknown>;
+    };
+    expect(landed.search({})).toMatchObject({ tab: "activity" });
+    // An unsaved edit disables it: Run now starts the SAVED definition.
+    fireEvent.click(screen.getByTestId("block-row-finder"));
+    const prompt = screen.getByTestId("field-promptTemplate").querySelector("textarea")!;
+    fireEvent.change(prompt, { target: { value: "Changed." } });
+    expect((screen.getByTestId("run-now-button") as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("Try it renders the draft, unsaved edits and all, and opens the test drawer", async () => {

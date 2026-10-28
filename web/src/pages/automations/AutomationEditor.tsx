@@ -10,15 +10,26 @@
  * as overrides (SetBlockOverrides) — its structure is never sent. */
 
 import { ConnectError } from "@connectrpc/connect";
-import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { Beaker, Copy, Lock } from "lucide-react";
+import { Link, useBlocker, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { Beaker, Copy, Lock, Play } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton-rows";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { useRunNow } from "@/hooks/useAutomations";
 import { FieldError } from "@/components/ui/field";
 import { Switch } from "@/components/ui/switch";
 import { useRun, useRunList } from "@/hooks/useAutomationRuns";
@@ -55,7 +66,7 @@ import {
 import { useAutomationTest } from "@/hooks/useAutomationTest";
 
 import { BuildTab } from "./build/BuildTab";
-import { parseInputsJson, parseInputsSchema } from "@/lib/automation-inputs";
+import { parseInputsJson, parseInputsSchema, stableJson } from "@/lib/automation-inputs";
 import { InputsTab } from "./inputs/InputsTab";
 import { AgentsTab } from "./agents/AgentsTab";
 import { DryRunButton } from "./build/DryRunButton";
@@ -136,6 +147,7 @@ export function AutomationEditor({
   const setOverrides = useSetBlockOverrides();
   const updateMeta = useUpdateAutomationMetaV2();
   const setEnabled = useSetAutomationEnabledV2();
+  const runNow = useRunNow();
   const duplicate = useDuplicateAutomation();
   const saving =
     create.isPending || saveVersion.isPending || setOverrides.isPending || updateMeta.isPending;
@@ -149,13 +161,26 @@ export function AutomationEditor({
     (automation !== undefined &&
       (name !== automation.name ||
         description !== automation.description ||
-        JSON.stringify(comparable(draft)) !== JSON.stringify(comparable(effective))));
+        stableJson(comparable(draft)) !== stableJson(comparable(effective))));
 
   const userDirty =
     baseline !== null &&
     (name !== baseline.name ||
       description !== baseline.description ||
-      JSON.stringify(comparable(draft)) !== baseline.draftJson);
+      stableJson(comparable(draft)) !== baseline.draftJson);
+
+  // Unsaved edits survive a tab change (the same page) but not a move to
+  // another page: the router asks first, and the browser asks before the tab
+  // closes. A stray key that fires a global shortcut can no longer lose them.
+  const unsaved =
+    mode === "create"
+      ? name !== "" || stableJson(draft) !== stableJson(EMPTY_DEFINITION)
+      : userDirty;
+  const leave = useBlocker({
+    shouldBlockFn: ({ current, next }) => unsaved && current.pathname !== next.pathname,
+    enableBeforeUnload: () => unsaved,
+    withResolver: true,
+  });
 
   const adoptCurrent = () => {
     if (!automation) return;
@@ -168,7 +193,7 @@ export function AutomationEditor({
     setBaseline({
       name: automation.name,
       description: automation.description,
-      draftJson: JSON.stringify(comparable(effective)),
+      draftJson: stableJson(comparable(effective)),
     });
     setErrors([]);
     setStaleVersion(null);
@@ -189,7 +214,7 @@ export function AutomationEditor({
       const matchesScreen =
         automation.name === name &&
         automation.description === description &&
-        JSON.stringify(comparable(effective)) === JSON.stringify(comparable(draft));
+        stableJson(comparable(effective)) === stableJson(comparable(draft));
       if (!matchesScreen) {
         setStaleVersion(key);
         return;
@@ -202,7 +227,7 @@ export function AutomationEditor({
     setBaseline({
       name: automation.name,
       description: automation.description,
-      draftJson: JSON.stringify(comparable(effective)),
+      draftJson: stableJson(comparable(effective)),
     });
     setErrors([]);
     setStaleVersion(null);
@@ -368,6 +393,16 @@ export function AutomationEditor({
     };
   }, [replayRun, automation, needsOldVersion, versions.data, effective, navigate]);
   // Try it: render the draft, saved or not, against the latest delivery, and
+  const runNowClick = async () => {
+    if (!automation) return;
+    try {
+      await runNow.mutateAsync({ automationId: automation.id });
+      toast.success("Run started");
+      setTab("activity");
+    } catch (error) {
+      fail(error);
+    }
+  };
   // open the drawer that shows what each block would do.
   const [testOpen, setTestOpen] = useState(false);
   const tryIt = () => {
@@ -529,6 +564,22 @@ export function AutomationEditor({
               <Copy aria-hidden /> Duplicate
             </Button>
           )}
+          {mode === "edit" && automation && draft.trigger.kind === "manual" && (
+            // The manual trigger's one way in. It runs the SAVED definition,
+            // so it waits for a clean editor, as Dry run does.
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={runNowClick}
+              disabled={runNow.isPending || dirty}
+              data-testid="run-now-button"
+              title={dirty ? "Save first: Run now starts the saved definition" : "Start a run"}
+            >
+              <Play aria-hidden />
+              {runNow.isPending ? "Starting…" : "Run now"}
+            </Button>
+          )}
           <Button
             type="button"
             variant="outline"
@@ -560,6 +611,25 @@ export function AutomationEditor({
             {mode === "create" ? "Create" : "Save"}
           </Button>
         </header>
+
+        <AlertDialog open={leave.status === "blocked"}>
+          <AlertDialogContent data-testid="leave-dialog">
+            <AlertDialogHeader>
+              <AlertDialogTitle>Leave without saving?</AlertDialogTitle>
+              <AlertDialogDescription>
+                This automation has edits that are not saved. Leaving discards them.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel onClick={() => leave.status === "blocked" && leave.reset()}>
+                Keep editing
+              </AlertDialogCancel>
+              <AlertDialogAction onClick={() => leave.status === "blocked" && leave.proceed()}>
+                Discard and leave
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
 
         {staleVersion !== null && (
           <div
@@ -608,6 +678,7 @@ export function AutomationEditor({
               automationId={id}
               inputsSchema={parseInputsSchema(draft.inputsSchema)}
               defaultInputs={parseInputsJson(automation?.inputsJson)}
+              {...(draft.agent?.scope.kind === "automation" ? { agentScope: "automation" } : {})}
             />
           </TabsContent>
         )}

@@ -204,20 +204,32 @@ export function GenericField(props: GenericFieldProps) {
 
 function ProfileField({ spec, value, onChange, pinned, error }: GenericFieldProps) {
   const profiles = useProfiles();
+  const current = asString(value);
+  const list = profiles.data?.profiles ?? [];
+  // A profile chosen per run (a template such as `${{ inputs.profile }}`, as
+  // a built-in's input is) is not one of the org's profiles: the select
+  // still names it instead of showing nothing.
+  const templated = current !== "" && !list.some((profile) => profile.id === current);
   return (
     <Shell spec={spec} pinned={pinned} error={error}>
-      <Select value={asString(value)} onValueChange={(next) => onChange(next)} disabled={pinned}>
+      <Select value={current} onValueChange={(next) => onChange(next)} disabled={pinned}>
         <SelectTrigger data-testid="profile-select">
           <SelectValue placeholder="Choose a profile…" />
         </SelectTrigger>
         <SelectContent>
-          {(profiles.data?.profiles ?? []).map((profile) => (
+          {templated && (
+            <SelectItem value={current} className="font-mono text-xs">
+              {current}
+            </SelectItem>
+          )}
+          {list.map((profile) => (
             <SelectItem key={profile.id} value={profile.id}>
               {profile.name}
             </SelectItem>
           ))}
         </SelectContent>
       </Select>
+      {templated && <FieldDescription>Chosen per run from the template above.</FieldDescription>}
     </Shell>
   );
 }

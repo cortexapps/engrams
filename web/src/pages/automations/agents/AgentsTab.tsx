@@ -17,14 +17,21 @@ export interface AgentsTabProps {
   inputsSchema: InputFieldSpec[];
   /** The automation's values become the defaults for a new agent. */
   defaultInputs: unknown;
+  /** `automation`: the one standing agent, which the engine keys itself;
+   * the start dialog then asks for no name. */
+  agentScope?: "key" | "automation";
   /** Tests inject one stable clock for all relative times. */
   now?: () => number;
 }
+
+/** The key the engine gives the one agent of an automation-scoped agent. */
+const STANDING_AGENT_KEY = "agent";
 
 export function AgentsTab({
   automationId,
   inputsSchema,
   defaultInputs,
+  agentScope,
   now = Date.now,
 }: AgentsTabProps) {
   const [status, setStatus] = useState<"open" | "closed">("open");
@@ -81,6 +88,7 @@ export function AgentsTab({
         automations={[{ id: automationId, name: "This automation", inputsSchema, defaultInputs }]}
         instances={all}
         fixedAutomationId={automationId}
+        {...(agentScope === "automation" ? { fixedKey: STANDING_AGENT_KEY } : {})}
         open={dialogOpen}
         onOpenChange={setDialogOpen}
       />

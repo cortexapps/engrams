@@ -162,6 +162,36 @@ describe("AgentsTab", () => {
     expect(requests[0]!.inputsJson).toBeUndefined();
   });
 
+  it("a standing agent (automation scope) starts under the engine's key, with no name asked", async () => {
+    const requests: RunNowRequest[] = [];
+    renderWithProviders(
+      <AgentsTab
+        automationId="auto-1"
+        inputsSchema={SCHEMA}
+        defaultInputs={{ project: "default" }}
+        agentScope="automation"
+        now={() => NOW}
+      />,
+      {
+        transport: transportWith({
+          instances: [],
+          runNow: (request) => {
+            requests.push(request);
+            return { runId: "autorun:auto-1:main:i-ai_new:manual:1" };
+          },
+        }),
+      },
+    );
+    expect(await screen.findByText(/No open agents/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Start an agent" }));
+    const form = await screen.findByTestId("start-agent-form");
+    expect(within(form).queryByRole("textbox", { name: "agent name" })).toBeNull();
+    await userEvent.click(within(form).getByRole("button", { name: "Start the agent" }));
+    await waitFor(() => expect(requests).toHaveLength(1));
+    // The key the engine renders for an automation-scoped agent, never a typed one.
+    expect(requests[0]).toMatchObject({ automationId: "auto-1", instanceKey: "agent" });
+  });
+
   it("opens the next run for an already-open name without replacing its inputs", async () => {
     const requests: RunNowRequest[] = [];
     renderTab({

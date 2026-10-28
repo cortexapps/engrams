@@ -508,14 +508,29 @@ export function BuildTab({
               </Button>
             </div>
             <div className="flex min-h-0 flex-1 gap-6 overflow-x-auto p-6 pt-12">
-              <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+              {/* Fit: every column shrinks and its canvas scales down, so the
+                  whole row is in view. An explicit zoom keeps each column at
+                  its canvas width and the row scrolls, so a later column is
+                  never painted under the "add" control beside the row. */}
+              <div
+                className={cn(
+                  "flex min-h-0 flex-1 flex-col",
+                  zoom === "fit" ? "min-w-0" : "min-w-max",
+                )}
+              >
                 <div className="flex min-h-0 flex-1 gap-6">
                   {ways.map((way) => {
                     const projected =
                       way === entrypointId ? active : projectEntrypoint(definition, way);
                     const carried = wayCarried(way, projected.blocks);
                     return (
-                      <div key={way} className="flex min-h-0 min-w-[240px] flex-1 flex-col">
+                      <div
+                        key={way}
+                        className={cn(
+                          "flex min-h-0 flex-1 flex-col",
+                          zoom === "fit" ? "min-w-0" : "min-w-[240px]",
+                        )}
+                      >
                         <Canvas
                           trigger={projected.trigger}
                           triggerSummary={triggerSummaryFor(way)}
