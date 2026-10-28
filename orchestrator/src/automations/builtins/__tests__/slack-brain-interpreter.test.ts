@@ -246,6 +246,7 @@ function harness(options: {
     recv: async () => recvQueue.shift() ?? null,
     instances: {
       async closeInstance() { return true; },
+      isOpen: async () => true,
       async recordInstanceHandle(input) {
         handles.push(input.handle);
         return { kind: "recorded" as const };
