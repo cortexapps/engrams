@@ -24,7 +24,7 @@ vi.mock("sonner", async (orig) => {
 
 const T0 = "2026-08-21T12:00:00Z";
 
-function automation(kind: "user" | "builtin") {
+function automation(kind: "user" | "builtin", agent?: Record<string, unknown>) {
   return {
     id: "auto-1",
     name: kind === "builtin" ? "PR review" : "Nightly triage",
@@ -42,6 +42,7 @@ function automation(kind: "user" | "builtin") {
         engine: 1,
         trigger: { kind: "manual" },
         blocks: [],
+        ...(agent ? { agent } : {}),
         inputsSchema: [],
         settings: {
           concurrency: { keyTemplate: "${{ event.pr.url }}", policy: "supersede" },
@@ -64,8 +65,9 @@ type ArchiveImpl = (req: ArchiveAutomationRequest) => { automation: ReturnType<t
 function transportFor(
   kind: "user" | "builtin",
   stubs: { updateAutomationMeta?: MetaImpl; archiveAutomation?: ArchiveImpl } = {},
+  agent?: Record<string, unknown>,
 ) {
-  const row = automation(kind);
+  const row = automation(kind, agent);
   return createRouterTransport((router) => {
     router.service(AutomationService, {
       getAutomation: () => ({ automation: row }),
@@ -153,6 +155,18 @@ describe("SettingsTab", () => {
       runDeadlineSeconds: 1800,
       endSessionsOnFinish: true,
     });
+  });
+
+  it("with an agent the run settings are derived: no fields, one sentence", async () => {
+    const withAgent = { scope: { kind: "event" }, profileId: "p1", promptTemplate: "Hi" };
+    renderWithProviders(<SettingsTab automationId="auto-1" />, {
+      transport: transportFor("user", {}, withAgent),
+    });
+    expect((await screen.findByTestId("settings-derived")).textContent).toContain("has an agent");
+    expect(screen.queryByLabelText(/run deadline/i)).toBeNull();
+    expect(screen.queryByTestId("settings-policy")).toBeNull();
+    expect(screen.queryByRole("button", { name: /save settings/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /^archive$/i })).toBeTruthy();
   });
 
   it("renders settings read-only on a built-in, with the hint, and disables Archive", async () => {

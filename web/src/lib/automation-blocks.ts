@@ -63,6 +63,9 @@ export interface AutomationEntrypoint {
   trigger: TriggerSpec;
   blocks: BlockDef[];
   role?: EntrypointRole;
+  /** What this way in tells the agent: a template over the event and this
+   * way in's steps. Absent = the agent's prompt on every event. */
+  promptTemplate?: string;
 }
 
 /** How many agents an automation has: one per event, one per rendered key
@@ -91,6 +94,8 @@ export interface AutomationDefinition {
   entrypoints?: AutomationEntrypoint[];
   /** The main way in's role; absent = `start`. */
   role?: EntrypointRole;
+  /** The main way in's message to the agent (see `AutomationEntrypoint`). */
+  promptTemplate?: string;
   /** The automation's agent. Every way in ends on it (by its role); the
    * agent's scope is what makes the automation's agents durable. */
   agent?: AgentSpec;
@@ -200,6 +205,34 @@ export function setRole(
   const put = <T extends { role?: EntrypointRole }>(target: T): T => {
     const { role: _old, ...rest } = target;
     return (role === "start" ? rest : { ...rest, role }) as T;
+  };
+  if (entrypointId === MAIN_ENTRYPOINT_ID) return put(definition);
+  return {
+    ...definition,
+    entrypoints: (definition.entrypoints ?? []).map((ep) =>
+      ep.id === entrypointId ? put(ep) : ep,
+    ),
+  };
+}
+
+/** One way in's message to the agent; undefined = the agent's prompt. */
+export function messageOf(
+  definition: AutomationDefinition,
+  entrypointId: string,
+): string | undefined {
+  if (entrypointId === MAIN_ENTRYPOINT_ID) return definition.promptTemplate;
+  return definition.entrypoints?.find((ep) => ep.id === entrypointId)?.promptTemplate;
+}
+
+/** Set one way in's message; empty (or undefined) is stored as no field. */
+export function setMessage(
+  definition: AutomationDefinition,
+  entrypointId: string,
+  message: string | undefined,
+): AutomationDefinition {
+  const put = <T extends { promptTemplate?: string }>(target: T): T => {
+    const { promptTemplate: _old, ...rest } = target;
+    return (message ? { ...rest, promptTemplate: message } : rest) as T;
   };
   if (entrypointId === MAIN_ENTRYPOINT_ID) return put(definition);
   return {
@@ -1348,12 +1381,20 @@ export function insertableBlockKinds(
   );
 }
 
+/** With an agent, every event is one short run that reaches the agent and
+ * ends; waiting is the agent's kept session, not a step. These kinds are
+ * offered only to an automation without one. */
+const WAIT_KINDS: ReadonlySet<string> = new Set(["wait_session", "wait_event"]);
+
 /** The insert menu's shape: the insertable kinds by group, in group order,
  * empty groups left out. */
 export function groupedBlockKinds(
   connectedRouters: ReadonlySet<string>,
+  options: { withAgent?: boolean } = {},
 ): ReadonlyArray<{ id: BlockGroup; label: string; kinds: readonly BlockKindSpec[] }> {
-  const kinds = insertableBlockKinds(connectedRouters);
+  const kinds = insertableBlockKinds(connectedRouters).filter(
+    (spec) => !options.withAgent || !WAIT_KINDS.has(spec.kind),
+  );
   return BLOCK_GROUPS.map((group) => ({
     ...group,
     kinds: kinds.filter((spec) => spec.group === group.id),

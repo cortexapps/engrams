@@ -16,9 +16,10 @@ export interface InsertMenuProps {
   at: ListPath;
   index: number;
   onInsert: (at: ListPath, index: number, kind: string) => void;
+  withAgent?: boolean;
 }
 
-export function InsertMenu({ x, y, at, index, onInsert }: InsertMenuProps) {
+export function InsertMenu({ x, y, at, index, onInsert, withAgent }: InsertMenuProps) {
   return (
     <div
       className="group/insert absolute z-20 flex size-8 -translate-x-1/2 -translate-y-1/2 items-center justify-center"
@@ -34,7 +35,7 @@ export function InsertMenu({ x, y, at, index, onInsert }: InsertMenuProps) {
             <Plus className="size-3.5" aria-hidden />
           </button>
         </DropdownMenuTrigger>
-        <BlockKindMenu onPick={(kind) => onInsert(at, index, kind)} />
+        <BlockKindMenu onPick={(kind) => onInsert(at, index, kind)} withAgent={withAgent} />
       </DropdownMenu>
     </div>
   );

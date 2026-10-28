@@ -1,7 +1,8 @@
 /** The automation's agent on the canvas: one node under every way in. Each
  * way in's column ends on a stub that says what it does with the agent
- * (starts it, reaches it, closes it, or nothing); a bus joins the stubs and
- * drops to the node. The node is the same card as a step; in replay it
+ * (tells it, tells it only when it is running, closes it, or nothing) and
+ * shows the first line of its message; a bus joins the stubs and drops to
+ * the node. The node is the same card as a step; in replay it
  * carries the agent step's status and sentence.
  *
  * No agent yet: a dashed "Add an agent" node in its place (never on a
@@ -26,16 +27,33 @@ const STATUS_TONE: Record<CanvasNodeStatus, StatusTone> = {
 
 /** The stub's caption: what the way in does with the agent. */
 export const ROLE_CAPTION: Record<EntrypointRole, string> = {
-  start: "starts it",
-  reach: "reaches it",
+  start: "tells it",
+  reach: "tells it, if running",
   close: "closes it",
   none: "no agent",
 };
 
+/** The first line of a way in's message, for the stub. */
+function firstLine(message: string): string {
+  return message.trim().split("\n", 1)[0] ?? "";
+}
+
 /** The connector under one way in's column. The stem grows to span the
  * space between the column's last node and the bus, so a short column still
- * reads as one path from its trigger to the agent. */
-export function AgentStub({ role, dimmed }: { role: EntrypointRole; dimmed?: boolean }) {
+ * reads as one path from its trigger to the agent. The caption is a button
+ * that selects the way in, whose inspector holds the role and the message. */
+export function AgentStub({
+  role,
+  message,
+  dimmed,
+  onSelect,
+}: {
+  role: EntrypointRole;
+  message?: string | undefined;
+  dimmed?: boolean;
+  onSelect?: () => void;
+}) {
+  const tells = role === "start" || role === "reach";
   return (
     <div
       className={cn(
@@ -51,9 +69,20 @@ export function AgentStub({ role, dimmed }: { role: EntrypointRole; dimmed?: boo
           role === "none" ? "border-l border-dashed border-foreground/30" : "bg-foreground/45",
         )}
       />
-      <span className="rounded-sm bg-background px-1.5 text-2xs font-semibold leading-4 text-muted-foreground">
-        {ROLE_CAPTION[role]}
-      </span>
+      <button
+        type="button"
+        onClick={onSelect}
+        disabled={!onSelect}
+        aria-label="What this way in does with the agent"
+        className="flex max-w-full flex-col items-center rounded-sm bg-background px-1.5 text-2xs leading-4 text-muted-foreground outline-none enabled:hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/60"
+      >
+        <span className="font-semibold">{ROLE_CAPTION[role]}</span>
+        {tells && message && (
+          <span className="max-w-full truncate italic" data-testid="agent-stub-message">
+            {firstLine(message)}
+          </span>
+        )}
+      </button>
     </div>
   );
 }

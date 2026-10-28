@@ -9,9 +9,11 @@ import {
   defaultAgent,
   hasScopedAgents,
   hasSlackTrigger,
+  messageOf,
   roleOf,
   scopeLabel,
   scopePresetOf,
+  setMessage,
   setRole,
   groupedBlockKinds,
   insertableBlockKinds,
@@ -359,6 +361,28 @@ describe("the agent with ways in", () => {
     d = setRole(setRole(d, "main", "reach"), "main", "start");
     expect("role" in d).toBe(false);
     expect(d.entrypoints?.[0]?.role).toBe("close");
+  });
+
+  it("a way in's message to the agent is read and written per way in; empty is no field", () => {
+    let d = base();
+    expect(messageOf(d, "main")).toBeUndefined();
+    d = setMessage(d, "done", "Closing: ${{ event.raw.text }}");
+    expect(messageOf(d, "done")).toBe("Closing: ${{ event.raw.text }}");
+    d = setMessage(setMessage(d, "main", "Hi"), "main", "");
+    expect("promptTemplate" in d).toBe(false);
+    expect(d.entrypoints?.[0]?.promptTemplate).toBe("Closing: ${{ event.raw.text }}");
+  });
+
+  it("with an agent the menu offers no wait blocks: waiting is the agent's session", () => {
+    const all = groupedBlockKinds(new Set()).flatMap((g) => g.kinds.map((k) => k.kind));
+    expect(all).toContain("wait_session");
+    expect(all).toContain("wait_event");
+    const withAgent = groupedBlockKinds(new Set(), { withAgent: true }).flatMap((g) =>
+      g.kinds.map((k) => k.kind),
+    );
+    expect(withAgent).not.toContain("wait_session");
+    expect(withAgent).not.toContain("wait_event");
+    expect(withAgent).toContain("create_session");
   });
 
   it("the ledger's agent steps take the agent's types, so their sentences read", () => {

@@ -3,7 +3,7 @@
  * inspector, and the dashed "Add an agent" node when there is none. */
 
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, screen } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
 
 import { renderWithProviders } from "@/test-utils";
 import type { AutomationDefinition } from "@/lib/automation-blocks";
@@ -81,8 +81,26 @@ describe("BuildTab agent", () => {
     expect(node.textContent).toContain("per PR");
     const stubs = screen.getAllByTestId("agent-stub");
     expect(stubs.map((s) => s.getAttribute("data-role"))).toEqual(["start", "close"]);
-    expect(stubs[0]!.textContent).toBe("starts it");
+    expect(stubs[0]!.textContent).toBe("tells it");
     expect(stubs[1]!.textContent).toBe("closes it");
+  });
+
+  it("a way in's message shows on its stub; the stub opens the way in, whose inspector edits it", async () => {
+    const { onChange } = mount({
+      ...withAgent,
+      promptTemplate: "Review ${{ steps.admit.passed }}\nsecond line",
+    });
+    const stub = (await screen.findAllByTestId("agent-stub"))[0]!;
+    expect(screen.getByTestId("agent-stub-message").textContent).toBe(
+      "Review ${{ steps.admit.passed }}",
+    );
+    fireEvent.click(within(stub).getByRole("button"));
+    const message = (await screen.findByLabelText("Message to the agent")) as HTMLTextAreaElement;
+    expect(message.value).toBe("Review ${{ steps.admit.passed }}\nsecond line");
+    fireEvent.change(message, { target: { value: "Review it" } });
+    expect((onChange.mock.calls.at(-1)![0] as AutomationDefinition).promptTemplate).toBe(
+      "Review it",
+    );
   });
 
   it("a click on the node opens the agent's inspector; the trigger's inspector offers the role", async () => {
@@ -96,14 +114,20 @@ describe("BuildTab agent", () => {
     expect(await screen.findByTestId("field-role")).toBeTruthy();
   });
 
-  it("removing the agent drops it and every way in's role", async () => {
-    const { onChange } = mount(withAgent);
+  it("removing the agent drops it and every way in's role and message", async () => {
+    const { onChange } = mount({
+      ...withAgent,
+      promptTemplate: "Hi",
+      entrypoints: [{ ...withAgent.entrypoints![0]!, role: "start", promptTemplate: "Bye" }],
+    });
     fireEvent.click(await screen.findByTestId("agent-node"));
     fireEvent.click(await screen.findByRole("button", { name: "Remove the agent" }));
     const next = onChange.mock.calls.at(-1)![0] as AutomationDefinition;
     expect("agent" in next).toBe(false);
     expect("role" in next).toBe(false);
+    expect("promptTemplate" in next).toBe(false);
     expect(next.entrypoints?.[0] && "role" in next.entrypoints[0]).toBe(false);
+    expect(next.entrypoints?.[0] && "promptTemplate" in next.entrypoints[0]).toBe(false);
   });
 
   it("with no agent the canvas offers to add one, scoped by the trigger", async () => {

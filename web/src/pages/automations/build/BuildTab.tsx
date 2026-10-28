@@ -48,8 +48,10 @@ import {
   removeBlock,
   removeEntrypoint,
   replaceBlock,
+  messageOf,
   roleOf,
   scopeLabel,
+  setMessage,
   setRole,
   walkBlocks,
   withAgent,
@@ -160,15 +162,16 @@ function sessionSourcesFor(definition: AutomationDefinition, selectedId: string 
   return ids;
 }
 
-/** The agent without its ways in's roles: what removing it leaves. */
+/** The agent without its ways in's roles and messages: what removing it
+ * leaves. */
 function withoutAgent(definition: AutomationDefinition): AutomationDefinition {
-  const { agent: _agent, role: _role, ...rest } = definition;
+  const { agent: _agent, role: _role, promptTemplate: _message, ...rest } = definition;
   return {
     ...rest,
     ...(rest.entrypoints
       ? {
           entrypoints: rest.entrypoints.map((ep) => {
-            const { role: _epRole, ...way } = ep;
+            const { role: _epRole, promptTemplate: _epMessage, ...way } = ep;
             return way;
           }),
         }
@@ -594,12 +597,15 @@ export function BuildTab({
                           onRemove={(id) => onRemove(way, id)}
                           zoom={zoom}
                           summaryFor={summaryFor}
+                          withAgent={agent !== undefined}
                           {...(replay ? { replay: { map: replay.map, onPath: carried } } : {})}
                         />
                         {agent && (
                           <AgentStub
                             role={roleOf(definition, way)}
+                            message={messageOf(definition, way)}
                             dimmed={replay ? !carried : false}
+                            onSelect={() => select(way, TRIGGER_ROW_ID)}
                           />
                         )}
                       </div>
@@ -809,6 +815,11 @@ export function BuildTab({
                       role: roleOf(definition, entrypointId),
                       onRoleChange: (role) => onChange(setRole(definition, entrypointId, role)),
                       scopeKind: agent.scope.kind,
+                      message: messageOf(definition, entrypointId),
+                      onMessageChange: (message) =>
+                        onChange(setMessage(definition, entrypointId, message)),
+                      variablePaths,
+                      variableValues: previewValues,
                     }
                   : {})}
               />

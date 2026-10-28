@@ -19,6 +19,8 @@ import { groupedBlockKinds, type BlockKindSpec } from "@/lib/automation-blocks";
 export interface BlockKindMenuProps {
   onPick: (kind: string) => void;
   align?: "start" | "center" | "end";
+  /** The automation has an agent: no wait blocks (see `groupedBlockKinds`). */
+  withAgent?: boolean;
 }
 
 function KindItem({ spec, onPick }: { spec: BlockKindSpec; onPick: (kind: string) => void }) {
@@ -30,9 +32,9 @@ function KindItem({ spec, onPick }: { spec: BlockKindSpec; onPick: (kind: string
   );
 }
 
-export function BlockKindMenu({ onPick, align = "center" }: BlockKindMenuProps) {
+export function BlockKindMenu({ onPick, align = "center", withAgent = false }: BlockKindMenuProps) {
   const connectedRouters = useConnectedRouters();
-  const groups = groupedBlockKinds(connectedRouters);
+  const groups = groupedBlockKinds(connectedRouters, { withAgent });
   const advanced = groups.find((group) => group.id === "advanced");
   const plain = groups.filter((group) => group.id !== "advanced");
   return (

@@ -119,6 +119,15 @@ describe("Canvas", () => {
     expect(h.onInsert).toHaveBeenCalledWith({ root: true }, 0, "run_command");
   });
 
+  it("with an agent the insert menus offer no wait blocks", async () => {
+    const user = userEvent.setup();
+    mount(false, { withAgent: true });
+    await screen.findByTestId("block-row-launch");
+    await user.click(screen.getAllByLabelText("Insert block here")[0]!);
+    expect(await screen.findByRole("menuitem", { name: /create session/i })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: /wait for session/i })).toBeNull();
+  });
+
   it("a node's second line comes from the owner when it can resolve it", async () => {
     mount(false, {
       summaryFor: (block) => (block.id === "launch" ? "PR reviewer · hi" : undefined),

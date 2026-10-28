@@ -107,6 +107,55 @@ describe("TriggerInspector", () => {
       />,
     );
     const role = await screen.findByTestId("field-role");
-    expect(role.textContent).toContain("An event with no running agent is dropped");
+    expect(role.textContent).toContain("Tells the agent");
+    const onlyRunning = screen.getByTestId("field-only-running");
+    expect(onlyRunning.textContent).toContain("An event with no running agent is dropped");
+    expect(
+      screen.getByRole("switch", { name: /only when the agent/i }).getAttribute("aria-checked"),
+    ).toBe("true");
+  });
+
+  it("the only-when-running switch turns reach into start; the message writes through", async () => {
+    const onRoleChange = vi.fn();
+    const onMessageChange = vi.fn();
+    renderWithProviders(
+      <TriggerInspector
+        trigger={reviewTrigger}
+        onChange={vi.fn()}
+        builtin={false}
+        errors={[]}
+        role="start"
+        onRoleChange={onRoleChange}
+        message="Review ${{ event.raw.number }}"
+        onMessageChange={onMessageChange}
+        variablePaths={["event.raw.number"]}
+      />,
+    );
+    const sw = await screen.findByRole("switch", { name: /only when the agent/i });
+    expect(sw.getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(sw);
+    expect(onRoleChange).toHaveBeenLastCalledWith("reach");
+    const message = screen.getByLabelText("Message to the agent") as HTMLTextAreaElement;
+    expect(message.value).toBe("Review ${{ event.raw.number }}");
+    fireEvent.change(message, { target: { value: "" } });
+    expect(onMessageChange).toHaveBeenLastCalledWith(undefined);
+  });
+
+  it("a session per event offers no close and no only-when-running switch", async () => {
+    renderWithProviders(
+      <TriggerInspector
+        trigger={reviewTrigger}
+        onChange={vi.fn()}
+        builtin={false}
+        errors={[]}
+        role="start"
+        onRoleChange={vi.fn()}
+        scopeKind="event"
+        onMessageChange={vi.fn()}
+      />,
+    );
+    await screen.findByTestId("field-role");
+    expect(screen.queryByTestId("field-only-running")).toBeNull();
+    expect(screen.getByTestId("field-message")).toBeTruthy();
   });
 });

@@ -49,6 +49,8 @@ export interface CanvasProps {
   zoom?: number | "fit";
   /** A node's second line, when the owner can resolve it (profile names). */
   summaryFor?: (block: BlockDef) => string | undefined;
+  /** The automation has an agent: the insert menus offer no wait blocks. */
+  withAgent?: boolean;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -72,6 +74,7 @@ export function Canvas({
   replay,
   zoom = "fit",
   summaryFor,
+  withAgent,
 }: CanvasProps) {
   const editable = !locked && !replay;
   const edgeTaken = (edgeId: string): boolean => {
@@ -210,6 +213,7 @@ export function Canvas({
                     at={edge.insert!.at}
                     index={edge.insert!.index}
                     onInsert={onInsert}
+                    withAgent={withAgent}
                   />
                 ))}
             {editable && tail?.insert && (
@@ -219,6 +223,7 @@ export function Canvas({
                 at={tail.insert.at}
                 index={tail.insert.index}
                 onInsert={onInsert}
+                withAgent={withAgent}
               />
             )}
           </div>
@@ -242,12 +247,14 @@ function AddStepNode({
   at,
   index,
   onInsert,
+  withAgent,
 }: {
   x: number;
   y: number;
   at: ListPath;
   index: number;
   onInsert: (at: ListPath, index: number, kind: string) => void;
+  withAgent?: boolean;
 }) {
   return (
     <div
@@ -266,7 +273,7 @@ function AddStepNode({
             Add step
           </button>
         </DropdownMenuTrigger>
-        <BlockKindMenu onPick={(kind) => onInsert(at, index, kind)} />
+        <BlockKindMenu onPick={(kind) => onInsert(at, index, kind)} withAgent={withAgent} />
       </DropdownMenu>
     </div>
   );
