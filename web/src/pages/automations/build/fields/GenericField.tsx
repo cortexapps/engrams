@@ -124,11 +124,15 @@ export function GenericField(props: GenericFieldProps) {
     case "boolean":
       return (
         <Shell spec={spec} pinned={pinned} error={error}>
-          <Switch
-            checked={value === true}
-            onCheckedChange={(checked) => onChange(checked)}
-            disabled={disabled}
-          />
+          {/* The field stretches every direct child to its width; a switch
+              is a fixed 36px control, so it sits in a row of its own. */}
+          <div className="flex items-center">
+            <Switch
+              checked={value === true}
+              onCheckedChange={(checked) => onChange(checked)}
+              disabled={disabled}
+            />
+          </div>
         </Shell>
       );
     case "select":
