@@ -219,6 +219,13 @@ describe("seedBuiltinAutomations", () => {
     expect(definitionContentHash(withEp)).not.toBe(definitionContentHash(withoutEp));
   });
 
+  test("content hash covers the agent and the main way in's role", () => {
+    const base = PR_REVIEW_BUILTIN.definition;
+    const agent = { scope: { kind: "event" as const }, profileId: "p", promptTemplate: "go" };
+    expect(definitionContentHash({ ...base, agent })).not.toBe(definitionContentHash(base));
+    expect(definitionContentHash({ ...base, agent, role: "none" })).not.toBe(definitionContentHash({ ...base, agent }));
+  });
+
   test("content hash ignores key order and is stable", () => {
     const a = definitionContentHash(PR_REVIEW_BUILTIN.definition);
     const reordered = JSON.parse(JSON.stringify(PR_REVIEW_BUILTIN.definition)) as AutomationDefinition;

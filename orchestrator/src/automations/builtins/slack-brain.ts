@@ -43,7 +43,6 @@ import {
   type BlockDef,
 } from "../engine/definition.ts";
 import type { BuiltinAutomation } from "../engine/builtins.ts";
-import { RELAY_CLOSE_TYPE } from "../engine/blocks/relay-close.ts";
 import { LOOKUP_INSTANCE_SESSION_TYPE } from "../engine/blocks/instance-session.ts";
 import { RESOLVE_USER_TYPE } from "../engine/blocks/resolve-user.ts";
 import { SLACK_CHOICE_LABEL_MAX, SLACK_CHOICE_TYPE } from "../engine/blocks/slack-choice.ts";
@@ -135,10 +134,12 @@ export default ({ event, inputs, trigger }) => {
  * A NEW session gets the whole thread so far: a mention in the middle of a
  * human conversation brings that conversation along. A CONTINUED session
  * already saw everything up to the previous turn, so the fold starts after
- * the previous turn's mention — the newest human message before this one
- * that mentions the bot (any mention when the payload does not say who we
- * are; our own newest reply as the last resort). Messages newer than the
- * mention are left for
+ * the previous turn's mention — the one the session's relay points at (a
+ * mention the brain dropped at admission was no turn and moves nothing);
+ * with no relay, the newest human message before this one that mentions
+ * the bot (any mention when the payload does not say who we are; our own
+ * newest reply as the last resort). Messages newer than the mention are
+ * left for
  * the NEXT turn (they arrived after the ask; the next mention's fold
  * carries them). Bot-authored messages never feed the prompt (the agent
  * must not read its own posts) EXCEPT the thread root, which is the subject
@@ -174,7 +175,8 @@ export default ({ steps }) => {
       if (num(ts) > num(previousMention)) previousMention = ts;
     }
   }
-  const since = continued ? previousMention || lastOwn : "";
+  const relayMention = String(steps.previous?.mention_ts ?? "");
+  const since = continued ? relayMention || previousMention || lastOwn : "";
   const kept = [];
   for (const m of messages) {
     const ts = String(m.ts ?? "");
@@ -265,7 +267,10 @@ const admit: BlockDef[] = [
  * before routing (a continued session is never re-routed). */
 const previous: BlockDef = { id: "previous", type: LOOKUP_INSTANCE_SESSION_TYPE, config: {} };
 
-/** The thread as Slack holds it, for the fold. */
+/** The thread as Slack holds it, for the fold. A continued session reads
+ * only what came after its previous turn (the page is capped; a long
+ * thread must not push the new messages off it); a new one reads the
+ * whole thread. */
 const replies: BlockDef = {
   id: "replies",
   type: "integration_action",
@@ -275,6 +280,7 @@ const replies: BlockDef = {
     params: {
       channel: `\${{ ${F}.channel }}`,
       threadTs: `\${{ ${F}.thread_ts }}`,
+      oldest: "${{ steps.previous.mention_ts | default: '' }}",
     },
   },
 };
@@ -640,32 +646,32 @@ export const SLACK_BRAIN_DEFINITION: AutomationDefinition = {
       max: MAX_WAIT_DEADLINE_S,
     },
   ],
+  // One run at a time per thread (the engine derives `queue` from the
+  // kept scope): two mentions in quick succession deliver their turns in
+  // order, and a turn never finds the thread's session owned by a live run.
   settings: {
-    concurrency: {
-      // One run at a time per thread: two mentions in quick succession
-      // deliver their turns in order, and a turn never finds the thread's
-      // session owned by a live run.
-      keyTemplate: THREAD_KEY,
-      policy: "queue",
-    },
     endSessionsOnFinish: false,
     onFinalize: [
-      // A run that fails after reaching the session (the prompt could not
-      // be delivered) tells the thread ❌ and lets the relay go; the next
-      // mention re-installs it on the same session. The session is the
-      // agent step's when it got that far, else the thread's kept one (a
-      // failed delivery leaves the agent step without outputs). No post on
-      // `completed` (the session's own ✅ already says the turn is done),
-      // nor on `filtered` (an unlinked author, a bare mention: the
-      // thread's relay must stay).
+      // A run that fails (the thread page could not be read, the prompt
+      // could not be delivered) tells the thread ❌ and why. The session's
+      // relay stays: the session is fine, this turn did not reach it, and
+      // the next mention is a new turn on it. No post on `completed` (the
+      // session's own ✅ already says the turn is done), nor on `filtered`
+      // (an unlinked author, a bare mention).
       {
         when: ["failed"],
         block: {
           id: "recap",
-          type: RELAY_CLOSE_TYPE,
+          type: "integration_action",
+          tunable: ["params"],
           config: {
-            session: { template: "${{ steps.agent.session_id | default: steps.previous.session_id }}" },
-            status: "${{ run.status }}",
+            provider: "slack",
+            actionId: "post_message",
+            params: {
+              channel: `\${{ ${F}.channel }}`,
+              threadTs: `\${{ ${F}.thread_ts }}`,
+              text: "❌ This turn failed: ${{ run.error }}",
+            },
           },
         },
       },

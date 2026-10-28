@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { matchesIntegrationTrigger } from "../../dispatch.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import {
+  concurrencySettingsOf,
   entrypointsOf,
   instanceSettingsOf,
   validateDefinition,
@@ -55,10 +56,13 @@ describe("Slack thread brain built-in — definition", () => {
     expect(parsed.agent).toMatchObject({ scope: { kind: "key" }, keepOnFinish: true, relay: { provider: "slack" } });
     const way = entrypointsOf(parsed)[0]!;
     expect(way.blocks.at(-1)).toMatchObject({ id: "agent", type: "run_agent", config: { reuse: "workstream" } });
-    // Only a failed run posts into the thread; a completed or filtered run
-    // leaves the session's relay alone.
-    expect(parsed.settings.onFinalize?.map((h) => [h.block.type, h.when])).toEqual([["relay_close", ["failed"]]]);
-    expect(parsed.settings.concurrency?.policy).toBe("queue");
+    // Only a failed run posts into the thread (a plain line that says why);
+    // the session's relay is never touched by a run's end.
+    expect(parsed.settings.onFinalize?.map((h) => [h.block.type, h.when])).toEqual([["integration_action", ["failed"]]]);
+    expect(parsed.settings.onFinalize?.[0]?.block.config).toMatchObject({ actionId: "post_message" });
+    // One run at a time per thread: derived from the kept scope.
+    expect(parsed.settings.concurrency).toBeUndefined();
+    expect(concurrencySettingsOf(parsed)).toEqual({ keyTemplate: "agent", policy: "queue" });
     expect(parsed.settings.runDeadlineSeconds).toBeUndefined();
     expect(parsed.settings.endSessionsOnFinish).toBe(false);
   });
@@ -74,7 +78,6 @@ describe("Slack thread brain built-in — definition", () => {
     // The workstream derives from the agent's scope; nothing is declared.
     expect(parsed.settings.instance).toBeUndefined();
     const instance = instanceSettingsOf(parsed)!;
-    expect(instance.keyTemplate).toBe(parsed.settings.concurrency!.keyTemplate);
     expect(instance.keyTemplate).toContain('coalesce: "thread_ts", "ts"');
     // The Slack page shows the opening mention's text as the thread's title.
     expect(instance.labelTemplate).toBe("${{ event.raw.event.text | strip_mentions | truncate: 80 }}");

@@ -185,8 +185,6 @@ describe("previewDefinition — code blocks run (the editor's Test with sample)"
     expect(JSON.stringify(byId["agent"]!.rendered)).toContain("summarize the incident");
     // The only gap left is an EXECUTING block's output (the identity block
     // resolves the user at run time) — reported on the field, as documented.
-    // The session-link post sits behind `steps.agent.started`, which the
-    // preview cannot know, so its arm is not walked.
     expect(res.errors.map((e) => `${e.blockId}.${e.field}`)).toEqual(["agent.ownerUserId"]);
   });
 

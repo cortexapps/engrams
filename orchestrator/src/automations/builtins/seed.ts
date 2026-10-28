@@ -63,8 +63,10 @@ export interface BuiltinSeedResult {
 export function definitionContentHash(definition: AutomationDefinition): string {
   const subject = {
     trigger: definition.trigger,
+    role: definition.role ?? null,
     blocks: definition.blocks,
     entrypoints: definition.entrypoints ?? [],
+    agent: definition.agent ?? null,
     inputsSchema: definition.inputsSchema,
     settings: definition.settings,
   };
@@ -197,8 +199,10 @@ async function seedOne(
   const stored: AutomationDefinition = {
     engine: 1,
     trigger: current.trigger,
+    ...(current.role !== null ? { role: current.role } : {}),
     blocks: current.blocks,
     ...(current.entrypoints.length > 0 ? { entrypoints: current.entrypoints } : {}),
+    ...(current.agent !== null ? { agent: current.agent } : {}),
     inputsSchema: current.inputsSchema,
     settings: current.settings,
   };
