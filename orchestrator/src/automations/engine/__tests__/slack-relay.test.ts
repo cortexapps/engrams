@@ -255,6 +255,41 @@ describe("session relay (contract 5)", () => {
     expect(h.store.rows.get(SESSION)!.version).toBe(3);
   });
 
+  test("a render that loses the CAS race to a re-point keeps the bubble closed and joins its additions", async () => {
+    const h = harness();
+    await h.install();
+    await h.render(ev("agent_message", { role: "assistant", text: "one" }));
+    const update = h.store.update.bind(h.store);
+    let raced = false;
+    h.store.update = async (sessionId, expectVersion, patch) => {
+      if (!raced) {
+        // A new mention re-points the relay between our read and our write
+        // (the agent step of the next run): the bubble closes there.
+        raced = true;
+        await installSessionRelay(
+          { sessionId: SESSION, automationId: "auto-1", target: { ...MENTION, ts: "200.0", eventId: "E2" } },
+          h.deps,
+        );
+      }
+      return update(sessionId, expectVersion, patch);
+    };
+    // This render asked a question: the card must be known after the merge.
+    await h.render(
+      ev("tool_call_requested", {
+        tool_call_id: "tc-1",
+        name: "ask_user_question",
+        args_json: JSON.stringify({
+          questions: [{ question: "Which?", header: "q", options: [{ label: "a", description: "a" }], multiSelect: false }],
+        }),
+      }),
+    );
+    const row = h.store.rows.get(SESSION)!;
+    expect(row.target).toMatchObject({ ts: "200.0" });
+    expect(row.state["bubble"]).toBeNull();
+    expect(row.state["questionTs"]).toHaveProperty("tc-1");
+    expect(row.state["lastAssistantText"]).toBe("one");
+  });
+
   test("a re-point keeps the conversation and opens a fresh bubble under the new mention", async () => {
     const h = harness();
     await h.install();

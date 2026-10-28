@@ -204,9 +204,11 @@ export async function renderSessionEvent(
   if (row === null) return "no_relay";
   const pol = deps.policy(sessionId);
   const session: StartedSession = { id: sessionId, webUrl: deps.sessionWebUrl(sessionId) };
-  const st = stateOf(row);
+  const mention = mentionOf(row);
+  const before = stateOf(row);
+  let st = stateOf(row);
   try {
-    await dispatch(pol, mentionOf(row), st, event, session);
+    await dispatch(pol, mention, st, event, session);
   } catch (err) {
     log.error({ sessionId, kind: event.kind, err }, "session relay: failed to render a session event; dropping it");
   }
@@ -216,9 +218,37 @@ export async function renderSessionEvent(
     if (await deps.store.update(sessionId, row.version, { state: st })) return "rendered";
     row = await deps.store.get(sessionId);
     if (row === null) return "rendered";
+    // Another writer won (a re-point, a render of a sibling event): what
+    // this render changed goes on top of the row as it is now, never over
+    // it — a re-point's closed bubble stays closed, a sibling's question
+    // card stays known.
+    st = mergeRenderState(stateOf(row), before, st, mentionOf(row).ts === mention.ts);
   }
   log.warn({ sessionId }, "session relay: render state write lost every CAS race; the next event re-reads");
   return "rendered";
+}
+
+/** What one render changed (`before` → `after`), applied to the state
+ * `base` another writer saved meanwhile. Questions and assets are added
+ * (never removed) by a render, so the additions join. The bubble and the
+ * last text are this render's only while the row still points at the
+ * mention it rendered under; after a re-point the bubble is closed and
+ * stays so. */
+function mergeRenderState(
+  base: RelayRenderState,
+  before: RelayRenderState,
+  after: RelayRenderState,
+  sameMention: boolean,
+): RelayRenderState {
+  const addedAssets = after.assets.slice(before.assets.length);
+  return {
+    questionTs: { ...base.questionTs, ...after.questionTs },
+    questionProtocols: { ...base.questionProtocols, ...after.questionProtocols },
+    assets: [...base.assets, ...addedAssets],
+    bubble: sameMention ? after.bubble : base.bubble,
+    lastAssistantText:
+      after.lastAssistantText !== before.lastAssistantText ? after.lastAssistantText : base.lastAssistantText,
+  };
 }
 
 /** The session ended: post the closing message and remove the relay. */
