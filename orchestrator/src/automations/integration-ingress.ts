@@ -129,7 +129,21 @@ export async function handleIntegrationDelivery(
     throw error;
   }
 
-  if (!(await route.verify(request.headers, rawBody))) {
+  let verified: boolean;
+  try {
+    verified = await route.verify(request.headers, rawBody);
+  } catch (error) {
+    // The signing secret could not be read (not sealed yet, or the resolver
+    // is down). The delivery is unverifiable, which is a refusal, not a
+    // fault: a 5xx here would make the provider retry an endpoint that is
+    // not set up to receive it.
+    log.warn(
+      { provider: route.provider, error },
+      "integration delivery could not be verified; rejecting it",
+    );
+    return { kind: "rejected", response: jsonResponse(401, "signature not verifiable") };
+  }
+  if (!verified) {
     return { kind: "rejected", response: jsonResponse(401, "invalid signature") };
   }
 

@@ -140,6 +140,23 @@ describe("handleIntegrationDelivery", () => {
     expect(s.recorded).toHaveLength(0);
   });
 
+  test("a verifier that cannot read its secret rejects with 401, never 500", async () => {
+    const s = seams();
+    const result = await handleIntegrationDelivery(
+      {
+        ...passRoute,
+        verify: async () => {
+          throw new Error('org secret "x.webhook_secret" is not set');
+        },
+      },
+      request("{}"),
+      s.deps,
+    );
+    expect(result.kind).toBe("rejected");
+    expect(result.kind === "rejected" && result.response.status).toBe(401);
+    expect(s.recorded).toHaveLength(0);
+  });
+
   test("a signed but unparseable body skips tolerantly with the raw bytes", async () => {
     const s = seams();
     const result = await handleIntegrationDelivery(passRoute, request("not json"), s.deps);
