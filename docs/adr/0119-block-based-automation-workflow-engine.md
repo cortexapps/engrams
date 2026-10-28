@@ -681,3 +681,43 @@ now — `relay` reads `mention_ts` from the re-point step instead of the
 retired `handler_state`, and the recap hook names its session — and moves
 onto short runs in the follow-up that ADR 0120 named. The `relay_close`
 hook posts nothing when the run never reached a session (a filtered run).
+
+## Amendment (2026-10-27): an automation is an agent with ways in
+
+**What was wrong.** The product exposed the engine's primitives. The
+standing agent of contract 5 was a block (`run_agent`) at the end of
+every entrypoint, each with its own copy of the profile, the prompt and
+the relay; the workstream scope was a settings object of templates and
+per-entrypoint admit policies the author had to keep in step with those
+blocks. Three ways in meant three agent configs that drifted apart, and no
+view could show the one agent they all delivered to.
+
+**Decision.** (1) **The agent is a part of the definition.** `agent:
+{scope, profileId, promptTemplate, openingPromptTemplate?, relay?, ...}`
+holds, once, every field of the `run_agent` executor's config except
+`reuse`, which the scope decides. (2) **Every way in ends on the agent
+step.** `entrypointsOf` appends one step per way in by its **role**:
+`start` (the default) and `reach` end on the step `agent` of type
+`run_agent`; `close` ends on `agent_close` of type `instance_close`;
+`none` ends on nothing. The stored definition never carries these steps;
+the interpreter, the preview and the validator all read the appended
+view. The ids `agent` and `agent_close` are reserved in an agent
+automation, and `run_agent` is refused in any block list. (3) **The
+workstream settings derive.** `instanceSettingsOf` maps scope `event` to
+no workstream (a fresh session per event), scope `automation` to one
+workstream keyed `agent`, and scope `key` to one workstream per rendered
+key; a `reach` or `close` way in admits with `require`. An agent
+automation that also declares `settings.instance` is refused; a block
+automation keeps declaring it. (4) **A new session is announced.** The
+agent step calls `announceStarted` after it installs a relay on a session
+it started, so the link lands in the place before any output. (5)
+**Storage.** `automation_version` gains `agent` (jsonb) and `role`
+(text), both null for a block automation.
+
+**Consequences.** The composer's catalog lists no `run_agent` block and
+carries the agent schema and the roles instead. The Slack built-in
+becomes one agent (scope per thread, relay into the thread) and one way
+in; its `started` block goes, since the step announces. The editor draws
+the ways in converging on one agent node and reads the scope from the
+agent, not from settings. A block automation (the PR review graph) is
+unchanged.
