@@ -8,8 +8,6 @@ It is an open source alternative to Devin and Factory.ai that runs in your own c
 
 A session is a plain OCI image plus an agent harness. You build the image with `docker build`, enable it once, and engrams boots it on a host in your own cloud, streams the transcript and tool calls to the dashboard, Slack, or the CLI, and snapshots the VM away when it goes quiet. Claude Code and Codex ship as harnesses. The sandbox layer is the pattern behind hosted products like E2B, Modal Sandboxes, and Ramp's Inspect; engrams is the version you run yourself.
 
-Getting started: [engramsfactory.com/docs/getting-started/overview](https://engramsfactory.com/docs/getting-started/overview/).
-
 ![A session in the engrams dashboard. Asked for a PNG of a pelican riding a bicycle with no image libraries and no internet, the agent wrote a PNG encoder in Python and shared the file in the thread.](site/src/assets/screenshots/session-pelican.png)
 
 ## Why should I use engrams?
