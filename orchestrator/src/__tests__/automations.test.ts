@@ -1041,6 +1041,34 @@ describe("AutomationService v2", () => {
     ).rejects.toThrow(/entrypoint "gone"/);
   });
 
+  test("re-enabling schedules the next fire from a cron entrypoint, not only a cron main trigger", async () => {
+    const deps = adminDeps();
+    const { automations } = clients(deps);
+    const created = await automations.createAutomation({
+      name: "ScheduledWay",
+      description: "",
+      enabled: true,
+      definitionJson: JSON.stringify(
+        cronDefinition({
+          trigger: { kind: "manual" },
+          entrypoints: [
+            {
+              id: "sweep",
+              trigger: { kind: "cron", schedule: "*/5 * * * *", timezone: "UTC" },
+              blocks: [],
+            },
+          ],
+        }),
+      ),
+      inputsJson: "{}",
+    });
+    const id = created.automation!.id;
+    await automations.setAutomationEnabled({ id, enabled: false });
+    expect(deps.fake.automations.get(id)!.meta.nextFireAt).toBeNull();
+    await automations.setAutomationEnabled({ id, enabled: true });
+    expect(deps.fake.automations.get(id)!.meta.nextFireAt).toBeInstanceOf(Date);
+  });
+
   test("ListInputKeyOptions goes through the injected source", async () => {
     const { automations } = clients(
       adminDeps({
