@@ -351,10 +351,22 @@ site-search button[data-open-modal] {
   text-transform: uppercase;
   opacity: 0.75;
 }
-.doc-meta .edit {
+.doc-meta .doc-links {
+  display: flex;
+  gap: 16px;
   margin-left: auto;
+}
+.doc-meta .doc-links a,
+.doc-meta .doc-links button {
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--ring);
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
   text-decoration: none;
+  cursor: pointer;
 }
 .doc-eyebrow {
   display: flex;

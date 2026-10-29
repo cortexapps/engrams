@@ -1,6 +1,6 @@
 ---
 // The article masthead: breadcrumb, title, description, and a meta strip with
-// the read time and the edit link. The docs home gets the hero variant instead:
+// the read time, the page as Markdown, and the edit link. The docs home gets the hero variant instead:
 // an eyebrow, the title, and the description as a lede.
 // Starlight anchors the page title at #_top; the skip link and the TOC rely on it.
 import { VERSION_LABEL } from "../../version";
@@ -27,6 +27,7 @@ const crumbs = trail(sidebar) ?? [];
 const words = (entry.body ?? "").split(/\s+/).filter(Boolean).length;
 const minutes = Math.max(1, Math.round(words / 200));
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const markdown = `${base}/${entry.id}.md`;
 ---
 
 {
@@ -53,10 +54,32 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, "");
       {entry.data.description && <p class="doc-desc">{entry.data.description}</p>}
       <div class="doc-meta">
         <span>≈ {minutes} min</span>
-        {editUrl && (
-          <a href={editUrl.href} class="edit">edit on github ↗</a>
-        )}
+        <span class="doc-links">
+          <a href={markdown}>markdown</a>
+          <button type="button" data-copy-markdown={markdown}>copy markdown</button>
+          {editUrl && (
+            <a href={editUrl.href} class="edit">edit on github ↗</a>
+          )}
+        </span>
       </div>
     </div>
   )
 }
+
+<script>
+  // Copy the page's Markdown, for pasting into an agent or a chat.
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-copy-markdown]")) {
+    button.addEventListener("click", async () => {
+      const label = button.textContent;
+      try {
+        const res = await fetch(button.dataset.copyMarkdown!);
+        if (!res.ok) throw new Error(String(res.status));
+        await navigator.clipboard.writeText(await res.text());
+        button.textContent = "copied";
+      } catch {
+        button.textContent = "copy failed";
+      }
+      setTimeout(() => (button.textContent = label), 2000);
+    });
+  }
+</script>
