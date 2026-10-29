@@ -747,6 +747,44 @@ describe("compileSessionCreateInput", () => {
     }
   });
 
+  test("the connection region controls both harness protocols and broker egress", async () => {
+    for (const host of ["openrouter.ai", "us.openrouter.ai", "eu.openrouter.ai"]) {
+      for (const protocol of ["anthropic_messages", "openai_responses"]) {
+        const connections = fakeConnections();
+        const row = (await connections.getDefault("openrouter"))!;
+        connections.getDefault = async () => ({
+          ...row,
+          config: { settings: { api_host: host } },
+        });
+        const inp = await compileSessionCreateInput(
+          profile({ modelRouter: "openrouter", model: "z-ai/glm-5.2" }),
+          {
+            ...deps(),
+            connections,
+            harnessCatalog: {
+              listHarnesses: async () => ({
+                harnesses: [{
+                  name: "claude",
+                  descriptor: { models: [], effort: [], routerProtocols: [protocol] },
+                }],
+              }),
+            },
+            orgSecret: { listSecrets: async () => ({ secrets: [{ name: "openrouter.api_key" }] }) },
+            modelRouters: fakeModelRouters(),
+          },
+        );
+        const path = protocol === "anthropic_messages" ? "/api" : "/api/v1";
+        expect(inp.harnessEnv?.ENGRAM_MODEL_ROUTER_BASE_URL).toBe(`https://${host}${path}`);
+        const policy = JSON.parse(inp.integrationPolicyJson!);
+        expect(policy.network.allow_hosts).toContain(host);
+        expect(policy.secrets[0].allow_hosts).toEqual([host]);
+        if (host !== "openrouter.ai") {
+          expect(policy.network.allow_hosts).not.toContain("openrouter.ai");
+        }
+      }
+    }
+  });
+
   test("fails before create when a routed model key is missing", async () => {
     const providerDeps: SessionCompileDeps = {
       ...deps(),

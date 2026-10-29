@@ -17,6 +17,7 @@
  * policy.
  */
 
+import { resolveIntegrationHost } from "../integrations/run-op.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 import { and, eq, isNull } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
@@ -336,6 +337,11 @@ export async function compileSessionCreateInput(
   if (selectedRouterId && !router) {
     throw new ConnectError(`model router \`${selectedRouterId}\` is not registered`, Code.InvalidArgument);
   }
+  const routerHost = router ? await resolveIntegrationHost(router.catalog.provider, {
+    connectors: deps.connectors,
+    settingsFor: async (provider) =>
+      storedSettingsOf((await deps.connections.getDefault(provider))?.config),
+  }) : undefined;
   const routerProtocol = router ? selectRouterProtocol(router, descriptor.routerProtocols ?? []) : null;
   if (router && !routerProtocol) {
     throw new ConnectError(
@@ -605,7 +611,7 @@ export async function compileSessionCreateInput(
   if (router && routerProtocol && modelId) {
     harness.ENGRAM_MODEL_ROUTER_ID = router.id;
     harness.ENGRAM_MODEL_ROUTER_PROTOCOL = routerProtocol;
-    harness.ENGRAM_MODEL_ROUTER_BASE_URL = router.protocols[routerProtocol].baseUrl;
+    harness.ENGRAM_MODEL_ROUTER_BASE_URL = `https://${routerHost}${router.protocols[routerProtocol].basePath}`;
     harness.ENGRAM_MODEL_ROUTER_MODEL = modelId;
   }
   // ADR 0031 §7: git commit attribution — the initiating human authors the
@@ -666,7 +672,7 @@ export async function compileSessionCreateInput(
       ...(isHuman && deps.oauthSubject ? { userSubjectId: deps.oauthSubject.id } : {}),
     },
   );
-  const routeEgress = router ? router.egressHosts : (descriptor.nativeEgress?.allowHosts ?? []);
+  const routeEgress = routerHost ? [routerHost] : (descriptor.nativeEgress?.allowHosts ?? []);
   policy.network.allow_hosts = [...new Set([...policy.network.allow_hosts, ...routeEgress])];
   policy.network.allow_host_patterns = [
     ...new Set([
@@ -679,7 +685,7 @@ export async function compileSessionCreateInput(
       secret_ref: router.credentialSecret,
       env_var: "ENGRAM_MODEL_ROUTER_API_KEY",
       mode: "broker",
-      allow_hosts: [...router.egressHosts],
+      allow_hosts: routerHost ? [routerHost] : [],
       allow_host_patterns: [],
     };
     policy.secrets.push(secret);

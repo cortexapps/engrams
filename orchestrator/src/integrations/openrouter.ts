@@ -17,9 +17,9 @@ interface OpenRouterClients {
   decisions: DecisionsClient;
 }
 
-registerIntegrationClient("openrouter", (cred): OpenRouterClients => {
+registerIntegrationClient("openrouter", (cred, host): OpenRouterClients => {
   const apiKey = asBearer(cred);
-  return { sdk: createOpenRouter({ apiKey }), decisions: makeDecisionsClient({ apiKey }) };
+  return { sdk: createOpenRouter({ apiKey, baseURL: `https://${host}/api/v1` }), decisions: makeDecisionsClient({ apiKey, host }) };
 });
 
 /** A ready OpenRouter AI-SDK provider, authenticated with the org key. */

@@ -114,6 +114,21 @@ async function resolveConnector(provider: string, deps?: RunOpDeps): Promise<Con
   return c;
 }
 
+/** Resolve the host from the same connection settings used by egress policy. */
+async function connectorHost(c: Connector, deps?: RunOpDeps): Promise<string> {
+  // Only a connector that declares settings has stored values to read; the
+  // rest resolve their static hosts without a connection lookup.
+  const settingsFor = deps?.settingsFor ?? defaultSettingsFor;
+  const stored = (c.settings ?? []).length > 0 ? await settingsFor(c.provider) : {};
+  const host = effectiveHosts(c, resolveSettings(c, stored))[0];
+  if (!host) throw new Error(`connector "${c.provider}" has no host`);
+  return host;
+}
+
+export async function resolveIntegrationHost(provider: string, deps?: RunOpDeps): Promise<string> {
+  return connectorHost(await resolveConnector(provider, deps), deps);
+}
+
 /**
  * Mode A — issue one authenticated request against the connector's host. The
  * coordinator resolves the credential and makes the call; the secret stays sealed.
@@ -125,12 +140,7 @@ export async function runIntegrationOp(
 ): Promise<IntegrationOpResult> {
   const client = deps?.integrationOp ?? defaultIntegrationOp;
   const c = await resolveConnector(provider, deps);
-  // Only a connector that declares settings has stored values to read; the
-  // rest resolve their static hosts without a connection lookup.
-  const settingsFor = deps?.settingsFor ?? defaultSettingsFor;
-  const stored = (c.settings ?? []).length > 0 ? await settingsFor(provider) : {};
-  const host = effectiveHosts(c, resolveSettings(c, stored))[0];
-  if (!host) throw new Error(`connector "${provider}" has no host`);
+  const host = await connectorHost(c, deps);
   const body =
     typeof req.body === "string" ? new TextEncoder().encode(req.body) : (req.body ?? new Uint8Array());
   const resp = await client.runIntegrationOp({

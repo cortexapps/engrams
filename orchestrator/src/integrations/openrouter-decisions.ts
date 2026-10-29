@@ -11,8 +11,6 @@
 
 import { z } from "zod";
 
-export const DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions";
-
 /** A JSON value the API accepts as `state`, `instructions` or a criterion. */
 export type DecisionText = string | Record<string, unknown> | unknown[];
 
@@ -79,6 +77,7 @@ export interface DecisionsClient {
 
 export interface DecisionsClientOptions {
   apiKey: string;
+  host: string;
   /** Per-call abort. The model answers in well under a second; a call that
    *  hangs is a provider failure the caller's retry policy handles. */
   timeoutMs?: number;
@@ -96,7 +95,7 @@ export function makeDecisionsClient(options: DecisionsClientOptions): DecisionsC
       let res: Response;
       let text: string;
       try {
-        res = await doFetch(DECISIONS_URL, {
+        res = await doFetch(`https://${options.host}/api/alpha/decisions`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${options.apiKey}`,

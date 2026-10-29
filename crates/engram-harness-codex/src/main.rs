@@ -2533,16 +2533,20 @@ mod tests {
 
     #[test]
     fn routed_provider_config_uses_responses_and_command_auth() {
-        let config = router_config(
-            "deepseek/deepseek-v4-pro-0813",
-            "https://openrouter.ai/api/v1",
-            "/sbin/engram-harness-codex",
-        );
-        assert!(config.contains("model_provider = \"openrouter\""));
-        assert!(config.contains("wire_api = \"responses\""));
-        assert!(config.contains("command = \"/sbin/engram-harness-codex\""));
-        assert!(config.contains("args = [\"__model-router-token\"]"));
-        assert!(!config.contains("router-secret"));
+        for host in ["openrouter.ai", "us.openrouter.ai", "eu.openrouter.ai"] {
+            let base_url = format!("https://{host}/api/v1");
+            let config = router_config(
+                "deepseek/deepseek-v4-pro-0813",
+                &base_url,
+                "/sbin/engram-harness-codex",
+            );
+            assert!(config.contains("model_provider = \"openrouter\""));
+            assert!(config.contains("wire_api = \"responses\""));
+            assert!(config.contains("command = \"/sbin/engram-harness-codex\""));
+            assert!(config.contains("args = [\"__model-router-token\"]"));
+            assert!(!config.contains("router-secret"));
+            assert!(config.contains(&format!("base_url = \"{base_url}\"")));
+        }
     }
 
     #[test]

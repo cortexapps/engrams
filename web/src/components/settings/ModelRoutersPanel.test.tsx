@@ -20,6 +20,7 @@ vi.mock("@/hooks/useModelRouters", () => ({
           protocols: ["anthropic_messages", "openai_responses"],
           credentialSecret: "openrouter.api_key",
           credentialConfigured: true,
+          egressHosts: ["us.openrouter.ai"],
           availableModelCount: 270,
           enabledModelCount: 3,
           modelCount: 270,
@@ -72,6 +73,7 @@ describe("ModelRoutersPanel", () => {
   test("shows catalog metadata and enforces the two policy switches", async () => {
     render(<ModelRoutersPanel />);
 
+    expect(screen.getByText("us.openrouter.ai")).toBeTruthy();
     expect(screen.getByText("270 available")).toBeTruthy();
     expect(screen.getByText("DeepSeek V4 Pro 0813")).toBeTruthy();
     expect(screen.getByText("deepseek")).toBeTruthy();
