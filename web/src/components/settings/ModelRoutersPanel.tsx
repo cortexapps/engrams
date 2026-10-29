@@ -127,7 +127,7 @@ function RouterCard({ router }: { router: ModelRouter }) {
                 </span>
               ))}
               <span className="mx-1 text-muted-foreground">→</span>
-              <span className="font-mono">openrouter.ai</span>
+              <span className="font-mono">{router.egressHosts.join(", ")}</span>
             </div>
           </div>
 

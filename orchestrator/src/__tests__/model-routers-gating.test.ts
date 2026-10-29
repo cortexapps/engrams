@@ -31,11 +31,12 @@ function fakeStore(): ModelRouterStore {
   };
 }
 
-function client(role: "user" | "admin", secretNames: string[]) {
+function client(role: "user" | "admin", secretNames: string[], host?: string) {
   const transport = createRouterTransport((router) =>
     registerModelRouters(router, {
       getSession: async () => ({ user: { id: "u1", role } }),
       store: fakeStore(),
+      integration: { connectors: { list: async () => [] }, settingsFor: async (): Promise<Record<string, string>> => host ? { api_host: host } : {} },
       orgSecret: {
         listSecrets: async () => ({ secrets: secretNames.map((name) => ({ name })) }),
       },
@@ -65,6 +66,11 @@ describe("router connection gating", () => {
     expect(result.routers[0].credentialConfigured).toBe(true);
     // Secret NAME stays admin-only.
     expect(result.routers[0].credentialSecret).toBe("");
+  });
+
+  test("reports the configured regional egress host", async () => {
+    const result = await client("admin", ["openrouter.api_key"], "us.openrouter.ai").listModelRouters({});
+    expect(result.routers[0].egressHosts).toEqual(["us.openrouter.ai"]);
   });
 
   test("non-admin with no key: the catalog is not browsable", async () => {

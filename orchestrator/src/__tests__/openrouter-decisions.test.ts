@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  DECISIONS_URL,
   DecisionsApiError,
   makeDecisionsClient,
   type DecisionsRequest,
@@ -16,6 +15,7 @@ const REQUEST: DecisionsRequest = {
 function clientReturning(status: number, body: string, seen?: Request[]) {
   return makeDecisionsClient({
     apiKey: "k-test",
+    host: "openrouter.ai",
     fetch: async (url, init) => {
       seen?.push(new Request(url, init));
       return new Response(body, { status });
@@ -49,7 +49,7 @@ describe("decisions client", () => {
     const res = await client.decide(REQUEST);
     expect(res.answers["urgent"]).toEqual({ type: "noul", noul: 0.91 });
     expect(res.usage.cost).toBe(0.0000017);
-    expect(seen[0]!.url).toBe(DECISIONS_URL);
+    expect(seen[0]!.url).toBe("https://openrouter.ai/api/alpha/decisions");
     expect(seen[0]!.headers.get("authorization")).toBe("Bearer k-test");
     expect(await seen[0]!.json()).toEqual(REQUEST);
   });
@@ -87,6 +87,7 @@ describe("decisions client", () => {
   test("a body that fails after the headers arrived is retryable", async () => {
     const client = makeDecisionsClient({
       apiKey: "k",
+      host: "openrouter.ai",
       fetch: async () =>
         new Response(
           new ReadableStream({
@@ -104,6 +105,7 @@ describe("decisions client", () => {
   test("a network failure is retryable", async () => {
     const client = makeDecisionsClient({
       apiKey: "k",
+      host: "openrouter.ai",
       fetch: async () => {
         throw new TypeError("connection reset");
       },

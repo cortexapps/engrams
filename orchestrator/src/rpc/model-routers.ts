@@ -1,3 +1,4 @@
+import { resolveIntegrationHost, type RunOpDeps } from "../integrations/run-op.ts";
 import { Code, ConnectError, type ConnectRouter } from "@connectrpc/connect";
 
 import { getDb } from "../db/client.ts";
@@ -23,6 +24,7 @@ interface SecretMetadataClient {
 
 export interface ModelRouterServiceDeps {
   getSession?: GetSession;
+  integration?: RunOpDeps;
   store?: ModelRouterStore;
   orgSecret?: SecretMetadataClient;
   refresh?: (routerId: string, deps: RouterCatalogDeps) => ReturnType<typeof refreshRouterCatalog>;
@@ -46,6 +48,7 @@ function modelToProto(row: RouterModelRow) {
     available: row.available,
     enabled: row.enabled,
     userEnabled: row.userEnabled,
+    // Model pages use the public website, independent of the API region.
     upstreamUrl: `https://openrouter.ai/${row.modelId}`,
     updatedAt: row.updatedAt.toISOString(),
     supportsReasoning:
@@ -76,9 +79,10 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
       );
       const routers = await Promise.all(
         visible.map(async (definition) => {
-          const [models, state] = await Promise.all([
+          const [models, state, host] = await Promise.all([
             store.listModels(definition.id, "admin"),
             store.getSyncState(definition.id),
+            resolveIntegrationHost(definition.catalog.provider, deps?.integration),
           ]);
           return {
             id: definition.id,
@@ -86,7 +90,7 @@ export function registerModelRouters(router: ConnectRouter, deps?: ModelRouterSe
             description: definition.description,
             protocols: Object.keys(definition.protocols),
             credentialSecret: user.role === "admin" ? definition.credentialSecret : "",
-            egressHosts: [...definition.egressHosts],
+            egressHosts: [host],
             credentialConfigured: configured.has(definition.credentialSecret),
             lastSuccessfulSyncAt: state?.lastSuccessfulSyncAt?.toISOString(),
             lastSyncError: state?.lastError ?? undefined,

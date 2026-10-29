@@ -13,7 +13,21 @@
       { "header": "Authorization", "template": "Bearer {}", "secretRef": "openrouter.api_key" }
     ]
   },
-  "hosts": ["openrouter.ai"],
+  "hosts": [],
+  "settings": [
+    {
+      "name": "api_host",
+      "label": "API region",
+      "kind": "host",
+      "options": [
+        { "value": "openrouter.ai", "label": "Global" },
+        { "value": "us.openrouter.ai", "label": "United States" },
+        { "value": "eu.openrouter.ai", "label": "European Union" }
+      ],
+      "default": "openrouter.ai",
+      "hint": "Select a region that your OpenRouter workspace permits. Applies to new sessions and orchestrator requests."
+    }
+  ],
   "test": { "path": "/api/v1/models" },
   "operations": [
     {

@@ -6,8 +6,7 @@ export interface ModelRouterDefinition {
   label: string;
   description: string;
   credentialSecret: string;
-  protocols: Readonly<Record<RouterProtocol, { baseUrl: string }>>;
-  egressHosts: readonly string[];
+  protocols: Readonly<Record<RouterProtocol, { basePath: string }>>;
   defaultModel: string;
   catalog: {
     provider: string;
@@ -22,10 +21,9 @@ const OPENROUTER: ModelRouterDefinition = {
   description: "Shared access to tool-capable models through OpenRouter.",
   credentialSecret: "openrouter.api_key",
   protocols: {
-    anthropic_messages: { baseUrl: "https://openrouter.ai/api" },
-    openai_responses: { baseUrl: "https://openrouter.ai/api/v1" },
+    anthropic_messages: { basePath: "/api" },
+    openai_responses: { basePath: "/api/v1" },
   },
-  egressHosts: ["openrouter.ai"],
   defaultModel: "deepseek/deepseek-v4-pro-0813",
   catalog: {
     provider: "openrouter",

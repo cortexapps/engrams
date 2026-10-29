@@ -8684,26 +8684,29 @@ mod tests {
 
     #[test]
     fn routed_model_pins_every_claude_tier_and_blanks_native_auth() {
-        let env = model_router_env(
-            "deepseek/deepseek-v4-pro-0813",
-            "https://openrouter.ai/api",
-            "router-secret",
-        )
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        for host in ["openrouter.ai", "us.openrouter.ai", "eu.openrouter.ai"] {
+            let base_url = format!("https://{host}/api");
+            let env = model_router_env(
+                "deepseek/deepseek-v4-pro-0813",
+                base_url.as_str(),
+                "router-secret",
+            )
+            .into_iter()
+            .collect::<HashMap<_, _>>();
 
-        assert_eq!(env["ANTHROPIC_BASE_URL"], "https://openrouter.ai/api");
-        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "router-secret");
-        assert_eq!(env["ANTHROPIC_API_KEY"], "");
-        for name in [
-            "ANTHROPIC_MODEL",
-            "ANTHROPIC_DEFAULT_FABLE_MODEL",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL",
-            "ANTHROPIC_DEFAULT_SONNET_MODEL",
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            "CLAUDE_CODE_SUBAGENT_MODEL",
-        ] {
-            assert_eq!(env[name], "deepseek/deepseek-v4-pro-0813");
+            assert_eq!(env["ANTHROPIC_BASE_URL"], base_url.as_str());
+            assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "router-secret");
+            assert_eq!(env["ANTHROPIC_API_KEY"], "");
+            for name in [
+                "ANTHROPIC_MODEL",
+                "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "CLAUDE_CODE_SUBAGENT_MODEL",
+            ] {
+                assert_eq!(env[name], "deepseek/deepseek-v4-pro-0813");
+            }
         }
     }
 

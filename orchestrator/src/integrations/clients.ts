@@ -9,7 +9,7 @@
  * line (see ../integrations/slack.ts for the first one, in PR2).
  */
 
-import { resolveIntegrationCredential, type RunOpDeps } from "./run-op.ts";
+import { resolveIntegrationCredential, resolveIntegrationHost, type RunOpDeps } from "./run-op.ts";
 import type { ResolvedCredential } from "../gen/engram/app/v1/integration_op_pb.ts";
 
 export type { ResolvedCredential };
@@ -34,7 +34,7 @@ export function asHeaders(cred: ResolvedCredential): Record<string, string> {
 }
 
 /** Maps a resolved credential onto a provider's SDK client instance. */
-export type IntegrationClientAdapter<T = unknown> = (cred: ResolvedCredential) => T;
+export type IntegrationClientAdapter<T = unknown> = (cred: ResolvedCredential, host: string) => T;
 
 const adapters = new Map<string, IntegrationClientAdapter>();
 
@@ -45,6 +45,7 @@ export function registerIntegrationClient<T>(provider: string, adapter: Integrat
 
 interface CachedClient {
   client: unknown;
+  host: string;
   /** epoch ms after which the cached client must be re-resolved. */
   expiresAt: number;
 }
@@ -62,18 +63,20 @@ const EXPIRY_SKEW_MS = 30_000;
  */
 export async function getIntegrationClient<T>(provider: string, deps?: RunOpDeps): Promise<T> {
   const now = Date.now();
-  const hit = cache.get(provider);
-  if (hit && hit.expiresAt > now) return hit.client as T;
-
   const adapter = adapters.get(provider);
   if (!adapter) throw new Error(`no integration client registered for "${provider}"`);
 
+  // Read the host before a cache hit so a region change applies on every replica.
+  const host = await resolveIntegrationHost(provider, deps);
+  const hit = cache.get(provider);
+  if (hit && hit.host === host && hit.expiresAt > now) return hit.client as T;
+
   const cred = await resolveIntegrationCredential(provider, deps);
-  const client = adapter(cred);
+  const client = adapter(cred, host);
   const expiresAt = cred.expiresAt
     ? Date.parse(cred.expiresAt) - EXPIRY_SKEW_MS
     : now + STATIC_TTL_MS;
-  cache.set(provider, { client, expiresAt });
+  cache.set(provider, { client, host, expiresAt });
   return client as T;
 }
 
