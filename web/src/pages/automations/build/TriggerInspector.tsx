@@ -33,7 +33,11 @@ const KINDS: ReadonlyArray<{ kind: TriggerSpec["kind"]; label: string; help: str
     label: "Integration event",
     help: "An event from a connected integration (GitHub, Slack, Linear).",
   },
-  { kind: "cron", label: "Schedule", help: "A cron schedule in an IANA timezone." },
+  {
+    kind: "cron",
+    label: "Schedule",
+    help: "A cron schedule in an IANA timezone. Run now also starts one run on demand.",
+  },
   {
     kind: "webhook",
     label: "Custom webhook",

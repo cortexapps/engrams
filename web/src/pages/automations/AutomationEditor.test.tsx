@@ -501,6 +501,20 @@ describe("AutomationEditor", () => {
     expect((screen.getByTestId("run-now-button") as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it("a scheduled automation also has Run now, for a run on demand", async () => {
+    const scheduled = automation("user");
+    scheduled.version.definitionJson = JSON.stringify({
+      ...definition,
+      trigger: { kind: "cron", schedule: "0 9 * * 1-5", timezone: "America/Los_Angeles" },
+    });
+    automationHolder.value = { automation: scheduled };
+    render(<AutomationEditor mode="edit" />);
+    const button = screen.getByTestId("run-now-button");
+    expect(button.getAttribute("title")).toMatch(/same as a scheduled run/);
+    fireEvent.click(button);
+    await waitFor(() => expect(runNow.mutateAsync).toHaveBeenCalledWith({ automationId: "a1" }));
+  });
+
   it("Try it renders the draft, unsaved edits and all, and opens the test drawer", async () => {
     automationHolder.value = { automation: automation("user") };
     render(<AutomationEditor mode="edit" />);

@@ -589,22 +589,31 @@ export function AutomationEditor({
               Drafting agent
             </Button>
           )}
-          {mode === "edit" && automation && draft.trigger.kind === "manual" && (
-            // The manual trigger's one way in. It runs the SAVED definition,
-            // so it waits for a clean editor, as Dry run does.
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={runNowClick}
-              disabled={runNow.isPending || dirty}
-              data-testid="run-now-button"
-              title={dirty ? "Save first: Run now starts the saved definition" : "Start a run"}
-            >
-              <Play aria-hidden />
-              {runNow.isPending ? "Starting…" : "Run now"}
-            </Button>
-          )}
+          {mode === "edit" &&
+            automation &&
+            (draft.trigger.kind === "manual" || draft.trigger.kind === "cron") && (
+              // The manual trigger's one way in, and an on-demand run of a
+              // schedule (the same path the schedule takes). It runs the SAVED
+              // definition, so it waits for a clean editor, as Dry run does.
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={runNowClick}
+                disabled={runNow.isPending || dirty}
+                data-testid="run-now-button"
+                title={
+                  dirty
+                    ? "Save first: Run now starts the saved definition"
+                    : draft.trigger.kind === "cron"
+                      ? "Start one run now, the same as a scheduled run"
+                      : "Start a run"
+                }
+              >
+                <Play aria-hidden />
+                {runNow.isPending ? "Starting…" : "Run now"}
+              </Button>
+            )}
           <Button
             type="button"
             variant="outline"
