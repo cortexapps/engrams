@@ -69,7 +69,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { Accept: "application/json", ...init?.headers },
     ...init,
   });
-  if (!response.ok) throw new Error(`${path} → ${response.status}`);
+  if (!response.ok) {
+    // The server's message says what went wrong in words (e.g. a token the
+    // provider did not confirm); the status line is the fallback.
+    const message = (await response.text().catch(() => "")).trim();
+    throw new Error(message && message.length <= 300 ? message : `${path} → ${response.status}`);
+  }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }

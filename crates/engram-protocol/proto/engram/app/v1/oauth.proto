@@ -143,6 +143,10 @@ message PutCredentialRequest {
   string provider = 2;
   // The raw token value. Sealed at rest; never logged or echoed back.
   string secret = 3;
+  // Optional "who am I" request, sent with the token before it is sealed.
+  // It fills the display and workspace names; the account id stays empty.
+  // A failing probe rejects the token.
+  RedirectMetadataProbe identity = 4;
 }
 
 message PutCredentialResponse { OAuthCredentialMeta credential = 1; }

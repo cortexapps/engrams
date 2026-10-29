@@ -102,13 +102,17 @@ fn metadata_from_proto(metadata: Option<app::RedirectMetadataSpec>) -> RedirectM
     let metadata = metadata.unwrap_or_default();
     RedirectMetadataSpec {
         from_token_response: metadata.from_token_response.into_iter().collect(),
-        probe: metadata.probe.map(|probe| RedirectMetadataProbe {
-            method: probe.method,
-            host: probe.host,
-            path: probe.path,
-            body: probe.body,
-            map: probe.map.into_iter().collect(),
-        }),
+        probe: metadata.probe.map(probe_from_proto),
+    }
+}
+
+fn probe_from_proto(probe: app::RedirectMetadataProbe) -> RedirectMetadataProbe {
+    RedirectMetadataProbe {
+        method: probe.method,
+        host: probe.host,
+        path: probe.path,
+        body: probe.body,
+        map: probe.map.into_iter().collect(),
     }
 }
 
@@ -446,6 +450,7 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             .put_static_credential(
                 &key(req.subject, req.provider).map_err(Status::invalid_argument)?,
                 &req.secret,
+                req.identity.map(probe_from_proto).as_ref(),
             )
             .await
             .map_err(oauth_status)?;

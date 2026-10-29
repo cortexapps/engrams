@@ -31,7 +31,9 @@ import { HTTPException } from "hono/http-exception";
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
 import { oauthCredential as defaultOAuthCredential } from "../control-plane/client.ts";
-import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
+import { OauthSubjectKind, type RedirectMetadataProbe } from "../gen/engram/app/v1/oauth_pb.ts";
+import { userTokenIdentityProbe } from "../connectors/oauth-spec.ts";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { loadRegistry, type CustomConnectorSource } from "../connectors/registry.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
@@ -125,7 +127,18 @@ export interface OAuthCredentialClient {
     subject: { kind: OauthSubjectKind; id: string };
     provider: string;
     secret: string;
+    identity?: RedirectMetadataProbe;
   }): Promise<unknown>;
+}
+
+/** A connector that accepts a personal credential, as the routes see it. */
+interface UserConnectorEntry {
+  name: string;
+  oauth: boolean;
+  token: boolean;
+  tokenHint?: string;
+  /** Names the account behind a pasted token, when the connector declares it. */
+  identity?: RedirectMetadataProbe;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,14 +219,9 @@ export function makeMeRoute(deps?: MeDeps): Hono {
 
   /** Connectors declaring user-scoped support → member-safe surface data.
    *  The map's keys are the only providers the PAT PUT/DELETE routes accept. */
-  async function connectorUnion(): Promise<
-    Map<string, { name: string; oauth: boolean; token: boolean; tokenHint?: string }>
-  > {
+  async function connectorUnion(): Promise<Map<string, UserConnectorEntry>> {
     const registry = await loadRegistry(resolveConnectors());
-    const union = new Map<
-      string,
-      { name: string; oauth: boolean; token: boolean; tokenHint?: string }
-    >();
+    const union = new Map<string, UserConnectorEntry>();
     for (const connector of registry.values()) {
       const uc = connector.userCredential;
       if (!uc) continue;
@@ -222,6 +230,7 @@ export function makeMeRoute(deps?: MeDeps): Hono {
         oauth: uc.oauth !== undefined,
         token: uc.token !== undefined,
         ...(uc.token ? { tokenHint: uc.token.hint } : {}),
+        identity: userTokenIdentityProbe(connector),
       });
     }
     return union;
@@ -369,11 +378,27 @@ export function makeMeRoute(deps?: MeDeps): Hono {
       throw new HTTPException(400, { message: "value must not be empty" });
     }
     // NEVER log the value. Sealed in the coordinator's credential store.
-    await resolveOAuth().putCredential({
-      subject: connectorSubject(user.id),
-      provider,
-      secret: value,
-    });
+    try {
+      await resolveOAuth().putCredential({
+        subject: connectorSubject(user.id),
+        provider,
+        secret: value,
+        ...(entry.identity ? { identity: entry.identity } : {}),
+      });
+    } catch (error) {
+      // The connector asks the provider who owns the token before the seal;
+      // a refusal or an unreachable provider leaves the token unconfirmed.
+      if (
+        error instanceof ConnectError &&
+        error.code === Code.Unavailable &&
+        error.metadata.get("engram-error-slug") === "probe_failed"
+      ) {
+        throw new HTTPException(400, {
+          message: `Could not confirm this token with ${entry.name}. Check the token and try again.`,
+        });
+      }
+      throw error;
+    }
     return new Response(null, { status: 204 });
   });
 

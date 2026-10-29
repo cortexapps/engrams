@@ -23,6 +23,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{oneshot, Semaphore};
 
+use crate::oauth_redirect::{
+    extract_mapped, RedirectMetadataProbe, RedirectMetadataSpec, META_DISPLAY_NAME,
+    META_WORKSPACE_ID, META_WORKSPACE_NAME,
+};
+
 pub const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 pub const MAX_OAUTH_BUNDLE_BYTES: usize = 256 * 1024;
 const FLOW_TTL: chrono::Duration = chrono::Duration::minutes(15);
@@ -436,11 +441,18 @@ impl OAuthManager {
     /// OAuth over PAT are both intended), so no account-identity check runs;
     /// the read-version CAS still fences concurrent writers.
     ///
+    /// `identity` is the connector's optional "who am I" probe. It runs with
+    /// the token before the seal: its answer names the account (GitHub: the
+    /// login), and a token the provider rejects is not saved. The account id
+    /// stays empty even when the probe maps one, so a later OAuth connect to
+    /// a different account still replaces the token.
+    ///
     /// [`ConnectorOAuthKind::StaticToken`]: engram_core::types::connector_oauth::ConnectorOAuthKind::StaticToken
     pub async fn put_static_credential(
         &self,
         key: &OAuthCredentialKey,
         secret: &str,
+        identity: Option<&RedirectMetadataProbe>,
     ) -> Result<SealedOAuthCredential, OAuthServiceError> {
         validate_key(key)?;
         if key.subject_kind != OAuthSubjectKind::UserConnector {
@@ -454,6 +466,24 @@ impl OAuthManager {
                 "credential value must not be empty".into(),
             ));
         }
+        let mut fields = BTreeMap::new();
+        if let Some(probe) = identity {
+            RedirectMetadataSpec {
+                from_token_response: BTreeMap::new(),
+                probe: Some(probe.clone()),
+            }
+            .validate()
+            .map_err(OAuthServiceError::BadRequest)?;
+            let json = self.run_probe(probe, secret).await?;
+            extract_mapped(&probe.map, &json, &mut fields);
+        }
+        let metadata = OAuthAccountMetadata {
+            account_id: String::new(),
+            display_name: fields.get(META_DISPLAY_NAME).cloned(),
+            plan_type: None,
+            workspace_id: fields.get(META_WORKSPACE_ID).cloned(),
+            workspace_name: fields.get(META_WORKSPACE_NAME).cloned(),
+        };
         use engram_core::types::connector_oauth::{
             ConnectorOAuthBundle, ConnectorOAuthKind, CONNECTOR_OAUTH_BUNDLE_VERSION,
         };
@@ -476,9 +506,8 @@ impl OAuthManager {
             key,
             ValidatedOAuthBundle {
                 payload,
-                // No provider-verified identity exists for a pasted token;
-                // an empty account id opts out of account-switch detection.
-                metadata: OAuthAccountMetadata::default(),
+                // An empty account id opts out of account-switch detection.
+                metadata,
                 expires_at: None,
             },
             current.map(|row| row.version),

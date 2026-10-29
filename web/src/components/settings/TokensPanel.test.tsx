@@ -204,6 +204,40 @@ describe("Credentials connector cards", () => {
     }
   });
 
+  test("shows the server's reason when a pasted token is refused", async () => {
+    const originalFetch = global.fetch;
+    global.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith("/me/credentials") && !init?.method) {
+        return Response.json({ credentials: [connectorEntry()] });
+      }
+      if (path.endsWith("/me/harness-env")) return Response.json({ vars: [] });
+      if (path.endsWith("/me/connector-credentials/acme") && init?.method === "PUT") {
+        return new Response(
+          "Could not confirm this token with Acme. Check the token and try again.",
+          {
+            status: 400,
+          },
+        );
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    }) as typeof fetch;
+    try {
+      renderWithProviders(<TokensPanel />);
+      const user = userEvent.setup();
+      await user.click(await screen.findByRole("button", { name: "Add token" }));
+      await user.type(screen.getByPlaceholderText("paste token…"), "pat-bad");
+      await user.click(screen.getByRole("button", { name: "Save" }));
+      expect(
+        await screen.findByText(
+          "Could not confirm this token with Acme. Check the token and try again.",
+        ),
+      ).toBeTruthy();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   test("disconnects a connected personal credential and surfaces a broken one", async () => {
     const originalFetch = global.fetch;
     let deleted = false;
