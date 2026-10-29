@@ -176,3 +176,18 @@ export function connectorOAuthAuthorizeUrl(provider: string, force = false): str
   const qs = force ? "?force=1" : "";
   return `${API_BASE}/me/connector-credentials/${encodeURIComponent(provider)}/oauth/authorize${qs}`;
 }
+
+/** The account behind the caller's personal credential for a connector, as
+ * the provider named it when the credential was saved (GitHub: the login). */
+export function useConnectorAccount(provider: string): {
+  isPending: boolean;
+  connected: boolean;
+  name: string | undefined;
+} {
+  const { data, isPending } = useCredentials();
+  const entry = data?.find(
+    (c): c is ConnectorCredentialEntry => c.kind === "connector" && c.provider === provider,
+  );
+  const connected = entry?.connected ?? false;
+  return { isPending, connected, name: connected ? entry?.account?.displayName : undefined };
+}
