@@ -14,8 +14,11 @@ interface Props {
   /** The landing page runs its own cover hero under the header and its own
    * Start band above the footer, so it asks the layout to leave both edges open. */
   landing?: boolean;
+  /** schema.org JSON-LD for the page, so search engines and assistants read
+   * what the product is and who makes it from the page itself. */
+  structuredData?: Record<string, unknown>;
 }
-const { title, description, landing = false } = Astro.props;
+const { title, description, landing = false, structuredData } = Astro.props;
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 const canonical = new URL(Astro.url.pathname, Astro.site);
 // In the header on wide screens, and in the menu on narrow ones.
@@ -53,9 +56,10 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
     <meta property="og:image" content={ogImage} />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="engrams: the open source alternative to Devin." />
+    <meta property="og:image:alt" content="engrams: the open source, self-hosted software factory." />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="theme-color" content="#081A1B" />
+    {structuredData && <script type="application/ld+json" set:html={JSON.stringify(structuredData)} />}
   </head>
   <body>
     <GoogleTagManager part="body" />
@@ -120,7 +124,7 @@ const ogImage = new URL(`${base}/og.png`, Astro.site);
           <a class="btn ghost" href="https://www.cortex.io">Visit cortex.io <span>→</span></a>
         </div>
         <div class="row">
-          <span>engrams · open source</span>
+          <span>engrams · the open source, self-hosted software factory</span>
           <nav aria-label="Footer">
             <a href={`${base}/architecture/`}>Architecture</a>
             <a href={`${base}/compare/`}>Compare</a>

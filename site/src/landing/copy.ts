@@ -4,7 +4,7 @@
 // Each section connects an outcome to the product behavior that makes it possible.
 
 export const hero = {
-  eyebrow: "Stand up a software factory of your own",
+  eyebrow: "The open source, self-hosted software factory",
   title: "The open source alternative to",
   titleAccent: "Devin.",
   lede: "engrams runs Claude Code, Codex, or your own agent in an isolated microVM on your infrastructure. Start one from a prompt, a schedule, a pull request, or a Slack thread. Walk away mid-task, and pick it up days later with its files and history intact.",

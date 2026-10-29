@@ -33,7 +33,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "engrams",
-      description: "Self-hosted sandboxes for AI coding agents, on Firecracker microVMs.",
+      description: "engrams is the open source, self-hosted software factory. It runs coding agents in Firecracker microVMs in your own cloud.",
       logo: { src: "./src/assets/engram-trace.svg", alt: "" },
       favicon: "/favicon.ico",
       head: [

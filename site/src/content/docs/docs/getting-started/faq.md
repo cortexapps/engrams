@@ -66,6 +66,8 @@ migrating a session. A cold start from an image's base snapshot is under a secon
 pre-warmed pool. These are the numbers from the reference deployment; measure your own fleet
 before you promise them to anyone.
 
-## What is the license?
+## Is it open source?
 
-engrams is free software under the GNU Affero General Public License v3.0.
+Yes. The whole system is open source on [GitHub](https://github.com/cortexapps/engrams): the
+control plane, the host agent, the dashboard, the CLI, and the Firecracker fork. You can read,
+change, and run every line.

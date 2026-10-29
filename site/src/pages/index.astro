@@ -4,6 +4,7 @@ import TraceMark from "../components/TraceMark.astro";
 import pelican from "../assets/screenshots/session-pelican.png";
 import { hero, modules, slack, automations, how, session, extensible, community, start } from "../landing/copy";
 import { nodes, edges, frame } from "../landing/demo";
+import { VERSION } from "../version";
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, "");
 const docs = `${base}/docs/`;
@@ -21,11 +22,54 @@ const beltItems = [...logos, ...logos];
 // The first frame, so the page is complete before the script runs.
 const first = frame(0, 0);
 const code = (s: string) => s.replace(/`([^`]+)`/g, "<code>$1</code>");
+
+const title = "engrams: the open source, self-hosted software factory";
+const description =
+  "engrams is the open source, self-hosted software factory: an alternative to Devin and Factory.ai that runs in your cloud. It runs Claude Code, Codex, or your own agent in an isolated microVM. Start one from a prompt, a schedule, a pull request, or a Slack thread, then inspect its changes.";
+const home = new URL(`${base}/`, Astro.site).href;
+const repo = "https://github.com/cortexapps/engrams";
+const structuredData = {
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      "@id": "https://www.cortex.io/#organization",
+      name: "Cortex",
+      url: "https://www.cortex.io",
+      sameAs: ["https://github.com/cortexapps"],
+    },
+    {
+      "@type": "SoftwareApplication",
+      "@id": `${home}#software`,
+      name: "engrams",
+      alternateName: "engrams software factory",
+      description,
+      url: home,
+      applicationCategory: "DeveloperApplication",
+      operatingSystem: "Linux",
+      softwareVersion: VERSION,
+      isAccessibleForFree: true,
+      offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+      downloadUrl: `${repo}/releases/latest`,
+      sameAs: [repo],
+      publisher: { "@id": "https://www.cortex.io/#organization" },
+    },
+    {
+      "@type": "SoftwareSourceCode",
+      name: "engrams",
+      codeRepository: repo,
+      programmingLanguage: ["Rust", "TypeScript"],
+      targetProduct: { "@id": `${home}#software` },
+      author: { "@id": "https://www.cortex.io/#organization" },
+    },
+  ],
+};
 ---
 
 <Marketing
-  title="engrams AI software factory: the open source alternative to Devin and Factory.ai"
-  description="engrams is a self-hosted, open source software factory. It runs Claude Code, Codex, or your own agent in an isolated microVM in your cloud. Start one from a prompt, a schedule, a pull request, or a Slack thread, then inspect its changes."
+  {title}
+  {description}
+  {structuredData}
   landing
 >
   <!-- COVER -->
