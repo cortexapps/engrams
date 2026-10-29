@@ -145,7 +145,7 @@ export function TaskComposer({
     isPending: profilesPending,
     error: profilesError,
     refetch: refetchProfiles,
-  } = useProfiles(false);
+  } = useProfiles(false, true);
   const { data: catalog } = useIntegrationCatalog();
   const { data: images } = useEnabledImages(true);
   const { data: harnesses } = useHarnessCatalog(true);
@@ -153,7 +153,9 @@ export function TaskComposer({
   const { data: harnessEnvVars } = useHarnessEnv(true);
   const { data: credentials } = useCredentials(true);
 
-  const profiles = profilesData?.profiles ?? [];
+  const profiles = (profilesData?.profiles ?? []).filter(
+    (profile) => isAdmin || !profile.programmaticOnly,
+  );
   const views = useMemo(() => catalogToViews(catalog?.providers ?? []), [catalog]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState(initialPrompt ?? "");
@@ -165,7 +167,7 @@ export function TaskComposer({
   }, [selectedId]);
 
   useEffect(() => {
-    if (selectedId || profiles.length === 0) return;
+    if (profiles.some((profile) => profile.id === selectedId) || profiles.length === 0) return;
     const stored = readLastProfileId();
     const pick =
       (stored && profiles.some((profile) => profile.id === stored) && stored) ||
@@ -594,6 +596,9 @@ function ProfileSwitcher({
                       <span className="truncate text-xs text-muted-foreground">
                         {profile.description}
                       </span>
+                      {profile.programmaticOnly && (
+                        <span className="text-xs text-muted-foreground">Programmatic only</span>
+                      )}
                     </span>
                     {isChosen && <Check aria-hidden className="mt-0.5 size-4 shrink-0" />}
                   </CommandItem>

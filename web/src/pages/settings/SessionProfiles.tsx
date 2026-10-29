@@ -54,6 +54,7 @@ interface ProfileLike {
   icon: string;
   imageId: string;
   archived: boolean;
+  programmaticOnly: boolean;
   integrationGrants: Array<{
     connectionId: string;
     operation: string;
@@ -67,10 +68,11 @@ interface ProfileLike {
 function Meta({ icon, text, caution }: { icon: React.ReactNode; text: string; caution?: boolean }) {
   return (
     <span
-      className={`inline-flex items-center gap-1 text-xs ${caution ? "text-instrument-caution" : "text-muted-foreground"}`}
+      title={text}
+      className={`inline-flex min-w-0 max-w-full items-center gap-1 [&>svg]:shrink-0 text-xs ${caution ? "text-instrument-caution" : "text-muted-foreground"}`}
     >
       {icon}
-      {text}
+      <span className="truncate">{text}</span>
     </span>
   );
 }
@@ -115,10 +117,19 @@ function Row({
       </span>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <span className="text-base font-semibold">{p.name}</span>
+          <span className="truncate text-base font-semibold" title={p.name}>
+            {p.name}
+          </span>
+          {p.programmaticOnly && (
+            <Badge variant="secondary" className="shrink-0">
+              Programmatic only
+            </Badge>
+          )}
           {p.archived && <Badge variant="secondary">archived</Badge>}
         </div>
-        <div className="truncate text-sm text-muted-foreground">{p.description}</div>
+        <div className="truncate text-sm text-muted-foreground" title={p.description}>
+          {p.description}
+        </div>
         <div className="mt-2 flex flex-wrap items-center gap-3.5">
           {policy.providers.length > 0 ? (
             <span className="inline-flex items-center gap-1">
@@ -165,12 +176,12 @@ function Row({
       data-testid={`profile-${p.id}`}
     >
       {p.archived ? (
-        <div className="flex flex-1 items-center gap-4">{inner}</div>
+        <div className="flex min-w-0 flex-1 items-center gap-4">{inner}</div>
       ) : (
         <Link
           to="/settings/profiles/$id"
           params={{ id: p.id }}
-          className="flex flex-1 items-center gap-4"
+          className="flex min-w-0 flex-1 items-center gap-4"
         >
           {inner}
         </Link>
@@ -178,7 +189,7 @@ function Row({
       {p.archived ? (
         <span className="text-xs text-muted-foreground">archived</span>
       ) : (
-        <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1">
           <Button asChild variant="ghost" size="sm">
             <Link to="/settings/profiles/$id" params={{ id: p.id }}>
               <PencilIcon className="size-4" />

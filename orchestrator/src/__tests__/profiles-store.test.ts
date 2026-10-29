@@ -52,6 +52,7 @@ describe("ProfileStore", () => {
     try {
       expect(created.id).toBeDefined();
       expect(created.deletedAt).toBeNull();
+      expect(created.programmaticOnly).toBe(false);
       expect(created.integrationGrants).toEqual(input.integrationGrants);
       // ADR 0118: apps round-trip through the store.
       expect(created.apps).toEqual([
@@ -69,7 +70,12 @@ describe("ProfileStore", () => {
       const listed = await store.list({ includeArchived: false });
       expect(listed.some((p) => p.id === created.id)).toBe(true);
 
-      const updated = await store.update(created.id, { ...input, includeUserTokens: true });
+      const updated = await store.update(created.id, { ...input, includeUserTokens: true, programmaticOnly: true });
+      expect(updated?.programmaticOnly).toBe(true);
+      expect((await store.getActive(created.id))?.programmaticOnly).toBe(true);
+      expect((await store.list({ includeArchived: false })).find((p) => p.id === created.id)?.programmaticOnly).toBe(true);
+      expect((await store.update(created.id, input))?.programmaticOnly).toBe(true);
+      expect((await store.update(created.id, { ...input, programmaticOnly: false }))?.programmaticOnly).toBe(false);
       expect(updated?.includeUserTokens).toBe(true);
 
       await store.softDelete(created.id);

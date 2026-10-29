@@ -1206,6 +1206,7 @@ export const profile = pgTable(
     modelRouter: text("model_router"),
     model: text("model"),
     effort: text("effort"),
+    programmaticOnly: boolean("programmatic_only").notNull().default(false),
     includeUserTokens: boolean("include_user_tokens").notNull().default(false),
     envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
     // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.

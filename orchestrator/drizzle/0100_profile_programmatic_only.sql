@@ -1,0 +1,1 @@
+ALTER TABLE "profile" ADD COLUMN "programmatic_only" boolean DEFAULT false NOT NULL;

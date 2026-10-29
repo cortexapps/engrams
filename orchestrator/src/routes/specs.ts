@@ -225,6 +225,7 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
       result = await deps.create({
         orgId: deps.orgId,
         ownerUserId: actor.id,
+        ...(actor.role === "admin" ? { ownerIsAdmin: true } : {}),
         ...(ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
         ...createSpecInput(body),
       });

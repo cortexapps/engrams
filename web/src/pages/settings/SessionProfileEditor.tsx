@@ -80,7 +80,14 @@ import { SkeletonRows } from "@/components/skeleton-rows";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
+import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldError,
+  FieldGroup,
+  FieldLabel,
+} from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
@@ -129,6 +136,7 @@ const schema = z.object({
   modelRouter: z.string().nullable(),
   model: z.string().nullable(),
   effort: z.string().nullable(),
+  programmaticOnly: z.boolean(),
   includeUserTokens: z.boolean(),
   skills: z.array(z.string()),
   integrationGrants: z.array(
@@ -210,6 +218,7 @@ const EMPTY: ProfileFormValues = {
   modelRouter: null,
   model: null,
   effort: null,
+  programmaticOnly: false,
   includeUserTokens: false,
   skills: [],
   integrationGrants: [],
@@ -292,6 +301,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       modelRouter: optionId(p.modelRouter),
       model: optionId(p.model),
       effort: optionId(p.effort),
+      programmaticOnly: p.programmaticOnly,
       includeUserTokens: p.includeUserTokens,
       skills: p.skills ?? [],
       integrationGrants: (p.integrationGrants ?? []).map((grant) => ({
@@ -462,6 +472,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       modelRouter: optionId(vals.modelRouter) ?? undefined,
       model: optionId(vals.model) ?? undefined,
       effort: optionId(vals.effort) ?? undefined,
+      programmaticOnly: vals.programmaticOnly,
       includeUserTokens: vals.includeUserTokens,
       skills: vals.skills,
       integrationGrants: vals.integrationGrants,
@@ -574,6 +585,26 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             title="Launches"
             sub="The image every session from this profile boots."
           >
+            <Controller
+              control={control}
+              name="programmaticOnly"
+              render={({ field }) => (
+                <Field orientation="horizontal">
+                  <FieldContent>
+                    <FieldLabel htmlFor="programmatic-only">Programmatic only</FieldLabel>
+                    <FieldDescription>
+                      Hidden from non-admin session pickers. Automations and API keys can use this
+                      profile. Admins can also start sessions with their own credentials.
+                    </FieldDescription>
+                  </FieldContent>
+                  <Switch
+                    id="programmatic-only"
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
+                </Field>
+              )}
+            />
             <Controller
               control={control}
               name="imageId"

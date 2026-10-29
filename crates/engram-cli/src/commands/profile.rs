@@ -50,6 +50,7 @@ struct ProfileJson {
     apps: Vec<AppJson>,
     env_vars: BTreeMap<String, String>,
     archived: bool,
+    programmatic_only: bool,
     created_at: String,
     updated_at: String,
 }
@@ -80,6 +81,7 @@ fn profile_json(p: Profile) -> ProfileJson {
             .collect(),
         env_vars: p.env_vars,
         archived: p.archived,
+        programmatic_only: p.programmatic_only,
         created_at: p.created_at,
         updated_at: p.updated_at,
     }

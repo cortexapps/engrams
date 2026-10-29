@@ -32,6 +32,7 @@ export interface ProfileRow {
   modelRouter?: string | null;
   model: string | null;
   effort: string | null;
+  programmaticOnly: boolean;
   includeUserTokens: boolean;
   envVars: Record<string, string>;
   // ADR 0055: dynamic skill bundle names this profile's sessions mount.
@@ -59,6 +60,8 @@ export interface ProfileInput {
   modelRouter?: string | null;
   model: string | null;
   effort: string | null;
+  /** Defaults to false on create; omission preserves the setting on update. */
+  programmaticOnly?: boolean;
   includeUserTokens: boolean;
   envVars: Record<string, string>;
   skills: string[];
@@ -97,6 +100,7 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     modelRouter: r.modelRouter ?? null,
     model: r.model ?? null,
     effort: r.effort ?? null,
+    programmaticOnly: r.programmaticOnly,
     includeUserTokens: r.includeUserTokens,
     envVars: (r.envVars ?? {}) as Record<string, string>,
     skills: (r.skills ?? []) as string[],

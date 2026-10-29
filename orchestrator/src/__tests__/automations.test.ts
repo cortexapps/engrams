@@ -52,6 +52,7 @@ const profile = (apps: ProfileApp[] = []): ProfileRow => ({
   harness: "claude",
   model: null,
   effort: null,
+  programmaticOnly: false,
   includeUserTokens: false,
   envVars: {},
   skills: [],
@@ -967,6 +968,7 @@ describe("AutomationService v2", () => {
     const deps = adminDeps({
       orgId: "org-test",
       startDraftSession: async (input) => {
+        expect(input.ownerIsAdmin).toBe(true);
         sessions.push({
           sessionId: input.sessionId,
           automationId: input.automationId,

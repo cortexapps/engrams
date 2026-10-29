@@ -255,6 +255,12 @@ describe("createSpec", () => {
     expect(store.rows.size).toBe(1);
   });
 
+  test("an admin role reaches the session create primitive", async () => {
+    const { deps, sessions } = testDeps();
+    await createSpec(deps, request({ ownerIsAdmin: true }));
+    expect(specCreateTaskParams(sessions[0]!).ownerIsAdmin).toBe(true);
+  });
+
   test("a service-account create reaches the session as programmatic", async () => {
     const { deps, sessions } = testDeps();
 
@@ -348,6 +354,15 @@ function createBody(overrides?: Record<string, unknown>) {
 }
 
 describe("POST /api/v1/specs", () => {
+  test("takes the admin role from authentication, not the request body", async () => {
+    const member = testApp();
+    await member.app.request("/api/v1/specs", createBody({ ownerIsAdmin: true }));
+    expect(member.calls[0]?.ownerIsAdmin).toBeUndefined();
+    const admin = testApp({ role: "admin" });
+    await admin.app.request("/api/v1/specs", createBody());
+    expect(admin.calls[0]?.ownerIsAdmin).toBe(true);
+  });
+
   test("a member creates a spec and gets its session", async () => {
     const { app, calls } = testApp();
 

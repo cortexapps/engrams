@@ -1086,6 +1086,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         {
           orgId: deps?.orgId ?? appConfig.deploymentId,
           ownerUserId: principal.id,
+          ownerIsAdmin: principal.role === "admin",
           idempotencyKey: requiredText(req.idempotencyKey, "idempotency_key"),
           prompt: requiredText(req.prompt, "prompt"),
           profileId: requiredText(req.profileId, "profile_id"),
