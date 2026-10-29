@@ -6,10 +6,10 @@ const docs = `${base}/docs`;
 
 // Vendor columns come from the vendors' public product and pricing pages. Keep
 // them to what those pages state, and update the "as of" line when you revise.
-const asOf = "September 2026";
+const asOf = "October 2026";
 const rows: [string, string, string, string][] = [
-  ["Who runs it", "You, in your own cloud account or on your own hardware", "Cognition; VPC deployment on Enterprise contracts", "Factory; on-premise deployment on Enterprise contracts"],
-  ["Source code", "Open source. Read it, change it, and run every line (AGPL-3.0)", "Proprietary", "Proprietary"],
+  ["Who runs it", "You, in your own cloud account or on your own hardware", "Cognition; on Enterprise, a single-tenant VPC that Cognition manages", "Factory; on-premise and air-gapped options on Enterprise contracts"],
+  ["Source code", "Open source. Read it, change it, and run every line", "Proprietary", "Proprietary"],
   ["The agent", "Claude Code, Codex, or your own harness, mounted by the host at boot; never baked into your image", "Devin, Cognition's agent", "Droids, Factory's agent"],
   ["Models", "Whatever your harness calls, on your own provider keys or model router", "From Cognition's model list", "From Factory's model list"],
   ["Where the work runs", "A Firecracker microVM per session, on your KVM nodes", "A vendor-managed cloud machine per session", "Vendor-managed cloud machines, or your machine through the CLI"],
@@ -19,11 +19,21 @@ const rows: [string, string, string, string][] = [
   ["Where people work", "Dashboard, Slack threads, GitHub pull request review, CLI, API", "Web app, desktop app, CLI, Slack, Linear", "CLI, IDE, web app, Slack, Linear"],
   ["What you pay", "No license fee. You pay your cloud provider and your model provider", "Per-seat plans with usage quotas", "Per-seat plans with usage limits"],
 ];
+
+// The other places a team looks. The same sourcing rule applies.
+const others: [string, string, string, string][] = [
+  ["OpenHands", "Open source agent and runtime; the hosted cloud, or self-hosted on Teams and Enterprise plans", "Docker containers", "You want the OpenHands agent itself, and container isolation is enough"],
+  ["Claude Code self-hosted environments", "Anthropic runs the control plane and stores transcripts; runners on your hosts do the work (Team and Enterprise, beta)", "Your hosts; isolation is yours to set up", "You use only Claude and accept a control plane at Anthropic"],
+  ["Cursor self-hosted cloud agents", "Cursor runs the agent loop and inference; your workers run commands and edits (team pools on Enterprise)", "Your machines or Kubernetes pods", "Your team works in Cursor and accepts a control plane at Cursor"],
+  ["OpenAI Codex cloud", "OpenAI runs everything", "OpenAI-hosted environments", "You pay for ChatGPT, and hosted execution is acceptable"],
+  ["E2B", "A sandbox SDK, not an agent product; open source infrastructure, or E2B runs it in your account", "Firecracker microVMs", "You are building your own agent product and need only the sandbox layer"],
+  ["Modal Sandboxes", "Modal runs everything", "gVisor containers or VMs, with GPUs", "You want serverless sandboxes with GPUs and no infrastructure to run"],
+];
 ---
 
 <Marketing
-  title="engrams vs Devin and Factory: the open source software factory"
-  description="How engrams, the open source and self-hosted software factory, compares to Devin and Factory.ai."
+  title="engrams vs Devin, Factory, and other coding agent platforms"
+  description="How engrams, the open source, self-hosted software factory, compares to Devin, Factory.ai, OpenHands, Claude Code, Cursor, Codex cloud, E2B, and Modal."
 >
   <section class="page-hero">
     <div class="wrap">
@@ -57,7 +67,42 @@ const rows: [string, string, string, string][] = [
 
   <section class="sec">
     <div class="wrap">
-      <div class="sec-head"><span class="sec-badge">Sec. 1</span><span>When to pick the others</span><span class="sec-rule"></span></div>
+      <div class="sec-head"><span class="sec-badge">Sec. 1</span><span>Other options</span><span class="sec-rule"></span></div>
+      <div class="sec-intro">
+        <h2 class="display">Where else teams look.</h2>
+        <div class="prose">
+          <p>
+            "Self-hosted" means different things. For most products below, the vendor keeps the
+            control plane: the agent loop, the session record, and often the transcripts. Only the
+            execution runs on your machines. engrams runs all of it in your account: the
+            orchestration, the database, the VMs, and the snapshots.
+          </p>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="hairline-table">
+          <thead>
+            <tr>
+              <th></th>
+              <th>Who runs what</th>
+              <th>Where the work runs</th>
+              <th>Pick it when</th>
+            </tr>
+          </thead>
+          <tbody>
+            {others.map((r) => (
+              <tr>{r.map((c) => <td>{c}</td>)}</tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p class="footnote">From each vendor's public docs and pricing pages as of {asOf}. Plans change; check with each vendor.</p>
+    </div>
+  </section>
+
+  <section class="sec">
+    <div class="wrap">
+      <div class="sec-head"><span class="sec-badge">Sec. 2</span><span>When to pick the others</span><span class="sec-rule"></span></div>
       <div class="sec-intro">
         <h2 class="display">Pick the other thing when it fits.</h2>
         <div class="prose">
