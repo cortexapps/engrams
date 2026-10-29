@@ -257,6 +257,7 @@ async function compileChildInput(
     modelRouter: policy.modelRouter ?? null,
     model: policy.model ?? null,
     effort: policy.effort ?? null,
+    programmaticOnly: false,
     includeUserTokens: policy.includeUserTokens,
     envVars: structuredClone(policy.envVars),
     skills: [...policy.skills],

@@ -701,6 +701,13 @@
       "when": 1793207598987,
       "tag": "0099_way_in_prompt",
       "breakpoints": true
+    },
+    {
+      "idx": 100,
+      "version": "7",
+      "when": 1793241391817,
+      "tag": "0100_profile_programmatic_only",
+      "breakpoints": true
     }
   ]
 }

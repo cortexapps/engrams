@@ -13,6 +13,7 @@ interface TestProfile {
   icon: string;
   imageId: string;
   includeUserTokens: boolean;
+  programmaticOnly?: boolean;
   integrationGrants: never[];
   network: { default: string; allowHosts: string[]; allowHostPatterns: string[] };
   repos: Array<{ path: string; remote: { owner: string; name: string } }>;
@@ -195,6 +196,51 @@ afterEach(() => {
 });
 
 describe("NewSpecPage", () => {
+  test("admins can select a programmatic-only profile for a user session", async () => {
+    state.profiles = [{ ...backend, programmaticOnly: true }, platform];
+    const user = userEvent.setup();
+    renderWithProviders(<NewSpecPage />);
+    expect(await screen.findByText("Backend")).toBeTruthy();
+    await user.click(screen.getByTestId("profile-switcher"));
+    expect(screen.getByTestId("profile-option-" + backend.id)).toBeTruthy();
+    expect(screen.getByText("Programmatic only")).toBeTruthy();
+  });
+
+  test("hides programmatic-only profiles and ignores a saved selection of one", async () => {
+    state.profiles = [{ ...backend, programmaticOnly: true }, platform];
+    localStorage.setItem("engrams:lastProfileId", backend.id);
+    const user = userEvent.setup();
+    renderWithProviders(<NewSpecPage />, {
+      principal: {
+        email: "member@example.test",
+        display_name: "Member",
+        role: "member",
+        is_admin: false,
+        can_sign_out: true,
+      },
+    });
+    expect(await screen.findByText("Platform")).toBeTruthy();
+    await user.click(screen.getByTestId("profile-switcher"));
+    expect(screen.queryByTestId("profile-option-" + backend.id)).toBeNull();
+    expect(screen.getByTestId("profile-option-" + platform.id)).toBeTruthy();
+  });
+
+  test("shows an empty picker when every profile is programmatic-only", async () => {
+    state.profiles = [{ ...backend, programmaticOnly: true }];
+    renderWithProviders(<NewSpecPage />, {
+      principal: {
+        email: "member@example.test",
+        display_name: "Member",
+        role: "member",
+        is_admin: false,
+        can_sign_out: true,
+      },
+    });
+    expect(screen.queryByText("Backend")).toBeNull();
+    expect(await screen.findByText(/No profiles/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Start" }).hasAttribute("disabled")).toBe(true);
+  });
+
   test("keeps the template radiogroup and has no repository chips", async () => {
     const user = userEvent.setup();
     renderWithProviders(<NewSpecPage />);

@@ -81,6 +81,7 @@ export interface SpecSessionInput {
    *  the programmatic credential, because such a principal has no per-user
    *  harness token (ADR 0063 B4). */
   ownerIsServiceAccount?: boolean;
+  ownerIsAdmin?: boolean;
   profileId: string;
   harness?: string;
   model?: string;
@@ -106,6 +107,7 @@ export interface CreateSpecRequest {
   /** The caller is a service-account principal. Carried to the session so an
    *  API-key create compiles the programmatic credential path. */
   ownerIsServiceAccount?: boolean;
+  ownerIsAdmin?: boolean;
   /** The client's stable key for this create. It derives every reserved id. */
   idempotencyKey: string;
   profileId: string;
@@ -174,6 +176,7 @@ export async function createSpec(
       sessionId,
       ownerUserId: request.ownerUserId,
       ...(request.ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
+      ...(request.ownerIsAdmin ? { ownerIsAdmin: true } : {}),
       profileId: request.profileId,
       ...(request.harness !== undefined ? { harness: request.harness } : {}),
       ...(request.model !== undefined ? { model: request.model } : {}),
@@ -305,6 +308,7 @@ export function specCreateTaskParams(input: SpecSessionInput): CreateTaskParams 
     type: "spec",
     ownerUserId: input.ownerUserId,
     ...(input.ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
+    ...(input.ownerIsAdmin ? { ownerIsAdmin: true } : {}),
     profileId: input.profileId,
     ...(input.harness !== undefined ? { harness: input.harness } : {}),
     ...(input.model !== undefined ? { model: input.model } : {}),

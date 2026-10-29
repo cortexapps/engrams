@@ -165,6 +165,19 @@ beforeEach(() => {
 const openAdvanced = () => fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
 
 describe("SessionProfileEditor (create)", () => {
+  it("defaults to user availability and can save a programmatic-only profile", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    const toggle = screen.getByRole("switch", { name: "Programmatic only" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    fireEvent.change(screen.getByLabelText(/profile name/i), {
+      target: { value: "Automation worker" },
+    });
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0].programmaticOnly).toBe(true);
+  });
+
   it("requires a name, then calls createProfile with the default image", async () => {
     render(<SessionProfileEditor mode="create" />);
     fireEvent.change(screen.getByLabelText(/profile name/i), {
@@ -444,6 +457,7 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
         harness: "claude",
         model: "opus",
         effort: "high",
+        programmaticOnly: false,
         includeUserTokens: false,
         envVars: {},
         integrationGrants: [
@@ -483,6 +497,7 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
         harness: "claude",
         model: "opus",
         effort: "high",
+        programmaticOnly: false,
         includeUserTokens: false,
         envVars: {},
         integrationGrants: [
@@ -509,6 +524,37 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
 });
 
 describe("SessionProfileEditor (edit)", () => {
+  it("loads the programmatic restriction and can make the profile available again", async () => {
+    paramsHolder.value = { id: "p1" };
+    profileHolder.value = {
+      profile: {
+        id: "p1",
+        name: "Automation worker",
+        description: "",
+        icon: "Bot",
+        imageId: "i1",
+        harness: "claude",
+        model: null,
+        effort: null,
+        programmaticOnly: true,
+        includeUserTokens: false,
+        envVars: {},
+        integrationGrants: [],
+        skills: [],
+        network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
+        secrets: [],
+        apps: [],
+      },
+    };
+    render(<SessionProfileEditor mode="edit" />);
+    const toggle = await screen.findByRole("switch", { name: "Programmatic only" });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(update).toHaveBeenCalled());
+    expect(update.mock.calls[0][0].programmaticOnly).toBe(false);
+  });
+
   it("round-trips every existing profile field on an unchanged save", async () => {
     paramsHolder.value = { id: "p1" };
     profileHolder.value = {
@@ -521,6 +567,7 @@ describe("SessionProfileEditor (edit)", () => {
         harness: "claude",
         model: "opus",
         effort: "high",
+        programmaticOnly: true,
         includeUserTokens: true,
         envVars: { ANTHROPIC_MODEL: "claude-x" },
         integrationGrants: [
@@ -636,6 +683,7 @@ describe("SessionProfileEditor (edit)", () => {
         harness: "claude",
         model: null,
         effort: null,
+        programmaticOnly: false,
         includeUserTokens: false,
         envVars: {},
         integrationGrants: [],
@@ -674,6 +722,7 @@ describe("SessionProfileEditor (edit)", () => {
         harness: "claude",
         model: "",
         effort: "",
+        programmaticOnly: false,
         includeUserTokens: false,
         envVars: {},
         integrationGrants: [],

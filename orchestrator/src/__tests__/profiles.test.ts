@@ -77,7 +77,7 @@ function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
   const rows = new Map<string, ProfileRow>(seed.map((r) => [r.id, r]));
   let n = 0;
   const mk = (id: string, input: ProfileInput): ProfileRow => ({
-    id, ...input, createdAt: new Date(0), updatedAt: new Date(0), deletedAt: null,
+    id, programmaticOnly: false, ...input, createdAt: new Date(0), updatedAt: new Date(0), deletedAt: null,
   });
   return {
     async list({ includeArchived }) {
@@ -91,7 +91,7 @@ function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
     async create(input) { const id = `p${n++}`; const r = mk(id, input); rows.set(id, r); return r; },
     async update(id, input) {
       const ex = rows.get(id); if (!ex || ex.deletedAt != null) return null;
-      const r = { ...ex, ...input, updatedAt: new Date(0) }; rows.set(id, r); return r;
+      const r = { ...ex, ...input, programmaticOnly: input.programmaticOnly ?? ex.programmaticOnly, updatedAt: new Date(0) }; rows.set(id, r); return r;
     },
     async softDelete(id) { const r = rows.get(id); if (r) rows.set(id, { ...r, deletedAt: new Date(0) }); },
   };
@@ -148,6 +148,7 @@ async function expectErr(p: Promise<unknown>, code: Code) {
 const archived: ProfileRow = {
   id: "arch", name: "Archived", description: "", icon: "Bot", imageId: "img-1",
   harness: "claude", model: null, effort: null,
+  programmaticOnly: false,
   includeUserTokens: false, envVars: { K: "V" }, skills: [], integrationGrants: [], createdAt: new Date(0), updatedAt: new Date(0),
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
   repos: [],
@@ -157,6 +158,41 @@ const archived: ProfileRow = {
 const active: ProfileRow = { ...archived, id: "act", name: "Active", deletedAt: null };
 
 describe("ProfileService — auth + field filtering", () => {
+  for (const principal of ["member", "admin", "api-key"] as const) {
+    test(`${principal}: session picker filters by the authenticated role`, async () => {
+      const restricted = { ...active, id: "restricted", programmaticOnly: true };
+      const s = await spawn({
+        getSession: principal === "api-key"
+          ? async () => ({ user: { id: "service", email: "apikey+worker@service.local", role: "user" } })
+          : makeGetSession("caller", principal === "admin" ? "admin" : "user"),
+        store: makeFakeStore([active, restricted]), images: fakeImages(["img-1"]),
+      });
+      try {
+        expect((await s.client.listProfiles({})).profiles).toHaveLength(2);
+        const picker = await s.client.listProfiles({ forSessionPicker: true });
+        expect(picker.profiles.map((p) => p.id)).toEqual(principal === "member" ? ["act"] : ["act", "restricted"]);
+      } finally { await s.close(); }
+    });
+  }
+
+  test("programmatic-only profiles round-trip and remain in the management catalog", async () => {
+    const store = makeFakeStore();
+    const s = await spawn({ getSession: makeGetSession("admin", "admin"), store, images: fakeImages(["img-1"]) });
+    try {
+      const input = { name: "Automation worker", imageId: "img-1", harness: "claude" };
+      const ordinary = await s.client.createProfile(input);
+      expect(ordinary.profile?.programmaticOnly).toBe(false);
+      const created = await s.client.createProfile({ ...input, programmaticOnly: true });
+      const id = created.profile!.id;
+      expect(created.profile?.programmaticOnly).toBe(true);
+      expect((await s.client.getProfile({ id })).profile?.programmaticOnly).toBe(true);
+      expect((await s.client.listProfiles({})).profiles.find((p) => p.id === id)?.programmaticOnly).toBe(true);
+      // An update that omits the optional field must preserve its stored value.
+      expect((await s.client.updateProfile({ ...input, id })).profile?.programmaticOnly).toBe(true);
+      expect((await s.client.updateProfile({ ...input, id, programmaticOnly: false })).profile?.programmaticOnly).toBe(false);
+    } finally { await s.close(); }
+  });
+
   test("anon ListProfiles → Unauthenticated", async () => {
     const s = await spawn({ getSession: makeGetSession(null), store: makeFakeStore(), images: fakeImages([]) });
     try { await expectErr(s.client.listProfiles({}), Code.Unauthenticated); } finally { await s.close(); }

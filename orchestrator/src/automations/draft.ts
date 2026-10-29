@@ -47,6 +47,7 @@ export interface DraftSessionInput {
   sessionId: string;
   ownerUserId: string;
   ownerIsServiceAccount?: boolean;
+  ownerIsAdmin?: boolean;
   profileId: string;
   harness?: string;
   model?: string;
@@ -63,6 +64,7 @@ export interface DraftAutomationRequest {
   orgId: string;
   ownerUserId: string;
   ownerIsServiceAccount?: boolean;
+  ownerIsAdmin?: boolean;
   idempotencyKey: string;
   prompt: string;
   profileId: string;
@@ -127,6 +129,7 @@ export async function draftAutomation(
       sessionId,
       ownerUserId: request.ownerUserId,
       ...(request.ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
+      ...(request.ownerIsAdmin ? { ownerIsAdmin: true } : {}),
       profileId: request.profileId,
       ...(request.harness !== undefined ? { harness: request.harness } : {}),
       ...(request.model !== undefined ? { model: request.model } : {}),

@@ -82,6 +82,8 @@ message Profile {
   optional string model_router = 23;
   // ADR 0118: the services every session from this profile hosts.
   repeated SessionApp apps = 24;
+  // When true, only automations, API keys, and admins can start sessions.
+  bool programmatic_only = 25;
 }
 
 // ADR 0118: one service a session hosts, published at
@@ -184,6 +186,9 @@ message ProfileSnapshot {
 message ListProfilesRequest {
   // Admin-only; silently ignored (treated as false) for non-admin callers.
   bool include_archived = 1;
+  // Only profiles this caller can select for a new session. Admins and API keys
+  // can select programmatic-only profiles. The management catalog leaves this off.
+  bool for_session_picker = 2;
 }
 
 message ListProfilesResponse {
@@ -223,6 +228,8 @@ message CreateProfileRequest {
   optional string model_router = 19;
   // ADR 0118: see Profile.apps.
   repeated SessionApp apps = 20;
+  // When true, only automations, API keys, and admins can start sessions.
+  bool programmatic_only = 21;
 }
 
 message CreateProfileResponse {
@@ -255,6 +262,9 @@ message UpdateProfileRequest {
   optional string model_router = 20;
   // ADR 0118: see Profile.apps.
   repeated SessionApp apps = 21;
+  // When true, only automations, API keys, and admins can start sessions.
+  // Omit to preserve the current setting.
+  optional bool programmatic_only = 22;
 }
 
 message UpdateProfileResponse {

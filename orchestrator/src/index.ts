@@ -540,6 +540,7 @@ const server = buildServer(
             type: "automation_draft",
             ownerUserId: input.ownerUserId,
             ...(input.ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
+            ...(input.ownerIsAdmin ? { ownerIsAdmin: true } : {}),
             profileId: input.profileId,
             ...(input.harness !== undefined ? { harness: input.harness } : {}),
             ...(input.model !== undefined ? { model: input.model } : {}),

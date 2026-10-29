@@ -846,6 +846,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           // harness token — compile the org-credential path (ADR 0063 B4)
           // even though the task type is "chat".
           ownerIsServiceAccount: user.serviceAccount,
+          ownerIsAdmin: user.role === "admin",
           profileId: req.profileId,
           title: req.title ?? null,
           ...(req.prompt != null ? { prompt: req.prompt } : {}),

@@ -79,6 +79,7 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
     harness: "claude",
     model: null,
     effort: null,
+    programmaticOnly: false,
     includeUserTokens: false,
     envVars: {},
     skills: [],

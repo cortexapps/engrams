@@ -62,6 +62,7 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   harness: "claude",
   model: null,
   effort: null,
+  programmaticOnly: false,
   includeUserTokens: false,
   envVars: {},
   skills: [],
@@ -1440,6 +1441,28 @@ const createDeps = (
 });
 
 describe("createTaskWithSession", () => {
+  for (const type of ["chat", "spec", "automation_draft"]) {
+    test(`rejects a human ${type} launch before any session or task write`, async () => {
+      const sessions = fakeSessions();
+      const records: Record<string, unknown>[] = [];
+      await expect(createTaskWithSession(
+        createDeps(sessions, recordingDb(records), { profileOver: { programmaticOnly: true } }),
+        { type, ownerUserId: "u", profileId: "p1" },
+      )).rejects.toMatchObject({ code: Code.PermissionDenied });
+      expect(sessions.createReqs).toEqual([]);
+      expect(records).toEqual([]);
+    });
+  }
+
+  test("allows an API-key launch with a programmatic-only profile", async () => {
+    const sessions = fakeSessions();
+    await createTaskWithSession(
+      createDeps(sessions, recordingDb([]), { profileOver: { programmaticOnly: true } }),
+      { type: "chat", ownerUserId: "service", ownerIsServiceAccount: true, profileId: "p1" },
+    );
+    expect(sessions.createReqs).toHaveLength(1);
+  });
+
   test("writes the per-session listener row in the task transaction", async () => {
     const records: Record<string, unknown>[] = [];
     await createTaskWithSession(createDeps(fakeSessions(), recordingDb(records)), {
@@ -1790,6 +1813,17 @@ describe("createTaskWithSession", () => {
 });
 
 describe("createSessionForExistingTask", () => {
+  test("allows automation launches with a programmatic-only profile", async () => {
+    for (const ownerUserId of [undefined, "u"]) {
+      const sessions = fakeSessions();
+      await createSessionForExistingTask(
+        createDeps(sessions, recordingDb([]), { profileOver: { programmaticOnly: true } }),
+        { taskId: "task-1", taskType: "automation", profileId: "p1", role: "primary", ownerUserId },
+      );
+      expect(sessions.createReqs).toHaveLength(1);
+    }
+  });
+
   test("stamps a launch-policy snapshot on the pre-existing task (spawn precondition)", async () => {
     const sessions = fakeSessions();
     const records: Record<string, unknown>[] = [];

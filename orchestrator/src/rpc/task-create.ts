@@ -803,6 +803,8 @@ export interface CreateTaskParams {
   /** The owner is a service-account principal (API key) — forces the
    *  programmatic (org-credential) compile path; see SessionCompileOpts. */
   ownerIsServiceAccount?: boolean;
+  /** Trusted role from the authenticated caller; permits an admin test launch. */
+  ownerIsAdmin?: boolean;
   /** The profile to start from; must be active (else NotFound). */
   profileId: string;
   title?: string | null;
@@ -1096,6 +1098,12 @@ export async function createTaskWithSession(
   const profile = await deps.profiles.getActive(params.profileId);
   if (!profile) {
     throw new ConnectError("profile not found or archived", Code.NotFound);
+  }
+  if (profile.programmaticOnly && !params.ownerIsServiceAccount && !params.ownerIsAdmin) {
+    throw new ConnectError(
+      "This profile is only available to automations, API keys, and admins.",
+      Code.PermissionDenied,
+    );
   }
   // ADR 0031 §7: resolve the owner's identity for git commit attribution.
   // Service-account owners (API-key creates) are skipped — their synthetic

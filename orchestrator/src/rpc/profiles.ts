@@ -121,6 +121,7 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     description: row.description,
     icon: row.icon,
     imageId: row.imageId,
+    programmaticOnly: row.programmaticOnly,
     includeUserTokens: row.includeUserTokens,
     envVars: isAdmin ? row.envVars : {},
     // ADR 0055: skills are not sensitive (they describe granted tooling), so
@@ -515,7 +516,11 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const includeArchived = isAdmin && req.includeArchived;
       const rows = await store.list({ includeArchived });
       return {
-        profiles: rows.map((row) => toProto(row, isAdmin)),
+        profiles: rows
+          .filter((row) =>
+            !req.forSessionPicker || isAdmin || user.serviceAccount || !row.programmaticOnly,
+          )
+          .map((row) => toProto(row, isAdmin)),
       };
     },
 
@@ -559,6 +564,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         description: req.description,
         icon: req.icon || "Bot",
         imageId: req.imageId,
+        programmaticOnly: req.programmaticOnly,
         includeUserTokens: req.includeUserTokens,
         envVars: req.envVars ?? {},
         skills: req.skills ?? [],
@@ -602,6 +608,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         description: req.description,
         icon: req.icon || "Bot",
         imageId: req.imageId,
+        programmaticOnly: req.programmaticOnly,
         includeUserTokens: req.includeUserTokens,
         envVars: req.envVars ?? {},
         skills: req.skills ?? [],

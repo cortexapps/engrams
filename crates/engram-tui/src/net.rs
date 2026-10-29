@@ -169,6 +169,7 @@ impl Net {
             let res = c
                 .list_profiles(ListProfilesRequest {
                     include_archived: false,
+                    for_session_picker: true,
                 })
                 .await
                 .map(|r| rows_from_profiles(&r.profiles))

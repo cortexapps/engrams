@@ -244,6 +244,7 @@ function makeSeededTokens(): UserSecretStore {
 const PROFILE_ID = "test-profile";
 
 function makeFakeProfiles(opts?: {
+  programmaticOnly?: boolean;
   includeUserTokens?: boolean;
   envVars?: Record<string, string>;
   imageId?: string;
@@ -260,6 +261,7 @@ function makeFakeProfiles(opts?: {
     harness: "claude",
     model: null,
     effort: null,
+    programmaticOnly: opts?.programmaticOnly ?? false,
     includeUserTokens: opts?.includeUserTokens ?? false,
     envVars: opts?.envVars ?? {},
     skills: opts?.skills ?? [],
@@ -2014,6 +2016,27 @@ function oneCreatedSession(prefix: string): FakeSession {
 }
 
 describe("TaskService — principal-authoritative harness credentials (ADR 0053/0063)", () => {
+  for (const role of ["user", "admin"] as const) {
+    test(`${role}: programmatic-only launch uses the authenticated role`, async () => {
+      const sessions = makeFakeSessions({ created: [oneCreatedSession("restricted")], existing: [] });
+      const srv = await spawnServer({
+        getSession: makeGetSession(MEMBER_A, role), sessions,
+        secrets: makeFakeTokens({ [MEMBER_A]: "user-test-token" }),
+        profiles: makeFakeProfiles({ programmaticOnly: true }), images: fakeImages(), db: okDb(),
+      });
+      try {
+        const call = makeClient(srv.serverUrl).createTask({ type: "chat", profileId: PROFILE_ID });
+        if (role === "admin") {
+          await call;
+          expect(sessions.createReqs[0]?.harnessEnv?.[USER_ENV]).toBe("user-test-token");
+        } else {
+          await expect(call).rejects.toMatchObject({ code: Code.PermissionDenied });
+          expect(sessions.createReqs).toHaveLength(0);
+        }
+      } finally { await srv.close(); }
+    });
+  }
+
   test("include_user_tokens=true + token present → harness_env carries the token", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-tok")], existing: [] });
     const srv = await spawnServer({

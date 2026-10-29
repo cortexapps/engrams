@@ -23,6 +23,7 @@ vi.mock("../../hooks/useProfiles", () => ({
         : [
             {
               id: "p1",
+              programmaticOnly: true,
               name: "Backend",
               description: "Node API",
               icon: "Server",
@@ -53,6 +54,7 @@ describe("SessionProfiles list", () => {
     renderWithProviders(<SessionProfiles />);
     expect(await screen.findByText("Backend")).toBeTruthy();
     expect(screen.getByText("Node API")).toBeTruthy();
+    expect(screen.getByText("Programmatic only")).toBeTruthy();
     // Capability-less profile reads as fully sandboxed in the meta strip.
     expect(screen.getAllByText(/fully sandboxed/i).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByRole("link", { name: /new profile/i })).toBeTruthy();

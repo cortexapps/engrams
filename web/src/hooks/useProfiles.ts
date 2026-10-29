@@ -10,8 +10,8 @@ import {
 } from "../gen/engram/app/v1/profile-ProfileService_connectquery";
 
 /** Active profiles (the picker menu). Admins can pass includeArchived. */
-export function useProfiles(includeArchived = false) {
-  return useQuery(listProfiles, { includeArchived }, { staleTime: 10_000 });
+export function useProfiles(includeArchived = false, forSessionPicker = false) {
+  return useQuery(listProfiles, { includeArchived, forSessionPicker }, { staleTime: 10_000 });
 }
 
 export function useProfile(id: string | undefined) {
