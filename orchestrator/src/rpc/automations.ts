@@ -71,6 +71,7 @@ import {
 } from "../db/integration-connections.ts";
 import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
 import {
+  cronEntrypointOf,
   entrypointsOf,
   entrypointOf,
   instanceSettingsOf,
@@ -1137,10 +1138,14 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const id = requiredText(req.id, "id");
       const existing = await store.getActive(id);
       if (!existing) throw new ConnectError("automation not found", Code.NotFound);
-      const trigger = existing.version.trigger;
+      // The schedule may sit on any way in, not only the main trigger:
+      // read the (single) cron entrypoint, as SaveVersion does. Reading the
+      // main trigger left an automation whose cron is an extra entrypoint
+      // with no next fire after an off/on, so it never ran again.
+      const cron = cronEntrypointOf(definitionOf(existing.version))?.trigger;
       const nextFireAt =
-        req.enabled && trigger.kind === "cron"
-          ? nextCronFire(trigger.schedule, trigger.timezone, now())
+        req.enabled && cron?.kind === "cron"
+          ? nextCronFire(cron.schedule, cron.timezone, now())
           : req.enabled
             ? undefined
             : null;
