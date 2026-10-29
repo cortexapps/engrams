@@ -835,15 +835,20 @@ function normalizeScope(provider: string, value: string): string {
   return CASE_INSENSITIVE_HANDLE_PROVIDERS.has(provider) ? value.toLowerCase() : value;
 }
 
-/** Resolve a {fromInput} scope binding against the automation's input values:
- * a map-typed input contributes its keys, a list input its string elements.
- * Anything else (absent, wrong shape) resolves to undefined → no match. */
+/** Resolve a {fromInput} scope binding against the automation's input values
+ * (schema defaults already overlaid): a map-typed input contributes its keys,
+ * a list input its string elements, a non-empty string input itself (one
+ * channel, one repository). Anything else (absent, empty, wrong shape)
+ * resolves to undefined → no match. */
 export function scopeValuesFromInput(
   inputs: Record<string, unknown>,
   key: string,
 ): string[] | undefined {
   if (!Object.prototype.hasOwnProperty.call(inputs, key)) return undefined;
   const value = inputs[key];
+  if (typeof value === "string") {
+    return value.trim() === "" ? undefined : [value.trim()];
+  }
   if (Array.isArray(value)) {
     const strings = value.filter((item): item is string => typeof item === "string");
     return strings.length === value.length ? strings : undefined;
@@ -913,7 +918,13 @@ export async function dispatchIntegrationEvent(
           eventKey: input.eventKey,
           ...(input.scopeValue !== undefined ? { scopeValue: input.scopeValue } : {}),
         },
-        (key) => scopeValuesFromInput(target.automation.inputs, key),
+        // The same resolution admission uses: schema defaults overlaid by
+        // stored values, so an input left at its default still scopes.
+        (key) =>
+          scopeValuesFromInput(
+            resolveAutomationInputs(target.definition.inputsSchema, target.automation.inputs),
+            key,
+          ),
       );
       return matched ? [{ target, entrypoint }] : [];
     });

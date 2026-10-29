@@ -156,7 +156,16 @@ describe("matchesIntegrationTrigger", () => {
     ).toBe(false);
     // A non-string list resolves to nothing.
     expect(scopeValuesFromInput({ repos: [1, 2] }, "repos")).toBeUndefined();
-    expect(scopeValuesFromInput({ repos: "one" }, "repos")).toBeUndefined();
+    // A string input is one scope value (a channel id); an empty one is none.
+    expect(scopeValuesFromInput({ repos: "one" }, "repos")).toEqual(["one"]);
+    expect(scopeValuesFromInput({ repos: "  " }, "repos")).toBeUndefined();
+    expect(
+      matchesIntegrationTrigger(
+        { ...scoped, scope: { fromInput: "channel" } },
+        event({ scopeValue: "C0123" }),
+        (key) => scopeValuesFromInput({ channel: "C0123" }, key),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -459,6 +468,26 @@ describe("dispatchIntegrationEvent", () => {
 
     const miss = await dispatchIntegrationEvent(
       input({ deliveryId: "gh-delivery-2", scopeValue: "other/repo" }),
+      deps(h),
+    );
+    expect(miss).toMatchObject({ matched: 0, started: 0 });
+  });
+
+  test("fromInput scope uses the input's schema default when no value is stored", async () => {
+    // A single channel id, left at its default (stored inputs are empty):
+    // matching resolves inputs the way admission does.
+    const scoped = {
+      automation: meta({ inputs: {} }),
+      definition: {
+        ...definition(trigger({ scope: { fromInput: "repo" } })),
+        inputsSchema: [{ key: "repo", label: "Repo", type: "string" as const, default: "engrams/engrams" }],
+      },
+    };
+    const h = makeHarness([scoped]);
+    const hit = await dispatchIntegrationEvent(input({ scopeValue: "engrams/engrams" }), deps(h));
+    expect(hit.started).toBe(1);
+    const miss = await dispatchIntegrationEvent(
+      input({ deliveryId: "gh-delivery-3", scopeValue: "other/repo" }),
       deps(h),
     );
     expect(miss).toMatchObject({ matched: 0, started: 0 });
