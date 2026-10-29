@@ -2,9 +2,11 @@
 
 [![Release](https://img.shields.io/github/v/release/cortexapps/engrams?filter=v*&label=release)](https://github.com/cortexapps/engrams/releases/latest)
 
-engrams is a self-hosted orchestrator for AI coding agents. It runs each agent in its own [Firecracker](https://github.com/firecracker-microvm/firecracker) microVM, snapshots the VM when the agent goes idle, and restores it when the next prompt arrives.
+engrams is the open source, self-hosted software factory, by [Cortex](https://www.cortex.io). It is an open source alternative to Devin and Factory.ai that runs in your own cloud. It runs Claude Code, Codex, or your own agent, each in its own [Firecracker](https://github.com/firecracker-microvm/firecracker) microVM, snapshots the VM when the agent goes idle, and restores it when the next prompt arrives.
 
-A session is a plain OCI image plus an agent harness. You build the image with `docker build`, enable it once, and engrams boots it on a host in your own cloud, streams the transcript and tool calls to the dashboard, Slack, or the CLI, and snapshots the VM away when it goes quiet. Claude Code and Codex ship as harnesses. The pattern is the one behind hosted sandbox products like E2B, Modal Sandboxes, and Ramp's Inspect; engrams is the version you run yourself.
+A session is a plain OCI image plus an agent harness. You build the image with `docker build`, enable it once, and engrams boots it on a host in your own cloud, streams the transcript and tool calls to the dashboard, Slack, or the CLI, and snapshots the VM away when it goes quiet. Claude Code and Codex ship as harnesses. The sandbox layer is the pattern behind hosted products like E2B, Modal Sandboxes, and Ramp's Inspect; engrams is the version you run yourself.
+
+Docs: [engramsfactory.com/docs](https://engramsfactory.com/docs/). For agents: [llms.txt](https://engramsfactory.com/llms.txt), and [install engrams with a coding agent](https://engramsfactory.com/docs/getting-started/install-with-an-agent/).
 
 ![A session in the engrams dashboard. Asked for a PNG of a pelican riding a bicycle with no image libraries and no internet, the agent wrote a PNG encoder in Python and shared the file in the thread.](site/src/assets/screenshots/session-pelican.png)
 

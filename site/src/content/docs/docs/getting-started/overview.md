@@ -5,8 +5,9 @@ sidebar:
   order: 1
 ---
 
-engrams is an open-source system that runs AI coding agents in isolated microVMs on your own
-infrastructure. It gives people one place to direct their work: start a task, inspect its
+engrams is the open source, self-hosted software factory. It runs AI coding agents in isolated
+microVMs on your own infrastructure, as an open source alternative to Devin and Factory.ai. It
+gives people one place to direct their work: start a task, inspect its
 changes, and continue the conversation from the dashboard or Slack. Turn repeat work into an
 automation that starts on a schedule or an event.
 
