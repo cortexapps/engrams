@@ -73,6 +73,9 @@ message in a conversation the bot is in, including a direct message, arrives as 
 `message` event with `event.channel_type` set to `channel`, `group`, `im`, or `mpim`, so an
 automation can answer inside the conversation it opened.
 
+The bot reads a group direct message back with `mpim:history`, which is also the scope the
+`message.mpim` event needs.
+
 An app installed before these scopes existed needs its manifest updated and a Reconnect from
 the integration page, which runs Slack's consent screen again with the new scopes.
 

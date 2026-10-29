@@ -1326,8 +1326,9 @@ describe("cli facet (ADR 0058)", () => {
   test("the slack seed can open direct messages and private channels", () => {
     const slack = connectorRegistry().get("slack")!;
     // conversations.open needs im:write (a DM) and mpim:write (a group DM);
-    // a private channel needs groups:write on top of channels:manage.
-    for (const s of ["im:write", "mpim:write", "groups:write"]) {
+    // a private channel needs groups:write on top of channels:manage. Reading
+    // a group DM back (and the message.mpim event) needs mpim:history.
+    for (const s of ["im:write", "mpim:write", "mpim:history", "groups:write"]) {
       expect(slack.oauth!.scopes).toContain(s);
     }
     const open = slack.operations.find(

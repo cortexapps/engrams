@@ -625,6 +625,7 @@
       "im:history",
       "im:write",
       "mpim:read",
+      "mpim:history",
       "mpim:write",
       "users:read",
       "users:read.email",
