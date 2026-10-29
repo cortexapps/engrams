@@ -37,7 +37,8 @@ Usage:
 <resource> is a path segment such as people, tests, or issues; it may carry a
 sub-path, such as tests/<id>/entities or trust-centers/<slug>/access-requests.
 
-Query fields pass straight to the API as filters, for example:
+Query fields pass straight to the API as filters; a ...MatchesAny field takes a
+comma list (sent as one value per item), for example:
   people   employmentStatus=CURRENT  tasksSummaryStatusMatchesAny=OVERDUE
            taskTypeMatchesAny=ACCEPT_POLICIES,COMPLETE_TRAININGS taskStatusMatchesAny=OVERDUE,DUE_SOON
   tests    statusFilter=NEEDS_ATTENTION  frameworkFilter=  ownerFilter=
@@ -119,10 +120,24 @@ request() {
 }
 
 # fetch <path> [field=value ...]: one GET; each field=value is a query param.
+# Vanta's list filters (`...MatchesAny`) are arrays sent as a repeated param
+# (statusMatchesAny=A&statusMatchesAny=B); a comma list is one invalid value.
+# So a comma value of such a field becomes one param per item.
 fetch() {
     p="$1"
     shift
-    flags=$(for kv in "$@"; do printf '%s\n%s\n' '--data-urlencode' "$kv"; done)
+    flags=$(for kv in "$@"; do
+        k="${kv%%=*}"
+        v="${kv#*=}"
+        case "$k" in
+        *MatchesAny)
+            printf '%s\n' "$v" | tr ',' '\n' | while IFS= read -r item; do
+                [ -n "$item" ] && printf '%s\n%s\n' '--data-urlencode' "$k=$item"
+            done
+            ;;
+        *) printf '%s\n%s\n' '--data-urlencode' "$kv" ;;
+        esac
+    done)
     OLD_IFS=$IFS
     IFS='
 '
