@@ -360,8 +360,17 @@ export interface UserCredentialFacet {
   /** `true` reuses the facet as-is (minus its authorize extras); an object
    * overrides the user flow's shape. */
   oauth?: true | UserOauthOverrides;
-  token?: { hint: string };
+  token?: UserTokenFacet;
   inject?: { header: string; template: string };
+}
+
+export interface UserTokenFacet {
+  /** The setup line shown in Settings → Credentials. */
+  hint: string;
+  /** Asks the provider who owns a pasted token when the user saves it. The
+   * answer names the credential's account (GitHub: the login), and a token
+   * the provider rejects is not saved. */
+  identity?: OauthMetadataProbe;
 }
 
 /**
@@ -1224,6 +1233,71 @@ const OAUTH_METADATA_FIELDS: ReadonlySet<string> = new Set([
 ]);
 const OAUTH_METADATA_SEGMENT_RE = /^[A-Za-z0-9_]{1,64}$/;
 
+/** Metadata field → bounded dot-path, as the coordinator's driver accepts it.
+ * `label` is the JSON path of the map, for error text. */
+function parseMetadataMap(
+  where: string,
+  label: string,
+  v: unknown,
+): Partial<Record<OauthMetadataField, string>> {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) {
+    fail(where, `"${label}" must be an object of field → dot-path`);
+  }
+  const out: Partial<Record<OauthMetadataField, string>> = {};
+  for (const [k, path] of Object.entries(v as Record<string, unknown>)) {
+    if (!OAUTH_METADATA_FIELDS.has(k)) {
+      fail(where, `"${label}" key "${k}" is not a metadata field (${[...OAUTH_METADATA_FIELDS].join(", ")})`);
+    }
+    if (typeof path !== "string" || !path) fail(where, `"${label}.${k}" must be a non-empty dot-path`);
+    const segments = path.split(".");
+    if (segments.length > MAX_OAUTH_METADATA_PATH_SEGMENTS) {
+      fail(where, `"${label}.${k}" has too many path segments (max ${MAX_OAUTH_METADATA_PATH_SEGMENTS})`);
+    }
+    for (const seg of segments) {
+      if (!OAUTH_METADATA_SEGMENT_RE.test(seg) || UNSAFE_OBJECT_PATH_SEGMENTS.has(seg)) {
+        fail(where, `"${label}.${k}" segment "${seg}" is not allowed`);
+      }
+    }
+    out[k as OauthMetadataField] = path;
+  }
+  return out;
+}
+
+/** One "who am I" request against one of the connector's hosts. Shared by
+ * the OAuth facet's metadata and a personal token's identity probe. */
+function parseMetadataProbe(
+  where: string,
+  label: string,
+  raw: unknown,
+  hosts: string[],
+): OauthMetadataProbe {
+  if (typeof raw !== "object" || raw === null) fail(where, `"${label}" must be an object`);
+  const p = raw as Record<string, unknown>;
+  if (p.method !== undefined && p.method !== "GET" && p.method !== "POST") {
+    fail(where, `"${label}.method" must be "GET" or "POST"`);
+  }
+  if (p.host !== undefined) {
+    if (typeof p.host !== "string" || !hosts.includes(p.host)) {
+      fail(where, `"${label}.host" must be one of the connector's hosts (${hosts.join(", ")})`);
+    }
+  }
+  if (typeof p.path !== "string" || !p.path.startsWith("/") || p.path.length > MAX_OAUTH_PARAM_LENGTH) {
+    fail(where, `"${label}.path" must be a short absolute path`);
+  }
+  if (p.body !== undefined && (typeof p.body !== "string" || p.body.length > MAX_OAUTH_PROBE_BODY)) {
+    fail(where, `"${label}.body" must be a bounded string`);
+  }
+  const map = parseMetadataMap(where, `${label}.map`, p.map);
+  if (Object.keys(map).length === 0) fail(where, `"${label}.map" must map at least one field`);
+  return {
+    ...(p.method !== undefined ? { method: p.method as "GET" | "POST" } : {}),
+    ...(p.host !== undefined ? { host: p.host as string } : {}),
+    path: p.path,
+    ...(p.body !== undefined ? { body: p.body as string } : {}),
+    map,
+  };
+}
+
 /** Validate the OAuth acquisition facet (admin-trust boundary). `tokenUrl` must
  * resolve to one of the connector's `hosts` (it receives the client secret, so an
  * admin-authored connector can't ship it elsewhere); `authorizeUrl` may instead
@@ -1370,67 +1444,16 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     );
   }
 
-  const metadataMap = (
-    field: string,
-    v: unknown,
-  ): Partial<Record<OauthMetadataField, string>> => {
-    if (typeof v !== "object" || v === null || Array.isArray(v)) {
-      fail(where, `"oauth.${field}" must be an object of field → dot-path`);
-    }
-    const out: Partial<Record<OauthMetadataField, string>> = {};
-    for (const [k, path] of Object.entries(v as Record<string, unknown>)) {
-      if (!OAUTH_METADATA_FIELDS.has(k)) {
-        fail(where, `"oauth.${field}" key "${k}" is not a metadata field (${[...OAUTH_METADATA_FIELDS].join(", ")})`);
-      }
-      if (typeof path !== "string" || !path) fail(where, `"oauth.${field}.${k}" must be a non-empty dot-path`);
-      const segments = path.split(".");
-      if (segments.length > MAX_OAUTH_METADATA_PATH_SEGMENTS) {
-        fail(where, `"oauth.${field}.${k}" has too many path segments (max ${MAX_OAUTH_METADATA_PATH_SEGMENTS})`);
-      }
-      for (const seg of segments) {
-        if (!OAUTH_METADATA_SEGMENT_RE.test(seg) || UNSAFE_OBJECT_PATH_SEGMENTS.has(seg)) {
-          fail(where, `"oauth.${field}.${k}" segment "${seg}" is not allowed`);
-        }
-      }
-      out[k as OauthMetadataField] = path;
-    }
-    return out;
-  };
-
   let metadata: OauthMetadataSpec | undefined;
   if (o.metadata !== undefined) {
     if (typeof o.metadata !== "object" || o.metadata === null) fail(where, '"oauth.metadata" must be an object');
     const m = o.metadata as Record<string, unknown>;
     metadata = {};
     if (m.fromTokenResponse !== undefined) {
-      metadata.fromTokenResponse = metadataMap("metadata.fromTokenResponse", m.fromTokenResponse);
+      metadata.fromTokenResponse = parseMetadataMap(where, "oauth.metadata.fromTokenResponse", m.fromTokenResponse);
     }
     if (m.probe !== undefined) {
-      if (typeof m.probe !== "object" || m.probe === null) fail(where, '"oauth.metadata.probe" must be an object');
-      const p = m.probe as Record<string, unknown>;
-      if (p.method !== undefined && p.method !== "GET" && p.method !== "POST") {
-        fail(where, '"oauth.metadata.probe.method" must be "GET" or "POST"');
-      }
-      if (p.host !== undefined) {
-        if (typeof p.host !== "string" || !hosts.includes(p.host)) {
-          fail(where, `"oauth.metadata.probe.host" must be one of the connector's hosts (${hosts.join(", ")})`);
-        }
-      }
-      if (typeof p.path !== "string" || !p.path.startsWith("/") || p.path.length > MAX_OAUTH_PARAM_LENGTH) {
-        fail(where, '"oauth.metadata.probe.path" must be a short absolute path');
-      }
-      if (p.body !== undefined && (typeof p.body !== "string" || p.body.length > MAX_OAUTH_PROBE_BODY)) {
-        fail(where, '"oauth.metadata.probe.body" must be a bounded string');
-      }
-      const map = metadataMap("metadata.probe.map", p.map);
-      if (Object.keys(map).length === 0) fail(where, '"oauth.metadata.probe.map" must map at least one field');
-      metadata.probe = {
-        ...(p.method !== undefined ? { method: p.method as "GET" | "POST" } : {}),
-        ...(p.host !== undefined ? { host: p.host as string } : {}),
-        path: p.path,
-        ...(p.body !== undefined ? { body: p.body as string } : {}),
-        map,
-      };
+      metadata.probe = parseMetadataProbe(where, "oauth.metadata.probe", m.probe, hosts);
     }
     if (metadata.fromTokenResponse === undefined && metadata.probe === undefined) {
       fail(where, '"oauth.metadata" must declare fromTokenResponse and/or probe');
@@ -2355,14 +2378,24 @@ export function parseConnector(
         fail(uw, '"oauth" must be true or an overrides object');
       }
     }
-    let token: { hint: string } | undefined;
+    let token: UserTokenFacet | undefined;
     if (uc.token !== undefined) {
       if (typeof uc.token !== "object" || uc.token === null) fail(uw, '"token" must be an object');
       const t = uc.token as Record<string, unknown>;
       if (typeof t.hint !== "string" || !t.hint.trim() || t.hint.length > MAX_DISPLAY_BLURB) {
         fail(uw, `"token.hint" must be a non-empty string (max ${MAX_DISPLAY_BLURB} chars)`);
       }
-      token = { hint: t.hint };
+      const identity =
+        t.identity !== undefined
+          ? parseMetadataProbe(uw, "token.identity", t.identity, hosts)
+          : undefined;
+      // A pasted token records no account id: a stored id would block a later
+      // OAuth connect to a different account, and a paste is a deliberate
+      // replacement.
+      if (identity?.map.accountId !== undefined) {
+        fail(uw, '"token.identity.map" must not map "accountId"');
+      }
+      token = { hint: t.hint, ...(identity ? { identity } : {}) };
     }
     if (userOauth === undefined && token === undefined) {
       fail(uw, 'must declare at least one mode ("oauth" and/or "token")');

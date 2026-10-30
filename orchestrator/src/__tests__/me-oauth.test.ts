@@ -3,6 +3,7 @@ import { makeMeRoute, type OAuthCredentialClient } from "../routes/me.ts";
 import type { UserSecretStore } from "../db/user-secrets.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import { invalidateRegistry } from "../connectors/registry.ts";
+import { Code, ConnectError } from "@connectrpc/connect";
 
 const secrets: UserSecretStore = {
   put: async () => {},
@@ -130,7 +131,7 @@ describe("/me connector credentials (ADR 0115)", () => {
 
   function fakeOauth() {
     const calls: {
-      put: Array<{ subject: { kind: OauthSubjectKind; id: string }; provider: string; secret: string }>;
+      put: Array<Parameters<OAuthCredentialClient["putCredential"]>[0]>;
       disconnect: Array<{ subject: { kind: OauthSubjectKind; id: string }; provider: string }>;
     } = { put: [], disconnect: [] };
     const oauth: OAuthCredentialClient = {
@@ -173,6 +174,40 @@ describe("/me connector credentials (ADR 0115)", () => {
         secret: "pat-1",
       },
     ]);
+  });
+
+  test("PUT sends the connector's identity probe with the token", async () => {
+    const { oauth, calls } = fakeOauth();
+    // GitHub (shipped) names the account behind a pasted token by its login.
+    const response = await appWith(oauth).request("/api/v1/me/connector-credentials/github", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ value: "ghp-1" }),
+    });
+    expect(response.status).toBe(204);
+    expect(calls.put).toHaveLength(1);
+    expect(calls.put[0]).toMatchObject({
+      provider: "github",
+      secret: "ghp-1",
+      identity: { method: "GET", host: "api.github.com", path: "/user", map: { display_name: "login" } },
+    });
+  });
+
+  test("PUT 400s a token the provider does not confirm", async () => {
+    const { oauth } = fakeOauth();
+    oauth.putCredential = async () => {
+      const metadata = new Headers({ "engram-error-slug": "probe_failed" });
+      throw new ConnectError("metadata probe returned HTTP 401", Code.Unavailable, metadata);
+    };
+    const response = await appWith(oauth).request("/api/v1/me/connector-credentials/github", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ value: "ghp-bad" }),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe(
+      "Could not confirm this token with GitHub. Check the token and try again.",
+    );
   });
 
   test("PUT 404s for a provider without token mode and 400s an empty value", async () => {

@@ -7,11 +7,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::routing::post;
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use engram_coordinator::oauth::{OAuthManager, OAuthServiceError};
 use engram_coordinator::oauth_redirect::{
     RedirectMetadataProbe, RedirectMetadataSpec, RedirectOauthSpec, META_ACCOUNT_ID,
+    META_DISPLAY_NAME,
 };
 use engram_core::traits::{Clock, MetadataStore};
 use engram_core::types::connector_oauth::{ConnectorOAuthBundle, ConnectorOAuthKind};
@@ -39,6 +41,18 @@ async fn serve(provider: Provider) -> String {
         .route(
             "/graphql",
             post(|State(p): State<Provider>| async move { Json(p.viewer_response.lock().clone()) }),
+        )
+        // A token "who am I": only the good token is known to the provider.
+        .route(
+            "/user",
+            get(|headers: HeaderMap| async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+                if auth == Some("Bearer pat-good") {
+                    Ok(Json(json!({"id": 42, "login": "octo-dev"})))
+                } else {
+                    Err(StatusCode::UNAUTHORIZED)
+                }
+            }),
         )
         .with_state(provider);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -176,7 +190,7 @@ async fn put_static_credential_seals_resolves_and_replaces() {
 
     let row = fx
         .manager
-        .put_static_credential(&key, "  pat-secret-1  ")
+        .put_static_credential(&key, "  pat-secret-1  ", None)
         .await
         .expect("put");
     assert_eq!(
@@ -201,7 +215,7 @@ async fn put_static_credential_seals_resolves_and_replaces() {
     // Replacement is a CAS write over the current version.
     let replaced = fx
         .manager
-        .put_static_credential(&key, "pat-secret-2")
+        .put_static_credential(&key, "pat-secret-2", None)
         .await
         .expect("replace");
     assert!(replaced.version > row.version);
@@ -223,17 +237,63 @@ async fn put_static_credential_rejects_bad_subjects_and_empty_values() {
     };
     let err = fx
         .manager
-        .put_static_credential(&connector_key, "pat")
+        .put_static_credential(&connector_key, "pat", None)
         .await
         .expect_err("connector subjects must be rejected");
     assert!(matches!(err, OAuthServiceError::BadRequest(_)));
 
     let err = fx
         .manager
-        .put_static_credential(&user_key("sentry"), "   ")
+        .put_static_credential(&user_key("sentry"), "   ", None)
         .await
         .expect_err("blank values must be rejected");
     assert!(matches!(err, OAuthServiceError::BadRequest(_)));
+}
+
+fn identity_probe(host: &str) -> RedirectMetadataProbe {
+    RedirectMetadataProbe {
+        method: "GET".into(),
+        host: host.to_string(),
+        path: "/user".into(),
+        body: String::new(),
+        map: BTreeMap::from([
+            (META_DISPLAY_NAME.to_string(), "login".to_string()),
+            (META_ACCOUNT_ID.to_string(), "id".to_string()),
+        ]),
+    }
+}
+
+#[tokio::test]
+async fn identity_probe_names_the_account_but_records_no_account_id() {
+    let fx = fixture().await;
+    let key = user_key("github");
+    let row = fx
+        .manager
+        .put_static_credential(&key, " pat-good ", Some(&identity_probe(&fx.host)))
+        .await
+        .expect("put");
+    assert_eq!(row.metadata.display_name.as_deref(), Some("octo-dev"));
+    // A mapped id is ignored: a stored id would block a later OAuth connect
+    // to a different account.
+    assert_eq!(row.metadata.account_id, "");
+}
+
+#[tokio::test]
+async fn identity_probe_rejects_a_token_the_provider_refuses() {
+    let fx = fixture().await;
+    let key = user_key("github");
+    let err = fx
+        .manager
+        .put_static_credential(&key, "pat-bad", Some(&identity_probe(&fx.host)))
+        .await
+        .expect_err("a refused token must not be saved");
+    assert!(matches!(err, OAuthServiceError::Driver(_)), "{err:?}");
+    assert!(fx
+        .meta
+        .get_oauth_credential(&key)
+        .await
+        .expect("get")
+        .is_none());
 }
 
 #[tokio::test]
@@ -241,7 +301,7 @@ async fn static_tokens_never_enter_the_refresh_sweep() {
     let fx = fixture().await;
     let key = user_key("sentry");
     fx.manager
-        .put_static_credential(&key, "pat-secret-1")
+        .put_static_credential(&key, "pat-secret-1", None)
         .await
         .expect("put");
 
@@ -316,7 +376,7 @@ async fn pat_and_oauth_deliberately_replace_each_other() {
     // PAT first; an OAuth connect replaces it (empty stored account id
     // records no identity to protect).
     fx.manager
-        .put_static_credential(&key, "pat-secret-1")
+        .put_static_credential(&key, "pat-secret-1", None)
         .await
         .expect("put PAT");
     connect_user_oauth(&fx, &sp).await;
@@ -327,7 +387,7 @@ async fn pat_and_oauth_deliberately_replace_each_other() {
     // A PAT write replaces the OAuth credential without an account check:
     // the user pasted it on purpose.
     fx.manager
-        .put_static_credential(&key, "pat-secret-2")
+        .put_static_credential(&key, "pat-secret-2", None)
         .await
         .expect("PAT over OAuth");
     let bundle = open_bundle(&fx, &key).await;

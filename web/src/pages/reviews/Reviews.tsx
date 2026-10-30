@@ -11,6 +11,7 @@ import { relativeAge } from "@/lib/relative-time";
 import { FilterBar, type FilterField } from "../sessions/filter-bar";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton-rows";
 import { GitFork, X } from "lucide-react";
@@ -18,6 +19,8 @@ import { useAbility } from "../../auth/AuthProvider";
 import { ReviewStage } from "./ReviewGlyph";
 import { Sep } from "./Sep";
 import { groupByPr, type PrGroup } from "./review-groups";
+import { useReviewScope, type ReviewScope } from "./review-scope";
+import { ReviewScopeNotice } from "./ReviewScopeNotice";
 import {
   diffShort,
   isActive,
@@ -58,6 +61,10 @@ export function Reviews() {
   const [query, setQuery] = useState("");
   const search = useDebouncedValue(query, 150).trim();
   const [filters, setFilters] = useState<Record<string, string[]>>({});
+  // "Mine" narrows the list to the reader's own pull requests by author, so
+  // it replaces the author filter while it is on.
+  const reviewScope = useReviewScope();
+  const mine = reviewScope.scope === "mine";
 
   const {
     reviews,
@@ -72,7 +79,7 @@ export function Reviews() {
     {
       search,
       repos: filters["repo"],
-      authors: filters["author"],
+      authors: mine ? reviewScope.authors : filters["author"],
       prStates: filters["pr_state"],
       statuses: filters["stage"],
       severities: filters["severity"],
@@ -97,11 +104,15 @@ export function Reviews() {
         label: "Repository",
         options: facets.repos.map((repo) => ({ value: repo, label: repo })),
       },
-      {
-        key: "author",
-        label: "Author",
-        options: facets.authors.map((author) => ({ value: author, label: author })),
-      },
+      ...(mine
+        ? []
+        : [
+            {
+              key: "author",
+              label: "Author",
+              options: facets.authors.map((author) => ({ value: author, label: author })),
+            },
+          ]),
       {
         key: "pr_state",
         label: "Pull request",
@@ -127,10 +138,13 @@ export function Reviews() {
         })),
       },
     ],
-    [facets],
+    [facets, mine],
   );
 
-  const hasFilters = query !== "" || Object.values(filters).some((v) => v.length > 0);
+  // The author filter does not apply under "Mine", so it does not count.
+  const hasFilters =
+    query !== "" ||
+    Object.entries(filters).some(([key, v]) => v.length > 0 && !(mine && key === "author"));
 
   // One count, in the masthead: the pull requests matching the filters, which
   // the server knows whether or not the reader has scrolled to them all.
@@ -156,6 +170,20 @@ export function Reviews() {
       />
 
       <div className="flex flex-wrap items-center gap-2">
+        <Tabs
+          value={reviewScope.scope}
+          onValueChange={(value) => reviewScope.setScope(value as ReviewScope)}
+        >
+          <TabsList aria-label="Whose pull requests">
+            <TabsTrigger value="all">All</TabsTrigger>
+            <TabsTrigger
+              value="mine"
+              title={reviewScope.login ? `Pull requests by ${reviewScope.login}` : undefined}
+            >
+              Mine
+            </TabsTrigger>
+          </TabsList>
+        </Tabs>
         <Input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -179,7 +207,11 @@ export function Reviews() {
         )}
       </div>
 
-      {isPending ? (
+      {reviewScope.unavailable ? (
+        <EmptyState>
+          <ReviewScopeNotice reason={reviewScope.unavailable} />
+        </EmptyState>
+      ) : isPending || reviewScope.pending ? (
         <SkeletonRows
           rows={5}
           columns={["minmax(0,1fr)", "64px", "80px", "36px"]}
@@ -191,7 +223,9 @@ export function Reviews() {
         <EmptyState>
           {hasFilters
             ? "No pull requests match these filters."
-            : "No pull requests reviewed yet. Enrol a repository in settings, or ask for a review on a PR with @engrams review."}
+            : mine
+              ? `No pull requests by ${reviewScope.login} have been reviewed yet.`
+              : "No pull requests reviewed yet. Enrol a repository in settings, or ask for a review on a PR with @engrams review."}
         </EmptyState>
       ) : (
         <>

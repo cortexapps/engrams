@@ -69,7 +69,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { Accept: "application/json", ...init?.headers },
     ...init,
   });
-  if (!response.ok) throw new Error(`${path} → ${response.status}`);
+  if (!response.ok) {
+    // The server's message says what went wrong in words (e.g. a token the
+    // provider did not confirm); the status line is the fallback.
+    const message = (await response.text().catch(() => "")).trim();
+    throw new Error(message && message.length <= 300 ? message : `${path} → ${response.status}`);
+  }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
@@ -170,4 +175,19 @@ export function useDeleteConnectorCredential() {
 export function connectorOAuthAuthorizeUrl(provider: string, force = false): string {
   const qs = force ? "?force=1" : "";
   return `${API_BASE}/me/connector-credentials/${encodeURIComponent(provider)}/oauth/authorize${qs}`;
+}
+
+/** The account behind the caller's personal credential for a connector, as
+ * the provider named it when the credential was saved (GitHub: the login). */
+export function useConnectorAccount(provider: string): {
+  isPending: boolean;
+  connected: boolean;
+  name: string | undefined;
+} {
+  const { data, isPending } = useCredentials();
+  const entry = data?.find(
+    (c): c is ConnectorCredentialEntry => c.kind === "connector" && c.provider === provider,
+  );
+  const connected = entry?.connected ?? false;
+  return { isPending, connected, name: connected ? entry?.account?.displayName : undefined };
 }

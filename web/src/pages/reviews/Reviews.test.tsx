@@ -235,6 +235,14 @@ vi.mock("../../hooks/useReviews", () => ({
 }));
 vi.mock("../../hooks/useNow", () => ({ useNow: () => 0 }));
 
+/** The reader's GitHub credential, as Settings → Credentials reports it. */
+const github: { isPending: boolean; connected: boolean; name: string | undefined } = {
+  isPending: false,
+  connected: true,
+  name: "octo-dev",
+};
+vi.mock("../../hooks/useCredentials", () => ({ useConnectorAccount: () => github }));
+
 // jsdom has no IntersectionObserver. Record what the sentinel observes and let
 // a test bring it into view.
 const observed: Element[] = [];
@@ -283,6 +291,10 @@ beforeEach(() => {
   view.hasNextPage = false;
   listParams.length = 0;
   observed.length = 0;
+  localStorage.clear();
+  github.isPending = false;
+  github.connected = true;
+  github.name = "octo-dev";
   retryMutate.mockClear();
   fetchNextPage.mockClear();
 });
@@ -404,6 +416,34 @@ describe("Reviews ledger", () => {
     await waitFor(() => expect(listParams.at(-1)).toMatchObject({ search: "quinn" }));
     // The rows are whatever the server answered with — nothing is filtered here.
     expect(screen.getByText("Bump quinn-proto from 0.11.14 to 0.11.16")).toBeTruthy();
+  });
+
+  it("narrows to the reader's own pull requests by their GitHub login", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<Reviews />);
+    await screen.findByText("Bump quinn-proto from 0.11.14 to 0.11.16");
+    expect(listParams.at(-1)?.authors).toBeUndefined();
+
+    await user.click(screen.getByRole("tab", { name: "Mine" }));
+
+    await waitFor(() => expect(listParams.at(-1)).toMatchObject({ authors: ["octo-dev"] }));
+    // The choice outlives the page, so the rail and the next visit agree.
+    expect(localStorage.getItem("engrams.reviewsScope")).toBe("mine");
+  });
+
+  it("says how to get Mine working when GitHub names no account", async () => {
+    localStorage.setItem("engrams.reviewsScope", "mine");
+    github.connected = false;
+    github.name = undefined;
+    const { unmount } = renderWithProviders(<Reviews />);
+    expect(await screen.findByText(/connect your GitHub account/)).toBeTruthy();
+    expect(screen.queryByText("Bump quinn-proto from 0.11.14 to 0.11.16")).toBeNull();
+    unmount();
+
+    // A token saved before engrams asked GitHub for the login.
+    github.connected = true;
+    renderWithProviders(<Reviews />);
+    expect(await screen.findByText(/save your GitHub token again/)).toBeTruthy();
   });
 
   it("reads the next page from a sentinel and says how much is in hand", async () => {
