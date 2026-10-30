@@ -640,7 +640,11 @@ impl OAuthManager {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| driver_err("http_client", e.to_string()))?;
-        let request = http.post(token_url);
+        // RFC 6749 answers in JSON, but some providers (GitHub) answer the
+        // token request in form encoding unless the client asks for JSON.
+        let request = http
+            .post(token_url)
+            .header(reqwest::header::ACCEPT, "application/json");
         let request = match body {
             TokenRequestBody::Form => request.form(form),
             TokenRequestBody::Json => {
