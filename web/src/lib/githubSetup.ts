@@ -102,6 +102,15 @@ export function githubWebhookUrl(origin: string): string {
   return `${origin}/api/v1/integrations/github/events`;
 }
 
+/**
+ * Where GitHub sends a member back after they authorize the App to act as
+ * them — the orchestrator's shared OAuth callback. It is the App's
+ * "Callback URL", and it must match exactly.
+ */
+export function githubOAuthCallbackUrl(origin: string): string {
+  return `${origin}/api/v1/integrations/github/oauth/callback`;
+}
+
 /** The engrams App as it appears in the target org. */
 const APP_NAME = "engrams";
 
@@ -130,6 +139,8 @@ export function buildGithubManifest({ origin, permissions, events }: GithubManif
     url: origin,
     hook_attributes: { url: githubWebhookUrl(origin), active: true },
     redirect_url: `${origin}/settings/integrations/github`,
+    // Members can connect their own GitHub account through the App.
+    callback_urls: [githubOAuthCallbackUrl(origin)],
     public: false,
     default_permissions,
     default_events: events,

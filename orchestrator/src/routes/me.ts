@@ -30,7 +30,10 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
-import { oauthCredential as defaultOAuthCredential } from "../control-plane/client.ts";
+import {
+  oauthCredential as defaultOAuthCredential,
+  orgSecret as defaultOrgSecret,
+} from "../control-plane/client.ts";
 import { OauthSubjectKind, type RedirectMetadataProbe } from "../gen/engram/app/v1/oauth_pb.ts";
 import { userTokenIdentityProbe } from "../connectors/oauth-spec.ts";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -84,6 +87,13 @@ export interface MeDeps {
   oauth?: OAuthCredentialClient;
   /** ADR 0115: custom-connector source for the user-credential surface. */
   connectors?: CustomConnectorSource;
+  /** The org secret names, to offer OAuth connect only when the app's client
+   * id and secret are set. */
+  orgSecrets?: OrgSecretNames;
+}
+
+export interface OrgSecretNames {
+  listSecrets(req: Record<string, never>): Promise<{ secrets: Array<{ name: string }> }>;
 }
 
 export interface OAuthCredentialClient {
@@ -139,6 +149,9 @@ interface UserConnectorEntry {
   tokenHint?: string;
   /** Names the account behind a pasted token, when the connector declares it. */
   identity?: RedirectMetadataProbe;
+  /** The org secrets the personal OAuth flow needs (the app's client id and
+   * secret), when the connector has one. */
+  oauthClientRefs?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +168,18 @@ export function makeMeRoute(deps?: MeDeps): Hono {
     deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogReader);
   const resolveOAuth = (): OAuthCredentialClient =>
     deps?.oauth ?? defaultOAuthCredential;
+  const resolveOrgSecrets = (): OrgSecretNames => deps?.orgSecrets ?? defaultOrgSecret;
+
+  /** The org secret names, or undefined when the listing fails. */
+  async function orgSecretNames(): Promise<ReadonlySet<string> | undefined> {
+    try {
+      const listed = await resolveOrgSecrets().listSecrets({});
+      return new Set(listed.secrets.map((secret) => secret.name));
+    } catch (error) {
+      console.error(`me: org-secret listing unavailable — ${(error as Error).message}`);
+      return undefined;
+    }
+  }
 
   const resolveSession: GetSession =
     deps?.getSession ??
@@ -225,12 +250,16 @@ export function makeMeRoute(deps?: MeDeps): Hono {
     for (const connector of registry.values()) {
       const uc = connector.userCredential;
       if (!uc) continue;
+      const oauthFacet = uc.oauth === undefined ? undefined : (uc.oauthFacet ?? connector.oauth);
       union.set(connector.provider, {
         name: connector.display.name,
         oauth: uc.oauth !== undefined,
         token: uc.token !== undefined,
         ...(uc.token ? { tokenHint: uc.token.hint } : {}),
         identity: userTokenIdentityProbe(connector),
+        ...(oauthFacet
+          ? { oauthClientRefs: [oauthFacet.clientIdRef, oauthFacet.clientSecretRef] }
+          : {}),
       });
     }
     return union;
@@ -293,13 +322,15 @@ export function makeMeRoute(deps?: MeDeps): Hono {
   // existing sealed-value flow; OAuth entries expose metadata and lifecycle.
   app.get("/api/v1/me/credentials", async (c) => {
     const user = await requireUser(c.req.raw.headers);
-    const [envVars, providers, connectors, oauthRows, connectorRows] = await Promise.all([
-      userEnvUnion(),
-      oauthUnion(),
-      connectorUnion(),
-      resolveOAuth().listCredentials({ subject: oauthSubject(user.id) }),
-      resolveOAuth().listCredentials({ subject: connectorSubject(user.id) }),
-    ]);
+    const [envVars, providers, connectors, oauthRows, connectorRows, secretNames] =
+      await Promise.all([
+        userEnvUnion(),
+        oauthUnion(),
+        connectorUnion(),
+        resolveOAuth().listCredentials({ subject: oauthSubject(user.id) }),
+        resolveOAuth().listCredentials({ subject: connectorSubject(user.id) }),
+        orgSecretNames(),
+      ]);
     const byProvider = new Map(oauthRows.credentials.map((row) => [row.provider, row]));
     const connectorByProvider = new Map(
       connectorRows.credentials.map((row) => [row.provider, row]),
@@ -308,11 +339,18 @@ export function makeMeRoute(deps?: MeDeps): Hono {
     // against the caller's personal credential row (PAT or OAuth — one slot).
     const connectorEntries = [...connectors.entries()].map(([provider, entry]) => {
       const row = connectorByProvider.get(provider);
+      // OAuth connect needs the app's client id and secret in the org store;
+      // without them the button would only fail. A failed listing keeps the
+      // button, and the flow reports the real error.
+      const oauthReady =
+        entry.oauth &&
+        (secretNames === undefined ||
+          (entry.oauthClientRefs ?? []).every((ref) => secretNames.has(ref)));
       return {
         kind: "connector" as const,
         provider,
         display: { name: entry.name },
-        modes: { oauth: entry.oauth, token: entry.token },
+        modes: { oauth: oauthReady, token: entry.token },
         ...(entry.tokenHint ? { tokenHint: entry.tokenHint } : {}),
         connected: row?.connected ?? false,
         status: row?.status ?? "",

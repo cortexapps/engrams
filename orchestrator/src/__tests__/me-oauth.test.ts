@@ -27,10 +27,16 @@ const acmeConnector = {
   userCredential: { token: { hint: "Create a PAT." } },
 };
 
+/** The org secret names the fake coordinator holds. */
+let orgSecretNames: string[] = [];
+
 function appWith(oauth: OAuthCredentialClient) {
   return makeMeRoute({
     secrets,
     oauth,
+    orgSecrets: {
+      listSecrets: async () => ({ secrets: orgSecretNames.map((name) => ({ name })) }),
+    },
     getSession: async () => ({ user: { id: "user-42", role: "user" } }),
     connectors: { list: async () => [{ provider: "acme", config: acmeConnector }] },
     harnessCatalog: {
@@ -127,7 +133,10 @@ describe("/me OAuth credentials", () => {
 });
 
 describe("/me connector credentials (ADR 0115)", () => {
-  beforeEach(() => invalidateRegistry());
+  beforeEach(() => {
+    invalidateRegistry();
+    orgSecretNames = [];
+  });
 
   function fakeOauth() {
     const calls: {
@@ -208,6 +217,23 @@ describe("/me connector credentials (ADR 0115)", () => {
     expect(await response.text()).toBe(
       "Could not confirm this token with GitHub. Check the token and try again.",
     );
+  });
+
+  test("offers OAuth connect only when the app's client id and secret are set", async () => {
+    const { oauth } = fakeOauth();
+    const githubModes = async () => {
+      const listed = await appWith(oauth).request("/api/v1/me/credentials");
+      const body = (await listed.json()) as { credentials: Array<Record<string, unknown>> };
+      return body.credentials.find(
+        (entry) => entry.kind === "connector" && entry.provider === "github",
+      )?.modes;
+    };
+    // Without the GitHub App's OAuth client, a Connect button would only fail.
+    expect(await githubModes()).toEqual({ oauth: false, token: true });
+    orgSecretNames = ["github_app.client_id"];
+    expect(await githubModes()).toEqual({ oauth: false, token: true });
+    orgSecretNames = ["github_app.client_id", "github_app.client_secret"];
+    expect(await githubModes()).toEqual({ oauth: true, token: true });
   });
 
   test("PUT 404s for a provider without token mode and 400s an empty value", async () => {
