@@ -121,7 +121,10 @@ fn github_app_descriptor_metadata() {
     // The field names are the org-secret suffixes the coordinator resolves; the
     // Plane-A form (C4) renders from this metadata, so pin the contract.
     let names: Vec<&str> = d.fields.iter().map(|f| f.name).collect();
-    assert_eq!(names, vec!["app_id", "private_key_pem"]);
+    assert_eq!(
+        names,
+        vec!["app_id", "private_key_pem", "client_id", "client_secret"]
+    );
     let pem = d
         .fields
         .iter()
@@ -131,6 +134,18 @@ fn github_app_descriptor_metadata() {
     assert!(pem.required);
     let app_id = d.fields.iter().find(|f| f.name == "app_id").unwrap();
     assert_eq!(app_id.field_kind, MintFieldKind::Config);
+    // The App's OAuth client serves personal connect only; minting works
+    // without it.
+    let client_secret = d.fields.iter().find(|f| f.name == "client_secret").unwrap();
+    assert_eq!(client_secret.field_kind, MintFieldKind::SealedSecret);
+    assert!(!client_secret.required);
+    assert!(
+        !d.fields
+            .iter()
+            .find(|f| f.name == "client_id")
+            .unwrap()
+            .required
+    );
 }
 
 #[test]
