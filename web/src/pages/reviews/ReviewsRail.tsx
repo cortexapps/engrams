@@ -11,6 +11,8 @@ import { EngramMark } from "../../components/EngramMark";
 import { LivePulse } from "../../components/LivePulse";
 import { ReviewGlyph } from "./ReviewGlyph";
 import { groupByPr } from "./review-groups";
+import { useReviewScope } from "./review-scope";
+import { ReviewScopeNotice } from "./ReviewScopeNotice";
 import { isActive, prTitleOf, reviewCreatedAt, stageOf } from "./review-format";
 
 /** Pull requests per page of the rail. */
@@ -44,13 +46,17 @@ export function ReviewsRail() {
   const now = useNow();
   const [search, setSearch] = useState("");
   const debounced = useDebouncedValue(search, 150).trim();
+  // The rail follows the ledger's All / Mine choice, so the switcher lists
+  // the same pull requests the ledger does.
+  const reviewScope = useReviewScope();
+  const mine = reviewScope.scope === "mine";
 
   // The search runs on the server, over what the row shows — the repo, the
   // number, the title and the author — so searching for "quinn" finds the PR a
   // developer remembers by name, on whichever page it sits. The rail reads a
   // page of pull requests at a time, like the tasks rail.
   const { reviews, hasNextPage, isFetchingNextPage, fetchNextPage, isPending, error } =
-    useReviewsInfinite({ search: debounced }, PAGE_SIZE);
+    useReviewsInfinite({ search: debounced, authors: reviewScope.authors }, PAGE_SIZE);
   const loadMoreRef = useLoadMoreSentinel({
     hasMore: hasNextPage,
     isFetching: isFetchingNextPage,
@@ -80,7 +86,7 @@ export function ReviewsRail() {
 
       <SidebarContent>
         <SidebarGroup className="py-1">
-          <SidebarGroupLabel>Reviewed PRs</SidebarGroupLabel>
+          <SidebarGroupLabel>{mine ? "My reviewed PRs" : "Reviewed PRs"}</SidebarGroupLabel>
           <SidebarGroupContent>
             {/* The review glyph reads content-surface instrument tokens, which
                 lose contrast on the deep-green rail. Re-tone them to the
@@ -99,7 +105,11 @@ export function ReviewsRail() {
                 } as CSSProperties
               }
             >
-              {isPending ? (
+              {reviewScope.unavailable ? (
+                <p className="px-2 py-2 text-xs text-sidebar-foreground/85">
+                  <ReviewScopeNotice reason={reviewScope.unavailable} />
+                </p>
+              ) : isPending || reviewScope.pending ? (
                 Array.from({ length: 5 }).map((_, i) => (
                   <SidebarMenuItem key={i}>
                     <SidebarMenuSkeleton />
@@ -114,7 +124,11 @@ export function ReviewsRail() {
                 </p>
               ) : rows.length === 0 ? (
                 <p className="px-2 py-2 text-xs text-sidebar-foreground/85">
-                  {search ? "No matching pull requests." : "No reviews yet."}
+                  {search
+                    ? "No matching pull requests."
+                    : mine
+                      ? "None of your pull requests have been reviewed yet."
+                      : "No reviews yet."}
                 </p>
               ) : (
                 rows.map((group) => {

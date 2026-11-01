@@ -18,7 +18,13 @@
   },
   "userCredential": {
     "token": {
-      "hint": "Create a fine-grained personal access token under GitHub Settings \u2192 Developer settings, with the permissions you want sessions to hold."
+      "hint": "Create a fine-grained personal access token under GitHub Settings \u2192 Developer settings, with the permissions you want sessions to hold.",
+      "identity": {
+        "path": "/user",
+        "map": {
+          "displayName": "login"
+        }
+      }
     },
     "inject": {
       "header": "Authorization",
