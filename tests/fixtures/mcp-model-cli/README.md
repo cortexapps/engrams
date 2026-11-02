@@ -2,7 +2,7 @@
 
 This test-only program replaces the model CLI. It does not replace either
 harness or authorize an MCP call. Claude uses the generated strict MCP config
-and hook settings. Codex uses app-server JSON-RPC. Both use the call ID
+and hook settings. Codex uses app-server JSON-RPC. By default, both use the call ID
 `fixture-call` and send `{"fixture":"<mode>"}` as tool arguments. The selected
 manifest tool must accept that input and have no native binding. Use a neutral
 fixture tool name, description, and data.
@@ -13,6 +13,18 @@ Set these variables for each fixture process:
 - `ENGRAM_FIXTURE_MODE`: `read`, `write`, `denied`, `refire`, `held-call`, or
   `forged` (call an unlisted name and require wrapper rejection).
   The mode is an input sentinel. Policy and the harness determine the outcome.
+- `ENGRAM_FIXTURE_ARGUMENTS_JSON`: optional JSON object, at most 4096 UTF-8
+  bytes and 16 nested containers (the root object has depth 1). Duplicate keys
+  at any depth, trailing data, and non-object values are rejected. The exact
+  parsed value is used in the assistant frame, hook, bridge, and dynamic call.
+- `ENGRAM_FIXTURE_CALL_ID`: optional ASCII `[A-Za-z0-9_-]{1,64}`. All call and
+  proof locations use it, including a resumed or repeated call. The default
+  remains `fixture-call`.
+- `ENGRAM_FIXTURE_EXPECTED_RESULT_JSON`: optional literal native result object,
+  at most 1 MiB. Duplicate keys and excessive parser depth are rejected.
+  Compare the actual native object, as described below. Do not put private
+  data in the environment. The operating system can impose a smaller total
+  environment limit than this parser limit.
 - `ENGRAM_FIXTURE_STATE_DIR`: an absolute, private mode-0700 directory owned by
   the test. No component may be a symlink.
 - `ENGRAM_FIXTURE_PROOF`: a new direct child of that directory. The fixture
@@ -24,13 +36,102 @@ Set these variables for each fixture process:
   absent, a call waits for up to 30 seconds; an interrupt can end the wait.
   Create a regular file at that path to release it. A symlink is rejected.
 
-The proof contains only a fixed call ID, the fixture tool name, booleans for
+The default proof contains only the call ID, the fixture tool name, booleans for
 the neutral `sentinel`, `second sentinel`, and `{"fixture":true}` result
 values, and bounded native outcome and delivery fields. It records a CLI-side
 observation. It is not evidence that the journal or an upstream service
 committed a result. Empty proof means no result was recorded. Never reuse a
 proof path. The fixture does not print the input environment, arguments, or
 tool payloads. `--fixture-version` prints `engram-mcp-model-fixture 1`.
+
+With any of the three optional scalar variables set, proof also records
+`selectedToolName`, `selectedSchemaSha256`, and `exposedMcpToolNamesSha256`.
+The first two come from the single matching
+member of the actual Claude `tools/list` or Codex `dynamicTools` array. The caller
+must verify the alias and schema against the public session binding before the
+prompt. The exposure hash covers the sorted array of actual exposed names that
+start with `mcp_`. It rejects invalid names, duplicates, and more than 128 MCP
+names. The caller compares this hash against the complete public binding set.
+This fixture does not select tools by description or infer their alias.
+
+When an expected object is configured and native output is available, proof adds
+`resultMatchesExpected`, `resultSha256`, and `expectedResultSha256`. A mismatch
+records `false`. SHA-256 values have the prefix `sha256:` and 64 lowercase hex
+digits. Hash input is compact JSON with recursively sorted object keys. Array
+order, absent fields, and text strings are preserved. No arguments, expected
+values, or received output bytes are stored in proof or error output.
+
+Claude compares the JSON-RPC `result` object, including `_meta`. Codex compares
+the complete `item/tool/call` response `result` object, including `success` and
+all `contentItems`. JSON text inside those items remains literal text. For
+example, a count of 1 with a successful receipt and `resultUnavailable=false`
+has these two expected objects:
+
+```json
+{"content":[{"type":"text","text":"count=1"}],"structuredContent":{"count":1},"isError":false,"_meta":{"engrams/toolResult":{"outcome":"succeeded","delivery":"available","resultUnavailable":false,"isError":false}}}
+```
+
+```json
+{"success":true,"contentItems":[{"type":"inputText","text":"count=1"},{"type":"inputText","text":"{\"structuredContent\":{\"count\":1}}"},{"type":"inputText","text":"{\"delivery\":\"available\",\"isError\":false,\"outcome\":\"succeeded\",\"resultUnavailable\":false}"}]}
+```
+
+Only fields actually sent by the runtime belong in the expected value. In
+particular, do not add an omitted `resultUnavailable` or `isError` field.
+An unavailable delivery has no comparison fields. A transport error does not
+become a tool error. The existing receipt fields remain separate, and a hash
+match does not prove an upstream effect. The legacy `resultReceived` flag says
+that a native completion was observed, including an unavailable receipt; it
+does not establish that tool output is available. Codex receipt flags use the
+last text item, which the native encoder reserves for receipt metadata.
+
+A scalar configuration has one fixed call ID and one fixed tool. For a bounded
+sequence, set `ENGRAM_FIXTURE_CALL_PLAN_JSON` instead of TOOL, ARGUMENTS_JSON,
+CALL_ID and EXPECTED_RESULT_JSON. These scalar variables must be absent in plan
+mode. The plan is at most 65536 UTF-8 bytes and has exactly a `steps` array of
+1 to 16 objects. Each step has `marker`, `tool`, `arguments`, `callId`,
+`resultFormat` (`mcp` or `json`), and optional `expectedResult`. Unknown fields
+are rejected. Markers and call IDs use the call-ID grammar and must be unique.
+Arguments have the scalar size and depth bounds. The whole-plan size limit also
+bounds the optional literal expected native objects.
+
+The current user prompt must contain exactly one `[[fixture:MARKER]]` token.
+Claude reads user `message.content` text; Codex reads current `turn/start` input
+text items. A missing, unknown, repeated, or ambiguous token fails closed. Tool
+result blocks cannot select a step. The same marker always selects the same
+fixed tool, arguments, and call ID. A new marker can select a new call ID in the
+same session. A fixed `spawn_session` message can contain a child marker, so the
+child selects its MCP read step rather than the spawn step. No argument or
+command interpolation is supported.
+
+```json
+{"steps":[{"marker":"read","tool":"mcp_example_01234567890123456789","arguments":{},"callId":"read-1","resultFormat":"mcp"},{"marker":"spawn","tool":"spawn_session","arguments":{"task_name":"fixture-child","message":"[[fixture:read]]","idempotency_key":"child-1"},"callId":"spawn-1","resultFormat":"json"}]}
+```
+
+Plan proof includes `planSha256`, the canonical digest of the entire immutable
+plan. A native JSON step hashes its literal native output even without an
+expected object. With an expected object, it also records the comparison and
+expected hash. Claude native JSON output is `{"content":[{"type":"text",
+"text":"<literal JSON text>"}]}`. Codex uses `{"success":true,"contentItems":
+[{"type":"inputText","text":"<literal JSON text>"}]}`. Native JSON proof has
+no MCP receipt fields; Codex retains its actual `success` flag. The fixture does
+not decode those text strings or assert that a child was actually created.
+
+Each completion appends one JSON line to the same process proof file and
+flushes it before the native turn-complete frame. With `{pid}` in the filename,
+a restarted process gets a new file. Read proof as JSONL when there are multiple
+turns; use the call ID and plan digest to select the required observation.
+
+A direct child of the private state directory, `plan-selection.json`, contains
+only planSha256, harness, mode, marker and pending. The fixture writes this
+receipt atomically before it emits a call. It marks the selection completed
+only after an actual native response. It stores no arguments or result bytes.
+A deferred Claude `--resume` in write/refire mode has no current prompt; it can
+repeat only a pending selection for the exact same plan, harness and mode.
+Missing, completed, malformed, mismatched or symlink receipts fail closed.
+A replay cannot advance to another step. A new ID requires a current marked
+prompt. This is a test-client retry; the production journal remains responsible
+for authorization, idempotency and effects. A session needs its own state
+directory, including when a parent and child use the same fixed plan.
 
 Build this standalone workspace and run its nonignored protocol tests:
 

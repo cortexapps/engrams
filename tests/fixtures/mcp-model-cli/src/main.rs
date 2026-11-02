@@ -1,3 +1,6 @@
+mod plan;
+mod scalar;
+use scalar::{configured_object, digest};
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -20,6 +23,18 @@ struct Config {
     mode: String,
     proof: File,
     barrier: Option<PathBuf>,
+    arguments: Value,
+    call_id: String,
+    expected: Option<Value>,
+    extended_proof: bool,
+    selected_schema: Option<String>,
+    exposed_hash: Option<String>,
+    exposed_tools: Vec<Value>,
+    plan: Option<plan::Plan>,
+    root: PathBuf,
+    marker: Option<String>,
+    native_json: bool,
+    harness: &'static str,
 }
 
 fn direct_child(root: &Path, path: &Path) -> bool {
@@ -67,17 +82,33 @@ fn config() -> Result<Config> {
     {
         return Err("barrier must be a direct child of the state directory".into());
     }
-    let tool = std::env::var("ENGRAM_FIXTURE_TOOL")?;
-    if tool.is_empty()
-        || tool.len() > 128
-        || !tool.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    let plan = plan::Plan::from_env()?;
+    let tool = if plan.is_some() {
+        "plan_pending".into()
+    } else {
+        std::env::var("ENGRAM_FIXTURE_TOOL")?
+    };
+    if !plan::tool_name(&tool) {
         return Err("invalid fixture tool".into());
     }
     let mode = std::env::var("ENGRAM_FIXTURE_MODE")?;
     if !["read", "write", "denied", "refire", "held-call", "forged"].contains(&mode.as_str()) {
         return Err("unsupported fixture mode".into());
     }
+    let arguments = configured_object("ENGRAM_FIXTURE_ARGUMENTS_JSON", 4096, 16)?;
+    let expected = configured_object("ENGRAM_FIXTURE_EXPECTED_RESULT_JSON", 1024 * 1024, 128)?;
+    let configured_id = match std::env::var("ENGRAM_FIXTURE_CALL_ID") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("invalid fixture call ID".into()),
+    };
+    let extended_proof =
+        plan.is_some() || arguments.is_some() || expected.is_some() || configured_id.is_some();
+    let call_id = configured_id.unwrap_or_else(|| "fixture-call".into());
+    if !plan::identifier(&call_id) {
+        return Err("invalid fixture call ID".into());
+    }
+    let arguments = arguments.unwrap_or_else(|| json!({"fixture":mode}));
     let proof = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -87,8 +118,111 @@ fn config() -> Result<Config> {
         mode,
         proof,
         barrier,
+        arguments,
+        call_id,
+        expected,
+        extended_proof,
+        selected_schema: None,
+        exposed_hash: None,
+        exposed_tools: Vec::new(),
+        plan,
+        root,
+        marker: None,
+        native_json: false,
+        harness: "unset",
     })
 }
+impl Config {
+    fn bind_tools(&mut self, tools: &[Value], harness: &'static str) -> Result<()> {
+        self.harness = harness;
+        if self.extended_proof {
+            self.exposed_hash = Some(plan::exposed_mcp_hash(tools)?);
+        }
+        self.exposed_tools = tools.to_vec();
+        if self.plan.is_none() {
+            self.validate_selected()?;
+        }
+        Ok(())
+    }
+    fn validate_selected(&mut self) -> Result<()> {
+        let selected: Vec<_> = self
+            .exposed_tools
+            .iter()
+            .filter(|tool| tool.get("name") == Some(&json!(self.tool)))
+            .collect();
+        if selected.len() != 1
+            || !selected[0]["inputSchema"].is_object()
+            || (self.harness == "codex" && !selected[0]["description"].is_string())
+        {
+            return Err("expected tool missing, duplicated, or malformed".into());
+        }
+        self.selected_schema = Some(digest(&selected[0]["inputSchema"])?);
+        Ok(())
+    }
+    fn select(&mut self, prompt: Option<&Value>) -> Result<()> {
+        let Some(plan) = &self.plan else {
+            return Ok(());
+        };
+        let step = match prompt {
+            Some(value) => plan.select(&plan::prompt_text(value, self.harness == "claude")?)?,
+            None => plan.resume(&self.root, self.harness, &self.mode)?,
+        };
+        self.tool = step.tool;
+        self.arguments = step.arguments;
+        self.call_id = step.call_id;
+        self.expected = step.expected;
+        self.native_json = step.native_json;
+        self.marker = Some(step.marker);
+        self.validate_selected()?;
+        Ok(())
+    }
+    fn persist_selection(&self, pending: bool) -> Result<()> {
+        if let Some(plan) = &self.plan {
+            plan.persist(
+                &self.root,
+                self.harness,
+                &self.mode,
+                self.marker.as_deref().ok_or("missing selected marker")?,
+                pending,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn record(cfg: &mut Config, mut proof: Value, native: Option<&Value>) -> Result<()> {
+    if cfg.extended_proof {
+        proof["selectedToolName"] = json!(cfg.tool);
+        proof["selectedSchemaSha256"] = json!(cfg
+            .selected_schema
+            .as_ref()
+            .ok_or("missing selected schema")?);
+        proof["exposedMcpToolNamesSha256"] = json!(cfg
+            .exposed_hash
+            .as_ref()
+            .ok_or("missing exposed MCP hash")?);
+    }
+    if let Some(plan) = &cfg.plan {
+        proof["planSha256"] = json!(plan.hash);
+    }
+    if let Some(native) = native.filter(|_| cfg.expected.is_some() || cfg.native_json) {
+        if !native.is_object() || serde_json::to_vec(native)?.len() > 1024 * 1024 {
+            return Err("invalid native result size or shape".into());
+        }
+        let actual_hash = digest(native)?;
+        if let Some(expected) = &cfg.expected {
+            let expected_hash = digest(expected)?;
+            proof["resultMatchesExpected"] = json!(actual_hash == expected_hash);
+            proof["expectedResultSha256"] = json!(expected_hash);
+        }
+        proof["resultSha256"] = json!(actual_hash);
+    }
+    writeln!(cfg.proof, "{proof}")?;
+    cfg.proof.flush()?;
+    cfg.persist_selection(false)?;
+    Ok(())
+}
+
 fn stdin_lines() -> mpsc::Receiver<io::Result<String>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -139,6 +273,9 @@ fn codex(mut cfg: Config) -> Result<()> {
     while let Ok(line) = input.recv() {
         let value: Value = serde_json::from_str(&line?)?;
         if value.get("method").is_none() && value.get("id") == Some(&json!(77)) && pending {
+            if value.get("error").is_some() {
+                return Err("dynamic transport error".into());
+            }
             let result = value
                 .get("result")
                 .and_then(Value::as_object)
@@ -156,12 +293,9 @@ fn codex(mut cfg: Config) -> Result<()> {
                 {
                     return Err("forged tool was not rejected".into());
                 }
-                writeln!(
-                    cfg.proof,
-                    "{}",
-                    json!({"callId":"fixture-call","tool":"fixture_forged","forgedRejected":true})
-                )?;
-                cfg.proof.flush()?;
+                let proof =
+                    json!({"callId":cfg.call_id,"tool":"fixture_forged","forgedRejected":true});
+                record(&mut cfg, proof, None)?;
                 emit(
                     json!({"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"completed"}}}),
                 )?;
@@ -178,6 +312,15 @@ fn codex(mut cfg: Config) -> Result<()> {
             }) {
                 return Err("unsupported content item".into());
             }
+            if cfg.native_json {
+                let proof = json!({"callId":cfg.call_id,"tool":cfg.tool,"resultReceived":true,"success":success});
+                record(&mut cfg, proof, value.get("result"))?;
+                emit(
+                    json!({"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"completed"}}}),
+                )?;
+                pending = false;
+                continue;
+            }
             let text_sentinel = items
                 .iter()
                 .any(|item| item == &json!({"type":"inputText","text":"sentinel"}));
@@ -192,10 +335,14 @@ fn codex(mut cfg: Config) -> Result<()> {
             let structured = parsed
                 .iter()
                 .any(|item| item == &json!({"structuredContent":{"fixture":true}}));
-            let receipt = parsed
-                .iter()
-                .find(|item| item.get("delivery").is_some())
-                .ok_or("missing receipt")?;
+            let receipt: Value = serde_json::from_str(
+                items
+                    .last()
+                    .and_then(|item| item.get("text"))
+                    .and_then(Value::as_str)
+                    .ok_or("missing receipt")?,
+            )?;
+            let receipt = &receipt;
             let delivery = receipt["delivery"]
                 .as_str()
                 .filter(|s| ["available", "unavailable"].contains(s))
@@ -209,12 +356,9 @@ fn codex(mut cfg: Config) -> Result<()> {
             let is_error = optional_bool(receipt, "isError")?;
             let unavailable = optional_bool(receipt, "resultUnavailable")?;
             let denial_plan = receipt.get("denial") == Some(&json!("plan_mode"));
-            writeln!(
-                cfg.proof,
-                "{}",
-                json!({"callId":"fixture-call","tool":cfg.tool,"resultReceived":true,"success":success,"textSentinel":text_sentinel,"textSequence":text_sequence,"structuredSentinel":structured,"isError":is_error,"outcome":outcome,"delivery":delivery,"resultUnavailable":unavailable,"denialPlanMode":denial_plan})
-            )?;
-            cfg.proof.flush()?;
+            let proof = json!({"callId":cfg.call_id,"tool":cfg.tool,"resultReceived":true,"success":success,"textSentinel":text_sentinel,"textSequence":text_sequence,"structuredSentinel":structured,"isError":is_error,"outcome":outcome,"delivery":delivery,"resultUnavailable":unavailable,"denialPlanMode":denial_plan});
+            let native = value.get("result").filter(|_| delivery == "available");
+            record(&mut cfg, proof, native)?;
             emit(
                 json!({"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"completed"}}}),
             )?;
@@ -248,22 +392,14 @@ fn codex(mut cfg: Config) -> Result<()> {
                     .pointer("/params/dynamicTools")
                     .and_then(Value::as_array)
                     .ok_or("missing dynamic tools")?;
-                let selected: Vec<_> = tools
-                    .iter()
-                    .filter(|tool| tool.get("name") == Some(&json!(cfg.tool)))
-                    .collect();
-                if selected.len() != 1
-                    || !selected[0]["inputSchema"].is_object()
-                    || !selected[0]["description"].is_string()
-                {
-                    return Err("expected tool missing, duplicated, or malformed".into());
-                }
+                cfg.bind_tools(tools, "codex")?;
                 thread_ready = true;
                 emit(
                     json!({"id":id.ok_or("missing id")?,"result":{"thread":{"id":"fixture-thread","turns":[]}}}),
                 )?;
             }
             "turn/start" if thread_ready && !pending => {
+                cfg.select(Some(&value))?;
                 emit(
                     json!({"id":id.ok_or("missing id")?,"result":{"turn":{"id":"fixture-turn","status":"inProgress"}}}),
                 )?;
@@ -279,8 +415,9 @@ fn codex(mut cfg: Config) -> Result<()> {
                     )?;
                     continue;
                 }
+                cfg.persist_selection(true)?;
                 emit(
-                    json!({"id":77,"method":"item/tool/call","params":{"callId":"fixture-call","tool":if cfg.mode == "forged" { "fixture_forged" } else { &cfg.tool },"arguments":{"fixture":cfg.mode},"threadId":"fixture-thread","turnId":"fixture-turn"}}),
+                    json!({"id":77,"method":"item/tool/call","params":{"callId":cfg.call_id,"tool":if cfg.mode == "forged" { "fixture_forged" } else { &cfg.tool },"arguments":cfg.arguments,"threadId":"fixture-thread","turnId":"fixture-turn"}}),
                 )?;
                 pending = true;
             }
@@ -452,13 +589,7 @@ fn claude(mut cfg: Config) -> Result<()> {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .ok_or("missing tools")?;
-    let selected: Vec<_> = tools
-        .iter()
-        .filter(|tool| tool["name"] == cfg.tool)
-        .collect();
-    if selected.len() != 1 || !selected[0]["inputSchema"].is_object() {
-        return Err("expected tool missing, duplicated, or malformed".into());
-    }
+    cfg.bind_tools(tools, "claude")?;
     emit(json!({"type":"system","subtype":"init","session_id":"fixture-session"}))?;
     let input = stdin_lines();
     let mut call_request_id = 3_u64;
@@ -467,7 +598,8 @@ fn claude(mut cfg: Config) -> Result<()> {
     let mut resumed = ["write", "refire"].contains(&cfg.mode.as_str())
         && args.iter().any(|arg| arg == "--resume");
     loop {
-        let prompt: Value = if std::mem::take(&mut resumed) {
+        let no_current_prompt = std::mem::take(&mut resumed);
+        let prompt: Value = if no_current_prompt {
             json!({"type":"user"})
         } else {
             match input.recv() {
@@ -478,6 +610,12 @@ fn claude(mut cfg: Config) -> Result<()> {
         if prompt["type"] != "user" {
             return Err("unsupported Claude input".into());
         }
+        cfg.select(if no_current_prompt {
+            None
+        } else {
+            Some(&prompt)
+        })?;
+        cfg.persist_selection(true)?;
         let mut hook = ChildGuard(
             Command::new(command)
                 .arg("hook-bridge")
@@ -486,18 +624,18 @@ fn claude(mut cfg: Config) -> Result<()> {
                 .spawn()?,
         );
         let hook_rx = read_lines(&mut hook.0)?;
-        let arguments = json!({"fixture":cfg.mode});
+        let arguments = cfg.arguments.clone();
         let call_tool = if cfg.mode == "forged" {
             "fixture_forged"
         } else {
             &cfg.tool
         };
         emit(
-            json!({"type":"assistant","message":{"id":"fixture-message","content":[{"type":"tool_use","id":"fixture-call","name":format!("mcp__engrams__{call_tool}"),"input":arguments}]}}),
+            json!({"type":"assistant","message":{"id":"fixture-message","content":[{"type":"tool_use","id":cfg.call_id,"name":format!("mcp__engrams__{call_tool}"),"input":arguments}]}}),
         )?;
         child_send(
             &mut hook.0,
-            json!({"tool_name":format!("mcp__engrams__{}",call_tool),"tool_use_id":"fixture-call","tool_input":arguments,"permission_mode":"default"}),
+            json!({"tool_name":format!("mcp__engrams__{}",call_tool),"tool_use_id":cfg.call_id,"tool_input":arguments,"permission_mode":"default"}),
         )?;
         drop(hook.0.stdin.take());
         let Some(decision) = interruptible_receive(&hook_rx, &input)? else {
@@ -532,7 +670,7 @@ fn claude(mut cfg: Config) -> Result<()> {
         }
         child_send(
             &mut bridge.0,
-            json!({"jsonrpc":"2.0","id":call_request_id,"method":"tools/call","params":{"name":call_tool,"arguments":arguments,"_meta":{"claudecode/toolUseId":"fixture-call"}}}),
+            json!({"jsonrpc":"2.0","id":call_request_id,"method":"tools/call","params":{"name":call_tool,"arguments":arguments,"_meta":{"claudecode/toolUseId":cfg.call_id}}}),
         )?;
         let Some(response) = interruptible_receive(&bridge_rx, &input)? else {
             child_send(
@@ -549,18 +687,36 @@ fn claude(mut cfg: Config) -> Result<()> {
             if response.pointer("/error/code") != Some(&json!(-32602)) {
                 return Err("forged tool was not rejected".into());
             }
-            writeln!(
-                cfg.proof,
-                "{}",
-                json!({"callId":"fixture-call","tool":"fixture_forged","forgedRejected":true})
-            )?;
-            cfg.proof.flush()?;
+            let proof = json!({"callId":cfg.call_id,"tool":"fixture_forged","forgedRejected":true});
+            record(&mut cfg, proof, None)?;
             emit(
                 json!({"type":"result","subtype":"success","session_id":"fixture-session","result":"fixture"}),
             )?;
             break;
         }
+        if response.get("result").is_some() && response.get("error").is_some() {
+            return Err("ambiguous tool response".into());
+        }
         let result = response.get("result");
+        if cfg.native_json {
+            let native = result.ok_or("missing native JSON result")?;
+            let content = native
+                .get("content")
+                .and_then(Value::as_array)
+                .ok_or("missing native JSON content")?;
+            if content.iter().any(|item| {
+                item.get("type") != Some(&json!("text"))
+                    || !item.get("text").is_some_and(Value::is_string)
+            }) {
+                return Err("invalid native JSON content".into());
+            }
+            let proof = json!({"callId":cfg.call_id,"tool":cfg.tool,"resultReceived":true});
+            record(&mut cfg, proof, Some(native))?;
+            emit(
+                json!({"type":"result","subtype":"success","session_id":"fixture-session","result":"fixture"}),
+            )?;
+            continue;
+        }
         let receipt = response
             .pointer("/result/_meta/engrams~1toolResult")
             .or_else(|| response.pointer("/error/data"))
@@ -609,19 +765,15 @@ fn claude(mut cfg: Config) -> Result<()> {
             .flatten();
         let unavailable = optional_bool(receipt, "resultUnavailable")?;
         let denial_plan = receipt.get("denial") == Some(&json!("plan_mode"));
-        writeln!(
-            cfg.proof,
-            "{}",
-            json!({"callId":"fixture-call","tool":cfg.tool,"resultReceived":true,"textSentinel":text,"textSequence":text_sequence,"structuredSentinel":structured,"isError":is_error,"outcome":outcome,"delivery":delivery,"resultUnavailable":unavailable,"denialPlanMode":denial_plan})
-        )?;
-        cfg.proof.flush()?;
+        let proof = json!({"callId":cfg.call_id,"tool":cfg.tool,"resultReceived":true,"textSentinel":text,"textSequence":text_sequence,"structuredSentinel":structured,"isError":is_error,"outcome":outcome,"delivery":delivery,"resultUnavailable":unavailable,"denialPlanMode":denial_plan});
+        record(&mut cfg, proof, result)?;
         emit(
             json!({"type":"result","subtype":"success","session_id":"fixture-session","result":"fixture"}),
         )?;
         // A completed deferred re-fire must leave this model process idle.
         // Exiting here would simulate a new crash and replay the completed
         // fixture call on every subsequent --resume startup.
-        if !["write", "refire"].contains(&cfg.mode.as_str()) {
+        if cfg.plan.is_none() && !["write", "refire"].contains(&cfg.mode.as_str()) {
             break;
         }
     }

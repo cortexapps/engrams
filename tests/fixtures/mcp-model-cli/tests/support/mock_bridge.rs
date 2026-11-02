@@ -7,15 +7,19 @@ fn main() {
             let mut input = String::new();
             io::stdin().read_to_string(&mut input).unwrap();
             let value: Value = serde_json::from_str(&input).unwrap();
-            assert_eq!(value["tool_use_id"], "fixture-call");
+            assert!(value["tool_use_id"] == call_id());
+            assert!(value["tool_input"] == arguments());
             let forged = std::env::var("ENGRAM_FIXTURE_MODE").as_deref() == Ok("forged");
-            assert_eq!(
-                value["tool_name"],
-                if forged {
-                    "mcp__engrams__fixture_forged"
-                } else {
-                    "mcp__engrams__remote_inventory"
-                }
+            assert!(
+                value["tool_name"]
+                    == format!(
+                        "mcp__engrams__{}",
+                        if forged {
+                            "fixture_forged".to_owned()
+                        } else {
+                            tool()
+                        }
+                    )
             );
             let deferred = std::env::var("ENGRAM_FIXTURE_MODE").as_deref() == Ok("refire")
                 && !std::path::Path::new(&std::env::var_os("ENGRAM_FIXTURE_STATE_DIR").unwrap())
@@ -71,14 +75,46 @@ fn main() {
                         json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
                     }
                     "tools/list" => {
-                        json!({"tools":[{"name":"remote_inventory","inputSchema":{"type":"object"}}]})
+                        let root = std::env::var_os("ENGRAM_FIXTURE_STATE_DIR").unwrap();
+                        if let Ok(raw) =
+                            std::fs::read(std::path::Path::new(&root).join("exposed-tools.json"))
+                        {
+                            json!({"tools":serde_json::from_slice::<Value>(&raw).unwrap()})
+                        } else {
+                            json!({"tools":[{"name":"remote_inventory","inputSchema":{"type":"object"}}]})
+                        }
                     }
                     "tools/call" => {
-                        assert_eq!(v["params"]["_meta"]["claudecode/toolUseId"], "fixture-call");
-                        assert_eq!(
-                            v["params"]["arguments"]["fixture"],
-                            std::env::var("ENGRAM_FIXTURE_MODE").unwrap()
-                        );
+                        assert!(v["params"]["_meta"]["claudecode/toolUseId"] == call_id());
+                        assert!(v["params"]["arguments"] == arguments());
+                        let root = std::env::var_os("ENGRAM_FIXTURE_STATE_DIR").unwrap();
+                        if std::path::Path::new(&root).join("hold-result").exists() {
+                            std::fs::write(
+                                std::path::Path::new(&root).join("mock-pending"),
+                                b"ready",
+                            )
+                            .unwrap();
+                            continue;
+                        }
+                        if let Ok(raw) =
+                            std::fs::read(std::path::Path::new(&root).join("native-responses.json"))
+                        {
+                            let responses: Value = serde_json::from_slice(&raw).unwrap();
+                            let mut response = responses.get(call_id()).unwrap().clone();
+                            response["id"] = id;
+                            println!("{response}");
+                            io::stdout().flush().unwrap();
+                            continue;
+                        }
+                        if let Ok(raw) =
+                            std::fs::read(std::path::Path::new(&root).join("native-response.json"))
+                        {
+                            let mut response: Value = serde_json::from_slice(&raw).unwrap();
+                            response["id"] = id;
+                            println!("{response}");
+                            io::stdout().flush().unwrap();
+                            continue;
+                        }
                         if std::env::var("ENGRAM_FIXTURE_MODE").as_deref() == Ok("held-call") {
                             let root = std::env::var_os("ENGRAM_FIXTURE_STATE_DIR").unwrap();
                             std::fs::write(
@@ -104,4 +140,46 @@ fn main() {
         }
         _ => std::process::exit(1),
     }
+}
+
+fn active_step() -> Option<Value> {
+    let raw = std::env::var("ENGRAM_FIXTURE_CALL_PLAN_JSON").ok()?;
+    let plan: Value = serde_json::from_str(&raw).unwrap();
+    let root = std::env::var_os("ENGRAM_FIXTURE_STATE_DIR").unwrap();
+    let receipt: Value = serde_json::from_slice(
+        &std::fs::read(std::path::Path::new(&root).join("plan-selection.json")).unwrap(),
+    )
+    .unwrap();
+    Some(
+        plan["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["marker"] == receipt["marker"])
+            .unwrap()
+            .clone(),
+    )
+}
+fn call_id() -> String {
+    active_step()
+        .map(|step| step["callId"].as_str().unwrap().to_owned())
+        .unwrap_or_else(|| {
+            std::env::var("ENGRAM_FIXTURE_CALL_ID").unwrap_or_else(|_| "fixture-call".into())
+        })
+}
+fn tool() -> String {
+    active_step()
+        .map(|step| step["tool"].as_str().unwrap().to_owned())
+        .unwrap_or_else(|| std::env::var("ENGRAM_FIXTURE_TOOL").unwrap())
+}
+fn arguments() -> Value {
+    active_step()
+        .map(|step| step["arguments"].clone())
+        .unwrap_or_else(|| {
+            std::env::var("ENGRAM_FIXTURE_ARGUMENTS_JSON")
+                .map(|raw| serde_json::from_str(&raw).unwrap())
+                .unwrap_or_else(
+                    |_| json!({"fixture":std::env::var("ENGRAM_FIXTURE_MODE").unwrap()}),
+                )
+        })
 }

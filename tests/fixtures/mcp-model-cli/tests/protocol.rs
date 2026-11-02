@@ -11,7 +11,9 @@ struct State(std::path::PathBuf);
 impl State {
     fn new(name: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = std::env::var_os("TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")))
             .join(format!("fixture-state-{}-{name}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -637,3 +639,8 @@ fn proof_pid_token_is_expanded_only_in_the_direct_child_basename() {
     assert_eq!(std::fs::read_dir(&state.0).unwrap().count(), 2);
     assert!(!state.0.join("proof-{pid}.json").exists());
 }
+
+#[path = "support/plan_contract.rs"]
+mod plan_contract;
+#[path = "support/scalar_contract.rs"]
+mod scalar_contract;
