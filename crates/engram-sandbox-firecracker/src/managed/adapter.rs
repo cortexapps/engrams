@@ -212,6 +212,21 @@ struct Proxy {
     call: Mutex<Call>,
     fail: watch::Sender<bool>,
 }
+// This guard exists only while the caller owns the serialized transaction.
+// Drop poisons a partial write/FD/ACK exchange before the mutex is released.
+struct InFlightHandoff<'a> {
+    call: &'a mut Call,
+    fail: &'a watch::Sender<bool>,
+    acknowledged: bool,
+}
+impl Drop for InFlightHandoff<'_> {
+    fn drop(&mut self) {
+        if !self.acknowledged {
+            self.call.failed = true;
+            self.fail.send_replace(true);
+        }
+    }
+}
 impl Proxy {
     async fn request(&self, operation: Operation, fd: Option<&UnixStream>) -> io::Result<()> {
         use std::os::fd::AsFd;
@@ -237,10 +252,15 @@ impl Proxy {
             epoch: call.epoch,
             operation,
         };
+        let mut handoff = InFlightHandoff {
+            call: &mut call,
+            fail: &self.fail,
+            acknowledged: false,
+        };
         let result = tokio::time::timeout(Duration::from_secs(wire::HANDOFF_SECONDS), async {
-            wire::write(&mut call.write, &request).await?;
+            wire::write(&mut handoff.call.write, &request).await?;
             if let Some(fd) = fd {
-                let socket = call.write.as_ref();
+                let socket = handoff.call.write.as_ref();
                 let carrier =
                     std::os::unix::net::UnixStream::from(socket.as_fd().try_clone_to_owned()?);
                 socket
@@ -249,7 +269,7 @@ impl Proxy {
                     })
                     .await?;
             }
-            if call.replies.recv().await != Some(expected) {
+            if handoff.call.replies.recv().await != Some(expected) {
                 return Err(wire::invalid());
             }
             Ok(())
@@ -257,10 +277,7 @@ impl Proxy {
         .await
         .map_err(|_| wire::invalid())
         .and_then(|r| r);
-        if result.is_err() {
-            call.failed = true;
-            self.fail.send_replace(true);
-        }
+        handoff.acknowledged = result.is_ok();
         result
     }
     async fn flow(&self, operation: Operation) -> io::Result<UnixStream> {
@@ -633,6 +650,115 @@ mod tests {
             }),
             reader,
         )
+    }
+    #[tokio::test]
+    async fn handoff_cancellation_after_fd_is_terminal_and_cannot_reuse_stream() {
+        let (private, mut peer) = UnixStream::pair().unwrap();
+        let (proxy, reader) = fixture_proxy(private);
+        let operation = || Operation::Dns {
+            destination: "192.0.2.1".parse().unwrap(),
+            port: 53,
+        };
+        let pending = tokio::spawn({
+            let proxy = proxy.clone();
+            async move { proxy.flow(operation()).await }
+        });
+        let request: Request = wire::read(&mut peer).await.unwrap();
+        let mut handed = wire::receive_stream(&peer).await.unwrap();
+        // The peer owns the FD, but has not acknowledged the transaction.
+        // Aborting drops the same future that an outer DNS deadline drops.
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert!(
+            *proxy.fail.borrow(),
+            "canceled handoff must signal terminal cleanup"
+        );
+        assert!(proxy.call.lock().await.failed);
+        assert_eq!(handed.read(&mut [0]).await.unwrap(), 0);
+        // A late exact ACK cannot recover an abandoned transaction.
+        wire::write(
+            &mut peer,
+            &Reply {
+                version: wire::VERSION,
+                sequence: request.sequence,
+                epoch: request.epoch,
+                state: "accepted".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), proxy.flow(operation()))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(proxy.call.lock().await.sequence, request.sequence);
+        assert_eq!(
+            peer.try_read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        reader.abort();
+    }
+    #[tokio::test]
+    async fn handoff_cancellation_while_waiting_for_mutex_does_not_poison_stream() {
+        use std::{future::Future, task::Poll};
+        let (private, mut peer) = UnixStream::pair().unwrap();
+        let (proxy, reader) = fixture_proxy(private);
+        let operation = || Operation::Dns {
+            destination: "192.0.2.1".parse().unwrap(),
+            port: 53,
+        };
+        let first = tokio::spawn({
+            let proxy = proxy.clone();
+            async move { proxy.flow(operation()).await }
+        });
+        let request: Request = wire::read(&mut peer).await.unwrap();
+        let handed = wire::receive_stream(&peer).await.unwrap();
+        let mut waiting = Box::pin(proxy.flow(operation()));
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(waiting);
+        assert!(!*proxy.fail.borrow());
+        wire::write(
+            &mut peer,
+            &Reply {
+                version: wire::VERSION,
+                sequence: request.sequence,
+                epoch: request.epoch,
+                state: "accepted".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let first_stream = first.await.unwrap().unwrap();
+        assert!(!proxy.call.lock().await.failed);
+        assert!(!*proxy.fail.borrow());
+        let next = tokio::spawn({
+            let proxy = proxy.clone();
+            async move { proxy.flow(operation()).await }
+        });
+        let next_request: Request = wire::read(&mut peer).await.unwrap();
+        assert_eq!(next_request.sequence, request.sequence + 1);
+        let next_handed = wire::receive_stream(&peer).await.unwrap();
+        wire::write(
+            &mut peer,
+            &Reply {
+                version: wire::VERSION,
+                sequence: next_request.sequence,
+                epoch: next_request.epoch,
+                state: "accepted".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let next_stream = next.await.unwrap().unwrap();
+        assert!(!*proxy.fail.borrow());
+        drop((first_stream, handed, next_stream, next_handed));
+        reader.abort();
     }
     #[tokio::test]
     async fn tcp_bridge_preserves_original_nonstandard_port_and_transfers_only_private_stream() {
