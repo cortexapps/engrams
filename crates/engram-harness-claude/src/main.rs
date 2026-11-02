@@ -1571,6 +1571,7 @@ mod adapter {
         pub type ParkedCalls = Arc<Mutex<HashMap<String, PendingCall>>>;
 
         pub struct PendingCall {
+            socket_owner: Arc<()>,
             pub tool_name: String,
             pub result_format: ResultFormat,
             pub sender: Option<oneshot::Sender<String>>,
@@ -1718,6 +1719,7 @@ mod adapter {
                 .filter(|id| !id.is_empty())
                 .unwrap_or_else(|| format!("toolu-engram-{}", uuid::Uuid::new_v4()));
 
+            let socket_owner = Arc::new(());
             // Both this insertion and `route_tool_result` lock parked→results.
             // Holding the parked lock across the stash check closes the only
             // lost-wakeup window: a result can neither slip between the check
@@ -1761,6 +1763,7 @@ mod adapter {
                 parked.insert(
                     call_id.clone(),
                     PendingCall {
+                        socket_owner: socket_owner.clone(),
                         tool_name: request.name.clone(),
                         result_format: manifest
                             .iter()
@@ -1791,14 +1794,40 @@ mod adapter {
                     Err(_) => tracing::debug!(%call_id, "parked MCP call was canceled"),
                 },
                 _ = lines.next_line() => {
-                    // Keep identity after disconnect for late host results.
-                    if let Some(call) = parked_calls.lock().await.get_mut(&call_id) {
-                        call.sender.take();
-                    }
-                    emit(&evt_tx, HarnessEvent::ToolCallCancelRequested {
-                        run_id, call_id, name: request.name,
-                    }).await;
+                    cancel_disconnected_call(&parked_calls, &socket_owner, &evt_tx,
+                        run_id, call_id, request.name).await;
                 }
+            }
+        }
+
+        async fn cancel_disconnected_call(
+            parked_calls: &ParkedCalls,
+            socket_owner: &Arc<()>,
+            evt_tx: &mpsc::Sender<HarnessEvent>,
+            run_id: String,
+            call_id: String,
+            name: String,
+        ) {
+            let canceled = {
+                let mut calls = parked_calls.lock().await;
+                calls
+                    .get_mut(&call_id)
+                    .filter(|call| Arc::ptr_eq(&call.socket_owner, socket_owner))
+                    // Keep identity after disconnect for late host results.
+                    .is_some_and(|call| call.sender.take().is_some())
+            };
+            // A re-fire can replace this ID while the old socket waits for
+            // the map lock. Only the socket that still owns it may cancel.
+            if canceled {
+                emit(
+                    evt_tx,
+                    HarnessEvent::ToolCallCancelRequested {
+                        run_id,
+                        call_id,
+                        name,
+                    },
+                )
+                .await;
             }
         }
 
@@ -1845,6 +1874,95 @@ mod adapter {
                 .await
                 .insert(call_id.to_string(), result_json);
             false
+        }
+        #[cfg(test)]
+        mod socket_ownership_tests {
+            use super::*;
+
+            #[tokio::test]
+            async fn stale_socket_disconnect_cannot_cancel_replacement_call() {
+                let (evt_tx, mut events) = mpsc::channel(8);
+                let state = State {
+                    results_in_hand: Arc::new(Mutex::new(HashMap::new())),
+                    parked_calls: Arc::new(Mutex::new(HashMap::new())),
+                    manifest: Arc::new(super::super::parse_tool_manifest(r#"[{"name":"remote_inventory","description":"Read","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{},"resultFormat":"mcp"}]"#).unwrap()),
+                    deferred_calls: Arc::new(Mutex::new(HashMap::new())),
+                    current_run_id: Arc::new(Mutex::new(Some("run-1".into()))),
+                    evt_tx,
+                };
+                let request =
+                    b"{\"name\":\"remote_inventory\",\"tool_use_id\":\"same-call\",\"args\":{}}\n";
+                let (socket_a, mut client_a) = UnixStream::pair().unwrap();
+                client_a.write_all(request).await.unwrap();
+                let mut a = std::pin::pin!(handle_one(socket_a, state.clone()));
+                tokio::select! {
+                    () = &mut a => panic!("socket A must remain pending"),
+                    event = events.recv() => assert!(matches!(event, Some(HarnessEvent::ToolCallRequested { .. }))),
+                }
+                let owner_a = state.parked_calls.lock().await["same-call"]
+                    .socket_owner
+                    .clone();
+
+                // Pause A before its EOF cleanup. B uses the same stable ID,
+                // then the exact production cleanup step for A runs late.
+                drop(client_a);
+                let (socket_b, mut client_b) = UnixStream::pair().unwrap();
+                client_b.write_all(request).await.unwrap();
+                let mut b = std::pin::pin!(handle_one(socket_b, state.clone()));
+                tokio::select! {
+                    () = &mut b => panic!("socket B must remain pending"),
+                    event = events.recv() => assert!(matches!(event, Some(HarnessEvent::ToolCallRequested { .. }))),
+                }
+                {
+                    let calls = state.parked_calls.lock().await;
+                    let replacement = &calls["same-call"];
+                    assert!(!Arc::ptr_eq(&replacement.socket_owner, &owner_a));
+                    assert_eq!(replacement.tool_name, "remote_inventory");
+                    assert_eq!(replacement.result_format, ResultFormat::Mcp);
+                }
+                cancel_disconnected_call(
+                    &state.parked_calls,
+                    &owner_a,
+                    &state.evt_tx,
+                    "run-1".into(),
+                    "same-call".into(),
+                    "remote_inventory".into(),
+                )
+                .await;
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut a)
+                    .await
+                    .unwrap();
+                let result = r#"{"outcome":"succeeded","delivery":"available","output":{"content":[{"type":"text","text":"replacement result"}]}}"#;
+                assert!(
+                    route_tool_result(
+                        "same-call",
+                        result.into(),
+                        &state.parked_calls,
+                        &state.results_in_hand
+                    )
+                    .await,
+                    "the replacement socket must still accept its result"
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut b)
+                    .await
+                    .unwrap();
+                let response = BufReader::new(client_b)
+                    .lines()
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&response).unwrap()["result_json"],
+                    result
+                );
+                assert!(
+                    matches!(events.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                    "stale cleanup must not emit cancellation for B"
+                );
+                assert!(state.parked_calls.lock().await.is_empty());
+                assert!(state.results_in_hand.lock().await.is_empty());
+            }
         }
     }
 
