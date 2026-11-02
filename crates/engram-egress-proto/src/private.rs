@@ -121,13 +121,28 @@ pub async fn write<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, v: &T) -> io:
     .map_err(|_| invalid())?
 }
 
+/// A host allocation and its registered reliable stream are inseparable until
+/// the backend transfers ownership to its helper. No unchecked constructor.
+pub struct RegisteredPrivateNetwork {
+    allocation: Allocation,
+    stream: tokio::net::UnixStream,
+}
+impl RegisteredPrivateNetwork {
+    pub fn allocation(&self) -> &Allocation {
+        &self.allocation
+    }
+    pub fn into_stream(self) -> tokio::net::UnixStream {
+        self.stream
+    }
+}
+
 /// Register a fresh capability on a dedicated host control connection. Never
 /// retry: loss of the reply makes this attempt unusable. The returned socket is
 /// for one helper only and starts closed. It must not be cached across boots.
 pub async fn register(
     mut stream: tokio::net::UnixStream,
     allocation: &Allocation,
-) -> io::Result<tokio::net::UnixStream> {
+) -> io::Result<RegisteredPrivateNetwork> {
     allocation.validate()?;
     crate::write_frame(&mut stream, &crate::ToProxyd::PrivateNetwork).await?;
     write(&mut stream, allocation).await?;
@@ -147,7 +162,10 @@ pub async fn register(
     {
         return Err(invalid());
     }
-    Ok(stream)
+    Ok(RegisteredPrivateNetwork {
+        allocation: allocation.clone(),
+        stream,
+    })
 }
 
 /// Receive exactly one connected Unix stream, with close-on-exec set before it
@@ -260,6 +278,65 @@ pub async fn drain_to_eof(socket: &tokio::net::UnixStream) -> io::Result<()> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+    #[tokio::test]
+    async fn registration_keeps_exact_allocation_and_rejects_wrong_closed_reply() {
+        let allocation = Allocation {
+            version: 1,
+            host_id: HostId::new(),
+            host_incarnation: "host-1".into(),
+            proxy_incarnation: "proxy-1".into(),
+            session_id: SessionId::new(),
+            sandbox_id: SandboxId::new(),
+            boot_attempt: "boot-1".into(),
+            attachment_generation: 1,
+            guest_ip: "192.0.2.2".parse().unwrap(),
+            gateway_ip: "192.0.2.1".parse().unwrap(),
+            policy_revision: 1,
+            policy_digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        for epoch in [0, 1] {
+            let (a, mut b) = tokio::net::UnixStream::pair().unwrap();
+            let expected = allocation.clone();
+            let peer = tokio::spawn(async move {
+                assert!(matches!(
+                    crate::read_frame::<_, crate::ToProxyd>(&mut b)
+                        .await
+                        .unwrap(),
+                    crate::ToProxyd::PrivateNetwork
+                ));
+                let sent: Allocation = read(&mut b).await.unwrap();
+                assert_eq!(sent, expected);
+                write(
+                    &mut b,
+                    &Reply {
+                        version: 1,
+                        sequence: 0,
+                        epoch,
+                        state: "closed".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                b
+            });
+            let result = register(a, &allocation).await;
+            let mut peer = peer.await.unwrap();
+            if epoch == 0 {
+                let registered = result.unwrap();
+                assert_eq!(registered.allocation(), &allocation);
+                // The stream remains the exact capability, owned until consumed.
+                let mut capability = registered.into_stream();
+                capability.write_all(b"x").await.unwrap();
+                let mut byte = [0];
+                peer.read_exact(&mut byte).await.unwrap();
+                assert_eq!(byte, *b"x");
+            } else {
+                assert!(result.is_err());
+                assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn oversized_private_header_is_rejected_before_body_read() {
         let (mut a, mut b) = tokio::net::UnixStream::pair().unwrap();

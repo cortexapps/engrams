@@ -241,6 +241,18 @@ impl VzBackend {
         })
     }
 
+    /// Prepare exact disk-only managed inputs with closed host networking.
+    /// The returned owner has no release API and is outside ordinary lifecycles.
+    pub async fn prepare_managed_cold(
+        &self,
+        request: engram_core::types::managed_cold::ManagedColdPrepare,
+        spec: SandboxSpec,
+        network: engram_egress_proto::private::RegisteredPrivateNetwork,
+        helper: crate::managed::ManagedHelperArtifact,
+    ) -> Result<crate::managed::PreparedManagedVz, SandboxError> {
+        crate::managed::prepare(&self.work_dir, &self.cfg, request, spec, network, helper).await
+    }
+
     /// Attach a chunk store. Once set, every `snapshot()` chunks
     /// the rootfs clone into the store and the returned metadata
     /// carries the `disk_manifest` ref. Required for cross-host

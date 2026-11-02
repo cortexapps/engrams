@@ -181,7 +181,7 @@ impl ProxydHandle {
     pub async fn register_private_network(
         &self,
         allocation: &engram_egress_proto::private::Allocation,
-    ) -> Result<tokio::net::UnixStream, ProxydError> {
+    ) -> Result<engram_egress_proto::private::RegisteredPrivateNetwork, ProxydError> {
         let stream = tokio::net::UnixStream::connect(&self.control_sock)
             .await
             .map_err(|e| ProxydError(format!("private network connect: {e}")))?;

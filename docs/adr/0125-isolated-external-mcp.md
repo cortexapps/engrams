@@ -391,3 +391,37 @@ poisons the stable session gate; policy replay or a fresh allocation cannot
 reopen it in that proxy incarnation. Recovery needs a fresh proxy incarnation
 and full policy replay with quarantine checks. Other sessions remain usable.
 This barrier cannot revoke bytes that were delivered before it completed.
+
+### Closed cold preparation
+
+A managed cold prepare request names one exact private disk manifest version,
+its materialized bytes, its trusted source record, and all selected boot files.
+Fresh images first get a private writable disk lineage. Capture eligibility and
+disk consistency come from the trusted durable producer, not from guest status
+or the absence of a memory manifest. Legacy artifacts cannot supply this input.
+The backend pins private copies and verifies their bytes before construction.
+
+The VZ producer owns a fresh stopped machine, its exact file-handle network
+attachment, and the helper's reliable channels in one opaque preparation object.
+It is outside the ordinary sandbox map and has no start or resume operation.
+Its receipt means closed preparation only; it is not an enforcement ACK.
+The later durable start producer must bind actual placement, final manifest,
+policy and start intent, check current liveness, and integrate all ordinary
+lifecycle gates. Drop must terminate and reap the helper without running the VM.
+
+VZ uses a host-selected static IPv4 address and gateway in the same /24,
+a fixed unicast MAC on each private point-to-point attachment, and MTU 1500.
+Kernel IP configuration also names that gateway as DNS. The current image init
+still writes legacy fixed resolver addresses and can preserve a pre-existing
+resolver file. A managed init/resolver producer must replace that behavior for
+these selected inputs before release, including existing resolver files.
+Guest configuration supplies functionality; it is not host enforcement proof.
+The backend does not widen the helper's DNS acceptance to old resolver addresses.
+
+The registration API returns an opaque allocation-and-stream owner. The VZ
+backend accepts that owner, not independently supplied allocation metadata and
+a raw stream. The helper inherits only the three selected descriptors, an empty
+environment, and no arguments. Native attachment identity, reliable control
+liveness, and child-process state are checked before a closed receipt. A helper
+cleanup timeout stays failed after forced reaping. This local cleanup result
+cannot replace the proxy's lease barrier or clear its stable session poison.
