@@ -1,20 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { eq, inArray, sql } from "drizzle-orm";
-import { checkDb, getDb } from "../db/client.ts";
-import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
-import {
-  integrationConnection,
-  mcpAdmission,
-  mcpAdmissionScope,
-  mcpApproval,
-  mcpCatalog,
-  mcpExecution,
-  mcpResolution,
-  task,
-  taskSession,
-} from "../db/schema.ts";
-import { makeMcpRepository } from "../mcp/repository.ts";
-import { makeMcpJournal } from "../mcp/journal.ts";
+import { eq, sql } from "drizzle-orm";
+import { checkDb } from "../db/client.ts";
+import { mcpAdmission, mcpApproval, task, taskSession } from "../db/schema.ts";
+import { reviewFixture } from "./mcp-review-fixture.ts";
+import { bindingSnapshotColumns } from "../mcp/binding-store.ts";
+import { reviewContext } from "../mcp/journal-review.ts";
+import { type McpCallAuthorization, makeMcpJournal } from "../mcp/journal.ts";
 import { canonicalDigest } from "../mcp/hash.ts";
 
 const reachable = process.env.ORCHESTRATOR_DATABASE_URL ? await checkDb() : false;
@@ -28,80 +19,80 @@ const config = {
   zone: "public",
   auth: { kind: "api_key", secretRef: "mcp.service.api-key" },
 };
+// These adapters supply trusted producer fixtures only. They do not prove host or runtime enforcement.
 async function fixture() {
-  const db = getDb();
-  const connections = makeIntegrationConnectionStore(db);
-  const row = await connections.create({
-    alias: `mcp-${crypto.randomUUID()}`,
-    provider: "mcp",
-    displayName: "Tools",
-    config,
-  });
-  const taskId = crypto.randomUUID();
-  const sessionId = crypto.randomUUID();
-  await db.insert(task).values({ id: taskId, type: "chat", createdByUserId: "owner" });
-  await db.insert(taskSession).values({ taskId, sessionId });
-  const repo = makeMcpRepository(db);
-  const now = new Date("2026-01-01T00:00:00Z");
-  await repo.setAuthorization(row.id, 1, 1, "account-a", now);
-  const live = (await connections.get(row.id))!;
-  const draft = await repo.saveDraft(row.id, live.mcp!, [tool], "admin", now);
-  const published = await repo.publish(
-    row.id,
-    draft.id,
-    0,
-    [{ ...tool, classification: "write", enabled: true }],
-    "admin",
-    now,
-  );
-  await repo.setEnabled(row.id, 1, true, now);
-  const journal = makeMcpJournal(db);
-  const deploymentId = crypto.randomUUID();
-  const input = {
-    taskId,
-    sessionId,
-    runId: "run-1",
-    toolCallId: "call-1",
-    connectionId: row.id,
-    catalogId: published.id,
-    principalId: "owner",
-    bindingHash: canonicalDigest({ binding: 1 }),
-    argumentHash: canonicalDigest({ x: 1 }),
-    upstreamName: tool.upstreamName,
-    configRevision: 1,
-    authGeneration: live.mcp!.authGeneration,
-    classification: "write" as const,
-    deadline: new Date(now.getTime() + 60_000),
-  };
-  return {
-    db,
-    connections,
-    row,
-    repo,
-    now,
-    draft,
-    published,
-    journal,
-    input,
-    deploymentId,
-    async cleanup() {
-      const executions = await db
-        .select({ id: mcpExecution.id })
-        .from(mcpExecution)
-        .where(eq(mcpExecution.sessionId, sessionId));
-      const ids = executions.map((e) => e.id);
-      if (ids.length) {
-        await db.delete(mcpAdmission).where(inArray(mcpAdmission.executionId, ids));
-        await db.delete(mcpApproval).where(inArray(mcpApproval.executionId, ids));
-        await db.delete(mcpResolution).where(inArray(mcpResolution.executionId, ids));
-        await db.delete(mcpExecution).where(inArray(mcpExecution.id, ids));
-      }
-      await db.delete(mcpAdmissionScope).where(eq(mcpAdmissionScope.id, deploymentId));
-      await db.delete(mcpCatalog).where(eq(mcpCatalog.connectionId, row.id));
-      await db.delete(task).where(eq(task.id, taskId));
-      await connections.delete(row.id);
+  const f = await reviewFixture();
+  const base = f.journal;
+  const input = { ...f.input, deadline: new Date(f.now.getTime() + 60_000) };
+  const actor = (id: string) => (id === "owner" ? f.actorId : id);
+  const journal = {
+    ...base,
+    async create(value: typeof input, authorization: McpCallAuthorization, now: Date) {
+      const { sessionId, runId, toolCallId } = value;
+      // Additional sessions in capacity tests use the same persisted fixture authority.
+      await f.db
+        .update(taskSession)
+        .set(
+          bindingSnapshotColumns(f.snapshot, [
+            {
+              id: f.connection.id,
+              alias: f.connection.alias,
+              provider: "mcp",
+              displayName: f.connection.displayName,
+              config: f.connection.config,
+            },
+          ]),
+        )
+        .where(eq(taskSession.sessionId, sessionId));
+      return base.create(
+        {
+          ...value,
+          requestPolicyContext: {
+            ...value.requestPolicyContext,
+            sessionId,
+            runId,
+            toolCallId,
+            acceptedPolicyRef: { ...value.requestPolicyContext.acceptedPolicyRef, sessionId },
+          },
+        },
+        authorization,
+        now,
+      );
     },
+    pending: (sid: string, id: string, _cachedAdmin: boolean, now: Date) =>
+      base.pending(sid, actor(id), now),
+    async decide(id: string, who: string, _cachedAdmin: boolean, approve: boolean, now: Date) {
+      const call = (await base.get(id))!;
+      const [item] = await f.db.select().from(mcpApproval).where(eq(mcpApproval.executionId, id));
+      return base.decide(id, actor(who), approve, reviewContext(call, item!), now);
+    },
+    async dispatch(
+      id: string,
+      intent: { bootId: string; intentId: string; expiresAt: Date },
+      now: Date,
+    ) {
+      const call = (await base.get(id))!;
+      return base.dispatch(id, intent, now, {
+        executionId: id,
+        requestDigest: call.requestDigest,
+        bindingHash: call.bindingHash,
+        principalId: call.principalId,
+        expectedJournalRevision: call.version,
+        reservationId: (await base.getAdmission(id))!.reservationId,
+        reservationExpiresAt: (await base.getAdmission(id))!.expiresAt,
+      });
+    },
+    cancel: (id: string, who: string, _cachedAdmin: boolean, now: Date) =>
+      base.cancel(id, actor(who), now),
+    resolveUnknown: (
+      id: string,
+      who: string,
+      _cachedAdmin: boolean,
+      outcome: "succeeded" | "failed" | "acknowledged",
+      now: Date,
+    ) => base.resolveUnknown(id, actor(who), outcome, now),
   };
+  return { ...f, input, journal, row: f.connection, repo: f.repository, published: f.catalog };
 }
 
 describe("MCP durable authority", () => {
@@ -178,6 +169,7 @@ describe("MCP durable authority", () => {
         expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
         const current = (await f.journal.get(call.id))!;
         expect(current.state).toBe("dispatching");
+        expect((await f.journal.getAdmission(call.id))?.state).toBe("admitted");
         await f.journal.finish(call.id, current.version, "outcome_unknown", null, false, f.now);
         const next = await f.journal.create(
           { ...f.input, toolCallId: "call-2" },
@@ -226,8 +218,8 @@ describe("MCP durable authority", () => {
         const calls = await Promise.all(
           Array.from({ length: 6 }, (_, n) =>
             f.journal.create(
-              { ...f.input, toolCallId: `call-${n}`, classification: "read" },
-              { kind: "read" },
+              { ...f.input, toolCallId: `call-${n}` },
+              { kind: "automation", grant: f.input.resolvedTool.effectiveGrant },
               f.now,
             ),
           ),
@@ -278,25 +270,14 @@ describe("MCP authority isolation", () => {
             first.now,
           ),
         ).rejects.toThrow("explicit automation");
-        const call = await first.journal.create(
-          { ...first.input, catalogId: second.published.id },
-          { kind: "approval" },
-          first.now,
-        );
-        await first.journal.requestApproval(call.id, first.deploymentId, first.now);
-        await first.journal.decide(call.id, "owner", false, true, first.now);
-        await first.journal.admit(call.id, first.deploymentId, first.now);
         await expect(
-          first.journal.dispatch(
-            call.id,
-            {
-              bootId: "boot",
-              intentId: crypto.randomUUID(),
-              expiresAt: new Date(first.now.getTime() + 1000),
-            },
+          first.journal.create(
+            { ...first.input, catalogId: second.published.id },
+            { kind: "approval" },
             first.now,
           ),
-        ).rejects.toThrow("stale");
+        ).rejects.toThrow("identity");
+        const call = await first.journal.create(first.input, { kind: "approval" }, first.now);
         await expect(
           Promise.resolve(
             first.db.execute(
@@ -313,7 +294,7 @@ describe("MCP authority isolation", () => {
         ).rejects.toThrow();
         await expect(
           first.journal.pending(first.input.sessionId, "intruder", false, first.now),
-        ).resolves.toHaveLength(0);
+        ).rejects.toThrow("owner");
       } finally {
         await first.cleanup();
         await second.cleanup();
@@ -467,7 +448,7 @@ test.skipIf(!reachable)("replicas share connection and deployment admission ceil
     for (const f of fixtures) await f.db.delete(task).where(eq(task.id, f.input.taskId));
     await first.db
       .insert(task)
-      .values({ id: first.input.taskId, type: "chat", createdByUserId: "owner" });
+      .values({ id: first.input.taskId, type: "chat", createdByUserId: first.actorId });
     const sessions = [first.input.sessionId, crypto.randomUUID(), crypto.randomUUID()];
     for (const sessionId of sessions)
       await first.db.insert(taskSession).values({ taskId: first.input.taskId, sessionId });

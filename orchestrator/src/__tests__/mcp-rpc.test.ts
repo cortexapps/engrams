@@ -66,6 +66,8 @@ function services(): McpServices {
     },
     journal: {
       get: unavailable,
+      readSession: unavailable,
+      getAdmission: unavailable,
       hasUnknown: unavailable,
       create: unavailable,
       requestApproval: unavailable,

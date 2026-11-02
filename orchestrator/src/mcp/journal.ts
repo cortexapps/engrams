@@ -8,9 +8,20 @@ import {
   mcpResolution as resolution,
   mcpAdmission as admission,
   mcpAdmissionScope as scope,
-  task,
+  taskSession,
 } from "../db/schema.ts";
-import { assertOwnerOrAdmin } from "./approvals.ts";
+import {
+  assertOriginalArguments,
+  freezeRequestContext,
+  lockHumanSession,
+  assertLocalReviewCurrent,
+  reviewContext,
+  requestPolicyContext,
+  type JournalReviewContext,
+} from "./journal-review.ts";
+import type { RequestPolicyContext } from "./session-policy.ts";
+import type { ResolvedBoundTool } from "./session-resolver.ts";
+import { restoreBindingSnapshot } from "./binding-store.ts";
 import { canonicalDigest, canonicalJson } from "./hash.ts";
 import { MCP_LIMITS } from "./limits.ts";
 import { validateMcpGrant, type McpToolGrant, type McpExecutionState } from "./types.ts";
@@ -37,23 +48,15 @@ export type McpCallInput = Pick<
   | "authGeneration"
   | "classification"
   | "deadline"
->;
+> & {
+  originalArguments: string;
+  resolvedTool: ResolvedBoundTool;
+  requestPolicyContext: RequestPolicyContext;
+};
 
 async function lockScope(tx: Tx, id: string) {
   await tx.insert(scope).values({ id }).onConflictDoNothing();
   await tx.select().from(scope).where(eq(scope.id, id)).for("update");
-}
-async function owned(
-  tx: Tx,
-  call: typeof execution.$inferSelect,
-  actorId: string,
-  isAdmin: boolean,
-) {
-  const [owner] = await tx
-    .select({ id: task.createdByUserId })
-    .from(task)
-    .where(eq(task.id, call.taskId));
-  assertOwnerOrAdmin(owner?.id ?? null, actorId, isAdmin);
 }
 async function unknown(tx: Tx | Db, sessionId: string, connectionId: string): Promise<boolean> {
   const rows = await tx
@@ -73,10 +76,24 @@ async function unknown(tx: Tx | Db, sessionId: string, connectionId: string): Pr
   return rows.length > 0;
 }
 
+/** Internal runtime proof; no public or guest route accepts this value. The runtime obtains it
+ * from its fresh principal, full binding/ancestry, schema, policy and kill checks. */
+export interface McpLiveDispatchAuthorization {
+  executionId: string;
+  requestDigest: string;
+  bindingHash: string;
+  principalId: string;
+  expectedJournalRevision: number;
+  reservationId: string;
+  reservationExpiresAt: Date;
+}
 export function makeMcpJournal(db = getDb()) {
   return {
     async get(id: string) {
       return (await db.select().from(execution).where(eq(execution.id, id)))[0] ?? null;
+    },
+    async getAdmission(id: string) {
+      return (await db.select().from(admission).where(eq(admission.executionId, id)))[0] ?? null;
     },
     hasUnknown(sessionId: string, connectionId: string) {
       return unknown(db, sessionId, connectionId);
@@ -84,6 +101,38 @@ export function makeMcpJournal(db = getDb()) {
     async create(input: McpCallInput, authorization: McpCallAuthorization, now: Date) {
       input = structuredClone(input);
       authorization = structuredClone(authorization);
+      assertOriginalArguments(input.originalArguments, input.argumentHash);
+      const context = freezeRequestContext(input.resolvedTool, input.requestPolicyContext);
+      const { resolvedTool, requestPolicyContext: policy, ...storedInput } = input;
+      const bound = resolvedTool.binding;
+      if (
+        policy.sessionId !== input.sessionId ||
+        policy.runId !== input.runId ||
+        policy.toolCallId !== input.toolCallId ||
+        policy.acceptedPolicyRef.sessionId !== input.sessionId ||
+        policy.acceptedPolicyRef.bindingEpoch < 0n ||
+        policy.acceptedPolicyRef.bindingEpoch > BigInt(Number.MAX_SAFE_INTEGER) ||
+        policy.ancestorPolicyRefs.length !== resolvedTool.ancestorAuthorityRefs.length ||
+        policy.ancestorPolicyRefs.some(
+          (ref, index) =>
+            ref.sessionId !== resolvedTool.ancestorAuthorityRefs[index]?.sessionId ||
+            ref.bindingEpoch !== BigInt(resolvedTool.ancestorAuthorityRefs[index]!.bindingEpoch),
+        ) ||
+        resolvedTool.bindingHash !== input.bindingHash ||
+        bound.connectionId !== input.connectionId ||
+        bound.catalogId !== input.catalogId ||
+        bound.configRevision !== input.configRevision ||
+        bound.authGeneration !== input.authGeneration ||
+        resolvedTool.reviewedTool.upstreamName !== input.upstreamName ||
+        resolvedTool.reviewedTool.classification !== input.classification ||
+        !bound.tools.some(
+          (tool) =>
+            tool.name === resolvedTool.modelToolName &&
+            canonicalDigest(tool.tool) === canonicalDigest(resolvedTool.reviewedTool) &&
+            canonicalDigest(tool.grant) === canonicalDigest(resolvedTool.effectiveGrant),
+        )
+      )
+        throw new Error("request review identity mismatch");
       if (
         ![input.argumentHash, input.bindingHash].every((hash) => /^sha256:[0-9a-f]{64}$/.test(hash))
       )
@@ -110,7 +159,8 @@ export function makeMcpJournal(db = getDb()) {
         if (
           input.classification !== "write" ||
           !authorization.grant.automationWrite ||
-          authorization.grant.upstreamName !== input.upstreamName
+          authorization.grant.upstreamName !== input.upstreamName ||
+          canonicalDigest(authorization.grant) !== canonicalDigest(resolvedTool.effectiveGrant)
         )
           throw new Error("explicit automation write grant is required");
       }
@@ -119,16 +169,40 @@ export function makeMcpJournal(db = getDb()) {
       const automationGrantHash =
         authorization.kind === "automation" ? canonicalDigest(authorization.grant) : null;
       const requestDigest = canonicalDigest({
-        ...input,
+        ...storedInput,
+        requestContext: context,
         deadline: input.deadline.toISOString(),
         authorizationKind,
         automationGrantHash,
       });
       return db.transaction(async (tx) => {
+        const [session] = await tx
+          .select()
+          .from(taskSession)
+          .where(
+            and(eq(taskSession.sessionId, input.sessionId), eq(taskSession.taskId, input.taskId)),
+          )
+          .for("share");
+        if (!session?.mcpBindingEnvelope) throw new Error("stored binding unavailable");
+        const snapshot = restoreBindingSnapshot(
+          session.mcpBindingEnvelope,
+          session.integrationConnections ?? [],
+        );
+        if (
+          snapshot.bindingHash !== input.bindingHash ||
+          BigInt(snapshot.bindingEpoch) !== policy.acceptedPolicyRef.bindingEpoch ||
+          !snapshot.immutableBindings.some(
+            (binding) => canonicalDigest(binding) === canonicalDigest(bound),
+          ) ||
+          canonicalDigest(snapshot.ancestorAuthorityRefs) !==
+            canonicalDigest(resolvedTool.ancestorAuthorityRefs)
+        )
+          throw new Error("stale request binding");
         await tx
           .insert(execution)
           .values({
-            ...input,
+            ...storedInput,
+            requestContext: context,
             id: crypto.randomUUID(),
             state,
             authorizationKind,
@@ -191,8 +265,9 @@ export function makeMcpJournal(db = getDb()) {
         return row!;
       });
     },
-    async pending(sessionId: string, actorId: string, isAdmin: boolean, now: Date) {
+    async pending(sessionId: string, actorId: string, now: Date) {
       return db.transaction(async (tx) => {
+        await lockHumanSession(tx, sessionId, actorId);
         const rows = await tx
           .select({ call: execution, approval })
           .from(execution)
@@ -203,30 +278,136 @@ export function makeMcpJournal(db = getDb()) {
               eq(approval.decision, "pending"),
               gt(approval.expiresAt, now),
             ),
-          );
-        for (const row of rows) await owned(tx, row.call, actorId, isAdmin);
-        return rows;
+          )
+          .orderBy(asc(execution.id))
+          .limit(MCP_LIMITS.sessionApprovals);
+        return rows.filter((row) => row.call.requestContext && row.call.originalArguments !== null);
       });
     },
-    async decide(id: string, actorId: string, isAdmin: boolean, approve: boolean, now: Date) {
+    async readSession(
+      sessionId: string,
+      actorId: string,
+      page: { after?: string; limit?: number } = {},
+    ) {
+      const limit = page.limit ?? 16;
+      if (
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        limit > 16 ||
+        (page.after?.length ?? 0) > 128
+      )
+        throw new Error("invalid state page");
       return db.transaction(async (tx) => {
-        const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
-        if (!call) throw new Error("call not found");
-        await owned(tx, call, actorId, isAdmin);
-        if (call.state !== "waiting_approval") throw new Error("approval is no longer pending");
+        const { session } = await lockHumanSession(tx, sessionId, actorId);
         const rows = await tx
-          .update(approval)
-          .set({ decision: approve ? "approved" : "denied", actorId, decidedAt: now })
+          .select({ call: execution, approval, resolution })
+          .from(execution)
+          .leftJoin(approval, eq(approval.executionId, execution.id))
+          .leftJoin(resolution, eq(resolution.executionId, execution.id))
           .where(
             and(
-              eq(approval.executionId, id),
-              eq(approval.requestDigest, call.requestDigest),
-              eq(approval.decision, "pending"),
-              gt(approval.expiresAt, now),
+              eq(execution.sessionId, sessionId),
+              page.after ? gt(execution.id, page.after) : undefined,
             ),
           )
+          .orderBy(asc(execution.id))
+          .limit(limit + 1);
+        const blocks = await tx
+          .selectDistinct({ connectionId: execution.connectionId })
+          .from(execution)
+          .leftJoin(resolution, eq(resolution.executionId, execution.id))
+          .where(
+            and(
+              eq(execution.sessionId, sessionId),
+              eq(execution.classification, "write"),
+              eq(execution.state, "outcome_unknown"),
+              isNull(resolution.executionId),
+            ),
+          )
+          .limit(17);
+        if (blocks.length > 16) throw new Error("unknown connection state exceeds limit");
+        return {
+          session,
+          rows: rows.slice(0, limit),
+          hasMore: rows.length > limit,
+          unknownWriteBlocks: blocks.map((row) => row.connectionId),
+        };
+      });
+    },
+    async decide(
+      id: string,
+      actorId: string,
+      approve: boolean,
+      expected: JournalReviewContext,
+      now: Date,
+    ) {
+      return db.transaction(async (tx) => {
+        const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
+        if (!identity) throw new Error("call not found");
+        const { session, owner, ancestors } = await lockHumanSession(
+          tx,
+          identity.sessionId,
+          actorId,
+          true,
+        );
+        // Lock profile before connection/execution; no network call is made in this transaction.
+        await assertLocalReviewCurrent(tx, identity, session, ancestors);
+        const [live] = await tx
+          .select()
+          .from(connection)
+          .where(eq(connection.id, identity.connectionId))
+          .for("share");
+        const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
+        const [item] = await tx
+          .select()
+          .from(approval)
+          .where(eq(approval.executionId, id))
+          .for("update");
+        if (
+          !call ||
+          call.requestDigest !== identity.requestDigest ||
+          call.taskId !== owner.id ||
+          call.state !== "waiting_approval" ||
+          !item ||
+          item.decision !== "pending" ||
+          item.expiresAt <= now ||
+          call.deadline <= now
+        )
+          throw new Error("approval expired or already decided");
+        if (!expected || canonicalDigest(expected) !== canonicalDigest(reviewContext(call, item)))
+          throw new Error("stale review context");
+        if (
+          approve &&
+          call.classification === "write" &&
+          requestPolicyContext(call.requestContext!).acceptedWriteEligibility !== "write_eligible"
+        )
+          throw new Error("request policy denies writes");
+        const frozen = call.requestContext!.resolvedTool;
+        const [review] = await tx.select().from(catalog).where(eq(catalog.id, call.catalogId));
+        if (
+          ["done", "failed", "cancelled"].includes(owner.status) ||
+          !live?.enabled ||
+          live.revoked ||
+          live.alias !== frozen.binding.alias ||
+          canonicalDigest(live.config) !== canonicalDigest(frozen.binding.config) ||
+          live.configRevision !== call.configRevision ||
+          live.authGeneration !== call.authGeneration ||
+          live.credentialIdentity !== frozen.binding.credentialIdentity ||
+          live.catalogRevision !== frozen.binding.catalogRevision ||
+          !review ||
+          review.kind !== "published" ||
+          review.connectionId !== call.connectionId ||
+          review.revision !== frozen.binding.catalogRevision ||
+          !review.tools.some(
+            (tool) => canonicalDigest(tool) === canonicalDigest(frozen.reviewedTool),
+          )
+        )
+          throw new Error("stale MCP review authority");
+        const [decision] = await tx
+          .update(approval)
+          .set({ decision: approve ? "approved" : "denied", actorId, decidedAt: now })
+          .where(eq(approval.executionId, id))
           .returning();
-        if (!rows.length) throw new Error("approval expired or already decided");
         const [updated] = await tx
           .update(execution)
           .set({
@@ -236,7 +417,7 @@ export function makeMcpJournal(db = getDb()) {
           })
           .where(eq(execution.id, id))
           .returning();
-        return updated!;
+        return { call: updated!, approval: decision!, reviewedContext: expected };
       });
     },
     async admit(
@@ -303,104 +484,161 @@ export function makeMcpJournal(db = getDb()) {
       id: string,
       intent: { bootId: string; intentId: string; expiresAt: Date },
       now: Date,
+      liveAuthorization: McpLiveDispatchAuthorization,
     ) {
-      return db.transaction(async (tx) => {
-        // Connection lock serializes unknown-outcome checks with finish/revoke.
-        const [identity] = await tx
-          .select({ connectionId: execution.connectionId })
-          .from(execution)
-          .where(eq(execution.id, id));
-        if (!identity) throw new Error("call not found");
-        const [live] = await tx
-          .select()
-          .from(connection)
-          .where(eq(connection.id, identity.connectionId))
-          .for("update");
-        const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
-        if (!call || call.state !== "authorized" || call.deadline <= now)
-          throw new Error("call cannot dispatch");
-        const [review] = await tx.select().from(catalog).where(eq(catalog.id, call.catalogId));
-        if (
-          !live ||
-          live.provider !== "mcp" ||
-          !live.enabled ||
-          live.revoked ||
-          live.configRevision !== call.configRevision ||
-          live.authGeneration !== call.authGeneration ||
-          !review ||
-          review.connectionId !== live.id ||
-          review.kind !== "published" ||
-          review.revision !== live.catalogRevision ||
-          review.configRevision !== call.configRevision ||
-          review.authGeneration !== call.authGeneration ||
-          review.credentialIdentity !== live.credentialIdentity
-        )
-          throw new Error("stale MCP authority");
-        const reviewedTool = review.tools.find((t) => t.upstreamName === call.upstreamName);
-        if (
-          !reviewedTool ||
-          !("classification" in reviewedTool) ||
-          reviewedTool.classification !== call.classification ||
-          !("enabled" in reviewedTool) ||
-          !reviewedTool.enabled
-        )
-          throw new Error("tool is not approved for this operation");
-        if (
-          call.classification === "write" &&
-          (await unknown(tx, call.sessionId, call.connectionId))
-        )
-          throw new Error("unknown write outcome blocks this connection");
-        const [lease] = await tx
-          .select()
-          .from(admission)
-          .where(
-            and(
-              eq(admission.executionId, id),
-              eq(admission.state, "admitted"),
-              gt(admission.expiresAt, now),
-            ),
-          );
-        if (
-          !lease ||
-          !intent.bootId ||
-          !intent.intentId ||
-          intent.expiresAt <= now ||
-          intent.expiresAt > lease.expiresAt
-        )
-          throw new Error("valid admission and intent are required");
-        const [decision] = await tx.select().from(approval).where(eq(approval.executionId, id));
-        if (call.authorizationKind === "approval" && !decision)
-          throw new Error("approval is required");
-        if (decision) {
-          const consumed = await tx
-            .update(approval)
-            .set({ consumedAt: now })
+      liveAuthorization = structuredClone(liveAuthorization);
+      intent = structuredClone(intent);
+      const [reservation] = await db.select().from(admission).where(eq(admission.executionId, id));
+      if (!reservation) throw new Error("valid admission is required");
+      try {
+        return await db.transaction(async (tx) => {
+          await lockScope(tx, reservation.deploymentId);
+          // Connection lock serializes unknown-outcome checks with finish/revoke.
+          const [identity] = await tx
+            .select({ connectionId: execution.connectionId })
+            .from(execution)
+            .where(eq(execution.id, id));
+          if (!identity) throw new Error("call not found");
+          const [live] = await tx
+            .select()
+            .from(connection)
+            .where(eq(connection.id, identity.connectionId))
+            .for("update");
+          const [call] = await tx
+            .select()
+            .from(execution)
+            .where(eq(execution.id, id))
+            .for("update");
+          if (!call || call.state !== "authorized" || call.deadline <= now)
+            throw new Error("call cannot dispatch");
+          if (
+            !call.requestContext ||
+            call.originalArguments === null ||
+            !liveAuthorization ||
+            liveAuthorization.executionId !== id ||
+            liveAuthorization.requestDigest !== call.requestDigest ||
+            liveAuthorization.bindingHash !== call.bindingHash ||
+            liveAuthorization.principalId !== call.principalId ||
+            liveAuthorization.expectedJournalRevision !== call.version
+          )
+            throw new Error("stale dispatch authorization");
+          const frozenPolicy = requestPolicyContext(call.requestContext);
+          if (
+            call.classification === "write" &&
+            frozenPolicy.acceptedWriteEligibility !== "write_eligible"
+          )
+            throw new Error("request policy denies writes");
+          const [review] = await tx.select().from(catalog).where(eq(catalog.id, call.catalogId));
+          if (
+            !live ||
+            live.provider !== "mcp" ||
+            !live.enabled ||
+            live.revoked ||
+            live.configRevision !== call.configRevision ||
+            live.authGeneration !== call.authGeneration ||
+            !review ||
+            review.connectionId !== live.id ||
+            review.kind !== "published" ||
+            review.revision !== live.catalogRevision ||
+            review.configRevision !== call.configRevision ||
+            review.authGeneration !== call.authGeneration ||
+            review.credentialIdentity !== live.credentialIdentity
+          )
+            throw new Error("stale MCP authority");
+          const reviewedTool = review.tools.find((t) => t.upstreamName === call.upstreamName);
+          if (
+            !reviewedTool ||
+            !("classification" in reviewedTool) ||
+            reviewedTool.classification !== call.classification ||
+            !("enabled" in reviewedTool) ||
+            !reviewedTool.enabled
+          )
+            throw new Error("tool is not approved for this operation");
+          if (
+            call.classification === "write" &&
+            (await unknown(tx, call.sessionId, call.connectionId))
+          )
+            throw new Error("unknown write outcome blocks this connection");
+          const [lease] = await tx
+            .select()
+            .from(admission)
             .where(
               and(
-                eq(approval.executionId, id),
-                eq(approval.requestDigest, call.requestDigest),
-                eq(approval.decision, "approved"),
-                isNull(approval.consumedAt),
-                gt(approval.expiresAt, now),
+                eq(admission.executionId, id),
+                eq(admission.state, "admitted"),
+                gt(admission.expiresAt, now),
               ),
-            )
+            );
+          if (
+            !lease ||
+            lease.reservationId !== reservation.reservationId ||
+            lease.reservationId !== liveAuthorization.reservationId ||
+            lease.expiresAt.getTime() !== liveAuthorization.reservationExpiresAt.getTime() ||
+            !intent.bootId ||
+            !intent.intentId ||
+            intent.expiresAt <= now ||
+            intent.expiresAt > lease.expiresAt
+          )
+            throw new Error("valid admission and intent are required");
+          const [decision] = await tx.select().from(approval).where(eq(approval.executionId, id));
+          if (call.authorizationKind === "approval" && !decision)
+            throw new Error("approval is required");
+          if (decision) {
+            const consumed = await tx
+              .update(approval)
+              .set({ consumedAt: now })
+              .where(
+                and(
+                  eq(approval.executionId, id),
+                  eq(approval.requestDigest, call.requestDigest),
+                  eq(approval.decision, "approved"),
+                  isNull(approval.consumedAt),
+                  gt(approval.expiresAt, now),
+                ),
+              )
+              .returning();
+            if (!consumed.length) throw new Error("approval expired or consumed");
+          }
+          const [updated] = await tx
+            .update(execution)
+            .set({
+              state: "dispatching",
+              version: call.version + 1,
+              bootId: intent.bootId,
+              intentId: intent.intentId,
+              intentExpiresAt: intent.expiresAt,
+              updatedAt: now,
+            })
+            .where(eq(execution.id, id))
             .returning();
-          if (!consumed.length) throw new Error("approval expired or consumed");
-        }
-        const [updated] = await tx
-          .update(execution)
-          .set({
-            state: "dispatching",
-            version: call.version + 1,
-            bootId: intent.bootId,
-            intentId: intent.intentId,
-            intentExpiresAt: intent.expiresAt,
-            updatedAt: now,
-          })
-          .where(eq(execution.id, id))
-          .returning();
-        return updated!;
-      });
+          return updated!;
+        });
+      } catch (error) {
+        // Release only a pre-barrier reservation. A concurrent committed dispatch keeps its lease.
+        await db.transaction(async (tx) => {
+          await lockScope(tx, reservation.deploymentId);
+          const [call] = await tx
+            .select()
+            .from(execution)
+            .where(eq(execution.id, id))
+            .for("update");
+          if (
+            call?.state === "authorized" &&
+            reservation.reservationId === liveAuthorization?.reservationId &&
+            reservation.expiresAt.getTime() === liveAuthorization.reservationExpiresAt.getTime()
+          )
+            await tx
+              .delete(admission)
+              .where(
+                and(
+                  eq(admission.executionId, id),
+                  eq(admission.reservationId, reservation.reservationId),
+                  eq(admission.expiresAt, reservation.expiresAt),
+                ),
+              );
+        });
+        throw error;
+      }
     },
     async finish(
       id: string,
@@ -445,20 +683,21 @@ export function makeMcpJournal(db = getDb()) {
         return row;
       });
     },
-    async cancel(id: string, actorId: string, isAdmin: boolean, now: Date) {
+    async cancel(id: string, actorId: string, now: Date) {
       return db.transaction(async (tx) => {
         const [identity] = await tx
-          .select({ connectionId: execution.connectionId })
+          .select({ connectionId: execution.connectionId, sessionId: execution.sessionId })
           .from(execution)
           .where(eq(execution.id, id));
         if (!identity) throw new Error("call not found");
+        await lockHumanSession(tx, identity.sessionId, actorId);
         await tx
           .select()
           .from(connection)
           .where(eq(connection.id, identity.connectionId))
           .for("update");
         const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
-        await owned(tx, call!, actorId, isAdmin);
+
         if (!["waiting_approval", "authorized", "dispatching"].includes(call!.state)) return call!;
         const state: McpExecutionState =
           call!.state === "dispatching" ? "outcome_unknown" : "canceled";
@@ -478,15 +717,22 @@ export function makeMcpJournal(db = getDb()) {
     async resolveUnknown(
       id: string,
       actorId: string,
-      isAdmin: boolean,
       outcome: "succeeded" | "failed" | "acknowledged",
       now: Date,
     ) {
       return db.transaction(async (tx) => {
+        const [identity] = await tx.select().from(execution).where(eq(execution.id, id));
+        if (!identity) throw new Error("call not found");
+        await lockHumanSession(tx, identity.sessionId, actorId);
+        await tx
+          .select()
+          .from(connection)
+          .where(eq(connection.id, identity.connectionId))
+          .for("update");
         const [call] = await tx.select().from(execution).where(eq(execution.id, id)).for("update");
         if (!call || call.state !== "outcome_unknown")
           throw new Error("call has no unknown outcome");
-        await owned(tx, call, actorId, isAdmin);
+
         const [row] = await tx
           .insert(resolution)
           .values({ executionId: id, actorId, outcome, createdAt: now })

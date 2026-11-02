@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package engram.app.v1;
 
+import "engram/app/v1/session.proto";
+
 // ADR 0057 C3: orchestrator-native connector catalog CRUD (Plane B). Connectors
 // live in the orchestrator DB (the `connector` table, C1); the built-ins
 // (github/datadog) are read-only file seeds surfaced alongside custom ones.
@@ -54,12 +56,13 @@ service IntegrationService {
   rpc GetGoogleCloudSetup(GetGoogleCloudSetupRequest) returns (GetGoogleCloudSetupResponse);
   rpc DiscoverMcp(DiscoverMcpRequest) returns (DiscoverMcpResponse);
   rpc PublishMcp(PublishMcpRequest) returns (PublishMcpResponse);
-  rpc PutMcpCredential(PutMcpCredentialRequest) returns (McpCredentialResponse);
+  rpc PutMcpCredential(PutMcpCredentialRequest) returns (PutMcpCredentialResponse);
   rpc GetMcpSetup(GetMcpSetupRequest) returns (GetMcpSetupResponse);
-  rpc CompleteMcpAuthorization(CompleteMcpAuthorizationRequest) returns (McpCredentialResponse);
-  rpc RecoverMcpCredential(RecoverMcpCredentialRequest) returns (McpCredentialResponse);
+  rpc CompleteMcpAuthorization(CompleteMcpAuthorizationRequest) returns (CompleteMcpAuthorizationResponse);
+  rpc RecoverMcpCredential(RecoverMcpCredentialRequest) returns (RecoverMcpCredentialResponse);
   rpc AuthorizeMcp(AuthorizeMcpRequest) returns (AuthorizeMcpResponse);
   rpc DisconnectMcp(DisconnectMcpRequest) returns (DisconnectMcpResponse);
+  rpc GetSessionMcpState(GetSessionMcpStateRequest) returns (GetSessionMcpStateResponse);
   rpc ListMcpApprovals(ListMcpApprovalsRequest) returns (ListMcpApprovalsResponse);
   rpc DecideMcpApproval(DecideMcpApprovalRequest) returns (DecideMcpApprovalResponse);
   rpc CancelMcpCall(CancelMcpCallRequest) returns (CancelMcpCallResponse);
@@ -416,19 +419,27 @@ message McpApproval {
   string request_digest = 7;
   string argument_hash = 8;
   string expires_at = 9;
+  string original_arguments = 10;
+  McpTool reviewed_tool = 11;
+  repeated string argument_constraint_documents_json = 12;
+  McpApprovalReviewContext expected_review_context = 13;
 }
 message ListMcpApprovalsRequest {
   string session_id = 1;
+  string after_execution_id = 2;
 }
 message ListMcpApprovalsResponse {
   repeated McpApproval approvals = 1;
+  string next_execution_id = 2;
 }
 message DecideMcpApprovalRequest {
   string execution_id = 1;
   bool approve = 2;
+  McpApprovalReviewContext expected_review_context = 3;
 }
 message DecideMcpApprovalResponse {
   string state = 1;
+  McpApprovalReceipt receipt = 2;
 }
 message CancelMcpCallRequest {
   string execution_id = 1;
@@ -468,7 +479,19 @@ message McpCredentialStatus {
   int64 version = 5;
   int64 reservation_generation = 6;
 }
-message McpCredentialResponse {
+message PutMcpCredentialResponse {
+  IntegrationConnection connection = 1;
+  McpCredentialStatus credential = 2;
+}
+message CompleteMcpAuthorizationResponse {
+  IntegrationConnection connection = 1;
+  McpCredentialStatus credential = 2;
+}
+message RecoverMcpCredentialResponse {
+  IntegrationConnection connection = 1;
+  McpCredentialStatus credential = 2;
+}
+message McpCredentialState {
   IntegrationConnection connection = 1;
   McpCredentialStatus credential = 2;
 }
@@ -492,7 +515,7 @@ message GetMcpSetupResponse {
   bool enabled = 1;
   repeated McpClientRegistration registrations = 2;
   repeated McpApprovedDestination destinations = 3;
-  McpCredentialResponse current = 4;
+  McpCredentialState current = 4;
   bool transition_pending = 5;
   string flow_id = 6;
   string flow_expires_at = 7;
@@ -512,4 +535,108 @@ message RecoverMcpCredentialRequest {
   string connection_id = 1;
   uint32 expected_revision = 2;
   uint32 expected_generation = 3;
+}
+
+// Exact server review. Clients must return it unchanged when they decide.
+message McpApprovalReviewContext {
+  string execution_id = 1;
+  string session_id = 2;
+  string run_id = 3;
+  string tool_call_id = 4;
+  string request_digest = 5;
+  string argument_hash = 6;
+  string binding_hash = 7;
+  string connection_id = 8;
+  string catalog_id = 9;
+  uint32 catalog_revision = 10;
+  uint32 config_revision = 11;
+  uint32 auth_generation = 12;
+  string credential_identity = 13;
+  string upstream_name = 14;
+  string tool_fingerprint = 15;
+  string context_digest = 16;
+  uint32 journal_revision = 17;
+  string expires_at = 18;
+  string policy_revision = 19;
+  string binding_epoch = 20;
+}
+message McpApprovalReceipt {
+  string execution_id = 1;
+  string decision = 2;
+  string actor_id = 3;
+  string decided_at = 4;
+  uint32 journal_revision = 5;
+  McpApprovalReviewContext reviewed_context = 6;
+}
+message McpExecutionReview {
+  string execution_id = 1;
+  string connection_id = 2;
+  string state = 3;
+  uint32 journal_revision = 4;
+  bool result_unavailable = 5;
+  McpApproval review = 6;
+  repeated string allowed_actions = 7;
+  string reason = 8;
+  string tool_call_id = 9;
+  string run_id = 10;
+  string request_digest = 11;
+  string upstream_name = 12;
+  string approval_decision = 13;
+  string original_arguments = 14;
+  McpTool reviewed_tool = 15;
+  repeated string argument_constraint_documents_json = 16;
+  string binding_hash = 17;
+}
+message McpResolutionReceipt {
+  string execution_id = 1;
+  string actor_id = 2;
+  string outcome = 3;
+  string created_at = 4;
+}
+message McpBindingReceipt {
+  string binding_hash = 1;
+  string binding_epoch = 2;
+  bool current = 3;
+  repeated string stale_reasons = 4;
+  repeated string allowed_actions = 5;
+}
+message GetSessionMcpStateRequest {
+  string session_id = 1;
+  string after_execution_id = 2;
+  uint32 page_size = 3;
+  optional string plan_tool_call_id = 4;
+  string after_binding_tool_name = 5;
+  uint32 binding_page_size = 6;
+  bool omit_bindings = 7;
+  bool omit_executions = 8;
+}
+message GetSessionMcpStateResponse {
+  McpBindingReceipt binding_receipt = 1;
+  repeated McpExecutionReview executions = 2;
+  repeated McpApproval approvals = 3;
+  repeated string unknown_write_blocks = 4;
+  repeated McpResolutionReceipt resolution_receipts = 5;
+  repeated string allowed_actions = 6;
+  string availability = 7;
+  string next_execution_id = 8;
+  GetMcpWritePolicyResponse write_policy = 9;
+  repeated McpBoundToolSummary binding_tools = 10;
+  string next_binding_tool_name = 11;
+  bool has_more_binding_tools = 12;
+  bool has_more_executions = 13;
+}
+
+// Immutable session grant. Schemas remain independent documents with their own roots.
+message McpBoundToolSummary {
+  string connection_id = 1;
+  string connection_alias = 2;
+  string model_tool_name = 3;
+  McpTool reviewed_tool = 4;
+  repeated string argument_constraint_documents_json = 5;
+  bool automation_write = 6;
+  bool unrestricted = 7;
+  string catalog_id = 8;
+  uint32 catalog_revision = 9;
+  uint32 config_revision = 10;
+  uint32 auth_generation = 11;
 }

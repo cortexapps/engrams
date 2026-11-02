@@ -2224,6 +2224,8 @@ export const mcpExecution = pgTable(
     bindingHash: text("binding_hash").notNull(),
     requestDigest: text("request_digest").notNull(),
     argumentHash: text("argument_hash").notNull(),
+    originalArguments: text("original_arguments"),
+    requestContext: jsonb("request_context").$type<import("../mcp/journal-review.ts").FrozenRequestContext>(),
     upstreamName: text("upstream_name").notNull(),
     configRevision: integer("config_revision").notNull(),
     authGeneration: integer("auth_generation").notNull(),
@@ -2325,6 +2327,7 @@ export const mcpAdmission = pgTable(
     executionId: text("execution_id")
       .primaryKey()
       .references(() => mcpExecution.id, { onDelete: "cascade" }),
+    reservationId: text("reservation_id").notNull().default(sql`gen_random_uuid()::text`),
     deploymentId: text("deployment_id")
       .notNull()
       .references(() => mcpAdmissionScope.id),
@@ -2337,6 +2340,7 @@ export const mcpAdmission = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
   },
   (t) => [
+    uniqueIndex("mcp_admission_reservation_idx").on(t.reservationId),
     index("mcp_admission_deployment_idx").on(t.deploymentId, t.state, t.expiresAt),
     index("mcp_admission_connection_idx").on(t.connectionId, t.state),
     index("mcp_admission_session_idx").on(t.sessionId, t.state),

@@ -743,6 +743,20 @@
       "when": 1793602718404,
       "tag": "0105_mcp_binding_envelope",
       "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "7",
+      "when": 1793604760959,
+      "tag": "0106_mcp_request_review",
+      "breakpoints": true
+    },
+    {
+      "idx": 107,
+      "version": "7",
+      "when": 1793605822727,
+      "tag": "0107_mcp_admission_generation",
+      "breakpoints": true
     }
   ]
 }

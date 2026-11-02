@@ -157,6 +157,11 @@ export const authorizeMcp = IntegrationService.method.authorizeMcp;
 export const disconnectMcp = IntegrationService.method.disconnectMcp;
 
 /**
+ * @generated from rpc engram.app.v1.IntegrationService.GetSessionMcpState
+ */
+export const getSessionMcpState = IntegrationService.method.getSessionMcpState;
+
+/**
  * @generated from rpc engram.app.v1.IntegrationService.ListMcpApprovals
  */
 export const listMcpApprovals = IntegrationService.method.listMcpApprovals;

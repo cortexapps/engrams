@@ -1,3 +1,7 @@
+import { sessionMcpState, type McpReviewProducers } from "./review-state.ts";
+import { toJson } from "@bufbuild/protobuf";
+import { McpApprovalReviewContextSchema } from "../gen/engram/app/v1/integration_pb.ts";
+import { policyReviewCurrent, type JournalReviewContext } from "./journal-review.ts";
 import { credentialHandlers } from "./credential-rpc.ts";
 import type { CredentialAdmin } from "./credential-admin.ts";
 import { Code, ConnectError, type ServiceImpl } from "@connectrpc/connect";
@@ -18,6 +22,7 @@ export interface McpServices {
   enabled: boolean;
   repository: McpRepository;
   journal: McpJournal;
+  reviewProducers?: McpReviewProducers;
   sessionOwner?: (sessionId: string) => Promise<string | null>;
   validateDestination?: (config: McpConfig) => Promise<void>;
   validateSchemas?: (tools: readonly McpReviewedTool[]) => Promise<void>;
@@ -143,6 +148,7 @@ type Methods =
   | "publishMcp"
   | "authorizeMcp"
   | "disconnectMcp"
+  | "getSessionMcpState"
   | "listMcpApprovals"
   | "decideMcpApproval"
   | "cancelMcpCall"
@@ -217,53 +223,106 @@ export function mcpHandlers(deps: {
         };
       });
     },
+    async getSessionMcpState(req, ctx) {
+      const actor = await requireUser(ctx, deps.getSession);
+      const service = services();
+      return mcpOperation(() =>
+        sessionMcpState({
+          journal: service.journal,
+          sessionId: req.sessionId,
+          actorId: actor.id,
+          now: deps.now(),
+          after: req.afterExecutionId || undefined,
+          limit: req.pageSize || undefined,
+          planToolCallId: req.planToolCallId,
+          producers: service.reviewProducers,
+          canCancel: Boolean(service.runtime?.cancel),
+          canRebind: Boolean(service.runtime?.rebind),
+          afterBindingToolName: req.afterBindingToolName || undefined,
+          bindingPageSize: req.bindingPageSize || undefined,
+          omitBindings: req.omitBindings,
+          omitExecutions: req.omitExecutions,
+        }),
+      );
+    },
     async listMcpApprovals(req, ctx) {
       const actor = await requireUser(ctx, deps.getSession);
       const service = services();
-      return mcpOperation(async () => ({
-        approvals: (
-          await service.journal.pending(req.sessionId, actor.id, actor.role === "admin", deps.now())
-        ).map(({ call, approval }) => ({
-          executionId: call.id,
-          sessionId: call.sessionId,
-          runId: call.runId,
-          toolCallId: call.toolCallId,
-          connectionId: call.connectionId,
-          upstreamName: call.upstreamName,
-          requestDigest: call.requestDigest,
-          argumentHash: call.argumentHash,
-          expiresAt: approval.expiresAt.toISOString(),
-        })),
-      }));
+      // Use the same bounded read; a continuation is available from GetSessionMcpState.
+      return mcpOperation(async () => {
+        const state = await sessionMcpState({
+          journal: service.journal,
+          sessionId: req.sessionId,
+          actorId: actor.id,
+          now: deps.now(),
+          after: req.afterExecutionId || undefined,
+          producers: service.reviewProducers,
+          canCancel: Boolean(service.runtime?.cancel),
+          omitBindings: true,
+        });
+        return { approvals: state.approvals, nextExecutionId: state.nextExecutionId };
+      });
     },
     async decideMcpApproval(req, ctx) {
       const actor = await requireUser(ctx, deps.getSession);
       const service = services();
-      if (actor.serviceAccount)
-        throw new ConnectError("a human approval is required", Code.PermissionDenied);
-      return mcpOperation(async () => ({
-        state: (
-          await service.journal.decide(
-            req.executionId,
-            actor.id,
-            actor.role === "admin",
-            req.approve,
-            deps.now(),
-          )
-        ).state,
-      }));
+      if (!req.expectedReviewContext)
+        throw new ConnectError("exact review context is required", Code.InvalidArgument);
+      // Copy known fields only. Protobuf runtime metadata is not review identity.
+      const expected = toJson(McpApprovalReviewContextSchema, req.expectedReviewContext, {
+        alwaysEmitImplicit: true,
+      }) as JournalReviewContext;
+      return mcpOperation(async () => {
+        await service.journal.readSession(expected.sessionId, actor.id, { limit: 1 });
+        const producers = requireMcpHook(service.reviewProducers);
+        const current = await producers.bindings.readCurrent(expected.sessionId);
+        const policy = await requireMcpHook(producers.policy.readWritePolicy)({
+          protocol: 1,
+          sessionId: expected.sessionId,
+        });
+        if (
+          current.bindingHash !== expected.bindingHash ||
+          !policy.state?.policy?.ref ||
+          policy.state.policy.ref.policyRevision?.toString() !== expected.policyRevision ||
+          policy.state.policy.ref.bindingEpoch?.toString() !== expected.bindingEpoch
+        )
+          throw new Error("stale review policy");
+        const call = await service.journal.get(req.executionId);
+        if (!call?.requestContext || !policyReviewCurrent(call.requestContext, policy.state.policy))
+          throw new Error("stale review policy lineage");
+        if (
+          req.approve &&
+          (!policy.state.policy.current ||
+            !policy.state.policy.initialized ||
+            policy.state.policy.writeEligibility !== "write_eligible")
+        )
+          throw new Error("current policy denies writes");
+        const result = await service.journal.decide(
+          req.executionId,
+          actor.id,
+          req.approve,
+          expected,
+          deps.now(),
+        );
+        return {
+          state: result.call.state,
+          receipt: {
+            executionId: result.call.id,
+            decision: result.approval.decision,
+            actorId: result.approval.actorId!,
+            decidedAt: result.approval.decidedAt!.toISOString(),
+            journalRevision: result.call.version,
+            reviewedContext: result.reviewedContext,
+          },
+        };
+      });
     },
     async cancelMcpCall(req, ctx) {
       const actor = await requireUser(ctx, deps.getSession);
       const service = services();
       const runtime = requireMcpHook(service.runtime);
       return mcpOperation(async () => {
-        const call = await service.journal.cancel(
-          req.executionId,
-          actor.id,
-          actor.role === "admin",
-          deps.now(),
-        );
+        const call = await service.journal.cancel(req.executionId, actor.id, deps.now());
         await runtime.cancel(call.id);
         return { state: call.state };
       });
@@ -278,13 +337,7 @@ export function mcpHandlers(deps: {
       const outcome = req.outcome;
       return mcpOperation(async () => ({
         outcome: (
-          await service.journal.resolveUnknown(
-            req.executionId,
-            actor.id,
-            actor.role === "admin",
-            outcome,
-            deps.now(),
-          )
+          await service.journal.resolveUnknown(req.executionId, actor.id, outcome, deps.now())
         ).outcome,
       }));
     },
