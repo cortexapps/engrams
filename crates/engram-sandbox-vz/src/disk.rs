@@ -111,7 +111,7 @@ pub(crate) async fn clone_or_copy(src: &Path, dst: &Path) -> Result<(), DiskErro
         })?
 }
 
-fn clone_or_copy_blocking(src: &Path, dst: &Path) -> Result<(), DiskError> {
+pub(crate) fn clone_or_copy_blocking(src: &Path, dst: &Path) -> Result<(), DiskError> {
     let src_c = std::ffi::CString::new(src.as_os_str().as_encoded_bytes()).map_err(|e| {
         DiskError::CopyFailed {
             clone_err: std::io::Error::other(format!("src CString: {e}")),

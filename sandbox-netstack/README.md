@@ -54,8 +54,13 @@ host-only upgrade is `ToProxyd::PrivateNetwork`, followed by the bounded
 `private::Allocation`. It binds host ID/incarnation, proxy incarnation,
 session/sandbox, boot attempt, attachment generation, exact guest/gateway IPv4,
 and the current managed policy revision/digest. Registration requires a live
-managed policy, starts CLOSED, and has no placement epoch. The returned socket
-has consumed the CLOSED registration reply; transfer that socket to the helper.
+managed policy, starts CLOSED, and has no placement epoch. The returned
+`RegisteredPrivateNetwork` owns the exact allocation and the socket whose CLOSED
+reply was consumed. There is no unchecked constructor. A backend reads
+`allocation()` and consumes `into_stream()` only when it transfers that same
+capability to its helper; it must not accept separate caller-asserted metadata.
+While pinning files before a helper exists, it must watch reliable proxy stop
+and close the capability promptly. Disk-copy time must not delay the barrier.
 
 The host sends this configuration on descriptor 1 within five seconds:
 
@@ -152,3 +157,42 @@ full policy replay and quarantine checks. The host adapter must treat any
 failed cleanup as a failed enforcement receipt and replace the proxy before
 recovery. A helper OPEN or CLOSE response is never the final enforcement ACK.
 Bytes already delivered before the cleanup barrier cannot be revoked.
+
+## Closed VZ preparation
+
+`VzBackend::prepare_managed_cold` accepts this registered owner plus exact trusted
+cold disk and boot inputs and a selected helper artifact path/digest. It pins
+private copies, builds a fresh stopped machine with a file-handle attachment,
+and returns an opaque `PreparedManagedVz` outside the ordinary sandbox map.
+It does not load saved memory, start the machine, open the helper, publish a
+network enforcement proof, or return a final policy acknowledgement. Its only
+public lifecycle operations check closed readiness or asynchronously close and
+reap the owner. Drop starts cleanup without waiting. A thread reserved before
+helper creation owns cleanup through reaping, so an unresponsive child cannot
+block other allocations on the async executor. Canceling a close wait does not
+cancel cleanup or discard its result while the owner remains live.
+
+The helper inherits only descriptors 0, 1 and 2 through native close-by-default
+spawn actions, an empty environment and no arguments. The selected native
+attachment is retained and checked again on the VM queue. A helper cleanup
+failure remains failed after forced reaping. Only the proxy owns the stable
+session poison and final drain acknowledgement.
+
+The later start producer must supply trusted capture eligibility and exact
+artifact provenance, actual placement and a durable start intent, final policy
+and manifest checks, and all generic lifecycle gates. It must also install
+managed guest resolver setup for the exact gateway, including a pre-existing
+resolver file; the current image init uses legacy fixed resolver addresses.
+This guest setup does not supply enforcement proof. Real guest DNS and packet
+acceptance still require separate VM tests.
+
+The backend-local process fixture uses the packaged helper explicitly:
+
+```sh
+ENGRAM_SANDBOX_NETSTACK_TEST_BIN=/path/to/verified/engram-sandbox-netstack \
+  cargo test -p engram-sandbox-vz --lib \
+  actual_helper_closed_lifetime_and_descriptor_isolation -- --ignored
+```
+
+A missing fixture binary fails. CI must stage and verify that native artifact
+before invoking the target; Cargo alone does not build the Go helper.

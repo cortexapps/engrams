@@ -70,6 +70,58 @@ pub(crate) struct VmConfig {
     /// state pins the whole effective device config, not just the
     /// machine identifier). `None` keeps the random default.
     pub mac_address: Option<String>,
+    pub managed_network: Option<ManagedVmNetwork>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedVmNetwork {
+    pub packet: Arc<std::os::unix::net::UnixDatagram>,
+    pub guest: std::net::Ipv4Addr,
+    pub gateway: std::net::Ipv4Addr,
+    pub mac: String,
+}
+
+impl ManagedVmNetwork {
+    fn validate(&self) -> Result<(), VzError> {
+        let parts: Vec<_> = self.mac.split(':').collect();
+        let bytes: Option<Vec<u8>> = parts
+            .iter()
+            .map(|p| {
+                if p.len() != 2 {
+                    return None;
+                }
+                u8::from_str_radix(p, 16).ok()
+            })
+            .collect();
+        let mac_valid = bytes.is_some_and(|m| {
+            m.len() == 6 && m[0] & 1 == 0 && m != [0; 6] && m != [2, 0, 0, 0, 0, 1]
+        });
+        let valid_ip = |ip: std::net::Ipv4Addr| {
+            !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_loopback()
+                && !ip.is_broadcast()
+                && !ip.is_link_local()
+                && ip.octets()[0] != 0
+        };
+        if !mac_valid
+            || !valid_ip(self.guest)
+            || !valid_ip(self.gateway)
+            || self.guest == self.gateway
+            || self.guest.octets()[..3] != self.gateway.octets()[..3]
+            || [self.guest, self.gateway]
+                .iter()
+                .any(|ip| matches!(ip.octets()[3], 0 | 255))
+        {
+            return Err(VzError::ConfigInvalid(
+                "invalid managed network shape".into(),
+            ));
+        }
+        self.packet
+            .peer_addr()
+            .map_err(|e| VzError::AttachmentFailed(e.to_string()))?;
+        Ok(())
+    }
 }
 
 impl VmConfig {
@@ -119,7 +171,18 @@ impl VmConfig {
             bundle_dir: std::path::PathBuf::new(),
             machine_identifier: None,
             mac_address: None,
+            managed_network: None,
         }
+    }
+
+    pub fn with_managed_network(mut self, network: ManagedVmNetwork) -> Result<Self, VzError> {
+        network.validate()?;
+        // IP configuration is a host-selected boot input. No DHCP or legacy
+        // guest DNAT is used on this attachment. Enforcement stays in the host.
+        self.kernel_cmdline = format!("console=hvc0 tsc=reliable panic=0 root=/dev/vda rw quiet init=/sbin/engram-init ip={}::{}:255.255.255.0::eth0:off:{}", network.guest, network.gateway, network.gateway);
+        self.mac_address = Some(network.mac.clone());
+        self.managed_network = Some(network);
+        Ok(self)
     }
 
     /// ADR 0096 spike: pin the platform machine identifier (see the
@@ -338,6 +401,7 @@ pub(crate) struct VzVm {
     /// delegates): dropping this deallocates the delegate and the stop
     /// callbacks silently never fire.
     _delegate: Retained<VmStopDelegate>,
+    managed_attachment: Option<Retained<objc2_virtualization::VZFileHandleNetworkDeviceAttachment>>,
 }
 
 // SAFETY: see `SendableVm` for the full argument. The `VzVm` itself
@@ -378,6 +442,21 @@ impl VzVm {
         // queue — the configuration object is plain data; it only
         // becomes "live" when handed to VZVirtualMachine::init.
         let vz_cfg = build_configuration(&cfg)?;
+
+        // Retain the exact attachment object so replacement or FD reuse cannot
+        // satisfy a later liveness read. This is still a local configuration.
+        let managed_attachment = if cfg.managed_network.is_some() {
+            // SAFETY: freshly built configuration, no concurrent VM access.
+            let attachment = unsafe { vz_cfg.networkDevices().objectAtIndex(0).attachment() }
+                .and_then(|a| {
+                    a.downcast::<objc2_virtualization::VZFileHandleNetworkDeviceAttachment>()
+                        .ok()
+                })
+                .ok_or_else(|| VzError::ConfigInvalid("managed attachment missing".into()))?;
+            Some(attachment)
+        } else {
+            None
+        };
 
         // Validate. Returns `Result<(), Retained<NSError>>`.
         // SAFETY: vz_cfg is freshly built and live for the call.
@@ -439,7 +518,42 @@ impl VzVm {
             queue,
             dead,
             _delegate: delegate,
+            managed_attachment,
         })
+    }
+
+    /// Check the actual connected device on the VM queue, not a guest report.
+    pub async fn managed_attachment_closed(&self) -> bool {
+        let (tx, rx) = oneshot::channel();
+        let vm = Sendable(self.vm.clone());
+        let expected = self.managed_attachment.clone().map(Sendable);
+        self.queue.exec_async(move || {
+            let vm = vm;
+            let expected = expected;
+            // SAFETY: all live VM property access is on its dispatch queue.
+            let closed = unsafe {
+                let devices = vm.0.networkDevices();
+                vm.0.state() == VZVirtualMachineState::Stopped
+                    && devices.count() == 1
+                    && devices
+                        .objectAtIndex(0)
+                        .attachment()
+                        .and_then(|a| {
+                            a.downcast::<objc2_virtualization::VZFileHandleNetworkDeviceAttachment>(
+                            )
+                            .ok()
+                        })
+                        .is_some_and(|a| {
+                            expected.as_ref().is_some_and(|e| {
+                                Retained::as_ptr(&a) == Retained::as_ptr(&e.0)
+                                    && a.maximumTransmissionUnit() == 1500
+                                    && a.fileHandle().fileDescriptor() >= 0
+                            })
+                        })
+            };
+            let _ = tx.send(closed);
+        });
+        rx.await.unwrap_or(false)
     }
 
     /// ADR 0096: true once the stop delegate has fired — the guest
@@ -658,10 +772,72 @@ pub(crate) fn aux_drives_in_slot_order(drives: &[AuxRoDrive]) -> Vec<&AuxRoDrive
     ordered
 }
 
+fn build_network(cfg: &VmConfig) -> Result<Retained<VZVirtioNetworkDeviceConfiguration>, VzError> {
+    // SAFETY: these fresh configuration objects are not attached to a running VM.
+    unsafe {
+        let net_dev = VZVirtioNetworkDeviceConfiguration::new();
+        let attachment: Retained<objc2_virtualization::VZNetworkDeviceAttachment> =
+            if let Some(network) = &cfg.managed_network {
+                use objc2_virtualization::VZFileHandleNetworkDeviceAttachment;
+                use std::os::fd::{AsRawFd, IntoRawFd};
+                network.validate()?;
+                if cfg.mac_address.as_ref() != Some(&network.mac) {
+                    return Err(VzError::ConfigInvalid(
+                        "managed network MAC mismatch".into(),
+                    ));
+                }
+                // The native attachment owns this duplicate. The source endpoint
+                // stays owned by the preparation object until VM destruction.
+                let fd = network
+                    .packet
+                    .try_clone()
+                    .map_err(|e| VzError::AttachmentFailed(e.to_string()))?
+                    .into_raw_fd();
+                let handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                    NSFileHandle::alloc(),
+                    fd,
+                    true,
+                );
+                let attachment = VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
+                    VZFileHandleNetworkDeviceAttachment::alloc(),
+                    &handle,
+                );
+                attachment.setMaximumTransmissionUnit(1500);
+                if attachment.maximumTransmissionUnit() != 1500
+                    || attachment.fileHandle().fileDescriptor() != fd
+                    || network.packet.as_raw_fd() == fd
+                {
+                    return Err(VzError::ConfigInvalid(
+                        "managed network attachment mismatch".into(),
+                    ));
+                }
+                Retained::cast_unchecked(attachment)
+            } else {
+                Retained::cast_unchecked(VZNATNetworkDeviceAttachment::new())
+            };
+        net_dev.setAttachment(Some(&attachment));
+        // ADR 0096 spike round 2: pin the MAC when asked — the default
+        // is a fresh random VZMACAddress per configuration, and a
+        // machine-state restore requires the restoring config's MAC to
+        // MATCH the saved VM's (mismatch = generic VZErrorRestore=12).
+        if let Some(mac) = &cfg.mac_address {
+            let mac_ns = NSString::from_str(mac);
+            let mac_addr = objc2_virtualization::VZMACAddress::initWithString(
+                objc2_virtualization::VZMACAddress::alloc(),
+                &mac_ns,
+            )
+            .ok_or_else(|| VzError::ConfigInvalid(format!("mac_address {mac:?} did not parse")))?;
+            net_dev.setMACAddress(&mac_addr);
+        }
+        Ok(net_dev)
+    }
+}
+
 /// Build a fully-configured `VZVirtualMachineConfiguration` for
 /// `cfg`. Linux boot, virtio-block rootfs, a `VZVirtioSocketDevice`
 /// (real virtio-vsock) for the host↔guest control/harness/relay
-/// channels, virtio-net NAT, and a separate single-port virtio-console
+/// channels, virtio-net NAT or a managed file-handle attachment, and a
+/// separate single-port virtio-console
 /// wired to host stderr for the kernel boot log.
 ///
 /// ADR 0066 Phase 2: the transport swapped from a multi-port
@@ -817,28 +993,7 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
             NSArray::from_retained_slice(&storage);
         vz_cfg.setStorageDevices(&storage_array);
 
-        // Network: NAT (the macOS host shares its network with the
-        // guest, no per-sandbox iptables filtering). FC doesn't
-        // have allow_hosts filtering today either; both backends
-        // defer it.
-        let nat = VZNATNetworkDeviceAttachment::new();
-        let net_dev = VZVirtioNetworkDeviceConfiguration::new();
-        let nat_super: Retained<objc2_virtualization::VZNetworkDeviceAttachment> =
-            Retained::cast_unchecked(nat);
-        net_dev.setAttachment(Some(&nat_super));
-        // ADR 0096 spike round 2: pin the MAC when asked — the default
-        // is a fresh random VZMACAddress per configuration, and a
-        // machine-state restore requires the restoring config's MAC to
-        // MATCH the saved VM's (mismatch = generic VZErrorRestore=12).
-        if let Some(mac) = &cfg.mac_address {
-            let mac_ns = NSString::from_str(mac);
-            let mac_addr = objc2_virtualization::VZMACAddress::initWithString(
-                objc2_virtualization::VZMACAddress::alloc(),
-                &mac_ns,
-            )
-            .ok_or_else(|| VzError::ConfigInvalid(format!("mac_address {mac:?} did not parse")))?;
-            net_dev.setMACAddress(&mac_addr);
-        }
+        let net_dev = build_network(cfg)?;
         let net_dev_super: Retained<objc2_virtualization::VZNetworkDeviceConfiguration> =
             Retained::cast_unchecked(net_dev);
         let network_array: Retained<NSArray<objc2_virtualization::VZNetworkDeviceConfiguration>> =
@@ -963,6 +1118,59 @@ fn ns_error_message(err: &NSError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_attachment_is_file_handle_with_exact_mac_and_mtu() {
+        let (packet, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let mut cfg = VmConfig::new("kernel", "disk", 128, 1);
+        cfg.mac_address = Some("02:00:00:00:00:02".into());
+        cfg.managed_network = Some(ManagedVmNetwork {
+            packet: Arc::new(packet),
+            guest: "192.0.2.2".parse().unwrap(),
+            gateway: "192.0.2.1".parse().unwrap(),
+            mac: "02:00:00:00:00:02".into(),
+        });
+        let device = build_network(&cfg).unwrap();
+        // SAFETY: fresh local configuration, no VM or queue access.
+        unsafe {
+            let attachment = device
+                .attachment()
+                .unwrap()
+                .downcast::<objc2_virtualization::VZFileHandleNetworkDeviceAttachment>()
+                .expect("managed network must never use NAT");
+            assert_eq!(attachment.maximumTransmissionUnit(), 1500);
+            let byte = b"x";
+            assert_eq!(
+                libc::send(
+                    attachment.fileHandle().fileDescriptor(),
+                    byte.as_ptr().cast(),
+                    1,
+                    0
+                ),
+                1
+            );
+            let mut received = [0];
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            assert_eq!(peer.recv(&mut received).unwrap(), 1);
+            assert_eq!(received, *b"x");
+            assert_eq!(
+                device.MACAddress().string().to_string(),
+                "02:00:00:00:00:02"
+            );
+        }
+        cfg.managed_network.as_mut().unwrap().gateway = "198.51.100.1".parse().unwrap();
+        assert!(
+            build_network(&cfg).is_err(),
+            "gateway must be reachable in selected subnet"
+        );
+        cfg.managed_network.as_mut().unwrap().gateway = "192.0.2.1".parse().unwrap();
+        cfg.mac_address = Some("02:00:00:00:00:03".into());
+        assert!(
+            build_network(&cfg).is_err(),
+            "backend MAC differs from helper"
+        );
+    }
 
     /// Without the `com.apple.security.virtualization` entitlement,
     /// `validateWithError` returns NSError code 7 (or a similar

@@ -23,6 +23,9 @@ unsafe_code = "allow"
 
 [dependencies]
 engram-core.workspace = true
+engram-egress-proto.workspace = true
+sha2.workspace = true
+hex.workspace = true
 engram-chunk-store.workspace = true
 engram-agentd.workspace = true
 engram-harness-proto.workspace = true

@@ -265,5 +265,8 @@ resource "kubectl_manifest" "web_backendconfig" {
       namespace: ${kubernetes_namespace_v1.app.metadata[0].name}
     spec:
       timeoutSec: 3600
+      # Callback queries and referrers must not enter load-balancer logs.
+      logging:
+        enable: false
   YAML
 }
