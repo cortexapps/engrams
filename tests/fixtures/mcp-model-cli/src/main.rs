@@ -388,7 +388,26 @@ fn claude(mut cfg: Config) -> Result<()> {
         &mut bridge.0,
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}),
     )?;
-    if receive(&bridge_rx)?["id"] != 1 {
+    let initialized = receive(&bridge_rx)?;
+    let result = initialized.get("result");
+    if initialized["jsonrpc"] != "2.0"
+        || initialized["id"] != 1
+        || initialized.get("error").is_some()
+        || result
+            .and_then(|v| v.get("protocolVersion"))
+            .and_then(Value::as_str)
+            != Some("2025-06-18")
+        || !result
+            .and_then(|v| v.get("capabilities"))
+            .is_some_and(Value::is_object)
+        || !["name", "version"].iter().all(|field| {
+            result
+                .and_then(|v| v.get("serverInfo"))
+                .and_then(|v| v.get(*field))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+    {
         return Err("invalid initialize response".into());
     }
     child_send(

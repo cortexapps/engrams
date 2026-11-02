@@ -51,6 +51,59 @@ fn wait_for_failure(child: &mut Child) {
 }
 
 #[test]
+fn claude_rejects_failed_or_malformed_initialize_even_when_list_works() {
+    for case in [
+        "error",
+        "missing",
+        "malformed",
+        "server-info",
+        "version",
+        "both",
+    ] {
+        let state = State::new(case);
+        let mock = env!("CARGO_BIN_EXE_fixture-mock-bridge");
+        let config = state.0.join("config.json");
+        let settings = state.0.join("settings.json");
+        let proof = state.0.join("proof.json");
+        std::fs::write(state.0.join("bad-initialize"), case).unwrap();
+        std::fs::write(
+            &config,
+            json!({"mcpServers":{"engrams":{"type":"stdio","command":mock,"args":["mcp-bridge"]}}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &settings,
+            json!({"hooks":{"PreToolUse":[{"hooks":[{"command":format!("{mock} hook-bridge")}]}]}})
+                .to_string(),
+        )
+        .unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_engram-mcp-model-fixture"))
+            .args(["--print", "--strict-mcp-config", "--mcp-config"])
+            .arg(config)
+            .arg("--settings")
+            .arg(settings)
+            .env("ENGRAM_FIXTURE_TOOL", "remote_inventory")
+            .env("ENGRAM_FIXTURE_MODE", "read")
+            .env("ENGRAM_FIXTURE_STATE_DIR", &state.0)
+            .env("ENGRAM_FIXTURE_PROOF", &proof)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = Fixture(child);
+        send(
+            &mut child.0,
+            json!({"type":"user","message":{"role":"user","content":"fixture"}}),
+        );
+        drop(child.0.stdin.take());
+        wait_for_failure(&mut child.0);
+        assert!(std::fs::read(&proof).unwrap().is_empty());
+    }
+}
+
+#[test]
 fn codex_declares_and_delivers_the_requested_tool() {
     let state = State::new("delivery");
     let proof = state.0.join("proof.json");

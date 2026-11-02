@@ -30,6 +30,34 @@ fn main() {
             for line in io::stdin().lock().lines() {
                 let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
                 let id = v["id"].clone();
+                if v["method"] == "initialize" {
+                    let root = std::env::var_os("ENGRAM_FIXTURE_STATE_DIR").unwrap();
+                    let marker = std::path::Path::new(&root).join("bad-initialize");
+                    if let Ok(case) = std::fs::read_to_string(marker) {
+                        let response = match case.as_str() {
+                            "error" => {
+                                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"fixture error"}})
+                            }
+                            "missing" => json!({"jsonrpc":"2.0","id":id}),
+                            "malformed" => {
+                                json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18","capabilities":[],"serverInfo":{"name":"fixture","version":"1"}}})
+                            }
+                            "server-info" => {
+                                json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"","version":"1"}}})
+                            }
+                            "version" => {
+                                json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"unsupported","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}})
+                            }
+                            "both" => {
+                                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"fixture error"},"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}})
+                            }
+                            _ => panic!("invalid case"),
+                        };
+                        println!("{response}");
+                        io::stdout().flush().unwrap();
+                        continue;
+                    }
+                }
                 if v["method"] == "tools/call" && v["params"]["name"] == "fixture_forged" {
                     println!(
                         "{}",
@@ -40,7 +68,7 @@ fn main() {
                 }
                 let result = match v["method"].as_str().unwrap() {
                     "initialize" => {
-                        json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}}})
+                        json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
                     }
                     "tools/list" => {
                         json!({"tools":[{"name":"remote_inventory","inputSchema":{"type":"object"}}]})

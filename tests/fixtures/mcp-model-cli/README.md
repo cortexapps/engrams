@@ -32,14 +32,16 @@ tool payloads. `--fixture-version` prints `engram-mcp-model-fixture 1`.
 Build this standalone workspace and run its nonignored protocol tests:
 
 ```sh
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
 cargo test --locked --manifest-path tests/fixtures/mcp-model-cli/Cargo.toml --test protocol
 cargo build --locked --release --target aarch64-unknown-linux-musl \
   --manifest-path tests/fixtures/mcp-model-cli/Cargo.toml --bin engram-mcp-model-fixture
-file target/aarch64-unknown-linux-musl/release/engram-mcp-model-fixture
-shasum -a 256 target/aarch64-unknown-linux-musl/release/engram-mcp-model-fixture
+file "$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/engram-mcp-model-fixture"
+shasum -a 256 "$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/engram-mcp-model-fixture"
 ```
 
-Set `CARGO_TARGET_DIR` to an owned directory if the default target is shared.
+Run these commands from the repository root and set `CARGO_TARGET_DIR` to a
+different owned directory if the root target is shared.
 Stage the exact build and verify its digest. This workspace is excluded from
 the main workspace, so normal workspace nextest does not run its tests. CI must
 trigger and invoke this standalone target for changes in this directory and for
