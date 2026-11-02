@@ -44,6 +44,8 @@ pub struct ManagedBootPrepare {
     pub key: ManagedBootKey,
     pub cold: ManagedColdPrepare,
     pub bootstrap_policy: super::managed_deny::ManagedDenyPolicy,
+    /// Exact persisted capture receipt. A fresh image has no capture authority.
+    pub capture_authority: Option<ManagedCaptureAuthority>,
     /// Exact, non-secret SandboxSpec JSON. Decode through `spec`, never a profile.
     pub sandbox_spec_json: String,
 }
@@ -65,6 +67,13 @@ impl ManagedBootPrepare {
             || self.cold.boot_attempt != self.key.boot_attempt
         {
             return Err(conflict());
+        }
+        match (&self.cold.disk.source, &self.capture_authority) {
+            (super::managed_cold::ManagedColdSource::FreshImage { .. }, None) => {}
+            (super::managed_cold::ManagedColdSource::Capture { .. }, Some(authority)) => {
+                authority.validate_recovery(self)?;
+            }
+            _ => return Err(conflict()),
         }
         Ok(spec)
     }
@@ -296,6 +305,7 @@ pub struct ManagedBootRecord {
     pub prepared: Option<ManagedBootPreparedReceipt>,
     pub finalization: Option<ManagedBootFinalization>,
     pub sealed_agent: Option<ManagedBootSealedAgent>,
+    pub write_policy: Option<super::mcp_policy::TrustedWritePolicy>,
     pub receipt: Option<ManagedBootFinalReceipt>,
     pub start: Option<ManagedBootStart>,
 }
@@ -306,6 +316,7 @@ pub enum ManagedBootAdvance {
     Finalize {
         finalization: Box<ManagedBootFinalization>,
         sealed_agent: ManagedBootSealedAgent,
+        write_policy: super::mcp_policy::TrustedWritePolicy,
     },
     Finalized(ManagedBootFinalReceipt),
     IssueStart(ManagedBootStart),
@@ -321,6 +332,7 @@ impl ManagedBootRecord {
             prepared: None,
             finalization: None,
             sealed_agent: None,
+            write_policy: None,
             receipt: None,
             start: None,
         }
@@ -343,6 +355,7 @@ impl ManagedBootRecord {
             ManagedBootAdvance::Finalize {
                 finalization: f,
                 sealed_agent,
+                write_policy,
             } => {
                 f.validate(native)?;
                 if self.phase != ManagedBootPhase::Prepared
@@ -354,6 +367,7 @@ impl ManagedBootRecord {
                 {
                     return Err(conflict());
                 }
+                next.write_policy = Some(write_policy);
                 next.finalization = Some(*f);
                 next.sealed_agent = Some(sealed_agent);
                 next.phase = ManagedBootPhase::Finalizing;
@@ -497,7 +511,7 @@ impl ManagedCaptureAuthority {
     }
     pub fn validate_recovery(&self, next: &ManagedBootPrepare) -> Result<(), MetaError> {
         self.validate()?;
-        next.spec()?;
+        next.key.validate()?;
         let old = &self.request.key;
         let key = &next.key;
         let cold = &next.cold;
@@ -531,4 +545,15 @@ impl ManagedCaptureAuthority {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedBootFinalizeInput {
+    pub key: ManagedBootKey,
+    pub prepared_receipt_id: String,
+    pub policy: ManagedAppliedState,
+    pub native_version: u32,
+    pub combined_manifest: Vec<u8>,
+    pub combined_manifest_digest: String,
 }
