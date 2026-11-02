@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from "vitest";
-import { act, cleanup, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient } from "@tanstack/react-query";
 import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
@@ -739,5 +739,74 @@ test("a page started before a failed base refetch cannot reappear after cache re
     client.setQueryData(query.queryKey, previous);
   });
   expect(screen.queryByText("late-old-call")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Cancel call" })).toBeNull();
+});
+
+test("pagination cannot start during a base refetch that fails and restores cached data", async () => {
+  let failRead!: (error: Error) => void;
+  let reads = 0;
+  let pageRequests = 0;
+  const pending = new Promise<never>((_resolve, reject) => {
+    failRead = reject;
+  });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+  const transport = createRouterTransport((router) =>
+    router.service(IntegrationService, {
+      getSessionMcpState: (req) => {
+        if (req.omitExecutions || req.omitBindings) {
+          pageRequests++;
+          return {
+            bindingReceipt: { bindingHash: "H1", bindingEpoch: "1" },
+            bindingTools: [{ modelToolName: "wrong-tool" }],
+            executions: [
+              {
+                executionId: "old",
+                upstreamName: "wrong-call",
+                state: "dispatching",
+                allowedActions: ["cancel"],
+              },
+            ],
+          };
+        }
+        reads++;
+        if (reads > 1) return pending;
+        return {
+          bindingReceipt: { bindingHash: "H1", bindingEpoch: "1" },
+          hasMoreBindingTools: true,
+          hasMoreExecutions: true,
+          nextExecutionId: "first",
+        };
+      },
+    }),
+  );
+  renderWithProviders(<McpSessionPanel sessionId="s1" />, { transport, queryClient: client });
+  await userEvent.click(await screen.findByText("Session MCP tools"));
+  const tools = await screen.findByRole("button", { name: "Load more tools" });
+  const calls = screen.getByRole("button", { name: "Load more calls" });
+  const query = client
+    .getQueryCache()
+    .getAll()
+    .find((q) => q.queryKey[0] === "connect-query")!;
+  const previous = query.state.data;
+  let refetch!: Promise<void>;
+  await act(async () => {
+    refetch = client.invalidateQueries();
+    // These events reach the old render before React applies the fetch notification.
+    fireEvent.click(tools);
+    fireEvent.click(calls);
+  });
+  expect((tools as HTMLButtonElement).disabled).toBe(true);
+  expect((calls as HTMLButtonElement).disabled).toBe(true);
+  expect(pageRequests).toBe(0);
+  await act(async () => {
+    failRead(new ConnectError("unavailable", Code.Unavailable));
+    await refetch;
+  });
+  await screen.findByText("Session MCP state is unavailable.");
+  await act(async () => {
+    client.setQueryData(query.queryKey, previous);
+  });
+  expect(screen.queryByText("wrong-tool")).toBeNull();
+  expect(screen.queryByText("wrong-call")).toBeNull();
   expect(screen.queryByRole("button", { name: "Cancel call" })).toBeNull();
 });

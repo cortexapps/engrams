@@ -170,6 +170,15 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
   const pages = state.data ? [state.data, ...executionPages] : [];
   const binding = state.data?.bindingReceipt;
   const hasBindingIdentity = Boolean(binding?.bindingHash && binding.bindingEpoch);
+  function canLoadPage() {
+    const current = queryClient.getQueryState(queryKey);
+    return (
+      current?.fetchStatus === "idle" &&
+      current.status === "success" &&
+      current.data === state.data &&
+      generationRef.current === generation
+    );
+  }
   async function refresh() {
     setExecutionSupplement(null);
     setBindingSupplement(null);
@@ -247,8 +256,9 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
             <Button
               size="sm"
               variant="outline"
-              disabled={busy}
+              disabled={busy || state.isFetching}
               onClick={async () => {
+                if (!canLoadPage()) return;
                 setBusy(true);
                 try {
                   const base = state.data;
@@ -445,8 +455,9 @@ export function McpSessionPanel({ sessionId }: { sessionId: string }) {
             <Button
               size="sm"
               variant="outline"
-              disabled={busy}
+              disabled={busy || state.isFetching}
               onClick={async () => {
+                if (!canLoadPage()) return;
                 setBusy(true);
                 try {
                   const base = state.data;
