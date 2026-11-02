@@ -1,4 +1,4 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
 import {
   mcpAdmission as admission,
@@ -56,8 +56,12 @@ export function makeMcpAdmission(db = getDb()) {
         const rows = await tx
           .select()
           .from(admission)
-          .where(eq(admission.deploymentId, deploymentId))
-          .orderBy(asc(admission.createdAt));
+          .where(
+            and(
+              eq(admission.deploymentId, deploymentId),
+              inArray(admission.state, ["queued", "admitted"]),
+            ),
+          );
         const active = rows.filter((row) => row.state === "admitted");
         const available =
           active.length < MCP_LIMITS.deploymentConcurrency &&
