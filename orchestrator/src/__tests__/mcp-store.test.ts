@@ -172,25 +172,11 @@ describe("MCP durable authority", () => {
         expect(current.state).toBe("dispatching");
         expect((await f.journal.getAdmission(call.id))?.state).toBe("admitted");
         await f.journal.finish(call.id, current.version, "outcome_unknown", null, false, f.now);
-        const next = await f.journal.create(
-          { ...f.input, toolCallId: "call-2" },
-          { kind: "approval" },
-          f.now,
-        );
-        await f.journal.requestApproval(next.id, f.deploymentId, f.now);
-        await f.journal.decide(next.id, "owner", false, true, f.now);
-        await f.journal.admit(next.id, f.deploymentId, f.now);
         await expect(
-          f.journal.dispatch(
-            next.id,
-            {
-              bootId: "boot-1",
-              intentId: `next-${call.id}`,
-              expiresAt: new Date(f.now.getTime() + 10_000),
-            },
-            f.now,
-          ),
+          f.journal.create({ ...f.input, toolCallId: "call-2" }, { kind: "approval" }, f.now),
         ).rejects.toThrow("unknown");
+        // The original request remains readable and cannot become a second dispatch.
+        expect((await f.journal.create(f.input, { kind: "approval" }, f.now)).id).toBe(call.id);
         await f.journal.resolveUnknown(call.id, "owner", false, "acknowledged", f.now);
         expect(await f.journal.hasUnknown(f.input.sessionId, f.row.id)).toBe(false);
         await expect(

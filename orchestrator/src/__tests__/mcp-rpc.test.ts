@@ -70,6 +70,7 @@ function services(): McpServices {
       readExecutionResult: unavailable,
       getAdmission: unavailable,
       hasUnknown: unavailable,
+      assertCurrent: unavailable,
       create: unavailable,
       requestApproval: unavailable,
       pending: unavailable,

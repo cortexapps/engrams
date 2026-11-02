@@ -197,9 +197,13 @@ export async function lockSessionChain(
       .map((ref) => ({ session: sessions.get(ref.sessionId)!, owner: tasks.get(ref.taskId)! })),
   };
 }
+export type McpReviewCall = Pick<
+  typeof mcpExecution.$inferSelect,
+  "requestContext" | "originalArguments" | "bindingHash"
+>;
 export async function assertLocalReviewCurrent(
   tx: JournalTx,
-  call: typeof mcpExecution.$inferSelect,
+  call: McpReviewCall,
   session: typeof taskSession.$inferSelect,
   ancestors: { session: typeof taskSession.$inferSelect; owner: typeof task.$inferSelect }[],
   connectionLock: "share" | "update" = "share",
