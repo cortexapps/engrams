@@ -1066,6 +1066,12 @@ impl HostService for HostServiceImpl {
     /// warm-lease path doesn't reach here — it goes through
     /// `WarmPool::launch` (which has its own histogram emission
     /// labelled `kind="warm"`).
+    async fn capture_managed_boot(
+        &self,
+        _req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
+    ) -> Result<tonic::Response<engram_protocol::grpc::ManagedBootResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("managed capture unavailable"))
+    }
     async fn prepare_managed_boot(
         &self,
         _req: tonic::Request<engram_protocol::grpc::ManagedBootRequest>,
