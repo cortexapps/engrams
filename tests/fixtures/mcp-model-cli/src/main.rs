@@ -1,3 +1,4 @@
+mod evidence;
 mod plan;
 mod scalar;
 use scalar::{configured_object, digest};
@@ -23,6 +24,10 @@ struct Config {
     mode: String,
     proof: File,
     barrier: Option<PathBuf>,
+    completion_barrier: Option<PathBuf>,
+    premature_barrier: Option<PathBuf>,
+    absent: bool,
+    premature: bool,
     arguments: Value,
     call_id: String,
     expected: Option<Value>,
@@ -82,6 +87,16 @@ fn config() -> Result<Config> {
     {
         return Err("barrier must be a direct child of the state directory".into());
     }
+    let completion_barrier = evidence::barrier(
+        &root,
+        "ENGRAM_FIXTURE_COMPLETION_BARRIER",
+        "completion-release",
+    )?;
+    let premature_barrier = evidence::barrier(
+        &root,
+        "ENGRAM_FIXTURE_PREMATURE_BARRIER",
+        "premature-release",
+    )?;
     let plan = plan::Plan::from_env()?;
     let tool = if plan.is_some() {
         "plan_pending".into()
@@ -118,6 +133,10 @@ fn config() -> Result<Config> {
         mode,
         proof,
         barrier,
+        completion_barrier,
+        premature_barrier,
+        absent: false,
+        premature: false,
         arguments,
         call_id,
         expected,
@@ -150,6 +169,13 @@ impl Config {
             .iter()
             .filter(|tool| tool.get("name") == Some(&json!(self.tool)))
             .collect();
+        if self.absent {
+            if !selected.is_empty() {
+                return Err("negative alias is exposed".into());
+            }
+            self.selected_schema = None;
+            return Ok(());
+        }
         if selected.len() != 1
             || !selected[0]["inputSchema"].is_object()
             || (self.harness == "codex" && !selected[0]["description"].is_string())
@@ -172,6 +198,8 @@ impl Config {
         self.call_id = step.call_id;
         self.expected = step.expected;
         self.native_json = step.native_json;
+        self.absent = step.absent;
+        self.premature = step.premature;
         self.marker = Some(step.marker);
         self.validate_selected()?;
         Ok(())
@@ -193,10 +221,12 @@ impl Config {
 fn record(cfg: &mut Config, mut proof: Value, native: Option<&Value>) -> Result<()> {
     if cfg.extended_proof {
         proof["selectedToolName"] = json!(cfg.tool);
-        proof["selectedSchemaSha256"] = json!(cfg
-            .selected_schema
-            .as_ref()
-            .ok_or("missing selected schema")?);
+        if !cfg.absent {
+            proof["selectedSchemaSha256"] = json!(cfg
+                .selected_schema
+                .as_ref()
+                .ok_or("missing selected schema")?);
+        }
         proof["exposedMcpToolNamesSha256"] = json!(cfg
             .exposed_hash
             .as_ref()
@@ -284,6 +314,24 @@ fn codex(mut cfg: Config) -> Result<()> {
                 .get("success")
                 .and_then(Value::as_bool)
                 .ok_or("missing success")?;
+            if cfg.absent {
+                if success
+                    || result.get("contentItems")
+                        != Some(
+                            &json!([{"type":"inputText","text":format!("undeclared dynamic tool: {}", cfg.tool)}]),
+                        )
+                {
+                    return Err("absent alias was not rejected".into());
+                }
+                let proof = json!({"callId":cfg.call_id,"tool":cfg.tool,"expectExposure":"absent","requestAttempted":true,"protocolDenialCode":"unknown_tool"});
+                record(&mut cfg, proof, None)?;
+                cfg.native_completion(&value, &input)?;
+                emit(
+                    json!({"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"completed"}}}),
+                )?;
+                pending = false;
+                continue;
+            }
             if cfg.mode == "forged" {
                 if success
                     || result.get("contentItems")
@@ -315,6 +363,7 @@ fn codex(mut cfg: Config) -> Result<()> {
             if cfg.native_json {
                 let proof = json!({"callId":cfg.call_id,"tool":cfg.tool,"resultReceived":true,"success":success});
                 record(&mut cfg, proof, value.get("result"))?;
+                cfg.native_completion(&value, &input)?;
                 emit(
                     json!({"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"completed"}}}),
                 )?;
@@ -359,6 +408,7 @@ fn codex(mut cfg: Config) -> Result<()> {
             let proof = json!({"callId":cfg.call_id,"tool":cfg.tool,"resultReceived":true,"success":success,"textSentinel":text_sentinel,"textSequence":text_sequence,"structuredSentinel":structured,"isError":is_error,"outcome":outcome,"delivery":delivery,"resultUnavailable":unavailable,"denialPlanMode":denial_plan});
             let native = value.get("result").filter(|_| delivery == "available");
             record(&mut cfg, proof, native)?;
+            cfg.native_completion(&value, &input)?;
             emit(
                 json!({"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"completed"}}}),
             )?;
@@ -400,6 +450,7 @@ fn codex(mut cfg: Config) -> Result<()> {
             }
             "turn/start" if thread_ready && !pending => {
                 cfg.select(Some(&value))?;
+                cfg.prepare_evidence()?;
                 emit(
                     json!({"id":id.ok_or("missing id")?,"result":{"turn":{"id":"fixture-turn","status":"inProgress"}}}),
                 )?;
@@ -419,7 +470,14 @@ fn codex(mut cfg: Config) -> Result<()> {
                 emit(
                     json!({"id":77,"method":"item/tool/call","params":{"callId":cfg.call_id,"tool":if cfg.mode == "forged" { "fixture_forged" } else { &cfg.tool },"arguments":cfg.arguments,"threadId":"fixture-thread","turnId":"fixture-turn"}}),
                 )?;
-                pending = true;
+                if cfg.premature {
+                    cfg.premature_completion(&input)?;
+                    emit(
+                        json!({"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"completed"}}}),
+                    )?;
+                } else {
+                    pending = true;
+                }
             }
             "turn/interrupt" if pending => {
                 emit(json!({"id":id.ok_or("missing id")?,"result":{}}))?;
@@ -615,6 +673,7 @@ fn claude(mut cfg: Config) -> Result<()> {
         } else {
             Some(&prompt)
         })?;
+        cfg.prepare_evidence()?;
         cfg.persist_selection(true)?;
         let mut hook = ChildGuard(
             Command::new(command)
@@ -645,6 +704,20 @@ fn claude(mut cfg: Config) -> Result<()> {
             .pointer("/hookSpecificOutput/permissionDecision")
             .and_then(Value::as_str)
         {
+            Some("defer") if cfg.premature => {
+                cfg.premature_completion(&input)?;
+                emit(
+                    json!({"type":"result","subtype":"success","session_id":"fixture-session","result":"fixture"}),
+                )?;
+                continue;
+            }
+            _ if cfg.premature
+                || cfg.absent
+                    && decision.pointer("/hookSpecificOutput/permissionDecision")
+                        != Some(&json!("allow")) =>
+            {
+                return Err("unexpected evidence hook decision".into());
+            }
             Some("allow") => {}
             Some("defer") | Some("deny") => {
                 emit(
@@ -698,6 +771,21 @@ fn claude(mut cfg: Config) -> Result<()> {
             return Err("ambiguous tool response".into());
         }
         let result = response.get("result");
+        if cfg.absent {
+            if result.is_some()
+                || response.pointer("/error/code") != Some(&json!(-32602))
+                || response.pointer("/error/message") != Some(&json!("Unknown tool"))
+            {
+                return Err("absent alias was not rejected".into());
+            }
+            let proof = json!({"callId":cfg.call_id,"tool":cfg.tool,"expectExposure":"absent","requestAttempted":true,"protocolDenialCode":"unknown_tool","nativeDenialCode":-32602});
+            record(&mut cfg, proof, None)?;
+            cfg.native_completion(&response, &input)?;
+            emit(
+                json!({"type":"result","subtype":"success","session_id":"fixture-session","result":"fixture"}),
+            )?;
+            continue;
+        }
         if cfg.native_json {
             let native = result.ok_or("missing native JSON result")?;
             let content = native
@@ -712,6 +800,7 @@ fn claude(mut cfg: Config) -> Result<()> {
             }
             let proof = json!({"callId":cfg.call_id,"tool":cfg.tool,"resultReceived":true});
             record(&mut cfg, proof, Some(native))?;
+            cfg.native_completion(&response, &input)?;
             emit(
                 json!({"type":"result","subtype":"success","session_id":"fixture-session","result":"fixture"}),
             )?;
@@ -767,6 +856,7 @@ fn claude(mut cfg: Config) -> Result<()> {
         let denial_plan = receipt.get("denial") == Some(&json!("plan_mode"));
         let proof = json!({"callId":cfg.call_id,"tool":cfg.tool,"resultReceived":true,"textSentinel":text,"textSequence":text_sequence,"structuredSentinel":structured,"isError":is_error,"outcome":outcome,"delivery":delivery,"resultUnavailable":unavailable,"denialPlanMode":denial_plan});
         record(&mut cfg, proof, result)?;
+        cfg.native_completion(&response, &input)?;
         emit(
             json!({"type":"result","subtype":"success","session_id":"fixture-session","result":"fixture"}),
         )?;

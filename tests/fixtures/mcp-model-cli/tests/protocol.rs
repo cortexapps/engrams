@@ -155,6 +155,7 @@ fn codex_declares_and_delivers_the_requested_tool() {
         &mut child.0,
         json!({"id":call["id"],"result":{"success":false,"contentItems":[{"type":"inputText","text":"sentinel"},{"type":"inputText","text":"second sentinel"},{"type":"inputText","text":"{\"structuredContent\":{\"fixture\":true}}"},{"type":"inputText","text":"{\"delivery\":\"available\",\"isError\":true,\"outcome\":\"failed\",\"resultUnavailable\":false}"}]}}),
     );
+    assert_eq!(receive()["method"], "item/completed");
     assert_eq!(receive()["method"], "turn/completed");
     let recorded: Value = serde_json::from_slice(&std::fs::read(&proof).unwrap()).unwrap();
     assert_eq!(
@@ -174,6 +175,7 @@ fn codex_rejects_a_thread_without_the_expected_tool() {
         .env("ENGRAM_FIXTURE_PROOF", state.0.join("proof.json"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut child = Fixture(child);
@@ -187,6 +189,9 @@ fn codex_rejects_a_thread_without_the_expected_tool() {
     );
     drop(child.0.stdin.take());
     wait_for_failure(&mut child.0);
+    let mut error = String::new();
+    std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut error).unwrap();
+    assert_eq!(error, "fixture protocol failure\n");
 }
 
 #[test]
@@ -203,10 +208,14 @@ fn rejects_proof_outside_the_owned_state_directory() {
         .env("ENGRAM_FIXTURE_PROOF", &proof)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut child = Fixture(child);
     wait_for_failure(&mut child.0);
+    let mut error = String::new();
+    std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut error).unwrap();
+    assert_eq!(error, "fixture protocol failure\n");
     assert_eq!(std::fs::read(proof).unwrap(), b"preserve");
 }
 
@@ -253,6 +262,9 @@ fn claude_reads_generated_config_and_exchanges_mcp_and_hook_messages() {
         };
         assert_eq!(receive()["subtype"], "init");
         assert_eq!(receive()["type"], "assistant");
+        if mode != "forged" {
+            assert_eq!(receive()["type"], "user");
+        }
         assert_eq!(receive()["type"], "result");
         let recorded: Value = serde_json::from_slice(&std::fs::read(proof).unwrap()).unwrap();
         if mode == "forged" {
@@ -510,6 +522,9 @@ fn claude_refires_the_same_call_after_process_death() {
         }
         assert_eq!(receive()["subtype"], "init");
         assert_eq!(receive()["type"], "assistant");
+        if attempt == 1 {
+            assert_eq!(receive()["type"], "user");
+        }
         assert_eq!(receive()["type"], "result");
         if attempt == 0 {
             assert!(std::fs::read(&proof).unwrap().is_empty());
@@ -583,6 +598,7 @@ fn codex_write_denied_and_unavailable_calls_keep_the_native_result() {
             &mut child.0,
             json!({"id":77,"result":{"success":success,"contentItems":[{"type":"inputText","text":"sentinel"},{"type":"inputText","text":receipt.to_string()}]}}),
         );
+        assert_eq!(receive()["method"], "item/completed");
         assert_eq!(receive()["method"], "turn/completed");
         let recorded: Value = serde_json::from_slice(&std::fs::read(&proof).unwrap()).unwrap();
         assert_eq!(recorded["success"], success);

@@ -41,8 +41,8 @@ the neutral `sentinel`, `second sentinel`, and `{"fixture":true}` result
 values, and bounded native outcome and delivery fields. It records a CLI-side
 observation. It is not evidence that the journal or an upstream service
 committed a result. Empty proof means no result was recorded. Never reuse a
-proof path. The fixture does not print the input environment, arguments, or
-tool payloads. `--fixture-version` prints `engram-mcp-model-fixture 1`.
+proof path. Proof and diagnostic output do not contain arguments or
+tool payloads. Native protocol stdout carries the actual call and result. `--fixture-version` prints `engram-mcp-model-fixture 1`.
 
 With any of the three optional scalar variables set, proof also records
 `selectedToolName`, `selectedSchemaSha256`, and `exposedMcpToolNamesSha256`.
@@ -89,7 +89,8 @@ sequence, set `ENGRAM_FIXTURE_CALL_PLAN_JSON` instead of TOOL, ARGUMENTS_JSON,
 CALL_ID and EXPECTED_RESULT_JSON. These scalar variables must be absent in plan
 mode. The plan is at most 65536 UTF-8 bytes and has exactly a `steps` array of
 1 to 16 objects. Each step has `marker`, `tool`, `arguments`, `callId`,
-`resultFormat` (`mcp` or `json`), and optional `expectedResult`. Unknown fields
+`resultFormat` (`mcp` or `json`), and optional `expectedResult`, `expectExposure`,
+and `completionProjection`. Unknown fields
 are rejected. Markers and call IDs use the call-ID grammar and must be unique.
 Arguments have the scalar size and depth bounds. The whole-plan size limit also
 bounds the optional literal expected native objects.
@@ -116,15 +117,18 @@ expected hash. Claude native JSON output is `{"content":[{"type":"text",
 no MCP receipt fields; Codex retains its actual `success` flag. The fixture does
 not decode those text strings or assert that a child was actually created.
 
-Each completion appends one JSON line to the same process proof file and
-flushes it before the native turn-complete frame. With `{pid}` in the filename,
+Each actual response appends one JSON line to the same process proof file and
+flushes it before the native tool-complete frame, then the turn-complete frame.
+Barrier and adversarial observations use separate lines. A live reader must
+parse only complete newline-terminated records. With `{pid}` in the filename,
 a restarted process gets a new file. Read proof as JSONL when there are multiple
 turns; use the call ID and plan digest to select the required observation.
 
 A direct child of the private state directory, `plan-selection.json`, contains
 only planSha256, harness, mode, marker and pending. The fixture writes this
 receipt atomically before it emits a call. It marks the selection completed
-only after an actual native response. It stores no arguments or result bytes.
+after an actual native response or after the fixed adversarial event is emitted
+and flushed. A denied absent-alias response also completes the selection. It stores no arguments or result bytes.
 A deferred Claude `--resume` in write/refire mode has no current prompt; it can
 repeat only a pending selection for the exact same plan, harness and mode.
 Missing, completed, malformed, mismatched or symlink receipts fail closed.
@@ -133,11 +137,79 @@ prompt. This is a test-client retry; the production journal remains responsible
 for authorization, idempotency and effects. A session needs its own state
 directory, including when a parent and child use the same fixed plan.
 
+
+A plan step can set `expectExposure` to `present` (the default) or `absent`.
+The absent case requires an `mcp_` alias, `resultFormat: "mcp"`, no expected
+result, and no completion projection. The fixture checks that the exact alias
+is absent from the actual current tool list, then sends that fixed alias through
+the native request path. Claude must return JSON-RPC error `-32602` with message
+`Unknown tool`. Codex must return `success: false` with the single native text
+`undeclared dynamic tool: <alias>`. Any other response fails closed. This does
+not relax the positive tool-list checks.
+
+Absent proof has `expectExposure: "absent"`, `requestAttempted: true`, and
+`protocolDenialCode: "unknown_tool"`, plus the existing call, tool, plan and
+exposure identities. Claude also records `nativeDenialCode: -32602`. There is
+no selected schema, result receipt, outcome or effect claim. After this proof,
+the fixture emits a normal native failure completion from the actual denial.
+
+For normal results, Claude emits a streamed `user` message with one `tool_result`
+block. It carries the exact call ID, actual content, and actual `isError` when
+present. JSON-RPC errors use their actual message and `is_error: true`. Codex
+emits `item/completed` with `type: "dynamicToolCall"`, the exact call ID/tool,
+actual success, and the complete actual native result. Native JSON responses
+remain native JSON; no MCP receipt is added. These native events let the real
+wrapper report tool completion. Only the actual coordinator outbox can prove ACK.
+
+`ENGRAM_FIXTURE_COMPLETION_BARRIER`, when set, must equal
+`STATE_DIR/completion-release`. The fixture first validates the native result
+and flushes its proof. It then records `observation: "completionBarrierHeld"`
+and waits before it emits native completion. The runner can inspect the real
+unacknowledged outbox and restart its services while this barrier is held.
+
+The release must be a newly created empty regular file, mode 0600, with one link
+and the same owner as the private state directory. Create it exclusively. The
+fixture rejects a preexisting release at startup and before each call. It opens
+without following symlinks, checks file identity and metadata, then removes only
+that release file. The fixed timeout is 120 seconds. No timeout environment
+setting exists. Input EOF, interrupt, unexpected input, invalid release or timeout
+fails closed without native completion. A valid interrupt receives the native
+interrupt reply before the process exits with failure. A release records
+`observation: "completionBarrierReleased"` before normal completion.
+
+The optional plan field `completionProjection: "premature"` selects one fixed
+adversarial probe. It requires a present `mcp_` alias, MCP result format, no
+expected result, and `ENGRAM_FIXTURE_PREMATURE_BARRIER` equal to
+`STATE_DIR/premature-release`. This barrier uses the same release rules and
+120-second bound. The legacy `forged` mode cannot combine with either new probe.
+
+Claude must first observe an actual `defer` hook decision for the known call.
+Codex first emits the actual dynamic request and has no native response. The
+fixture records `observation: "prematureBarrierHeld"`. The runner must observe
+actual waiting approval and zero upstream effects before release. A Codex
+response received while held fails closed. After release, the fixture records
+`prematureBarrierReleased`, then emits the fixed native success projection:
+Claude has empty content and `is_error: false`; Codex has `success: true` and
+no result field. No caller can supply event fields or a result payload.
+
+After the adversarial event is emitted and flushed, proof records only
+`observation: "prematureCompletionEmitted"`, its canonical `eventSha256`, and
+the call/tool/plan identities. It clears the local pending selection to prevent
+promptless replay. This proves emission only. Interrupted or unreleased probes
+do not clear pending selection. The real journal, outbox and upstream counter
+must establish whether authorization or an effect occurred. A projected
+completion can retire a call or run; a later approval for that call may fail.
+Use a distinct valid call to test subsequent approved execution.
+
+All barrier observations contain only the observation name, call/tool identity,
+and plan digest when configured. They do not establish result receipt or an
+upstream effect. Use one private state directory per session.
+
 Build this standalone workspace and run its nonignored protocol tests:
 
 ```sh
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
-cargo test --locked --manifest-path tests/fixtures/mcp-model-cli/Cargo.toml --test protocol
+cargo test --locked --manifest-path tests/fixtures/mcp-model-cli/Cargo.toml
 cargo build --locked --release --target aarch64-unknown-linux-musl \
   --manifest-path tests/fixtures/mcp-model-cli/Cargo.toml --bin engram-mcp-model-fixture
 file "$CARGO_TARGET_DIR/aarch64-unknown-linux-musl/release/engram-mcp-model-fixture"

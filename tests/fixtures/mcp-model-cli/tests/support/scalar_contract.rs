@@ -20,6 +20,8 @@ pub(super) fn command(state: &State, claude: bool, mode: &str) -> Command {
         .env_remove("ENGRAM_FIXTURE_EXPECTED_RESULT_JSON")
         .env_remove("ENGRAM_FIXTURE_CALL_ID")
         .env_remove("ENGRAM_FIXTURE_BARRIER")
+        .env_remove("ENGRAM_FIXTURE_COMPLETION_BARRIER")
+        .env_remove("ENGRAM_FIXTURE_PREMATURE_BARRIER")
         .env("ENGRAM_FIXTURE_TOOL", "remote_inventory")
         .env("ENGRAM_FIXTURE_MODE", mode)
         .env("ENGRAM_FIXTURE_STATE_DIR", &state.0)
@@ -122,6 +124,17 @@ pub(super) fn exercise(
         let frame = receive(&rx);
         assert_eq!(frame.pointer("/message/content/0/id"), Some(&json!(id)));
         assert_eq!(frame.pointer("/message/content/0/input"), Some(&args));
+        let completion = receive(&rx);
+        let block = &completion["message"]["content"][0];
+        assert_eq!(completion["type"], "user");
+        assert_eq!(block["tool_use_id"], id);
+        if actual.get("error").is_some() {
+            assert_eq!(block["content"], actual["error"]["message"]);
+            assert_eq!(block["is_error"], true);
+        } else {
+            assert_eq!(block["content"], actual["content"]);
+            assert_eq!(block.get("is_error"), actual.get("isError"));
+        }
         assert_eq!(receive(&rx)["type"], "result");
     } else {
         send(&mut child.0, json!({"id":1,"method":"initialize"}));
@@ -137,6 +150,10 @@ pub(super) fn exercise(
         assert_eq!(call["params"]["callId"], id);
         assert_eq!(call["params"]["arguments"], args);
         send(&mut child.0, json!({"id":77,"result":actual}));
+        let completion = receive(&rx);
+        assert_eq!(completion["method"], "item/completed");
+        assert_eq!(completion["params"]["item"]["id"], id);
+        assert_eq!(completion["params"]["item"]["result"], actual);
         assert_eq!(receive(&rx)["method"], "turn/completed");
     }
     finish(&mut child.0);
@@ -407,7 +424,12 @@ fn configured_claude_refire_repeats_id_and_arguments_after_reaped_process() {
             // EOF lets the fixture reap its bridge before this process is reaped.
             finish(&mut child.0);
         } else {
-            assert_eq!(result["subtype"], "success");
+            assert_eq!(result["type"], "user");
+            assert_eq!(
+                result["message"]["content"][0]["tool_use_id"],
+                "stable-write_1"
+            );
+            assert_eq!(receive(&rx)["subtype"], "success");
             finish(&mut child.0);
             let proof: Value = serde_json::from_slice(&std::fs::read(proof).unwrap()).unwrap();
             assert_eq!(proof["callId"], "stable-write_1");

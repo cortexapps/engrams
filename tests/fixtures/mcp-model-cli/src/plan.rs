@@ -15,6 +15,8 @@ pub struct Step {
     pub call_id: String,
     pub native_json: bool,
     pub expected: Option<Value>,
+    pub absent: bool,
+    pub premature: bool,
 }
 pub struct Plan {
     pub hash: String,
@@ -84,7 +86,7 @@ impl Plan {
             exact_keys(
                 step,
                 &["marker", "tool", "arguments", "callId", "resultFormat"],
-                &["expectedResult"],
+                &["expectedResult", "expectExposure", "completionProjection"],
             )?;
             let marker = text(step, "marker")?;
             let call_id = text(step, "callId")?;
@@ -107,6 +109,23 @@ impl Plan {
                 Some("mcp") => false,
                 _ => return Err("invalid plan result format".into()),
             };
+            let absent = match step.get("expectExposure").and_then(Value::as_str) {
+                Some("absent") => true,
+                Some("present") => false,
+                None if step.get("expectExposure").is_none() => false,
+                _ => return Err("invalid exposure expectation".into()),
+            };
+            let premature = match step.get("completionProjection").and_then(Value::as_str) {
+                Some("premature") => true,
+                None if step.get("completionProjection").is_none() => false,
+                _ => return Err("invalid completion projection".into()),
+            };
+            if (absent || premature)
+                && (native_json || expected.is_some() || !tool.starts_with("mcp_"))
+                || absent && premature
+            {
+                return Err("invalid evidence step".into());
+            }
             parsed.push(Step {
                 marker,
                 tool,
@@ -114,6 +133,8 @@ impl Plan {
                 call_id,
                 native_json,
                 expected,
+                absent,
+                premature,
             });
         }
         Ok(Some(Self {
