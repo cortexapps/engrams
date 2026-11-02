@@ -47,5 +47,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // reach 16 MiB at 1M IDs; the host server bumps its decode
         // cap inline at the call site rather than globally here.
         .compile_protos(&protos, &includes)?;
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .skip_debug([
+            ".engram.mcp.v1.PutSecretRequest",
+            ".engram.mcp.v1.CompleteAuthorizationRequest",
+            ".engram.mcp.v1.BeginAuthorizationResponse",
+            ".engram.mcp.v1.LeaseResponse",
+        ])
+        .compile_protos(&["proto/engram/mcp/v1/control.proto"], &includes)?;
     Ok(())
 }

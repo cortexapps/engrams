@@ -284,3 +284,12 @@ mod tests {
         ));
     }
 }
+
+/// Security tokens use OS entropy, never the reproducible simulation RNG.
+pub fn security_random_bytes() -> Result<[u8; 32], CryptoError> {
+    let mut bytes = [0; 32];
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| CryptoError::Provider("security entropy unavailable".into()))?;
+    Ok(bytes)
+}

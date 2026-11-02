@@ -392,6 +392,11 @@ impl OAuthManager {
         &self,
         key: &OAuthCredentialKey,
     ) -> Result<ResolvedConnectorToken, OAuthServiceError> {
+        if key.subject_kind == OAuthSubjectKind::Mcp {
+            return Err(OAuthServiceError::BadRequest(
+                "MCP credentials require the dedicated control service".into(),
+            ));
+        }
         let row = self
             .meta
             .get_oauth_credential(key)

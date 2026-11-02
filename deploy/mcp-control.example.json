@@ -1,0 +1,65 @@
+{
+  "registry": {
+    "enabled": false,
+    "deploymentId": "deployment-a",
+    "zones": {
+      "public": {
+        "policyDigest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "policyRevision": "1",
+        "endpoints": [
+          "https://tools.example/mcp",
+          "https://tools.example/.well-known/oauth-protected-resource",
+          "https://auth.example/.well-known/oauth-authorization-server",
+          "https://auth.example/authorize",
+          "https://auth.example/token"
+        ]
+      }
+    },
+    "registrations": {
+      "registered-public": {
+        "id": "registered-public",
+        "clientId": "registered-client-id",
+        "confidential": false,
+        "redirectUri": "https://app.example/mcp/callback",
+        "issuer": "https://auth.example/",
+        "resource": {
+          "zoneId": "public",
+          "endpoint": "https://tools.example/mcp"
+        },
+        "resourceMetadata": {
+          "zoneId": "public",
+          "endpoint": "https://tools.example/.well-known/oauth-protected-resource"
+        },
+        "authorizationMetadata": {
+          "zoneId": "public",
+          "endpoint": "https://auth.example/.well-known/oauth-authorization-server"
+        },
+        "authorization": {
+          "zoneId": "public",
+          "endpoint": "https://auth.example/authorize"
+        },
+        "token": {
+          "zoneId": "public",
+          "endpoint": "https://auth.example/token"
+        },
+        "scopes": ["tools.read"],
+        "issuerParameterRequired": true,
+        "accountField": null
+      }
+    }
+  },
+  "listenAddr": "0.0.0.0:50062",
+  "serverCertificateFile": "/run/mcp-control/server.crt",
+  "serverPrivateKeyFile": "/run/mcp-control/server.key",
+  "orchestratorCaFile": "/run/mcp-control/orchestrator-ca.crt",
+  "orchestratorFingerprints": [
+    "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00"
+  ],
+  "workers": {
+    "public": {
+      "url": "https://mcp-public.example:8443",
+      "serverCaFile": "/run/mcp-worker/server-ca.crt",
+      "clientIdentityFile": "/run/mcp-worker/coordinator.pem"
+    }
+  }
+}

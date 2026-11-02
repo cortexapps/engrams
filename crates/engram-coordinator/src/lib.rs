@@ -31,6 +31,7 @@ pub mod idle_detector;
 pub mod idle_evictor;
 pub mod integration_ops;
 pub mod integrations;
+pub mod mcp;
 pub mod metrics;
 pub mod oauth;
 pub mod oauth_client_credentials;
@@ -376,6 +377,19 @@ pub async fn run_with_registry_and_local(
         state.services.host.set_upload_sink(sink);
     }
 
+    // The optional credential service has its own authenticated listener.
+    let mcp_control = mcp::startup::start(
+        cfg.mcp_control_config.as_deref(),
+        state.oauth.clone(),
+        state.subscribe_shutdown(),
+    )
+    .await
+    .map_err(|_| {
+        CoordinatorError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid MCP control configuration",
+        ))
+    })?;
     // ADR 0051 B: the orchestrator-facing app gRPC surface, served
     // BESIDE the axum API (additive — no REST route changes). Spawned so
     // a runtime serve crash doesn't take the web surface down with it
@@ -446,10 +460,12 @@ pub async fn run_with_registry_and_local(
         .await
         .map_err(CoordinatorError::Io)?;
 
-    // Graceful shutdown drains both servers: axum has returned, now
-    // wait for the app gRPC serve loop to finish its own drain. A
+    // Axum has drained. Wait for both control listeners to finish. A
     // JoinError here means the spawned task panicked — log it rather
     // than turning a clean web-side shutdown into a process error.
+    if let Some(task) = mcp_control {
+        let _ = task.await;
+    }
     if let Err(e) = app_grpc.await {
         tracing::error!(error = %e, "app gRPC server task panicked");
     }

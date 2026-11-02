@@ -77,6 +77,10 @@ struct Cli {
     #[arg(long, env = "ENGRAM_APP_GRPC_ADDR", default_value = "127.0.0.1:50061")]
     app_grpc_addr: std::net::SocketAddr,
 
+    /// Operator configuration file for the separate MCP credential control listener.
+    #[arg(long, env = "ENGRAM_MCP_CONTROL_CONFIG")]
+    mcp_control_config: Option<PathBuf>,
+
     /// Comma-separated bearer tokens accepted on the app gRPC surface
     /// (ADR 0051 §5) — the orchestrator's machine credential, separate
     /// from `--auth-tokens` (different caller, different blast radius,
@@ -368,6 +372,7 @@ async fn main() -> Result<(), CoordinatorError> {
             .collect(),
         harness_listen_addr: cli.harness_listen_addr,
         app_grpc_addr: cli.app_grpc_addr,
+        mcp_control_config: cli.mcp_control_config.clone(),
         // Same empty-entry stripping as `auth_tokens` above (clap's
         // value_delimiter turns an unset env into one "" entry), plus
         // trim so `a, b` rotation lists don't mint a " b" token. An

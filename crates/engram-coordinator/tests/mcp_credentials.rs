@@ -269,3 +269,29 @@ mod publication_race {
         }
     }
 }
+
+#[tokio::test]
+async fn generic_connector_resolver_rejects_mcp_before_loading_credentials() {
+    use engram_coordinator::oauth::{OAuthManager, OAuthServiceError};
+    use engram_core::types::oauth::{OAuthCredentialKey, OAuthSubjectKind};
+    let clock = ManualClock::new();
+    let entropy = Arc::new(SimEntropy::seeded(4));
+    let meta = SimMetadataStore::new(clock.clone(), entropy.clone());
+    let manager = OAuthManager::new(
+        meta,
+        Arc::new(EnvVarKeyProvider::from_bytes([7; 32], "test")),
+        clock,
+        entropy,
+        Arc::new(StaticSecretStore::new(HashMap::new())),
+    );
+    assert!(matches!(
+        manager
+            .resolve_connector_token(&OAuthCredentialKey {
+                subject_kind: OAuthSubjectKind::Mcp,
+                subject_id: "connection-a".into(),
+                provider: "registered-a".into()
+            })
+            .await,
+        Err(OAuthServiceError::BadRequest(_))
+    ));
+}

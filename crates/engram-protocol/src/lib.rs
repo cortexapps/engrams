@@ -25,3 +25,5 @@ pub mod wire;
 pub use admin::HostAdminHandler;
 pub use heartbeat::*;
 pub use wire::{WireExecRequest, WireReapStats, WIRE_VERSION};
+
+pub mod mcp;

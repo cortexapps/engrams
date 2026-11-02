@@ -33,7 +33,9 @@ fn subject_from_proto(
     let kind = match app::OauthSubjectKind::try_from(subject.kind) {
         Ok(app::OauthSubjectKind::User) => OAuthSubjectKind::User,
         Ok(app::OauthSubjectKind::Connector) => OAuthSubjectKind::Connector,
-        Ok(app::OauthSubjectKind::Mcp) => OAuthSubjectKind::Mcp,
+        Ok(app::OauthSubjectKind::Mcp) => {
+            return Err("MCP credentials require the dedicated control service")
+        }
         Ok(app::OauthSubjectKind::UserConnector) => OAuthSubjectKind::UserConnector,
         _ => return Err("subject kind is required"),
     };
@@ -391,7 +393,11 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
         let kind = match app::OauthSubjectKind::try_from(subject.kind) {
             Ok(app::OauthSubjectKind::User) => OAuthSubjectKind::User,
             Ok(app::OauthSubjectKind::Connector) => OAuthSubjectKind::Connector,
-            Ok(app::OauthSubjectKind::Mcp) => OAuthSubjectKind::Mcp,
+            Ok(app::OauthSubjectKind::Mcp) => {
+                return Err(Status::permission_denied(
+                    "MCP credentials require the dedicated control service",
+                ))
+            }
             Ok(app::OauthSubjectKind::UserConnector) => OAuthSubjectKind::UserConnector,
             _ => return Err(Status::invalid_argument("subject kind is required")),
         };
@@ -550,5 +556,18 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             version,
             opaque_bundle,
         }))
+    }
+}
+
+#[cfg(test)]
+mod mcp_boundary_tests {
+    use super::*;
+    #[test]
+    fn mcp_subject_rejects_all_generic_app_oauth_operations() {
+        assert!(subject_from_proto(Some(app::OAuthSubject {
+            kind: app::OauthSubjectKind::Mcp as i32,
+            id: "connection-a".into()
+        }))
+        .is_err());
     }
 }
