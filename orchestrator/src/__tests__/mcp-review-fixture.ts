@@ -138,6 +138,7 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
     bound = binding.tools[0]!;
   const resolvedTool = {
     bindingHash: snapshot.bindingHash,
+    profilePublication: snapshot.profilePublication,
     binding,
     modelToolName: bound.name,
     reviewedTool: bound.tool,

@@ -39,6 +39,7 @@ test("explicit reviewed rebind installs exact deny acknowledgement before atomic
       },
     };
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -107,6 +108,7 @@ test("typed rebind requires the exact reviewed candidate", async () => {
       },
     };
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -164,6 +166,21 @@ test("typed rebind requires the exact reviewed candidate", async () => {
       });
       expect(candidate.bindingHash).toBeTruthy();
       expect(candidate.bindingTools.length).toBeGreaterThan(0);
+      const { profile } = await import("../db/schema.ts");
+      await f.db
+        .update(profile)
+        .set({ mcpGrantPublication: null })
+        .where(eq(profile.id, f.profileId));
+      await expect(
+        client.prepareMcpRebind({
+          sessionId: f.sessionId,
+          expectedBindingHash: f.snapshot.bindingHash,
+        }),
+      ).rejects.toThrow("An administrator must publish MCP grants before rebind");
+      await f.db
+        .update(profile)
+        .set({ mcpGrantPublication: f.snapshot.profilePublication })
+        .where(eq(profile.id, f.profileId));
       try {
         await client.rebindMcp({
           sessionId: f.sessionId,
@@ -237,6 +254,7 @@ test("lost host acknowledgement leaves old snapshot and preserves installed deni
       },
     };
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -297,6 +315,7 @@ test("stale hashes, lost owner and changed connection cannot apply a reviewed ca
       },
     };
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -368,6 +387,7 @@ test("concurrent commits expose only one reviewed binding", async () => {
       },
     };
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -423,6 +443,7 @@ test("physical placement change after host acknowledgement prevents exposure", a
       },
     };
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -476,6 +497,7 @@ test("changed grant publication rejects commit before host apply", async () => {
       },
     };
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -579,6 +601,7 @@ test("child rebind retains the exact current parent intersection", async () => {
     };
     let parentCurrent = true;
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -662,6 +685,7 @@ test("new published leaf grants expand only through the exact reviewed rebind", 
       },
     };
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -756,6 +780,7 @@ test("a newly administrator-published leaf grant is adopted only after candidate
       },
     };
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -783,6 +808,7 @@ test("rebind remains closed when the trusted host producer is absent", async () 
   const f = await effectFixture({ classification: "read" });
   try {
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       readOperatorPolicies: async () => f.operatorPolicies,
@@ -838,6 +864,7 @@ test("managed authority inserted during host acknowledgement prevents exposure",
       },
     };
     const service = makeMcpRebind({
+      readFrozenNativeManifest: async () => "[]",
       db: f.db,
       deploymentId: f.deploymentId,
       host,
@@ -858,6 +885,96 @@ test("managed authority inserted during host acknowledgement prevents exposure",
     expect(row!.mcpBindingEnvelope!.bindingHash).toBe(f.snapshot.bindingHash);
   } finally {
     await f.db.delete(integrationConnection).where(eq(integrationConnection.id, insertedId));
+    await f.cleanup();
+  }
+}, 20000);
+
+test("rebind rejects missing, oversized and duplicate frozen native manifests before host apply", async () => {
+  const { appendMcpManifest } = await import("../tools/manifest.ts");
+  const f = await effectFixture({ classification: "read" });
+  try {
+    let applied = 0;
+    const state = {
+      sessionId: f.sessionId,
+      bindingEpoch: f.snapshot.bindingEpoch,
+      bindingHash: f.snapshot.bindingHash,
+      policy: f.snapshot.managedDenyPolicy,
+    };
+    const host = {
+      async readApplied() {
+        return state;
+      },
+      async compareAndApply(
+        _prev: typeof state,
+        ack: {
+          bindingHash: string;
+          sessionId: string;
+          bindingEpoch: number;
+          denyRevision: number;
+          denyDigest: string;
+        },
+      ) {
+        applied++;
+        return ack;
+      },
+    };
+    const native = (name: string, description = "x") => ({
+      name,
+      description,
+      inputSchema: {},
+      execution: "sync",
+      nativeBindings: {},
+    });
+    const common = {
+      db: f.db,
+      deploymentId: f.deploymentId,
+      host,
+      readOperatorPolicies: async () => f.operatorPolicies,
+      readBindingEpoch: async () => f.snapshot.bindingEpoch,
+      readParentCurrent: async () => {
+        throw Error("unexpected parent");
+      },
+    };
+    const byteBase = Buffer.byteLength(
+      JSON.stringify(appendMcpManifest(JSON.stringify([native("large", "")]), f.snapshot)),
+    );
+    const exactBytes = JSON.stringify([native("large", "x".repeat(1024 * 1024 - byteBase))]);
+    const exactCount = JSON.stringify(Array.from({ length: 127 }, (_, i) => native(`native-${i}`)));
+    for (const manifest of [exactCount, exactBytes]) {
+      const service = makeMcpRebind({ ...common, readFrozenNativeManifest: async () => manifest });
+      expect(
+        (await service.prepare(f.sessionId, f.snapshot.bindingHash, f.actorId)).bindingHash,
+      ).toBeTruthy();
+    }
+    const manifests = [
+      undefined,
+      JSON.stringify(Array.from({ length: 128 }, (_, i) => native(`native-${i}`))),
+      JSON.stringify([native("large", "x".repeat(1024 * 1024 - byteBase + 1))]),
+      JSON.stringify([native(f.snapshot.immutableBindings[0]!.tools[0]!.name)]),
+    ];
+    let currentManifest: string | undefined = "[]";
+    const committing = makeMcpRebind({
+      ...common,
+      readFrozenNativeManifest: async () => currentManifest,
+    });
+    const candidate = await committing.prepare(f.sessionId, f.snapshot.bindingHash, f.actorId);
+    for (const manifest of manifests) {
+      const service = makeMcpRebind({ ...common, readFrozenNativeManifest: async () => manifest });
+      await expect(
+        service.prepare(f.sessionId, f.snapshot.bindingHash, f.actorId),
+      ).rejects.toThrow();
+      currentManifest = manifest;
+      await expect(
+        committing.commit(f.sessionId, f.snapshot.bindingHash, candidate.bindingHash, f.actorId),
+      ).rejects.toThrow();
+      const [row] = await f.db
+        .select()
+        .from(taskSession)
+        .where(eq(taskSession.sessionId, f.sessionId));
+      expect(row!.mcpBindingEnvelope!.bindingHash).toBe(f.snapshot.bindingHash);
+    }
+    expect(applied).toBe(0);
+  } finally {
     await f.cleanup();
   }
 }, 20000);

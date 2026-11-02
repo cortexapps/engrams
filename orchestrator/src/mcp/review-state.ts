@@ -1,3 +1,4 @@
+import { hasPublishedLeaf } from "./session-bindings.ts";
 import { create, toBinary, toJson, type MessageInitShape } from "@bufbuild/protobuf";
 import { GetSessionMcpStateResponseSchema } from "../gen/engram/app/v1/integration_pb.ts";
 import { unknownContext, type McpJournal } from "./journal.ts";
@@ -5,6 +6,8 @@ import { reviewContext, policyReviewCurrent } from "./journal-review.ts";
 import { restoreBindingSnapshot } from "./binding-store.ts";
 import type { SessionBindingResolver } from "./session-resolver.ts";
 import type { SessionPolicyControl } from "./session-policy.ts";
+
+class PublicationRequired extends Error {}
 
 function stateSize(value: MessageInitShape<typeof GetSessionMcpStateResponseSchema>): number {
   const message = create(GetSessionMcpStateResponseSchema, value);
@@ -106,6 +109,10 @@ export async function sessionMcpState(input: {
     };
     try {
       snapshot = restoreBindingSnapshot(envelope, data.session.integrationConnections ?? []);
+      if (!hasPublishedLeaf(snapshot)) {
+        response.bindingReceipt.staleReasons = ["publication_required"];
+        throw new PublicationRequired();
+      }
       if (!input.producers?.policy.readWritePolicy) throw new Error("live producers missing");
       const live = await input.producers.bindings.readCurrent(input.sessionId);
       const policy = await input.producers.policy.readWritePolicy({
@@ -125,8 +132,9 @@ export async function sessionMcpState(input: {
       response.bindingReceipt.current = true;
       response.bindingReceipt.staleReasons = [];
       response.availability = "available";
-    } catch {
-      response.bindingReceipt.staleReasons = ["binding_or_policy_unavailable"];
+    } catch (error) {
+      if (!(error instanceof PublicationRequired))
+        response.bindingReceipt.staleReasons = ["binding_or_policy_unavailable"];
     }
   }
   if (input.canRebind && snapshot && response.bindingReceipt)

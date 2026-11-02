@@ -21,6 +21,33 @@ import { registerPassthrough } from "../rpc/passthrough.ts";
 
 const reachable = process.env.ORCHESTRATOR_DATABASE_URL ? await checkDb() : false;
 async function wire(f: Awaited<ReturnType<typeof reviewFixture>>, producers = true) {
+  const { taskSession, profile } = await import("../db/schema.ts");
+  const { canonicalDigest } = await import("../mcp/hash.ts");
+  const publication = { revision: 1, actorId: f.actorId, grantsHash: f.snapshot.profileGrantsHash };
+  const { bindingHash: _oldHash, ...body } = f.snapshot;
+  f.snapshot.profilePublication = publication;
+  f.snapshot.bindingHash = canonicalDigest({ ...body, profilePublication: publication });
+  f.input.bindingHash = f.snapshot.bindingHash;
+  f.input.resolvedTool.bindingHash = f.snapshot.bindingHash;
+  f.input.resolvedTool.profilePublication = publication;
+  const [sessionRow] = await f.db
+    .select()
+    .from(taskSession)
+    .where(eq(taskSession.sessionId, f.sessionId));
+  await f.db
+    .update(taskSession)
+    .set({
+      mcpBindingEnvelope: {
+        ...sessionRow!.mcpBindingEnvelope!,
+        profilePublication: publication,
+        bindingHash: f.snapshot.bindingHash,
+      },
+    })
+    .where(eq(taskSession.sessionId, f.sessionId));
+  await f.db
+    .update(profile)
+    .set({ mcpGrantPublication: publication })
+    .where(eq(profile.id, f.profileId));
   const service: McpServices = { enabled: true, repository: f.repository, journal: f.journal };
   // Injected policy and resolver are fixtures, not a live coordinator/host ACK.
   if (producers)
@@ -430,3 +457,48 @@ test.skipIf(!reachable)("a fresh policy lineage change invalidates a saved revie
     await f.cleanup();
   }
 });
+
+test.skipIf(!reachable)(
+  "typed state reports legacy leaf publication as unavailable",
+  async () => {
+    const { taskSession } = await import("../db/schema.ts");
+    const { canonicalDigest } = await import("../mcp/hash.ts");
+    const f = await reviewFixture();
+    const s = await wire(f);
+    try {
+      const call = await f.journal.create(f.input, { kind: "approval" }, f.now);
+      await f.journal.requestApproval(call.id, f.deploymentId, f.now);
+      const published = await s.client.getSessionMcpState({ sessionId: f.sessionId });
+      expect(published.availability).toBe("available");
+      expect(published.executions[0]!.allowedActions).toContain("approve");
+      const { bindingHash: _old, ...body } = f.snapshot;
+      const legacy = { ...body, profilePublication: null };
+      const hash = canonicalDigest(legacy);
+      f.snapshot.profilePublication = null;
+      f.snapshot.bindingHash = hash;
+      const [stored] = await f.db
+        .select()
+        .from(taskSession)
+        .where(eq(taskSession.sessionId, f.sessionId));
+      await f.db
+        .update(taskSession)
+        .set({
+          mcpBindingEnvelope: {
+            ...stored!.mcpBindingEnvelope!,
+            profilePublication: null,
+            bindingHash: hash,
+          },
+        })
+        .where(eq(taskSession.sessionId, f.sessionId));
+      const state = await s.client.getSessionMcpState({ sessionId: f.sessionId });
+      expect(state.availability).toBe("unavailable");
+      expect(state.bindingReceipt?.staleReasons).toContain("publication_required");
+      expect(state.executions[0]!.allowedActions).not.toContain("approve");
+      expect(state.writePolicy?.allowedActions ?? []).not.toContain("approve_current_plan");
+    } finally {
+      await s.close();
+      await f.cleanup();
+    }
+  },
+  20000,
+);

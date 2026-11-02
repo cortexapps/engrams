@@ -7,7 +7,7 @@ import {
   taskSession,
   type IntegrationConnectionSnapshot,
 } from "../db/schema.ts";
-import { lockAdmissionScope } from "./admission.ts";
+import { appendMcpManifest } from "../tools/manifest.ts";
 import {
   bindingSnapshotColumns,
   readLiveBindingAuthority,
@@ -25,6 +25,11 @@ import {
 } from "./session-bindings.ts";
 import { expectedManagedDenyAck } from "./session-resolver.ts";
 
+export class McpPublicationRequired extends Error {
+  constructor() {
+    super("MCP publication required");
+  }
+}
 export type McpRebindDrain = {
   reason: "dispatch_in_progress" | "unknown_intent" | "legacy_intent";
   retryAfter: string;
@@ -54,6 +59,9 @@ export function makeMcpRebind(deps: {
   db?: ReturnType<typeof getDb>;
   deploymentId: string;
   host?: McpRebindHost;
+  /** Trusted producer returns the exact native manifest frozen at creation for this session.
+   * It must reject missing or unverifiable storage; guest input and profile rebuilds are not authority. */
+  readFrozenNativeManifest: (sessionId: string) => Promise<string | undefined>;
   readOperatorPolicies(): Promise<McpOperatorPolicy[]>;
   readBindingEpoch(id: string): Promise<number>;
   readParentCurrent(id: string): Promise<McpSessionBindingSnapshot>;
@@ -65,7 +73,6 @@ export function makeMcpRebind(deps: {
       throw Error("MCP rebind service unavailable");
     const host = deps.host;
     return db.transaction(async (tx) => {
-      await lockAdmissionScope(tx, deps.deploymentId);
       const { session, owner, ancestors } = await lockHumanSession(
         tx,
         sessionId,
@@ -98,18 +105,45 @@ export function makeMcpRebind(deps: {
           ...ancestors.map((row) => row.session.profileId).filter((id): id is string => !!id),
         ]),
       ].sort();
-      await tx
+      const profiles = await tx
         .select()
         .from(profile)
         .where(inArray(profile.id, profileIds))
         .orderBy(asc(profile.id))
         .for("share");
+      const connectionIds = [
+        ...new Set([
+          ...old.immutableBindings.map((binding) => binding.connectionId),
+          ...profiles.flatMap((row) =>
+            row.integrationGrants.filter((grant) => grant.mcp).map((grant) => grant.connectionId),
+          ),
+          ...ancestors.flatMap(({ session: parent }) =>
+            parent.mcpBindingEnvelope
+              ? restoreBindingSnapshot(
+                  parent.mcpBindingEnvelope,
+                  parent.integrationConnections ?? [],
+                ).immutableBindings.map((binding) => binding.connectionId)
+              : [],
+          ),
+        ]),
+      ].sort();
+      if (connectionIds.length)
+        await tx
+          .select({ id: integrationConnection.id })
+          .from(integrationConnection)
+          .where(
+            and(
+              eq(integrationConnection.provider, "mcp"),
+              inArray(integrationConnection.id, connectionIds),
+            ),
+          )
+          .orderBy(asc(integrationConnection.id))
+          .for("share");
       const connections = await tx
         .select()
         .from(integrationConnection)
         .where(eq(integrationConnection.provider, "mcp"))
-        .orderBy(asc(integrationConnection.id))
-        .for("share");
+        .orderBy(asc(integrationConnection.id));
       // A broker may already be beyond its last database check. The original intent
       // expiry bounds credential delivery even after cancellation or manual resolution.
       const [pending] = await tx
@@ -159,7 +193,7 @@ export function makeMcpRebind(deps: {
         live.profilePublication.grantsHash !==
           canonicalDigest(live.profileGrants.filter((grant) => grant.mcp !== undefined))
       )
-        throw Error("MCP grant publication unavailable");
+        throw new McpPublicationRequired();
       const epoch = await bounded(() => deps.readBindingEpoch(sessionId));
       const applied = await bounded(() => host.readApplied(sessionId, epoch));
       let parentAuthority: { sessionId: string; snapshot: McpSessionBindingSnapshot } | undefined;
@@ -204,6 +238,10 @@ export function makeMcpRebind(deps: {
       const { bindingHash: _hash, ...body } = { ...compiled, managedDenyPolicy: deny };
       const candidate = { ...body, bindingHash: canonicalDigest(body) };
       compileMcpManifest(candidate);
+      if (!deps.readFrozenNativeManifest) throw Error("MCP native manifest unavailable");
+      const nativeManifest = await bounded(() => deps.readFrozenNativeManifest(sessionId));
+      if (nativeManifest === undefined) throw Error("MCP native manifest unavailable");
+      appendMcpManifest(nativeManifest, candidate);
       if (candidateHash !== undefined) {
         if (candidate.bindingHash !== candidateHash) throw Error("stale MCP rebind candidate");
         await bounded(() =>

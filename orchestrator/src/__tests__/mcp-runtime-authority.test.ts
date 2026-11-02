@@ -221,17 +221,52 @@ test("competing barriers commit once and losing cleanup preserves the committed 
   }
 });
 
-test("barrier and human cancellation share a safe lock order", async () => {
+test("cancellation commits before a waiting dispatch", async () => {
   const f = await ready();
   try {
-    const results = await Promise.allSettled([
-      f.journal.dispatch(f.call.id, f.intent, f.now, f.proof),
-      f.journal.cancel(f.call.id, f.actorId, f.now, (await f.journal.get(f.call.id))!.version),
-    ]);
-    expect(results[1]!.status).toBe("fulfilled");
-    expect(["canceled", "outcome_unknown"]).toContain((await f.journal.get(f.call.id))!.state);
+    const revision = (await f.journal.get(f.call.id))!.version;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const dispatch = (async () => {
+      await gate;
+      return f.journal.dispatch(f.call.id, f.intent, f.now, f.proof);
+    })();
+    const canceled = await f.journal.cancel(f.call.id, f.actorId, f.now, revision);
+    expect(canceled.state).toBe("canceled");
+    release();
+    await expect(dispatch).rejects.toThrow();
+    expect((await f.journal.get(f.call.id))!.state).toBe("canceled");
     expect(await f.journal.getAdmission(f.call.id)).toBeNull();
     await expect(f.journal.assertDispatchCurrent(f.call.id, f.proof, f.now)).rejects.toThrow();
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("committed dispatch rejects cancellation with the previously observed revision", async () => {
+  const f = await ready();
+  try {
+    const revision = (await f.journal.get(f.call.id))!.version;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const cancel = (async () => {
+      await gate;
+      return f.journal.cancel(f.call.id, f.actorId, f.now, revision);
+    })();
+    expect((await f.journal.dispatch(f.call.id, f.intent, f.now, f.proof)).state).toBe(
+      "dispatching",
+    );
+    release();
+    await expect(cancel).rejects.toThrow("stale cancellation context");
+    const call = (await f.journal.get(f.call.id))!;
+    expect(call.state).toBe("dispatching");
+    expect(call.intentId).toBe(f.intent.intentId);
+    expect((await f.journal.getAdmission(f.call.id))!.reservationId).toBe(f.proof.reservationId);
+    await expect(f.journal.dispatch(f.call.id, f.intent, f.now, f.proof)).rejects.toThrow();
   } finally {
     await f.cleanup();
   }

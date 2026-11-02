@@ -5,7 +5,7 @@ import {
   McpRebindDrainSchema,
   McpRebindDrainReason,
 } from "../gen/engram/app/v1/integration_pb.ts";
-import { McpRebindDraining, type McpRebindDrain } from "./rebind.ts";
+import { McpPublicationRequired, McpRebindDraining, type McpRebindDrain } from "./rebind.ts";
 import { policyReviewCurrent, type JournalReviewContext } from "./journal-review.ts";
 import { credentialHandlers } from "./credential-rpc.ts";
 import type { CredentialAdmin } from "./credential-admin.ts";
@@ -75,6 +75,11 @@ export async function mcpOperation<T>(run: () => Promise<T>): Promise<T> {
     return await run();
   } catch (error) {
     if (error instanceof ConnectError) throw error;
+    if (error instanceof McpPublicationRequired)
+      throw new ConnectError(
+        "An administrator must publish MCP grants before rebind",
+        Code.FailedPrecondition,
+      );
     if (error instanceof McpRebindDraining)
       throw new ConnectError("MCP calls are still draining", Code.FailedPrecondition, undefined, [
         { desc: McpRebindDrainSchema, value: drainProto(error.drain) },

@@ -125,6 +125,16 @@ export function managedAuthorityHash(live: McpLiveAuthority) {
       .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
   );
 }
+export function hasPublishedLeaf(snapshot: McpSessionBindingSnapshot): boolean {
+  const value = snapshot.profilePublication;
+  return (
+    !!value &&
+    Number.isSafeInteger(value.revision) &&
+    value.revision >= 1 &&
+    !!value.actorId &&
+    value.grantsHash === snapshot.profileGrantsHash
+  );
+}
 function effectiveGrants(snapshot: McpSessionBindingSnapshot): ProfileIntegrationGrant[] {
   return snapshot.immutableBindings.flatMap((binding) =>
     binding.tools.map((tool) => ({

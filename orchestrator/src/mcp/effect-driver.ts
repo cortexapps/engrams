@@ -28,7 +28,7 @@ import {
   type SessionBindingResolver,
   type ResolvedBoundTool,
 } from "./session-resolver.ts";
-import type { McpSessionBindingSnapshot } from "./session-bindings.ts";
+import { hasPublishedLeaf, type McpSessionBindingSnapshot } from "./session-bindings.ts";
 import { makeResourceWorkerClient } from "./worker-client.ts";
 import { toWorkerBindingHash } from "./worker-encoding.ts";
 
@@ -86,15 +86,7 @@ function argumentsValue(raw: string): Record<string, unknown> {
   }
 }
 function publication(snapshot: McpSessionBindingSnapshot) {
-  const value = snapshot.profilePublication;
-  if (
-    !value ||
-    !Number.isSafeInteger(value.revision) ||
-    value.revision < 1 ||
-    !value.actorId ||
-    value.grantsHash !== snapshot.profileGrantsHash
-  )
-    throw new McpRequestDenied("publication_required");
+  if (!hasPublishedLeaf(snapshot)) throw new McpRequestDenied("publication_required");
 }
 
 /** The authenticated worker envelope is verified by the client and broker first. */
