@@ -85,12 +85,15 @@ pub struct ManagedBootPreparedReceipt {
     pub request: ManagedBootPrepare,
     pub host_incarnation: String,
     pub network_identity: String,
+    pub guest_ip: std::net::Ipv4Addr,
     pub receipt_id: String,
 }
 impl ManagedBootPreparedReceipt {
     pub fn validate(&self) -> Result<(), MetaError> {
         self.request.spec()?;
-        if self.host_incarnation.is_empty()
+        if self.guest_ip.is_unspecified()
+            || self.guest_ip.is_loopback()
+            || self.host_incarnation.is_empty()
             || self.host_incarnation.len() > 128
             || !is_digest(&self.network_identity)
             || !is_digest(&self.receipt_id)
@@ -128,6 +131,8 @@ impl ManagedBootFinalization {
                 .as_ref()
                 .map(|p| &p.network_identity)
                 != Some(&self.prepared.network_identity)
+            || self.policy.network_proof.as_ref().map(|p| p.guest_ip)
+                != Some(self.prepared.guest_ip)
             || native.version != self.native_version
             || native.digest != key.native_digest
             || self.combined_manifest_digest != digest(&self.combined_manifest)
@@ -454,6 +459,15 @@ pub struct ManagedCaptureRequest {
     pub key: ManagedBootKey,
     pub capture_id: crate::SnapshotId,
 }
+impl ManagedCaptureRequest {
+    /// Pin this exact immutable artifact before the host starts the capture.
+    pub fn disk_manifest(&self) -> super::manifest::ManifestRef {
+        super::manifest::ManifestRef {
+            manifest_id: self.capture_id.as_uuid(),
+            version: 1,
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedDiskConsistency {
@@ -496,6 +510,7 @@ impl ManagedCaptureAuthority {
             || self.request.capture_id.as_uuid().is_nil()
             || self.host_incarnation.is_empty()
             || self.host_incarnation.len() > 128
+            || self.disk_manifest != self.request.disk_manifest()
             || self.disk_manifest.manifest_id.is_nil()
             || self.disk_manifest.version == 0
             || self.disk_size_bytes == 0
