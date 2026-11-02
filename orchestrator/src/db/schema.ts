@@ -69,6 +69,7 @@ export interface TaskLaunchPolicy {
   integrationPolicyJson: string;
   integrationGrants: ProfileIntegrationGrant[];
   integrationConnections: IntegrationConnectionSnapshot[];
+  mcpBindingEnvelope?: import("../mcp/binding-store.ts").McpBindingEnvelope;
   network: ProfileNetwork;
   secrets: ProfileSecret[];
   repos: ProfileRepo[];
@@ -173,6 +174,9 @@ export const taskSession = pgTable(
     // snapshot. This makes broker audit records attributable without consulting
     // mutable workflow state.
     integrationPrincipalId: text("integration_principal_id"),
+    // Candidate metadata only. The host must separately acknowledge deny enforcement.
+    mcpBindingEnvelope: jsonb("mcp_binding_envelope")
+      .$type<import("../mcp/binding-store.ts").McpBindingEnvelope>(),
     // ADR 0109: content-hash of the compiled authorization snapshot
     // (profileId + grants + connections). The broker emits it as the
     // `engrams_profile_snapshot` OIDC claim, so Google-side audit logs join
@@ -1176,7 +1180,7 @@ export interface ProfileRepo {
 
 /** Immutable non-secret connection configuration stamped onto a session. */
 export interface IntegrationConnectionSnapshot {
-  mcp?: import("../mcp/types.ts").McpBinding;
+  mcp?: import("../mcp/session-bindings.ts").McpSessionBinding;
   id: string;
   alias: string;
   provider: string;

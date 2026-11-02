@@ -1,5 +1,8 @@
 /** Recursive session coordination tools (ADR 0113). */
 
+import { createReservedTaskSession } from "../mcp/session-create.ts";
+import { assertChildMcpCreationBlocked } from "../mcp/session-child.ts";
+
 import { createHash } from "node:crypto";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { and, eq, ne, sql } from "drizzle-orm";
@@ -214,6 +217,7 @@ function snapshotConnectionStore(policy: TaskLaunchPolicy): IntegrationConnectio
 
 async function compileChildInput(
   parent: TaskRow,
+  spawningSessionId: string,
   args: z.output<typeof SpawnInput>,
   sessionId: string,
 ): Promise<SessionCreateInput> {
@@ -225,6 +229,7 @@ async function compileChildInput(
   // unattended sessions never carry human credentials extends to spawns.
   // The frozen policy already stamped org authority for such a parent (no
   // oauth_user mint sources), so no user seam below would fire anyway.
+  await assertChildMcpCreationBlocked(parent.id, spawningSessionId, policy.integrationGrants);
   const ownerId = parent.createdByUserId;
   const db = getDb();
   const secrets = makeUserSecretStore(db);
@@ -536,10 +541,14 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
           throw new Error(`sub-session depth exceeds ${config.subSessionMaxDepth}`);
         }
         const rootTaskId = parent.rootTaskId ?? parent.id;
-        const input = await compileChildInput(parent, args, sessionId);
+        const input = await compileChildInput(parent, ctx.sessionId, args, sessionId);
         const policy = parent.launchPolicy!;
+        const { mcpBindingEnvelope: _parentEnvelope, ...basePolicy } = structuredClone(policy);
         const childPolicy: TaskLaunchPolicy = {
-          ...structuredClone(policy),
+          ...basePolicy,
+          integrationGrants: input.integrationGrants ?? [],
+          integrationConnections: input.integrationConnections ?? [],
+          ...(input.mcpBindingEnvelope ? { mcpBindingEnvelope: input.mcpBindingEnvelope } : {}),
           harness: input.harness ?? policy.harness,
           ...(input.modelRouter ? { modelRouter: input.modelRouter } : {}),
           ...(input.model ? { model: input.model } : {}),
@@ -613,13 +622,19 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
               role: "primary",
               profileId: policy.profileId,
               capabilities: [...policy.capabilities],
-              integrationGrants: structuredClone(policy.integrationGrants),
-              integrationConnections: structuredClone(policy.integrationConnections),
+              integrationGrants: structuredClone(input.integrationGrants ?? []),
+              integrationConnections: structuredClone(input.integrationConnections ?? []),
+              ...(input.mcpBindingEnvelope
+                ? { mcpBindingEnvelope: input.mcpBindingEnvelope }
+                : {}),
               integrationPrincipalId: parent.createdByUserId,
               integrationSnapshotHash: integrationSnapshotHash({
                 profileId: policy.profileId,
-                integrationGrants: policy.integrationGrants,
-                integrationConnections: policy.integrationConnections,
+                integrationGrants: input.integrationGrants ?? [],
+                integrationConnections: input.integrationConnections ?? [],
+                ...(input.mcpBindingEnvelope
+                ? { mcpBindingEnvelope: input.mcpBindingEnvelope }
+                : {}),
               }),
             })
             .onConflictDoNothing();
@@ -651,7 +666,10 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
           }
         });
         try {
-          await sessions.createSession(input);
+          await createReservedTaskSession({ sessions }, input, {
+            actorId: parent.createdByUserId ?? "",
+            inputId: sessionId,
+          });
         } catch (error) {
           try {
             await sessions.getSession({ sessionId });

@@ -23,6 +23,7 @@ export interface IntegrationSnapshot {
   profileId: string | null;
   integrationGrants: readonly ProfileIntegrationGrant[];
   integrationConnections: readonly IntegrationConnectionSnapshot[];
+  mcpBindingEnvelope?: import("../mcp/binding-store.ts").McpBindingEnvelope | null;
 }
 
 /** Recursively sort object keys so the hash survives a JSONB round-trip
@@ -52,6 +53,7 @@ export function integrationSnapshotHash(snapshot: IntegrationSnapshot): string {
       profileId: snapshot.profileId,
       integrationGrants: snapshot.integrationGrants,
       integrationConnections: snapshot.integrationConnections,
+      ...(snapshot.mcpBindingEnvelope ? { mcpBindingEnvelope: snapshot.mcpBindingEnvelope } : {}),
     })))
     .digest("hex");
   return `sha256:${digest}`;

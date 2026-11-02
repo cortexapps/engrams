@@ -736,6 +736,13 @@
       "when": 1793585592276,
       "tag": "0104_mcp_credential_metadata",
       "breakpoints": true
+    },
+    {
+      "idx": 105,
+      "version": "7",
+      "when": 1793602718404,
+      "tag": "0105_mcp_binding_envelope",
+      "breakpoints": true
     }
   ]
 }

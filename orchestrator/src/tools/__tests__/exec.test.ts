@@ -212,3 +212,22 @@ describe("tool exec plain functions", () => {
     expect(f.submitted).toEqual(["session-1:call-1"]);
   });
 });
+
+test("MCP resolution is session-local and absent runtime never calls a static handler", async () => {
+  const f = fixture();
+  let resolvedSession: string | undefined;
+  const deps: ToolExecDeps = {
+    ...f.deps,
+    resolveMcpBoundTool: async ({ sessionId }) => {
+      resolvedSession = sessionId;
+      return undefined;
+    },
+  };
+  const outcome = await executeToolCall({ ...f.input, toolName: "mcp_docs_unknown" }, deps);
+  expect(resolvedSession).toBe(f.input.sessionId);
+  expect(outcome).toEqual({
+    kind: "submit",
+    result: { error: "external MCP tool is unavailable" },
+  });
+  expect(f.handlerCalls).toEqual([]);
+});

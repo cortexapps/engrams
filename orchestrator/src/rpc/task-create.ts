@@ -17,6 +17,8 @@
  * policy.
  */
 
+import { createReservedTaskSession, type makeBoundSessionCreator } from "../mcp/session-create.ts";
+
 import { resolveIntegrationHost } from "../integrations/run-op.ts";
 import { ConnectError, Code } from "@connectrpc/connect";
 import { and, eq, isNull } from "drizzle-orm";
@@ -116,6 +118,8 @@ export type Db = NodePgDatabase<typeof schema>;
 /** The control-plane CreateSession request the orchestrator compiles. Mirrors
  *  the `SessionsClient.createSession` request shape (rpc/tasks.ts). */
 export interface SessionCreateInput {
+  /** Candidate metadata only; production MCP creation remains guarded. */
+  mcpBindingEnvelope?: import("../mcp/binding-store.ts").McpBindingEnvelope;
   /** ADR 0109: reserved before boot so the authorization snapshot exists. */
   requestedSessionId?: string;
   /** ADR 0118: the session's apps, already resolved to public hostnames. The
@@ -771,6 +775,7 @@ export interface TaskSessionsClient {
 }
 
 export interface CreateTaskDeps {
+  boundSessionCreator?: ReturnType<typeof makeBoundSessionCreator>;
   profiles: ProfileStore;
   images: ImagesClient;
   connectors: CustomConnectorSource;
@@ -915,6 +920,9 @@ export function buildLaunchPolicy(
     integrationPolicyJson: sessionInput.integrationPolicyJson ?? "",
     integrationGrants: [...(sessionInput.integrationGrants ?? [])],
     integrationConnections: [...(sessionInput.integrationConnections ?? [])],
+    ...(sessionInput.mcpBindingEnvelope
+      ? { mcpBindingEnvelope: structuredClone(sessionInput.mcpBindingEnvelope) }
+      : {}),
     network: profile.network,
     secrets: [...profile.secrets],
     repos: [...profile.repos],
@@ -1034,10 +1042,16 @@ export async function createSessionForExistingTask(
       capabilities: sessionInput.capabilities ?? [],
       integrationGrants: sessionInput.integrationGrants ?? [],
       integrationConnections: sessionInput.integrationConnections ?? [],
+      ...(sessionInput.mcpBindingEnvelope
+        ? { mcpBindingEnvelope: sessionInput.mcpBindingEnvelope }
+        : {}),
       integrationSnapshotHash: integrationSnapshotHash({
         profileId: profile.id,
         integrationGrants: sessionInput.integrationGrants ?? [],
         integrationConnections: sessionInput.integrationConnections ?? [],
+        ...(sessionInput.mcpBindingEnvelope
+          ? { mcpBindingEnvelope: sessionInput.mcpBindingEnvelope }
+          : {}),
       }),
       ...(integrationPrincipalId ? { integrationPrincipalId } : {}),
     });
@@ -1047,7 +1061,10 @@ export async function createSessionForExistingTask(
   try {
     // When prompt is omitted (as it is for the finder), the session boots idle
     // so deterministic bootstrap can finish before SendPrompt wakes it.
-    const created = await deps.sessions.createSession(sessionInput);
+    const created = await createReservedTaskSession(deps, sessionInput, {
+      actorId: integrationPrincipalId ?? "",
+      inputId: sessionId,
+    });
     createdSessionId = created.sessionId;
     if (created.sessionId !== sessionId) {
       throw new Error("coordinator returned a different reserved session ID");
@@ -1226,10 +1243,16 @@ export async function createTaskWithSession(
       capabilities: sessionInput.capabilities ?? [],
       integrationGrants: sessionInput.integrationGrants ?? [],
       integrationConnections: sessionInput.integrationConnections ?? [],
+      ...(sessionInput.mcpBindingEnvelope
+        ? { mcpBindingEnvelope: sessionInput.mcpBindingEnvelope }
+        : {}),
       integrationSnapshotHash: integrationSnapshotHash({
         profileId: profile.id,
         integrationGrants: sessionInput.integrationGrants ?? [],
         integrationConnections: sessionInput.integrationConnections ?? [],
+        ...(sessionInput.mcpBindingEnvelope
+          ? { mcpBindingEnvelope: sessionInput.mcpBindingEnvelope }
+          : {}),
       }),
       integrationPrincipalId: params.ownerUserId,
     });
@@ -1269,7 +1292,10 @@ export async function createTaskWithSession(
 
   let createdSessionId: string | undefined;
   try {
-    const created = await deps.sessions.createSession(sessionInput);
+    const created = await createReservedTaskSession(deps, sessionInput, {
+      actorId: params.ownerUserId,
+      inputId: sessionId,
+    });
     createdSessionId = created.sessionId;
     if (created.sessionId !== sessionId) {
       throw new Error("coordinator returned a different reserved session ID");
