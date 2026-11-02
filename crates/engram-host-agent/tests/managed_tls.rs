@@ -123,7 +123,10 @@ async fn managed_host_requires_pinned_mutual_tls() {
         ca.cert_pem,
         None,
     ));
-    let backend = Arc::new(EndpointFixture(egress.clone()));
+    let backend = Arc::new(EndpointFixture {
+        egress: egress.clone(),
+        calls: Default::default(),
+    });
     let bindings = engram_host_agent::bindings::BindingStore::open(dir.join("bindings")).unwrap();
     let target = ManagedPolicyTarget {
         session_id: engram_core::SessionId::new(),
@@ -151,10 +154,10 @@ async fn managed_host_requires_pinned_mutual_tls() {
     );
     let hub = Arc::new(engram_host_agent::harness::HarnessHub::new(
         engram_host_agent::harness::event_sink_to(|_, _, _, _| async { Ok(()) }),
-        bindings,
+        bindings.clone(),
     ));
     let local = Arc::new(
-        engram_host_agent::host_client::LocalHostClient::new(backend, hub)
+        engram_host_agent::host_client::LocalHostClient::new(backend.clone(), hub)
             .with_managed_policy(managed),
     );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -243,7 +246,7 @@ async fn managed_host_requires_pinned_mutual_tls() {
     let apply = ManagedPolicyApply {
         context,
         expected: None,
-        egress: policy,
+        egress: policy.clone(),
     };
     let ack = remote.apply_managed_policy(apply.clone()).await.unwrap();
     assert_eq!(
@@ -255,6 +258,151 @@ async fn managed_host_requires_pinned_mutual_tls() {
         ack.context.binding_hash.is_none() && ack.network_proof.is_none(),
         "bootstrap is not final network proof"
     );
+    // Every generic start must validate durable sandbox identity before bind or policy I/O.
+    // An ordinary duplicate binding must not hide the managed association.
+    let alias = engram_core::SessionId::new();
+    bindings.bind(alias, target.sandbox_id, 1).unwrap();
+    let agent = engram_core::types::sandbox::AgentSpec {
+        binding_epoch: 1,
+        argv: vec!["fixture".into()],
+        env: Default::default(),
+        session_env: Default::default(),
+        host_ca_pem: None,
+    };
+    let binding_bytes = || {
+        std::fs::read_dir(dir.join("bindings"))
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    std::fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    for host in [&*local as &dyn HostClient, &remote as &dyn HostClient] {
+        let mut ordinary = policy.clone();
+        ordinary.managed_deny = None;
+        ordinary.session_id = engram_core::SessionId::new();
+        let fence = engram_core::traits::SessionFence::new(ordinary.session_id, 1);
+        let before = binding_bytes();
+        let calls = backend.calls.load(std::sync::atomic::Ordering::SeqCst);
+        for supplied_fence in [fence, engram_core::traits::SessionFence::unfenced()] {
+            let error = host
+                .start_agent(
+                    target.sandbox_id,
+                    agent.clone(),
+                    ordinary.clone(),
+                    supplied_fence,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("managed session requires acknowledged boot finalization"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            binding_bytes(),
+            before,
+            "rejected start must not bind or persist policy"
+        );
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls
+        );
+        assert_eq!(
+            host.read_managed_policy(target.clone()).await.unwrap(),
+            Some(ack.clone())
+        );
+        ordinary.sandbox_id = engram_core::SandboxId::new();
+        for (sandbox, supplied_fence) in [
+            (engram_core::SandboxId::new(), fence),
+            (
+                ordinary.sandbox_id,
+                engram_core::traits::SessionFence::new(engram_core::SessionId::new(), 1),
+            ),
+            (
+                ordinary.sandbox_id,
+                engram_core::traits::SessionFence::new(engram_core::SessionId::new(), 0),
+            ),
+        ] {
+            let error = host
+                .start_agent(sandbox, agent.clone(), ordinary.clone(), supplied_fence)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("start identity mismatch"),
+                "{error}"
+            );
+        }
+        assert_eq!(binding_bytes(), before);
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls
+        );
+        ordinary.guest_ip = "10.200.0.43".parse().unwrap();
+        host.start_agent(ordinary.sandbox_id, agent.clone(), ordinary.clone(), fence)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls + 2
+        );
+        assert_eq!(
+            bindings
+                .read(ordinary.session_id)
+                .unwrap()
+                .unwrap()
+                .sandbox_id,
+            ordinary.sandbox_id
+        );
+        host.start_agent(
+            ordinary.sandbox_id,
+            agent.clone(),
+            ordinary,
+            engram_core::traits::SessionFence::unfenced(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls + 4
+        );
+    }
+    // The retained managed record still names the sandbox after the binding is removed.
+    let binding_path = dir
+        .join("bindings")
+        .join(format!("{}.json", target.session_id));
+    let binding = std::fs::read(&binding_path).unwrap();
+    std::fs::remove_file(&binding_path).unwrap();
+    let mut disguised = policy.clone();
+    disguised.managed_deny = None;
+    disguised.session_id = engram_core::SessionId::new();
+    for host in [&*local as &dyn HostClient, &remote as &dyn HostClient] {
+        let before = binding_bytes();
+        let calls = backend.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(host
+            .start_agent(
+                target.sandbox_id,
+                agent.clone(),
+                disguised.clone(),
+                engram_core::traits::SessionFence::unfenced()
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("managed session requires acknowledged boot finalization"));
+        assert_eq!(binding_bytes(), before);
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls
+        );
+    }
+    std::fs::write(binding_path, binding).unwrap();
     let snapshot: engram_core::types::snapshot::SnapshotMetadata =
         serde_json::from_value(serde_json::json!({
             "id": engram_core::SnapshotId::new(), "size_bytes": 0,
@@ -318,6 +466,26 @@ async fn managed_host_requires_pinned_mutual_tls() {
         .unwrap_err()
         .to_string()
         .contains("managed restore quarantine unavailable"));
+    for host in [&*local as &dyn HostClient, &remote as &dyn HostClient] {
+        let before = binding_bytes();
+        let calls = backend.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(host
+            .start_agent(
+                target.sandbox_id,
+                agent.clone(),
+                disguised.clone(),
+                engram_core::traits::SessionFence::unfenced()
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("managed session requires acknowledged boot finalization"));
+        assert_eq!(binding_bytes(), before);
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls
+        );
+    }
     client.client_certificate = dir.join("other.pem");
     client.client_key = dir.join("other.key");
     assert!(
@@ -379,9 +547,20 @@ async fn managed_host_requires_pinned_mutual_tls() {
     let _ = server.await;
 }
 
-struct EndpointFixture(Arc<engram_host_agent::egress::HostEgress>);
+struct EndpointFixture {
+    egress: Arc<engram_host_agent::egress::HostEgress>,
+    calls: std::sync::atomic::AtomicUsize,
+}
 #[async_trait::async_trait]
 impl engram_core::traits::SandboxBackend for EndpointFixture {
+    async fn start_agent(
+        &self,
+        _: engram_core::SandboxId,
+        _: engram_core::types::sandbox::AgentSpec,
+    ) -> Result<(), engram_core::SandboxError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
     async fn create(
         &self,
         _: engram_core::types::sandbox::SandboxSpec,
@@ -442,7 +621,8 @@ impl engram_core::traits::SandboxBackend for EndpointFixture {
         &self,
         policy: engram_core::types::egress::SessionEgressPolicy,
     ) -> Result<(), engram_core::SandboxError> {
-        self.0
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.egress
             .apply_policy(policy)
             .await
             .map_err(|e| engram_core::SandboxError::InvalidSpec(e.to_string()))

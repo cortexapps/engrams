@@ -66,12 +66,9 @@ impl LocalHostClient {
         let bindings = self.harness_hub.binding_store();
         let mut managed = bindings.managed_required(fence.session_id);
         if let Some(sandbox) = sandbox {
-            if let Some(binding) = bindings
-                .find_by_sandbox(sandbox)
-                .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
-            {
-                managed |= bindings.managed_required(binding.session_id);
-            }
+            managed |= bindings
+                .managed_sandbox_required(sandbox)
+                .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?;
         }
         if managed {
             return Err(SandboxError::InvalidSpec(
@@ -357,9 +354,14 @@ impl HostClient for LocalHostClient {
         id: SandboxId,
         agent: AgentSpec,
         policy: SessionEgressPolicy,
-        _fence: SessionFence,
+        fence: SessionFence,
     ) -> Result<(), SandboxError> {
-        if policy.managed_deny.is_some()
+        let bindings = self.harness_hub.binding_store();
+        if bindings
+            .managed_sandbox_required(id)
+            .map_err(|e| SandboxError::InvalidSpec(e.to_string()))?
+            || bindings.managed_required(fence.session_id)
+            || policy.managed_deny.is_some()
             || self
                 .harness_hub
                 .binding_store()
@@ -368,6 +370,14 @@ impl HostClient for LocalHostClient {
             return Err(SandboxError::InvalidSpec(
                 "managed session requires acknowledged boot finalization".into(),
             ));
+        }
+        // Legacy ordinary callers can still use the explicit unfenced sentinel.
+        // Every supplied identity must otherwise agree before any durable mutation.
+        if policy.sandbox_id != id
+            || policy.session_id.as_uuid().is_nil()
+            || (fence != SessionFence::unfenced() && fence.session_id != policy.session_id)
+        {
+            return Err(SandboxError::InvalidSpec("start identity mismatch".into()));
         }
         // ADR 0073: persist the binding record BEFORE the harness can
         // dial (the spawn below), so the first attach validates instead

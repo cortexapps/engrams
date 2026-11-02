@@ -1132,7 +1132,12 @@ impl HostService for HostServiceImpl {
         check_wire_version(&req)?;
         async move {
             let r = req.into_inner();
-            let fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+            let mut fence = self.check_session_epoch(&r.session_id, r.fencing_epoch)?;
+            // Epoch zero skips high-water updates, but must not erase a supplied
+            // identity before the start gate compares it with the policy.
+            if r.fencing_epoch == 0 && !r.session_id.is_empty() {
+                fence.session_id = decode_session_id(&r.session_id)?;
+            }
             let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
             let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
             let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
