@@ -1,3 +1,4 @@
+import { operatorPublication } from "./mcp-binding-fixture.ts";
 import { create } from "@bufbuild/protobuf";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
@@ -93,6 +94,7 @@ export async function reviewFixture(documents: Record<string, unknown>[] = [], t
     ],
     operatorPolicies: [
       {
+        publication: structuredClone(operatorPublication),
         zoneId: "public",
         policyRevision: "1",
         policyDigest: canonicalDigest({ policy: 1 }),

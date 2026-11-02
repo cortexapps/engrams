@@ -12,6 +12,7 @@ export function makeMcpRecoveryScanner(deps: {
   now?: () => Date;
 }) {
   let after: string | undefined;
+  let expiryAfter: string | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let running: Promise<void> | undefined;
   let stopped = true;
@@ -21,7 +22,12 @@ export function makeMcpRecoveryScanner(deps: {
     const journal = deps.journal ?? makeMcpJournal();
     const now = (deps.now ?? (() => new Date()))();
     // These producers recover distinct crash states. Disabling dispatch never disables expiry.
-    await journal.expire(deps.deploymentId, now);
+    const scopes = await journal.expiryScopes(now, expiryAfter);
+    for (const scope of scopes) {
+      await journal.expire(scope, now);
+      expiryAfter = scope;
+    }
+    if (scopes.length === 0) expiryAfter = undefined;
     await journal.expireUnadmitted(now);
     const runtime = (deps.runtime ?? mcpRecovery)();
     if (!runtime) return;

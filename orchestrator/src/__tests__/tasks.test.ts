@@ -755,6 +755,7 @@ function listSessionRef(
     integrationPrincipalId: null,
     integrationSnapshotHash: null,
     mcpBindingEnvelope: null,
+    mcpManagedLifecycle: null,
     createdAt: new Date(createdAt),
   };
 }

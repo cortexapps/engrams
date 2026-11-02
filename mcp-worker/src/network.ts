@@ -183,7 +183,7 @@ function matches(address: ipaddr.IPv4 | ipaddr.IPv6, cidr: string) {
 export function restrictedFetch(
   zone: ZonePolicy,
   dependencies: NetworkDependencies = defaults,
-): typeof fetch {
+): (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => ReturnType<typeof fetch> {
   return async (input, init) => {
     const raw = input instanceof Request ? input.url : String(input);
     const url = zone.endpoint(raw);

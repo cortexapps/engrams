@@ -1,4 +1,5 @@
 import { appendMcpManifest } from "../tools/manifest.ts";
+import { mcpSessionCapabilities } from "./session-capabilities.ts";
 import type { IntegrationConnectionSnapshot } from "../db/schema.ts";
 import type { SessionCreateInput } from "../rpc/task-create.ts";
 import type { SessionPolicyControlClient } from "./control-client.ts";
@@ -171,8 +172,14 @@ export async function createReservedTaskSession(
     input.mcpBindingEnvelope ||
     input.integrationGrants?.some((grant) => grant.mcp) ||
     input.integrationConnections?.some((connection) => connection.provider === "mcp");
-  if (!hasMcp) return deps.sessions.createSession(input);
-  if (!input.mcpBindingEnvelope || !deps.boundSessionCreator)
+  if (!hasMcp) {
+    const created = await deps.sessions.createSession(input);
+    if (input.requestedSessionId && created.sessionId !== input.requestedSessionId)
+      throw new McpSessionCreationMismatchError(created.sessionId);
+    return created;
+  }
+  const creator = deps.boundSessionCreator ?? mcpSessionCapabilities();
+  if (!input.mcpBindingEnvelope || !creator)
     throw new Error("external MCP session activation is not configured");
-  return deps.boundSessionCreator.create(input, source);
+  return creator.create(input, source);
 }

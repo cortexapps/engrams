@@ -78,6 +78,8 @@ export async function lockRuntimeAuthority(
     authority = human;
   }
   if (
+    (authority.session.mcpManagedLifecycle != null &&
+      authority.session.mcpManagedLifecycle.phase !== "started") ||
     authority.session.profileId !== authority.session.mcpBindingEnvelope?.profileId ||
     authority.session.integrationPrincipalId !== call.principalId ||
     authority.session.taskId !== call.taskId ||

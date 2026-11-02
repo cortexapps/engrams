@@ -2,6 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { getDb } from "../db/client.ts";
 import { taskSession, type ProfileIntegrationGrant } from "../db/schema.ts";
 import { compileSessionBindings, type McpSessionBindingSnapshot } from "./session-bindings.ts";
+import { mcpSessionCapabilities } from "./session-capabilities.ts";
 
 /** The caller supplies the actual tool-call session ID, never a task launch snapshot. */
 export async function compileChildSessionBindings(
@@ -17,7 +18,7 @@ export async function compileChildSessionBindings(
     parentAuthority: { sessionId: input.spawningSessionId, snapshot },
   });
 }
-/** Retain the unconditional activation guard until the host can enforce child denies. */
+/** A managed parent requires the installed trusted creation path even with zero child tools. */
 export async function assertChildMcpCreationBlocked(
   taskId: string,
   spawningSessionId: string,
@@ -33,10 +34,12 @@ export async function assertChildMcpCreationBlocked(
     .from(taskSession)
     .where(and(eq(taskSession.taskId, taskId), eq(taskSession.sessionId, spawningSessionId)));
   if (!parent) throw new Error("spawning session authority unavailable");
-  if (
+  const managed = Boolean(
     parent.envelope ||
     [...(parent.grants ?? []), ...launchGrants].some((grant) => grant.mcp) ||
-    parent.connections?.some((connection) => connection.provider === "mcp")
-  )
+    parent.connections?.some((connection) => connection.provider === "mcp"),
+  );
+  if (managed && !mcpSessionCapabilities())
     throw new Error("external MCP session activation is not configured");
+  return managed;
 }

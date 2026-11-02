@@ -59,6 +59,11 @@ import {
   type IntegrationSecretJson,
 } from "../connectors/registry.ts";
 import { compileToolManifest } from "../tools/manifest.ts";
+import {
+  mcpSessionCapabilities,
+  type McpSessionCapabilities,
+} from "../mcp/session-capabilities.ts";
+import { McpManagedCreationPending } from "../mcp/managed-runtime.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 import { systemPromptForTaskType } from "../prompts/base.ts";
 import type { SpecPromptContext } from "../prompts/spec-mode.ts";
@@ -86,10 +91,7 @@ import {
   providerGuestServices,
 } from "../integrations/providers/index.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
-import {
-  getModelRouterDefinition,
-  selectRouterProtocol,
-} from "../model-routers/registry.ts";
+import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -206,6 +208,7 @@ export interface OrgSecretNameClient {
 }
 
 export interface SessionCompileDeps {
+  mcpCompiler?: McpSessionCapabilities["compile"];
   images: ImagesClient;
   connectors: CustomConnectorSource;
   harnessCatalog: HarnessCatalogClient;
@@ -236,6 +239,9 @@ export interface SessionCompileDeps {
 }
 
 export interface SessionCompileOpts {
+  /** Actual trusted spawning session, never a launch snapshot. */
+  spawningSessionId?: string;
+  inheritMcp?: boolean;
   prompt?: string;
   /** Orchestrator task context used to select prompt and tool surfaces. This
    *  value is not sent to the sandbox. */
@@ -339,18 +345,28 @@ export async function compileSessionCreateInput(
   const selectedRouterId = opts.modelRouter ?? profile.modelRouter ?? undefined;
   const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
   if (!descriptor) {
-    throw new ConnectError(`harness \`${selectedHarness}\` is not in the catalog`, Code.FailedPrecondition);
+    throw new ConnectError(
+      `harness \`${selectedHarness}\` is not in the catalog`,
+      Code.FailedPrecondition,
+    );
   }
   const router = selectedRouterId ? getModelRouterDefinition(selectedRouterId) : null;
   if (selectedRouterId && !router) {
-    throw new ConnectError(`model router \`${selectedRouterId}\` is not registered`, Code.InvalidArgument);
+    throw new ConnectError(
+      `model router \`${selectedRouterId}\` is not registered`,
+      Code.InvalidArgument,
+    );
   }
-  const routerHost = router ? await resolveIntegrationHost(router.catalog.provider, {
-    connectors: deps.connectors,
-    settingsFor: async (provider) =>
-      storedSettingsOf((await deps.connections.getDefault(provider))?.config),
-  }) : undefined;
-  const routerProtocol = router ? selectRouterProtocol(router, descriptor.routerProtocols ?? []) : null;
+  const routerHost = router
+    ? await resolveIntegrationHost(router.catalog.provider, {
+        connectors: deps.connectors,
+        settingsFor: async (provider) =>
+          storedSettingsOf((await deps.connections.getDefault(provider))?.config),
+      })
+    : undefined;
+  const routerProtocol = router
+    ? selectRouterProtocol(router, descriptor.routerProtocols ?? [])
+    : null;
   if (router && !routerProtocol) {
     throw new ConnectError(
       `harness \`${selectedHarness}\` has no protocol adapter for model router \`${router.id}\``,
@@ -377,19 +393,26 @@ export async function compileSessionCreateInput(
     const secretClient: OrgSecretNameClient = deps.orgSecret ?? defaultOrgSecret;
     const [routed, availableSecrets] = await Promise.all([
       (deps.modelRouters ?? makeModelRouterStore()).getModel(router.id, modelId),
-      secretClient
-        .listSecrets({})
-        .then((r) => new Set(r.secrets.map((secret) => secret.name))),
+      secretClient.listSecrets({}).then((r) => new Set(r.secrets.map((secret) => secret.name))),
     ]);
     routedModel = routed;
     if (!routedModel || !routedModel.available) {
       throw new ConnectError(`router model \`${modelId}\` is unavailable`, Code.FailedPrecondition);
     }
     if (!routedModel.enabled || (isHumanPrincipal(opts) && !routedModel.userEnabled)) {
-      log.warn({ routerId: router.id, modelId, human: isHumanPrincipal(opts) }, "model router policy rejected launch");
-      throw new ConnectError(`router model \`${modelId}\` is not enabled for this principal`, Code.PermissionDenied);
+      log.warn(
+        { routerId: router.id, modelId, human: isHumanPrincipal(opts) },
+        "model router policy rejected launch",
+      );
+      throw new ConnectError(
+        `router model \`${modelId}\` is not enabled for this principal`,
+        Code.PermissionDenied,
+      );
     }
-    if (!routedModel.supportedParameters.includes("reasoning") && !routedModel.supportedParameters.includes("reasoning_effort")) {
+    if (
+      !routedModel.supportedParameters.includes("reasoning") &&
+      !routedModel.supportedParameters.includes("reasoning_effort")
+    ) {
       effortId = undefined;
     }
     if (!availableSecrets.has(router.credentialSecret)) {
@@ -408,7 +431,10 @@ export async function compileSessionCreateInput(
       "model router launch accepted",
     );
   } else if (modelId && !modelOption) {
-    throw new ConnectError(`model \`${modelId}\` is not valid for harness \`${selectedHarness}\``, Code.InvalidArgument);
+    throw new ConnectError(
+      `model \`${modelId}\` is not valid for harness \`${selectedHarness}\``,
+      Code.InvalidArgument,
+    );
   }
   const effortOption = descriptor.effort.find((e) => e.id === effortId);
 
@@ -498,11 +524,15 @@ export async function compileSessionCreateInput(
       ? overrideGrants
       : [...profile.integrationGrants, ...overrideGrants];
   const resolvedEffectiveGrants = await resolveIntegrationGrants(effectiveGrants, connections);
-  // The runtime must install managed-host denies and session-local tool bindings
-  // before any MCP authority is exposed. That activation is not configured yet.
-  if (resolvedEffectiveGrants.some(({ connection }) => connection.provider === "mcp")) {
-    throw new ConnectError("external MCP session activation is not configured", Code.FailedPrecondition);
-  }
+  const hasMcp =
+    opts.inheritMcp === true ||
+    resolvedEffectiveGrants.some(({ connection }) => connection.provider === "mcp");
+  const mcpCompiler = deps.mcpCompiler ?? mcpSessionCapabilities()?.compile;
+  if (hasMcp && !mcpCompiler)
+    throw new ConnectError(
+      "external MCP session activation is not configured",
+      Code.FailedPrecondition,
+    );
   const disabledConnection = resolvedEffectiveGrants.find(({ connection }) => !connection.enabled);
   if (disabledConnection) {
     throw new ConnectError(
@@ -600,12 +630,7 @@ export async function compileSessionCreateInput(
           baseToolRegistry.complete(sessionId, toolCallId, result),
       }
     : baseToolRegistry;
-  const toolManifest = compileToolManifest(
-    manifestRegistry,
-    surfacedCapabilities,
-    opts.taskType,
-  );
-  if (toolManifest.length > 0) harness.ENGRAM_TOOLS = JSON.stringify(toolManifest);
+  const toolManifest = compileToolManifest(manifestRegistry, surfacedCapabilities, opts.taskType);
   if (!opts.dropProfileSecretsAndEnv) {
     for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
   }
@@ -662,7 +687,12 @@ export async function compileSessionCreateInput(
 
   // The human credential remains the final, principal-authoritative env write,
   // so no descriptor or trigger can replace it.
-  if (isHuman && !router && userEnv && humanUserToken !== undefined) harness[userEnv] = humanUserToken;
+  if (isHuman && !router && userEnv && humanUserToken !== undefined)
+    harness[userEnv] = humanUserToken;
+  // Only the trusted registry supplies the native manifest. Freeze it after every
+  // environment contribution, before managed creation stores its exact bytes.
+  if (toolManifest.length > 0) harness.ENGRAM_TOOLS = JSON.stringify(toolManifest);
+  else delete harness.ENGRAM_TOOLS;
   const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
   // Per-session integration policy (caps + network + secrets), shipped only
@@ -728,7 +758,7 @@ export async function compileSessionCreateInput(
   }
   const integrationPolicyJson = policyHasContent(policy) ? JSON.stringify(policy) : undefined;
 
-  return {
+  const compiled: SessionCreateInput = {
     imageUri: image.imageUri,
     mode: "agent",
     harness: selectedHarness,
@@ -760,6 +790,14 @@ export async function compileSessionCreateInput(
       ).values(),
     ],
   };
+  if (!hasMcp) return compiled;
+  return mcpCompiler!(compiled, {
+    profileId: profile.id,
+    profileGrants: profile.integrationGrants,
+    grants: activeResolvedGrants.map(({ grant }) => grant),
+    directPolicy: policy,
+    ...(opts.spawningSessionId ? { spawningSessionId: opts.spawningSessionId } : {}),
+  });
 }
 
 function isHumanPrincipal(opts: SessionCompileOpts): boolean {
@@ -1079,6 +1117,7 @@ export async function createSessionForExistingTask(
       });
     }
   } catch (err) {
+    if (err instanceof McpManagedCreationPending) throw err;
     if (err instanceof McpSessionCreationMismatchError) createdSessionId = err.createdSessionId;
     // Compensation must never mask the original failure: guard every step and
     // log what it could not undo. On an ID mismatch, the session that leaks is
@@ -1309,6 +1348,7 @@ export async function createTaskWithSession(
       await tx.insert(sessionListenerTable).values({ sessionId });
     });
   } catch (err) {
+    if (err instanceof McpManagedCreationPending) throw err;
     if (err instanceof McpSessionCreationMismatchError) createdSessionId = err.createdSessionId;
     // Compensation must never mask the original failure: guard every step and
     // log what it could not undo. On an ID mismatch, the session that leaks is

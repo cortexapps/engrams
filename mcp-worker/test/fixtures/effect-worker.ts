@@ -23,6 +23,18 @@ const provider = createServer(tls, (req, res) => {
         supportedVersions: ["2026-07-28"],
         capabilities: { tools: {} },
       };
+    else if (message.method === "tools/list")
+      result = {
+        ttlMs: 0,
+        cacheScope: "private",
+        tools: [
+          {
+            name: "Lookup.Record",
+            description: "Find a fixture record",
+            inputSchema: { type: "object" },
+          },
+        ],
+      };
     else if (message.method === "tools/call") {
       calls++;
       if (response === "hold") {
@@ -107,8 +119,7 @@ const make = () =>
   });
 let worker = make();
 const port = await worker.listen(0, "127.0.0.1");
-const send = (value: unknown) =>
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+const send = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 send({ port, identity: worker.identity, node: process.versions.node });
 for await (const command of { [Symbol.asyncIterator]: () => input }) {
   if (command === "stats") send({ calls, credentialRequests });

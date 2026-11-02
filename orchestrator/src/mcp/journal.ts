@@ -385,13 +385,14 @@ export function makeMcpJournal(db = getDb()) {
           .from(approval)
           .where(
             and(
-              eq(approval.deploymentId, deploymentId),
+              or(eq(approval.deploymentId, deploymentId), eq(approval.sessionId, call.sessionId)),
               eq(approval.decision, "pending"),
               gt(approval.expiresAt, now),
             ),
           );
         if (
-          pending.length >= MCP_LIMITS.deploymentApprovals ||
+          pending.filter((a) => a.deploymentId === deploymentId).length >=
+            MCP_LIMITS.deploymentApprovals ||
           pending.filter((a) => a.sessionId === call.sessionId).length >=
             MCP_LIMITS.sessionApprovals
         )
@@ -1025,6 +1026,20 @@ export function makeMcpJournal(db = getDb()) {
         if (changed) expired++;
       }
       return expired;
+    },
+    /** Stored scopes survive worker removal and disabled dispatch. Scan only due work. */
+    async expiryScopes(now: Date, after = "") {
+      const rows = await db.execute<{ deployment_id: string }>(sql`
+        SELECT deployment_id FROM (
+          SELECT ${admission.deploymentId} AS deployment_id FROM ${admission}
+          WHERE ${admission.state} IN ('queued', 'admitted') AND ${admission.expiresAt} <= ${now}
+          UNION
+          SELECT ${approval.deploymentId} AS deployment_id FROM ${approval}
+          WHERE ${approval.decision} IN ('pending', 'approved')
+            AND ${approval.consumedAt} IS NULL AND ${approval.expiresAt} <= ${now}
+        ) AS due WHERE deployment_id > ${after} ORDER BY deployment_id LIMIT 32
+      `);
+      return rows.rows.map((row) => row.deployment_id);
     },
     async expire(deploymentId: string, now: Date) {
       // Lock order is scope -> connection -> execution, shared with admission/dispatch.

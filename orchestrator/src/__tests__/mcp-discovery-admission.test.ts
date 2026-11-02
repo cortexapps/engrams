@@ -48,33 +48,29 @@ async function fixture() {
     },
     reference: { kind: CredentialKind.API_KEY, connectionId, name: "mcp.org.key", generation: 1n },
   });
-  await db
-    .insert(schema.user)
-    .values({
-      id: actorId,
-      name: "Discovery administrator",
-      email: `${actorId}@example.test`,
-      role: "admin",
-      createdAt: now,
-      updatedAt: now,
-    });
-  await db
-    .insert(schema.integrationConnection)
-    .values({
-      id: connectionId,
-      alias: `discovery-${connectionId}`,
-      displayName: "Discovery tools",
-      provider: "mcp",
-      configRevision: 1,
-      authGeneration: 2,
-      credentialIdentity: "account",
-      config: {
-        endpoint: "https://tools.example.test/mcp",
-        zone: "public",
-        auth: { kind: "api_key", secretRef: "mcp.org.key" },
-      },
-      mcpCredential: { status: statusMetadata(status) },
-    });
+  await db.insert(schema.user).values({
+    id: actorId,
+    name: "Discovery administrator",
+    email: `${actorId}@example.test`,
+    role: "admin",
+    createdAt: now,
+    updatedAt: now,
+  });
+  await db.insert(schema.integrationConnection).values({
+    id: connectionId,
+    alias: `discovery-${connectionId}`,
+    displayName: "Discovery tools",
+    provider: "mcp",
+    configRevision: 1,
+    authGeneration: 2,
+    credentialIdentity: "account",
+    config: {
+      endpoint: "https://tools.example.test/mcp",
+      zone: "public",
+      auth: { kind: "api_key", secretRef: "mcp.org.key" },
+    },
+    mcpCredential: { status: statusMetadata(status) },
+  });
   const input = {
     requestId: crypto.randomUUID(),
     actorId,
@@ -355,5 +351,60 @@ test("discovery deployment budget admits four independent connections with no qu
         .where(eq(schema.mcpDiscoveryAdmission.connectionId, f.input.connectionId));
   } finally {
     for (const f of fixtures.slice().reverse()) await f.cleanup();
+  }
+});
+
+test("administrative schema admission is credential-free, one-use, bounded and exact", async () => {
+  const f = await fixture();
+  try {
+    const documents = [{ type: "object", properties: { value: { type: "integer" } } }];
+    const input = { ...f.input, documents };
+    const intents = [];
+    for (let i = 0; i < 4; i++)
+      intents.push(
+        await f.admission.reserveSchema({ ...input, requestId: crypto.randomUUID() }, f.now),
+      );
+    await expect(
+      f.admission.reserveSchema({ ...input, requestId: crypto.randomUUID() }, f.now),
+    ).rejects.toThrow("capacity");
+    // Schema capacity does not consume discovery capacity, including this connection.
+    const discovery = await f.admission.reserve(f.input, f.now);
+    const intent = intents[0]!;
+    expect(intent.operation).toBe("validateSchemas");
+    expect(intent.destination).toBe("");
+    if (intent.scope.kind !== "administration") throw Error("scope");
+    const requestId = intent.scope.requestId;
+    const operation = { identity: input.identity, intent, documents };
+    await expect(f.admission.assertSchemaAdmitted(operation, f.now)).rejects.toThrow();
+    await f.admission.beginDispatch(requestId, intent.id, f.now);
+    await f.admission.assertSchemaAdmitted(operation, f.now);
+    await expect(f.admission.beginDispatch(requestId, intent.id, f.now)).rejects.toThrow();
+    await expect(
+      f.admission.assertSchemaAdmitted({ ...operation, documents: [{ type: "string" }] }, f.now),
+    ).rejects.toThrow();
+    await expect(
+      f.admission.assertSchemaAdmitted(
+        { ...operation, identity: { ...input.identity, bootId: "changed" } },
+        f.now,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      f.admission.assertSchemaAdmitted(operation, new Date(intent.expiresAt)),
+    ).rejects.toThrow();
+    await f.db.update(schema.user).set({ role: "user" }).where(eq(schema.user.id, input.actorId));
+    await expect(f.admission.assertSchemaAdmitted(operation, f.now)).rejects.toThrow();
+    await f.db.update(schema.user).set({ role: "admin" }).where(eq(schema.user.id, input.actorId));
+    await f.admission.finish(requestId, intent.id, f.now);
+    await expect(f.admission.reserveSchema({ ...input, requestId }, f.now)).rejects.toThrow(
+      "consumed",
+    );
+    await expect(f.admission.assertSchemaAdmitted(operation, f.now)).rejects.toThrow();
+    await f.admission.reserveSchema(
+      { ...input, requestId: crypto.randomUUID() },
+      new Date(intent.expiresAt),
+    );
+    await f.admission.finish(f.input.requestId, discovery.id, f.now);
+  } finally {
+    await f.cleanup();
   }
 });

@@ -1,3 +1,4 @@
+import { operatorPublication } from "./mcp-binding-fixture.ts";
 import { expect } from "bun:test";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -44,7 +45,10 @@ export async function effectFixture(
   const child = spawn(
     process.env.MCP_WORKER_TEST_NODE ?? "node",
     [new URL("../../../mcp-worker/test/fixtures/effect-worker.ts", import.meta.url).pathname],
-    { stdio: ["pipe", "pipe", "pipe"], env: { PATH: process.env.PATH ?? "" } },
+    {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { PATH: process.env.PATH ?? "", TMPDIR: process.env.TMPDIR ?? "/tmp" },
+    },
   );
   const output = createInterface({ input: child.stdout }),
     lines = output[Symbol.asyncIterator]();
@@ -100,6 +104,7 @@ export async function effectFixture(
     await f.db.update(user).set({ role: "user" }).where(eq(user.id, f.actorId));
     const operatorPolicies = [
       {
+        publication: structuredClone(operatorPublication),
         zoneId: ready.identity.zoneId,
         policyRevision: ready.identity.policyRevision,
         policyDigest: `sha256:${ready.identity.policyDigest}`,
@@ -288,6 +293,7 @@ export async function effectFixture(
     return {
       ...f,
       driver,
+      control,
       remote: {
         workerTls: {
           ...tls,
@@ -346,9 +352,14 @@ export async function effectFixture(
           await f.cleanup();
         } finally {
           const exited = once(child, "exit");
+          const timeout = setTimeout(() => child.kill("SIGKILL"), 5000);
           child.stdin.end("close\n");
-          await exited;
-          output.close();
+          try {
+            await exited;
+          } finally {
+            clearTimeout(timeout);
+            output.close();
+          }
           expect(stderr).toBe("");
         }
       },
@@ -357,7 +368,11 @@ export async function effectFixture(
     try {
       await f.cleanup();
     } finally {
-      child.kill();
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, "exit");
+        child.kill("SIGKILL");
+        await exited;
+      }
       output.close();
     }
     throw error;

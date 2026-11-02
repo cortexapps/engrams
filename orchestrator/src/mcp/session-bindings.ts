@@ -9,7 +9,16 @@ import { MCP_LIMITS } from "./limits.ts";
 import type { McpBinding, McpConnectionState, McpReviewedTool } from "./types.ts";
 
 /** Operator-owned projection of the worker's approved zone policy. Never profile input. */
+export interface McpOperatorPublicationIdentity {
+  generation: number;
+  identity: string;
+  deploymentIdentity: string;
+  networkIdentity: string;
+  trustIdentity: string;
+  caContentDigests: Record<string, string>;
+}
 export interface McpOperatorPolicy {
+  publication: McpOperatorPublicationIdentity;
   zoneId: string;
   policyRevision: string;
   policyDigest: string;
@@ -72,10 +81,22 @@ function profileHash(grants: readonly ProfileIntegrationGrant[]) {
   return canonicalDigest(mcpGrants(grants));
 }
 function normalizedPolicy(policy: McpOperatorPolicy): McpOperatorPolicy {
+  const publication = policy.publication;
   if (
     !policy.zoneId ||
     !policy.policyRevision ||
-    !/^sha256:[0-9a-f]{64}$/.test(policy.policyDigest)
+    !/^sha256:[0-9a-f]{64}$/.test(policy.policyDigest) ||
+    !publication ||
+    !Number.isSafeInteger(publication.generation) ||
+    publication.generation < 1 ||
+    ![
+      publication.identity,
+      publication.deploymentIdentity,
+      publication.networkIdentity,
+      publication.trustIdentity,
+      ...Object.values(publication.caContentDigests),
+    ].every((value) => /^sha256:[0-9a-f]{64}$/.test(value)) ||
+    !Object.keys(publication.caContentDigests).length
   )
     throw new Error("operator MCP policy identity unavailable");
   const authorities = [...new Set(policy.authorities)].sort();
@@ -88,6 +109,7 @@ function normalizedPolicy(policy: McpOperatorPolicy): McpOperatorPolicy {
   }
   for (const alias of aliases) assertHostname(alias);
   return {
+    publication: structuredClone(publication),
     zoneId: policy.zoneId,
     policyRevision: policy.policyRevision,
     policyDigest: policy.policyDigest,
@@ -112,8 +134,14 @@ function policyFor(config: ReturnType<typeof validateMcpConfig>, live: McpLiveAu
   return policy;
 }
 export function managedAuthorityHash(live: McpLiveAuthority) {
-  return canonicalDigest(
-    live.connections
+  const policies = live.operatorPolicies
+    .map(normalizedPolicy)
+    .sort((a, b) => a.zoneId.localeCompare(b.zoneId));
+  if (!policies.length || new Set(policies.map((policy) => policy.zoneId)).size !== policies.length)
+    throw new Error("operator MCP zone policy unavailable");
+  return canonicalDigest({
+    policies,
+    connections: live.connections
       .map((connection) => {
         const config = validateMcpConfig(connection.config);
         return {
@@ -123,7 +151,7 @@ export function managedAuthorityHash(live: McpLiveAuthority) {
         };
       })
       .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
-  );
+  });
 }
 export function hasPublishedLeaf(snapshot: McpSessionBindingSnapshot): boolean {
   const value = snapshot.profilePublication;
@@ -221,6 +249,13 @@ export function compileSessionBindings(input: {
   });
   // Keep managed destinations even when the request has no tool grants.
   const hosts = new Set<string>(parent?.snapshot.managedDenyPolicy.hosts ?? []);
+  // The published set includes unused zones and authorities before a connection exists.
+  for (const raw of live.operatorPolicies) {
+    const policy = normalizedPolicy(raw);
+    for (const authority of policy.authorities)
+      hosts.add(new URL(`https://${authority}/`).hostname);
+    for (const alias of policy.aliases) hosts.add(alias);
+  }
   for (const connection of live.connections) {
     const config = validateMcpConfig(connection.config);
     const policy = policyFor(config, live);

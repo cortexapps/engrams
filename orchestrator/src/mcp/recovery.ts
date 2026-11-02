@@ -3,7 +3,9 @@ import { log } from "../log.ts";
 import { and, asc, eq, gt, lt, sql } from "drizzle-orm";
 import { sessions } from "../control-plane/client.ts";
 import { getDb } from "../db/client.ts";
-import { mcpExecution } from "../db/schema.ts";
+import { mcpExecution, taskSession } from "../db/schema.ts";
+import { requestPolicyContext } from "./journal-review.ts";
+import type { SessionPolicyControlClient } from "./control-client.ts";
 import type { ToolCallCompleter } from "../tools/complete.ts";
 import {
   McpRequestDenied,
@@ -24,6 +26,12 @@ export interface McpExecutionMarker {
   sessionId: string;
   runId: string;
   toolCallId: string;
+}
+export interface McpCancelRequest {
+  sessionId: string;
+  runId: string;
+  toolCallId: string;
+  modelToolName: string;
 }
 /** Durable pointer to the first authenticated coordinator request, not a guest projection. */
 export interface McpRequestMarker {
@@ -64,6 +72,7 @@ export function makeMcpRecovery(deps: {
   db?: ReturnType<typeof getDb>;
   /** Durable completion remains available when dispatch configuration is absent. */
   driver?: ReturnType<typeof makeMcpEffectDriver>;
+  cancellationPolicy?: Pick<SessionPolicyControlClient, "validateExecutionIdentity">;
   dispatchEnabled?: () => boolean;
   deploymentId: string;
   completer?: ToolCallCompleter;
@@ -125,6 +134,45 @@ export function makeMcpRecovery(deps: {
     )[0];
   }
   return {
+    /** Advisory authenticated harness event. Only the exact current accepted call may cancel. */
+    async cancelRequest(input: McpCancelRequest) {
+      if (
+        !Object.values(input).every(
+          (value) =>
+            typeof value === "string" &&
+            value.length > 0 &&
+            value.length <= 256 &&
+            !/[\x00-\x1f]/.test(value),
+        )
+      )
+        throw Error("MCP cancellation identity invalid");
+      const call = await existing(input);
+      if (!call) throw Error("MCP accepted call not yet available");
+      if (!active.has(call.state)) return;
+      if (
+        call.runId !== input.runId ||
+        call.requestContext?.resolvedTool.modelToolName !== input.modelToolName ||
+        call.originalArguments === null
+      )
+        return;
+      const [session] = await db
+        .select()
+        .from(taskSession)
+        .where(eq(taskSession.sessionId, input.sessionId));
+      if (session?.mcpBindingEnvelope?.bindingHash !== call.bindingHash) return;
+      if (!deps.cancellationPolicy) throw Error("MCP cancellation authority unavailable");
+      const result = await deps.cancellationPolicy.validateExecutionIdentity({
+        protocol: 1,
+        ...requestPolicyContext(call.requestContext),
+        modelToolName: input.modelToolName,
+        originalArguments: call.originalArguments,
+      });
+      if (result.protocol !== 1 || result.status === "unknown")
+        throw Error("MCP cancellation identity unavailable");
+      if (result.status !== "current") return;
+      await journal.cancelInternal(call.id, "interrupt", deps.now());
+      deps.driver?.cancel(call.id);
+    },
     reconcileLifecycle: async () => {
       await reconciler.runOnce();
     },
