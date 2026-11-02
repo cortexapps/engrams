@@ -628,6 +628,26 @@ pub trait MetadataStore: Send + Sync {
         Err(MetaError::Conflict("MCP flow storage unavailable".into()))
     }
 
+    /// Fence this exact MCP attempt, including consumed state. Terminal attempts
+    /// are idempotent; a missing or differently scoped attempt is not evidence.
+    async fn cancel_mcp_oauth_flow(
+        &self,
+        _id: uuid::Uuid,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::Conflict("MCP flow storage unavailable".into()))
+    }
+    /// Atomically require a live consumed flow, publish by credential version CAS,
+    /// and finish that flow. Cancellation and publication lock the same flow row.
+    async fn complete_mcp_oauth_flow(
+        &self,
+        _id: uuid::Uuid,
+        _credential: crate::types::oauth::NewSealedOAuthCredential,
+        _expected_version: Option<i64>,
+    ) -> Result<crate::types::oauth::SealedOAuthCredential, MetaError> {
+        Err(MetaError::Conflict("MCP flow storage unavailable".into()))
+    }
+
     async fn create_oauth_flow(
         &self,
         _flow: crate::types::oauth::OAuthFlow,

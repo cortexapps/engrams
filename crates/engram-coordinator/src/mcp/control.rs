@@ -322,6 +322,28 @@ impl CredentialControl for Control {
             self.authority.callback(&callback).await.map_err(error)?,
         )))
     }
+    async fn cancel_authorization(
+        &self,
+        req: Request<wire::CancelAuthorizationRequest>,
+    ) -> RpcResult<wire::CancelAuthorizationResponse> {
+        let _permit = self.check(&req, req.get_ref().protocol)?;
+        let v = req.into_inner();
+        actor(&v.actor_id)?;
+        let id = v
+            .flow_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid flow id"))?;
+        self.authority
+            .cancel_authorization(id, &v.connection_id, &v.registration_id)
+            .await
+            .map_err(error)?;
+        Ok(Response::new(wire::CancelAuthorizationResponse {
+            protocol: wire::PROTOCOL,
+            flow_id: v.flow_id,
+            connection_id: v.connection_id,
+            registration_id: v.registration_id,
+        }))
+    }
     async fn get_status(
         &self,
         req: Request<wire::GetStatusRequest>,

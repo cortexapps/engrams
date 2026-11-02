@@ -2088,71 +2088,14 @@ impl MetadataStore for PostgresStore {
         credential: engram_core::types::oauth::NewSealedOAuthCredential,
         expected_version: Option<i64>,
     ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
-        let now = self.clock.now_utc();
-        let metadata = serde_json::to_value(&credential.metadata)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
-        let row = if let Some(expected) = expected_version {
-            sqlx::query(
-                r#"
-                UPDATE oauth_credentials SET
-                    wrapped_dek = $4, nonce = $5, ciphertext = $6, key_id = $7,
-                    account_metadata = $8, version = version + 1,
-                    updated_at = $9, revoked_at = NULL, expires_at = $11,
-                    refresh_claim_until = NULL, broken_at = NULL, broken_reason = NULL
-                WHERE subject_kind = $1 AND subject_id = $2 AND provider = $3
-                  AND version = $10
-                RETURNING *
-                "#,
-            )
-            .bind(credential.key.subject_kind.as_str())
-            .bind(&credential.key.subject_id)
-            .bind(&credential.key.provider)
-            .bind(&credential.wrapped_dek)
-            .bind(&credential.nonce)
-            .bind(&credential.ciphertext)
-            .bind(&credential.key_id)
-            .bind(metadata)
-            .bind(now)
-            .bind(expected)
-            .bind(credential.expires_at)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?
-        } else {
-            sqlx::query(
-                r#"
-                INSERT INTO oauth_credentials (
-                    subject_kind, subject_id, provider, wrapped_dek, nonce,
-                    ciphertext, key_id, account_metadata, version, created_at,
-                    updated_at, revoked_at, expires_at
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$9,NULL,$10)
-                ON CONFLICT (subject_kind, subject_id, provider) DO NOTHING
-                RETURNING *
-                "#,
-            )
-            .bind(credential.key.subject_kind.as_str())
-            .bind(&credential.key.subject_id)
-            .bind(&credential.key.provider)
-            .bind(&credential.wrapped_dek)
-            .bind(&credential.nonce)
-            .bind(&credential.ciphertext)
-            .bind(&credential.key_id)
-            .bind(metadata)
-            .bind(now)
-            .bind(credential.expires_at)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?
-        };
-        match row {
-            Some(row) => oauth_credential_from_pg(&row),
-            None => Err(MetaError::Conflict(format!(
-                "OAuth credential CAS rejected for {}/{}/{}",
-                credential.key.subject_kind.as_str(),
-                credential.key.subject_id,
-                credential.key.provider
-            ))),
-        }
+        let mut conn = self.pool.acquire().await.map_err(db_err)?;
+        put_oauth_credential_on(
+            &mut conn,
+            self.clock.now_utc(),
+            credential,
+            expected_version,
+        )
+        .await
     }
 
     async fn get_oauth_credential(
@@ -2345,6 +2288,50 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         serde_json::from_value(state).map_err(|e| MetaError::Serialization(e.to_string()))
+    }
+
+    async fn cancel_mcp_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+    ) -> Result<(), MetaError> {
+        if key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp {
+            return Err(MetaError::Conflict("MCP flow cancellation rejected".into()));
+        }
+        let result = sqlx::query("UPDATE oauth_flows SET status=CASE WHEN status='pending' THEN 'cancelled' ELSE status END, mcp_state=NULL, updated_at=$4 WHERE id=$1 AND subject_kind='mcp' AND subject_id=$2 AND provider=$3")
+            .bind(id).bind(&key.subject_id).bind(&key.provider).bind(self.clock.now_utc())
+            .execute(&self.pool).await.map_err(db_err)?;
+        if result.rows_affected() != 1 {
+            return Err(MetaError::Conflict("MCP flow cancellation rejected".into()));
+        }
+        Ok(())
+    }
+    async fn complete_mcp_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+        credential: engram_core::types::oauth::NewSealedOAuthCredential,
+        expected_version: Option<i64>,
+    ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+        if credential.key.subject_kind != engram_core::types::oauth::OAuthSubjectKind::Mcp {
+            return Err(MetaError::Conflict("MCP flow publication rejected".into()));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let now = self.clock.now_utc();
+        let locked: Option<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM oauth_flows WHERE id=$1 AND subject_kind='mcp' AND subject_id=$2 AND provider=$3 AND status='pending' AND mcp_state IS NULL AND expires_at>$4 FOR UPDATE")
+            .bind(id).bind(&credential.key.subject_id).bind(&credential.key.provider).bind(now)
+            .fetch_optional(&mut *tx).await.map_err(db_err)?;
+        if locked.is_none() {
+            return Err(MetaError::Conflict("MCP flow publication rejected".into()));
+        }
+        let row = put_oauth_credential_on(&mut tx, now, credential, expected_version).await?;
+        sqlx::query("UPDATE oauth_flows SET status='succeeded', updated_at=$2 WHERE id=$1")
+            .bind(id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(row)
     }
 
     async fn create_oauth_flow(
@@ -10129,4 +10116,76 @@ async fn append_teleport_finished_tx(
         .await?;
     }
     Ok(())
+}
+
+async fn put_oauth_credential_on(
+    conn: &mut sqlx::PgConnection,
+    now: chrono::DateTime<chrono::Utc>,
+    credential: engram_core::types::oauth::NewSealedOAuthCredential,
+    expected_version: Option<i64>,
+) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+    let metadata = serde_json::to_value(&credential.metadata)
+        .map_err(|e| MetaError::Serialization(e.to_string()))?;
+    let row = if let Some(expected) = expected_version {
+        sqlx::query(
+            r#"
+                UPDATE oauth_credentials SET
+                    wrapped_dek = $4, nonce = $5, ciphertext = $6, key_id = $7,
+                    account_metadata = $8, version = version + 1,
+                    updated_at = $9, revoked_at = NULL, expires_at = $11,
+                    refresh_claim_until = NULL, broken_at = NULL, broken_reason = NULL
+                WHERE subject_kind = $1 AND subject_id = $2 AND provider = $3
+                  AND version = $10
+                RETURNING *
+                "#,
+        )
+        .bind(credential.key.subject_kind.as_str())
+        .bind(&credential.key.subject_id)
+        .bind(&credential.key.provider)
+        .bind(&credential.wrapped_dek)
+        .bind(&credential.nonce)
+        .bind(&credential.ciphertext)
+        .bind(&credential.key_id)
+        .bind(metadata)
+        .bind(now)
+        .bind(expected)
+        .bind(credential.expires_at)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?
+    } else {
+        sqlx::query(
+            r#"
+                INSERT INTO oauth_credentials (
+                    subject_kind, subject_id, provider, wrapped_dek, nonce,
+                    ciphertext, key_id, account_metadata, version, created_at,
+                    updated_at, revoked_at, expires_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$9,NULL,$10)
+                ON CONFLICT (subject_kind, subject_id, provider) DO NOTHING
+                RETURNING *
+                "#,
+        )
+        .bind(credential.key.subject_kind.as_str())
+        .bind(&credential.key.subject_id)
+        .bind(&credential.key.provider)
+        .bind(&credential.wrapped_dek)
+        .bind(&credential.nonce)
+        .bind(&credential.ciphertext)
+        .bind(&credential.key_id)
+        .bind(metadata)
+        .bind(now)
+        .bind(credential.expires_at)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?
+    };
+    match row {
+        Some(row) => oauth_credential_from_pg(&row),
+        None => Err(MetaError::Conflict(format!(
+            "OAuth credential CAS rejected for {}/{}/{}",
+            credential.key.subject_kind.as_str(),
+            credential.key.subject_id,
+            credential.key.provider
+        ))),
+    }
 }

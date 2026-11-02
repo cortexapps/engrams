@@ -15,6 +15,11 @@ export const putSecret = CredentialControl.method.putSecret;
 export const beginAuthorization = CredentialControl.method.beginAuthorization;
 
 /**
+ * @generated from rpc engram.mcp.v1.CredentialControl.CancelAuthorization
+ */
+export const cancelAuthorization = CredentialControl.method.cancelAuthorization;
+
+/**
  * @generated from rpc engram.mcp.v1.CredentialControl.CompleteAuthorization
  */
 export const completeAuthorization = CredentialControl.method.completeAuthorization;

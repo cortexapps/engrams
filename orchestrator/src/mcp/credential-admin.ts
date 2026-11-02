@@ -5,6 +5,7 @@ import {
   CredentialKind,
   CredentialStatusSchema,
   type CredentialStatus,
+  type AuthorityContext,
 } from "../gen/engram/mcp/v1/control_pb.ts";
 import type { CredentialControlClient } from "./control-client.ts";
 import {
@@ -144,7 +145,12 @@ export function makeCredentialAdmin(deps: {
     await store.stage(claim, { ...claim.metadata, [field]: statusMetadata(receipt) }, now());
     return receipt;
   }
-  async function revokeTargetOAuth(claim: CredentialClaim, actorId: string, recover = false) {
+  async function revokeTargetOAuth(
+    claim: CredentialClaim,
+    actorId: string,
+    recover = false,
+    cancelledContext?: AuthorityContext,
+  ) {
     if (claim.config.auth.kind !== "oauth") return undefined;
     const registrationId = claim.config.auth.clientRegistrationId;
     const saved = decode(claim.metadata.status);
@@ -178,10 +184,42 @@ export function makeCredentialAdmin(deps: {
       current.reference.registrationId !== registrationId
     )
       throw new Error("stale OAuth authority");
-    // Recovery owns the connection transition. Revoke the exact current snapshot,
-    // including a late callback result, without granting or restoring its authority.
+    if (
+      recover &&
+      !(
+        (saved?.context &&
+          saved.reference?.kind === CredentialKind.OAUTH &&
+          saved.reference.registrationId === registrationId &&
+          equals(AuthorityContextSchema, current.context!, saved.context)) ||
+        (cancelledContext && equals(AuthorityContextSchema, current.context!, cancelledContext))
+      )
+    )
+      throw new Error("stale OAuth recovery authority");
+    // Accept only the saved authority or this canceled attempt's exact context.
+    // A newer same-registration authority is not evidence for old recovery.
     await store.stage(claim, { ...claim.metadata, status: statusMetadata(current) }, now());
     return revoke(claim, "status", actorId);
+  }
+  async function cancelPending(claim: CredentialClaim, actorId: string) {
+    const flow = claim.metadata.flow;
+    if (!flow) return;
+    const receipt = await control.cancelAuthorization({
+      protocol: 1,
+      flowId: flow.id,
+      connectionId: claim.id,
+      registrationId: flow.registrationId,
+      actorId,
+    });
+    if (
+      receipt.protocol !== 1 ||
+      receipt.flowId !== flow.id ||
+      receipt.connectionId !== claim.id ||
+      receipt.registrationId !== flow.registrationId
+    )
+      throw new Error("stale cancellation receipt");
+    // Keep the attempt proof durable until the whole transition finishes.
+    // A later recovery may need it to identify a callback that won publication.
+    return flow;
   }
   async function claimCurrent(
     id: string,
@@ -191,7 +229,10 @@ export function makeCredentialAdmin(deps: {
     config?: McpConfig,
   ) {
     const row = await store.get(id);
-    return store.claim(id, revision, generation, actor, config ?? row.config, now());
+    const claim = await store.claim(id, revision, generation, actor, config ?? row.config, now());
+    await cancelPending(claim, actor);
+    delete claim.metadata.flow;
+    return claim;
   }
   return {
     registrations: () => structuredClone(registrations),
@@ -413,14 +454,18 @@ export function makeCredentialAdmin(deps: {
     },
     async recover(id: string, revision: number, generation: number, actorId: string) {
       const claim = await store.recover(id, revision, generation, actorId, now());
+      const cancelled = await cancelPending(claim, actorId);
+      const cancelledContext = cancelled
+        ? fromJson(AuthorityContextSchema, cancelled.context)
+        : undefined;
       if (
         claim.config.auth.kind === "oauth" &&
         decode(claim.metadata.status)?.reference?.kind === CredentialKind.OAUTH
       )
-        await revokeTargetOAuth(claim, actorId, true);
+        await revokeTargetOAuth(claim, actorId, true, cancelledContext);
       else {
         await revoke(claim, "status", actorId);
-        await revokeTargetOAuth(claim, actorId, true);
+        await revokeTargetOAuth(claim, actorId, true, cancelledContext);
       }
       // Client-secret writes also need a durable fence after interrupted publication.
       await revoke(claim, "clientSecret", actorId);

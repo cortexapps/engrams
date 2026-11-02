@@ -2,7 +2,10 @@ use engram_coordinator::{
     mcp::{control::*, model::Registry, *},
     oauth::OAuthManager,
 };
-use engram_core::traits::StaticSecretStore;
+use engram_core::{
+    traits::{Clock, MetadataStore, StaticSecretStore},
+    types::{mcp::McpSealedState, oauth::*},
+};
 use engram_crypto::EnvVarKeyProvider;
 use engram_protocol::mcp as wire;
 use engram_sim::{ManualClock, SimEntropy, SimMetadataStore};
@@ -34,9 +37,9 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
     let entropy = Arc::new(SimEntropy::seeded(1));
     let meta = SimMetadataStore::new(clock.clone(), entropy.clone());
     let manager = OAuthManager::new(
-        meta,
+        meta.clone(),
         Arc::new(EnvVarKeyProvider::from_bytes([7; 32], "test")),
-        clock,
+        clock.clone(),
         entropy,
         Arc::new(StaticSecretStore::new(HashMap::new())),
     );
@@ -143,6 +146,58 @@ async fn control_listener_requires_tls_client_certificate_pin_and_protocol_one()
                 .await
                 .unwrap_err();
             assert_eq!(missing.code(), tonic::Code::NotFound);
+            let id = uuid::Uuid::from_u128(999);
+            let now = clock.now_utc();
+            meta.create_mcp_oauth_flow(
+                OAuthFlow {
+                    id,
+                    key: OAuthCredentialKey {
+                        subject_kind: OAuthSubjectKind::Mcp,
+                        subject_id: "connection-a".into(),
+                        provider: "registered-a".into(),
+                    },
+                    owner_replica: "replica-a".into(),
+                    lease_expires_at: now + chrono::Duration::minutes(10),
+                    expires_at: now + chrono::Duration::minutes(10),
+                    status: OAuthFlowStatus::Pending,
+                    error_code: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                McpSealedState {
+                    wrapped_dek: vec![],
+                    nonce: vec![],
+                    ciphertext: vec![],
+                    key_id: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let cancel = wire::CancelAuthorizationRequest {
+                protocol: 1,
+                flow_id: id.to_string(),
+                connection_id: "connection-a".into(),
+                registration_id: "registered-a".into(),
+                actor_id: "admin".into(),
+            };
+            for _ in 0..2 {
+                let receipt = client
+                    .cancel_authorization(cancel.clone())
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(receipt.flow_id, cancel.flow_id);
+                assert_eq!(receipt.connection_id, cancel.connection_id);
+                assert_eq!(receipt.registration_id, cancel.registration_id);
+                assert_eq!(receipt.protocol, 1);
+            }
+            assert_eq!(
+                meta.get_oauth_flow(id).await.unwrap().unwrap().status,
+                OAuthFlowStatus::Cancelled
+            );
+            let mut wrong = cancel;
+            wrong.connection_id = "unrelated".into();
+            assert!(client.cancel_authorization(wrong).await.is_err());
         }
         let error = client
             .get_status(wire::GetStatusRequest {

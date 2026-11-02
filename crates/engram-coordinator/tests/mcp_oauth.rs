@@ -22,10 +22,15 @@ impl SecurityEntropy for Security {
         Ok([self.0.fetch_add(1, Ordering::SeqCst); 32])
     }
 }
+struct TokenPause {
+    entered: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
 struct Provider {
     identity: WorkerIdentity,
     registration: ClientRegistration,
     grants: Mutex<Vec<Value>>,
+    pause: Mutex<Option<TokenPause>>,
     calls: Mutex<Vec<Value>>,
 }
 #[async_trait::async_trait]
@@ -55,6 +60,11 @@ impl WorkerTransport for Provider {
             ),
             WorkerOperation::ValidateDestination { .. } => Ok(json!({"valid":true})),
             WorkerOperation::Token { .. } => {
+                let pause = self.pause.lock().unwrap().take();
+                if let Some(pause) = pause {
+                    pause.entered.send(()).unwrap();
+                    pause.resume.await.unwrap();
+                }
                 self.grants.lock().unwrap().pop().ok_or(McpError::Transport)
             }
         }
@@ -135,6 +145,7 @@ fn fixture_with_client(grants: Vec<Value>, confidential: bool) -> Fixture {
         identity,
         registration: registration.clone(),
         grants: Mutex::new(grants),
+        pause: Mutex::new(None),
         calls: Mutex::new(vec![]),
     });
     let security = Arc::new(Security(AtomicU8::new(1)));
@@ -596,4 +607,82 @@ async fn revoke_before_authority_switch_fences_old_leases_and_late_callbacks() {
         .unwrap();
     f.authority.callback(&callback(&flow)).await.unwrap();
     assert!(f.authority.lease(&old_key_lease).await.is_err());
+}
+
+#[tokio::test]
+async fn cancelled_attempt_cannot_exchange_or_block_replacement() {
+    for reconnect in [false, true] {
+        let f = fixture(vec![grant("new"), grant("old")]);
+        let expected = if reconnect {
+            let first = begin(&f).await;
+            let status = f.authority.callback(&callback(&first)).await.unwrap();
+            Some(f.authority.revoke(&status).await.unwrap().version)
+        } else {
+            None
+        };
+        let pending = f
+            .authority
+            .begin(&f.change, "registered-a", None, expected, "actor-a", true)
+            .await
+            .unwrap();
+        let before = f.provider.calls.lock().unwrap().len();
+        f.replica
+            .cancel_authorization(pending.flow_id, &f.change.connection_id, "registered-a")
+            .await
+            .unwrap();
+        assert!(f.authority.callback(&callback(&pending)).await.is_err());
+        assert_eq!(f.provider.calls.lock().unwrap().len(), before);
+        let replacement = f
+            .replica
+            .begin(&f.change, "registered-a", None, expected, "actor-a", true)
+            .await
+            .unwrap();
+        f.authority
+            .cancel_authorization(pending.flow_id, &f.change.connection_id, "registered-a")
+            .await
+            .unwrap();
+        let published = f.replica.callback(&callback(&replacement)).await.unwrap();
+        assert!(f.authority.callback(&callback(&pending)).await.is_err());
+        assert_eq!(
+            f.authority
+                .status(&f.change.connection_id, &published.reference)
+                .await
+                .unwrap(),
+            published
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancellation_fences_an_inflight_token_response() {
+    let f = fixture(vec![grant("late")]);
+    let begun = begin(&f).await;
+    let callback = callback(&begun);
+    let (entered, wait) = tokio::sync::oneshot::channel();
+    let (resume, paused) = tokio::sync::oneshot::channel();
+    *f.provider.pause.lock().unwrap() = Some(TokenPause {
+        entered,
+        resume: paused,
+    });
+    let complete = f.authority.callback(&callback);
+    let cancel = async {
+        wait.await.unwrap();
+        f.replica
+            .cancel_authorization(begun.flow_id, &f.change.connection_id, "registered-a")
+            .await
+            .unwrap();
+        resume.send(()).unwrap();
+    };
+    let (result, ()) = tokio::join!(complete, cancel);
+    assert!(result.is_err());
+    assert!(f
+        .authority
+        .status(
+            &f.change.connection_id,
+            &CredentialReference::OAuth {
+                registration_id: "registered-a".into()
+            }
+        )
+        .await
+        .is_err());
 }

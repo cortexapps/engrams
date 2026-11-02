@@ -7820,3 +7820,227 @@ async fn mcp_admission_and_refresh(ctx: &Ctx) {
         .is_some());
 }
 conformance!(t_mcp_admission_and_refresh, mcp_admission_and_refresh);
+
+// Cancellation and publication use the same flow row even when no credential exists.
+async fn mcp_flow_cancellation_fences_publication(ctx: &Ctx) {
+    use engram_core::types::{mcp::*, oauth::*};
+    let now = ctx.clock.now_utc();
+    for reconnect in [false, true] {
+        let key = OAuthCredentialKey {
+            subject_kind: OAuthSubjectKind::Mcp,
+            subject_id: format!("cancel-{reconnect}"),
+            provider: "registered-a".into(),
+        };
+        let candidate = NewSealedOAuthCredential {
+            key: key.clone(),
+            wrapped_dek: vec![1; 32],
+            nonce: vec![2; 12],
+            ciphertext: vec![3; 64],
+            key_id: "test".into(),
+            metadata: OAuthAccountMetadata::default(),
+            expires_at: None,
+        };
+        let expected = if reconnect {
+            let old = ctx
+                .meta
+                .put_oauth_credential(candidate.clone(), None)
+                .await
+                .unwrap();
+            ctx.meta
+                .revoke_oauth_credential(&key, old.version)
+                .await
+                .unwrap();
+            Some(
+                ctx.meta
+                    .get_oauth_credential(&key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version,
+            )
+        } else {
+            None
+        };
+        let base = if reconnect { 920 } else { 910 };
+        let flow = |n: u128| OAuthFlow {
+            id: uuid::Uuid::from_u128(base + n),
+            key: key.clone(),
+            owner_replica: "replica-a".into(),
+            lease_expires_at: now + chrono::Duration::minutes(10),
+            expires_at: now + chrono::Duration::minutes(10),
+            status: OAuthFlowStatus::Pending,
+            error_code: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let state = McpSealedState {
+            wrapped_dek: vec![1; 32],
+            nonce: vec![2; 12],
+            ciphertext: vec![3; 64],
+            key_id: "test".into(),
+        };
+        let old = flow(0);
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(old.id, candidate.clone(), expected)
+            .await
+            .is_err());
+        ctx.meta
+            .create_mcp_oauth_flow(old.clone(), state.clone())
+            .await
+            .unwrap();
+        // An unknown (lost response) pending attempt blocks same-subject begin.
+        assert!(ctx
+            .meta
+            .create_mcp_oauth_flow(flow(9), state.clone())
+            .await
+            .is_err());
+        let mut wrong = key.clone();
+        wrong.subject_id = "unrelated".into();
+        assert!(ctx
+            .meta
+            .cancel_mcp_oauth_flow(old.id, &wrong)
+            .await
+            .is_err());
+        ctx.meta.cancel_mcp_oauth_flow(old.id, &key).await.unwrap();
+        ctx.meta.cancel_mcp_oauth_flow(old.id, &key).await.unwrap();
+        assert!(ctx
+            .meta
+            .create_mcp_oauth_flow(old.clone(), state.clone())
+            .await
+            .is_err());
+        assert!(ctx.meta.consume_mcp_oauth_flow(old.id, &key).await.is_err());
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(old.id, candidate.clone(), expected)
+            .await
+            .is_err());
+        let inflight = flow(1);
+        ctx.meta
+            .create_mcp_oauth_flow(inflight.clone(), state.clone())
+            .await
+            .unwrap();
+        ctx.meta
+            .consume_mcp_oauth_flow(inflight.id, &key)
+            .await
+            .unwrap();
+        ctx.meta
+            .cancel_mcp_oauth_flow(inflight.id, &key)
+            .await
+            .unwrap();
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(inflight.id, candidate.clone(), expected)
+            .await
+            .is_err());
+        // A flow that has not consumed state cannot publish.
+        let untouched = flow(3);
+        ctx.meta
+            .create_mcp_oauth_flow(untouched.clone(), state.clone())
+            .await
+            .unwrap();
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(untouched.id, candidate.clone(), expected)
+            .await
+            .is_err());
+        ctx.meta
+            .cancel_mcp_oauth_flow(untouched.id, &key)
+            .await
+            .unwrap();
+        let replacement = flow(2);
+        ctx.meta
+            .create_mcp_oauth_flow(replacement.clone(), state)
+            .await
+            .unwrap();
+        ctx.meta
+            .consume_mcp_oauth_flow(replacement.id, &key)
+            .await
+            .unwrap();
+        ctx.meta.cancel_mcp_oauth_flow(old.id, &key).await.unwrap();
+        let mut wrong_candidate = candidate.clone();
+        wrong_candidate.key.subject_id = "unrelated".into();
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(replacement.id, wrong_candidate, expected)
+            .await
+            .is_err());
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(replacement.id, candidate.clone(), Some(999))
+            .await
+            .is_err());
+        let published = ctx
+            .meta
+            .complete_mcp_oauth_flow(replacement.id, candidate.clone(), expected)
+            .await
+            .unwrap();
+        assert!(ctx
+            .meta
+            .complete_mcp_oauth_flow(inflight.id, candidate, expected)
+            .await
+            .is_err());
+        assert_eq!(
+            ctx.meta.get_oauth_credential(&key).await.unwrap().unwrap(),
+            published
+        );
+        assert_eq!(
+            ctx.meta
+                .get_oauth_flow(replacement.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            OAuthFlowStatus::Succeeded
+        );
+        // Either transaction may win; a cancellation winner cannot publish.
+        let race = flow(4);
+        ctx.meta
+            .create_mcp_oauth_flow(
+                race.clone(),
+                McpSealedState {
+                    wrapped_dek: vec![1; 32],
+                    nonce: vec![2; 12],
+                    ciphertext: vec![3; 64],
+                    key_id: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.meta
+            .consume_mcp_oauth_flow(race.id, &key)
+            .await
+            .unwrap();
+        let candidate = NewSealedOAuthCredential {
+            key: key.clone(),
+            wrapped_dek: vec![4; 32],
+            nonce: vec![5; 12],
+            ciphertext: vec![6; 64],
+            key_id: "test".into(),
+            metadata: OAuthAccountMetadata::default(),
+            expires_at: None,
+        };
+        let (cancel, complete) = tokio::join!(
+            ctx.meta.cancel_mcp_oauth_flow(race.id, &key),
+            ctx.meta
+                .complete_mcp_oauth_flow(race.id, candidate, Some(published.version))
+        );
+        cancel.unwrap();
+        let terminal = ctx
+            .meta
+            .get_oauth_flow(race.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status;
+        assert_eq!(complete.is_ok(), terminal == OAuthFlowStatus::Succeeded);
+        assert!(matches!(
+            terminal,
+            OAuthFlowStatus::Succeeded | OAuthFlowStatus::Cancelled
+        ));
+    }
+}
+conformance!(
+    t_mcp_flow_cancellation_fences_publication,
+    mcp_flow_cancellation_fences_publication
+);

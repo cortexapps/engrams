@@ -5,6 +5,7 @@ package engram.mcp.v1;
 service CredentialControl {
   rpc PutSecret(PutSecretRequest) returns (CredentialStatus);
   rpc BeginAuthorization(BeginAuthorizationRequest) returns (BeginAuthorizationResponse);
+  rpc CancelAuthorization(CancelAuthorizationRequest) returns (CancelAuthorizationResponse);
   rpc CompleteAuthorization(CompleteAuthorizationRequest) returns (CredentialStatus);
   rpc GetStatus(GetStatusRequest) returns (CredentialStatus);
   rpc Revoke(RevokeRequest) returns (CredentialStatus);
@@ -145,4 +146,19 @@ message LeaseResponse {
   int64 expires_at = 4;
   string intent_id = 5;
   int64 operation_expires_at = 6;
+}
+
+// Exact attempt only. Cancellation persists in the existing flow row.
+message CancelAuthorizationRequest {
+  uint32 protocol = 1;
+  string flow_id = 2;
+  string connection_id = 3;
+  string registration_id = 4;
+  string actor_id = 5;
+}
+message CancelAuthorizationResponse {
+  uint32 protocol = 1;
+  string flow_id = 2;
+  string connection_id = 3;
+  string registration_id = 4;
 }

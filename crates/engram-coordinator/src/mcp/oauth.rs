@@ -266,6 +266,19 @@ impl McpAuthority {
             expires_at,
         })
     }
+    pub async fn cancel_authorization(
+        &self,
+        flow_id: Uuid,
+        connection_id: &str,
+        registration_id: &str,
+    ) -> Result<()> {
+        self.enabled()?;
+        self.manager
+            .meta
+            .cancel_mcp_oauth_flow(flow_id, &key(connection_id, registration_id))
+            .await?;
+        Ok(())
+    }
     pub async fn callback(&self, callback: &Callback) -> Result<CredentialStatus> {
         self.enabled()?;
         // The winner removes ciphertext atomically BEFORE any token request.
@@ -338,7 +351,7 @@ impl McpAuthority {
             let row = self
                 .manager
                 .meta
-                .put_oauth_credential(sealed, flow.expected_version)
+                .complete_mcp_oauth_flow(callback.flow_id, sealed, flow.expected_version)
                 .await?;
             Ok(status(&bundle, &row))
         }

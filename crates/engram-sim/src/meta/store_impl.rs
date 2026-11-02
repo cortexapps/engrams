@@ -5660,35 +5660,12 @@ impl MetadataStore for SimMetadataStore {
         expected_version: Option<i64>,
     ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
         self.gate()?;
-        let now = self.now();
-        let mut db = self.db.lock();
-        let (version, created_at) = match db.oauth_credentials.get(&credential.key) {
-            None if expected_version.is_none() => (1, now),
-            Some(current) if expected_version == Some(current.version) => {
-                (current.version + 1, current.created_at)
-            }
-            _ => return Err(MetaError::Conflict("OAuth credential CAS rejected".into())),
-        };
-        let row = engram_core::types::oauth::SealedOAuthCredential {
-            key: credential.key.clone(),
-            wrapped_dek: credential.wrapped_dek,
-            nonce: credential.nonce,
-            ciphertext: credential.ciphertext,
-            key_id: credential.key_id,
-            metadata: credential.metadata,
-            version,
-            created_at,
-            updated_at: now,
-            revoked_at: None,
-            expires_at: credential.expires_at,
-            broken_at: None,
-            broken_reason: None,
-        };
-        // Publishing a validated bundle IS the repair: broken/claim state
-        // clears on every successful write (PG mirrors this in the UPDATE).
-        db.oauth_refresh_claims.remove(&credential.key);
-        db.oauth_credentials.insert(credential.key, row.clone());
-        Ok(row)
+        put_oauth_credential_in(
+            &mut self.db.lock(),
+            self.now(),
+            credential,
+            expected_version,
+        )
     }
 
     async fn list_oauth_credentials_due_for_refresh(
@@ -5946,6 +5923,57 @@ impl MetadataStore for SimMetadataStore {
             .ok_or_else(|| MetaError::Conflict("MCP state consumed".into()))
     }
 
+    async fn cancel_mcp_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+    ) -> Result<(), MetaError> {
+        use engram_core::types::oauth::{OAuthFlowStatus, OAuthSubjectKind};
+        self.gate()?;
+        let mut db = self.db.lock();
+        let flow = db
+            .oauth_flows
+            .get_mut(&id)
+            .ok_or_else(|| MetaError::Conflict("MCP flow cancellation rejected".into()))?;
+        if key.subject_kind != OAuthSubjectKind::Mcp || &flow.key != key {
+            return Err(MetaError::Conflict("MCP flow cancellation rejected".into()));
+        }
+        if flow.status == OAuthFlowStatus::Pending {
+            flow.status = OAuthFlowStatus::Cancelled;
+        }
+        flow.updated_at = self.now();
+        db.mcp_flow_states.remove(&id);
+        Ok(())
+    }
+    async fn complete_mcp_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+        credential: engram_core::types::oauth::NewSealedOAuthCredential,
+        expected_version: Option<i64>,
+    ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+        use engram_core::types::oauth::{OAuthFlowStatus, OAuthSubjectKind};
+        self.gate()?;
+        let mut db = self.db.lock();
+        let now = self.now();
+        let flow = db
+            .oauth_flows
+            .get(&id)
+            .ok_or_else(|| MetaError::Conflict("MCP flow publication rejected".into()))?;
+        if credential.key.subject_kind != OAuthSubjectKind::Mcp
+            || flow.key != credential.key
+            || flow.status != OAuthFlowStatus::Pending
+            || flow.expires_at <= now
+            || db.mcp_flow_states.contains_key(&id)
+        {
+            return Err(MetaError::Conflict("MCP flow publication rejected".into()));
+        }
+        let row = put_oauth_credential_in(&mut db, now, credential, expected_version)?;
+        let flow = db.oauth_flows.get_mut(&id).expect("locked flow");
+        flow.status = OAuthFlowStatus::Succeeded;
+        flow.updated_at = now;
+        Ok(row)
+    }
+
     async fn create_oauth_flow(
         &self,
         flow: engram_core::types::oauth::OAuthFlow,
@@ -6172,4 +6200,39 @@ fn append_event_idempotent_locked(
         rewound_at: None,
     });
     Ok(Some(idx))
+}
+
+fn put_oauth_credential_in(
+    db: &mut SimDb,
+    now: DateTime<Utc>,
+    credential: engram_core::types::oauth::NewSealedOAuthCredential,
+    expected_version: Option<i64>,
+) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+    let (version, created_at) = match db.oauth_credentials.get(&credential.key) {
+        None if expected_version.is_none() => (1, now),
+        Some(current) if expected_version == Some(current.version) => {
+            (current.version + 1, current.created_at)
+        }
+        _ => return Err(MetaError::Conflict("OAuth credential CAS rejected".into())),
+    };
+    let row = engram_core::types::oauth::SealedOAuthCredential {
+        key: credential.key.clone(),
+        wrapped_dek: credential.wrapped_dek,
+        nonce: credential.nonce,
+        ciphertext: credential.ciphertext,
+        key_id: credential.key_id,
+        metadata: credential.metadata,
+        version,
+        created_at,
+        updated_at: now,
+        revoked_at: None,
+        expires_at: credential.expires_at,
+        broken_at: None,
+        broken_reason: None,
+    };
+    // Publishing a validated bundle IS the repair: broken/claim state
+    // clears on every successful write (PG mirrors this in the UPDATE).
+    db.oauth_refresh_claims.remove(&credential.key);
+    db.oauth_credentials.insert(credential.key, row.clone());
+    Ok(row)
 }

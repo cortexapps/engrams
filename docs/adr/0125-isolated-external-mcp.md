@@ -143,6 +143,19 @@ authority revoked. Late control replies and callbacks cannot publish through an
 old token. A lost fresh-reference response can leave a sealed orphan; recovery
 cannot publish an unknown reference or restore the previous credential.
 
+A local transition token alone cannot fence a delayed coordinator callback.
+Before recovery or replacement, the orchestrator cancels each recorded attempt
+by exact flow UUID, MCP connection and registration. Cancellation clears sealed
+state and marks the existing flow row cancelled. Callback consumption admits token
+I/O; cancellation before consumption prevents that exchange. Credential publication
+locks the same flow row, requires live consumed state, applies credential-version
+CAS and marks success in one transaction. Cancellation after consumption therefore
+fences publication even if external I/O cannot be stopped. If publication wins,
+recovery queries and revokes that exact credential before clearing its local fence.
+A lost begin response can leave an unknown pending flow until expiry and cleanup;
+the stale orchestrator call cannot return its authorization URL or record a usable
+callback after recovery. Unknown flow IDs are never inferred or broadly cancelled.
+
 ### Authorization and irreversible dispatch
 
 Before execution, validate the active session/run, immutable binding, principal,

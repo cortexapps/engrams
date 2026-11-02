@@ -110,7 +110,8 @@ export function makeCredentialMetadataStore(db = getDb()) {
         throw new Error("stale authorization flow");
       const metadata = checkedMetadata(row.mcpCredential);
       metadata.transition = { id: crypto.randomUUID(), actorId, startedAt: now.getTime() };
-      if (!callbackId) delete metadata.flow;
+      // Keep the exact pending attempt until the lifecycle adapter has durably
+      // canceled it. Clearing it here would lose the coordinator fence subject.
       const nextRevision = revision + (callbackId ? 0 : 1),
         nextGeneration = generation + (callbackId ? 0 : 1);
       await tx
