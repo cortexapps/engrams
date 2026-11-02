@@ -231,12 +231,15 @@ impl SessionPolicyService for PolicyControl {
             .get_managed_boot(&identity)
             .await
             .map_err(err)?;
-        boot_response(row)
+        Ok(Response::new(wire::ReadManagedBootResponse {
+            protocol: wire::PROTOCOL,
+            boot_json: boot_json(row)?,
+        }))
     }
     async fn finalize_managed_boot(
         &self,
         req: Request<wire::FinalizeManagedBootRequest>,
-    ) -> Result<Response<wire::ReadManagedBootResponse>, Status> {
+    ) -> Result<Response<wire::FinalizeManagedBootResponse>, Status> {
         let _admission = self.control.check(&req, req.get_ref().protocol)?;
         if req.get_ref().protocol != wire::PROTOCOL {
             return Err(Status::invalid_argument("unsupported protocol"));
@@ -256,7 +259,10 @@ impl SessionPolicyService for PolicyControl {
             .map_err(|_| {
                 Status::failed_precondition("managed boot authority changed or unavailable")
             })?;
-        boot_response(Some(row))
+        Ok(Response::new(wire::FinalizeManagedBootResponse {
+            protocol: wire::PROTOCOL,
+            boot_json: boot_json(Some(row))?,
+        }))
     }
     async fn reserve_managed_create(
         &self,
@@ -785,18 +791,13 @@ mod tests {
 #[path = "policy_tests.rs"]
 mod recovery_tests;
 
-fn boot_response(
+fn boot_json(
     row: Option<engram_core::types::managed_boot::ManagedBootRecord>,
-) -> Result<Response<wire::ReadManagedBootResponse>, Status> {
-    let boot_json = row
-        .map(|mut r| {
-            r.sealed_agent = None;
-            engram_protocol::managed_boot::encode(&r)
-                .map_err(|_| Status::internal("managed boot encoding failed"))
-        })
-        .transpose()?;
-    Ok(Response::new(wire::ReadManagedBootResponse {
-        protocol: wire::PROTOCOL,
-        boot_json,
-    }))
+) -> Result<Option<Vec<u8>>, Status> {
+    row.map(|mut r| {
+        r.sealed_agent = None;
+        engram_protocol::managed_boot::encode(&r)
+            .map_err(|_| Status::internal("managed boot encoding failed"))
+    })
+    .transpose()
 }
