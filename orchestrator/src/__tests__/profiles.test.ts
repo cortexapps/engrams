@@ -770,18 +770,27 @@ describe("user-scoped grants (ADR 0115)", () => {
 describe("MCP profile grant contract", () => {
   test("create, update, and list preserve explicit organization scope and constraints", async () => {
     const s = await spawn({ getSession: makeGetSession("admin", "admin"), store: makeFakeStore(), images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]) });
-    const grant = { connectionId: "default-mcp", operation: "invoke", credentialScope: "org", resourceConstraints: [], mcp: { upstreamName: "Create.Record", automationWrite: true, argumentConstraintsJson: JSON.stringify({ type: "object", properties: { project: { const: "allowed" } }, required: ["project"] }), unrestricted: false } };
+    const grant = { connectionId: "default-mcp", operation: "invoke", credentialScope: "org", resourceConstraints: [], mcp: { upstreamName: "Create.Record", automationWrite: true, argumentConstraintDocumentsJson: [
+      JSON.stringify({ $schema: "http://json-schema.org/draft-07/schema#", $id: "https://schemas.example.test/constraint", $defs: { item: { const: "allowed" } }, type: "object", properties: { project: { $ref: "#/$defs/item" } }, required: ["project"] }),
+      JSON.stringify({ $schema: "https://json-schema.org/draft/2020-12/schema", $id: "https://schemas.example.test/constraint", $defs: { item: { type: "integer", minimum: 1 } }, type: "object", properties: { count: { $ref: "#/$defs/item" } }, required: ["count"] }),
+    ], unrestricted: false } };
     const input = { name: "Tools", imageId: "img-1", harness: "claude", integrationGrants: [grant] };
     try {
       const created = await s.client.createProfile(input);
       expect(created.profile!.integrationGrants[0]!.credentialScope).toBe("org");
-      expect(created.profile!.integrationGrants[0]!.mcp?.argumentConstraintsJson).toBe(grant.mcp.argumentConstraintsJson);
+      expect(created.profile!.integrationGrants[0]!.mcp?.argumentConstraintDocumentsJson).toEqual(grant.mcp.argumentConstraintDocumentsJson);
       const updated = await s.client.updateProfile({ ...input, id: created.profile!.id, name: "Renamed tools" });
       expect(updated.profile!.integrationGrants[0]!.mcp?.automationWrite).toBe(true);
+      expect(updated.profile!.integrationGrants[0]!.mcp?.argumentConstraintDocumentsJson).toEqual(grant.mcp.argumentConstraintDocumentsJson);
       const listed = await s.client.listProfiles({});
       expect(listed.profiles[0]!.integrationGrants[0]!.mcp?.upstreamName).toBe("Create.Record");
+      expect(listed.profiles[0]!.integrationGrants[0]!.mcp?.argumentConstraintDocumentsJson).toEqual(grant.mcp.argumentConstraintDocumentsJson);
       await expectErr(s.client.updateProfile({ ...input, id: created.profile!.id, integrationGrants: [{ ...grant, credentialScope: "user" }] }), Code.InvalidArgument);
-      await expectErr(s.client.updateProfile({ ...input, id: created.profile!.id, integrationGrants: [{ ...grant, mcp: { ...grant.mcp, argumentConstraintsJson: "{}" } }] }), Code.InvalidArgument);
+      await expectErr(s.client.updateProfile({ ...input, id: created.profile!.id, integrationGrants: [{ ...grant, mcp: { ...grant.mcp, argumentConstraintDocumentsJson: [] } }] }), Code.InvalidArgument);
+      await expectErr(s.client.updateProfile({ ...input, id: created.profile!.id, integrationGrants: [{ ...grant, mcp: { ...grant.mcp, argumentConstraintDocumentsJson: ["[]"] } }] }), Code.InvalidArgument);
+      const unrestricted = await s.client.updateProfile({ ...input, id: created.profile!.id, integrationGrants: [{ ...grant, mcp: { ...grant.mcp, argumentConstraintDocumentsJson: [], unrestricted: true } }] });
+      expect(unrestricted.profile!.integrationGrants[0]!.mcp?.argumentConstraintDocumentsJson).toEqual([]);
+      expect(unrestricted.profile!.integrationGrants[0]!.mcp?.unrestricted).toBe(true);
     } finally { await s.close(); }
   });
 });

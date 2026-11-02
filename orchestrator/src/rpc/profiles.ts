@@ -135,7 +135,7 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
       mcp: grant.mcp ? {
         upstreamName: grant.mcp.upstreamName,
         automationWrite: grant.mcp.automationWrite,
-        argumentConstraintsJson: JSON.stringify(grant.mcp.argumentConstraints),
+        argumentConstraintDocumentsJson: grant.mcp.argumentConstraintDocuments.map((document) => JSON.stringify(document)),
         unrestricted: grant.mcp.unrestricted,
       } : undefined,
     })),
@@ -492,7 +492,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       operation?: string;
       resourceConstraints?: string[];
       credentialScope?: string;
-      mcp?: { upstreamName: string; automationWrite: boolean; argumentConstraintsJson: string; unrestricted: boolean };
+      mcp?: { upstreamName: string; automationWrite: boolean; argumentConstraintDocumentsJson: string[]; unrestricted: boolean };
     }>,
   ): ProfileIntegrationGrant[] {
     return grants.map((grant) => {
@@ -505,11 +505,14 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       }
       let mcp: ProfileIntegrationGrant["mcp"];
       if (grant.mcp) {
-        let constraints: unknown;
-        try { constraints = JSON.parse(grant.mcp.argumentConstraintsJson); }
-        catch { throw new ConnectError("MCP constraints must be valid JSON", Code.InvalidArgument); }
-        if (!constraints || typeof constraints !== "object" || Array.isArray(constraints)) throw new ConnectError("MCP constraints must be a JSON object", Code.InvalidArgument);
-        mcp = { upstreamName: grant.mcp.upstreamName, automationWrite: grant.mcp.automationWrite, argumentConstraints: constraints as Record<string, unknown>, unrestricted: grant.mcp.unrestricted };
+        const documents = grant.mcp.argumentConstraintDocumentsJson.map((json) => {
+          let document: unknown;
+          try { document = JSON.parse(json); }
+          catch { throw new ConnectError("MCP constraints must be valid JSON", Code.InvalidArgument); }
+          if (!document || typeof document !== "object" || Array.isArray(document)) throw new ConnectError("MCP constraints must be JSON objects", Code.InvalidArgument);
+          return document as Record<string, unknown>;
+        });
+        mcp = { upstreamName: grant.mcp.upstreamName, automationWrite: grant.mcp.automationWrite, argumentConstraintDocuments: documents, unrestricted: grant.mcp.unrestricted };
       }
       return {
         ...(mcp ? { mcp } : {}),

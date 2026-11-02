@@ -94,25 +94,23 @@ export function intersectMcpGrants(
     );
     if (!inherited) throw new Error("child tool grant exceeds parent authority");
     validateMcpGrant(inherited);
-    const parentConstraint = inherited.mcp!.argumentConstraints;
-    const childConstraint = child.mcp!.argumentConstraints;
     const unrestricted = inherited.mcp!.unrestricted && child.mcp!.unrestricted;
-    const argumentConstraints = unrestricted
-      ? {}
-      : inherited.mcp!.unrestricted
-        ? childConstraint
-        : child.mcp!.unrestricted
-          ? parentConstraint
-          : { allOf: [parentConstraint, childConstraint] };
-    return structuredClone({
+    // Keep each root intact: allOf wrapping changes local references and resource scope.
+    const argumentConstraintDocuments = [
+      ...inherited.mcp!.argumentConstraintDocuments,
+      ...child.mcp!.argumentConstraintDocuments,
+    ];
+    const effective = structuredClone({
       ...child,
       mcp: {
         ...child.mcp!,
         automationWrite: inherited.mcp!.automationWrite && child.mcp!.automationWrite,
         unrestricted,
-        argumentConstraints,
+        argumentConstraintDocuments,
       },
     });
+    validateMcpGrant(effective);
+    return effective;
   });
 }
 

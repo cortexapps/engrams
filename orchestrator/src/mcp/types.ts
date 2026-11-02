@@ -1,11 +1,14 @@
 import type { ProfileIntegrationGrant } from "../db/schema.ts";
 import type { McpConfig } from "./config.ts";
 import { assertSchemaShape } from "./catalog.ts";
+import { canonicalJson } from "./hash.ts";
+import { MCP_LIMITS } from "./limits.ts";
 
 export interface McpToolGrant {
   upstreamName: string;
   automationWrite: boolean;
-  argumentConstraints: Record<string, unknown>;
+  /** Conjunction of independent documents. Compile each in its own dialect/resource scope. */
+  argumentConstraintDocuments: Record<string, unknown>[];
   /** Required affirmative choice when constraints are empty. */
   unrestricted: boolean;
 }
@@ -66,8 +69,14 @@ export function validateMcpGrant(grant: ProfileIntegrationGrant): void {
     typeof tool.unrestricted !== "boolean"
   )
     throw new Error("invalid MCP tool grant");
-  assertSchemaShape(tool.argumentConstraints);
-  const empty = Object.keys(tool.argumentConstraints).length === 0;
+  const documents = tool.argumentConstraintDocuments;
+  if (!Array.isArray(documents)) throw new Error("MCP constraints must be schema documents");
+  if (Buffer.byteLength(canonicalJson(documents)) > MCP_LIMITS.argumentBytes)
+    throw new Error("MCP constraints are too large");
+  for (const document of documents) assertSchemaShape(document);
+  const empty = documents.length === 0;
+  if (!empty && documents.every((document) => Object.keys(document).length === 0))
+    throw new Error("empty constraints require an explicit unrestricted choice");
   if (empty !== tool.unrestricted)
     throw new Error("empty constraints require an explicit unrestricted choice");
 }

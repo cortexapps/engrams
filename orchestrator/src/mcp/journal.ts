@@ -268,6 +268,8 @@ export function makeMcpJournal(db = getDb()) {
             MCP_LIMITS.connectionConcurrency &&
           active.filter((a) => a.sessionId === call.sessionId).length <
             MCP_LIMITS.sessionConcurrency;
+        // Polling cannot extend the original queue deadline. Promotion starts a tool lease.
+        if (existing && !available) return "queued";
         const state = available ? "admitted" : "queued";
         if (
           !available &&

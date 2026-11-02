@@ -281,6 +281,10 @@ message DeleteProfileResponse {}
 message McpToolGrant {
   string upstream_name = 1;
   bool automation_write = 2;
-  string argument_constraints_json = 3;
+  reserved 3;
+  reserved "argument_constraints_json";
   bool unrestricted = 4;
+  // Every document must pass in its own dialect and resource scope.
+  // An empty list requires an explicit unrestricted choice.
+  repeated string argument_constraint_documents_json = 5;
 }

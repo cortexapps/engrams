@@ -186,7 +186,7 @@ describe("MCP durable authority", () => {
             grant: {
               upstreamName: tool.upstreamName,
               automationWrite: true,
-              argumentConstraints: {},
+              argumentConstraintDocuments: [],
               unrestricted: true,
             },
           },
@@ -271,7 +271,7 @@ describe("MCP authority isolation", () => {
               grant: {
                 upstreamName: tool.upstreamName,
                 automationWrite: false,
-                argumentConstraints: {},
+                argumentConstraintDocuments: [],
                 unrestricted: true,
               },
             },
@@ -364,7 +364,7 @@ describe("MCP authority isolation", () => {
             grant: {
               upstreamName: tool.upstreamName,
               automationWrite: true,
-              argumentConstraints: {},
+              argumentConstraintDocuments: [],
               unrestricted: true,
             },
           },
@@ -444,7 +444,7 @@ test.skipIf(!reachable)("replicas share connection and deployment admission ceil
     grant: {
       upstreamName: tool.upstreamName,
       automationWrite: true,
-      argumentConstraints: {},
+      argumentConstraintDocuments: [],
       unrestricted: true,
     },
   };
@@ -529,7 +529,7 @@ test.skipIf(!reachable)(
           grant: {
             upstreamName: tool.upstreamName,
             automationWrite: true,
-            argumentConstraints: {},
+            argumentConstraintDocuments: [],
             unrestricted: true,
           },
         },
@@ -539,6 +539,57 @@ test.skipIf(!reachable)(
       expect(count).toBeGreaterThanOrEqual(2);
       expect((await f.journal.get(waiting.id))!.state).toBe("canceled");
       expect((await f.journal.get(ready.id))!.state).toBe("canceled");
+    } finally {
+      await f.cleanup();
+    }
+  },
+);
+
+test.skipIf(!reachable)(
+  "admission retries preserve queue expiry and promotion starts a tool window",
+  async () => {
+    const f = await fixture();
+    const authorization = {
+      kind: "automation" as const,
+      grant: {
+        upstreamName: tool.upstreamName,
+        automationWrite: true,
+        argumentConstraintDocuments: [],
+        unrestricted: true,
+      },
+    };
+    const at = (seconds: number) => new Date(f.now.getTime() + seconds * 1000);
+    try {
+      const calls = await Promise.all(
+        Array.from({ length: 6 }, (_, i) =>
+          f.journal.create(
+            { ...f.input, toolCallId: `fixed-queue-${i}`, deadline: at(300) },
+            authorization,
+            f.now,
+          ),
+        ),
+      );
+      for (const call of calls.slice(0, 4))
+        expect(await f.journal.admit(call.id, f.deploymentId, f.now)).toBe("admitted");
+      for (const call of calls.slice(4)) {
+        expect(await f.journal.admit(call.id, f.deploymentId, f.now)).toBe("queued");
+        expect(await f.journal.admit(call.id, f.deploymentId, at(20))).toBe("queued");
+        const [lease] = await f.db
+          .select()
+          .from(mcpAdmission)
+          .where(eq(mcpAdmission.executionId, call.id));
+        expect(lease!.expiresAt).toEqual(at(30));
+      }
+      await f.journal.cancel(calls[0]!.id, "owner", false, at(25));
+      expect(await f.journal.admit(calls[4]!.id, f.deploymentId, at(25))).toBe("admitted");
+      const [promoted] = await f.db
+        .select()
+        .from(mcpAdmission)
+        .where(eq(mcpAdmission.executionId, calls[4]!.id));
+      expect(promoted!.expiresAt).toEqual(at(85));
+      await f.journal.expire(f.deploymentId, at(31));
+      expect((await f.journal.get(calls[5]!.id))!.state).toBe("canceled");
+      expect((await f.journal.get(calls[4]!.id))!.state).toBe("authorized");
     } finally {
       await f.cleanup();
     }

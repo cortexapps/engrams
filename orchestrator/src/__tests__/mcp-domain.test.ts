@@ -32,7 +32,7 @@ const grant = {
   mcp: {
     upstreamName: tool.upstreamName,
     automationWrite: false,
-    argumentConstraints: {},
+    argumentConstraintDocuments: [],
     unrestricted: true,
   },
 };
@@ -72,6 +72,18 @@ describe("MCP domain", () => {
       validateMcpGrant({ ...grant, mcp: { ...grant.mcp, unrestricted: false } }),
     ).toThrow();
     expect(() => validateMcpGrant({ ...grant, operation: tool.upstreamName })).toThrow();
+    expect(() =>
+      validateMcpGrant({
+        ...grant,
+        mcp: { ...grant.mcp, unrestricted: false, argumentConstraintDocuments: [{}] },
+      }),
+    ).toThrow();
+    expect(() =>
+      validateMcpGrant({
+        ...grant,
+        mcp: { ...grant.mcp, argumentConstraintDocuments: [{ type: "object" }] },
+      }),
+    ).toThrow();
   });
   test("catalog fingerprints bind upstream schema and explicit review", () => {
     const reviewed = reviewCatalog([tool]);
@@ -123,13 +135,17 @@ test("MCP child grants intersect constraints and automation permission", async (
     mcp: {
       ...grant.mcp,
       unrestricted: false,
-      argumentConstraints: { properties: { project: { const: "allowed" } }, required: ["project"] },
+      argumentConstraintDocuments: [
+        { properties: { project: { const: "allowed" } }, required: ["project"] },
+      ],
     },
   };
   const child = { ...grant, mcp: { ...grant.mcp, automationWrite: true } };
   const [effective] = intersectMcpGrants([parent], [child]);
   expect(effective!.mcp!.automationWrite).toBe(false);
-  expect(effective!.mcp!.argumentConstraints).toEqual(parent.mcp.argumentConstraints);
+  expect(effective!.mcp!.argumentConstraintDocuments).toEqual(
+    parent.mcp.argumentConstraintDocuments,
+  );
   expect(() => intersectMcpGrants([], [child])).toThrow();
 });
 
@@ -162,4 +178,75 @@ test("schema keyword checks do not reinterpret ordinary property names or consta
   expect(() =>
     assertSchemaShape({ properties: { child: { $ref: "https://example.test/schema" } } }),
   ).toThrow("local");
+});
+
+test("child intersections preserve independent local references with colliding definition names", async () => {
+  const { intersectMcpGrants } = await import("../mcp/bindings.ts");
+  const parentSchema = {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: "https://schemas.example.test/constraint",
+    $defs: { item: { const: "allowed" } },
+    type: "object",
+    properties: { project: { $ref: "#/$defs/item" } },
+    required: ["project"],
+  };
+  const childSchema = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    $id: "https://schemas.example.test/constraint",
+    $defs: { item: { type: "integer", minimum: 1, maximum: 5 } },
+    type: "object",
+    properties: { count: { $ref: "#/$defs/item" } },
+    required: ["count"],
+  };
+  const parent = {
+    ...grant,
+    mcp: { ...grant.mcp, unrestricted: false, argumentConstraintDocuments: [parentSchema] },
+  };
+  const child = {
+    ...grant,
+    mcp: { ...grant.mcp, unrestricted: false, argumentConstraintDocuments: [childSchema] },
+  };
+  const [effective] = intersectMcpGrants([parent], [child]);
+  expect(effective!.mcp).toHaveProperty("argumentConstraintDocuments", [parentSchema, childSchema]);
+  expect(effective!.mcp!.unrestricted).toBe(false);
+  const documents = effective!.mcp!.argumentConstraintDocuments;
+  const resolve = (document: Record<string, unknown>, pointer: string): unknown =>
+    pointer
+      .slice(2)
+      .split("/")
+      .reduce<unknown>((value, key) => {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+          throw new Error("missing reference target");
+        return (value as Record<string, unknown>)[key];
+      }, document);
+  expect(resolve(documents[0]!, parentSchema.properties.project.$ref)).toEqual({
+    const: "allowed",
+  });
+  expect(resolve(documents[1]!, childSchema.properties.count.$ref)).toEqual({
+    type: "integer",
+    minimum: 1,
+    maximum: 5,
+  });
+  const [descendant] = intersectMcpGrants([effective!], [grant]);
+  expect(descendant!.mcp!.argumentConstraintDocuments).toEqual(documents);
+  const [binding] = compileBindings([
+    {
+      id: "c1",
+      alias: "docs",
+      config,
+      state,
+      enabled: true,
+      tools: reviewCatalog([tool]),
+      grants: [effective!],
+    },
+  ]);
+  expect(binding!.tools[0]!.grant.argumentConstraintDocuments).toEqual(documents);
+  parentSchema.$defs.item.const = "changed";
+  childSchema.$defs.item.maximum = 100;
+  expect(resolve(documents[0]!, "#/$defs/item")).toEqual({ const: "allowed" });
+  expect(resolve(documents[1]!, "#/$defs/item")).toEqual({
+    type: "integer",
+    minimum: 1,
+    maximum: 5,
+  });
 });
