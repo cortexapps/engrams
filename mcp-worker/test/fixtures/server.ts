@@ -23,6 +23,24 @@ export interface FixtureOptions {
   holdCalls?: boolean;
   requireAuth?: boolean;
   callbackIssuer?: string;
+  apiKey?: string;
+  initialCount?: number;
+  commitWrite?: (callIdentity: string, delta: number) => number;
+  network?: {
+    host: string;
+    port: number;
+    key: string;
+    cert: string;
+    ca: string;
+    origin: string;
+    oauth: {
+      issuer: string;
+      authorization: string;
+      token: string;
+      redirectUri: string;
+    };
+    allowedAuthorities: string[];
+  };
 }
 export interface ObservedRequest {
   method: string;
@@ -39,9 +57,9 @@ interface RpcMessage {
 export async function startMcpFixture(options: FixtureOptions = {}) {
   const version = options.version ?? "2026-07-28";
   const modern = version === "2026-07-28";
-  let origin = "";
+  let origin = options.network?.origin ?? "";
   let revision = 1;
-  let count = 0;
+  let count = options.initialCount ?? 0;
   let reads = 0;
   let writes = 0;
   let cancellations = 0;
@@ -58,38 +76,93 @@ export async function startMcpFixture(options: FixtureOptions = {}) {
   >();
   const calls = eventBarrier();
   const canceled = eventBarrier();
-  const oauth = createOAuthFixture(() => origin, options.callbackIssuer);
+  const oauth = createOAuthFixture(
+    () => origin,
+    options.callbackIssuer,
+    options.network?.oauth,
+  );
   const server = createServer(
-    { key: TEST_KEY, cert: TEST_CERT },
+    {
+      key: options.network?.key ?? TEST_KEY,
+      cert: options.network?.cert ?? TEST_CERT,
+    },
     (req, res) => {
-      void handle(req, res).catch((error: unknown) => {
+      void handle(req, res).catch(() => {
         if (!res.headersSent) res.writeHead(500);
-        res.end(
-          error instanceof Error ? error.message : "Fixture request failed",
-        );
+        res.end("Fixture request failed");
       });
     },
   );
+  server.requestTimeout = 5000;
+  server.headersTimeout = 5000;
+  server.keepAliveTimeout = 1000;
+  server.maxConnections = 64;
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
+    server.listen(
+      options.network?.port ?? 0,
+      options.network?.host ?? "127.0.0.1",
+      resolve,
+    );
   });
   const address = server.address();
   if (!address || typeof address === "string")
     throw new Error("Missing fixture listener");
-  origin = `https://127.0.0.1:${address.port}`;
+  if (!options.network) origin = `https://127.0.0.1:${address.port}`;
 
   async function handle(req: IncomingMessage, res: ServerResponse) {
-    const url = new URL(req.url ?? "/", origin);
+    if (
+      options.network &&
+      (!req.headers.host ||
+        !options.network.allowedAuthorities.includes(req.headers.host))
+    ) {
+      res.writeHead(421).end();
+      return;
+    }
+    if (!req.url?.startsWith("/") || req.url.startsWith("//")) {
+      res.writeHead(400).end();
+      return;
+    }
+    const url = new URL(
+      req.url,
+      `https://${req.headers.host ?? new URL(origin).host}`,
+    );
+    if (options.network) {
+      const expected =
+        url.pathname === "/authorize"
+          ? options.network.oauth.authorization
+          : url.pathname === "/token"
+            ? options.network.oauth.token
+            : url.pathname === "/.well-known/oauth-authorization-server"
+              ? options.network.oauth.issuer
+              : origin;
+      if (url.origin !== expected) {
+        res.writeHead(421).end();
+        return;
+      }
+    }
     const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    let bytes = 0;
+    for await (const chunk of req) {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > 65536) {
+        res.writeHead(413).end();
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    }
     const raw = Buffer.concat(chunks).toString("utf8");
     if (oauth.handle(req, res, url, raw)) return;
     if (url.pathname !== "/mcp") {
       res.writeHead(404).end();
       return;
     }
-    if (options.requireAuth && !oauth.accepts(req.headers.authorization)) {
+    if (
+      options.requireAuth &&
+      (!options.apiKey ||
+        req.headers.authorization !== `Bearer ${options.apiKey}`) &&
+      !oauth.accepts(req.headers.authorization)
+    ) {
       res.writeHead(401, {
         "content-type": "application/json",
         "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"`,
@@ -131,6 +204,7 @@ export async function startMcpFixture(options: FixtureOptions = {}) {
       return;
     }
     const message = body;
+    if (requests.length === 128) requests.shift();
     requests.push({
       method: message.method,
       sessionId,
@@ -151,6 +225,10 @@ export async function startMcpFixture(options: FixtureOptions = {}) {
       return;
     }
     if (!modern && message.method === "initialize") {
+      if (sessions.size >= 128) {
+        rpcError(-32000, "Session limit", 429);
+        return;
+      }
       const id = `fixture-session-${++sessionSequence}`;
       sessions.set(id, req.headers.authorization);
       res.setHeader("mcp-session-id", id);
@@ -228,13 +306,23 @@ export async function startMcpFixture(options: FixtureOptions = {}) {
           rpcError(-32602, "Arguments must be an object");
           return;
         }
+        if (pending.size >= 64) {
+          rpcError(-32000, "Held call limit", 429);
+          return;
+        }
         if (message.params?.name === "read_counter") ++reads;
         else if (
           message.params?.name === "write_counter" &&
           Number.isSafeInteger(args.delta)
         ) {
+          const delta = Number(args.delta);
+          count = options.commitWrite
+            ? options.commitWrite(
+                JSON.stringify([sessionId ?? null, message.id ?? null]),
+                delta,
+              )
+            : count + delta;
           ++writes;
-          count += Number(args.delta);
         } else {
           rpcError(-32602, "Unknown tool or invalid delta");
           return;
@@ -348,9 +436,24 @@ export async function startMcpFixture(options: FixtureOptions = {}) {
     get origin() {
       return origin;
     },
-    ca: TEST_CA,
+    ca: options.network?.ca ?? TEST_CA,
     fetch: fixtureFetch,
     requests,
+    oauth,
+    get heldCalls() {
+      return pending.size;
+    },
+    setCase(
+      value: Pick<
+        FixtureOptions,
+        "reply" | "response" | "holdCalls" | "requireAuth"
+      >,
+    ) {
+      Object.assign(options, value);
+    },
+    cancelCalls() {
+      for (const [response] of pending) response.destroy();
+    },
     get reads() {
       return reads;
     },
