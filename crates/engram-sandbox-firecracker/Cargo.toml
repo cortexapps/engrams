@@ -18,6 +18,9 @@ unsafe_code = "allow"
 [dependencies]
 engram-chunk-store.workspace = true
 engram-core.workspace = true
+engram-egress-proto.workspace = true
+sha2.workspace = true
+hex.workspace = true
 engram-telemetry.workspace = true
 engram-agentd.workspace = true
 engram-harness-proto.workspace = true
@@ -43,8 +46,6 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 rtnetlink.workspace = true
 
 [dev-dependencies]
-sha2.workspace = true
-hex.workspace = true
 engram-egress-proxy.workspace = true
 engram-storage-local.workspace = true
 # ADR 0080 phase 3b: `materialize_boot` runs the real materializer
