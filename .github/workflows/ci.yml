@@ -253,6 +253,28 @@ jobs:
           done
       - name: terraform fmt -check
         run: terraform fmt -check -recursive -diff deploy/terraform
+      - name: Callback ingress profiles and effective nginx canary
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ruby
+          python3 -m unittest discover \
+            -s deploy/helm/engram/ci/tests -p 'test_callback_profiles.py'
+          python3 -m unittest discover \
+            -s .github/scripts/tests -p 'test_mcp_lanes.py'
+          image="$(sed -n 's/^FROM \(nginx:[^ ]*\)$/\1/p' docker/web.Dockerfile)"
+          test -n "$image"
+          docker pull "$image"
+          python3 deploy/helm/engram/ci/callback-ingress-canary.py \
+            --stage var/mcp-callback-canary
+      - name: Keep callback canary evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: callback-ingress-canary
+          path: var/mcp-callback-canary
+          if-no-files-found: error
       - name: terraform validate (every root)
         run: |
           set -euo pipefail

@@ -585,9 +585,9 @@ def main():
     test_buf = ci_self or proto
     test_integrations_cli = ci_self or any_path(changed, INTEGRATIONS_CLI_PATHS)
     # ADR 0122: the deploy-config lane (helm lint/template + terraform
-    # fmt/validate). Same path set as the bake-side tf_or_helm flag,
-    # plus ci_self like every test lane.
-    test_deploy = ci_self or tf_or_helm
+    # fmt/validate + actual nginx callback canary). The web runtime image
+    # also changes the effective nginx behavior, without changing the chart.
+    test_deploy = ci_self or tf_or_helm or any_path(changed, ["docker/web.Dockerfile"])
     # The site lane: leak lint + astro build, build-only (no deploy on PRs).
     test_site = ci_self or any_path(changed, SITE_PATHS)
     # ADR 0098 P9: the host-sim swarm — its binary's own release closure.

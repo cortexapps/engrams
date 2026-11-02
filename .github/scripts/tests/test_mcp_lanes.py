@@ -50,5 +50,15 @@ class McpLanes(unittest.TestCase):
         self.assertEqual(result['test_mcp_worker'], 'false')
         self.assertEqual(result['test_netstack'], 'false')
 
+    def test_callback_canary_runs_for_its_profiles_runtime_and_script(self):
+        for path in ['deploy/helm/engram/templates/web-configmap.yaml',
+                     'deploy/helm/engram/values-aws.yaml.example',
+                     'deploy/terraform/gcp/quickstart/eso.tf',
+                     'deploy/helm/engram/ci/callback-ingress-canary.py',
+                     'docker/web.Dockerfile']:
+            with self.subTest(path=path):
+                self.assertEqual(detect(path)['test_deploy'], 'true')
+        self.assertEqual(detect('README.md')['test_deploy'], 'false')
+
 if __name__ == '__main__':
     unittest.main()
