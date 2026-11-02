@@ -24,6 +24,7 @@ fn verify_file(path: &Path, digest: &str, size: Option<u64>) -> io::Result<()> {
 }
 
 pub(super) struct PinnedFiles {
+    pub(super) retain: std::sync::atomic::AtomicBool,
     pub path: std::path::PathBuf,
 }
 impl PinnedFiles {
@@ -43,7 +44,10 @@ impl PinnedFiles {
         // exclusive creation rejects a collision, never adopts another owner.
         let path = work.join(format!("m-{}", &name[..24]));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        let files = Self { path };
+        let files = Self {
+            path,
+            retain: std::sync::atomic::AtomicBool::new(false),
+        };
         files.pin(
             spec.rootfs_source
                 .as_deref()
@@ -87,6 +91,9 @@ impl PinnedFiles {
 }
 impl Drop for PinnedFiles {
     fn drop(&mut self) {
+        if self.retain.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
@@ -144,6 +151,18 @@ pub(super) mod tests {
         cfg.bundle_dir = dir.to_owned();
         cfg.balloon = false;
         (cfg, request, spec)
+    }
+    #[test]
+    fn retirement_failure_retains_exact_private_source_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, request, spec) = inputs(dir.path());
+        let files = PinnedFiles::prepare(&dir.path().join("owned"), &cfg, &request, &spec).unwrap();
+        let path = files.path.clone();
+        files
+            .retain
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(files);
+        assert_eq!(std::fs::read(path.join("rootfs.ext4")).unwrap(), b"disk-a");
     }
     #[test]
     fn uuid_boot_attempt_fits_native_control_socket_path() {

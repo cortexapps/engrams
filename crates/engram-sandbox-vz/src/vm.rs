@@ -179,7 +179,7 @@ impl VmConfig {
         network.validate()?;
         // IP configuration is a host-selected boot input. No DHCP or legacy
         // guest DNAT is used on this attachment. Enforcement stays in the host.
-        self.kernel_cmdline = format!("console=hvc0 tsc=reliable panic=0 root=/dev/vda rw quiet init=/sbin/engram-init ip={}::{}:255.255.255.0::eth0:off:{}", network.guest, network.gateway, network.gateway);
+        self.kernel_cmdline = format!("console=hvc0 tsc=reliable panic=0 root=/dev/vda rw quiet init=/sbin/engram-init ip={}::{}:255.255.255.0::eth0:off:{} engram_managed_dns={}", network.guest, network.gateway, network.gateway, network.gateway);
         self.mac_address = Some(network.mac.clone());
         self.managed_network = Some(network);
         Ok(self)
@@ -402,6 +402,7 @@ pub(crate) struct VzVm {
     /// callbacks silently never fire.
     _delegate: Retained<VmStopDelegate>,
     managed_attachment: Option<Retained<objc2_virtualization::VZFileHandleNetworkDeviceAttachment>>,
+    managed_attachment_identity: Option<(i32, (u64, u64))>,
 }
 
 // SAFETY: see `SendableVm` for the full argument. The `VzVm` itself
@@ -456,6 +457,20 @@ impl VzVm {
             Some(attachment)
         } else {
             None
+        };
+
+        let managed_attachment_identity = match &managed_attachment {
+            Some(attachment) => {
+                // SAFETY: the fresh retained attachment owns this descriptor.
+                let fd = unsafe { attachment.fileHandle().fileDescriptor() };
+                Some((
+                    fd,
+                    descriptor_identity(fd).ok_or_else(|| {
+                        VzError::ConfigInvalid("managed descriptor missing".into())
+                    })?,
+                ))
+            }
+            None => None,
         };
 
         // Validate. Returns `Result<(), Retained<NSError>>`.
@@ -519,21 +534,32 @@ impl VzVm {
             dead,
             _delegate: delegate,
             managed_attachment,
+            managed_attachment_identity,
         })
     }
 
     /// Check the actual connected device on the VM queue, not a guest report.
     pub async fn managed_attachment_closed(&self) -> bool {
+        self.managed_attachment_current(false).await
+    }
+
+    pub(crate) async fn managed_attachment_current(&self, running: bool) -> bool {
         let (tx, rx) = oneshot::channel();
         let vm = Sendable(self.vm.clone());
         let expected = self.managed_attachment.clone().map(Sendable);
+        let identity = self.managed_attachment_identity;
         self.queue.exec_async(move || {
             let vm = vm;
             let expected = expected;
             // SAFETY: all live VM property access is on its dispatch queue.
             let closed = unsafe {
                 let devices = vm.0.networkDevices();
-                vm.0.state() == VZVirtualMachineState::Stopped
+                vm.0.state()
+                    == if running {
+                        VZVirtualMachineState::Running
+                    } else {
+                        VZVirtualMachineState::Stopped
+                    }
                     && devices.count() == 1
                     && devices
                         .objectAtIndex(0)
@@ -547,7 +573,10 @@ impl VzVm {
                             expected.as_ref().is_some_and(|e| {
                                 Retained::as_ptr(&a) == Retained::as_ptr(&e.0)
                                     && a.maximumTransmissionUnit() == 1500
-                                    && a.fileHandle().fileDescriptor() >= 0
+                                    && identity.as_ref().is_some_and(|(fd, stamp)| {
+                                        a.fileHandle().fileDescriptor() == *fd
+                                            && descriptor_identity(*fd).as_ref() == Some(stamp)
+                                    })
                             })
                         })
             };
@@ -770,6 +799,20 @@ pub(crate) fn aux_drives_in_slot_order(drives: &[AuxRoDrive]) -> Vec<&AuxRoDrive
     let mut ordered: Vec<&AuxRoDrive> = drives.iter().collect();
     ordered.sort_by_key(|d| d.slot_index().unwrap_or(usize::MAX));
     ordered
+}
+
+fn descriptor_identity(fd: i32) -> Option<(u64, u64)> {
+    use std::os::{fd::BorrowedFd, unix::fs::MetadataExt};
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: the retained native file handle owns this descriptor throughout
+    // the queue operation. The duplicate is used only for a metadata read.
+    let duplicate = unsafe { BorrowedFd::borrow_raw(fd) }
+        .try_clone_to_owned()
+        .ok()?;
+    let metadata = std::fs::File::from(duplicate).metadata().ok()?;
+    Some((metadata.dev(), metadata.ino()))
 }
 
 fn build_network(cfg: &VmConfig) -> Result<Retained<VZVirtioNetworkDeviceConfiguration>, VzError> {

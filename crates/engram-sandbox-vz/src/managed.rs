@@ -1,4 +1,4 @@
-//! Closed VZ construction and owned helper lifetime. No start permit lives here.
+//! Exact managed VZ ownership from CLOSED preparation through source retirement.
 use std::{io, path::Path};
 
 fn verify_file(path: &Path, digest: &str, size: Option<u64>) -> io::Result<()> {
@@ -35,8 +35,7 @@ pub struct ManagedHelperArtifact {
     pub sha256: String,
 }
 
-/// A stopped VM and its closed network owner. No operation can release it in
-/// this producer. It is never inserted into the ordinary sandbox map.
+/// A private VM and network owner. It never enters the ordinary sandbox map.
 pub struct PreparedManagedVz {
     // Drop the native machine before files or the attachment owner.
     vm: crate::vm::VzVm,
@@ -44,6 +43,9 @@ pub struct PreparedManagedVz {
     _files: PinnedFiles,
     receipt: ManagedVzClosedReceipt,
     failed: bool,
+    released_epoch: Option<u64>,
+    started: bool,
+    bridge: Option<crate::vsock_bridge::VsockBridge>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -73,11 +75,131 @@ impl PreparedManagedVz {
         }
         Ok(self.receipt.clone())
     }
+    /// Keep the fresh VM stopped until the helper acknowledges the exact epoch.
+    pub async fn release(&mut self, epoch: u64) -> Result<(), engram_core::SandboxError> {
+        self.closed_receipt().await?;
+        self.failed = true;
+        self.helper.release(epoch).await?;
+        if !self.vm.managed_attachment_closed().await {
+            let _ = self.helper.close().await;
+            return Err(io::Error::other("managed attachment changed before release").into());
+        }
+        self.released_epoch = Some(epoch);
+        self.failed = false;
+        Ok(())
+    }
+    pub async fn check_ready(&mut self, epoch: u64) -> Result<(), engram_core::SandboxError> {
+        if self.failed || self.released_epoch != Some(epoch) || self.vm.is_dead() {
+            return Err(io::Error::other("managed owner is not ready").into());
+        }
+        self.helper.check_ready(epoch)?;
+        if !self.vm.managed_attachment_current(self.started).await {
+            return Err(io::Error::other("managed attachment changed").into());
+        }
+        Ok(())
+    }
+    /// A single SpawnHarness write into a fresh kernel context. No reattach retry.
+    pub async fn start_agent(
+        &mut self,
+        agent: engram_core::types::sandbox::AgentSpec,
+        sink: engram_core::traits::HarnessSink,
+    ) -> Result<(), engram_core::SandboxError> {
+        let epoch = agent.binding_epoch;
+        self.check_ready(epoch).await?;
+        if self.started {
+            return Err(io::Error::other("managed start already issued").into());
+        }
+        self.started = true;
+        // Preserve the exact source through an unknown start, Drop or close.
+        self._files
+            .retain
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.failed = true;
+        self.vm.start().await?;
+        let dir = engram_core::socket::short_socket_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!(
+            "{}.managed",
+            self.receipt.prepared.request.sandbox_id
+        ));
+        let (bridge, connector) = crate::vsock_bridge::VsockBridge::start(
+            self.vm.raw_clone(),
+            self.vm.queue_clone(),
+            path,
+            Some(sink),
+            None,
+            None,
+        )
+        .await
+        .map_err(io::Error::other)?;
+        self.bridge = Some(bridge);
+        let mut conn = connector.connect_stream(1024).await?;
+        let request =
+            engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
+                argv: agent.argv,
+                env: agent.env.into_iter().collect(),
+                session_env: agent.session_env.into_iter().collect(),
+                host_ca_pem: agent.host_ca_pem,
+            });
+        engram_agentd::write_msg(&mut conn, &request).await?;
+        let response: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn).await?;
+        if !matches!(response, engram_agentd::WireResponse::HarnessSpawned { .. }) {
+            return Err(io::Error::other("managed harness start failed").into());
+        }
+        self.helper.check_ready(epoch)?;
+        self.failed = false;
+        Ok(())
+    }
+    /// Pause, retire the source, sync its disk, then copy the exact durable cut.
+    /// This makes no claim about unflushed guest page-cache data.
+    pub async fn retire_disk(
+        &mut self,
+        destination: &Path,
+    ) -> Result<(), engram_core::SandboxError> {
+        if self.failed {
+            return Err(io::Error::other("managed capture source unavailable").into());
+        }
+        self._files
+            .retain
+            .store(true, std::sync::atomic::Ordering::Release);
+        if !self.started {
+            if let Some(epoch) = self.released_epoch {
+                self.check_ready(epoch).await?;
+            } else {
+                self.closed_receipt().await?;
+            }
+        }
+        self.failed = true;
+        if self.started {
+            self.vm.pause().await?;
+            self.vm.stop().await?;
+        }
+        if let Some(mut bridge) = self.bridge.take() {
+            bridge.stop().await;
+        }
+        self.helper.close().await?;
+        let source = self._files.path.join("rootfs.ext4");
+        let destination = destination.to_owned();
+        tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&source)?.sync_all()?;
+            crate::disk::clone_or_copy_blocking(&source, &destination).map_err(io::Error::other)?;
+            std::fs::File::open(&destination)?.sync_all()
+        })
+        .await
+        .map_err(io::Error::other)??;
+        Ok(())
+    }
     /// Await owned process cleanup without blocking the executor. Drop starts
     /// cleanup but does not wait for its result. Success does not acknowledge the proxy
     /// policy barrier. Only that proxy can release its lease or poison its gate.
     pub async fn close(mut self) -> Result<(), engram_core::SandboxError> {
         self.failed = true;
+        if self.started {
+            let _ = self.vm.stop().await;
+        }
+        if let Some(mut bridge) = self.bridge.take() {
+            bridge.stop().await;
+        }
         self.helper.close().await?;
         Ok(())
     }
@@ -179,6 +301,9 @@ pub(crate) async fn prepare(
         helper,
         _files: files,
         failed: false,
+        released_epoch: None,
+        started: false,
+        bridge: None,
         receipt: ManagedVzClosedReceipt {
             prepared: ManagedColdPrepared {
                 version: 1,
@@ -232,6 +357,7 @@ fn configure_packet(socket: &std::os::unix::net::UnixDatagram) -> io::Result<()>
 }
 
 struct PinnedFiles {
+    retain: std::sync::atomic::AtomicBool,
     path: std::path::PathBuf,
 }
 impl PinnedFiles {
@@ -250,7 +376,10 @@ impl PinnedFiles {
         ));
         // No overwrite or adoption of an earlier attempt's directory.
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        let files = Self { path };
+        let files = Self {
+            path,
+            retain: std::sync::atomic::AtomicBool::new(false),
+        };
         files.pin(
             spec.rootfs_source
                 .as_deref()
@@ -270,6 +399,17 @@ impl PinnedFiles {
             if !files.path.join(&filename).exists() {
                 files.pin(&cfg.bundle_dir.join(&filename), &filename, hash, None)?;
             }
+        }
+        use std::os::unix::fs::MetadataExt;
+        let helper_metadata = std::fs::symlink_metadata(&artifact.path)?;
+        // SAFETY: geteuid only reads this process identity.
+        let owner = unsafe { libc::geteuid() };
+        if !artifact.path.is_absolute()
+            || !helper_metadata.is_file()
+            || helper_metadata.mode() & 0o022 != 0
+            || (helper_metadata.uid() != 0 && helper_metadata.uid() != owner)
+        {
+            return Err(io::Error::other("managed helper is not operator owned").into());
         }
         files.pin(&artifact.path, "netstack", &artifact.sha256, None)?;
         use std::os::unix::fs::PermissionsExt;
@@ -301,6 +441,9 @@ impl PinnedFiles {
 }
 impl Drop for PinnedFiles {
     fn drop(&mut self) {
+        if self.retain.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
@@ -395,6 +538,26 @@ mod tests {
     }
 
     #[test]
+    fn retirement_failure_retains_source_and_untrusted_helper_mode_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, request, spec, artifact) = inputs(dir.path());
+        let files =
+            PinnedFiles::prepare(&dir.path().join("owned"), &cfg, &request, &spec, &artifact)
+                .unwrap();
+        let path = files.path.clone();
+        files
+            .retain
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(files);
+        assert_eq!(std::fs::read(path.join("rootfs.ext4")).unwrap(), b"disk-a");
+        std::fs::set_permissions(&artifact.path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            PinnedFiles::prepare(&dir.path().join("other"), &cfg, &request, &spec, &artifact)
+                .is_err()
+        );
+    }
+    #[test]
     fn all_selected_boot_files_are_private_and_failed_attempts_leave_no_files() {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, request, spec, artifact) = inputs(dir.path());
@@ -487,6 +650,7 @@ mod tests {
         let owned = dir.path().join("private");
         std::fs::create_dir(&owned).unwrap();
         let files = PinnedFiles {
+            retain: std::sync::atomic::AtomicBool::new(false),
             path: owned.clone(),
         };
         let digest = hex::encode(Sha256::digest(b"disk-a"));

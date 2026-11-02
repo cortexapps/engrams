@@ -26,6 +26,7 @@ pub(in crate::managed) struct Namespace {
     addresses: Value,
     routes: Value,
     rules: Value,
+    released: std::sync::atomic::AtomicBool,
 }
 impl Namespace {
     pub async fn create(
@@ -64,6 +65,7 @@ impl Namespace {
             addresses: Value::Null,
             routes: Value::Null,
             rules: Value::Null,
+            released: std::sync::atomic::AtomicBool::new(false),
         };
         owner.run(
             "sysctl",
@@ -242,6 +244,35 @@ impl Namespace {
         }
         Ok(routes)
     }
+    /// Remove only the two retained CLOSED tables after the adapter's exact ACK.
+    pub fn release(&self, child_pid: u32) -> io::Result<()> {
+        self.check(Some(child_pid))?;
+        if self.released.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        self.run(
+            "nft",
+            &["-f", "-"],
+            Some(b"delete table netdev closed\ndelete table inet closed\n"),
+        )?;
+        if self.json("nft", &["-j", "-s", "list", "ruleset"])? != self.released_rules() {
+            return Err(io::Error::other("released network rules changed"));
+        }
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.check(Some(child_pid))
+    }
+    fn released_rules(&self) -> Value {
+        let mut rules = self.rules.clone();
+        if let Some(items) = rules["nftables"].as_array_mut() {
+            items.retain(|item| {
+                item["table"]["name"] != "closed"
+                    && item["chain"]["table"] != "closed"
+                    && item["rule"]["table"] != "closed"
+            });
+        }
+        rules
+    }
     pub fn check(&self, child_pid: Option<u32>) -> io::Result<()> {
         let metadata = self.fd.metadata()?;
         if metadata.dev() != self.identity.namespace_device
@@ -260,7 +291,12 @@ impl Namespace {
         if self.link_shape()? != self.links
             || addresses != self.addresses
             || self.route_shape()? != self.routes
-            || self.json("nft", &["-j", "-s", "list", "ruleset"])? != self.rules
+            || self.json("nft", &["-j", "-s", "list", "ruleset"])?
+                != if self.released.load(std::sync::atomic::Ordering::Acquire) {
+                    self.released_rules()
+                } else {
+                    self.rules.clone()
+                }
         {
             return Err(io::Error::other("managed network shape changed"));
         }

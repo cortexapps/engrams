@@ -1,4 +1,4 @@
-//! Managed cold preparation. Closed owners have no start or resume operation.
+//! Exact managed Firecracker ownership from CLOSED preparation to retirement.
 #[cfg(any(target_os = "linux", test))]
 mod adapter;
 #[cfg(any(target_os = "linux", test))]
@@ -31,8 +31,8 @@ pub struct ManagedFcClosedReceipt {
     pub rules_sha256: String,
     pub configuration_sha256: String,
 }
-/// A never-started process, exact private boot files and closed private network.
-/// It cannot enter the ordinary sandbox map or expose a start/resume permit.
+/// Exact private process, boot files and network ownership through retirement.
+/// It cannot enter the ordinary sandbox map or expose a generic resume permit.
 pub struct PreparedManagedFc {
     #[cfg(not(target_os = "linux"))]
     _unavailable: std::convert::Infallible,
@@ -48,6 +48,10 @@ struct Prepared {
     config: serde_json::Value,
     receipt: ManagedFcClosedReceipt,
     failed: bool,
+    files: std::sync::Arc<files::PinnedFiles>,
+    released_epoch: Option<u64>,
+    started: bool,
+    streams: tokio::task::JoinSet<()>,
 }
 impl crate::FirecrackerBackend {
     pub async fn prepare_managed_cold(
@@ -99,11 +103,143 @@ impl PreparedManagedFc {
             ))
         }
     }
+    #[cfg(target_os = "linux")]
+    pub async fn release(&mut self, epoch: u64) -> Result<(), SandboxError> {
+        self.closed_receipt().await?;
+        self.inner.failed = true;
+        self.inner.adapter.release(epoch).await?;
+        let pid = self.inner.process.live_pid()?;
+        let namespace = self.inner.namespace.clone();
+        tokio::task::spawn_blocking(move || namespace.release(pid))
+            .await
+            .map_err(std::io::Error::other)??;
+        self.inner.adapter.check_ready(epoch)?;
+        self.inner.released_epoch = Some(epoch);
+        self.inner.failed = false;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn check_ready(&mut self, epoch: u64) -> Result<(), SandboxError> {
+        if self.inner.failed || self.inner.released_epoch != Some(epoch) {
+            return Err(std::io::Error::other("managed owner is not ready").into());
+        }
+        self.inner.adapter.check_ready(epoch)?;
+        let pid = self.inner.process.live_pid()?;
+        let namespace = self.inner.namespace.clone();
+        tokio::task::spawn_blocking(move || namespace.check(Some(pid)))
+            .await
+            .map_err(std::io::Error::other)??;
+        if self.inner.api.managed_get("/vm/config").await? != self.inner.config
+            || self.inner.api.managed_get("/").await?["state"]
+                != if self.inner.started {
+                    "Running"
+                } else {
+                    "Not started"
+                }
+        {
+            return Err(std::io::Error::other("managed VM configuration changed").into());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn start_agent(
+        &mut self,
+        agent: engram_core::types::sandbox::AgentSpec,
+        sink: engram_core::traits::HarnessSink,
+    ) -> Result<(), SandboxError> {
+        self.check_ready(agent.binding_epoch).await?;
+        if self.inner.started {
+            return Err(std::io::Error::other("managed start already issued").into());
+        }
+        self.inner.started = true;
+        // An issued start can change the disk before its reply. Preserve the
+        // exact private lineage through cancellation, Drop and terminal close.
+        self.inner
+            .files
+            .retain
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.inner.failed = true;
+        let vsock = self.inner.files.path.join("guest.vsock");
+        let listener = tokio::net::UnixListener::bind(crate::harness_uds_for(&vsock))?;
+        self.inner.streams.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                sink(Box::pin(stream));
+            }
+        });
+        self.inner
+            .api
+            .put_action(crate::client::ActionType::InstanceStart)
+            .await?;
+        let mut conn = tokio::time::timeout(std::time::Duration::from_secs(180), async {
+            loop {
+                self.inner.process.live_pid()?;
+                self.inner.adapter.check_ready(agent.binding_epoch)?;
+                if let Ok(conn) =
+                    crate::FirecrackerBackend::connect_fc_vsock_once(&vsock, 1024).await
+                {
+                    return Ok::<_, SandboxError>(conn);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| std::io::Error::other("managed agent connection timed out"))??;
+        let request =
+            engram_agentd::WireRequest::SpawnHarness(engram_agentd::SpawnHarnessRequest {
+                argv: agent.argv,
+                env: agent.env.into_iter().collect(),
+                session_env: agent.session_env.into_iter().collect(),
+                host_ca_pem: agent.host_ca_pem,
+            });
+        // Never retry the write or unknown response in this fresh guest context.
+        engram_agentd::write_msg(&mut conn, &request).await?;
+        let response: engram_agentd::WireResponse = engram_agentd::read_msg(&mut conn).await?;
+        if !matches!(response, engram_agentd::WireResponse::HarnessSpawned { .. }) {
+            return Err(std::io::Error::other("managed harness start failed").into());
+        }
+        self.inner.failed = false;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub async fn retire_disk(&mut self, destination: &std::path::Path) -> Result<(), SandboxError> {
+        if self.inner.failed {
+            return Err(std::io::Error::other("managed capture source unavailable").into());
+        }
+        self.inner
+            .files
+            .retain
+            .store(true, std::sync::atomic::Ordering::Release);
+        if !self.inner.started {
+            if let Some(epoch) = self.inner.released_epoch {
+                self.check_ready(epoch).await?;
+            } else {
+                self.closed_receipt().await?;
+            }
+        }
+        self.inner.failed = true;
+        if self.inner.started {
+            self.inner.api.pause().await?;
+        }
+        self.inner.streams.shutdown().await;
+        self.inner.adapter.close().await?;
+        self.inner.process.close().await?;
+        let source = self.inner.files.path.join("rootfs.ext4");
+        let destination = destination.to_owned();
+        tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&source)?.sync_all()?;
+            std::fs::copy(&source, &destination)?;
+            std::fs::File::open(&destination)?.sync_all()
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        Ok(())
+    }
     /// Wait for adapter and VM cleanup. Drop initiates cleanup only.
     pub async fn close(mut self) -> Result<(), SandboxError> {
         #[cfg(target_os = "linux")]
         {
             self.inner.failed = true;
+            self.inner.streams.shutdown().await;
             let network = self.inner.adapter.close().await;
             let process = self.inner.process.close().await;
             network?;
@@ -167,7 +303,7 @@ async fn prepare(
         network = network::Namespace::create(shape.clone()) => network?,
     };
     let path = files.path.clone();
-    let mut process = process::Process::reserve(namespace.clone(), files)?;
+    let mut process = process::Process::reserve(namespace.clone(), files.clone())?;
     let adapter = adapter::Adapter::spawn(
         private,
         tokio::net::TcpListener::from_std(tcp)?,
@@ -220,6 +356,10 @@ async fn prepare(
             api,
             config,
             failed: false,
+            files,
+            released_epoch: None,
+            started: false,
+            streams: tokio::task::JoinSet::new(),
             receipt: ManagedFcClosedReceipt {
                 prepared: ManagedColdPrepared {
                     version: 1,

@@ -22,9 +22,10 @@ const DEAD: u8 = 2;
 
 pub(super) struct Adapter {
     cancel: watch::Sender<bool>,
-    // Only the later durable start implementation may expose a consuming
-    // release operation. Holding this sender keeps the worker dormant.
+    // The exact host-owned epoch consumes this sender once. Until then the
+    // worker cannot admit packet flows.
     _release: Option<oneshot::Sender<u64>>,
+    released_epoch: Option<u64>,
     state: Arc<AtomicU8>,
     done: oneshot::Receiver<()>,
     result: Option<Result<(), String>>,
@@ -126,15 +127,78 @@ impl Adapter {
         Ok(Self {
             cancel,
             _release: Some(release),
+            released_epoch: None,
             state,
             done,
             result: None,
             probe,
         })
     }
+    /// Only READY after the exact private Bind reply can release native fences.
+    pub async fn release(&mut self, epoch: u64) -> io::Result<()> {
+        if self.released_epoch == Some(epoch) && self.state.load(Ordering::Acquire) == READY {
+            return self.check_ready(epoch);
+        }
+        self.check_closed()?;
+        if self.released_epoch.is_some() || epoch == 0 || epoch > 9_007_199_254_740_991 {
+            return Err(wire::invalid());
+        }
+        struct ReleaseGuard {
+            cancel: watch::Sender<bool>,
+            state: Arc<AtomicU8>,
+            armed: bool,
+        }
+        impl Drop for ReleaseGuard {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.state.store(DEAD, Ordering::Release);
+                    self.cancel.send_replace(true);
+                }
+            }
+        }
+        let mut guard = ReleaseGuard {
+            cancel: self.cancel.clone(),
+            state: self.state.clone(),
+            armed: true,
+        };
+        self.released_epoch = Some(epoch);
+        self._release
+            .take()
+            .ok_or_else(wire::invalid)?
+            .send(epoch)
+            .map_err(|_| wire::invalid())?;
+        let result = tokio::time::timeout(Duration::from_secs(wire::HANDOFF_SECONDS), async {
+            loop {
+                match self.state.load(Ordering::Acquire) {
+                    READY => return Ok(()),
+                    DEAD => return Err(wire::invalid()),
+                    _ => tokio::time::sleep(Duration::from_millis(1)).await,
+                }
+            }
+        })
+        .await
+        .map_err(|_| wire::invalid())
+        .and_then(|r| r);
+        if result.is_err() {
+            self.cancel.send_replace(true);
+        }
+        if result.is_ok() {
+            guard.armed = false;
+        }
+        result
+    }
+    pub fn check_ready(&self, epoch: u64) -> io::Result<()> {
+        if self.released_epoch != Some(epoch)
+            || self.state.load(Ordering::Acquire) != READY
+            || *self.cancel.borrow()
+        {
+            return Err(wire::invalid());
+        }
+        Ok(())
+    }
     pub fn check_closed(&self) -> io::Result<()> {
         use std::os::fd::AsRawFd;
-        if self.state.load(Ordering::Acquire) != CLOSED {
+        if self.state.load(Ordering::Acquire) != CLOSED || *self.cancel.borrow() {
             return Err(io::Error::other("private network is no longer closed"));
         }
         let guard = self.probe.lock().map_err(|_| wire::invalid())?;
@@ -434,6 +498,81 @@ fn original_destination(_stream: &TcpStream) -> io::Result<SocketAddrV4> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn release_requires_exact_epoch_ack_and_never_reuses_unknown_start() {
+        for wrong_epoch in [false, true] {
+            let (private, mut peer) = UnixStream::pair().unwrap();
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut adapter = Adapter::spawn(
+                private,
+                tcp,
+                dns,
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::LOCALHOST,
+                None,
+            )
+            .unwrap();
+            let server = tokio::spawn(async move {
+                let bind: Request = wire::read(&mut peer).await.unwrap();
+                assert_eq!(bind.epoch, 7);
+                assert_eq!(bind.sequence, 1);
+                assert!(matches!(bind.operation, Operation::Bind));
+                wire::write(
+                    &mut peer,
+                    &Reply {
+                        version: 1,
+                        sequence: 1,
+                        epoch: if wrong_epoch { 8 } else { 7 },
+                        state: "ready".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                peer
+            });
+            let result = adapter.release(7).await;
+            let mut peer = server.await.unwrap();
+            if wrong_epoch {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+                adapter.check_ready(7).unwrap();
+                adapter.release(7).await.unwrap();
+                assert!(adapter.release(8).await.is_err());
+                assert!(adapter.check_closed().is_err());
+            }
+            adapter.close().await.unwrap();
+            assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+            assert!(adapter.check_ready(7).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_release_cannot_reissue_bind() {
+        let (private, mut peer) = UnixStream::pair().unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut adapter = Adapter::spawn(
+            private,
+            tcp,
+            dns,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+            None,
+        )
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), adapter.release(7))
+                .await
+                .is_err()
+        );
+        let bind: Request = wire::read(&mut peer).await.unwrap();
+        assert!(matches!(bind.operation, Operation::Bind));
+        assert!(adapter.release(7).await.is_err());
+        adapter.close().await.unwrap();
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    }
     #[tokio::test]
     async fn closed_adapter_emits_nothing_and_proxy_loss_is_terminal() {
         let (private, mut peer) = UnixStream::pair().unwrap();

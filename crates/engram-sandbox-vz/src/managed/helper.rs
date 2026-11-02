@@ -45,6 +45,8 @@ pub(super) struct Helper {
     cleanup: Cleanup,
     cleanup_complete: bool,
     cleanup_failed: bool,
+    released_epoch: Option<u64>,
+    release_pending: bool,
 }
 impl Helper {
     pub async fn spawn(
@@ -73,6 +75,8 @@ impl Helper {
             cleanup,
             cleanup_complete: false,
             cleanup_failed: false,
+            released_epoch: None,
+            release_pending: false,
         };
         // Establish the Drop owner before the first cancellable handshake write.
         private::write(&mut helper.control, config).await?;
@@ -82,6 +86,78 @@ impl Helper {
     }
     /// Reliable-channel and process checks. Datagram EOF is never evidence.
     pub fn check_closed(&mut self) -> io::Result<()> {
+        if self.released_epoch.is_some() || self.release_pending {
+            return Err(private::invalid());
+        }
+        self.check_live()
+    }
+    pub fn check_ready(&mut self, epoch: u64) -> io::Result<()> {
+        if self.released_epoch != Some(epoch) || self.release_pending {
+            return Err(private::invalid());
+        }
+        self.check_live()
+    }
+    /// One exact epoch, acknowledged by the helper after its private proxy bind.
+    /// A canceled handshake cannot be sent again on this owner.
+    pub async fn release(&mut self, epoch: u64) -> io::Result<()> {
+        if self.released_epoch == Some(epoch) && !self.release_pending {
+            return self.check_ready(epoch);
+        }
+        self.check_closed()?;
+        if epoch == 0 || epoch > 9_007_199_254_740_991 {
+            return Err(private::invalid());
+        }
+        use std::os::fd::AsFd;
+        struct ReleaseGuard {
+            socket: std::os::unix::net::UnixStream,
+            armed: bool,
+        }
+        impl Drop for ReleaseGuard {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = self.socket.shutdown(std::net::Shutdown::Both);
+                }
+            }
+        }
+        let mut guard = ReleaseGuard {
+            socket: std::os::unix::net::UnixStream::from(
+                self.control.as_fd().try_clone_to_owned()?,
+            ),
+            armed: true,
+        };
+        self.release_pending = true;
+        let result = tokio::time::timeout(DEADLINE, async {
+            private::write(
+                &mut self.control,
+                &serde_json::json!({"version":1,"kind":"open","epoch":epoch}),
+            )
+            .await?;
+            let reply: Reply = private::read(&mut self.control).await?;
+            if reply
+                != (Reply {
+                    version: 1,
+                    sequence: 1,
+                    epoch,
+                    state: "ready".into(),
+                })
+            {
+                return Err(private::invalid());
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| private::invalid())
+        .and_then(|r| r);
+        if result.is_err() {
+            self.begin_close();
+            return result;
+        }
+        guard.armed = false;
+        self.released_epoch = Some(epoch);
+        self.release_pending = false;
+        self.check_ready(epoch)
+    }
+    fn check_live(&mut self) -> io::Result<()> {
         if self.cleanup_failed
             || self
                 .child
@@ -340,6 +416,8 @@ mod tests {
                 cleanup,
                 cleanup_complete: false,
                 cleanup_failed: false,
+                released_epoch: None,
+                release_pending: false,
             };
             let (allocation, mut proxy) = UnixStream::pair().unwrap();
             let started = Instant::now();
@@ -419,6 +497,8 @@ mod tests {
             cleanup,
             cleanup_complete: false,
             cleanup_failed: false,
+            released_epoch: None,
+            release_pending: false,
         };
         assert!(
             tokio::time::timeout(Duration::from_millis(10), helper.close())
@@ -471,6 +551,236 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the verified packaged native helper"]
+    async fn actual_helper_release_ack_and_active_dns_cleanup() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let path = std::path::PathBuf::from(
+            std::env::var_os("ENGRAM_SANDBOX_NETSTACK_TEST_BIN").expect("packaged helper"),
+        );
+        let config = Config {
+            version: 1,
+            guest: "192.0.2.2".parse().unwrap(),
+            gateway: "192.0.2.1".parse().unwrap(),
+            mac: "02:00:00:00:00:02".into(),
+        };
+        let (packet, peer) = UnixDatagram::pair().unwrap();
+        let (private, mut proxy) = UnixStream::pair().unwrap();
+        let mut helper = Helper::spawn(&path, packet, private, &config)
+            .await
+            .unwrap();
+        let pid = helper.child.as_ref().unwrap().pid;
+        use futures::FutureExt;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            std::panic::AssertUnwindSafe(async {
+                let ack = tokio::spawn(async move {
+                    let bind: private::Request = private::read(&mut proxy).await.unwrap();
+                    assert_eq!(bind.epoch, 7);
+                    assert_eq!(bind.sequence, 1);
+                    assert!(matches!(bind.operation, private::Operation::Bind));
+                    private::write(
+                        &mut proxy,
+                        &Reply {
+                            version: 1,
+                            sequence: 1,
+                            epoch: 7,
+                            state: "ready".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    proxy
+                });
+                helper.release(7).await.unwrap();
+                let mut proxy = ack.await.unwrap();
+                helper.check_ready(7).unwrap();
+                helper.release(7).await.unwrap();
+                assert!(helper.release(8).await.is_err());
+                assert!(helper.check_closed().is_err());
+                // One UDP DNS datagram, entirely on the anonymous packet pair. The
+                // proxy holds its private stream; there is no host network socket.
+                let query = [
+                    0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 7, b'e', b'x', b'a', b'm', b'p',
+                    b'l', b'e', 0, 0, 1, 0, 1,
+                ];
+                let mut frame = vec![0; 14 + 20 + 8 + query.len()];
+                frame[..14].copy_from_slice(&[2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2, 8, 0]);
+                let len = (20 + 8 + query.len()) as u16;
+                frame[14..34].copy_from_slice(&[
+                    0x45,
+                    0,
+                    (len >> 8) as u8,
+                    len as u8,
+                    0,
+                    1,
+                    0,
+                    0,
+                    64,
+                    17,
+                    0,
+                    0,
+                    192,
+                    0,
+                    2,
+                    2,
+                    192,
+                    0,
+                    2,
+                    1,
+                ]);
+                let mut sum: u32 = frame[14..34]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from(u16::from_be_bytes([b[0], b[1]])))
+                    .sum();
+                while sum > 65535 {
+                    sum = (sum & 65535) + (sum >> 16);
+                }
+                frame[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+                let udp = (8 + query.len()) as u16;
+                frame[34..42].copy_from_slice(&[
+                    0x12,
+                    0x34,
+                    0,
+                    53,
+                    (udp >> 8) as u8,
+                    udp as u8,
+                    0,
+                    0,
+                ]);
+                frame[42..].copy_from_slice(&query);
+                peer.send(&frame).unwrap();
+                let flow: private::Request =
+                    tokio::time::timeout(DEADLINE, private::read(&mut proxy))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(matches!(
+                    flow.operation,
+                    private::Operation::Dns { port: 53, .. }
+                ));
+                let mut dns = private::receive_stream(&proxy).await.unwrap();
+                private::write(
+                    &mut proxy,
+                    &Reply {
+                        version: 1,
+                        sequence: flow.sequence,
+                        epoch: 7,
+                        state: "accepted".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(dns.read_u16().await.unwrap() as usize, query.len());
+                let mut received = vec![0; query.len()];
+                dns.read_exact(&mut received).await.unwrap();
+                proxy.shutdown().await.unwrap();
+                assert_eq!(
+                    tokio::time::timeout(DEADLINE, proxy.read(&mut [0]))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    tokio::time::timeout(DEADLINE, dns.read(&mut [0]))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+            })
+            .catch_unwind(),
+        )
+        .await;
+        helper.close().await.unwrap();
+        outcome
+            .expect("bounded helper exercise")
+            .expect("helper assertions");
+        assert!(helper.check_ready(7).is_err());
+        // SAFETY: this test observes only its exact already-reaped child.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the verified packaged native helper"]
+    async fn actual_helper_rejects_wrong_epoch_and_canceled_release() {
+        use futures::FutureExt;
+        let path = std::path::PathBuf::from(
+            std::env::var_os("ENGRAM_SANDBOX_NETSTACK_TEST_BIN").expect("packaged helper"),
+        );
+        let config = Config {
+            version: 1,
+            guest: "192.0.2.2".parse().unwrap(),
+            gateway: "192.0.2.1".parse().unwrap(),
+            mac: "02:00:00:00:00:02".into(),
+        };
+        for cancel in [false, true] {
+            let (packet, _peer) = UnixDatagram::pair().unwrap();
+            let (private, mut proxy) = UnixStream::pair().unwrap();
+            let mut helper = Helper::spawn(&path, packet, private, &config)
+                .await
+                .unwrap();
+            let pid = helper.child.as_ref().unwrap().pid;
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(15),
+                std::panic::AssertUnwindSafe(async {
+                    if cancel {
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(20), helper.release(7))
+                                .await
+                                .is_err()
+                        );
+                        assert!(helper.release(7).await.is_err());
+                    } else {
+                        let ack = tokio::spawn(async move {
+                            let _: private::Request = private::read(&mut proxy).await.unwrap();
+                            private::write(
+                                &mut proxy,
+                                &Reply {
+                                    version: 1,
+                                    sequence: 1,
+                                    epoch: 8,
+                                    state: "ready".into(),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            proxy
+                        });
+                        assert!(helper.release(7).await.is_err());
+                        drop(ack.await.unwrap());
+                    }
+                    assert!(helper.check_ready(7).is_err());
+                })
+                .catch_unwind(),
+            )
+            .await;
+            let _ = helper.close().await;
+            outcome
+                .expect("bounded invalid ACK exercise")
+                .expect("invalid ACK assertions");
+            // SAFETY: observe only the exact child owned and reaped above.
+            assert_eq!(
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
     }
 
     // Task 8 supplies the packaged helper and invokes this explicit target.

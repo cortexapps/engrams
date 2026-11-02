@@ -30,19 +30,20 @@ pub(super) async fn configure(
     .await?;
     // Reject a second kernel networking declaration. Guest configuration gives
     // function; the namespace and nft rules provide enforcement.
-    if cfg
-        .default_boot_args
-        .split_whitespace()
-        .any(|arg| arg.starts_with("ip=") || arg == "engram_base_capture=1")
-    {
+    if cfg.default_boot_args.split_whitespace().any(|arg| {
+        arg.starts_with("ip=")
+            || arg.starts_with("engram_managed_dns=")
+            || arg == "engram_base_capture=1"
+    }) {
         return Err(SandboxError::InvalidSpec(
             "managed boot arguments conflict with selected network".into(),
         ));
     }
     let boot_args = format!(
-        "{} ip={}::{}:255.255.255.0::eth0:off:{}",
+        "{} ip={}::{}:255.255.255.0::eth0:off:{} engram_managed_dns={}",
         cfg.default_boot_args.trim_end(),
         shape.guest,
+        shape.gateway,
         shape.gateway,
         shape.gateway
     );

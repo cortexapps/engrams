@@ -165,7 +165,24 @@ mark fs_mounts_done
 # timeout:2/attempts:2 bounds the residual worst case. Skip if
 # /etc/resolv.conf already exists (operator override).
 mkdir -p /etc
-if [ ! -s /etc/resolv.conf ]; then
+managed_dns=""
+if [ -r /proc/cmdline ]; then
+    read -r boot_line < /proc/cmdline || true
+    for boot_arg in $boot_line; do
+        case "$boot_arg" in
+            engram_managed_dns=*)
+                [ -z "$managed_dns" ] || exit 1
+                managed_dns=${boot_arg#engram_managed_dns=}
+                case "$managed_dns" in ""|*[!0-9.]*) exit 1 ;; esac
+                ;;
+        esac
+    done
+fi
+if [ -n "$managed_dns" ]; then
+    # The host selects this gateway before boot. Override image resolver data.
+    rm -f /etc/resolv.conf
+    printf 'nameserver %s\noptions timeout:2 attempts:2\n' "$managed_dns" > /etc/resolv.conf
+elif [ ! -s /etc/resolv.conf ]; then
     # Shell-pure VZ detection (no ip/grep dependency — the shim only
     # assumes /bin/sh): the guest's local addresses appear in
     # /proc/net/fib_trie; a 192.168.64.x entry means Apple's VZ NAT.
@@ -493,6 +510,44 @@ async fn chmod_executable(path: &Path) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_dns_uses_exact_boot_gateway_over_existing_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = dir.path().join("resolv.conf");
+        let cmdline = dir.path().join("cmdline");
+        std::fs::write(&resolver, "nameserver 203.0.113.53\n").unwrap();
+        std::fs::write(
+            &cmdline,
+            "root=/dev/vda engram_managed_dns=192.0.2.1 ip=192.0.2.2::192.0.2.1",
+        )
+        .unwrap();
+        let dns = DEFAULT_INIT_SHIM
+            .split("# DNS for userspace.")
+            .nth(1)
+            .unwrap()
+            .split("# /etc/hosts:")
+            .next()
+            .unwrap();
+        let script = format!("# DNS for userspace.{}", dns)
+            .replace("/etc/resolv.conf", resolver.to_str().unwrap())
+            .replace("/proc/cmdline", cmdline.to_str().unwrap())
+            .replace("mkdir -p /etc", "true");
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-ec")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(resolver).unwrap(),
+            "nameserver 192.0.2.1\noptions timeout:2 attempts:2\n"
+        );
+    }
 
     /// issue #240: the FC branch of the init shim's resolv.conf writer
     /// must NOT hand the guest a public recursive resolver. With the
