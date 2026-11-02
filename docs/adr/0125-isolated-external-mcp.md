@@ -466,3 +466,18 @@ policy, then implement the sole release/start operation. Its guest resolver
 must use the selected gateway. Root installed-rule, packet and VM acceptance
 remain required on Linux; local socket fixtures and cross-compilation are not
 that evidence. This decision remains Proposed.
+
+## CLOSED namespace CI qualification
+
+The required Firecracker root lane builds the current library test executable and
+runs `managed::network::linux::tests::actual_closed_namespace_readback_detects_route_tampering`
+with `--ignored --exact`. The gate requires one selected test and one passing test.
+It requires root with CAP_SYS_ADMIN and CAP_NET_ADMIN, a TAP device, `ip`,
+`sysctl`, nftables JSON support, and kernel netdev egress support (Linux 5.16 or
+later). A missing capability or unsupported kernel fails the test. The lane does
+not depend on the optional NBD device check.
+
+This is source wiring until the assigned CI lane runs and records a pass. It checks
+installed CLOSED state and detects route tampering. Packet forwarding, original
+destination, live DNS, Firecracker VM, VZ parity, full-stack and CNI acceptance
+remain separate gates. This check does not authorize activation.

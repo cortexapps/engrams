@@ -1267,6 +1267,14 @@ jobs:
           gh-token: ${{ secrets.GITHUB_TOKEN }}
           rust-cache-shared-key: fc-nbd-net
 
+      - name: Install CLOSED namespace test tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends iproute2 nftables procps
+
+      - name: CLOSED namespace installed-state test (root)
+        run: bash .github/scripts/mcp-acceptance-fc-closed.sh
+
       # ADR 0007 Phase 4: NBD daemon serves chunked disks. The
       # `nbd_chunked_disk` integration test boots a real FC microVM
       # with `/dev/nbd0` as the rootfs; the kernel's NBD client
