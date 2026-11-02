@@ -738,7 +738,7 @@ fn wire_version_pinned() {
     // 38 -> 39: per-call harness cancellation; 39 -> 40: creation authority RPCs.
     // The latter adds protobuf messages without changing existing bincode bytes.
     assert_eq!(
-        WIRE_VERSION, 40,
+        WIRE_VERSION, 41,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

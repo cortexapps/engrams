@@ -381,6 +381,34 @@ pub trait HostClient: Send + Sync {
     /// eliminates the WS-era frame-ordering invariant that the
     /// stateless transport can't honour. Local impl applies in-proc;
     /// the gRPC impl ships both fields in a single `StartAgent` RPC.
+    /// Exact managed authority only. Unsupported hosts remain closed.
+    async fn prepare_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedBootPrepare,
+    ) -> Result<crate::types::managed_boot::ManagedBootPreparedReceipt, SandboxError> {
+        Err(SandboxError::Unsupported("managed boot unavailable".into()))
+    }
+    /// Exact managed authority only. Unsupported hosts remain closed.
+    async fn read_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedBootKey,
+    ) -> Result<crate::types::managed_boot::ManagedBootHostState, SandboxError> {
+        Err(SandboxError::Unsupported("managed boot unavailable".into()))
+    }
+    /// Exact managed authority only. Unsupported hosts remain closed.
+    async fn finalize_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedBootFinalize,
+    ) -> Result<crate::types::managed_boot::ManagedBootFinalReceipt, SandboxError> {
+        Err(SandboxError::Unsupported("managed boot unavailable".into()))
+    }
+    /// Exact managed authority only. Unsupported hosts remain closed.
+    async fn start_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedBootStart,
+    ) -> Result<crate::types::managed_boot::ManagedBootHostState, SandboxError> {
+        Err(SandboxError::Unsupported("managed boot unavailable".into()))
+    }
     async fn read_managed_policy(
         &self,
         _target: crate::types::managed_deny::ManagedPolicyTarget,

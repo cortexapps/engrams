@@ -173,7 +173,8 @@ use serde::{Deserialize, Serialize};
 // v37 appends HostCapabilities.page_idle and the optional MigrationItem::HotHint.
 // v39 appends the harness per-call cancellation signal. Older fleets cannot decode it.
 // v40 adds immutable managed creation reservation and native-manifest reads.
-pub const WIRE_VERSION: u32 = 40;
+// v41: exact managed prepare/read/finalize/start authority. No ordinary fallback.
+pub const WIRE_VERSION: u32 = 41;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

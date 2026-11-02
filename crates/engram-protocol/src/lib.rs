@@ -31,3 +31,5 @@ pub mod mcp;
 pub mod host_tls;
 
 pub mod managed_policy;
+
+pub mod managed_boot;

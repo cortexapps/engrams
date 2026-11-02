@@ -18,6 +18,10 @@ syntax = "proto3";
 package engram.host.v1;
 
 service HostService {
+  rpc PrepareManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
+  rpc ReadManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
+  rpc FinalizeManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
+  rpc StartManagedBoot(ManagedBootRequest) returns (ManagedBootResponse);
   rpc ReadManagedPolicy(ReadManagedPolicyRequest) returns (ReadManagedPolicyResponse);
   rpc ApplyManagedPolicy(ApplyManagedPolicyRequest) returns (ApplyManagedPolicyResponse);
   // ---- sandbox lifecycle ----
@@ -874,3 +878,8 @@ message ReadManagedPolicyRequest { bytes target_bincode = 1; }
 message ReadManagedPolicyResponse { bytes state_bincode = 1; }
 message ApplyManagedPolicyRequest { bytes request_bincode = 1; }
 message ApplyManagedPolicyResponse { bytes state_bincode = 1; }
+
+// Versioned, bounded JSON for the exact typed managed boot commands.
+// Finalize contains plaintext environment only on authenticated host transport.
+message ManagedBootRequest { bytes payload_json = 1; }
+message ManagedBootResponse { bytes payload_json = 1; }
