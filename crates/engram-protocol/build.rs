@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .file_descriptor_set_path(&descriptor_path)
+        .skip_debug([".engram.host.v1.ManagedBootRequest"])
         // The default 4 MiB inbound message cap is fine for unary
         // payloads (SandboxSpec, SnapshotMetadata are well under
         // that). `ReapMaterializeDir` ships a vec of UUIDs that can
@@ -56,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".engram.app.v1", "crate::app")
         .skip_debug([
             ".engram.mcp.v1.PutSecretRequest",
+            ".engram.mcp.v1.ReserveManagedCreateRequest",
             ".engram.mcp.v1.CreatePolicySessionRequest",
             ".engram.mcp.v1.CompleteAuthorizationRequest",
             ".engram.mcp.v1.BeginAuthorizationResponse",

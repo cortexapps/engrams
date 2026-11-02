@@ -61,3 +61,6 @@ pub mod mcp_policy;
 pub mod managed_deny;
 
 pub mod managed_cold;
+pub mod managed_create;
+
+pub mod managed_boot;

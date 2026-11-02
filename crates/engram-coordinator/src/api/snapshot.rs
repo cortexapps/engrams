@@ -112,6 +112,8 @@ pub(crate) async fn reattach_harness_in_place(
     sandbox_id: SandboxId,
     fence: SessionFence,
 ) -> Result<bool, ApiError> {
+    crate::managed_boot::gate(state, session_id, false).await?;
+
     let session = state.services.meta.get_session(session_id).await?;
     // Re-confirm the session is still bound to the sandbox the caller resolved —
     // a concurrent eviction/resume may have moved it, and we must never re-issue
@@ -164,6 +166,8 @@ pub(crate) async fn snapshot_core(
     state: &SharedState,
     id: SessionId,
 ) -> Result<SnapshotResponse, ApiError> {
+    crate::managed_boot::gate(state, id, false).await?;
+
     state.services.meta.get_session(id).await?;
 
     let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
@@ -425,6 +429,8 @@ pub(crate) async fn resume_core(
     state: &SharedState,
     id: SessionId,
 ) -> Result<SnapshotResponse, ApiError> {
+    crate::managed_boot::gate(state, id, false).await?;
+
     let observed = enqueue_and_observe_resume(state, id).await?;
     Ok(SnapshotResponse {
         session_id: id,
@@ -564,6 +570,8 @@ async fn observe_resume_op(
 /// return 410; terminal `Completed` / `Failed` return 409 (no work
 /// is left to dispatch).
 pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), ApiError> {
+    crate::managed_boot::gate(state, id, true).await?;
+
     let session = state.services.meta.get_session(id).await?;
     match session.status {
         SessionState::Active => {

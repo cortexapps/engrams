@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/mcp/v1/session_policy.proto.
  */
 export const file_engram_mcp_v1_session_policy: GenFile = /*@__PURE__*/
-  fileDesc("CiJlbmdyYW0vbWNwL3YxL3Nlc3Npb25fcG9saWN5LnByb3RvEg1lbmdyYW0ubWNwLnYxIr0BChpDcmVhdGVQb2xpY3lTZXNzaW9uUmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRIzCgZjcmVhdGUYAiABKAsyIy5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0EhAKCGFjdG9yX2lkGAMgASgJEhAKCGlucHV0X2lkGAQgASgJEh4KEXBhcmVudF9zZXNzaW9uX2lkGAUgASgJSACIAQFCFAoSX3BhcmVudF9zZXNzaW9uX2lkInQKFlJlYWRXcml0ZVBvbGljeVJlcXVlc3QSEAoIcHJvdG9jb2wYASABKA0SEgoKc2Vzc2lvbl9pZBgCIAEoCRIeChFwbGFuX3Rvb2xfY2FsbF9pZBgDIAEoCUgAiAEBQhQKEl9wbGFuX3Rvb2xfY2FsbF9pZCKAAQoVQWNjZXB0UGxhbkV4aXRSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEi4KCGV4cGVjdGVkGAIgASgLMhwuZW5ncmFtLmFwcC52MS5NY3BQbGFuUmV2aWV3EhAKCGFjdG9yX2lkGAMgASgJEhMKC3Jlc3VsdF9qc29uGAQgASgJIsICChxWYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEhIKCnNlc3Npb25faWQYAiABKAkSDgoGcnVuX2lkGAMgASgJEhQKDHRvb2xfY2FsbF9pZBgEIAEoCRI9ChNhY2NlcHRlZF9wb2xpY3lfcmVmGAUgASgLMiAuZW5ncmFtLmFwcC52MS5NY3BXcml0ZVBvbGljeVJlZhIiChphY2NlcHRlZF93cml0ZV9lbGlnaWJpbGl0eRgGIAEoCRI+ChRhbmNlc3Rvcl9wb2xpY3lfcmVmcxgHIAMoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYSFwoPbW9kZWxfdG9vbF9uYW1lGAggASgJEhoKEm9yaWdpbmFsX2FyZ3VtZW50cxgJIAEoCSJBCh1WYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXNwb25zZRIQCghwcm90b2NvbBgBIAEoDRIOCgZzdGF0dXMYAiABKAkiVAobQ3JlYXRlUG9saWN5U2Vzc2lvblJlc3BvbnNlEjUKB3Nlc3Npb24YASABKAsyJC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXNwb25zZSJSChdSZWFkV3JpdGVQb2xpY3lSZXNwb25zZRI3CgVzdGF0ZRgBIAEoCzIoLmVuZ3JhbS5hcHAudjEuR2V0TWNwV3JpdGVQb2xpY3lSZXNwb25zZSJOChZBY2NlcHRQbGFuRXhpdFJlc3BvbnNlEjQKBnBvbGljeRgBIAEoCzIkLmVuZ3JhbS5hcHAudjEuTWNwVHJ1c3RlZFdyaXRlUG9saWN5IsYCCiBWYWxpZGF0ZUV4ZWN1dGlvbklkZW50aXR5UmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRISCgpzZXNzaW9uX2lkGAIgASgJEg4KBnJ1bl9pZBgDIAEoCRIUCgx0b29sX2NhbGxfaWQYBCABKAkSPQoTYWNjZXB0ZWRfcG9saWN5X3JlZhgFIAEoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYSIgoaYWNjZXB0ZWRfd3JpdGVfZWxpZ2liaWxpdHkYBiABKAkSPgoUYW5jZXN0b3JfcG9saWN5X3JlZnMYByADKAsyIC5lbmdyYW0uYXBwLnYxLk1jcFdyaXRlUG9saWN5UmVmEhcKD21vZGVsX3Rvb2xfbmFtZRgIIAEoCRIaChJvcmlnaW5hbF9hcmd1bWVudHMYCSABKAkiRQohVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eVJlc3BvbnNlEhAKCHByb3RvY29sGAEgASgNEg4KBnN0YXR1cxgCIAEoCSJlChNNYW5hZ2VkUG9saWN5VGFyZ2V0EhIKCnNlc3Npb25faWQYASABKAkSEgoKc2FuZGJveF9pZBgCIAEoCRIPCgdob3N0X2lkGAMgASgJEhUKDWJpbmRpbmdfZXBvY2gYBCABKAQi4AEKFE1hbmFnZWRQb2xpY3lDb250ZXh0EjIKBnRhcmdldBgBIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZFBvbGljeVRhcmdldBIbChNvcGVyYXRvcl9nZW5lcmF0aW9uGAIgASgEEhkKEW9wZXJhdG9yX2lkZW50aXR5GAMgASgJEjAKBXBoYXNlGAQgASgOMiEuZW5ncmFtLm1jcC52MS5NYW5hZ2VkUG9saWN5UGhhc2USGQoMYmluZGluZ19oYXNoGAUgASgJSACIAQFCDwoNX2JpbmRpbmdfaGFzaCJVChFNYW5hZ2VkRGVueVBvbGljeRIPCgd2ZXJzaW9uGAEgASgNEhAKCHJldmlzaW9uGAIgASgEEg0KBWhvc3RzGAMgAygJEg4KBmRpZ2VzdBgEIAEoCSKWAgoTTWFuYWdlZEFwcGxpZWRTdGF0ZRI0Cgdjb250ZXh0GAEgASgLMiMuZW5ncmFtLm1jcC52MS5NYW5hZ2VkUG9saWN5Q29udGV4dBIwCgZwb2xpY3kYAiABKAsyIC5lbmdyYW0ubWNwLnYxLk1hbmFnZWREZW55UG9saWN5EhgKEGhvc3RfaW5jYXJuYXRpb24YAyABKAkSGQoRcHJveHlfaW5jYXJuYXRpb24YBCABKAkSEAoIc3RhdGVfaWQYBSABKAkSPgoNbmV0d29ya19wcm9vZhgGIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZE5ldHdvcmtQcm9vZkgAiAEBQhAKDl9uZXR3b3JrX3Byb29mImAKGFJlYWRNYW5hZ2VkUG9saWN5UmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRIyCgZ0YXJnZXQYAiABKAsyIi5lbmdyYW0ubWNwLnYxLk1hbmFnZWRQb2xpY3lUYXJnZXQitAEKGVJlYWRNYW5hZ2VkUG9saWN5UmVzcG9uc2USEAoIcHJvdG9jb2wYASABKA0SOAoHYXBwbGllZBgCIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZEFwcGxpZWRTdGF0ZUgAiAEBEj8KEHJldGFpbmVkX2Rlc2lyZWQYAyABKAsyJS5lbmdyYW0ubWNwLnYxLk1hbmFnZWRSZXRhaW5lZERlc2lyZWRCCgoIX2FwcGxpZWQijgEKFk1hbmFnZWRSZXRhaW5lZERlc2lyZWQSMgoGdGFyZ2V0GAEgASgLMiIuZW5ncmFtLm1jcC52MS5NYW5hZ2VkUG9saWN5VGFyZ2V0EjUKBnBvbGljeRgCIAEoCzIgLmVuZ3JhbS5tY3AudjEuTWFuYWdlZERlbnlQb2xpY3lIAIgBAUIJCgdfcG9saWN5It0BChlBcHBseU1hbmFnZWRQb2xpY3lSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEjQKB2NvbnRleHQYAiABKAsyIy5lbmdyYW0ubWNwLnYxLk1hbmFnZWRQb2xpY3lDb250ZXh0EjAKBnBvbGljeRgDIAEoCzIgLmVuZ3JhbS5tY3AudjEuTWFuYWdlZERlbnlQb2xpY3kSOQoIZXhwZWN0ZWQYBCABKAsyIi5lbmdyYW0ubWNwLnYxLk1hbmFnZWRBcHBsaWVkU3RhdGVIAIgBAUILCglfZXhwZWN0ZWQiYwoaQXBwbHlNYW5hZ2VkUG9saWN5UmVzcG9uc2USEAoIcHJvdG9jb2wYASABKA0SMwoHYXBwbGllZBgCIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZEFwcGxpZWRTdGF0ZSJ1ChNNYW5hZ2VkTmV0d29ya1Byb29mEjIKBnRhcmdldBgBIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZFBvbGljeVRhcmdldBIQCghndWVzdF9pcBgCIAEoCRIYChBuZXR3b3JrX2lkZW50aXR5GAMgASgJKn4KEk1hbmFnZWRQb2xpY3lQaGFzZRIkCiBNQU5BR0VEX1BPTElDWV9QSEFTRV9VTlNQRUNJRklFRBAAEiIKHk1BTkFHRURfUE9MSUNZX1BIQVNFX0JPT1RTVFJBUBABEh4KGk1BTkFHRURfUE9MSUNZX1BIQVNFX0ZJTkFMEAIyjAYKFFNlc3Npb25Qb2xpY3lTZXJ2aWNlEmYKEVJlYWRNYW5hZ2VkUG9saWN5EicuZW5ncmFtLm1jcC52MS5SZWFkTWFuYWdlZFBvbGljeVJlcXVlc3QaKC5lbmdyYW0ubWNwLnYxLlJlYWRNYW5hZ2VkUG9saWN5UmVzcG9uc2USaQoSQXBwbHlNYW5hZ2VkUG9saWN5EiguZW5ncmFtLm1jcC52MS5BcHBseU1hbmFnZWRQb2xpY3lSZXF1ZXN0GikuZW5ncmFtLm1jcC52MS5BcHBseU1hbmFnZWRQb2xpY3lSZXNwb25zZRJsChNDcmVhdGVQb2xpY3lTZXNzaW9uEikuZW5ncmFtLm1jcC52MS5DcmVhdGVQb2xpY3lTZXNzaW9uUmVxdWVzdBoqLmVuZ3JhbS5tY3AudjEuQ3JlYXRlUG9saWN5U2Vzc2lvblJlc3BvbnNlEmAKD1JlYWRXcml0ZVBvbGljeRIlLmVuZ3JhbS5tY3AudjEuUmVhZFdyaXRlUG9saWN5UmVxdWVzdBomLmVuZ3JhbS5tY3AudjEuUmVhZFdyaXRlUG9saWN5UmVzcG9uc2USXQoOQWNjZXB0UGxhbkV4aXQSJC5lbmdyYW0ubWNwLnYxLkFjY2VwdFBsYW5FeGl0UmVxdWVzdBolLmVuZ3JhbS5tY3AudjEuQWNjZXB0UGxhbkV4aXRSZXNwb25zZRJ+ChlWYWxpZGF0ZUV4ZWN1dGlvbklkZW50aXR5Ei8uZW5ncmFtLm1jcC52MS5WYWxpZGF0ZUV4ZWN1dGlvbklkZW50aXR5UmVxdWVzdBowLmVuZ3JhbS5tY3AudjEuVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eVJlc3BvbnNlEnIKFVZhbGlkYXRlRGlzcGF0Y2hGZW5jZRIrLmVuZ3JhbS5tY3AudjEuVmFsaWRhdGVEaXNwYXRjaEZlbmNlUmVxdWVzdBosLmVuZ3JhbS5tY3AudjEuVmFsaWRhdGVEaXNwYXRjaEZlbmNlUmVzcG9uc2ViBnByb3RvMw", [file_engram_app_v1_session]);
+  fileDesc("CiJlbmdyYW0vbWNwL3YxL3Nlc3Npb25fcG9saWN5LnByb3RvEg1lbmdyYW0ubWNwLnYxIr0BChpDcmVhdGVQb2xpY3lTZXNzaW9uUmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRIzCgZjcmVhdGUYAiABKAsyIy5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0EhAKCGFjdG9yX2lkGAMgASgJEhAKCGlucHV0X2lkGAQgASgJEh4KEXBhcmVudF9zZXNzaW9uX2lkGAUgASgJSACIAQFCFAoSX3BhcmVudF9zZXNzaW9uX2lkInQKFlJlYWRXcml0ZVBvbGljeVJlcXVlc3QSEAoIcHJvdG9jb2wYASABKA0SEgoKc2Vzc2lvbl9pZBgCIAEoCRIeChFwbGFuX3Rvb2xfY2FsbF9pZBgDIAEoCUgAiAEBQhQKEl9wbGFuX3Rvb2xfY2FsbF9pZCKAAQoVQWNjZXB0UGxhbkV4aXRSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEi4KCGV4cGVjdGVkGAIgASgLMhwuZW5ncmFtLmFwcC52MS5NY3BQbGFuUmV2aWV3EhAKCGFjdG9yX2lkGAMgASgJEhMKC3Jlc3VsdF9qc29uGAQgASgJIsICChxWYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEhIKCnNlc3Npb25faWQYAiABKAkSDgoGcnVuX2lkGAMgASgJEhQKDHRvb2xfY2FsbF9pZBgEIAEoCRI9ChNhY2NlcHRlZF9wb2xpY3lfcmVmGAUgASgLMiAuZW5ncmFtLmFwcC52MS5NY3BXcml0ZVBvbGljeVJlZhIiChphY2NlcHRlZF93cml0ZV9lbGlnaWJpbGl0eRgGIAEoCRI+ChRhbmNlc3Rvcl9wb2xpY3lfcmVmcxgHIAMoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYSFwoPbW9kZWxfdG9vbF9uYW1lGAggASgJEhoKEm9yaWdpbmFsX2FyZ3VtZW50cxgJIAEoCSJBCh1WYWxpZGF0ZURpc3BhdGNoRmVuY2VSZXNwb25zZRIQCghwcm90b2NvbBgBIAEoDRIOCgZzdGF0dXMYAiABKAkiVAobQ3JlYXRlUG9saWN5U2Vzc2lvblJlc3BvbnNlEjUKB3Nlc3Npb24YASABKAsyJC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXNwb25zZSJSChdSZWFkV3JpdGVQb2xpY3lSZXNwb25zZRI3CgVzdGF0ZRgBIAEoCzIoLmVuZ3JhbS5hcHAudjEuR2V0TWNwV3JpdGVQb2xpY3lSZXNwb25zZSJOChZBY2NlcHRQbGFuRXhpdFJlc3BvbnNlEjQKBnBvbGljeRgBIAEoCzIkLmVuZ3JhbS5hcHAudjEuTWNwVHJ1c3RlZFdyaXRlUG9saWN5IsYCCiBWYWxpZGF0ZUV4ZWN1dGlvbklkZW50aXR5UmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRISCgpzZXNzaW9uX2lkGAIgASgJEg4KBnJ1bl9pZBgDIAEoCRIUCgx0b29sX2NhbGxfaWQYBCABKAkSPQoTYWNjZXB0ZWRfcG9saWN5X3JlZhgFIAEoCzIgLmVuZ3JhbS5hcHAudjEuTWNwV3JpdGVQb2xpY3lSZWYSIgoaYWNjZXB0ZWRfd3JpdGVfZWxpZ2liaWxpdHkYBiABKAkSPgoUYW5jZXN0b3JfcG9saWN5X3JlZnMYByADKAsyIC5lbmdyYW0uYXBwLnYxLk1jcFdyaXRlUG9saWN5UmVmEhcKD21vZGVsX3Rvb2xfbmFtZRgIIAEoCRIaChJvcmlnaW5hbF9hcmd1bWVudHMYCSABKAkiRQohVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eVJlc3BvbnNlEhAKCHByb3RvY29sGAEgASgNEg4KBnN0YXR1cxgCIAEoCSJlChNNYW5hZ2VkUG9saWN5VGFyZ2V0EhIKCnNlc3Npb25faWQYASABKAkSEgoKc2FuZGJveF9pZBgCIAEoCRIPCgdob3N0X2lkGAMgASgJEhUKDWJpbmRpbmdfZXBvY2gYBCABKAQi4AEKFE1hbmFnZWRQb2xpY3lDb250ZXh0EjIKBnRhcmdldBgBIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZFBvbGljeVRhcmdldBIbChNvcGVyYXRvcl9nZW5lcmF0aW9uGAIgASgEEhkKEW9wZXJhdG9yX2lkZW50aXR5GAMgASgJEjAKBXBoYXNlGAQgASgOMiEuZW5ncmFtLm1jcC52MS5NYW5hZ2VkUG9saWN5UGhhc2USGQoMYmluZGluZ19oYXNoGAUgASgJSACIAQFCDwoNX2JpbmRpbmdfaGFzaCJVChFNYW5hZ2VkRGVueVBvbGljeRIPCgd2ZXJzaW9uGAEgASgNEhAKCHJldmlzaW9uGAIgASgEEg0KBWhvc3RzGAMgAygJEg4KBmRpZ2VzdBgEIAEoCSKWAgoTTWFuYWdlZEFwcGxpZWRTdGF0ZRI0Cgdjb250ZXh0GAEgASgLMiMuZW5ncmFtLm1jcC52MS5NYW5hZ2VkUG9saWN5Q29udGV4dBIwCgZwb2xpY3kYAiABKAsyIC5lbmdyYW0ubWNwLnYxLk1hbmFnZWREZW55UG9saWN5EhgKEGhvc3RfaW5jYXJuYXRpb24YAyABKAkSGQoRcHJveHlfaW5jYXJuYXRpb24YBCABKAkSEAoIc3RhdGVfaWQYBSABKAkSPgoNbmV0d29ya19wcm9vZhgGIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZE5ldHdvcmtQcm9vZkgAiAEBQhAKDl9uZXR3b3JrX3Byb29mImAKGFJlYWRNYW5hZ2VkUG9saWN5UmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRIyCgZ0YXJnZXQYAiABKAsyIi5lbmdyYW0ubWNwLnYxLk1hbmFnZWRQb2xpY3lUYXJnZXQitAEKGVJlYWRNYW5hZ2VkUG9saWN5UmVzcG9uc2USEAoIcHJvdG9jb2wYASABKA0SOAoHYXBwbGllZBgCIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZEFwcGxpZWRTdGF0ZUgAiAEBEj8KEHJldGFpbmVkX2Rlc2lyZWQYAyABKAsyJS5lbmdyYW0ubWNwLnYxLk1hbmFnZWRSZXRhaW5lZERlc2lyZWRCCgoIX2FwcGxpZWQijgEKFk1hbmFnZWRSZXRhaW5lZERlc2lyZWQSMgoGdGFyZ2V0GAEgASgLMiIuZW5ncmFtLm1jcC52MS5NYW5hZ2VkUG9saWN5VGFyZ2V0EjUKBnBvbGljeRgCIAEoCzIgLmVuZ3JhbS5tY3AudjEuTWFuYWdlZERlbnlQb2xpY3lIAIgBAUIJCgdfcG9saWN5It0BChlBcHBseU1hbmFnZWRQb2xpY3lSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEjQKB2NvbnRleHQYAiABKAsyIy5lbmdyYW0ubWNwLnYxLk1hbmFnZWRQb2xpY3lDb250ZXh0EjAKBnBvbGljeRgDIAEoCzIgLmVuZ3JhbS5tY3AudjEuTWFuYWdlZERlbnlQb2xpY3kSOQoIZXhwZWN0ZWQYBCABKAsyIi5lbmdyYW0ubWNwLnYxLk1hbmFnZWRBcHBsaWVkU3RhdGVIAIgBAUILCglfZXhwZWN0ZWQiYwoaQXBwbHlNYW5hZ2VkUG9saWN5UmVzcG9uc2USEAoIcHJvdG9jb2wYASABKA0SMwoHYXBwbGllZBgCIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZEFwcGxpZWRTdGF0ZSJ1ChNNYW5hZ2VkTmV0d29ya1Byb29mEjIKBnRhcmdldBgBIAEoCzIiLmVuZ3JhbS5tY3AudjEuTWFuYWdlZFBvbGljeVRhcmdldBIQCghndWVzdF9pcBgCIAEoCRIYChBuZXR3b3JrX2lkZW50aXR5GAMgASgJIp8BChtSZXNlcnZlTWFuYWdlZENyZWF0ZVJlcXVlc3QSEAoIcHJvdG9jb2wYASABKA0SGAoQY3JlYXRpb25fcmVxdWVzdBgCIAEoDBIPCgd0YXNrX2lkGAMgASgJEhYKDm5hdGl2ZV92ZXJzaW9uGAQgASgNEhUKDW5hdGl2ZV9kaWdlc3QYBSABKAkSFAoMaW5wdXRfZGlnZXN0GAYgASgJIscBChVNYW5hZ2VkQ3JlYXRlSWRlbnRpdHkSEgoKc2Vzc2lvbl9pZBgBIAEoCRIPCgd0YXNrX2lkGAIgASgJEhAKCGlucHV0X2lkGAMgASgJEhAKCGFjdG9yX2lkGAQgASgJEh4KEXBhcmVudF9zZXNzaW9uX2lkGAUgASgJSACIAQESGQoRd3JpdGVfZWxpZ2liaWxpdHkYBiABKAkSFAoMaW5wdXRfZGlnZXN0GAcgASgJQhQKEl9wYXJlbnRfc2Vzc2lvbl9pZCJ3ChxSZXNlcnZlTWFuYWdlZENyZWF0ZVJlc3BvbnNlEhAKCHByb3RvY29sGAEgASgNEjYKCGlkZW50aXR5GAIgASgLMiQuZW5ncmFtLm1jcC52MS5NYW5hZ2VkQ3JlYXRlSWRlbnRpdHkSDQoFc3RhdGUYAyABKAkiZQoZUmVhZE5hdGl2ZU1hbmlmZXN0UmVxdWVzdBIQCghwcm90b2NvbBgBIAEoDRI2CghpZGVudGl0eRgCIAEoCzIkLmVuZ3JhbS5tY3AudjEuTWFuYWdlZENyZWF0ZUlkZW50aXR5IqsBChpSZWFkTmF0aXZlTWFuaWZlc3RSZXNwb25zZRIQCghwcm90b2NvbBgBIAEoDRI2CghpZGVudGl0eRgCIAEoCzIkLmVuZ3JhbS5tY3AudjEuTWFuYWdlZENyZWF0ZUlkZW50aXR5EhYKDm5hdGl2ZV92ZXJzaW9uGAMgASgNEhQKDG5hdGl2ZV9ieXRlcxgEIAEoDBIVCg1uYXRpdmVfZGlnZXN0GAUgASgJImIKFlJlYWRNYW5hZ2VkQm9vdFJlcXVlc3QSEAoIcHJvdG9jb2wYASABKA0SNgoIaWRlbnRpdHkYAiABKAsyJC5lbmdyYW0ubWNwLnYxLk1hbmFnZWRDcmVhdGVJZGVudGl0eSJRChdSZWFkTWFuYWdlZEJvb3RSZXNwb25zZRIQCghwcm90b2NvbBgBIAEoDRIWCglib290X2pzb24YAiABKAxIAIgBAUIMCgpfYm9vdF9qc29uIkIKGkZpbmFsaXplTWFuYWdlZEJvb3RSZXF1ZXN0EhAKCHByb3RvY29sGAEgASgNEhIKCmlucHV0X2pzb24YAiABKAwqfgoSTWFuYWdlZFBvbGljeVBoYXNlEiQKIE1BTkFHRURfUE9MSUNZX1BIQVNFX1VOU1BFQ0lGSUVEEAASIgoeTUFOQUdFRF9QT0xJQ1lfUEhBU0VfQk9PVFNUUkFQEAESHgoaTUFOQUdFRF9QT0xJQ1lfUEhBU0VfRklOQUwQAjK0CQoUU2Vzc2lvblBvbGljeVNlcnZpY2USYAoPUmVhZE1hbmFnZWRCb290EiUuZW5ncmFtLm1jcC52MS5SZWFkTWFuYWdlZEJvb3RSZXF1ZXN0GiYuZW5ncmFtLm1jcC52MS5SZWFkTWFuYWdlZEJvb3RSZXNwb25zZRJoChNGaW5hbGl6ZU1hbmFnZWRCb290EikuZW5ncmFtLm1jcC52MS5GaW5hbGl6ZU1hbmFnZWRCb290UmVxdWVzdBomLmVuZ3JhbS5tY3AudjEuUmVhZE1hbmFnZWRCb290UmVzcG9uc2USbwoUUmVzZXJ2ZU1hbmFnZWRDcmVhdGUSKi5lbmdyYW0ubWNwLnYxLlJlc2VydmVNYW5hZ2VkQ3JlYXRlUmVxdWVzdBorLmVuZ3JhbS5tY3AudjEuUmVzZXJ2ZU1hbmFnZWRDcmVhdGVSZXNwb25zZRJpChJSZWFkTmF0aXZlTWFuaWZlc3QSKC5lbmdyYW0ubWNwLnYxLlJlYWROYXRpdmVNYW5pZmVzdFJlcXVlc3QaKS5lbmdyYW0ubWNwLnYxLlJlYWROYXRpdmVNYW5pZmVzdFJlc3BvbnNlEmYKEVJlYWRNYW5hZ2VkUG9saWN5EicuZW5ncmFtLm1jcC52MS5SZWFkTWFuYWdlZFBvbGljeVJlcXVlc3QaKC5lbmdyYW0ubWNwLnYxLlJlYWRNYW5hZ2VkUG9saWN5UmVzcG9uc2USaQoSQXBwbHlNYW5hZ2VkUG9saWN5EiguZW5ncmFtLm1jcC52MS5BcHBseU1hbmFnZWRQb2xpY3lSZXF1ZXN0GikuZW5ncmFtLm1jcC52MS5BcHBseU1hbmFnZWRQb2xpY3lSZXNwb25zZRJsChNDcmVhdGVQb2xpY3lTZXNzaW9uEikuZW5ncmFtLm1jcC52MS5DcmVhdGVQb2xpY3lTZXNzaW9uUmVxdWVzdBoqLmVuZ3JhbS5tY3AudjEuQ3JlYXRlUG9saWN5U2Vzc2lvblJlc3BvbnNlEmAKD1JlYWRXcml0ZVBvbGljeRIlLmVuZ3JhbS5tY3AudjEuUmVhZFdyaXRlUG9saWN5UmVxdWVzdBomLmVuZ3JhbS5tY3AudjEuUmVhZFdyaXRlUG9saWN5UmVzcG9uc2USXQoOQWNjZXB0UGxhbkV4aXQSJC5lbmdyYW0ubWNwLnYxLkFjY2VwdFBsYW5FeGl0UmVxdWVzdBolLmVuZ3JhbS5tY3AudjEuQWNjZXB0UGxhbkV4aXRSZXNwb25zZRJ+ChlWYWxpZGF0ZUV4ZWN1dGlvbklkZW50aXR5Ei8uZW5ncmFtLm1jcC52MS5WYWxpZGF0ZUV4ZWN1dGlvbklkZW50aXR5UmVxdWVzdBowLmVuZ3JhbS5tY3AudjEuVmFsaWRhdGVFeGVjdXRpb25JZGVudGl0eVJlc3BvbnNlEnIKFVZhbGlkYXRlRGlzcGF0Y2hGZW5jZRIrLmVuZ3JhbS5tY3AudjEuVmFsaWRhdGVEaXNwYXRjaEZlbmNlUmVxdWVzdBosLmVuZ3JhbS5tY3AudjEuVmFsaWRhdGVEaXNwYXRjaEZlbmNlUmVzcG9uc2ViBnByb3RvMw", [file_engram_app_v1_session]);
 
 /**
  * @generated from message engram.mcp.v1.CreatePolicySessionRequest
@@ -621,6 +621,254 @@ export const ManagedNetworkProofSchema: GenMessage<ManagedNetworkProof> = /*@__P
   messageDesc(file_engram_mcp_v1_session_policy, 19);
 
 /**
+ * Exact bytes of CreatePolicySessionRequest, retained by the caller for retries.
+ * The coordinator stores only the digest of this payload, which can hold secrets.
+ *
+ * @generated from message engram.mcp.v1.ReserveManagedCreateRequest
+ */
+export type ReserveManagedCreateRequest = Message<"engram.mcp.v1.ReserveManagedCreateRequest"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: bytes creation_request = 2;
+   */
+  creationRequest: Uint8Array;
+
+  /**
+   * @generated from field: string task_id = 3;
+   */
+  taskId: string;
+
+  /**
+   * @generated from field: uint32 native_version = 4;
+   */
+  nativeVersion: number;
+
+  /**
+   * @generated from field: string native_digest = 5;
+   */
+  nativeDigest: string;
+
+  /**
+   * @generated from field: string input_digest = 6;
+   */
+  inputDigest: string;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ReserveManagedCreateRequest.
+ * Use `create(ReserveManagedCreateRequestSchema)` to create a new message.
+ */
+export const ReserveManagedCreateRequestSchema: GenMessage<ReserveManagedCreateRequest> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 20);
+
+/**
+ * @generated from message engram.mcp.v1.ManagedCreateIdentity
+ */
+export type ManagedCreateIdentity = Message<"engram.mcp.v1.ManagedCreateIdentity"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: string task_id = 2;
+   */
+  taskId: string;
+
+  /**
+   * @generated from field: string input_id = 3;
+   */
+  inputId: string;
+
+  /**
+   * @generated from field: string actor_id = 4;
+   */
+  actorId: string;
+
+  /**
+   * @generated from field: optional string parent_session_id = 5;
+   */
+  parentSessionId?: string;
+
+  /**
+   * @generated from field: string write_eligibility = 6;
+   */
+  writeEligibility: string;
+
+  /**
+   * @generated from field: string input_digest = 7;
+   */
+  inputDigest: string;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ManagedCreateIdentity.
+ * Use `create(ManagedCreateIdentitySchema)` to create a new message.
+ */
+export const ManagedCreateIdentitySchema: GenMessage<ManagedCreateIdentity> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 21);
+
+/**
+ * @generated from message engram.mcp.v1.ReserveManagedCreateResponse
+ */
+export type ReserveManagedCreateResponse = Message<"engram.mcp.v1.ReserveManagedCreateResponse"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: engram.mcp.v1.ManagedCreateIdentity identity = 2;
+   */
+  identity?: ManagedCreateIdentity;
+
+  /**
+   * A held queued reservation is not permission to start a sandbox.
+   *
+   * @generated from field: string state = 3;
+   */
+  state: string;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ReserveManagedCreateResponse.
+ * Use `create(ReserveManagedCreateResponseSchema)` to create a new message.
+ */
+export const ReserveManagedCreateResponseSchema: GenMessage<ReserveManagedCreateResponse> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 22);
+
+/**
+ * @generated from message engram.mcp.v1.ReadNativeManifestRequest
+ */
+export type ReadNativeManifestRequest = Message<"engram.mcp.v1.ReadNativeManifestRequest"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: engram.mcp.v1.ManagedCreateIdentity identity = 2;
+   */
+  identity?: ManagedCreateIdentity;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ReadNativeManifestRequest.
+ * Use `create(ReadNativeManifestRequestSchema)` to create a new message.
+ */
+export const ReadNativeManifestRequestSchema: GenMessage<ReadNativeManifestRequest> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 23);
+
+/**
+ * @generated from message engram.mcp.v1.ReadNativeManifestResponse
+ */
+export type ReadNativeManifestResponse = Message<"engram.mcp.v1.ReadNativeManifestResponse"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: engram.mcp.v1.ManagedCreateIdentity identity = 2;
+   */
+  identity?: ManagedCreateIdentity;
+
+  /**
+   * @generated from field: uint32 native_version = 3;
+   */
+  nativeVersion: number;
+
+  /**
+   * @generated from field: bytes native_bytes = 4;
+   */
+  nativeBytes: Uint8Array;
+
+  /**
+   * @generated from field: string native_digest = 5;
+   */
+  nativeDigest: string;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ReadNativeManifestResponse.
+ * Use `create(ReadNativeManifestResponseSchema)` to create a new message.
+ */
+export const ReadNativeManifestResponseSchema: GenMessage<ReadNativeManifestResponse> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 24);
+
+/**
+ * @generated from message engram.mcp.v1.ReadManagedBootRequest
+ */
+export type ReadManagedBootRequest = Message<"engram.mcp.v1.ReadManagedBootRequest"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: engram.mcp.v1.ManagedCreateIdentity identity = 2;
+   */
+  identity?: ManagedCreateIdentity;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ReadManagedBootRequest.
+ * Use `create(ReadManagedBootRequestSchema)` to create a new message.
+ */
+export const ReadManagedBootRequestSchema: GenMessage<ReadManagedBootRequest> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 25);
+
+/**
+ * @generated from message engram.mcp.v1.ReadManagedBootResponse
+ */
+export type ReadManagedBootResponse = Message<"engram.mcp.v1.ReadManagedBootResponse"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: optional bytes boot_json = 2;
+   */
+  bootJson?: Uint8Array;
+};
+
+/**
+ * Describes the message engram.mcp.v1.ReadManagedBootResponse.
+ * Use `create(ReadManagedBootResponseSchema)` to create a new message.
+ */
+export const ReadManagedBootResponseSchema: GenMessage<ReadManagedBootResponse> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 26);
+
+/**
+ * Exact typed ManagedBootFinalizeInput JSON. No guest or profile input is read.
+ *
+ * @generated from message engram.mcp.v1.FinalizeManagedBootRequest
+ */
+export type FinalizeManagedBootRequest = Message<"engram.mcp.v1.FinalizeManagedBootRequest"> & {
+  /**
+   * @generated from field: uint32 protocol = 1;
+   */
+  protocol: number;
+
+  /**
+   * @generated from field: bytes input_json = 2;
+   */
+  inputJson: Uint8Array;
+};
+
+/**
+ * Describes the message engram.mcp.v1.FinalizeManagedBootRequest.
+ * Use `create(FinalizeManagedBootRequestSchema)` to create a new message.
+ */
+export const FinalizeManagedBootRequestSchema: GenMessage<FinalizeManagedBootRequest> = /*@__PURE__*/
+  messageDesc(file_engram_mcp_v1_session_policy, 27);
+
+/**
  * These messages describe a host receipt, not permission to expose guest tools.
  *
  * @generated from enum engram.mcp.v1.ManagedPolicyPhase
@@ -654,6 +902,38 @@ export const ManagedPolicyPhaseSchema: GenEnum<ManagedPolicyPhase> = /*@__PURE__
  * @generated from service engram.mcp.v1.SessionPolicyService
  */
 export const SessionPolicyService: GenService<{
+  /**
+   * @generated from rpc engram.mcp.v1.SessionPolicyService.ReadManagedBoot
+   */
+  readManagedBoot: {
+    methodKind: "unary";
+    input: typeof ReadManagedBootRequestSchema;
+    output: typeof ReadManagedBootResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.mcp.v1.SessionPolicyService.FinalizeManagedBoot
+   */
+  finalizeManagedBoot: {
+    methodKind: "unary";
+    input: typeof FinalizeManagedBootRequestSchema;
+    output: typeof ReadManagedBootResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.mcp.v1.SessionPolicyService.ReserveManagedCreate
+   */
+  reserveManagedCreate: {
+    methodKind: "unary";
+    input: typeof ReserveManagedCreateRequestSchema;
+    output: typeof ReserveManagedCreateResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.mcp.v1.SessionPolicyService.ReadNativeManifest
+   */
+  readNativeManifest: {
+    methodKind: "unary";
+    input: typeof ReadNativeManifestRequestSchema;
+    output: typeof ReadNativeManifestResponseSchema;
+  },
   /**
    * @generated from rpc engram.mcp.v1.SessionPolicyService.ReadManagedPolicy
    */

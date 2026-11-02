@@ -1686,6 +1686,76 @@ impl HostClient for GrpcHostClient {
         Self::restore_base_for_session(self, metadata, session_env, selected_mounts, fence).await
     }
 
+    async fn capture_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedCaptureRequest,
+    ) -> Result<engram_core::types::managed_boot::ManagedCaptureAuthority, SandboxError> {
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .capture_managed_boot(crate::grpc::ManagedBootRequest { payload_json })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        crate::managed_boot::decode(&response.payload_json)
+    }
+    async fn prepare_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootPrepare,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootPreparedReceipt, SandboxError> {
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .prepare_managed_boot(crate::grpc::ManagedBootRequest { payload_json })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        crate::managed_boot::decode(&response.payload_json)
+    }
+    async fn read_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootKey,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootHostState, SandboxError> {
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .read_managed_boot(crate::grpc::ManagedBootRequest { payload_json })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        crate::managed_boot::decode(&response.payload_json)
+    }
+    async fn finalize_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootFinalize,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootFinalReceipt, SandboxError> {
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .finalize_managed_boot(crate::grpc::ManagedBootRequest { payload_json })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        crate::managed_boot::decode(&response.payload_json)
+    }
+    async fn start_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootStart,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootHostState, SandboxError> {
+        let payload_json = crate::managed_boot::encode(&request)?;
+        let response = self
+            .inner
+            .clone()
+            .start_managed_boot(crate::grpc::ManagedBootRequest { payload_json })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        crate::managed_boot::decode(&response.payload_json)
+    }
     async fn read_managed_policy(
         &self,
         target: engram_core::types::managed_deny::ManagedPolicyTarget,

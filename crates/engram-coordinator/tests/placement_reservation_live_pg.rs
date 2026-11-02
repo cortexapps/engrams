@@ -123,6 +123,8 @@ fn bare_write_set(
     cpu_budget_vcpus: i32,
 ) -> SessionCreateWriteSet {
     SessionCreateWriteSet {
+        managed_initial_prompt: None,
+        managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 1,
         session_id,
@@ -268,6 +270,8 @@ async fn reserve_and_persist_create_commits_the_full_write_set_together() {
     let session_id = SessionId::new();
     let cap = Capability::parse("github:read@owner/repo").expect("valid capability");
     let ws = SessionCreateWriteSet {
+        managed_initial_prompt: None,
+        managed_creation: None,
         mcp_policy: None,
         nbd_slot_need: 1,
         session_id,

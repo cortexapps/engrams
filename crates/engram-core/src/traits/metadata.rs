@@ -45,12 +45,44 @@ pub enum DisableEnabledImageOutcome {
     Blocked(Vec<(SessionId, String)>),
 }
 
+#[derive(Clone, Debug)]
+pub struct ManagedInitialPrompt {
+    pub row: crate::types::outbox::OutboxRow,
+    pub events: Vec<(String, serde_json::Value)>,
+}
+
+impl ManagedInitialPrompt {
+    pub fn validate(&self, ws: &SessionCreateWriteSet) -> Result<(), MetaError> {
+        if ws.managed_creation.is_none()
+            || self.row.session_id != ws.session_id
+            || self.row.prompt_id != format!("create:{}", ws.session_id)
+            || self.row.kind != crate::types::outbox::OutboxKind::Prompt
+            || !self
+                .row
+                .payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty() && s.len() <= 1024 * 1024)
+            || self.row.attempts != 0
+            || self.row.delivered_at.is_some()
+            || self.row.acked_at.is_some()
+        {
+            return Err(MetaError::Conflict("invalid managed initial prompt".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Issue #535 (b): the durable write-set for a new session — one logical
 /// fact ("this session exists with these secrets/capabilities/policy/
 /// harness/skills") passed to [`MetadataStore::reserve_and_persist_create`]
 /// to commit in a single transaction, before any host RPC.
 #[derive(Clone, Debug)]
 pub struct SessionCreateWriteSet {
+    /// Held managed reservation; ordinary placement must never consume it.
+    pub managed_creation: Option<crate::types::managed_create::ManagedCreation>,
+    /// Initial prompt and visible events commit with a held managed creation.
+    pub managed_initial_prompt: Option<ManagedInitialPrompt>,
     pub mcp_policy: Option<crate::types::mcp_policy::McpPolicyCreation>,
     /// One root slot plus one slot when swap is enabled.
     pub nbd_slot_need: u32,
@@ -242,6 +274,93 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ---- sessions ----
+    /// Read the current boot under the complete immutable creation association.
+    /// A held creation has no boot; a missing creation authority is an error.
+    async fn get_managed_boot(
+        &self,
+        _identity: &crate::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<Option<crate::types::managed_boot::ManagedBootRecord>, MetaError> {
+        unimplemented!("get_managed_boot")
+    }
+    async fn reserve_managed_capture(
+        &self,
+        _request: &crate::types::managed_boot::ManagedCaptureRequest,
+    ) -> Result<Option<crate::types::managed_boot::ManagedCaptureAuthority>, MetaError> {
+        unimplemented!("reserve_managed_capture")
+    }
+    async fn record_managed_capture(
+        &self,
+        _authority: &crate::types::managed_boot::ManagedCaptureAuthority,
+    ) -> Result<(), MetaError> {
+        unimplemented!("record_managed_capture")
+    }
+    async fn managed_sandbox_open(&self, _sandbox: SandboxId) -> Result<Option<bool>, MetaError> {
+        unimplemented!("managed_sandbox_open")
+    }
+    /// Claim the exact held row and physical epoch atomically before host I/O.
+    async fn claim_managed_boot(
+        &self,
+        _request: crate::types::managed_boot::ManagedBootPrepare,
+    ) -> Result<crate::types::managed_boot::ManagedBootRecord, MetaError> {
+        unimplemented!("claim_managed_boot")
+    }
+    async fn read_managed_boot(
+        &self,
+        _key: &crate::types::managed_boot::ManagedBootKey,
+    ) -> Result<crate::types::managed_boot::ManagedBootRecord, MetaError> {
+        unimplemented!("read_managed_boot")
+    }
+    async fn advance_managed_boot(
+        &self,
+        _key: &crate::types::managed_boot::ManagedBootKey,
+        _revision: u64,
+        _event: crate::types::managed_boot::ManagedBootAdvance,
+    ) -> Result<crate::types::managed_boot::ManagedBootRecord, MetaError> {
+        unimplemented!("advance_managed_boot")
+    }
+    /// Stable session-ID pages prevent a closed earlier row from starving later boots.
+    async fn list_managed_boots(
+        &self,
+        _after: Option<SessionId>,
+        _limit: u32,
+    ) -> Result<Vec<crate::types::managed_boot::ManagedBootKey>, MetaError> {
+        unimplemented!("list_managed_boots")
+    }
+    /// None is ordinary. Some(false) is managed and closed, including no claim.
+    async fn managed_boot_open(&self, _session_id: SessionId) -> Result<Option<bool>, MetaError> {
+        unimplemented!("managed_boot_open")
+    }
+    async fn managed_tool_target_gone(
+        &self,
+        _session_id: SessionId,
+        _tool_call_id: &str,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("managed_tool_target_gone")
+    }
+    async fn managed_delivery_target_gone(
+        &self,
+        _session_id: SessionId,
+        _binding_epoch: u64,
+    ) -> Result<bool, MetaError> {
+        unimplemented!("managed_delivery_target_gone")
+    }
+    async fn read_managed_creation(
+        &self,
+        _identity: &crate::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<crate::types::managed_create::ManagedCreation, MetaError> {
+        unimplemented!("read_managed_creation")
+    }
+
+    /// Read the original source and held state in one store snapshot. Exact
+    /// retries require queued, no host/sandbox and epoch zero. Only a missing
+    /// source returns NotFound; an existing non-held source returns Conflict.
+    async fn read_held_managed_creation(
+        &self,
+        _identity: &crate::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<crate::types::managed_create::ManagedCreation, MetaError> {
+        unimplemented!("read_held_managed_creation")
+    }
+
     /// Read durable server policy and all current ancestors in one locked snapshot.
     async fn read_mcp_write_policy(
         &self,
@@ -2368,6 +2487,15 @@ pub trait MetadataStore: Send + Sync {
         Err(MetaError::Serialization(
             "harness settlement is not implemented".into(),
         ))
+    }
+
+    /// Check exact managed physical authority, append, and acknowledge its outbox
+    /// row under the same session lock as interruption. Stale replays also fail.
+    async fn append_managed_harness_event(
+        &self,
+        _event: &crate::types::event::ManagedHarnessEvent,
+    ) -> Result<crate::types::event::ManagedHarnessEventAccepted, MetaError> {
+        unimplemented!("append_managed_harness_event")
     }
 
     /// Append once per session and key. A replay returns no index.

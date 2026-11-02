@@ -34,7 +34,11 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 use uuid::Uuid;
 
+mod managed_boot;
+mod managed_create;
+mod managed_operator_gate;
 mod mcp_policy;
+mod outbox_accept;
 mod row;
 
 #[derive(Clone)]
@@ -1608,6 +1612,85 @@ impl MetadataStore for PostgresStore {
         Ok(row.try_get::<i64, _>(0).map_err(db_err)? as u64)
     }
 
+    async fn get_managed_boot(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<Option<engram_core::types::managed_boot::ManagedBootRecord>, MetaError> {
+        self.boot_get(identity).await
+    }
+    async fn reserve_managed_capture(
+        &self,
+        request: &engram_core::types::managed_boot::ManagedCaptureRequest,
+    ) -> Result<Option<engram_core::types::managed_boot::ManagedCaptureAuthority>, MetaError> {
+        self.capture_reserve(request).await
+    }
+    async fn record_managed_capture(
+        &self,
+        authority: &engram_core::types::managed_boot::ManagedCaptureAuthority,
+    ) -> Result<(), MetaError> {
+        self.capture_record(authority).await
+    }
+    async fn managed_sandbox_open(&self, sandbox: SandboxId) -> Result<Option<bool>, MetaError> {
+        self.boot_sandbox_open(sandbox).await
+    }
+    async fn claim_managed_boot(
+        &self,
+        request: engram_core::types::managed_boot::ManagedBootPrepare,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootRecord, MetaError> {
+        self.boot_claim(request).await
+    }
+    async fn read_managed_boot(
+        &self,
+        key: &engram_core::types::managed_boot::ManagedBootKey,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootRecord, MetaError> {
+        self.boot_read(key).await
+    }
+    async fn advance_managed_boot(
+        &self,
+        key: &engram_core::types::managed_boot::ManagedBootKey,
+        revision: u64,
+        event: engram_core::types::managed_boot::ManagedBootAdvance,
+    ) -> Result<engram_core::types::managed_boot::ManagedBootRecord, MetaError> {
+        self.boot_advance(key, revision, event).await
+    }
+    async fn list_managed_boots(
+        &self,
+        after: Option<SessionId>,
+        limit: u32,
+    ) -> Result<Vec<engram_core::types::managed_boot::ManagedBootKey>, MetaError> {
+        self.boot_list(after, limit).await
+    }
+    async fn managed_boot_open(&self, sid: SessionId) -> Result<Option<bool>, MetaError> {
+        self.boot_open(sid).await
+    }
+    async fn managed_tool_target_gone(
+        &self,
+        sid: SessionId,
+        call: &str,
+    ) -> Result<bool, MetaError> {
+        self.boot_tool_target_gone(sid, call).await
+    }
+    async fn managed_delivery_target_gone(
+        &self,
+        sid: SessionId,
+        epoch: u64,
+    ) -> Result<bool, MetaError> {
+        self.boot_target_gone(sid, epoch).await
+    }
+    async fn read_managed_creation(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
+        self.managed_creation(identity, false).await
+    }
+
+    async fn read_held_managed_creation(
+        &self,
+        identity: &engram_core::types::managed_create::ManagedCreateIdentity,
+    ) -> Result<engram_core::types::managed_create::ManagedCreation, MetaError> {
+        self.managed_creation(identity, true).await
+    }
+
     async fn reserve_and_persist_create(
         &self,
         ws: SessionCreateWriteSet,
@@ -1622,8 +1705,37 @@ impl MetadataStore for PostgresStore {
             ));
         }
 
+        if let Some(creation) = &ws.managed_creation {
+            creation.validate_for(&ws)?;
+        }
+        if let Some(initial) = &ws.managed_initial_prompt {
+            initial.validate(&ws)?;
+        }
+
         let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        if let Some(creation) = &ws.managed_creation {
+            if !managed_create::reserve(&mut tx, creation).await? {
+                let prior: Option<serde_json::Value> = sqlx::query_scalar("SELECT payload FROM session_outbox WHERE prompt_id=$1 AND session_id=$2 AND kind='prompt'")
+                    .bind(format!("create:{}",ws.session_id)).bind(ws.session_id.as_uuid()).fetch_optional(&mut *tx).await.map_err(db_err)?;
+                if prior.as_ref() != ws.managed_initial_prompt.as_ref().map(|p| &p.row.payload) {
+                    return Err(MetaError::Conflict("managed initial prompt changed".into()));
+                }
+                tx.commit().await.map_err(db_err)?;
+                return Ok(CreateDisposition::Queued);
+            }
+        }
+        let candidates = if ws.managed_creation.is_some() {
+            &[][..]
+        } else {
+            candidates
+        };
+        let affinity_len = if ws.managed_creation.is_some() {
+            0
+        } else {
+            affinity_len
+        };
 
         // -------- pick a host (ADR 0046/0048 best-fit 2D), if any candidate --------
         // Issue #535 (b): `pick_host_2d` is `reserve_placement`'s FOR-UPDATE
@@ -1844,6 +1956,10 @@ impl MetadataStore for PostgresStore {
             }
         }
 
+        if let Some(initial) = &ws.managed_initial_prompt {
+            outbox_accept::accept(&mut tx, now, ws.session_id, &initial.events, &initial.row)
+                .await?;
+        }
         tx.commit().await.map_err(db_err)?;
         if matches!(disposition, CreateDisposition::Queued) {
             // Closes the race where capacity frees between the failed
@@ -2843,7 +2959,7 @@ impl MetadataStore for PostgresStore {
                    COALESCE(cpu_budget_vcpus, 0) AS cpu_budget_vcpus,
                    queue_origin, queued_at, nbd_slot_need
             FROM sessions
-            WHERE status = 'queued'
+            WHERE status = 'queued' AND NOT EXISTS (SELECT 1 FROM session_managed_creations c WHERE c.session_id=sessions.id)
             ORDER BY queued_at ASC
             "#,
         )
@@ -2893,7 +3009,7 @@ impl MetadataStore for PostgresStore {
             r#"
             UPDATE sessions
                SET status = 'pending', host_id = $2, last_active_at = $3
-             WHERE id = $1 AND status = 'queued'
+             WHERE id = $1 AND status = 'queued' AND NOT EXISTS (SELECT 1 FROM session_managed_creations c WHERE c.session_id=sessions.id)
             "#,
         )
         .bind(id.as_uuid())
@@ -4007,6 +4123,7 @@ impl MetadataStore for PostgresStore {
             .await
             .map_err(db_err)?
             .ok_or(MetaError::NotFound)?;
+        crate::managed_boot::require_tool_result_target(&mut tx, outbox).await?;
         let inserted = sqlx::query(
             r#"
             INSERT INTO session_outbox
@@ -4102,156 +4219,12 @@ impl MetadataStore for PostgresStore {
         events: &[(String, serde_json::Value)],
         outbox: &engram_core::types::outbox::OutboxRow,
     ) -> Result<Option<Vec<i64>>, MetaError> {
-        if outbox.session_id != session_id {
-            return Err(MetaError::Serialization(
-                "event/outbox session ids do not match".into(),
-            ));
-        }
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        sqlx::query("SELECT id FROM sessions WHERE id=$1 FOR UPDATE")
-            .bind(session_id.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?
-            .ok_or(MetaError::NotFound)?;
-        let inserted = sqlx::query(
-            r#"
-            INSERT INTO session_outbox
-                (prompt_id, session_id, kind, payload, created_at, not_before)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (prompt_id) DO NOTHING
-            RETURNING prompt_id
-            "#,
-        )
-        .bind(&outbox.prompt_id)
-        .bind(session_id.as_uuid())
-        .bind(outbox.kind.as_str())
-        .bind(&outbox.payload)
-        .bind(outbox.created_at)
-        .bind(outbox.not_before)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)?
-        .is_some();
-
-        if !inserted {
-            // A retry of the SAME command is the designed no-op; a
-            // prompt_id claimed by a DIFFERENT command — including the
-            // same kind with different text/mode (review finding on
-            // #993: payload must be part of the identity, as it is in
-            // `append_session_event_and_outbox`) — is a Conflict, never
-            // a silent drop.
-            let existing = sqlx::query(
-                "SELECT session_id, kind, payload FROM session_outbox WHERE prompt_id = $1",
-            )
-            .bind(&outbox.prompt_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?
-            .ok_or_else(|| {
-                MetaError::Conflict(format!(
-                    "outbox id {} disappeared during accept",
-                    outbox.prompt_id
-                ))
-            })?;
-            let existing_session: uuid::Uuid = existing.try_get("session_id").map_err(db_err)?;
-            let existing_kind: String = existing.try_get("kind").map_err(db_err)?;
-            let existing_payload: serde_json::Value =
-                existing.try_get("payload").map_err(db_err)?;
-            if existing_session != session_id.as_uuid()
-                || existing_kind != outbox.kind.as_str()
-                || existing_payload != outbox.payload
-            {
-                return Err(MetaError::Conflict(format!(
-                    "outbox id {} belongs to another command",
-                    outbox.prompt_id
-                )));
-            }
-            tx.rollback().await.map_err(db_err)?;
-            return Ok(None);
-        }
-
-        if outbox.kind == engram_core::types::outbox::OutboxKind::Prompt
-            && outbox.payload["mode"] == "plan"
-        {
-            let row =
-                sqlx::query("SELECT mcp_write_policy,next_event_idx FROM sessions WHERE id=$1")
-                    .bind(session_id.as_uuid())
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(db_err)?;
-            let old: Option<serde_json::Value> = row.try_get("mcp_write_policy").map_err(db_err)?;
-            let old = old
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|_| MetaError::Conflict("policy unavailable".into()))?;
-            let policy = engram_core::types::mcp_policy::StoredWritePolicy::restrict(
-                old.as_ref(),
-                &outbox.prompt_id,
-                row.try_get("next_event_idx").map_err(db_err)?,
-            )?;
-            sqlx::query("UPDATE sessions SET mcp_write_policy=$2 WHERE id=$1")
-                .bind(session_id.as_uuid())
-                .bind(
-                    serde_json::to_value(policy)
-                        .map_err(|_| MetaError::Conflict("policy encode failed".into()))?,
-                )
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-        }
-        let mut idxs = Vec::with_capacity(events.len());
-        for (kind, payload) in events {
-            let event = sqlx::query(
-                r#"
-                WITH next AS (
-                    UPDATE sessions
-                       SET next_event_idx = next_event_idx + 1,
-                           updated_at = $4,
-                           last_event_at = $4
-                     WHERE id = $1
-                 RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
-                ),
-                inserted AS (
-                    INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch, created_at)
-                    SELECT $1, allocated_idx, $2, $3, recovery_epoch, $4 FROM next
-                    RETURNING idx
-                )
-                SELECT idx FROM inserted
-                "#,
-            )
-            .bind(session_id.as_uuid())
-            .bind(kind)
-            .bind(payload)
-            .bind(self.clock.now_utc())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?
-            .ok_or(MetaError::NotFound)?;
-            idxs.push(event.try_get::<i64, _>("idx").map_err(db_err)?);
-        }
-
-        // Notifications fire at commit: replicas see the events and the
-        // outbox row together, so delivery can never observe the row
-        // without its echo (the ADR 0052 echo-before-run_started
-        // ordering, now transactional instead of sequenced).
-        for idx in &idxs {
-            sqlx::query("SELECT pg_notify('session_events', $1)")
-                .bind(
-                    serde_json::json!({ "session_id": session_id.to_string(), "idx": idx })
-                        .to_string(),
-                )
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-        }
-        sqlx::query("SELECT pg_notify('session_outbox', $1)")
-            .bind(session_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        let result =
+            outbox_accept::accept(&mut tx, self.clock.now_utc(), session_id, events, outbox)
+                .await?;
         tx.commit().await.map_err(db_err)?;
-        Ok(Some(idxs))
+        Ok(result)
     }
 
     async fn outbox_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
@@ -5711,6 +5684,8 @@ impl MetadataStore for PostgresStore {
             SELECT DISTINCT disk_manifest_id
             FROM snapshots
             WHERE disk_manifest_id IS NOT NULL
+            UNION SELECT (record->'request'->'cold'->'disk'->'manifest'->>'manifest_id')::UUID FROM session_managed_boots
+            UNION SELECT capture_id FROM session_managed_captures
             "#,
         )
         .fetch_all(&self.pool)
@@ -5898,6 +5873,13 @@ impl MetadataStore for PostgresStore {
         }
         tx.commit().await.map_err(db_err)?;
         Ok(Some(settled))
+    }
+
+    async fn append_managed_harness_event(
+        &self,
+        event: &engram_core::types::event::ManagedHarnessEvent,
+    ) -> Result<engram_core::types::event::ManagedHarnessEventAccepted, MetaError> {
+        self.managed_event_append(event).await
     }
 
     async fn append_session_event_idempotent(
@@ -9430,7 +9412,9 @@ impl MetadataStore for PostgresStore {
             "SELECT DISTINCT live_disk_manifest_id, live_disk_manifest_version
                FROM sessions
               WHERE live_disk_manifest_id IS NOT NULL
-                AND live_disk_manifest_version IS NOT NULL",
+                AND live_disk_manifest_version IS NOT NULL
+            UNION SELECT (record->'request'->'cold'->'disk'->'manifest'->>'manifest_id')::UUID, (record->'request'->'cold'->'disk'->'manifest'->>'version')::BIGINT FROM session_managed_boots
+            UNION SELECT capture_id, 1 FROM session_managed_captures",
         )
         .fetch_all(&self.pool)
         .await

@@ -31,6 +31,9 @@ proptest! {
         let _=mcp::CompleteAuthorizationResponse::decode(bytes.as_slice());
         let _=mcp::GetStatusResponse::decode(bytes.as_slice());
         let _=mcp::RevokeResponse::decode(bytes.as_slice());
+        let _=mcp::ReadManagedBootRequest::decode(bytes.as_slice());
+        let _=mcp::ReadManagedBootResponse::decode(bytes.as_slice());
+        let _=mcp::FinalizeManagedBootRequest::decode(bytes.as_slice());
     }
 }
 
@@ -95,4 +98,40 @@ fn managed_read_requires_explicit_canonical_retention_and_exact_target() {
         response.validate_for(&target).is_err(),
         "applied target must agree independently"
     );
+}
+
+#[test]
+fn managed_boot_pinned_wire_tags_are_stable() {
+    let request = mcp::FinalizeManagedBootRequest {
+        protocol: 1,
+        input_json: b"{}".to_vec(),
+    };
+    assert_eq!(request.encode_to_vec(), [8, 1, 18, 2, 123, 125]);
+    let response = mcp::ReadManagedBootResponse {
+        protocol: 1,
+        boot_json: Some(b"{}".to_vec()),
+    };
+    assert_eq!(response.encode_to_vec(), [8, 1, 18, 2, 123, 125]);
+    assert_eq!(
+        mcp::ReadManagedBootResponse::decode([8u8, 1].as_slice())
+            .unwrap()
+            .boot_json,
+        None
+    );
+}
+#[test]
+fn managed_capture_json_golden_roundtrip() {
+    use engram_core::types::managed_boot::ManagedCaptureRequest;
+    let bytes = include_bytes!("golden/managed_capture.json");
+    let request: ManagedCaptureRequest = engram_protocol::managed_boot::decode(bytes).unwrap();
+    request.key.validate().unwrap();
+    assert_eq!(
+        engram_protocol::managed_boot::encode(&request).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        request.disk_manifest().manifest_id,
+        request.capture_id.as_uuid()
+    );
+    assert_eq!(request.disk_manifest().version, 1);
 }

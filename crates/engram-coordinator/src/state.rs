@@ -1354,14 +1354,14 @@ pub type SharedState = Arc<AppState>;
 pub async fn emit_harness_event(
     state: &SharedState,
     session_id: SessionId,
-    _sandbox_id: engram_core::SandboxId,
+    sandbox_id: engram_core::SandboxId,
     event: engram_harness_proto::HarnessEvent,
     _at: chrono::DateTime<chrono::Utc>,
     delivery: Option<EventDelivery>,
 ) -> Result<(), crate::error::ApiError> {
     state
         .harness_event_writer
-        .emit(session_id, event, delivery)
+        .ingest(session_id, sandbox_id, event, delivery)
         .await
 }
 
@@ -1400,15 +1400,73 @@ impl HarnessEventWriter {
     /// withholds the acknowledgement and drops the connection, so the
     /// harness replays the event (ADR 0123 C4).
     fn sink(self: Arc<Self>) -> EventSink {
-        Arc::new(move |session, _sandbox, event, delivery| {
+        Arc::new(move |session, sandbox, event, delivery| {
             let writer = self.clone();
             Box::pin(async move {
                 writer
-                    .emit(session, event, delivery)
+                    .ingest(session, sandbox, event, delivery)
                     .await
                     .map_err(|e| engram_host_agent::harness::SinkError(e.to_string()))
             })
         })
+    }
+
+    async fn wake_waiting_harness(&self, session_id: SessionId, kind: &str) {
+        if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy") {
+            // ADR 0108 A8: a harness that just announced Idle can
+            // take a prompt NOW — a row waiting out ACK_TIMEOUT
+            // from a forward into a dead link has no reason to
+            // keep waiting. Without this recall the wake below
+            // finds nothing due and no-ops; the row then sits out
+            // the full timeout after a fast reattach.
+            if let Err(e) = self.meta.outbox_make_due(session_id).await {
+                tracing::debug!(
+                    session_id = %session_id,
+                    error = %e,
+                    "outbox make-due on attach signal failed (ack timeout backstops)",
+                );
+            }
+            if let Err(e) = self
+                .meta
+                .op_wake_queued_kind(session_id, engram_core::types::session_op::OpKind::Deliver)
+                .await
+            {
+                tracing::debug!(
+                    session_id = %session_id,
+                    error = %e,
+                    "deliver wake on attach signal failed (poll backstops)",
+                );
+            }
+            // The shim scan enqueues a Deliver op when rows are due
+            // and none is queued; a wake with nothing due is a
+            // no-op.
+            self.outbox_wake.notify_one();
+        }
+    }
+
+    async fn ingest(
+        &self,
+        session: SessionId,
+        sandbox: engram_core::SandboxId,
+        event: engram_harness_proto::HarnessEvent,
+        delivery: Option<EventDelivery>,
+    ) -> Result<(), crate::error::ApiError> {
+        let managed_target = if let Some(open) = self.meta.managed_boot_open(session).await? {
+            let target = self.meta.managed_policy_target(session).await?;
+            if !open
+                || target.sandbox_id != sandbox
+                || delivery.as_ref().map(|d| d.binding_epoch) != Some(target.binding_epoch)
+            {
+                return Err(engram_core::MetaError::Conflict(
+                    "managed event authority is closed".into(),
+                )
+                .into());
+            }
+            Some(target)
+        } else {
+            None
+        };
+        self.emit(session, event, delivery, managed_target).await
     }
 
     async fn emit(
@@ -1416,15 +1474,16 @@ impl HarnessEventWriter {
         session_id: SessionId,
         ev: engram_harness_proto::HarnessEvent,
         delivery: Option<EventDelivery>,
+        managed_target: Option<engram_core::types::managed_deny::ManagedPolicyTarget>,
     ) -> Result<(), crate::error::ApiError> {
         let Self {
             events,
             meta,
             clock,
-            outbox_wake,
+            outbox_wake: _,
             last_kind,
         } = self;
-        if let Some(delivery) = delivery {
+        if let Some(delivery) = delivery.filter(|_| managed_target.is_none()) {
             // ADR 0123 C5: the first event of a new generation settles the
             // open runs of older generations, except the run this event
             // itself continues (a re-attached harness keeps running it).
@@ -1500,7 +1559,8 @@ impl HarnessEventWriter {
         // phantom re-runs + resume/evict churn + a duplicate-turn transcript
         // the web can't render). Capture the ack id here (before
         // `session_event` moves into the published frame) and retire the row
-        // after the append. Unknown / already-acked ids are no-ops.
+        // with the append for managed sessions, or after it for ordinary
+        // sessions. Unknown / already-acked ids are no-ops.
         let ack_id = outbox_ack_id(session_id, &session_event);
 
         // Session titles: a harness-suggested title is materialized onto
@@ -1526,35 +1586,8 @@ impl HarnessEventWriter {
         // below: a re-announce after a reattach is exactly the
         // signal the incident waited 41 s for, and it is exactly
         // the shape the dedupe drops from the log.
-        if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy") {
-            // ADR 0108 A8: a harness that just announced Idle can
-            // take a prompt NOW — a row waiting out ACK_TIMEOUT
-            // from a forward into a dead link has no reason to
-            // keep waiting. Without this recall the wake below
-            // finds nothing due and no-ops; the row then sits out
-            // the full timeout (prod 7eddce62: 35.5 s after a
-            // 120 ms un-park).
-            if let Err(e) = meta.outbox_make_due(session_id).await {
-                tracing::debug!(
-                    session_id = %session_id,
-                    error = %e,
-                    "outbox make-due on attach signal failed (ack timeout backstops)",
-                );
-            }
-            if let Err(e) = meta
-                .op_wake_queued_kind(session_id, engram_core::types::session_op::OpKind::Deliver)
-                .await
-            {
-                tracing::debug!(
-                    session_id = %session_id,
-                    error = %e,
-                    "deliver wake on attach signal failed (poll backstops)",
-                );
-            }
-            // The shim scan enqueues a Deliver op when rows are due
-            // and none is queued; a wake with nothing due is a
-            // no-op.
-            outbox_wake.notify_one();
+        if managed_target.is_none() {
+            self.wake_waiting_harness(session_id, kind).await;
         }
 
         // Drop a back-to-back duplicate waiting-state marker. The
@@ -1623,7 +1656,27 @@ impl HarnessEventWriter {
             return Ok(());
         }
 
-        let idx = if let Some(delivery) = delivery {
+        let managed = managed_target.is_some();
+        let idx = if let Some(target) = managed_target {
+            let delivery = delivery.ok_or_else(|| {
+                engram_core::MetaError::Conflict("managed event sequence is missing".into())
+            })?;
+            let accepted = meta
+                .append_managed_harness_event(&engram_core::types::event::ManagedHarnessEvent {
+                    target,
+                    incarnation: delivery.incarnation,
+                    seq: delivery.seq,
+                    kind: kind.into(),
+                    payload,
+                    ack_id: ack_id.clone(),
+                })
+                .await?;
+            if accepted.outbox_acked {
+                metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
+            }
+            self.wake_waiting_harness(session_id, kind).await;
+            accepted.idx
+        } else if let Some(delivery) = delivery {
             meta.append_session_event_idempotent(
                 session_id,
                 &format!(
@@ -1660,14 +1713,15 @@ impl HarnessEventWriter {
         // ADR 0073 fix: retire the durable outbox row this harness
         // event confirms. Placed AFTER `publish` so the ack's PG
         // write never sits in front of the live SSE frame (same
-        // rationale as the metric join below). Without this, the
+        // rationale as the metric join below). Managed sessions already
+        // acknowledged atomically with the accepted event. Without this, the
         // delivery driver never learns the prompt was consumed and
         // redelivers it on every resume forever. The ack runs for a
         // replayed duplicate too (idx None): the first delivery may
         // have stored the event and died before this ack, and the
         // replay is the only retry there is. A failed ack withholds the
         // harness ack so the event is replayed again.
-        if let Some(ack_id) = &ack_id {
+        if let Some(ack_id) = ack_id.as_ref().filter(|_| !managed) {
             match meta.outbox_ack(ack_id).await {
                 Ok(true) => {
                     metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
@@ -2551,6 +2605,19 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl MetadataStore for MiniMeta {
+        async fn managed_boot_open(&self, _: SessionId) -> Result<Option<bool>, MetaError> {
+            Ok(None)
+        }
+        async fn managed_sandbox_open(
+            &self,
+            _: engram_core::SandboxId,
+        ) -> Result<Option<bool>, MetaError> {
+            Ok(None)
+        }
+        async fn managed_tool_target_gone(&self, _: SessionId, _: &str) -> Result<bool, MetaError> {
+            Ok(false)
+        }
+
         /// ADR 0073: derive the idle-scan candidate from the mock's own
         /// session + event rows — the same "newest event" semantics the
         /// PG lateral implements, so idle_detector tests exercise real

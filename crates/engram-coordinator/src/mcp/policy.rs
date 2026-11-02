@@ -1,8 +1,13 @@
 //! Trusted policy service. It is never served on application gRPC.
 use super::control::Control;
 use crate::state::SharedState;
+use engram_core::types::managed_create::{
+    FrozenNativeManifest, ManagedCreateIdentity, ManagedCreation,
+};
 use engram_core::{types::mcp_policy::*, SessionId};
 use engram_protocol::{app, mcp as wire};
+#[cfg(test)]
+use prost::Message;
 use tonic::{Request, Response, Status};
 use wire::session_policy_service_server::SessionPolicyService;
 #[derive(Clone)]
@@ -105,8 +110,214 @@ fn creation(request: &wire::CreatePolicySessionRequest) -> Result<McpPolicyCreat
         eligibility,
     })
 }
+fn managed_identity(r: wire::ManagedCreateIdentity) -> Result<ManagedCreateIdentity, Status> {
+    let identity = ManagedCreateIdentity {
+        session_id: id(&r.session_id)?,
+        task_id: r.task_id,
+        input_digest: r.input_digest,
+        policy: McpPolicyCreation {
+            actor_id: r.actor_id,
+            input_id: r.input_id,
+            parent_session_id: r.parent_session_id.as_deref().map(id).transpose()?,
+            eligibility: eligibility(&r.write_eligibility)?,
+        },
+    };
+    identity.validate().map_err(err)?;
+    Ok(identity)
+}
+fn identity_wire(i: ManagedCreateIdentity) -> wire::ManagedCreateIdentity {
+    wire::ManagedCreateIdentity {
+        session_id: i.session_id.to_string(),
+        task_id: i.task_id,
+        input_id: i.policy.input_id,
+        actor_id: i.policy.actor_id,
+        parent_session_id: i.policy.parent_session_id.map(|p| p.to_string()),
+        write_eligibility: i.policy.eligibility.as_str().into(),
+        input_digest: i.input_digest,
+    }
+}
+fn managed_creation(
+    r: &wire::ReserveManagedCreateRequest,
+) -> Result<(ManagedCreation, app::CreateSessionRequest), Status> {
+    if r.protocol != wire::PROTOCOL
+        || r.creation_request.len() > 3 * 1024 * 1024
+        || r.input_digest != wire::managed_create_input_digest(r)
+    {
+        return Err(Status::invalid_argument("invalid managed creation input"));
+    }
+    let policy_request = r
+        .decode_creation()
+        .map_err(|_| Status::invalid_argument("invalid creation request"))?;
+    if policy_request.protocol != wire::PROTOCOL {
+        return Err(Status::invalid_argument("unsupported control protocol"));
+    }
+    let policy = creation(&policy_request)?;
+    let create = required(policy_request.create)?;
+    let session_id = id(create
+        .requested_session_id
+        .as_deref()
+        .ok_or_else(|| Status::invalid_argument("reserved session required"))?)?;
+    if !matches!(create.mode.as_str(), "" | "agent")
+        || !matches!(create.harness.as_deref(), Some("claude" | "codex"))
+    {
+        return Err(Status::invalid_argument(
+            "managed creation requires a supported agent harness",
+        ));
+    }
+    let bytes = create
+        .harness_env
+        .get("ENGRAM_TOOLS")
+        .ok_or_else(|| Status::invalid_argument("native manifest required"))?
+        .as_bytes()
+        .to_vec();
+    let frozen = ManagedCreation {
+        identity: ManagedCreateIdentity {
+            session_id,
+            task_id: r.task_id.clone(),
+            policy,
+            input_digest: r.input_digest.clone(),
+        },
+        native: FrozenNativeManifest {
+            version: r.native_version,
+            bytes,
+            digest: r.native_digest.clone(),
+        },
+    };
+    frozen.identity.validate().map_err(err)?;
+    frozen.native.validate().map_err(err)?;
+    Ok((frozen, create))
+}
+
+/// A missing creation may enter preparation; an existing creation must still be held.
+async fn managed_creation_retry(
+    meta: &dyn engram_core::traits::MetadataStore,
+    frozen: &ManagedCreation,
+) -> Result<bool, Status> {
+    match meta.read_held_managed_creation(&frozen.identity).await {
+        Ok(existing) if existing == *frozen => Ok(true),
+        Ok(_) => Err(Status::failed_precondition("creation input changed")),
+        Err(engram_core::MetaError::NotFound) => Ok(false),
+        Err(e) => Err(err(e)),
+    }
+}
+
+/// No operator admission producer exists yet. This must precede all mutations.
+fn require_managed_create_admission() -> Result<(), Status> {
+    Err(Status::unavailable(
+        "managed creation admission unavailable",
+    ))
+}
+
 #[tonic::async_trait]
 impl SessionPolicyService for PolicyControl {
+    async fn read_managed_boot(
+        &self,
+        req: Request<wire::ReadManagedBootRequest>,
+    ) -> Result<Response<wire::ReadManagedBootResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        if req.get_ref().protocol != wire::PROTOCOL {
+            return Err(Status::invalid_argument("unsupported protocol"));
+        }
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let identity = managed_identity(required(req.into_inner().identity)?)?;
+        let row = self
+            .control
+            .authority
+            .manager
+            .meta
+            .get_managed_boot(&identity)
+            .await
+            .map_err(err)?;
+        boot_response(row)
+    }
+    async fn finalize_managed_boot(
+        &self,
+        req: Request<wire::FinalizeManagedBootRequest>,
+    ) -> Result<Response<wire::ReadManagedBootResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        if req.get_ref().protocol != wire::PROTOCOL {
+            return Err(Status::invalid_argument("unsupported protocol"));
+        }
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let input = engram_protocol::managed_boot::decode(&req.into_inner().input_json)
+            .map_err(|_| Status::invalid_argument("invalid managed finalization"))?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("managed boot unavailable"))?;
+        let row = crate::managed_boot::finalize(state, input)
+            .await
+            .map_err(|_| {
+                Status::failed_precondition("managed boot authority changed or unavailable")
+            })?;
+        boot_response(Some(row))
+    }
+    async fn reserve_managed_create(
+        &self,
+        req: Request<wire::ReserveManagedCreateRequest>,
+    ) -> Result<Response<wire::ReserveManagedCreateResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let (frozen, create) = managed_creation(req.get_ref())?;
+        require_managed_create_admission()?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("creation unavailable"))?;
+        let identity = frozen.identity.clone();
+        // The exact retry is independent of current image/profile resolution.
+        if !managed_creation_retry(self.control.authority.manager.meta.as_ref(), &frozen).await? {
+            let identity_env = create.harness_env.clone().into_iter().collect();
+            let mut api = crate::grpc_app::convert::create_request_from_proto(create)
+                .map_err(|_| Status::invalid_argument("invalid creation request"))?;
+            api.mcp_creation = Some(identity.policy.clone());
+            api.managed_creation = Some(frozen);
+            crate::api::sessions::create_session_core(state, identity_env, api, None)
+                .await
+                .map_err(|_| Status::failed_precondition("session reservation unavailable"))?;
+        }
+        Ok(Response::new(wire::ReserveManagedCreateResponse {
+            protocol: wire::PROTOCOL,
+            identity: Some(identity_wire(identity)),
+            state: "held".into(),
+        }))
+    }
+    async fn read_native_manifest(
+        &self,
+        req: Request<wire::ReadNativeManifestRequest>,
+    ) -> Result<Response<wire::ReadNativeManifestResponse>, Status> {
+        let _admission = self.control.check(&req, req.get_ref().protocol)?;
+        self.control
+            .authority
+            .enabled()
+            .map_err(|_| Status::unavailable("policy unavailable"))?;
+        let identity = managed_identity(required(req.into_inner().identity)?)?;
+        let stored = self
+            .control
+            .authority
+            .manager
+            .meta
+            .read_managed_creation(&identity)
+            .await
+            .map_err(err)?;
+        Ok(Response::new(wire::ReadNativeManifestResponse {
+            protocol: wire::PROTOCOL,
+            identity: Some(identity_wire(stored.identity)),
+            native_version: stored.native.version,
+            native_bytes: stored.native.bytes,
+            native_digest: stored.native.digest,
+        }))
+    }
+
     async fn read_managed_policy(
         &self,
         req: Request<wire::ReadManagedPolicyRequest>,
@@ -282,6 +493,18 @@ impl SessionPolicyService for PolicyControl {
                 .map(from_ref)
                 .collect::<Result<_, _>>()?,
         };
+        if self
+            .control
+            .authority
+            .manager
+            .meta
+            .managed_boot_open(ctx.session_id)
+            .await
+            .map_err(err)?
+            == Some(false)
+        {
+            return Err(Status::failed_precondition("managed execution gate closed"));
+        }
         let answer = self
             .control
             .authority
@@ -328,6 +551,18 @@ impl SessionPolicyService for PolicyControl {
                 .map(from_ref)
                 .collect::<Result<_, _>>()?,
         };
+        if self
+            .control
+            .authority
+            .manager
+            .meta
+            .managed_boot_open(ctx.session_id)
+            .await
+            .map_err(err)?
+            == Some(false)
+        {
+            return Err(Status::failed_precondition("managed execution gate closed"));
+        }
         let answer = self
             .control
             .authority
@@ -467,6 +702,61 @@ async fn check_managed_target(
 mod tests {
     use super::*;
     #[test]
+    fn managed_creation_requires_exact_native_input_and_reserved_identity() {
+        let sid = "00000000-0000-0000-0000-000000000001";
+        let make = |native: Option<&str>| {
+            let mut create = app::CreateSessionRequest {
+                requested_session_id: Some(sid.into()),
+                harness: Some("codex".into()),
+                ..Default::default()
+            };
+            if let Some(native) = native {
+                create
+                    .harness_env
+                    .insert("ENGRAM_TOOLS".into(), native.into());
+            }
+            let policy = wire::CreatePolicySessionRequest {
+                protocol: 1,
+                actor_id: "owner".into(),
+                input_id: "create-a".into(),
+                create: Some(create),
+                ..Default::default()
+            };
+            let mut r = wire::ReserveManagedCreateRequest {
+                protocol: 1,
+                creation_request: policy.encode_to_vec(),
+                task_id: "task-a".into(),
+                native_version: 1,
+                native_digest: engram_core::types::managed_create::digest(
+                    native.unwrap_or("").as_bytes(),
+                ),
+                input_digest: String::new(),
+            };
+            r.input_digest = wire::managed_create_input_digest(&r);
+            r
+        };
+        let original = make(Some(" [ ] "));
+        let (frozen, _) = managed_creation(&original).unwrap();
+        assert_eq!(frozen.native.bytes, b" [ ] ");
+        assert_eq!(frozen.identity.session_id.to_string(), sid);
+        assert!(managed_creation(&make(None)).is_err());
+        let mut wrong = original.clone();
+        wrong.task_id = "task-b".into();
+        assert!(managed_creation(&wrong).is_err());
+        let mut wrong = original.clone();
+        wrong.native_version = 2;
+        wrong.input_digest = wire::managed_create_input_digest(&wrong);
+        assert!(managed_creation(&wrong).is_err());
+        let mut wrong = original;
+        wrong.creation_request.push(0);
+        assert!(managed_creation(&wrong).is_err());
+        assert_eq!(
+            require_managed_create_admission().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+    }
+
+    #[test]
     fn creation_policy_comes_only_from_explicit_supported_creation_input() {
         let mut r = wire::CreatePolicySessionRequest {
             protocol: 1,
@@ -494,3 +784,19 @@ mod tests {
 #[cfg(test)]
 #[path = "policy_tests.rs"]
 mod recovery_tests;
+
+fn boot_response(
+    row: Option<engram_core::types::managed_boot::ManagedBootRecord>,
+) -> Result<Response<wire::ReadManagedBootResponse>, Status> {
+    let boot_json = row
+        .map(|mut r| {
+            r.sealed_agent = None;
+            engram_protocol::managed_boot::encode(&r)
+                .map_err(|_| Status::internal("managed boot encoding failed"))
+        })
+        .transpose()?;
+    Ok(Response::new(wire::ReadManagedBootResponse {
+        protocol: wire::PROTOCOL,
+        boot_json,
+    }))
+}

@@ -392,6 +392,25 @@ reopen it in that proxy incarnation. Recovery needs a fresh proxy incarnation
 and full policy replay with quarantine checks. Other sessions remain usable.
 This barrier cannot revoke bytes that were delivered before it completed.
 
+### Immutable managed creation authority
+
+The session create transaction stores a held reservation with the exact native
+ENGRAM_TOOLS bytes, version and SHA-256 digest. It binds the reserved session ID
+to the task, create input, actor and immutable parent policy. The request digest
+covers the exact serialized trusted creation request and its native version and
+task context. A retry must match all original input; it cannot replace a manifest
+with the current profile. Empty native input is an explicit `[]`, never an absent
+value. Native classification follows the descriptor contract, not a name prefix.
+
+Held reservations use the existing queued session row and all existing creation
+satellites. Ordinary queue listing and placement exclude them. No host request
+occurs during reservation. The pinned mTLS policy service alone can read this
+source. Public creation and managed admission stay closed until the operator
+admission and physical boot gate exist. The future boot transition must claim
+the same held row and bind the actual physical epoch; a reservation is not a
+network receipt or permission to start a harness. Legacy sessions have no source
+and cannot be backfilled from guest state or a current profile.
+
 ### Closed cold preparation
 
 A managed cold prepare request names one exact private disk manifest version,
@@ -425,6 +444,60 @@ environment, and no arguments. Native attachment identity, reliable control
 liveness, and child-process state are checked before a closed receipt. A helper
 cleanup timeout stays failed after forced reaping. This local cleanup result
 cannot replace the proxy's lease barrier or clear its stable session poison.
+
+
+### Durable managed boot and disk capture authority
+
+The immutable creation row remains unchanged. A companion boot row claims the
+actual host, sandbox, physical epoch and boot attempt before host I/O. Each
+transition takes the session or policy-ancestor locks and compares its exact
+revision. The pinned policy service reads this row and finalizes its manifest;
+it never waits for the orchestrator while holding a transaction. Finalization
+preserves every original native descriptor and its order. Only the full sealed
+AgentSpec is durable; the plaintext environment is a transport-only input.
+
+The prepared receipt names the actual network allocation and host incarnation.
+It is closed preparation only. Finalization requires an authenticated current
+policy receipt with the final binding hash, the exact native source and the
+combined manifest digest. The coordinator commits one start intent before its
+first host call. After a lost reply, the scanner reads the same host intent and
+state. Missing state does not authorize another start. Scanner pages use stable
+session IDs so failed rows cannot starve later claims.
+The scanner also reads prepared, finalizing and started owners so a retained
+retirement proof cannot be hidden by a failed finalization or start reply. An
+older exact retirement receipt may be recorded when the stored desired deny
+policy is already a newer superset. This keeps the newer next-boot requirement;
+it does not acknowledge that policy as applied to the retired owner.
+
+The singleton `managed_operator_generation_gate` starts closed with no published
+generation or identity. Boot claim, finalization, start intent and started CAS
+acquire its `FOR SHARE` lock before session or ancestor locks and require an
+open exact generation and identity. The authenticated operator publisher must
+acquire `FOR UPDATE` first, close admission, stage the generation and invalidate
+participant readiness in a short transaction. It may open the gate only after
+all required participants have current actual receipts. No host I/O occurs
+under either lock. The publisher must also use this lock for held-create
+admission and placement invalidation. There is no public or configuration
+setter. Public managed creation stays unavailable until that publisher exists.
+
+A cold capture first interrupts the old physical target. It preserves history
+and pending prompts, retires pending old tool-result deliveries, and makes old
+call targets permanently unavailable. A capture intent fixes its source key,
+capture ID, and independent disk manifest (capture UUID, version one) before
+host I/O. The intent and claimed disk are GC roots; a missing pending manifest
+fails GC collection closed. The authenticated producer returns the actual
+retirement and disk receipt. Its digest binds the exact image, kernel, ordered
+bundles, disk manifest, byte hash and size, and `CrashConsistentDiskCutV1` result.
+That result does not assert clean guest caches or application transactions.
+
+Recovery requires the exact stored capture authority and an authoritatively
+destroyed source. A capture-shaped request is insufficient. Destination prepare
+also receives the exact record, so it verifies the selected disk against the
+same retired source. Same-source capture retries return the same durable result,
+including after replacement. No path infers a disk from a file name or restores
+memory, device state, or a pending effect. Generic coordinator lifecycle and
+execution gates remain closed until the appropriate durable start proof exists;
+generic resume, snapshot, teleport, and harness restart cannot replace this path.
 
 ### Firecracker closed cold producer
 

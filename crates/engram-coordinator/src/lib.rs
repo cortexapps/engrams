@@ -218,6 +218,7 @@ pub async fn run_with_registry_and_local(
     // Push-driven via `queue_wake` (see above); polling is the fallback.
     // ADR 0073 phase 2: the outbox delivery driver — resume-behind-
     // enqueue + at-least-once forward + redelivery-until-acked.
+    let _managed_boot = managed_boot::spawn(state.clone());
     let _outbox_delivery = outbox_delivery::spawn(state.clone(), state.outbox_wake.clone());
     // ADR 0079: the session-op executor — the lifecycle kernel.
     let _session_ops = session_ops::spawn(state.clone(), state.session_ops_wake.clone());
@@ -633,3 +634,5 @@ impl std::error::Error for CoordinatorError {
         }
     }
 }
+
+pub mod managed_boot;
